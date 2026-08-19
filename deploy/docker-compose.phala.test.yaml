@@ -98,7 +98,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: &enclave-image ghcr.io/teleport-computer/feedling:d4f3cae
+    image: &enclave-image ghcr.io/teleport-computer/feedling:816109f
     command: &enclave-command ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -178,7 +178,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:d4f3cae
+    image: ghcr.io/teleport-computer/feedling:816109f
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -254,6 +254,9 @@ services:
       # source database; switch both values atomically when TEST promotes the
       # owner-migrated TEE database to primary.
       FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
+      # TEST plaintext tier: known users whose preference is unset/off write
+      # plaintext shapes; explicit on and unknown users remain encrypted.
+      FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "1"
       # TEE 明文影子库（feedling-io-db-test，独立 pg CVM）。best-effort 双写：
       # db.py 写主库后镜像到这里，tee_shadow.mirror 永不 raise、失败只计数，绝不
       # 拖垮主路径。两个都为空 = 双写 OFF（mirror.enabled() 需 FEEDLING_TEE_DUAL_WRITE=1
@@ -365,7 +368,7 @@ services:
   # (deploy/docker-compose.phala.runner.yaml) is unrelated extra V2 capacity
   # and is untouched by this change.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:d4f3cae
+    image: ghcr.io/teleport-computer/feedling:816109f
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
@@ -377,6 +380,8 @@ services:
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
       DATABASE_URL: "${DATABASE_URL:-}"
       FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
+      # Keep Runtime V2 writes aligned with backend whoami/effective preference.
+      FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "1"
       # frame_get resolves R2-backed photo pointers in this process.
       R2_ENDPOINT: "${R2_ENDPOINT:-}"
       R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"
@@ -477,7 +482,7 @@ services:
       retries: 3
 
   cpu-recorder:
-    image: ghcr.io/teleport-computer/feedling:d4f3cae
+    image: ghcr.io/teleport-computer/feedling:816109f
     container_name: cpu-recorder
     command: ["python", "-u", "ops/cpu_recorder.py"]
     restart: unless-stopped

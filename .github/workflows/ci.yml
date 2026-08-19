@@ -611,7 +611,7 @@ jobs:
             tests/test_verify_enclave_domain.py \
             -v
 
-      - name: Run CI security tier 3 (58 files)
+      - name: Run CI security tier 3 (59 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
@@ -641,6 +641,7 @@ jobs:
             tests/test_perception_recent_apps_flow.py \
             tests/test_perception_signal_state_v2.py \
             tests/test_plaintext_job_exclusivity.py \
+            tests/test_postgres_restore_wait.py \
             tests/test_screen_ws_revoked.py \
             tests/test_store_append_chat_file.py \
             tests/test_tee_dual_write.py \
@@ -2316,6 +2317,7 @@ jobs:
         env:
           FEEDLING_API_URL:     ${{ vars.TEST_API_URL || 'https://test-api.feedling.app' }}
           FEEDLING_ENCLAVE_URL: ${{ vars.TEST_MAIN_ENCLAVE_URL }}
+          FEEDLING_CANARY_EXPECT_PLAINTEXT: "1"
         run: |
           python3 -m pip install --quiet cryptography
           python3 tools/deploy_canary.py
@@ -2486,6 +2488,7 @@ jobs:
             fi
           done
           exit "$publish_status"
+
       # No post-deploy Runtime V2 fleet gate here — this CVM runs the V1
       # agent-runner, which has no v2_worker_heartbeats identity to check.
       # The main test CVM's serve-worker liveness is proved separately by the

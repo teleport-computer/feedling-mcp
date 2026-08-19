@@ -258,7 +258,6 @@ def _build_context_memories(moments, decrypted, query_args):
 
     context_mode = query_args["context_mode"]
     want_trace = query_args["want_trace"]
-    use_readside = query_args["use_readside"]
 
     context_memories: list[dict] = []
     context_memory_trace: dict | None = None
@@ -295,26 +294,27 @@ def _build_context_memories(moments, decrypted, query_args):
     started = time.monotonic()
     selection_trace: dict | None = None
 
-    if use_readside:
-        mode = "readside_relevance"
-        picked, selection_trace = readside.select_context_memories_via_readside(
-            garden_cards,
-            latest_user_text,
-            cap=8,
-        )
-        context_memories = _back_to_original(picked)
-        context_memory_trace = selection_trace if want_trace else None
-    else:
-        mode = f"bucketed:{context_mode or 'default'}"
-        # 一律走带 trace 那支：落库记录需要 selection_trace，
-        # 且它与不带 trace 那支选出的卡完全一致（只是多返回一份说明）。
-        picked, selection_trace = select_context_memories_with_trace(
-            garden_cards,
-            latest_user_text,
-            mode=context_mode,
-        )
-        context_memories = _back_to_original(picked)
-        context_memory_trace = selection_trace if want_trace else None
+    # 🔴 两条 runtime 统一走**分桶**那套（hx 2026-08-18 拍板：
+    # 「v2 的挑卡参考 v1 的，就是挑桶那种」—— 目标是用户切 runtime 无感）。
+    #
+    # 此前的分叉不是设计意图：`context_mode` 由调用方传，hosted/turn.py 传
+    # "model_api"、resident consumer 不传，于是同一个产品有两套注入规则
+    # （分桶 vs 纯相关性；候选池 200 vs 50）。2026-06 换管道时顺手丢掉了
+    # 打底逻辑，见 docs/superpowers/specs/2026-08-17-auto-injection-unification.md。
+    #
+    # MEMORY_READSIDE_FOR_MODEL_API 这个开关就此失效：它此前控制的两件事
+    # （用哪套挑法、候选池多大）现在都统一了。开关本身留在 readside.py 里
+    # 没有清理 —— 别的地方可能还读它，删之前要全仓确认。
+    mode = "bucketed:unified"
+    picked, selection_trace = select_context_memories_with_trace(
+        garden_cards,
+        latest_user_text,
+        # 固定 default：strict 那套（纠正卡 ≤2 + 严格阈值）是 model_api 专有的
+        # 判据，统一之后不再按调用方分叉。
+        mode="default",
+    )
+    context_memories = _back_to_original(picked)
+    context_memory_trace = selection_trace if want_trace else None
 
     context_memory_log = mg_observability.injection_record(
         mode=mode,
@@ -399,17 +399,15 @@ async def v1_chat_history(request: Request):
         want_trace = str(
             request.query_params.get("context_trace") or ""
         ).lower() in {"1", "true", "yes", "on"}
-        use_readside = (
-            context_mode == "model_api"
-            and readside.memory_readside_for_model_api_enabled()
-        )
-        memory_limit = (
-            readside.memory_readside_model_api_limit() if use_readside else 200
-        )
+        # 候选池统一成 resident 一直在用的 200 —— 挑法一样但池子是 50 vs 200
+        # 的话，「切 runtime 无感」仍然不成立：卡多的用户在小池子里会漏掉旧卡。
+        #
+        # 仍然可配（MEMORY_READSIDE_MODEL_API_LIMIT），只是默认值从 50 提到 200：
+        # 池子大小是运维旋钮（数据规模问题），不该随这次统一一起被写死。
+        memory_limit = readside.memory_readside_model_api_limit(default=200)
         query_args = {
             "context_mode": context_mode,
             "want_trace": want_trace,
-            "use_readside": use_readside,
             "authorized_user_id": user_id,
             "content_sk": content_sk,
         }

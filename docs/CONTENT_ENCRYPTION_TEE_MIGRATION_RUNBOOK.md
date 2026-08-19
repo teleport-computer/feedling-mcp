@@ -148,8 +148,9 @@ counts scoped by canary account and creation time before cleanup.
 
 - `pre`: gate open; full two-account and physical-device Broadcast/Perception
   regression. Retain frozen RDS for the observation window.
-- `test`: repeat with test-only secrets. Promote TEE with gate closed, smoke,
-  then open and repeat dual-account regression.
+- `test`: TEE primary is promoted and the gate is open. Keep backend, in-CVM
+  worker, and independent runner aligned; repeat the dual-account regression
+  after every content-shape release.
 - `prod`: require test evidence, backup/restore drill, rollback owner, and a
   scheduled freeze. Promote with gate closed. Opening plaintext is a separate,
   reversible configuration step after encrypted canaries stay green.

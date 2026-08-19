@@ -380,15 +380,17 @@ ORDER BY table_name;
 - **重签证书**：用冷存的 `ca.key` 重跑 gen-certs 的 server 证书部分，redeploy 注入新
   `PG_SERVER_CERT_B64/KEY_B64`。
 
-## 5. 恢复演练与 RTO（2026-07-28 首次实测，test 环境）
+## 5. 恢复演练与 RTO（2026-07-28 test / 2026-08-19 prod）
 
 > 对应主计划 `docs/superpowers/plans/2026-07-23-tee-promotion-decrypt-removal.md`
-> Phase 0 Task 0.3。**演练结论：备份链可恢复、RPO≈0，但 `restore.sh` 现状下无法
-> 一把跑通**——三处需要人工干预（见 §5.3），扶正为唯一主库前应先修 §5.3 第 1 条。
+> Phase 0 Task 0.3。2026-07-28 的首次 test 演练确认备份链可恢复，但暴露了恢复参数
+> 与完成判据缺口；2026-08-19 的 PROD 隔离演练再次确认备份链可恢复，并证明
+> `pg_ctl -w` 只代表数据库已经接受只读连接，**不代表 WAL 已回放完成**。
 
 ### 5.1 演练方法
 
-test 备份 → 本机一次性容器（**非** TEE 内，只验证备份可恢复性）：
+test 可在本机一次性容器恢复；PROD 必须使用 prod workspace 的独立临时 CVM，
+不挂在线卷、不开放数据库端口、关闭公开日志，核验后删除整个 CVM。两者容器内步骤相同：
 
 ```bash
 docker run -d --name feedling-restore-drill --entrypoint /bin/bash \
@@ -396,17 +398,29 @@ docker run -d --name feedling-restore-drill --entrypoint /bin/bash \
   -e AWS_ENDPOINT=… -e AWS_ACCESS_KEY_ID=… -e AWS_SECRET_ACCESS_KEY=… \
   -e AWS_S3_FORCE_PATH_STYLE=true -e AWS_REGION=auto \
   -e PGDATA=/var/lib/postgresql/data \
-  ghcr.io/teleport-computer/feedling-postgres:<prod 同款 tag> -c 'sleep infinity'
+  ghcr.io/teleport-computer/feedling-postgres:<含 recovery helper 的已验证 immutable tag> \
+  -c 'sleep infinity'
 docker exec -u postgres feedling-restore-drill restore.sh          # 取 LATEST
 docker exec -u postgres feedling-restore-drill \
-  /usr/lib/postgresql/17/bin/pg_ctl -D "$PGDATA" -l /tmp/pg.log start -w
+  restore-start-and-wait.sh
 ```
+
+`restore-start-and-wait.sh` 默认等待最多 1800 秒，并且只有
+`pg_is_in_recovery() = false` 才返回成功。`pg_ctl -w` 会在 archive recovery
+仍在进行、数据库刚能接受只读连接时就返回，禁止单独拿它作为恢复完成证据。
+需要调整时使用 `RESTORE_RECOVERY_TIMEOUT_SEC` / `RESTORE_POLL_INTERVAL_SEC`；
+前者同时约束 PostgreSQL 启动等待和后续 recovery 轮询，必须为正整数；超时会
+fail-closed 并保留恢复实例与日志供诊断。
+
+> 该 helper 随下一版 PostgreSQL 镜像交付；演练必须选择 CI 构建并验证过、包含该
+> helper 的 immutable tag/digest。现役 PROD PG 镜像尚未包含它，不能照搬现役 tag，
+> 也不能把当前镜像中的裸 `pg_ctl -w` 当作完成门禁。
 
 机密取自 `~/documents/teleport/feedling-pg-test-secrets.txt` 的
 `TEST_WALG_*` / `TEST_PG_BACKUP_R2_*`（注意有 `TEST_` 前缀，且 compose 侧变量名是
 `PG_BACKUP_R2_*` → 容器内要映射成 wal-g 认的 `AWS_*`）。
 
-### 5.2 RTO / RPO 实测
+### 5.2 首次 test RTO / RPO 实测
 
 | 阶段 | 耗时 | 说明 |
 |---|---|---|
@@ -416,9 +430,26 @@ docker exec -u postgres feedling-restore-drill \
 | **RTO 合计** | **≈ 7 分钟** | ⚠️ 本机为 arm64 跑 amd64 镜像（Rosetta 模拟），**属上限**；原生 x86 应更快 |
 | **RPO** | **≈ 0** | 恢复点 `13:34:36 UTC`，演练启动为 `13:25` —— WAL 归档及时，几乎无数据损失 |
 
-### 5.3 演练发现的三个卡点（都需人工干预，建议修掉）
+#### 2026-08-19 PROD 隔离复演
 
-1. **⚠️ `max_connections` 不足会让回放直接 FATAL（唯一的真缺陷，应修）**
+使用 PROD workspace 的无端口临时 CVM，从 03:01 UTC 的 `LATEST` base backup
+恢复并持续回放到 archive recovery 自动 promote：
+
+| 阶段 | 耗时 / 结果 |
+|---|---|
+| `wal-g backup-fetch` | **42s** |
+| WAL 回放至 `pg_is_in_recovery() = false` | **653s** |
+| **RTO 合计** | **695s（约 11m35s）** |
+| **RPO** | **约 20s**（恢复实例最后事务时间与核验时间差） |
+| 完整性标量 | PostgreSQL 17.10；TEE schema `0011_perception_signal_state_v2`；57 张 public 表；871 个用户聚合行 |
+
+第一次复演曾在 `pg_ctl -w` 返回后立即核验，当时 `pg_is_in_recovery() = true`，
+只回放到 base backup 后第三个 WAL segment；这不是归档缺失，而是完成判据错误。
+加入显式 recovery wait 后，同一条备份链连续回放到最新 WAL 并以退出码 0 完成。
+
+### 5.3 演练发现的三个卡点与当前状态
+
+1. **`max_connections` 不足会让回放直接 FATAL（已修）**
 
    ```
    FATAL:  recovery aborted because of insufficient parameter settings
@@ -428,18 +459,19 @@ docker exec -u postgres feedling-restore-drill \
 
    线上 `max_connections=400` 是**部署参数注入的，不在备份的 `postgresql.conf` 里**，
    恢复端起来是默认 100 → PG 拒绝回放。演练中靠手工往 `postgresql.conf` 追加
-   `max_connections = 400` 才继续。**建议 `restore.sh` 在写 recovery 配置那段
-   一并写入 `max_connections`（以及同类的 `max_worker_processes` /
-   `max_prepared_transactions` / `max_locks_per_transaction`，PG 对这些都有
-   "≥ primary" 的硬要求）**，否则真出事时会在这里卡住。
+   `max_connections = 400` 才继续。当前 `restore.sh` 已从恢复出的 `pg_control`
+   自动读取并写入 `max_connections`、`max_worker_processes`、`max_wal_senders`、
+   `max_prepared_transactions` 与 `max_locks_per_transaction`，不再写死线上值。
 
-2. **`pg_ctl` 不在默认 PATH**：交互式 `docker exec` 拿不到 `/usr/lib/postgresql/17/bin`，
-   直接敲 `pg_ctl` 得到 `exit 127`。必须用绝对路径。（与 §3 记的 cron PATH 坑同源。）
+2. **`pg_ctl` 不在默认 PATH（已修）**：交互式 `docker exec` 拿不到
+   `/usr/lib/postgresql/17/bin`，直接敲 `pg_ctl` 得到 `exit 127`。
+   `restore.sh` 与 `restore-start-and-wait.sh` 现在都会解析并导出实际 bin 目录。
 
 3. **恢复出来的实例没有 `postgres` 角色**：备份来自 TEE 库，角色是
    `feedling_owner` / `app` / `monitoring`。用 `psql -U postgres` 会得到
    `FATAL: role "postgres" does not exist`；本地 socket 要用
-   `psql -U feedling_owner -d feedling`。**写恢复脚本/健康探针时别默认 postgres 角色。**
+   `psql -U feedling_owner -d feedling`。新 helper 默认使用这组 owner/database，
+   也允许通过 `RESTORE_OWNER_USER` / `RESTORE_DATABASE` 显式覆盖。
 
 ### 5.4 一致性核对结果
 
@@ -457,7 +489,8 @@ docker exec -u postgres feedling-restore-drill \
 
 ### 5.5 收尾
 
-演练容器是一次性的，核完即删：`docker rm -f feedling-restore-drill`。
+演练容器或临时 CVM 是一次性的，核完即删：本地容器执行
+`docker rm -f feedling-restore-drill`；PROD 临时 CVM 必须连同磁盘一起删除。
 **不要**把演练容器留着——它持有可解密备份的 `WALG_LIBSODIUM_KEY`。
 
 ## 6. 本地原地重部署（机密轮换用；2026-07-29 test 实测通过）

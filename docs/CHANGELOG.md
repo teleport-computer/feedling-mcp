@@ -47,6 +47,26 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-19 — PROD 备份恢复门禁等待 WAL 真正回放完成
+
+**[DONE] 恢复流程不再把 `pg_ctl -w` 误当成 archive recovery 完成。**
+
+- PROD 隔离复演从 `LATEST` base backup 完成恢复：fetch 42s、WAL 回放 653s，
+  总 RTO 约 11m35s，恢复点距核验约 20s；临时 CVM 与恢复数据已删除。
+- 新增 `restore-start-and-wait.sh`，只有 `pg_is_in_recovery() = false` 才成功；
+  默认 30 分钟超时并 fail-closed，保留现场供诊断。
+- PostgreSQL 镜像、CI 与恢复 runbook 同步接入该门禁；现役 PROD 镜像在下一次
+  PG 镜像发布前仍不具备此 helper。
+
+## 2026-08-19 — TEST 打开按用户明文内容档
+
+**[DONE] test backend、主 serve-worker 与独立 runner 统一打开明文写入闸。**
+
+- 未设置或显式 `off` 的已知用户新写入走 `body` / `body_b64` 明文形状；显式
+  `on` 和未知用户继续加密，production 仍保持关闭。
+- 本次只改变新写入，不改写历史密文；混合形状读侧与 enclave 兼容路径保留。
+- 部署契约测试锁定三类 test 写入进程必须使用相同闸值，避免 worker 漂移回密文。
+
 ## 2026-08-14 — Runtime V2 profile 失败可自动持久恢复
 
 **[DONE] profile retry 不再依赖用户下一轮 Chat，且不挤占前台或触发 watchdog 误杀。**

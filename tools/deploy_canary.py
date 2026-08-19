@@ -16,6 +16,7 @@ Config (env):
   FEEDLING_ENCLAVE_URL   enclave base url   (default http://127.0.0.1:5003)
   FEEDLING_CANARY_LABEL  register label     (default deploy-canary-<GITHUB_SHA|local>)
   FEEDLING_CANARY_RETRIES  decrypt retries  (default 4)
+  FEEDLING_CANARY_EXPECT_PLAINTEXT  exact 1 requires whoami effective=off
 
 The enclave terminates its own in-enclave self-signed TLS on :5003s, so enclave
 HTTPS calls are made WITHOUT cert verification — exactly how the backend reaches
@@ -45,6 +46,7 @@ SHA = os.environ.get("GITHUB_SHA", "local")[:12]
 LABEL = os.environ.get("FEEDLING_CANARY_LABEL", f"deploy-canary-{SHA}")
 DECRYPT_RETRIES = int(os.environ.get("FEEDLING_CANARY_RETRIES", "4"))
 HTTP_TRIES = int(os.environ.get("FEEDLING_CANARY_HTTP_TRIES", "5"))
+EXPECT_PLAINTEXT = os.environ.get("FEEDLING_CANARY_EXPECT_PLAINTEXT", "").strip() == "1"
 
 # Transient right after a CVM (re)deploy: 0 = transport layer (TLS EOF, timeout,
 # connection refused — the run #664 / PR #703 class), 502/503/504 = gateway while
@@ -165,6 +167,14 @@ def main() -> None:
         if advertised_pk != attested_pk:
             _fail(f"advertised pk != attested pk\n  advertised={advertised_pk}\n  attested ={attested_pk}")
         print("[canary] advertised pk == attested pk ✓")
+        if EXPECT_PLAINTEXT:
+            effective = str(who.get("content_encryption_effective") or "").strip().lower()
+            if effective != "off":
+                _fail(
+                    "TEST plaintext release expected "
+                    f"content_encryption_effective=off, got {effective!r}"
+                )
+            print("[canary] plaintext effective tier = off ✓")
 
         # 4. build a v1 shared envelope sealed to the enclave pk
         enclave_pk = X25519PublicKey.from_public_bytes(bytes.fromhex(attested_pk))
