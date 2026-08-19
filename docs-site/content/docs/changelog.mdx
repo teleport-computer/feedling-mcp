@@ -10,6 +10,30 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **An image-generation provider may now answer with a link, and the server
+  retrieves it.** Some providers return `data[].url` from the image endpoint
+  instead of inline bytes — measured on a relay that does this only for the 2K
+  variant of a model that is inline at lower resolutions. That response was
+  generated and billed, so the image is now fetched rather than discarded and
+  charged for again. **This is a change to what the server connects to:** a URL
+  chosen by a provider is now retrieved by Feedling. It is treated as untrusted
+  input and is fetched only under fixed rules — `https` only; every address the
+  hostname resolves to must be publicly routable, and the request is pinned to a
+  validated address with the hostname preserved for TLS, so a name that changes
+  between the check and the connection cannot redirect it inward; redirects are
+  never followed and only `200` is accepted; the response must be a PNG, JPEG or
+  WebP that actually decodes; the body is read undecoded under a byte ceiling
+  with a whole-operation deadline; and no Feedling credential, cookie or proxy
+  setting is involved. The retrieval does send the URL the provider chose,
+  including whatever path or query it encoded there. **Only the image endpoint's
+  `data[].url` is eligible — a link inside a chat reply is still never
+  fetched.** Byte, time and concurrency budgets are shared across all links in
+  one response rather than granted per link. A link that fails these checks is
+  skipped and the retrieval stops there; the request then fails if no usable
+  image remains, and never triggers a second, separately billed request. This
+  applies to every provider that answers the image endpoint with a link, not
+  only OpenAI-compatible relays.
+
 - **Image generation now works for more OpenAI-compatible relay routes.** Some
   routes whose provider is `openai_compatible` ended in
   `image_generation_invalid_output` even though the upstream request had already
@@ -21,9 +45,9 @@ change must not be interpreted as an API guarantee.
   failure is returned as-is instead of being retried on the other endpoint, so
   Feedling does not issue a second request after a failure that may represent
   paid work. Generated images are also accepted when a provider embeds them in
-  the reply text as an inline `data:` URL. **Only inline image bytes are ever
-  read — an `http(s)` image link in a provider response is ignored and is never
-  fetched by the server.** Endpoint selection and fallback routing for official
+  the reply text as an inline `data:` URL. An image link inside a chat reply is
+  still ignored and never fetched; the separate entry below covers the one place
+  a link is retrieved. Endpoint selection and fallback routing for official
   OpenAI and OpenRouter routes are unchanged; image-generation requests on
   provider wires that carry a token output budget now ask for that wire's
   existing ceiling, because the previous fixed budget could truncate an image

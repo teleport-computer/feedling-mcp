@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
 import copy
 import http.cookiejar as _cookiejar
@@ -17,7 +18,12 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
-from generated_image import MAX_GENERATED_IMAGES_PER_REPLY
+import generated_image
+import safe_url_fetch
+from generated_image import (
+    MAX_GENERATED_IMAGE_SOURCE_BYTES,
+    MAX_GENERATED_IMAGES_PER_REPLY,
+)
 from provider_types import ToolExchange
 
 if TYPE_CHECKING:
@@ -49,6 +55,9 @@ _MAX_PG_BIGINT = (1 << 63) - 1
 # bytes are billed against that same completion budget, so image requests ask
 # for the ceiling rather than a text-sized slice.
 IMAGE_OUTPUT_MAX_TOKENS = 8192
+# One wall-clock budget for every link in a single image response, so a handful
+# of slow links cannot each add a fresh fetch deadline to the turn.
+IMAGE_LINK_TOTAL_DEADLINE_SECONDS = 45.0
 
 
 def classify_provider_error(exc: BaseException) -> str:
@@ -2880,16 +2889,124 @@ def _extract_openai_compatible_media(body: dict[str, Any]) -> list[dict]:
     return media
 
 
+def _dedicated_image_links(body: dict[str, Any]) -> list[str]:
+    """The https links a dedicated Images response offered instead of bytes.
+
+    Only this response shape is eligible for a fetch. A link inside a chat
+    reply stays ignored: chat text is model-authored, and no measured relay
+    needs it — every relay that answers chat with a link also serves the
+    dedicated endpoint, which returns the bytes directly.
+    """
+    links: list[str] = []
+    rows = body.get("data")
+    if not isinstance(rows, list):
+        return links
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        url = str(row.get("url") or "").strip()
+        if url.lower().startswith("https://"):
+            links.append(url)
+            if len(links) >= MAX_GENERATED_IMAGES_PER_REPLY:
+                break
+    return links
+
+
+async def _fetch_dedicated_image_links(links: list[str], *, model: str) -> list[dict]:
+    """Fetch provider-chosen image links, one at a time, and prove each decodes.
+
+    A content-type header is a filter, not evidence: the setup probe that marks
+    a route usable only checks that media came back, so bytes that never decode
+    would mark a route "ok" and fail later in a real chat.
+
+    Three budgets are shared across the whole response rather than granted per
+    link: bytes (four links must not pull four times the single-image ceiling),
+    wall clock (four slow links must not extend the turn four deadlines), and
+    concurrency of one (a hostile URL must not fan out connections).
+
+    A fetch that fails stops the loop. Bytes already pulled by a failed
+    download cannot be counted — the failure carries no length — so continuing
+    would hand the next link a budget that is silently wrong.
+    """
+    media: list[dict] = []
+    remaining_bytes = MAX_GENERATED_IMAGE_SOURCE_BYTES
+    deadline = time.monotonic() + IMAGE_LINK_TOTAL_DEADLINE_SECONDS
+    for url in links:
+        remaining_time = deadline - time.monotonic()
+        if remaining_bytes <= 0 or remaining_time <= 0:
+            log.warning(
+                "[image-generation] image link budget exhausted model=%s "
+                "bytes_left=%s seconds_left=%.1f",
+                str(model or "")[:96],
+                remaining_bytes,
+                remaining_time,
+            )
+            break
+        try:
+            fetched = await safe_url_fetch.fetch_image_bytes_async(
+                url,
+                max_bytes=remaining_bytes,
+                deadline_seconds=min(
+                    remaining_time, safe_url_fetch.DEFAULT_DEADLINE_SECONDS
+                ),
+            )
+        except safe_url_fetch.UnsafeURLError as exc:
+            # `exc` is a stable slug by construction; the URL never appears.
+            log.warning(
+                "[image-generation] refused provider image link reason=%s model=%s",
+                str(exc)[:64],
+                str(model or "")[:96],
+            )
+            break
+        # Charged the moment the bytes exist, not once they prove decodable:
+        # undecodable downloads are exactly what an attacker would send, and
+        # charging them later would let each one refill the budget.
+        remaining_bytes -= len(fetched.data)
+        try:
+            # Decoding a 25MB image is CPU-bound and attacker-sized; on the
+            # event loop it would stall every other turn in this process.
+            normalized = await asyncio.to_thread(
+                generated_image.normalize_generated_image,
+                fetched.data,
+                declared_mime=fetched.mime_type,
+                name="",
+                index=len(media) + 1,
+            )
+        except Exception as exc:  # noqa: BLE001 - undecodable bytes are not an image
+            log.warning(
+                "[image-generation] provider image link did not decode "
+                "error=%s model=%s",
+                type(exc).__name__,
+                str(model or "")[:96],
+            )
+            continue
+        item = _inline_media_item(
+            base64.b64encode(normalized.data).decode("ascii"),
+            normalized.mime_type,
+        )
+        if item is not None:
+            media.append(item)
+            if len(media) >= MAX_GENERATED_IMAGES_PER_REPLY:
+                break
+    return media
+
+
 def _parse_openrouter_images_body(
     body: dict[str, Any],
     *,
     provider: str = "openrouter",
     model: str,
+    fetched_media: list[dict] | None = None,
 ) -> dict[str, Any]:
     """Normalize a dedicated OpenAI-style Images API response as terminal media."""
-    media = _extract_openai_compatible_media(body)
+    media = _extract_openai_compatible_media(body) or list(fetched_media or [])
     if not media:
-        raise ProviderError("provider response had no usable image")
+        # Same code the chat wire raises for the same meaning: the provider
+        # answered, but not with an image we can use. As a generic error this
+        # mapped to "test failed" — i.e. retry — and every retry is billed.
+        exc = ProviderError("image_generation_invalid_output")
+        exc.feedling_error_class = "provider_incompatible"
+        raise exc
     return {
         "reply": "",
         "reasoning": "",
@@ -4332,12 +4449,23 @@ async def _chat_completion_async_impl(
                 raise ProviderError("provider returned non-json response") from exc
             if not isinstance(body, dict):
                 raise ProviderError("provider returned non-object response")
-            # A 2xx that carried no inline image (e.g. a URL-only answer) is a
-            # real answer too: it was billed, so it must not be paid for twice.
+            # Some providers answer this endpoint with a link rather than bytes
+            # (measured: one relay does it only for its 2K variant of a model
+            # that is inline at lower resolutions). The image was generated and
+            # billed either way, so it is fetched — under safe_url_fetch's
+            # rules — instead of being thrown away and charged again.
+            fetched_media: list[dict] = []
+            if not _extract_openai_compatible_media(body):
+                fetched_media = await _fetch_dedicated_image_links(
+                    _dedicated_image_links(body), model=request_model
+                )
+            # A 2xx that carried nothing usable at all is a real answer too: it
+            # was billed, so it must not be paid for twice on the chat wire.
             return _parse_openrouter_images_body(
                 body,
                 provider=provider,
                 model=request_model,
+                fetched_media=fetched_media,
             )
         log.info(
             "[image-generation] dedicated image endpoint declined this model, "

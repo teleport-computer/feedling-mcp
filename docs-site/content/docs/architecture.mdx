@@ -42,6 +42,7 @@ deployment topology.
 | Managed CPU recorder | Retain bounded host and per-container CPU history without a public endpoint | Infrastructure identifiers and numeric CPU/load samples only; no application content |
 | Model or push provider | Perform user-selected inference or device delivery | The plaintext and delivery material required by that external service |
 | ElevenLabs voice service | Transcribe and segment speech, manage interruption, and synthesize the selected voice | Call audio, transcript text, and the assistant text returned for speech |
+| Provider-chosen image URL | Serve a generated image that the provider returned as a link instead of inline bytes | The URL the provider chose — including any path or query it encoded — plus ordinary request metadata such as the Host header and the deployment's outbound address. No Feedling-held credential, cookie, prompt, or request body is attached. Only the image endpoint's `data[].url` is eligible, it must resolve to a publicly routable address, redirects are not followed, and the bytes must decode as a PNG, JPEG or WebP within fixed size and time budgets |
 
 The component that stores a record is therefore not always the component that
 can interpret its protected body. Conversely, “encrypted at rest” does not mean
