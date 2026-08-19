@@ -698,6 +698,7 @@ jobs:
             tests/test_model_api_profiles_db.py \
             tests/test_model_api_profiles_endpoints.py \
             tests/test_provider_prompt_cache.py \
+            tests/test_safe_url_fetch.py \
             tests/test_prompt_cache_canary.py \
             tests/test_provider_usage_normalize.py \
             tests/test_provider_malformed_tool_fallback.py \
