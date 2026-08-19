@@ -21,6 +21,21 @@ change must not be interpreted as an API guarantee.
   content, and ciphertext-shape verification. The target and its backups are
   explicitly plaintext recipients and are not application failover sources.
 
+- **A `base_url` is now matched by host, not by string prefix.** Saving or
+  testing a model configuration previously accepted any `base_url` beginning
+  with `http://127.0.0.1`, which is a prefix and not a host: both
+  `http://127.0.0.1.evil.example` (the real host is `evil.example`) and
+  `http://127.0.0.1@evil.example` (`127.0.0.1` is only userinfo) were accepted
+  and sent the provider key to that host in cleartext. The URL is now parsed and
+  the host compared exactly, so those and similar disguises are refused. Two
+  consequences are user-visible. Credentials embedded in a `base_url`
+  (`https://user:pw@host/v1`) are now rejected on every scheme. And
+  `http://localhost:<port>` is now accepted where previously only
+  `http://127.0.0.1` was — the model-catalog endpoint already accepted it, and
+  the save path now uses that same check rather than a second, weaker one.
+  **This does not add address-level egress filtering:** an `https` `base_url`
+  pointing at a private or link-local address is accepted exactly as before.
+
 - **An image-generation provider may now answer with a link, and the server
   retrieves it.** Some providers return `data[].url` from the image endpoint
   instead of inline bytes — measured on a relay that does this only for the 2K

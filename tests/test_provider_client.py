@@ -2161,3 +2161,110 @@ def test_decoding_does_not_block_the_event_loop(monkeypatch):
     gaps = [b - a for a, b in zip(ticks, ticks[1:])]
     assert ticks, "the heartbeat must have run at all"
     assert max(gaps or [0]) < 0.15, f"loop was blocked for {max(gaps or [0]):.3f}s"
+
+
+# --- T152: the cleartext-loopback allowlist is parsed, not prefix-matched -----
+#
+# The save/test path used to approve a base_url with
+# `startswith("http://127.0.0.1")`, which reads a prefix rather than a host.
+# Every FORGED_* case below begins with that prefix (or with "https://") and so
+# passed before this change, sending the user's provider key to someone else's
+# server in cleartext.
+#
+# These assert the parsing contract only. They deliberately do NOT assert
+# anything about private-network https targets — see the final test, which pins
+# the fact that those are still accepted so nobody mistakes this suite for an
+# SSRF regression net.
+
+FORGED_LOOPBACK_URLS = [
+    # Real host is evil.example; "127.0.0.1" is only a label of it.
+    "http://127.0.0.1.evil.example/v1",
+    # Real host is evil.example; "127.0.0.1" is userinfo before the '@'.
+    "http://127.0.0.1@evil.example/v1",
+    # Same trick with a password component.
+    "http://127.0.0.1:ignored@evil.example/v1",
+    # A trailing dot is a distinct hostname (the DNS root form) and must not be
+    # smuggled in as equal to the bare address.
+    "http://127.0.0.1./v1",
+    # Adjacent loopback-looking addresses are not the allowlisted one.
+    "http://127.0.0.2/v1",
+    # https disguise: this begins with "https://" so the old prefix branch took
+    # it, yet the real host is evil.example.
+    "https://api.example.com@evil.example/v1",
+]
+
+
+@pytest.mark.parametrize("base_url", FORGED_LOOPBACK_URLS)
+def test_validate_config_rejects_hosts_disguised_as_loopback(base_url):
+    with pytest.raises(pc.ProviderError):
+        pc.validate_config("openai_compatible", "gpt-4", base_url)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://127.0.0.1/v1",
+        "http://127.0.0.1:8080/v1",
+        # Ollama's default. The catalog path already accepted this; the save
+        # path did not, which is the inconsistency this migration removes.
+        "http://localhost:11434/v1",
+        # Scheme and host are compared case-insensitively.
+        "HTTP://127.0.0.1/v1",
+        "http://LOCALHOST:11434/v1",
+        "https://api.example.com/v1",
+    ],
+)
+def test_validate_config_still_accepts_real_local_and_https_targets(base_url):
+    _, _, out = pc.validate_config("openai_compatible", "gpt-4", base_url)
+    assert out == base_url.rstrip("/")
+
+
+def test_validate_config_rejects_userinfo_on_https_too():
+    """Credentials in a URL are both a leak and a way to hide the real host, so
+    they are refused regardless of scheme. This narrows the save path: the old
+    prefix check accepted any string starting with "https://"."""
+    with pytest.raises(pc.ProviderError):
+        pc.validate_config("openai_compatible", "gpt-4", "https://user:pw@api.example.com/v1")
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    ["ftp://evil.example/v1", "http://evil.example/v1", "file:///etc/passwd"],
+)
+def test_validate_config_rejects_non_https_remote_targets(base_url):
+    with pytest.raises(pc.ProviderError):
+        pc.validate_config("openai_compatible", "gpt-4", base_url)
+
+
+def test_validate_config_and_catalog_path_now_agree():
+    """The two validators disagreeing is why the forgery survived: it was fixed
+    on the catalog path and left in place here. Pin them together so a future
+    change to one cannot silently re-open the gap in the other."""
+    for base_url in FORGED_LOOPBACK_URLS + ["http://localhost:11434/v1", "http://127.0.0.1:8080/v1"]:
+        def _save_path():
+            pc.validate_config("openai_compatible", "gpt-4", base_url)
+
+        def _catalog_path():
+            pc.validate_catalog_target("openai_compatible", base_url)
+
+        save_ok = catalog_ok = True
+        try:
+            _save_path()
+        except pc.ProviderError:
+            save_ok = False
+        try:
+            _catalog_path()
+        except pc.ProviderError:
+            catalog_ok = False
+        assert save_ok == catalog_ok, f"paths disagree on {base_url!r}"
+
+
+def test_https_private_addresses_are_still_accepted_this_is_not_an_ssrf_fix():
+    """Guards the SCOPE of this change, not a behaviour we want.
+
+    Address-level egress policy does not exist on this path. If someone later
+    adds it, this test SHOULD fail — that failure is the signal to update the
+    changelog and the docs claim, not to weaken the new check."""
+    for base_url in ["https://10.0.0.5/v1", "https://169.254.169.254/latest"]:
+        _, _, out = pc.validate_config("openai_compatible", "gpt-4", base_url)
+        assert out == base_url.rstrip("/")

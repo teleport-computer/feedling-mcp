@@ -375,15 +375,26 @@ def validate_config(
         raise ProviderError("model required")
     if provider == "openai_compatible" and not base_url:
         raise ProviderError("base_url required for openai_compatible")
-    # NOTE (owner): this startswith() loopback check has the SAME latent
-    # prefix-forgery flaw fixed in validate_catalog_target / _validate_egress_url
-    # ("http://127.0.0.1.evil.example" and "http://127.0.0.1@evil.example" both
-    # pass). Left untouched here to avoid changing the normal save/test path;
-    # migrate this to _validate_egress_url when that path is next revisited.
-    if base_url and not (
-        base_url.startswith("https://") or base_url.startswith("http://127.0.0.1")
-    ):
-        raise ProviderError("base_url must be https:// or local http://127.0.0.1")
+    # This is the migration the owner's NOTE here asked for: the save/test path
+    # used to approve the base_url with startswith(), which reads a prefix rather
+    # than a host. "http://127.0.0.1.evil.example" (real host evil.example) and
+    # "http://127.0.0.1@evil.example" (127.0.0.1 is userinfo) both begin with
+    # "http://127.0.0.1" and both sent the user's provider key in cleartext to
+    # someone else's server. Our users routinely paste relay base_urls handed to
+    # them by third parties, so a URL disguised as loopback is a plausible way in,
+    # not a theoretical one.
+    #
+    # The structured check already existed one screen down and the catalog path
+    # already used it; the bug survived because the two paths disagreed. Sharing
+    # one parser is the point — a third dialect would leave the same seam.
+    #
+    # SCOPE: this fixes how the cleartext-loopback allowlist is parsed and matched.
+    # It is NOT an SSRF fix. https targets are still accepted without any address
+    # check at all, so https://10.0.0.5/v1 and https://169.254.169.254/latest pass
+    # today and still pass after this change. That gap is a separate, larger piece
+    # of work waiting on a product ruling about private-network and proxy support.
+    if base_url:
+        _validate_egress_url(base_url)
     if not base_url:
         base_url = default_base_url(provider)
     if not base_url:
@@ -3933,7 +3944,10 @@ def validate_catalog_target(provider: str, base_url: str = "") -> tuple[str, str
     return provider, base_url
 
 
-_CATALOG_LOOPBACK_HOSTS = {"127.0.0.1", "localhost"}
+# Named for what it gates, not for the caller that happened to need it first:
+# both the model-catalog path and the save/test path validate through here, and
+# tying the name to one of them is how they drifted apart before.
+_CLEARTEXT_ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
 
 
 def _validate_egress_url(base_url: str) -> None:
@@ -3946,6 +3960,18 @@ def _validate_egress_url(base_url: str) -> None:
     ``evil.example``) pass a prefix check and would send the provider key in
     plaintext to the attacker. urlsplit resolves the true ``hostname`` and lets
     us forbid userinfo outright.
+
+    What this does and does not decide, stated plainly because the name is
+    broader than the check:
+
+    * it decides **which cleartext http targets are allowed** — only the exact
+      hosts above, so ``127.0.0.1.evil.example``, ``127.0.0.1@evil.example``,
+      a trailing-dot ``127.0.0.1.``, ``127.0.0.2`` and ``[::1]`` are all refused;
+    * it rejects userinfo on **every** scheme, https included, because
+      credentials in a URL are both a leak and a way to disguise the real host;
+    * it does **not** look at addresses for https targets. ``https://10.0.0.5``
+      and ``https://169.254.169.254`` pass. Address-level egress policy does not
+      exist on this path yet; nothing here should be read as providing it.
     """
     parts = urlsplit(base_url)
     scheme = parts.scheme.lower()
@@ -3957,7 +3983,7 @@ def _validate_egress_url(base_url: str) -> None:
         raise ProviderError("base_url must be https:// or local http://127.0.0.1")
     if scheme == "http":
         host = (parts.hostname or "").lower()
-        if host not in _CATALOG_LOOPBACK_HOSTS:
+        if host not in _CLEARTEXT_ALLOWED_HOSTS:
             raise ProviderError("base_url must be https:// or local http://127.0.0.1")
 
 
