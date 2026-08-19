@@ -100,6 +100,12 @@ REGISTRY: dict[str, Entry] = {
         "lane_rollup_watermark——两个源丢历史的方式不同，共用一行会把更悲观的"
         "下界强加给两边",
     ),
+    "trace_write_stats": Entry(
+        MIRROR,
+        "T138 块0的永久日速率尺子（RDS 0095/TEE 0027）；test primary 必须直接写"
+        "TEE，RDS-primary 期间则以每进程启动实例的单调绝对值幂等热镜像。行按日永久"
+        "增长，不能进 20 万行硬阀的 SNAPSHOT；reconciler 按复合主键扶正漏镜像",
+    ),
 
     # ---------------------------------------------------------------- #
     # CIPHERTEXT —— 装信封的表，经 enclave 解密成明文写进 TEE。

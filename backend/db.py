@@ -6808,6 +6808,170 @@ def append_blob_events_strict(
     return persisted
 
 
+# --- Debug-trace write-rate ruler (T138 block 0) --------------------------- #
+
+# Absolute per-writer totals, not additive deltas.  A client can therefore
+# safely retry after commit ambiguity: GREATEST(same total) is idempotent.
+_TRACE_WRITE_STATS_UPSERT_SQL = """
+INSERT INTO trace_write_stats (
+    day, writer_id, subsystem, event_type, lane,
+    persisted_events, persisted_bytes,
+    known_drop_events, known_drop_bytes,
+    at_risk_events, at_risk_bytes,
+    first_seen_at, updated_at
+) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,to_timestamp(%s),now())
+ON CONFLICT (day, writer_id, subsystem, event_type, lane) DO UPDATE SET
+    persisted_events = GREATEST(
+        trace_write_stats.persisted_events, EXCLUDED.persisted_events),
+    persisted_bytes = GREATEST(
+        trace_write_stats.persisted_bytes, EXCLUDED.persisted_bytes),
+    known_drop_events = GREATEST(
+        trace_write_stats.known_drop_events, EXCLUDED.known_drop_events),
+    known_drop_bytes = GREATEST(
+        trace_write_stats.known_drop_bytes, EXCLUDED.known_drop_bytes),
+    at_risk_events = GREATEST(
+        trace_write_stats.at_risk_events, EXCLUDED.at_risk_events),
+    at_risk_bytes = GREATEST(
+        trace_write_stats.at_risk_bytes, EXCLUDED.at_risk_bytes),
+    first_seen_at = LEAST(
+        trace_write_stats.first_seen_at, EXCLUDED.first_seen_at),
+    updated_at = now()
+"""
+
+_TRACE_WRITE_STATS_MIN_MEASUREMENT_HOURS = 7 * 24
+
+
+def upsert_trace_write_stats(rows: list[tuple]) -> None:
+    """Persist absolute trace-rate counters and best-effort mirror them.
+
+    Each row is ``(day, writer_id, subsystem, event_type, lane,
+    persisted_events, persisted_bytes, known_drop_events, known_drop_bytes,
+    at_risk_events, at_risk_bytes, first_seen_epoch)``.  The primary batch is
+    atomic; replay is safe even if the caller cannot tell whether a prior
+    commit succeeded.
+    """
+    if not rows:
+        return
+    normalized = [tuple(row) for row in rows]
+    with get_pool().connection() as conn:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.executemany(_TRACE_WRITE_STATS_UPSERT_SQL, normalized)
+    from tee_shadow import mirror
+    mirror.execute_many([
+        (_TRACE_WRITE_STATS_UPSERT_SQL, params) for params in normalized
+    ])
+
+
+def trace_write_stats_measurement(
+    *, days: int = 7, now_epoch: float | None = None,
+) -> dict:
+    """Return the fixed peak-based capacity ruler for recent trace writes.
+
+    No average is emitted deliberately: permanent retention must be sized from
+    the observed daily peak.  ``confirmed`` is the persisted lower bound;
+    ``conservative`` adds known queue drops and commit-ambiguous at-risk rows.
+    At-risk events may already be in the persisted count, so the latter is an
+    upper observation, not a claim that those events were lost.
+    """
+    window_days = max(1, min(int(days or 7), 90))
+    now = float(now_epoch if now_epoch is not None else time.time())
+    zone = ZoneInfo("Asia/Shanghai")
+    today = datetime.fromtimestamp(now, zone).date()
+    since_day = (today - timedelta(days=window_days - 1)).isoformat()
+    with get_pool().connection() as conn:
+        started = conn.execute(
+            "SELECT extract(epoch FROM MIN(first_seen_at)) "
+            "FROM trace_write_stats"
+        ).fetchone()
+        rows = conn.execute(
+            "SELECT day, subsystem, event_type, lane, "
+            "SUM(persisted_events), SUM(persisted_bytes), "
+            "SUM(known_drop_events), SUM(known_drop_bytes), "
+            "SUM(at_risk_events), SUM(at_risk_bytes) "
+            "FROM trace_write_stats WHERE day >= %s "
+            "GROUP BY day, subsystem, event_type, lane "
+            "ORDER BY day, subsystem, event_type, lane",
+            (since_day,),
+        ).fetchall()
+
+    started_epoch = (
+        float(started[0]) if started is not None and started[0] is not None else None
+    )
+    daily: dict[str, dict[str, int]] = {}
+    breakdown: list[dict] = []
+    fields = (
+        "persisted_events", "persisted_bytes",
+        "known_drop_events", "known_drop_bytes",
+        "at_risk_events", "at_risk_bytes",
+    )
+    for row in rows:
+        values = [int(row[index] or 0) for index in range(4, 10)]
+        item = {
+            "day": str(row[0]), "subsystem": str(row[1]),
+            "event_type": str(row[2]), "lane": str(row[3]),
+            **dict(zip(fields, values)),
+        }
+        item["conservative_events"] = (
+            item["persisted_events"] + item["known_drop_events"]
+            + item["at_risk_events"]
+        )
+        item["conservative_bytes"] = (
+            item["persisted_bytes"] + item["known_drop_bytes"]
+            + item["at_risk_bytes"]
+        )
+        breakdown.append(item)
+        totals = daily.setdefault(
+            item["day"], {field: 0 for field in fields}
+        )
+        for field in fields:
+            totals[field] += item[field]
+
+    rendered_daily = []
+    for day, totals in sorted(daily.items()):
+        rendered_daily.append({
+            "day": day,
+            **totals,
+            "conservative_events": (
+                totals["persisted_events"] + totals["known_drop_events"]
+                + totals["at_risk_events"]
+            ),
+            "conservative_bytes": (
+                totals["persisted_bytes"] + totals["known_drop_bytes"]
+                + totals["at_risk_bytes"]
+            ),
+        })
+    peak = max(
+        rendered_daily,
+        key=lambda item: (item["conservative_bytes"], item["day"]),
+        default=None,
+    )
+    elapsed_hours = (
+        max(0.0, (now - started_epoch) / 3600.0)
+        if started_epoch is not None else 0.0
+    )
+    return {
+        "timezone": "Asia/Shanghai",
+        "window_days": window_days,
+        "measurement_started_epoch": started_epoch,
+        "measurement_elapsed_hours": round(elapsed_hours, 3),
+        # ``days`` controls only the rendered detail window.  Seven's minimum
+        # observation gate is fixed at seven real days and must not be
+        # weakenable via ``--days 1`` on the report CLI.
+        "minimum_measurement_hours": _TRACE_WRITE_STATS_MIN_MEASUREMENT_HOURS,
+        "measurement_ready": (
+            elapsed_hours >= _TRACE_WRITE_STATS_MIN_MEASUREMENT_HOURS
+        ),
+        "capacity_basis": "daily_peak_not_average",
+        "peak": peak,
+        "daily": rendered_daily,
+        "breakdown": breakdown,
+        "crash_gap": (
+            "abnormal-exit loss is not countable here; correlate process "
+            "liveness to identify the unknown time window"
+        ),
+    }
+
+
 def patch_blob_strict(
     user_id: str,
     kind: str,

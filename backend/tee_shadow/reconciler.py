@@ -98,6 +98,14 @@ TABLES: dict[str, tuple[tuple[str, ...], str]] = {
         ("scope",),
         "scope, backfill_from, through_day, frozen_at",
     ),
+    # T138 块0的速率尺子。每个 writer_id 写自己的单调绝对值，热镜像可安全重放；
+    # reconciler 仍负责把影子写失败后的旧值扶正到源库终值。
+    "trace_write_stats": (
+        ("day", "writer_id", "subsystem", "event_type", "lane"),
+        "day, writer_id, subsystem, event_type, lane, persisted_events, "
+        "persisted_bytes, known_drop_events, known_drop_bytes, at_risk_events, "
+        "at_risk_bytes, first_seen_at, updated_at",
+    ),
 }
 
 # 每表可选的辖区 WHERE 子句：不满足的行完全不归本 reconciler 管——既不 copy、
