@@ -11,6 +11,8 @@ WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 TEE_MIGRATE_WORKFLOW = ROOT / ".github" / "workflows" / "tee-migrate.yml"
 TEST_COMPOSE = ROOT / "deploy" / "docker-compose.phala.test.yaml"
 TEST_RUNNER_COMPOSE = ROOT / "deploy" / "docker-compose.phala.runner.yaml"
+PROD_COMPOSE = ROOT / "deploy" / "docker-compose.phala.yaml"
+PROD_RUNNER_COMPOSE = ROOT / "deploy" / "docker-compose.phala.prod.runner.yaml"
 
 
 def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
@@ -284,3 +286,81 @@ def test_test_preflight_rejects_noncanonical_database_schema_selector():
     assert 'case "$FEEDLING_DATABASE_SCHEMA" in' in complete_config
     assert "rds|tee)" in complete_config
     assert "must be exactly rds or tee" in complete_config
+
+
+def test_prod_deploys_forward_one_database_schema_selector_to_every_database_client():
+    source = WORKFLOW.read_text()
+    main = _job(source, "deploy-cvm", "deploy-test-cvm")
+    runner = _job(source, "deploy-prod-runner-cvm", "notify-lark-prod-deploy")
+
+    selector = "${{ vars.PROD_FEEDLING_DATABASE_SCHEMA || 'rds' }}"
+    for deploy in (main, runner):
+        assert "FEEDLING_DATABASE_SCHEMA:" in deploy
+        assert selector in deploy
+        assert '-e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA"' in deploy
+
+
+def test_prod_compose_forwards_database_schema_to_every_database_client():
+    main = PROD_COMPOSE.read_text()
+    backend = main.split("\n  backend:\n", 1)[1].split("\n  serve-worker:\n", 1)[0]
+    worker = main.split("\n  serve-worker:\n", 1)[1]
+    runner = PROD_RUNNER_COMPOSE.read_text()
+    selector = 'FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"'
+
+    assert selector in backend
+    assert selector in worker
+    assert selector in runner
+
+
+def test_prod_preflight_blocks_unready_tee_primary_before_mutating_any_cvm():
+    preflight = _job(
+        WORKFLOW.read_text(),
+        "validate-prod-runner-topology",
+        "detect-cvm-changes-pre",
+    )
+
+    for required in (
+        "PROD_FEEDLING_DATABASE_SCHEMA == 'tee'",
+        "PROD_TEE_MIGRATION_DSN",
+        "PROD_TEE_PG_CA_PEM",
+        "APP_DATABASE_URL",
+        "backend/alembic_tee/alembic.ini",
+        "SELECT version_num FROM alembic_tee_version",
+        "owner_fingerprint != app_fingerprint",
+        'owner_user != "feedling_owner"',
+        "current_user",
+        "PROD TEE schema migration required",
+        "run the TEE migrate workflow for prod",
+        "No production CVM was changed",
+        'os.environ["FEEDLING_DATABASE_SCHEMA"] = "tee"',
+        'os.environ["DATABASE_URL"] = os.environ["APP_DATABASE_URL"]',
+        "db.init_schema()",
+    ):
+        assert required in preflight
+
+    schema_gate = preflight.index(
+        "Require PROD TEE schema at release head before mutating any CVM"
+    )
+    image_gate = preflight.index(
+        "Require both production images before mutating either CVM"
+    )
+    assert schema_gate < image_gate
+
+
+def test_prod_preflight_rejects_invalid_selector_and_stale_shadow_wiring():
+    preflight = _job(
+        WORKFLOW.read_text(),
+        "validate-prod-runner-topology",
+        "detect-cvm-changes-pre",
+    )
+    complete_config = preflight.split(
+        "- name: Require complete production Runtime V2 configuration", 1
+    )[1].split("\n      - name:", 1)[0]
+
+    assert "FEEDLING_DATABASE_SCHEMA:" in complete_config
+    assert "${{ vars.PROD_FEEDLING_DATABASE_SCHEMA || 'rds' }}" in complete_config
+    assert 'case "$FEEDLING_DATABASE_SCHEMA" in' in complete_config
+    assert "rds|tee)" in complete_config
+    assert "PROD_FEEDLING_DATABASE_SCHEMA must be exactly rds or tee" in complete_config
+    assert "PROD_TEE_DATABASE_URL must be empty for TEE primary" in complete_config
+    assert "PROD_FEEDLING_TEE_DUAL_WRITE must be empty for TEE primary" in complete_config
