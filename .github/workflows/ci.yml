@@ -372,6 +372,7 @@ jobs:
             tests/test_proactive_agent_protocol_v2.py \
             tests/test_tool_markup_leak.py \
             tests/test_memory_search_retry_guidance.py \
+            tests/test_tool_selection_eval.py \
             tests/test_v2_provider_output_edges.py \
             tests/test_runtime_v2_default_flag.py \
             tests/test_screen_vision_verdict_runtime.py \

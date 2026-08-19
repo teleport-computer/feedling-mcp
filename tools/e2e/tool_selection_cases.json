@@ -1,6 +1,6 @@
 {
   "_readme": [
-    "工具选择评测用例集。每条 = 一句真实用户话 + 唯一正解工具。",
+    "工具选择评测用例集。cases 测 first action，不是 production completion。",
     "整份完整工具目录始终一起发给模型,所以同族的其他成员天然就是混淆项 ——",
     "这正是要测的:perception_trend 的用例里,另外三个 perception 就坐在旁边。",
     "",
@@ -8,7 +8,9 @@
     "  reply / stay_silent / mcp_tool_search  —— 协议与元工具,不由用户请求触发",
     "  identity_nudge                         —— 描述明写是模型自己推断的微调",
     "  memory_fetch / history_fetch           —— 必须先由 index/search 给出 id",
-    "它们的正确性由别处保证。⚠️ 本量具只看第一轮选择、不执行 tool loop,因此**不覆盖** mcp_tool_search 的恢复协议(被拦→提示 search→下一轮拿到 full schema)—— 那需要多轮执行器,由别处的测试保证。"
+    "native_image_cases 单列当前消息原生图片：生产会直接注入 image block，不应调用图库工具。",
+    "completion_cases 用确定性 ToolExchange fixture 测前置→目标→最终可见答复；仍不冒充后端气泡发布 E2E。",
+    "它们的正确性由别处保证。mcp_tool_search 的恢复协议仍由生产 tool_loop 测试覆盖。"
   ],
   "excluded_tools": {
     "reply": "protocol tool, not user-triggered",
@@ -165,31 +167,35 @@
       "id": "scr_read_1",
       "family": "screen",
       "expect": "screen_read",
-      "utterance": "我屏幕上这个报错是什么意思?"
+      "utterance": "我屏幕上这个报错是什么意思?",
+      "runtime_fixtures": ["screen_share_active"]
     },
     {
       "id": "scr_read_2",
       "family": "screen",
       "expect": "screen_read",
-      "utterance": "你看看我现在共享的画面里写的是啥"
+      "utterance": "你看看我现在共享的画面里写的是啥",
+      "runtime_fixtures": ["screen_share_active"]
     },
     {
       "id": "scr_recent_1",
       "family": "screen",
       "expect": "screen_recent",
-      "utterance": "我刚才一共共享过几帧画面?列一下"
+      "utterance": "我刚才一共共享过几帧画面?列一下",
+      "runtime_fixtures": ["screen_share_active"]
     },
     {
       "id": "scr_recent_2",
       "family": "screen",
       "expect": "screen_recent",
-      "utterance": "最近的屏幕共享记录有哪些?只要列表"
+      "utterance": "最近的屏幕共享记录有哪些?只要列表",
+      "runtime_fixtures": ["screen_share_active"]
     },
     {
       "id": "photo_read_1",
       "family": "photo",
       "expect": "photo_read",
-      "utterance": "看看我刚发的那张照片里都有什么",
+      "utterance": "看看我上周存进图库的那张海边照片里都有什么",
       "also_ok": [
         "photo_recent"
       ]
@@ -198,7 +204,7 @@
       "id": "photo_read_2",
       "family": "photo",
       "expect": "photo_read",
-      "utterance": "这张图你帮我认一下是什么品种的狗",
+      "utterance": "从我图库里找那张狗的旧照片,读出来看看是什么品种",
       "also_ok": [
         "photo_recent"
       ]
@@ -345,13 +351,15 @@
       "id": "wake_cancel_1",
       "family": "wake",
       "expect": "cancel_wake",
-      "utterance": "把明早那个提醒取消了"
+      "utterance": "把明早那个提醒取消了",
+      "runtime_fixtures": ["scheduled_wakes"]
     },
     {
       "id": "wake_cancel_2",
       "family": "wake",
       "expect": "cancel_wake",
-      "utterance": "把周五晚上给妈妈打电话那个提醒撤掉"
+      "utterance": "把周五晚上给妈妈打电话那个提醒撤掉",
+      "runtime_fixtures": ["scheduled_wakes"]
     },
     {
       "id": "img_1",
@@ -388,6 +396,97 @@
       "family": "single",
       "expect": "task",
       "utterance": "派一个子任务去查清楚「我们上周定的发布日期到底是哪天」,查完回来告诉我结论"
+    }
+  ],
+  "native_image_cases": [
+    {
+      "id": "photo_current_1",
+      "family": "photo",
+      "utterance": "看看我刚发的这张照片里都有什么",
+      "input_fixture": "current_message_native_image",
+      "expected_action": "answer_from_native_image"
+    },
+    {
+      "id": "photo_current_2",
+      "family": "photo",
+      "utterance": "这张图里的狗是什么品种",
+      "input_fixture": "current_message_native_image",
+      "expected_action": "answer_from_native_image"
+    }
+  ],
+  "completion_cases": [
+    {
+      "id": "completion_workspace_read",
+      "family": "workspace",
+      "utterance": "把我上次写的那份方案的内容读出来看看",
+      "tool_steps": [
+        {
+          "expect": "workspace_list",
+          "result": {
+            "entries": [
+              {"path": "/workspace/plan.md", "revision": 7}
+            ]
+          }
+        },
+        {
+          "expect": "workspace_read",
+          "args_contains": {"path": "/workspace/plan.md"},
+          "result": {
+            "path": "/workspace/plan.md",
+            "revision": 7,
+            "content": "周五上线，负责人小王。"
+          }
+        }
+      ],
+      "require_visible_reply": true
+    },
+    {
+      "id": "completion_voice_read",
+      "family": "voice",
+      "utterance": "上次那通电话里我具体说了什么?原话",
+      "tool_steps": [
+        {
+          "expect": "voice_transcript_list",
+          "result": {
+            "calls": [
+              {"call_id": "call_20260818_01", "occurred_at": "2026-08-18T20:00:00Z"}
+            ]
+          }
+        },
+        {
+          "expect": "voice_transcript_read",
+          "args_contains": {"call_id": "call_20260818_01"},
+          "result": {
+            "call_id": "call_20260818_01",
+            "transcript": "我周五下午到上海。"
+          }
+        }
+      ],
+      "require_visible_reply": true
+    },
+    {
+      "id": "completion_photo_read",
+      "family": "photo",
+      "utterance": "从我图库里找最近那张狗的旧照片,读出来看看是什么品种",
+      "tool_steps": [
+        {
+          "expect": "photo_recent",
+          "result": {
+            "photos": [
+              {"photo_id": "photo_old_17", "occurred_at": "2026-08-17T10:00:00Z"}
+            ]
+          }
+        },
+        {
+          "expect": "photo_read",
+          "args_contains": {"photo_id": "photo_old_17"},
+          "result": {
+            "photo_id": "photo_old_17",
+            "observations": ["一只金毛犬站在草地上"]
+          }
+        }
+      ],
+      "require_visible_reply": true
     }
   ]
 }
