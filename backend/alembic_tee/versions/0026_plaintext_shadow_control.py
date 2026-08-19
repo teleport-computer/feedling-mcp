@@ -89,22 +89,24 @@ DECLARE
     dirty_key  JSONB := '{}'::jsonb;
     key_name   TEXT;
 BEGIN
-    IF TG_NARGS = 0 THEN
-        RAISE EXCEPTION 'plaintext shadow capture requires at least one key column';
-    END IF;
-
     IF TG_OP = 'DELETE' THEN
         source_row := to_jsonb(OLD);
     ELSE
         source_row := to_jsonb(NEW);
     END IF;
 
-    FOREACH key_name IN ARRAY TG_ARGV LOOP
-        IF NOT source_row ? key_name OR source_row->key_name = 'null'::jsonb THEN
-            RAISE EXCEPTION 'plaintext shadow capture key column is missing or null: %', key_name;
-        END IF;
-        dirty_key := dirty_key || jsonb_build_object(key_name, source_row->key_name);
-    END LOOP;
+    -- Zero arguments deliberately means a table-level marker.  Some legacy
+    -- tables use an authentication token or object-storage key as their
+    -- primary key; copying that value into the control plane would leak a
+    -- credential.  Their consumer performs one table reconcile instead.
+    IF TG_NARGS > 0 THEN
+        FOREACH key_name IN ARRAY TG_ARGV LOOP
+            IF NOT source_row ? key_name OR source_row->key_name = 'null'::jsonb THEN
+                RAISE EXCEPTION 'plaintext shadow capture key column is missing or null: %', key_name;
+            END IF;
+            dirty_key := dirty_key || jsonb_build_object(key_name, source_row->key_name);
+        END LOOP;
+    END IF;
 
     INSERT INTO plaintext_shadow_dirty_keys
         (table_name, key_json, operation, generation, created_at, attempts,
@@ -151,4 +153,3 @@ def downgrade() -> None:
     raise NotImplementedError(
         "alembic_tee downgrade is not supported; restore from backup"
     )
-

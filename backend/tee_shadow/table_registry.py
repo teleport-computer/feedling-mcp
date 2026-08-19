@@ -54,6 +54,9 @@ class Entry:
     # Most targets keep the source name.  frame_envelopes is transformed into
     # the historical `frames` plaintext shape.
     destination_table: str | None = None
+    # None means capture the real primary key.  An empty tuple means a table-
+    # level dirty marker: required when the primary key itself is a secret.
+    capture_key_columns: tuple[str, ...] | None = None
 
 
 REGISTRY: dict[str, Entry] = {
@@ -334,6 +337,11 @@ REGISTRY = {
         entry,
         key_columns=_PRIMARY_KEYS.get(name, ()),
         destination_table="frames" if name == "frame_envelopes" else name,
+        capture_key_columns=(
+            ()
+            if name in {"notify_relay_configs", "chat_r2_cleanup"}
+            else _PRIMARY_KEYS.get(name, ())
+        ),
     )
     for name, entry in REGISTRY.items()
 }
