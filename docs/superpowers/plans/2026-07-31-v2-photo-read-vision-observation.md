@@ -1,5 +1,4 @@
 # Runtime V2 `photo_read` Vision Observation Implementation Plan
-
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make Hosted Runtime V2 turn a model-requested `photo_read(include_image=true)` into a real, routed visual observation without changing V1 or auto-opening photos on wake.
@@ -251,4 +250,3 @@ Run `git diff --check`, `git diff --stat`, and `git status --short`. Confirm the
 git add docs/CHANGELOG.md
 git commit -m "docs: record v2 stored photo vision fix"
 ```
-

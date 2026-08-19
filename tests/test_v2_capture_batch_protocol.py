@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import conftest
 import db
+from core import envelope as core_envelope
 from core import store as core_store
 from memory import service as memory_service
 from model_api_runtime.v2 import jobs_store, trajectory, worker
@@ -79,6 +80,21 @@ def _envelope(user_id: str, memory_id: str, *, body: str = "ciphertext") -> dict
     }
 
 
+def _plaintext_envelope(user_id: str, memory_id: str) -> dict:
+    return {
+        "id": memory_id,
+        "owner_user_id": user_id,
+        "visibility": "shared",
+        "body": '{"summary":"plain","content":"memory","bucket":"","threads":[]}',
+        "type": "fact",
+        "occurred_at": "2026-07-20T12:00:00Z",
+        "source": "memory_capture",
+        "importance": 0.8,
+        "pulse": 0.4,
+        "last_referenced_at": "2026-07-20T12:00:00Z",
+    }
+
+
 def _window(*, after: int = 0, through: int = 1) -> dict:
     return {
         "after_seq": after,
@@ -107,11 +123,27 @@ def _manual_card(user_id: str, memory_id: str) -> dict:
     }
 
 
+def test_capture_action_validation_normalizes_occurred_at_and_rejects_garbage():
+    action = _add("u_capture_timestamp", "mom-timestamp")
+    action["envelope"]["occurred_at"] = "2026-07-20T20:00:00+08:00"
+
+    normalized = jobs_store._validate_capture_actions(
+        "u_capture_timestamp", [action]
+    )
+
+    assert normalized[0]["envelope"]["occurred_at"] == "2026-07-20T12:00:00Z"
+
+    action["envelope"]["occurred_at"] = "not-a-date"
+    with pytest.raises(ValueError, match="invalid occurred_at"):
+        jobs_store._validate_capture_actions("u_capture_timestamp", [action])
+
+
 def test_capture_commit_is_atomic_strips_plaintext_and_keeps_canonical_logs():
     uid = "u_capture_atomic"
     _seed(uid)
     job_id, _job = _running(uid)
     action = _add(uid, "mom-atomic")
+    action["envelope"]["occurred_at"] = "2026-07-20T20:00:00+08:00"
     action["envelope"]["_inner"] = {"content": "DO_NOT_STORE"}
     batch = jobs_store.prepare_capture_batch(
         job_id=job_id,
@@ -161,9 +193,88 @@ def test_capture_commit_is_atomic_strips_plaintext_and_keeps_canonical_logs():
     assert status == "completed"
     assert state["last_captured_until_seq"] == 1
     assert state["capture_seq_initialized"] is True
-    assert moment["created_at"] != moment["occurred_at"]
+    assert moment["occurred_at"] == "2026-07-20T12:00:00Z"
+    assert moment["created_at"].endswith("Z")
+    assert "." not in moment["created_at"]
     assert batch_count == 0
     assert {"memory_changes", "bootstrap_events"}.issubset(streams)
+
+
+def test_capture_commit_accepts_plaintext_envelope_for_plaintext_user(monkeypatch):
+    uid = "u_capture_plaintext"
+    _seed(uid)
+    monkeypatch.setattr(
+        core_envelope,
+        "resolve_content_encryption",
+        lambda user_id: "off" if user_id == uid else "on",
+    )
+    job_id, _job = _running(uid)
+    action = {
+        "type": "memory.add",
+        "envelope": _plaintext_envelope(uid, "mom-plaintext"),
+    }
+
+    batch = jobs_store.prepare_capture_batch(
+        job_id=job_id,
+        user_id=uid,
+        claimed_by="capture-worker",
+        window=_window(),
+        actions=[action],
+    )
+    result = jobs_store.commit_capture_batch(
+        job_id=job_id,
+        user_id=uid,
+        claimed_by="capture-worker",
+        batch_id=batch["id"],
+    )
+
+    assert result["committed"] is True
+    with db.get_pool().connection() as conn:
+        moment = conn.execute(
+            "SELECT doc FROM memory_moments WHERE user_id=%s AND moment_id=%s",
+            (uid, "mom-plaintext"),
+        ).fetchone()[0]
+    assert moment["body"].startswith("{\"summary\":")
+    assert "body_ct" not in moment
+
+
+def test_capture_rejects_plaintext_envelope_for_encrypted_user(monkeypatch):
+    uid = "u_capture_encrypted_plaintext_rejected"
+    _seed(uid)
+    monkeypatch.setattr(core_envelope, "resolve_content_encryption", lambda _uid: "on")
+    job_id, _job = _running(uid)
+
+    with pytest.raises(ValueError, match="plaintext envelope not enabled"):
+        jobs_store.prepare_capture_batch(
+            job_id=job_id,
+            user_id=uid,
+            claimed_by="capture-worker",
+            window=_window(),
+            actions=[
+                {
+                    "type": "memory.add",
+                    "envelope": _plaintext_envelope(uid, "mom-rejected"),
+                }
+            ],
+        )
+
+
+def test_capture_rejects_mixed_plaintext_and_ciphertext_envelope(monkeypatch):
+    uid = "u_capture_mixed_shape_rejected"
+    _seed(uid)
+    monkeypatch.setattr(core_envelope, "resolve_content_encryption", lambda _uid: "off")
+    job_id, _job = _running(uid)
+    envelope = _envelope(uid, "mom-mixed")
+    envelope["body"] = "plaintext must not coexist"
+
+    with pytest.raises(ValueError, match="content shape invalid"):
+        jobs_store.prepare_capture_batch(
+            job_id=job_id,
+            user_id=uid,
+            claimed_by="capture-worker",
+            window=_window(),
+            actions=[{"type": "memory.add", "envelope": envelope}],
+        )
 
 
 def test_v2_capture_banner_accumulates_across_midnight_and_ignores_noop(monkeypatch):

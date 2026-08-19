@@ -57,6 +57,14 @@ def test_provider_tool_surface_has_explicit_admin_step_label():
     }) == ("🧩", "MCP Provider 实收工具面")
 
 
+def test_provider_roundtrip_summary_has_explicit_admin_step_label():
+    assert data_track._debug_friendly_step({
+        "type": "mcp.roundtrip.provider",
+        "subsystem": "mcp",
+        "detail": {},
+    }) == ("🔁", "Provider 本轮往返")
+
+
 def test_memory_search_and_index_have_distinct_admin_labels():
     search = data_track._debug_friendly_step({
         "type": "memory.search.called",
@@ -97,6 +105,73 @@ def test_context_truncation_has_explicit_admin_label_and_visible_counts():
             "worldbook_truncated": 0,
         }
     }
+
+
+def test_memory_content_truncation_has_visible_route_and_counts_without_body():
+    secret = "T074_ADMIN_SECRET_MUST_NOT_APPEAR"
+    event = _event(
+        1,
+        "user_t074",
+        "memory.content.truncation",
+        trace_id="t074",
+        status="warning",
+        detail={
+            "route": "genesis_history_import",
+            "counts": {
+                "original_chars": 5042,
+                "truncated_chars": 42,
+            },
+        },
+        content_excerpt={},
+    )
+    event["unexpected_upstream_content"] = secret
+
+    assert data_track._debug_friendly_step(event) == ("✂️", "记忆卡截断")
+    public = data_track._debug_event_public_json(event)
+    assert public["detail"] == {
+        "route": "genesis_history_import",
+        "counts": {
+            "original_chars": 5042,
+            "truncated_chars": 42,
+        },
+    }
+    assert secret not in str(public)
+
+
+def test_identity_dimensions_set_admin_trace_exposes_only_counts():
+    secret_dimension = "T085_DIMENSION_SECRET_NEVER_ADMIN"
+    secret_reason = "T085_REASON_SECRET_NEVER_ADMIN"
+    event = _event(
+        1,
+        "user_t085",
+        "identity.dimensions_set",
+        trace_id="t085",
+        detail={
+            "counts": {
+                "changed_count": 4,
+                "added_count": 1,
+                "deleted_count": 2,
+                "labels_changed": 1,
+            },
+        },
+        content_excerpt={},
+    )
+    event["dimension_name"] = secret_dimension
+    event["reason"] = secret_reason
+
+    assert data_track._debug_friendly_step(event) == ("🪪", "身份维度重写")
+    public = data_track._debug_event_public_json(event)
+    assert public["detail"] == {
+        "counts": {
+            "changed_count": 4,
+            "added_count": 1,
+            "deleted_count": 2,
+            "labels_changed": 1,
+        },
+    }
+    serialized = str(public)
+    assert secret_dimension not in serialized
+    assert secret_reason not in serialized
 
 
 def test_query_fingerprint_is_visible_but_plaintext_query_stays_redacted():

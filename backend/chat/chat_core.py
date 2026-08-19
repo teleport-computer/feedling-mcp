@@ -669,19 +669,19 @@ def write_message(store: UserStore, payload: dict) -> tuple[dict, int]:
     envelope = payload.get("envelope")
     if envelope is None:
         return {"error": "envelope required"}, 400
-    missing = [f for f in _ENVELOPE_REQUIRED if not envelope.get(f)]
-    if missing:
-        return {"error": "envelope_missing_fields", "detail": missing}, 400
-    if envelope["visibility"] not in ("shared", "local_only"):
-        return {"error": "envelope.visibility must be 'shared' or 'local_only'"}, 400
-    if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
-        return {"error": "envelope with visibility=shared requires K_enclave"}, 400
-    conflict = _stale_key_conflict(store, envelope)
-    if conflict is not None:
-        return conflict
     content_type = payload.get("content_type", "text")
     if content_type not in ("text", "image", "file"):
         return {"error": "content_type must be 'text', 'image', or 'file'"}, 400
+    gate_err = core_envelope.validate_uploaded_chat_envelope(
+        envelope,
+        user_id=store.user_id,
+        content_type=content_type,
+    )
+    if gate_err is not None:
+        return gate_err, 400
+    conflict = _stale_key_conflict(store, envelope)
+    if conflict is not None:
+        return conflict
     file_extra: dict = {}
     if content_type == "image":
         # Lazy import mirrors the existing hosted bridge below.
@@ -782,7 +782,12 @@ def trace_response_gated(store: UserStore, payload: dict, allow_verify_reply: bo
     )
 
 
-def gate_response_dict(store: UserStore, allow_verify_reply: bool, payload: dict | None = None):
+def gate_response_dict(
+    store: UserStore,
+    allow_verify_reply: bool,
+    payload: dict | None = None,
+    consumer_info: dict | None = None,
+):
     """Bridge to the shared bootstrap gate.
 
     ``boot_gates._gate_bootstrap_for_chat`` returns a framework-neutral
@@ -793,9 +798,10 @@ def gate_response_dict(store: UserStore, allow_verify_reply: bool, payload: dict
     Identity Card presence/content is not part of this gate. The remaining VPS
     checks prove that a resident consumer and live chat loop are available.
     """
-    gated = boot_gates._gate_bootstrap_for_chat(
-        store, allow_verify_reply=allow_verify_reply
-    )
+    gate_kwargs = {"allow_verify_reply": allow_verify_reply}
+    if consumer_info:
+        gate_kwargs["consumer_info"] = consumer_info
+    gated = boot_gates._gate_bootstrap_for_chat(store, **gate_kwargs)
     if gated is None:
         return None
     if _is_resident_maintenance_reply(store, payload):
@@ -821,23 +827,22 @@ def write_response(
     ``consumer_info`` is the X-Feedling-Consumer identity for the liveness state.
     Both are parsed framework-neutrally by the adapter.
     """
-    chat_consumer._record_consumer_event(store, "response", info=consumer_info)
     envelope = payload.get("envelope")
     if envelope is None:
         return {"error": "envelope required"}, 400
-    missing = [f for f in _ENVELOPE_REQUIRED if not envelope.get(f)]
-    if missing:
-        return {"error": "envelope_missing_fields", "detail": missing}, 400
-    if envelope["visibility"] not in ("shared", "local_only"):
-        return {"error": "envelope.visibility must be 'shared' or 'local_only'"}, 400
-    if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
-        return {"error": "envelope with visibility=shared requires K_enclave"}, 400
-    conflict = _stale_key_conflict(store, envelope)
-    if conflict is not None:
-        return conflict
     content_type = payload.get("content_type", "text")
     if content_type not in ("text", "image"):
         return {"error": "content_type must be 'text' or 'image'"}, 400
+    gate_err = core_envelope.validate_uploaded_chat_envelope(
+        envelope,
+        user_id=store.user_id,
+        content_type=content_type,
+    )
+    if gate_err is not None:
+        return gate_err, 400
+    conflict = _stale_key_conflict(store, envelope)
+    if conflict is not None:
+        return conflict
     raw_file_followups = payload.get("file_followups")
     file_followups: list[tuple[dict, dict]] = []
     if raw_file_followups is not None:
@@ -854,24 +859,14 @@ def write_response(
             followup_envelope = raw_followup.get("envelope")
             if not isinstance(followup_envelope, dict):
                 return {"error": "file_followup envelope required"}, 400
-            missing = [
-                field for field in _ENVELOPE_REQUIRED
-                if not followup_envelope.get(field)
-            ]
-            if missing:
-                return {
-                    "error": "file_followup_envelope_missing_fields",
-                    "detail": missing,
-                }, 400
-            if followup_envelope["visibility"] not in ("shared", "local_only"):
-                return {"error": "invalid file_followup visibility"}, 400
-            if (
-                followup_envelope["visibility"] == "shared"
-                and not followup_envelope.get("K_enclave")
-            ):
-                return {
-                    "error": "shared file_followup requires K_enclave"
-                }, 400
+            gate_err = core_envelope.validate_uploaded_chat_envelope(
+                followup_envelope,
+                user_id=store.user_id,
+                content_type="file",
+                max_binary_bytes=1_000_000,
+            )
+            if gate_err is not None:
+                return gate_err, 400
             conflict = _stale_key_conflict(store, followup_envelope)
             if conflict is not None:
                 return conflict
@@ -971,29 +966,27 @@ def write_response(
     if thinking_envelope is not None:
         if not isinstance(thinking_envelope, dict):
             return {"error": "thinking_envelope must be an object"}, 400
-        missing = [f for f in _ENVELOPE_REQUIRED if not thinking_envelope.get(f)]
+        required, shape_err = core_envelope.upload_shape_gate(
+            thinking_envelope, user_id=store.user_id)
+        if shape_err is not None:
+            return shape_err, 400
+        missing = [f for f in required if not thinking_envelope.get(f)]
         if missing:
             return {"error": "thinking_envelope_missing_fields", "detail": missing}, 400
         if thinking_envelope["visibility"] not in ("shared", "local_only"):
             return {"error": "thinking_envelope.visibility must be 'shared' or 'local_only'"}, 400
-        if thinking_envelope["visibility"] == "shared" and not thinking_envelope.get("K_enclave"):
+        if core_envelope.requires_enclave_key(thinking_envelope):
             return {"error": "thinking_envelope with visibility=shared requires K_enclave"}, 400
         conflict = _stale_key_conflict(store, thinking_envelope)
         if conflict is not None:
             return conflict
         thinking_extra = {
-            "thinking_v": str(thinking_envelope.get("v", 1)),
-            "thinking_id": str(thinking_envelope.get("id") or ""),
-            "thinking_body_ct": str(thinking_envelope["body_ct"]),
-            "thinking_nonce": str(thinking_envelope["nonce"]),
-            "thinking_K_user": str(thinking_envelope["K_user"]),
-            "thinking_visibility": str(thinking_envelope["visibility"]),
-            "thinking_owner_user_id": str(thinking_envelope["owner_user_id"]),
-            "thinking_enclave_pk_fpr": str(thinking_envelope.get("enclave_pk_fpr") or ""),
-            "thinking_content_pk_fpr": str(thinking_envelope.get("content_pk_fpr") or ""),
+            # 这两个指纹保持「键恒在、缺省空串」的既有行为；下面的 splice 只在
+            # 信封真带了值时覆盖。
+            "thinking_enclave_pk_fpr": "",
+            "thinking_content_pk_fpr": "",
+            **core_envelope.envelope_prefixed_fields(thinking_envelope, "thinking"),
         }
-        if thinking_envelope.get("K_enclave"):
-            thinking_extra["thinking_K_enclave"] = str(thinking_envelope["K_enclave"])
         thinking_extra.update(chat_service._chat_thinking_metadata_from_payload(payload))
     else:
         thinking_extra.update(chat_service._chat_plaintext_thinking_extra_for_store(store, payload))
@@ -1181,6 +1174,9 @@ def write_response(
             # A resident may finish after the phone has hung up. This is an
             # accepted terminal disposition, not a transport error that should
             # keep the local consumer retrying the same stale answer forever.
+            chat_consumer._record_consumer_event(
+                store, "response", info=consumer_info
+            )
             return {
                 "status": "ignored",
                 "reason": str(exc),
@@ -1206,6 +1202,9 @@ def write_response(
                 winner = db.chat_get_strict(store.user_id, winner_reply_id)
                 if winner is not None:
                     _maybe_mark_first_chat_ok(store, reply_to_message_id)
+                    chat_consumer._record_consumer_event(
+                        store, "response", info=consumer_info
+                    )
                     return {
                         "id": winner["id"],
                         "ts": winner["ts"],
@@ -1229,6 +1228,10 @@ def write_response(
             content_type=content_type,
             extra=extra,
         )
+    # Persist liveness only after the response has been accepted (or on the two
+    # explicit accepted/idempotent return paths above). Malformed or conflicting
+    # submissions must not update the shared activity clock.
+    chat_consumer._record_consumer_event(store, "response", info=consumer_info)
     delivery_fields: dict = {}
     visible_push_body = (push_body or alert_body).strip()
     # Defense-in-depth: synthetic/maintenance replies must NEVER surface as push

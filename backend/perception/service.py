@@ -25,7 +25,10 @@ from datetime import datetime
 from typing import Any, Callable, Mapping
 
 from content_encryption import random_item_id
-from core import enclave as core_enclave
+from core import envelope as core_envelope
+from core import enclave as core_enclave  # noqa: F401 — 读侧已改走 core_envelope.read_envelope_body；
+# 这行保留是因为测试 monkeypatch `<module>.core_enclave` 上的
+# _decrypt_envelope_via_enclave（patch 的是共享模块对象，仍然生效）。
 
 from . import catalog, history, permissions, resolve, store
 from .ingress_v2 import device_event_observations_v2, operation_observations_v2, observe_signal_v2
@@ -139,10 +142,13 @@ def _decrypt_signal_payload_v2(
 ) -> tuple[Any | None, str]:
     if not isinstance(envelope, Mapping):
         return None, "invalid_envelope"
-    if not api_key and decrypt_envelope is None:
+    if (not envelope.get("body") and not envelope.get("body_b64")
+            and not api_key and decrypt_envelope is None):
         return None, "decrypt_skipped"
     try:
-        decrypt = decrypt_envelope or core_enclave._decrypt_envelope_via_enclave
+        # 默认走形状路由：明文行直读、信封行才打 enclave。签名与
+        # _decrypt_envelope_via_enclave 逐字一致，注入方（测试/上层）不受影响。
+        decrypt = decrypt_envelope or core_envelope.read_envelope_body
         raw = decrypt(dict(envelope), api_key, purpose=f"perception:{key}")
         return _decode_decrypted_payload_v2(raw), ""
     except Exception as e:
@@ -370,11 +376,19 @@ def _ingest_snapshot_v2_inner(
                 results[key] = "accepted"
             continue
         if key in ENCRYPTED_SIGNAL_KEYS_V2:
-            if signal.encrypted:
+            envelope = item.get("envelope")
+            if isinstance(envelope, Mapping):
+                shape_error = None
+                if envelope.get("body") is not None:
+                    shape_error = core_envelope.validate_uploaded_envelope(
+                        dict(envelope), user_id=user_id)
+                if shape_error is not None:
+                    results[key] = str(shape_error.get("error") or "invalid_envelope")
+                    continue
                 results[key] = "accepted"
                 plaintext, err = _decrypt_signal_payload_v2(
                     key,
-                    item.get("envelope") if isinstance(item.get("envelope"), Mapping) else {},
+                    envelope,
                     api_key=api_key,
                     decrypt_envelope=decrypt_envelope,
                 )
@@ -848,24 +862,37 @@ def _fire_wake_event_v2(event) -> None:
         # must not silently strand a V2 event in resident ``proactive_jobs``.
         runtime_mode = hosted_config_store.get_hosted_runtime_mode_strict(s)
         if runtime_mode == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
+            photo = (
+                event.payload.get("photo")
+                if isinstance(event.payload, dict)
+                and isinstance(event.payload.get("photo"), dict)
+                else {}
+            )
+            context_doc = {
+                "wake_id": str(event.wake_id or "")[:160],
+                "source": str(event.source or "")[:120],
+                "trigger": str(event.trigger or "")[:120],
+                "change_digest": str(event.change_digest or "")[:2000],
+                "origin_refs": [
+                    str(ref)[:200]
+                    for ref in list(event.origin_refs or ())[:10]
+                ],
+                "presence_hints": dict(event.presence_hints or {}),
+                "created_at": float(event.created_at or _now()),
+            }
+            if str(event.trigger or "") == "photo_added":
+                context_doc.update({
+                    "photo_id": str(photo.get("photo_id") or "")[:160],
+                    "scene": str(photo.get("scene") or "")[:200],
+                    "time_of_day": str(photo.get("time_of_day") or "")[:80],
+                })
             job_id, _ = jobs_store.enqueue_job_with_context_log(
                 event.user_id,
                 "heartbeat",
                 reason=str(event.trigger or event.source or "perception_event")[:120],
                 trace_id=str(event.wake_id or "")[:160] or None,
                 context_stream=store.V2_WAKE_CONTEXT_STREAM,
-                context_doc={
-                    "wake_id": str(event.wake_id or "")[:160],
-                    "source": str(event.source or "")[:120],
-                    "trigger": str(event.trigger or "")[:120],
-                    "change_digest": str(event.change_digest or "")[:2000],
-                    "origin_refs": [
-                        str(ref)[:200]
-                        for ref in list(event.origin_refs or ())[:10]
-                    ],
-                    "presence_hints": dict(event.presence_hints or {}),
-                    "created_at": float(event.created_at or _now()),
-                },
+                context_doc=context_doc,
                 context_ts=float(event.created_at or _now()),
             )
             store.trim_v2_wake_context(event.user_id)
@@ -1293,7 +1320,11 @@ def photo_evaluate(user_id: str, metadata: dict,
         return {"error": "content_envelope_required"}, 400
 
     # Store ciphertext in the frame channel + metadata as a confirmed item.
-    store.put_photo_envelope(user_id, photo_id, now, content_envelope)
+    stored = store.put_photo_envelope(user_id, photo_id, now, content_envelope)
+    if stored is False:
+        # Do not confirm metadata without durable pixels. iOS keeps its cursor
+        # unchanged on this retryable non-2xx response.
+        return {"error": "photo_storage_unavailable"}, 503
     doc = {"photo_id": photo_id, "metadata": meta_out, "status": "confirmed",
            "usable": True, "sensitive": sensitive, "frame_id": photo_id}
     if meta_envelope:
@@ -1313,7 +1344,12 @@ def photo_evaluate(user_id: str, metadata: dict,
             observe_signal_v2(
                 user_id,
                 "photo_added",
-                {"photo_id": photo_id, "sensitive": sensitive},
+                {
+                    "photo_id": photo_id,
+                    "sensitive": sensitive,
+                    "scene": str(meta_out.get("scene_hint") or "")[:200],
+                    "time_of_day": str(meta_out.get("time_of_day") or "")[:80],
+                },
                 ts=now,
                 origin_refs=(f"photo:{photo_id}",),
                 source_event_id=photo_id,

@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 
 from core import enclave as core_enclave
-from identity import card_view, identity_core
+from core import envelope as core_envelope
+from identity import card_policy, card_view, identity_core
 
 from capabilities import errors
 from capabilities.types import CapabilityResult, ok, err
@@ -41,16 +42,22 @@ def get(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityRe
     identity = body.get("identity") if isinstance(body, dict) else None
     if not isinstance(identity, dict):
         return ok(data=errors.cap_data(body))  # no card written yet
-    if not identity.get("body_ct"):
-        return ok(data=errors.cap_data(body))  # already plaintext; nothing to open
-
+    if not any(key in identity for key in ("body", "body_b64", "body_ct")):
+        # Compatibility with injected/older identity adapters that already
+        # return a materialized plaintext view rather than a stored envelope.
+        return ok(data=errors.cap_data(body))
     base = card_view.envelope_base(identity)
     if identity.get("visibility") == "local_only":
         return ok(data=errors.cap_data({"identity": card_view.local_only_view(base)}))
 
     try:
-        raw = core_enclave._decrypt_envelope_via_enclave(
-            identity, api_key, purpose="identity_get", runtime_token=runtime_token or "")
+        shape = core_envelope.classify_envelope_shape(identity)
+        if shape in ("plaintext_text", "plaintext_binary"):
+            raw = core_envelope.read_plaintext_envelope_body(
+                identity, owner_user_id=str(getattr(store, "user_id", "") or ""))
+        else:
+            raw = core_enclave._decrypt_envelope_via_enclave(
+                identity, api_key, purpose="identity_get", runtime_token=runtime_token or "")
         inner = json.loads(raw.decode("utf-8"))
         if not isinstance(inner, dict):
             raise ValueError("identity_plaintext_not_object")
@@ -217,3 +224,38 @@ def nudge(store, *, api_key=None, runtime_token=None, params=None) -> Capability
     body, status = identity_core.run_actions(store, payload, api_key=api_key,
                                              runtime_token=runtime_token or "")
     return _norm(body, status, default_msg="identity nudge unavailable")
+
+
+def set_dimensions(
+    store, *, api_key=None, runtime_token=None, params=None
+) -> CapabilityResult:
+    """Replace the complete dimensions list without touching profile fields."""
+    params = params or {}
+    dimensions = params.get("dimensions")
+    valid, validation_error = card_policy.validate_dimensions_structure(dimensions)
+    if not valid:
+        return err(
+            errors.INVALID,
+            f"identity_dimensions_set: {validation_error}",
+            retryable=False,
+        )
+    reason = params.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return err(
+            errors.INVALID,
+            "identity_dimensions_set requires a non-empty reason explaining "
+            "the user-requested rewrite",
+            retryable=False,
+        )
+    action = {
+        "type": "identity.dimensions_set",
+        "dimensions": dimensions,
+        "reason": reason.strip(),
+    }
+    body, status = identity_core.run_actions(
+        store,
+        {"action": action},
+        api_key=api_key,
+        runtime_token=runtime_token or "",
+    )
+    return _norm(body, status, default_msg="identity dimensions rewrite unavailable")

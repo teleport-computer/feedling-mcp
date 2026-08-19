@@ -22,6 +22,14 @@ _EVENT_FIELDS = {
     "broadcast_opened": {"trigger": "broadcast_opened", "screen_share_started": True},
     "broadcast_closed": {"trigger": "broadcast_closed", "screen_share_ended": True},
 }
+V1_PRESENCE_HINT_FIELDS = (
+    "place_label",
+    "motion_state",
+    "now_playing",
+    "locale",
+    "broadcast_state",
+    "broadcast_active",
+)
 
 
 def _finite_number(value: Any) -> bool:
@@ -168,9 +176,59 @@ def build_perception_glance(
     return out
 
 
-def project_perception_wake_events(items: Sequence[Mapping[str, Any]]) -> list[dict[str, bool | str]]:
-    return [dict(_EVENT_FIELDS[trigger]) for item in items if isinstance(item, Mapping)
-            if (trigger := str(item.get("trigger") or "")) in _EVENT_FIELDS]
+def project_perception_wake_events(items: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Project the producer-bounded wake facts, excluding internal cursor data.
+
+    ``serve_worker._read_perception_wake_context`` is the trust boundary that
+    limits every string/list/scalar.  The old projection discarded those facts
+    and retained only a trigger-derived constant, leaving the provider unable to
+    tell what actually changed.  Copy only the closed field set consumed by the
+    prompt; never pass through arbitrary keys from storage.
+    """
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        trigger = str(item.get("trigger") or "")
+        if trigger not in _EVENT_FIELDS:
+            continue
+        projected: dict[str, Any] = dict(_EVENT_FIELDS[trigger])
+        for field, cap in (
+            ("wake_id", 160),
+            ("source", 120),
+            ("change_digest", 2000),
+        ):
+            value = str(item.get(field) or "")[:cap]
+            if value:
+                projected[field] = value
+        origin_refs = [
+            str(ref)[:200] for ref in list(item.get("origin_refs") or [])[:10]
+        ]
+        if origin_refs:
+            projected["origin_refs"] = origin_refs
+        raw_hints = item.get("presence_hints")
+        hints: dict[str, bool | int | float | str] = {}
+        if isinstance(raw_hints, Mapping):
+            for key in V1_PRESENCE_HINT_FIELDS:
+                value = raw_hints.get(key)
+                safe_key = str(key)[:80]
+                if isinstance(value, bool):
+                    hints[safe_key] = value
+                elif isinstance(value, int):
+                    hints[safe_key] = value
+                elif isinstance(value, float) and math.isfinite(value):
+                    hints[safe_key] = value
+                elif isinstance(value, str):
+                    hints[safe_key] = value[:200]
+        if hints:
+            projected["presence_hints"] = hints
+        if trigger == "photo_added":
+            for field, cap in (("photo_id", 160), ("scene", 200), ("time_of_day", 80)):
+                value = str(item.get(field) or "")[:cap]
+                if value:
+                    projected[field] = value
+        out.append(projected)
+    return out
 
 
 def perception_glance_fingerprint(glance: Mapping[str, Any]) -> str:

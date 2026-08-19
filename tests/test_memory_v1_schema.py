@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import types
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from enclave import readside  # noqa: E402
 from memory import actions as memory_actions  # noqa: E402
+from memory import memory_core  # noqa: E402
 from memory import service as memory_service  # noqa: E402
 from memory.source_policy import MEMORY_SOURCE_VALUES  # noqa: E402
 
@@ -89,7 +91,7 @@ def test_memory_add_writes_clean_v1_schema_without_legacy_fields(monkeypatch):
                 "threads": ["蛋子", "狗狗"],
                 "importance": 0.72,
                 "pulse": 0.45,
-                "occurred_at": "2026-06-25T12:24:00",
+                "occurred_at": "2026-06-25T20:24:00+08:00",
                 "source": "chat",
             },
         }
@@ -101,6 +103,8 @@ def test_memory_add_writes_clean_v1_schema_without_legacy_fields(monkeypatch):
     assert moment["importance"] == 0.72
     assert moment["pulse"] == 0.45
     assert moment["status"] == "active"
+    assert moment["occurred_at"] == "2026-06-25T12:24:00Z"
+    assert moment["created_at"].endswith("Z")
     assert moment["last_referenced_at"] == moment["occurred_at"]
     for legacy_key in ("type", "card_v", "salience", "source_type", "anchor_memory_ids"):
         assert legacy_key not in moment
@@ -112,6 +116,117 @@ def test_memory_add_writes_clean_v1_schema_without_legacy_fields(monkeypatch):
         "bucket": "宠物",
         "threads": ["蛋子", "狗狗"],
     }
+
+
+def test_memory_add_route_normalizes_supplied_timestamp(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1_route")
+    saved: list[dict] = []
+    monkeypatch.setattr(memory_core.memory_service, "_load_moments", lambda _store: [])
+    monkeypatch.setattr(
+        memory_core.memory_service,
+        "_save_moments",
+        lambda _store, moments: saved.extend(moments),
+    )
+    monkeypatch.setattr(
+        memory_core.memory_service,
+        "mutation_lock",
+        lambda _store: nullcontext(),
+    )
+    monkeypatch.setattr(
+        memory_core.boot_gates,
+        "_log_bootstrap_event",
+        lambda *_args, **_kwargs: None,
+    )
+    envelope = {
+        "id": "mem_route_timestamp",
+        "type": "fact",
+        "body_ct": "ciphertext",
+        "nonce": "nonce",
+        "K_user": "ku",
+        "K_enclave": "ke",
+        "visibility": "shared",
+        "owner_user_id": store.user_id,
+        "occurred_at": "2026-08-15T20:00:00+08:00",
+    }
+
+    body, status = memory_core.add(store, {"envelope": envelope})
+
+    assert status == 201, body
+    assert saved[0]["occurred_at"] == "2026-08-15T12:00:00Z"
+    assert saved[0]["created_at"].endswith("Z")
+    assert "." not in saved[0]["created_at"]
+
+    envelope["occurred_at"] = "not-a-date"
+    body, status = memory_core.add(store, {"envelope": envelope})
+    assert status == 400
+    assert body["error"].startswith("occurred_at required")
+
+
+def test_memory_add_truncation_emits_content_free_counts_without_behavior_change(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1_truncation")
+    saved = _install_memory_action_fakes(monkeypatch, [])
+    events = []
+    monkeypatch.setattr(
+        memory_actions.debug_trace,
+        "trace_event",
+        lambda _store, **event: events.append(event),
+    )
+    secret = "T074_SECRET_MUST_NOT_REACH_TRACE"
+    raw_content = ("x" * 5001) + secret
+
+    body, status = memory_actions._execute_memory_actions(store, "api_key", [{
+        "type": "memory.add",
+        "memory": {
+            "summary": "Long card",
+            "content": raw_content,
+            "source": "chat",
+        },
+    }])
+
+    assert status == 200
+    assert body["status"] == "ok"
+    stored = json.loads(saved[0]["body_ct"])["content"]
+    assert stored == raw_content[:5000]
+    assert events == [{
+        "subsystem": "memory",
+        "type": "memory.content.truncation",
+        "actor": "backend",
+        "status": "warning",
+        "summary": "",
+        "explain": "",
+        "detail": {
+            "route": "memory_actions",
+            "counts": {
+                "original_chars": len(raw_content),
+                "truncated_chars": len(raw_content) - 5000,
+            },
+        },
+    }]
+    assert secret not in json.dumps(events, ensure_ascii=False)
+
+
+def test_memory_add_truncation_trace_failure_does_not_block_write(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1_trace_failure")
+    saved = _install_memory_action_fakes(monkeypatch, [])
+
+    def fail_trace(*_args, **_kwargs):
+        raise RuntimeError("trace backend unavailable")
+
+    monkeypatch.setattr(memory_actions.debug_trace, "trace_event", fail_trace)
+    raw_content = "x" * 5017
+
+    body, status = memory_actions._execute_memory_actions(store, "api_key", [{
+        "type": "memory.add",
+        "memory": {
+            "summary": "Long card",
+            "content": raw_content,
+            "source": "chat",
+        },
+    }])
+
+    assert status == 200
+    assert body["status"] == "ok"
+    assert json.loads(saved[0]["body_ct"])["content"] == raw_content[:5000]
 
 
 def test_memory_add_preserves_explicit_empty_occurred_at(monkeypatch):
@@ -381,46 +496,100 @@ def test_memory_batch_skipped_plus_failed_without_apply_returns_400(monkeypatch)
     assert [row["http_status"] for row in body["results"]] == [200, 404]
 
 
-def test_memory_add_skips_normalized_duplicate_but_keeps_distinct_content(monkeypatch):
+def test_memory_add_always_creates_duplicate_without_decrypting_existing_cards(monkeypatch):
     store = types.SimpleNamespace(user_id="usr_v1")
-    moments: list[dict] = []
+    moments = [{
+        "id": f"mem_existing_{index}",
+        "owner_user_id": store.user_id,
+        "visibility": "shared",
+        "status": "active",
+        "body_ct": json.dumps({
+            "summary": "Coffee Preference",
+            "content": "Likes oat milk.",
+        }),
+    } for index in range(80)]
     saved = _install_memory_action_fakes(monkeypatch, moments)
+
+    decrypt_calls = []
+
+    def fail_if_decrypted(moment, _api_key, runtime_token=""):
+        decrypt_calls.append((moment["id"], runtime_token))
+        raise AssertionError("memory.add must not decrypt existing cards")
+
     monkeypatch.setattr(
         memory_actions,
         "_memory_plain_from_envelope",
-        lambda moment, _api_key, runtime_token="": (
-            json.loads(moment["body_ct"]),
-            "",
-        ),
+        fail_if_decrypted,
     )
 
-    def add(summary: str, content: str):
-        return memory_actions._execute_memory_actions(store, "api_key", [{
+    body, status = memory_actions._execute_memory_actions(
+        store,
+        "api_key",
+        [{
             "type": "memory.add",
             "memory": {
-                "summary": summary,
-                "content": content,
+                "summary": "  Ｃｏｆｆｅｅ   Preference ",
+                "content": "LIKES   OAT MILK.",
                 "source": "chat",
             },
-        }])
-
-    first, first_status = add("Coffee Preference", "Likes oat milk.")
-    duplicate, duplicate_status = add(
-        "  Ｃｏｆｆｅｅ   Preference ",
-        "LIKES   OAT MILK.",
-    )
-    distinct, distinct_status = add(
-        "Coffee Preference",
-        "Likes espresso without milk.",
+        }],
+        runtime_token="rt-hosted",
     )
 
-    assert first_status == duplicate_status == distinct_status == 200
-    assert first["results"][0]["status"] == "ok"
-    assert duplicate["results"][0]["skipped"] == "duplicate_active"
-    assert duplicate["results"][0]["noop"] is True
-    assert duplicate["effects"] == []
-    assert distinct["results"][0].get("skipped") is None
-    assert len(saved) == 2
+    assert status == 200
+    assert body["results"][0]["status"] == "ok"
+    assert body["results"][0].get("skipped") is None
+    assert body["effects"][0]["type"] == "memory_added"
+    assert len(saved) == 81
+    assert decrypt_calls == []
+
+
+def test_memory_add_prebuilt_envelope_does_not_decrypt_for_duplicate_scan(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1")
+    moments = [{
+        "id": f"mem_existing_{index}",
+        "owner_user_id": store.user_id,
+        "visibility": "shared",
+        "status": "active",
+        "body_ct": "existing-ciphertext",
+    } for index in range(80)]
+    saved = _install_memory_action_fakes(monkeypatch, moments)
+    decrypt_calls = []
+
+    def fail_if_decrypted(moment, _api_key, runtime_token=""):
+        decrypt_calls.append((moment["id"], runtime_token))
+        raise AssertionError("prebuilt memory.add must not decrypt for duplicate scan")
+
+    monkeypatch.setattr(
+        memory_actions,
+        "_memory_plain_from_envelope",
+        fail_if_decrypted,
+    )
+
+    body, status = memory_actions._execute_memory_actions(
+        store,
+        "api_key",
+        [{
+            "type": "memory.add",
+            "envelope": {
+                "id": "mem_prebuilt_new",
+                "body_ct": "new-ciphertext",
+                "nonce": "nonce-new",
+                "K_user": "ku-new",
+                "K_enclave": "ke-new",
+                "visibility": "shared",
+                "owner_user_id": store.user_id,
+                "type": "fact",
+                "occurred_at": "2026-08-15T00:00:00Z",
+            },
+        }],
+        runtime_token="rt-hosted",
+    )
+
+    assert status == 200
+    assert body["results"][0]["memory"]["id"] == "mem_prebuilt_new"
+    assert len(saved) == 81
+    assert decrypt_calls == []
 
 
 def test_backend_envelope_adapter_normalizes_only_plaintext_fields():

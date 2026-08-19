@@ -73,6 +73,11 @@ Optional:
                         Short retry count before encrypted reply writes (default: 3)
   WHOAMI_REFRESH_RETRY_DELAY_SEC
                         Initial reply whoami retry backoff in seconds (default: 0.5)
+  FEEDLING_CHAT_RESPONSE_MAX_RETRIES
+                        Retryable bootstrap 409 retries (default: 3, maximum: 10)
+  FEEDLING_CHAT_RESPONSE_RETRY_BASE_SEC /
+  FEEDLING_CHAT_RESPONSE_RETRY_MAX_ELAPSED_SEC
+                        Reply retry backoff base and total wait budget (defaults: 1 / 15)
   SEND_FALLBACK_ON_AGENT_ERROR
                         Default true. Agent failures post a visible, bounded
                         failure reply instead of silently dropping the turn.
@@ -136,12 +141,13 @@ try:
 except ImportError:
     _ENCRYPTION_AVAILABLE = False
 
-import provider_client
 import generated_image
 
 # Shared torn-protocol-JSON leak detector (backend/core, pure). backend/ is on
 # sys.path via the insert above, so it imports as a top-level `core.*` name.
 from core import protocol_leak as _protocol_leak
+from core import envelope as _core_envelope
+from identity import card_view as _identity_card_view
 # 世界书注入侧的标头/上限/截断标记与 V2 共用同一份定义(纯模块,无 enclave 依赖)。
 # 各写一份就会漂——本文件前台原本就漂成了没有 UNTRUSTED 标注的弱版本。
 import worldbook_match as _worldbook_match
@@ -154,10 +160,10 @@ from memory.capture_prompt_v1 import (
     sanitize_user_name,
 )
 from identity.user_naming import transcript_speaker_label
-from memory import card_guard
-from memory import dream_gates as memory_dream_gates
-from memory.prompts_v1 import normalize_bucket_language
-from memory.card_text import (
+from memory_garden.text import card_guard
+from memory_garden.guards import dream_gates as memory_dream_gates
+from memory_garden.prompts.buckets import normalize_bucket_language
+from memory_garden.text.card_text import (
     count_user_token_residuals,
     is_retryable_parse_error,
 )
@@ -166,7 +172,7 @@ from memory.dream_prompt_v1 import (
     build_dream_retry_prompt,
     parse_dream_consolidations,
 )
-from memory.migrate_prompt_v1 import build_migrate_prompt, parse_migrated_cards
+from memory_garden.prompts.migrate import build_migrate_prompt, parse_migrated_cards
 from chat.reply_language import (
     format_time_anchor,
     infer_reply_language_policy,
@@ -643,6 +649,22 @@ WHOAMI_STARTUP_RETRY_DELAY_SEC = float(
 )
 WHOAMI_REFRESH_RETRIES = int(os.environ.get("WHOAMI_REFRESH_RETRIES", "3"))
 WHOAMI_REFRESH_RETRY_DELAY_SEC = float(os.environ.get("WHOAMI_REFRESH_RETRY_DELAY_SEC", "0.5"))
+# A stale resident liveness decision can reject the reply that proves the
+# resident is alive. New backends mark that exact bootstrap 409 retryable; retry
+# it in-process so the generated reply is not terminally discarded. Old
+# backends omit the flag and retain the historical one-shot behavior.
+CHAT_RESPONSE_MAX_RETRIES = max(
+    0,
+    min(10, int(os.environ.get("FEEDLING_CHAT_RESPONSE_MAX_RETRIES", "3"))),
+)
+CHAT_RESPONSE_RETRY_BASE_SEC = max(
+    0.0,
+    float(os.environ.get("FEEDLING_CHAT_RESPONSE_RETRY_BASE_SEC", "1")),
+)
+CHAT_RESPONSE_RETRY_MAX_ELAPSED_SEC = max(
+    0.0,
+    float(os.environ.get("FEEDLING_CHAT_RESPONSE_RETRY_MAX_ELAPSED_SEC", "15")),
+)
 # TTL gate for the pre-reply whoami refresh. Encryption keys are stable (the
 # user's own pubkey never changes; the enclave content pubkey is dstack-KMS
 # derived and stable across compose rotations), so re-fetching before every
@@ -2445,6 +2467,33 @@ def _unmark_seen(keys) -> None:
 # Decrypt sources — plaintext content for v1 encrypted messages
 # ---------------------------------------------------------------------------
 
+
+def _emit_injection_trace(log: dict | None) -> None:
+    """把 enclave 带回来的注入记录落成一条 debug trace。
+
+    记录本身已经是内容无关的（见 memory_garden/observability.py）；
+    这里只负责转发，不再加工 —— 加工会让「什么算内容」这件事散成两处。
+    失败一律吞掉：可观测性绝不能拖垮聊天。
+    """
+    if not isinstance(log, dict) or not log:
+        return
+    try:
+        counts = log.get("counts") or {}
+        injected = counts.get("injected", 0)
+        pool = counts.get("candidate_pool", 0)
+        mode = log.get("mode", "?")
+        _emit_debug_trace(
+            "memory", "memory.inject",
+            status="ok" if mode != "failed" else "failed",
+            summary=f"注入 {injected} 张（{mode}，候选 {pool}）",
+            explain="每轮自动挑卡的结果。id 与计数落库，卡片正文不落库。",
+            detail=log,
+            dur_ms=log.get("dur_ms"),
+        )
+    except Exception:  # noqa: BLE001 — 观测失败绝不能影响这一轮对话
+        pass
+
+
 def _filter_since(msgs: list, since: float) -> list:
     return [m for m in msgs if float(m.get("ts", m.get("timestamp", 0)) or 0) > since]
 
@@ -2478,6 +2527,10 @@ def _fetch_from_enclave(
             )
             resp.raise_for_status()
             data = resp.json()
+            # 自动注入的内容无关记录：enclave 算好带出来，由这里落库 ——
+            # enclave 自己没有数据库发不了 debug_trace（2026-08-17 补的盲区，
+            # 此前「每轮注入了哪几张卡」服务端一个字都查不到）。
+            _emit_injection_trace(data.get("context_memory_log"))
             msgs = data.get("messages") or data.get("history") or []
             return _filter_since(msgs, since)
         except httpx.HTTPStatusError as e:
@@ -2957,6 +3010,11 @@ def get_decrypted_history(
               (may be empty if no new messages).
       None  — no source configured, or all configured sources failed.
     """
+    handled, local_result = _fetch_plaintext_or_mixed_history(
+        since, limit, include_image_body=include_image_body)
+    if handled:
+        return local_result
+
     if FEEDLING_ENCLAVE_URL:
         result = _fetch_from_enclave(since, limit, include_image_body=include_image_body)
         if result is not None:
@@ -2964,6 +3022,98 @@ def get_decrypted_history(
         log.warning("enclave source failed")
 
     return None  # no configured source succeeded
+
+
+def _fetch_plaintext_or_mixed_history(
+    since: float,
+    limit: int,
+    *,
+    include_image_body: bool,
+) -> tuple[bool, list[dict] | None]:
+    """Use backend rows when a page contains plaintext; decrypt sealed rows one-by-one.
+
+    ``handled=False`` means the page is entirely sealed and the existing bulk
+    enclave path remains the efficient path. Once plaintext is present, the
+    bulk endpoint is forbidden because it would forward that plaintext page to
+    enclave along with the sealed rows.
+    """
+    params: dict = {"limit": limit, "since": since}
+    if not include_image_body:
+        params["include_image_body"] = "false"
+    try:
+        resp = _HTTP.get(
+            f"{FEEDLING_API_URL}/v1/chat/history",
+            params=params,
+            headers=_HEADERS,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        rows = data.get("messages") or data.get("history") or []
+    except Exception as exc:
+        log.warning("backend history shape probe failed: %s", exc)
+        return False, None
+    if not isinstance(rows, list):
+        return False, None
+
+    def _shape(row: dict) -> str:
+        if row.get("body_ct"):
+            return "sealed"
+        if row.get("body_b64") is not None:
+            return "plaintext_binary"
+        if isinstance(row.get("body"), str):
+            return "plaintext_text"
+        return "invalid"
+
+    if not any(isinstance(row, dict) and _shape(row).startswith("plaintext") for row in rows):
+        return False, None
+
+    out: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        shape = _shape(row)
+        if shape == "sealed":
+            message_id = str(row.get("id") or row.get("message_id") or "")
+            decrypted = _fetch_message_body_from_enclave(message_id)
+            if decrypted is None:
+                out.append({**row, "body_unavailable": True})
+            else:
+                out.append({**row, **decrypted})
+            continue
+        if shape == "plaintext_text":
+            out.append({**row, "content": str(row.get("body") or "")})
+            continue
+        if shape == "plaintext_binary":
+            ctype = str(row.get("content_type") or "")
+            key = "file_b64" if ctype == "file" else "image_b64"
+            out.append({**row, key: str(row.get("body_b64") or "")})
+            continue
+        if row.get("body_omitted") and row.get("body_size_bytes") is not None:
+            message_id = str(row.get("id") or row.get("message_id") or "")
+            try:
+                body_resp = _HTTP.get(
+                    f"{FEEDLING_API_URL}/v1/chat/messages/"
+                    f"{urllib.parse.quote(message_id, safe='')}/body",
+                    headers=_HEADERS,
+                    timeout=20,
+                )
+                body_resp.raise_for_status()
+                full = (body_resp.json() or {}).get("message")
+            except Exception:
+                full = None
+            if isinstance(full, dict):
+                merged = {**row, **full}
+                ctype = str(merged.get("content_type") or "")
+                if merged.get("body_b64") is not None:
+                    merged["file_b64" if ctype == "file" else "image_b64"] = str(
+                        merged.get("body_b64") or "")
+                elif isinstance(merged.get("body"), str):
+                    merged["content"] = merged["body"]
+                out.append(merged)
+                continue
+        out.append({**row, "body_unavailable": True})
+    return True, _filter_since(out, since)
 
 
 def _fetch_message_body_from_enclave(message_id: str) -> dict | None:
@@ -4452,12 +4602,12 @@ def _sanitize_thinking_summary(text: str) -> str:
     text = text.replace("\r\n", "\n").strip()
     if not text:
         return ""
-    blocked = re.compile(
-        r"(system prompt|developer message|chain[-\s]*of[-\s]*thought|"
-        r"modelUsage|terminal_reason|permission_denials|cache_read|"
-        r"cache_creation|session_id|uuid|costUSD|input_tokens|output_tokens)",
-        re.IGNORECASE,
-    )
+    # 词表来自共享内核(core.self_thinking.INTERNAL_FIELD_TERMS)。
+    # V1 的**处置**不变:仍逐行丢弃、仍用宽匹配 —— 只是不再自己维护一份字面量,
+    # 「两代词表漂移」由构造消除,不必靠测试去追源码(codex2 review 2026-08-17)。
+    from core import self_thinking as _st_terms
+
+    blocked = re.compile(_st_terms.internal_field_terms_pattern(), re.IGNORECASE)
     kept: list[str] = []
     for raw_ln in text.splitlines():
         ln = raw_ln.strip()
@@ -9432,7 +9582,6 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
     fails before the model ever saw the prompt does not permanently skip the
     catalog for the rest of that session."""
     global _io_cli_catalog_cache, _io_cli_catalog_pending_session_id
-    global _web_advertised_session_id, _web_off_notice_session_id
     if _HOSTED or AGENT_MODE != "cli":
         return content
 
@@ -9612,6 +9761,9 @@ _whoami_cache: dict = {
     "enclave_pk": None,
     "timezone": "",
     "archive_language": "",
+    # Fail safe for older backends: absent/unknown effective values mean the
+    # resident must keep sealing replies, never silently downgrade to plaintext.
+    "content_encryption_effective": "on",
 }
 
 # monotonic ts of the last successful _load_whoami() that yielded encryption
@@ -10461,6 +10613,11 @@ def _load_whoami() -> bool:
 
     tz = str(info.get("timezone") or "").strip()
     archive_language = str(info.get("archive_language") or "").strip()
+    content_encryption_effective = str(
+        info.get("content_encryption_effective") or "on"
+    ).strip().lower()
+    if content_encryption_effective not in {"on", "off"}:
+        content_encryption_effective = "on"
     _whoami_cache.update(
         user_id=user_id, user_pk=user_pk, enclave_pk=enc_pk,
         # A successful whoami is authoritative — adopt its timezone verbatim,
@@ -10470,6 +10627,7 @@ def _load_whoami() -> bool:
         # update runs.
         timezone=tz,
         archive_language=archive_language,
+        content_encryption_effective=content_encryption_effective,
     )
     ok = bool(user_id and user_pk)
     if _whoami_cache_has_full_keys():
@@ -10678,6 +10836,12 @@ def _decrypt_envelope(envelope: dict) -> bytes:
     the consumer already uses for chat/memory — no new trust surface. Auth rides
     the shared ``_HEADERS`` (runtime-token or api-key, kept fresh by
     ``_refresh_auth_header``)."""
+    if not envelope.get("body_ct"):
+        if envelope.get("body_b64") is not None:
+            return base64.b64decode(envelope["body_b64"], validate=True)
+        if isinstance(envelope.get("body"), str):
+            return envelope["body"].encode("utf-8")
+        raise ValueError("envelope_shape_unrecognized")
     if not FEEDLING_ENCLAVE_URL or _ENCLAVE_CLIENT is None:
         raise RuntimeError("enclave_unavailable")
     resp = _ENCLAVE_CLIENT.post(
@@ -11659,15 +11823,16 @@ def post_reply(
     file_followups: list[StagedChatFile] | None = None,
     image_followups: list[StagedChatImage] | None = None,
 ) -> dict:
-    """Post agent reply as a v1 ciphertext envelope.
+    """Post an agent reply using the account's effective envelope shape.
 
     `suppress_push=True` sends an empty alert_body and no push fields so
     /v1/chat/response's app-state push policy is a no-op — used for private
     writes that must land in the store (for liveness/verify) but must never
     surface as a user-visible APNs notification.
 
-    Falls back to plaintext only when encryption is unavailable — this will
-    return 400 on v1 backends and is logged as an error so it's visible.
+    Missing or unrecognized ``content_encryption_effective`` values fail safe
+    to the encrypted shape.  Plaintext-tier replies still use a v1 envelope;
+    they never use the removed legacy raw ``content`` request shape.
 
     Handles `bootstrap_incomplete` 409 by logging the structured error
     (stage, memory_count, required) and returning without raising — the
@@ -11677,37 +11842,62 @@ def post_reply(
     """
     url = f"{FEEDLING_API_URL}/v1/chat/response"
     if _ENCRYPTION_AVAILABLE and not _refresh_whoami_for_encrypted_reply():
-        log.error("whoami refresh failed before encrypted reply and no cached keys are available; skipping write")
+        log.error("whoami refresh failed before reply and no cached keys are available; skipping write")
         return {"error": "whoami_refresh_failed"}
 
     user_id = _whoami_cache["user_id"]
     user_pk: bytes | None = _whoami_cache["user_pk"]
 
     if _ENCRYPTION_AVAILABLE and user_id and user_pk:
-        def _sealed_body() -> dict[str, Any]:
+        def _effective_encryption() -> str:
+            value = str(
+                _whoami_cache.get("content_encryption_effective") or "on"
+            ).strip().lower()
+            return value if value in {"on", "off"} else "on"
+
+        def _reply_body() -> dict[str, Any]:
             # Reads the whoami cache fresh on every call so the fpr-mismatch
-            # retry below re-seals with the just-refreshed key.
+            # retry below rebuilds with the just-refreshed key and preference.
             seal_user_id = _whoami_cache["user_id"]
             seal_user_pk: bytes = _whoami_cache["user_pk"]
             seal_enc_pk: bytes | None = _whoami_cache["enclave_pk"]
-            visibility = "shared" if seal_enc_pk else "local_only"
-            envelope = _build_envelope(
-                plaintext=content.encode("utf-8"),
-                owner_user_id=seal_user_id,
-                user_pk_bytes=seal_user_pk,
-                enclave_pk_bytes=seal_enc_pk,
-                visibility=visibility,
-            )
-            sealed_file_followups = []
-            for file_item in file_followups or []:
-                file_envelope = _build_envelope(
-                    plaintext=bytes(file_item.data),
+            plaintext_tier = _effective_encryption() == "off"
+            visibility = "shared" if (plaintext_tier or seal_enc_pk) else "local_only"
+
+            def _text_envelope(value: str) -> dict[str, Any]:
+                if plaintext_tier:
+                    return {
+                        "body": value,
+                        "owner_user_id": seal_user_id,
+                        "visibility": "shared",
+                    }
+                return _build_envelope(
+                    plaintext=value.encode("utf-8"),
                     owner_user_id=seal_user_id,
                     user_pk_bytes=seal_user_pk,
                     enclave_pk_bytes=seal_enc_pk,
                     visibility=visibility,
                 )
-                sealed_file_followups.append(
+
+            envelope = _text_envelope(content)
+            reply_file_followups = []
+            for file_item in file_followups or []:
+                if plaintext_tier:
+                    file_envelope = {
+                        "body_b64": base64.b64encode(bytes(file_item.data)).decode("ascii"),
+                        "body_size_bytes": len(file_item.data),
+                        "owner_user_id": seal_user_id,
+                        "visibility": "shared",
+                    }
+                else:
+                    file_envelope = _build_envelope(
+                        plaintext=bytes(file_item.data),
+                        owner_user_id=seal_user_id,
+                        user_pk_bytes=seal_user_pk,
+                        enclave_pk_bytes=seal_enc_pk,
+                        visibility=visibility,
+                    )
+                reply_file_followups.append(
                     {
                         "envelope": file_envelope,
                         "file_name": file_item.name,
@@ -11715,16 +11905,24 @@ def post_reply(
                         "file_byte_count": len(file_item.data),
                     }
                 )
-            sealed_image_followups = []
+            reply_image_followups = []
             for image_item in image_followups or []:
-                image_envelope = _build_envelope(
-                    plaintext=bytes(image_item.data),
-                    owner_user_id=seal_user_id,
-                    user_pk_bytes=seal_user_pk,
-                    enclave_pk_bytes=seal_enc_pk,
-                    visibility=visibility,
-                )
-                sealed_image_followups.append(
+                if plaintext_tier:
+                    image_envelope = {
+                        "body_b64": base64.b64encode(bytes(image_item.data)).decode("ascii"),
+                        "body_size_bytes": len(image_item.data),
+                        "owner_user_id": seal_user_id,
+                        "visibility": "shared",
+                    }
+                else:
+                    image_envelope = _build_envelope(
+                        plaintext=bytes(image_item.data),
+                        owner_user_id=seal_user_id,
+                        user_pk_bytes=seal_user_pk,
+                        enclave_pk_bytes=seal_enc_pk,
+                        visibility=visibility,
+                    )
+                reply_image_followups.append(
                     {
                         "envelope": image_envelope,
                         "image_mime": image_item.mime_type,
@@ -11734,13 +11932,7 @@ def post_reply(
             thinking_envelope = None
             safe_thinking = _sanitize_thinking_summary(thinking_summary)
             if safe_thinking:
-                thinking_envelope = _build_envelope(
-                    plaintext=safe_thinking.encode("utf-8"),
-                    owner_user_id=seal_user_id,
-                    user_pk_bytes=seal_user_pk,
-                    enclave_pk_bytes=seal_enc_pk,
-                    visibility=visibility,
-                )
+                thinking_envelope = _text_envelope(safe_thinking)
             visible_body = "" if suppress_push else content[:240]
             body: dict[str, Any] = {
                 "envelope": envelope,
@@ -11780,10 +11972,10 @@ def post_reply(
                     body["turn_failure_provider"] = failure_provider
             if reply_to_message_id:
                 body["reply_to_message_id"] = reply_to_message_id
-            if sealed_file_followups:
-                body["file_followups"] = sealed_file_followups
-            if sealed_image_followups:
-                body["image_followups"] = sealed_image_followups
+            if reply_file_followups:
+                body["file_followups"] = reply_file_followups
+            if reply_image_followups:
+                body["image_followups"] = reply_image_followups
             if gate_decision_id:
                 body["gate_decision_id"] = gate_decision_id
             if proactive_job_id:
@@ -11798,7 +11990,15 @@ def post_reply(
                 }
             return body
 
-        resp = _HTTP.post(url, json=_sealed_body(), headers=_HEADERS, timeout=15)
+        def _send_encrypted_reply():
+            return _HTTP.post(
+                url,
+                json=_reply_body(),
+                headers=_HEADERS,
+                timeout=15,
+            )
+
+        resp = _post_reply_with_bootstrap_retry(_send_encrypted_reply)
         if _is_fpr_mismatch_response(resp):
             # The backend bounced the envelope: our cached user pk is no longer
             # the registered content key (rotated since the last whoami). Force
@@ -11817,7 +12017,7 @@ def post_reply(
                 context="stale-key reseal",
                 backoff_multiplier=2.0,
             ) and _whoami_cache.get("user_pk"):
-                resp = _HTTP.post(url, json=_sealed_body(), headers=_HEADERS, timeout=15)
+                resp = _post_reply_with_bootstrap_retry(_send_encrypted_reply)
         return _handle_post_reply_response(resp)
 
     if file_followups or image_followups:
@@ -11829,26 +12029,30 @@ def post_reply(
         "ENCRYPTION UNAVAILABLE — posting plaintext will fail on v1 backends. "
         "Ensure content_encryption.py is importable and whoami succeeded."
     )
-    resp = _HTTP.post(
-        url,
-        json={
-            "content": content,
-            "push_live_activity": source == PROACTIVE_JOB_SOURCE and not suppress_push,
-            "push_body": content[:240] if (source == PROACTIVE_JOB_SOURCE and not suppress_push) else "",
-            "alert_body": "" if suppress_push else content[:240],
-            "source": source,
-            "gate_decision_id": gate_decision_id,
-            "proactive_job_id": proactive_job_id,
-            "reply_to_message_id": reply_to_message_id,
-            "thinking_summary": _sanitize_thinking_summary(thinking_summary),
-            "thinking_kind": _sanitize_thinking_kind(thinking_kind),
-            "thinking_source": _sanitize_thinking_meta(thinking_source, max_len=80),
-            "thinking_model": _sanitize_thinking_meta(thinking_model, max_len=96),
-            "thinking_native": thinking_native,
-            "role": role,
-            "notice_kind": notice_kind,
-        },
-        headers=_HEADERS, timeout=15,
+    plaintext_body = {
+        "content": content,
+        "push_live_activity": source == PROACTIVE_JOB_SOURCE and not suppress_push,
+        "push_body": content[:240] if (source == PROACTIVE_JOB_SOURCE and not suppress_push) else "",
+        "alert_body": "" if suppress_push else content[:240],
+        "source": source,
+        "gate_decision_id": gate_decision_id,
+        "proactive_job_id": proactive_job_id,
+        "reply_to_message_id": reply_to_message_id,
+        "thinking_summary": _sanitize_thinking_summary(thinking_summary),
+        "thinking_kind": _sanitize_thinking_kind(thinking_kind),
+        "thinking_source": _sanitize_thinking_meta(thinking_source, max_len=80),
+        "thinking_model": _sanitize_thinking_meta(thinking_model, max_len=96),
+        "thinking_native": thinking_native,
+        "role": role,
+        "notice_kind": notice_kind,
+    }
+    resp = _post_reply_with_bootstrap_retry(
+        lambda: _HTTP.post(
+            url,
+            json=plaintext_body,
+            headers=_HEADERS,
+            timeout=15,
+        )
     )
     return _handle_post_reply_response(resp)
 
@@ -11866,6 +12070,47 @@ def _is_fpr_mismatch_response(resp) -> bool:
     return isinstance(body, dict) and body.get("error") == "content_pk_fpr_mismatch"
 
 
+def _retryable_bootstrap_body(resp) -> dict | None:
+    if resp.status_code != 409:
+        return None
+    try:
+        body = resp.json()
+    except Exception:
+        return None
+    if not isinstance(body, dict):
+        return None
+    if body.get("error") != "bootstrap_incomplete":
+        return None
+    # Exact True is intentional: false and missing preserve compatibility with
+    # non-retryable and old servers.
+    return body if body.get("retryable") is True else None
+
+
+def _post_reply_with_bootstrap_retry(send: Callable[[], Any]) -> Any:
+    """Retry only an explicitly retryable bootstrap 409, with hard bounds."""
+    started = time.monotonic()
+    response = send()
+    for retry_index in range(CHAT_RESPONSE_MAX_RETRIES):
+        body = _retryable_bootstrap_body(response)
+        if body is None:
+            return response
+        delay = CHAT_RESPONSE_RETRY_BASE_SEC * (2 ** retry_index)
+        elapsed = max(0.0, time.monotonic() - started)
+        if elapsed + delay > CHAT_RESPONSE_RETRY_MAX_ELAPSED_SEC:
+            break
+        log.warning(
+            "chat_response temporarily rejected stage=%s; retrying %d/%d in %.1fs",
+            body.get("stage"),
+            retry_index + 1,
+            CHAT_RESPONSE_MAX_RETRIES,
+            delay,
+        )
+        if delay > 0:
+            time.sleep(delay)
+        response = send()
+    return response
+
+
 def _handle_post_reply_response(resp) -> dict:
     """Inspect a /v1/chat/response response. Re-raises 4xx/5xx EXCEPT for
     the structured `bootstrap_incomplete` 409, which we want to surface in
@@ -11878,16 +12123,21 @@ def _handle_post_reply_response(resp) -> dict:
         except Exception:
             body = {}
         if body.get("error") == "bootstrap_incomplete":
-            log.error(
-                "chat_response rejected: bootstrap_incomplete stage=%s "
-                "memory_count=%s identity_written=%s — the upstream agent "
-                "hasn't completed onboarding (identity + live chat). Have the "
-                "user re-run onboarding from the start prompt; until then this "
-                "user's Feedling chat is dead-ended.",
-                body.get("stage"),
-                body.get("memory_count"),
-                body.get("identity_written"),
-            )
+            if body.get("retryable") is True:
+                log.error(
+                    "chat_response temporarily rejected after bounded retries: "
+                    "bootstrap_incomplete stage=%s; the reply was not accepted",
+                    body.get("stage"),
+                )
+            else:
+                log.error(
+                    "chat_response rejected: bootstrap_incomplete stage=%s "
+                    "memory_count=%s identity_written=%s — onboarding is not "
+                    "complete; re-run the required onboarding step before retrying.",
+                    body.get("stage"),
+                    body.get("memory_count"),
+                    body.get("identity_written"),
+                )
             return body
     resp.raise_for_status()
     try:
@@ -13054,15 +13304,48 @@ def _capture_context_text(value: Any, *, empty: str = "（暂无）") -> str:
         return str(value)[:CAPTURE_CONTEXT_MAX_CHARS]
 
 
+def _resident_identity_view() -> dict:
+    """Read plaintext cards locally; ask the enclave only for sealed cards."""
+    body = _capture_get_json("/v1/identity/get")
+    stored = body.get("identity") if isinstance(body.get("identity"), dict) else None
+    if not isinstance(stored, dict):
+        return {}
+
+    shape = _core_envelope.classify_envelope_shape(stored)
+    if shape in ("plaintext_text", "plaintext_binary"):
+        if stored.get("visibility") == "local_only":
+            return _identity_card_view.local_only_view(
+                _identity_card_view.envelope_base(stored))
+        try:
+            raw = _core_envelope.read_plaintext_envelope_body(
+                stored,
+                owner_user_id=str(_whoami_cache.get("user_id") or ""),
+            )
+            inner = json.loads(raw.decode("utf-8"))
+            if not isinstance(inner, dict):
+                return {}
+            return _identity_card_view.plaintext_view(
+                _identity_card_view.envelope_base(stored),
+                inner,
+                stored,
+                days_with_user=int(stored.get("days_with_user") or 0),
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return {}
+
+    if shape != "sealed" or not FEEDLING_ENCLAVE_URL:
+        # Compatibility: some injected/older backends already return a materialized
+        # card view rather than an envelope. It is plaintext and stays local.
+        return stored if not stored.get("body_ct") else {}
+
+    decrypted = _capture_get_json(
+        "/v1/identity/get", base_url=FEEDLING_ENCLAVE_URL)
+    identity = decrypted.get("identity")
+    return identity if isinstance(identity, dict) else {}
+
+
 def _capture_identity_context() -> tuple[dict, str, str, str]:
-    body = (
-        _capture_get_json("/v1/identity/get", base_url=FEEDLING_ENCLAVE_URL)
-        if FEEDLING_ENCLAVE_URL
-        else {}
-    )
-    if not isinstance(body.get("identity"), dict):
-        body = _capture_get_json("/v1/identity/get")
-    identity = body.get("identity") if isinstance(body.get("identity"), dict) else {}
+    identity = _resident_identity_view()
     identity = {
         key: value
         for key, value in identity.items()
@@ -13341,7 +13624,7 @@ def _memory_agent_parse_with_bounce(
     _note_agent_turn_success()
     parsed = parse(reply_text, strict=True)
     err = parsed[-1]
-    # 谓词与 V2 的 ParseRetry.should_retry 是同一个(memory.card_text)。两条 lane
+    # 谓词与 V2 的 ParseRetry.should_retry 是同一个(memory_garden.text.card_text)。两条 lane
     # 必须共用一份判据,否则同一个模型在托管和自建上会得到不同的重问行为 ——
     # json_decode_error 以前不在重问范围,注释说它「各有自己的退避路径」,实测那条
     # 路是空的:usr_450ee421e16a3b5a 连续 6 次失败,reask_count 全是 0。
@@ -16313,6 +16596,12 @@ def _decrypt_sealed_material(env: dict) -> bytes:
 
     Same decrypt the consumer already uses for chat/memory — the envelope is the
     identical v1 shape, so no new crypto path is introduced."""
+    if not env.get("body_ct"):
+        if env.get("body_b64") is not None:
+            return base64.b64decode(env["body_b64"], validate=True)
+        if isinstance(env.get("body"), str):
+            return env["body"].encode("utf-8")
+        raise ValueError("envelope_shape_unrecognized")
     if not FEEDLING_ENCLAVE_URL or _ENCLAVE_CLIENT is None:
         raise RuntimeError("enclave_not_configured")
     resp = _ENCLAVE_CLIENT.post(
@@ -17226,13 +17515,7 @@ def _resident_existing_identity() -> dict:
     keeps fields the upload doesn't mention (parallel to the cloud card merge).
     {} => fresh derive (old behavior). VPS has no genesis persona, so this is card-only."""
     try:
-        body = (
-            _capture_get_json("/v1/identity/get", base_url=FEEDLING_ENCLAVE_URL)
-            if FEEDLING_ENCLAVE_URL else {}
-        )
-        if not isinstance(body.get("identity"), dict):
-            body = _capture_get_json("/v1/identity/get")
-        identity = body.get("identity") if isinstance(body.get("identity"), dict) else {}
+        identity = _resident_identity_view()
         from identity import distill_prompt_v1 as _dp
         return {
             k: identity[k]
@@ -17250,13 +17533,7 @@ def _resident_current_replaced_at() -> str:
     ``_resident_existing_identity``; "" on any failure or missing field (never raises,
     never invents a value)."""
     try:
-        body = (
-            _capture_get_json("/v1/identity/get", base_url=FEEDLING_ENCLAVE_URL)
-            if FEEDLING_ENCLAVE_URL else {}
-        )
-        if not isinstance(body.get("identity"), dict):
-            body = _capture_get_json("/v1/identity/get")
-        identity = body.get("identity") if isinstance(body.get("identity"), dict) else {}
+        identity = _resident_identity_view()
         return str(identity.get("replaced_at") or "")
     except Exception:
         return ""

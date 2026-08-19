@@ -1082,7 +1082,10 @@ def test_wake_yields_snapshot_race_input_to_chat_without_duplicate_reply(
 
     def _load_workspace_with_send_race(*_args, **_kwargs):
         _append_racing_send()
-        return {"trusted_system_blocks": [], "working_memory": ""}
+        return {
+            "identity_card_or_persona": "",
+            "trusted_system_blocks": [],
+        }
 
     def _plain_rows(after_seq: int, *, limit=None, oldest_first=True, through_seq=None):
         rows = db.chat_messages_after_seq(
@@ -1266,7 +1269,10 @@ def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(m
         # Arrives after initial coalescing but before the raw-chat snapshot.
         if not seq3_box["value"]:
             seq3_box["value"] = _append_user("m3", "third-snapshot-race")
-        return {"trusted_system_blocks": [], "working_memory": ""}
+        return {
+            "identity_card_or_persona": "",
+            "trusted_system_blocks": [],
+        }
 
     def _recent_turns(_uid: str, _max_turns: int, row_cap: int, *, through_seq):
         rows = _plain_rows(

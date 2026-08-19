@@ -85,7 +85,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: &enclave-image ghcr.io/teleport-computer/feedling:453d65e
+    image: &enclave-image ghcr.io/teleport-computer/feedling:4efdff1
     command: &enclave-command ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -149,7 +149,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:453d65e
+    image: ghcr.io/teleport-computer/feedling:4efdff1
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -195,6 +195,22 @@ services:
       # compose synthesis / build never aborts on an unset var; the backend
       # still fails fast at startup (db.py) if it ends up empty at runtime.
       DATABASE_URL: "${DATABASE_URL:-}"
+      # Phase-4 schema selector. Keep "rds" while DATABASE_URL points at the
+      # shadow source; switch both values together (DATABASE_URL=TEE app DSN,
+      # FEEDLING_DATABASE_SCHEMA=tee). In tee mode startup only asserts the
+      # owner-migrated alembic_tee head and never runs the RDS migration chain.
+      FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
+      # Dedicated pre TEE Postgres shadow. Both values use the encrypted env
+      # channel and do not affect compose_hash. Empty dual-write keeps the
+      # freshly provisioned shadow isolated until schema/backup verification
+      # has passed; TEE_DATABASE_URL uses the non-DDL app role.
+      TEE_DATABASE_URL: "${TEE_DATABASE_URL:-}"
+      FEEDLING_TEE_DUAL_WRITE: "${FEEDLING_TEE_DUAL_WRITE:-}"
+      # Pre rollout lane for PR #131. The backend defaults this gate OFF and
+      # accepts plaintext content shapes only for the exact value "1"; test and
+      # prod manifests intentionally omit it. Per-user intent still decides
+      # whether a known user is effective=off, and unknown users stay encrypted.
+      FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "1"
       # Cloudflare R2 (S3-compatible) offload for the heavy frame ciphertext
       # (backend/object_storage.py). Injected via `phala deploy -e R2_*=...`
       # (encrypted env channel). Empty default = feature OFF (body_ct stays
@@ -264,6 +280,10 @@ services:
       # Runtime-token secret shared by backend, enclave, and pooled V2 worker.
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS: "${FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS:-}"
+      # One V1 runner CVM is part of Pre's dual-runtime topology. Public runner
+      # health must fail on a missing/stale heartbeat instead of failing because
+      # the expected inventory was never declared.
+      FEEDLING_EXPECTED_RUNNER_COUNT: "1"
       FEEDLING_PERCEPTION_REBASELINE_UNKNOWN_KEYS: "${FEEDLING_PERCEPTION_REBASELINE_UNKNOWN_KEYS:-0}"
     ports:
       - "5001:5001"
@@ -284,7 +304,7 @@ services:
   # removed when this one was added — a single V2 pool per environment avoids
   # two workers claiming the same job queue.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:453d65e
+    image: ghcr.io/teleport-computer/feedling:4efdff1
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
@@ -295,6 +315,15 @@ services:
       FEEDLING_API_URL: "http://backend:5001"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
       DATABASE_URL: "${DATABASE_URL:-}"
+      # frame_get resolves R2-backed photo pointers in this process.
+      R2_ENDPOINT: "${R2_ENDPOINT:-}"
+      R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"
+      R2_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY:-}"
+      R2_FRAMES_BUCKET: "${R2_FRAMES_BUCKET:-}"
+      FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
+      # Must match backend: otherwise whoami advertises effective=off while V2
+      # fail-safe encrypts every reply from this separate process.
+      FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "1"
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       FEEDLING_V2_MAX_WORKERS: "4"
       FEEDLING_V2_FLEET_IDENTITY_REQUIRED: "1"
@@ -320,7 +349,7 @@ services:
       # the duration of an incident and back to "0" afterwards — the ${VAR:-}
       # form means neither flip needs a new compose_hash / on-chain publish.
       FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED: "${FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED:-0}"
-      # MEMORY/USER prompt replacement is normal-on and aligned with prod/test.
+      # MEMORY/STYLE prompt replacement is normal-on and aligned with prod/test.
       FEEDLING_V2_PROFILE_ENABLED: "1"
       FEEDLING_HOSTED_RUNTIME_POLICY: "dual"
       FEEDLING_RUNTIME_DEFAULT_DESIRED: "resident"

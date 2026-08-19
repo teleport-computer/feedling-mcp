@@ -10,6 +10,8 @@ import sys
 import uuid
 from pathlib import Path
 
+import pytest
+
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
@@ -87,6 +89,15 @@ def _env(uid: str, fid: str, body: bytes = b"\x00\xffJPEG\x80") -> dict:
     }
 
 
+def _plaintext_env(uid: str, fid: str, body: bytes = b'{"image":"AA=="}') -> dict:
+    return {
+        "id": fid, "v": 1,
+        "body_b64": base64.b64encode(body).decode(),
+        "body_size_bytes": len(body), "visibility": "shared",
+        "owner_user_id": uid,
+    }
+
+
 def _row(uid: str, fid: str):
     with db.get_pool().connection() as conn:
         return conn.execute(
@@ -123,6 +134,76 @@ def test_get_reconstructs_full_envelope(monkeypatch):
     env = _env(uid, "f1")
     db.frame_upsert(uid, "f1", 1.0, env)
     assert db.frame_get(uid, "f1") == env  # byte-for-byte, incl body_ct
+
+
+def test_get_retries_one_transient_r2_failure(monkeypatch):
+    fake = _FakeS3()
+    _enable_r2(monkeypatch, fake)
+    uid = _uid()
+    seed_user(uid)
+    env = _env(uid, "f1")
+    assert db.frame_upsert(uid, "f1", 1.0, env) is True
+    real_get = object_storage.get_frame_body_strict
+    calls = {"count": 0}
+
+    def flaky_get(user_id, frame_id):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise _ClientError("InternalError")
+        return real_get(user_id, frame_id)
+
+    monkeypatch.setattr(object_storage, "get_frame_body_strict", flaky_get)
+    monkeypatch.setattr(db.time, "sleep", lambda _seconds: None)
+
+    assert db.frame_get(uid, "f1") == env
+    assert calls["count"] == 2
+
+
+def test_get_can_distinguish_exhausted_r2_failure_from_missing(monkeypatch):
+    fake = _FakeS3()
+    _enable_r2(monkeypatch, fake)
+    uid = _uid()
+    seed_user(uid)
+    assert db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1")) is True
+    monkeypatch.setattr(
+        object_storage,
+        "get_frame_body_strict",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            _ClientError("InternalError")
+        ),
+    )
+    monkeypatch.setattr(db.time, "sleep", lambda _seconds: None)
+
+    assert db.frame_get(uid, "f1") is None
+    with pytest.raises(db.FrameReadUnavailable):
+        db.frame_get(uid, "f1", unavailable_raises=True)
+
+
+def test_plaintext_frame_body_is_offloaded_and_reconstructed(monkeypatch):
+    fake = _FakeS3()
+    _enable_r2(monkeypatch, fake)
+    uid = _uid()
+    seed_user(uid)
+    env = _plaintext_env(uid, "plain-f1")
+    db.frame_upsert(uid, "plain-f1", 1.0, env)
+    doc, env_meta, body_key = _row(uid, "plain-f1")
+    assert doc is None
+    assert body_key == f"frames/{uid}/plain-f1"
+    assert env_meta["body_object_format"] == "plaintext_v1"
+    assert len(env_meta["body_sha256"]) == 64
+    assert "body_b64" not in env_meta
+    assert db.frame_get(uid, "plain-f1") == env
+
+
+def test_plaintext_frame_r2_integrity_mismatch_fails_closed(monkeypatch):
+    fake = _FakeS3()
+    _enable_r2(monkeypatch, fake)
+    uid = _uid()
+    seed_user(uid)
+    db.frame_upsert(uid, "plain-bad", 1.0, _plaintext_env(uid, "plain-bad"))
+    fake.store[("io-image-frames", f"frames/{uid}/plain-bad")] = b"tampered"
+
+    assert db.frame_get(uid, "plain-bad") is None
 
 
 def test_caller_dict_not_mutated(monkeypatch):
@@ -190,7 +271,7 @@ def test_upsert_does_not_overwrite_r2_when_db_write_fails(monkeypatch):
     assert fake.store[key] == b"AAAA"
 
     monkeypatch.setattr(db, "get_pool", lambda: _BoomPool())
-    db.frame_upsert(uid, "f1", 2.0, _env(uid, "f1", body=b"BBBB"))
+    assert db.frame_upsert(uid, "f1", 2.0, _env(uid, "f1", body=b"BBBB")) is False
     assert fake.store[key] == b"AAAA"  # unchanged — old object not clobbered
 
 

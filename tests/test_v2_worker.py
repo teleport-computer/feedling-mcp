@@ -1474,11 +1474,11 @@ def test_chat_uses_recent_profile_context_without_compact_dependencies(monkeypat
             or {"rows": recent_rows, "source_truncated": False}
         ),
         select_profile_for_turn=lambda _uid, **_kwargs: (
-            worker.v2_profile_store.ProfilePromptSelection(
-                memory="remembered relationship",
-                user="preferred interaction style",
-                state="last_good",
-            )
+                worker.v2_profile_store.ProfilePromptSelection(
+                    memory="remembered relationship",
+                    style="preferred interaction style",
+                    state="last_good",
+                )
         ),
         apply_pending_effects=_apply_effects,
     )

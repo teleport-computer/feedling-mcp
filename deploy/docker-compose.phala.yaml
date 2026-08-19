@@ -98,7 +98,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: &enclave-image ghcr.io/teleport-computer/feedling:b2697ae
+    image: &enclave-image ghcr.io/teleport-computer/feedling:f7c1f84
     command: &enclave-command ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -181,7 +181,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:b2697ae
+    image: ghcr.io/teleport-computer/feedling:f7c1f84
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -237,6 +237,7 @@ services:
       # compose synthesis / build never aborts on an unset var; the backend
       # still fails fast at startup (db.py) if it ends up empty at runtime.
       DATABASE_URL: "${DATABASE_URL:-}"
+      FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
       # TEE 明文影子库（feedling-io-db-prod，独立 pg CVM）。best-effort 双写：
       # db.py 写主库后镜像到这里，tee_shadow.mirror 永不 raise、失败只计数，绝不
       # 拖垮主路径。两个都为空 = 双写 OFF（mirror.enabled() 需 FEEDLING_TEE_DUAL_WRITE=1
@@ -314,15 +315,16 @@ services:
       # Keep both deployment gates aligned. User consent remains independent.
       FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
       # Backend owns the V2-cutover profile trigger; serve-worker executes it.
-      # M1-M5 (generation + MEMORY/USER prompt injection) merged 3086025c
+      # M1-M5 (generation + MEMORY/STYLE prompt injection) merged 3086025c
       # (2026-07-31). Hard-coded on 2026-08-12 to match test, which has run this
-      # profile normal-on since 2026-08-05. Conversation coverage is permanently
-      # metadata-only; roll back the worker image to restore the removed path.
+      # profile normal-on since 2026-08-05. Conversation compaction is removed;
+      # roll back the worker image to restore the removed path.
       FEEDLING_V2_PROFILE_ENABLED: "1"
       # Unaudited-route context-window default — keep in sync with serve-worker
       # (the setup path resolves/validates the same limit). See the serve-worker
       # block for the rationale. ${VAR:-} form → tunable without a new compose_hash.
       FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS: "${FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS:-131072}"
+      FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS: "${FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS:-32768}"
       # Genesis v2 (foreground-fast onboarding): greet on 3-5 core + identity
       # baseline, push the heavy reduce (the old ~37% failure surface) to the
       # background. Validated on test; flip to "false" to revert to the v1
@@ -393,7 +395,7 @@ services:
   # separate agent-runner CVM(s) (deploy/docker-compose.phala.prod.runner.yaml),
   # which this compose change does NOT touch (§7b: "runner CVM: 不动").
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:b2697ae
+    image: ghcr.io/teleport-computer/feedling:f7c1f84
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
@@ -404,6 +406,12 @@ services:
       FEEDLING_API_URL: "http://backend:5001"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
       DATABASE_URL: "${DATABASE_URL:-}"
+      FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
+      # frame_get resolves R2-backed photo pointers in this process.
+      R2_ENDPOINT: "${R2_ENDPOINT:-}"
+      R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"
+      R2_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY:-}"
+      R2_FRAMES_BUCKET: "${R2_FRAMES_BUCKET:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       FEEDLING_V2_MAX_WORKERS: "4"
       FEEDLING_V2_FLEET_IDENTITY_REQUIRED: "1"
@@ -425,6 +433,7 @@ services:
       # call). ${VAR:-} form: tunable later via encrypted env WITHOUT a new
       # compose_hash; "0" restores strict fail-closed.
       FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS: "${FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS:-131072}"
+      FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS: "${FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS:-32768}"
       # web_fetch article extraction (trafilatura, runs in this serve-worker).
       # Default ON — a rollback lever, not a feature gate. Set to "0" to fall back
       # to the plain tag-strip; takes effect on the next serve-worker restart.
@@ -435,7 +444,7 @@ services:
       # the duration of an incident and back to "0" afterwards — the ${VAR:-}
       # form means neither flip needs a new compose_hash / on-chain publish.
       FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED: "${FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED:-0}"
-      # M5 MEMORY/USER prompt injection merged 3086025c (2026-07-31) and is
+      # M5 MEMORY/STYLE prompt injection merged 3086025c (2026-07-31) and is
       # live here. Hard-coded 2026-08-12 (was `${…:-0}`, but the env was being
       # injected as 1 — the literal makes the real state readable).
       FEEDLING_V2_PROFILE_ENABLED: "1"
@@ -483,7 +492,7 @@ services:
       retries: 3
 
   cpu-recorder:
-    image: ghcr.io/teleport-computer/feedling:b2697ae
+    image: ghcr.io/teleport-computer/feedling:f7c1f84
     container_name: cpu-recorder
     command: ["python", "-u", "ops/cpu_recorder.py"]
     restart: unless-stopped

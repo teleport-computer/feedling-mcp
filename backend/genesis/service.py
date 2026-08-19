@@ -25,6 +25,8 @@ from identity import card_policy
 from identity.user_naming import sanitize_user_name
 from identity import service as identity_service
 from memory import actions as memory_actions
+from model_api_runtime.v2 import profile as v2_profile
+from model_api_runtime.v2 import profile_store as v2_profile_store
 from notices import catalog
 from notices import core as notices
 
@@ -36,6 +38,7 @@ GENESIS_STAGED_BLOB_PREFIX = "genesis_staged:"
 GENESIS_SOURCE = "genesis_import"
 GENESIS_PERSONA_REF = f"user_blob:{GENESIS_PERSONA_BLOB}"
 GENESIS_VOICE_REF = f"user_blob:{GENESIS_VOICE_BLOB}"
+GENESIS_PROFILE_REF = f"user_blob:{v2_profile_store.PROFILE_BLOB_KIND}"
 PERSONA_SOURCE_PRIORITY = {
     "ai_persona": 100,
     "merged": 100,
@@ -397,6 +400,8 @@ SAFE_JOB_METADATA_KEYS = {
     "window_count",
 }
 INTERNAL_JOB_METADATA_KEYS = {
+    "identity_change_anchor_id",
+    "identity_change_anchor_ts",
     "plaintext_worker_host",
     "plaintext_worker_pid",
     "plaintext_worker_instance",
@@ -460,6 +465,19 @@ def _safe_job_metadata(metadata: Any) -> dict:
 def _chunk_envelope_meta(store: UserStore, envelope_meta: dict | None, encrypted_body: bytes) -> dict:
     if not isinstance(envelope_meta, dict):
         raise ValueError("chunk_envelope_required")
+    shape_error = core_envelope.validate_uploaded_envelope(
+        envelope_meta, user_id=store.user_id)
+    if shape_error is not None:
+        raise ValueError(str(shape_error.get("error") or "chunk_envelope_invalid"))
+    if envelope_meta.get("body") is not None:
+        if str(envelope_meta.get("body") or "").encode("utf-8") != encrypted_body:
+            raise ValueError("chunk_envelope_body_mismatch")
+        return {
+            "v": int(envelope_meta.get("v") or 1),
+            "id": _text(envelope_meta.get("id"), 160),
+            "visibility": "shared", "owner_user_id": store.user_id,
+            "body_object_format": "plaintext_v1",
+        }
     body_ct = str(envelope_meta.get("body_ct") or "")
     if body_ct:
         if b64decode_required(body_ct) != encrypted_body:
@@ -511,6 +529,9 @@ def chunk_envelope_from_row(chunk: dict) -> dict:
         raise ValueError("chunk_encrypted_body_required")
     if not meta:
         raise ValueError("chunk_envelope_meta_missing")
+    if meta.get("body_object_format") == "plaintext_v1":
+        clean = {k: v for k, v in meta.items() if k != "body_object_format"}
+        return {**clean, "body": bytes(encrypted_body).decode("utf-8")}
     return {**meta, "body_ct": b64encode(bytes(encrypted_body))}
 
 
@@ -573,8 +594,11 @@ def load_genesis_staged_payload(
     envelope = blob.get("content_envelope")
     if not isinstance(envelope, dict):
         raise RuntimeError("staged_import_payload_missing")
-    raw = core_enclave._decrypt_envelope_via_enclave(
-        envelope, api_key, purpose="genesis_staged_payload")
+    try:
+        raw = core_envelope.read_envelope_body(
+            envelope, api_key, purpose="genesis_staged_payload")
+    except ValueError as exc:
+        raise RuntimeError(f"staged_import_envelope_invalid:{exc}") from exc
     if _sha256_hex(raw) != str(blob.get("sha256") or ""):
         raise RuntimeError("staged_import_sha256_mismatch")
     try:
@@ -682,12 +706,15 @@ def load_genesis_checkpoint(
     envelope = blob.get("content_envelope") if isinstance(blob, dict) else None
     if not isinstance(envelope, dict):
         raise RuntimeError("genesis_checkpoint_envelope_missing")
-    raw = core_enclave._decrypt_envelope_via_enclave(
-        envelope,
-        api_key,
-        purpose="genesis_checkpoint",
-        runtime_token=runtime_token,
-    )
+    try:
+        raw = core_envelope.read_envelope_body(
+            envelope,
+            api_key,
+            purpose="genesis_checkpoint",
+            runtime_token=runtime_token,
+        )
+    except ValueError as exc:
+        raise RuntimeError(f"genesis_checkpoint_envelope_invalid:{exc}") from exc
     digest = _sha256_hex(raw)
     if digest != str(blob.get("sha256") or ""):
         raise RuntimeError("genesis_checkpoint_sha256_mismatch")
@@ -789,6 +816,9 @@ def create_import_job(
         **internal_metadata,
         "privacy_copy": PRIVACY_COPY,
     }
+    identity_anchor = identity_service.identity_change_anchor(store)
+    metadata["identity_change_anchor_ts"] = identity_anchor["ts"]
+    metadata["identity_change_anchor_id"] = identity_anchor["id"]
     normalized_status = str(initial_status or "created").strip().lower()
     if normalized_status not in {"created", "processing"}:
         raise ValueError("invalid_initial_job_status")
@@ -978,14 +1008,21 @@ def _memory_occurred_at_from_output(
 def _memory_action_from_output(
     item: dict,
     *,
+    store: UserStore | None = None,
     preserve_dates: bool = False,
     fallback_occurred_at: str = "",
 ) -> dict:
     mem_type = _coerce_memory_type(item.get("type"))
+    if store is not None and item.get("content"):
+        memory_actions.trace_memory_content_truncation(
+            store,
+            item.get("content"),
+            route="genesis_history_import",
+        )
     memory = {
         "type": mem_type,
         "summary": _text(item.get("summary") or item.get("title") or item.get("description"), 2000),
-        "content": str(item.get("content") or "").strip()[:5000],
+        "content": str(item.get("content") or "").strip()[:memory_actions.MEMORY_CONTENT_MAX_CHARS],
         "bucket": _text(item.get("bucket"), 80),
         "threads": _memory_threads_from_output(item, preserve_tags=preserve_dates),
         "occurred_at": _memory_occurred_at_from_output(
@@ -1043,6 +1080,7 @@ def apply_memory_outputs(
         try:
             actions.append(_memory_action_from_output(
                 item,
+                store=store,
                 preserve_dates=item_preserve_dates,
                 fallback_occurred_at=effective_fallback_occurred_at,
             ))
@@ -1185,6 +1223,7 @@ def _safe_reducer_doc(job_id: str, output: dict) -> dict:
     identity = output.get("identity") if isinstance(output.get("identity"), dict) else {}
     dims = identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else []
     persona_content, prompt_version = _persona_content_from_output(output)
+    profile = _profile_output_from_reducer(output)
     return {
         "v": 1,
         "job_id": job_id,
@@ -1201,6 +1240,9 @@ def _safe_reducer_doc(job_id: str, output: dict) -> dict:
         "persona_sha256": _sha256_hex(persona_content.encode("utf-8")) if persona_content else "",
         "persona_prompt_version": prompt_version if persona_content else "",
         "voice_workset_provided": bool(output.get("voice_workset")),
+        "profile_provided": bool(profile),
+        "profile_memory_touched": bool(profile.get("memory_touched")),
+        "profile_style_touched": bool(profile.get("style_touched")),
     }
 
 
@@ -1388,7 +1430,23 @@ def _identity_payload_from_existing_plain(identity: dict | None) -> dict:
     return payload
 
 
-def _existing_identity_plain_for_update(api_key: str | None, runtime_token: str = "") -> tuple[dict | None, str]:
+def _existing_identity_plain_for_update(
+    store: UserStore,
+    api_key: str | None,
+    runtime_token: str = "",
+) -> tuple[dict | None, str]:
+    stored = identity_service._load_identity(store)
+    shape = core_envelope.classify_envelope_shape(stored)
+    if shape in ("plaintext_text", "plaintext_binary"):
+        try:
+            raw = core_envelope.read_plaintext_envelope_body(
+                stored, owner_user_id=store.user_id)
+            inner = json.loads(raw.decode("utf-8"))
+            if not isinstance(inner, dict):
+                raise ValueError("identity plaintext is not an object")
+            return inner, ""
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            return None, f"identity_plain_invalid:{type(exc).__name__}"
     if not api_key and not runtime_token:
         return None, "api_key_unavailable"
     data, err = core_enclave._enclave_get_json_for_gate(
@@ -1429,7 +1487,8 @@ def init_identity_if_absent(
 
     base_payload = {"agent_name": "", "self_introduction": "", "dimensions": []}
     if existing:
-        existing_plain, err = _existing_identity_plain_for_update(api_key, runtime_token)
+        existing_plain, err = _existing_identity_plain_for_update(
+            store, api_key, runtime_token)
         if existing_plain is not None:
             base_payload = _identity_payload_from_existing_plain(existing_plain)
         elif str(existing.get("relationship_anchor_source") or "") != GENESIS_SOURCE:
@@ -1481,12 +1540,8 @@ def init_identity_if_absent(
     identity_doc = {
         "v": 1,
         "id": envelope.get("id") or (existing or {}).get("id") or core_util._new_public_id("identity"),
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
-        "visibility": envelope["visibility"],
-        "owner_user_id": envelope["owner_user_id"],
+        "enclave_pk_fpr": "",
+        **core_envelope.envelope_storage_fields(envelope),
         "created_at": (existing or {}).get("created_at") or now,
         "updated_at": now,
         "replaced_at": now,
@@ -1523,7 +1578,75 @@ def init_identity_if_absent(
     return "updated" if existing else "initialized"
 
 
-def _merge_identity_replace_payload(existing_plain: dict, distilled: dict) -> dict:
+def _distilled_identity_fields(distilled: dict) -> list[str]:
+    addressed: set[str] = set()
+    for key in identity_service._IDENTITY_PROFILE_STRING_FIELDS:
+        value = distilled.get(key)
+        if isinstance(value, str) and value.strip():
+            addressed.add(key)
+    if isinstance(distilled.get("dimensions"), list) and distilled["dimensions"]:
+        addressed.add("dimensions")
+    for key in identity_service._IDENTITY_PROFILE_LIST_FIELDS:
+        value = distilled.get(key)
+        if isinstance(value, list) and value:
+            addressed.add(key)
+    return [
+        field
+        for field in identity_service.IDENTITY_CHANGE_FIELDS
+        if field in addressed
+    ]
+
+
+def identity_field_lock_for_job(store: UserStore, job_id: str) -> dict:
+    """Resolve and trace the trusted field lock for one Genesis job.
+
+    The cursor is read only from server-created job metadata.  Callers never
+    accept an anchor or lock set supplied by the resident consumer/model.
+    """
+    job = db.genesis_get_job(store.user_id, str(job_id or ""))
+    metadata = job.get("metadata") if isinstance(job, dict) else {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    anchor_ts = str(metadata.get("identity_change_anchor_ts") or "")
+    lock = identity_service.identity_fields_changed_since(
+        store,
+        since=anchor_ts,
+    )
+    public = {
+        "outcome": str(lock.get("outcome") or "per_field"),
+        "fields": list(lock.get("fields") or []),
+        "change_count": int(lock.get("change_count") or 0),
+    }
+    try:
+        import debug_trace
+
+        debug_trace.trace_event(
+            store,
+            subsystem="genesis",
+            type="genesis.field_lock",
+            actor="backend",
+            status="ok",
+            job_id=str(job_id or ""),
+            trace_id=str(job_id or ""),
+            turn_id=str(job_id or ""),
+            summary="genesis identity field lock resolved",
+            detail={
+                "outcome": public["outcome"],
+                "change_count": public["change_count"],
+                "locked_field_count": len(public["fields"]),
+                "anchor_present": bool(anchor_ts),
+            },
+        )
+    except Exception:
+        pass
+    return public
+
+
+def _merge_identity_replace_payload(
+    existing_plain: dict,
+    distilled: dict,
+    *,
+    locked_fields: tuple[str, ...] = (),
+) -> dict:
     """T12 (spec 3.6 / D5): key-level overlay of a distilled REPLACE payload onto
     the LATEST decrypted card, so a field the distill lane didn't address is
     NEVER wiped ("没提的字段永不丢失"). `existing_plain` must be freshly
@@ -1539,14 +1662,23 @@ def _merge_identity_replace_payload(existing_plain: dict, distilled: dict) -> di
     the module docstring on card_policy.py calls out (hand-copied field lists
     have silently dropped user-authored fields like custom_persona_prompt
     before)."""
+    locked = frozenset(locked_fields)
     merged = _identity_payload_from_existing_plain(existing_plain)
     for key in identity_service._IDENTITY_PROFILE_STRING_FIELDS:
+        if key in locked:
+            continue
         value = distilled.get(key)
         if isinstance(value, str) and value.strip():
             merged[key] = value
-    if isinstance(distilled.get("dimensions"), list) and distilled["dimensions"]:
+    if (
+        "dimensions" not in locked
+        and isinstance(distilled.get("dimensions"), list)
+        and distilled["dimensions"]
+    ):
         merged["dimensions"] = distilled["dimensions"]
     for key in identity_service._IDENTITY_PROFILE_LIST_FIELDS:
+        if key in locked:
+            continue
         value = distilled.get(key)
         if isinstance(value, list) and value:
             merged[key] = value
@@ -1603,6 +1735,8 @@ def replace_identity_preserving_anchor(
     output: dict,
     api_key: str | None = None,
     runtime_token: str = "",
+    *,
+    field_lock: dict | None = None,
 ) -> str:
     """Create or replace identity content for explicit update_identity imports
     AND the resident-distill (redistill) lane's identity.replace landing point.
@@ -1646,6 +1780,34 @@ def replace_identity_preserving_anchor(
     if not _identity_replace_payload_has_content(distilled):
         return "identity_update_empty"
 
+    lock = field_lock if isinstance(field_lock, dict) else {
+        "outcome": "per_field",
+        "fields": [],
+    }
+    if str(lock.get("outcome") or "") == "whole_card_fail_safe":
+        return "locked"
+    locked_fields = tuple(
+        field
+        for field in lock.get("fields", [])
+        if field in identity_service.IDENTITY_CHANGE_FIELDS
+    )
+    raw_identity = output.get("identity") if isinstance(output.get("identity"), dict) else {}
+    if (
+        "dimensions" in locked_fields
+        and not _clean_identity_category(raw_identity.get("category"))
+        and "category" not in locked_fields
+    ):
+        # category may be synthesized from dimensions during normalization. If
+        # the stale dimensions are locked, their derived category must not slip
+        # through as an apparently independent field.
+        locked_fields = (*locked_fields, "category")
+    addressed_fields = _distilled_identity_fields(distilled)
+    applied_fields = [
+        field for field in addressed_fields if field not in locked_fields
+    ]
+    if not applied_fields:
+        return "locked" if locked_fields else "not_provided"
+
     with identity_service.identity_mutation_lock(store.user_id):
         for attempt in range(_IDENTITY_REPLACE_MAX_ATTEMPTS):
             # Snapshot the raw blob FIRST — before the enclave plaintext read —
@@ -1657,11 +1819,16 @@ def replace_identity_preserving_anchor(
             snapshot = identity_service._load_identity(store)
             if not snapshot:
                 return "identity_not_initialized"
-            existing_plain, _plain_err = _existing_identity_plain_for_update(api_key, runtime_token)
+            existing_plain, _plain_err = _existing_identity_plain_for_update(
+                store, api_key, runtime_token)
             if existing_plain is None:
                 return "identity_plain_unavailable"
 
-            merged = _merge_identity_replace_payload(existing_plain, distilled)
+            merged = _merge_identity_replace_payload(
+                existing_plain,
+                distilled,
+                locked_fields=locked_fields,
+            )
             envelope, err = core_envelope._build_shared_envelope_for_store(
                 store,
                 json.dumps(merged, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
@@ -1674,16 +1841,20 @@ def replace_identity_preserving_anchor(
                 **snapshot,
                 "v": 1,
                 "id": snapshot.get("id") or envelope.get("id") or core_util._new_public_id("identity"),
-                "body_ct": envelope["body_ct"],
-                "nonce": envelope["nonce"],
-                "K_user": envelope["K_user"],
-                "enclave_pk_fpr": envelope.get("enclave_pk_fpr", snapshot.get("enclave_pk_fpr", "")),
-                "visibility": envelope["visibility"],
-                "owner_user_id": envelope["owner_user_id"],
+                "enclave_pk_fpr": snapshot.get("enclave_pk_fpr", ""),
+                **core_envelope.envelope_storage_fields(envelope),
                 "created_at": snapshot.get("created_at") or now,
                 "updated_at": now,
                 "replaced_at": now,
-                **_relationship_anchor_fields_for_replace(snapshot, output),
+                **(
+                    {
+                        "relationship_started_at": snapshot.get("relationship_started_at", ""),
+                        "relationship_anchor_source": snapshot.get("relationship_anchor_source", ""),
+                        "relationship_anchor_evidence": snapshot.get("relationship_anchor_evidence", ""),
+                    }
+                    if "days_with_user" in locked_fields
+                    else _relationship_anchor_fields_for_replace(snapshot, output)
+                ),
                 "identity_agent_name_present": bool(merged.get("agent_name")),
                 "identity_dimension_count": len(merged.get("dimensions") or []),
             }
@@ -1694,6 +1865,7 @@ def replace_identity_preserving_anchor(
                 identity_service._append_identity_change(store, {
                     "action": "replace",
                     "reason": "Identity replaced from explicit Genesis identity update.",
+                    "fields": applied_fields,
                 })
                 return "updated"
             # CAS lost the race to a concurrent writer — retry the whole span
@@ -1776,6 +1948,122 @@ def write_voice_artifact(store: UserStore, job_id: str, output: dict) -> tuple[s
     return GENESIS_VOICE_REF, digest
 
 
+def render_genesis_profile_source(output: dict) -> tuple[str, int, bool]:
+    """Render only valid cards proposed by this Genesis reducer pass."""
+    proposed_rendered: list[str] = []
+    raw_items = output.get("memories")
+    if raw_items is None:
+        raw_items = output.get("facts")
+    for item in raw_items if isinstance(raw_items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            # This is a dry render before publication. The real writer records
+            # truncation observability once; do not double-count it here.
+            action = _memory_action_from_output(item)
+        except ValueError:
+            continue
+        memory = action.get("memory") if isinstance(action.get("memory"), dict) else {}
+        summary = str(memory.get("summary") or "")
+        content = memory_actions._memory_content_from_action(memory, summary)
+        if memory_actions.card_guard.guard_enabled() and (
+            memory_actions.card_guard.hard_field_pollution_reason(summary)
+            or memory_actions.card_guard.hard_field_pollution_reason(content)
+        ):
+            continue
+        if memory_actions._memory_tombstone_reason(summary, content):
+            continue
+        line = v2_profile.render_profile_card(memory)
+        if line:
+            proposed_rendered.append(line)
+
+    rendered = "\n".join(proposed_rendered)
+    total_count = len(proposed_rendered)
+    return rendered, total_count, total_count > 0
+
+
+def _profile_output_from_reducer(output: dict) -> dict:
+    profile = output.get("profile")
+    if not isinstance(profile, dict):
+        return {}
+    memory = profile.get("memory")
+    style = profile.get("style")
+    if not isinstance(memory, str) or not isinstance(style, str):
+        raise ValueError("genesis_profile_fields_invalid")
+    memory_touched = profile.get("memory_touched")
+    style_touched = profile.get("style_touched")
+    if not isinstance(memory_touched, bool) or not isinstance(style_touched, bool):
+        raise ValueError("genesis_profile_touch_flags_invalid")
+    return {
+        "memory": memory,
+        "style": style,
+        "memory_touched": memory_touched,
+        "style_touched": style_touched,
+        "provider_calls": max(0, int(profile.get("provider_calls") or 0)),
+    }
+
+
+def write_profile_artifact(
+    store: UserStore,
+    job_id: str,
+    output: dict,
+    api_key: str | None,
+    *,
+    runtime_token: str = "",
+) -> tuple[str, str, str]:
+    """CAS-persist Genesis MEMORY/STYLE and copy untouched envelopes verbatim."""
+    del api_key, runtime_token
+    profile = _profile_output_from_reducer(output)
+    if not profile:
+        return "", "", ""
+    if not profile["memory_touched"] and not profile["style_touched"]:
+        return "", "", "skipped"
+
+    def _recompute(previous: dict) -> dict:
+        # Re-read content-free Garden freshness on every CAS attempt. A race
+        # winner may have landed after a concurrent memory mutation; replaying
+        # the first attempt's source witness would make the final document look
+        # older than the state it actually preserved.
+        card_count, max_updated_at = db.memory_profile_source_stats(store.user_id)
+        now = _now_iso()
+        return v2_profile_store.build_profile_document_patching_fields(
+            store.user_id,
+            state="ok",
+            source={
+                "card_count": card_count,
+                "max_updated_at": max_updated_at,
+                "generated_at": now,
+            },
+            last_attempt={
+                "at": now,
+                "reject_code": "",
+                "attempts": profile["provider_calls"],
+            },
+            memory_text=(profile["memory"] if profile["memory_touched"] else None),
+            style_text=(profile["style"] if profile["style_touched"] else None),
+            previous=previous,
+        )
+
+    result = v2_profile_store.update_profile_cas(
+        store.user_id,
+        _recompute,
+        # A Genesis pass may touch only MEMORY or only STYLE. A concurrent
+        # ordinary refresh with a fresher source witness does not supersede
+        # that independent side update; recompute once against the winner so
+        # its untouched side is preserved and the Genesis side still lands.
+        allow_freshness_supersede=False,
+    )
+    if result.status == "cas_failed":
+        raise RuntimeError("genesis_profile_write_conflict")
+    digest = _stable_json_sha256({
+        "memory": profile["memory"] if profile["memory_touched"] else "",
+        "style": profile["style"] if profile["style_touched"] else "",
+        "memory_touched": profile["memory_touched"],
+        "style_touched": profile["style_touched"],
+    })
+    return GENESIS_PROFILE_REF, digest, result.status
+
+
 def apply_reducer_output(
     store: UserStore,
     api_key: str | None,
@@ -1821,6 +2109,13 @@ def apply_reducer_output(
     identity_status = init_identity_if_absent(store, output, api_key, runtime_token)
     persona_ref, persona_sha = write_persona_artifact(store, job_id, output)
     voice_ref, voice_sha = write_voice_artifact(store, job_id, output)
+    profile_ref, profile_sha, profile_status = write_profile_artifact(
+        store,
+        job_id,
+        output,
+        api_key,
+        runtime_token=runtime_token,
+    )
     result_doc = {
         "memory_action_count": memory_count,
         "memory_results": memory_results,
@@ -1829,6 +2124,9 @@ def apply_reducer_output(
         "persona_sha256": persona_sha,
         "voice_ref": voice_ref,
         "voice_sha256": voice_sha,
+        "profile_ref": profile_ref,
+        "profile_sha256": profile_sha,
+        "profile_status": profile_status,
     }
     db.genesis_upsert_output(
         store.user_id,

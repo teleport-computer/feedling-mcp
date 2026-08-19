@@ -25,11 +25,15 @@ def test_prompt_renders_with_context_and_escaped_json():
     assert '"rationale"' in p
     # red line present
     assert "superseded" in p and "不删" in p
+    assert "关于这个人的一切" in p
+    assert "你们现在没有在对话" in p
+    assert "留着问这个人" in p
 
 
 def test_prompt_falls_back_to_neutral_defaults():
     p = build_dream_prompt(ai_name="", user_name="", cards="", recent_conversations="")
     assert "（暂无卡）" in p and "（这几天没有新对话）" in p
+    assert p.startswith("你是 我——这个人 的伴侣。")
 
 
 def test_prompt_naming_rule_and_backfill_instruction():

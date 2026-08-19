@@ -36,6 +36,7 @@ import pytest
 import conftest
 import db
 import provider_client
+from core import self_thinking
 from core import store as core_store
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
@@ -81,6 +82,18 @@ def test_screen_watch_policy_does_not_default_to_silence():
     assert "you do not need a strong reason to speak" in prompt
     assert "only if" not in prompt
     assert "silence is the correct answer most of the time" not in prompt
+
+
+def test_screen_watch_prompt_scopes_no_narration_to_visible_message(monkeypatch):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+
+    prompt = worker._wake_system_prompt_for_lane(
+        "screen_watch", worker._SCREEN_WATCH_SYSTEM_PROMPT
+    )
+
+    assert "In the visible message" in prompt
+    assert "never narrate that you are watching" in prompt
+    assert self_thinking.SCREEN_WATCH_INSTRUCTION.strip() in prompt
 
 
 def _reply_effect_dispatch(user_id):
@@ -163,7 +176,12 @@ def test_screen_watch_turn_passes_safe_screen_context_and_its_own_prompt(monkeyp
     system_msg = next(m for m in seen["messages"] if m["role"] == "system")
     assert system_msg["content"] is not None
     assert "watching the screen" in system_msg["content"]  # _SCREEN_WATCH_SYSTEM_PROMPT, not _WAKE_SYSTEM_PROMPT
-    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION in system_msg["content"]
+    assert self_thinking.INSTRUCTION.strip() in system_msg["content"]
+    assert "In the visible message" in system_msg["content"]
+    assert self_thinking.SCREEN_WATCH_INSTRUCTION.strip() in system_msg["content"]
+    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() in (
+        system_msg["content"]
+    )
     joined = " ".join(str(m.get("content", "")) for m in seen["messages"])
     assert "a stack trace" not in joined                    # caption is pull-only
     assert '"recent_count":1' in joined

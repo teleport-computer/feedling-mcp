@@ -38,18 +38,29 @@ _PROVIDER = provider_client.ProviderConfig(
 
 def test_file_delivery_policy_is_semantic_and_hides_internal_paths():
     prompt = v2_context.CHAT_SYSTEM_PROMPT
-    description = tool_schema.DESCRIPTIONS[tool_schema.FILE_REPLY_TOOL]
+    description = next(
+        spec.description
+        for spec in tool_schema.build_tool_specs()
+        if spec.name == tool_schema.FILE_REPLY_TOOL
+    )
 
-    assert "semantically, not by matching specific words" in prompt
-    assert "save, open, download, share, or use outside the chat" in prompt
-    assert "never ask the user for an internal workspace path" in prompt
     assert "not from exact keywords, wording, language" in description
+    assert "save, open, download, share, or use outside the chat" in description
+    assert "绝不要询问对方内部 workspace 路径" in prompt
     assert "user never needs to know /workspace" in description
     assert "Do not call this merely because" in description
-    assert "Word means .docx and PDF means .pdf" in prompt
-    assert "Never substitute Markdown" in prompt
-    assert "search memory for that subject" in prompt
-    assert "do not substitute unrelated preferences or events" in prompt
+    assert "Word means .docx and PDF means .pdf" in description
+    assert "绝不要拿 Markdown 顶替" not in prompt
+    assert (
+        "Even when reformatting an existing file, never substitute Markdown for "
+        "another supported format the user explicitly requested."
+    ) in description
+    assert "memory-grounded summary or deliverable about a specific subject" in next(
+        spec.description
+        for spec in tool_schema.build_tool_specs()
+        if spec.name == "memory_search"
+    )
+    assert "别拿无关偏好或事件冒充这个问题的答案" in prompt
     assert "real Word/PDF bytes" in description
 
 
@@ -996,6 +1007,40 @@ def test_reply_payload_sequence_accepts_image_primary_and_image_followups():
     ]
 
 
+def test_generated_image_effect_uses_plaintext_binary_envelope_when_off(monkeypatch):
+    """非加密 V2 生图必须把二进制保存成 body_b64，而不是当 UTF-8 文本。"""
+
+    class Store:
+        user_id = "u_v2_plaintext_generated_image"
+
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "resolve_content_encryption",
+        lambda _user_id: "off",
+    )
+    raw = b"\x89PNG\r\n\x1a\n\x00binary-image"
+
+    payload = worker._build_encrypted_image_reply_effect_payload(
+        Store(),
+        worker.GeneratedImageReply(
+            name="result.png",
+            mime_type="image/png",
+            data=raw,
+        ),
+        effect_id="generated-image-effect",
+    )
+
+    envelope = payload["envelope"]
+    assert base64.b64decode(envelope["body_b64"], validate=True) == raw
+    assert envelope["body_size_bytes"] == len(raw)
+    assert "body" not in envelope and "body_ct" not in envelope
+    assert payload["message_extra"] == {
+        "content_type": "image",
+        "image_mime": "image/png",
+        "image_byte_count": len(raw),
+    }
+
+
 def test_process_job_commits_single_generated_image_without_empty_followups(
     monkeypatch,
 ):
@@ -1033,7 +1078,14 @@ def test_process_job_commits_single_generated_image_without_empty_followups(
     job = jobs_store.claim_next_job("image-worker")
     assert job is not None and job["id"] == job_id
 
-    def build_envelope(store, plaintext, *, item_id=None):
+    def build_envelope(
+        store,
+        plaintext,
+        *,
+        item_id=None,
+        content_kind="text",
+    ):
+        assert content_kind == "binary"
         return (
             {
                 "v": 1,

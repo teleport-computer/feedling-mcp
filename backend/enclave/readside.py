@@ -7,7 +7,7 @@ and routing cross-module calls through `config.env_flag_enabled` /
 monkeypatch them.
 
 `select_context_memories_via_readside` still reaches into the root
-`memory_index_selector` module (not moved as part of this migration).
+`memory_garden.scoring.selector` module (not moved as part of this migration).
 """
 
 from __future__ import annotations
@@ -16,7 +16,8 @@ import json
 import os
 
 from enclave import config, envelope
-from memory_index_selector import select_memory_index_items  # noqa: E402
+from memory import card_shape  # noqa: E402
+from memory_garden.scoring.selector import select_memory_index_items  # noqa: E402
 
 
 def memory_readside_for_model_api_enabled() -> bool:
@@ -74,20 +75,26 @@ def context_moment_to_index_item(moment: dict) -> dict:
     while unifying the matching pipe.
     """
 
-    title = memory_readside_text(moment.get("title"), 500)
-    description = memory_readside_text(moment.get("description"), 500)
     linked = memory_readside_text(moment.get("linked_dimension"), 160)
-    context = memory_readside_text(moment.get("context"), 240)
-    summary = description or title or context
+    # 摘要**只能**来自可公开字段（card_fields 保证 content 不在其列）——
+    # 它会进 selector 的 skipped/selected trace，而 context_trace=1 时整个
+    # trace 会返回客户端。用正文兜底会让被拒掉的卡从 trace 漏出正文。
+    summary = memory_readside_text(card_shape.summary_of(moment), 500)
     bucket_refs = [item for item in (linked, memory_readside_text(moment.get("type"), 40)) if item]
     return {
         "id": memory_readside_text(moment.get("id"), 120),
         "summary": summary,
+        # 私有搜索语料：只在 enclave 内参与匹配，任何出口都必须剥掉。
+        # 沿用 build_memory_search_item 已有的字段名与既定语义，不新造一套。
+        "_search_content": card_shape.private_text(moment),
         "bucket_refs": bucket_refs,
         "status": "active",
         "salience": "medium",
         "is_open_thread": False,
-        "is_sensitive": False,
+        # 由 moments_to_cards 带上来的真实标记。此前这里硬写 False，
+        # selector 的敏感闸（scoring/selector.py 的 sensitive_not_allowed_for_query）
+        # 因而永不触发 —— 标了敏感的卡在普通闲聊里照样会被选中喂给模型。
+        "is_sensitive": bool(moment.get("is_sensitive")),
         "score": 0,
         "occurred_at": memory_readside_text(moment.get("occurred_at"), 80),
         "created_at": memory_readside_text(moment.get("created_at"), 80),
@@ -113,7 +120,9 @@ def select_context_memories_via_readside(
     by_id = {str(moment.get("id") or ""): moment for moment in moments if str(moment.get("id") or "")}
     index_items = [
         item for item in (context_moment_to_index_item(moment) for moment in moments)
-        if item.get("id") and item.get("summary")
+        # 只有正文、没有摘要的卡也必须进候选池 —— 此前这里只看 summary，
+        # 于是新一代形状（summary/content）的卡被整批丢弃（2026-08-16 事故根因）。
+        if item.get("id") and (item.get("summary") or item.get("_search_content"))
     ]
     selection = select_memory_index_items(
         latest_user_text,
@@ -361,12 +370,16 @@ def decrypt_readside_items(
         if not isinstance(moment, dict):
             continue
         memory_id = str(moment.get("id") or "")
-        if moment.get("visibility") == "local_only" or not moment.get("K_enclave"):
+        if moment.get("visibility") == "local_only" or (
+            not moment.get("K_enclave")
+            and moment.get("body") is None
+            and moment.get("body_b64") is None
+        ):
             if memory_id:
                 unavailable_ids.append(memory_id)
             continue
         try:
-            plaintext = envelope.decrypt_envelope(moment, authorized_user_id, content_sk)
+            plaintext = envelope.read_envelope(moment, authorized_user_id, content_sk)
             inner = json.loads(plaintext.decode("utf-8"))
             if not isinstance(inner, dict):
                 raise ValueError("memory plaintext is not an object")
@@ -387,7 +400,7 @@ def moments_to_cards(moments: list, authorized_user_id: str, content_sk) -> list
         if m.get("visibility") == "local_only":
             continue  # enclave doesn't have K_enclave for these
         try:
-            plaintext = envelope.decrypt_envelope(m, authorized_user_id, content_sk)
+            plaintext = envelope.read_envelope(m, authorized_user_id, content_sk)
             inner = json.loads(plaintext.decode("utf-8"))
         except (envelope.DecryptFailure, json.JSONDecodeError):
             continue
@@ -407,5 +420,10 @@ def moments_to_cards(moments: list, authorized_user_id: str, content_sk) -> list
             "her_quote": inner.get("her_quote"),
             "context": inner.get("context"),
             "linked_dimension": inner.get("linked_dimension"),
+            # 敏感标记必须跟着卡走 —— Route B 以前在 context_moment_to_index_item
+            # 里硬写 is_sensitive=False，于是 selector 的「敏感卡不给非敏感提问」
+            # 那道闸永远看不到真实标记，等于空转（2026-08-16 查实）。
+            # 这里用与 index/fetch 同一个判据，避免第三套语义。
+            "is_sensitive": memory_readside_is_sensitive(m, inner),
         })
     return out

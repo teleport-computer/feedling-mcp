@@ -1,8 +1,9 @@
-"""Encrypted storage contract for the Runtime V2 MEMORY/USER profile.
+"""Content-shape-aware storage contract for the Runtime V2 MEMORY/STYLE profile.
 
 ``user_blobs.doc`` is ordinary JSONB.  Only bounded metadata may live outside
-the two shared envelopes; profile plaintext must be sealed before this module
-hands a document to the blob CAS or its TEE mirror.
+the two content records. Each record follows the user's effective content
+encryption shape: encrypted tier stores a shared envelope; plaintext tier stores
+``body``. The blob CAS and TEE mirror preserve that chosen shape verbatim.
 """
 
 from __future__ import annotations
@@ -29,6 +30,18 @@ log = logging.getLogger("feedling.runtime_v2.profile_store")
 PROFILE_BLOB_KIND = "v2_agent_profile"
 PROFILE_VERSION = 1
 PROFILE_STATES = frozenset({"ok", "pending", "degraded", "empty"})
+PROFILE_RETRY_DISPOSITIONS = frozenset(
+    {"", "scheduled", "provider_config", "source_change", "terminal"}
+)
+# These dispositions deliberately stop the ordinary refresh scheduler until an
+# operator repairs the metadata.  Keep the rescue CLI and worker scheduler on
+# one source of truth: copying these strings into an operator script can leave
+# a newly introduced permanent disposition stranded forever.
+PROFILE_STUCK_RETRY_DISPOSITIONS = frozenset({"provider_config", "terminal"})
+# A successful foreground chat proves only that the user's provider credential
+# works again.  It may automatically re-arm provider-config failures, but a
+# terminal disposition remains an explicit operator-only decision.
+PROFILE_PROVIDER_SUCCESS_RECOVERABLE_DISPOSITIONS = frozenset({"provider_config"})
 _REJECT_CODE_RE = re.compile(r"^[A-Za-z0-9_.:-]{0,160}$")
 
 
@@ -39,11 +52,13 @@ class ProfileStorageError(RuntimeError):
 @dataclass(frozen=True)
 class ProfilePromptSelection:
     memory: str = ""
-    user: str = ""
+    style: str = ""
     state: str = "empty"
     memory_chars: int = 0
-    user_chars: int = 0
+    style_chars: int = 0
     age_seconds: float | None = None
+    used_profile: bool = False
+    fallback_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -52,6 +67,13 @@ class ProfileCasResult:
     document: dict
     cas_attempts: int
     recomputations: int
+
+
+@dataclass(frozen=True)
+class ProfileRetryRepairResult:
+    status: str
+    disposition: str = ""
+    cas_attempts: int = 0
 
 
 _fallback_lock = threading.Lock()
@@ -93,16 +115,20 @@ def _nonnegative_int(value: Any, name: str) -> int:
     return parsed
 
 
-def _validate_encrypted_field(value: Any, name: str) -> dict:
+def _validate_content_field(value: Any, name: str) -> dict:
     if not isinstance(value, dict):
         raise ProfileStorageError(f"invalid_{name}")
     envelope = value.get("envelope")
     if not isinstance(envelope, dict) or not envelope:
         raise ProfileStorageError(f"invalid_{name}_envelope")
-    if not str(envelope.get("body_ct") or ""):
-        raise ProfileStorageError(f"invalid_{name}_ciphertext")
     if any(key in envelope for key in ("plaintext", "text", "content")):
         raise ProfileStorageError(f"plaintext_{name}_envelope")
+    has_ciphertext = bool(str(envelope.get("body_ct") or ""))
+    has_plaintext = isinstance(envelope.get("body"), str)
+    if has_ciphertext and has_plaintext:
+        raise ProfileStorageError(f"mixed_{name}_content_shape")
+    if not has_ciphertext and not has_plaintext:
+        raise ProfileStorageError(f"invalid_{name}_content_shape")
     chars = _nonnegative_int(value.get("chars"), f"{name}_chars")
     return {"envelope": deepcopy(envelope), "chars": chars}
 
@@ -135,13 +161,7 @@ def validate_profile_document(value: Any) -> dict:
     if not math.isfinite(retry_not_before) or retry_not_before < 0:
         raise ProfileStorageError("profile_retry_not_before_invalid")
     retry_disposition = str(attempt.get("retry_disposition") or "")
-    if retry_disposition not in {
-        "",
-        "scheduled",
-        "provider_config",
-        "source_change",
-        "terminal",
-    }:
+    if retry_disposition not in PROFILE_RETRY_DISPOSITIONS:
         raise ProfileStorageError("profile_retry_disposition_invalid")
     retry_family = str(attempt.get("retry_family") or "")
     if retry_family not in {
@@ -186,12 +206,22 @@ def validate_profile_document(value: Any) -> dict:
         "disabled": disabled,
     }
     memory = value.get("memory")
-    user = value.get("user")
-    if (memory is None) != (user is None):
+    style = value.get("style")
+    legacy_user = value.get("user")
+    if style is not None and legacy_user is not None:
+        raise ProfileStorageError("profile_style_alias_conflict")
+    # TODO(profile-style-migration): remove the legacy USER read fallback after
+    # every stored profile has completed one successful MEMORY/STYLE redistill.
+    style_key = "style" if style is not None else "user"
+    style_value = style if style is not None else legacy_user
+    if (memory is None) != (style_value is None):
         raise ProfileStorageError("profile_fields_torn")
     if memory is not None:
-        normalized["memory"] = _validate_encrypted_field(memory, "memory")
-        normalized["user"] = _validate_encrypted_field(user, "user")
+        normalized["memory"] = _validate_content_field(memory, "memory")
+        normalized[style_key] = _validate_content_field(
+            style_value,
+            style_key,
+        )
     if state == "ok" and memory is None:
         raise ProfileStorageError("profile_ok_fields_missing")
     return normalized
@@ -215,18 +245,21 @@ def build_profile_document(
     source: dict,
     last_attempt: dict,
     memory_text: str | None = None,
-    user_text: str | None = None,
+    style_text: str | None = None,
     previous: dict | None = None,
     disabled: bool = False,
     seal_text: Callable[[str, str], dict] = _seal_text,
 ) -> dict:
-    """Build one all-or-nothing profile document with locally sealed fields.
+    """Build one all-or-nothing profile document with shape-routed fields.
 
     A degraded/pending metadata update may omit both plaintext fields to retain
-    the previous winning envelopes.  Supplying only one field is always a torn
-    write and fails before any CAS.
+    the previous winning records. ``seal_text`` is retained as the injection
+    parameter name for source compatibility; the production implementation
+    returns either a shared envelope or ``body`` according to effective
+    ``content_encryption``. Supplying only one field is always a torn write and
+    fails before any CAS.
     """
-    if (memory_text is None) != (user_text is None):
+    if (memory_text is None) != (style_text is None):
         raise ProfileStorageError("profile_fields_torn")
     document: dict[str, Any] = {
         "v": PROFILE_VERSION,
@@ -235,23 +268,94 @@ def build_profile_document(
         "last_attempt": deepcopy(last_attempt),
         "disabled": bool(disabled),
     }
-    if memory_text is not None and user_text is not None:
-        if not memory_text.strip() or not user_text.strip():
-            raise ProfileStorageError("profile_field_empty")
+    if memory_text is not None and style_text is not None:
         document["memory"] = {
             "envelope": seal_text(str(user_id), memory_text),
             "chars": len(memory_text),
         }
-        document["user"] = {
-            "envelope": seal_text(str(user_id), user_text),
-            "chars": len(user_text),
+        document["style"] = {
+            "envelope": seal_text(str(user_id), style_text),
+            "chars": len(style_text),
         }
     elif isinstance(previous, dict):
-        if previous.get("memory") is not None or previous.get("user") is not None:
+        if (
+            previous.get("memory") is not None
+            or previous.get("style") is not None
+            or previous.get("user") is not None
+        ):
             prior = validate_profile_document(previous)
             if prior.get("memory") is not None:
                 document["memory"] = prior["memory"]
-                document["user"] = prior["user"]
+                if prior.get("style") is not None:
+                    document["style"] = prior["style"]
+                else:
+                    document["user"] = prior["user"]
+    return validate_profile_document(document)
+
+
+def build_profile_document_patching_fields(
+    user_id: str,
+    *,
+    state: str,
+    source: dict,
+    last_attempt: dict,
+    memory_text: str | None,
+    style_text: str | None,
+    previous: dict | None,
+    disabled: bool | None = None,
+    seal_text: Callable[[str, str], dict] = _seal_text,
+) -> dict:
+    """Write touched fields and byte-preserve untouched content shapes.
+
+    Genesis can derive only MEMORY or only STYLE from one upload.  Requiring it
+    to decrypt and reseal the untouched side adds an enclave dependency and can
+    change content for data the pass did not own. A missing prior side is
+    initialized through ``seal_text`` using the owner's effective content shape
+    so the paired-field contract stays atomic.
+    """
+    prior = (
+        validate_profile_document(previous)
+        if isinstance(previous, dict) and previous
+        else {}
+    )
+    document: dict[str, Any] = {
+        "v": PROFILE_VERSION,
+        "state": str(state),
+        "source": deepcopy(source),
+        "last_attempt": deepcopy(last_attempt),
+        "disabled": (
+            bool(prior.get("disabled"))
+            if disabled is None
+            else bool(disabled)
+        ),
+    }
+    if memory_text is not None:
+        document["memory"] = {
+            "envelope": seal_text(str(user_id), memory_text),
+            "chars": len(memory_text),
+        }
+    elif prior.get("memory") is not None:
+        document["memory"] = deepcopy(prior["memory"])
+    else:
+        document["memory"] = {
+            "envelope": seal_text(str(user_id), ""),
+            "chars": 0,
+        }
+
+    if style_text is not None:
+        document["style"] = {
+            "envelope": seal_text(str(user_id), style_text),
+            "chars": len(style_text),
+        }
+    elif prior.get("style") is not None:
+        document["style"] = deepcopy(prior["style"])
+    elif prior.get("user") is not None:
+        document["user"] = deepcopy(prior["user"])
+    else:
+        document["style"] = {
+            "envelope": seal_text(str(user_id), ""),
+            "chars": 0,
+        }
     return validate_profile_document(document)
 
 
@@ -287,9 +391,63 @@ def _winner_supersedes(winner: dict, candidate: dict) -> bool:
     )
 
 
+def repair_stuck_profile_retry(
+    user_id: str,
+    *,
+    target_dispositions: frozenset[str] = PROFILE_STUCK_RETRY_DISPOSITIONS,
+    read_profile: Callable[[str, str], Any] | None = None,
+    compare_and_swap: Callable[..., bool] | None = None,
+) -> ProfileRetryRepairResult:
+    """CAS-clear selected stuck retry metadata without touching profile fields.
+
+    The document is re-read on every CAS attempt.  That second predicate check
+    is load-bearing: a concurrent profile lane may have already moved the user
+    to a scheduled retry or healthy state, which must not be cleared using a
+    stale plan.  Callers choose the allowed stuck subset; terminal is therefore
+    kept operator-only when chat success passes only provider_config.
+    """
+
+    targets = frozenset(str(value) for value in target_dispositions)
+    if not targets or not targets.issubset(PROFILE_STUCK_RETRY_DISPOSITIONS):
+        raise ProfileStorageError("profile_retry_repair_target_invalid")
+    read = read_profile or db.get_blob_strict
+    cas = compare_and_swap or db.set_blob_if_unchanged
+    for cas_attempt in (1, 2):
+        raw = read(str(user_id), PROFILE_BLOB_KIND)
+        if raw is None:
+            return ProfileRetryRepairResult("skipped_fresh", cas_attempts=cas_attempt)
+        document = validate_profile_document(raw)
+        if document.get("disabled") is True:
+            return ProfileRetryRepairResult(
+                "skipped_disabled", cas_attempts=cas_attempt
+            )
+        state = str(document.get("state") or "")
+        disposition = str(
+            (document.get("last_attempt") or {}).get("retry_disposition") or ""
+        )
+        if state == "ok" or disposition not in targets:
+            return ProfileRetryRepairResult("skipped_fresh", cas_attempts=cas_attempt)
+
+        candidate = deepcopy(document)
+        last_attempt = deepcopy(candidate["last_attempt"])
+        last_attempt["retry_disposition"] = ""
+        last_attempt["retry_not_before"] = 0.0
+        candidate["last_attempt"] = last_attempt
+        candidate = validate_profile_document(candidate)
+        if cas(str(user_id), PROFILE_BLOB_KIND, raw, candidate):
+            return ProfileRetryRepairResult(
+                "repaired",
+                disposition=disposition,
+                cas_attempts=cas_attempt,
+            )
+    raise ProfileStorageError("profile_retry_repair_cas_failed")
+
+
 def update_profile_cas(
     user_id: str,
     recompute: Callable[[dict], dict],
+    *,
+    allow_freshness_supersede: bool = True,
 ) -> ProfileCasResult:
     """CAS one profile, recomputing once against the winning race document.
 
@@ -299,13 +457,20 @@ def update_profile_cas(
     """
     expected_raw = db.get_blob_strict(str(user_id), PROFILE_BLOB_KIND)
     expected = deepcopy(expected_raw) if isinstance(expected_raw, dict) else {}
-    return _update_profile_cas_from_expected(str(user_id), expected, recompute)
+    return _update_profile_cas_from_expected(
+        str(user_id),
+        expected,
+        recompute,
+        allow_freshness_supersede=allow_freshness_supersede,
+    )
 
 
 def _update_profile_cas_from_expected(
     user_id: str,
     expected_doc: dict,
     recompute: Callable[[dict], dict],
+    *,
+    allow_freshness_supersede: bool = True,
 ) -> ProfileCasResult:
     """Internal snapshot form used by the true two-connection race test."""
     expected = deepcopy(expected_doc)
@@ -328,7 +493,11 @@ def _update_profile_cas_from_expected(
             )
         winner_raw = db.get_blob_strict(str(user_id), PROFILE_BLOB_KIND)
         winner = deepcopy(winner_raw) if isinstance(winner_raw, dict) else {}
-        if winner and _winner_supersedes(winner, candidate):
+        if (
+            allow_freshness_supersede
+            and winner
+            and _winner_supersedes(winner, candidate)
+        ):
             return ProfileCasResult(
                 status="superseded",
                 document=validate_profile_document(winner),
@@ -414,40 +583,53 @@ def select_profile_for_turn(
     decrypt_envelope: Callable[[dict, str], bytes],
     read_blob: Callable[[str, str], Any] = db.get_blob_strict,
 ) -> ProfilePromptSelection:
-    """Select decryptable profile fields without consulting Chat summary state."""
+    """Select decryptable Profile fields without consulting Chat summary state."""
     if not enabled:
-        return ProfilePromptSelection(state="empty")
+        return ProfilePromptSelection(state="empty", fallback_reason="disabled")
     try:
         raw = read_blob(str(user_id), PROFILE_BLOB_KIND)
     except Exception as exc:  # DB outage must not masquerade as a missing profile.
         reason = f"strict_read_failed:{type(exc).__name__.lower()}"
         _record_turn_fallback(reason)
-        return ProfilePromptSelection(state="unavailable")
+        return ProfilePromptSelection(state="unavailable", fallback_reason=reason)
     if raw is None:
-        return ProfilePromptSelection(state="empty")
+        return ProfilePromptSelection(state="empty", fallback_reason="missing")
     try:
         document = validate_profile_document(raw)
     except ProfileStorageError:
         reason = "invalid_profile_document"
         _record_turn_fallback(reason)
-        return ProfilePromptSelection(state="unavailable")
+        return ProfilePromptSelection(state="unavailable", fallback_reason=reason)
     if document["disabled"]:
-        return ProfilePromptSelection(state="empty")
+        return ProfilePromptSelection(state="empty", fallback_reason="disabled")
     if document.get("memory") is None:
-        return ProfilePromptSelection(state="empty")
-    try:
-        memory = decrypt_envelope(document["memory"]["envelope"], "memory").decode(
-            "utf-8"
+        return ProfilePromptSelection(
+            state="empty", fallback_reason=f"state:{document['state']}"
         )
-        user = decrypt_envelope(document["user"]["envelope"], "user").decode("utf-8")
+
+    def _read_field(name: str) -> str:
+        envelope = document[name]["envelope"]
+        if envelope.get("body_ct"):
+            return decrypt_envelope(envelope, name).decode("utf-8")
+        body = envelope.get("body")
+        if isinstance(body, str):
+            return body
+        raise ProfileStorageError(f"invalid_{name}_content_shape")
+    try:
+        memory = _read_field("memory")
+        # TODO(profile-style-migration): delete the USER fallback after the
+        # fleet has naturally rewritten every profile through distillation.
+        style_key = "style" if document.get("style") is not None else "user"
+        style_field = document[style_key]
+        style = _read_field(style_key)
         if len(memory) != document["memory"]["chars"]:
             raise ProfileStorageError("memory_chars_mismatch")
-        if len(user) != document["user"]["chars"]:
-            raise ProfileStorageError("user_chars_mismatch")
+        if len(style) != style_field["chars"]:
+            raise ProfileStorageError(f"{style_key}_chars_mismatch")
     except Exception as exc:
         reason = f"decrypt_failed:{type(exc).__name__.lower()}"
         _record_turn_fallback(reason)
-        return ProfilePromptSelection(state="unavailable")
+        return ProfilePromptSelection(state="unavailable", fallback_reason=reason)
     generated_at = _timestamp_rank(document["source"].get("generated_at"))
     age_seconds = (
         None
@@ -456,9 +638,10 @@ def select_profile_for_turn(
     )
     return ProfilePromptSelection(
         memory=memory,
-        user=user,
+        style=style,
         state="ok" if document["state"] == "ok" else "last_good",
         memory_chars=len(memory),
-        user_chars=len(user),
+        style_chars=len(style),
         age_seconds=age_seconds,
+        used_profile=True,
     )

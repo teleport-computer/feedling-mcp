@@ -66,6 +66,18 @@ TABLES: dict[str, tuple[tuple[str, ...], str]] = {
         "id, auth_token, push_type, target_token, apns_env, status, err_msg, "
         "content, created_at, updated_at",
     ),
+    # 冻结格子（0091 / tee 0023）。写侧是 execute_many 按日整组 best-effort
+    # 镜像；本 reconciler 是漏写后的扶正通道（格子写后不变、语句幂等，按 PK
+    # 对齐即收敛）。
+    "lane_daily_rollup": (
+        ("user_id", "day", "route", "lane", "enqueue_source"),
+        "user_id, day, route, lane, enqueue_source, completed, failed, "
+        "expired, superseded, failure_codes, frozen_at",
+    ),
+    "lane_rollup_watermark": (
+        ("route",),
+        "route, backfill_from, through_day, frozen_at",
+    ),
 }
 
 # 每表可选的辖区 WHERE 子句：不满足的行完全不归本 reconciler 管——既不 copy、
@@ -175,6 +187,21 @@ def reconcile_table(table: str, *, prune: bool = True) -> dict:
             rds_rows += len(rows)
             try:
                 with dst.transaction(), dst.cursor() as cur:
+                    if table == "notify_relay_configs":
+                        # Once the TEE schema is primary-capable it carries the
+                        # same UNIQUE(device_token) contract as RDS.  A missed
+                        # shadow DELETE can therefore leave an old auth_token
+                        # occupying the token before the normal PK upsert runs.
+                        # Remove only that displaced binding, in the same
+                        # transaction as its replacement; the source UNIQUE
+                        # guarantees at most one replacement per device token.
+                        auth_idx = col_list.index("auth_token")
+                        device_idx = col_list.index("device_token")
+                        cur.executemany(
+                            "DELETE FROM notify_relay_configs "
+                            "WHERE device_token = %s AND auth_token <> %s",
+                            [(row[device_idx], row[auth_idx]) for row in rows],
+                        )
                     # executemany(而非逐行 execute):psycopg3 对同一条 SQL 的多组参数
                     # 自动走 pipeline,把整批的往返压成一次网络交换。reconcile 经 Phala
                     # 网关 direct-TLS,单行往返延迟正是大表(user_logs 38 万行)回填慢到

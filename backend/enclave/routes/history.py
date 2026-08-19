@@ -31,9 +31,7 @@ from model_api_runtime.v2.history_search import normalize_for_match
 router = APIRouter()
 
 # 调用方预算的硬上限（clamp，不是默认值——默认值由 backend 侧统一配置后随
-# payload 送来）。数值锚点：spec §5 的「单调用 raw 512 条」「叶子 ≤64/256KiB」。
-_LEAF_ROWS_HARD_MAX = 256
-_LEAF_BYTES_HARD_MAX = 1 << 20          # 1 MiB 摘要密文
+# payload 送来）。数值锚点：spec §5 的「单调用 raw 512 条」。
 _SCAN_ROWS_HARD_MAX = 512               # spec §5 单调用 raw 上限
 _SCAN_BYTES_HARD_MAX = 2 << 20          # 2 MiB
 # 1 anchor + 15 before + 15 after = spec §3.2 的请求上限 31，再留一点富余。
@@ -142,98 +140,6 @@ def _build_snippet(text: str, normalized_query: str, max_chars: int) -> tuple[st
             return snippet, (lead > 0 or len(hay) > lead + len(snippet))
     snippet = src[:max_chars]
     return snippet, len(src) > len(snippet)
-
-
-@router.post("/v1/history/leaf-hints")
-async def v1_history_leaf_hints(request: Request):
-    """解密一批 level-0 摘要叶子并返回 query 命中段（扫描优先级提示）。
-
-    exact 叶子命中 → 返回 (segment_id, start_seq, end_seq)；legacy_opaque 叶子
-    命中 → 只返回标记（spec §4：无精确 source witness，绝不参与范围推断，其
-    覆盖区由 raw 兜底 phase 扫）。
-    """
-    ctx = auth.extract_auth(request)
-    user_id, error = await auth.resolve_read_caller(ctx)
-    if error is not None:
-        body, status = error
-        return JSONResponse(body, status_code=status)
-    content_sk, err_response = await content_sk_or_503()
-    if err_response is not None:
-        return err_response
-    payload = await read_json_payload(request)
-    leaves = payload.get("leaves")
-    if not isinstance(leaves, list):
-        return JSONResponse({"error": "leaves must be a list"}, status_code=400)
-    query = normalize_for_match(str(payload.get("query") or ""))
-    if not query:
-        # 叶子提示只存在于 query 模式（时间模式跳过摘要提示，spec §4）。
-        return JSONResponse({"error": "query required"}, status_code=400)
-    max_leaves = _clamped_int(
-        payload, "max_leaves", default=64, lo=1, hard_max=_LEAF_ROWS_HARD_MAX)
-    max_bytes = _clamped_int(
-        payload, "max_ciphertext_bytes",
-        default=256 * 1024, lo=1024, hard_max=_LEAF_BYTES_HARD_MAX)
-
-    def _work():
-        hits: list[dict] = []
-        legacy_hits: list[str] = []
-        unavailable = 0
-        checked = 0
-        used_bytes = 0
-        truncated = False
-        for leaf in leaves:
-            if not isinstance(leaf, dict):
-                continue
-            env = leaf.get("summary_envelope")
-            size = (
-                len(str(env.get("body_ct") or "")) if isinstance(env, dict) else 0
-            )
-            # 字节闸判在这片叶子**进批之前**（同 /scan）：先加后判等于每批都
-            # 允许超支一整片，一片超大摘要就能把闸穿过去。
-            if checked >= max_leaves or (checked and used_bytes + size > max_bytes):
-                # 先到者停（spec §5）；没扫到的叶子由调用方的 raw 兜底覆盖。
-                truncated = True
-                break
-            checked += 1
-            used_bytes += size
-            if not isinstance(env, dict) or not env.get("K_enclave"):
-                unavailable += 1
-                continue
-            if size > max_bytes:
-                # 单叶自身就装不下：不解密（这类明文可能极大），按不可用计，
-                # 它覆盖的那段由调用方的 raw 兜底扫。
-                unavailable += 1
-                truncated = True
-                continue
-            try:
-                text = envelope.decrypt_envelope(
-                    env, user_id or "", content_sk
-                ).decode("utf-8", errors="replace")
-            except envelope.DecryptFailure:
-                unavailable += 1
-                continue
-            if query not in normalize_for_match(text):
-                continue
-            if str(leaf.get("coverage_kind") or "") == "legacy_opaque":
-                legacy_hits.append(str(leaf.get("segment_id") or ""))
-            else:
-                hits.append({
-                    "segment_id": leaf.get("segment_id"),
-                    "start_seq": int(leaf.get("start_seq") or 0),
-                    "end_seq": int(leaf.get("end_seq") or 0),
-                })
-        return hits, legacy_hits, checked, unavailable, truncated
-
-    hits, legacy_hits, checked, unavailable, truncated = (
-        await anyio.to_thread.run_sync(_work))
-    return JSONResponse({
-        "user_id": user_id,
-        "hits": hits,
-        "legacy_opaque_hits": legacy_hits,
-        "checked_count": checked,
-        "unavailable_count": unavailable,
-        "truncated": truncated,
-    })
 
 
 @router.post("/v1/history/scan")

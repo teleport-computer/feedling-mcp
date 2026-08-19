@@ -60,6 +60,7 @@ def should_kill(
     turn_stall_timeout_sec: float | None = None,
     turn_absolute_timeout_sec: float | None = None,
     turn_hard_timeout_sec: float | None = None,
+    child_startup_timeout_sec: float | None = None,
 ) -> bool:
     """PURE — no I/O, no clock reads (the caller already resolved `liveness` and
     `jobs_claimable` before calling in). Returns True iff any of:
@@ -100,6 +101,21 @@ def should_kill(
 
     if not liveness.get("alive", False):
         return True
+
+    # A spawned interpreter performs synchronous schema/user/runtime bootstrap
+    # before its asyncio heartbeat task exists. Production cold starts can take
+    # longer than the steady-state heartbeat budget, especially when all pool
+    # processes initialize concurrently. Give only generations that have never
+    # emitted a valid runtime message a separate bounded startup budget. Once
+    # the first heartbeat/progress arrives, all normal liveness rules apply.
+    if liveness.get("startup_complete") is False:
+        startup_timeout = (
+            child_liveness_timeout_sec
+            if child_startup_timeout_sec is None
+            else float(child_startup_timeout_sec)
+        )
+        startup_age = float(liveness.get("startup_age_sec", math.inf))
+        return startup_age > startup_timeout
 
     # New supervisors expose the event-loop clock explicitly.  Its heartbeat
     # is unconditional, including while idle, so staleness is a real loop wedge
@@ -144,6 +160,7 @@ async def _watchdog_loop(
     recovery_timeout_sec: float = 5.0,
     recovery_queue: claim_recovery.ClaimRecoveryQueue | None = None,
     pool: str = "foreground",
+    child_startup_timeout_sec: float | None = None,
 ) -> None:
     """PARENT loop — mirrors `serve_worker._reaper_loop`/`_heartbeat_loop`'s
     interruptible `wait_for(stop_event.wait(), timeout=interval)` shape so
@@ -274,6 +291,7 @@ async def _watchdog_loop(
                 turn_stall_timeout_sec=turn_stall_timeout_sec,
                 turn_absolute_timeout_sec=turn_absolute_timeout_sec,
                 child_liveness_timeout_sec=child_liveness_timeout_sec,
+                child_startup_timeout_sec=child_startup_timeout_sec,
                 jobs_claimable=False,
             )
             if immediate:
@@ -317,6 +335,7 @@ async def _watchdog_loop(
                     turn_stall_timeout_sec=turn_stall_timeout_sec,
                     turn_absolute_timeout_sec=turn_absolute_timeout_sec,
                     child_liveness_timeout_sec=child_liveness_timeout_sec,
+                    child_startup_timeout_sec=child_startup_timeout_sec,
                     jobs_claimable=claimable,
                 ):
                     await _kill_child(liveness, claimable)

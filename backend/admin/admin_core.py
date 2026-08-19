@@ -84,6 +84,26 @@ def dau_payload(query_string: str) -> dict:
         return data_track._data_track_dau_payload()
 
 
+def events_payload(query_string: str) -> dict:
+    """Return the content-free event-health aggregates for one Beijing day.
+
+    ``capture`` deliberately preserves :func:`db.admin_events_overview`'s
+    category-level contract: it combines capture, dream, and migrate jobs.  It
+    must not be presented downstream as a dream-only metric.
+    """
+    with bind(query_string):
+        raw_day = str(request.args.get("day") or "").strip()
+        day = (
+            data_track._validated_dau_day(raw_day)
+            if raw_day
+            else data_track._events_today()
+        )
+        return {
+            "filters": {"day": day, "timezone": "Asia/Shanghai"},
+            **db.admin_events_overview(day=day, tz="Asia/Shanghai"),
+        }
+
+
 def growth_payload(query_string: str) -> dict:
     with bind(query_string):
         return data_track._data_track_growth_payload()
@@ -486,8 +506,18 @@ def _build_page_html(query_string: str) -> str:
             except Exception:
                 logging.exception("runtime user report failed (health still served)")
                 user_report = None
+            try:
+                # stuck：非终态尝试不进失败率（Seven 2026-08-18 定 A），所以必须
+                # 与失败率并排出现在同一页 —— 否则它就是下一个「用户完全看不见」。
+                stuck = _timed(
+                    "runtime_stuck",
+                    lambda: db.admin_lane_rollup(limit=1)["stuck"],
+                )
+            except Exception:
+                logging.exception("runtime stuck failed (health still served)")
+                stuck = None
             return data_track._render_runtime_health_page(
-                payload, tokens, delivery, user_report
+                payload, tokens, delivery, user_report, stuck
             )
         if view == "events":
             event = (request.args.get("event") or "").strip()

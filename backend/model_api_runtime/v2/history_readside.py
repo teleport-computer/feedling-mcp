@@ -24,7 +24,9 @@ from dataclasses import dataclass, replace
 
 import httpx
 
+from core import envelope as core_envelope
 import db
+from enclave.routes import history as enclave_history
 from model_api_runtime.v2 import history_search, jobs_store
 
 # 与 serve_worker._ASSISTANT_ROLES 同一套历史 role 归一（V1 时代写 'agent'，
@@ -156,10 +158,147 @@ def _row_payload(row: dict) -> dict:
                 out[key] = row[key]
         if ctype == "file":
             out["file_name"] = row.get("file_name")
+        if row.get("caption_body") is not None:
+            out["caption_body"] = row.get("caption_body")
     else:
-        for key in _TEXT_ENVELOPE_FIELDS:
-            out[key] = row.get(key)
+        shape = core_envelope.classify_envelope_shape(row)
+        if shape == "sealed":
+            for key in _TEXT_ENVELOPE_FIELDS:
+                out[key] = row.get(key)
+        elif shape == "plaintext_binary":
+            out["body_b64"] = row.get("body_b64")
+        elif shape == "plaintext_text":
+            out["body"] = row.get("body")
     return out
+
+
+def _row_is_plaintext(row: dict) -> bool:
+    ctype = str(row.get("content_type") or "text")
+    if ctype in ("image", "file"):
+        return row.get("caption_body") is not None or not row.get("caption_body_ct")
+    return core_envelope.classify_envelope_shape(row) in (
+        "plaintext_text", "plaintext_binary")
+
+
+def _local_row_text(row: dict, owner_user_id: str) -> str | None:
+    ctype = str(row.get("content_type") or "text")
+    if ctype in ("image", "file"):
+        if row.get("caption_body") is None:
+            return ""
+        caption_owner = str(
+            row.get("caption_owner_user_id") or row.get("owner_user_id") or "")
+        if caption_owner != owner_user_id:
+            return None
+        return str(row.get("caption_body") or "")
+    try:
+        return core_envelope.read_plaintext_envelope_body(
+            row, owner_user_id=owner_user_id).decode("utf-8", errors="replace")
+    except ValueError:
+        return None
+
+
+def _local_scan_row(row: dict, owner_user_id: str, query: str, snippet_max: int) -> dict | None:
+    text = _local_row_text(row, owner_user_id)
+    if text is None or (query and query not in history_search.normalize_for_match(text)):
+        return None
+    display = text or enclave_history._attachment_marker(row)
+    snippet, truncated = enclave_history._build_snippet(display, query, snippet_max)
+    return {
+        "message_id": str(row.get("id") or ""),
+        "seq": int(row.get("seq") or 0),
+        "ts": float(row.get("ts") or 0.0),
+        "role": str(row.get("role") or ""),
+        "snippet": snippet,
+        "content_truncated": bool(truncated),
+    }
+
+
+def _project_sealed_row(row: dict) -> dict:
+    projected = dict(row)
+    projected.pop("body", None)
+    projected.pop("body_b64", None)
+    projected.pop("caption_body", None)
+    return projected
+
+
+def _scan_rows_partitioned(
+    rows: list[dict],
+    *,
+    owner_user_id: str,
+    query: str,
+    stop_after_hits: int,
+    deadline_ms: int,
+    max_rows: int,
+    max_ciphertext_bytes: int,
+    snippet_max_chars: int,
+    post,
+) -> tuple[dict, int]:
+    hits: list[dict] = []
+    checked = 0
+    unavailable = 0
+    last_checked: int | None = None
+    stopped = "exhausted"
+    truncated = False
+    posts = 0
+    index = 0
+    while index < len(rows) and checked < max_rows:
+        row = rows[index]
+        if _row_is_plaintext(row):
+            checked += 1
+            last_checked = int(row.get("seq") or 0)
+            text = _local_row_text(row, owner_user_id)
+            if text is None:
+                unavailable += 1
+            elif not query or query in history_search.normalize_for_match(text):
+                hit = _local_scan_row(
+                    row, owner_user_id, query, snippet_max_chars)
+                if hit is not None:
+                    hits.append(hit)
+            index += 1
+            if stop_after_hits and len(hits) >= stop_after_hits:
+                stopped = "hits"
+                break
+            continue
+
+        end = index + 1
+        while end < len(rows) and not _row_is_plaintext(rows[end]):
+            end += 1
+        remaining_hits = max(0, stop_after_hits - len(hits))
+        response = post("scan", {
+            "rows": [_project_sealed_row(row) for row in rows[index:end]],
+            "query": query,
+            "stop_after_hits": remaining_hits,
+            "deadline_ms": deadline_ms,
+            "max_rows": max_rows - checked,
+            "max_ciphertext_bytes": max_ciphertext_bytes,
+            "snippet_max_chars": snippet_max_chars,
+        })
+        posts += 1
+        part_checked = int(response.get("checked_count") or 0)
+        checked += part_checked
+        unavailable += int(response.get("unavailable_count") or 0)
+        part_hits = response.get("hits") if isinstance(response.get("hits"), list) else []
+        hits.extend(part_hits[:max(0, stop_after_hits - len(hits))])
+        if response.get("last_checked_seq") is not None:
+            last_checked = int(response["last_checked_seq"])
+        part_stopped = str(response.get("stopped") or "exhausted")
+        truncated = truncated or bool(response.get("truncated"))
+        if part_checked < end - index or part_stopped != "exhausted":
+            stopped = part_stopped
+            break
+        index = end
+
+    if checked >= max_rows and index < len(rows):
+        stopped = "budget"
+        truncated = True
+    return {
+        "hits": hits,
+        "checked_count": checked,
+        "unavailable_count": unavailable,
+        "last_checked_seq": last_checked,
+        "stopped": stopped,
+        "truncated": truncated,
+    }, posts
 
 
 def _payload_ciphertext_size(row_payload: dict) -> int:
@@ -296,15 +435,17 @@ def run_history_search(
             payload_rows.append(projected)
             used_bytes += size
         try:
-            response = post("scan", {
-                "rows": payload_rows,
-                "query": normalized_query,
-                "stop_after_hits": limit_n - len(matches),
-                "deadline_ms": max(1, remaining_ms),
-                "max_rows": budget.raw_batch_rows,
-                "max_ciphertext_bytes": budget.raw_batch_bytes,
-                "snippet_max_chars": budget.snippet_max_chars,
-            })
+            response, posts_used = _scan_rows_partitioned(
+                payload_rows,
+                owner_user_id=str(user_id),
+                query=normalized_query,
+                stop_after_hits=limit_n - len(matches),
+                deadline_ms=max(1, remaining_ms),
+                max_rows=budget.raw_batch_rows,
+                max_ciphertext_bytes=budget.raw_batch_bytes,
+                snippet_max_chars=budget.snippet_max_chars,
+                post=post,
+            )
         except RuntimeError as exc:
             # 一旦有过成功的 scan 投递，本次调用就**已经解密过原文**，此后再冒出
             # 的 enclave 错误绝不能带上 route-missing 那个词面：facade 会把它翻成
@@ -314,7 +455,7 @@ def run_history_search(
             if scan_posts and str(exc) == "enclave_history_capability_unavailable":
                 raise RuntimeError("enclave_error_after_scan") from exc
             raise
-        scan_posts += 1
+        scan_posts += posts_used
         checked = int(response.get("checked_count") or 0)
         scanned += checked
         unavailable += int(response.get("unavailable_count") or 0)
@@ -380,6 +521,29 @@ def _fetch_item(item: dict) -> dict:
     return out
 
 
+def _local_fetch_item(row: dict, owner_user_id: str, max_chars: int) -> dict:
+    ctype = str(row.get("content_type") or "text")
+    item = {
+        "message_id": str(row.get("id") or ""),
+        "seq": int(row.get("seq") or 0),
+        "ts": float(row.get("ts") or 0.0),
+        "role": str(row.get("role") or ""),
+    }
+    if ctype != "text":
+        item["content_type"] = ctype
+    text = _local_row_text(row, owner_user_id)
+    if text is None:
+        item["content"] = None
+        item["unavailable"] = True
+        return item
+    content = text or (
+        enclave_history._attachment_marker(row)
+        if ctype in ("image", "file") else "")
+    item["content"] = content[:max_chars]
+    item["content_truncated"] = len(content) > max_chars
+    return item
+
+
 def run_history_fetch(
     user_id: str,
     *,
@@ -429,16 +593,61 @@ def run_history_fetch(
         str(user_id), int(anchor["seq"]),
         before=keep_before, after=keep_after,
         before_requested=n_before, after_requested=n_after)
-    response = post("fetch", {
-        "anchor": _row_payload(anchor),
-        "before": [_row_payload(row) for row in older],
-        "after": [_row_payload(row) for row in newer],
-        "max_chars_per_message": budget.fetch_max_chars_per_message,
-        "deadline_ms": max(1, int(budget.call_deadline_ms)),
-    })
-    anchor_item = response.get("anchor")
-    before_items = response.get("before") if isinstance(response.get("before"), list) else []
-    after_items = response.get("after") if isinstance(response.get("after"), list) else []
+    rows = [anchor, *older, *newer]
+    local_by_id = {
+        str(row.get("id") or ""): _local_fetch_item(
+            row, str(user_id), budget.fetch_max_chars_per_message)
+        for row in rows
+        if _row_is_plaintext(row)
+    }
+    sealed_rows = [row for row in rows if not _row_is_plaintext(row)]
+    response = {
+        "anchor": None,
+        "before": [],
+        "after": [],
+        "unavailable_count": 0,
+    }
+    if sealed_rows:
+        if not _row_is_plaintext(anchor):
+            sealed_anchor = anchor
+            sealed_before = [row for row in older if not _row_is_plaintext(row)]
+            sealed_after = [row for row in newer if not _row_is_plaintext(row)]
+        else:
+            sealed_anchor = sealed_rows[0]
+            sealed_before = sealed_rows[1:]
+            sealed_after = []
+        response = post("fetch", {
+            "anchor": _project_sealed_row(_row_payload(sealed_anchor)),
+            "before": [
+                _project_sealed_row(_row_payload(row)) for row in sealed_before
+            ],
+            "after": [
+                _project_sealed_row(_row_payload(row)) for row in sealed_after
+            ],
+            "max_chars_per_message": budget.fetch_max_chars_per_message,
+            "deadline_ms": max(1, int(budget.call_deadline_ms)),
+        })
+    sealed_items = []
+    if isinstance(response.get("anchor"), dict):
+        sealed_items.append(response["anchor"])
+    sealed_items.extend(
+        response.get("before") if isinstance(response.get("before"), list) else [])
+    sealed_items.extend(
+        response.get("after") if isinstance(response.get("after"), list) else [])
+    items_by_id = {
+        str(item.get("message_id") or ""): item
+        for item in [*local_by_id.values(), *sealed_items]
+        if isinstance(item, dict)
+    }
+    anchor_item = items_by_id.get(str(anchor.get("id") or ""))
+    before_items = [
+        items_by_id[str(row.get("id") or "")]
+        for row in older if str(row.get("id") or "") in items_by_id
+    ]
+    after_items = [
+        items_by_id[str(row.get("id") or "")]
+        for row in newer if str(row.get("id") or "") in items_by_id
+    ]
     return {
         "anchor": _fetch_item(anchor_item) if isinstance(anchor_item, dict) else None,
         "before": [_fetch_item(i) for i in before_items if isinstance(i, dict)],

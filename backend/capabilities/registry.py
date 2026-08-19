@@ -14,6 +14,7 @@ CAPABILITIES: dict[str, Callable[..., CapabilityResult]] = {
     "identity_get": lambda store, **kw: identity.get(store, **kw),
     "identity_patch": lambda store, **kw: identity.patch(store, **kw),
     "identity_nudge": lambda store, **kw: identity.nudge(store, **kw),
+    "identity_dimensions_set": lambda store, **kw: identity.set_dimensions(store, **kw),
     "memory_index": lambda store, **kw: memory.index(store, **kw),
     "memory_fetch": lambda store, **kw: memory.fetch(store, **kw),
     "voice_transcript_list": lambda store, **kw: voice.transcript_list(store, **kw),
@@ -44,7 +45,8 @@ CAPABILITIES: dict[str, Callable[..., CapabilityResult]] = {
 }
 
 WRITE_ACTIONS = frozenset({
-    "memory_write", "identity_patch", "identity_nudge", "schedule_wake", "cancel_wake",
+    "memory_write", "identity_patch", "identity_nudge", "identity_dimensions_set",
+    "schedule_wake", "cancel_wake",
     "workspace_write", "workspace_delete",
 })
 READ_ACTIONS = frozenset(set(CAPABILITIES) - WRITE_ACTIONS)

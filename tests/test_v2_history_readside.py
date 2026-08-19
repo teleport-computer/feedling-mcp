@@ -1,7 +1,7 @@
 """Batch 2 tests: enclave history readside routes + backend 协调层 + store helpers.
 
-覆盖 spec §8.7/§8.8/§8.9 的 enclave 侧：叶子命中/legacy_opaque 标记、scan 命中
-+ snippet + last_checked_seq 语义（密集命中提前停）、deadline 逐行生效、
+覆盖 spec §8.7/§8.8/§8.9 的 enclave 侧：raw scan 命中 + snippet +
+last_checked_seq 语义（密集命中提前停）、deadline 逐行生效、
 unavailable 计数、fetch 结构、预算 clamp、空 query 纯时间模式；外加
 history_readside 协调层（fake enclave/monkeypatch store）与三个新增
 jobs_store 密文行查询的 DB 侧（真 Postgres，走 conftest 供给的库——因此
@@ -71,25 +71,6 @@ def _text_row(seq: int, *, role: str = "user", **extra) -> dict:
     return row
 
 
-def _leaf(segment_id: int, start: int, end: int, *, kind: str = "exact") -> dict:
-    return {
-        "segment_id": segment_id,
-        "coverage_kind": kind,
-        "start_seq": start,
-        "end_seq": end,
-        "legacy_opaque_through_seq": end if kind == "legacy_opaque" else 0,
-        "summary_envelope": {
-            "id": f"s{segment_id}", "v": 1, "body_ct": "ct", "nonce": "n",
-            "K_enclave": "k", "owner_user_id": "usr_a",
-        },
-    }
-
-
-# ---------------------------------------------------------------------------
-# enclave 路由：/v1/history/leaf-hints
-# ---------------------------------------------------------------------------
-
-
 def test_history_routes_missing_key_space_spelling(client):
     r = client.post("/v1/history/scan", json={"rows": []})
     assert r.status_code == 401
@@ -101,64 +82,6 @@ def test_scan_rows_must_be_list(client, _authed):
                     headers={"X-API-Key": "k"})
     assert r.status_code == 400
     assert r.get_json() == {"error": "rows must be a list"}
-
-
-def test_leaf_hints_query_required(client, _authed):
-    r = client.post("/v1/history/leaf-hints", json={"leaves": []},
-                    headers={"X-API-Key": "k"})
-    assert r.status_code == 400
-    assert r.get_json() == {"error": "query required"}
-
-
-def test_leaf_hints_exact_ranges_and_legacy_marker_only(client, _authed, monkeypatch):
-    _patch_decrypt(monkeypatch, {
-        "s11": "我们聊过 Blue-Orchid 那家餐厅".encode(),
-        "s12": b"legacy blob mentioning blue-orchid",
-        "s13": b"nothing relevant",
-    })
-    leaves = [
-        _leaf(11, 10, 20),
-        _leaf(12, 0, 900, kind="legacy_opaque"),
-        _leaf(13, 21, 30),
-    ]
-    r = client.post(
-        "/v1/history/leaf-hints",
-        json={"leaves": leaves, "query": "BLUE-orchid"},
-        headers={"X-API-Key": "k"},
-    )
-    assert r.status_code == 200
-    body = r.get_json()
-    # exact 命中回精确段；legacy_opaque 命中只回标记、绝不回范围（spec §4）
-    assert body["hits"] == [{"segment_id": 11, "start_seq": 10, "end_seq": 20}]
-    assert body["legacy_opaque_hits"] == ["12"]
-    assert body["checked_count"] == 3
-    assert body["truncated"] is False
-
-
-def test_leaf_hints_budget_truncates(client, _authed, monkeypatch):
-    _patch_decrypt(monkeypatch, {"s1": b"match target", "s2": b"match target"})
-    leaves = [_leaf(1, 1, 5), _leaf(2, 6, 9)]
-    r = client.post(
-        "/v1/history/leaf-hints",
-        json={"leaves": leaves, "query": "target", "max_leaves": 1},
-        headers={"X-API-Key": "k"},
-    )
-    body = r.get_json()
-    assert body["checked_count"] == 1
-    assert body["truncated"] is True
-    assert body["hits"] == [{"segment_id": 1, "start_seq": 1, "end_seq": 5}]
-
-
-def test_leaf_hints_undecryptable_counts_unavailable(client, _authed, monkeypatch):
-    _patch_decrypt(monkeypatch, {})
-    r = client.post(
-        "/v1/history/leaf-hints",
-        json={"leaves": [_leaf(1, 1, 5)], "query": "x"},
-        headers={"X-API-Key": "k"},
-    )
-    body = r.get_json()
-    assert body["unavailable_count"] == 1
-    assert body["hits"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -327,33 +250,6 @@ def test_scan_row_crossing_byte_budget_is_left_for_the_next_page(
     assert body["truncated"] is True and body["stopped"] == "budget"
 
 
-def test_leaf_hints_leaf_crossing_byte_budget_is_not_decrypted(
-        client, _authed, monkeypatch):
-    """叶子提示同一条规则：跨界的叶子加进批之前拦下，超大单叶不解密。"""
-    small = _leaf(1, 1, 5)
-    small["summary_envelope"]["body_ct"] = "a" * 600
-    big = _leaf(2, 6, 9)
-    big["summary_envelope"]["body_ct"] = "b" * 600
-    decrypted: list[str] = []
-
-    def fake(env, user, sk):
-        decrypted.append(str(env.get("id")))
-        return b"match target"
-    monkeypatch.setattr(envmod, "decrypt_envelope", fake)
-
-    r = client.post(
-        "/v1/history/leaf-hints",
-        json={"leaves": [small, big], "query": "target",
-              "max_ciphertext_bytes": 1024},
-        headers={"X-API-Key": "k"},
-    )
-    body = r.get_json()
-    assert decrypted == ["s1"]
-    assert body["checked_count"] == 1
-    assert body["truncated"] is True
-    assert body["hits"] == [{"segment_id": 1, "start_seq": 1, "end_seq": 5}]
-
-
 def test_scan_snippet_bounded_and_marks_truncation(client, _authed, monkeypatch):
     row = _text_row(1)
     long_text = ("前情提要。" * 100) + "关键词藏在这里" + ("后续内容。" * 100)
@@ -501,8 +397,7 @@ def test_fetch_anchor_must_be_object(client, _authed):
 _KEY = b"unit-test-cursor-key-32-bytes!!!"
 
 
-def _patch_store(monkeypatch, *, max_seq=100, generation=7, watermark=60,
-                 leaves=None, candidate_fn=None):
+def _patch_store(monkeypatch, *, max_seq=100, generation=7, candidate_fn=None):
     monkeypatch.setattr(history_readside.db, "chat_max_seq", lambda uid: max_seq)
     monkeypatch.setattr(
         history_readside.db, "get_runtime_generation", lambda uid: generation)
@@ -571,9 +466,7 @@ def test_run_history_search_pages_raw_snapshot_newest_to_oldest(monkeypatch):
 
 
 def test_run_history_search_time_only_uses_raw_scan(monkeypatch):
-    _patch_store(
-        monkeypatch, leaves=[_leaf(1, 30, 40)],
-        candidate_fn=lambda uid, **kw: [])
+    _patch_store(monkeypatch, candidate_fn=lambda uid, **kw: [])
     posts: list[tuple] = []
 
     def fake_post(op, payload):
@@ -589,6 +482,61 @@ def test_run_history_search_time_only_uses_raw_scan(monkeypatch):
     assert all(op == "scan" for op, _ in posts)
     assert out["matches"] == []
     assert out["complete"] is True
+
+
+def test_run_history_search_plaintext_never_posts_enclave(monkeypatch):
+    _patch_store(monkeypatch)
+    plaintext = _text_row(100)
+    plaintext.pop("body_ct")
+    plaintext.pop("nonce")
+    plaintext.pop("K_enclave")
+    plaintext["body"] = "the local needle"
+    monkeypatch.setattr(
+        history_readside.jobs_store,
+        "chat_history_rows_by_seqs",
+        lambda _uid, _seqs: [plaintext],
+    )
+
+    out = history_readside.run_history_search(
+        "usr_a",
+        cursor_hmac_key=_KEY,
+        query="needle",
+        limit=1,
+        post_enclave=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext history must not post to enclave")
+        ),
+    )
+
+    assert [match["message_id"] for match in out["matches"]] == ["m100"]
+
+
+def test_run_history_search_mixed_posts_only_sealed_projection(monkeypatch):
+    _patch_store(monkeypatch)
+    plaintext = _text_row(100)
+    for key in ("body_ct", "nonce", "K_enclave"):
+        plaintext.pop(key)
+    plaintext["body"] = "local miss"
+    sealed = _text_row(99)
+    monkeypatch.setattr(
+        history_readside.jobs_store,
+        "chat_history_rows_by_seqs",
+        lambda _uid, _seqs: [plaintext, sealed],
+    )
+    posted = []
+
+    def post(op, payload):
+        assert op == "scan"
+        posted.extend(payload["rows"])
+        return {
+            "hits": [], "checked_count": 1, "unavailable_count": 0,
+            "last_checked_seq": 99, "stopped": "exhausted", "truncated": False,
+        }
+
+    history_readside.run_history_search(
+        "usr_a", cursor_hmac_key=_KEY, query="needle", post_enclave=post)
+
+    assert posted and {row["id"] for row in posted} == {"m99"}
+    assert all("body" not in row and "body_b64" not in row for row in posted)
 
 
 def test_run_history_search_requires_query_or_range(monkeypatch):
@@ -722,7 +670,7 @@ def test_readside_row_byte_budget_checked_before_the_row_joins_the_batch(monkeyp
     的闸等于没有。跨界行留给下一页；单行自身即超限时只送不含密文的占位（行仍
     然算检查过，cursor 才推得动）。
     """
-    _patch_store(monkeypatch, max_seq=3, watermark=3, leaves=[])
+    _patch_store(monkeypatch, max_seq=3)
     rows = {3: "A" * 600, 2: "B" * 600, 1: "C" * 20}
     monkeypatch.setattr(
         history_readside.jobs_store, "chat_history_rows_by_seqs",
@@ -747,7 +695,7 @@ def test_readside_row_byte_budget_checked_before_the_row_joins_the_batch(monkeyp
 
 def test_readside_single_row_over_byte_budget_sent_as_placeholder(monkeypatch):
     """单行自身即超限：不送密文，但必须作为占位送出去让 cursor 越过它。"""
-    _patch_store(monkeypatch, max_seq=2, watermark=2, leaves=[])
+    _patch_store(monkeypatch, max_seq=2)
     monkeypatch.setattr(
         history_readside.jobs_store, "chat_history_rows_by_seqs",
         lambda uid, seqs: [_text_row(int(s), body_ct="X" * 5000)
@@ -788,7 +736,7 @@ def test_run_history_search_attachment_rows_project_caption_only(monkeypatch):
         "caption_owner_user_id": "usr_a",
     }
     _patch_store(
-        monkeypatch, leaves=[],
+        monkeypatch,
         candidate_fn=lambda uid, **kw: (
             [{"seq": 100, "msg_id": "img1", "ts": 100.0, "role": "user",
               "content_type": "image", "has_ciphertext": True}]
@@ -855,6 +803,40 @@ def test_run_history_fetch_not_found_and_structure(monkeypatch):
     assert out["omitted_before"] == 0 and out["omitted_after"] == 0
     assert out["after"][0]["content"] == "newer body"
     assert out["unavailable_count"] == 0
+
+
+def test_run_history_fetch_plaintext_window_never_posts_enclave(monkeypatch):
+    def plain(seq, role="user"):
+        row = _text_row(seq, role=role)
+        for key in ("body_ct", "nonce", "K_enclave"):
+            row.pop(key)
+        row["body"] = f"plain {seq}"
+        return row
+
+    monkeypatch.setattr(
+        history_readside.jobs_store,
+        "chat_history_anchor_row",
+        lambda _uid, _mid: plain(5),
+    )
+    monkeypatch.setattr(
+        history_readside.jobs_store,
+        "chat_history_neighbor_rows",
+        lambda *_args, **_kwargs: (
+            [plain(4, "openclaw")], [plain(6)], {"before": 1, "after": 1}
+        ),
+    )
+
+    out = history_readside.run_history_fetch(
+        "usr_a",
+        message_id="m5",
+        post_enclave=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext history must not post to enclave")
+        ),
+    )
+
+    assert out["anchor"]["content"] == "plain 5"
+    assert out["before"][0]["content"] == "plain 4"
+    assert out["after"][0]["content"] == "plain 6"
 
 
 def _patch_fetch_store(monkeypatch, *, anchor_seq=50,

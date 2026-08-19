@@ -190,7 +190,13 @@ async def dispatch_tool_calls(
             writes.append(tc)
 
     async def _read(tc):
-        step = {"type": tc.name, "payload": tc.args}
+        params = dict(tc.args)
+        # photo_recent is the metadata-only surface. Once the model chooses
+        # photo_read, make the visual read real even if it omits the optional
+        # compatibility flag; an explicit false is rejected by the schema.
+        if tc.name == "photo_read":
+            params.setdefault("include_image", True)
+        step = {"type": tc.name, "payload": params}
         metadata = None
         try:
             _t, data = await _run_one(
@@ -336,7 +342,18 @@ async def dispatch_tool_calls(
                 continue
         if before_write is not None:
             await before_write()
-        enqueued = enqueue_write_effect(tc)  # producer -> PR A outbox (drained at turn end)
+        try:
+            enqueued = enqueue_write_effect(tc)  # producer -> PR A outbox (drained at turn end)
+        except ValueError as exc:
+            # Content gates are model-recoverable: return a bounded tool error so
+            # the loop can ask for a corrected card instead of failing the turn.
+            reason = str(exc).strip()[:200] or "invalid_memory_card"
+            results_by_id[tc.id] = ToolResult(
+                call_id=tc.id,
+                content=f"error: {reason}",
+            )
+            write_index += 1
+            continue
         if inspect.isawaitable(enqueued):
             await enqueued
         results_by_id[tc.id] = ToolResult(call_id=tc.id, content=f"queued: {tc.name}")

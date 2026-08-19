@@ -45,7 +45,7 @@ def _naming_rule(user_name: str) -> str:
     return (
         "如果材料里明确出现了本人希望被称呼的名字，就用那个名字；"
         "没有名字时优先省略主语（例如「常在深夜写代码，累了会突然沉默」）。"
-        "需要主语时，按身份卡、你和 TA 的关系、旧卡和对话里的线索判断性别，"
+        "需要主语时，按身份卡、你们的关系、旧卡和对话里的线索判断性别，"
         "用「他」或「她」；线索不足以判断，才用中性的「对方」。"
         "不要用「用户」/\"user\"、指代本人的「TA」，"
         "也不要用第二人称「你」来指代本人。"
@@ -107,7 +107,7 @@ def transcript_speaker_label(role: str, *, user_name: str, ai_name: str = "") ->
 # 安全边界不该承担一个 POS parser。真正的完整性靠:
 #   ① transcript_speaker_label —— 根因,不再把 "user:" 喂给模型;
 #   ② prompt 明令 —— 产品术语去掉「用户」前缀,只有模型知道自己想说哪个意思;
-#   ③ memory.card_text.count_user_token_residuals() —— 把残留量出来,不假装覆盖。
+#   ③ memory_garden.text.card_text.count_user_token_residuals() —— 把残留量出来,不假装覆盖。
 # 这一层只做「已观察到的、高置信的个人谓词」这一件小事。
 # ---------------------------------------------------------------------------
 
@@ -126,7 +126,7 @@ def rewrite_user_reference(text: str, user_name: str, subject: str = "") -> str:
     锚点必须**紧贴**「用户」——中间不许夹字,所以结构上不可能命中
     「用户+产品名词+…」。所有主语位规则都已删除(v4 被真例打穿:
     「用户界面这一版…」「用户最近流失很多」)。因此本函数**必然**有残留,
-    那不是 bug:残留由 memory.card_text.count_user_token_residuals() 计数,
+    那不是 bug:残留由 memory_garden.text.card_text.count_user_token_residuals() 计数,
     真正的完整性靠转写标签(transcript_speaker_label)和 prompt 明令。
     """
     raw = str(text or "")

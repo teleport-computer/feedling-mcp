@@ -12,6 +12,9 @@ _SHAPE_PREFIXES = (
     "field_empty:",
     "placeholder_detected:",
     "memory_chars_over_budget:",
+    "style_chars_over_budget:",
+    # Legacy reject codes may remain in stored retry metadata until the next
+    # successful MEMORY/STYLE distillation rewrites the profile.
     "user_chars_over_budget:",
     "fields_overlap:",
     "map_reply_chars_over_budget:",

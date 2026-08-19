@@ -97,6 +97,23 @@ def test_identity_nudge_effect_mapping_op_cannot_be_overridden_by_model_args():
     assert payload["op"] == "identity_nudge"
 
 
+def test_identity_dimensions_set_effect_mapping_carries_trusted_op():
+    dimensions = [{"name": "directness", "value": 73, "description": "clear"}]
+    effect_type, payload = worker._write_tool_effect_payload(
+        SimpleNamespace(
+            name="identity_dimensions_set",
+            args={"dimensions": dimensions, "reason": "explicit rewrite"},
+        )
+    )
+
+    assert effect_type == "identity"
+    assert payload == {
+        "dimensions": dimensions,
+        "reason": "explicit rewrite",
+        "op": "identity_dimensions_set",
+    }
+
+
 # --- Item 1: frozen relationship anchor round-trips producer -> validator ------
 
 
@@ -234,6 +251,30 @@ def test_validate_identity_effect_accepts_nudge_op():
         "identity",
         {"effect_id": "e", "op": "identity_nudge", "dimension": "trust", "delta": 2},
     )  # must not raise
+
+
+def test_validate_identity_effect_accepts_dimensions_set_op():
+    serve_worker._validate_decrypted_tool_effect(
+        "identity",
+        {
+            "effect_id": "e",
+            "op": "identity_dimensions_set",
+            "dimensions": [{"name": "directness", "value": 73}],
+            "reason": "user requested rewrite",
+        },
+    )  # must not raise
+
+
+def test_validate_identity_dimensions_set_rejects_missing_reason():
+    with pytest.raises(RuntimeError, match="invalid encrypted effect arguments"):
+        serve_worker._validate_decrypted_tool_effect(
+            "identity",
+            {
+                "effect_id": "e",
+                "op": "identity_dimensions_set",
+                "dimensions": [{"name": "directness", "value": 73}],
+            },
+        )
 
 
 def test_validate_identity_effect_rejects_unknown_op_fail_closed():
@@ -519,12 +560,12 @@ def test_production_applier_decrypts_tool_effects_with_one_lazy_token(monkeypatc
     ]
 
 
-def test_production_applier_replays_nudge_and_legacy_patch_through_validation(monkeypatch):
+def test_production_applier_replays_identity_ops_through_validation(monkeypatch):
     """Full-chain replay (Codex C1): decrypt -> _validate_decrypted_tool_effect
-    -> dispatch, for BOTH a new identity_nudge effect (carries `op`) and an old
-    identity_patch effect enqueued before the op key existed (NO `op`). Both
-    must survive the real validator and reach the sink with `identity` logical
-    type; the nudge keeps its op so the sink can route it."""
+    -> dispatch, for a new identity_nudge, a full dimensions rewrite (both carry
+    `op`), and an old identity_patch effect enqueued before the op key existed
+    (NO `op`). All must survive the real validator and retain the routing data
+    expected by the shared `identity` sink."""
     delivered = []
     monkeypatch.setattr(
         serve_worker,
@@ -540,6 +581,8 @@ def test_production_applier_replays_nudge_and_legacy_patch_through_validation(mo
     def fake_decrypt(value, api_key, *, purpose, runtime_token):
         if value["body_ct"] == "nudge":
             return b'{"op":"identity_nudge","dimension":"trust","delta":2}'
+        if value["body_ct"] == "dimensions":
+            return b'{"op":"identity_dimensions_set","dimensions":[{"name":"directness","value":73}],"reason":"user requested rewrite"}'
         return b'{"patch":{"signature":"kind"}}'  # legacy patch, no op
 
     monkeypatch.setattr(
@@ -547,7 +590,11 @@ def test_production_applier_replays_nudge_and_legacy_patch_through_validation(mo
     )
 
     def fake_apply(user_id, *, dispatch, dispatch_reply_in_transaction=None):
-        for body_ct, effect_id in (("nudge", "eid-nudge"), ("patch", "eid-patch")):
+        for body_ct, effect_id in (
+            ("nudge", "eid-nudge"),
+            ("dimensions", "eid-dimensions"),
+            ("patch", "eid-patch"),
+        ):
             dispatch(worker.ENCRYPTED_TOOL_EFFECT_TYPES["identity"], {
                 "effect_envelope": {
                     "id": worker._tool_effect_item_id(effect_id),
@@ -556,7 +603,7 @@ def test_production_applier_replays_nudge_and_legacy_patch_through_validation(mo
                 },
                 "effect_id": effect_id,
             })
-        return {"applied": 2, "discarded": 0}
+        return {"applied": 3, "discarded": 0}
 
     monkeypatch.setattr(
         serve_worker.v2_effect_outbox, "apply_pending_effects", fake_apply
@@ -564,10 +611,16 @@ def test_production_applier_replays_nudge_and_legacy_patch_through_validation(mo
 
     result = serve_worker._apply_pending_effects_for_user("u_replay")
 
-    assert result == {"applied": 2, "discarded": 0}
+    assert result == {"applied": 3, "discarded": 0}
     assert delivered == [
         ("identity", {"op": "identity_nudge", "dimension": "trust", "delta": 2,
                       "effect_id": "eid-nudge"}),
+        ("identity", {
+            "op": "identity_dimensions_set",
+            "dimensions": [{"name": "directness", "value": 73}],
+            "reason": "user requested rewrite",
+            "effect_id": "eid-dimensions",
+        }),
         ("identity", {"patch": {"signature": "kind"}, "effect_id": "eid-patch"}),
     ]
 

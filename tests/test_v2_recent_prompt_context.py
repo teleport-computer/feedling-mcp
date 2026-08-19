@@ -85,14 +85,15 @@ def test_read_recent_prompt_context_uses_only_recent_rows_and_profile():
         mint_enclave_token=lambda _uid: "rt",
         read_recent_turns=read_recent,
         select_profile_for_turn=lambda _uid, **_kwargs: (
-            profile_store.ProfilePromptSelection(
-                memory="memory",
-                user="user",
-                state="last_good",
-                memory_chars=6,
-                user_chars=4,
-                age_seconds=12.0,
-            )
+                profile_store.ProfilePromptSelection(
+                    memory="memory",
+                    style="user",
+                    state="last_good",
+                    memory_chars=6,
+                    style_chars=4,
+                    age_seconds=12.0,
+                    used_profile=True,
+                )
         ),
     )
 

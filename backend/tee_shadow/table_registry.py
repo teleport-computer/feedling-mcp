@@ -23,7 +23,7 @@ MIRROR = "MIRROR"
 # 解密、写 TEE 明文行。适用于装信封的表。
 CIPHERTEXT = "CIPHERTEXT"
 
-# 整表快照刷：TRUNCATE + COPY 原子替换（tee_shadow.snapshot）。适用于数据量
+# 整表快照刷：临时表 COPY + 主键精确合并（tee_shadow.snapshot）。适用于数据量
 # 小、但有 UPDATE/DELETE 的明文表——全量替换天然处理可变行，不需要 requeue
 # 补偿和 prune。
 SNAPSHOT = "SNAPSHOT"
@@ -69,6 +69,19 @@ REGISTRY: dict[str, Entry] = {
     "genesis_import_outputs": Entry(MIRROR, "入住导入产物，明文；reconciler.TABLES 已覆盖"),
     "notify_relay_configs": Entry(MIRROR, "自部署推送中继配置；alembic_tee 0002 已建表"),
     "notify_relay_logs": Entry(MIRROR, "推送中继日志；id 是 IDENTITY 列"),
+    "lane_daily_rollup": Entry(
+        MIRROR,
+        "按用户×道×北京日的 job 结果冻结格子（0091/tee 0023），单例调度器日批写、"
+        "写后不变、永久增长——正因永久增长不能走 SNAPSHOT（20 万行 MAX_ROWS 硬阀，"
+        "超限后仅该表复制失败并停止更新、其余表继续，codex2 2026-08-18 审出）。语句幂等"
+        "（ON CONFLICT DO NOTHING），冻结点以 execute_many 按日整组镜像；"
+        "期 2 接 user_logs 源后格子是环形缓冲滚掉明细后的唯一存留，必须双写",
+    ),
+    "lane_rollup_watermark": Entry(
+        MIRROR,
+        "格子覆盖水位（每 route 一行，through_day 原地 UPDATE），与当日格子同组"
+        "镜像——TEE 侧水位若滞后，cutover 后会把「已冻结」误读成「记录史之前」",
+    ),
 
     # ---------------------------------------------------------------- #
     # CIPHERTEXT —— 装信封的表，经 enclave 解密成明文写进 TEE。
@@ -150,16 +163,34 @@ REGISTRY: dict[str, Entry] = {
     "v2_chat_tail_anchor": Entry(
         SNAPSHOT,
         "V2 对话尾锚点 anchor_seq，per-user 单行 UPDATE 密集（GREATEST 单调 upsert），明文整数"),
-    "v2_effect_outbox": Entry(SNAPSHOT, "V2 效果 outbox，投递后删行，明文 payload（实测非信封）"),
+    "v2_effect_outbox": Entry(
+        SNAPSHOT,
+        "V2 效果 outbox，投递后更新状态而非删行（仅账号清空时删除），明文 payload（实测非信封）",
+    ),
     "v2_effect_sink_applied": Entry(SNAPSHOT, "V2 效果幂等标记，明文"),
     "v2_mcp_mutation_attempts": Entry(SNAPSHOT, "V2 MCP 变更尝试记录，明文"),
     "v2_runtime_control": Entry(SNAPSHOT, "V2 运行时总控单行表，明文"),
     "v2_runtime_state": Entry(SNAPSHOT, "V2 per-user 运行时 fence，UPDATE 密集，明文"),
     "v2_sandbox_usage_events": Entry(SNAPSHOT, "V2 sandbox 用量事件，明文"),
-    "v2_terminal_failure_outbox": Entry(SNAPSHOT, "V2 终态失败 outbox，投递后删行，明文"),
+    "v2_terminal_failure_outbox": Entry(
+        SNAPSHOT,
+        "V2 终态失败 outbox，投递后更新状态而非删行（仅账号清空时删除），明文",
+    ),
     "v2_trajectory_access_audit": Entry(SNAPSHOT, "V2 轨迹访问审计（审计元数据本身是明文）"),
     "v2_trajectory_streams": Entry(SNAPSHOT, "V2 轨迹流游标，UPDATE 密集，明文"),
     "v2_turn_metrics": Entry(SNAPSHOT, "V2 回合指标，明文"),
+    "v2_usage_daily_dimensions": Entry(
+        SNAPSHOT,
+        "Admin 用量页从 v2_turn_metrics 派生的按日维度投影；TEE 扶正后由同库 worker 继续维护",
+    ),
+    "v2_usage_daily_users": Entry(
+        SNAPSHOT,
+        "Admin 用量页从 v2_turn_metrics 派生的按日用户投影；TEE 扶正后保留报表连续性",
+    ),
+    "v2_usage_rollup_watermarks": Entry(
+        SNAPSHOT,
+        "Admin 用量 rollup 的 bootstrap/cursor/error 控制面；必须与扶正后的派生表同库推进",
+    ),
     "v2_user_allowlist": Entry(SNAPSHOT, "V2 灰度名单，UPDATE 密集，明文"),
     "v2_wake_schedule": Entry(SNAPSHOT, "V2 唤醒排程，UPDATE 密集，明文"),
     "v2_worker_heartbeats": Entry(SNAPSHOT, "V2 worker 心跳，UPDATE 密集，明文"),
@@ -171,24 +202,10 @@ REGISTRY: dict[str, Entry] = {
         SKIP, "RDS 迁移链自己的版本表；TEE 有独立的 alembic_tee_version，两条链互不感知"),
     "genesis_import_chunks": Entry(
         SKIP, "入住导入的 staging 数据，冻结窗口内处理完即弃，非用户资产（上游 plan 已决定不复制）"),
-    "v2_usage_daily_dimensions": Entry(
-        SKIP,
-        "Admin 用量页从 v2_turn_metrics 可重建的按日维度投影；复制会在 TEE 重复派生数据，"
-        "当前业务 RDS 是这份报表的唯一服务存储",
-    ),
-    "v2_usage_daily_users": Entry(
-        SKIP,
-        "Admin 用量页从 v2_turn_metrics 可重建的按日用户投影；已知用户行在 RDS 通过 FK 随销号级联，"
-        "无需在 TEE 保存第二份派生副本",
-    ),
     "v2_wake_shadow_decisions": Entry(
         SKIP,
         "主动唤醒 A′ 影子观测；只含本地日期/时分、lane、放行与 APNs 告警投递布尔，"
         "独立保留 90 天且不依赖 agent_jobs 生命周期，RDS Admin 报表是唯一消费者",
-    ),
-    "v2_usage_rollup_watermarks": Entry(
-        SKIP,
-        "Admin 用量 rollup 的 bootstrap/cursor/error 控制面；不含用户内容，必须跟 RDS 派生表同库推进",
     ),
     "tee_sync_runs": Entry(
         SKIP, "TEE 同步自身的控制面/指标表，必须住在 RDS——复制到被它监控的库里没有意义"),

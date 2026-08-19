@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -29,9 +30,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import asgi_app  # noqa: E402
+import db  # noqa: E402
 from accounts import registry as accounts_registry  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
 from bootstrap import gates as boot_gates  # noqa: E402
+from chat import consumer as chat_consumer  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
 from runtime.waiters import registry  # noqa: E402
@@ -310,6 +313,137 @@ def test_response_gate_parity_needs_resident_consumer(user):
     assert a_body == f.get_json()
     assert a_body["stage"] == "needs_resident_consumer"
     assert a_body["error"] == "bootstrap_incomplete"
+    assert a_body["retryable"] is True
+
+
+@pytest.mark.parametrize("poll_age_sec", [179.0, 181.0])
+def test_response_from_prior_poller_survives_long_turn_and_refreshes_activity(
+    user,
+    monkeypatch,
+    poll_age_sec,
+):
+    uid, api_key = user
+    now = time.time()
+    poll_epoch = now - poll_age_sec
+    consumer_id = "resident-long-turn"
+    db.set_blob(uid, "consumer_state", {
+        "official": True,
+        "consumer_name": "feedling-chat-resident",
+        "consumer_id": consumer_id,
+        "last_poll_at": "earlier",
+        "last_poll_epoch": poll_epoch,
+        "last_activity_at": "earlier",
+        "last_activity_epoch": poll_epoch,
+        "last_activity_type": "poll",
+        "poll_consumers": {
+            consumer_id: {
+                "consumer_id": consumer_id,
+                "consumer_name": "feedling-chat-resident",
+                "last_poll_epoch": poll_epoch,
+            },
+        },
+    })
+    monkeypatch.setattr(boot_gates, "_bootstrap_state", lambda store: {
+        "stage": "main_loop",
+        "memory_count": 2,
+        "memory_floor": 2,
+        "identity_written": True,
+    })
+    monkeypatch.setattr(
+        boot_gates.accounts_onboarding,
+        "_load_onboarding_route",
+        lambda store: "resident",
+    )
+    monkeypatch.setattr(
+        chat_consumer,
+        "_decrypt_health_enforcement_state",
+        lambda *args, **kwargs: {"blocks_chat": False},
+    )
+    monkeypatch.setattr(boot_gates, "_chat_loop_verified_by_server", lambda store: True)
+    headers = {
+        **_hk(api_key),
+        "X-Feedling-Consumer": "feedling-chat-resident",
+        "X-Feedling-Consumer-Id": consumer_id,
+    }
+    status, body = _asgi(
+        "POST",
+        "/v1/chat/response",
+        headers=headers,
+        json={"envelope": _env(uid, f"long-{int(poll_age_sec)}")},
+    )
+    assert status == 200, body
+    saved = db.get_blob(uid, "consumer_state")
+    assert saved["last_poll_epoch"] == poll_epoch
+    assert saved["last_response_epoch"] >= now
+    assert saved["last_activity_epoch"] == saved["last_response_epoch"]
+    assert saved["last_activity_type"] == "response"
+
+
+def test_response_without_prior_poll_cannot_mint_liveness(user, monkeypatch):
+    uid, api_key = user
+    db.set_blob(uid, "consumer_state", {})
+    monkeypatch.setattr(boot_gates, "_bootstrap_state", lambda store: {
+        "stage": "main_loop",
+        "memory_count": 2,
+        "memory_floor": 2,
+        "identity_written": True,
+    })
+    monkeypatch.setattr(
+        boot_gates.accounts_onboarding,
+        "_load_onboarding_route",
+        lambda store: "resident",
+    )
+    headers = {
+        **_hk(api_key),
+        "X-Feedling-Consumer": "feedling-chat-resident",
+        "X-Feedling-Consumer-Id": "never-polled",
+    }
+    status, body = _asgi(
+        "POST",
+        "/v1/chat/response",
+        headers=headers,
+        json={"envelope": _env(uid, "foreign")},
+    )
+    assert status == 409
+    assert body["stage"] == "needs_resident_consumer"
+    assert body["retryable"] is True
+    saved = db.get_blob(uid, "consumer_state") or {}
+    assert "last_response_epoch" not in saved
+    assert "last_activity_epoch" not in saved
+
+
+def test_invalid_response_does_not_refresh_prior_poller_activity(user, monkeypatch):
+    uid, api_key = user
+    poll_epoch = time.time() - 10
+    consumer_id = "resident-invalid"
+    original = {
+        "official": True,
+        "consumer_name": "feedling-chat-resident",
+        "consumer_id": consumer_id,
+        "last_poll_epoch": poll_epoch,
+        "last_activity_epoch": poll_epoch,
+        "last_activity_type": "poll",
+        "poll_consumers": {
+            consumer_id: {"last_poll_epoch": poll_epoch},
+        },
+    }
+    db.set_blob(uid, "consumer_state", original)
+    monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    headers = {
+        **_hk(api_key),
+        "X-Feedling-Consumer": "feedling-chat-resident",
+        "X-Feedling-Consumer-Id": consumer_id,
+    }
+    status, _body = _asgi(
+        "POST",
+        "/v1/chat/response",
+        headers=headers,
+        json={},
+    )
+    assert status == 400
+    saved = db.get_blob(uid, "consumer_state")
+    assert saved["last_activity_epoch"] == poll_epoch
+    assert "last_response_epoch" not in saved
 
 
 def test_response_validation_parity_gate_bypassed(user, monkeypatch):

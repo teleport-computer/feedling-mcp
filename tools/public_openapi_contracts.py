@@ -201,7 +201,8 @@ OPERATION_PARAMETERS: dict[Operation, list[dict[str, Any]]] = {
         _query("since", _schema("string"), "Return changes whose ISO-8601 ts is strictly newer than this value.", example="2026-07-01T00:00:00Z"),
     ],
     ("get", "/v1/memory/list"): [
-        _query("limit", _schema("integer", minimum=1, maximum=200, default=50), "Recommended page size; values above 200 are capped.", example=50),
+        _query("limit", _schema("integer", minimum=1, maximum=500, default=50), "Page size; values above 500 are capped.", example=50),
+        _query("cursor", _schema("string", minLength=1, maxLength=1024), "Opaque continuation token from next_cursor. Omit for the first page.", example="eyJoIjp0cnVlLCJpIjoibWVtXzEyMyIsInQiOiIyMDI2LTA3LTEzVDEyOjMwOjAwKzAwOjAwIiwidiI6MX0"),
         _query("since", _schema("string"), "Return memories whose occurred_at is at or after this ISO-8601 value.", example="2026-07-01T00:00:00Z"),
         _query("include_archived", _schema("boolean", default=False), "Include archived memories.", example=False),
     ],
@@ -656,6 +657,29 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "description": "JSON response object. Endpoint-specific fields may be added compatibly.",
         "additionalProperties": True,
     },
+    "MemoryListResponse": {
+        "type": "object",
+        "description": (
+            "One page of raw encrypted Memory Garden records. total is the "
+            "filtered full count and is independent of limit and cursor."
+        ),
+        "required": ["moments", "total", "next_cursor"],
+        "additionalProperties": False,
+        "properties": {
+            "moments": {
+                "type": "array",
+                "items": {"$ref": "#/components/schemas/FreeFormJsonObject"},
+            },
+            "total": {"type": "integer", "minimum": 0},
+            "next_cursor": {
+                "anyOf": [
+                    {"type": "string", "minLength": 1, "maxLength": 1024},
+                    {"type": "null"},
+                ],
+                "description": "Opaque continuation token; null exactly when the filtered result is exhausted.",
+            },
+        },
+    },
     "DreamStatusResponse": {
         "type": "object",
         "description": (
@@ -753,13 +777,67 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "additionalProperties": True,
         "example": {"error": "invalid_payload", "detail": "The request body is invalid", "request_id": "req_abc123"},
     },
+    "ChatBootstrapIncompleteResponse": {
+        "type": "object",
+        "required": ["error", "stage", "retryable"],
+        "properties": {
+            "error": {"type": "string", "const": "bootstrap_incomplete"},
+            "stage": {
+                "type": "string",
+                "enum": [
+                    "needs_resident_consumer",
+                    "needs_decrypt_source",
+                    "needs_live_connection",
+                ],
+            },
+            "retryable": {
+                "type": "boolean",
+                "description": (
+                    "True only when the current resident response may be retried "
+                    "without repeating onboarding. Missing is false for compatibility "
+                    "with older servers."
+                ),
+            },
+        },
+        "allOf": [
+            {
+                "if": {"properties": {"stage": {"const": "needs_resident_consumer"}}},
+                "then": {"properties": {"retryable": {"const": True}}},
+                "else": {"properties": {"retryable": {"const": False}}},
+            },
+        ],
+        "additionalProperties": True,
+    },
     "EncryptedEnvelope": {
         "type": "object",
-        "required": ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"],
+        "required": ["visibility", "owner_user_id"],
         "properties": {
             "v": {"type": "integer", "const": 1, "default": 1},
             "id": {"type": "string"},
             "body_ct": {"type": "string", "description": "Base64 ciphertext."},
+            "body_b64": {
+                "type": "string",
+                "format": "byte",
+                "description": "Base64 plaintext bytes. Accepted by binary content "
+                               "surfaces (Chat image/file, Perception photo, and "
+                               "screen-frame ingest) when content_encryption_effective "
+                               "is \"off\"; text-envelope surfaces reject this shape. "
+                               "Mutually exclusive with body_ct and body.",
+            },
+            "body_size_bytes": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Optional decoded byte count for body_b64. When "
+                               "provided it must match exactly.",
+            },
+            "body": {
+                "type": "string",
+                "description": "Plaintext body. Only valid when the caller's "
+                               "content_encryption_effective (see /v1/users/whoami) "
+                               "is \"off\"; otherwise the write is rejected with "
+                               "plaintext_envelope_not_enabled_for_this_account. "
+                               "Mutually exclusive with body_ct.",
+            },
             "nonce": {"type": "string", "description": "Base64 nonce."},
             "K_user": {"type": "string", "description": "Content key wrapped for the user."},
             "K_enclave": {"type": "string", "description": "Content key wrapped for the enclave; required for shared visibility."},
@@ -775,11 +853,32 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                                "content_pk_fpr_mismatch — re-fetch whoami and re-seal.",
             },
         },
-        "if": {
-            "properties": {"visibility": {"const": "shared"}},
-            "required": ["visibility"],
-        },
-        "then": {"required": ["K_enclave"]},
+        "oneOf": [
+            {
+                "title": "Encrypted body",
+                "required": ["body_ct", "nonce", "K_user"],
+                "if": {
+                    "properties": {"visibility": {"const": "shared"}},
+                    "required": ["visibility"],
+                },
+                "then": {"required": ["K_enclave"]},
+            },
+            {
+                "title": "Plaintext body",
+                "description": "local_only requires encryption, so this branch pins "
+                               "visibility to shared.",
+                "required": ["body"],
+                "properties": {"visibility": {"const": "shared"}},
+            },
+            {
+                "title": "Binary plaintext body",
+                "description": "Only supported binary content paths accept this "
+                               "branch, and only while the account's effective tier "
+                               "is off.",
+                "required": ["body_b64"],
+                "properties": {"visibility": {"const": "shared"}},
+            },
+        ],
         "additionalProperties": True,
         "example": {
             "v": 1,
@@ -794,11 +893,19 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "MemoryEnvelope": {
         "type": "object",
-        "required": ["body_ct", "nonce", "K_user", "visibility", "owner_user_id", "type", "occurred_at"],
+        "required": ["visibility", "owner_user_id", "type", "occurred_at"],
         "properties": {
             "v": {"type": "integer", "const": 1, "default": 1},
             "id": {"type": "string"},
             "body_ct": {"type": "string", "description": "Base64 ciphertext."},
+            "body": {
+                "type": "string",
+                "description": "Plaintext body. Only valid when the caller's "
+                               "content_encryption_effective (see /v1/users/whoami) "
+                               "is \"off\"; otherwise the write is rejected with "
+                               "plaintext_envelope_not_enabled_for_this_account. "
+                               "Mutually exclusive with body_ct.",
+            },
             "nonce": {"type": "string", "description": "Base64 nonce."},
             "K_user": {"type": "string", "description": "Content key wrapped for the user."},
             "K_enclave": {"type": "string", "description": "Content key wrapped for the enclave; required for shared visibility."},
@@ -806,7 +913,15 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "owner_user_id": {"type": "string"},
             "enclave_pk_fpr": {"type": "string"},
             "type": {"type": "string", "enum": ["moment", "quote", "fact", "event", "insight", "reflection"]},
-            "occurred_at": {"type": "string", "minLength": 1, "description": "Plaintext ISO-8601 ordering metadata."},
+            "occurred_at": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Plaintext ISO-8601 event time. Accepted datetime values are "
+                    "normalized to the equivalent UTC value with a Z suffix; "
+                    "date-only values remain date-only."
+                ),
+            },
             "source": {
                 "type": "string",
                 "enum": [
@@ -831,11 +946,24 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "anchor_memory_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
         },
-        "if": {
-            "properties": {"visibility": {"const": "shared"}},
-            "required": ["visibility"],
-        },
-        "then": {"required": ["K_enclave"]},
+        "oneOf": [
+            {
+                "title": "Encrypted body",
+                "required": ["body_ct", "nonce", "K_user"],
+                "if": {
+                    "properties": {"visibility": {"const": "shared"}},
+                    "required": ["visibility"],
+                },
+                "then": {"required": ["K_enclave"]},
+            },
+            {
+                "title": "Plaintext body",
+                "description": "local_only requires encryption, so this branch pins "
+                               "visibility to shared.",
+                "required": ["body"],
+                "properties": {"visibility": {"const": "shared"}},
+            },
+        ],
         "additionalProperties": True,
         "example": {
             "v": 1,
@@ -1240,7 +1368,12 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "required": ["envelope"],
         "properties": {
-            "envelope": {"$ref": "#/components/schemas/EncryptedEnvelope"},
+            "envelope": {
+                "allOf": [{"$ref": "#/components/schemas/EncryptedEnvelope"}],
+                "description": "For content_type image/file, plaintext-tier clients "
+                               "may send body_b64 instead of an encrypted body_ct "
+                               "envelope. Text messages do not accept body_b64.",
+            },
             "client_msg_id": {
                 "type": "string",
                 "format": "uuid",
@@ -1251,7 +1384,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "file_mime": {"type": "string"},
             "caption_envelope": {
                 "allOf": [{"$ref": "#/components/schemas/EncryptedEnvelope"}],
-                "description": "Optional separately-encrypted user text sent alongside an image/file (content_type image or file). Same E2E envelope shape as the main `envelope`; the enclave decrypts it into the message's plaintext content so the agent sees the caption. Ignored for content_type=text.",
+                "description": "Optional shape-aware user text sent alongside an image/file. It follows content_encryption_effective independently of the binary main envelope. Ignored for content_type=text.",
             },
             "context_refs": {
                 "type": "array",
@@ -1298,7 +1431,12 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "required": ["envelope"],
         "properties": {
-            "envelope": {"$ref": "#/components/schemas/EncryptedEnvelope"},
+            "envelope": {
+                "allOf": [{"$ref": "#/components/schemas/EncryptedEnvelope"}],
+                "description": "For content_type image, plaintext-tier clients may "
+                               "send body_b64 instead of an encrypted body_ct "
+                               "envelope. Text replies do not accept body_b64.",
+            },
             "source": {
                 "type": "string",
                 "enum": [
@@ -1479,7 +1617,11 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "required": ["type"],
         "properties": {
-            "type": {"type": "string", "enum": ["memory.add", "memory.supersede", "memory.delete", "memory.retype"]},
+            "type": {
+                "type": "string",
+                "enum": ["memory.add", "memory.supersede", "memory.delete", "memory.retype"],
+                "description": "Accepted memory.add actions always create a new card; repeated content is not deduplicated.",
+            },
             "envelope": {"$ref": "#/components/schemas/MemoryEnvelope"},
             "memory": {
                 "$ref": "#/components/schemas/MemoryRecordInput",
@@ -1681,7 +1823,10 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "required": ["content_envelope"],
         "properties": {
-            "content_envelope": {"$ref": "#/components/schemas/EncryptedEnvelope"},
+            "content_envelope": {
+                "allOf": [{"$ref": "#/components/schemas/EncryptedEnvelope"}],
+                "description": "Encrypted body_ct or plaintext-tier body_b64 image envelope.",
+            },
             "metadata": {
                 "type": "object",
                 "properties": {
@@ -1697,7 +1842,10 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                 },
                 "additionalProperties": False,
             },
-            "meta_envelope": {"$ref": "#/components/schemas/EncryptedEnvelope"},
+            "meta_envelope": {
+                "allOf": [{"$ref": "#/components/schemas/EncryptedEnvelope"}],
+                "description": "Optional encrypted or plaintext-tier UTF-8 metadata envelope.",
+            },
             "exif_gps": {"type": "object", "deprecated": True, "description": "Legacy compatibility only; clients should not upload raw EXIF GPS."},
         },
         "additionalProperties": False,
@@ -2230,9 +2378,16 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("get", "/v1/onboarding/validate"): "Return ordered onboarding checks. Resident routes include a decrypt_source step between resident_consumer and live_loop, with status, checked_at_epoch, reason, policy, and remediation fields.",
     ("get", "/v1/chat/poll"): "Long-poll and optionally claim resident chat work. Official residents report their running commit and may report an intentionally skipped compatible backend target with X-Feedling-Consumer-Compat-Commit. They also report decrypt-source status and its confirmation time on every poll heartbeat with X-Feedling-Decrypt-Status and X-Feedling-Decrypt-Checked-At.",
     ("post", "/v1/chat/message"): "Store a user chat message as a v1 ciphertext envelope; the server never decrypts it. If the envelope carries a content_pk_fpr label that does not match the user's currently registered content key, the write is rejected with 409 content_pk_fpr_mismatch (re-fetch whoami and re-seal); unlabeled envelopes are accepted for compatibility.",
-    ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope plus optional thinking and encrypted file/image followups. A text primary and its attachment rows commit as one ordered transaction; generated images are returned as native content_type=image Chat messages. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
+    ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope plus optional thinking and encrypted file/image followups. A text primary and its attachment rows commit as one ordered transaction; generated images are returned as native content_type=image Chat messages. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. A bootstrap_incomplete 409 always includes retryable: needs_resident_consumer is true so an official identity that previously polled may retry the same reply with bounded backoff; other stages are false, and a missing field from an old server must be treated as false. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
     ("post", "/v1/chat/verify_loop"): "Insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether the reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded.",
     ("post", "/v1/model_api/chat/send"): "Queue an asynchronous hosted-agent turn. A successful response is always 202 and never contains a plaintext assistant reply.",
+    ("post", "/v1/model_api/setup"): (
+        "Create or update the active hosted model route. context_window_tokens "
+        "is treated as route metadata: a value below Runtime V2's "
+        "deployment-tunable trust floor (32,768 by default) falls through to "
+        "the audited-family or unaudited-route default rather than becoming "
+        "the prompt budget. The resolved value is returned and persisted."
+    ),
     ("post", "/v1/model_api/models"): "列出某 provider 在该凭据下可见的模型清单（实时拉取，非 io 兼容性保证）。unsupported / partial 时客户端退回手填。",
     ("post", "/v1/model_api/runtime_error"): "Record or clear the resident runtime's latest provider error. provider_result=success refreshes provider health immediately; provider_result=failure applies error_class to the provider-health policy.",
     ("get", "/v1/image-generation/config"): "Return the effective image-generation route, candidate routes, and validation state. The response mirrors vision routing semantics: follow_main uses the active chat route and dedicated pins a separately validated route.",
@@ -2261,6 +2416,8 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("get", "/v1/perception/app_open"): "Legacy iOS Shortcut compatibility endpoint. This GET records an event and therefore has side effects.",
     ("get", "/v1/perception/app_close"): "iOS Shortcut compatibility endpoint for the automation's \"is closed\" trigger. This GET records an event and therefore has side effects.",
     ("post", "/v1/users/register"): "Create a Feedling user and issue its first API key. The key is returned once and this operation is not idempotent.",
+    ("get", "/v1/users/whoami"): "Return the authenticated user's identifiers, registered content public key, attested decrypt-service material, and first-class preferences. content_encryption is the user's stated content-encryption preference; content_encryption_effective is the shape a client must actually write and is the only one a write path may act on. Treat an absent, empty, or unrecognized effective value as \"on\" — a deployment that has not enabled plaintext storage reports \"on\" regardless of the preference.",
+    ("post", "/v1/users/preferences"): "Update first-class user preferences. Accepts archive_language, timezone, and/or content_encryption (\"on\", \"off\", or null to clear). Setting content_encryption records intent only; it neither converts existing records nor changes what a client must write until content_encryption_effective follows. Use /v1/content/swap to convert existing records between shapes.",
     ("post", "/v1/access/claim-token"): "Consume a one-time link token and issue an additional API key. Existing keys remain active.",
     ("post", "/v1/account/recover/verify"): "Verify keypair possession and issue an additional API key for the existing account. Existing keys remain active.",
     ("post", "/v1/account/reset"): "Permanently delete the account, its data, and all of its API keys. This is not a per-key revocation endpoint.",
@@ -2364,12 +2521,50 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
 
 
 RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
+    ("post", "/v1/chat/response"): {
+        "409": {
+            "description": (
+                "The reply conflicted with an existing answer/key, or Chat bootstrap "
+                "is incomplete. bootstrap_incomplete responses include a required "
+                "retryable boolean; clients must treat a missing field from an older "
+                "server as false."
+            ),
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/ChatBootstrapIncompleteResponse"},
+                            {"$ref": "#/components/schemas/ErrorResponse"},
+                        ]
+                    }
+                }
+            },
+        },
+    },
     ("get", "/v1/dream/status"): {
         "200": {
             "description": "Current Dream and Capture banner status.",
             "content": {
                 "application/json": {
                     "schema": {"$ref": "#/components/schemas/DreamStatusResponse"}
+                }
+            },
+        },
+    },
+    ("get", "/v1/memory/list"): {
+        "200": {
+            "description": "One deterministic page of encrypted memory records.",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/MemoryListResponse"}
+                }
+            },
+        },
+        "400": {
+            "description": "The limit or opaque cursor is invalid.",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/ErrorResponse"}
                 }
             },
         },

@@ -23,7 +23,18 @@ from __future__ import annotations
 import re
 
 
-_MEMORY_TEXT_FIELDS = ("title", "description", "her_quote", "context", "linked_dimension")
+from .. import timestamps as memory_timestamps
+
+
+#: 内核认的卡片文本字段 —— **固定的，不适应宿主**。
+#: 宿主负责把自己的形状翻译成这一种（io 侧见 memory/card_shape.py::to_garden_card）。
+#: 2026-08-17 边界整理：此前这里兼容 io 的两种历史形状，那是把宿主的债背进了内核。
+_MEMORY_TEXT_FIELDS = ("summary", "content", "bucket")
+
+#: 内核认的卡片角色。宿主负责把自己的识别方式（标题前缀、来源名、显式字段…）
+#: 翻译成这两个值 —— 内核不认任何宿主的命名约定。
+ROLE_TURNING_POINT = "turning_point"
+ROLE_CORRECTION = "correction"
 
 
 def char_bigrams(s: str) -> set:
@@ -73,6 +84,18 @@ _ZH_GENERIC_PHRASES = {
 
 
 def _text_for_memory(memory: dict) -> str:
+    """匹配用的 haystack。
+
+    **优先用宿主显式给的 `search_text`** —— 内核不从展示字段猜搜索语料。
+    宿主最清楚自己哪些字段承载可搜索的文本（io 的老卡把它散在 title /
+    her_quote / linked_dimension 里，光看 summary 会漏掉一大半）。
+
+    没给 search_text 时退回 summary + content：让只有规范字段的简单宿主
+    也能直接用，不必先理解这套机制。
+    """
+    explicit = str(memory.get("search_text") or "").strip()
+    if explicit:
+        return str(memory.get("search_text"))
     return " ".join(str(memory.get(key) or "") for key in _MEMORY_TEXT_FIELDS)
 
 
@@ -279,6 +302,16 @@ def memory_relevance_details(query: str, memory: dict) -> dict:
 
 
 def _is_correction_memory(memory: dict) -> bool:
+    """是不是纠正卡 —— 只认宿主打好的 `roles` 标记。
+
+    2026-08-17 边界整理：此前靠 source 名与标题里的「纠正/correction」字样判断，
+    那是把宿主的命名约定写进了内核，而且对没有 title 的新形状卡完全失效。
+    识别的脆弱部分已收到 io 侧（memory/card_shape.py::roles_of）。
+    """
+    return ROLE_CORRECTION in (memory.get("roles") or [])
+
+
+def _legacy_is_correction_memory(memory: dict) -> bool:
     source = str(memory.get("source") or "").lower()
     if source in {"model_api_correction", "user_correction", "settings_correction"}:
         return True
@@ -324,7 +357,17 @@ def _query_trace(query: str) -> dict:
 
 
 def _is_global_correction(memory: dict) -> bool:
-    text = " ".join(str(memory.get(k) or "") for k in ("title", "description", "context")).lower()
+    """这条纠正是不是「全局边界」类（改称呼/改人设/立规矩），要享受加权。
+
+    2026-08-17 边界整理：改读规范字段与宿主给的 search_text ——
+    此前读 title/description/context，那是 io 的字段名，翻译后就没了。
+
+    ⚠️ 关键词表本身仍是中文为主，属于**宿主的语言约定**。提示词英文化那批
+    会把它一起挪走（届时这个判断也该由宿主在 roles 里表达，内核只认标签）。
+    """
+    text = " ".join(
+        str(memory.get(k) or "") for k in ("summary", "content", "search_text")
+    ).lower()
     return any(
         marker in text
         for marker in (
@@ -345,16 +388,9 @@ def select_context_memories_with_trace(
     if not moments:
         return [], {**_query_trace(latest_user_text), "selected": [], "rejected_sample": []}
 
-    moments = [
-        m for m in moments
-        if not (
-            m.get("is_archived") is True
-            or str(m.get("archived_at") or "").strip()
-            or str(m.get("archive_reason") or "").strip()
-        )
-    ]
-    if not moments:
-        return [], {**_query_trace(latest_user_text), "selected": [], "rejected_sample": []}
+    # 2026-08-17 边界整理：生命周期过滤（归档/被取代）已归宿主，在翻译前完成。
+    # 内核不再认识 io 的 is_archived / archived_at / archive_reason 三个字段 ——
+    # 那是宿主的命名约定，换个宿主就不成立。
 
     strict = str(mode or "").strip().lower() in {"model_api", "strict"}
     chosen_ids: set = set()
@@ -386,7 +422,12 @@ def select_context_memories_with_trace(
                     "reason": "global_correction",
                 }
             if global_boundary or rel.get("confidence") in {"strong", "medium"}:
-                corrections.append((float(rel.get("score") or 0.0), m.get("created_at") or "", m, rel))
+                corrections.append((
+                    float(rel.get("score") or 0.0),
+                    memory_timestamps.sort_key(m.get("created_at")),
+                    m,
+                    rel,
+                ))
         corrections.sort(key=lambda item: (item[0], item[1]), reverse=True)
         for _, __, m, rel in corrections[:2]:
             choose(m, rel, bucket="correction")
@@ -399,9 +440,19 @@ def select_context_memories_with_trace(
             reason = str(rel.get("reason") or "")
             score = float(rel.get("score") or 0.0)
             if conf == "strong" and score >= 0.55:
-                query_relevant.append((score, m.get("occurred_at") or "", m, rel))
+                query_relevant.append((
+                    score,
+                    memory_timestamps.sort_key(m.get("occurred_at")),
+                    m,
+                    rel,
+                ))
             elif conf == "medium" and score >= 0.35 and reason != "weak_generic_overlap":
-                query_relevant.append((score, m.get("occurred_at") or "", m, rel))
+                query_relevant.append((
+                    score,
+                    memory_timestamps.sort_key(m.get("occurred_at")),
+                    m,
+                    rel,
+                ))
             elif score > 0:
                 rejected.append((score, reason, m, rel))
         query_relevant.sort(key=lambda x: (x[0], x[1]), reverse=True)
@@ -427,9 +478,9 @@ def select_context_memories_with_trace(
         index_pool = sorted(
             [m for m in moments if m.get("id") not in index_ids],
             key=lambda m: (
-                str(m.get("title") or "").startswith("转折｜"),
-                m.get("occurred_at") or "",
-                m.get("created_at") or "",
+                ROLE_TURNING_POINT in (m.get("roles") or []),
+                memory_timestamps.sort_key(m.get("occurred_at")),
+                memory_timestamps.sort_key(m.get("created_at")),
             ),
             reverse=True,
         )[:20]
@@ -456,8 +507,8 @@ def select_context_memories_with_trace(
 
     # Bucket 1 — turning points by occurred_at desc, max 3
     turning = sorted(
-        [m for m in moments if (m.get("title") or "").startswith("转折｜")],
-        key=lambda m: m.get("occurred_at") or "",
+        [m for m in moments if ROLE_TURNING_POINT in (m.get("roles") or [])],
+        key=lambda m: memory_timestamps.sort_key(m.get("occurred_at")),
         reverse=True,
     )[:3]
     for m in turning:
@@ -467,7 +518,7 @@ def select_context_memories_with_trace(
     recent_pool = [m for m in moments if m.get("id") not in chosen_ids]
     recent = sorted(
         recent_pool,
-        key=lambda m: m.get("created_at") or "",
+        key=lambda m: memory_timestamps.sort_key(m.get("created_at")),
         reverse=True,
     )[:2]
     for m in recent:

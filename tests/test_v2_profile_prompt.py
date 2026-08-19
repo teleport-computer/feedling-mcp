@@ -42,7 +42,7 @@ def test_selection_failure_records_only_content_free_unavailable_state(monkeypat
 
     assert selection.state == "unavailable"
     assert selection.memory == ""
-    assert selection.user == ""
+    assert selection.style == ""
     assert events == [
         (
             "profile_prompt_state",
@@ -72,18 +72,10 @@ def test_same_profile_two_turn_prompt_prefix_bytes_are_identical():
     )([])
 
     def _profile_prefix(messages):
-        index = next(
-            i
-            for i, message in enumerate(messages)
-            if str(message.get("content") or "").startswith(
-                context.AGENT_MEMORY_HEADER
-            )
-        )
+        assert context.AGENT_MEMORY_HEADER in messages[0]["content"]
+        assert context.USER_PROFILE_HEADER in messages[0]["content"]
         return json.dumps(
-            messages[: index + 1],
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
+            messages[0], ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode()
 
     assert _profile_prefix(first) == _profile_prefix(second)

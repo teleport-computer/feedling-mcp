@@ -124,7 +124,7 @@ def test_inner_default_bucket_english_description_only():
 
 
 def test_migrate_polluted_bucket_gets_localized_default():
-    from memory.migrate_prompt_v1 import parse_migrated_cards
+    from memory_garden.prompts.migrate import parse_migrated_cards
     upgrades, _unmigrated, err = parse_migrated_cards(
         '{"upgrades": [{"id": "m1", "summary": "用户喜欢普洱茶",'
         ' "content": "上次视频里提到", "bucket": "long_term_preference_or_event_v1"}]}',

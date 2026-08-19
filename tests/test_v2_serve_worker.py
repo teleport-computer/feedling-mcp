@@ -6,6 +6,7 @@ import sys
 import types
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -583,6 +584,7 @@ def test_v2_debug_trace_user_seam_resolves_store_and_preserves_duration(monkeypa
         explain="safe",
         detail={"tool": "perception_snapshot"},
         dur_ms=7.5,
+        trace_id="trace-v2-seam",
     )
 
     assert calls == [
@@ -596,9 +598,35 @@ def test_v2_debug_trace_user_seam_resolves_store_and_preserves_duration(monkeypa
                 "explain": "safe",
                 "detail": {"tool": "perception_snapshot"},
                 "dur_ms": 7.5,
+                "trace_id": "trace-v2-seam",
             },
         ),
     ]
+
+
+def test_v2_debug_trace_payload_preserves_turn_trace_id(monkeypatch):
+    from diagnostics import diagnostics_core
+
+    captured = []
+    monkeypatch.setattr(
+        diagnostics_core,
+        "emit_trace_event_payload",
+        lambda store, payload: captured.append((store, payload)),
+    )
+    store = object()
+
+    serve_worker._emit_v2_debug_trace(
+        store,
+        "provider.empty_response",
+        status="warning",
+        summary="safe",
+        explain="content-free",
+        detail={"lane": "chat"},
+        trace_id="trace-current-turn",
+    )
+
+    assert captured[0][0] is store
+    assert captured[0][1]["event"]["trace_id"] == "trace-current-turn"
 
 
 def test_context_truncation_reaches_final_debug_event_without_upstream_content(
@@ -814,6 +842,86 @@ def test_wire_assembly_injects_envelope_pubkey_getter():
 
     serve_worker.wire_assembly()
     assert core_envelope.get_user_public_key is accounts_registry._get_user_public_key
+    assert (
+        core_envelope.resolve_content_encryption
+        is accounts_registry.effective_content_encryption
+    )
+
+
+def test_wire_assembly_makes_off_account_v2_writes_plaintext(monkeypatch):
+    from accounts import registry as accounts_registry
+    from core import envelope as core_envelope
+
+    monkeypatch.setattr(core_envelope, "PLAINTEXT_WRITES_ACCEPTED", True)
+    monkeypatch.setattr(
+        accounts_registry,
+        "_get_user_content_encryption",
+        lambda user_id: "off" if user_id == "u_v2_plain" else None,
+    )
+    serve_worker.wire_assembly()
+
+    envelope, error = core_envelope._build_shared_envelope_for_store(
+        SimpleNamespace(user_id="u_v2_plain"),
+        b'{"kind":"reply"}',
+        item_id="v2-plain-reply",
+    )
+
+    assert error == ""
+    assert envelope == {
+        "body": '{"kind":"reply"}',
+        "id": "v2-plain-reply",
+        "owner_user_id": "u_v2_plain",
+        "visibility": "shared",
+    }
+
+
+def test_plaintext_trajectory_round_trips_compressed_binary(monkeypatch):
+    user_id = "u_v2_plain_trajectory"
+    payload = b"feedling-v2-trajectory-json-zlib-v1\x00\xff\x00compressed"
+    monkeypatch.setattr(
+        serve_worker.core_store,
+        "get_store",
+        lambda _user_id: SimpleNamespace(user_id=user_id),
+    )
+    monkeypatch.setattr(
+        serve_worker.core_envelope,
+        "resolve_content_encryption",
+        lambda _user_id: "off",
+    )
+
+    envelope = serve_worker._seal_trajectory_payload(
+        user_id,
+        payload,
+        "trajectory-plain",
+    )
+
+    assert set(envelope) == {"body", "id", "owner_user_id", "visibility"}
+    assert envelope["body"].startswith(
+        serve_worker._TRAJECTORY_PLAINTEXT_B64_PREFIX
+    )
+    assert jobs_store._validate_trajectory_envelope(user_id, envelope) == envelope
+    assert serve_worker._open_trajectory_payload(user_id, envelope, "") == payload
+
+
+def test_plaintext_trajectory_rejects_unmarked_or_invalid_base64():
+    base = {
+        "id": "trajectory-bad",
+        "owner_user_id": "u_v2_plain_trajectory_bad",
+        "visibility": "shared",
+    }
+    with pytest.raises(RuntimeError, match="trajectory_plaintext_encoding_invalid"):
+        serve_worker._open_trajectory_payload(
+            base["owner_user_id"], {**base, "body": "unmarked"}, ""
+        )
+    with pytest.raises(RuntimeError, match="trajectory_plaintext_encoding_invalid"):
+        serve_worker._open_trajectory_payload(
+            base["owner_user_id"],
+            {
+                **base,
+                "body": serve_worker._TRAJECTORY_PLAINTEXT_B64_PREFIX + "%%%",
+            },
+            "",
+        )
 
 
 def test_health_app_healthz_ok():
@@ -993,6 +1101,84 @@ def test_seq_reader_preserves_local_only_row_as_safe_placeholder(monkeypatch):
 
     assert out == [{
         "id": "local", "seq": 11, "ts": 100.0, "role": "user",
+        "content": "[message unavailable]",
+    }]
+
+
+def test_seq_reader_reads_plaintext_chat_row_without_enclave(monkeypatch):
+    monkeypatch.setattr(
+        serve_worker.db, "chat_messages_after_seq",
+        lambda *args, **kwargs: [{
+            "id": "plain", "seq": 12, "ts": 101.0, "role": "user",
+            "body": "hello from plaintext tier", "visibility": "shared",
+            "owner_user_id": "u",
+        }],
+    )
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext chat rows must not call the enclave")
+        ),
+    )
+
+    out = serve_worker._read_messages_after_seq("u", 11, through_seq=12)
+
+    assert out == [{
+        "id": "plain", "seq": 12, "ts": 101.0, "role": "user",
+        "content": "hello from plaintext tier",
+    }]
+
+
+def test_chat_reader_prefers_ciphertext_when_plaintext_field_also_exists(monkeypatch):
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
+    decrypted = []
+
+    def _decrypt(row, *_args, **_kwargs):
+        decrypted.append(row["id"])
+        return b"current encrypted body"
+
+    monkeypatch.setattr(
+        serve_worker.core_enclave, "_decrypt_envelope_via_enclave", _decrypt,
+    )
+
+    out = serve_worker._decrypt_chat_rows(
+        "u",
+        [{
+            "id": "mixed", "seq": 13, "ts": 102.0, "role": "openclaw",
+            "body_ct": "ciphertext", "K_enclave": "wrapped-key",
+            "body": "stale plaintext body", "reply_to_message_id": "plain",
+        }],
+        user_only=False,
+        preserve_unreadable=True,
+    )
+
+    assert decrypted == ["mixed"]
+    assert out == [{
+        "id": "mixed", "seq": 13, "ts": 102.0, "role": "assistant",
+        "content": "current encrypted body", "reply_to_message_id": "plain",
+    }]
+
+
+def test_chat_reader_does_not_fall_back_to_stale_body_when_enclave_key_is_missing(
+    monkeypatch,
+):
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
+
+    out = serve_worker._decrypt_chat_rows(
+        "u",
+        [{
+            "id": "broken-mixed", "seq": 14, "ts": 103.0, "role": "user",
+            "body_ct": "ciphertext", "K_enclave": None,
+            "body": "stale plaintext body",
+        }],
+        user_only=True,
+        preserve_unreadable=True,
+    )
+
+    assert out == [{
+        "id": "broken-mixed", "seq": 14, "ts": 103.0, "role": "user",
         "content": "[message unavailable]",
     }]
 
@@ -1407,20 +1593,25 @@ def test_fire_scheduled_for_user_enqueues_a_scheduled_agent_job(monkeypatch, bac
     )
 
     calls = []
-    monkeypatch.setattr(jobs_store, "enqueue_job",
-                        lambda u, lane, **kw: calls.append((u, lane)) or (101, False))
+    monkeypatch.setattr(
+        jobs_store,
+        "enqueue_job",
+        lambda u, lane, **kw: calls.append((u, lane, kw)) or (101, False),
+    )
 
     class _FakeService:
         def __init__(self, *a, **kw):
             pass
 
         def fire_due_timers(self, user_id, *, settings, submit_wake, owner_id):
-            submit_wake(object())
+            submit_wake(types.SimpleNamespace(wake_id="wake_scheduled_test"))
             return ()
 
     monkeypatch.setattr("proactive.scheduled_wake_v2.ScheduledWakeServiceV2", _FakeService)
     assert serve_worker._fire_scheduled_for_user(uid) == 1
-    assert calls == [(uid, "scheduled")]
+    assert calls == [
+        (uid, "scheduled", {"reason": "scheduled_wake", "trace_id": "wake_scheduled_test"})
+    ]
 
 
 def test_read_scheduled_wake_context_returns_notes_and_confirmed_metadata_for_one_job(

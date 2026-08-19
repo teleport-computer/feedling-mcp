@@ -69,9 +69,9 @@ def plaintext_view(base: dict, inner: dict, identity: dict, *, days_with_user: i
 
     The profile fields are driven off ``card_policy``'s canonical list, not a
     hand-written one. They feed the read-modify-write merge in
-    ``identity.profile_patch`` / ``dimension_nudge``, which rebuilds the card from
-    THIS view and re-encrypts it — so a field missing here is not merely hidden,
-    it is ERASED on the next partial update.
+    ``identity.profile_patch`` / ``dimension_nudge`` / ``dimensions_set``, which
+    rebuild the card from THIS view and re-encrypt it — so a field missing here
+    is not merely hidden, it is ERASED on the next partial update.
     """
     view = {
         **base,
@@ -91,4 +91,6 @@ def plaintext_view(base: dict, inner: dict, identity: dict, *, days_with_user: i
             continue  # already set unconditionally above
         if inner.get(key):
             view[key] = inner.get(key)
+    if isinstance(inner.get("last_dimensions_set"), dict):
+        view["last_dimensions_set"] = inner["last_dimensions_set"]
     return view

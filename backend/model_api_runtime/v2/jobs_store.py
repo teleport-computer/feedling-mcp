@@ -7,6 +7,8 @@ CONTRIBUTING §2：新表存取逻辑全部收进本模块（jobs_store）。连
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import logging
 import math
@@ -32,6 +34,7 @@ from psycopg.types.json import Jsonb
 
 import db
 from core import wake_bus
+from memory_garden import timestamps as memory_timestamps
 from model_api_runtime.v2 import usage_reporting
 from notices import catalog as notices_catalog
 from proactive import capture_daily
@@ -101,6 +104,23 @@ LANES = {
 }
 
 
+def _positive_int_env(name: str, default: str) -> int:
+    """正整数,fail-closed。形状对齐 `_positive_float_env`。
+
+    为什么不能沉默兜底(codex2 审出):这个值是**重投预算**。配成 0 或负数会让
+    每个 scheduled 第一次租约超时就直接终结 —— 等于**把修复静默关掉**,
+    而且没有任何现象:提醒照常丢,日志照常安静。配错必须启动即炸。
+    """
+    raw = os.environ.get(name, default)
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} must be an integer > 0") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be an integer > 0")
+    return value
+
+
 def _positive_float_env(name: str, default: str) -> float:
     raw = os.environ.get(name, default)
     try:
@@ -145,6 +165,45 @@ class PreemptedJob:
 # wedged therefore cannot keep a blind heartbeat alive forever.
 PENDING_CHAT_TTL_SEC = _positive_float_env("FEEDLING_V2_CHAT_PENDING_TTL_SEC", "120")
 RUNNING_TTL_SEC = _positive_float_env("FEEDLING_V2_LEASE_TTL_SEC", "300")
+# 到期提醒的租约超时重投上限。scheduled 是**必须送达**的道:入队时就 mark_fired
+# (scheduled_wake_v2.py),所以一次 worker 进程死亡造成的租约超时若按终结处理,
+# 这条提醒就永久消失且不会重试 —— 用户侧完全无感。
+#
+# 同文件的前台抢占路径早已按道分流:scheduled/capture 重投、其余终结。
+# 本常量把同一条语义补给租约回收器。有界是必须的:一个每次都失败的提醒若无限
+# 重投,会变成永不停歇的唤醒循环。
+# 「可重投」= pristine:这一轮**没有产生过任何持久副作用**。
+# 重投复用同一 job_id 并重跑整轮,而 mutation recovery barrier 只保护 lane='chat',
+# 保护不到 scheduled —— 所以任何已落地的写都可能被再执行一次。
+# 闭集与 worker.ENCRYPTED_TOOL_EFFECT_TYPES 的值域一致(见 test 里的漂移守卫);
+# 这里不 import worker:jobs_store 是底层,反向依赖会成环。
+# ⚠️ 只拦持久平台写,**不拦**普通 reply/status effect —— 那些重放无害,
+# 拦了会把可修复的场景无谓地变成永久丢失。
+DURABLE_TOOL_EFFECT_TYPES = frozenset({
+    "memory_encrypted_v1",
+    "identity_encrypted_v1",
+    "schedule_encrypted_v1",
+    "workspace_encrypted_v1",
+    "workspace_batch_encrypted_v1",
+})
+
+SCHEDULED_LEASE_REQUEUE_MAX_ATTEMPTS = _positive_int_env(
+    "FEEDLING_V2_SCHEDULED_REQUEUE_MAX_ATTEMPTS", "3"
+)
+
+# Shared by the periodic lease reaper and the eager watchdog recovery path.
+# Keeping the SQL predicate single-sourced prevents either recovery mechanism
+# from silently widening scheduled whole-turn replay in the future.
+_SCHEDULED_REQUEUE_SAFETY_SQL = (
+    "AND attempt_count < %s "
+    "AND NOT EXISTS ("
+    "  SELECT 1 FROM v2_mcp_mutation_attempts a "
+    "  WHERE a.job_id=agent_jobs.id) "
+    "AND NOT EXISTS ("
+    "  SELECT 1 FROM v2_effect_outbox e "
+    "  WHERE e.job_id=agent_jobs.id "
+    "    AND e.effect_type = ANY(%s)) "
+)
 
 _ACTIVE_STATUSES = ("pending", "claimed", "running")
 SCHEDULED_WAKE_STREAM = "proactive_scheduled_wakes_v2"
@@ -261,7 +320,7 @@ _TRAJECTORY_ACCESS_RESULT_RE = re.compile(r"^[a-z][a-z0-9_]{0,79}$")
 _TRAJECTORY_ACCESS_REASONS = frozenset(
     {"incident", "support", "security", "debug"}
 )
-_TRAJECTORY_ENVELOPE_REQUIRED = frozenset(
+_TRAJECTORY_SEALED_REQUIRED = frozenset(
     {
         "v",
         "id",
@@ -273,7 +332,7 @@ _TRAJECTORY_ENVELOPE_REQUIRED = frozenset(
         "K_enclave",
     }
 )
-_TRAJECTORY_ENVELOPE_ALLOWED = frozenset(
+_TRAJECTORY_SEALED_ALLOWED = frozenset(
     {
         "v",
         "id",
@@ -287,6 +346,10 @@ _TRAJECTORY_ENVELOPE_ALLOWED = frozenset(
         "content_pk_fpr",
     }
 )
+_TRAJECTORY_PLAINTEXT_REQUIRED = frozenset(
+    {"id", "owner_user_id", "visibility", "body"}
+)
+TRAJECTORY_PLAINTEXT_B64_PREFIX = "feedling-v2-trajectory-b64-v1:"
 
 
 def trajectory_review_admission_cap() -> int:
@@ -337,19 +400,42 @@ def _review_admission_available_on_cursor(cur) -> bool:
 def _validate_trajectory_envelope(user_id: str, envelope: object) -> dict:
     if not isinstance(envelope, dict):
         raise ValueError("trajectory payload envelope must be an object")
-    if not _TRAJECTORY_ENVELOPE_REQUIRED.issubset(envelope):
-        raise ValueError("trajectory payload envelope is incomplete")
-    if set(envelope) - _TRAJECTORY_ENVELOPE_ALLOWED:
-        raise ValueError("trajectory payload envelope has unsupported fields")
-    if type(envelope.get("v")) is not int:
-        raise ValueError("trajectory payload envelope version must be an integer")
     if envelope.get("owner_user_id") != str(user_id):
         raise ValueError("trajectory payload envelope owner mismatch")
     if envelope.get("visibility") != "shared":
         raise ValueError("trajectory payload envelope must be shared")
-    for field in ("id", "body_ct", "nonce", "K_user", "K_enclave"):
+    if "body_ct" in envelope:
+        if not _TRAJECTORY_SEALED_REQUIRED.issubset(envelope):
+            raise ValueError("trajectory payload envelope is incomplete")
+        if set(envelope) - _TRAJECTORY_SEALED_ALLOWED:
+            raise ValueError("trajectory payload envelope has unsupported fields")
+        if type(envelope.get("v")) is not int:
+            raise ValueError("trajectory payload envelope version must be an integer")
+        required = ("id", "body_ct", "nonce", "K_user", "K_enclave")
+    else:
+        if not _TRAJECTORY_PLAINTEXT_REQUIRED.issubset(envelope):
+            raise ValueError("trajectory plaintext payload is incomplete")
+        if set(envelope) != _TRAJECTORY_PLAINTEXT_REQUIRED:
+            raise ValueError("trajectory plaintext payload has unsupported fields")
+        required = ("id", "body")
+    for field in required:
         if not isinstance(envelope.get(field), str) or not envelope[field]:
             raise ValueError(f"trajectory payload envelope {field} required")
+    if "body_ct" not in envelope:
+        from core import envelope as core_envelope
+
+        if core_envelope.resolve_content_encryption(str(user_id)) != "off":
+            raise ValueError("trajectory plaintext payload not enabled")
+        encoded = envelope["body"]
+        if not encoded.startswith(TRAJECTORY_PLAINTEXT_B64_PREFIX):
+            raise ValueError("trajectory plaintext encoding invalid")
+        encoded = encoded[len(TRAJECTORY_PLAINTEXT_B64_PREFIX) :]
+        if not encoded:
+            raise ValueError("trajectory plaintext encoding invalid")
+        try:
+            base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("trajectory plaintext encoding invalid") from exc
     return envelope
 
 
@@ -1109,6 +1195,37 @@ def valid_active_claims(
     return {(int(row[0]), str(row[1])) for row in rows}
 
 
+def valid_reconcile_claims(
+    claims: list[tuple[int, str]],
+) -> set[tuple[int, str]]:
+    """Return snapshot pairs that do not justify cancelling their slot.
+
+    Besides a live claimed/running lease, accept ``completed`` and ``failed``
+    rows fenced by the same owner.  The worker commits those terminal states
+    before its final trajectory/unwind work and parent pipe signal, so treating
+    that bounded window as an invalid claim kills a healthy slot after every
+    normal turn.  Cancellation states and missing/reassigned rows deliberately
+    remain invalid so the reconciler still backs up dropped cancellation
+    notifications.
+    """
+    if not claims:
+        return set()
+    job_ids = [int(job_id) for job_id, _claimed_by in claims]
+    owners = [str(claimed_by) for _job_id, claimed_by in claims]
+    with _pool().connection() as conn:
+        rows = conn.execute(
+            "WITH wanted(job_id, claimed_by) AS ("
+            "SELECT * FROM unnest(%s::bigint[], %s::text[])"
+            ") SELECT j.id, j.claimed_by FROM wanted w "
+            "JOIN agent_jobs j ON j.id=w.job_id AND j.claimed_by=w.claimed_by "
+            "WHERE (j.status IN ('claimed','running') "
+            "AND j.lease_expires_at > clock_timestamp()) "
+            "OR j.status IN ('completed','failed')",
+            (job_ids, owners),
+        ).fetchall()
+    return {(int(row[0]), str(row[1])) for row in rows}
+
+
 def mark_running(job_id, *, claimed_by: str) -> bool:
     with _pool().connection() as conn:
         with conn.transaction():
@@ -1186,7 +1303,7 @@ def renew_job_lease(
             return cur.rowcount == 1
 
 
-_FAIL_BACKOFF_WAKE_LANES = frozenset({"heartbeat", "scheduled"})
+_FAIL_BACKOFF_WAKE_LANES = frozenset({"heartbeat"})
 
 
 def _latest_genuine_user_seq_on_cursor(cur, user_id: str) -> int:
@@ -1257,15 +1374,18 @@ def mark_completed(
     *,
     claimed_by: str,
     clear_wake_backoff: bool = False,
+    wake_result: str | None = None,
+    wake_result_reason: str | None = None,
 ) -> bool:
     with _pool().connection() as conn:
         with conn.transaction():
             cur = conn.execute(
-                "UPDATE agent_jobs SET status='completed', finished_at=now() "
+                "UPDATE agent_jobs SET status='completed', finished_at=now(), "
+                "wake_result=%s, wake_result_reason=%s "
                 "WHERE id=%s AND status IN ('claimed','running') "
                 "AND claimed_by=%s AND lease_expires_at > now() "
                 "RETURNING user_id,lane",
-                (job_id, str(claimed_by)),
+                (wake_result, wake_result_reason, job_id, str(claimed_by)),
             )
             row = cur.fetchone()
             if row is None:
@@ -1348,6 +1468,8 @@ def finish_wake_job(
     consumed_context_seq: int,
     clear_wake_backoff: bool = False,
     completed_perception_glance_fingerprint: str | None = None,
+    wake_result: str | None = None,
+    wake_result_reason: str | None = None,
 ) -> tuple[bool, int | None]:
     """Complete a wake, persist its glance, and hand input to one successor.
 
@@ -1428,9 +1550,10 @@ def finish_wake_job(
                     observed_generation
                 )
                 cur.execute(
-                    "UPDATE agent_jobs SET status='completed',finished_at=now() "
+                    "UPDATE agent_jobs SET status='completed',finished_at=now(), "
+                    "wake_result=%s,wake_result_reason=%s "
                     "WHERE id=%s",
-                    (int(job_id),),
+                    (wake_result, wake_result_reason, int(job_id)),
                 )
                 if completed_fingerprint is not None:
                     _merge_completed_perception_glance_on_cursor(
@@ -1606,6 +1729,79 @@ def reschedule_owned_job(
             return cur.rowcount == 1
 
 
+def reschedule_pristine_scheduled_failure(
+    job_id: int,
+    *,
+    claimed_by: str,
+    error: str,
+    available_at: float,
+    expected_attempt_count: int,
+    max_attempts: int,
+) -> bool:
+    """Retry one failed scheduled delivery only while the turn is pristine.
+
+    The same job id is retained because fired reminder context and deterministic
+    effect ids are keyed by it.  Any MCP mutation attempt or durable platform
+    write makes a whole-turn replay unsafe even when its recorded outcome is
+    known: a successful side effect must never be executed a second time.
+
+    This transition deliberately does not enqueue terminal-failure visibility.
+    The worker calls :func:`mark_failed` only when this bounded retry is
+    ineligible or exhausted.
+    """
+    attempt_count = int(expected_attempt_count)
+    attempt_limit = int(max_attempts)
+    if attempt_count < 0:
+        raise ValueError("expected_attempt_count must be non-negative")
+    if attempt_limit <= 0:
+        raise ValueError("max_attempts must be positive")
+
+    with _pool().connection() as conn:
+        with conn.transaction():
+            identity = conn.execute(
+                "SELECT user_id FROM agent_jobs WHERE id=%s",
+                (int(job_id),),
+            ).fetchone()
+            if identity is None:
+                return False
+            control = conn.execute(
+                "SELECT hosted_runtime_state,runtime_generation "
+                "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
+                (str(identity[0]),),
+            ).fetchone()
+            if control is None or str(control[0]) != "v2":
+                return False
+            runtime_generation = int(control[1])
+            cur = conn.execute(
+                "UPDATE agent_jobs AS job SET status='pending',"
+                "available_at=to_timestamp(%s),last_error=%s,"
+                "attempt_count=attempt_count+1,claimed_by=NULL,claimed_at=NULL,"
+                "started_at=NULL,finished_at=NULL,lease_expires_at=NULL,"
+                "deadline_at=NULL "
+                "WHERE job.id=%s AND job.lane='scheduled' "
+                "AND job.claimed_by=%s AND job.status IN ('claimed','running') "
+                "AND job.lease_expires_at > clock_timestamp() "
+                "AND job.expected_runtime_generation=%s "
+                "AND job.attempt_count=%s AND job.attempt_count<%s "
+                "AND NOT EXISTS (SELECT 1 FROM v2_mcp_mutation_attempts mcp "
+                "  WHERE mcp.job_id=job.id) "
+                "AND NOT EXISTS (SELECT 1 FROM v2_effect_outbox effect "
+                "  WHERE effect.job_id=job.id "
+                "  AND effect.effect_type = ANY(%s))",
+                (
+                    float(available_at),
+                    str(error)[:500],
+                    int(job_id),
+                    str(claimed_by),
+                    runtime_generation,
+                    attempt_count,
+                    attempt_limit - 1,
+                    sorted(DURABLE_TOOL_EFFECT_TYPES),
+                ),
+            )
+            return cur.rowcount == 1
+
+
 def make_pending_job_ready(user_id: str, *, lane: str = "profile") -> bool:
     """Make one current-generation delayed pending job immediately claimable."""
     with _pool().connection() as conn:
@@ -1688,6 +1884,69 @@ def recover_killed_job(
                         cur, int(job_id)
                     )
                     _queue_failure_review_on_cursor(cur, int(job_id))
+                elif lane == "scheduled":
+                    # Watchdog recovery is an eager form of the lease reaper.
+                    # It must use the same replay-safety contract: only a
+                    # pristine scheduled turn with retry budget remaining may
+                    # run again. Any MCP attempt or durable platform effect
+                    # makes whole-turn replay unsafe, even when the recorded
+                    # MCP outcome is known-success.
+                    cur.execute(
+                        "UPDATE agent_jobs SET status='pending',created_at=now(), "
+                        "last_error=%s,attempt_count=attempt_count+1,"
+                        "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
+                        "finished_at=NULL,lease_expires_at=NULL,deadline_at=NULL,"
+                        "queue_deadline_at=NULL "
+                        "WHERE id=%s AND claimed_by=%s AND lane='scheduled' "
+                        "AND status IN ('claimed','running') "
+                        + _SCHEDULED_REQUEUE_SAFETY_SQL,
+                        (
+                            str(reason)[:500],
+                            int(job_id),
+                            str(claimed_by),
+                            int(SCHEDULED_LEASE_REQUEUE_MAX_ATTEMPTS),
+                            sorted(DURABLE_TOOL_EFFECT_TYPES),
+                        ),
+                    )
+                    if cur.rowcount == 1:
+                        recovery = "requeued"
+                    else:
+                        recovery = "terminal"
+                        cur.execute(
+                            "UPDATE agent_jobs SET status='expired',finished_at=now(), "
+                            "last_error=CASE WHEN EXISTS ("
+                            "  SELECT 1 FROM v2_mcp_mutation_attempts a "
+                            "  WHERE a.job_id=agent_jobs.id "
+                            "    AND (a.outcome IS NULL OR a.outcome='unknown')"
+                            ") THEN 'mcp_mutation_outcome_unknown' ELSE %s END, "
+                            "attempt_count=attempt_count+1,"
+                            "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
+                            "lease_expires_at=NULL,deadline_at=NULL "
+                            "WHERE id=%s AND claimed_by=%s "
+                            "AND status IN ('claimed','running') "
+                            "RETURNING last_error",
+                            (str(reason)[:500], int(job_id), str(claimed_by)),
+                        )
+                        terminal = cur.fetchone()
+                        if terminal is None:
+                            return None
+                        terminal_error = str(terminal["last_error"])
+                        cur.execute(
+                            "UPDATE v2_mcp_mutation_attempts "
+                            "SET outcome='unknown',resolved_at=clock_timestamp() "
+                            "WHERE job_id=%s AND outcome IS NULL",
+                            (int(job_id),),
+                        )
+                        _queue_terminal_failure_on_cursor(
+                            cur,
+                            int(job_id),
+                            str(row["user_id"]),
+                            terminal_error,
+                        )
+                        recovered_reviews = _recover_review_runner_on_cursor(
+                            cur, int(job_id)
+                        )
+                        _queue_failure_review_on_cursor(cur, int(job_id))
                 else:
                     recovery = "requeued"
                     cur.execute(
@@ -1729,6 +1988,48 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
     with _pool().connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
+                # 租约超时的 scheduled 先摘走重投,不进下面的终结扫描。
+                # 只认 lease_timeout(claimed/running 且租约过期 = worker 死了,
+                # 活儿根本没干),**不认 queue_timeout** —— 那是队列本身堵了,
+                # 重投只会再排一次队。
+                # 字段清理逐条对齐前台抢占的 requeued 分支;额外清 queue_deadline_at,
+                # 否则一个已过期的入队截止会让刚重投的行在下一轮立刻再次终结。
+                cur.execute(
+                    "UPDATE agent_jobs SET status='pending', "
+                    "attempt_count=attempt_count+1, "
+                    "last_error='scheduled_lease_timeout_requeued', "
+                    "claimed_by=NULL, claimed_at=NULL, started_at=NULL, "
+                    "finished_at=NULL, lease_expires_at=NULL, deadline_at=NULL, "
+                    "queue_deadline_at=NULL, created_at=now() "
+                    "WHERE lane='scheduled' "
+                    "AND status IN ('claimed','running') "
+                    "AND COALESCE(lease_expires_at, deadline_at) IS NOT NULL "
+                    "AND COALESCE(lease_expires_at, deadline_at) "
+                    "    <= COALESCE(to_timestamp(%s), now()) "
+                    # Replay-safety predicate is shared with eager watchdog
+                    # recovery; neither path may widen it independently.
+                    # ⚠️ P0(codex2 交叉审计):**碰过 MCP 写的这一轮,一律不重投** ——
+                    # 不看 outcome。理由(get_chat_mutation_recovery_barrier 的契约原文):
+                    #   "Outcomes ... do not weaken the barrier:
+                    #    a known success is exactly the case that must not be repeated"
+                    #
+                    # 我第一版只排 NULL/unknown,依据是「与下面的终结 CTE 保持一致」——
+                    # 那是**类别错误**:终结 CTE 里那个 EXISTS 是在**选错误标签**
+                    # (mcp_mutation_outcome_unknown vs lease_timeout),**不是**在决定
+                    # 终结还是重投 —— 它对 known 也照样终结。原实现从来没有重跑过整轮。
+                    #
+                    # 而重投复用同一个 job_id,worker 侧的 mutation recovery barrier
+                    # 查询又**只覆盖 lane='chat'**,保护不到 scheduled;模型重跑后会
+                    # 生成新的 call_id 再写一次 —— 一次已成功的远端写就被重复执行了。
+                    # 同族第二层(codex2 交叉审计):不只 MCP。
+                    # worker._write_tool_effect_payload 是**所有道共享**的,
+                    # scheduled 一样能落 memory/identity/schedule/workspace 写。
+                    + _SCHEDULED_REQUEUE_SAFETY_SQL
+                    + "RETURNING id",
+                    (ts, int(SCHEDULED_LEASE_REQUEUE_MAX_ATTEMPTS),
+                     sorted(DURABLE_TOOL_EFFECT_TYPES)),
+                )
+                requeued_scheduled = [int(r["id"]) for r in cur.fetchall()]
                 cur.execute(
                     "WITH terminal AS ("
                     "  UPDATE agent_jobs SET status='expired', finished_at=now(), "
@@ -1789,6 +2090,11 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
         for user_id, source_job_id in recovered_reviews:
             mirror.mark_pending(
                 user_id, "v2_trajectory_reviews", source_job_id, "requeue")
+    if requeued_scheduled:
+        log.info(
+            "[v2.reaper] scheduled lease timeout requeued job_ids=%s",
+            requeued_scheduled,
+        )
     return rows
 
 
@@ -1840,6 +2146,7 @@ _CAPTURE_PROVIDER_DB_KEEPALIVE_SEC = 15.0
 _CAPTURE_ENVELOPE_FIELDS = frozenset(
     {
         "id",
+        "body",
         "body_ct",
         "nonce",
         "K_user",
@@ -1967,6 +2274,8 @@ def _capture_owned_job_on_cursor(cur, job_id, user_id: str, claimed_by: str):
 
 
 def _validate_capture_actions(user_id: str, actions: list[dict]) -> list[dict]:
+    from core import envelope as core_envelope  # keep jobs_store import-light
+
     if not isinstance(actions, list) or len(actions) > 20:
         raise ValueError("capture actions must be a list of at most 20 items")
     normalized: list[dict] = []
@@ -1989,17 +2298,30 @@ def _validate_capture_actions(user_id: str, actions: list[dict]) -> list[dict]:
         ):
             raise ValueError("invalid capture memory identity")
         seen_ids.add(memory_id)
-        for field in (
-            "body_ct",
-            "nonce",
-            "K_user",
-            "K_enclave",
-            "visibility",
-            "occurred_at",
-            "type",
-        ):
+        for field in ("visibility", "occurred_at", "type"):
             if not envelope.get(field):
                 raise ValueError(f"capture envelope missing {field}")
+        has_ciphertext = bool(envelope.get("body_ct"))
+        has_plaintext_field = envelope.get("body") is not None
+        if has_ciphertext == has_plaintext_field:
+            raise ValueError("capture envelope content shape invalid")
+        if has_ciphertext:
+            for field in ("nonce", "K_user", "K_enclave"):
+                if not envelope.get(field):
+                    raise ValueError(f"capture envelope missing {field}")
+        else:
+            if not isinstance(envelope.get("body"), str) or not envelope["body"]:
+                raise ValueError("capture plaintext body invalid")
+            if core_envelope.resolve_content_encryption(str(user_id)) != "off":
+                raise ValueError("capture plaintext envelope not enabled")
+            if any(
+                envelope.get(field) is not None
+                for field in ("nonce", "K_user", "K_enclave")
+            ):
+                raise ValueError("capture plaintext envelope has crypto fields")
+        occurred_at = memory_timestamps.normalize(envelope.get("occurred_at"))
+        if not occurred_at:
+            raise ValueError("capture envelope invalid occurred_at")
         if str(envelope["visibility"]) != "shared":
             raise ValueError("capture envelope must be shared")
         if str(envelope["type"]) not in {"moment", "quote", "fact", "event"}:
@@ -2021,6 +2343,7 @@ def _validate_capture_actions(user_id: str, actions: list[dict]) -> list[dict]:
                 if key in envelope
             },
         }
+        clean_action["envelope"]["occurred_at"] = occurred_at
         if action_type == "memory.supersede":
             clean_action["supersedes"] = targets
         normalized.append(clean_action)
@@ -2223,9 +2546,11 @@ def get_prepared_capture_batch(
 
 
 def _capture_memory_doc(user_id: str, action: dict) -> dict:
+    from core import envelope as core_envelope  # 延迟导入：与本模块既有惯例一致
+
     envelope = dict(action["envelope"])
-    occurred_at = str(envelope["occurred_at"])
-    now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    occurred_at = memory_timestamps.normalize(envelope["occurred_at"])
+    now_iso = memory_timestamps.now_iso()
     doc = {
         "v": 1,
         "id": str(envelope["id"]),
@@ -2234,11 +2559,11 @@ def _capture_memory_doc(user_id: str, action: dict) -> dict:
         "created_at": now_iso,
         "updated_at": now_iso,
         "source": str(envelope.get("source") or "memory_capture"),
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "K_enclave": envelope["K_enclave"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
+        "enclave_pk_fpr": "",
+        # splice 之后再钉死 visibility/owner：本站点刻意忽略信封里的值。
+        # 注意 K_enclave 由 splice 决定「在不在」——信封行必带（shared 封装
+        # 一定有），明文行本就没有。
+        **core_envelope.envelope_storage_fields(envelope),
         "visibility": "shared",
         "owner_user_id": str(user_id),
         "status": str(envelope.get("status") or "active"),
@@ -2265,6 +2590,7 @@ def _capture_same_memory(existing: dict, wanted: dict) -> bool:
         for key in (
             "id",
             "type",
+            "body",
             "body_ct",
             "nonce",
             "K_user",
@@ -3148,56 +3474,97 @@ def _ack_terminal_failure_reply(job_id) -> bool:
         return cur.rowcount == 1
 
 
-def _scheduled_failure_notes(user_id: str, job_id) -> list[str]:
-    """Read the canonical reminder notes for one fired scheduled job."""
+def _scheduled_failure_contexts(user_id: str, job_id) -> list[dict[str, object]]:
+    """Read bounded canonical reminder identity for one fired scheduled job."""
     with _pool().connection() as conn:
         rows = conn.execute(
-            "SELECT doc->>'note' FROM user_logs "
+            "SELECT doc->>'note',doc->>'at',doc->>'timezone',doc->>'due_at' "
+            "FROM user_logs "
             "WHERE user_id=%s AND stream=%s AND doc->>'status'='fired' "
             "AND doc->>'fired_job_id'=%s ORDER BY seq LIMIT 10",
             (str(user_id), SCHEDULED_WAKE_STREAM, str(int(job_id))),
         ).fetchall()
     return [
-        str(row[0]).strip()[:1000]
+        {
+            "note": str(row[0]).strip()[:1000],
+            "at": str(row[1] or "").strip()[:120],
+            "timezone": str(row[2] or "").strip()[:80],
+            "due_at": str(row[3] or "").strip()[:40],
+        }
         for row in rows
         if str(row[0] or "").strip()
     ]
+
+
+def _scheduled_failure_display_time(
+    context: dict[str, object], *, language: str
+) -> str:
+    raw_at = str(context.get("at") or "").strip()
+    zone = str(context.get("timezone") or "").strip()
+    try:
+        local = datetime.fromisoformat(raw_at)
+    except (TypeError, ValueError):
+        local = None
+    if local is not None:
+        clock = (
+            f"{local.hour:02d}:{local.minute:02d}:{local.second:02d}"
+            if local.second or local.microsecond
+            else f"{local.hour:02d}:{local.minute:02d}"
+        )
+        if str(language or "").strip().lower().startswith("en"):
+            rendered = f"{local.year:04d}-{local.month:02d}-{local.day:02d} {clock}"
+            return f"{rendered} ({zone})" if zone else rendered
+        rendered = f"{local.year}年{local.month}月{local.day}日 {clock}"
+        return f"{rendered}（{zone}）" if zone else rendered
+    if raw_at:
+        return f"{raw_at}（{zone}）" if zone else raw_at
+    try:
+        due = datetime.fromtimestamp(float(context.get("due_at") or 0), timezone.utc)
+    except (TypeError, ValueError, OSError):
+        due = None
+    if due is not None and due.timestamp() > 0:
+        return due.strftime("%Y-%m-%d %H:%M UTC")
+    return "the scheduled time" if str(language or "").lower().startswith("en") else "原定时间"
 
 
 def _scheduled_failure_reply_text(
     error_class: str,
     *,
     language: str,
-    user_text: str,
-    notes: list[str],
+    contexts: list[dict[str, object]],
 ) -> str:
-    """Explain a missed timer without impersonating a model-authored reply."""
+    """Render approved system copy without impersonating the companion."""
+    notes = [str(item.get("note") or "").strip() for item in contexts]
+    title = "；".join(note for note in notes if note) or "这条提醒"
+    scheduled_time = _scheduled_failure_display_time(
+        contexts[0] if contexts else {}, language=language
+    )
     if str(language or "").strip().lower().startswith("en"):
-        reminder = (
-            " (" + "; ".join(notes) + ")"
-            if notes
-            else ""
-        )
-        if error_class == "provider_empty_reply":
+        if error_class == "quota_insufficient":
             return (
-                "A scheduled reminder" + reminder
-                + " was due, but your model service returned "
-                "an empty reply, so it could not be delivered. Please set it "
-                "again; if this keeps happening, check the model provider or relay."
+                "Reminder couldn't be delivered\n"
+                f"“{title}” was scheduled for {scheduled_time}, but could not be "
+                "delivered because the model-service quota was insufficient.\n"
+                "New reminders will work after you add credit; this one will not "
+                "be delivered automatically."
             )
         return (
-            "A scheduled reminder" + reminder
-            + " was due, but its reply could not be delivered. "
-            "Please set it again."
+            "Reminder couldn't be delivered\n"
+            f"“{title}” was scheduled for {scheduled_time}, but delivery still "
+            "failed after several attempts.\n"
+            "This reminder will not be delivered automatically; set a new one if "
+            "you still need it."
         )
-    reminder = (
-        "（" + "；".join(f"“{note}”" for note in notes) + "）"
-        if notes
-        else ""
-    )
+    if error_class == "quota_insufficient":
+        return (
+            "提醒没能送到\n"
+            f"「{title}」原定 {scheduled_time} 提醒你,因为模型服务额度不足没能送出。\n"
+            "充值后新的提醒就能正常工作;这一条不会自动补发。"
+        )
     return (
-        "刚才的定时任务" + reminder + "已触发，但 TA 的回复没有成功送达。"
-        + str(user_text or "连接模型服务时出了问题。").strip()
+        "提醒没能送到\n"
+        f"「{title}」原定 {scheduled_time} 提醒你,试了几次都没成功。\n"
+        "这条提醒不会自动补发,需要的话可以重新设一个。"
     )
 
 
@@ -3281,8 +3648,8 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         error_class,
         language=language,
     )
-    scheduled_notes = (
-        _scheduled_failure_notes(user_id, job_id)
+    scheduled_contexts = (
+        _scheduled_failure_contexts(user_id, job_id)
         if lane == "scheduled"
         else []
     )
@@ -3290,8 +3657,7 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         _scheduled_failure_reply_text(
             error_class,
             language=language,
-            user_text=user_text,
-            notes=scheduled_notes,
+            contexts=scheduled_contexts,
         )
         if lane == "scheduled"
         else (
@@ -4736,6 +5102,7 @@ def wake_lane_activity_for_user(user_id: str, *, within_hours: int = 72) -> dict
         "by_lane": {},
         "totals": {"jobs": 0, "completed": 0, "failed": 0, "pending": 0},
         "recent_failures": [],
+        "recent_silences": [],
         "last_terminal_at": "",
     }
     if not uid:
@@ -4762,6 +5129,15 @@ def wake_lane_activity_for_user(user_id: str, *, within_hours: int = 72) -> dict
                 (uid, list(WAKE_LANES_FOR_SUPPORT), safe_hours),
             )
             failures = cur.fetchall()
+            cur.execute(
+                "SELECT id, lane, wake_result_reason, finished_at FROM agent_jobs "
+                "WHERE user_id=%s AND lane = ANY(%s) "
+                "  AND status='completed' AND wake_result='sleep' "
+                "  AND finished_at >= now() - make_interval(hours => %s) "
+                "ORDER BY finished_at DESC, id DESC LIMIT 20",
+                (uid, list(WAKE_LANES_FOR_SUPPORT), safe_hours),
+            )
+            silences = cur.fetchall()
 
     by_lane: dict[str, dict] = {}
     totals = {"jobs": 0, "completed": 0, "failed": 0, "pending": 0}
@@ -4796,6 +5172,16 @@ def wake_lane_activity_for_user(user_id: str, *, within_hours: int = 72) -> dict
                 "finished_at": _iso_or_empty(r["finished_at"]),
             }
             for r in failures
+        ],
+        "recent_silences": [
+            {
+                "job_id": int(r["id"]),
+                "lane": str(r["lane"] or ""),
+                "wake_result": "sleep",
+                "reason": str(r["wake_result_reason"] or "")[:500],
+                "finished_at": _iso_or_empty(r["finished_at"]),
+            }
+            for r in silences
         ],
         "last_terminal_at": _iso_or_empty(last_terminal),
     }
@@ -10718,7 +11104,9 @@ def due_scheduled_users(*, now: float | None = None, limit: int = 500) -> list[s
     `DISTINCT ON (user_id, item_key) ... ORDER BY seq DESC` 只取每个 timer 的**最新一版**，
     否则早已 fire 的 timer 会被当成 pending 反复唤醒。
 
-    到期 = pending，或 claimed 但 claim 租约已过期（持有者死了）。触发的原子性由
+    到期 = pending，或 claimed 但 claim 租约已过期（持有者死了）。通用主动唤醒
+    失败退避只属于 heartbeat，不能推迟明确的提醒交付；但 BYOK 支付冷却仍会阻止
+    必然失败的模型调用。触发的原子性由
     `ScheduledWakeServiceV2.fire_due_timers` 内部的 claim_due CAS 保证——本函数只是个
     廉价的候选人筛子，允许假阳性（多个 scheduler 抢同一个 timer 是安全的）。"""
     ts = time.time() if now is None else float(now)
@@ -10735,11 +11123,8 @@ def due_scheduled_users(*, now: float | None = None, limit: int = 500) -> list[s
         "WHERE COALESCE(NULLIF(doc->>'due_at','')::float8, 0) <= %s "
         "  AND (doc->>'status' = 'pending' OR (doc->>'status' = 'claimed' "
         "       AND COALESCE(NULLIF(doc->>'claim_expires_at','')::float8, 0) <= %s)) "
-        "  AND (schedule.proactive_backoff_until IS NULL "
-        "       OR schedule.proactive_backoff_until <= to_timestamp(%s) "
-        "       OR schedule.proactive_fail_user_seq < "
-        + _LATEST_GENUINE_USER_SEQ_SQL
-        + ") "
+        "  AND (schedule.payment_cooldown_until IS NULL "
+        "       OR schedule.payment_cooldown_until <= to_timestamp(%s)) "
         "LIMIT %s"
     )
     with _pool().connection() as conn:

@@ -361,6 +361,31 @@ def test_openai_compat_payload_preserves_forced_tool_choice():
     assert payload["tool_choice"] is not choice
 
 
+def test_anthropic_payload_translates_forced_function_tool_choice():
+    payload, _url, _headers = pc._build_anthropic_payload(
+        model="claude-sonnet-4-5",
+        base_url="https://api.anthropic.com/v1",
+        key="sk-test",
+        messages=[{"role": "user", "content": "emit"}],
+        max_tokens=500,
+        temperature=0.2,
+        response_format={"type": "json_object"},
+        tools=[
+            ToolSpec(
+                name="emit_profile",
+                description="emit",
+                parameters={"type": "object", "properties": {}},
+            )
+        ],
+        tool_choice={
+            "type": "function",
+            "function": {"name": "emit_profile"},
+        },
+    )
+
+    assert payload["tool_choice"] == {"type": "tool", "name": "emit_profile"}
+
+
 def test_anthropic_payload_encodes_tool_choice_none_with_tools():
     payload, _url, _headers = pc._build_anthropic_payload(
         model="claude-opus-4-8",
@@ -382,6 +407,27 @@ def test_anthropic_payload_encodes_tool_choice_none_with_tools():
 
     assert payload["tools"][0]["name"] == "memory_index"
     assert payload["tool_choice"] == {"type": "none"}
+
+
+def test_provider_specific_named_tool_choice_wire_shapes():
+    choice = {"type": "function", "function": {"name": "workspace_write"}}
+    tool = ToolSpec("workspace_write", "write", {"type": "object", "properties": {}})
+    anthropic, _url, _headers = pc._build_anthropic_payload(
+        model="claude-opus-4-8", base_url="https://api.anthropic.com/v1", key="k",
+        messages=[{"role": "user", "content": "write"}], max_tokens=700,
+        temperature=None, response_format=None, tools=[tool], tool_choice=choice)
+    assert anthropic["tool_choice"] == {"type": "tool", "name": "workspace_write"}
+    gemini, _url, _headers = pc._build_gemini_payload(
+        model="gemini-2.5-pro", base_url="https://generativelanguage.googleapis.com/v1beta", key="k",
+        messages=[{"role": "user", "content": "write"}], max_tokens=700,
+        temperature=None, response_format=None, tools=[tool], tool_choice=choice)
+    assert gemini["toolConfig"]["functionCallingConfig"] == {
+        "mode": "ANY", "allowedFunctionNames": ["workspace_write"]}
+    bedrock, _url, _headers = pc._build_bedrock_payload(
+        model="anthropic.claude-3", base_url="https://bedrock.example", key="k",
+        messages=[{"role": "user", "content": [{"text": "write"}]}], max_tokens=700,
+        temperature=None, response_format=None, tools=[tool], tool_choice=choice)
+    assert bedrock["toolConfig"]["toolChoice"] == {"tool": {"name": "workspace_write"}}
 
 
 def test_parse_openai_compat_body_result_shape():
@@ -422,6 +468,65 @@ def test_parse_openai_compat_body_result_shape():
         pc._parse_openai_compat_body(
             FakeResponse(200, ["not-an-object"]),
             provider="openrouter", model="m", require_reply=False)
+
+
+def test_parse_openai_compat_body_preserves_all_visible_text_blocks():
+    resp = FakeResponse(200, {
+        "id": "chatcmpl-blocks",
+        "choices": [{
+            "message": {
+                "content": [
+                    {"type": "text", "text": "first visible block"},
+                    {"type": "reasoning", "text": "hidden chain of thought"},
+                    {"type": "output_text", "text": "second visible block"},
+                ],
+            },
+            "finish_reason": "stop",
+        }],
+    })
+
+    out = pc._parse_openai_compat_body(
+        resp, provider="openai_compatible", model="gpt-5.5", require_reply=True)
+
+    assert out["reply"] == "first visible block\nsecond visible block"
+    assert out["reasoning"] == "hidden chain of thought"
+
+
+def test_parse_openai_compat_body_treats_untyped_text_block_as_visible():
+    """Accept minimal relay text blocks that omit ``type``.
+
+    This is an explicit compatibility tradeoff: an untyped reasoning block
+    would be indistinguishable from visible text. Unknown *typed* blocks remain
+    fail-closed, while observed minimal relays keep their ordinary reply text.
+    """
+    resp = FakeResponse(200, {
+        "choices": [{"message": {"content": [{"text": "visible relay text"}]}}],
+    })
+
+    out = pc._parse_openai_compat_body(
+        resp, provider="openai_compatible", model="relay-model", require_reply=True)
+
+    assert out["reply"] == "visible relay text"
+
+
+def test_parse_openai_compat_body_drops_untyped_sibling_when_typed_blocks_exist():
+    """Mixed typed/untyped output fails closed for its ambiguous siblings.
+
+    A fully untyped list remains inherently ambiguous: without a type or
+    protocol marker there is no signal that can distinguish visible text from
+    reasoning. That residual risk is limited to all-untyped relay output.
+    """
+    resp = FakeResponse(200, {
+        "choices": [{"message": {"content": [
+            {"text": "ambiguous private reasoning"},
+            {"type": "text", "text": "visible answer"},
+        ]}}],
+    })
+
+    out = pc._parse_openai_compat_body(
+        resp, provider="openai_compatible", model="relay-model", require_reply=True)
+
+    assert out["reply"] == "visible answer"
 
 
 def test_parse_deepseek_body_extracts_reasoning_content():

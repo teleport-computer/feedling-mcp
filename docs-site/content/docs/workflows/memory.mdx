@@ -13,7 +13,7 @@ execution gate.
 
 ## Hosted profile refresh execution
 
-Runtime V2 generates its bounded Memory/User profile as low-priority Heavy-pool
+Runtime V2 generates its bounded MEMORY/STYLE profile as low-priority Heavy-pool
 work, separate from foreground Chat. It first verifies the complete lightweight
 Garden index, then fetches card bodies in stable batches of 64 and fails closed
 if any batch is incomplete. At most one Profile Job runs in a serve-worker
@@ -23,11 +23,29 @@ profile is not mistaken for a hung Job.
 
 This Profile is Runtime V2's automatic long-term semantic context. Chat first
 feeds asynchronous Capture, Capture updates the Memory Garden, and Profile
-refresh condenses that Garden into bounded MEMORY/USER fields. Chat and wake
+refresh condenses that Garden into bounded MEMORY/STYLE fields. Chat and wake
 then combine the latest usable fields with up to 40 and 16 complete recent raw
 turns respectively. Refresh lag or failure is non-blocking and preserves usable
 last-known-good fields; older raw conversation remains available only through
 explicit bounded `history_search`/`history_fetch` calls from foreground Chat.
+
+Non-empty MEMORY and STYLE fields enter the
+trusted system prefix after the current identity card (or transitional Genesis
+persona fallback) and before general behavior rules. They are presented as the
+companion's own memory and learned speaking style, while the verbatim
+conversation remains authoritative on conflict. World Book and changing runtime
+context stay in non-privileged application-data messages. A successful profile
+refresh changes that user's provider prompt-cache prefix once.
+
+Genesis onboarding and identity redistillation do not wait for the later
+maintenance refresh to create this profile. They use only valid cards,
+persona, and voice material produced from the current upload; Genesis never
+reads the existing encrypted Garden. The fields share Runtime V2's validation
+and encrypted CAS contract, and an untouched side keeps its existing envelope
+byte-for-byte. Profile publication remains required for these two paths.
+Add-memory imports do not write a profile at all: they write cards, changing
+the Garden fingerprint that causes the ordinary profile lane to perform the
+later full-Garden refresh.
 
 | Operation | Returns |
 | --- | --- |
@@ -149,6 +167,12 @@ The authenticated user must own every anchor. Reflection creation also has an
 endpoint-specific relationship-age cap and can return `429`; that response is
 not a generic service-wide rate limit.
 
+For new cards, datetime-valued `occurred_at` metadata is normalized to the same
+instant in UTC with a `Z` suffix. A date-only `YYYY-MM-DD` value remains
+date-only. The server stamps `created_at` in UTC with a `Z` suffix. Existing
+cards keep their stored timestamp strings when they are retyped, rewrapped, or
+otherwise updated; this does not backfill historical records.
+
 ```http
 HTTP/1.1 201 Created
 Content-Type: application/json
@@ -160,7 +184,7 @@ Content-Type: application/json
     "id": "mom_7f20d39af321",
     "type": "fact",
     "occurred_at": "2026-07-13T12:30:00Z",
-    "created_at": "2026-07-13T12:31:02.125000",
+    "created_at": "2026-07-13T12:31:02Z",
     "source": "live_conversation",
     "body_ct": "BASE64_CIPHERTEXT",
     "nonce": "BASE64_NONCE",
@@ -322,6 +346,21 @@ the memory content itself; card retirement bookkeeping is recorded by the
 server, never written into visible text. Ordinary prose about something being
 replaced is unaffected: the rejection requires an internal-id-like hex string
 next to the phrase.
+
+A `memory.supersede` action accepts one source ID or an array of at most 20
+source IDs. An oversized array fails that action with
+`too_many_supersedes` before any card is changed; it is never truncated to a
+successful prefix. On success, `superseded_ids` lists the cards the mutation
+actually retired rather than echoing the requested IDs. Every requested source
+must still be active when the mutation commits. If a source is already
+unavailable, the action fails with `supersede_targets_unavailable`; if one
+changes between validation and commit, it fails with
+`supersede_targets_changed`. Either failure leaves all source cards unchanged
+and does not write the successor. After either conflict, search or index memory
+again for the current active source IDs before retrying; do not repeat the stale
+IDs. Clients consolidating more than 20 cards should continue in a later
+request, including the returned successor ID among that request's at most 20
+source IDs.
 
 This example adds one encrypted card, retypes an existing card, supersedes an
 outdated card with a new encrypted card, and deletes a fourth card:
@@ -519,15 +558,13 @@ action and returns that action's HTTP status. Earlier results and effects remain
 committed; they are included in the error response and are not rolled back.
 Split independent writes when partial completion would be hard to reconcile.
 
-There is no `Idempotency-Key` support. Before an add, the server compares the
-normalized title and content with readable active shared cards. An exact
-normalized duplicate is not written: its result has `status: "ok"`, `noop: true`,
-`skipped: "duplicate_active"`, and `duplicate_of` set to the active card ID.
-Normalization applies Unicode NFKC, case folding, and whitespace collapsing.
-This protects exact retries but does not make a mixed batch idempotent: later
-actions can still target state changed by an earlier attempt. Read `index` or
-`fetch`, reconcile stable memory IDs, and construct a new batch instead of
-replaying the original blindly.
+There is no `Idempotency-Key` support and the server does not scan existing
+cards for duplicate content. Every accepted add creates a new memory ID and
+emits a write effect, even when its title and content match an active card.
+Prebuilt envelopes are validated from their plaintext metadata and envelope
+shape without decrypting their body during the add. Read `index` or `fetch`,
+reconcile stable memory IDs, and construct a new batch instead of replaying the
+original blindly.
 
 `memory.upgrade` exists for controlled legacy migration, but it is not part of
 the public Memory workflow and should not be emitted by ordinary clients.
@@ -561,14 +598,22 @@ X-API-Key: YOUR_FEEDLING_API_KEY
       "owner_user_id": "usr_0123456789abcdef"
     }
   ],
-  "total": 1
+  "total": 73,
+  "next_cursor": "eyJoIjp0cnVlLCJpIjoibW9tXzdmMjBkMzlhZjMyMSIsInQiOiIyMDI2LTA3LTEzVDEyOjMwOjAwKzAwOjAwIiwidiI6MX0"
 }
 ```
 
-`since` is compared with the ISO-8601 `occurred_at` metadata. Results are newest
-first, `limit` is capped at 200, and `total` is the number matching the filters
-before the page slice. This endpoint does not expose a universal cursor token;
-see [pagination rules](/docs/reliability#pagination).
+`since` and card `occurred_at` values are parsed as ISO-8601 instants before
+comparison, so equivalent `Z`, offset, and legacy naive datetime strings sort
+consistently. Date-only values are interpreted at UTC midnight. Invalid card
+timestamps sort after valid timestamps and are excluded when a valid `since`
+filter is active. Results are newest first with memory ID as a stable tie-break.
+The default `limit` is 50 and the server caps a page at 500. `total` is the
+number matching the filters before any cursor or page slice, so it stays
+constant while paging. Pass each opaque `next_cursor` back as `cursor` until the
+response returns `next_cursor: null`. Existing clients may continue to omit the
+cursor and receive the same first-page filtering and ordering behavior. See the
+[pagination rules](/docs/reliability#pagination).
 
 ## Retype an existing card
 

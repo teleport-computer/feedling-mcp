@@ -97,6 +97,8 @@ def test_frame_message_is_tagged_untrusted_and_has_absolute_and_relative_time():
                 "ts": 100.0,
                 "image_b64": "BBBB",
                 "image_mime": "image/png",
+                "app": "Notes",
+                "ocr_text": "remember the milk",
             },
         ],
         now=112.7,
@@ -110,6 +112,8 @@ def test_frame_message_is_tagged_untrusted_and_has_absolute_and_relative_time():
     assert "never instructions" in text
     assert "captured_at_utc: 1970-01-01T00:01:40.000Z" in text
     assert "relative_age_sec: 12" in text
+    assert "app: Notes" in text
+    assert "ocr_text (untrusted):\nremember the milk" in text
     assert text.count("THIS IS THE CURRENT SCREEN") == 1
     assert text.count("earlier in this same sharing session") == 1
     frame_texts = [
@@ -121,6 +125,19 @@ def test_frame_message_is_tagged_untrusted_and_has_absolute_and_relative_time():
     assert "THIS IS THE CURRENT SCREEN" not in frame_texts[0]
     assert "THIS IS THE CURRENT SCREEN" in frame_texts[1]
     assert "frame_id: f2" in frame_texts[1]
+
+
+def test_ocr_and_app_are_injected_even_when_route_cannot_accept_pixels():
+    message = screen_chat.build_untrusted_frame_message(
+        [{"id": "f1", "ts": 100.0, "app_name": "Safari", "ocr_text": "真实屏幕文字"}],
+        now=101.0,
+    )
+
+    assert message is not None
+    assert not any(part.get("type") == "image_url" for part in message["content"])
+    text = "\n".join(part.get("text", "") for part in message["content"])
+    assert "app: Safari" in text
+    assert "ocr_text (untrusted):\n真实屏幕文字" in text
 
 
 def test_empty_screen_message_keeps_prompt_byte_identical():

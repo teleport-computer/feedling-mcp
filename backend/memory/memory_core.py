@@ -20,18 +20,23 @@ the action executor) so the framework adapter just serializes it.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import json
 import uuid
 from datetime import datetime
 
 import db
 import debug_trace
 from accounts import registry
+from core import envelope as core_envelope
 from bootstrap import gates as boot_gates
 from identity import service as identity_service
 from memory import actions as memory_actions_mod
 from memory import migration as memory_migration
 from memory import service as memory_service
+from memory_garden import timestamps as memory_timestamps
 import memory_readside_core
 
 
@@ -267,19 +272,147 @@ def legacy_batch(store, api_key, runtime_token: str, payload: dict) -> tuple[dic
 # plain store reads
 # --------------------------------------------------------------------------- #
 
-def list_moments(store, *, limit_raw, since: str, include_archived_raw) -> tuple[dict, int]:
+MEMORY_LIST_DEFAULT_LIMIT = 50
+MEMORY_LIST_MAX_LIMIT = 500
+_MEMORY_LIST_CURSOR_VERSION = 1
+_MEMORY_LIST_CURSOR_MAX_CHARS = 1024
+
+
+class _MemoryListCursorInvalid(ValueError):
+    pass
+
+
+def _memory_list_key(moment: dict) -> tuple[bool, datetime, str]:
+    has_valid_ts, occurred_at = memory_timestamps.sort_key(moment.get("occurred_at"))
+    return has_valid_ts, occurred_at, str(moment.get("id") or "")
+
+
+def _encode_memory_list_cursor(moment: dict) -> str:
+    has_valid_ts, occurred_at, moment_id = _memory_list_key(moment)
+    payload = {
+        "v": _MEMORY_LIST_CURSOR_VERSION,
+        "h": has_valid_ts,
+        "t": occurred_at.isoformat() if has_valid_ts else None,
+        "i": moment_id,
+    }
+    raw = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _decode_memory_list_cursor(token: str) -> tuple[bool, datetime, str]:
+    text = str(token or "")
+    if not text or len(text) > _MEMORY_LIST_CURSOR_MAX_CHARS:
+        raise _MemoryListCursorInvalid
     try:
-        limit = min(int(limit_raw), 200)
+        raw = base64.b64decode(
+            (text + "=" * (-len(text) % 4)).encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeEncodeError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError):
+        raise _MemoryListCursorInvalid from None
+    if not isinstance(payload, dict) or set(payload) != {"v", "h", "t", "i"}:
+        raise _MemoryListCursorInvalid
+    if (
+        type(payload.get("v")) is not int
+        or payload["v"] != _MEMORY_LIST_CURSOR_VERSION
+        or not isinstance(payload.get("h"), bool)
+    ):
+        raise _MemoryListCursorInvalid
+    moment_id = payload.get("i")
+    if not isinstance(moment_id, str) or not moment_id:
+        raise _MemoryListCursorInvalid
+    if payload["h"]:
+        if not isinstance(payload.get("t"), str):
+            raise _MemoryListCursorInvalid
+        occurred_at = memory_timestamps.parse_ts(payload["t"])
+        if occurred_at is None:
+            raise _MemoryListCursorInvalid
+    else:
+        if payload.get("t") is not None:
+            raise _MemoryListCursorInvalid
+        occurred_at = memory_timestamps.sort_key(None)[1]
+    key = payload["h"], occurred_at, moment_id
+    canonical_moment = {
+        "id": moment_id,
+        "occurred_at": occurred_at.isoformat() if payload["h"] else "",
+    }
+    canonical = _encode_memory_list_cursor(canonical_moment)
+    if canonical != text:
+        raise _MemoryListCursorInvalid
+    return key
+
+
+def _sort_memory_list(moments: list[dict]) -> list[dict]:
+    # ``db.memory_load`` already returns identical raw timestamps by moment_id
+    # ascending.  Repeat that tie-break here so test doubles and future storage
+    # adapters get the same deterministic order, then use the historical stable
+    # timestamp sort to preserve the no-cursor first-page behavior.
+    by_id = sorted(moments, key=lambda m: str(m.get("id") or ""))
+    return sorted(
+        by_id,
+        key=lambda m: memory_timestamps.sort_key(m.get("occurred_at")),
+        reverse=True,
+    )
+
+
+def list_moments(
+    store,
+    *,
+    limit_raw,
+    cursor: str = "",
+    since: str,
+    include_archived_raw,
+) -> tuple[dict, int]:
+    try:
+        limit = min(int(limit_raw), MEMORY_LIST_MAX_LIMIT)
     except (TypeError, ValueError):
+        return {"error": "invalid limit"}, 400
+    if limit < 1:
         return {"error": "invalid limit"}, 400
     include_archived = str(include_archived_raw or "").lower() in {"1", "true", "yes"}
     moments = memory_service._load_moments(store)
     if not include_archived:
         moments = memory_service._active_memory_moments(moments)
-    if since:
-        moments = [m for m in moments if m.get("occurred_at", "") >= since]
-    moments = sorted(moments, key=lambda m: m.get("occurred_at", ""), reverse=True)
-    return {"moments": moments[:limit], "total": len(moments)}, 200
+    since_ts = memory_timestamps.parse_ts(since)
+    if since_ts is not None:
+        moments = [
+            m
+            for m in moments
+            if (
+                occurred_ts := memory_timestamps.parse_ts(m.get("occurred_at"))
+            ) is not None
+            and occurred_ts >= since_ts
+        ]
+    moments = _sort_memory_list(moments)
+    total = len(moments)
+    if cursor:
+        try:
+            cursor_key = _decode_memory_list_cursor(cursor)
+        except _MemoryListCursorInvalid:
+            return {"error": "invalid cursor"}, 400
+        try:
+            start = next(
+                index + 1
+                for index, moment in enumerate(moments)
+                if _memory_list_key(moment) == cursor_key
+            )
+        except StopIteration:
+            return {"error": "invalid cursor"}, 400
+        moments = moments[start:]
+    page = moments[:limit]
+    next_cursor = (
+        _encode_memory_list_cursor(page[-1])
+        if page and len(moments) > limit
+        else None
+    )
+    return {"moments": page, "total": total, "next_cursor": next_cursor}, 200
 
 
 def get_moment(store, moment_id: str) -> tuple[dict, int]:
@@ -311,20 +444,15 @@ def delete_moment(store, moment_id: str) -> tuple[dict, int]:
 
 def add(store, payload: dict) -> tuple[dict, int]:
     envelope = payload.get("envelope")
-    now = datetime.now().isoformat()
+    now = memory_timestamps.now_iso()
 
     if envelope is None:
         return {"error": "envelope required (v1 encryption is mandatory)"}, 400
 
-    required = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
-    missing = [f for f in required if not envelope.get(f)]
-    if missing:
-        return {"error": "envelope_missing_fields", "detail": missing}, 400
-    if envelope["visibility"] not in ("shared", "local_only"):
-        return {"error": "envelope.visibility must be 'shared' or 'local_only'"}, 400
-    if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
-        return {"error": "envelope with visibility=shared requires K_enclave"}, 400
-    occurred_at = (envelope.get("occurred_at") or "").strip()
+    gate_err = core_envelope.validate_uploaded_envelope(envelope, user_id=store.user_id)
+    if gate_err is not None:
+        return gate_err, 400
+    occurred_at = memory_timestamps.normalize(envelope.get("occurred_at"))
     if not occurred_at:
         return {"error": "occurred_at required (plaintext metadata for ordering)"}, 400
     if envelope["owner_user_id"] != store.user_id:
@@ -389,15 +517,9 @@ def add(store, payload: dict) -> tuple[dict, int]:
         "occurred_at": occurred_at,
         "created_at": now,
         "source": (envelope.get("source") or "live_conversation").strip(),
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
-        "visibility": envelope["visibility"],
-        "owner_user_id": envelope["owner_user_id"],
+        "enclave_pk_fpr": "",
+        **core_envelope.envelope_storage_fields(envelope),
     }
-    if envelope.get("K_enclave"):
-        moment["K_enclave"] = envelope["K_enclave"]
     if anchor_ids:
         moment["anchor_memory_ids"] = list(anchor_ids)
     # Re-read + append + save under one memory_lock hold so a concurrent

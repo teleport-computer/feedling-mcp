@@ -316,11 +316,11 @@ def test_v2_cache_breakpoints_exclude_dynamic_perception_grounding() -> None:
     assert _nested_cache_controls(anthropic["messages"][-1]["content"]) == []
 
 
-def test_stable_skills_and_working_memory_precede_dynamic_cache_frontier() -> None:
+def test_stable_skills_precede_dynamic_cache_frontier() -> None:
     messages = v2_context.build_turn_messages(
         system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
         trusted_system_blocks=("<skill>stable skill</skill>",),
-        working_memory="- project alpha is active",
+        agent_memory="- project alpha is active",
         tail=[{"role": "user", "content": "continue"}],
         action_context="now=dynamic",
     )
@@ -337,12 +337,8 @@ def test_stable_skills_and_working_memory_precede_dynamic_cache_frontier() -> No
         tools=TOOLS,
         prompt_cache_key=CACHE_KEY,
     )
-    working = next(
-        message
-        for message in openrouter["messages"]
-        if v2_context.WORKING_MEMORY_HEADER in str(message.get("content"))
-    )
-    assert _nested_cache_controls(working["content"]) == [
+    assert "<skill>stable skill</skill>" in str(openrouter["messages"][0])
+    assert _nested_cache_controls(openrouter["messages"][0]) == [
         {"type": "ephemeral"}
     ]
 
@@ -373,27 +369,13 @@ def test_stable_skills_and_working_memory_precede_dynamic_cache_frontier() -> No
         tools=TOOLS,
         prompt_cache_key=CACHE_KEY,
     )
-    merged = bedrock["messages"][0]["content"]
-    working_index = next(
-        index
-        for index, block in enumerate(merged)
-        if v2_context.WORKING_MEMORY_HEADER in str(block.get("text") or "")
-    )
-    runtime_index = next(
-        index
-        for index, block in enumerate(merged)
-        if v2_context.RUNTIME_CONTEXT_HEADER in str(block.get("text") or "")
-    )
-    assert merged[working_index + 1] == {"cachePoint": {"type": "default"}}
-    assert working_index < working_index + 1 < runtime_index
-    assert not any("cachePoint" in block for block in merged[runtime_index + 1 :])
+    assert "<skill>stable skill</skill>" in str(bedrock["system"])
 
 
-def test_profile_header_contract_and_cache_priority_on_openai_and_anthropic():
+def test_memory_header_contract_and_system_cache_priority_on_openai_and_anthropic():
     assert pc._PROFILE_HEADER == v2_context.AGENT_MEMORY_HEADER.splitlines()[0]
     messages = v2_context.build_turn_messages(
         system_prompt="stable system",
-        working_memory="- editable state",
         agent_memory="stable relationship facts",
         user_profile="stable interaction style",
         tail=[
@@ -405,12 +387,13 @@ def test_profile_header_contract_and_cache_priority_on_openai_and_anthropic():
     )
 
     marked_openai = pc._mark_openai_chat_cache_breakpoint(messages)
-    openai_profile = next(
-        message
-        for message in marked_openai
-        if pc._is_profile_message(message)
+    assert v2_context.AGENT_MEMORY_HEADER in pc._content_text(
+        marked_openai[0]["content"]
     )
-    assert _nested_cache_controls(openai_profile) == [{"type": "ephemeral"}]
+    assert v2_context.USER_PROFILE_HEADER in pc._content_text(
+        marked_openai[0]["content"]
+    )
+    assert not any(pc._is_profile_message(message) for message in marked_openai)
     assert _nested_cache_controls(marked_openai[0]) == [{"type": "ephemeral"}]
     openai_newest = next(
         message
@@ -423,7 +406,7 @@ def test_profile_header_contract_and_cache_priority_on_openai_and_anthropic():
         if pc._content_text(message.get("content")) == "older request"
     )
     assert _nested_cache_controls(openai_newest) == [{"type": "ephemeral"}]
-    assert _nested_cache_controls(openai_older) == []
+    assert _nested_cache_controls(openai_older) == [{"type": "ephemeral"}]
     assert not any(
         _nested_cache_controls(message)
         for message in marked_openai
@@ -437,11 +420,9 @@ def test_profile_header_contract_and_cache_priority_on_openai_and_anthropic():
         messages[1:],
     )
     assert _nested_cache_controls(anthropic_system) == [{"type": "ephemeral"}]
-    anthropic_profile = next(
-        message
-        for message in marked_anthropic
-        if pc._is_profile_message(message)
-    )
+    assert v2_context.AGENT_MEMORY_HEADER in pc._content_text(anthropic_system)
+    assert v2_context.USER_PROFILE_HEADER in pc._content_text(anthropic_system)
+    assert not any(pc._is_profile_message(message) for message in marked_anthropic)
     newest_user = next(
         message
         for message in marked_anthropic
@@ -452,9 +433,8 @@ def test_profile_header_contract_and_cache_priority_on_openai_and_anthropic():
         for message in marked_anthropic
         if pc._content_text(message.get("content")) == "older request"
     )
-    assert _nested_cache_controls(anthropic_profile) == [{"type": "ephemeral"}]
     assert _nested_cache_controls(newest_user) == [{"type": "ephemeral"}]
-    assert _nested_cache_controls(older_user) == []
+    assert _nested_cache_controls(older_user) == [{"type": "ephemeral"}]
     assert not any(
         _nested_cache_controls(message)
         for message in marked_anthropic
@@ -462,12 +442,17 @@ def test_profile_header_contract_and_cache_priority_on_openai_and_anthropic():
     )
 
 
-def test_working_memory_revision_preserves_skill_prefix_on_all_cache_wires():
+def test_working_memory_revision_never_changes_any_prompt_cache_wire():
     backend = InMemoryWorkspaceBackend()
     backend.put_read_only(
         "/skills/research.md",
         "Stable research policy",
         kind="skill",
+        expected_revision=0,
+    )
+    backend.write(
+        "/memory/WORKING.md",
+        "Initial editable state",
         expected_revision=0,
     )
 
@@ -478,10 +463,6 @@ def test_working_memory_revision_preserves_skill_prefix_on_all_cache_wires():
             trusted_system_blocks=tuple(
                 block.content for block in blocks
                 if block.name.startswith("skill:")
-            ),
-            working_memory=next(
-                block.content for block in blocks
-                if block.name == "working-memory"
             ),
             tail=[{"role": "user", "content": "continue"}],
             action_context="dynamic-now",
@@ -512,19 +493,8 @@ def test_working_memory_revision_preserves_skill_prefix_on_all_cache_wires():
 
     first_openrouter = openrouter(first_messages)
     second_openrouter = openrouter(second_messages)
-    assert first_openrouter["messages"][0] == second_openrouter["messages"][0]
+    assert first_openrouter == second_openrouter
     assert "Stable research policy" in str(first_openrouter["messages"][0])
-    first_working = next(
-        message for message in first_openrouter["messages"]
-        if v2_context.WORKING_MEMORY_HEADER in str(message.get("content"))
-    )
-    second_working = next(
-        message for message in second_openrouter["messages"]
-        if v2_context.WORKING_MEMORY_HEADER in str(message.get("content"))
-    )
-    assert first_working != second_working
-    assert _nested_cache_controls(first_working) == [{"type": "ephemeral"}]
-    assert _nested_cache_controls(second_working) == [{"type": "ephemeral"}]
 
     def anthropic(messages):
         payload, _, _ = pc._build_anthropic_payload(
@@ -542,8 +512,7 @@ def test_working_memory_revision_preserves_skill_prefix_on_all_cache_wires():
 
     first_anthropic = anthropic(first_messages)
     second_anthropic = anthropic(second_messages)
-    assert first_anthropic["system"] == second_anthropic["system"]
-    assert first_anthropic["messages"] != second_anthropic["messages"]
+    assert first_anthropic == second_anthropic
     assert _nested_cache_controls(first_anthropic["system"]) == [
         {"type": "ephemeral"}
     ]
@@ -564,23 +533,8 @@ def test_working_memory_revision_preserves_skill_prefix_on_all_cache_wires():
 
     first_bedrock_payload = bedrock(first_messages)
     second_bedrock_payload = bedrock(second_messages)
-    assert (
-        first_bedrock_payload["system"]
-        == second_bedrock_payload["system"]
-    )
+    assert first_bedrock_payload == second_bedrock_payload
     assert "Stable research policy" in str(first_bedrock_payload["system"])
-    first_bedrock = first_bedrock_payload["messages"][0]["content"]
-    second_bedrock = second_bedrock_payload["messages"][0]["content"]
-    assert first_bedrock != second_bedrock
-    for blocks in (first_bedrock, second_bedrock):
-        working_index = next(
-            index for index, block in enumerate(blocks)
-            if v2_context.WORKING_MEMORY_HEADER
-            in str(block.get("text") or "")
-        )
-        assert blocks[working_index + 1] == {
-            "cachePoint": {"type": "default"}
-        }
 
 
 def test_direct_anthropic_two_turn_runtime_data_preserves_cached_prefix() -> None:

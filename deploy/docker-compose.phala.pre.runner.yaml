@@ -20,6 +20,7 @@
 #   FEEDLING_RUNTIME_TOKEN_SECRET same value as the main backend
 #   FEEDLING_API_URL              main CVM public ingress URL
 #   FEEDLING_ENCLAVE_URL          main CVM enclave gateway-passthrough URL
+#   R2_*                          same frame-object store as the backend
 #   FEEDLING_HOST_ALL=1           mirror the backend
 #   AGENT_MAX_CHILDREN            per-runner capacity ceiling (must cover the
 #                                 user count or some users go unserved)
@@ -36,6 +37,15 @@ x-agent-runner-env: &agent-runner-env
   AGENT_RESOLVE_CONCURRENCY: "${AGENT_RESOLVE_CONCURRENCY:-8}"
   AGENT_RUNTIME_ISOLATION: "process"
   DATABASE_URL: "${DATABASE_URL:-}"
+  R2_ENDPOINT: "${R2_ENDPOINT:-}"
+  R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"
+  R2_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY:-}"
+  R2_FRAMES_BUCKET: "${R2_FRAMES_BUCKET:-}"
+  # Must flip atomically with DATABASE_URL during Phase-4 promotion. Child
+  # processes inherit it and perform the same read-only TEE-head assertion.
+  FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
+  # Keep V1 reply writes aligned with the Pre API's per-user plaintext gate.
+  FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "1"
   AGENT_RUNTIME_USERS: "${AGENT_RUNTIME_USERS:-}"
   AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
   FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
@@ -54,7 +64,7 @@ services:
   # re-acquires here resumes from a consistent cursor (no cross-runner
   # stale-checkpoint wedge).
   agent-runner:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:453d65e   # CI pins the sha
+    image: ghcr.io/teleport-computer/feedling-agent-runner:4efdff1   # CI pins the sha
     container_name: agent-runner
     command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
     restart: unless-stopped

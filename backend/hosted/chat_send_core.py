@@ -222,9 +222,14 @@ def model_api_chat_send_core(
         )
         return {"error": "turns_halted"}, 503
 
-    # §6 admission ceiling：存活闸已保证 ≥1 活 worker；再估排队等待，超 SLA 就在
-    # persist 之前回独立 busy（区别于 workers_unavailable=供给死）。任何计算异常
-    # fail-open（放行）——此闸绝不能自身变成故障源。
+    # §6 admission telemetry：存活闸已保证 ≥1 活 worker；继续估算排队等待，
+    # 但容量过载不能拒绝用户输入。V2 的原子 append+enqueue 已经能持久化并合并
+    # 同一用户的新输入；在它之前返回 busy 会让消息只留在客户端输入框里，使
+    # 后端的 chat-priority / wake-preemption 闸完全看不见这次用户发言。
+    #
+    # 控制面、worker liveness、kill switch 等 fail-closed 闸仍在上方；这里只把
+    # live-but-overloaded 从 admission decision 降为可观测信号。任何估算异常也继续
+    # fail-open（放行）——telemetry 绝不能自身变成故障源。
     _inflight = _workers = 0
     try:
         _workers = jobs_store.live_worker_capacity(
@@ -250,11 +255,10 @@ def model_api_chat_send_core(
     if not _admit:
         debug_trace.trace_event(
             store, subsystem="route", type="route.decided", actor="host_agent_runtime",
-            status="gated", summary="admission_over_sla",
-            detail={"mode": "blocked", "reason": "queue_over_sla",
+            status="ok", summary="admission_over_sla",
+            detail={"mode": "admit", "reason": "queue_over_sla",
                     "est_wait_sec": int(_est), "inflight": _inflight, "workers": _workers},
         )
-        return {"error": "busy", "reason": "queue_over_sla", "est_wait_sec": int(_est)}, 503
     # ---- end V2 gates ---------------------------------------------------------
 
     config = hosted_config_store._load_model_api_config(store)
@@ -265,7 +269,11 @@ def model_api_chat_send_core(
         user_plaintext = file_parse["bytes"]
     else:
         user_plaintext = message.encode("utf-8")
-    user_env, env_err = core_envelope._build_shared_envelope_for_store(store, user_plaintext)
+    user_env, env_err = core_envelope._build_shared_envelope_for_store(
+        store,
+        user_plaintext,
+        content_kind="binary" if (has_image or has_file) else "text",
+    )
     if user_env is None:
         return {"error": "user_message_envelope_failed", "detail": env_err}, 409
     # A supported provider enters the unified V2 loop; reject before persistence
@@ -472,7 +480,11 @@ def _send_resident(
         user_plaintext = file_parse["bytes"]
     else:
         user_plaintext = message.encode("utf-8")
-    user_env, env_err = core_envelope._build_shared_envelope_for_store(store, user_plaintext)
+    user_env, env_err = core_envelope._build_shared_envelope_for_store(
+        store,
+        user_plaintext,
+        content_kind="binary" if (has_image or has_file) else "text",
+    )
     if user_env is None:
         return {"error": "user_message_envelope_failed", "detail": env_err}, 409
     # 收口：配了 fit provider 即托管到 agent-runner，否则 409。

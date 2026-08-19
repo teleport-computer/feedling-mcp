@@ -19,13 +19,13 @@ from tee_shadow import ciphertext_prune
 def test_prune_keys_sql_arity_matches_delete_sql():
     """两条 keys SQL 选出的列数必须与 DELETE 的占位符数一致。
 
-    prune 把差集里的元组**原样**喂给 requeue_delete_tee_sql。列数对不上时
+    prune 把差集里的元组**原样**喂给独立的 prune DELETE SQL。列数对不上时
     psycopg 会在真环境里抛参数个数错误，而本仓库的 TEE 侧失败是被吞掉的
     （影子期铁律）——只会计入失败计数，不会有人立刻发现。所以在这里静态卡死。
     """
     for table in ciphertext_prune.prunable_tables():
         cfg = tee_worker._TABLES[table]
-        n_delete = cfg.requeue_delete_tee_sql.count("%s")
+        n_delete = ciphertext_prune._PRUNE_DELETE_SQL[table].count("%s")
         for label, sql in (("rds", cfg.prune_rds_keys_sql),
                            ("tee", cfg.prune_tee_keys_sql)):
             n_select = len([c for c in sql.split("FROM")[0]
@@ -54,15 +54,15 @@ def test_frame_envelopes_reads_rds_and_tee_from_different_tables():
     assert "FROM frames" in cfg.prune_tee_keys_sql
 
 
-def test_append_only_tables_are_not_pruned_and_are_reported():
+def test_only_tables_without_a_safe_delete_contract_are_reported_uncovered():
     """没有删除语义的纯 append-only 表不参与 prune，但必须出现在 uncovered 里。
 
     prune 存在的理由就是"静默的覆盖缺口"，它自己不能再制造一个。
     """
     covered = set(ciphertext_prune.prunable_tables())
     uncovered = set(ciphertext_prune.unprunable_tables())
-    for t in ("chat_message_archive", "v2_trajectory_events",
-              "v2_conversation_summary_segments"):
+    assert "v2_trajectory_events" in covered
+    for t in ("chat_message_archive", "v2_conversation_summary_segments"):
         assert t not in covered, f"{t} 没有删除语义，不该参与 prune"
         assert t in uncovered, f"{t} 未覆盖但没进报告——静默缺口"
     assert not (covered & uncovered)

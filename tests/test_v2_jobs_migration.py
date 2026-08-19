@@ -70,14 +70,55 @@ def _migration_0085_module():
     )
 
 
-def test_agent_jobs_available_at_is_the_single_installed_head():
+def test_agent_jobs_chain_has_one_installed_head_and_available_at_baseline():
     """A deploy missing the durable baseline migration must fail before rollout."""
     backend = Path(__file__).parent.parent / "backend"
     cfg = Config(str(backend / "alembic.ini"))
     cfg.set_main_option("script_location", str(backend / "alembic"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0088_agent_jobs_available_at"]
+    heads = script.get_heads()
+    assert heads == ["0093_lane_rollup_voice"]
+    assert (script.get_revision("0093_lane_rollup_voice").down_revision
+            == "0092_lane_rollup_safe_ts")
+    assert (script.get_revision("0092_lane_rollup_safe_ts").down_revision
+            == "0091_lane_daily_rollup")
+    rollup = script.get_revision("0091_lane_daily_rollup")
+    assert rollup.down_revision == "0090_merge_wake_outcomes"
+    release_merge = script.get_revision("0090_merge_wake_outcomes")
+    assert set(release_merge.down_revision) == {
+        "0089_merge_pre_test_agent_jobs",
+        "0089_v2_wake_outcomes",
+    }
+    final_merge = script.get_revision("0089_merge_pre_test_agent_jobs")
+    assert set(final_merge.down_revision) == {
+        "0088_merge_pre_test_heads",
+        "0088_agent_jobs_available_at",
+    }
+    convergence = script.get_revision("0088_merge_pre_test_heads")
+    assert set(convergence.down_revision) == {
+        "0086_merge_voice_wake",
+        "0087_v2_first_chat_activation",
+    }
+    merge = script.get_revision("0086_merge_voice_wake")
+    assert set(merge.down_revision) == {
+        "0085_voice_transcript_shapes",
+        "0084_wake_support_indexes",
+    }
+    voice_shape = script.get_revision("0085_voice_transcript_shapes")
+    assert len(voice_shape.revision) <= 32
+    assert voice_shape.down_revision == "0084_merge_screen_plaintext"
+    assert "transcript_envelope ? 'body'" in voice_shape.module._shape_check(
+        "transcript_envelope"
+    )
+    assert set(
+        script.get_revision("0084_merge_screen_plaintext").down_revision
+    ) == {
+        "0083_screen_chat_frames",
+        "0079_merge_admin_plaintext",
+    }
+    migration = script.get_revision("0084_wake_support_indexes")
+    assert migration.down_revision == "0083_screen_chat_frames"
     migration = script.get_revision("0088_agent_jobs_available_at")
     assert migration.down_revision == "0087_v2_first_chat_activation"
     migration = script.get_revision("0087_v2_first_chat_activation")
@@ -86,12 +127,13 @@ def test_agent_jobs_available_at_is_the_single_installed_head():
     assert migration.down_revision == "0085_v2_wake_shadow_decisions"
     migration = script.get_revision("0085_v2_wake_shadow_decisions")
     assert migration.down_revision == "0084_wake_support_indexes"
-    assert script.get_revision("0084_wake_support_indexes").down_revision == (
-        "0083_screen_chat_frames"
-    )
     assert script.get_revision("0083_screen_chat_frames").down_revision == (
         "0082_merge_image_voice"
     )
+    assert set(script.get_revision("0079_merge_admin_plaintext").down_revision) == {
+        "0078_admin_dashboard_indexes",
+        "0078_merge_plaintext_perception",
+    }
     assert script.get_revision("0082_merge_image_voice").down_revision == (
         "0073_image_generation_route",
         "0081_voice_call_sessions",
@@ -108,6 +150,8 @@ def test_agent_jobs_available_at_is_the_single_installed_head():
     migration = script.get_revision("0077_perception_signal_state_v2")
     assert migration.down_revision == "0076_plaintext_job_exclusivity"
 
+
+def test_perception_signal_schema_is_installed_at_the_merged_head():
     with db.get_pool().connection() as conn:
         installed_head = conn.execute(
             "SELECT version_num FROM alembic_version"
@@ -156,7 +200,7 @@ def test_agent_jobs_available_at_is_the_single_installed_head():
             "AND indexname='ix_agent_jobs_pending_available_at'"
         ).fetchone()
 
-    assert installed_head == ("0088_agent_jobs_available_at",)
+    assert installed_head == ("0093_lane_rollup_voice",)
     assert available_at[:2] == ("timestamp with time zone", "NO")
     assert "now()" in str(available_at[2])
     assert pending_index is not None
@@ -185,7 +229,10 @@ def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
     assert "INSERT INTO v2_usage_daily" not in migration._SCHEMA_UP
 
     with db.get_pool().connection() as conn:
-        head = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+        heads = {
+            row[0]
+            for row in conn.execute("SELECT version_num FROM alembic_version").fetchall()
+        }
         tables = {
             row[0]
             for row in conn.execute(
@@ -221,7 +268,7 @@ def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
             "AND tgrelid='v2_turn_metrics'::regclass"
         ).fetchone()[0]
 
-    assert head == ("0088_agent_jobs_available_at",)
+    assert heads == {"0093_lane_rollup_voice"}
     assert tables == {
         "v2_usage_daily_users",
         "v2_usage_daily_dimensions",
@@ -524,13 +571,15 @@ def test_0075_downgrade_and_replay_is_repeatable():
     try:
         command.downgrade(cfg, "0074_runtime_user_delivery_idx")
         with db.get_pool().connection() as conn:
-            assert set(
-                conn.execute(
+            assert {
+                row[0]
+                for row in conn.execute(
                     "SELECT version_num FROM alembic_version"
                 ).fetchall()
-            ) == {
-                ("0073_image_generation_route",),
-                ("0074_runtime_user_delivery_idx",),
+            } == {
+                "0073_image_generation_route",
+                "0074_merge_plaintext_tail",
+                "0074_runtime_user_delivery_idx",
             }
             assert conn.execute(
                 "SELECT to_regclass('v2_usage_daily_users')"
@@ -538,13 +587,15 @@ def test_0075_downgrade_and_replay_is_repeatable():
 
         command.upgrade(cfg, "0075_v2_usage_rollup")
         with db.get_pool().connection() as conn:
-            assert set(
-                conn.execute(
+            assert {
+                row[0]
+                for row in conn.execute(
                     "SELECT version_num FROM alembic_version"
                 ).fetchall()
-            ) == {
-                ("0073_image_generation_route",),
-                ("0075_v2_usage_rollup",),
+            } == {
+                "0073_image_generation_route",
+                "0074_merge_plaintext_tail",
+                "0075_v2_usage_rollup",
             }
             assert conn.execute(
                 "SELECT to_regclass('v2_usage_daily_users')"
@@ -553,13 +604,15 @@ def test_0075_downgrade_and_replay_is_repeatable():
         command.downgrade(cfg, "0074_runtime_user_delivery_idx")
         command.upgrade(cfg, "0075_v2_usage_rollup")
         with db.get_pool().connection() as conn:
-            assert set(
-                conn.execute(
+            assert {
+                row[0]
+                for row in conn.execute(
                     "SELECT version_num FROM alembic_version"
                 ).fetchall()
-            ) == {
-                ("0073_image_generation_route",),
-                ("0075_v2_usage_rollup",),
+            } == {
+                "0073_image_generation_route",
+                "0074_merge_plaintext_tail",
+                "0075_v2_usage_rollup",
             }
             assert conn.execute(
                 "SELECT to_regclass('v2_usage_daily_dimensions')"

@@ -6,6 +6,17 @@ on:
   pull_request:
     branches: [main, test, pre]
   workflow_dispatch:
+    inputs:
+      operation:
+        description: "Optional maintenance operation"
+        required: false
+        default: validate
+        type: choice
+        options:
+          - validate
+          - check-test-transport
+          - diagnose-test-photo
+          - restart-test-cvm
 
 # Pull-request validation is replaceable, but branch pushes may already be
 # between the main-CVM and runner-CVM mutations. Never cancel a release unit.
@@ -14,6 +25,194 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Operate on the existing Test CVM without changing its compose, image,
+  # sealed environment, database, or on-chain authorization. This is
+  # dispatch-only and branch-locked so it can never target prod by accident.
+  maintain-test-cvm:
+    name: maintain CVM (test)
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/test' &&
+      (inputs.operation == 'check-test-transport' ||
+       inputs.operation == 'diagnose-test-photo' ||
+       inputs.operation == 'restart-test-cvm')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    concurrency:
+      group: maintain-test-cvm
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install phala CLI
+        if: ${{ inputs.operation == 'restart-test-cvm' || inputs.operation == 'diagnose-test-photo' }}
+        run: npm install -g phala@1.1.19
+
+      - name: Restart Test CVM and wait for Phala readiness
+        if: ${{ inputs.operation == 'restart-test-cvm' }}
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+        run: |
+          if [ -z "$PHALA_CLOUD_API_KEY" ]; then
+            echo "::error::TEST_PHALA_CLOUD_API_KEY is not configured"
+            exit 1
+          fi
+          CVM_ID=$(tr -d '[:space:]' < deploy/test-cvm-id.txt)
+          if [ -z "$CVM_ID" ]; then
+            echo "::error::deploy/test-cvm-id.txt is empty"
+            exit 1
+          fi
+          phala cvms restart "$CVM_ID" --api-token "$PHALA_CLOUD_API_KEY"
+          ./deploy/wait-cvm-ready.sh "$CVM_ID" 900
+
+      - name: Read recent Test photo failure breadcrumbs
+        if: ${{ inputs.operation == 'diagnose-test-photo' }}
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          TEST_ADMIN_BASE_URL: ${{ secrets.TEST_ADMIN_BASE_URL }}
+          TEST_ADMIN_KEY: ${{ secrets.TEST_ADMIN_KEY }}
+        run: |
+          if [ -z "$PHALA_CLOUD_API_KEY" ]; then
+            echo "::error::TEST_PHALA_CLOUD_API_KEY is not configured"
+            exit 1
+          fi
+          CVM_ID=$(tr -d '[:space:]' < deploy/test-cvm-id.txt)
+          if [ -z "$CVM_ID" ]; then
+            echo "::error::deploy/test-cvm-id.txt is empty"
+            exit 1
+          fi
+
+          # Only print transport/status/error breadcrumbs. Never publish raw
+          # request bodies, encrypted frames, provider keys, or photo pixels.
+          pattern='photo_read|photo_storage_unavailable|frame_store_unavailable|frame_get|/v1/perception/photos|/v1/screen/frames/|bad frame id|vision_model_unavailable|photo_(observation|pixels)'
+          found=0
+          containers_json=$(phala ps "$CVM_ID" \
+            --api-token "$PHALA_CLOUD_API_KEY" --json)
+          mapfile -t containers < <(
+            printf '%s' "$containers_json" | jq -r \
+              '.. | objects | (.name? // .container_name? // empty)' | \
+              grep -E '(^|[-_])(backend|serve-worker|enclave|enclave-domain)([-_]|$)' | \
+              sort -u
+          )
+          if [ "${#containers[@]}" -eq 0 ]; then
+            echo "::warning::Phala returned no matching container names; trying compose service names"
+            containers=(backend serve-worker enclave enclave-domain)
+          fi
+          printf 'Inspecting containers: %s\n' "${containers[*]}"
+
+          for container in "${containers[@]}"; do
+            log_file=$(mktemp)
+            if phala logs "$container" \
+              --cvm-id "$CVM_ID" \
+              --api-token "$PHALA_CLOUD_API_KEY" \
+              --since 45m --tail 4000 --timestamps --stderr \
+              >"$log_file" 2>&1; then
+              matches=$(grep -Eai "$pattern" "$log_file" | tail -n 300 || true)
+              if [ -n "$matches" ]; then
+                echo "photo breadcrumbs from $container"
+                printf '%s\n' "$matches"
+                found=1
+              fi
+            else
+              echo "::warning::could not fetch $container logs"
+              tail -n 2 "$log_file" | sed -E 's/phak_[A-Za-z0-9_-]+/[redacted]/g'
+            fi
+            rm -f "$log_file"
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "No matching photo failure breadcrumbs in the last 45 minutes"
+          fi
+
+          if [ -n "$TEST_ADMIN_KEY" ]; then
+            base_url=${TEST_ADMIN_BASE_URL:-https://test-api.feedling.app}
+            trace_file=$(mktemp)
+            http_code=$(curl --silent --show-error \
+              --retry 6 --retry-all-errors --retry-delay 1 \
+              --connect-timeout 8 --max-time 45 \
+              --get --output "$trace_file" --write-out '%{http_code}' \
+              --header "X-Admin-Token: $TEST_ADMIN_KEY" \
+              --data-urlencode 'since=2h' \
+              --data-urlencode 'q=photo_read' \
+              --data-urlencode 'limit=100' \
+              --data-urlencode 'mode=flat' \
+              "$base_url/v1/admin/data-track/debug")
+            if [ "$http_code" = "200" ]; then
+              # The admin payload contains full traces. Emit only identity-free
+              # stage/status fields and stable photo/vision/frame error strings.
+              jq '{
+                summary,
+                events: [.events[] | {
+                  ts,
+                  trace_id,
+                  subsystem,
+                  type,
+                  status,
+                  dur_ms,
+                  codes: ([
+                    .detail | .. | strings |
+                    select(test("vision_model_|photo_read|photo_storage_|frame_store_|capability_")) |
+                    .[0:120]
+                  ] | unique)
+                }]
+              }' "$trace_file"
+            else
+              echo "::warning::photo trace query returned HTTP $http_code"
+            fi
+            rm -f "$trace_file"
+          else
+            echo "::warning::TEST_ADMIN_KEY is not configured; skipped photo trace query"
+          fi
+
+      - name: Require stable Test transports
+        if: ${{ inputs.operation == 'restart-test-cvm' || inputs.operation == 'check-test-transport' }}
+        env:
+          TEST_API_URL: https://test-api.feedling.app
+          TEST_ENCLAVE_URL: https://test-enclave.feedling.app
+          TEST_DIRECT_ENCLAVE_URL: ${{ vars.TEST_MAIN_ENCLAVE_URL }}
+        run: |
+          if [ -z "$TEST_DIRECT_ENCLAVE_URL" ]; then
+            echo "::error::TEST_MAIN_ENCLAVE_URL is not configured"
+            exit 1
+          fi
+          deadline=$((SECONDS + 600))
+          consecutive=0
+          attempt=0
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            attempt=$((attempt + 1))
+            api_code=$(curl --silent --show-error \
+              --connect-timeout 8 --max-time 15 \
+              --output /dev/null --write-out '%{http_code}' \
+              "$TEST_API_URL/healthz" || true)
+            enclave_code=$(curl --silent --show-error \
+              --connect-timeout 8 --max-time 15 \
+              --output /dev/null --write-out '%{http_code}' \
+              "$TEST_ENCLAVE_URL/healthz" || true)
+            # The direct endpoint intentionally serves the enclave's self-signed
+            # certificate; clients authenticate it against the attestation quote.
+            direct_code=$(curl --insecure --silent --show-error \
+              --connect-timeout 8 --max-time 15 \
+              --output /dev/null --write-out '%{http_code}' \
+              "$TEST_DIRECT_ENCLAVE_URL/healthz" || true)
+            if [ "$api_code" = "200" ] && \
+               [ "$enclave_code" = "200" ] && \
+               [ "$direct_code" = "200" ]; then
+              consecutive=$((consecutive + 1))
+              echo "probe $attempt: API 200, custom enclave 200, direct enclave 200 ($consecutive/10 consecutive)"
+              if [ "$consecutive" -ge 10 ]; then
+                echo "Test API and enclave transports are stable"
+                exit 0
+              fi
+            else
+              echo "probe $attempt: API ${api_code:-transport-error}, custom enclave ${enclave_code:-transport-error}, direct enclave ${direct_code:-transport-error}; resetting streak"
+              consecutive=0
+            fi
+            sleep 10
+          done
+          echo "::error::Test transports did not reach 10 consecutive healthy probes within 10 minutes"
+          exit 1
+
   # -------------------------------------------------------------------------
   # Solidity — FeedlingAppAuth contract tests
   # -------------------------------------------------------------------------
@@ -213,6 +412,25 @@ jobs:
             tests/test_cpu_socket_proxy_integration.py \
             -v
 
+      - name: Memory Garden kernel unit tests
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m pytest \
+            tests/test_garden_selection_pluggable.py \
+            tests/test_garden_card_shape.py \
+            tests/test_route_b_card_shape_recall.py \
+            tests/test_route_b_sensitive_gate.py \
+            tests/test_memory_injection_observability.py \
+            tests/test_memory_garden_purity.py \
+            tests/test_memory_garden_policies.py \
+            tests/test_memory_garden_capture_golden.py \
+            tests/test_memory_garden_dream_migrate_golden.py \
+            tests/test_memory_garden_prompt_params.py \
+            tests/test_memory_garden_storage_port.py \
+            tests/test_memory_garden_dreaming.py \
+            -v
+
       - name: Guard top-level pytest discovery coverage
         run: |
           export LC_ALL=C
@@ -272,7 +490,7 @@ jobs:
       # Keep one pytest process per batch: the tests share one session database,
       # so file-order pollution stays visible instead of being hidden by process
       # isolation. The explicit paths also feed the discovery coverage ratchet.
-      - name: Run CI security tier 1 (33 files)
+      - name: Run CI security tier 1 (35 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
@@ -282,6 +500,7 @@ jobs:
             tests/test_enclave_history_probe_skips_memory.py \
             tests/test_enclave_keys_attestation.py \
             tests/test_enclave_routes_memory.py \
+            tests/test_genesis_profile_dual_write.py \
             tests/test_identity_init_server_encrypt.py \
             tests/test_memory_actions_guard.py \
             tests/test_memory_backoff_notice.py \
@@ -298,6 +517,7 @@ jobs:
             tests/test_memory_readside_core.py \
             tests/test_memory_readside_docker_e2e.py \
             tests/test_memory_readside_sandbox.py \
+            tests/test_memory_timestamps.py \
             tests/test_memory_upgrade_id_stable.py \
             tests/test_memory_v1_readers.py \
             tests/test_memory_v1_readside.py \
@@ -312,7 +532,7 @@ jobs:
             tests/test_v2_quoted_memory.py \
             -v
 
-      - name: Run CI security tier 2 (69 files)
+      - name: Run CI security tier 2 (72 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
@@ -355,7 +575,10 @@ jobs:
             tests/test_enclave_trace_coalescing.py \
             tests/test_enclave_visual_readside_units.py \
             tests/test_genesis_foreground_identity.py \
+            tests/test_genesis_identity_field_lock.py \
             tests/test_genesis_lightweight_identity.py \
+            tests/test_genesis_notice.py \
+            tests/test_genesis_v2_orchestration.py \
             tests/test_health_route_isolation.py \
             tests/test_history_import_identity.py \
             tests/test_identity_actions.py \
@@ -388,7 +611,7 @@ jobs:
             tests/test_verify_enclave_domain.py \
             -v
 
-      - name: Run CI security tier 3 (56 files)
+      - name: Run CI security tier 3 (58 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
@@ -428,6 +651,8 @@ jobs:
             tests/test_tee_replicator_main.py \
             tests/test_tee_replicator_transforms.py \
             tests/test_tee_replicator_worker.py \
+            tests/test_tee_reflow.py \
+            tests/test_tee_replication_workflow_guard.py \
             tests/test_tee_requeue.py \
             tests/test_tee_requeue_coverage.py \
             tests/test_tee_schema.py \
@@ -458,6 +683,7 @@ jobs:
           python -m pytest \
             tests/test_ci_image_tag_width.py \
             tests/test_deploy_yaml_strict.py \
+            tests/test_frame_r2_deploy_config.py \
             tests/test_admin_runtime_mode.py \
             tests/test_hosted_runtime_policy.py \
             tests/test_dual_runtime_coexistence.py \
@@ -501,7 +727,9 @@ jobs:
             tests/test_admin_proactive_observability.py \
             tests/test_wake_support_indexes_migration.py \
             tests/test_v2_first_chat_activation_backfill.py \
+            tests/test_pre_test_migration_convergence.py \
             tests/test_v2_jobs_migration.py \
+            tests/test_lane_rollup.py \
             tests/test_v2_jobs_store.py \
             tests/test_v2_enclave_broker.py \
             tests/test_v2_job_lease_fencing.py \
@@ -529,6 +757,7 @@ jobs:
             tests/test_v2_mutation_recovery.py \
             tests/test_v2_reconcile.py \
             tests/test_v2_tool_loop.py \
+            tests/test_v2_turn_budget_defaults.py \
             tests/test_v2_tool_loop_mcp.py \
             tests/test_v2_worker_mcp.py \
             tests/test_v2_worker_tool_loop.py \
@@ -541,6 +770,19 @@ jobs:
             tests/test_v2_extraction.py \
             tests/test_v2_extraction_lanes.py \
             tests/test_v2_extraction_memory_integration.py \
+            tests/test_backfill_chat_bodies_to_plaintext.py \
+            tests/test_byok_plaintext_read_routing.py \
+            tests/test_content_encryption_preference.py \
+            tests/test_encryption_surface_frozen.py \
+            tests/test_envelope_storage_fields.py \
+            tests/test_no_fake_envelope_shapes.py \
+            tests/test_phase4_cutover.py \
+            tests/test_plaintext_memory_quality.py \
+            tests/test_read_side_shape_routing.py \
+            tests/test_swap_shape_transition.py \
+            tests/test_tee_carry_verbatim.py \
+            tests/test_uploaded_envelope_gate.py \
+            tests/test_write_side_format_routing.py \
             tests/test_data_track_debug.py \
             -v
 
@@ -584,6 +826,7 @@ jobs:
           FEEDLING_V2_PROFILE_ENABLED: "${{ matrix.profile_enabled }}"
         run: |
           python -m pytest \
+            tests/test_backfill_v2_profiles.py \
             tests/test_chat_send_v2_enqueue.py \
             tests/test_dual_runtime_flip_no_loss.py \
             tests/test_dual_runtime_send_routing.py \
@@ -822,6 +1065,7 @@ jobs:
           FEEDLING_API_URL:              ${{ vars.TEST_MAIN_API_URL }}
           FEEDLING_ENCLAVE_URL:          ${{ vars.TEST_MAIN_ENCLAVE_URL }}
           FEEDLING_ADMIN_TOKEN:          ${{ secrets.FEEDLING_ADMIN_TOKEN }}
+          FEEDLING_DATABASE_SCHEMA:      ${{ vars.TEST_FEEDLING_DATABASE_SCHEMA || 'rds' }}
           FEEDLING_V2_SANDBOX_PROVIDER:  ${{ vars.TEST_FEEDLING_V2_SANDBOX_PROVIDER || 'disabled' }}
           E2B_API_KEY:                    ${{ secrets.TEST_E2B_API_KEY || secrets.E2B_API_KEY }}
           FEEDLING_V2_E2B_TEMPLATE:       ${{ vars.TEST_FEEDLING_V2_E2B_TEMPLATE }}
@@ -843,6 +1087,10 @@ jobs:
           case "$FEEDLING_V2_SANDBOX_PROVIDER" in
             disabled|e2b) ;;
             *) echo "::error::test sandbox provider must be exactly disabled or e2b"; missing=1 ;;
+          esac
+          case "$FEEDLING_DATABASE_SCHEMA" in
+            rds|tee) ;;
+            *) echo "::error::TEST_FEEDLING_DATABASE_SCHEMA must be exactly rds or tee"; missing=1 ;;
           esac
           if [ "$FEEDLING_V2_SANDBOX_PROVIDER" = "e2b" ]; then
             if [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
@@ -877,6 +1125,90 @@ jobs:
           name: test-e2b-template-${{ github.sha }}
           path: deploy/e2b/runtime-v2/e2b-template-build.json
           retention-days: 90
+
+      # TEST can promote its owner-migrated TEE database to DATABASE_URL. The
+      # app role cannot run DDL, so prove both the migration head and the real
+      # application startup contract before either CVM is mutated.
+      - name: Prepare TEST TEE schema preflight credentials
+        if: ${{ vars.TEST_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        env:
+          TEST_CA_PEM: ${{ secrets.TEST_TEE_PG_CA_PEM }}
+          TEST_DSN: ${{ secrets.TEST_TEE_MIGRATION_DSN }}
+        run: |
+          test -n "$TEST_DSN" || { echo "::error::TEST_TEE_MIGRATION_DSN is required for TEE-primary deploy preflight"; exit 1; }
+          umask 077
+          printf '%s' "$TEST_CA_PEM" > /tmp/test-tee-ca.crt
+          test -s /tmp/test-tee-ca.crt || { echo "::error::TEST_TEE_PG_CA_PEM is required for TEE-primary deploy preflight"; exit 1; }
+
+      - name: Set up Python for TEST TEE schema preflight
+        if: ${{ vars.TEST_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install TEST TEE schema preflight dependencies
+        if: ${{ vars.TEST_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r backend/requirements.lock
+
+      - name: Require TEST TEE schema at release head before mutating either CVM
+        if: ${{ vars.TEST_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        env:
+          TEST_DSN: ${{ secrets.TEST_TEE_MIGRATION_DSN }}
+          APP_DATABASE_URL: ${{ secrets.TEST_DATABASE_URL }}
+        run: |
+          export TEE_MIGRATION_DATABASE_URL="${TEST_DSN}&sslrootcert=/tmp/test-tee-ca.crt"
+          python - <<'PY'
+          import os
+          import sys
+          import psycopg
+          from alembic.config import Config
+          from alembic.script import ScriptDirectory
+
+          cfg = Config("backend/alembic_tee/alembic.ini")
+          cfg.set_main_option("script_location", "backend/alembic_tee")
+          expected = set(ScriptDirectory.from_config(cfg).get_heads())
+          fingerprint_sql = (
+              "SELECT current_database(), COALESCE(inet_server_addr()::text, ''), "
+              "inet_server_port()"
+          )
+          with psycopg.connect(os.environ["TEE_MIGRATION_DATABASE_URL"]) as conn:
+              owner_fingerprint = tuple(conn.execute(fingerprint_sql).fetchone())
+              owner_user = str(conn.execute("SELECT current_user").fetchone()[0])
+              actual = {
+                  str(row[0])
+                  for row in conn.execute(
+                      "SELECT version_num FROM alembic_tee_version"
+                  ).fetchall()
+              }
+          with psycopg.connect(os.environ["APP_DATABASE_URL"]) as conn:
+              app_fingerprint = tuple(conn.execute(fingerprint_sql).fetchone())
+          if owner_fingerprint != app_fingerprint:
+              print(
+                  "::error::TEST_DATABASE_URL and TEST_TEE_MIGRATION_DSN must "
+                  "target the same database. No TEST CVM was changed."
+              )
+              raise SystemExit(1)
+          print(f"TEST TEE schema: expected={sorted(expected)} actual={sorted(actual)}")
+          if actual != expected:
+              print(
+                  "::error title=TEST TEE schema migration required::"
+                  f"expected {sorted(expected)}, got {sorted(actual)}; "
+                  "run the TEE migrate workflow for test, then rerun failed jobs. "
+                  "No TEST CVM was changed."
+              )
+              raise SystemExit(1)
+
+          sys.path.insert(0, "backend")
+          os.environ["FEEDLING_DATABASE_SCHEMA"] = "tee"
+          os.environ["DATABASE_URL"] = os.environ["APP_DATABASE_URL"]
+
+          import db
+
+          db.init_schema()
+          print("TEST TEE application startup contract: ok")
+          PY
 
       - name: Require both Runtime V2 images before mutating either CVM
         env:
@@ -952,6 +1284,9 @@ jobs:
       - name: Require complete production Runtime V2 configuration
         env:
           DATABASE_URL:                  ${{ secrets.DATABASE_URL }}
+          FEEDLING_DATABASE_SCHEMA:      ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA || 'rds' }}
+          TEE_DATABASE_URL:              ${{ secrets.PROD_TEE_DATABASE_URL }}
+          FEEDLING_TEE_DUAL_WRITE:       ${{ secrets.PROD_FEEDLING_TEE_DUAL_WRITE }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
           FEEDLING_API_URL:              ${{ vars.PROD_MAIN_API_URL }}
           FEEDLING_ENCLAVE_URL:          ${{ vars.PROD_MAIN_ENCLAVE_URL }}
@@ -977,6 +1312,20 @@ jobs:
             disabled|e2b) ;;
             *) echo "::error::production sandbox provider must be exactly disabled or e2b"; missing=1 ;;
           esac
+          case "$FEEDLING_DATABASE_SCHEMA" in
+            rds|tee) ;;
+            *) echo "::error::PROD_FEEDLING_DATABASE_SCHEMA must be exactly rds or tee"; missing=1 ;;
+          esac
+          if [ "$FEEDLING_DATABASE_SCHEMA" = "tee" ]; then
+            if [ -n "$TEE_DATABASE_URL" ]; then
+              echo "::error::PROD_TEE_DATABASE_URL must be empty for TEE primary"
+              missing=1
+            fi
+            if [ -n "$FEEDLING_TEE_DUAL_WRITE" ]; then
+              echo "::error::PROD_FEEDLING_TEE_DUAL_WRITE must be empty for TEE primary"
+              missing=1
+            fi
+          fi
           if [ "$FEEDLING_V2_SANDBOX_PROVIDER" = "e2b" ]; then
             if [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
               FEEDLING_V2_E2B_TEMPLATE=$(tr -d '[:space:]' < deploy/e2b/runtime-v2/template-tag.txt)
@@ -987,6 +1336,105 @@ jobs:
             fi
           fi
           exit "$missing"
+
+      # PROD promotion uses the owner DSN only for read-only preflight checks;
+      # the deployed main and runner CVMs both receive the app-role DATABASE_URL.
+      # Fail before either CVM is mutated if the two credentials point at
+      # different databases, the owner migration is behind, the app role is
+      # wrong, or the Phase-4 prepared marker/startup contract is missing.
+      - name: Prepare PROD TEE schema preflight credentials
+        if: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        env:
+          PROD_CA_PEM: ${{ secrets.PROD_TEE_PG_CA_PEM }}
+          PROD_DSN: ${{ secrets.PROD_TEE_MIGRATION_DSN }}
+        run: |
+          test -n "$PROD_DSN" || { echo "::error::PROD_TEE_MIGRATION_DSN is required for TEE-primary deploy preflight"; exit 1; }
+          umask 077
+          printf '%s' "$PROD_CA_PEM" > /tmp/prod-tee-ca.crt
+          test -s /tmp/prod-tee-ca.crt || { echo "::error::PROD_TEE_PG_CA_PEM is required for TEE-primary deploy preflight"; exit 1; }
+
+      - name: Set up Python for PROD TEE schema preflight
+        if: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PROD TEE schema preflight dependencies
+        if: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r backend/requirements.lock
+
+      - name: Require PROD TEE schema at release head before mutating any CVM
+        if: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        env:
+          PROD_DSN: ${{ secrets.PROD_TEE_MIGRATION_DSN }}
+          APP_DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          export TEE_MIGRATION_DATABASE_URL="${PROD_DSN}&sslrootcert=/tmp/prod-tee-ca.crt"
+          python - <<'PY'
+          import os
+          import sys
+          import psycopg
+          from alembic.config import Config
+          from alembic.script import ScriptDirectory
+
+          cfg = Config("backend/alembic_tee/alembic.ini")
+          cfg.set_main_option("script_location", "backend/alembic_tee")
+          expected = set(ScriptDirectory.from_config(cfg).get_heads())
+          fingerprint_sql = (
+              "SELECT current_database(), COALESCE(inet_server_addr()::text, ''), "
+              "inet_server_port()"
+          )
+          with psycopg.connect(os.environ["TEE_MIGRATION_DATABASE_URL"]) as conn:
+              owner_fingerprint = tuple(conn.execute(fingerprint_sql).fetchone())
+              owner_user = str(conn.execute("SELECT current_user").fetchone()[0])
+              actual = {
+                  str(row[0])
+                  for row in conn.execute(
+                      "SELECT version_num FROM alembic_tee_version"
+                  ).fetchall()
+              }
+          with psycopg.connect(os.environ["APP_DATABASE_URL"]) as conn:
+              app_fingerprint = tuple(conn.execute(fingerprint_sql).fetchone())
+              app_user = str(conn.execute("SELECT current_user").fetchone()[0])
+          if owner_user != "feedling_owner":
+              print(
+                  "::error::PROD_TEE_MIGRATION_DSN must use the feedling_owner "
+                  f"role; got {owner_user!r}. No production CVM was changed."
+              )
+              raise SystemExit(1)
+          if owner_fingerprint != app_fingerprint:
+              print(
+                  "::error::DATABASE_URL and PROD_TEE_MIGRATION_DSN must "
+                  "target the same database. No production CVM was changed."
+              )
+              raise SystemExit(1)
+          if app_user != "app":
+              print(
+                  "::error::DATABASE_URL must use the TEE app role; "
+                  f"got {app_user!r}. No production CVM was changed."
+              )
+              raise SystemExit(1)
+          print(f"PROD TEE schema: expected={sorted(expected)} actual={sorted(actual)}")
+          if actual != expected:
+              print(
+                  "::error title=PROD TEE schema migration required::"
+                  f"expected {sorted(expected)}, got {sorted(actual)}; "
+                  "run the TEE migrate workflow for prod, then rerun failed jobs. "
+                  "No production CVM was changed."
+              )
+              raise SystemExit(1)
+
+          sys.path.insert(0, "backend")
+          os.environ["FEEDLING_DATABASE_SCHEMA"] = "tee"
+          os.environ["DATABASE_URL"] = os.environ["APP_DATABASE_URL"]
+
+          import db
+
+          db.init_schema()
+          print("PROD TEE application startup contract: ok")
+          PY
 
       - name: Build and verify the production E2B template
         if: ${{ vars.PROD_FEEDLING_V2_SANDBOX_PROVIDER == 'e2b' }}
@@ -1160,6 +1608,78 @@ jobs:
             fi
           fi
           exit "$missing"
+
+      # PRE can run with the owner-migrated TEE database as DATABASE_URL.  The
+      # app role deliberately cannot run DDL and startup fails closed when the
+      # database is behind the release head.  Check that contract before
+      # `phala deploy`; otherwise a push containing a new alembic_tee revision
+      # replaces the healthy CVM first and only discovers the missing owner
+      # migration while backend and serve-worker restart-loop.
+      - name: Prepare PRE TEE schema preflight credentials
+        if: ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        env:
+          PRE_CA_PEM: ${{ secrets.PRE_TEE_PG_CA_PEM }}
+          PRE_DSN: ${{ secrets.PRE_TEE_MIGRATION_DSN }}
+        run: |
+          test -n "$PRE_DSN" || { echo "::error::PRE_TEE_MIGRATION_DSN is required for TEE-primary deploy preflight"; exit 1; }
+          umask 077
+          printf '%s' "$PRE_CA_PEM" > /tmp/pre-tee-ca.crt
+          test -s /tmp/pre-tee-ca.crt || { echo "::error::PRE_TEE_PG_CA_PEM is required for TEE-primary deploy preflight"; exit 1; }
+
+      - name: Set up Python for PRE TEE schema preflight
+        if: ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PRE TEE schema preflight dependencies
+        if: ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r backend/requirements.lock
+
+      - name: Require PRE TEE schema at release head before mutating either CVM
+        if: ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        env:
+          PRE_DSN: ${{ secrets.PRE_TEE_MIGRATION_DSN }}
+        run: |
+          export TEE_MIGRATION_DATABASE_URL="${PRE_DSN}&sslrootcert=/tmp/pre-tee-ca.crt"
+          python - <<'PY'
+          import os
+          import sys
+          import psycopg
+          from alembic.config import Config
+          from alembic.script import ScriptDirectory
+
+          cfg = Config("backend/alembic_tee/alembic.ini")
+          cfg.set_main_option("script_location", "backend/alembic_tee")
+          expected = set(ScriptDirectory.from_config(cfg).get_heads())
+          with psycopg.connect(os.environ["TEE_MIGRATION_DATABASE_URL"]) as conn:
+              actual = {
+                  str(row[0])
+                  for row in conn.execute(
+                      "SELECT version_num FROM alembic_tee_version"
+                  ).fetchall()
+              }
+          print(f"PRE TEE schema: expected={sorted(expected)} actual={sorted(actual)}")
+          if actual != expected:
+              print(
+                  "::error title=PRE TEE schema migration required::"
+                  f"expected {sorted(expected)}, got {sorted(actual)}; "
+                  "run the TEE migrate workflow for pre, then rerun failed jobs. "
+                  "No PRE CVM was changed."
+              )
+              raise SystemExit(1)
+
+          sys.path.insert(0, "backend")
+          os.environ["FEEDLING_DATABASE_SCHEMA"] = "tee"
+          os.environ["DATABASE_URL"] = os.environ["TEE_MIGRATION_DATABASE_URL"]
+
+          import db
+
+          db.init_schema()
+          print("PRE TEE application startup contract: ok")
+          PY
 
       - name: Build and verify the content-addressed E2B template
         if: ${{ vars.PRE_FEEDLING_V2_SANDBOX_PROVIDER == 'e2b' }}
@@ -1387,6 +1907,7 @@ jobs:
           # via the encrypted env channel — carries DB credentials, NOT baked
           # into compose_hash. The backend fails fast at boot if this is empty.
           DATABASE_URL:        ${{ secrets.DATABASE_URL }}
+          FEEDLING_DATABASE_SCHEMA: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA || 'rds' }}
           # TEE 明文影子库双写（feedling-io-db-prod 独立 pg CVM）。best-effort 镜像，
           # mirror 永不 raise。两个都空 = OFF。app 角色 DSN、sslmode=require。加密 env
           # 通道，不烧 compose_hash（同 DATABASE_URL）。⚠️ 开启触发 prod enclave 全量
@@ -1454,6 +1975,7 @@ jobs:
             -e "FEEDLING_ADMIN_TOKEN=$FEEDLING_ADMIN_TOKEN" \
             -e "FEEDLING_ADMIN_PASSWORD=$FEEDLING_ADMIN_PASSWORD" \
             -e "DATABASE_URL=$DATABASE_URL" \
+            -e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA" \
             -e "TEE_DATABASE_URL=$TEE_DATABASE_URL" \
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
@@ -1640,6 +2162,7 @@ jobs:
           FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
           FEEDLING_ADMIN_PASSWORD: ${{ secrets.TEST_FEEDLING_ADMIN_PASSWORD }}
           DATABASE_URL:        ${{ secrets.TEST_DATABASE_URL }}
+          FEEDLING_DATABASE_SCHEMA: ${{ vars.TEST_FEEDLING_DATABASE_SCHEMA || 'rds' }}
           # TEE 明文影子库双写（feedling-io-db-test 独立 pg CVM）。best-effort
           # 镜像，mirror 永不 raise。两个都空 = OFF。app 角色 DSN、sslmode=require。
           # 加密 env 通道，不烧 compose_hash（同 DATABASE_URL）。
@@ -1704,6 +2227,7 @@ jobs:
             -e "FEEDLING_ADMIN_TOKEN=$FEEDLING_ADMIN_TOKEN" \
             -e "FEEDLING_ADMIN_PASSWORD=$FEEDLING_ADMIN_PASSWORD" \
             -e "DATABASE_URL=$DATABASE_URL" \
+            -e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA" \
             -e "TEE_DATABASE_URL=$TEE_DATABASE_URL" \
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
@@ -1877,6 +2401,11 @@ jobs:
           AGENT_MAX_CHILDREN:           ${{ vars.TEST_AGENT_MAX_CHILDREN }}
           # Shared with the main test CVM — MUST match (esp. the token secret).
           DATABASE_URL:                 ${{ secrets.TEST_DATABASE_URL }}
+          FEEDLING_DATABASE_SCHEMA:      ${{ vars.TEST_FEEDLING_DATABASE_SCHEMA || 'rds' }}
+          R2_ENDPOINT:                  ${{ secrets.TEST_R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID:             ${{ secrets.TEST_R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY:         ${{ secrets.TEST_R2_SECRET_ACCESS_KEY }}
+          R2_FRAMES_BUCKET:             ${{ secrets.TEST_R2_FRAMES_BUCKET }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           AGENT_RUNTIME_USERS:          ${{ secrets.TEST_AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
@@ -1900,6 +2429,11 @@ jobs:
             -e "FEEDLING_ENCLAVE_URL=$FEEDLING_ENCLAVE_URL" \
             -e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN" \
             -e "DATABASE_URL=$DATABASE_URL" \
+            -e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA" \
+            -e "R2_ENDPOINT=$R2_ENDPOINT" \
+            -e "R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
+            -e "R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
+            -e "R2_FRAMES_BUCKET=$R2_FRAMES_BUCKET" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
             -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
@@ -2024,6 +2558,13 @@ jobs:
           OPENROUTER_API_KEY:  ${{ secrets.OPENROUTER_API_KEY }}
           FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
           DATABASE_URL:        ${{ secrets.PRE_DATABASE_URL }}
+          # Phase-4 DB-chain selector, shared by backend + in-CVM worker and
+          # the independent runner. Flip only together with PRE_DATABASE_URL.
+          FEEDLING_DATABASE_SCHEMA: ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA || 'rds' }}
+          # Dedicated pre TEE Postgres shadow. Keep dual-write blank until the
+          # new instance has passed schema, backup, and connectivity checks.
+          TEE_DATABASE_URL:        ${{ secrets.PRE_TEE_DATABASE_URL }}
+          FEEDLING_TEE_DUAL_WRITE: ${{ secrets.PRE_FEEDLING_TEE_DUAL_WRITE }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           # Empty until the environment-specific admission rollout is activated.
@@ -2077,6 +2618,9 @@ jobs:
             -e "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" \
             -e "FEEDLING_ADMIN_TOKEN=$FEEDLING_ADMIN_TOKEN" \
             -e "DATABASE_URL=$DATABASE_URL" \
+            -e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA" \
+            -e "TEE_DATABASE_URL=$TEE_DATABASE_URL" \
+            -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_V2_NEW_USER_CUTOFF=$FEEDLING_V2_NEW_USER_CUTOFF" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
@@ -2142,6 +2686,10 @@ jobs:
         env:
           FEEDLING_API_URL:     ${{ vars.PRE_API_URL || 'https://pre-api.feedling.app' }}
           FEEDLING_ENCLAVE_URL: ${{ vars.PRE_MAIN_ENCLAVE_URL }}
+          # Phala reports the CVM running before the custom-domain TLS ingress
+          # necessarily accepts connections. Keep functional failures strict,
+          # but give transport/502/503/504 readiness up to ~2 minutes.
+          FEEDLING_CANARY_HTTP_TRIES: '7'
         run: |
           python3 -m pip install --quiet cryptography
           python3 tools/deploy_canary.py
@@ -2239,6 +2787,11 @@ jobs:
           AGENT_MAX_CHILDREN:           ${{ vars.PRE_AGENT_MAX_CHILDREN }}
           # Shared with the main pre CVM — MUST match (esp. the token secret).
           DATABASE_URL:                 ${{ secrets.PRE_DATABASE_URL }}
+          R2_ENDPOINT:                  ${{ secrets.TEST_R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID:             ${{ secrets.TEST_R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY:         ${{ secrets.TEST_R2_SECRET_ACCESS_KEY }}
+          R2_FRAMES_BUCKET:             ${{ secrets.TEST_R2_FRAMES_BUCKET }}
+          FEEDLING_DATABASE_SCHEMA:      ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA || 'rds' }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           AGENT_RUNTIME_USERS:          ${{ secrets.PRE_AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.PRE_AGENT_RUNTIME_AUTODISCOVER }}
@@ -2262,6 +2815,11 @@ jobs:
             -e "FEEDLING_ENCLAVE_URL=$FEEDLING_ENCLAVE_URL" \
             -e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN" \
             -e "DATABASE_URL=$DATABASE_URL" \
+            -e "R2_ENDPOINT=$R2_ENDPOINT" \
+            -e "R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
+            -e "R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
+            -e "R2_FRAMES_BUCKET=$R2_FRAMES_BUCKET" \
+            -e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
             -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
@@ -2403,6 +2961,11 @@ jobs:
           AGENT_MAX_CHILDREN:            ${{ vars.AGENT_MAX_CHILDREN }}
           # Reused from the main prod CVM — MUST match (esp. the token secret).
           DATABASE_URL:                  ${{ secrets.DATABASE_URL }}
+          FEEDLING_DATABASE_SCHEMA:      ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA || 'rds' }}
+          R2_ENDPOINT:                   ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID:              ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY:          ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_FRAMES_BUCKET:              ${{ secrets.R2_FRAMES_BUCKET }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
           AGENT_RUNTIME_USERS:           ${{ secrets.AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:    ${{ vars.AGENT_RUNTIME_AUTODISCOVER }}
@@ -2427,6 +2990,11 @@ jobs:
               -e "FEEDLING_ENCLAVE_URL=$FEEDLING_ENCLAVE_URL" \
               -e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN" \
               -e "DATABASE_URL=$DATABASE_URL" \
+              -e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA" \
+              -e "R2_ENDPOINT=$R2_ENDPOINT" \
+              -e "R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
+              -e "R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
+              -e "R2_FRAMES_BUCKET=$R2_FRAMES_BUCKET" \
               -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
               -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
               -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \

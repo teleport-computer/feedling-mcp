@@ -69,6 +69,10 @@ from capabilities import history as cap_history
 from capabilities import registry as cap_registry
 from capabilities import result_budget as cap_result_budget
 from capabilities import tool_schema as cap_tool_schema
+from chat.reply_language import (
+    infer_reply_language_policy,
+    reply_language_system_line,
+)
 from core import chat_activity as core_chat_activity
 from core import envelope as core_envelope
 from core import protocol_leak
@@ -78,6 +82,7 @@ from core import provider_usage
 from core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
+from memory_garden import timestamps as memory_timestamps
 from core.downloadable_reply import sanitize_downloadable_reply
 from perception.glance import (
     perception_glance_fingerprint,
@@ -100,6 +105,7 @@ from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import slot_protocol
 from model_api_runtime.v2 import kill_switch
+from model_api_runtime.v2 import language_follow as v2_language_follow
 from model_api_runtime.v2 import model_identity as v2_model_identity
 from model_api_runtime.v2 import web_gate as v2_web_gate
 from model_api_runtime.v2 import prompt_frontier as v2_prompt_frontier
@@ -109,6 +115,7 @@ from model_api_runtime.v2 import profile_store as v2_profile_store
 from model_api_runtime.v2 import status_stream
 from model_api_runtime.v2 import subagents as v2_subagents
 from model_api_runtime.v2 import tool_loop as v2_tool_loop
+from model_api_runtime.v2 import tool_surface as v2_tool_surface
 from model_api_runtime.v2 import trajectory as v2_trajectory
 
 # 纯 prompt/parse 模块（无 I/O、不碰 DB/enclave）——依赖方向允许 worker 直接 import
@@ -121,11 +128,15 @@ from memory.capture_prompt_v1 import (
     parse_capture_cards,
 )
 from identity.user_naming import transcript_speaker_label
-from memory.card_text import (
+from memory_garden.text.card_text import (
+    build_truncation_retry_prompt,
+    card_text_rejection,
     count_user_token_residuals,
     is_retryable_parse_error,
+    sanitize_card_labels,
 )
-from memory import dream_gates as memory_dream_gates
+from memory_garden.text import card_guard
+from memory_garden.guards import dream_gates as memory_dream_gates
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
     build_dream_retry_prompt,
@@ -459,6 +470,17 @@ PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN = _positive_float_env(
 PROMPT_IMAGE_RESERVE_TOKENS = _positive_int_env(
     "FEEDLING_V2_PROMPT_IMAGE_RESERVE_TOKENS", "8192"
 )
+try:
+    TOOL_SCHEMA_COLLAPSE_POLICY = v2_tool_surface.normalize_collapse_policy(
+        os.environ.get(
+            "FEEDLING_V2_TOOL_SCHEMA_COLLAPSE_POLICY",
+            v2_tool_surface.DEFAULT_COLLAPSE_POLICY,
+        )
+    )
+except ValueError as exc:
+    raise RuntimeError(
+        "FEEDLING_V2_TOOL_SCHEMA_COLLAPSE_POLICY is invalid"
+    ) from exc
 if any(
     context_window <= PROMPT_OUTPUT_RESERVE_TOKENS + PROMPT_SAFETY_MARGIN_TOKENS
     for context_window in PROMPT_CONTEXT_WINDOW_OVERRIDES.values()
@@ -590,7 +612,7 @@ _VOICE_TRANSCRIPT_PROMPT_CHARS = _positive_int_env(
 )
 _PROFILE_ENABLED = _allowlisted_bool_env("FEEDLING_V2_PROFILE_ENABLED")
 _PROFILE_MAX_AGE_SEC = float(
-    os.environ.get("FEEDLING_V2_PROFILE_MAX_AGE_SEC", str(7 * 24 * 60 * 60))
+    os.environ.get("FEEDLING_V2_PROFILE_MAX_AGE_SEC", str(3 * 24 * 60 * 60))
 )
 _PROFILE_RETRY_BASE_SEC = float(
     os.environ.get("FEEDLING_V2_PROFILE_RETRY_BASE_SEC", "300")
@@ -623,7 +645,7 @@ _TAIL_FILE_LIMIT = int(os.environ.get("FEEDLING_V2_TAIL_FILE_LIMIT", "2"))
 
 # 单个 native tool loop 的 provider 调用硬闸。最后一次调用会禁用
 # tools 来强制收口，使模型无法用无限工具链烧穿用户的 BYOK key。
-_TURN_MAX_LLM_CALLS = int(os.environ.get("FEEDLING_V2_TURN_MAX_LLM_CALLS", "6"))
+_TURN_MAX_LLM_CALLS = int(os.environ.get("FEEDLING_V2_TURN_MAX_LLM_CALLS", "15"))
 _FILE_TURN_MAX_LLM_CALLS = int(
     os.environ.get("FEEDLING_V2_FILE_TURN_MAX_LLM_CALLS", "10")
 )
@@ -868,10 +890,24 @@ _SCREEN_WATCH_SYSTEM_PROMPT = (
     "neither is the default or safer answer, and you do not need a strong reason to speak. "
     "Decide naturally from your personality, the real conversation, and what is happening "
     "on screen now. Use attention_facts to avoid interrupting or repeating yourself. If you "
-    "speak, choose one coherent thought rather than reporting the screen state. Never mention "
-    "this wake or any system wording, and never narrate that you are watching or that you "
-    "looked at frames."
+    "speak, choose one coherent thought rather than reporting the screen state. In the visible "
+    "message, never mention this wake or any system wording, and never narrate that you are "
+    "watching or that you looked at frames."
 )
+
+
+def _wake_system_prompt_for_lane(lane: str, base_prompt: str) -> str:
+    """Attach the shared thinking contract and lane-specific suffixes."""
+    if not self_thinking.enabled():
+        return base_prompt
+    blocks = [base_prompt, self_thinking.INSTRUCTION]
+    if lane == "screen_watch":
+        blocks.append(self_thinking.SCREEN_WATCH_INSTRUCTION)
+    if lane != "scheduled":
+        blocks.append(_OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION)
+    return context._join_policy_blocks(*blocks)
+
+
 # D3 Task 7 (BYOK payment cooldown): a "provider_config" wake failure (402 out-of-credits,
 # 401/403 bad key) means the user's BYOK key is dead/broke — retrying it every heartbeat
 # interval is a retry storm against a key that cannot succeed until the user fixes it
@@ -885,7 +921,8 @@ _WAKE_FAIL_BACKOFF_BASE_SEC = float(
 _WAKE_FAIL_BACKOFF_CAP_SEC = float(
     os.environ.get("PROACTIVE_FAIL_BACKOFF_CAP_SEC", "3600")
 )
-_FAIL_BACKOFF_WAKE_LANES = frozenset({"heartbeat", "scheduled"})
+_FAIL_BACKOFF_WAKE_LANES = frozenset({"heartbeat"})
+_SCHEDULED_FAILURE_RETRY_DELAYS_SEC = (30.0, 120.0)
 
 _DEGENERATE_REPLY_FALLBACK = (
     os.environ.get(
@@ -1037,6 +1074,7 @@ _EXTRACTION_FAILURE_REASONS = frozenset(
         "capture_provider_result_invalid",
         "dream_blast_radius_exceeded",
         "dream_no_memory_actions",
+        "dream_source_occurred_at_unavailable",
         "empty_reply",
         "extraction_memory_writer_unavailable",
         "memory_occurred_at_required",
@@ -1044,6 +1082,7 @@ _EXTRACTION_FAILURE_REASONS = frozenset(
         "missing_consolidations_list",
         "no_json_object",
         "not_an_object",
+        "output_truncated",
         "semantic_validation_failed_after_retry",
     }
 )
@@ -1337,12 +1376,11 @@ class TurnDeps:
     # MCP tool as a parallel read. None (every non-chat/legacy caller) means no
     # MCP tools.
     load_mcp_turn: Callable[..., Any] | None = None
-    # (store, *, runtime_token) -> {trusted_system_blocks, working_memory}.
-    # Production eagerly renders only encrypted read-only /skills. The legacy
-    # working_memory field is accepted but never injected: editable
-    # /memory/WORKING.md is pull-only through workspace_read, which activates
-    # the outbound-data fence. Missing wiring remains empty only for legacy/unit
-    # callers; a wired loader failure is terminal and visible/conservative.
+    # (store, *, runtime_token) -> {identity_card_or_persona, trusted_system_blocks}.
+    # Production eagerly renders the decrypted identity card (or transition
+    # persona fallback) plus encrypted read-only /skills. Missing
+    # wiring remains empty only for legacy/unit callers; a wired loader failure
+    # is terminal and visible/conservative.
     load_workspace_prompt: Callable[..., dict] | None = None
     # (store, *, runtime_token, path, expected_revision) -> workspace data. Production
     # resolves the path inside this user's encrypted V2 workspace. It never
@@ -1391,13 +1429,19 @@ _EMPTY_MCP_TURN = _EmptyMcpTurn()
 MCP_TURN_WALL_BUDGET_EXHAUSTED_ERROR = "error: mcp_turn_wall_budget_exhausted"
 
 
+@dataclass(frozen=True)
+class WorkspacePromptContext:
+    identity_card_or_persona: str = ""
+    trusted_system_blocks: tuple[str, ...] = ()
+
+
 async def _load_workspace_prompt_context(
     deps: TurnDeps,
     store,
     *,
     runtime_token: str,
     enclave_sem: asyncio.Semaphore,
-) -> tuple[tuple[str, ...], str]:
+) -> WorkspacePromptContext:
     """Load one workspace prompt snapshot without a silent fallback.
 
     Optional/unwired test callers retain the historical empty prompt. Once the
@@ -1405,7 +1449,7 @@ async def _load_workspace_prompt_context(
     chat turn surfaces an error and a wake turn fails conservatively.
     """
     if deps.load_workspace_prompt is None:
-        return (), ""
+        return WorkspacePromptContext()
     try:
         async with enclave_sem:
             rendered = await asyncio.to_thread(
@@ -1415,21 +1459,22 @@ async def _load_workspace_prompt_context(
             )
         if not isinstance(rendered, dict):
             raise TypeError
+        identity_card_or_persona = rendered.get("identity_card_or_persona")
         trusted = rendered.get("trusted_system_blocks")
-        working_memory = rendered.get("working_memory", "")
         if (
+            not isinstance(identity_card_or_persona, str)
+            or
             not isinstance(trusted, (tuple, list))
             or isinstance(trusted, (str, bytes))
             or any(not isinstance(block, str) or not block.strip() for block in trusted)
-            or not isinstance(working_memory, str)
         ):
             raise TypeError
     except Exception:  # noqa: BLE001 — never leak decrypted workspace data
         raise WorkspacePromptUnavailable from None
-    # Editable persistent state is deliberately pull-only. Keeping the legacy
-    # field shape during rollout lets old loaders coexist, but the core refuses
-    # to place its untrusted contents in the eager base prompt.
-    return tuple(trusted), ""
+    return WorkspacePromptContext(
+        identity_card_or_persona=identity_card_or_persona.strip(),
+        trusted_system_blocks=tuple(trusted),
+    )
 
 
 @dataclass
@@ -1719,24 +1764,54 @@ def _mcp_turn_usage_detail(
     }
 
 
-def _provider_tool_surface_callback(
-    deps: TurnDeps,
-    user_id: str,
-    lane: str,
-):
-    """Build a best-effort plaintext-count trace sink for one runtime lane."""
+@dataclass
+class _ProviderRoundtripTrace:
+    """Collect one turn's content-free provider-round budget evidence."""
 
-    if deps.emit_debug_trace is None:
-        return None
+    deps: TurnDeps
+    user_id: str
+    lane: str
+    trace_id: str = ""
+    provider_roundtrips: int = 0
+    terminal_text_round_reached: bool = False
+    terminal_text_round_reason: str = "none"
+    force_text_fallback_reason: str = "none"
+    empty_response_recovery_used: bool = False
 
-    async def _emit(detail: dict[str, Any]) -> None:
-        trace_detail = {"lane": lane, **dict(detail)}
-        if lane != "chat":
-            trace_detail["wake_kind"] = lane
+    def __post_init__(self) -> None:
+        self.lane = _normalize_provider_trace_lane(self.lane)
+
+    async def __call__(self, detail: dict[str, Any]) -> None:
+        try:
+            self.provider_roundtrips = max(
+                self.provider_roundtrips,
+                int(detail.get("round") or 0),
+            )
+        except (TypeError, ValueError, OverflowError):
+            pass
+        if detail.get("terminal_text_round") is True:
+            self.terminal_text_round_reached = True
+            self.terminal_text_round_reason = _normalize_provider_trace_reason(
+                detail.get("terminal_text_round_reason"),
+                v2_tool_loop._PROVIDER_TERMINAL_TEXT_ROUND_REASONS,
+            )
+        fallback_reason = _normalize_provider_trace_reason(
+            detail.get("force_text_fallback_reason"),
+            v2_tool_loop._PROVIDER_FORCE_TEXT_FALLBACK_REASONS,
+        )
+        if fallback_reason != "none":
+            self.force_text_fallback_reason = fallback_reason
+        if detail.get("empty_response_recovery") is True:
+            self.empty_response_recovery_used = True
+
+        trace_detail = {"lane": self.lane, **dict(detail)}
+        if self.lane != "chat":
+            trace_detail["wake_kind"] = self.lane
         await asyncio.to_thread(
-            deps.emit_debug_trace,
-            user_id,
+            self.deps.emit_debug_trace,
+            self.user_id,
             "mcp.surface.provider",
+            trace_id=self.trace_id,
             status=(
                 "warning"
                 if trace_detail["dropped_tool_count"]
@@ -1753,6 +1828,128 @@ def _provider_tool_surface_callback(
             detail=trace_detail,
         )
 
+    async def emit_summary(self) -> None:
+        detail = {
+            "lane": self.lane,
+            "provider_roundtrips": self.provider_roundtrips,
+            "roundtrip_lens": "tool_loop_provider_round_excludes_transport_retries",
+            "terminal_text_round_reached": self.terminal_text_round_reached,
+            "terminal_text_round_reason": self.terminal_text_round_reason,
+            "force_text_fallback_reason": self.force_text_fallback_reason,
+            "empty_response_recovery_used": self.empty_response_recovery_used,
+        }
+        if self.lane != "chat":
+            detail["wake_kind"] = self.lane
+        try:
+            await asyncio.to_thread(
+                self.deps.emit_debug_trace,
+                self.user_id,
+                "mcp.roundtrip.provider",
+                trace_id=self.trace_id,
+                status=(
+                    "warning"
+                    if self.terminal_text_round_reason == "max_calls"
+                    else "ok"
+                ),
+                summary=(
+                    f"Provider 本轮往返 {self.provider_roundtrips} 次,"
+                    f"收口原因 {self.terminal_text_round_reason}"
+                ),
+                explain=(
+                    "计数口径是会消耗工具循环 max_calls 的 provider 轮次;"
+                    "不含 transport 内部重试,不记录 prompt、回复、工具参数或结果。"
+                ),
+                detail=detail,
+            )
+        except Exception as exc:  # noqa: BLE001 -- telemetry is best-effort
+            log.warning(
+                "[v2.mcp] provider roundtrip trace failed user=%s code=%s",
+                self.user_id,
+                type(exc).__name__.lower(),
+            )
+
+
+def _provider_tool_surface_callback(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+    trace_id: str = "",
+):
+    """Build a best-effort content-free trace sink for one runtime lane."""
+
+    if deps.emit_debug_trace is None:
+        return None
+    return _ProviderRoundtripTrace(deps, user_id, lane, str(trace_id or ""))
+
+
+def _normalize_provider_trace_lane(lane: object) -> str:
+    raw_lane = str(lane or "").strip()
+    return raw_lane if raw_lane == "chat" or raw_lane in _WAKE_LANES else "other"
+
+
+def _normalize_provider_trace_reason(
+    reason: object, allowed_values: frozenset[str]
+) -> str:
+    raw_reason = str(reason or "none").strip()
+    return raw_reason if raw_reason in allowed_values else "other"
+
+
+def _empty_provider_response_debug_callback(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+    trace_id: str = "",
+):
+    """Build a content-free admin trace sink for provider-empty responses."""
+    if deps.emit_debug_trace is None:
+        return None
+
+    safe_lane = _normalize_provider_trace_lane(lane)
+
+    async def _emit(response_shape: dict[str, Any]) -> None:
+        raw_stop_reason = str(response_shape.get("stop_reason") or "")
+        stop_reason = (
+            raw_stop_reason
+            if raw_stop_reason in v2_tool_loop._CONTENT_FREE_STOP_REASONS
+            else ("other" if raw_stop_reason else "")
+        )
+        completion_tokens = response_shape.get("completion_tokens")
+        detail = {
+            "stop_reason": stop_reason,
+            "has_visible_text": bool(response_shape.get("has_visible_text")),
+            "reasoning_present": bool(response_shape.get("reasoning_present")),
+            "tool_call_count": max(
+                0, int(response_shape.get("tool_call_count") or 0)
+            ),
+            "completion_tokens": (
+                max(0, int(completion_tokens))
+                if isinstance(completion_tokens, (int, float))
+                else None
+            ),
+            "lane": safe_lane,
+        }
+        try:
+            await asyncio.to_thread(
+                deps.emit_debug_trace,
+                user_id,
+                "provider.empty_response",
+                trace_id=str(trace_id or ""),
+                status="warning",
+                summary="V2 provider 返回空回复",
+                explain=(
+                    "仅记录归一化 stop reason、布尔/计数与 lane；"
+                    "不记录回复、reasoning、prompt 或错误正文。"
+                ),
+                detail=detail,
+            )
+        except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a turn
+            log.warning(
+                "[v2.empty_response] trace failed user=%s lane=%s code=%s",
+                user_id,
+                safe_lane,
+                type(exc).__name__.lower(),
+            )
+
     return _emit
 
 
@@ -1761,6 +1958,313 @@ _CONTEXT_TRUNCATION_COUNT_KEYS = (
     "profile_cards_truncated",
     "worldbook_truncated",
 )
+
+_PROMPT_FRONTIER_TRACE_EVENTS = frozenset({
+    "v2.prompt_frontier.budget",
+    "v2.prompt_frontier.exhausted",
+    "v2.prompt_frontier.metadata_rejected",
+})
+_PROMPT_FRONTIER_TRACE_LANES = frozenset({"chat", *_WAKE_LANES})
+_PROMPT_FRONTIER_LIMIT_SOURCES = frozenset({
+    "provider_metadata",
+    "caller",
+    "audited_family",
+    "unaudited_default",
+    "deployment_override",
+})
+_PROMPT_FRONTIER_REQUIRED_COMPONENTS = frozenset({
+    "message_context",
+    "tool_transcript",
+    "required_tool_schemas",
+})
+_PROMPT_FRONTIER_WARNING_RATIO = 0.70
+_PROMPT_FRONTIER_TRACE_PROVIDERS = frozenset({
+    "openai",
+    "openrouter",
+    "anthropic",
+    "bedrock",
+    "gemini",
+    "deepseek",
+    "openai_compatible",
+})
+
+
+def _prompt_frontier_message_component_bytes(
+    messages: Iterable[Any],
+) -> tuple[v2_prompt_frontier.PromptByteComponent, ...]:
+    """Project exact assembled messages to closed, content-free byte families."""
+
+    totals: dict[str, int] = {}
+    for message in messages:
+        if isinstance(message, ToolExchange):
+            name = "tool_transcript"
+        elif not isinstance(message, dict):
+            name = "tail"
+        else:
+            role = str(message.get("role") or "")
+            content = message.get("content")
+            text = content if isinstance(content, str) else ""
+            if role == "system":
+                name = "system"
+            elif message.get(v2_screen_chat.MESSAGE_TAG) is True:
+                name = "screen"
+            elif text.startswith(context.WORLD_BOOK_CONTEXT_HEADER + "\n"):
+                name = "worldbook"
+            elif any(
+                text.startswith(prefix)
+                for prefix in (
+                    context.RUNTIME_CONTEXT_HEADER + "\n",
+                    context.TEMPORAL_CONTEXT_HEADER + "\n",
+                    context.PROACTIVE_TURN_BOUNDARY,
+                )
+            ):
+                name = "runtime_data"
+            else:
+                name = "tail"
+        totals[name] = totals.get(name, 0) + (
+            v2_prompt_frontier.prompt_structure_utf8_bytes(message)
+        )
+    return tuple(
+        v2_prompt_frontier.PromptByteComponent(name=name, bytes=byte_count)
+        for name in (
+            "system",
+            "tail",
+            "worldbook",
+            "runtime_data",
+            "screen",
+            "tool_transcript",
+        )
+        if (byte_count := totals.get(name, 0)) > 0
+    )
+
+
+def _validated_prompt_frontier_trace_components(
+    components: Iterable[Any],
+) -> list[dict[str, Any]]:
+    """Allow only closed names and integer byte counts into plaintext trace."""
+
+    normalized = v2_prompt_frontier.normalize_prompt_byte_components(
+        tuple(components)
+    )
+    return [
+        {"name": item.name, "bytes": item.bytes}
+        for item in normalized
+    ]
+
+
+def _prompt_frontier_trace_detail(
+    observation: Any,
+    *,
+    lane: str,
+) -> tuple[str, str, dict[str, Any]]:
+    """Build one same-shape success/exhaustion observation with no prompt text."""
+
+    safe_lane = str(lane or "")
+    if safe_lane not in _PROMPT_FRONTIER_TRACE_LANES:
+        raise ValueError("prompt frontier trace lane is not in the closed set")
+    if isinstance(observation, v2_prompt_frontier.PromptFrontierPlan):
+        budget = observation.budget
+        required_tokens = sum(
+            item.estimated_tokens
+            for item in observation.decisions
+            if item.required
+        )
+        estimated_input_tokens = int(observation.estimated_input_tokens)
+        context_window_tokens = int(budget.context_window_tokens)
+        input_budget_tokens = int(budget.input_budget_tokens)
+        output_reserve_tokens = int(budget.output_reserve_tokens)
+        safety_margin_tokens = int(budget.safety_margin_tokens)
+        limit_source = str(observation.model_limit.source)
+        required_components = [
+            item.name for item in observation.decisions if item.required
+        ]
+        event_type = "v2.prompt_frontier.budget"
+        utilization = (
+            estimated_input_tokens / input_budget_tokens
+            if input_budget_tokens > 0
+            else 1.0
+        )
+        status = (
+            "warning"
+            if utilization >= _PROMPT_FRONTIER_WARNING_RATIO
+            else "ok"
+        )
+        utf8_bytes_per_token = float(observation.utf8_bytes_per_token)
+    elif isinstance(observation, v2_prompt_frontier.PromptFrontierExhausted):
+        required_tokens = int(observation.required_tokens)
+        estimated_input_tokens = required_tokens
+        context_window_tokens = int(observation.context_window_tokens)
+        input_budget_tokens = int(observation.input_budget_tokens)
+        output_reserve_tokens = observation.output_reserve_tokens
+        safety_margin_tokens = observation.safety_margin_tokens
+        if output_reserve_tokens is None or safety_margin_tokens is None:
+            raise ValueError("prompt frontier exhaustion lacks budget partitions")
+        output_reserve_tokens = int(output_reserve_tokens)
+        safety_margin_tokens = int(safety_margin_tokens)
+        limit_source = str(observation.limit_source)
+        required_components = list(observation.required_components)
+        event_type = "v2.prompt_frontier.exhausted"
+        status = "warning"
+        if observation.utf8_bytes_per_token is None:
+            raise ValueError("prompt frontier exhaustion lacks estimator ratio")
+        utf8_bytes_per_token = float(observation.utf8_bytes_per_token)
+    else:
+        raise ValueError("unsupported prompt frontier observation")
+    if event_type not in _PROMPT_FRONTIER_TRACE_EVENTS:
+        raise ValueError("prompt frontier trace event is not in the closed set")
+    if limit_source not in _PROMPT_FRONTIER_LIMIT_SOURCES:
+        raise ValueError("prompt frontier limit source is not in the closed set")
+    if any(
+        str(name) not in _PROMPT_FRONTIER_REQUIRED_COMPONENTS
+        for name in required_components
+    ):
+        raise ValueError("required prompt component is not in the closed set")
+    if not math.isfinite(utf8_bytes_per_token) or utf8_bytes_per_token <= 0:
+        raise ValueError("prompt frontier estimator ratio is invalid")
+    detail = {
+        "context_window_tokens": context_window_tokens,
+        "input_budget_tokens": input_budget_tokens,
+        "required_tokens": required_tokens,
+        "estimated_input_tokens": estimated_input_tokens,
+        "overflow_tokens": max(0, required_tokens - input_budget_tokens),
+        "output_reserve_tokens": output_reserve_tokens,
+        "safety_margin_tokens": safety_margin_tokens,
+        "utf8_bytes_per_token": utf8_bytes_per_token,
+        "limit_source": limit_source,
+        "lane": safe_lane,
+        "required_components": required_components,
+        "components": _validated_prompt_frontier_trace_components(
+            observation.component_bytes
+        ),
+    }
+    return event_type, status, detail
+
+
+def _prompt_frontier_metadata_rejection_detail(
+    observation: Any,
+) -> dict[str, Any] | None:
+    """Project a rejected metadata limit to one closed, content-free shape."""
+
+    if isinstance(observation, v2_prompt_frontier.PromptFrontierPlan):
+        model_limit = observation.model_limit
+        provider = model_limit.provider
+        reported_tokens = model_limit.rejected_provider_metadata_tokens
+        floor_tokens = model_limit.provider_metadata_floor_tokens
+        resolved_tokens = model_limit.context_window_tokens
+        resolved_source = model_limit.source
+    elif isinstance(observation, v2_prompt_frontier.PromptFrontierExhausted):
+        provider = observation.provider
+        reported_tokens = observation.rejected_provider_metadata_tokens
+        floor_tokens = observation.provider_metadata_floor_tokens
+        resolved_tokens = observation.context_window_tokens
+        resolved_source = observation.limit_source
+    else:
+        raise ValueError("unsupported prompt frontier observation")
+    if reported_tokens is None and floor_tokens is None:
+        return None
+    numeric_values = (reported_tokens, floor_tokens, resolved_tokens)
+    if any(type(value) is not int or value <= 0 for value in numeric_values):
+        raise ValueError("prompt frontier metadata rejection counts are invalid")
+    if reported_tokens >= floor_tokens:
+        raise ValueError("prompt frontier metadata rejection is below no floor")
+    if provider not in _PROMPT_FRONTIER_TRACE_PROVIDERS:
+        raise ValueError("prompt frontier provider is not in the closed set")
+    if (
+        resolved_source not in _PROMPT_FRONTIER_LIMIT_SOURCES
+        or resolved_source == "provider_metadata"
+    ):
+        raise ValueError("prompt frontier resolved source is invalid")
+    detail = {
+        "reported_tokens": reported_tokens,
+        "floor_tokens": floor_tokens,
+        "resolved_tokens": resolved_tokens,
+        "resolved_source": resolved_source,
+        "provider": provider,
+    }
+    if set(detail) != {
+        "reported_tokens",
+        "floor_tokens",
+        "resolved_tokens",
+        "resolved_source",
+        "provider",
+    }:
+        raise ValueError("prompt frontier metadata rejection shape is invalid")
+    return detail
+
+
+def _emit_prompt_frontier_trace(
+    deps: TurnDeps,
+    user_id: str,
+    observation: Any,
+    *,
+    lane: str,
+) -> None:
+    """Best-effort final debug-trace boundary for one prompt budget decision."""
+
+    if deps.emit_debug_trace is None:
+        return
+    try:
+        event_type, status, detail = _prompt_frontier_trace_detail(
+            observation,
+            lane=lane,
+        )
+        deps.emit_debug_trace(
+            user_id,
+            event_type,
+            status=status,
+            summary="V2 prompt 预算观测",
+            explain=(
+                "仅记录闭集组件名、字节/预算计数、lane 与 limit source；"
+                "不记录 prompt、工具 schema、回复或用户正文。"
+            ),
+            detail=detail,
+        )
+    except Exception as exc:  # noqa: BLE001 — observability cannot fail a turn
+        log.warning(
+            "[v2.prompt_frontier_trace] emit failed user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
+    try:
+        rejection_detail = _prompt_frontier_metadata_rejection_detail(observation)
+        if rejection_detail is not None:
+            deps.emit_debug_trace(
+                user_id,
+                "v2.prompt_frontier.metadata_rejected",
+                status="warning",
+                summary="V2 provider 元数据窗口过小",
+                explain=(
+                    "仅记录闭集 provider/source 与窗口计数；"
+                    "不记录模型名、prompt、回复或用户正文。"
+                ),
+                detail=rejection_detail,
+            )
+    except Exception as exc:  # noqa: BLE001 — observability cannot fail a turn
+        log.warning(
+            "[v2.prompt_frontier_metadata_trace] emit failed user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
+
+
+def _prompt_frontier_exhaustion_trace_callback(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+):
+    if deps.emit_debug_trace is None:
+        return None
+
+    async def _emit(observation: Any) -> None:
+        await asyncio.to_thread(
+            _emit_prompt_frontier_trace,
+            deps,
+            user_id,
+            observation,
+            lane=lane,
+        )
+
+    return _emit
 
 
 def _emit_context_truncation_trace(
@@ -1792,8 +2296,13 @@ def _emit_context_truncation_trace(
         content = message.get("content")
         if not isinstance(content, str):
             continue
+        worldbook_prefix = context.WORLD_BOOK_CONTEXT_HEADER + "\n"
+        has_worldbook_block = content.startswith(worldbook_prefix) or (
+            content.startswith(context.AGENT_MEMORY_HEADER + "\n")
+            and ("\n\n" + worldbook_prefix) in content
+        )
         if (
-            content.startswith(context.WORLD_BOOK_CONTEXT_HEADER + "\n")
+            has_worldbook_block
             and context.WORLD_BOOK_TRUNCATION_MARKER in content
         ):
             counts["worldbook_truncated"] = 1
@@ -2742,6 +3251,7 @@ def _ledger_tapped_sink(
     *,
     deps: TurnDeps | None = None,
     user_id: str = "",
+    lane: str = "chat",
 ):
     """`recorder.record` plus the plaintext ledger mirror, for tool_loop.
 
@@ -2758,6 +3268,13 @@ def _ledger_tapped_sink(
             await recorder.record(event_kind, payload)
             await _mirror_provider_attempt(recorder, event_kind, payload)
         if event_kind == "provider_request" and deps is not None:
+            await asyncio.to_thread(
+                _emit_prompt_frontier_trace,
+                deps,
+                user_id,
+                payload.get("prompt_frontier"),
+                lane=lane,
+            )
             await asyncio.to_thread(
                 _emit_context_truncation_trace,
                 deps,
@@ -3347,7 +3864,7 @@ async def _perception_glance_grounding_results(
     enclave_sem,
     previous_fingerprint: str | None,
 ) -> tuple[dict[str, list[dict]] | None, str | None]:
-    """Prefetch one number-free proactive glance and compare it locally."""
+    """Prefetch the V1-equivalent factual board and compare it locally."""
     data = await _cap_data(
         store,
         "perception_glance",
@@ -3356,12 +3873,43 @@ async def _perception_glance_grounding_results(
         params={"days": 30},
         enclave_sem=enclave_sem,
     )
-    glance = data.get("glance") if isinstance(data, dict) else None
-    if not isinstance(glance, dict) or not glance:
+    if not isinstance(data, dict):
         return None, None
-    fingerprint = perception_glance_fingerprint(glance)
+    presence_hints = data.get("presence_hints")
+    cross_domain_board = data.get("cross_domain_board")
+    legacy_glance = data.get("glance")
+    if (
+        not isinstance(presence_hints, dict)
+        and not isinstance(cross_domain_board, dict)
+        and isinstance(legacy_glance, dict)
+        and legacy_glance
+    ):
+        # Rolling-upgrade compatibility for an older enclave capability. New
+        # builds never produce this shape, but an in-flight worker must not turn
+        # a deployment skew into an empty proactive prompt or fingerprint churn.
+        fingerprint = perception_glance_fingerprint(legacy_glance)
+        return {
+            "perception_glance": [{
+                "ok": True,
+                "data": {
+                    "glance": legacy_glance,
+                    "glance_changed": fingerprint != previous_fingerprint,
+                },
+            }]
+        }, fingerprint
+    facts = {
+        "presence_hints": (
+            presence_hints if isinstance(presence_hints, dict) else {}
+        ),
+        "cross_domain_board": (
+            cross_domain_board if isinstance(cross_domain_board, dict) else {}
+        ),
+    }
+    if not facts["presence_hints"] and not facts["cross_domain_board"]:
+        return None, None
+    fingerprint = perception_glance_fingerprint(facts)
     prompt_data = {
-        "glance": glance,
+        **facts,
         "glance_changed": fingerprint != previous_fingerprint,
     }
     return {"perception_glance": [{"ok": True, "data": prompt_data}]}, fingerprint
@@ -3664,8 +4212,8 @@ def _make_build_messages_fn(
     tail: list[dict],
     extra_context: str = "",
     mutation_recovery_active: bool = False,
+    identity_card_or_persona: str = "",
     trusted_system_blocks: tuple[str, ...] = (),
-    working_memory: str = "",
     agent_memory: str = "",
     user_profile: str = "",
     worldbook_context: str = "",
@@ -3751,8 +4299,9 @@ def _make_build_messages_fn(
             tail=rendered_tail,
             action_context=extra_context,
             mutation_recovery_active=mutation_recovery_active,
-            trusted_system_blocks=(identity_block, *trusted_system_blocks),
-            working_memory=working_memory,
+            runtime_identity_block=identity_block,
+            identity_card_or_persona=identity_card_or_persona,
+            trusted_system_blocks=trusted_system_blocks,
             agent_memory=agent_memory,
             user_profile=user_profile,
             worldbook_context=worldbook_context,
@@ -3796,6 +4345,13 @@ def _make_build_messages_fn(
             utf8_bytes_per_token: float,
             image_reserve_tokens: int,
             required_tool_names=(),
+            protected_tool_names=(),
+            collapsed_tool_specs=None,
+            recovery_tool_name: str = "",
+            recovery_tool_active: bool = False,
+            tool_schema_collapse_policy: str = (
+                v2_tool_surface.DEFAULT_COLLAPSE_POLICY
+            ),
             system_suffix: str = "",
         ) -> tuple[list, Any, dict]:
             rendered_transcript: list = []
@@ -3829,10 +4385,20 @@ def _make_build_messages_fn(
                     messages=messages,
                     tools=tools,
                     required_tool_names=required_tool_names,
+                    protected_tool_names=protected_tool_names,
+                    collapsed_tool_specs=collapsed_tool_specs,
+                    recovery_tool_name=recovery_tool_name,
+                    recovery_tool_active=recovery_tool_active,
+                    tool_schema_collapse_policy=(
+                        tool_schema_collapse_policy
+                    ),
                     output_reserve_tokens=output_reserve_tokens,
                     safety_margin_tokens=safety_margin_tokens,
                     utf8_bytes_per_token=utf8_bytes_per_token,
                     image_reserve_tokens=image_reserve_tokens,
+                    message_component_bytes=(
+                        _prompt_frontier_message_component_bytes(messages)
+                    ),
                 )
                 return messages, plan
 
@@ -4044,6 +4610,7 @@ def _make_task_batch_dispatcher(
     api_key,
     runtime_token: str,
     enclave_sem: asyncio.Semaphore,
+    identity_card_or_persona: str = "",
     trusted_system_blocks: tuple[str, ...],
     add_usage: Callable[[dict | None], None],
     observe_photo=None,
@@ -4201,12 +4768,8 @@ def _make_task_batch_dispatcher(
             build_messages = _make_build_messages_fn(
                 system_prompt=_SUBAGENT_SYSTEM_PROMPT,
                 tail=[{"role": "user", "content": task.prompt}],
+                identity_card_or_persona=identity_card_or_persona,
                 trusted_system_blocks=trusted_system_blocks,
-                # WORKING.md is encrypted private state. Injecting it before the
-                # first round would let prompt-injected text choose an outbound
-                # web query. Children can request it via workspace_read; that
-                # read activates the outbound-tool fence below.
-                working_memory="",
             )
             outcome = await v2_tool_loop.run_tool_loop(
                 provider_config=child_provider_config,
@@ -4456,25 +5019,36 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
         ).strip()
         if not summary:
             summary = content[:80]
-        target = str(
+        raw_targets = a.get("target_ids")
+        if not isinstance(raw_targets, list):
+            raw_supersedes = a.get("supersedes")
+            raw_targets = raw_supersedes if isinstance(raw_supersedes, list) else []
+        targets: list[str] = []
+        for value in raw_targets:
+            target_id = str(value or "").strip()
+            if target_id and target_id not in targets:
+                targets.append(target_id)
+        legacy_target = str(
             a.get("target_id")
             or a.get("id")
-            or a.get("supersedes")
+            or (a.get("supersedes") if not isinstance(a.get("supersedes"), list) else "")
             or a.get("memory_id")
             or ""
         ).strip()
+        if legacy_target and legacy_target not in targets:
+            targets.append(legacy_target)
         reason = str(a.get("reason") or "").strip()[:1000]
         if not reason:
             reason = "Written by the agent via the memory_write tool."
         if op in ("delete", "remove"):
-            if target:
+            if legacy_target:
                 out.append({
                     "type": "memory.delete",
-                    "memory_id": target,
+                    "memory_id": legacy_target,
                     "reason": reason,
                 })
             continue
-        if op in ("update", "supersede", "merge", "patch") and not target:
+        if op in ("update", "supersede", "merge", "patch") and not targets:
             # Never turn an invalid targeted mutation into a new memory.add.
             continue
         if op not in ("add", "create", "update", "supersede", "merge", "patch"):
@@ -4489,7 +5063,7 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             #
             # 刻意放在字典**前面**、且不读 a.get("occurred_at"):这是服务端的可信元数据,
             # 不接受模型自报(schema 里也没有这个字段)。
-            "occurred_at": core_util._now_iso(),
+            "occurred_at": memory_timestamps.now_iso(),
         }
         # ⚠️ 只在模型**真的传了**的时候才放这两个键。
         #
@@ -4510,6 +5084,24 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
         )
         if threads_raw is not None:
             inner["threads"] = list(threads_raw)
+        guard_on = card_guard.guard_enabled()
+        rejection = card_text_rejection(
+            summary=summary,
+            content=content or summary,
+            guard=guard_on,
+        )
+        if rejection:
+            raise ValueError(f"memory_card_rejected:{rejection}")
+        bucket, clean_threads, _label_reasons = sanitize_card_labels(
+            bucket=str(inner.get("bucket") or ""),
+            threads=list(inner.get("threads") or []),
+            guard=guard_on,
+            lang_text=f"{summary}\n{content}",
+        )
+        if bucket:
+            inner["bucket"] = bucket
+        if threads_raw is not None:
+            inner["threads"] = clean_threads
         # 评分同理:同样要区分「没传」(继承旧卡)和「传了」。⚠️ 不能用 `or`——
         # importance=0 / pulse=0 是合法取值,`or` 会把它们吞成没传。
         for score in ("importance", "pulse"):
@@ -4524,7 +5116,7 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             out.append(
                 {
                     "type": "memory.supersede",
-                    "supersedes": target,
+                    "supersedes": targets[0] if len(targets) == 1 else targets,
                     "memory": inner,
                     **base,
                 }
@@ -4601,7 +5193,7 @@ def _write_tool_effect_payload(tc) -> tuple[str, dict]:
         if frozen is not None:
             payload["relationship_started_at"] = frozen
         return "identity", payload
-    if tc.name == "identity_nudge":
+    if tc.name in ("identity_nudge", "identity_dimensions_set"):
         # Same ``identity`` effect_type/sink as identity_patch, disambiguated by
         # a trusted ``op`` taken from the tool NAME (mirrors schedule/workspace):
         # ``{**tc.args, "op": tc.name}`` puts op LAST so a model that smuggled an
@@ -4925,7 +5517,7 @@ class WorkspaceFileReply:
 
 @dataclass(frozen=True)
 class GeneratedImageReply:
-    """One validated provider image ready for encrypted chat publication."""
+    """One validated provider image ready for native Chat publication."""
 
     name: str
     mime_type: str
@@ -5041,6 +5633,46 @@ def _sanitize_reasoning(text: str) -> str:
     return cleaned
 
 
+def _self_thinking_internal_terms() -> frozenset[str]:
+    """Derive the closed tool vocabulary used by the visible-thinking guard."""
+    return frozenset(
+        str(spec.name)
+        for spec in cap_tool_schema.build_tool_specs()
+        if str(spec.name).strip()
+    )
+
+
+def _self_thinking_internal_term(text: str) -> str | None:
+    """Return the first internal identifier leaked into visible thinking.
+
+    两类都查,因为它们互补:
+      · **工具名**(B2-1 已有):从 build_tool_specs 派生,随工具面自动扩展
+      · **内部字段名/协议词**(本批补):共享内核的闭集,V1 早有、V2 一直缺 ——
+        `_sanitize_reasoning` 的 docstring 明写「只截长度,原样渲染」,
+        所以 `session_id: …` / `permission_denials` / `costUSD` 会直达用户。
+    """
+    value = str(text or "")
+    for name in sorted(_self_thinking_internal_terms(), key=len, reverse=True):
+        if name in value:
+            return name
+    return self_thinking.internal_field_leak(value)
+
+
+def _self_thinking_language_mismatch(
+    thinking: str, user_rows: Iterable[dict]
+) -> tuple[str, str] | None:
+    """Return (user, thinking) scripts when visible thinking drifts languages."""
+    user_script = _latest_user_writing_system(user_rows)
+    thinking_script = v2_language_follow.classify_writing_system(thinking)
+    if (
+        user_script in {"indeterminate", "mixed"}
+        or thinking_script in {"indeterminate", "mixed"}
+        or user_script == thinking_script
+    ):
+        return None
+    return user_script, thinking_script
+
+
 def _select_thinking_surface(
     provider_reasoning: str,
     *,
@@ -5134,6 +5766,101 @@ async def _emit_thinking_surfaced_trace(
         )
 
 
+def _latest_user_writing_system(rows: Iterable[dict]) -> str:
+    """Find the newest classifiable user-authored text without retaining it."""
+
+    for row in reversed(list(rows)):
+        if str(row.get("role") or "") not in {"user", "human"}:
+            continue
+        text = context.text_of(row.get("content")).strip()
+        if not text:
+            continue
+        script = v2_language_follow.classify_writing_system(text)
+        if script != "indeterminate":
+            return script
+    return "indeterminate"
+
+
+def _reply_language_follow_observation(
+    user_rows: Iterable[dict], visible_reply: str
+) -> tuple[str, str, str]:
+    """Return the shared closed-enum language-follow observation."""
+
+    user_script = _latest_user_writing_system(user_rows)
+    reply_script = v2_language_follow.classify_writing_system(visible_reply)
+    if "indeterminate" in {user_script, reply_script}:
+        outcome = "skip"
+    elif user_script == reply_script:
+        outcome = "match"
+    else:
+        outcome = "mismatch"
+    return user_script, reply_script, outcome
+
+
+async def _emit_reply_language_follow_trace(
+    emit_debug_trace: Callable[..., None] | None,
+    user_id: str,
+    *,
+    user_rows: Iterable[dict],
+    visible_reply: str,
+    lane: str,
+    correction_attempted: bool = False,
+    correction_outcome: str = "skipped",
+) -> None:
+    """Emit one terminal, content-free language-follow observation.
+
+    The event stays content-free while also recording the bounded foreground
+    correction disposition. Wake lanes never attempt correction and report the
+    default ``False``/``skipped`` pair.
+    """
+
+    if emit_debug_trace is None:
+        return
+    user_script, reply_script, outcome = _reply_language_follow_observation(
+        user_rows, visible_reply
+    )
+    safe_correction_outcome = (
+        correction_outcome
+        if correction_outcome
+        in {
+            "corrected",
+            "kept_original_still_mismatch",
+            "retry_error",
+            "retry_empty",
+            "skipped",
+        }
+        else "skipped"
+    )
+    safe_lane = "wake" if lane == "wake" else "chat"
+    try:
+        await asyncio.to_thread(
+            emit_debug_trace,
+            user_id,
+            "reply.language_follow",
+            status="warning" if outcome == "mismatch" else "ok",
+            summary="V2 回复文字系统跟随观测",
+            explain=(
+                "仅记录用户与可见回复的主导文字系统、匹配结果、纠偏处置和 lane；"
+                "不记录正文、比例或思考内容。"
+            ),
+            detail={
+                "user_script": user_script,
+                "reply_script": reply_script,
+                "outcome": outcome,
+                "lane": safe_lane,
+                "correction_attempted": bool(correction_attempted),
+                "correction_outcome": safe_correction_outcome,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a reply
+        log.warning(
+            "[v2.language_follow] trace failed user=%s lane=%s code=%s",
+            user_id,
+            safe_lane,
+            type(exc).__name__.lower(),
+        )
+
+
 def _build_thinking_payload(
     store,
     reasoning: str,
@@ -5185,18 +5912,10 @@ def _thinking_extra(thinking: dict | None) -> dict:
     env = thinking.get("envelope")
     if not isinstance(env, dict):
         return {}
-    extra = {
-        "thinking_v": str(env.get("v", 1)),
-        "thinking_id": str(env.get("id") or ""),
-        "thinking_body_ct": str(env.get("body_ct") or ""),
-        "thinking_nonce": str(env.get("nonce") or ""),
-        "thinking_K_user": str(env.get("K_user") or ""),
-        "thinking_visibility": str(env.get("visibility") or "shared"),
-        "thinking_owner_user_id": str(env.get("owner_user_id") or ""),
-        "thinking_enclave_pk_fpr": str(env.get("enclave_pk_fpr") or ""),
-    }
-    if env.get("K_enclave"):
-        extra["thinking_K_enclave"] = str(env.get("K_enclave") or "")
+    try:
+        extra = core_envelope.envelope_prefixed_fields(env, "thinking")
+    except ValueError:
+        return {}
     extra = {k: v for k, v in extra.items() if str(v).strip()}
     meta = thinking.get("metadata") or {}
     for key in ("thinking_kind", "thinking_source", "thinking_model"):
@@ -5350,12 +6069,13 @@ def _build_encrypted_image_reply_effect_payload(
     *,
     effect_id: str,
 ) -> dict:
-    """Seal one normalized image into a deterministic Chat image message."""
+    """Wrap one normalized image into a deterministic Chat image message."""
     item_id = hashlib.sha256(effect_id.encode("utf-8")).hexdigest()[:32]
     envelope, error = core_envelope._build_shared_envelope_for_store(
         store,
         bytes(image_reply.data),
         item_id=item_id,
+        content_kind="binary",
     )
     if envelope is None:
         raise RuntimeError(error or "image reply envelope build failed")
@@ -5617,10 +6337,10 @@ async def _read_recent_prompt_context(
         optional_turns=optional_turns,
         tail_source_truncated=tail_source_truncated,
         agent_memory=profile.memory,
-        user_profile=profile.user,
+        user_profile=profile.style,
         profile_state=profile.state,
         profile_memory_chars=profile.memory_chars,
-        profile_user_chars=profile.user_chars,
+        profile_user_chars=profile.style_chars,
         profile_age_seconds=profile.age_seconds,
     )
 
@@ -5662,6 +6382,8 @@ async def _run_wake(
     claimed_by: str,
     tm: "TurnMetrics | None" = None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
+    attempt_count: int = 0,
+    trace_id: str = "",
 ) -> str:
     """wake-lane（heartbeat/scheduled/manual_wake/screen_watch）turn：让伴侣主动开口，而不是
     回答用户刚发的消息（用户根本没发消息——这就是唤醒的定义）。它自成一体、拥有自己的
@@ -5684,7 +6406,7 @@ async def _run_wake(
     "provider_config"错误（死/欠费 BYOK key）额外写一条 payment_cooldown（D3 Task 7），
     让 scheduler 的 `due_heartbeat_users` 停止对一把修不好的钥匙反复重试。
 
-    prompt 组装：读 bounded recent turns + MEMORY/USER；真实历史保留原 role，
+    prompt 组装：读 bounded recent turns + MEMORY/STYLE；真实历史保留原 role，
     主动场景的 application-data blocks 使用 assistant role。
     `system_prompt`：`_SCREEN_WATCH_SYSTEM_PROMPT`（screen_watch lane）或
     `_WAKE_SYSTEM_PROMPT`（其余三条 wake lane）。screen_watch 的 `screen_recent`、
@@ -5696,6 +6418,14 @@ async def _run_wake(
     """
     push_slot: dict | None = None
     shadow_decision_allowed: bool | None = None
+    stay_silent_reason: str | None = None
+    language_user_rows: list[dict] = []
+    provider_roundtrip_trace = _provider_tool_surface_callback(
+        deps,
+        user_id,
+        lane,
+        trace_id,
+    )
     try:
         store = core_store.get_store(user_id)
         seq_native = deps.read_messages_after_seq is not None
@@ -5799,12 +6529,14 @@ async def _run_wake(
             api_key=None,
             runtime_token=token,
         )
-        trusted_system_blocks, working_memory = await _load_workspace_prompt_context(
+        workspace_prompt = await _load_workspace_prompt_context(
             deps,
             store,
             runtime_token=token,
             enclave_sem=enclave_sem,
         )
+        identity_card_or_persona = workspace_prompt.identity_card_or_persona
+        trusted_system_blocks = workspace_prompt.trusted_system_blocks
 
         async def _fence_wake_effect(effect: str) -> None:
             if not await asyncio.to_thread(
@@ -6017,13 +6749,16 @@ async def _run_wake(
             if isinstance(attention_snapshot, dict):
                 temporal_snapshot.update(attention_snapshot)
         wake_tail = list(tail)
+        language_user_rows[:] = (
+            _flatten_turns(optional_tail_turns) + wake_tail
+        )
 
         # screen_watch lane grounds on recent shared-screen availability (Task 3).
         # Fetch ONLY screen_recent — no perception_glance or perception_snapshot: the
-        # resident explicitly sets perception_digest=None for screen-watch jobs
-        # (chat_resident_consumer.py:6611). Caption/app/window text is pull-only;
-        # putting it in the first prompt would let screen content choose an outbound
-        # web/MCP/task call before any execution fence can activate.
+        # resident explicitly sets perception_digest=None for screen-watch jobs.
+        # B1 aligns its separate screen recipe with V1: at most four frames carry
+        # bounded OCR/app facts plus pixels. Because those facts are untrusted,
+        # the tool loop starts with outbound tools fenced below.
         #
         # This _cap_data call sits DELIBERATELY OUTSIDE the `async with enclave_sem`
         # block above: `_cap_data` acquires enclave_sem ITSELF (see its body), and
@@ -6034,6 +6769,8 @@ async def _run_wake(
         # call — _cap_data holds the semaphore for its own turn.
         grounding_results = None
         glance_fingerprint = None
+        screen_frame_message: dict[str, Any] | None = None
+        screen_vision_verdict = None
         if lane == "screen_watch":
             data = await _cap_data(
                 store,
@@ -6047,6 +6784,62 @@ async def _run_wake(
                 grounding_results = {
                     "screen_recent": [{"ok": True, "data": safe_screen}]
                 }
+            frame_rows = (
+                data.get("frames")
+                if isinstance(data, dict) and isinstance(data.get("frames"), list)
+                else []
+            )
+            selected_meta = v2_screen_chat.select_recent_session_frames(frame_rows)
+            if selected_meta and deps.read_screen_frames is not None:
+                try:
+                    selected_ids = [
+                        str(row.get("id") or row.get("frame_id") or "")
+                        for row in selected_meta
+                    ]
+                    async with enclave_sem:
+                        batch = await asyncio.to_thread(
+                            deps.read_screen_frames, user_id, selected_ids
+                        )
+                    decrypted = (
+                        batch.get("frames") if isinstance(batch, dict) else {}
+                    )
+                    decrypted = decrypted if isinstance(decrypted, dict) else {}
+                    screen_vision_verdict = await asyncio.to_thread(
+                        db.model_api_active_route_vision_verdict, user_id
+                    )
+                    allow_pixels = _screen_vision_allows_pixels(
+                        screen_vision_verdict
+                    )
+                    merged_frames: list[dict[str, Any]] = []
+                    for meta in selected_meta:
+                        frame_id = str(
+                            meta.get("id") or meta.get("frame_id") or ""
+                        )
+                        content = decrypted.get(frame_id)
+                        if not isinstance(content, dict):
+                            continue
+                        merged = {**meta, **content, "id": frame_id}
+                        if not allow_pixels:
+                            merged.pop("image_b64", None)
+                        merged_frames.append(merged)
+                    screen_frame_message = (
+                        v2_screen_chat.build_untrusted_frame_message(
+                            merged_frames, now=time.time()
+                        )
+                    )
+                    if tm is not None:
+                        tm.record_screen_frames(
+                            pushed=len(merged_frames),
+                            cache_hits=int((batch or {}).get("cache_hits") or 0),
+                            cache_misses=int((batch or {}).get("cache_misses") or 0),
+                        )
+                except Exception as exc:  # noqa: BLE001 - optional grounding
+                    log.warning(
+                        "[v2.worker] screen-watch frame grounding failed "
+                        "user=%s code=%s",
+                        user_id,
+                        type(exc).__name__,
+                    )
         elif lane in {"heartbeat", "manual_wake"}:
             prior = await asyncio.to_thread(jobs_store.get_runtime_state, user_id)
             grounding_results, glance_fingerprint = (
@@ -6146,6 +6939,7 @@ async def _run_wake(
                     "effect_id": enqueued_id,
                     "effect_type": prepared.effect_type,
                     "status": "enqueued",
+                    "screen_frame_present": screen_frame_message is not None,
                 }
             finally:
                 effect_reservations.mark_ready(tc)
@@ -6190,6 +6984,7 @@ async def _run_wake(
                         "effect_id": enqueued_id,
                         "effect_type": prepared.effect_type,
                         "status": "enqueued",
+                        "screen_frame_present": screen_frame_message is not None,
                     }
             finally:
                 effect_reservations.mark_batch_ready(calls)
@@ -6237,6 +7032,13 @@ async def _run_wake(
             cap_history.HISTORY_SEARCH_TOOL,
             cap_history.HISTORY_FETCH_TOOL,
         }
+        _IDENTITY_WRITE_ACTIONS = frozenset(
+            action
+            for action in cap_registry.WRITE_ACTIONS
+            if action.startswith("identity_")
+        )
+        if lane == "screen_watch" and screen_frame_message is not None:
+            wake_disabled_tool_names |= _IDENTITY_WRITE_ACTIONS
 
         dispatch_task_batch = _make_task_batch_dispatcher(
             disabled_web_tool_names=wake_disabled_web_tool_names,
@@ -6245,6 +7047,7 @@ async def _run_wake(
             api_key=None,
             runtime_token=token,
             enclave_sem=enclave_sem,
+            identity_card_or_persona=identity_card_or_persona,
             trusted_system_blocks=trusted_system_blocks,
             add_usage=_add_usage,
             observe_photo=observe_photo,
@@ -6463,10 +7266,15 @@ async def _run_wake(
             )
 
         thinking_trace_emitted = False
+        language_trace_emitted = False
+        wake_self_thinking_failed = False
 
         async def _on_reply(text: str, *, final: bool, reasoning: str = "") -> None:
-            nonlocal thinking_trace_emitted, shadow_decision_allowed
+            nonlocal thinking_trace_emitted, language_trace_emitted
+            nonlocal shadow_decision_allowed
+            nonlocal wake_self_thinking_failed
             text = str(text or "").strip()
+            wake_self_thinking_failed = False
             # Self-authored thinking (same mechanism as the chat lane): peel a leading
             # <think> off the wake reply BEFORE the degenerate/torn checks so they see
             # the real reply, and surface the block in the thinking channel instead of
@@ -6489,6 +7297,9 @@ async def _run_wake(
                 if _wst_status == _st_wake.COMPLETE:
                     text = _wst_reply
                     _wake_self_thinking_text = _wst_thinking
+                    if _self_thinking_internal_term(_wake_self_thinking_text):
+                        _wake_self_thinking_text = ""
+                        wake_self_thinking_failed = True
                 elif _wst_status == _st_wake.SILENT:
                     # A clean thinking-only response is an intentional weak-wake
                     # sleep, not malformed protocol. There is no reply effect to
@@ -6673,6 +7484,7 @@ async def _run_wake(
                 reasoning,
                 self_thinking_on=_wake_self_thinking_on,
                 self_thinking_text=_wake_self_thinking_text,
+                self_thinking_failed=wake_self_thinking_failed,
             )
             _wake_thinking_chars = 0
             if final and _wake_display_reasoning:
@@ -6847,6 +7659,15 @@ async def _run_wake(
                                 branch=_wake_thinking_branch,
                                 chars=_wake_thinking_chars,
                             )
+                        if not language_trace_emitted:
+                            language_trace_emitted = True
+                            await _emit_reply_language_follow_trace(
+                                deps.emit_debug_trace,
+                                user_id,
+                                user_rows=language_user_rows,
+                                visible_reply=text,
+                                lane="wake",
+                            )
                     return
                 if (
                     status == "discarded"
@@ -6909,6 +7730,15 @@ async def _run_wake(
                     branch=_wake_thinking_branch,
                     chars=_wake_thinking_chars,
                 )
+            if final and not language_trace_emitted:
+                language_trace_emitted = True
+                await _emit_reply_language_follow_trace(
+                    deps.emit_debug_trace,
+                    user_id,
+                    user_rows=language_user_rows,
+                    visible_reply=text,
+                    lane="wake",
+                )
             # Legacy/non-seq assembly can enqueue without a sink. That proves
             # the model produced text, not that a user-visible bubble was
             # applied. Count only the applied-but-unverified path here; the
@@ -6924,9 +7754,19 @@ async def _run_wake(
         else:
             wake_start_seq = 0
             cursor_box = {"ts": time.time()}
-        fold_new_messages = _make_fold_new_messages(
+        base_fold_new_messages = _make_fold_new_messages(
             user_id, deps, cursor_box, enclave_sem=enclave_sem
         )
+
+        async def fold_new_messages() -> list[dict]:
+            rows = await base_fold_new_messages()
+            # ``_make_fold_new_messages`` returns coalesced user-only rows and
+            # intentionally omits the redundant role field.  Restore that
+            # known provenance only in this private telemetry snapshot.
+            language_user_rows.extend(
+                {**row, "role": "user"} for row in rows
+            )
+            return rows
 
         # ── 世界书:主动开口的四条道也要认得这个世界（Seven 2026-08-10）
         #
@@ -6979,8 +7819,6 @@ async def _run_wake(
                 )
 
         def _wake_builder():
-            from core import self_thinking as _st_wake_sys
-
             _wake_sys = (
                 _SCREEN_WATCH_SYSTEM_PROMPT
                 if lane == "screen_watch"
@@ -6989,10 +7827,19 @@ async def _run_wake(
             # Same as the chat lane's context.chat_system_prompt(): ask the model to
             # open its reply with a <think> block so proactive turns show a clean
             # self-authored thought instead of raw native reasoning.
-            if _st_wake_sys.enabled():
-                _wake_sys = _wake_sys + _st_wake_sys.INSTRUCTION
-                if lane != "scheduled":
-                    _wake_sys += _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION
+            _wake_sys = _wake_system_prompt_for_lane(lane, _wake_sys)
+            language_policy = infer_reply_language_policy(
+                {},
+                [],
+                locale=str(temporal_snapshot.get("locale") or ""),
+                archive_language=str(
+                    temporal_snapshot.get("archive_language") or ""
+                ),
+            )
+            _wake_sys = context._join_policy_blocks(
+                _wake_sys,
+                reply_language_system_line(language_policy, proactive=True),
+            )
             return _make_build_messages_fn(
                 system_prompt=_wake_sys,
                 tail=wake_tail,
@@ -7001,8 +7848,8 @@ async def _run_wake(
                     if grounding_results
                     else ""
                 ),
+                identity_card_or_persona=identity_card_or_persona,
                 trusted_system_blocks=trusted_system_blocks,
-                working_memory=working_memory,
                 agent_memory=agent_memory,
                 user_profile=user_profile,
                 worldbook_context=worldbook_context,
@@ -7015,6 +7862,7 @@ async def _run_wake(
                 application_data_role="assistant",
                 proactive_turn_boundary=True,
                 manual_wake=(lane == "manual_wake"),
+                screen_frame_message=screen_frame_message,
             )
 
         build_messages = _wake_builder()
@@ -7023,7 +7871,14 @@ async def _run_wake(
                 build_messages,
                 provider_config=provider_config,
             )
-        except v2_prompt_frontier.PromptFrontierExhausted:
+        except v2_prompt_frontier.PromptFrontierExhausted as exc:
+            await asyncio.to_thread(
+                _emit_prompt_frontier_trace,
+                deps,
+                user_id,
+                exc,
+                lane=lane,
+            )
             if tm is not None:
                 tm.record_prompt_frontier_exhaustion()
             raise
@@ -7031,12 +7886,27 @@ async def _run_wake(
         await _fence_wake_effect("wake turn")
         from core import self_thinking as _st_wake_loop
 
+        async def _on_wake_screen_images_rejected(
+            _exc: BaseException,
+        ) -> None:
+            await asyncio.to_thread(
+                _mark_screen_route_vision_unsupported,
+                user_id,
+                screen_vision_verdict,
+            )
+
+        async def _on_stay_silent(reason: str) -> None:
+            nonlocal stay_silent_reason, shadow_decision_allowed
+            stay_silent_reason = str(reason or "").strip()[:500]
+            shadow_decision_allowed = False
+
         try:
             await v2_tool_loop.run_tool_loop(
                 provider_config=provider_config,
                 build_messages=build_messages,
                 suppress_native_reasoning=_st_wake_loop.enabled(),
                 disabled_tool_names=wake_disabled_tool_names,
+                on_stay_silent=(_on_stay_silent if lane != "scheduled" else None),
                 memory_delete_allowed=False,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,
@@ -7077,10 +7947,11 @@ async def _run_wake(
                     user_id,
                     exc,
                 ),
-                on_provider_tool_surface=_provider_tool_surface_callback(
-                    deps,
-                    user_id,
-                    lane,
+                on_provider_tool_surface=provider_roundtrip_trace,
+                on_empty_provider_response=(
+                    _empty_provider_response_debug_callback(
+                        deps, user_id, lane, trace_id
+                    )
                 ),
                 fold_before_first=deps.read_messages_after_seq is not None,
                 on_progress=_report_turn_progress,
@@ -7088,6 +7959,7 @@ async def _run_wake(
                     trajectory_recorder,
                     deps=deps,
                     user_id=user_id,
+                    lane=lane,
                 ),
                 outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
@@ -7105,12 +7977,24 @@ async def _run_wake(
                 prompt_estimator_utf8_bytes_per_token=(
                     PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
                 ),
+                initial_outbound_tools_blocked=(screen_frame_message is not None),
+                tagged_image_message_key=v2_screen_chat.MESSAGE_TAG,
+                on_tagged_images_rejected=(
+                    _on_wake_screen_images_rejected
+                    if screen_frame_message is not None
+                    else None
+                ),
                 prompt_image_reserve_tokens=PROMPT_IMAGE_RESERVE_TOKENS,
                 on_tail_window=_tail_window_callback(tm),
                 on_prompt_frontier_exhaustion=(
                     tm.record_prompt_frontier_exhaustion
                     if tm is not None
                     else None
+                ),
+                on_prompt_frontier_exhausted_detail=(
+                    _prompt_frontier_exhaustion_trace_callback(
+                        deps, user_id, lane
+                    )
                 ),
             )
             if shadow_decision_allowed is None:
@@ -7155,6 +8039,8 @@ async def _run_wake(
                 completed_perception_glance_fingerprint=(
                     completed_glance_fingerprint
                 ),
+                wake_result=("sleep" if stay_silent_reason is not None else None),
+                wake_result_reason=stay_silent_reason,
             )
             heartbeat_terminalized = completed
         else:
@@ -7169,6 +8055,8 @@ async def _run_wake(
                 job_id,
                 claimed_by=claimed_by,
                 clear_wake_backoff=(lane in _FAIL_BACKOFF_WAKE_LANES),
+                wake_result=("sleep" if stay_silent_reason is not None else None),
+                wake_result_reason=stay_silent_reason,
             )
             if lane == "heartbeat":
                 heartbeat_terminalized = transitioned
@@ -7219,6 +8107,47 @@ async def _run_wake(
         log.warning(
             "[v2.worker] wake job %s lane=%s failed code=%s", job_id, lane, code
         )
+        scheduled_retry_delay = None
+        if (
+            lane == "scheduled"
+            and not isinstance(e, (LostJobLease, RuntimeModeChanged))
+            and not (
+                isinstance(e, TurnError)
+                and str(e) == _TOOL_BUDGET_EXHAUSTED_REASON
+            )
+            and provider_client.classify_provider_error(e) != "provider_config"
+            and 0 <= int(attempt_count) < len(
+                _SCHEDULED_FAILURE_RETRY_DELAYS_SEC
+            )
+        ):
+            scheduled_retry_delay = _SCHEDULED_FAILURE_RETRY_DELAYS_SEC[
+                int(attempt_count)
+            ]
+        if scheduled_retry_delay is not None:
+            rescheduled = await asyncio.to_thread(
+                jobs_store.reschedule_pristine_scheduled_failure,
+                job_id,
+                claimed_by=claimed_by,
+                error=f"scheduled_retry:{code}",
+                available_at=time.time() + scheduled_retry_delay,
+                expected_attempt_count=int(attempt_count),
+                max_attempts=len(_SCHEDULED_FAILURE_RETRY_DELAYS_SEC) + 1,
+            )
+            if rescheduled:
+                await _record_trajectory(
+                    trajectory_recorder,
+                    "scheduled_failure_retry",
+                    {
+                        "lane": "scheduled",
+                        "attempt_count": int(attempt_count) + 1,
+                        "retry_delay_sec": scheduled_retry_delay,
+                        "error_code": code,
+                    },
+                    best_effort=True,
+                )
+                if tm is not None:
+                    tm.flush(failed=True, status="scheduled_retry_scheduled")
+                return "rescheduled"
         arm_wake_backoff = (
             lane in _FAIL_BACKOFF_WAKE_LANES
             and not isinstance(e, (LostJobLease, RuntimeModeChanged))
@@ -7253,6 +8182,8 @@ async def _run_wake(
             tm.flush(failed=True, status=code)
         return "failed"
     finally:
+        if provider_roundtrip_trace is not None:
+            await provider_roundtrip_trace.emit_summary()
         decided_at = time.time()
         apns_alert_sent = False
         if push_slot is not None and deps.send_reply_push is not None:
@@ -7379,7 +8310,7 @@ def _profile_refresh_due(user_id: str, *, now: float | None = None) -> bool:
     if state != "ok":
         attempt = document.get("last_attempt") or {}
         disposition = str(attempt.get("retry_disposition") or "")
-        if disposition in {"provider_config", "terminal"}:
+        if disposition in v2_profile_store.PROFILE_STUCK_RETRY_DISPOSITIONS:
             return False
         if disposition == "source_change":
             card_count, max_updated_at = db.memory_profile_source_stats(user_id)
@@ -7404,8 +8335,10 @@ async def _enqueue_profile_if_due(
     *,
     reason: str,
     force: bool = False,
+    enabled: bool | None = None,
 ) -> bool:
-    if not _PROFILE_ENABLED:
+    effective_enabled = _PROFILE_ENABLED if enabled is None else bool(enabled)
+    if not effective_enabled:
         return False
     if not force and not await asyncio.to_thread(_profile_refresh_due, user_id):
         return False
@@ -7425,6 +8358,27 @@ async def _enqueue_profile_if_due(
     if not coalesced or made_ready:
         await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
     return (not coalesced) or made_ready
+
+
+async def _repair_profile_after_chat_provider_success(user_id: str) -> bool:
+    """Best-effort re-arm of provider-config profile failures after chat works."""
+
+    try:
+        result = await asyncio.to_thread(
+            v2_profile_store.repair_stuck_profile_retry,
+            str(user_id),
+            target_dispositions=(
+                v2_profile_store.PROFILE_PROVIDER_SUCCESS_RECOVERABLE_DISPOSITIONS
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — a delivered chat is authoritative
+        log.warning(
+            "[v2.worker] post-chat profile repair failed user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
+        return False
+    return result.status == "repaired"
 
 
 def _profile_attempt_count(previous: dict) -> int:
@@ -7716,7 +8670,7 @@ async def _run_profile(
                 "retry_not_before": 0,
             },
             memory_text=generated.fields["memory"],
-            user_text=generated.fields["user"],
+            style_text=generated.fields["style"],
         )
 
     try:
@@ -7836,6 +8790,7 @@ async def _run_extraction(
     「弱唤醒睡回去」同口径 —— 模型选择什么都不做，不是失败。
     """
     extraction_status_recorded = False
+    extraction_failure_detail: dict[str, Any] = {}
     capture_window: dict[str, Any] = {}
     # call_id -> 该通电话的全文明文。只在 capture lane 填充（见 enclave_sem 闸内）。
     voice_transcripts: dict[str, str] = {}
@@ -8137,6 +9092,7 @@ async def _run_extraction(
                 parse=lambda reply: parse_capture_cards(reply, strict=False),
                 semantic_reasons=capture_semantic_retry_reasons,
                 build_semantic_prompt=build_capture_semantic_retry_prompt,
+                build_truncation_prompt=build_truncation_retry_prompt,
             )
         else:
             prompt = build_dream_prompt(
@@ -8166,6 +9122,7 @@ async def _run_extraction(
                 parse=lambda reply: parse_dream_consolidations(
                     reply, strict=False, known_ids=dream_known_ids
                 ),
+                build_truncation_prompt=build_truncation_retry_prompt,
             )
 
         if lane == "capture" and not prompt_tail:
@@ -8205,6 +9162,8 @@ async def _run_extraction(
                     prompt=prompt,
                     parse=parse,
                     parse_retry=parse_retry,
+                    max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
+                    failure_detail_out=extraction_failure_detail.update,
                     progress_cb=lambda stage, attempt: _report_turn_progress(
                         f"extraction_provider_{stage}_{attempt}"
                     ),
@@ -8333,6 +9292,8 @@ async def _run_extraction(
                 prompt=prompt,
                 parse=parse,
                 parse_retry=parse_retry,
+                max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
+                failure_detail_out=extraction_failure_detail.update,
                 progress_cb=lambda stage, attempt: _report_turn_progress(
                     f"extraction_provider_{stage}_{attempt}"
                 ),
@@ -8422,6 +9383,13 @@ async def _run_extraction(
                     "card_user_token_residual",
                     {"lane": lane, "count": leak_count, "cards": len(items)},
                 )
+            # 源卡时间降级留痕。**必须接到生产上** —— 只在 helper 单测里传
+            # 等于零留痕。那批脏卡的 created_at 集中在 08-10~08-14,是最近两周
+            # 写的,说明产生它们的写入路径可能还开着;不留痕就把源头永久盖住了。
+            #
+            # 回调在 extraction 里是**同步**调用的,所以这里只收集事实,
+            # 等 to_actions 返回后再统一 await —— 不在同步回调里造未 await 的协程。
+            source_time_degraded: list[tuple[int, int, bool]] = []
             action_kwargs = {
                 "occurred_at": occurred_at,
                 "source_ids": source_ids,
@@ -8433,7 +9401,25 @@ async def _run_extraction(
                 # rejected deterministically by the pure mapper before any
                 # write reaches Memory Garden.
                 action_kwargs["existing_cards"] = list(ctx.get("card_items") or [])
+            if lane == "dream":
+                action_kwargs["on_source_time_degraded"] = (
+                    lambda known, missing, fb: source_time_degraded.append(
+                        (int(known), int(missing), bool(fb))
+                    )
+                )
             actions, _added, _superseded = to_actions(items, **action_kwargs)
+            for _known, _missing, _fb in source_time_degraded:
+                log.warning(
+                    "[v2.dream] source occurred_at degraded user=%s job=%s "
+                    "known=%d missing=%d created_at_fallback=%s",
+                    user_id, job_id, _known, _missing, _fb,
+                )
+                if trajectory_recorder is not None:
+                    await trajectory_recorder.record(
+                        "dream_source_time_degraded",
+                        {"known": _known, "missing": _missing,
+                         "created_at_fallback": _fb},
+                    )
             if lane == "dream":
                 # 爆炸半径保险丝:单晚要退休的卡超过花园的绝大部分 = 规模明显
                 # 不对(834→1 事故的最后防线),整个 job 失败等人查,不部分执行。
@@ -8592,14 +9578,16 @@ async def _run_extraction(
                     lane,
                     type(status_exc).__name__.lower(),
                 )
+        failure_payload = {
+            "stage": "extraction",
+            "error_class": type(e).__name__,
+            "error_code": code,
+        }
+        failure_payload.update(extraction_failure_detail)
         await _record_trajectory(
             trajectory_recorder,
             "turn_exception",
-            {
-                "stage": "extraction",
-                "error_class": type(e).__name__,
-                "error_code": code,
-            },
+            failure_payload,
             best_effort=True,
         )
         log.warning(
@@ -8907,6 +9895,16 @@ async def process_job(
     mcp_offered_names: tuple[str, ...] = ()
     mcp_called_names: list[str] = []
     mcp_turn_outcome = "failed"
+    provider_roundtrip_trace = (
+        _provider_tool_surface_callback(
+            deps,
+            user_id,
+            lane,
+            str(job.get("trace_id") or ""),
+        )
+        if lane == "chat"
+        else None
+    )
 
     try:
         if not claimed_by or not await asyncio.to_thread(
@@ -9024,6 +10022,8 @@ async def process_job(
                 claimed_by,
                 tm,
                 trajectory_recorder,
+                attempt_count=int(job.get("attempt_count") or 0),
+                trace_id=str(job.get("trace_id") or ""),
             )
         if lane in _EXTRACTION_LANES:
             # 自成一体的记忆抽取路径（capture/dream，Task 3）：build prompt → BYOK 抽取 →
@@ -9263,12 +10263,14 @@ async def process_job(
         # cannot block a reply that was already committed by a previous worker.
         # It still precedes every provider call, preventing an
         # under-authorized response when the workspace snapshot is unavailable.
-        trusted_system_blocks, working_memory = await _load_workspace_prompt_context(
+        workspace_prompt = await _load_workspace_prompt_context(
             deps,
             store,
             runtime_token=runtime_token,
             enclave_sem=enclave_sem,
         )
+        identity_card_or_persona = workspace_prompt.identity_card_or_persona
+        trusted_system_blocks = workspace_prompt.trusted_system_blocks
 
         # —— Unified provider-native tool loop (spec C6 + C9a) ——
         # Every model drives the same catalog through the same loop. Writes
@@ -9291,7 +10293,7 @@ async def process_job(
         )
 
         # Read one frozen, bounded raw-Chat window plus the latest usable
-        # MEMORY/USER profile. Conversation summary coverage is not a turn
+        # MEMORY/STYLE profile. Conversation summary coverage is not a turn
         # dependency: Profile lag/failure yields an empty profile and Chat
         # continues from recent turns.
         # This all-role upper bound controls prompt membership/de-duplication
@@ -9536,9 +10538,139 @@ async def process_job(
             )
 
         offered_mcp_tool_specs = _current_offered_mcp_tool_specs()
+        platform_schema_recovery = v2_tool_surface.SchemaRecoveryState({
+            spec.name: spec for spec in cap_tool_schema.build_tool_specs()
+        })
+        pressure_mcp_specs = getattr(
+            mcp_turn, "pressure_collapsed_tool_specs", None
+        )
+        protected_mcp_names = getattr(
+            mcp_turn, "protected_tool_names", None
+        )
+        mcp_recovery_needed = getattr(mcp_turn, "recovery_needed", None)
+        record_mcp_pressure_surface = getattr(
+            mcp_turn, "set_pressure_tool_surface", None
+        )
         mcp_offered_names = tuple(
             str(spec.name) for spec in offered_mcp_tool_specs if str(spec.name)
         )
+        if not callable(mcp_recovery_needed):
+            requires_mcp_resolution = getattr(
+                mcp_turn, "requires_resolution", None
+            )
+
+            def _legacy_mcp_recovery_needed() -> bool:
+                return callable(requires_mcp_resolution) and any(
+                    requires_mcp_resolution(name) for name in mcp_offered_names
+                )
+
+            mcp_recovery_needed = _legacy_mcp_recovery_needed
+        if not callable(protected_mcp_names):
+            requires_mcp_resolution = getattr(
+                mcp_turn, "requires_resolution", None
+            )
+
+            def _legacy_protected_mcp_names() -> set[str]:
+                collapsed = set(
+                    getattr(mcp_turn, "collapsed_names", ()) or ()
+                )
+                if not callable(requires_mcp_resolution):
+                    return set()
+                return {
+                    name for name in collapsed
+                    if not requires_mcp_resolution(name)
+                }
+
+            protected_mcp_names = _legacy_protected_mcp_names
+
+        def _record_pressure_tool_surface(decision: dict | None) -> None:
+            detail = decision if isinstance(decision, dict) else {}
+            collapsed = detail.get("pressure_collapsed_names", ())
+            platform_schema_recovery.set_pressure_collapsed(collapsed)
+            if callable(record_mcp_pressure_surface):
+                record_mcp_pressure_surface(detail)
+
+        def _protected_pressure_tool_names() -> set[str]:
+            protected = platform_schema_recovery.protected_names()
+            if callable(protected_mcp_names):
+                protected.update(protected_mcp_names() or ())
+            return protected
+
+        def _pressure_tool_recovery_needed() -> bool:
+            return platform_schema_recovery.recovery_needed() or (
+                callable(mcp_recovery_needed) and bool(mcp_recovery_needed())
+            )
+
+        def _resolve_pressure_tool_schemas(args: dict | None) -> dict:
+            requires_mcp_resolution = getattr(
+                mcp_turn, "requires_resolution", None
+            )
+            mcp_candidates = {
+                spec.name: spec
+                for spec in _current_offered_mcp_tool_specs()
+                if callable(requires_mcp_resolution)
+                and requires_mcp_resolution(spec.name)
+            }
+            candidates = {
+                **platform_schema_recovery.discoverable_specs(),
+                **mcp_candidates,
+            }
+            selection = v2_tool_surface.select_schema_names(
+                args,
+                candidates,
+                max_results=8,
+            )
+            if selection.get("error"):
+                return {"error": selection["error"], "tools": []}
+            selected = list(selection.get("selected") or [])
+            platform_selected = [
+                name for name in selected
+                if name in platform_schema_recovery.full_specs
+            ]
+            platform_resolved = platform_schema_recovery.resolve(
+                platform_selected
+            )
+            tools_by_name = {
+                name: platform_schema_recovery.full_specs[name]
+                for name in platform_resolved
+            }
+            mcp_selected = [name for name in selected if name in mcp_candidates]
+            mcp_result = {"resolved": [], "not_found": [], "tools": []}
+            resolve_mcp = getattr(mcp_turn, "resolve_tool_schemas", None)
+            if mcp_selected and callable(resolve_mcp):
+                mcp_result = resolve_mcp({"names": mcp_selected})
+                for item in mcp_result.get("tools") or []:
+                    if isinstance(item, dict) and item.get("name"):
+                        tools_by_name[str(item["name"])] = item
+            resolved_set = set(platform_resolved) | set(
+                mcp_result.get("resolved") or []
+            )
+
+            def _public_tool(name: str) -> dict | None:
+                item = tools_by_name.get(name)
+                if isinstance(item, dict):
+                    return item
+                if item is None:
+                    return None
+                return {
+                    "name": item.name,
+                    "description": item.description,
+                    "parameters": item.parameters,
+                }
+
+            return {
+                "resolved": [name for name in selected if name in resolved_set],
+                "not_found": list(selection.get("not_found") or [])
+                + list(mcp_result.get("not_found") or []),
+                "schema_budget_exceeded": list(
+                    mcp_result.get("schema_budget_exceeded") or []
+                ),
+                "tools": [
+                    public
+                    for name in selected
+                    if (public := _public_tool(name)) is not None
+                ],
+            }
         if mutation_recovery_barrier is not None:
             disabled_mutation_tool_names = frozenset(
                 set(cap_registry.WRITE_ACTIONS)
@@ -9594,12 +10726,10 @@ async def process_job(
             if history_tools_offered
             else frozenset(cap_history.HISTORY_TOOL_NAMES)
         )
-        disabled_mcp_search_tool_names = (
-            frozenset()
-            if set(getattr(mcp_turn, "collapsed_names", ()) or ())
-            & {spec.name for spec in offered_mcp_tool_specs}
-            else frozenset({cap_tool_schema.MCP_TOOL_SEARCH_TOOL})
-        )
+        # The search schema remains latent in full-fit plans. It must stay in
+        # the planner's candidate catalog even without MCP, because prompt
+        # pressure can fold non-resident platform manuals too.
+        disabled_mcp_search_tool_names = frozenset()
         disabled_tool_names_for_turn = (
             frozenset(disabled_mutation_tool_names)
             | disabled_web_tool_names
@@ -9655,6 +10785,7 @@ async def process_job(
             api_key=api_key,
             runtime_token=runtime_token,
             enclave_sem=enclave_sem,
+            identity_card_or_persona=identity_card_or_persona,
             trusted_system_blocks=trusted_system_blocks,
             add_usage=tm.add_call,
             observe_photo=observe_photo,
@@ -9747,16 +10878,10 @@ async def process_job(
                 # worker-level gate as MCP reads. Executor still owns validation,
                 # provenance, encrypted outbox writes, and terminal write failures.
                 if tc.name == cap_tool_schema.MCP_TOOL_SEARCH_TOOL:
-                    resolve = getattr(mcp_turn, "resolve_tool_schemas", None)
-                    if not callable(resolve):
-                        return ToolResult(
-                            call_id=tc.id,
-                            content="error: no folded MCP tools are available",
-                        )
                     return ToolResult(
                         call_id=tc.id,
                         content=json.dumps(
-                            resolve(tc.args),
+                            _resolve_pressure_tool_schemas(tc.args),
                             ensure_ascii=False,
                             sort_keys=True,
                             separators=(",", ":"),
@@ -9941,8 +11066,8 @@ async def process_job(
                     for tc, result in zip(calls, results)
                 ]
 
-            # Schema omission is the provider-facing control; this runtime gate
-            # independently refuses unresolved MCP calls before any durable
+            # Folding is the provider-facing control; this runtime gate
+            # independently refuses every unresolved call before a durable
             # mutation marker or remote request.
             blocked_by_id: dict[str, ToolResult] = {}
             dispatchable_calls = list(tool_calls)
@@ -9950,14 +11075,20 @@ async def process_job(
                 str(tc.id): ToolResult(
                     call_id=tc.id,
                     content=(
-                        "error: mcp tool schema is not loaded; call "
+                        "error: tool schema is not loaded; call "
                         f'{cap_tool_schema.MCP_TOOL_SEARCH_TOOL} with '
                         f'names=["{tc.name}"] first'
                     ),
                 )
                 for tc in dispatchable_calls
-                if callable(getattr(mcp_turn, "requires_resolution", None))
-                and mcp_turn.requires_resolution(tc.name)
+                if (
+                    tc.name
+                    in platform_schema_recovery.discoverable_specs()
+                    or (
+                        callable(getattr(mcp_turn, "requires_resolution", None))
+                        and mcp_turn.requires_resolution(tc.name)
+                    )
+                )
             }
             if unresolved_by_id:
                 blocked_by_id.update(unresolved_by_id)
@@ -10078,12 +11209,28 @@ async def process_job(
         final_job_completed_atomically = False
         pending_file_replies: list[WorkspaceFileReply] = []
         pending_file_keys: set[tuple[str, int]] = set()
+        last_promotable_reply_text = ""
 
         async def _on_file_requirement_changed() -> None:
             pending_file_replies.clear()
             pending_file_keys.clear()
 
         thinking_trace_emitted = False
+        language_trace_emitted = False
+        language_user_rows: list[dict] = []
+        language_correction_attempted = False
+        language_correction_pending = False
+        language_correction_outcome = "skipped"
+        thinking_language_correction_pending = False
+
+        def _cancel_language_correction() -> None:
+            nonlocal language_correction_attempted
+            nonlocal language_correction_pending, language_correction_outcome
+            nonlocal thinking_language_correction_pending
+            language_correction_attempted = False
+            language_correction_pending = False
+            language_correction_outcome = "skipped"
+            thinking_language_correction_pending = False
 
         async def _on_reply(
             text: str | WorkspaceFileReply,
@@ -10091,12 +11238,22 @@ async def process_job(
             final: bool,
             reasoning: str = "",
             media: tuple[ProviderMedia, ...] = (),
-        ) -> None:
+            correction_outcome: str = "",
+        ) -> (
+            v2_tool_loop.FinalReplyCorrectionRequest
+            | v2_tool_loop.FinalReplyCorrectionRejected
+            | None
+        ):
             nonlocal final_job_completed_atomically, voice_reply_slot
             nonlocal voice_call_ended_atomically
-            nonlocal thinking_trace_emitted
+            nonlocal thinking_trace_emitted, language_trace_emitted
+            nonlocal language_correction_attempted
+            nonlocal language_correction_pending, language_correction_outcome
+            nonlocal thinking_language_correction_pending
+            nonlocal last_promotable_reply_text
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
-            text = "" if file_reply is not None else str(text or "").strip()
+            raw_reply_text = "" if file_reply is not None else str(text or "").strip()
+            text = raw_reply_text
             image_replies: list[GeneratedImageReply] = []
             if media:
                 if file_reply is not None or not final:
@@ -10147,6 +11304,9 @@ async def process_job(
                 if _st_status == self_thinking.COMPLETE:
                     text = _st_reply
                     self_thinking_text = _st_thinking
+                    if _self_thinking_internal_term(self_thinking_text):
+                        self_thinking_text = ""
+                        self_thinking_failed = True
                 elif _st_status in {self_thinking.SILENT, self_thinking.FAILED}:
                     # Foreground chat must always answer, so both malformed protocol
                     # and a clean thinking-only response keep the pre-existing FAILED
@@ -10266,6 +11426,72 @@ async def process_job(
                     )
                     if not pending_file_replies:
                         raise TurnError("internal_file_reference_without_attachment")
+            if correction_outcome:
+                safe_outcomes = {
+                    "corrected",
+                    "kept_original_still_mismatch",
+                    "retry_error",
+                    "retry_empty",
+                    "skipped",
+                }
+                language_correction_outcome = (
+                    correction_outcome
+                    if correction_outcome in safe_outcomes
+                    else "skipped"
+                )
+                language_correction_attempted = (
+                    language_correction_outcome != "skipped"
+                )
+                language_correction_pending = False
+                thinking_language_correction_pending = False
+            elif final and file_reply is None and not image_replies and text:
+                if (
+                    self_thinking_text
+                    and not thinking_language_correction_pending
+                    and not correction_outcome
+                ):
+                    thinking_mismatch = _self_thinking_language_mismatch(
+                        self_thinking_text, language_user_rows
+                    )
+                    if thinking_mismatch is not None:
+                        thinking_language_correction_pending = True
+                        return v2_tool_loop.FinalReplyCorrectionRequest(
+                            instruction=(
+                                v2_language_follow.CORRECTION_INSTRUCTION
+                                + "\n重写时保留 <think>…</think> 结构，并让思考段与用户语言一致。"
+                            ),
+                            original_text=raw_reply_text,
+                            original_reasoning=reasoning,
+                            on_cancel=_cancel_language_correction,
+                        )
+                (
+                    user_script,
+                    reply_script,
+                    follow_outcome,
+                ) = _reply_language_follow_observation(language_user_rows, text)
+                if language_correction_pending:
+                    if reply_script == user_script:
+                        language_correction_pending = False
+                        language_correction_outcome = "corrected"
+                    else:
+                        # The loop still owns the original candidate. Reject this
+                        # one without publishing so it can fail-open to that exact
+                        # original rather than exposing a second wrong-language
+                        # rewrite.
+                        return v2_tool_loop.FinalReplyCorrectionRejected()
+                elif (
+                    follow_outcome == "mismatch"
+                    and user_script not in {"indeterminate", "mixed"}
+                    and reply_script not in {"indeterminate", "mixed"}
+                ):
+                    language_correction_attempted = True
+                    language_correction_pending = True
+                    return v2_tool_loop.FinalReplyCorrectionRequest(
+                        instruction=v2_language_follow.CORRECTION_INSTRUCTION,
+                        original_text=raw_reply_text,
+                        original_reasoning=reasoning,
+                        on_cancel=_cancel_language_correction,
+                    )
             delivery_started_ns = time.monotonic_ns()
             # A cutover/ABA can happen while awaiting the provider. Fence at
             # the reply effect itself; the pre-round check is not sufficient.
@@ -10577,6 +11803,8 @@ async def process_job(
                                 "text": spoken_reply,
                             }
                 if status == "applied" and not final:
+                    if file_reply is None and not image_replies:
+                        last_promotable_reply_text = str(text or "").strip()
                     return
                 if status == "applied":
                     source_status = await asyncio.to_thread(
@@ -10598,6 +11826,17 @@ async def process_job(
                             lane="chat",
                             branch=_thinking_branch,
                             chars=_thinking_chars,
+                        )
+                    if final and not language_trace_emitted:
+                        language_trace_emitted = True
+                        await _emit_reply_language_follow_trace(
+                            deps.emit_debug_trace,
+                            user_id,
+                            user_rows=language_user_rows,
+                            visible_reply=text,
+                            lane="chat",
+                            correction_attempted=language_correction_attempted,
+                            correction_outcome=language_correction_outcome,
                         )
                     final_job_completed_atomically = True
                     return
@@ -10675,6 +11914,194 @@ async def process_job(
                     branch=_thinking_branch,
                     chars=_thinking_chars,
                 )
+            if final and not language_trace_emitted:
+                language_trace_emitted = True
+                await _emit_reply_language_follow_trace(
+                    deps.emit_debug_trace,
+                    user_id,
+                    user_rows=language_user_rows,
+                    visible_reply=text,
+                    lane="chat",
+                    correction_attempted=language_correction_attempted,
+                    correction_outcome=language_correction_outcome,
+                )
+
+        async def _on_promote_last_intermediate() -> bool:
+            """Close this chat turn through its last durable reply-tool bubble."""
+            nonlocal final_job_completed_atomically
+            nonlocal thinking_trace_emitted, language_trace_emitted
+            nonlocal voice_reply_slot
+
+            if not seq_native or pending_file_replies:
+                return False
+            await _ensure_runtime_mode()
+            await _renew_lease()
+            receipt = await asyncio.to_thread(
+                v2_effect_outbox.last_promotable_intermediate_reply,
+                user_id=user_id,
+                job_id=job_id,
+            )
+            if receipt is None:
+                return False
+
+            source_effect_id = str(receipt["effect_id"])
+            payload = dict(receipt["payload"])
+            payload.pop(v2_effect_outbox.REPLY_SOURCE_FENCE_KEY, None)
+            payload["reply_through_seq"] = int(cursor_box["seq"])
+            payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
+                "claimed_by": claimed_by,
+                "input_generation": int(observed_generation),
+                "through_seq": int(cursor_box["seq"]),
+            }
+            if ordered_chat_replies:
+                payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY][
+                    "preserve_queued_input"
+                ] = True
+            payload[
+                v2_effect_outbox.PROMOTED_INTERMEDIATE_EFFECT_ID_KEY
+            ] = source_effect_id
+            if reply_parent_message_id:
+                payload["reply_to_message_id"] = reply_parent_message_id
+            if voice_call_context:
+                payload.update(voice_call_context)
+            try:
+                status_rows = await asyncio.to_thread(
+                    jobs_store.status_events_for_job, user_id, int(job_id)
+                )
+                payload.update(
+                    _activity_extra(
+                        core_chat_activity.project_tool_events(status_rows),
+                        turn_id=str(job.get("trace_id") or ""),
+                        job_id=int(job_id),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - reply stays authoritative
+                log.warning(
+                    "[v2.activity] promoted final projection failed "
+                    "user=%s job=%s code=%s",
+                    user_id,
+                    job_id,
+                    type(exc).__name__.lower(),
+                )
+
+            delivery_started_ns = time.monotonic_ns()
+            effect_id = await asyncio.to_thread(
+                v2_effect_outbox.enqueue_reply_promotion,
+                intermediate_effect_id=source_effect_id,
+                job_id=job_id,
+                user_id=user_id,
+                expected_generation=gen,
+                payload=payload,
+            )
+            if deps.apply_pending_effects is not None:
+                await asyncio.to_thread(deps.apply_pending_effects, user_id)
+            disposition = await asyncio.to_thread(
+                v2_effect_outbox.get_effect_disposition,
+                effect_id,
+                user_id=user_id,
+                job_id=job_id,
+                effect_type=v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE,
+            )
+            status = "missing" if disposition is None else disposition["status"]
+            last_error = "" if disposition is None else disposition["last_error"]
+            await _record_trajectory(
+                trajectory_recorder,
+                "reply_effect_disposition",
+                {
+                    "effect_id": effect_id,
+                    "effect_type": v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE,
+                    "final": True,
+                    "promoted_intermediate": True,
+                    "status": status,
+                    "last_error": last_error,
+                    "duration_ms": round(
+                        max(0, time.monotonic_ns() - delivery_started_ns)
+                        / 1_000_000.0,
+                        3,
+                    ),
+                },
+                best_effort=True,
+            )
+            if status == "applied":
+                source_status = await asyncio.to_thread(
+                    jobs_store.get_job_status,
+                    job_id,
+                    user_id=user_id,
+                    claimed_by=claimed_by,
+                )
+                if source_status != "completed":
+                    raise RuntimeError(
+                        "promoted final reply applied without completing source job"
+                    )
+                if not thinking_trace_emitted:
+                    thinking_trace_emitted = True
+                    await _emit_thinking_surfaced_trace(
+                        deps.emit_debug_trace,
+                        user_id,
+                        provider_config,
+                        lane="chat",
+                        branch="none",
+                        chars=0,
+                    )
+                if not language_trace_emitted:
+                    language_trace_emitted = True
+                    await _emit_reply_language_follow_trace(
+                        deps.emit_debug_trace,
+                        user_id,
+                        user_rows=language_user_rows,
+                        visible_reply=last_promotable_reply_text,
+                        lane="chat",
+                        correction_attempted=False,
+                        correction_outcome="skipped",
+                    )
+                if last_promotable_reply_text:
+                    voice_context = await asyncio.to_thread(
+                        _voice_context_for_seq,
+                        user_id,
+                        cursor_box["seq"],
+                    )
+                    if voice_context is not None:
+                        voice_reply_slot = {
+                            **voice_context,
+                            "message_id": str(payload["envelope"]["id"]),
+                            "text": last_promotable_reply_text,
+                        }
+                final_job_completed_atomically = True
+                return True
+            if (
+                status == "discarded"
+                and last_error == v2_effect_outbox.FINAL_REPLY_INPUT_ADVANCED
+            ):
+                raise v2_tool_loop.FinalReplySuperseded()
+            if (
+                status == "discarded"
+                and last_error == v2_effect_outbox.FINAL_REPLY_INVALID_FENCE
+            ):
+                raise RuntimeError("invalid promoted final reply fence")
+            if (
+                status == "discarded"
+                and last_error == v2_effect_outbox.FINAL_REPLY_SOURCE_JOB_INACTIVE
+            ):
+                raise LostJobLease(
+                    "source job became inactive before reply promotion"
+                )
+            if status == "discarded" and last_error in {
+                v2_effect_outbox.EFFECT_RUNTIME_STATE_CHANGED,
+                v2_effect_outbox.EFFECT_RUNTIME_GENERATION_CHANGED,
+            }:
+                code = (
+                    "runtime_mode_changed"
+                    if last_error
+                    == v2_effect_outbox.EFFECT_RUNTIME_STATE_CHANGED
+                    else "runtime_generation_changed"
+                )
+                await _fail_runtime_fence(
+                    code,
+                    "runtime ownership changed before reply promotion",
+                )
+            raise RuntimeError(
+                "promoted final reply effect not durably applied: " + status
+            )
 
         # `seq` is exclusively the consumed user|human frontier. The base prompt's
         # all-role snapshot bound is passed separately to the fold closure so an
@@ -10783,7 +12210,13 @@ async def process_job(
             if boundary_generation is None:
                 raise LostJobLease("job ownership lost at round boundary")
             observed_generation = int(boundary_generation)
-            return await base_fold_new_messages()
+            rows = await base_fold_new_messages()
+            # Folded rows are user-only by contract, though coalescing removes
+            # their redundant role field.
+            language_user_rows.extend(
+                {**row, "role": "user"} for row in rows
+            )
+            return rows
 
         grounding_results: dict[str, Any] = {}
         if pending_schedule_results:
@@ -10884,8 +12317,8 @@ async def process_job(
                 tail=tail,
                 extra_context=turn_extra_context,
                 mutation_recovery_active=(mutation_recovery_barrier is not None),
+                identity_card_or_persona=identity_card_or_persona,
                 trusted_system_blocks=turn_trusted_system_blocks,
-                working_memory=working_memory,
                 agent_memory=agent_memory,
                 user_profile=user_profile,
                 worldbook_context=worldbook_context,
@@ -10904,10 +12337,22 @@ async def process_job(
                 build_messages,
                 provider_config=provider_config,
             )
-        except v2_prompt_frontier.PromptFrontierExhausted:
+        except v2_prompt_frontier.PromptFrontierExhausted as exc:
+            await asyncio.to_thread(
+                _emit_prompt_frontier_trace,
+                deps,
+                user_id,
+                exc,
+                lane=lane,
+            )
             tm.record_prompt_frontier_exhaustion()
             raise
 
+        language_user_rows[:] = (
+            _flatten_turns(optional_tail_turns)
+            + list(tail)
+            + [{**row, "role": "user"} for row in coalesced]
+        )
         await _ensure_runtime_mode()
         await _renew_lease()
         await asyncio.to_thread(_emit_status, user_id, job_id, "writing_reply")
@@ -10930,6 +12375,7 @@ async def process_job(
             build_messages=build_messages,
             dispatch_tools=_dispatch_tools,
             on_reply=_on_reply,
+            on_promote_last_intermediate=_on_promote_last_intermediate,
             on_file_reply=(
                 _on_file_reply if deps.load_workspace_file is not None else None
             ),
@@ -10957,10 +12403,14 @@ async def process_job(
                 user_id,
                 exc,
             ),
-            on_provider_tool_surface=_provider_tool_surface_callback(
-                deps,
-                user_id,
-                lane,
+            on_provider_tool_surface=provider_roundtrip_trace,
+            on_empty_provider_response=(
+                _empty_provider_response_debug_callback(
+                    deps,
+                    user_id,
+                    lane,
+                    str(job.get("trace_id") or ""),
+                )
             ),
             fold_before_first=seq_native and not ordered_chat_replies,
             on_progress=_report_turn_progress,
@@ -10968,9 +12418,23 @@ async def process_job(
                 trajectory_recorder,
                 deps=deps,
                 user_id=user_id,
+                lane=lane,
             ),
             extra_tool_specs=offered_mcp_tool_specs,
             refresh_extra_tool_specs=_current_offered_mcp_tool_specs,
+            refresh_pressure_collapsed_extra_tool_specs=(
+                pressure_mcp_specs if callable(pressure_mcp_specs) else None
+            ),
+            refresh_protected_extra_tool_names=(
+                _protected_pressure_tool_names
+            ),
+            extra_tool_recovery_name=cap_tool_schema.MCP_TOOL_SEARCH_TOOL,
+            extra_tool_recovery_active=(
+                _pressure_tool_recovery_needed
+            ),
+            on_extra_tool_surface_plan=(
+                _record_pressure_tool_surface
+            ),
             extra_mutating_tool_names=mcp_mutating_names,
             disabled_tool_names=disabled_tool_names_for_turn,
             outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
@@ -10993,9 +12457,15 @@ async def process_job(
                 PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
             ),
             prompt_image_reserve_tokens=PROMPT_IMAGE_RESERVE_TOKENS,
+            tool_schema_collapse_policy=TOOL_SCHEMA_COLLAPSE_POLICY,
             on_tail_window=_tail_window_callback(tm),
             on_prompt_frontier_exhaustion=(
                 tm.record_prompt_frontier_exhaustion
+            ),
+            on_prompt_frontier_exhausted_detail=(
+                _prompt_frontier_exhaustion_trace_callback(
+                    deps, user_id, lane
+                )
             ),
         )
         if pushed_screen_frame_ids:
@@ -11181,6 +12651,12 @@ async def process_job(
             )
             if not completed:
                 raise LostJobLease("job ownership lost during finalization")
+        # A successfully committed foreground reply proves the user's provider
+        # credential is working again.  Re-arm only provider_config profile
+        # failures; terminal remains operator-only.  This runs after the current
+        # turn's profile scheduling check, so the next natural trigger owns the
+        # retry, and any read/CAS failure cannot rewrite the delivered chat.
+        await _repair_profile_after_chat_provider_success(user_id)
         # The reply/cursor/job lifecycle transition above is authoritative.  In
         # the seq-native path it is one transaction; in the compatibility path
         # ``finish_chat_job`` has already committed before we get here.  Status
@@ -11360,6 +12836,8 @@ async def process_job(
         if lease_keepalive_task is not None:
             lease_keepalive_task.cancel()
             await asyncio.gather(lease_keepalive_task, return_exceptions=True)
+        if provider_roundtrip_trace is not None:
+            await provider_roundtrip_trace.emit_summary()
         if mcp_offered_names and deps.emit_debug_trace is not None:
             detail = _mcp_turn_usage_detail(mcp_offered_names, mcp_called_names)
             try:

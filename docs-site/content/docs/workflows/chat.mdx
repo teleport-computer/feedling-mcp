@@ -30,12 +30,26 @@ trigger, the scheduler creates the next pending occurrence with a new
 reminder context and cancels the whole repeating series. Omitting `repeat`
 preserves one-time reminder behavior.
 
+Hosted Runtime V2 gives a pristine failed reminder delivery up to three total
+attempts, waiting 30 seconds and then 120 seconds. It does not retry failures
+that cannot safely repeat, including provider configuration/payment failures,
+attempts that mutated an MCP service or staged a durable platform write, lost
+leases, runtime-mode changes, and exhausted budgets. Generic heartbeat failure
+backoff does not delay reminder delivery; payment cooldown still prevents calls
+that cannot succeed. Intermediate failures and a later successful retry remain
+silent. After a terminal failure, the chat stream receives one standalone
+system notice with the reminder title and original local time, plus recharge
+guidance when model-service quota is insufficient; the failed occurrence is not
+automatically delivered later.
+
 ## Hosted chat
 
 Before sending, the account needs a content public key, a configured model route,
 and a live Hosted Runtime V2 worker pool. Runtime-control, worker-liveness,
-kill-switch, and admission failures are returned before the user message is
-stored.
+kill-switch, and provider/configuration failures are returned before the user
+message is stored. A live but overloaded worker pool still accepts the encrypted
+message and queues or coalesces its Chat Job; capacity estimates are telemetry,
+not a reason to make the client retain the only copy of the user's words.
 
 Accepted Chat work has dedicated Foreground execution capacity. During the same
 database transaction that enqueues a new Chat Job, Runtime V2 can supersede or
@@ -62,7 +76,7 @@ resident path.
 
 ### Automatic context and archive lookup
 
-Hosted Runtime V2 automatically supplies the latest usable MEMORY/USER Profile
+Hosted Runtime V2 automatically supplies the latest usable MEMORY/STYLE Profile
 plus bounded raw Chat: up to 40 complete recent turns for foreground Chat and
 up to 16 for proactive wakes. Profile refresh is asynchronous and
 last-known-good, so a missing, delayed, failed, or undecryptable refresh never
@@ -330,9 +344,11 @@ X-API-Key: YOUR_FEEDLING_API_KEY
 }
 ```
 
-Decrypt `body_ct` on the authorized client. When a history item has
+Decrypt `body_ct` on the authorized client. A `body_b64` field is already
+plaintext bytes and must only be strict-base64-decoded. When a history item has
 `body_omitted: true`, fetch `/v1/chat/messages/{message_id}/body` instead of
-assuming the message is empty.
+assuming the message is empty. Omitted plaintext pointers report
+`body_size_bytes`; legacy encrypted pointers retain `body_ct_len`.
 
 Hosted Runtime V2 can return a generated document as a native attachment. The
 model first creates or replaces editable UTF-8 source in an encrypted
@@ -522,6 +538,33 @@ does not wake the resident consumer again. An invalid UUID returns
 
 For `content_type: "file"`, `file_name` and `file_mime` are optional metadata.
 
+When `content_encryption_effective` is `"off"`, an image or file can instead use
+the binary plaintext shape. `body_b64` is strict base64 of the original bytes,
+not ciphertext; `body_size_bytes` is optional but must match when present.
+`body_b64` is rejected for text messages and for accounts whose effective tier
+is `"on"`.
+
+```json
+{
+  "envelope": {
+    "v": 1,
+    "id": "env_file_123",
+    "body_b64": "BASE64_PLAINTEXT_FILE_BYTES",
+    "body_size_bytes": 48231,
+    "visibility": "shared",
+    "owner_user_id": "usr_0123456789abcdef"
+  },
+  "content_type": "file",
+  "file_name": "plan.pdf",
+  "file_mime": "application/pdf"
+}
+```
+
+The service may offload those decoded bytes to object storage as a
+`plaintext_v1` pointer. It verifies the persisted SHA-256 and byte length on
+read, then returns `body_b64`; internal object keys and hashes are never part of
+the public response.
+
 To attach user-selected memory references to the turn (the Garden "talk in
 chat" flow), pass `context_refs` beside the envelope — the same plaintext
 routing shape as the hosted send. Only entries with `type: "memory"` are
@@ -655,6 +698,22 @@ seconds. Missing, malformed, future, or stale reports normalize to `unknown`.
 Every official poll is authoritative: omitting the two headers clears any
 previous cached green report instead of inheriting it. Response requests do not
 update this poll-heartbeat state.
+
+Resident liveness itself uses the newest accepted poll or response activity.
+When an official resident takes longer than the normal 180-second freshness
+window to answer, its current response can still prove liveness only if that
+same consumer identity previously polled. A client that never polled cannot mint
+liveness by copying resident headers. Successful responses refresh the shared
+activity clock without overwriting the separate poll timestamp.
+
+Every `409 bootstrap_incomplete` response includes `retryable`. The
+`needs_resident_consumer` stage returns `true`, allowing the standard resident
+to retry the same reply with up to three bounded exponential-backoff retries. Other
+bootstrap stages return `false`; clients must also treat a missing field from an
+older server as false. The backoff uses
+`FEEDLING_CHAT_RESPONSE_RETRY_BASE_SEC` (default 1 second) and stops after
+`FEEDLING_CHAT_RESPONSE_RETRY_MAX_ELAPSED_SEC` (default 15 seconds); deployments
+can change the retry count with `FEEDLING_CHAT_RESPONSE_MAX_RETRIES`.
 
 For a resident-route account that has not completed one ordinary user/agent
 exchange, every non-`ok` result blocks onboarding validation, live-loop

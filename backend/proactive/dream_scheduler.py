@@ -6,7 +6,6 @@ agent, write chat, or consult proactive reach-out gates.
 """
 from __future__ import annotations
 
-import hashlib
 import os
 import time
 from datetime import datetime, timezone
@@ -14,7 +13,9 @@ from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
 import db
+import debug_trace
 import memory_readside_core
+from memory_garden import dreaming as mg_dreaming
 from memory import service as memory_service
 from proactive import capture_jobs
 
@@ -157,6 +158,10 @@ def _live_user_turn_count(store) -> int:
 
 
 def _dream_snapshot(store) -> dict[str, Any]:
+    """取花园形状。**「什么算种子卡」「签名怎么算」已搬进内核** —— 那是 Garden
+    内部结构的知识；这里只负责取数（查库、按归属和可见性过滤）与拼上 io 侧的
+    对话轮数。见 memory_garden/dreaming.py 的模块说明。
+    """
     all_moments = [
         dict(moment)
         for moment in memory_service._load_moments(store)
@@ -171,26 +176,7 @@ def _dream_snapshot(store) -> dict[str, Any]:
         ],
         key=lambda item: str(item.get("id") or ""),
     )
-    # Dream output is intentionally excluded from the durable trigger source.
-    # Count historical seed cards (including ones Dream later superseded), so
-    # Dream's own retire/add writes cannot decrease/increase this frontier.
-    seed_moments = sorted(
-        [
-            moment
-            for moment in all_moments
-            if str(moment.get("source") or "").strip() != "memory_dream"
-        ],
-        key=lambda item: str(item.get("id") or ""),
-    )
-    digest = hashlib.sha256(
-        "\n".join(
-            "|".join(
-                str(moment.get(key) or "")
-                for key in ("id", "source", "created_at", "occurred_at")
-            )
-            for moment in seed_moments
-        ).encode("utf-8")
-    ).hexdigest()[:32]
+    snap = mg_dreaming.dream_snapshot(available_cards=moments, all_cards=all_moments)
     last = moments[-1] if moments else {}
     last_until = str(
         last.get("updated_at")
@@ -199,24 +185,28 @@ def _dream_snapshot(store) -> dict[str, Any]:
         or ""
     )[:240]
     return {
-        "card_count": len(moments),
-        "seed_card_count": len(seed_moments),
+        "card_count": snap.card_count,
+        "seed_card_count": snap.seed_card_count,
         "turn_count": _live_user_turn_count(store),
-        "signature": digest,
+        "signature": snap.signature,
         "last_until": last_until,
     }
 
 
 def dream_key_for_snapshot(state: Mapping[str, Any], snapshot: Mapping[str, Any]) -> str:
-    material = "|".join(
-        [
-            str(state.get("last_dream_signature") or ""),
-            str(snapshot.get("signature") or ""),
-            str(snapshot.get("seed_card_count") or 0),
-            str(snapshot.get("turn_count") or 0),
-        ]
+    """幂等键。键的算法在内核，io 只把自己那侧的材料（对话轮数）拌进去。"""
+    return mg_dreaming.dream_idempotency_key(
+        mg_dreaming.DreamLedger(
+            last_seed_card_count=int(state.get("last_dreamed_seed_card_count") or 0),
+            last_signature=str(state.get("last_dream_signature") or ""),
+        ),
+        mg_dreaming.DreamSnapshot(
+            card_count=int(snapshot.get("card_count") or 0),
+            seed_card_count=int(snapshot.get("seed_card_count") or 0),
+            signature=str(snapshot.get("signature") or ""),
+        ),
+        extra=(int(snapshot.get("turn_count") or 0),),
     )
-    return "dream:" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
 def _dream_enabled(store) -> bool:
@@ -227,6 +217,63 @@ def _dream_enabled(store) -> bool:
 
 
 def tick_memory_dream(
+    store, *, now: float | None = None, force: bool = False,
+    submit: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """做梦判定 —— 外层只负责留痕，判定逻辑一行没动（见 `_tick_memory_dream`）。
+
+    2026-08-17 补：此前 7 种早退理由全是裸 return，服务端查不到「为什么没做梦」。
+    实测代价：某用户六天没做过梦，从日志里完全看不出是没攒够卡、还是被夜间
+    窗口挡住、还是失败退避 —— 只能去猜。
+    """
+    started = time.monotonic()
+    outcome = _tick_memory_dream(store, now=now, force=force, submit=submit)
+    try:
+        _emit_dream_trace(store, outcome, duration_ms=(time.monotonic() - started) * 1000.0,
+                          forced=bool(force))
+    except Exception:  # noqa: BLE001 — 观测失败绝不能挡住做梦
+        pass
+    return outcome
+
+
+def _emit_dream_trace(store, outcome: Mapping[str, Any], *, duration_ms: float,
+                      forced: bool) -> None:
+    """一条内容无关的做梦判定记录。卡片正文、摘要一律不进。"""
+    snapshot = outcome.get("snapshot") if isinstance(outcome.get("snapshot"), Mapping) else {}
+    enqueued = bool(outcome.get("enqueued"))
+    reason = str(outcome.get("reason") or ("enqueued" if enqueued else "unknown"))
+    detail = {
+        "enqueued": enqueued,
+        "reason": reason,
+        "forced": forced,
+        "counts": {
+            # 「攒够没」这个判据的两个输入 —— 没有它们就说不清为什么没触发
+            "seed_cards": _safe_int(snapshot.get("seed_card_count")),
+            "new_since_last": _safe_int(snapshot.get("new_since_last")),
+            "min_new_cards": min_new_cards(),
+            "user_turns": _safe_int(snapshot.get("user_turn_count")),
+        },
+        "signature_changed": bool(snapshot.get("signature")
+                                  and snapshot.get("signature") != outcome.get("last_signature")),
+        "dur_ms": round(float(duration_ms), 1),
+    }
+    debug_trace.trace_event(
+        store, subsystem="memory", type="memory.dream.tick", actor="backend",
+        status="ok" if (enqueued or reason in _EXPECTED_SKIP_REASONS) else "warning",
+        summary=("已排入做梦" if enqueued else f"未做梦：{reason}"),
+        explain="每次做梦判定都留一条。计数与理由落库，卡片内容不落库。",
+        detail=detail,
+    )
+
+
+#: 这些「没做梦」是正常的，不该在面板上显示成告警。
+_EXPECTED_SKIP_REASONS = frozenset({
+    "dream_disabled", "no_memory_cards", "dream_already_pending",
+    "night_not_due", "min_interval", "not_enough_new_cards", "already_dreamed",
+})
+
+
+def _tick_memory_dream(
     store, *, now: float | None = None, force: bool = False,
     submit: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -256,14 +303,28 @@ def tick_memory_dream(
         now_ts,
     ):
         return {"enqueued": False, "reason": "failure_backoff", "state": state, "job": None, "snapshot": snapshot}
-    seed_card_count = max(0, int(snapshot.get("seed_card_count") or 0))
-    last_count = max(0, int(state.get("last_dreamed_card_count") or 0))
-    last_seed_count = max(0, int(state.get("last_dreamed_seed_card_count") or 0))
-    new_cards = max(0, seed_card_count - last_seed_count)
     turn_count = max(0, int(snapshot.get("turn_count") or 0))
     last_turn_count = max(0, int(state.get("last_dreamed_turn_count") or 0))
     new_turns = max(0, turn_count - last_turn_count)
-    if str(state.get("last_dream_signature") or "") == str(snapshot.get("signature") or ""):
+
+    # 「值不值得整理」的判据在内核 —— 只数种子卡、比指纹，不看时间不看内容。
+    # 这里保留的是「能不能 / 什么时候」那半（上面的开关/防重/夜间窗口/失败退避，
+    # 以及下面的 min_interval），它们跟哪个记忆库无关。
+    verdict = mg_dreaming.needs_dream(
+        mg_dreaming.DreamSnapshot(
+            card_count=int(snapshot.get("card_count") or 0),
+            seed_card_count=max(0, int(snapshot.get("seed_card_count") or 0)),
+            signature=str(snapshot.get("signature") or ""),
+        ),
+        mg_dreaming.DreamLedger(
+            last_seed_card_count=max(0, int(state.get("last_dreamed_seed_card_count") or 0)),
+            last_signature=str(state.get("last_dream_signature") or ""),
+        ),
+        min_new_cards=min_new_cards(),
+    )
+    new_cards = verdict.new_cards
+
+    if verdict.reason == "already_dreamed":
         return {
             "enqueued": False,
             "reason": "already_dreamed",
@@ -276,13 +337,11 @@ def tick_memory_dream(
     last_completed = _safe_float(state.get("last_dream_completed_at"), 0.0)
     if last_completed and not force and now_ts - last_completed < min_interval_sec():
         return {"enqueued": False, "reason": "min_interval", "state": state, "job": None, "snapshot": snapshot}
-    # User turns no longer independently trigger Dream.  Only new cards from a
-    # non-Dream source advance the durable seed frontier; otherwise normal
-    # conversation plus Dream's own rewritten snapshot caused nightly churn.
-    if not force and new_cards < min_new_cards():
+    # force 绕过内核判据（人工触发不受「攒够没」限制），与原实现一致。
+    if not force and not verdict.needed:
         return {
             "enqueued": False,
-            "reason": "not_enough_new_cards",
+            "reason": verdict.reason,
             "state": state,
             "job": None,
             "snapshot": snapshot,
@@ -308,9 +367,11 @@ def tick_memory_dream(
             "card_count": card_count,
             "new_cards": new_cards,
             "new_turns": new_turns,
-            "last_dreamed_card_count": last_count,
-            "last_dreamed_seed_card_count": last_seed_count,
-            "seed_card_count": seed_card_count,
+            "last_dreamed_card_count": max(0, int(state.get("last_dreamed_card_count") or 0)),
+            "last_dreamed_seed_card_count": max(
+                0, int(state.get("last_dreamed_seed_card_count") or 0)
+            ),
+            "seed_card_count": max(0, int(snapshot.get("seed_card_count") or 0)),
             "last_dreamed_turn_count": last_turn_count,
             "turn_count": turn_count,
             "signature": snapshot.get("signature") or "",

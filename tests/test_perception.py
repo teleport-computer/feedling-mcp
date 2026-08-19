@@ -292,6 +292,52 @@ def test_v2_perception_wake_uses_agent_jobs_instead_of_legacy_queue(monkeypatch)
     assert legacy_jobs == []
 
 
+def test_v2_photo_wake_carries_id_scene_and_time_into_context(monkeypatch):
+    enqueued = []
+    user_store = types.SimpleNamespace(proactive_activation_ready=lambda: True)
+    monkeypatch.setattr(core_store, "get_store", lambda _uid: user_store)
+    monkeypatch.setattr(
+        hosted_config_store,
+        "get_hosted_runtime_mode_strict",
+        lambda _store: hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2,
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "enqueue_job_with_context_log",
+        lambda uid, lane, **kwargs: (
+            enqueued.append((uid, lane, kwargs)),
+            (123, False),
+        )[1],
+    )
+    monkeypatch.setattr(core_wake_bus, "notify", lambda *_args: None)
+    monkeypatch.setattr(service.store, "trim_v2_wake_context", lambda uid: None)
+    event = types.SimpleNamespace(
+        user_id="u_v2_photo",
+        wake_id="wake-photo-1",
+        source="perception_event",
+        trigger="photo_added",
+        change_digest="photo_added: changed",
+        origin_refs=("photo:p1",),
+        presence_hints={},
+        payload={
+            "photo": {
+                "photo_id": "p1",
+                "scene": "cafe",
+                "time_of_day": "evening",
+            }
+        },
+        created_at=100.0,
+        manual=False,
+    )
+
+    service._fire_wake_event_v2(event)
+
+    context_doc = enqueued[0][2]["context_doc"]
+    assert context_doc["photo_id"] == "p1"
+    assert context_doc["scene"] == "cafe"
+    assert context_doc["time_of_day"] == "evening"
+
+
 def test_resident_perception_wake_keeps_legacy_queue(monkeypatch):
     legacy_jobs = []
     user_store = types.SimpleNamespace(
@@ -634,6 +680,22 @@ def test_photo_one_step_store(env):
     assert c2 == 200 and content["frame_id"] == "p_ok" and "envelope" not in content
     assert fake.get_photo_envelope(UID, "p_ok")["body_ct"] == "cipher"  # in frame channel
     assert any(c == "photos" for c, _ in wakes)               # legacy dormant fallback fired
+
+
+def test_photo_storage_failure_is_retryable_and_never_confirmed(env, monkeypatch):
+    fake, wakes = env
+    monkeypatch.setattr(fake, "put_photo_envelope", lambda *_args, **_kwargs: False)
+
+    out, code = service.photo_evaluate(
+        UID,
+        {"scene_hint": "landscape"},
+        {"id": "p_failed", "body_ct": "cipher"},
+    )
+
+    assert code == 503
+    assert out == {"error": "photo_storage_unavailable"}
+    assert service.photos_recent(UID)[0]["photos"] == []
+    assert wakes == []
 
 
 def test_photo_v2_burst_dedup_collapses_rapid_captures(env, monkeypatch):

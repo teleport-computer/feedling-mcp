@@ -10,6 +10,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from model_api_runtime.v2 import profile_store, worker
 
 
+_PROFILE_MAX_AGE_SEC = worker._PROFILE_MAX_AGE_SEC
+_DAY_SEC = 24 * 60 * 60
+
+
 def _seal(_uid, text):
     return {"body_ct": "ct-" + str(len(text)), "nonce": "n"}
 
@@ -30,7 +34,7 @@ def _ok(*, generated_at: str, count: int = 5, updated: str = "u5"):
             "retry_not_before": 0,
         },
         memory_text="共同事实",
-        user_text="沟通方式",
+        style_text="沟通方式",
         seal_text=_seal,
     )
 
@@ -42,21 +46,25 @@ def _iso(timestamp: float) -> str:
 @pytest.fixture(autouse=True)
 def _enabled(monkeypatch):
     monkeypatch.setattr(worker, "_PROFILE_ENABLED", True)
-    monkeypatch.setattr(worker, "_PROFILE_MAX_AGE_SEC", 7 * 24 * 60 * 60)
+    monkeypatch.setattr(worker, "_PROFILE_MAX_AGE_SEC", _PROFILE_MAX_AGE_SEC)
+
+
+def test_profile_refresh_default_age_is_three_days():
+    assert _PROFILE_MAX_AGE_SEC == 3 * _DAY_SEC
 
 
 @pytest.mark.parametrize(
-    ("age_days", "stats", "expected"),
+    ("age_seconds", "stats", "expected"),
     [
-        (6, (6, "u6"), False),  # fresh + changed
-        (8, (5, "u5"), False),  # stale + unchanged
-        (8, (6, "u5"), True),  # stale + count changed
-        (8, (5, "u6"), True),  # stale + max(updated_at) changed
+        (_PROFILE_MAX_AGE_SEC - 1, (6, "u6"), False),  # fresh + changed
+        (_PROFILE_MAX_AGE_SEC + 1, (5, "u5"), False),  # stale + unchanged
+        (_PROFILE_MAX_AGE_SEC + 1, (6, "u5"), True),  # stale + count changed
+        (_PROFILE_MAX_AGE_SEC + 1, (5, "u6"), True),  # stale + updated changed
     ],
 )
-def test_stale_floor_four_quadrants(monkeypatch, age_days, stats, expected):
+def test_stale_floor_four_quadrants(monkeypatch, age_seconds, stats, expected):
     now = 2_000_000_000.0
-    document = _ok(generated_at=_iso(now - age_days * 86400))
+    document = _ok(generated_at=_iso(now - age_seconds))
     monkeypatch.setattr(worker.db, "get_blob_strict", lambda *_args: document)
     monkeypatch.setattr(
         worker.db,
@@ -124,7 +132,9 @@ def test_scheduled_profile_refresh_respects_persisted_retry_time(monkeypatch):
     assert worker._profile_refresh_due("u", now=1061) is True
 
 
-@pytest.mark.parametrize("disposition", ["provider_config", "terminal"])
+@pytest.mark.parametrize(
+    "disposition", sorted(profile_store.PROFILE_STUCK_RETRY_DISPOSITIONS)
+)
 def test_non_timed_profile_failure_waits_for_explicit_repair(
     monkeypatch, disposition
 ):
@@ -162,7 +172,7 @@ def test_source_change_retry_only_requeues_after_garden_witness_changes(monkeypa
 
 def test_stale_floor_is_independent_of_dream_setting(monkeypatch):
     now = 2_000_000_000.0
-    document = _ok(generated_at=_iso(now - 8 * 86400))
+    document = _ok(generated_at=_iso(now - _PROFILE_MAX_AGE_SEC - 1))
     monkeypatch.setattr(worker.db, "get_blob_strict", lambda *_args: document)
     monkeypatch.setattr(
         worker.db,

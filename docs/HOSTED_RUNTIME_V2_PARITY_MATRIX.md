@@ -31,6 +31,7 @@
 | Executable action vocabulary | ✅ | The exposed native catalog maps to registered executable capabilities. Scheduling, web search/fetch, and exact memory search are present; obsolete planner-only `sleep`/`capture_memory` vocabulary is absent. |
 | One deployment topology | ✅ | Local, test, pre, and production hosted model-API deployments are `v2_only`. A bounded `serve-worker` pool runs in the runner CVM, separate from the main backend/enclave CVM; there is no hosted per-account runtime flip. |
 | Prompt caching and cache telemetry | ⚠️ | Provider-aware cache controls/affinity and per-turn read/write/miss telemetry are implemented for OpenAI-compatible, Anthropic/OpenRouter, Gemini, and Bedrock paths. The existing Pre canary proves a route-bound OpenRouter cache read; the trusted `/skills` prefix and native Bedrock path still need post-deploy live cache-hit proof. Editable `WORKING.md` is deliberately pull-only and is not part of the eager cache prefix. |
+| Durable profile field naming | ✅ | New profile distillation and encrypted storage use `MEMORY` for facts and `STYLE` for interaction style. The injection heading remains `HOW YOU TWO GET ALONG`; legacy stored `USER` fields are read-only compatibility input until each profile naturally redistills, and admin telemetry temporarily emits both `style_chars` and the `user_chars` compatibility alias. |
 | Tokens/turn and admission ceiling | ✅ | Whole-turn token/call/latency metrics and an admission ceiling are implemented. The offline token regression gate is live, and `/v1/admin/v2-metrics.turn_health` exposes bounded queue/lease expiry, failure/expiry rates, pending age, p95 latency, and trajectory completeness/gaps. |
 | Concurrent CVM-class load proof | ⚠️ | The harness exists, but the authoritative concurrent run on the target CVM class remains an operational gate. |
 | Typing-signal pre-warm | ➖ | Removed from the release scope by product decision. Ordinary Send remains the only foreground trigger; V2 does not create speculative jobs or provider spend while the user types. |
@@ -96,7 +97,7 @@ or arbitrary code-execution tool. The detailed facade and enclave mapping lives 
 | Memory Dream | ➖ | Native `op/card_ids/result` consolidations map to multi-card supersede actions and pass the real Garden validator, but activation is a separate optional product lane rather than a Runtime V2 release requirement. All managed defaults keep it off. This Dream organizes memory cards and is not runtime failure replay. |
 | Genesis import | ✅ | Rehomed under `serve-worker` with a dedicated heartbeat |
 | Trajectory review | ✅ | Encrypted capture is always on and retained until account deletion; Chat Clear preserves it. Provider-backed offline review is opt-in/default-off, globally capped, tools-disabled, and has no live effect surfaces; operators have a separate default-off, exact-job, runner-local audited inspector. |
-| Foreground World Book grounding | ✅ | Chat matches the current user turn through the shared enclave read side and adds matched entries as a standalone untrusted user-role setting-data block. The block is prompt-budgeted and deterministically truncated with an explicit marker; wake lanes remain unchanged for V1 parity. |
+| Foreground World Book grounding | ✅ | Chat matches the current user turn through the shared enclave read side and appends matched entries after memory/profile in the same user-role durable-context message (or a standalone message when memory/profile is absent), under a shared user-authored-setting header whose replay-conflict rule is used by both V2 and Resident. The World Book payload remains prompt-budgeted and deterministically truncated with an explicit marker; wake lanes remain unchanged for V1 parity. |
 
 ## Incident-hardened guards — ported?
 
@@ -402,14 +403,15 @@ At minimum, current-status changes should remain covered by:
 - `tests/test_provider_tools_bedrock.py`
 - `tests/test_prompt_cache_canary.py`
 - `tests/test_v2_turn_metrics.py`
-- `tests/test_v2_summary_store.py`
 - `tests/test_v2_summary_watermark_seq.py`
-- `tests/test_v2_summary_frontier_unit.py`
-- `tests/test_v2_summary_frontier_store.py`
-- `tests/test_v2_prompt_invariant.py`
+- `tests/test_v2_context.py`
+- `tests/test_v2_recent_prompt_context.py`
+- `tests/test_v2_maintenance_retired.py`
+- `tests/test_v2_profile_prompt.py`
+- `tests/test_v2_profile_storage.py`
 - `tests/test_v2_p0_history_safety.py`
+- `tests/test_v2_history_readside.py`
 - `tests/test_v2_gc_coverage_gate.py`
-- `tests/test_v2_compaction_integration.py`
 - `tests/test_v2_extraction_memory_integration.py`
 - `tests/test_memory_readside_core.py`
 - `tests/test_v2_worker_files.py`

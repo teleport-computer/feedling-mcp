@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import sys
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from memory.capture_prompt_v1 import (
     build_capture_retry_prompt,
     parse_capture_cards,
 )
-from memory.card_text import is_retryable_parse_error
+from memory_garden.text.card_text import is_retryable_parse_error
 from memory.dream_prompt_v1 import build_dream_prompt
 from model_api_runtime.v2 import extraction, worker
 
@@ -20,6 +21,35 @@ def _env(inner):
 
 
 # ---------- extract ----------
+
+def test_extraction_lane_output_budgets_are_independent_and_dream_is_larger():
+    assert extraction.DREAM_MAX_OUTPUT_TOKENS > extraction.CAPTURE_MAX_OUTPUT_TOKENS
+    assert extraction.max_output_tokens_for_lane("capture") == (
+        extraction.CAPTURE_MAX_OUTPUT_TOKENS
+    )
+    assert extraction.max_output_tokens_for_lane("dream") == (
+        extraction.DREAM_MAX_OUTPUT_TOKENS
+    )
+
+
+@pytest.mark.parametrize(
+    ("lane", "env_name"),
+    [
+        ("capture", "FEEDLING_V2_CAPTURE_MAX_OUTPUT_TOKENS"),
+        ("dream", "FEEDLING_V2_DREAM_MAX_OUTPUT_TOKENS"),
+    ],
+)
+def test_extraction_lane_output_budget_has_its_own_env(monkeypatch, lane, env_name):
+    try:
+        with monkeypatch.context() as env:
+            env.setenv(env_name, "1777")
+            reloaded = importlib.reload(extraction)
+            assert reloaded.max_output_tokens_for_lane(lane) == 1777
+    finally:
+        # The module object is shared with worker; restore startup-resolved values
+        # before the next test observes it.
+        importlib.reload(extraction)
+
 
 def test_extract_returns_parsed_on_success(monkeypatch):
     async def _fake(cfg, messages, **kw):
@@ -120,6 +150,268 @@ def test_extract_treats_empty_reply_as_a_reason_not_a_crash(monkeypatch):
     parsed, err = asyncio.run(extraction.extract(
         provider_config=object(), prompt="P", parse=lambda raw: (["never"], None)))
     assert parsed is None and err == "empty_reply"
+
+
+def test_extract_attributes_length_stop_before_parsing_and_records_safe_shape(
+    monkeypatch,
+):
+    limit = extraction.CAPTURE_MAX_OUTPUT_TOKENS
+
+    async def _truncated(_cfg, _messages, **_kwargs):
+        return {
+            "reply": '{"cards":[{"summary":"half',
+            "stop_reason": "length",
+            "usage": {
+                "prompt_tokens": 16576,
+                "completion_tokens": limit,
+            },
+        }
+
+    monkeypatch.setattr(
+        extraction.provider_client,
+        "reliable_chat_completion_async",
+        _truncated,
+    )
+    details = []
+    events = []
+
+    async def _record(kind, payload):
+        if kind == "extraction_output_truncated":
+            events.append(payload)
+
+    def _must_not_parse(_reply):
+        raise AssertionError("a length-stopped response must be attributed before parsing")
+
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=_must_not_parse,
+            max_tokens=limit,
+            trajectory_out=_record,
+            failure_detail_out=details.append,
+        )
+    )
+
+    expected = {
+        "stop_reason": "length",
+        "completion_tokens": limit,
+        "max_tokens": limit,
+    }
+    assert parsed is None and err == "output_truncated"
+    assert details == [expected]
+    assert events == [{**expected, "attempt": 1}]
+
+
+def test_extract_retries_truncated_output_once_with_same_budget_and_recovers(
+    monkeypatch,
+):
+    limit = extraction.DREAM_MAX_OUTPUT_TOKENS
+    calls = []
+
+    async def _responses(_cfg, messages, **kwargs):
+        calls.append((messages[0]["content"], kwargs["max_tokens"]))
+        if len(calls) == 1:
+            return {
+                "reply": '{"consolidations":[{"result":{"summary":"half',
+                "stop_reason": "length",
+                "usage": {"completion_tokens": limit},
+            }
+        return {
+            "reply": '{"consolidations":[]}',
+            "stop_reason": "end_turn",
+            "usage": {"completion_tokens": 12},
+        }
+
+    monkeypatch.setattr(
+        extraction.provider_client,
+        "reliable_chat_completion_async",
+        _responses,
+    )
+    events = []
+    parsed_replies = []
+
+    async def _record(kind, payload):
+        if kind.startswith("extraction_output_"):
+            events.append((kind, payload))
+
+    def _parse(raw):
+        parsed_replies.append(raw)
+        return (["ok"], None)
+
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=_parse,
+            max_tokens=limit,
+            trajectory_out=_record,
+            parse_retry=extraction.ParseRetry(
+                should_retry=lambda _err: True,
+                build_prompt=lambda prompt, _err: prompt + "|format",
+                parse=lambda _raw: (["retry-parser"], None),
+                build_truncation_prompt=lambda prompt: prompt + "|更简洁并闭合 JSON",
+            ),
+        )
+    )
+
+    assert parsed == ["ok"] and err is None
+    assert parsed_replies == ['{"consolidations":[]}']
+    assert calls == [
+        ("P", limit),
+        ("P|更简洁并闭合 JSON", limit),
+    ]
+    assert events == [
+        (
+            "extraction_output_truncated",
+            {
+                "stop_reason": "length",
+                "completion_tokens": limit,
+                "max_tokens": limit,
+                "attempt": 1,
+            },
+        ),
+        (
+            "extraction_output_truncation_retry",
+            {
+                "attempt": 2,
+                "strategy": "concise_prompt",
+                "max_tokens": limit,
+            },
+        ),
+    ]
+
+
+def test_extract_stops_after_second_truncation(monkeypatch):
+    limit = extraction.CAPTURE_MAX_OUTPUT_TOKENS
+    calls = 0
+
+    async def _truncated(_cfg, _messages, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return {
+            "reply": '{"cards":[{"summary":"half',
+            "stop_reason": "length",
+            "usage": {"completion_tokens": limit},
+        }
+
+    monkeypatch.setattr(
+        extraction.provider_client,
+        "reliable_chat_completion_async",
+        _truncated,
+    )
+    events = []
+    details = []
+
+    async def _record(kind, payload):
+        if kind == "extraction_output_truncated":
+            events.append(payload)
+
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=lambda _raw: (["never"], None),
+            max_tokens=limit,
+            trajectory_out=_record,
+            failure_detail_out=details.append,
+            parse_retry=extraction.ParseRetry(
+                should_retry=lambda _err: True,
+                build_prompt=lambda prompt, _err: prompt,
+                parse=lambda _raw: (["never"], None),
+                build_truncation_prompt=lambda prompt: prompt + "|concise",
+            ),
+        )
+    )
+
+    assert parsed is None and err == "output_truncated"
+    assert calls == 2
+    assert [event["attempt"] for event in events] == [1, 2]
+    assert details == [{
+        "stop_reason": "length",
+        "completion_tokens": limit,
+        "max_tokens": limit,
+    }]
+
+
+def test_extract_does_not_issue_third_call_after_truncation_retry_parse_error(
+    monkeypatch,
+):
+    calls = 0
+
+    async def _responses(_cfg, _messages, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"reply": '{"cards":[', "stop_reason": "length"}
+        return {"reply": "still bad", "stop_reason": "end_turn"}
+
+    monkeypatch.setattr(
+        extraction.provider_client,
+        "reliable_chat_completion_async",
+        _responses,
+    )
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=lambda _raw: (None, "invalid_card_content:summary_empty"),
+            parse_retry=extraction.ParseRetry(
+                should_retry=lambda _err: True,
+                build_prompt=lambda prompt, _err: prompt + "|format",
+                parse=lambda _raw: (["must-not-run"], None),
+                build_truncation_prompt=lambda prompt: prompt + "|concise",
+            ),
+        )
+    )
+
+    assert parsed is None and err == "invalid_card_content:summary_empty"
+    assert calls == 2
+
+
+def test_extract_attributes_length_stop_on_existing_parse_retry(monkeypatch):
+    limit = extraction.CAPTURE_MAX_OUTPUT_TOKENS
+    calls = 0
+
+    async def _responses(_cfg, _messages, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"reply": "bad format", "stop_reason": "end_turn"}
+        return {
+            "reply": '{"cards":[{"summary":"half',
+            "stop_reason": "length",
+            "usage": {"completion_tokens": limit},
+        }
+
+    monkeypatch.setattr(
+        extraction.provider_client,
+        "reliable_chat_completion_async",
+        _responses,
+    )
+    details = []
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=lambda _raw: (None, "invalid_card_content:summary_empty"),
+            max_tokens=limit,
+            failure_detail_out=details.append,
+            parse_retry=extraction.ParseRetry(
+                should_retry=lambda _err: True,
+                build_prompt=lambda prompt, _err: prompt + "|retry",
+                parse=lambda _raw: (None, "no_json_object"),
+            ),
+        )
+    )
+
+    assert parsed is None and err == "output_truncated"
+    assert calls == 2
+    assert details == [{
+        "stop_reason": "length",
+        "completion_tokens": limit,
+        "max_tokens": limit,
+    }]
 
 
 # ---------- parse_retry(内容闸打回)----------
@@ -379,6 +671,9 @@ def test_extraction_failure_codes_are_allowlisted_and_drop_raw_details():
     assert worker._extraction_failure_code(
         RuntimeError("extraction_memory_write_rejected:private-db-detail")
     ) == "extraction_failed:memory_write_rejected"
+    assert worker._extraction_failure_code(
+        RuntimeError("output_truncated")
+    ) == "extraction_failed:output_truncated"
 
 
 def test_extract_provider_reason_records_failure_not_false_success(monkeypatch):
@@ -503,6 +798,10 @@ def test_empty_cards_is_not_an_error():
 # ---------- consolidations_to_actions ----------
 
 def test_consolidations_to_actions_supersedes_when_target_present():
+    cards = [
+        _existing("m1", occurred_at="2026-02-01T00:00:00Z"),
+        _existing("m2", occurred_at="2026-05-01T00:00:00Z"),
+    ]
     actions, added, superseded = extraction.consolidations_to_actions(
         [{
             "op": "merge",
@@ -510,22 +809,30 @@ def test_consolidations_to_actions_supersedes_when_target_present():
             "rationale": "同一事件的两条记录",
             "result": {"summary": "merged", "content": "merged body"},
         }],
-        occurred_at="T", source_ids=[], build_envelope=_env)
+        occurred_at="2099-01-01T00:00:00Z", source_ids=[], build_envelope=_env,
+        existing_cards=cards)
     assert added == 0 and superseded == 2
     assert actions[0]["type"] == "memory.supersede"
     assert actions[0]["supersedes"] == ["m1", "m2"]
     assert actions[0]["capture_mode"] == "memory_dream"
     assert actions[0]["envelope"]["type"] == "fact"
-    assert actions[0]["envelope"]["occurred_at"] == "T"
+    assert actions[0]["envelope"]["occurred_at"] == "2026-05-01T00:00:00Z"
 
 
-def _existing(memory_id, *, source="memory_capture", created_at="2026-07-01T00:00:00Z"):
+def _existing(
+    memory_id,
+    *,
+    source="memory_capture",
+    created_at="2026-07-01T00:00:00Z",
+    occurred_at="2026-06-01T00:00:00Z",
+):
     return {
         "id": memory_id,
         "summary": f"{memory_id} 的旧摘要",
         "content": f"{memory_id} 的旧卡正文，包含需要完整保留的具体事实。",
         "source": source,
         "created_at": created_at,
+        "occurred_at": occurred_at,
     }
 
 
@@ -616,8 +923,10 @@ def test_dream_guard_allows_prior_run_dream_output_to_evolve_immediately():
 
 def test_dream_guard_accepts_low_text_overlap_evolution_after_review():
     cards = [
-        {"id": "plan", "summary": "想去京都看红叶", "content": "希望今年秋天成行。"},
-        {"id": "ticket", "summary": "已经订好机票", "content": "11 月飞往关西机场。"},
+        {"id": "plan", "summary": "想去京都看红叶", "content": "希望今年秋天成行。",
+         "occurred_at": "2026-03-01T00:00:00Z"},
+        {"id": "ticket", "summary": "已经订好机票", "content": "11 月飞往关西机场。",
+         "occurred_at": "2026-05-01T00:00:00Z"},
     ]
 
     actions, _added, superseded = extraction.consolidations_to_actions(
@@ -629,6 +938,73 @@ def test_dream_guard_accepts_low_text_overlap_evolution_after_review():
     )
 
     assert len(actions) == 1 and superseded == 2
+
+
+def test_dream_merge_uses_latest_source_occurred_at_not_worker_now():
+    cards = [
+        _existing("feb", occurred_at="2026-02-08T09:00:00Z"),
+        _existing("mar", occurred_at="2026-03-17T10:00:00+08:00"),
+        _existing("may", occurred_at="2026-05-03"),
+    ]
+
+    actions, _added, superseded = extraction.consolidations_to_actions(
+        [_merge(["feb", "mar", "may"])],
+        occurred_at="2099-12-31T23:59:59Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=cards,
+    )
+
+    assert superseded == 3
+    assert actions[0]["envelope"]["occurred_at"] == "2026-05-03"
+
+
+def test_dream_merge_with_today_source_naturally_keeps_today():
+    cards = [
+        _existing("old", occurred_at="2026-02-08T09:00:00Z"),
+        _existing("today", occurred_at="2026-08-14T07:30:00Z"),
+    ]
+
+    actions, _added, _superseded = extraction.consolidations_to_actions(
+        [_merge(["old", "today"])],
+        occurred_at="2099-12-31T23:59:59Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=cards,
+    )
+
+    assert actions[0]["envelope"]["occurred_at"] == "2026-08-14T07:30:00Z"
+
+
+@pytest.mark.parametrize("bad_value", ["", None, "not-a-date", "1970-ish"])
+def test_dream_merge_degrades_to_known_source_time_not_job_time(bad_value):
+    """一张源卡时间不可用 → **跳过它、取已知的**,不再整轮失败。
+
+    ⚠️ 本用例 2026-08-17 由 fail-closed 改写(Seven 定)。它原来断言的是
+    「任何一张不可用就抛」—— 实测那会让缺失率 12%~64% 的用户 dream 永久阻塞。
+
+    **但它真正在守的那件事没变、也不能变**:传进来的 `occurred_at`
+    (这里是 2099-12-31,job 时间)**绝不能**成为事件时间。降级只允许退到
+    「其他源卡的已知时间」或「created_at 的日期」,永远不退到 job 时间。
+    """
+    cards = [
+        _existing("valid", occurred_at="2026-02-08T09:00:00Z"),
+        _existing("bad", occurred_at=bad_value),
+    ]
+
+    actions = extraction.consolidations_to_actions(
+        [_merge(["valid", "bad"])],
+        occurred_at="2099-12-31T23:59:59Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=cards,
+    )
+    assert actions, "一张源卡缺时间就整轮产不出动作 —— 那正是我们要修掉的阻塞"
+    payload = str(actions[0])
+    assert "2026-02-08T09:00:00Z" in payload, "没有退到已知的那张源卡时间"
+    assert "2099" not in payload, (
+        "job 时间泄漏成了事件时间 —— 这是本用例从一开始就在守的红线"
+    )
 
 
 def test_dream_prompt_pairs_evolution_example_with_independent_health_example():
@@ -673,3 +1049,125 @@ def test_extraction_is_pure():
     for forbidden in ("import hosted", "from hosted", "agent_runtime", "jobs_store",
                       "core.store", "psycopg", "memory_core"):
         assert forbidden not in src, f"extraction.py must not reference {forbidden}"
+
+
+# ── dream 源卡时间降级(Seven 2026-08-17 定) ────────────────────────────
+# 原来只要一张源卡缺 occurred_at 就整轮 fail-closed。实测四个受影响用户的
+# 花园缺失率 12%~64%,dream 每次挑几张源卡碰上一张就废 = 永久阻塞且用户无感。
+# 代价对比:降级 → 排序位置偏(显示);拦死 → dream 整个不跑(功能)。
+
+
+def _card(occurred_at=None, created_at=None):
+    c = {}
+    if occurred_at is not None:
+        c["occurred_at"] = occurred_at
+    if created_at is not None:
+        c["created_at"] = created_at
+    return c
+
+
+def test_picks_latest_known_not_just_any():
+    """取**已知里最晚的** —— 随手取一张可能取到旧的,而明明有更新的已知值。"""
+    from model_api_runtime.v2 import extraction
+
+    out = extraction._latest_source_occurred_at([
+        _card("2026-08-10T09:00:00Z"),
+        _card(""),                       # 缺失,跳过
+        _card("2026-08-14T09:00:00Z"),   # 最晚
+        _card("2026-08-12T09:00:00Z"),
+    ])
+    assert out == "2026-08-14T09:00:00Z"
+
+
+def test_one_missing_source_no_longer_blocks_the_whole_run():
+    """核心行为变更:一张缺失不再让整轮失败。"""
+    from model_api_runtime.v2 import extraction
+
+    assert extraction._latest_source_occurred_at([
+        _card(""), _card("2026-08-14T09:00:00Z"),
+    ]) == "2026-08-14T09:00:00Z"
+
+
+def test_unparseable_occurred_at_is_skipped_not_fatal():
+    """解析不了的也只是跳过 —— 与「缺失」同等对待。"""
+    from model_api_runtime.v2 import extraction
+
+    assert extraction._latest_source_occurred_at([
+        _card("not-a-timestamp"), _card("2026-08-14T09:00:00Z"),
+    ]) == "2026-08-14T09:00:00Z"
+
+
+def test_falls_back_to_created_at_date_when_none_known():
+    """全都没有 → 退到 created_at 的**日期**(不是完整时刻)。
+
+    created_at 是写入时间;只有日期这一档是对事件时间的诚实近似。
+    """
+    from model_api_runtime.v2 import extraction
+
+    out = extraction._latest_source_occurred_at([
+        _card("", created_at="2026-08-11T08:53:58Z"),
+        _card("", created_at="2026-08-10T09:23:03Z"),
+    ])
+    assert out == "2026-08-11", f"应取日期,实际 {out!r}"
+
+
+def test_created_at_fallback_also_takes_the_latest_not_the_first():
+    """fallback 那一半同样取**最晚**,不是遍历到的第一张。
+
+    ⚠️ 我第一版写成「第一张能解析的就返回」,输入顺序一变结果就变
+    (codex2 实测正序 08-10 / 反序 08-11) —— 而我自己的 docstring
+    写着「取已知里最晚的」。**实现没照着自己的注释做。**
+    """
+    from model_api_runtime.v2 import extraction
+
+    cards = [_card("", created_at="2026-08-10T09:23:03Z"),
+             _card("", created_at="2026-08-11T08:53:58Z")]
+    assert extraction._latest_source_occurred_at(cards) == "2026-08-11"
+    assert extraction._latest_source_occurred_at(cards[::-1]) == "2026-08-11", (
+        "结果依赖输入顺序 —— 说明取的是第一张而不是最晚"
+    )
+
+
+def test_still_fails_closed_when_created_at_also_unusable():
+    """created_at 也全没有 → 仍然失败。到这步没有任何可信来源,编不如失败。
+
+    (实测 260 张真实卡里 0 例,但判据要在。)
+    """
+    import pytest as _p
+    from model_api_runtime.v2 import extraction
+
+    with _p.raises(ValueError, match="dream_source_occurred_at_unavailable"):
+        extraction._latest_source_occurred_at([_card(""), _card("")])
+
+
+def test_degradation_is_recorded_both_kinds():
+    """**必须留痕**:那批脏卡 created_at 集中在 08-10~08-14,是最近两周写的,
+    说明产生它们的写入路径可能还开着。降级不留痕 = 把源头永久盖住。
+    """
+    from model_api_runtime.v2 import extraction
+
+    seen = []
+    extraction._latest_source_occurred_at(
+        [_card(""), _card("2026-08-14T09:00:00Z")],
+        on_degraded=lambda known, missing, fb: seen.append((known, missing, fb)),
+    )
+    assert seen == [(1, 1, False)], "部分缺失没留痕"
+
+    seen.clear()
+    extraction._latest_source_occurred_at(
+        [_card("", created_at="2026-08-11T08:53:58Z")],
+        on_degraded=lambda known, missing, fb: seen.append((known, missing, fb)),
+    )
+    assert seen == [(0, 1, True)], "退到 created_at 没留痕"
+
+
+def test_no_degradation_signal_when_everything_is_clean():
+    """不误报:全都有 occurred_at 时不该记降级。"""
+    from model_api_runtime.v2 import extraction
+
+    seen = []
+    extraction._latest_source_occurred_at(
+        [_card("2026-08-14T09:00:00Z"), _card("2026-08-12T09:00:00Z")],
+        on_degraded=lambda *a: seen.append(a),
+    )
+    assert seen == []

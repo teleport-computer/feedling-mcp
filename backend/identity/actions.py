@@ -1,26 +1,46 @@
-"""Identity write actions (profile patch / nudge / days set) + executor.
+"""Identity write actions (profile patch / dimensions set / nudge / days set).
 
-写卡原则：只有蒸馏任务可 identity.replace，其余一切写卡走 profile_patch（局部合并）。
+写卡原则：只有蒸馏任务可 identity.replace；身份文本走 profile_patch，完整维度
+重写走 dimensions_set，小幅数值调整走 dimension_nudge，三者都保留其余卡片内容。
 replace/patch 合一（patch+版本参数）是 V2 开放问题，归架构层。——spec 2026-07-22 §3.5
 """
 
 import json
+import logging
 import re
 import uuid
 
 
+import debug_trace
 from core.store import UserStore
 
 from bootstrap import gates as boot_gates
 from core import util as core_util
 from core import enclave as core_enclave
 from core import envelope as core_envelope
+from identity import card_view
 from identity import service as identity_service
+
+
+log = logging.getLogger(__name__)
+
+IDENTITY_DIMENSIONS_SET_EVENT = "identity.dimensions_set"
+_DIMENSION_CHANGE_REASON_FIELD = "last_nudge_reason"
+_DIMENSION_CHANGE_TOOL_FIELD = "last_nudge_tool"
+_DIMENSIONS_SET_MARKER_FIELD = "last_dimensions_set"
+
 
 def _identity_action_text(value, max_chars: int) -> str:
     text = str(value or "").strip()
     text = re.sub(r"\s+", " ", text)
     return text[:max_chars].strip()
+
+
+def _identity_action_count(value) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
 
 
 class ListOpConflict(Exception):
@@ -223,6 +243,24 @@ def apply_list_ops(existing: dict, patch: dict) -> dict:
 
 def _identity_plain_for_action(store: UserStore, api_key: str | None,
                                runtime_token: str = "") -> tuple[dict | None, str]:
+    stored = identity_service._load_identity(store)
+    shape = core_envelope.classify_envelope_shape(stored)
+    if shape in ("plaintext_text", "plaintext_binary"):
+        try:
+            raw = core_envelope.read_plaintext_envelope_body(
+                stored, owner_user_id=store.user_id)
+            inner = json.loads(raw.decode("utf-8"))
+            if not isinstance(inner, dict):
+                raise ValueError("identity plaintext is not an object")
+            return card_view.plaintext_view(
+                card_view.envelope_base(stored),
+                inner,
+                stored,
+                days_with_user=identity_service._live_days_with_user(
+                    stored, store=store),
+            ), ""
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            return None, f"identity_plaintext_invalid:{type(exc).__name__}"
     # Only pass runtime_token when present, so the api_key path keeps the original
     # 2-arg call shape (mocks/monkeypatches that predate the runtime_token param).
     if runtime_token:
@@ -243,8 +281,9 @@ def _identity_plain_for_action(store: UserStore, api_key: str | None,
 
 def _identity_payload_from_plain(identity: dict) -> dict:
     from identity import card_policy
-    # Single chokepoint for init / profile_patch / dimension_nudge: run the
-    # dimensions through card_policy.sanitize so no non-integer value (BYOK weak
+    # Single chokepoint for init / profile_patch / dimension_nudge /
+    # dimensions_set: run the dimensions through card_policy.sanitize so no
+    # non-integer value (BYOK weak
     # models emit 0–1-scale floats like 0.95) is ever re-encrypted into the card.
     # sanitize also drops malformed dims and normalizes to the 0–100 int contract,
     # self-healing an already-poisoned existing card on the next write.
@@ -254,6 +293,18 @@ def _identity_payload_from_plain(identity: dict) -> dict:
         "self_introduction": str(identity.get("self_introduction") or "")[:1200],
         "dimensions": card_policy.sanitize_identity_card({"dimensions": raw_dims})["dimensions"],
     }
+    marker = identity.get(_DIMENSIONS_SET_MARKER_FIELD)
+    if isinstance(marker, dict):
+        reason = _identity_action_text(marker.get("reason"), 500)
+        if reason:
+            payload[_DIMENSIONS_SET_MARKER_FIELD] = {
+                "reason": reason,
+                "tool": "set",
+                "changed_count": _identity_action_count(marker.get("changed_count")),
+                "added_count": _identity_action_count(marker.get("added_count")),
+                "deleted_count": _identity_action_count(marker.get("deleted_count")),
+                "labels_changed": int(bool(marker.get("labels_changed"))),
+            }
     for key in identity_service._IDENTITY_PROFILE_STRING_FIELDS:
         if key in {"agent_name", "self_introduction"}:
             continue
@@ -301,18 +352,14 @@ def _save_identity_action_payload(
     identity = {
         "v": 1,
         "id": envelope.get("id") or existing.get("id") or uuid.uuid4().hex,
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
-        "visibility": envelope["visibility"],
-        "owner_user_id": envelope["owner_user_id"],
+        "enclave_pk_fpr": "",
+        **core_envelope.envelope_storage_fields(envelope),
         "created_at": existing.get("created_at") or now,
         "updated_at": now,
         # replaced_at is the P5 concurrency baseline: it is stamped ONLY by
         # full-card writes (identity.init / identity.replace). Partial
-        # mutations (profile_patch / dimension_nudge, both routed through
-        # this helper) must carry it forward untouched, not drop it — this
+        # mutations (profile_patch / dimension_nudge / dimensions_set, all
+        # routed through this helper) must carry it forward untouched, not drop it — this
         # dict is an explicit field list, not a copy of `existing`, so it
         # must be listed here or the raw blob overwrite in _save_identity
         # would silently erase it.
@@ -447,12 +494,8 @@ def _create_identity_action_payload(
     identity = {
         "v": 1,
         "id": envelope.get("id") or core_util._new_public_id("identity"),
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
-        "visibility": envelope["visibility"],
-        "owner_user_id": envelope["owner_user_id"],
+        "enclave_pk_fpr": "",
+        **core_envelope.envelope_storage_fields(envelope),
         "created_at": now,
         "updated_at": now,
         # A create IS a full-card write, so it stamps the replaced_at baseline
@@ -492,8 +535,9 @@ def _load_identity_snapshot_for_write(store: UserStore) -> tuple[dict | None, st
     passed as `existing=` to `_save_identity_action_payload`'s CAS write.
 
     MUST be called BEFORE the enclave plaintext read
-    (`_identity_plain_for_action`) in both `_identity_profile_patch` and
-    `_identity_dimension_nudge`'s `_read_merge_save` closures — not after.
+    (`_identity_plain_for_action`) in `_identity_profile_patch`,
+    `_identity_dimension_nudge`, and `_identity_dimensions_set`'s
+    `_read_merge_save` closures — not after.
     Reading it after the enclave round trip (the original, buggy ordering)
     leaves a window where a concurrent writer's change lands AFTER the
     enclave read but BEFORE this load: the merge is computed from stale
@@ -813,6 +857,7 @@ def _identity_profile_patch(
             "old_value": audit_old,
             "new_value": audit_new,
             "reason": reason,
+            "fields": changed,
         }
         if bootstrap:
             # No existing card yet — atomically mint one (see
@@ -925,6 +970,7 @@ def _identity_dimension_nudge(
         reason = _identity_action_text(action.get("reason") or f"{dimension_name} adjusted by {delta:+d}.", 500)
         if reason:
             matched["last_nudge_reason"] = reason
+            matched["last_nudge_tool"] = "nudge"
         payload["dimensions"] = dims
 
         identity, change, err = _save_identity_action_payload(
@@ -938,6 +984,7 @@ def _identity_dimension_nudge(
                 "new_value": new_value,
                 "delta": delta,
                 "reason": reason,
+                "fields": ["dimensions"],
             },
             event_type="identity_action_dimension_nudge",
         )
@@ -965,6 +1012,205 @@ def _identity_dimension_nudge(
     return _with_identity_mutation_lock_and_retry(store, "identity.dimension_nudge", _read_merge_save)
 
 
+def _identity_dimensions_set(
+    store: UserStore,
+    api_key: str | None,
+    action: dict,
+    *,
+    runtime_token: str = "",
+) -> tuple[dict, list[dict], int]:
+    """Replace only the identity card's dimensions list.
+
+    This is deliberately separate from ``identity.profile_patch`` (profile text)
+    and ``identity.dimension_nudge`` (small relative score adjustments). A full
+    replacement naturally supports rename/content/value rewrites plus add/delete,
+    while preserving every non-dimension identity field.
+    """
+    dimensions = action.get("dimensions")
+    from identity import card_policy
+    ok, err = card_policy.validate_dimensions_structure(dimensions)
+    if not ok:
+        return {
+            "status": "error",
+            "error": err,
+            "action": "identity.dimensions_set",
+        }, [], 400
+    raw_reason = action.get("reason")
+    reason = (
+        _identity_action_text(raw_reason, 500)
+        if isinstance(raw_reason, str)
+        else ""
+    )
+    if not reason:
+        return {
+            "status": "error",
+            "error": "reason_required",
+            "action": "identity.dimensions_set",
+        }, [], 400
+    normalized_dimensions = card_policy.sanitize_identity_card(
+        {"dimensions": dimensions}
+    )["dimensions"]
+
+    def _read_merge_save() -> tuple[dict, list[dict], int]:
+        existing, snapshot_err = _load_identity_snapshot_for_write(store)
+        if existing is None:
+            return {
+                "status": "error",
+                "error": snapshot_err,
+                "action": "identity.dimensions_set",
+            }, [], 409
+
+        plain, plain_err = _identity_plain_for_action(
+            store, api_key, runtime_token=runtime_token
+        )
+        if plain is None:
+            return {
+                "status": "error",
+                "error": plain_err,
+                "action": "identity.dimensions_set",
+            }, [], 409
+
+        payload = _identity_payload_from_plain(plain)
+        old_dimensions = list(payload.get("dimensions") or [])
+        old_by_name = {
+            str(item.get("name") or "").strip().lower(): item
+            for item in old_dimensions
+            if isinstance(item, dict)
+        }
+        new_names = {
+            str(item.get("name") or "").strip().lower()
+            for item in normalized_dimensions
+        }
+        old_names = set(old_by_name)
+        added_count = len(new_names - old_names)
+        deleted_count = len(old_names - new_names)
+        changed_new_count = 0
+        stamped_dimensions: list[dict] = []
+        for item in normalized_dimensions:
+            stamped = dict(item)
+            key = str(stamped.get("name") or "").strip().lower()
+            old_item = old_by_name.get(key)
+            semantic_new = {
+                field: value
+                for field, value in stamped.items()
+                if field not in (
+                    _DIMENSION_CHANGE_REASON_FIELD,
+                    _DIMENSION_CHANGE_TOOL_FIELD,
+                )
+            }
+            semantic_old = {
+                field: value
+                for field, value in (old_item or {}).items()
+                if field not in (
+                    _DIMENSION_CHANGE_REASON_FIELD,
+                    _DIMENSION_CHANGE_TOOL_FIELD,
+                )
+            }
+            if old_item is None or semantic_new != semantic_old:
+                changed_new_count += 1
+                stamped[_DIMENSION_CHANGE_REASON_FIELD] = reason
+                stamped[_DIMENSION_CHANGE_TOOL_FIELD] = "set"
+            elif old_item is not None:
+                for field in (
+                    _DIMENSION_CHANGE_REASON_FIELD,
+                    _DIMENSION_CHANGE_TOOL_FIELD,
+                ):
+                    if field in old_item:
+                        stamped[field] = old_item[field]
+            stamped_dimensions.append(stamped)
+
+        metrics = {
+            "changed_count": changed_new_count + deleted_count,
+            "added_count": added_count,
+            "deleted_count": deleted_count,
+            "labels_changed": int(new_names != old_names),
+        }
+        if metrics["changed_count"] == 0:
+            return {
+                "status": "ok",
+                "action": "identity.dimensions_set",
+                "changed_fields": [],
+                "noop": True,
+            }, [], 200
+
+        payload["dimensions"] = stamped_dimensions
+        payload[_DIMENSIONS_SET_MARKER_FIELD] = {
+            "reason": reason,
+            "tool": "set",
+            **metrics,
+        }
+        identity, change, save_err = _save_identity_action_payload(
+            store,
+            payload,
+            existing=existing,
+            audit={
+                "action": "dimensions_set",
+                "old_value": len(old_dimensions),
+                "new_value": len(stamped_dimensions),
+                "fields": ["dimensions"],
+            },
+            event_type="identity_action_dimensions_set",
+        )
+        if identity is None:
+            return {
+                "status": "error",
+                "error": save_err,
+                "action": "identity.dimensions_set",
+            }, [], 409
+        trace_identity_dimensions_set(store, metrics)
+        effect = {
+            "type": "identity_updated",
+            "action": "identity.dimensions_set",
+            "fields": ["dimensions"],
+            "identity_id": identity.get("id", ""),
+            "change_id": change.get("id", "") if change else "",
+        }
+        return {
+            "status": "ok",
+            "action": "identity.dimensions_set",
+            "changed_fields": ["dimensions"],
+            "identity": {
+                "id": identity.get("id", ""),
+                "updated_at": identity.get("updated_at", ""),
+                "days_with_user": identity_service._live_days_with_user(
+                    identity, store=store
+                ),
+            },
+            "change": change or {},
+        }, [effect], 200
+
+    return _with_identity_mutation_lock_and_retry(
+        store, "identity.dimensions_set", _read_merge_save
+    )
+
+
+def trace_identity_dimensions_set(store: UserStore, metrics: dict) -> None:
+    """Emit only count/boolean metadata; card labels and reason stay encrypted."""
+    try:
+        debug_trace.trace_event(
+            store,
+            subsystem="identity",
+            type=IDENTITY_DIMENSIONS_SET_EVENT,
+            actor="backend",
+            status="ok",
+            summary="",
+            explain="",
+            detail={
+                "counts": {
+                    "changed_count": int(metrics.get("changed_count") or 0),
+                    "added_count": int(metrics.get("added_count") or 0),
+                    "deleted_count": int(metrics.get("deleted_count") or 0),
+                    "labels_changed": int(bool(metrics.get("labels_changed"))),
+                },
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — observability must not block a card write
+        log.warning(
+            "[identity.actions] dimensions-set trace failed error=%s",
+            type(exc).__name__,
+        )
+
+
 def _relationship_anchor_cas_write(
     store: UserStore, *, days, source: str, evidence: str,
 ) -> tuple[dict | None, int, str]:
@@ -975,7 +1221,8 @@ def _relationship_anchor_cas_write(
     (identity_core.update_relationship_anchor) — used to do a plain
     ``_save_identity`` (whole-blob overwrite, no lock, no compare-and-swap) from
     their OWN independently-taken snapshot. Either could land between a concurrent
-    profile_patch/dimension_nudge's CAS win and that caller observing success,
+    profile_patch/dimension_nudge/dimensions_set's CAS win and that caller
+    observing success,
     silently clobbering it (the KNOWN RESIDUAL the old comment flagged). They now
     both funnel through here so there is ONE anchor writer and it is CAS-safe.
 
@@ -1037,6 +1284,7 @@ def _identity_relationship_days_set(store: UserStore, action: dict) -> tuple[dic
         "new_value": days,
         "delta": days - old_days,
         "reason": evidence or "Relationship day count recalibrated.",
+        "fields": ["days_with_user"],
     })
     effect = {
         "type": "identity_updated",
@@ -1122,7 +1370,9 @@ def _identity_replace_action(
     # Omitted or "" (every existing caller, and legacy jobs pre-dating the baseline) skips the
     # check entirely — back-compat, not a security gate.
     base_identity_replaced_at = str(action.get("base_identity_replaced_at") or "").strip()
-    if base_identity_replaced_at:
+    job_metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+    has_field_lock_anchor = "identity_change_anchor_ts" in job_metadata
+    if base_identity_replaced_at and not has_field_lock_anchor:
         current_identity = identity_service._load_identity(store)
         current_replaced_at = str((current_identity or {}).get("replaced_at") or "")
         if base_identity_replaced_at != current_replaced_at:
@@ -1136,24 +1386,35 @@ def _identity_replace_action(
     # T12 (spec 3.6 / D5): replace_identity_preserving_anchor now reads the LATEST
     # decrypted card at write time and key-level merges the distilled payload onto
     # it under identity_mutation_lock + a CAS retry loop — the base_identity_replaced_at
-    # check above stays as the coarser replace-vs-replace guard (P5), but it is no
-    # longer the only concurrency protection: a profile_patch/dimension_nudge landing
+    # check above remains only for legacy jobs without a field-lock anchor. New
+    # jobs use the finer per-field change-log lock below, so a concurrent full
+    # replace locks every distilled field without preventing profile/persona
+    # persistence or completion. A profile_patch/dimension_nudge/
+    # dimensions_set landing
     # between this function's reads and its write can no longer be silently clobbered
     # (closes the KNOWN RESIDUAL this comment used to document).
     from genesis import service as genesis_service  # lazy — avoid import cycle
+    field_lock = genesis_service.identity_field_lock_for_job(store, job_id)
     result = genesis_service.replace_identity_preserving_anchor(
         store,
         {"identity": identity_payload, "relationship_anchor": _replace_relationship_anchor(action)},
         api_key,
         runtime_token=runtime_token,
+        field_lock=field_lock,
     )
-    if result != "updated":
+    if result not in {"updated", "locked"}:
         status = 409 if result in (
             "identity_not_initialized", "identity_update_empty", "not_provided",
             "identity_plain_unavailable", "identity_write_conflict",
         ) else 400
         return {"status": "error", "error": result, "action": "identity.replace"}, [], status
-    return {"status": "ok", "action": "identity.replace", "job_id": job_id}, [], 200
+    return {
+        "status": "ok",
+        "action": "identity.replace",
+        "job_id": job_id,
+        "identity_status": result,
+        "identity_field_lock": field_lock,
+    }, [], 200
 
 
 def _execute_identity_action(
@@ -1173,6 +1434,10 @@ def _execute_identity_action(
             trusted_relationship_anchor=trusted_relationship_anchor)
     if action_type == "identity.dimension_nudge":
         return _identity_dimension_nudge(store, api_key, action, runtime_token=runtime_token)
+    if action_type == "identity.dimensions_set":
+        return _identity_dimensions_set(
+            store, api_key, action, runtime_token=runtime_token
+        )
     if action_type == "identity.relationship_days_set":
         return _identity_relationship_days_set(store, action)
     if action_type == "identity.replace":
@@ -1184,6 +1449,7 @@ def _execute_identity_action(
         "supported": [
             "identity.profile_patch",
             "identity.dimension_nudge",
+            "identity.dimensions_set",
             "identity.relationship_days_set",
             "identity.replace",
         ],

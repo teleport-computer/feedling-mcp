@@ -30,8 +30,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from capabilities import tool_schema  # noqa: E402
 from genesis import prompts as genesis_prompts  # noqa: E402
 from memory.capture_prompt_v1 import build_capture_prompt  # noqa: E402
-from memory.migrate_prompt_v1 import build_migrate_prompt  # noqa: E402
-from memory import prompts_v1  # noqa: E402
+from memory_garden.prompts import buckets as prompts_v1  # noqa: E402
+from memory_garden.prompts.migrate import build_migrate_prompt  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -78,6 +78,22 @@ def test_v2_tool_description_still_states_its_own_ops():
 
     assert "'add'" in desc and "'update'" in desc and "'delete'" in desc
     assert "target_id" in desc
+
+
+def test_v2_tool_description_states_merge_limit_and_single_delete_target():
+    desc = tool_schema.DESCRIPTIONS["memory_write"]
+
+    assert "at most 20 per update" in desc
+    assert "'delete' accepts one 'target_id' only" in desc
+
+
+def test_v2_tool_description_explains_how_to_recover_from_stale_merge_ids():
+    desc = tool_schema.DESCRIPTIONS["memory_write"]
+
+    assert "supersede_targets_unavailable" in desc
+    assert "supersede_targets_changed" in desc
+    assert "do not retry the stale ids" in desc
+    assert "memory_search/memory_index again" in desc
 
 
 def test_v1_guidance_keeps_its_own_op_names():

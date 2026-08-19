@@ -137,6 +137,9 @@ def test_run_plaintext_add_memory_job_resolves_prior_failure(monkeypatch):
 
     n = _notices(uid)["genesis:job_am1"]
     assert n["resolved"] is True
+    job = db.genesis_get_job(uid, "job_am1")
+    assert job["status"] == "done"
+    assert not any(key.startswith("profile_") for key in job["output"])
 
 
 def test_run_plaintext_update_identity_job_resolves_prior_failure(monkeypatch):
@@ -168,6 +171,24 @@ def test_run_plaintext_update_identity_job_resolves_prior_failure(monkeypatch):
     )
     monkeypatch.setattr(service, "replace_identity_preserving_anchor", lambda *_a, **_k: "updated")
     monkeypatch.setattr(service, "write_persona_artifact", lambda *_a, **_k: ("ref", "sha"))
+    monkeypatch.setattr(
+        plaintext,
+        "_attach_plaintext_profile",
+        lambda _store, _api_key, _job_id, *, output, **_kwargs: output.update({
+            "profile": {
+                "memory": "",
+                "style": "style",
+                "memory_touched": False,
+                "style_touched": True,
+                "provider_calls": 1,
+            }
+        }) or output,
+    )
+    monkeypatch.setattr(
+        service,
+        "write_profile_artifact",
+        lambda *_a, **_k: ("profile-ref", "profile-sha", "written"),
+    )
 
     plaintext._run_plaintext_update_identity_job(
         store, "api_key", "job_ui1",
@@ -177,3 +198,6 @@ def test_run_plaintext_update_identity_job_resolves_prior_failure(monkeypatch):
 
     n = _notices(uid)["genesis:job_ui1"]
     assert n["resolved"] is True
+    job = db.genesis_get_job(uid, "job_ui1")
+    assert job["status"] == "done"
+    assert job["output"]["profile_status"] == "written"

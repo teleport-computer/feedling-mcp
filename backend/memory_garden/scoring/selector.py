@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from context_memory_selection import memory_relevance_details
+from .relevance import memory_relevance_details
 
 
 SENSITIVE_QUERY_MARKERS = {
@@ -125,13 +125,14 @@ def index_item_to_relevance_memory(item: dict) -> dict:
     summary = _text(item.get("summary"), 500)
     return {
         "id": _text(item.get("id"), 120),
-        "title": summary,
-        "description": summary,
-        "linked_dimension": buckets,
-        "context": buckets,
-        # Do not synthesize her_quote from index. The index should remain a
-        # no-raw-quote surface.
-        "her_quote": "",
+        # 内核形状：summary / content / bucket（2026-08-17 边界整理，
+        # 此前这里合成的是 io 的老形状 title/description/linked_dimension）。
+        "summary": summary,
+        "bucket": buckets,
+        # 私有搜索语料放进 content 位 —— 正文里的关键词才搜得到。
+        # 索引本身仍是「无原话」的表面：这个 dict 只在 enclave 内用于打分，
+        # 用完即弃，不会被序列化。
+        "content": _text(item.get("_search_content"), 5000),
         "occurred_at": _text(item.get("occurred_at"), 80),
         "created_at": _text(item.get("created_at"), 80),
         "type": "memory_index_item",
@@ -162,6 +163,10 @@ def _topic_match(query: str, item: dict) -> bool:
     query_text = str(query or "").lower()
     haystack = " ".join([
         str(item.get("summary") or "").lower(),
+        # 私有搜索语料：正文只在 enclave 内参与匹配，序列化前由出口剥掉。
+        # 这道关口和下面的词法打分**必须同时**认它 —— 只接一处的话，
+        # 卡会分别卡在 no_index_topic_match 或 no_query_overlap 上（codex 2026-08-16）。
+        str(item.get("_search_content") or "").lower(),
         " ".join(str(bucket or "").lower() for bucket in (item.get("bucket_refs") or [])),
         str(item.get("bucket") or "").lower(),
         " ".join(str(thread or "").lower() for thread in (item.get("threads") or [])),

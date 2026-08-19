@@ -195,7 +195,7 @@ flip、resident supervisor 或 hosted resident rollback。旧 proactive API 如�
 | `hosted_runtime.py` | 旧接口兼容辅助；不是 hosted 执行路径，也不能启动 resident runtime |
 | `model_api_runtime/v2/` | 托管 Runtime V2：durable queue、统一 provider/tool loop、summary+tail、outbox、prompt-cache telemetry、加密 trajectory、workspace、bounded subagents 与 background lanes |
 | `agent_runtime/` | 仅保留与独立 agent 接入有关的非 supervisor 辅助；旧 hosted per-user CLI supervisor/spawner 已删除 |
-| `context_memory_selection.py` | 记忆检索与相关性打分，组上下文窗口 |
+| `memory_garden/scoring/relevance.py` | 记忆检索与相关性打分，组上下文窗口 |
 | `perception/` | 扩展感知：信号目录、权限、快照、wake 触发 |
 | `dstack_tls.py` | dstack-KMS 密钥派生 + 确定性 TLS 证书生成 |
 
@@ -480,7 +480,7 @@ tab 概念，`below_floor` 的三个 per-tab key 仅为响应形状兼容保留�
 所有变更写入 `user_logs` 的 `memory_changes` 流；批量捕获（聊天历史蒸馏
 成记忆卡）走 `memory_capture_jobs` 流跟踪进度。
 
-**检索（喂给 agent 的上下文怎么选）**：`backend/context_memory_selection.py`，
+**检索（喂给 agent 的上下文怎么选）**：`backend/memory_garden/scoring/relevance.py`，
 纯函数、不依赖向量库——
 
 - resident 路径（宽松）：最多 3 张转折卡（标题前缀 `转折｜`，最新

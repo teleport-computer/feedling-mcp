@@ -2,7 +2,6 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -171,7 +170,7 @@ def test_profile_cards_truncation_fails_before_generation(monkeypatch, body):
 
 def test_profile_card_content_has_no_second_per_card_bound():
     content = "中" * (
-        profile.PROFILE_MEMORY_MAX_CHARS + profile.PROFILE_USER_MAX_CHARS
+        profile.PROFILE_MEMORY_MAX_CHARS + profile.PROFILE_STYLE_MAX_CHARS
     )
     rendered = serve_worker._render_profile_card(
         {"id": "m", "content": content}
@@ -182,7 +181,7 @@ def test_profile_card_content_has_no_second_per_card_bound():
 def test_profile_card_full_content_reaches_provider_request_trace(monkeypatch):
     tail_sentinel = "T062_PROFILE_CARD_TAIL_REACHES_PROVIDER"
     full_body = (
-        "Q" * (profile.PROFILE_MEMORY_MAX_CHARS + profile.PROFILE_USER_MAX_CHARS)
+        "Q" * (profile.PROFILE_MEMORY_MAX_CHARS + profile.PROFILE_STYLE_MAX_CHARS)
         + tail_sentinel
     )
     _wire(
@@ -200,7 +199,7 @@ def test_profile_card_full_content_reaches_provider_request_trace(monkeypatch):
 
     async def _llm(_config, messages, **_kwargs):
         provider_messages.append(messages)
-        return {"reply": '{"memory":"事实","user":"方式"}'}
+        return {"reply": '{"memory":"事实","style":"方式"}'}
 
     async def _trajectory(kind, payload):
         events.append((kind, payload))
@@ -216,7 +215,7 @@ def test_profile_card_full_content_reaches_provider_request_trace(monkeypatch):
     )
 
     assert count == 1
-    assert result.fields == {"memory": "事实", "user": "方式"}
+    assert result.fields == {"memory": "事实", "style": "方式"}
     provider_payload = json.dumps(provider_messages, ensure_ascii=False)
     assert full_body in provider_payload
     assert tail_sentinel in provider_payload

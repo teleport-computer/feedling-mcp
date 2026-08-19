@@ -1436,6 +1436,23 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "The reply conflicted with an existing answer/key, or Chat bootstrap is incomplete. bootstrap_incomplete responses include a required retryable boolean; clients must treat a missing field from an older server as false.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ChatBootstrapIncompleteResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  ]
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -1520,7 +1537,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Store an agent reply as a v1 ciphertext envelope plus optional thinking and encrypted file/image followups. A text primary and its attachment rows commit as one ordered transaction; generated images are returned as native content_type=image Chat messages. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once."
+        "description": "Store an agent reply as a v1 ciphertext envelope plus optional thinking and encrypted file/image followups. A text primary and its attachment rows commit as one ordered transaction; generated images are returned as native content_type=image Chat messages. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. A bootstrap_incomplete 409 always includes retryable: needs_resident_consumer is true so an official identity that previously polled may retry the same reply with bounded backoff; other stages are false, and a missing field from an old server must be treated as false. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once."
       }
     },
     "/v1/chat/turn-activity/{turn_id}": {
@@ -3133,6 +3150,7 @@
     "/v1/identity/changes": {
       "get": {
         "summary": "Identity Changes",
+        "description": "List content-free identity mutations, newest first.\n\nNewly written records include ``fields`` with canonical changed-field\nlabels. Legacy records may omit it and clients must tolerate that shape.",
         "operationId": "identity_changes_v1_identity_changes_get",
         "responses": {
           "200": {
@@ -4377,17 +4395,27 @@
         "operationId": "memory_list_v1_memory_list_get",
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "One deterministic page of encrypted memory records.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
+                  "$ref": "#/components/schemas/MemoryListResponse"
                 }
               }
             }
           },
           "default": {
             "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The limit or opaque cursor is invalid.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4405,14 +4433,26 @@
             "name": "limit",
             "in": "query",
             "required": false,
-            "description": "Recommended page size; values above 200 are capped.",
+            "description": "Page size; values above 500 are capped.",
             "schema": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 200,
+              "maximum": 500,
               "default": 50
             },
             "example": 50
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Opaque continuation token from next_cursor. Omit for the first page.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            },
+            "example": "eyJoIjp0cnVlLCJpIjoibWVtXzEyMyIsInQiOiIyMDI2LTA3LTEzVDEyOjMwOjAwKzAwOjAwIiwidiI6MX0"
           },
           {
             "name": "since",
@@ -5374,7 +5414,8 @@
             }
           }
         },
-        "x-feedling-contract-level": "compatibility"
+        "x-feedling-contract-level": "compatibility",
+        "description": "Create or update the active hosted model route. context_window_tokens is treated as route metadata: a value below Runtime V2's deployment-tunable trust floor (32,768 by default) falls through to the audited-family or unaudited-route default rather than becoming the prompt budget. The resolved value is returned and persisted."
       }
     },
     "/v1/model_api/test": {
@@ -7831,7 +7872,8 @@
             }
           }
         },
-        "x-feedling-contract-level": "compatibility"
+        "x-feedling-contract-level": "compatibility",
+        "description": "Update first-class user preferences. Accepts archive_language, timezone, and/or content_encryption (\"on\", \"off\", or null to clear). Setting content_encryption records intent only; it neither converts existing records nor changes what a client must write until content_encryption_effective follows. Use /v1/content/swap to convert existing records between shapes."
       }
     },
     "/v1/users/public-key": {
@@ -7949,7 +7991,8 @@
         "tags": [
           "Accounts"
         ],
-        "x-feedling-contract-level": "documented"
+        "x-feedling-contract-level": "documented",
+        "description": "Return the authenticated user's identifiers, registered content public key, attested decrypt-service material, and first-class preferences. content_encryption is the user's stated content-encryption preference; content_encryption_effective is the shape a client must actually write and is the only one a write path may act on. Treat an absent, empty, or unrecognized effective value as \"on\" — a deployment that has not enabled plaintext storage reports \"on\" regardless of the preference."
       }
     },
     "/v1/vision/config": {
@@ -9094,6 +9137,41 @@
         "description": "JSON response object. Endpoint-specific fields may be added compatibly.",
         "additionalProperties": true
       },
+      "MemoryListResponse": {
+        "type": "object",
+        "description": "One page of raw encrypted Memory Garden records. total is the filtered full count and is independent of limit and cursor.",
+        "required": [
+          "moments",
+          "total",
+          "next_cursor"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "moments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FreeFormJsonObject"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque continuation token; null exactly when the filtered result is exhausted."
+          }
+        }
+      },
       "DreamStatusResponse": {
         "type": "object",
         "description": "Memory Garden banner status. Dream counts describe the latest completed Dream. Capture fields expose a monotonic total of cards added by Capture; clients subtract the total saved when the user last dismissed the banner. Legal zero-card Capture runs do not reset or refresh the fields.",
@@ -9201,12 +9279,61 @@
           "request_id": "req_abc123"
         }
       },
+      "ChatBootstrapIncompleteResponse": {
+        "type": "object",
+        "required": [
+          "error",
+          "stage",
+          "retryable"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "const": "bootstrap_incomplete"
+          },
+          "stage": {
+            "type": "string",
+            "enum": [
+              "needs_resident_consumer",
+              "needs_decrypt_source",
+              "needs_live_connection"
+            ]
+          },
+          "retryable": {
+            "type": "boolean",
+            "description": "True only when the current resident response may be retried without repeating onboarding. Missing is false for compatibility with older servers."
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "stage": {
+                  "const": "needs_resident_consumer"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "retryable": {
+                  "const": true
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "retryable": {
+                  "const": false
+                }
+              }
+            }
+          }
+        ],
+        "additionalProperties": true
+      },
       "EncryptedEnvelope": {
         "type": "object",
         "required": [
-          "body_ct",
-          "nonce",
-          "K_user",
           "visibility",
           "owner_user_id"
         ],
@@ -9222,6 +9349,20 @@
           "body_ct": {
             "type": "string",
             "description": "Base64 ciphertext."
+          },
+          "body_b64": {
+            "type": "string",
+            "format": "byte",
+            "description": "Base64 plaintext bytes. Accepted by binary content surfaces (Chat image/file, Perception photo, and screen-frame ingest) when content_encryption_effective is \"off\"; text-envelope surfaces reject this shape. Mutually exclusive with body_ct and body."
+          },
+          "body_size_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Optional decoded byte count for body_b64. When provided it must match exactly."
+          },
+          "body": {
+            "type": "string",
+            "description": "Plaintext body. Only valid when the caller's content_encryption_effective (see /v1/users/whoami) is \"off\"; otherwise the write is rejected with plaintext_envelope_not_enabled_for_this_account. Mutually exclusive with body_ct."
           },
           "nonce": {
             "type": "string",
@@ -9253,21 +9394,55 @@
             "description": "Optional label: first 16 hex chars of SHA-256 of the user public key K_user was sealed to. When present on a chat write and it does not match the user's currently registered content key, the write is rejected with 409 content_pk_fpr_mismatch — re-fetch whoami and re-seal."
           }
         },
-        "if": {
-          "properties": {
-            "visibility": {
-              "const": "shared"
+        "oneOf": [
+          {
+            "title": "Encrypted body",
+            "required": [
+              "body_ct",
+              "nonce",
+              "K_user"
+            ],
+            "if": {
+              "properties": {
+                "visibility": {
+                  "const": "shared"
+                }
+              },
+              "required": [
+                "visibility"
+              ]
+            },
+            "then": {
+              "required": [
+                "K_enclave"
+              ]
             }
           },
-          "required": [
-            "visibility"
-          ]
-        },
-        "then": {
-          "required": [
-            "K_enclave"
-          ]
-        },
+          {
+            "title": "Plaintext body",
+            "description": "local_only requires encryption, so this branch pins visibility to shared.",
+            "required": [
+              "body"
+            ],
+            "properties": {
+              "visibility": {
+                "const": "shared"
+              }
+            }
+          },
+          {
+            "title": "Binary plaintext body",
+            "description": "Only supported binary content paths accept this branch, and only while the account's effective tier is off.",
+            "required": [
+              "body_b64"
+            ],
+            "properties": {
+              "visibility": {
+                "const": "shared"
+              }
+            }
+          }
+        ],
         "additionalProperties": true,
         "example": {
           "v": 1,
@@ -9283,9 +9458,6 @@
       "MemoryEnvelope": {
         "type": "object",
         "required": [
-          "body_ct",
-          "nonce",
-          "K_user",
           "visibility",
           "owner_user_id",
           "type",
@@ -9303,6 +9475,10 @@
           "body_ct": {
             "type": "string",
             "description": "Base64 ciphertext."
+          },
+          "body": {
+            "type": "string",
+            "description": "Plaintext body. Only valid when the caller's content_encryption_effective (see /v1/users/whoami) is \"off\"; otherwise the write is rejected with plaintext_envelope_not_enabled_for_this_account. Mutually exclusive with body_ct."
           },
           "nonce": {
             "type": "string",
@@ -9343,7 +9519,7 @@
           "occurred_at": {
             "type": "string",
             "minLength": 1,
-            "description": "Plaintext ISO-8601 ordering metadata."
+            "description": "Plaintext ISO-8601 event time. Accepted datetime values are normalized to the equivalent UTC value with a Z suffix; date-only values remain date-only."
           },
           "source": {
             "type": "string",
@@ -9375,21 +9551,43 @@
             }
           }
         },
-        "if": {
-          "properties": {
-            "visibility": {
-              "const": "shared"
+        "oneOf": [
+          {
+            "title": "Encrypted body",
+            "required": [
+              "body_ct",
+              "nonce",
+              "K_user"
+            ],
+            "if": {
+              "properties": {
+                "visibility": {
+                  "const": "shared"
+                }
+              },
+              "required": [
+                "visibility"
+              ]
+            },
+            "then": {
+              "required": [
+                "K_enclave"
+              ]
             }
           },
-          "required": [
-            "visibility"
-          ]
-        },
-        "then": {
-          "required": [
-            "K_enclave"
-          ]
-        },
+          {
+            "title": "Plaintext body",
+            "description": "local_only requires encryption, so this branch pins visibility to shared.",
+            "required": [
+              "body"
+            ],
+            "properties": {
+              "visibility": {
+                "const": "shared"
+              }
+            }
+          }
+        ],
         "additionalProperties": true,
         "example": {
           "v": 1,
@@ -10289,7 +10487,12 @@
         ],
         "properties": {
           "envelope": {
-            "$ref": "#/components/schemas/EncryptedEnvelope"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EncryptedEnvelope"
+              }
+            ],
+            "description": "For content_type image/file, plaintext-tier clients may send body_b64 instead of an encrypted body_ct envelope. Text messages do not accept body_b64."
           },
           "client_msg_id": {
             "type": "string",
@@ -10317,7 +10520,7 @@
                 "$ref": "#/components/schemas/EncryptedEnvelope"
               }
             ],
-            "description": "Optional separately-encrypted user text sent alongside an image/file (content_type image or file). Same E2E envelope shape as the main `envelope`; the enclave decrypts it into the message's plaintext content so the agent sees the caption. Ignored for content_type=text."
+            "description": "Optional shape-aware user text sent alongside an image/file. It follows content_encryption_effective independently of the binary main envelope. Ignored for content_type=text."
           },
           "context_refs": {
             "type": "array",
@@ -10394,7 +10597,12 @@
         ],
         "properties": {
           "envelope": {
-            "$ref": "#/components/schemas/EncryptedEnvelope"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EncryptedEnvelope"
+              }
+            ],
+            "description": "For content_type image, plaintext-tier clients may send body_b64 instead of an encrypted body_ct envelope. Text replies do not accept body_b64."
           },
           "source": {
             "type": "string",
@@ -10729,7 +10937,8 @@
               "memory.supersede",
               "memory.delete",
               "memory.retype"
-            ]
+            ],
+            "description": "Accepted memory.add actions always create a new card; repeated content is not deduplicated."
           },
           "envelope": {
             "$ref": "#/components/schemas/MemoryEnvelope"
@@ -11181,7 +11390,12 @@
         ],
         "properties": {
           "content_envelope": {
-            "$ref": "#/components/schemas/EncryptedEnvelope"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EncryptedEnvelope"
+              }
+            ],
+            "description": "Encrypted body_ct or plaintext-tier body_b64 image envelope."
           },
           "metadata": {
             "type": "object",
@@ -11269,7 +11483,12 @@
             "additionalProperties": false
           },
           "meta_envelope": {
-            "$ref": "#/components/schemas/EncryptedEnvelope"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EncryptedEnvelope"
+              }
+            ],
+            "description": "Optional encrypted or plaintext-tier UTF-8 metadata envelope."
           },
           "exif_gps": {
             "type": "object",

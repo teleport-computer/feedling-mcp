@@ -100,6 +100,15 @@ def _start_runtime_reconciler_leader() -> None:
     core_leader.run_singleton("runtime-reconciler", runtime_reconciler.start)
 
 
+def _start_lane_rollup_leader() -> None:
+    """Freeze per-user per-lane daily job-outcome cells on exactly one
+    backend worker (admin read path must never scan full history)."""
+    from admin import lane_rollup_scheduler
+    from core import leader as core_leader
+
+    core_leader.run_singleton("lane-rollup", lane_rollup_scheduler.start)
+
+
 @asynccontextmanager
 async def lifespan(app):
     # (1) Threadpool limiter — off anyio's 40-token default (§5.2).
@@ -154,6 +163,13 @@ async def lifespan(app):
 
     core_envelope.get_user_public_key = accounts_registry._get_user_public_key
 
+    # (4c) 同理注入「生效内容形状」解析（v6 加密可选）。用 effective 而不是原始
+    #      偏好：它把 core.envelope.PLAINTEXT_WRITES_ACCEPTED 一并算进去，所以
+    #      服务端自产内容与客户端上传闸是**同一个开关**，不会一边放开一边没放。
+    #      未接线时 core 侧默认 "on"（fail-safe 加密）。
+    core_envelope.resolve_content_encryption = (
+        accounts_registry.effective_content_encryption)
+
     # (5) Cross-worker wake bus — always on (required for poll wakes). Its
     #     "users" handler keeps the registry fresh on later cross-process writes.
     _start_wake_bus()
@@ -163,6 +179,7 @@ async def lifespan(app):
         _start_ws_leader()
         _start_dau_snapshot_leader()
         _start_runtime_reconciler_leader()
+        _start_lane_rollup_leader()
         # (6b) TEE 影子库自动同步单例 — 仅在双写已接时选举（env 决定，接=重部署）。
         from tee_shadow import mirror as _tee_mirror
 

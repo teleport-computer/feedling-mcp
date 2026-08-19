@@ -20,6 +20,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import pytest
 
 import provider_client
+from capabilities import registry as cap_registry
+from capabilities import tool_schema as cap_tool_schema
 from provider_types import ProviderMedia, ToolExchange, ToolResult
 from model_api_runtime.v2 import executor as v2_executor
 from model_api_runtime.v2 import tool_loop
@@ -109,6 +111,11 @@ class _AdaptiveBuildMessages(_RecordingBuildMessages):
         transcript,
         tools,
         required_tool_names,
+        protected_tool_names,
+        collapsed_tool_specs,
+        recovery_tool_name,
+        recovery_tool_active,
+        tool_schema_collapse_policy,
         model_limit,
         output_reserve_tokens,
         safety_margin_tokens,
@@ -124,6 +131,11 @@ class _AdaptiveBuildMessages(_RecordingBuildMessages):
             messages=messages,
             tools=tools,
             required_tool_names=required_tool_names,
+            protected_tool_names=protected_tool_names,
+            collapsed_tool_specs=collapsed_tool_specs,
+            recovery_tool_name=recovery_tool_name,
+            recovery_tool_active=recovery_tool_active,
+            tool_schema_collapse_policy=tool_schema_collapse_policy,
             output_reserve_tokens=output_reserve_tokens,
             safety_margin_tokens=safety_margin_tokens,
             utf8_bytes_per_token=utf8_bytes_per_token,
@@ -168,6 +180,94 @@ def test_empty_tool_calls_is_final_reply_no_dispatch(monkeypatch):
     assert outcome.stop_reason == "final_text"
     assert outcome.replied_intermediate is False
     assert progress == ["round_boundary", "provider_start", "provider_complete"]
+
+
+def test_new_input_cancels_old_final_reply_correction_before_retry(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "old candidate", "tool_calls": [], "usage": {}},
+        {"reply": "answer for new input", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    published = []
+    cancelled = []
+    first = True
+
+    async def publish(text, *, final, reasoning="", correction_outcome=""):
+        nonlocal first
+        if first:
+            first = False
+            return tool_loop.FinalReplyCorrectionRequest(
+                instruction="rewrite old candidate",
+                original_text=text,
+                original_reasoning=reasoning,
+                on_cancel=lambda: cancelled.append(True),
+            )
+        published.append((text, final, correction_outcome))
+        return None
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_AdaptiveBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=publish,
+        fold_new_messages=_RecordingFold([[
+            {"role": "user", "content": "new input"},
+        ]]),
+        add_usage=_noop_add_usage,
+        max_calls=5,
+    ))
+
+    assert cancelled == [True]
+    assert published == [("answer for new input", True, "")]
+    assert outcome.final_text == "answer for new input"
+    assert len(provider.calls) == 2
+    assert "rewrite old candidate" not in provider.calls[1]["messages"][0]["content"]
+    assert provider.calls[1]["tools"] is not None
+
+
+def test_final_reply_correction_is_bounded_to_exactly_one_retry(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "original candidate", "tool_calls": [], "usage": {}},
+        {"reply": "still mismatched", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    decisions = []
+    published = []
+
+    async def always_request_correction(
+        text, *, final, reasoning="", correction_outcome=""
+    ):
+        decisions.append((text, final, correction_outcome))
+        if correction_outcome:
+            published.append((text, correction_outcome))
+            return None
+        return tool_loop.FinalReplyCorrectionRequest(
+            instruction="rewrite in the user's language",
+            original_text=text,
+            original_reasoning=reasoning,
+        )
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_AdaptiveBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=always_request_correction,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=5,
+    ))
+
+    assert len(provider.calls) == 2
+    assert provider.calls[1]["tools"] is None
+    assert decisions == [
+        ("original candidate", True, ""),
+        ("still mismatched", True, ""),
+        ("original candidate", True, "skipped"),
+    ]
+    assert published == [("original candidate", "skipped")]
+    assert outcome.final_text == "original candidate"
+    assert outcome.rounds == 2
+    assert outcome.stop_reason == "final_text"
 
 
 def test_memory_delete_surface_defaults_fail_closed(monkeypatch):
@@ -304,6 +404,36 @@ def test_initial_outbound_fence_is_armed_before_first_provider_call(monkeypatch)
 
     offered = {spec.name for spec in (provider.calls[0]["tools"] or ())}
     assert {"web_search", "web_fetch", "task"}.isdisjoint(offered)
+
+
+def test_foreground_screen_context_does_not_remove_write_surface(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "已看到", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    screen_message = {
+        "role": "user",
+        "content": [{"type": "text", "text": "ocr_text (untrusted): note"}],
+        "_screen_test": True,
+    }
+
+    asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=lambda _transcript: [screen_message],
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=2,
+        initial_outbound_tools_blocked=False,
+    ))
+
+    offered = {spec.name for spec in provider.calls[0]["tools"]}
+    identity_writes = {
+        name for name in cap_registry.WRITE_ACTIONS if name.startswith("identity_")
+    }
+    assert identity_writes <= offered
+    assert {"memory_write", "schedule_wake", cap_tool_schema.REPLY_TOOL} <= offered
 
 
 def test_provider_image_is_a_terminal_reply_without_synthetic_text(monkeypatch):
@@ -481,9 +611,13 @@ def test_foreground_semantic_empty_response_gets_one_correction(monkeypatch):
     ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     published = []
+    surfaces = []
 
     async def publish(text, *, final, reasoning=""):
         published.append((text, final, reasoning))
+
+    async def record_surface(detail):
+        surfaces.append(detail)
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
         provider_config=_TEST_PROVIDER_CONFIG,
@@ -493,6 +627,7 @@ def test_foreground_semantic_empty_response_gets_one_correction(monkeypatch):
         fold_new_messages=_RecordingFold([]),
         add_usage=_noop_add_usage,
         max_calls=5,
+        on_provider_tool_surface=record_surface,
     ))
 
     assert outcome.final_text == "recovered"
@@ -501,6 +636,160 @@ def test_foreground_semantic_empty_response_gets_one_correction(monkeypatch):
     correction = provider.calls[1]["messages"][0]
     assert correction["role"] == "system"
     assert "Do not return a thinking-only response" in correction["content"]
+    assert [item["empty_response_recovery"] for item in surfaces] == [
+        False,
+        True,
+    ]
+    assert all(
+        item["force_text_fallback_reason"] == "none" for item in surfaces
+    )
+
+
+def test_reply_bubble_promotes_only_after_empty_recovery_is_exhausted(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "r1", "name": "reply", "args": {"text": "complete answer"}}
+            ],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "reasoning": "private work with no visible answer",
+            "stop_reason": "end_turn",
+            "tool_calls": [],
+            "usage": {"completion_tokens": 3930},
+        },
+        {
+            "reply": "",
+            "reasoning": "still no new visible answer",
+            "stop_reason": "end_turn",
+            "tool_calls": [],
+            "usage": {"completion_tokens": 5},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    on_reply = _RecordingReply()
+    promotion_calls = []
+
+    async def promote():
+        promotion_calls.append(len(provider.calls))
+        return True
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_AdaptiveBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=on_reply,
+        on_promote_last_intermediate=promote,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=5,
+    ))
+
+    assert len(provider.calls) == 3
+    assert promotion_calls == [3]
+    assert "without visible text" in provider.calls[2]["messages"][0]["content"]
+    assert on_reply.calls == [("complete answer", False)]
+    assert outcome.final_text == ""
+    assert outcome.stop_reason == "intermediate_promoted"
+    assert outcome.replied_intermediate is True
+
+
+def test_first_empty_at_call_budget_never_promotes_reply_bubble(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "r1", "name": "reply", "args": {"text": "one moment"}}
+            ],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "reasoning": "provider produced no visible answer",
+            "stop_reason": "end_turn",
+            "tool_calls": [],
+            "usage": {"completion_tokens": 3930},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    on_reply = _RecordingReply()
+    promotion_calls = []
+
+    async def promote():
+        promotion_calls.append(True)
+        return True
+
+    with pytest.raises(tool_loop.ProviderEmptyReply, match="empty_reply"):
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_AdaptiveBuildMessages(),
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=on_reply,
+            on_promote_last_intermediate=promote,
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            max_calls=2,
+        ))
+
+    assert len(provider.calls) == 2
+    assert provider.calls[1]["tools"] is not None
+    assert provider.calls[1]["tool_choice"] == "none"
+    assert on_reply.calls == [("one moment", False)]
+    assert promotion_calls == []
+
+
+def test_empty_recovery_can_still_publish_new_final_after_reply_bubble(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "r1", "name": "reply", "args": {"text": "one moment"}}
+            ],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "reasoning": "provider produced no body",
+            "stop_reason": "end_turn",
+            "tool_calls": [],
+            "usage": {},
+        },
+        {
+            "reply": "different final answer",
+            "stop_reason": "end_turn",
+            "tool_calls": [],
+            "usage": {},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    on_reply = _RecordingReply()
+    promotion_calls = []
+
+    async def promote():
+        promotion_calls.append(True)
+        return True
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_AdaptiveBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=on_reply,
+        on_promote_last_intermediate=promote,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=5,
+    ))
+
+    assert promotion_calls == []
+    assert on_reply.calls == [
+        ("one moment", False),
+        ("different final answer", True),
+    ]
+    assert outcome.final_text == "different final answer"
+    assert outcome.stop_reason == "final_text"
 
 
 def test_serialized_upstream_response_envelope_gets_one_correction(monkeypatch):
@@ -738,9 +1027,14 @@ def test_empty_response_trajectory_records_only_content_free_shape(monkeypatch):
     ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     events = []
+    debug_shapes = []
 
     async def record(event_kind, payload):
         events.append((event_kind, payload))
+
+    async def record_debug(response_shape):
+        debug_shapes.append(response_shape)
+        raise RuntimeError("diagnostics unavailable")
 
     asyncio.run(tool_loop.run_tool_loop(
         provider_config=_TEST_PROVIDER_CONFIG,
@@ -751,6 +1045,7 @@ def test_empty_response_trajectory_records_only_content_free_shape(monkeypatch):
         add_usage=_noop_add_usage,
         max_calls=5,
         on_trajectory_event=record,
+        on_empty_provider_response=record_debug,
     ))
 
     empty_events = [
@@ -770,6 +1065,14 @@ def test_empty_response_trajectory_records_only_content_free_shape(monkeypatch):
     }]
     assert "private trajectory content" not in str(empty_events)
     assert "messages" not in str(empty_events)
+    assert debug_shapes == [empty_events[0]["response_shape"]]
+    assert set(debug_shapes[0]) == {
+        "stop_reason",
+        "has_visible_text",
+        "reasoning_present",
+        "tool_call_count",
+        "completion_tokens",
+    }
 
 
 def test_usable_provider_success_survives_response_trajectory_failure(monkeypatch):
@@ -1709,7 +2012,21 @@ def test_same_batch_memory_search_reuses_same_query(monkeypatch):
     assert outcome.final_text == "direct answer"
 
 
-def test_openrouter_file_recovery_forces_write_then_send_file(monkeypatch):
+@pytest.mark.parametrize(
+    "provider_name, supports_named_choice",
+    [
+        ("openai", True),
+        ("openrouter", True),
+        ("openai_compatible", True),
+        ("deepseek", True),
+        ("anthropic", True),
+        ("gemini", True),
+        ("bedrock", True),
+    ],
+)
+def test_file_recovery_tool_choice_dispatches_by_provider_capability(
+    monkeypatch, provider_name, supports_named_choice
+):
     provider = _ScriptedProvider([
         {"reply": "# draft", "tool_calls": [], "usage": {}},
         {
@@ -1761,7 +2078,7 @@ def test_openrouter_file_recovery_forces_write_then_send_file(monkeypatch):
         surfaces.append(detail)
 
     config = provider_client.ProviderConfig(
-        provider="openrouter",
+        provider=provider_name,
         model="deepseek/deepseek-v4-flash",
         api_key="test-key",
     )
@@ -1776,19 +2093,38 @@ def test_openrouter_file_recovery_forces_write_then_send_file(monkeypatch):
         add_usage=_noop_add_usage,
         max_calls=5,
         on_provider_tool_surface=record_surface,
+        extra_tool_recovery_name="mcp_tool_search",
+        tool_schema_collapse_policy="always",
     ))
 
     assert [tc.name for tc in dispatched] == ["workspace_write"]
-    assert provider.calls[1]["tool_choice"] == {
+    expected_choice = {
         "type": "function",
         "function": {"name": "workspace_write"},
     }
-    assert [spec.name for spec in provider.calls[1]["tools"]] == ["workspace_write"]
-    assert provider.calls[2]["tool_choice"] == {
-        "type": "function",
-        "function": {"name": "send_file"},
+    if supports_named_choice:
+        assert provider.calls[1]["tool_choice"] == expected_choice
+    else:
+        assert "tool_choice" not in provider.calls[1]
+    assert {spec.name for spec in provider.calls[1]["tools"]} == {
+        "workspace_write",
+        "mcp_tool_search",
     }
-    assert [spec.name for spec in provider.calls[2]["tools"]] == ["send_file"]
+    assert next(
+        spec for spec in provider.calls[1]["tools"]
+        if spec.name == "workspace_write"
+    ).parameters["required"] == ["path", "content", "expected_revision"]
+    if supports_named_choice:
+        assert provider.calls[2]["tool_choice"] == {
+            "type": "function",
+            "function": {"name": "send_file"},
+        }
+    else:
+        assert "tool_choice" not in provider.calls[2]
+    assert {spec.name for spec in provider.calls[2]["tools"]} == {
+        "send_file",
+        "mcp_tool_search",
+    }
     assert files == [("/workspace/summary.md", 1)]
     assert outcome.final_text == "文档已生成。"
     assert [item["reason"] for item in surfaces[:3]] == [
@@ -2339,6 +2675,9 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
     assert surfaces[0]["sent_tool_count"] > 0
     assert surfaces[1]["sent_tool_count"] == 0
     assert surfaces[1]["dropped_tool_count"] == surfaces[1]["candidate_tool_count"]
+    assert surfaces[1]["terminal_text_round"] is True
+    assert surfaces[1]["terminal_text_round_reason"] == "force_text_fallback"
+    assert surfaces[1]["force_text_fallback_reason"] == "tool_schema_rejected"
 
 
 def test_provider_surface_marks_reserved_terminal_text_round(monkeypatch):
@@ -2366,6 +2705,9 @@ def test_provider_surface_marks_reserved_terminal_text_round(monkeypatch):
     assert surfaces[0]["reason"] == "terminal_text_round"
     assert surfaces[0]["sent_tool_count"] == 0
     assert surfaces[0]["dropped_tool_count"] == surfaces[0]["candidate_tool_count"]
+    assert surfaces[0]["terminal_text_round"] is True
+    assert surfaces[0]["terminal_text_round_reason"] == "max_calls"
+    assert surfaces[0]["force_text_fallback_reason"] == "none"
 
 
 def test_provider_call_exception_still_counts_a_model_call(monkeypatch):
@@ -2678,3 +3020,46 @@ def test_superseded_image_final_folds_like_a_text_final_not_a_turn_failure(monke
     # 被抢占的那轮**没有**变成异常,而是回到外层重答了新的对话
     assert published == [("刚说到哪儿了?", True, ())]
     assert outcome.stop_reason != "final_media"
+def test_stay_silent_is_offered_only_with_callback_and_ends_wake(monkeypatch):
+    provider = _ScriptedProvider([{
+        "reply": "",
+        "tool_calls": [{"id": "s1", "name": "stay_silent", "args": {"reason": "刚主动说过话"}}],
+        "usage": {},
+    }])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    reasons = []
+
+    async def on_stay_silent(reason):
+        reasons.append(reason)
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        on_stay_silent=on_stay_silent,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=2,
+        require_reply=False,
+    ))
+
+    assert "stay_silent" in {spec.name for spec in provider.calls[0]["tools"]}
+    assert reasons == ["刚主动说过话"]
+    assert outcome.stop_reason == "stay_silent"
+    assert outcome.final_text == ""
+
+
+def test_stay_silent_is_hidden_without_callback(monkeypatch):
+    provider = _ScriptedProvider([{"reply": "done", "tool_calls": [], "usage": {}}])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=2,
+    ))
+    assert "stay_silent" not in {spec.name for spec in provider.calls[0]["tools"]}

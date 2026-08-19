@@ -24,7 +24,7 @@ import os
 import re
 
 from core import protocol_leak
-from memory.prompts_v1 import _text_is_chinese
+from ..prompts.buckets import _text_is_chinese
 
 
 def guard_enabled() -> bool:

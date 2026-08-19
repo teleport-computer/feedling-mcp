@@ -74,6 +74,63 @@ def test_short_transcript_is_previewed_verbatim():
     assert transcript_store.build_preview(text) == text
 
 
+def test_load_plaintext_reads_plaintext_tier_without_enclave(monkeypatch):
+    monkeypatch.setattr(
+        transcript_store,
+        "get_envelope",
+        lambda *_args, **_kwargs: {
+            "transcript": {
+                "id": "vtx_vcall_plain",
+                "owner_user_id": "usr_plain",
+                "visibility": "shared",
+                "body": "用户: 你好\n伴侣: 我在",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        transcript_store.core_envelope.enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext transcript must not call enclave")
+        ),
+    )
+
+    assert transcript_store.load_plaintext("usr_plain", "vcall_plain") == (
+        "用户: 你好\n伴侣: 我在"
+    )
+
+
+def test_reconstruct_turns_reads_plaintext_chat_rows_without_enclave(monkeypatch):
+    monkeypatch.setattr(
+        cleanup,
+        "call_message_rows",
+        lambda *_args: [("m1", 1)],
+    )
+    monkeypatch.setattr(
+        cleanup.db,
+        "chat_get_strict",
+        lambda *_args: {
+            "id": "m1",
+            "seq": 1,
+            "role": "user",
+            "body": "hello",
+            "owner_user_id": "usr_plain",
+        },
+    )
+    monkeypatch.setattr(
+        cleanup.core_envelope.enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext chat row must not call enclave")
+        ),
+    )
+
+    assert cleanup.transcript_turns_from_rows(
+        "usr_plain", "vcall_plain", runtime_token="rt") == [
+            {"role": "user", "text": "hello"}
+        ]
+
+
 def test_rendered_transcript_never_leaks_the_literal_role():
     """`user:` in a transcript taught models to write 「用户」 into user-visible
     cards (usr_fee1, 2026-07-17). Rendering goes through the shared speaker
@@ -112,6 +169,8 @@ def test_capture_header_spells_out_who_is_who():
     header = transcript_store.capture_window_header(turn_count=24, ai_name="小满")
     assert "「我」是" in header and "不是你" in header
     assert "「小满」才是你自己" in header
+    assert "这个人明确讲出来的每一件事" in header
+    assert "TA" not in header
     # 「宁少勿多」是为闲聊窗口写的;不显式推翻它,一通电话只会留下一两张卡。
     assert "不适用于这里" in header
 

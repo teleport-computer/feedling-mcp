@@ -302,7 +302,7 @@ def test_profile_provider_setup_failure_waits_for_explicit_repair(monkeypatch):
             "retry_not_before": 0,
         },
         memory_text="事实",
-        user_text="方式",
+        style_text="方式",
         seal_text=lambda _uid, _text: {"body_ct": "ct", "nonce": "n"},
     )
     captured = {}
@@ -567,7 +567,7 @@ def test_profile_full_card_reaches_recorded_provider_request(monkeypatch):
     traces = []
     tail_sentinel = "T062_PROFILE_CARD_TAIL_REACHES_PROVIDER_ONLY"
     content = (
-        "P" * (profile.PROFILE_MEMORY_MAX_CHARS + profile.PROFILE_USER_MAX_CHARS)
+        "P" * (profile.PROFILE_MEMORY_MAX_CHARS + profile.PROFILE_STYLE_MAX_CHARS)
         + tail_sentinel
     )
     rendered_cards = serve_worker._render_profile_card({
@@ -577,7 +577,7 @@ def test_profile_full_card_reaches_recorded_provider_request(monkeypatch):
 
     async def _llm(_config, messages, **_kwargs):
         provider_messages.append(messages)
-        return {"reply": '{"memory":"事实","user":"方式"}'}
+        return {"reply": '{"memory":"事实","style":"方式"}'}
 
     async def _cas(_uid, recompute):
         return _cas_result(await recompute({}))
@@ -662,7 +662,7 @@ def test_profile_reports_read_provider_and_durable_write_boundaries(monkeypatch)
             object(), [], max_tokens=10, temperature=0.2, timeout=90.0
         )
         return profile.ProfileGenerationResult(
-            fields={"memory": "事实", "user": "方式"},
+            fields={"memory": "事实", "style": "方式"},
             reject_code="",
             overlap=None,
             provider_calls=1,
@@ -708,7 +708,7 @@ def test_profile_reports_read_provider_and_durable_write_boundaries(monkeypatch)
 def test_profile_roll_back_after_generation_blocks_profile_cas(monkeypatch):
     async def _generate(**_kwargs):
         return profile.ProfileGenerationResult(
-            fields={"memory": "事实", "user": "方式"},
+            fields={"memory": "事实", "style": "方式"},
             reject_code="",
             overlap=None,
             provider_calls=1,
@@ -902,7 +902,7 @@ def test_profile_output_budget_is_raised_for_full_cjk_json():
 
     async def _llm(_config, _messages, **kwargs):
         seen.update(kwargs)
-        return {"reply": '{"memory":"事实","user":"方式"}'}
+        return {"reply": '{"memory":"事实","style":"方式"}'}
 
     result = asyncio.run(
         profile.generate_profile(
@@ -912,7 +912,7 @@ def test_profile_output_budget_is_raised_for_full_cjk_json():
         )
     )
 
-    assert result.fields == {"memory": "事实", "user": "方式"}
+    assert result.fields == {"memory": "事实", "style": "方式"}
     assert seen["max_tokens"] == 8000
 
 

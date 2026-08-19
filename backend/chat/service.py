@@ -95,18 +95,12 @@ def is_conversation_user_message(msg: dict) -> bool:
 def _chat_thinking_extra_from_envelope(envelope: dict | None) -> dict:
     if not isinstance(envelope, dict):
         return {}
-    out = {
-        "thinking_v": str(envelope.get("v", 1)),
-        "thinking_id": str(envelope.get("id") or ""),
-        "thinking_body_ct": str(envelope.get("body_ct") or ""),
-        "thinking_nonce": str(envelope.get("nonce") or ""),
-        "thinking_K_user": str(envelope.get("K_user") or ""),
-        "thinking_visibility": str(envelope.get("visibility") or "shared"),
-        "thinking_owner_user_id": str(envelope.get("owner_user_id") or ""),
-        "thinking_enclave_pk_fpr": str(envelope.get("enclave_pk_fpr") or ""),
-    }
-    if envelope.get("K_enclave"):
-        out["thinking_K_enclave"] = str(envelope.get("K_enclave") or "")
+    try:
+        out = core_envelope.envelope_prefixed_fields(envelope, "thinking")
+    except ValueError:
+        # 形状不认识（既无 body_ct 也无 body）：本函数历来对残缺信封宽容——
+        # 空值会被下面的过滤丢掉，调用方按「没有 thinking」处理。
+        return {}
     return {k: v for k, v in out.items() if str(v).strip()}
 
 
@@ -121,18 +115,10 @@ def _chat_caption_extra_from_envelope(envelope: dict | None) -> dict:
     """
     if not isinstance(envelope, dict):
         return {}
-    out = {
-        "caption_v": str(envelope.get("v", 1)),
-        "caption_id": str(envelope.get("id") or ""),
-        "caption_body_ct": str(envelope.get("body_ct") or ""),
-        "caption_nonce": str(envelope.get("nonce") or ""),
-        "caption_K_user": str(envelope.get("K_user") or ""),
-        "caption_visibility": str(envelope.get("visibility") or "shared"),
-        "caption_owner_user_id": str(envelope.get("owner_user_id") or ""),
-        "caption_enclave_pk_fpr": str(envelope.get("enclave_pk_fpr") or ""),
-    }
-    if envelope.get("K_enclave"):
-        out["caption_K_enclave"] = str(envelope.get("K_enclave") or "")
+    try:
+        out = core_envelope.envelope_prefixed_fields(envelope, "caption")
+    except ValueError:
+        return {}
     return {k: v for k, v in out.items() if str(v).strip()}
 
 
@@ -269,19 +255,40 @@ def _is_r2_pointer(m: dict) -> bool:
     return bool(m.get("body_key")) and m.get("body_ct") is None
 
 
+def _strip_body_storage_fields(m: dict) -> dict:
+    """Remove server-internal R2 coordinates from a delivered chat document."""
+    out = dict(m)
+    for key in ("body_key", "body_object_format", "body_sha256"):
+        out.pop(key, None)
+    return out
+
+
 def _body_omit_decision(m: dict, *, include_image_body: bool) -> tuple[bool, str, int]:
-    """(omit?, reason, body_ct_len) for one message. Shared by the page pre-fetch
+    """(omit?, reason, encoded-or-raw size) for one message. Shared by pre-fetch
     and the item renderer so the two can never disagree about which bodies this
-    page delivers. A pointer's length is read off the row (``body_ct_len``), so
-    the omit path can report a size without fetching from R2."""
+    page delivers. Pointer size is read off the row, so the omit path can report
+    it without fetching from R2. Plaintext pointers use raw ``body_size_bytes``;
+    sealed pointers retain the legacy base64 ``body_ct_len``."""
     is_pointer = _is_r2_pointer(m)
-    body_ct_len = int(m.get("body_ct_len") or 0) if is_pointer else len(m.get("body_ct") or "")
+    is_plaintext_pointer = (
+        is_pointer and m.get("body_object_format") == "plaintext_v1"
+    )
+    body_size = (
+        int(m.get("body_size_bytes") or 0)
+        if is_plaintext_pointer
+        else (
+            int(m.get("body_ct_len") or 0)
+            if is_pointer
+            else len(m.get("body_ct") or m.get("body_b64") or "")
+        )
+    )
     if not include_image_body:
         if m.get("content_type", "text") == "image":
-            return True, "image_body", body_ct_len
-        if body_ct_len > CHAT_HISTORY_INLINE_BODY_CT_MAX:
-            return True, "large_body_ct", body_ct_len
-    return False, "", body_ct_len
+            return True, "image_body", body_size
+        if body_size > CHAT_HISTORY_INLINE_BODY_CT_MAX:
+            reason = "large_body" if is_plaintext_pointer else "large_body_ct"
+            return True, reason, body_size
+    return False, "", body_size
 
 
 def hydrate_history_page(msgs: list[dict], *, include_image_body: bool) -> list[dict]:
@@ -333,15 +340,28 @@ def _chat_history_item(m: dict, *, include_image_body: bool = True) -> dict:
 
     content_type = item.get("content_type", "text")
     is_pointer = _is_r2_pointer(item)
-    should_omit_body, body_omitted_reason, body_ct_len = _body_omit_decision(
+    should_omit_body, body_omitted_reason, body_size = _body_omit_decision(
         item, include_image_body=include_image_body
+    )
+    is_plaintext_pointer = (
+        is_pointer and item.get("body_object_format") == "plaintext_v1"
     )
 
     if should_omit_body:
-        item["body_ct_len"] = body_ct_len
+        size_field = "body_size_bytes" if is_plaintext_pointer else "body_ct_len"
+        item[size_field] = body_size
         item["body_omitted"] = True
         item["body_omitted_reason"] = body_omitted_reason
-        for key in ("body_ct", "nonce", "K_user", "K_enclave", "body_key"):
+        for key in (
+            "body_ct",
+            "body_b64",
+            "nonce",
+            "K_user",
+            "K_enclave",
+            "body_key",
+            "body_object_format",
+            "body_sha256",
+        ):
             item.pop(key, None)
     else:
         # Body is being delivered — if it lives in R2, fetch it now. This is the
@@ -350,8 +370,12 @@ def _chat_history_item(m: dict, *, include_image_body: bool = True) -> dict:
         if is_pointer:
             item = dict(db.hydrate_chat_file_body(str(item.get("owner_user_id") or ""), item))
             item.setdefault("content", "")
-        if content_type == "image" or body_ct_len > CHAT_HISTORY_INLINE_BODY_CT_MAX:
-            item["body_ct_len"] = body_ct_len
+            # A failed fetch leaves the pointer in place. Never expose internal
+            # storage coordinates or integrity metadata on the public response.
+            item = _strip_body_storage_fields(item)
+        if content_type == "image" or body_size > CHAT_HISTORY_INLINE_BODY_CT_MAX:
+            size_field = "body_size_bytes" if is_plaintext_pointer else "body_ct_len"
+            item[size_field] = body_size
             item["body_omitted"] = False
 
     role = item.get("role")
@@ -596,7 +620,9 @@ def _pending_chat_messages_for_poll(
                 # read-only peek — hydrate an R2-offloaded file body so the
                 # delivered message carries its ciphertext (claim path below gets
                 # this via chat_try_claim_reply).
-                claimed.append(db.hydrate_chat_file_body(store.user_id, dict(msg)))
+                claimed.append(_strip_body_storage_fields(
+                    db.hydrate_chat_file_body(store.user_id, dict(msg))
+                ))
                 if ts <= since:
                     redelivered += 1
                 continue
@@ -638,7 +664,7 @@ def _pending_chat_messages_for_poll(
                     f"prev_claim={prev_claimed_by} consumer={consumer_id}"
                 )
             msg.update(fields)  # keep this worker's cache copy consistent
-            claimed.append(dict(merged))
+            claimed.append(_strip_body_storage_fields(merged))
             if ts <= since:
                 redelivered += 1
     return claimed

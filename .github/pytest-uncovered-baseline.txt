@@ -111,7 +111,6 @@ tests/test_genesis_foreground_worker.py
 tests/test_genesis_import_capture_mode.py
 tests/test_genesis_keep_all.py
 tests/test_genesis_llm_client.py
-tests/test_genesis_notice.py
 tests/test_genesis_prompts.py
 tests/test_genesis_reclaim_worker.py
 tests/test_genesis_resident_claim.py
@@ -123,7 +122,6 @@ tests/test_genesis_service.py
 tests/test_genesis_terms_note.py
 tests/test_genesis_unclaimed_reaper.py
 tests/test_genesis_v2_e2e.py
-tests/test_genesis_v2_orchestration.py
 tests/test_genesis_worker.py
 tests/test_genesis_worker_claim.py
 tests/test_genesis_worker_claim_migration.py

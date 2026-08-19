@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import base64
+import json
 
 from perception import perception_read_core
 from screen import screen_read_core
 
 from capabilities import errors
 from capabilities.types import CapabilityResult, ok, err
+from core.frame_ids import is_supported_frame_id
 
 
 def _norm(body, status, *, default_msg) -> CapabilityResult:
@@ -22,7 +24,33 @@ def _norm(body, status, *, default_msg) -> CapabilityResult:
 def recent(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityResult:
     params = params or {}
     body, status = perception_read_core.photos_recent(store, params.get("limit"))
+    if status == 200 and isinstance(body, dict) and isinstance(body.get("photos"), list):
+        body = {
+            **body,
+            "photos": [
+                photo
+                for photo in body["photos"]
+                if isinstance(photo, dict)
+                and is_supported_frame_id(photo.get("photo_id") or photo.get("id"))
+            ],
+        }
     return _norm(body, status, default_msg="photos unavailable")
+
+
+def _proxy_json_body(response) -> dict | None:
+    """Decode the enclave decrypt proxy without mistaking JSON for pixels."""
+    if isinstance(response.json_body, dict):
+        return response.json_body
+    raw = response.raw_body
+    if raw is None or "json" not in str(response.media_type or "").lower():
+        return None
+    try:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        decoded = json.loads(raw)
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
 
 
 def read(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityResult:
@@ -39,9 +67,34 @@ def read(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityR
         return result
     img = screen_read_core.frame_decrypt(store, frame_id, include_image="true",
                                          api_key=api_key, runtime_token=runtime_token)
-    if img.status == 200:
-        result.data = {**result.data, "image_media_type": img.media_type,
-                       "has_image": img.raw_body is not None}
-        if img.raw_body is not None:
-            result.data["image_b64"] = base64.b64encode(img.raw_body).decode("ascii")
+    proxy_body = _proxy_json_body(img)
+    if img.status != 200:
+        return err(
+            errors.code_for_status(img.status),
+            errors.message_for_body(proxy_body, "photo pixels unavailable"),
+            retryable=errors.retryable_for_status(img.status),
+        )
+
+    if proxy_body is not None:
+        image_b64 = str(proxy_body.get("image_b64") or "")
+        if not image_b64:
+            return err(errors.UNAVAILABLE, "photo pixels unavailable", retryable=False)
+        result.data = {
+            **result.data,
+            "image_media_type": str(proxy_body.get("image_mime") or "image/jpeg"),
+            "has_image": True,
+            "image_b64": image_b64,
+        }
+        return result
+
+    if "json" in str(img.media_type or "").lower():
+        return err(errors.UPSTREAM, "photo decrypt response invalid", retryable=True)
+    if img.raw_body is None:
+        return err(errors.UNAVAILABLE, "photo pixels unavailable", retryable=False)
+    result.data = {
+        **result.data,
+        "image_media_type": img.media_type,
+        "has_image": True,
+        "image_b64": base64.b64encode(img.raw_body).decode("ascii"),
+    }
     return result

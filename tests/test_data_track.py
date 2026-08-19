@@ -1215,6 +1215,7 @@ def test_detail_runtime_reports_the_prompt_budget_turns_are_planned_against(clie
     inherited default can never read as something the user chose.
     """
     from admin import data_track as data_track
+    from model_api_runtime.v2 import prompt_frontier
     from conftest import configure_model_api_route
 
     supplied = 24576
@@ -1229,8 +1230,14 @@ def test_detail_runtime_reports_the_prompt_budget_turns_are_planned_against(clie
         user_entry, include_detail=True)["runtime"]
 
     assert runtime["context_window_configured"] == supplied
-    assert runtime["context_window_tokens"] == supplied
-    assert runtime["context_window_source"] == "provider_metadata"
+    # Route storage has no provenance bit. A configured value below the metadata
+    # trust floor is intentionally visible as configured but not used as the
+    # runtime budget; the warning trace makes this accepted tradeoff observable.
+    assert supplied < prompt_frontier.provider_metadata_context_window_floor()
+    assert runtime["context_window_tokens"] == (
+        prompt_frontier.unaudited_default_context_window()
+    )
+    assert runtime["context_window_source"] == "unaudited_default"
 
 
 def test_detail_runtime_marks_an_inherited_window_as_not_user_chosen(client):
@@ -1511,6 +1518,7 @@ def test_detail_payload_exposes_content_free_v2_profile_status_true_pg(client):
     assert pending.get_json()["user"]["v2_profile"] == {
         "state": "pending",
         "memory_chars": 0,
+        "style_chars": 0,
         "user_chars": 0,
         "source": {
             "card_count": 7,
@@ -1540,7 +1548,7 @@ def test_detail_payload_exposes_content_free_v2_profile_status_true_pg(client):
             "retry_not_before": 0,
         },
         memory_text="private memory profile",
-        user_text="private user profile",
+        style_text="private style profile",
         seal_text=lambda _uid, text: {
             "body_ct": f"private-ciphertext-{len(text)}",
             "nonce": "private-nonce",
@@ -1556,7 +1564,8 @@ def test_detail_payload_exposes_content_free_v2_profile_status_true_pg(client):
     assert profile == {
         "state": "ok",
         "memory_chars": len("private memory profile"),
-        "user_chars": len("private user profile"),
+        "style_chars": len("private style profile"),
+        "user_chars": len("private style profile"),
         "source": {
             "card_count": 8,
             "max_updated_at": "2026-08-02T10:00:00Z",
@@ -1605,7 +1614,8 @@ def test_v2_profile_detail_is_allowlisted_truncated_and_read_safe(monkeypatch):
     detail = data_track._v2_profile_detail("usr_test")
     assert detail["last_attempt"]["reject_code"] == "r" * 160
     assert set(detail) == {
-        "state", "memory_chars", "user_chars", "source", "last_attempt", "disabled"
+        "state", "memory_chars", "style_chars", "user_chars", "source",
+        "last_attempt", "disabled"
     }
     assert set(detail["source"]) == {
         "card_count", "max_updated_at", "generated_at"

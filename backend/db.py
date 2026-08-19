@@ -29,6 +29,8 @@ behavior identical to the file era. Read helpers return empty/None on failure.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -37,7 +39,7 @@ import threading
 import time
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -74,6 +76,21 @@ def _database_url() -> str:
             "set DATABASE_URL (must include sslmode=require for external PG)."
         )
     return url
+
+
+def database_schema() -> str:
+    """Return the migration contract for ``DATABASE_URL``.
+
+    ``rds`` is the backwards-compatible default.  Phase-4 promotion sets this
+    explicitly to ``tee`` on every process that points ``DATABASE_URL`` at the
+    promoted database.  Keeping the selector independent from the hostname is
+    deliberate: inferring a trust/schema boundary from a mutable DSN is too
+    easy to get wrong during rollback.
+    """
+    value = os.environ.get("FEEDLING_DATABASE_SCHEMA", "rds").strip().lower()
+    if value not in {"rds", "tee"}:
+        raise RuntimeError("FEEDLING_DATABASE_SCHEMA must be 'rds' or 'tee'")
+    return value
 
 
 def _pool_max_size() -> int:
@@ -151,16 +168,79 @@ def close_pool() -> None:
 # ---------------------------------------------------------------------------
 
 _schema_lock = threading.Lock()
+_TEE_PRIMARY_PREPARED_KEY = "phase4_primary_prepared"
+_TEE_PRIMARY_TRIGGERS = {
+    "chat_messages_retire_r2_body",
+    "chat_message_archive_retire_r2_body",
+    "chat_message_archive_immutable",
+}
 
 
 def init_schema() -> None:
-    """Bring the database schema up to the latest Alembic revision.
+    """Bring the selected database schema to a safe application state.
 
-    Runs ``alembic upgrade head`` programmatically, reading DATABASE_URL via
-    backend/alembic/env.py. The baseline revision's DDL is idempotent, so this
-    is safe on the already-provisioned production database (it just records the
-    version). Called at app startup, by the migrate container, and by tests.
+    The historical ``rds`` mode runs ``alembic upgrade head``.  A promoted TEE
+    database is different: its owner-only migration chain has already run in a
+    dedicated workflow, while application processes connect as the non-DDL
+    ``app`` role.  ``tee`` mode therefore performs a read-only, fail-closed head
+    assertion and must never run the RDS chain against that database.
     """
+    if database_schema() == "tee":
+        from alembic.script import ScriptDirectory
+        from alembic.config import Config
+
+        here = Path(__file__).resolve().parent
+        cfg = Config(str(here / "alembic_tee" / "alembic.ini"))
+        cfg.set_main_option("script_location", str(here / "alembic_tee"))
+        expected_heads = set(ScriptDirectory.from_config(cfg).get_heads())
+        with _schema_lock, psycopg.connect(_database_url(), autocommit=True) as conn:
+            actual_heads = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT version_num FROM alembic_tee_version"
+                ).fetchall()
+            }
+            marker_row = conn.execute(
+                "SELECT value FROM server_config WHERE key = %s",
+                (_TEE_PRIMARY_PREPARED_KEY,),
+            ).fetchone()
+            enabled_triggers = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT tgname FROM pg_trigger "
+                    "WHERE NOT tgisinternal AND tgenabled = 'O' "
+                    "AND tgname = ANY(%s)",
+                    (list(_TEE_PRIMARY_TRIGGERS),),
+                ).fetchall()
+            }
+        if actual_heads != expected_heads:
+            raise RuntimeError(
+                "TEE database schema is not at the application head: "
+                f"expected={sorted(expected_heads)} actual={sorted(actual_heads)}; "
+                "run the owner-only alembic_tee migration workflow before startup"
+            )
+        marker = None
+        if marker_row is not None:
+            try:
+                marker = json.loads(bytes(marker_row[0]).decode("utf-8"))
+            except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+                marker = None
+        if (
+            not isinstance(marker, dict)
+            or marker.get("prepared") is not True
+            or set(marker.get("tee_heads") or ()) != expected_heads
+            or enabled_triggers != _TEE_PRIMARY_TRIGGERS
+        ):
+            raise RuntimeError(
+                "TEE database has not completed the frozen Phase-4 prepare: "
+                f"marker_ok={isinstance(marker, dict) and marker.get('prepared') is True} "
+                f"enabled_triggers={sorted(enabled_triggers)}; run "
+                "admin.phase4_cutover --apply --confirm-writes-frozen before startup"
+            )
+        log.info("[db] TEE schema at head (read-only assertion: %s)",
+                 ",".join(sorted(actual_heads)))
+        return
+
     from alembic import command
     from alembic.config import Config
 
@@ -749,6 +829,17 @@ def save_all_users(users: list[dict]) -> None:
                         mirror_group.append(
                             ("DELETE FROM users WHERE user_id=%s", (removed_id,))
                         )
+                # Bulk removal is an account deletion just as much as
+                # delete_user() — same authoritative anonymize-merge, same
+                # ordering rationale (users DELETE first, merge second), same
+                # mirror statements appended from the same operation.
+                for removed_id in removed_ids:
+                    if lane_rollup_anonymize_user(conn, removed_id):
+                        mirror_group.append(
+                            (_LANE_ROLLUP_ANON_MERGE_SQL,
+                             (_LANE_ROLLUP_DELETED_USER, removed_id)))
+                        mirror_group.append(
+                            (_LANE_ROLLUP_ANON_DELETE_SQL, (removed_id,)))
                 for entry in users:
                     uid = entry.get("user_id")
                     if not uid:
@@ -789,8 +880,23 @@ def delete_user(user_id: str) -> bool:
                 )
                 _delete_runtime_allowlist_on_cursor(cur, user_id)
                 cur.execute(sql, (user_id,))
+            # Rollup anonymize-merge AFTER the users DELETE, inside the same
+            # transaction (this is the AUTHORITATIVE site — delete_user_data
+            # is only a swallowed best-effort belt and must not be the load
+            # bearer; codex2 2026-08-18 live repro). Ordering closes the
+            # freeze race: the DELETE above blocks on any in-flight freeze's
+            # FOR KEY SHARE on this users row, so by the time it proceeds the
+            # freeze's cells are committed and visible to this merge; and any
+            # later freeze finds no users row, so its guarded INSERT..SELECT
+            # inserts nothing.
+            anonymized = lane_rollup_anonymize_user(conn, user_id)
     from tee_shadow import mirror
-    mirror.execute(sql, (user_id,))
+    group: list[tuple[str, tuple]] = [(sql, (user_id,))]
+    if anonymized:
+        group.append((_LANE_ROLLUP_ANON_MERGE_SQL,
+                      (_LANE_ROLLUP_DELETED_USER, user_id)))
+        group.append((_LANE_ROLLUP_ANON_DELETE_SQL, (user_id,)))
+    mirror.execute_many(group)
     return True
 
 
@@ -4177,6 +4283,962 @@ def freeze_completed_retention_cohorts(*, now_epoch: float | None = None,
     except Exception as e:
         log.error("[db] freeze_completed_retention_cohorts failed: %s", e)
         return []
+
+
+# --- Per-user per-lane daily rollup cells (lane_daily_rollup) --------------- #
+# Same frozen-cell philosophy as the DAU/retention snapshots above, but keyed
+# per user so the admin surface can answer "is lane X's failure rate carried
+# by dormant accounts" without a read-time full-history scan. See migration
+# 0091 for the table rationale and the column vocabulary.
+
+# Failure-code identifiers only — anything else is collapsed so no free text
+# (and therefore no user content) can ever reach a frozen cell. Same regex as
+# admin/memory_metadata.py's dream-job surface.
+_LANE_ROLLUP_CODE_RE = re.compile(r"^[a-z0-9_:-]{1,120}$")
+
+_LANE_ROLLUP_TERMINAL = ("completed", "failed", "expired", "superseded")
+
+
+def _lane_rollup_day_bounds(day: date, zone: ZoneInfo) -> tuple[datetime, datetime]:
+    """[start, end) UTC-comparable bounds of one Beijing calendar day.
+
+    Computed in Python so the SQL predicate stays sargable on ``finished_at``
+    (``to_char(timezone(...))`` equality would force a per-day full scan)."""
+    start = datetime.combine(day, datetime.min.time(), tzinfo=zone)
+    return start, start + timedelta(days=1)
+
+
+def _lane_rollup_freeze_day(conn, *, day: date, zone: ZoneInfo,
+                            mirror_batch: list | None = None) -> int:
+    """Insert route='model_api' cells for one closed Beijing day. Idempotent
+    (ON CONFLICT DO NOTHING); returns how many cells were newly written.
+    When ``mirror_batch`` is given, every executed (sql, params) is appended
+    verbatim so the caller can replay the day into the TEE shadow as one
+    atomic group (MIRROR lane; SNAPSHOT was rejected — the table grows
+    forever and would hit snapshot's 200k MAX_ROWS hard stop).
+
+    Source is ``agent_jobs`` — the business terminal-state table, deliberately
+    NOT the trace ring: traces can be missing (that is pillar-① of the trace
+    overhaul), and statistics must not be built on something that can be
+    missing. Bucketing is by ``finished_at`` (terminal transitions stamp
+    ``finished_at=now()``), so once a day has closed no new row can ever land
+    in it and the cell is immutable by construction.
+
+    ``enqueue_source`` discriminates heartbeat's two enqueue paths via
+    ``reason IS NULL`` (serve_worker's hourly tick omits reason; the
+    perception path always sets one). Other lanes carry ''.
+    """
+    start, end = _lane_rollup_day_bounds(day, zone)
+    # 说话判据的两份取值都从 v2/effect_outbox 取,不在这里手抄——宽窄两套 reply
+    # 谓词并存(见该模块 REPLY_EFFECT_TYPES 注释),抄错一套指标就是错的。
+    from model_api_runtime.v2.effect_outbox import (
+        DELIVERED_EFFECT_STATUSES,
+        REPLY_EFFECT_TYPES,
+    )
+
+    counts = conn.execute(
+        f"""
+        SELECT j.user_id, j.lane,
+               CASE WHEN j.lane = 'heartbeat'
+                    THEN CASE WHEN j.reason IS NULL THEN 'clock' ELSE 'perception' END
+                    ELSE '' END AS enqueue_source,
+               COUNT(*) FILTER (WHERE j.status = 'completed')::int AS completed,
+               COUNT(*) FILTER (WHERE j.status = 'failed')::int AS failed,
+               COUNT(*) FILTER (WHERE j.status = 'expired')::int AS expired,
+               COUNT(*) FILTER (WHERE j.status = 'superseded')::int AS superseded,
+               {_LANE_ROLLUP_V2_VOICE_SELECT}
+        FROM agent_jobs j{_LANE_ROLLUP_V2_SPOKE_JOIN}
+        WHERE j.status = ANY(%s)
+          AND j.finished_at >= %s AND j.finished_at < %s
+        GROUP BY j.user_id, j.lane, enqueue_source
+        """,
+        (sorted(REPLY_EFFECT_TYPES), sorted(DELIVERED_EFFECT_STATUSES),
+         list(_LANE_ROLLUP_TERMINAL), start, end),
+    ).fetchall()
+    if not counts:
+        return 0
+    codes: dict[tuple[str, str, str], dict[str, int]] = {}
+    for uid, lane, src, code, n in conn.execute(
+        """
+        SELECT user_id, lane,
+               CASE WHEN lane = 'heartbeat'
+                    THEN CASE WHEN reason IS NULL THEN 'clock' ELSE 'perception' END
+                    ELSE '' END AS enqueue_source,
+               last_error, COUNT(*)::int
+        FROM agent_jobs
+        WHERE status IN ('failed', 'expired') AND last_error IS NOT NULL
+          AND finished_at >= %s AND finished_at < %s
+        GROUP BY user_id, lane, enqueue_source, last_error
+        """,
+        (start, end),
+    ).fetchall():
+        key = (str(uid), str(lane), str(src))
+        clean = str(code) if _LANE_ROLLUP_CODE_RE.match(str(code)) else "runtime_failed"
+        cell = codes.setdefault(key, {})
+        cell[clean] = cell.get(clean, 0) + int(n)
+    written = 0
+    day_s = day.isoformat()
+    # INSERT..SELECT sourced from the users row under FOR KEY SHARE — the
+    # race guard against concurrent account deletion (codex2 2026-08-18):
+    # a live users row is key-share-locked until this freeze transaction
+    # commits, so delete_user's users DELETE waits and its anonymize-merge
+    # then sees these cells; an already-deleted user yields no source row,
+    # so the insert is a no-op and the original id can never reappear.
+    cell_sql = """
+            INSERT INTO lane_daily_rollup
+                (user_id, day, route, lane, enqueue_source,
+                 completed, failed, expired, superseded, failure_codes,
+                 spoke, spoke_completed, silent_declared, silent_undeclared)
+            SELECT u.user_id, %s, 'model_api', %s, %s, %s, %s, %s, %s, %s,
+                   %s, %s, %s, %s
+            FROM users u WHERE u.user_id = %s FOR KEY SHARE OF u
+            ON CONFLICT (user_id, day, route, lane, enqueue_source) DO NOTHING
+            RETURNING user_id
+            """
+    for (uid, lane, src, completed, failed, expired, superseded,
+         spoke, spoke_completed, silent_declared, silent_undeclared) in counts:
+        params = (day_s, lane, src, completed, failed, expired, superseded,
+                  Jsonb(codes.get((str(uid), str(lane), str(src)), {})),
+                  spoke, spoke_completed, silent_declared, silent_undeclared, uid)
+        saved = conn.execute(cell_sql, params).fetchone()
+        if saved:
+            written += 1
+        if mirror_batch is not None:
+            mirror_batch.append((cell_sql, params))
+    return written
+
+
+# Bounds one tick's catch-up work so the single-leader thread never wedges on
+# a huge backfill: at 45 days/tick the full agent_jobs history (V2 rollout was
+# 2026-07) closes within a few 300s ticks.
+_LANE_ROLLUP_MAX_DAYS_PER_TICK = 45
+
+# 读侧 live 补齐窗口的上限（天）。冻结器长期停摆时,admin 的一次 GET 不该退化成
+# 无界历史聚合——那正是本表要退休的失败形态。超出部分不静默丢弃,而是在
+# coverage.live_truncated_before 里声明。
+_LANE_ROLLUP_LIVE_MAX_DAYS = 3
+
+# --- stuck：与失败率并列的一等指标（Seven 2026-08-18 拍板 A） --------------- #
+#
+# 口径：失败率只统计「已终结」的尝试——非终态既不进分子也不进分母。代价是永久卡在
+# pending/claimed/realizing 的 job 会从失败率里彻底消失,所以它必须有自己的出口,
+# 且与失败率**并排**呈现,否则就是下一个「用户完全看不见」。
+#
+# ⚠️ stuck 刻意**不进冻结格子**,是读时的实时查询。理由:stuck 是「此刻」状态,
+# 不是历史事实——D 日卡住、D+5 才完成的 job,若按天冻进格子就被永久钉成 stuck,
+# 且需要回头改写已冻结的行,直接拆掉「Frozen cells win + ON CONFLICT DO NOTHING」
+# 这块刚钉稳的地基。4h lag 是冻结等待,不是 stuck 的分类规则(两者无关)。
+#
+# 判据分两条源:
+#   model_api → 用 agent_jobs **自带的 deadline 契约**(queue_deadline_at /
+#     pending 看 queue_deadline_at;claimed/running 逐字照抄 jobs_store 的权威
+#     stale 契约 COALESCE(lease_expires_at, deadline_at) <= clock_timestamp()),
+#     判据只有一份、不是我拍的小时数;
+#   resident  → user_logs 没有 deadline 列,只能用年龄阈值,故阈值随 payload 一起
+#     返回(stuck_after_hours),让读的人知道这个数是怎么来的。
+_LANE_ROLLUP_NONTERMINAL = ("pending", "claimed", "running")
+_LANE_ROLLUP_V1_NONTERMINAL = ("pending", "active", "claimed", "realizing")
+_LANE_ROLLUP_STUCK_AFTER_HOURS = 6.0
+
+# --- 说话率与沉默分解（Seven 2026-08-18 拍板：主动侧要两个数） ---------------- #
+#
+# 失败率答「机制坏没坏」，答不了「它是不是不理我」——一个干净跑完却一个字没说的
+# 唤醒回合，终态和说了话的那次一模一样。所以并排放第二个数：
+#     失败率 = failed / 已终结      说话率 = spoke / 已终结
+# 同一个分母，两个数可以直接加减，共同把已终结的尝试切完。
+#
+# spoke 锚**产出**，绝不锚状态字段（broadcast=on 而后端零帧那次立的规矩：状态字段
+# 描述的是另一条通路，会和真实产出漂开）：
+#   model_api → v2_effect_outbox 里该 job 有 reply 类效果且处于送达终态；
+#   resident  → chat_messages 里有行带着该 job 的 proactive_job_id
+#               （chat_core.py 写进 extra），所以 V1 也是按尝试归因，
+#               和 V2 同强度，不必退回 status='posted' 这种收据。
+#
+# 沉默必须再拆，因为它盖着两件完全不同的事：
+#   silent_declared   —— 模型显式选择闭嘴（两个运行时都写 wake_result='sleep'，
+#                        V1 在 consumer 的 sleep 分支，V2 在 stay_silent 工具后）；
+#   silent_undeclared —— 没有任何声明的沉默。这是**被计量的盲区**，不是一个干净
+#                        类别：除 scheduled 外的唤醒 lane 都是 require_reply=False，
+#                        空回复检测整段不执行，于是「provider 返回空」和「模型没
+#                        产文本」目前不可区分。把它量出来，指标就带着自己盲区的
+#                        大小一起上线，而不是把盲区悄悄吸收进说话率。将来那条
+#                        silent_empty_response trace 落地后，是把这一列再劈两半，
+#                        表结构不动。
+#
+# 承重恒等式（写漏任何一侧都会破）：
+#     completed = spoke_completed + silent_declared + silent_undeclared
+#
+# ⚠️ 完成侧**直接数**，不要改回 (spoke - 某个扣减项) 的减法形态。减法曾经在这里
+# 待过，被 codex2 在全新 PG 上实证打掉：一次尝试可以先投出中间气泡、再因租约超时
+# 终结成 expired（或 superseded），只扣 failed 的减法盖不住，等式当场不闭合。直接
+# 数 completed 那一侧，除 completed 外的终态根本不进这个和，同类洞长不出来。
+# 「投了气泡但没完成」需要时用 spoke - spoke_completed 现算，信息没丢。
+#
+# ⚠️ 逐 lane 一律计算，不按 lane 名开白名单——lane 是开集，写死枚举那次漏了 9 个
+# 里的 3 个。代价是 capture/dream 这类结构上就不说话的 lane 恒为 spoke=0，读侧据此
+# 说明「说话率只对以消息为产物的 lane 可解释」，而这个 0 本身也是真的。
+# 四列的表达式各抽成**一份**，冻结与读侧 live 补齐共用。期 2 的教训就在这条上：
+# 计数和失败码各写了一份成败谓词，proactive 的 status='error' 于是在两处算出不同
+# 的数。这里同样有两条路会用到同一组判据，先合并再用。
+_LANE_ROLLUP_V2_SPOKE_JOIN = """
+        CROSS JOIN LATERAL (
+            SELECT EXISTS (
+                SELECT 1 FROM v2_effect_outbox e
+                WHERE e.job_id = j.id
+                  AND e.effect_type = ANY(%s)
+                  AND e.status = ANY(%s)
+            ) AS hit
+        ) spoke"""
+#
+# ⚠️ 完成侧**直接数**，不用「spoke 减去说过话又失败的」这种减法。codex2 在全新
+# PG head 上实证过减法的洞:一次尝试可以先投出中间气泡、随后因租约超时终结成
+# expired(或 superseded),只扣 failed 的减法盖不住,恒等式当场不闭合。直接数
+# completed 那一侧结构上不会长出这类洞——除 completed 外的终态根本不在这个和里。
+_LANE_ROLLUP_V2_VOICE_SELECT = """
+               COUNT(*) FILTER (WHERE spoke.hit)::int,
+               COUNT(*) FILTER (WHERE spoke.hit AND j.status = 'completed')::int,
+               COUNT(*) FILTER (WHERE NOT spoke.hit AND j.status = 'completed'
+                                  AND j.wake_result = 'sleep')::int,
+               COUNT(*) FILTER (WHERE NOT spoke.hit AND j.status = 'completed'
+                                  AND j.wake_result IS DISTINCT FROM 'sleep')::int"""
+
+# resident 的送达锚：聊天行自带 proactive_job_id，能落到具体那一次尝试。
+#
+# ⚠️ 刻意**不设时间窗**。早先按 chat_messages.ts 给了一天下界，理由是「聊天行先落、
+# 状态补丁后写，间隔毫秒级」——codex2 实证这个理由没有代码保证:consumer 里
+# post_reply 与 update_proactive_job_status 是两次独立调用，后者失败只 warning，
+# 进程重启/恢复可以让终态补丁晚几天才写上。窗口一旦漏掉那条聊天行，这次尝试就被
+# 误记成 silent_undeclared——把真实产出算进「盲区」，正好污染了这个指标最该诚实的
+# 那一列。改成按 (user_id, job_id) 直接找产出，代价是需要 0093 建的表达式索引。
+_LANE_ROLLUP_V1_SPOKE_JOIN = """
+        LEFT JOIN LATERAL (
+            SELECT 1 AS hit FROM chat_messages m
+            WHERE m.user_id = l.user_id
+              AND m.doc->>'proactive_job_id' = l.doc->>'job_id'
+              AND COALESCE(m.doc->>'proactive_job_id','') <> ''
+            LIMIT 1
+        ) d ON COALESCE(l.doc->>'job_id','') <> ''"""
+_LANE_ROLLUP_V1_VOICE_SELECT = """
+               COUNT(*) FILTER (WHERE d.hit IS NOT NULL)::int,
+               COUNT(*) FILTER (WHERE d.hit IS NOT NULL AND {ok})::int,
+               COUNT(*) FILTER (WHERE d.hit IS NULL AND {ok}
+                                  AND l.doc->>'wake_result' = 'sleep')::int,
+               COUNT(*) FILTER (WHERE d.hit IS NULL AND {ok}
+                                  AND l.doc->>'wake_result'
+                                      IS DISTINCT FROM 'sleep')::int"""
+
+def freeze_completed_lane_days(*, now_epoch: float | None = None,
+                               tz: str = "Asia/Shanghai") -> list[str]:
+    """Freeze route='model_api' rollup cells for every closed Beijing day.
+
+    First run establishes ``backfill_from`` = the Beijing day of the oldest
+    terminal ``agent_jobs`` row (agent_jobs is never pruned, so cells can be
+    backfilled to the very start of V2 history — unlike user_logs, whose ring
+    buffer already ate its tail; that source arrives in a later phase with its
+    own watermark). Later runs advance ``through_day`` one day at a time; the
+    watermark only moves AFTER a day's cells are inserted, so a crash between
+    the two steps re-freezes the same day and ON CONFLICT dedups.
+    """
+    try:
+        zone = ZoneInfo(tz)
+        now = (datetime.fromtimestamp(float(now_epoch), zone)
+               if now_epoch is not None else datetime.now(zone))
+        last_completed = now.date() - timedelta(days=1)
+        frozen: list[str] = []
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT backfill_from, through_day FROM lane_rollup_watermark "
+                "WHERE route = 'model_api'",
+            ).fetchone()
+            if row:
+                cursor = date.fromisoformat(row[1]) + timedelta(days=1)
+                backfill_from = row[0]
+            else:
+                oldest = conn.execute(
+                    "SELECT MIN(finished_at) FROM agent_jobs WHERE status = ANY(%s)",
+                    (list(_LANE_ROLLUP_TERMINAL),),
+                ).fetchone()
+                if not oldest or oldest[0] is None:
+                    return []
+                cursor = oldest[0].astimezone(zone).date()
+                backfill_from = cursor.isoformat()
+            steps = 0
+            # voice_from 用 COALESCE 只认第一次：说话四列是 0093 之后才有的，它之前
+            # 冻的格子在这四列上是结构性的 0（不是「量过、确实没说话」）。第一次带着
+            # 说话数字冻的那天就是可信起点，之后不再移动。
+            watermark_sql = """
+                    INSERT INTO lane_rollup_watermark
+                        (route, backfill_from, through_day, voice_from)
+                    VALUES ('model_api', %s, %s, %s)
+                    ON CONFLICT (route) DO UPDATE
+                        SET through_day = EXCLUDED.through_day, frozen_at = now(),
+                            voice_from = COALESCE(lane_rollup_watermark.voice_from,
+                                                  EXCLUDED.voice_from)
+                    """
+            from tee_shadow import mirror
+            while cursor <= last_completed and steps < _LANE_ROLLUP_MAX_DAYS_PER_TICK:
+                # One day's cells + its watermark advance mirror to the TEE
+                # shadow as a single atomic group: a torn mirror would leave
+                # the TEE watermark claiming a day whose cells never arrived,
+                # which after cutover reads as "genuinely zero".
+                mirror_batch: list[tuple[str, tuple]] = []
+                _lane_rollup_freeze_day(conn, day=cursor, zone=zone,
+                                        mirror_batch=mirror_batch)
+                wm_params = (backfill_from, cursor.isoformat(),
+                             cursor.isoformat())
+                conn.execute(watermark_sql, wm_params)
+                mirror_batch.append((watermark_sql, wm_params))
+                mirror.execute_many(mirror_batch)
+                frozen.append(cursor.isoformat())
+                cursor += timedelta(days=1)
+                steps += 1
+        return frozen
+    except Exception as e:
+        log.error("[db] freeze_completed_lane_days failed: %s", e)
+        return []
+
+
+# --- 期 2：V1/resident 源（user_logs → 格子） ------------------------------ #
+# 只冻 route='resident' 用户的 user_logs 流：hosted 用户的 user_logs 条目与
+# agent_jobs 是同一事件的第二份记录。⚠️ 注意它**不会**撞主键——PK 含 route 列，
+# 两条源写的 route 不同，插入会成功，于是 hosted 用户凭空多出一条 route='resident'
+# 的幽灵格子：跨 route 汇总时双计，且给 hosted 用户贴了错误的路线标签。
+# 静默多一行比撞键报错危险得多，所以这条过滤是本期最要害的一行。
+# hosted 的权威源是永不清理的 agent_jobs，环形缓冲滚掉的只是副本；resident 的
+# user_logs 是唯一记录（环 500 条/人正在滚动丢失），这正是本期止血的对象。
+# 口径抄 admin_events_overview（lane 推断/成败集合），使格子可与 events 页互核。
+
+# 分桶时刻 = **终态时刻**（Seven 定 A：失败率只统计「有终态时刻的已终结尝试」，
+# 这条口径本身就预设了按终态时刻分桶）。
+#
+# 为什么不能按创建时刻（l.ts）：codex2 独立 PG 复现——D 日创建、当时 pending、
+# D+5 才完成的 resident job 会**彻底消失**：D 日冻结时它非终态、不入格子，而 D 日
+# 一旦冻结永不回访；等它完成后又不再是 stuck。两头都不计，等于凭空蒸发。
+# 按终态时刻分桶则落在 D+5 的格子里，那天还开着。
+#
+# 字段按**最终状态**选，不用固定 COALESCE：一个最终 failed 却仍留着旧 posted_at
+# 的 job，固定顺序会取到 posted_at，把失败记到前一天、当天记成空（同为 codex2 复现）。
+#
+# 解析走 lane_rollup_safe_ts（migration 0092/tee 0024）。实测 PG 16：直接 cast 与
+# to_timestamp **都会抛**（'2026-99-99'、'2026-02-30' 皆然），一行坏数据就能让整日
+# 聚合失败；形状正则也挡不住 '2026-02-29' 这种合法形状的非法日期。解析失败或缺字段
+# 一律 fallback 到 to_timestamp(l.ts)，让「解析不了」与「压根没有」退化成同一条路。
+#
+# ⚠️ 由此与 admin_events_overview 产生**有意的**分歧：events 页按创建时刻分桶
+# （_day_filter('l.ts')），所以跨零点的 job 两边会落在不同日子。这不是 bug，是两个
+# 口径回答两个问题（「那天发起了多少」vs「那天出了多少结果」）。互核测试因此只在
+# 不含跨零点 job 的日子上断言相等，并在用例里写明理由。
+_LANE_ROLLUP_V1_TERMINAL_FIELD = (
+    "CASE COALESCE(l.doc->>'status','') "
+    "WHEN 'completed' THEN l.doc->>'completed_at' "
+    "WHEN 'posted' THEN l.doc->>'posted_at' "
+    "WHEN 'delivered' THEN COALESCE(l.doc->>'posted_at', l.doc->>'completed_at') "
+    "WHEN 'failed' THEN l.doc->>'failed_at' "
+    "WHEN 'error' THEN l.doc->>'failed_at' "
+    "WHEN 'skipped' THEN l.doc->>'failed_at' "
+    "ELSE NULL END"
+)
+_LANE_ROLLUP_V1_TS = (
+    f"COALESCE(lane_rollup_safe_ts({_LANE_ROLLUP_V1_TERMINAL_FIELD}), "
+    "to_timestamp(l.ts))"
+)
+
+# 旧口径（创建时刻，与 events 页逐字同源）保留给 stuck 用：非终态 job 没有终态
+# 时刻，只能按创建时刻判年龄。
+#
+# 这里曾经按 doc 里的 ISO 终态字段（completed_at/posted_at/failed_at）分桶，被
+# codex2 独立 PG 实证打掉三处，根子是同一个：**doc 里的时间是自由文本，l.ts 是列**。
+#   1. 与 events 页分歧：events 按创建时刻分桶，跨零点 job（23:58 建、00:03 完成）
+#      两边会落在不同日子——「格子与 events 一致」这个承重判据会在真实数据上失效，
+#      而我的互核测试只因样本里没有跨零点数据才绿（假绿）。
+#   2. 形状正则挡不住非法日期：'2026-99-99T…' 能过 ^[0-9]{4}-[0-9]{2}-[0-9]{2}，
+#      ::timestamptz 直接抛 DatetimeFieldOverflow，**整日聚合失败**——与「坏值退化
+#      成 NULL」的原注释正相反。
+#   3. 固定 COALESCE 顺序选错字段：最终 failed 却仍留着旧 posted_at 时，会取到
+#      posted_at 的日子，把失败记到前一天、当天记成空。
+# l.ts 是 double 列，三个问题一次消失。
+#
+# 4 小时 lag 与分桶口径无关，仍然必需且理由更清晰：D 日创建的 job 可能在 D+1 凌晨
+# 才被打上终态补丁，lag 保证冻 D 日时其状态字段已经定稿。
+#
+# stuck 专用：非终态 job **没有**终态时刻，只能按创建时刻算年龄。刻意与上面的
+# 分桶时刻分成两个名字——它们回答不同问题，早先共用一个常量时后定义的那份会
+# 静默盖掉前一份（本轮自查发现）。
+_LANE_ROLLUP_V1_CREATED_TS = "to_timestamp(l.ts)"
+
+# 成败谓词抽成常量，供计数与失败码分布**共用同一份**——codex2 实证：原先失败码
+# 查询对所有 lane 用 {failed,error,skipped}，而计数按家族分谓词，于是 proactive
+# 的 status='error' 不计入 failed 却计入 failure_codes，原因分布之和超过失败分子。
+_LANE_ROLLUP_V1_OK_PRED = (
+    "((NOT {mem} AND COALESCE(l.doc->>'status','') IN ('posted','delivered','completed')) "
+    "OR ({mem} AND COALESCE(l.doc->>'status','') = 'completed'))"
+)
+_LANE_ROLLUP_V1_FAIL_PRED = (
+    "((NOT {mem} AND COALESCE(l.doc->>'status','') IN ('failed','skipped')) "
+    "OR ({mem} AND COALESCE(l.doc->>'status','') IN ('failed','error','skipped')))"
+)
+
+# lane 推断与 admin_events_overview 同一 CASE；memory 三种 job_kind 在这里拆成
+# 独立 lane（capture/dream/migrate）——events 页的合并 category 等于三者之和，
+# 互核仍然成立，粒度更高。
+_LANE_ROLLUP_V1_LANE = (
+    "CASE "
+    "WHEN l.stream = 'memory_capture_jobs' THEN 'capture' "
+    "WHEN COALESCE(l.doc->>'job_kind','') = 'memory_capture' THEN 'capture' "
+    "WHEN COALESCE(l.doc->>'job_kind','') = 'memory_dream' THEN 'dream' "
+    "WHEN COALESCE(l.doc->>'job_kind','') = 'memory_migrate' THEN 'migrate' "
+    "WHEN k.kind IN ('screen_watch','screen_tick','broadcast_opened',"
+    "'broadcast_closed','heartbeat_broadcast_on') THEN 'screen' "
+    "WHEN k.kind IN ('perception_event','scene_change','photo_added',"
+    "'arrived_at_anchor','location','unlock_after_absence','scheduled_wake') "
+    "THEN 'trigger' "
+    "WHEN k.kind = 'presence' OR left(k.kind, 9) = 'heartbeat' THEN 'heartbeat' "
+    "ELSE 'other' END"
+)
+
+# 成败集合与 events 页一致：proactive 家族 success={posted,delivered,completed}
+# fail={failed,skipped}；memory 家族 success={completed} fail={failed,error,skipped}。
+#
+# 词汇完整性不是靠「与 events 页一致」自证的（抄错会一致地错），而是拿 prod 实测
+# 恒等式验的：2026-08-18 查 08-17/08-18 两天，resident 的 proactive 四行全部
+# success+failed+pending == total，即没有状态落在这套词汇之外。
+#
+# 非终态 job 不入格子 —— 这是口径本身（Seven 2026-08-18 定 A：失败率只统计有终态
+# 时刻的已终结尝试，非终态既不进分子也不进分母），不是缺口。
+# 它的代价是永久卡住的 job 会从失败率里彻底消失，补偿在 admin_lane_rollup 返回的
+# **stuck** 区块（实时查询 + 面板与失败率并排 + 能定位到具体 job）。两者必须一起读。
+# 实测量级（2026-08-18 prod）：resident proactive 0；resident capture 约 1/天。
+_LANE_ROLLUP_V1_IS_MEMORY = (
+    "(l.stream = 'memory_capture_jobs' OR COALESCE(l.doc->>'job_kind','') IN "
+    "('memory_capture','memory_dream','memory_migrate'))"
+)
+
+
+def _lane_rollup_freeze_resident_day(conn, *, day: date, zone: ZoneInfo,
+                                     mirror_batch: list | None = None) -> int:
+    """Insert route='resident' cells for one closed Beijing day from the
+    ring-buffered user_logs streams. Same idempotency/mirroring/users-guard
+    contract as the agent_jobs freezer."""
+    start, end = _lane_rollup_day_bounds(day, zone)
+    ok_pred = _LANE_ROLLUP_V1_OK_PRED.format(mem=_LANE_ROLLUP_V1_IS_MEMORY)
+    fail_pred = _LANE_ROLLUP_V1_FAIL_PRED.format(mem=_LANE_ROLLUP_V1_IS_MEMORY)
+    voice_select = _LANE_ROLLUP_V1_VOICE_SELECT.format(ok=ok_pred)
+    rows = conn.execute(
+        f"""
+        WITH routes AS (
+            SELECT user_id,
+                   lower(COALESCE(NULLIF(doc->>'route',''),'resident')) AS route
+            FROM user_blobs WHERE kind = 'onboarding_route'
+        )
+        SELECT l.user_id,
+               {_LANE_ROLLUP_V1_LANE} AS lane,
+               COUNT(*) FILTER (WHERE {ok_pred})::int AS completed,
+               COUNT(*) FILTER (WHERE {fail_pred})::int AS failed,
+               {voice_select}
+        FROM user_logs l
+        LEFT JOIN routes r ON r.user_id = l.user_id
+{_LANE_ROLLUP_V1_SPOKE_JOIN},
+        LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),
+                                 NULLIF(l.doc->>'wake_kind',''),
+                                 NULLIF(l.doc->>'trigger',''),'unknown') AS kind) k
+        WHERE l.stream IN ('proactive_jobs','memory_capture_jobs')
+          AND COALESCE(r.route,'resident') = 'resident'
+          AND {_LANE_ROLLUP_V1_TS} >= %s
+          AND {_LANE_ROLLUP_V1_TS} < %s
+        GROUP BY l.user_id, lane
+        """,
+        (start, end),
+    ).fetchall()
+    if not rows:
+        return 0
+    codes: dict[tuple[str, str], dict[str, int]] = {}
+    for uid, lane, code, n in conn.execute(
+        f"""
+        WITH routes AS (
+            SELECT user_id,
+                   lower(COALESCE(NULLIF(doc->>'route',''),'resident')) AS route
+            FROM user_blobs WHERE kind = 'onboarding_route'
+        )
+        SELECT l.user_id, {_LANE_ROLLUP_V1_LANE} AS lane,
+               l.doc->>'status_reason', COUNT(*)::int
+        FROM user_logs l
+        LEFT JOIN routes r ON r.user_id = l.user_id,
+        LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),
+                                 NULLIF(l.doc->>'wake_kind',''),
+                                 NULLIF(l.doc->>'trigger',''),'unknown') AS kind) k
+        WHERE l.stream IN ('proactive_jobs','memory_capture_jobs')
+          AND COALESCE(r.route,'resident') = 'resident'
+          AND {fail_pred}
+          AND NULLIF(l.doc->>'status_reason','') IS NOT NULL
+          AND {_LANE_ROLLUP_V1_TS} >= %s
+          AND {_LANE_ROLLUP_V1_TS} < %s
+        GROUP BY l.user_id, lane, l.doc->>'status_reason'
+        """,
+        (start, end),
+    ).fetchall():
+        key = (str(uid), str(lane))
+        clean = (str(code) if _LANE_ROLLUP_CODE_RE.match(str(code))
+                 else "runtime_failed")
+        cell = codes.setdefault(key, {})
+        cell[clean] = cell.get(clean, 0) + int(n)
+    written = 0
+    day_s = day.isoformat()
+    cell_sql = """
+            INSERT INTO lane_daily_rollup
+                (user_id, day, route, lane, enqueue_source,
+                 completed, failed, expired, superseded, failure_codes,
+                 spoke, spoke_completed, silent_declared, silent_undeclared)
+            SELECT u.user_id, %s, 'resident', %s, '', %s, %s, 0, 0, %s,
+                   %s, %s, %s, %s
+            FROM users u WHERE u.user_id = %s FOR KEY SHARE OF u
+            ON CONFLICT (user_id, day, route, lane, enqueue_source) DO NOTHING
+            RETURNING user_id
+            """
+    for (uid, lane, completed, failed,
+         spoke, spoke_completed, silent_declared, silent_undeclared) in rows:
+        if not completed and not failed:
+            continue  # 该组全是非终态,不落格子
+        params = (day_s, lane, completed, failed,
+                  Jsonb(codes.get((str(uid), str(lane)), {})),
+                  spoke, spoke_completed, silent_declared, silent_undeclared, uid)
+        saved = conn.execute(cell_sql, params).fetchone()
+        if saved:
+            written += 1
+        if mirror_batch is not None:
+            mirror_batch.append((cell_sql, params))
+    return written
+
+
+def freeze_completed_resident_lane_days(*, now_epoch: float | None = None,
+                                        tz: str = "Asia/Shanghai") -> list[str]:
+    """Freeze route='resident' cells with a 4h lag (a job created 23:58 that
+    terminates 00:03 patches its user_logs doc after its creation day closed —
+    the lag guarantees day D is only frozen once no D job can still be
+    patched). First run anchors ``backfill_from`` at the oldest surviving
+    user_logs row — the ring already ate everything older, and that loss is
+    recorded honestly as coverage.partial_before rather than papered over.
+    ⚠️ The ring rolls per user, so days shortly AFTER partial_before may still
+    be per-user incomplete near the boundary; partial_before means "nothing
+    before this", not "everything after this".
+    """
+    try:
+        zone = ZoneInfo(tz)
+        now = (datetime.fromtimestamp(float(now_epoch), zone)
+               if now_epoch is not None else datetime.now(zone))
+        last_completed = (now - timedelta(hours=4)).date() - timedelta(days=1)
+        frozen: list[str] = []
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT backfill_from, through_day FROM lane_rollup_watermark "
+                "WHERE route = 'resident'",
+            ).fetchone()
+            if row:
+                cursor = date.fromisoformat(row[1]) + timedelta(days=1)
+                backfill_from = row[0]
+            else:
+                oldest = conn.execute(
+                    "SELECT MIN(ts) FROM user_logs "
+                    "WHERE stream IN ('proactive_jobs','memory_capture_jobs')",
+                ).fetchone()
+                if not oldest or oldest[0] is None:
+                    return []
+                cursor = datetime.fromtimestamp(float(oldest[0]), zone).date()
+                backfill_from = cursor.isoformat()
+            steps = 0
+            # voice_from 语义同 model_api 路：只认第一次，见那边的说明。
+            watermark_sql = """
+                    INSERT INTO lane_rollup_watermark
+                        (route, backfill_from, through_day, voice_from)
+                    VALUES ('resident', %s, %s, %s)
+                    ON CONFLICT (route) DO UPDATE
+                        SET through_day = EXCLUDED.through_day, frozen_at = now(),
+                            voice_from = COALESCE(lane_rollup_watermark.voice_from,
+                                                  EXCLUDED.voice_from)
+                    """
+            from tee_shadow import mirror
+            while cursor <= last_completed and steps < _LANE_ROLLUP_MAX_DAYS_PER_TICK:
+                mirror_batch: list[tuple[str, tuple]] = []
+                _lane_rollup_freeze_resident_day(conn, day=cursor, zone=zone,
+                                                 mirror_batch=mirror_batch)
+                wm_params = (backfill_from, cursor.isoformat(),
+                             cursor.isoformat())
+                conn.execute(watermark_sql, wm_params)
+                mirror_batch.append((watermark_sql, wm_params))
+                mirror.execute_many(mirror_batch)
+                frozen.append(cursor.isoformat())
+                cursor += timedelta(days=1)
+                steps += 1
+        return frozen
+    except Exception as e:
+        log.error("[db] freeze_completed_resident_lane_days failed: %s", e)
+        return []
+
+
+# 删号后的格子处置（Seven 2026-08-18 拍板）：匿名化归并——既非级联删除（会让
+# 冻结的历史聚合数字事后变动），也非带 id 永久保留（0021 先例是匿名 cohort，
+# 与逐用户行不等价，codex2 审出）。归并目标行 user_id='deleted'。
+_LANE_ROLLUP_DELETED_USER = "deleted"
+
+# 加法式 upsert：把一个用户的格子并进匿名行。加法语句对「同一初始状态的两个库」
+# 重放产生同一终态，所以 RDS 与 TEE 镜像走同一条语句即可保持一致；failure_codes
+# 逐 key 相加（scalar 子查询在 ON CONFLICT SET 里合法）。
+_LANE_ROLLUP_ANON_MERGE_SQL = """
+INSERT INTO lane_daily_rollup
+    (user_id, day, route, lane, enqueue_source,
+     completed, failed, expired, superseded, failure_codes,
+     spoke, spoke_completed, silent_declared, silent_undeclared)
+SELECT %s, day, route, lane, enqueue_source,
+       completed, failed, expired, superseded, failure_codes,
+       spoke, spoke_completed, silent_declared, silent_undeclared
+FROM lane_daily_rollup WHERE user_id = %s
+ON CONFLICT (user_id, day, route, lane, enqueue_source) DO UPDATE SET
+    completed = lane_daily_rollup.completed + EXCLUDED.completed,
+    failed = lane_daily_rollup.failed + EXCLUDED.failed,
+    expired = lane_daily_rollup.expired + EXCLUDED.expired,
+    superseded = lane_daily_rollup.superseded + EXCLUDED.superseded,
+    spoke = lane_daily_rollup.spoke + EXCLUDED.spoke,
+    spoke_completed = lane_daily_rollup.spoke_completed + EXCLUDED.spoke_completed,
+    silent_declared = lane_daily_rollup.silent_declared
+                      + EXCLUDED.silent_declared,
+    silent_undeclared = lane_daily_rollup.silent_undeclared
+                        + EXCLUDED.silent_undeclared,
+    failure_codes = (
+        SELECT COALESCE(
+            jsonb_object_agg(
+                keys.k,
+                COALESCE((lane_daily_rollup.failure_codes ->> keys.k)::int, 0)
+                + COALESCE((EXCLUDED.failure_codes ->> keys.k)::int, 0)
+            ), '{}'::jsonb)
+        FROM (
+            SELECT jsonb_object_keys(
+                lane_daily_rollup.failure_codes || EXCLUDED.failure_codes
+            ) AS k
+        ) keys
+    ),
+    frozen_at = now()
+"""
+
+_LANE_ROLLUP_ANON_DELETE_SQL = "DELETE FROM lane_daily_rollup WHERE user_id = %s"
+
+
+def lane_rollup_anonymize_user(conn, user_id: str) -> int:
+    """Merge one user's frozen cells into the anonymous 'deleted' rows and
+    drop the originals. Runs on the caller's connection so delete_user_data
+    can keep it inside its cascade transaction; returns the merged cell count.
+    The caller is responsible for mirroring the same two statements to TEE
+    (delete_user_data's mirror group) — additive SQL replays consistently.
+    """
+    if not user_id or user_id == _LANE_ROLLUP_DELETED_USER:
+        return 0
+    n = conn.execute(
+        "SELECT COUNT(*) FROM lane_daily_rollup WHERE user_id = %s", (user_id,),
+    ).fetchone()[0]
+    if not n:
+        return 0
+    conn.execute(_LANE_ROLLUP_ANON_MERGE_SQL,
+                 (_LANE_ROLLUP_DELETED_USER, user_id))
+    conn.execute(_LANE_ROLLUP_ANON_DELETE_SQL, (user_id,))
+    return int(n)
+
+
+def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
+                      since_day: str = "", until_day: str = "",
+                      limit: int = 100, offset: int = 0,
+                      tz: str = "Asia/Shanghai") -> dict:
+    """Read frozen rollup cells, plus a live (clearly-flagged) partial for the
+    still-open Beijing day. Content-free: counts, sanitized failure codes and
+    ids only.
+
+    ``coverage`` echoes the watermark so a reader can distinguish "genuinely
+    zero" from "before recorded history": querying earlier than
+    ``partial_before`` means the cells simply do not cover that range.
+    """
+    zone = ZoneInfo(tz)
+    today = datetime.now(zone).date()
+    where = ["route = %s"] if route else []
+    params: list = [route] if route else []
+    if user_id:
+        where.append("user_id = %s")
+        params.append(user_id)
+    if lane:
+        where.append("lane = %s")
+        params.append(lane)
+    if since_day:
+        where.append("day >= %s")
+        params.append(since_day)
+    if until_day:
+        where.append("day <= %s")
+        params.append(until_day)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    with get_pool().connection() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM lane_daily_rollup{clause}", params,
+        ).fetchone()[0]
+        rows = conn.execute(
+            f"""
+            SELECT user_id, day, route, lane, enqueue_source,
+                   completed, failed, expired, superseded, failure_codes,
+                   spoke, spoke_completed, silent_declared, silent_undeclared
+            FROM lane_daily_rollup{clause}
+            ORDER BY day DESC, user_id, lane, enqueue_source
+            LIMIT %s OFFSET %s
+            """,
+            params + [int(limit), int(offset)],
+        ).fetchall()
+        out_rows = [
+            {"user_id": r[0], "day": r[1], "route": r[2], "lane": r[3],
+             "enqueue_source": r[4], "completed": r[5], "failed": r[6],
+             "expired": r[7], "superseded": r[8],
+             "failure_codes": dict(r[9] or {}), "frozen": True,
+             "spoke": r[10], "spoke_completed": r[11],
+             "silent_declared": r[12], "silent_undeclared": r[13]}
+            for r in rows
+        ]
+        coverage: dict[str, dict] = {}
+        for r in conn.execute(
+            "SELECT route, backfill_from, through_day, voice_from "
+            "FROM lane_rollup_watermark",
+        ).fetchall():
+            coverage[str(r[0])] = {
+                "backfill_from": r[1],
+                "through_day": r[2],
+                "partial_before": r[1],
+                # 说话四列比计数列晚上线，所以有自己的起点。None = 还没有任何格子
+                # 带过说话数字，读的人**不许**把 0 当成「量过、确实没说话」。
+                "voice_from": r[3],
+            }
+        # Days after the watermark cannot be frozen yet — surface them live and
+        # explicitly non-frozen, so a still-open day (or resident's 4h freeze
+        # lag) never reads as "no activity". Deriving the window from the
+        # WATERMARK rather than hardcoding "today" also means a stalled freezer
+        # widens the live window instead of silently showing an empty gap.
+        today_rows: list[dict] = []
+        for live_route in ("model_api", "resident"):
+            if route and route != live_route:
+                continue
+            wm = coverage.get(live_route)
+            # 无水位 = 冻结器从未跑过（首次启动）或彻底停摆。此时若只补「今天」，
+            # 昨天既没冻结也不在 live 窗口里 —— 端点会把它显示成「没有活动」。
+            # codex2 实证过这条静默漏报，所以无水位时按受限缺口的最大宽度回看。
+            gap_start = (date.fromisoformat(wm["through_day"]) + timedelta(days=1)
+                         if wm
+                         else today - timedelta(days=_LANE_ROLLUP_LIVE_MAX_DAYS - 1))
+            if gap_start > today:
+                continue
+            # Bound the live scan: a long-dead freezer must not turn one admin
+            # GET into an unbounded historical aggregate (the exact failure
+            # this whole table exists to retire). What we refuse to compute is
+            # declared, not silently dropped.
+            if (today - gap_start).days >= _LANE_ROLLUP_LIVE_MAX_DAYS:
+                gap_start = today - timedelta(days=_LANE_ROLLUP_LIVE_MAX_DAYS - 1)
+            if wm is None or gap_start > date.fromisoformat(wm["through_day"]) + timedelta(days=1):
+                # 有水位时=水位落后于窗口上限;无水位时=从未冻结。两种情况读的人都
+                # 必须能分辨「这天真没活动」与「这天在我的回看范围之外」。
+                coverage.setdefault(live_route, {})["live_truncated_before"] = (
+                    gap_start.isoformat())
+            if until_day and until_day < gap_start.isoformat():
+                continue
+            if since_day and since_day > today.isoformat():
+                continue
+            win_start, _ = _lane_rollup_day_bounds(gap_start, zone)
+            _, win_end = _lane_rollup_day_bounds(today, zone)
+            live_params: list = [tz]
+            if live_route == "model_api":
+                from model_api_runtime.v2.effect_outbox import (
+                    DELIVERED_EFFECT_STATUSES,
+                    REPLY_EFFECT_TYPES,
+                )
+
+                live_where = ["j.status = ANY(%s)",
+                              "j.finished_at >= %s", "j.finished_at < %s"]
+                live_params += [sorted(REPLY_EFFECT_TYPES),
+                                sorted(DELIVERED_EFFECT_STATUSES),
+                                list(_LANE_ROLLUP_TERMINAL), win_start, win_end]
+                if user_id:
+                    live_where.append("j.user_id = %s")
+                    live_params.append(user_id)
+                if lane:
+                    live_where.append("j.lane = %s")
+                    live_params.append(lane)
+                live_sql = f"""
+                SELECT to_char(timezone(%s, j.finished_at), 'YYYY-MM-DD') AS day,
+                       j.user_id, j.lane,
+                       CASE WHEN j.lane = 'heartbeat'
+                            THEN CASE WHEN j.reason IS NULL THEN 'clock' ELSE 'perception' END
+                            ELSE '' END AS enqueue_source,
+                       COUNT(*) FILTER (WHERE j.status = 'completed')::int,
+                       COUNT(*) FILTER (WHERE j.status = 'failed')::int,
+                       COUNT(*) FILTER (WHERE j.status = 'expired')::int,
+                       COUNT(*) FILTER (WHERE j.status = 'superseded')::int,
+                       {_LANE_ROLLUP_V2_VOICE_SELECT}
+                FROM agent_jobs j{_LANE_ROLLUP_V2_SPOKE_JOIN}
+                WHERE {' AND '.join(live_where)}
+                GROUP BY day, j.user_id, j.lane, enqueue_source
+                ORDER BY day, j.user_id, j.lane, enqueue_source
+                """
+            else:
+                live_where = [f"{_LANE_ROLLUP_V1_TS} >= %s",
+                              f"{_LANE_ROLLUP_V1_TS} < %s"]
+                live_params += [win_start, win_end]
+                if user_id:
+                    live_where.append("l.user_id = %s")
+                    live_params.append(user_id)
+                _ok = _LANE_ROLLUP_V1_OK_PRED.format(mem=_LANE_ROLLUP_V1_IS_MEMORY)
+                _fail = _LANE_ROLLUP_V1_FAIL_PRED.format(mem=_LANE_ROLLUP_V1_IS_MEMORY)
+                _voice = _LANE_ROLLUP_V1_VOICE_SELECT.format(ok=_ok)
+                live_sql = f"""
+                WITH routes AS (
+                    SELECT user_id,
+                           lower(COALESCE(NULLIF(doc->>'route',''),'resident')) AS route
+                    FROM user_blobs WHERE kind = 'onboarding_route'
+                )
+                SELECT to_char(timezone(%s, {_LANE_ROLLUP_V1_TS}),
+                               'YYYY-MM-DD') AS day,
+                       l.user_id, {_LANE_ROLLUP_V1_LANE} AS lane, '' AS enqueue_source,
+                       COUNT(*) FILTER (WHERE {_ok})::int,
+                       COUNT(*) FILTER (WHERE {_fail})::int,
+                       0, 0,
+                       {_voice}
+                FROM user_logs l
+                LEFT JOIN routes r ON r.user_id = l.user_id
+{_LANE_ROLLUP_V1_SPOKE_JOIN},
+                LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),
+                                         NULLIF(l.doc->>'wake_kind',''),
+                                         NULLIF(l.doc->>'trigger',''),'unknown') AS kind) k
+                WHERE l.stream IN ('proactive_jobs','memory_capture_jobs')
+                  AND COALESCE(r.route,'resident') = 'resident'
+                  AND {' AND '.join(live_where)}
+                GROUP BY day, l.user_id, lane
+                ORDER BY day, l.user_id, lane
+                """
+            for r in conn.execute(live_sql, live_params).fetchall():
+                if lane and str(r[2]) != lane:
+                    continue  # resident lane is a derived CASE — filter in Python
+                if since_day and r[0] < since_day:
+                    continue
+                if until_day and r[0] > until_day:
+                    continue
+                if not r[4] and not r[5] and not r[6] and not r[7]:
+                    continue
+                today_rows.append(
+                    {"user_id": r[1], "day": r[0], "route": live_route,
+                     "lane": r[2], "enqueue_source": r[3],
+                     "completed": r[4], "failed": r[5], "expired": r[6],
+                     "superseded": r[7], "failure_codes": {}, "frozen": False,
+                     "spoke": r[8], "spoke_completed": r[9],
+                     "silent_declared": r[10], "silent_undeclared": r[11]}
+                )
+        # stuck：实时查询，与失败率并排返回（见常量处的口径说明）。带 job 定位信息
+        # ——Seven 要求「能点到具体 job」，只给数字等于又造一个查不下去的聚合。
+        stuck_rows: list[dict] = []
+        # deadline 判据必须 status-aware：一个 running 的 job 早就离开队列了，
+        # 它的 queue_deadline_at 过期是**正常**的，只要租约还在就没卡住。三字段
+        # 无差别 OR 会把健康的 running 报成 stuck（codex2 PG 复现），而 stuck 一旦
+        # 有假阳性就没人会再认真看它——那等于这个指标白加。
+        #
+        # **整条 CASE 逐字照抄 jobs_store 的权威 stale 契约**
+        # （jobs_store.py:631-638 / :2045-2051），TTL 直接 import 同一个常量而不
+        # 另造一份——判据只能有一份来源，两处各写一份迟早会漂。
+        #
+        # 分两轮才抄全，两轮的教训是同一个：**「差不多」不算同源**。
+        #   第一轮 claimed/running 我写成「lease 过期 AND COALESCE(...) 过期」，
+        #     比权威更严 → 租约过 1 分钟、deadline 还有 1 小时的 job 被漏判；
+        #   第二轮 pending 我只判 queue_deadline_at，漏了 deadline_at 与 chat 的
+        #     created_at+TTL 两级 fallback → queue_deadline 为 NULL 的 dream/chat
+        #     pending 被漏判（两条都由 codex2 在全新 PG head 上实证）。
+        # 同一个 job，jobs_store 判 stale 而面板判不 stuck，比缺这个指标更坏。
+        from model_api_runtime.v2.jobs_store import PENDING_CHAT_TTL_SEC
+        stuck_where = [
+            "status = ANY(%s)",
+            "(CASE WHEN status='pending' THEN "
+            "  COALESCE(queue_deadline_at,deadline_at,"
+            "    CASE WHEN lane='chat' THEN "
+            "      created_at + make_interval(secs => %s) END) "
+            "      <= clock_timestamp() "
+            "ELSE COALESCE(lease_expires_at,deadline_at) IS NOT NULL "
+            "  AND COALESCE(lease_expires_at,deadline_at) "
+            "      <= clock_timestamp() END)",
+        ]
+        stuck_params: list = [list(_LANE_ROLLUP_NONTERMINAL),
+                              float(PENDING_CHAT_TTL_SEC)]
+        if user_id:
+            stuck_where.append("user_id = %s")
+            stuck_params.append(user_id)
+        if lane:
+            stuck_where.append("lane = %s")
+            stuck_params.append(lane)
+        if not route or route == "model_api":
+            for r in conn.execute(
+                f"""
+                SELECT user_id, lane, COUNT(*)::int,
+                       MIN(created_at), (array_agg(id ORDER BY created_at))[1:5]
+                FROM agent_jobs
+                WHERE {' AND '.join(stuck_where)}
+                GROUP BY user_id, lane ORDER BY 3 DESC
+                """,
+                stuck_params,
+            ).fetchall():
+                stuck_rows.append(
+                    {"user_id": r[0], "route": "model_api", "lane": r[1],
+                     "count": r[2], "oldest_at": r[3].isoformat() if r[3] else None,
+                     "job_ids": [int(x) for x in (r[4] or [])],
+                     "basis": "past_own_deadline"})
+        if not route or route == "resident":
+            cutoff = (datetime.now(zone)
+                      - timedelta(hours=_LANE_ROLLUP_STUCK_AFTER_HOURS))
+            v1_where = ["l.stream IN ('proactive_jobs','memory_capture_jobs')",
+                        "COALESCE(r.route,'resident') = 'resident'",
+                        "COALESCE(l.doc->>'status','') = ANY(%s)",
+                        f"{_LANE_ROLLUP_V1_CREATED_TS} < %s"]
+            v1_params: list = [list(_LANE_ROLLUP_V1_NONTERMINAL), cutoff]
+            if user_id:
+                v1_where.append("l.user_id = %s")
+                v1_params.append(user_id)
+            for r in conn.execute(
+                f"""
+                WITH routes AS (
+                    SELECT user_id,
+                           lower(COALESCE(NULLIF(doc->>'route',''),'resident')) AS route
+                    FROM user_blobs WHERE kind = 'onboarding_route'
+                )
+                SELECT l.user_id, {_LANE_ROLLUP_V1_LANE} AS lane, COUNT(*)::int,
+                       MIN(l.ts), (array_agg(l.seq ORDER BY l.ts))[1:5]  -- noqa
+                FROM user_logs l
+                LEFT JOIN routes r ON r.user_id = l.user_id,
+                LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),
+                                         NULLIF(l.doc->>'wake_kind',''),
+                                         NULLIF(l.doc->>'trigger',''),'unknown') AS kind) k
+                WHERE {' AND '.join(v1_where)}
+                GROUP BY l.user_id, lane ORDER BY 3 DESC
+                """,
+                v1_params,
+            ).fetchall():
+                if lane and str(r[1]) != lane:
+                    continue
+                stuck_rows.append(
+                    {"user_id": r[0], "route": "resident", "lane": r[1],
+                     "count": r[2],
+                     "oldest_at": (datetime.fromtimestamp(float(r[3]), timezone.utc)
+                                   .isoformat() if r[3] else None),
+                     "job_seqs": [int(x) for x in (r[4] or [])],
+                     "basis": "older_than_threshold"})
+    return {
+        "rows": out_rows,
+        "today_partial": today_rows,
+        "stuck": {
+            "rows": stuck_rows,
+            "total": sum(r["count"] for r in stuck_rows),
+            "stuck_after_hours": _LANE_ROLLUP_STUCK_AFTER_HOURS,
+            "note": ("非终态尝试不进失败率的分子或分母（Seven 2026-08-18 定 A）；"
+                     "它们只出现在这里，必须与失败率并排读"),
+        },
+        "coverage": coverage,
+        "pagination": {"limit": int(limit), "offset": int(offset),
+                       "returned": len(out_rows), "total": int(total)},
+        "filters": {"user_id": user_id, "lane": lane, "route": route,
+                    "since_day": since_day, "until_day": until_day,
+                    "timezone": tz},
+    }
 
 
 def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30,
@@ -7611,6 +8673,7 @@ _CHAT_BODY_CAS_FIELDS = (
     "id",
     "v",
     "body_ct",
+    "body_b64",
     "nonce",
     "K_user",
     "K_enclave",
@@ -7623,6 +8686,21 @@ _CHAT_BODY_CAS_FIELDS = (
 _CHAT_BODY_CAS_PREDICATE = " AND ".join(
     f"(doc->'{field}') IS NOT DISTINCT FROM %s"
     for field in _CHAT_BODY_CAS_FIELDS
+)
+_CHAT_POINTER_REPLACED_FIELDS = (
+    "body_ct",
+    "body_b64",
+    "body",
+    "body_key",
+    "body_ct_len",
+    "body_object_format",
+    "body_size_bytes",
+    "body_sha256",
+    "nonce",
+    "K_user",
+    "K_enclave",
+    "enclave_pk_fpr",
+    "content_pk_fpr",
 )
 
 
@@ -8084,16 +9162,32 @@ def chat_seq_for_msg_id(user_id: str, msg_id: str) -> int | None:
 
 
 def _is_chat_file_pointer(doc) -> bool:
-    return isinstance(doc, dict) and bool(doc.get("body_key")) and doc.get("body_ct") is None
+    return (
+        isinstance(doc, dict)
+        and bool(doc.get("body_key"))
+        and doc.get("body_ct") is None
+        and doc.get("body_b64") is None
+    )
+
+
+def _chat_body_object_format(doc: dict) -> str:
+    """Classify an R2 pointer without guessing an unknown marker."""
+    if "body_object_format" not in doc or doc.get("body_object_format") is None:
+        return "sealed_v1"
+    marker = doc.get("body_object_format")
+    if marker == "plaintext_v1":
+        return marker
+    raise ValueError("chat_body_object_format_unrecognized")
 
 
 def hydrate_chat_file_body(user_id: str, doc: dict) -> dict:
-    """Return a doc guaranteed to carry ``body_ct``. If ``doc`` is an R2 pointer
-    (``body_key`` set, ``body_ct`` absent) the ciphertext is fetched from R2 and
-    inlined into a COPY (the stored/cached row stays slim). Non-pointers and, when
-    R2 is unconfigured, everything are returned unchanged. A missing/failed fetch
-    returns the doc as-is (``body_ct`` still absent) so the enclave surfaces a
-    per-item decrypt error for that one message rather than crashing the read.
+    """Hydrate a sealed or plaintext R2 pointer according to its marker.
+
+    Legacy pointers (marker absent) produce ``body_ct`` exactly as before.
+    ``plaintext_v1`` pointers validate raw size and SHA-256 before producing
+    ``body_b64``.  Unknown markers and corrupt plaintext objects fail closed;
+    missing/unavailable objects retain the pointer so the caller can surface an
+    absent body or retry without misclassifying its bytes.
 
     Call this ONLY at exits that actually deliver a body (poll delivery, a
     history page that includes the body, single message-body fetch) — never in
@@ -8104,11 +9198,54 @@ def hydrate_chat_file_body(user_id: str, doc: dict) -> dict:
     so object_storage refuses one that isn't under this user's own prefix."""
     if not _is_chat_file_pointer(doc) or not object_storage.chat_files_enabled():
         return doc
-    body = object_storage.get_chat_body(str(doc.get("body_key") or ""), user_id)
-    if body is None:
+    body_format = _chat_body_object_format(doc)
+    if body_format == "sealed_v1":
+        body = object_storage.get_chat_body(
+            str(doc.get("body_key") or ""),
+            user_id,
+        )
+        if body is None:
+            return doc
+        out = {
+            k: v
+            for k, v in doc.items()
+            if k not in ("body_key", "body_object_format", "body_sha256")
+        }
+        out["body_ct"] = body
+        return out
+
+    raw = object_storage.get_chat_body_bytes(
+        str(doc.get("body_key") or ""),
+        user_id,
+    )
+    if raw is None:
         return doc
-    out = {k: v for k, v in doc.items() if k != "body_key"}
-    out["body_ct"] = body
+    out = {
+        k: v
+        for k, v in doc.items()
+        if k not in ("body_key", "body_object_format", "body_sha256")
+    }
+    encoded = base64.b64encode(raw).decode("ascii")
+
+    try:
+        expected_size = int(doc["body_size_bytes"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("chat_plaintext_body_size_invalid") from exc
+    expected_sha256 = doc.get("body_sha256")
+    if (
+        expected_size < 0
+        or len(raw) != expected_size
+        or not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or expected_sha256.lower() != expected_sha256
+        or any(ch not in "0123456789abcdef" for ch in expected_sha256)
+    ):
+        raise ValueError("chat_plaintext_body_integrity_mismatch")
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ValueError("chat_plaintext_body_integrity_mismatch")
+    out.pop("body_ct_len", None)
+    out["body_b64"] = encoded
+    out["body_size_bytes"] = expected_size
     return out
 
 
@@ -8130,8 +9267,10 @@ def _normalize_chat_body_doc(doc: dict) -> dict:
     branch in :func:`_chat_insert_on_cursor`.
     """
     out = dict(doc or {})
-    if out.get("body_ct") is not None:
+    if out.get("body_ct") is not None or out.get("body_b64") is not None:
         out.pop("body_key", None)
+        out.pop("body_object_format", None)
+        out.pop("body_sha256", None)
         out.pop("body_ct_len", None)
     return out
 
@@ -8845,7 +9984,10 @@ def _offload_chat_body_after_commit(
         object_storage.chat_files_enabled()
         and isinstance(doc, dict)
         and doc.get("content_type") in _R2_OFFLOAD_CONTENT_TYPES
-        and doc.get("body_ct") is not None
+        and (
+            doc.get("body_ct") is not None
+            or doc.get("body_b64") is not None
+        )
     ):
         return
     normalized_doc = _normalize_chat_body_doc(doc)
@@ -8889,8 +10031,25 @@ def _offload_chat_body_after_commit(
                         expected_generation,
                         "upload_guard",
                     )
-        body_ct_len = len(normalized_doc["body_ct"])
-        pointer = {"body_key": key, "body_ct_len": body_ct_len}
+        is_plaintext = normalized_doc.get("body_b64") is not None
+        if is_plaintext:
+            raw_plaintext = base64.b64decode(
+                normalized_doc["body_b64"],
+                validate=True,
+            )
+            pointer = {
+                "body_key": key,
+                "body_object_format": "plaintext_v1",
+                "body_size_bytes": len(raw_plaintext),
+                "body_sha256": hashlib.sha256(raw_plaintext).hexdigest(),
+            }
+            inline_field = "body_b64"
+        else:
+            pointer = {
+                "body_key": key,
+                "body_ct_len": len(normalized_doc["body_ct"]),
+            }
+            inline_field = "body_ct"
         with get_pool().connection() as conn:
             conn.execute(
                 "SELECT pg_advisory_lock(hashtextextended(%s, 0))",
@@ -8928,14 +10087,24 @@ def _offload_chat_body_after_commit(
                             and current_generation == int(expected_generation)
                         )
                 if upload_allowed:
-                    object_storage.put_chat_body(
-                        user_id,
-                        msg_id,
-                        normalized_doc["body_ct"],
-                        content_type,
-                        upload_version=upload_version,
-                        storage_generation=expected_generation,
-                    )
+                    if is_plaintext:
+                        object_storage.put_chat_body_bytes(
+                            user_id,
+                            msg_id,
+                            raw_plaintext,
+                            content_type,
+                            upload_version=upload_version,
+                            storage_generation=expected_generation,
+                        )
+                    else:
+                        object_storage.put_chat_body(
+                            user_id,
+                            msg_id,
+                            normalized_doc["body_ct"],
+                            content_type,
+                            upload_version=upload_version,
+                            storage_generation=expected_generation,
+                        )
                     with conn.transaction():
                         with conn.cursor() as cur:
                             current_generation = _lock_chat_r2_lifecycle_on_cursor(
@@ -8953,7 +10122,7 @@ def _offload_chat_body_after_commit(
                             ):
                                 cur.execute(
                                     "UPDATE chat_messages "
-                                    "SET doc = (doc - 'body_ct') || %s "
+                                    f"SET doc = (doc - '{inline_field}') || %s "
                                     "WHERE user_id=%s AND msg_id=%s "
                                     "  AND storage_generation=%s AND "
                                     f"{_CHAT_BODY_CAS_PREDICATE} RETURNING 1",
@@ -8987,6 +10156,275 @@ def _offload_chat_body_after_commit(
         # The upload guard was committed before PUT. Never perform network
         # cleanup on this write path: the isolated cleanup worker owns retries,
         # including ambiguous PUT/COMMIT outcomes.
+
+
+def migrate_chat_r2_pointer_to_plaintext(
+    user_id: str,
+    *,
+    table: str,
+    item_id: str | int,
+    old_body_key: str,
+    storage_generation: int,
+    plaintext: bytes,
+    content_type: str,
+) -> bool:
+    """Atomically replace one sealed R2 pointer with a plaintext-v1 pointer.
+
+    The plaintext is written to a fresh private key under an upload guard.  A
+    successful database CAS removes that guard in the same transaction; the
+    existing row-retirement trigger durably queues the old key.  Any failure or
+    CAS loss leaves the new-key guard intact for the normal cleanup worker.
+
+    ``table`` is ``"live"`` (``item_id`` = msg_id) or ``"archive"``
+    (``item_id`` = source_seq).  Archive replacement uses delete+insert so the
+    immutable UPDATE trigger remains load-bearing.
+    """
+    if table not in ("live", "archive"):
+        raise ValueError("table must be live or archive")
+    if not isinstance(plaintext, bytes):
+        raise TypeError("plaintext must be bytes")
+    if content_type not in _R2_OFFLOAD_CONTENT_TYPES:
+        raise ValueError("chat plaintext R2 migration requires file/image")
+    if not object_storage.chat_key_owned_by(old_body_key, user_id):
+        raise ValueError("chat plaintext R2 migration foreign body key")
+
+    generation = int(storage_generation)
+    upload_version = object_storage.new_chat_body_upload_version()
+    new_key = object_storage.chat_body_key(
+        user_id,
+        str(item_id) if table == "live" else "",
+        content_type,
+        upload_version=upload_version,
+        storage_generation=generation,
+    )
+    if table == "archive":
+        # Archive item_id is source_seq, not msg_id. Resolve the current msg_id
+        # under the initial row lock before deriving the destination key.
+        new_key = ""
+
+    def _select_current(cur, *, for_update: bool = True):
+        suffix = " FOR UPDATE" if for_update else ""
+        if table == "live":
+            cur.execute(
+                "SELECT msg_id,doc FROM chat_messages "
+                "WHERE user_id=%s AND msg_id=%s AND storage_generation=%s "
+                "AND doc->>'body_key'=%s "
+                "AND COALESCE(doc->>'body_object_format','sealed_v1')='sealed_v1' "
+                "AND doc ? 'K_enclave'"
+                + suffix,
+                (user_id, str(item_id), generation, old_body_key),
+            )
+        else:
+            cur.execute(
+                "SELECT msg_id,doc FROM chat_message_archive "
+                "WHERE user_id=%s AND source_seq=%s AND storage_generation=%s "
+                "AND doc->>'body_key'=%s "
+                "AND COALESCE(doc->>'body_object_format','sealed_v1')='sealed_v1' "
+                "AND doc ? 'K_enclave'"
+                + suffix,
+                (user_id, int(item_id), generation, old_body_key),
+            )
+        return cur.fetchone()
+
+    # S0 -> S1: validate the authoritative row/tier and commit a durable guard.
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                current_generation = _lock_chat_r2_lifecycle_on_cursor(cur, user_id)
+                if current_generation != generation:
+                    return False
+                cur.execute(
+                    "SELECT 1 FROM users WHERE user_id=%s "
+                    "AND doc->>'content_encryption'='off'",
+                    (user_id,),
+                )
+                if cur.fetchone() is None:
+                    return False
+                current = _select_current(cur)
+                if current is None:
+                    return False
+                current_msg_id = str(current[0])
+                if not new_key:
+                    new_key = object_storage.chat_body_key(
+                        user_id,
+                        current_msg_id,
+                        content_type,
+                        upload_version=upload_version,
+                        storage_generation=generation,
+                    )
+                _enqueue_chat_r2_cleanup_on_cursor(
+                    cur,
+                    user_id,
+                    new_key,
+                    generation,
+                    "upload_guard",
+                )
+
+    pointer = {
+        "body_key": new_key,
+        "body_object_format": "plaintext_v1",
+        "body_size_bytes": len(plaintext),
+        "body_sha256": hashlib.sha256(plaintext).hexdigest(),
+    }
+    promoted = False
+    with get_pool().connection() as conn:
+        conn.execute(
+            "SELECT pg_advisory_lock(hashtextextended(%s, 0))",
+            (new_key,),
+        )
+        try:
+            # Revalidate after the committed guard and before network I/O.
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    current_generation = _lock_chat_r2_lifecycle_on_cursor(
+                        cur, user_id,
+                    )
+                    cur.execute(
+                        "SELECT 1 FROM chat_r2_cleanup "
+                        "WHERE body_key=%s AND user_id=%s FOR UPDATE",
+                        (new_key, user_id),
+                    )
+                    guard_exists = cur.fetchone() is not None
+                    cur.execute(
+                        "SELECT 1 FROM users WHERE user_id=%s "
+                        "AND doc->>'content_encryption'='off'",
+                        (user_id,),
+                    )
+                    tier_allows = cur.fetchone() is not None
+                    row_matches = _select_current(cur) is not None
+                    upload_allowed = (
+                        guard_exists
+                        and tier_allows
+                        and row_matches
+                        and current_generation == generation
+                    )
+            if not upload_allowed:
+                return False
+
+            object_storage.put_chat_body_bytes(
+                user_id,
+                current_msg_id,
+                plaintext,
+                content_type,
+                upload_version=upload_version,
+                storage_generation=generation,
+            )
+
+            # S2 -> S3: CAS pointer and delete the new-key guard atomically.
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    current_generation = _lock_chat_r2_lifecycle_on_cursor(
+                        cur, user_id,
+                    )
+                    cur.execute(
+                        "SELECT 1 FROM chat_r2_cleanup "
+                        "WHERE body_key=%s AND user_id=%s FOR UPDATE",
+                        (new_key, user_id),
+                    )
+                    guard_exists = cur.fetchone() is not None
+                    cur.execute(
+                        "SELECT 1 FROM users WHERE user_id=%s "
+                        "AND doc->>'content_encryption'='off'",
+                        (user_id,),
+                    )
+                    tier_allows = cur.fetchone() is not None
+                    if (
+                        not guard_exists
+                        or not tier_allows
+                        or current_generation != generation
+                    ):
+                        return False
+
+                    if table == "live":
+                        subtraction = " ".join(
+                            f"- '{field}'" for field in _CHAT_POINTER_REPLACED_FIELDS
+                        )
+                        cur.execute(
+                            "UPDATE chat_messages SET doc = (doc "
+                            f"{subtraction}) || %s "
+                            "WHERE user_id=%s AND msg_id=%s "
+                            "AND storage_generation=%s "
+                            "AND doc->>'body_key'=%s "
+                            "AND COALESCE(doc->>'body_object_format','sealed_v1')="
+                            "'sealed_v1' AND doc ? 'K_enclave' RETURNING 1",
+                            (
+                                Jsonb(pointer),
+                                user_id,
+                                str(item_id),
+                                generation,
+                                old_body_key,
+                            ),
+                        )
+                        promoted = cur.fetchone() is not None
+                    else:
+                        # Lock/current-shape check precedes DELETE. DELETE
+                        # RETURNING supplies every immutable column so reinsertion
+                        # cannot accidentally regenerate timestamps/generations.
+                        if _select_current(cur) is None:
+                            promoted = False
+                        else:
+                            cur.execute(
+                                "DELETE FROM chat_message_archive "
+                                "WHERE user_id=%s AND source_seq=%s "
+                                "AND storage_generation=%s "
+                                "AND doc->>'body_key'=%s "
+                                "RETURNING user_id,source_seq,msg_id,ts,doc,"
+                                "storage_generation,clear_generation,cleared_at",
+                                (
+                                    user_id,
+                                    int(item_id),
+                                    generation,
+                                    old_body_key,
+                                ),
+                            )
+                            retired = cur.fetchone()
+                            if retired is not None:
+                                new_doc = dict(retired[4])
+                                for field in _CHAT_POINTER_REPLACED_FIELDS:
+                                    new_doc.pop(field, None)
+                                new_doc.update(pointer)
+                                cur.execute(
+                                    "INSERT INTO chat_message_archive "
+                                    "(user_id,source_seq,msg_id,ts,doc,"
+                                    "storage_generation,clear_generation,cleared_at) "
+                                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                                    (
+                                        retired[0],
+                                        retired[1],
+                                        retired[2],
+                                        retired[3],
+                                        Jsonb(new_doc),
+                                        retired[5],
+                                        retired[6],
+                                        retired[7],
+                                    ),
+                                )
+                                promoted = True
+                    if promoted:
+                        cur.execute(
+                            "DELETE FROM chat_r2_cleanup "
+                            "WHERE body_key=%s AND user_id=%s",
+                            (new_key, user_id),
+                        )
+        finally:
+            conn.execute(
+                "SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
+                (new_key,),
+            )
+
+    if promoted:
+        from tee_shadow import mirror
+
+        tee_table = (
+            "chat_messages" if table == "live" else "chat_message_archive"
+        )
+        mirror.mark_pending(
+            user_id,
+            tee_table,
+            str(item_id),
+            "requeue_r2_plaintext_pointer",
+        )
+    return promoted
 
 
 def _chat_insert_on_cursor(
@@ -9178,27 +10616,56 @@ def _same_reply_envelope(existing_doc, requested_doc) -> bool:
             )
         )
     immutable_reply_fields = (
-        "id", "role", "source", "v", "body_ct", "nonce",
+        "id", "role", "source", "v", "body_ct", "body_b64", "nonce",
         "K_user", "K_enclave", "enclave_pk_fpr", "visibility",
         "owner_user_id", "content_type", "reply_to_message_id",
+        # 明文行的正文（v6）。密文行有 body_ct 在清单里兜着，明文行漏了它就会
+        # 把「同 id 不同正文」判成同一条而静默丢弃后者。
+        "body",
         "voice_call_id", "voice_turn_id",
     )
     if not isinstance(existing_doc, dict) or not isinstance(requested_doc, dict):
         return False
-    if _is_chat_file_pointer(existing_doc) and requested_doc.get("body_ct") is not None:
-        # Post-commit R2 offload intentionally replaces body_ct with a pointer.
-        # A retry still has the original inline envelope, so compare every other
-        # immutable crypto/routing field and use the persisted ciphertext length
-        # to bridge the one deliberate shape change.
+    requested_inline_field = (
+        "body_ct"
+        if requested_doc.get("body_ct") is not None
+        else "body_b64"
+        if requested_doc.get("body_b64") is not None
+        else ""
+    )
+    if _is_chat_file_pointer(existing_doc) and requested_inline_field:
+        # Post-commit R2 offload intentionally replaces the inline body with a
+        # pointer. A retry still carries that inline body, so compare every
+        # other immutable field and bridge the deliberate shape change using
+        # the pointer's format-specific length/hash metadata.
         pointer_fields = tuple(
-            field for field in immutable_reply_fields if field != "body_ct"
+            field
+            for field in immutable_reply_fields
+            if field != requested_inline_field
         )
-        return (
-            all(
-                existing_doc.get(field) == requested_doc.get(field)
-                for field in pointer_fields
+        fields_match = all(
+            existing_doc.get(field) == requested_doc.get(field)
+            for field in pointer_fields
+        )
+        if not fields_match:
+            return False
+        if requested_inline_field == "body_ct":
+            return (
+                existing_doc.get("body_object_format") in (None, "")
+                and existing_doc.get("body_ct_len")
+                == len(requested_doc["body_ct"])
             )
-            and existing_doc.get("body_ct_len") == len(requested_doc["body_ct"])
+        try:
+            raw = base64.b64decode(
+                requested_doc["body_b64"],
+                validate=True,
+            )
+        except Exception:
+            return False
+        return (
+            existing_doc.get("body_object_format") == "plaintext_v1"
+            and existing_doc.get("body_size_bytes") == len(raw)
+            and existing_doc.get("body_sha256") == hashlib.sha256(raw).hexdigest()
         )
     return all(
         existing_doc.get(field) == requested_doc.get(field)
@@ -11057,37 +12524,20 @@ def chat_finalize_reply_post_commit(
     committed inline reply readable.
     """
     reply_msg_id = str(reply_doc.get("id") or "")
-    offload = (
-        object_storage.chat_files_enabled()
-        and reply_doc.get("content_type") in _R2_OFFLOAD_CONTENT_TYPES
-        and reply_doc.get("body_ct") is not None
-    )
     try:
-        if offload:
-            try:
-                body_ct_len = len(reply_doc["body_ct"])
-                key = object_storage.put_chat_body(
-                    user_id,
-                    reply_msg_id,
-                    reply_doc["body_ct"],
-                    str(reply_doc.get("content_type") or "file"),
-                )
-                pointer = {"body_key": key, "body_ct_len": body_ct_len}
-                with get_pool().connection() as conn:
-                    conn.execute(
-                        "UPDATE chat_messages SET doc = (doc - 'body_ct') || %s "
-                        "WHERE user_id = %s AND msg_id = %s AND doc ? 'body_ct'",
-                        (Jsonb(pointer), user_id, reply_msg_id),
-                    )
-            except Exception as e:  # noqa: BLE001
-                log.error(
-                    "[db] chat_finalize_reply_post_commit(%s,%s) R2 offload "
-                    "failed, left inline: %s",
-                    user_id,
-                    reply_msg_id,
-                    e,
-                )
-
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT storage_generation FROM chat_messages "
+                "WHERE user_id=%s AND msg_id=%s",
+                (user_id, reply_msg_id),
+            ).fetchone()
+        if row is not None:
+            _offload_chat_body_after_commit(
+                user_id,
+                reply_msg_id,
+                reply_doc,
+                int(row[0]),
+            )
     except Exception as e:  # noqa: BLE001
         log.error(
             "[db] chat_finalize_reply_post_commit(%s,%s) failed: %s",
@@ -12569,6 +14019,10 @@ def model_api_autoselect_active(user_id: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+class FrameReadUnavailable(RuntimeError):
+    """The frame may exist, but its durable store could not be read."""
+
+
 def _frame_write_row(user_id: str, frame_id: str, ts: float,
                      doc: dict | None, env_meta: dict | None, body_key: str | None) -> bool:
     """Upsert one frame_envelopes row. Returns True on success; swallows-and-logs
@@ -12592,7 +14046,7 @@ def _frame_write_row(user_id: str, frame_id: str, ts: float,
         return False
 
 
-def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> None:
+def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> bool:
     """Persist a v1 frame envelope.
 
     With R2 configured, the heavy ``body_ct`` is offloaded to object storage and
@@ -12609,26 +14063,36 @@ def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> None:
     A crash/abort at any point leaves either an inline (readable) row or a
     pointer whose object is already present; a failed upload just keeps the
     inline row. ``doc`` is offloaded out of the row only after the body is in
-    R2, so the at-rest table stays small without a missing-object window."""
-    if object_storage.enabled() and isinstance(doc, dict) and doc.get("body_ct") is not None:
+    R2, so the at-rest table stays small without a missing-object window.
+    Returns whether a readable row was durably stored."""
+    body_field = (
+        "body_ct" if isinstance(doc, dict) and doc.get("body_ct") is not None
+        else "body_b64" if isinstance(doc, dict) and doc.get("body_b64") is not None
+        else None
+    )
+    if object_storage.enabled() and body_field is not None:
         # 1) inline first — frame readable, references no R2 object yet.
         if not _frame_write_row(user_id, frame_id, ts, doc, None, None):
-            return  # DB write failed → nothing committed, R2 untouched.
+            return False  # DB write failed → nothing committed, R2 untouched.
         # 2) upload; on failure keep the inline row (frame stays readable).
         try:
-            object_storage.put_frame_body(user_id, frame_id, doc["body_ct"])
+            object_storage.put_frame_body(user_id, frame_id, doc[body_field])
         except Exception as e:  # noqa: BLE001
             log.error("[db] frame_upsert(%s,%s) R2 upload failed, leaving inline: %s",
                       user_id, frame_id, e)
-            return
+            return True
         # 3) object now exists → flip to pointer as the last durable step. If
         #    this write fails the row stays inline (readable); the uploaded
         #    object is a harmless orphan.
-        env_meta = {k: v for k, v in doc.items() if k != "body_ct"}
+        env_meta = {k: v for k, v in doc.items() if k != body_field}
+        if body_field == "body_b64":
+            env_meta["body_object_format"] = "plaintext_v1"
+            raw = base64.b64decode(str(doc[body_field]), validate=True)
+            env_meta["body_sha256"] = hashlib.sha256(raw).hexdigest()
         body_key = object_storage.frame_key(user_id, frame_id)
         _frame_write_row(user_id, frame_id, ts, None, env_meta, body_key)
-        return
-    _frame_write_row(user_id, frame_id, ts, doc, None, None)
+        return True
+    return _frame_write_row(user_id, frame_id, ts, doc, None, None)
 
 
 def frame_exists(user_id: str, frame_id: str) -> bool:
@@ -12677,10 +14141,19 @@ def perception_broadcast_meta(user_id: str) -> dict:
     }
 
 
-def frame_get(user_id: str, frame_id: str) -> dict | None:
+def frame_get(
+    user_id: str,
+    frame_id: str,
+    *,
+    unavailable_raises: bool = False,
+) -> dict | None:
     """Return the full v1 envelope, reconstructing ``body_ct`` from R2 for
     offloaded rows (``body_key`` set) and returning the inline ``doc`` for
-    legacy rows."""
+    legacy rows.
+
+    When ``unavailable_raises`` is true, storage outages are distinguished from
+    a definitive missing row or object so request handlers can return 503.
+    """
     try:
         with get_pool().connection() as conn:
             row = conn.execute(
@@ -12690,20 +14163,56 @@ def frame_get(user_id: str, frame_id: str) -> dict | None:
             ).fetchone()
     except Exception as e:
         log.error("[db] frame_get(%s,%s) failed: %s", user_id, frame_id, e)
+        if unavailable_raises:
+            raise FrameReadUnavailable("frame row read unavailable") from e
         return None
     if row is None:
         return None
     doc, env_meta, body_key = row
     if body_key:
-        body_ct = object_storage.get_frame_body(user_id, frame_id)
-        if body_ct is None:
-            # The pointer row exists but its R2 body is missing/unreadable.
+        body = None
+        for attempt in range(2):
+            try:
+                body = object_storage.get_frame_body_strict(user_id, frame_id)
+                break
+            except Exception as e:  # noqa: BLE001
+                if attempt == 0:
+                    # One fresh read covers a broken pooled connection after
+                    # the SDK's own bounded HTTP retries are exhausted.
+                    time.sleep(0.15)
+                    continue
+                log.error("[db] frame_get(%s,%s) R2 read unavailable: %s",
+                          user_id, frame_id, e)
+                if unavailable_raises:
+                    raise FrameReadUnavailable("frame body read unavailable") from e
+                return None
+        if body is None:
+            # The pointer row exists but its R2 body is definitively missing.
             # Report not-found rather than a metadata-only dict — callers treat
             # any dict as a valid envelope and would serve an undecryptable frame.
             log.error("[db] frame_get(%s,%s) R2 body missing for key %s",
                       user_id, frame_id, body_key)
             return None
-        return {**(env_meta or {}), "body_ct": body_ct}
+        out = dict(env_meta or {})
+        if out.pop("body_object_format", None) == "plaintext_v1":
+            try:
+                raw = base64.b64decode(body, validate=True)
+            except Exception:
+                log.error("[db] frame_get(%s,%s) plaintext R2 body invalid base64",
+                          user_id, frame_id)
+                return None
+            expected_size = out.get("body_size_bytes")
+            expected_sha = str(out.pop("body_sha256", "") or "")
+            if (type(expected_size) is not int or len(raw) != expected_size
+                    or not expected_sha
+                    or hashlib.sha256(raw).hexdigest() != expected_sha):
+                log.error("[db] frame_get(%s,%s) plaintext R2 integrity mismatch",
+                          user_id, frame_id)
+                return None
+            out["body_b64"] = body
+        else:
+            out["body_ct"] = body
+        return out
     return doc
 
 
@@ -13052,6 +14561,11 @@ def delete_user_data(user_id: str) -> None:
             with conn.transaction():
                 for table in tables:
                     conn.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
+                # lane_daily_rollup is deliberately NOT in the delete list:
+                # frozen cells are anonymize-merged into user_id='deleted'
+                # instead of dropped (Seven 2026-08-18) so aggregate history
+                # stays true while the per-user linkage dies with the account.
+                anonymized_cells = lane_rollup_anonymize_user(conn, user_id)
     except Exception as e:
         log.error("[db] delete_user_data(%s) failed: %s", user_id, e)
         return
@@ -13084,6 +14598,12 @@ def delete_user_data(user_id: str) -> None:
     # re-deriving it table-by-table.
     mirror_group.append(
         ("DELETE FROM tee_pending_device_migration WHERE user_id = %s", (user_id,)))
+    if anonymized_cells:
+        # Same additive merge + delete replayed on TEE: additive statements
+        # take two consistent stores to the same end state.
+        mirror_group.append(
+            (_LANE_ROLLUP_ANON_MERGE_SQL, (_LANE_ROLLUP_DELETED_USER, user_id)))
+        mirror_group.append((_LANE_ROLLUP_ANON_DELETE_SQL, (user_id,)))
     from tee_shadow import mirror
     mirror.execute_many(mirror_group)
 

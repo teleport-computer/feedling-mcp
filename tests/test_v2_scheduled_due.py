@@ -68,47 +68,17 @@ def test_dedupes_a_user_with_two_due_timers_and_respects_limit():
     assert jobs_store.due_scheduled_users(now=200.0, limit=0) == []
 
 
-def test_failure_backoff_defers_timer_until_expiry_or_real_user_input():
+def test_payment_cooldown_defers_timer_but_heartbeat_backoff_does_not():
     uid = "u_due_backoff"
     conftest.seed_user(uid)
-    conftest.set_v2_runtime_owner(uid)
     _append(uid, "t1", {"status": "pending", "due_at": 100.0})
-    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
-    job = jobs_store.claim_next_job("scheduled-backoff")
-    assert int(job["id"]) == int(job_id)
-    assert jobs_store.mark_failed(
-        job_id,
-        "wake_failed:runtimeerror",
-        claimed_by="scheduled-backoff",
-        wake_backoff_base_sec=100,
-        wake_backoff_cap_sec=100,
-        wake_backoff_now=150.0,
-    )
+    jobs_store.upsert_wake_schedule(uid, payment_cooldown_until=250.0)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_wake_schedule SET proactive_backoff_until=to_timestamp(%s), "
+            "proactive_fail_streak=7 WHERE user_id=%s",
+            (9_999.0, uid),
+        )
 
     assert jobs_store.due_scheduled_users(now=200.0) == []
     assert jobs_store.due_scheduled_users(now=251.0) == [uid]
-
-    second_id, _ = jobs_store.enqueue_job(uid, "scheduled")
-    second = jobs_store.claim_next_job("scheduled-backoff-2")
-    assert int(second["id"]) == int(second_id)
-    assert jobs_store.mark_failed(
-        second_id,
-        "wake_failed:runtimeerror",
-        claimed_by="scheduled-backoff-2",
-        wake_backoff_base_sec=100,
-        wake_backoff_cap_sec=100,
-        wake_backoff_now=300.0,
-    )
-    db.chat_append_strict(
-        uid,
-        "scheduled-user-reset",
-        time.time(),
-        {
-            "id": "scheduled-user-reset",
-            "role": "user",
-            "source": "chat",
-            "body_ct": "test-ciphertext",
-        },
-        5000,
-    )
-    assert jobs_store.due_scheduled_users(now=301.0) == [uid]

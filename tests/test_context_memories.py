@@ -19,12 +19,29 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 # Pure-function module — zero native deps, imports cleanly anywhere Python runs.
-from context_memory_selection import (  # noqa: E402
+from memory import card_shape  # noqa: E402
+from memory_garden.scoring.relevance import (  # noqa: E402
     char_bigrams as _char_bigrams,
     bigram_jaccard as _bigram_jaccard,
-    select_context_memories as _select_context_memories,
-    select_context_memories_with_trace as _select_context_memories_with_trace,
+    select_context_memories as _kernel_select,
+    select_context_memories_with_trace as _kernel_select_with_trace,
 )
+
+
+# 2026-08-17 边界整理：内核只认翻译后的卡，且生命周期过滤归宿主。
+# 在这层包住，34 个调用点就都自动走真实的三段式：
+#     宿主过滤 → 宿主翻译 → 内核挑卡
+# 这样测试跑的路径和线上完全一致 —— 而不是绕过入口直接喂内核。
+def _for_garden(moments: list[dict]) -> list[dict]:
+    return [card_shape.to_garden_card(m) for m in moments if not card_shape.is_retired(m)]
+
+
+def _select_context_memories(moments, *args, **kwargs):
+    return _kernel_select(_for_garden(moments), *args, **kwargs)
+
+
+def _select_context_memories_with_trace(moments, *args, **kwargs):
+    return _kernel_select_with_trace(_for_garden(moments), *args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -39,15 +56,22 @@ def _moment(
     occurred_at: str = "2026-01-01T00:00:00",
     created_at: str = "2026-01-01T00:00:00",
     type: str = "",
+    source: str = "",
 ) -> dict:
-    return {
+    # 工厂产出**原始卡**（io 的老形状）。翻译不在这里做 ——
+    # 2026-08-17 踩过：工厂里翻译会让后续加的 is_archived / source 落在
+    # 翻译产物上，把「归档过滤必须在翻译之前」这个真实入口问题掩盖掉。
+    # 正确顺序见 _for_garden()：过滤 → 翻译 → 挑卡，与线上一致。
+    return ({
         "id": id,
         "title": title,
         "description": description,
         "type": type,
         "occurred_at": occurred_at,
         "created_at": created_at,
-    }
+        "source": source,
+    })
+
 
 
 def _retrieval_fixture_moments() -> list[dict]:
@@ -112,16 +136,16 @@ def _retrieval_fixture_moments() -> list[dict]:
                 id="correction_global",
                 title="用户更新称呼边界",
                 description="以后不要再叫用户老师。",
+                source="model_api_correction",
             ),
-            "source": "model_api_correction",
         },
         {
             **_moment(
                 id="correction_lemon",
                 title="柠檬茶纠正",
                 description="用户纠正过柠檬茶不是冰的。",
+                source="model_api_correction",
             ),
-            "source": "model_api_correction",
         },
     ]
 
@@ -253,6 +277,26 @@ def test_select_orders_recent_by_created_at_desc():
     assert [m["id"] for m in out[:2]] == ["newest", "newer"]
 
 
+def test_select_recent_compares_created_at_instants_not_strings():
+    moments = [
+        _moment(
+            id="older_offset",
+            title="older",
+            created_at="2026-08-13T20:00:00+08:00",
+        ),
+        _moment(
+            id="newer_z",
+            title="newer",
+            created_at="2026-08-13T13:00:00Z",
+        ),
+        _moment(id="bad", title="bad", created_at="garbage"),
+    ]
+
+    out = _select_context_memories(moments, "")
+
+    assert [m["id"] for m in out] == ["newer_z", "older_offset"]
+
+
 def test_select_handles_500_cards_under_budget():
     # Stress: 500 cards, request still completes quickly. Time budget
     # is generous (this asserts < 1 second; in practice << 100 ms).
@@ -289,9 +333,31 @@ def test_select_caps_turning_points_at_3():
         for i in range(5)
     ]
     out = _select_context_memories(moments, "")
-    turning_ids = [m["id"] for m in out if m["title"].startswith("转折｜")]
+    # 2026-08-17 边界整理：内核拿到的是翻译产物，没有 title —— 角色改看 roles。
+    # 「靠标题前缀认转折卡」的识别逻辑已收到宿主侧（card_shape.roles_of）。
+    turning_ids = [m["id"] for m in out if "turning_point" in (m.get("roles") or [])]
     # Top 3 by occurred_at desc should be t4, t3, t2
     assert turning_ids[:3] == ["t4", "t3", "t2"]
+
+
+def test_turning_points_compare_instants_and_put_garbage_last():
+    moments = [
+        _moment(id="bad", title="转折｜bad", occurred_at="garbage"),
+        _moment(
+            id="older_offset",
+            title="转折｜older",
+            occurred_at="2026-08-13T20:00:00+08:00",
+        ),
+        _moment(id="newer_z", title="转折｜newer", occurred_at="2026-08-13T13:00:00Z"),
+        _moment(id="date_only", title="转折｜date", occurred_at="2026-08-13"),
+    ]
+
+    out = _select_context_memories(moments, "")
+    # 2026-08-17 边界整理：内核拿到的是翻译产物，没有 title —— 角色改看 roles。
+    # 「靠标题前缀认转折卡」的识别逻辑已收到宿主侧（card_shape.roles_of）。
+    turning_ids = [m["id"] for m in out if "turning_point" in (m.get("roles") or [])]
+
+    assert turning_ids[:3] == ["newer_z", "older_offset", "date_only"]
 
 
 def test_model_api_mode_skips_unrelated_recent_cards_and_keeps_corrections():
@@ -314,8 +380,8 @@ def test_model_api_mode_skips_unrelated_recent_cards_and_keeps_corrections():
                 title="用户更新了 AI 设定",
                 description="以后不要再使用烂梗王设定。",
                 created_at="2026-06-04T12:00:00",
+                source="model_api_correction",
             ),
-            "source": "model_api_correction",
         },
     ]
 
@@ -553,8 +619,7 @@ def test_model_api_mixed_alias_handles_spaces_between_chinese_and_english():
 def test_model_api_keeps_at_most_two_global_corrections():
     moments = [
         {
-            **_moment(id=f"corr{i}", title=f"边界更新 {i}", description=f"以后不要再使用称呼 {i}。"),
-            "source": "model_api_correction",
+            **_moment(id=f"corr{i}", title=f"边界更新 {i}", description=f"以后不要再使用称呼 {i}。", source="model_api_correction"),
         }
         for i in range(4)
     ]
@@ -567,6 +632,42 @@ def test_model_api_keeps_at_most_two_global_corrections():
 
     assert len(out) == 2
     assert all(m["id"].startswith("corr") for m in out)
+
+
+def test_model_api_correction_tuple_compares_created_at_instants():
+    moments = [
+        {
+            **_moment(
+                id="bad",
+                title="称呼边界",
+                description="以后不要再使用旧称呼。",
+                created_at="garbage",
+                source="model_api_correction",
+            ),
+        },
+        {
+            **_moment(
+                id="older_offset",
+                title="称呼边界",
+                description="以后不要再使用旧称呼。",
+                created_at="2026-08-13T20:00:00+08:00",
+                source="model_api_correction",
+            ),
+        },
+        {
+            **_moment(
+                id="newer_z",
+                title="称呼边界",
+                description="以后不要再使用旧称呼。",
+                created_at="2026-08-13T13:00:00Z",
+                source="model_api_correction",
+            ),
+        },
+    ]
+
+    out = _select_context_memories(moments, "今天聊点别的", mode="model_api")
+
+    assert [m["id"] for m in out] == ["newer_z", "older_offset"]
 
 
 def test_model_api_keeps_at_most_three_query_relevant_cards():
@@ -582,6 +683,39 @@ def test_model_api_keeps_at_most_three_query_relevant_cards():
     )
 
     assert len(out) == 3
+
+
+def test_model_api_query_tuple_compares_occurred_at_instants():
+    moments = [
+        _moment(
+            id="bad",
+            title="柠檬茶",
+            description="用户喜欢柠檬茶。",
+            occurred_at="garbage",
+        ),
+        _moment(
+            id="older_offset",
+            title="柠檬茶",
+            description="用户喜欢柠檬茶。",
+            occurred_at="2026-08-13T20:00:00+08:00",
+        ),
+        _moment(
+            id="newer_z",
+            title="柠檬茶",
+            description="用户喜欢柠檬茶。",
+            occurred_at="2026-08-13T13:00:00Z",
+        ),
+        _moment(
+            id="date_only",
+            title="柠檬茶",
+            description="用户喜欢柠檬茶。",
+            occurred_at="2026-08-13",
+        ),
+    ]
+
+    out = _select_context_memories(moments, "柠檬茶", mode="model_api")
+
+    assert [m["id"] for m in out] == ["newer_z", "older_offset", "date_only"]
 
 
 def test_model_api_archived_cards_are_excluded_even_when_strong_match():
@@ -679,6 +813,28 @@ def test_strict_index_sample_excludes_selected_and_lists_rest():
     for item in index:  # compact shape only — no description/body
         assert set(item.keys()) == {"id", "type", "title", "occurred_at"}
     assert index[0]["id"] == "b"  # turning point sorts to the front
+
+
+def test_strict_index_tuple_compares_occurred_at_instants_and_garbage_last():
+    moments = [
+        _index_card("bad", "unrelated bad", "garbage"),
+        _index_card("older_offset", "unrelated older", "2026-08-13T20:00:00+08:00"),
+        _index_card("newer_z", "unrelated newer", "2026-08-13T13:00:00Z"),
+        _index_card("date_only", "unrelated date", "2026-08-13"),
+    ]
+
+    _selected, trace = _select_context_memories_with_trace(
+        moments,
+        "zzqqplugh",
+        mode="model_api",
+    )
+
+    assert [item["id"] for item in trace["index_sample"]] == [
+        "newer_z",
+        "older_offset",
+        "date_only",
+        "bad",
+    ]
 
 
 def test_strict_index_sample_capped_at_20():

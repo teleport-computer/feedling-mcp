@@ -372,6 +372,15 @@ def test_chat_memory_and_perception_contracts_are_concrete(
 
     response_sources = schemas["ChatResponseRequest"]["properties"]["source"]["enum"]
     assert "resident_maintenance" in response_sources
+    bootstrap_error = schemas["ChatBootstrapIncompleteResponse"]
+    assert set(bootstrap_error["required"]) == {"error", "stage", "retryable"}
+    assert bootstrap_error["properties"]["retryable"]["type"] == "boolean"
+    response_409 = operations[("post", "/v1/chat/response")]["responses"]["409"]
+    response_409_schema = response_409["content"]["application/json"]["schema"]
+    assert {item["$ref"] for item in response_409_schema["anyOf"]} == {
+        "#/components/schemas/ChatBootstrapIncompleteResponse",
+        "#/components/schemas/ErrorResponse",
+    }
 
     poll_query = _parameters(operations[("get", "/v1/chat/poll")], "query")
     assert set(poll_query) == {"since", "timeout", "consumer_id", "claim"}
@@ -428,10 +437,37 @@ def test_conditional_payloads_and_review_contract_match_runtime(
 ) -> None:
     schemas = public_schema["components"]["schemas"]
 
+    # v6：内容加密改成每用户偏好，信封因此有两种形状。密文分支的既有约束
+    # （shared ⇒ 必须有 K_enclave）不能松，明文分支必须钉死 shared——local_only
+    # 靠的是没有 K_enclave，一行明文服务端天然读得到，标成 local_only 等于给
+    # 用户一个假的隐私承诺。
     for schema_name in ("EncryptedEnvelope", "MemoryEnvelope"):
         envelope = schemas[schema_name]
-        assert envelope["if"]["properties"]["visibility"] == {"const": "shared"}
-        assert envelope["then"]["required"] == ["K_enclave"]
+        branches = {branch["title"]: branch for branch in envelope["oneOf"]}
+        expected = {"Encrypted body", "Plaintext body"}
+        if schema_name == "EncryptedEnvelope":
+            expected.add("Binary plaintext body")
+        assert set(branches) == expected
+
+        sealed = branches["Encrypted body"]
+        assert sealed["required"] == ["body_ct", "nonce", "K_user"]
+        assert sealed["if"]["properties"]["visibility"] == {"const": "shared"}
+        assert sealed["then"]["required"] == ["K_enclave"]
+
+        plain = branches["Plaintext body"]
+        assert plain["required"] == ["body"]
+        assert plain["properties"]["visibility"] == {"const": "shared"}
+
+        if schema_name == "EncryptedEnvelope":
+            binary = branches["Binary plaintext body"]
+            assert binary["required"] == ["body_b64"]
+            assert binary["properties"]["visibility"] == {"const": "shared"}
+            assert envelope["properties"]["body_b64"]["format"] == "byte"
+
+        # 顶层必填只剩两种形状共有的字段。
+        assert "body_ct" not in envelope["required"]
+        assert {"visibility", "owner_user_id"} <= set(envelope["required"])
+
         assert envelope["example"]["visibility"] == "shared"
         assert envelope["example"]["K_enclave"]
 
@@ -489,6 +525,8 @@ def test_memory_actions_response_exposes_independent_item_outcomes(
     assert {"error", "detail"} <= set(schema["properties"])
     result_schema = public_schema["components"]["schemas"]["MemoryActionResult"]
     assert {"status", "http_status"} <= set(result_schema["required"])
+    action_type = public_schema["components"]["schemas"]["MemoryAction"]["properties"]["type"]
+    assert "always create a new card" in action_type["description"]
 
 
 def test_dream_status_documents_monotonic_capture_banner_fields(

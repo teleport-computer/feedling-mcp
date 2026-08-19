@@ -197,6 +197,30 @@ def test_supervisor_snapshot_preserves_identity_and_discards_late_generation():
     assert sup.snapshot() == current
 
 
+def test_first_valid_child_message_marks_startup_complete(monkeypatch):
+    clock = {"now": 150.0}
+    monkeypatch.setattr(child_supervisor_module.time, "monotonic", lambda: clock["now"])
+    sup = ChildSupervisor(_fake_target_idle_only, liveness_timeout_sec=5.0)
+    sup._slot_generation = "g8"
+    sup._started_at = 100.0
+    sup._last_progress_at = 100.0
+    sup._last_slot_progress_at = 100.0
+    sup._proc = type("AliveProcess", (), {"is_alive": lambda self: True})()
+
+    booting = sup.poll_liveness()
+    assert booting["startup_complete"] is False
+    assert booting["startup_age_sec"] == pytest.approx(50.0)
+
+    sup._handle_message(slot_protocol.encode_message(current := slot_protocol.SlotProgress(
+        "heavy-0", "g8", 150.0, None, "idle", None
+    )))
+
+    ready = sup.poll_liveness()
+    assert ready["startup_complete"] is True
+    assert ready["startup_age_sec"] == pytest.approx(50.0)
+    assert sup.snapshot() == current
+
+
 def test_supervisor_routes_duplex_enclave_grant_and_release_by_generation():
     parent, child = multiprocessing.Pipe(duplex=True)
     broker = enclave_broker.EnclaveBroker(

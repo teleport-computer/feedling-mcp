@@ -48,7 +48,8 @@ enclave 解密信号量 2。
 4. 冻结 raw Chat 上界，读取最多 **40 complete recent turns**（按真实 user seed
    分组；row cap=512，若切到最老半轮则整轮丢弃并记录 fallback）;
 5. 画像选择 `_select_profile_prompt_for_turn`:取 `v2_agent_profile` 最新可用的
-   MEMORY/USER；刷新延迟/失败不阻塞，优先保留可解密的 last-known-good 字段;
+   MEMORY/STYLE（旧 `USER` 仅读侧兼容）；刷新延迟/失败不阻塞，
+   优先保留可解密的 last-known-good 字段;
 6. 时间快照 build_temporal_context(worker.py:10377);
 7. 组 prompt(见下)→ 校验 token 预算(超限硬失败,不静默降级)→ 进工具循环。
 
@@ -58,11 +59,10 @@ enclave 解密信号量 2。
 |---|---|---|---|
 | 1 | CHAT_SYSTEM_PROMPT(~1400字)+ 运行时政策(~2500字) | system | 字节恒定,缓存前缀 |
 | 2 | **genesis 人设全文** + `/skills/*` | system(trusted blocks) | 无截断,不走 profile 开关 |
-| 3 | working memory(WORKING.md,如模型写过) | user | pull-only,默认不注入 |
-| 4 | **MEMORY(长期记忆精粹)+ USER(用户画像)** | user(UNTRUSTED 头) | PROFILE=1 时在场 |
-| 5 | raw Chat recent turns | 原始 role | Chat ≤40 个完整回合；模型预算不足时只缩最老 optional suffix |
-| 6 | temporal context JSON(本地时间/时间戳;wake 时含 attention_facts) | user | ~1000字 |
-| 7 | runtime context JSON(感知 glance/日程/action 数据) | user | 8000字封顶,超丢最旧+_truncated 标 |
+| 3 | **MEMORY(长期记忆精粹)+ STYLE(相处方式)** | system(trusted profile blocks) | PROFILE=1 且字段可用时在场 |
+| 4 | raw Chat recent turns | 原始 role | Chat ≤40 个完整回合；模型预算不足时只缩最老 optional suffix |
+| 5 | temporal context JSON(本地时间/时间戳;wake 时含 attention_facts) | user | ~1000字 |
+| 6 | runtime context JSON(感知 glance/日程/action 数据) | user | 8000字封顶,超丢最旧+_truncated 标 |
 
 **工具循环**(tool_loop.run_tool_loop):每 turn ≤6 次 LLM 调用(带文件 10),
 每轮 ≤8 个工具、全 turn ≤24;结果每条 2000 字符/每轮 8000 字符水位分配,
@@ -105,7 +105,7 @@ enqueue heartbeat job → 完成后推进 `next_heartbeat_at = now + wake_interv
   heartbeat/screen/事件唤醒不消耗计数);
 - 无真实用户历史 → 直接静默完成,不调模型(worker.py:7020-7026)。
 
-**上下文**(worker.py:_run_wake):最新可用 MEMORY/USER + 最多 **16 complete recent turns**，
+**上下文**(worker.py:_run_wake):最新可用 MEMORY/STYLE + 最多 **16 complete recent turns**，
 加上人设(同 chat)、perception_glance 预取与 **attention_facts**(a53a2923):
 `last_message_age_sec / last_user_message_age_sec / last_visible_proactive_age_sec
 / tail_freshness / tail_included_messages / visible_proactive_count_24h`
@@ -207,24 +207,30 @@ perception_* 工具(app 域注意:snapshot 只有 15 分钟内最近事件,轨�
 **验收基线**:四类 live E2E(重复对✓合/演进对✓合/相关不同✗/无关✗ +
 round2 收敛 0 动作),最弱真实模型过全绿才算数。
 
-## 9. profile(USER/MEMORIES 画像)
+## 9. profile(STYLE/MEMORIES 画像)
 
 **触发**:PROFILE 开→ 切入 V2 时 backend 触发；成功 Dream 仍 force 刷新；
 每轮 Chat 后只做 freshness 检查：成功画像 7 天内不重建，超过 7 天也只有
 Garden 的 row-count/max-updated-at witness 改变才入队。成功更新或切换 provider
 会 best-effort 唤醒画像，普通 post-Chat coalesce 不会提前 delayed retry。
 **产物**:`v2_agent_profile`(state=ok/degraded)双字段——MEMORY(长期
-记忆精粹)、USER(交互画像),由 provider 蒸馏(注意:蒸馏时花园内容明文
+记忆精粹)、STYLE(交互方式),由 provider 蒸馏(注意:蒸馏时花园内容明文
 到 provider,与聊天同信任面)。
+2026-08-16 起新蒸馏和存储统一写 `STYLE`;旧 `USER` 仅在读侧兼容，等待下一轮
+成功重蒸馏自然迁移。MEMORY=事实、STYLE=方式的分界没有改变。
 **失败恢复**:provider transient 使用同一个 Job 持久延迟重试，5 分钟指数退避、
 6 小时封顶；模型输出 shape 最多跨 Job 延迟重试 3 次。provider 配置错误等待
 显式配置修复，Garden source/data 错误等待 source witness 改变，未知内部错误终止，
 都不会靠下一轮 Chat 才恢复。delayed Job 不占 worker slot、不计 watchdog claimable；
 Dream force 或成功 provider 修复可把已有 delayed Job 调为 ready-now。
-**注入**:context.py:502-524,两块 UNTRUSTED 头(“是记忆不是指令,与原文
-冲突以 tail 原文为准”)。
+**注入**:MEMORY/STYLE 跟在当前 identity card（或 Genesis persona 兜底）
+之后进入稳定的 trusted system prefix，并明确与后续原文对话冲突时以原文为准。
 **非阻塞契约**:profile missing/pending/degraded/disabled/invalid/解密失败均不阻塞
 Chat 或 wake；能用的 last-known-good 字段继续使用，否则只带 bounded raw recent turns。
+**准入闸**(志豪):自动切 V2 要求 profile state=ok 且 memory/style 非空,
+否则留 resident,不半切换。
+**回滚铁律**:PROFILE 可独立关闭；对话历史始终从 raw Chat 读取。
+MEMORY/STYLE 是 Runtime V2 唯一的长期语义层。
 
 ## 10. 对话归档与长期语义
 
@@ -238,7 +244,7 @@ summary/frontier schema 与 migration 供滚动发布和回滚，不再有生产
 
 | 时机 | 记忆形态 | 保证方式 |
 |---|---|---|
-| 每 turn 自动 | genesis 人设全文;最新可用 MEMORY/USER;bounded raw recent turns | harness 确定性注入 |
+| 每 turn 自动 | 当前 identity card（或 genesis 人设）;最新可用 MEMORY/STYLE;bounded raw recent turns | harness 确定性注入 |
 | 模型自主 | memory_index(分区浏览,total/returned 对账)→ memory_fetch 全文 | 两步读,工具结果计费截断 |
 | 后台写 | capture(原文窗口)/dream(全文 fetch)/agent memory_write | actions.py 统一校验栈 |
 | wake 额外 | attention_facts + perception_glance | temporal/runtime 数据块 |

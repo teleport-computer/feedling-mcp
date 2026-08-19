@@ -13,9 +13,9 @@
 """
 from __future__ import annotations
 
-from memory import card_guard
-from memory.card_text import extract_json_block, sanitize_card_labels
-from memory.prompts_v1 import COMMON_BUCKETS_GUIDANCE_V1
+from ..text import card_guard
+from ..text.card_text import extract_json_block, sanitize_card_labels
+from .buckets import COMMON_BUCKETS_GUIDANCE_V1
 
 _MIGRATE_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。现在是一段安静的时间，没人在和你说话。
 你在把一些**旧格式**的记忆卡整理成新格式。这不是重新理解、不是合并、不是新增——
@@ -70,9 +70,12 @@ def build_migrate_prompt(
 ) -> str:
     """Render the migration prompt. Callers pass already-rendered strings
     (handler decides formatting/truncation of the batch + the bucket/thread vocab)."""
+    prompt_user_name = str(user_name or "").strip()
+    if prompt_user_name.casefold() == "ta":
+        prompt_user_name = "这个人"
     return _MIGRATE_PROMPT_TEMPLATE.format(
         ai_name=(ai_name or "我").strip(),
-        user_name=(user_name or "TA").strip(),
+        user_name=prompt_user_name or "这个人",
         old_cards=old_cards or "（没有要升级的卡）",
         vocab=vocab or "（暂无已有桶/线索）",
         common_buckets=COMMON_BUCKETS_GUIDANCE_V1,

@@ -9,7 +9,7 @@ tested by earlier tasks:
     replication (hits the enclave for real decrypts).
   - ``tee_shadow.verify.run`` — read-only sampled consistency check.
   - ``tee_shadow.snapshot.snapshot_all`` / ``snapshot_table`` — SNAPSHOT lane
-    full-table TRUNCATE+COPY atomic replace.
+    full-table staged primary-key merge.
 
 This module owns no business logic of its own beyond the execution
 guardrails (spec §5 四要素): a literal ``confirm == "MIGRATE"`` gate on any
@@ -28,6 +28,7 @@ revisit (background job + status polling) if user count grows.
 from __future__ import annotations
 
 import os
+import math
 import threading
 
 from tee_replicator import worker as tee_worker
@@ -35,7 +36,7 @@ from tee_shadow import mirror
 from tee_shadow import reconciler as tee_reconciler
 from tee_shadow import verify as tee_verify
 
-_ACTIONS = ("reconcile", "replicate", "verify", "snapshot")
+_ACTIONS = ("reconcile", "replicate", "reflow", "prune", "verify", "snapshot")
 
 # Non-blocking guard: two concurrent /run calls must not stomp on each other
 # (reconcile/replicate both do multi-statement writes against the TEE pool).
@@ -69,7 +70,7 @@ def _require_tee_configured() -> None:
         raise Unconfigured()
 
 
-def _validate(action: str, table: str | None, dry_run) -> None:
+def _validate(action: str, table: str | None, dry_run, expected_stale=None, qps=None) -> None:
     if action not in _ACTIONS:
         raise BadRequest("unknown_action")
     # Strict bool: JSON strings like "false" are truthy in Python, which would
@@ -78,11 +79,36 @@ def _validate(action: str, table: str | None, dry_run) -> None:
         raise BadRequest("invalid_dry_run")
     if action == "reconcile" and table is not None and table not in tee_reconciler.TABLES:
         raise BadRequest("unknown_table")
-    if action == "replicate":
+    if action in ("replicate", "reflow", "prune"):
         if not table:
             raise BadRequest("table_required")
         if table not in tee_worker._TABLES:
             raise BadRequest("unknown_table")
+    if action == "reflow":
+        from tee_replicator import reflow as tee_reflow
+
+        if table not in tee_reflow.SUPPORTED_TABLES:
+            raise BadRequest("unsupported_reflow_table")
+    if action == "prune":
+        from tee_shadow import ciphertext_prune
+
+        if table not in ciphertext_prune.prunable_tables():
+            raise BadRequest("unsupported_prune_table")
+    if expected_stale is not None and (
+        isinstance(expected_stale, bool)
+        or not isinstance(expected_stale, int)
+        or expected_stale < 0
+    ):
+        raise BadRequest("invalid_expected_stale")
+    if expected_stale is not None and action not in ("reflow", "prune"):
+        raise BadRequest("invalid_expected_stale")
+    if action == "reflow" and qps is not None and (
+        isinstance(qps, bool)
+        or not isinstance(qps, (int, float))
+        or not math.isfinite(qps)
+        or qps < 0
+    ):
+        raise BadRequest("invalid_qps")
     if action == "snapshot" and table is not None:
         from tee_shadow import table_registry as reg
 
@@ -98,6 +124,7 @@ def run_action(
     confirm: str | None = None,
     qps: float | None = None,
     sample_rate: float | None = None,
+    expected_stale: int | None = None,
 ) -> dict:
     """Validate + dispatch one admin-triggered replication action.
 
@@ -105,7 +132,7 @@ def run_action(
     violations; otherwise returns the operation's report dict with
     ``action``/``dry_run`` echoed in.
     """
-    _validate(action, table, dry_run)
+    _validate(action, table, dry_run, expected_stale, qps)
     if action != "verify" and not dry_run and confirm != "MIGRATE":
         raise BadRequest("confirm_required")
     # A dry-run reconcile never touches the TEE pool (plan-only short-circuit),
@@ -121,6 +148,22 @@ def run_action(
             report = _run_reconcile(table=table, dry_run=dry_run)
         elif action == "replicate":
             report = _run_replicate(table=table, dry_run=dry_run, qps=qps)
+        elif action == "reflow":
+            from tee_replicator import reflow as tee_reflow
+
+            kwargs = {"dry_run": dry_run, "expected_stale": expected_stale}
+            if qps is not None:
+                kwargs["qps"] = qps
+            report = tee_reflow.reflow_table(table, **kwargs)
+        elif action == "prune":
+            from tee_shadow import ciphertext_prune
+
+            report = ciphertext_prune.prune_table(
+                table, dry_run=dry_run, expected_stale=expected_stale
+            )
+            failures = int(bool(report.get("error"))) + int(bool(report.get("refused")))
+            report["failures"] = failures
+            report["ok"] = failures == 0
         elif action == "snapshot":
             from tee_shadow import snapshot as tee_snapshot
 
@@ -134,7 +177,7 @@ def run_action(
                 # `dry_run=payload.get("dry_run", True)`，默认 True。
                 # 少了这条短路，一个 `{"action": "snapshot"}` 的探测请求（admin 按
                 # reconcile/replicate 的既有习惯，会以为这是安全的演练）就会直接对
-                # TEE 侧 25 张表做真实 TRUNCATE+COPY，且绕过全部确认门。
+                # TEE 侧 25 张表做真实 stage+merge，且绕过全部确认门。
                 tables = list(tee_snapshot.snapshot_order()) if table is None else [table]
                 report = {"planned": tables, "tables": [], "copied": 0, "failures": 0}
             else:

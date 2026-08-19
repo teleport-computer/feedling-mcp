@@ -2,6 +2,7 @@
 all side effects injected. One loop for every model — no is_official branch."""
 
 from __future__ import annotations
+from collections.abc import Callable
 from dataclasses import dataclass
 import inspect
 import json
@@ -14,6 +15,7 @@ from capabilities import tool_schema
 from core import protocol_leak
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import provenance
+from model_api_runtime.v2 import tool_surface
 import provider_client
 
 
@@ -69,6 +71,11 @@ _FILE_DELIVERY_TOOLS = frozenset(
         tool_schema.FILE_REPLY_TOOL,
     }
 )
+# These wires accept the OpenAI-style named-function ``tool_choice`` payload.
+# Other providers may expose tools but do not accept this exact forcing shape.
+_NAMED_TOOL_CHOICE_PROVIDERS = frozenset(
+    {"openai", "openrouter", "openai_compatible", "deepseek", "anthropic", "gemini", "bedrock"}
+)
 _EMPTY_RESPONSE_CORRECTION = (
     "The previous response completed without visible text or a client tool call. "
     "Complete the user's request now. Return either non-empty visible answer text "
@@ -97,6 +104,28 @@ _CONTENT_FREE_STOP_REASONS = frozenset(
         "stop_sequence",
         "tool_calls",
         "tool_use",
+    }
+)
+# These values are emitted by the provider-surface callback and later summarized
+# for admin diagnostics.  Keep the producer vocabulary here, beside the state
+# machine that creates it; worker/admin consume these sets instead of copying
+# telemetry enums that can silently drift apart.
+_PROVIDER_TERMINAL_TEXT_ROUND_REASONS = frozenset(
+    {
+        "none",
+        "force_text_fallback",
+        "final_reply_correction",
+        "max_calls",
+        "other",
+    }
+)
+_PROVIDER_FORCE_TEXT_FALLBACK_REASONS = frozenset(
+    {
+        "none",
+        "tool_schema_rejected",
+        "final_reply_correction",
+        "invalid_or_over_budget_tool_exchange",
+        "other",
     }
 )
 
@@ -447,6 +476,27 @@ class ProviderEmptyReply(RuntimeError):
     """A structurally valid provider success had no foreground-usable output."""
 
 
+@dataclass(frozen=True)
+class FinalReplyCorrectionRequest:
+    """Ask the loop for one text-only rewrite before publishing a final reply.
+
+    ``original_text`` is the caller's pre-publication provider text.  It stays
+    private to the loop and is published unchanged if the bounded rewrite is
+    unusable.  Only foreground Chat returns this marker; other lanes keep the
+    historical ``on_reply -> None`` contract.
+    """
+
+    instruction: str
+    original_text: str
+    original_reasoning: str = ""
+    on_cancel: Callable[[], None] | None = None
+
+
+@dataclass(frozen=True)
+class FinalReplyCorrectionRejected:
+    """The one rewrite was usable text but failed the caller's acceptance gate."""
+
+
 def _empty_response_shape(pr: ProviderResponse) -> dict[str, object]:
     """Return content-free diagnostics for a provider success with no output."""
     raw_stop_reason = str(pr.raw.get("stop_reason") or "").strip().lower()
@@ -493,11 +543,13 @@ async def run_tool_loop(
     build_messages,
     dispatch_tools,
     on_reply,
+    on_promote_last_intermediate=None,
     fold_new_messages,
     add_usage,
     max_calls: int,
     before_provider_call=None,
     on_provider_tool_surface=None,
+    on_empty_provider_response=None,
     on_provider_success=None,
     on_provider_failure=None,
     fold_before_first: bool = False,
@@ -505,6 +557,11 @@ async def run_tool_loop(
     on_trajectory_event=None,
     extra_tool_specs=None,
     refresh_extra_tool_specs=None,
+    refresh_pressure_collapsed_extra_tool_specs=None,
+    refresh_protected_extra_tool_names=None,
+    extra_tool_recovery_name: str = "",
+    extra_tool_recovery_active=None,
+    on_extra_tool_surface_plan=None,
     extra_mutating_tool_names=None,
     disabled_tool_names=None,
     # Wake turns retain memory add/update but must never be offered delete.
@@ -512,6 +569,7 @@ async def run_tool_loop(
     # dispatch_tools closure; this parameter controls only the provider surface.
     memory_delete_allowed: bool = False,
     allow_reply_tool: bool = True,
+    on_stay_silent=None,
     include_reasoning: bool = False,
     # Self-authored thinking: when True, NEVER request provider-native reasoning —
     # not via include_reasoning, and NOT via reasoning_effort either. The model then
@@ -561,8 +619,14 @@ async def run_tool_loop(
     prompt_safety_margin_tokens: int | None = None,
     prompt_estimator_utf8_bytes_per_token: float = prompt_frontier.DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN,
     prompt_image_reserve_tokens: int = prompt_frontier.DEFAULT_IMAGE_RESERVE_TOKENS,
+    # Chat passes its configured policy explicitly. Other lanes retain the
+    # pressure-only behavior until they own a schema-search recovery state.
+    tool_schema_collapse_policy: str = (
+        tool_surface.COLLAPSE_POLICY_UNDER_PRESSURE
+    ),
     on_tail_window=None,
     on_prompt_frontier_exhaustion=None,
+    on_prompt_frontier_exhausted_detail=None,
 ) -> LoopOutcome:
     """Run one chronological, provider-native tool transcript.
 
@@ -585,6 +649,16 @@ async def run_tool_loop(
     write; the drain itself is `asyncio.to_thread`-offloaded on the caller's side, so
     ``on_reply`` must be awaited here, never called synchronously (a sync call would
     reintroduce the event-loop-blocking write the offload is meant to avoid).
+    Foreground Chat may instead return :class:`FinalReplyCorrectionRequest` before
+    publishing, then either publish the accepted rewrite or return
+    :class:`FinalReplyCorrectionRejected`.  The loop gives that request exactly one
+    text-only provider call and otherwise republishes the original fail-open.
+
+    Foreground Chat may also provide ``on_promote_last_intermediate``.  It is
+    consulted only after the existing one-shot semantic-empty recovery has
+    already been consumed.  A true result means the caller atomically closed
+    the turn through a previously published reply bubble; false preserves the
+    ordinary empty-reply failure.
 
     ``on_file_reply`` is an optional async chat-lane callback. When absent, the
     ``send_file`` tool is removed from the offered catalog. Production resolves
@@ -669,6 +743,8 @@ async def run_tool_loop(
     force_text_fallback_reason = ""
     empty_response_recovery_used = False
     empty_response_retry_instruction = ""
+    final_reply_correction_request: FinalReplyCorrectionRequest | None = None
+    final_reply_correction_instruction = ""
     external_content_seen = False
     mutation_outcome_unknown = False
     outbound_tools_blocked = bool(initial_outbound_tools_blocked)
@@ -753,6 +829,10 @@ async def run_tool_loop(
         disabled_names.discard(tool_schema.REPLY_TOOL)
     else:
         disabled_names.add(tool_schema.REPLY_TOOL)
+    if on_stay_silent is None:
+        disabled_names.add(tool_schema.STAY_SILENT_TOOL)
+    else:
+        disabled_names.discard(tool_schema.STAY_SILENT_TOOL)
     if on_file_reply is None:
         disabled_names.add(tool_schema.FILE_REPLY_TOOL)
     if on_image_reply is None:
@@ -828,6 +908,39 @@ async def run_tool_loop(
     def _merged_reasoning() -> str:
         return "\n\n".join(reasoning_fragments)
 
+    async def _publish_final_correction_fallback(outcome: str) -> None:
+        """Publish the saved usable answer when its one rewrite cannot be used."""
+
+        request = final_reply_correction_request
+        if request is None:
+            raise RuntimeError("final reply correction fallback without request")
+        decision = await on_reply(
+            request.original_text,
+            final=True,
+            reasoning=request.original_reasoning,
+            correction_outcome=outcome,
+        )
+        if decision is not None:
+            raise RuntimeError("final reply correction fallback was not published")
+
+    def _cancel_final_reply_correction() -> None:
+        """Drop an old-target correction when newly folded input supersedes it."""
+
+        nonlocal final_reply_correction_request
+        nonlocal final_reply_correction_instruction
+        nonlocal force_text_fallback, force_text_fallback_reason
+        request = final_reply_correction_request
+        if request is not None and request.on_cancel is not None:
+            try:
+                request.on_cancel()
+            except Exception:
+                pass
+        final_reply_correction_request = None
+        final_reply_correction_instruction = ""
+        if force_text_fallback_reason == "final_reply_correction":
+            force_text_fallback = False
+            force_text_fallback_reason = ""
+
     async def _tool_event(tc, event_kind: str, payload: dict) -> None:
         if on_tool_event is not None:
             await on_tool_event(tc, event_kind, payload)
@@ -840,6 +953,8 @@ async def run_tool_loop(
             # after-first behavior until their timestamp seam is removed.
             folded = await fold_new_messages()
             if folded:
+                if final_reply_correction_request is not None:
+                    _cancel_final_reply_correction()
                 # A newly arrived user message changes the answer target. Do not
                 # attach reasoning produced for the superseded prompt to the
                 # revised final reply.
@@ -882,14 +997,16 @@ async def run_tool_loop(
 
         messages = build_messages(list(transcript))
         turn_catalog = _turn_catalog()
-        # 三道有界纠正共用同一条临时 system suffix 注入通道：文件投递缺失、
-        # 生图谎报，以及语义空回复。各自最多打回一次，不写入 transcript。
+        # 四道有界纠正共用同一条临时 system suffix 注入通道：文件投递缺失、
+        # 生图谎报、语义空回复，以及 chat 最终回复的语言纠偏。各自最多打回
+        # 一次，不写入 transcript。
         retry_instructions = "\n\n".join(
             instruction
             for instruction in (
                 delivery_retry_instruction,
                 image_claim_retry_instruction,
                 empty_response_retry_instruction,
+                final_reply_correction_instruction,
             )
             if instruction
         )
@@ -899,7 +1016,22 @@ async def run_tool_loop(
         # a real tool_choice=none keep schemas referenced by their native history;
         # other wires omit tools as before. A 400/422 schema rejection or repeated
         # malformed call also forces this bounded fallback.
-        terminal_text_round = force_text_fallback or attempts == max_calls - 1
+        terminal_text_round = (
+            force_text_fallback
+            or final_reply_correction_request is not None
+            or attempts == max_calls - 1
+        )
+        terminal_text_round_reason = "none"
+        if terminal_text_round:
+            terminal_text_round_reason = (
+                "force_text_fallback"
+                if force_text_fallback
+                else (
+                    "final_reply_correction"
+                    if final_reply_correction_request is not None
+                    else "max_calls"
+                )
+            )
         historical_tool_names = {
             call.name
             for item in transcript
@@ -1002,7 +1134,11 @@ async def run_tool_loop(
             and not requirement_already_met
         ):
             # Keep the recovery path narrow enough for weaker tool-using models.
-            tools = [spec for spec in tools if spec.name in _FILE_DELIVERY_TOOLS]
+            tools = [
+                spec for spec in tools
+                if spec.name in _FILE_DELIVERY_TOOLS
+                or spec.name == extra_tool_recovery_name
+            ]
             surface_reason = "file_delivery_forced"
             if file_delivery_recovery_needed:
                 forced_delivery_tool = (
@@ -1010,13 +1146,53 @@ async def run_tool_loop(
                     if workspace_write_applied
                     else "workspace_write"
                 )
-                tools = [spec for spec in tools if spec.name == forced_delivery_tool]
+                tools = [
+                    spec for spec in tools
+                    if spec.name in {
+                        forced_delivery_tool,
+                        extra_tool_recovery_name,
+                    }
+                ]
         tail_window = None
         required_schema_names = (
             historical_tool_names
             if terminal_schema_guard
             else completed_memory_discovery_tools
         )
+        if forced_delivery_tool:
+            required_schema_names = set(required_schema_names) | {
+                forced_delivery_tool
+            }
+        pressure_collapsed_specs = {}
+        if refresh_pressure_collapsed_extra_tool_specs is not None:
+            try:
+                pressure_collapsed_specs = {
+                    str(name): spec
+                    for name, spec in dict(
+                        refresh_pressure_collapsed_extra_tool_specs() or {}
+                    ).items()
+                    if str(name)
+                }
+            except Exception:
+                pressure_collapsed_specs = {}
+        protected_extra_names: set[str] = set()
+        if refresh_protected_extra_tool_names is not None:
+            try:
+                protected_extra_names = {
+                    str(name)
+                    for name in (
+                        refresh_protected_extra_tool_names() or ()
+                    )
+                    if str(name)
+                }
+            except Exception:
+                protected_extra_names = set()
+        recovery_active = False
+        if extra_tool_recovery_active is not None:
+            try:
+                recovery_active = bool(extra_tool_recovery_active())
+            except Exception:
+                recovery_active = False
         adaptive_planner = getattr(build_messages, "plan_provider_round", None)
         try:
             if callable(adaptive_planner):
@@ -1024,6 +1200,11 @@ async def run_tool_loop(
                     transcript=list(transcript),
                     tools=tools,
                     required_tool_names=required_schema_names,
+                    protected_tool_names=protected_extra_names,
+                    collapsed_tool_specs=pressure_collapsed_specs,
+                    recovery_tool_name=extra_tool_recovery_name,
+                    recovery_tool_active=recovery_active,
+                    tool_schema_collapse_policy=tool_schema_collapse_policy,
                     model_limit=model_prompt_limit,
                     output_reserve_tokens=prompt_output_reserve_tokens,
                     safety_margin_tokens=prompt_safety_margin_tokens,
@@ -1037,12 +1218,24 @@ async def run_tool_loop(
                     messages=messages,
                     tools=tools,
                     required_tool_names=required_schema_names,
+                    protected_tool_names=protected_extra_names,
+                    collapsed_tool_specs=pressure_collapsed_specs,
+                    recovery_tool_name=extra_tool_recovery_name,
+                    recovery_tool_active=recovery_active,
+                    tool_schema_collapse_policy=tool_schema_collapse_policy,
                     output_reserve_tokens=prompt_output_reserve_tokens,
                     safety_margin_tokens=prompt_safety_margin_tokens,
                     utf8_bytes_per_token=prompt_estimator_utf8_bytes_per_token,
                     image_reserve_tokens=prompt_image_reserve_tokens,
                 )
-        except prompt_frontier.PromptFrontierExhausted:
+        except prompt_frontier.PromptFrontierExhausted as exc:
+            if on_prompt_frontier_exhausted_detail is not None:
+                try:
+                    emitted = on_prompt_frontier_exhausted_detail(exc)
+                    if inspect.isawaitable(emitted):
+                        await emitted
+                except Exception:
+                    pass
             if on_prompt_frontier_exhaustion is not None:
                 try:
                     on_prompt_frontier_exhaustion()
@@ -1060,13 +1253,40 @@ async def run_tool_loop(
         planned_offered_tool_names = tuple(
             getattr(frontier_plan, "offered_tool_names", ()) or ()
         )
+        if (
+            extra_tool_recovery_name
+            and not getattr(
+                frontier_plan,
+                "schema_recovery_needed",
+                getattr(frontier_plan, "mcp_recovery_needed", False),
+            )
+        ):
+            surface_candidate_tools = [
+                spec for spec in surface_candidate_tools
+                if spec.name != extra_tool_recovery_name
+            ]
         if planned_offered_tool_names:
             included_tool_names = set(planned_tool_names)
+            pressure_collapsed_names = set(
+                getattr(
+                    frontier_plan,
+                    "pressure_collapsed_tool_names",
+                    (),
+                )
+                or ()
+            )
             tools = [
-                spec
+                pressure_collapsed_specs.get(
+                    spec.name,
+                    tool_surface.collapsed_tool_spec(spec),
+                )
+                if spec.name in pressure_collapsed_names
+                else spec
                 for spec in (tools or [])
                 if spec.name in included_tool_names
             ] or None
+            if pressure_collapsed_names and not surface_reason:
+                surface_reason = "frontier_collapsed"
             if (
                 not surface_reason
                 and len(tools or []) < len(surface_candidate_tools)
@@ -1088,6 +1308,21 @@ async def run_tool_loop(
                 and len(tools or []) < len(surface_candidate_tools)
             ):
                 surface_reason = "frontier_omitted"
+        if on_extra_tool_surface_plan is not None:
+            planned = on_extra_tool_surface_plan(
+                {
+                    "pressure_collapsed_names": tuple(
+                        getattr(
+                            frontier_plan,
+                            "pressure_collapsed_tool_names",
+                            (),
+                        )
+                        or ()
+                    ),
+                }
+            )
+            if inspect.isawaitable(planned):
+                await planned
         if before_provider_call is not None:
             before_provider_call()
         if tagged_image_fallback_active:
@@ -1121,8 +1356,7 @@ async def run_tool_loop(
                 forced_delivery_tool
                 and not terminal_text_round
                 and tools is not None
-                and str(getattr(provider_config, "provider", "")).strip().lower()
-                == "openrouter"
+                and provider_name in _NAMED_TOOL_CHOICE_PROVIDERS
             ):
                 provider_kwargs["tool_choice"] = {
                     "type": "function",
@@ -1177,6 +1411,16 @@ async def run_tool_loop(
                                 mcp_candidate_names - mcp_sent_names
                             ),
                             "reason": surface_reason or "none",
+                            "terminal_text_round": terminal_text_round,
+                            "terminal_text_round_reason": (
+                                terminal_text_round_reason
+                            ),
+                            "force_text_fallback_reason": (
+                                force_text_fallback_reason or "none"
+                            ),
+                            "empty_response_recovery": bool(
+                                empty_response_retry_instruction
+                            ),
                         }
                     )
                 except Exception:
@@ -1261,6 +1505,32 @@ async def run_tool_loop(
                     await on_provider_failure(exc)
                 except Exception:
                     pass
+            if final_reply_correction_request is not None:
+                # Language correction is a best-effort polish over an already
+                # usable answer. A failed rewrite must never turn that answer
+                # into a failed Chat turn.
+                try:
+                    await _publish_final_correction_fallback("retry_error")
+                except FinalReplySuperseded:
+                    _cancel_final_reply_correction()
+                    reasoning_fragments.clear()
+                    seen_reasoning_fragments.clear()
+                    _progress("final_reply_superseded")
+                    await _trajectory(
+                        "final_reply_superseded",
+                        {"round": attempts},
+                    )
+                    if attempts < max_calls:
+                        continue
+                    return LoopOutcome(
+                        "", attempts, "input_advanced", replied_intermediate
+                    )
+                return LoopOutcome(
+                    final_reply_correction_request.original_text,
+                    attempts,
+                    "final_text",
+                    replied_intermediate,
+                )
             if (
                 file_delivery_retry_used
                 and not normalized_required_suffixes.issubset(
@@ -1371,6 +1641,55 @@ async def run_tool_loop(
         pr = ProviderResponse.from_result(result)
 
         if (
+            final_reply_correction_request is not None
+            and (not pr.text.strip() or upstream_response_envelope)
+            and not pr.tool_calls
+            and not pr.media
+        ):
+            # Do not hand an empty language rewrite to the ordinary empty-response
+            # recovery, which would create a second correction loop. The original
+            # answer is already usable, so publish it immediately instead.
+            await _trajectory(
+                "empty_provider_response",
+                {
+                    "round": attempts,
+                    "reason": (
+                        "upstream_response_envelope"
+                        if upstream_response_envelope
+                        else "empty_provider_success"
+                    ),
+                    "response_shape": _empty_response_shape(pr),
+                    "action": "language_correction_fallback",
+                },
+            )
+            if on_empty_provider_response is not None:
+                try:
+                    await on_empty_provider_response(_empty_response_shape(pr))
+                except Exception:
+                    pass
+            try:
+                await _publish_final_correction_fallback("retry_empty")
+            except FinalReplySuperseded:
+                if final_reply_correction_request is not None:
+                    _cancel_final_reply_correction()
+                reasoning_fragments.clear()
+                seen_reasoning_fragments.clear()
+                _progress("final_reply_superseded")
+                await _trajectory(
+                    "final_reply_superseded",
+                    {"round": attempts},
+                )
+                if attempts < max_calls:
+                    continue
+                return LoopOutcome("", attempts, "input_advanced", replied_intermediate)
+            return LoopOutcome(
+                final_reply_correction_request.original_text,
+                attempts,
+                "final_text",
+                replied_intermediate,
+            )
+
+        if (
             require_reply
             and (not pr.text.strip() or upstream_response_envelope)
             and not pr.tool_calls
@@ -1386,6 +1705,11 @@ async def run_tool_loop(
                 and not empty_response_recovery_used
                 and attempts < max_calls - 1
             )
+            can_attempt_promotion = bool(
+                on_promote_last_intermediate is not None
+                and empty_response_recovery_used
+                and not upstream_response_envelope
+            )
             await _trajectory(
                 "empty_provider_response",
                 {
@@ -1399,10 +1723,21 @@ async def run_tool_loop(
                     "action": (
                         "semantic_correction"
                         if can_correct
-                        else "fail_provider_empty_reply"
+                        else (
+                            "promote_intermediate_or_fail"
+                            if can_attempt_promotion
+                            else "fail_provider_empty_reply"
+                        )
                     ),
                 },
             )
+            if on_empty_provider_response is not None:
+                try:
+                    await on_empty_provider_response(_empty_response_shape(pr))
+                except Exception:
+                    # Plaintext diagnostics are best-effort and must never
+                    # alter the retry/failure decision below.
+                    pass
             if can_correct:
                 empty_response_recovery_used = True
                 empty_response_retry_instruction = (
@@ -1412,6 +1747,31 @@ async def run_tool_loop(
                 seen_reasoning_fragments.clear()
                 _progress("empty_response_retry_boundary")
                 continue
+            if can_attempt_promotion:
+                try:
+                    promoted = await on_promote_last_intermediate()
+                except FinalReplySuperseded:
+                    reasoning_fragments.clear()
+                    seen_reasoning_fragments.clear()
+                    _progress("final_reply_superseded")
+                    await _trajectory(
+                        "final_reply_superseded",
+                        {"round": attempts, "source": "intermediate_promotion"},
+                    )
+                    if attempts < max_calls:
+                        continue
+                    return LoopOutcome(
+                        "", attempts, "input_advanced", replied_intermediate
+                    )
+                if promoted:
+                    replied_intermediate = True
+                    await _trajectory(
+                        "intermediate_reply_promoted",
+                        {"round": attempts},
+                    )
+                    return LoopOutcome(
+                        "", attempts, "intermediate_promoted", True
+                    )
             exc = ProviderEmptyReply("empty_reply")
             if on_provider_failure is not None:
                 try:
@@ -1581,8 +1941,70 @@ async def run_tool_loop(
                 }
                 if pr.media:
                     reply_kwargs["media"] = pr.media
-                await on_reply(pr.text, **reply_kwargs)
+                reply_decision = await on_reply(pr.text, **reply_kwargs)
+                if isinstance(reply_decision, FinalReplyCorrectionRequest):
+                    if (
+                        final_reply_correction_request is None
+                        and attempts < max_calls
+                    ):
+                        final_reply_correction_request = reply_decision
+                        final_reply_correction_instruction = str(
+                            reply_decision.instruction or ""
+                        ).strip()
+                        if not final_reply_correction_instruction:
+                            await on_reply(
+                                reply_decision.original_text,
+                                final=True,
+                                reasoning=reply_decision.original_reasoning,
+                                correction_outcome="skipped",
+                            )
+                            return LoopOutcome(
+                                reply_decision.original_text,
+                                attempts,
+                                "final_text",
+                                replied_intermediate,
+                            )
+                        # A rewrite is not authorized to repeat tools or side
+                        # effects. Keep historical schemas only where the wire
+                        # requires them, paired with tool_choice=none.
+                        force_text_fallback = True
+                        force_text_fallback_reason = "final_reply_correction"
+                        reasoning_fragments.clear()
+                        seen_reasoning_fragments.clear()
+                        _progress("final_reply_correction_boundary")
+                        continue
+                    # No call budget (or a malformed second request): publish
+                    # the already usable original instead of failing the turn.
+                    fallback = (
+                        final_reply_correction_request or reply_decision
+                    )
+                    final_reply_correction_request = fallback
+                    await _publish_final_correction_fallback("skipped")
+                    return LoopOutcome(
+                        fallback.original_text,
+                        attempts,
+                        "final_text",
+                        replied_intermediate,
+                    )
+                if isinstance(reply_decision, FinalReplyCorrectionRejected):
+                    if final_reply_correction_request is None:
+                        raise RuntimeError(
+                            "final reply correction rejected without request"
+                        )
+                    await _publish_final_correction_fallback(
+                        "kept_original_still_mismatch"
+                    )
+                    return LoopOutcome(
+                        final_reply_correction_request.original_text,
+                        attempts,
+                        "final_text",
+                        replied_intermediate,
+                    )
+                if reply_decision is not None:
+                    raise RuntimeError("unsupported final reply decision")
             except FinalReplySuperseded:
+                if final_reply_correction_request is not None:
+                    _cancel_final_reply_correction()
                 reasoning_fragments.clear()
                 seen_reasoning_fragments.clear()
                 _progress("final_reply_superseded")
@@ -1653,11 +2075,15 @@ async def run_tool_loop(
         image_reply_calls = [
             tc for tc in pr.tool_calls if tc.name == tool_schema.IMAGE_REPLY_TOOL
         ]
+        stay_silent_calls = [
+            tc for tc in pr.tool_calls if tc.name == tool_schema.STAY_SILENT_TOOL
+        ]
         mixed_reply_write = any(
             tc.name in {
                 tool_schema.REPLY_TOOL,
                 tool_schema.FILE_REPLY_TOOL,
                 tool_schema.IMAGE_REPLY_TOOL,
+                tool_schema.STAY_SILENT_TOOL,
             }
             for tc in pr.tool_calls
         ) and any(
@@ -1667,11 +2093,15 @@ async def run_tool_loop(
         invalid_image_batch = bool(image_reply_calls) and (
             len(image_reply_calls) != 1 or len(pr.tool_calls) != 1
         )
+        invalid_silence_batch = bool(stay_silent_calls) and (
+            len(stay_silent_calls) != 1 or len(pr.tool_calls) != 1
+        )
         if (
             malformed
             or len(set(call_ids)) != len(call_ids)
             or mixed_reply_write
             or invalid_image_batch
+            or invalid_silence_batch
             or over_tool_call_budget
             or oversized_tool_exchange
         ):
@@ -1698,7 +2128,9 @@ async def run_tool_loop(
                 },
             )
             force_text_fallback = True
-            force_text_fallback_reason = ""
+            force_text_fallback_reason = (
+                "invalid_or_over_budget_tool_exchange"
+            )
             continue
 
         tool_calls_used += len(pr.tool_calls)
@@ -1712,6 +2144,7 @@ async def run_tool_loop(
             tool_schema.REPLY_TOOL,
             tool_schema.FILE_REPLY_TOOL,
             tool_schema.IMAGE_REPLY_TOOL,
+            tool_schema.STAY_SILENT_TOOL,
         }
         other_calls = [tc for tc in pr.tool_calls if tc.name not in loop_reply_tools]
         reply_results: dict[str, ToolResult] = {}
@@ -1783,6 +2216,20 @@ async def run_tool_loop(
             await _tool_event(
                 tc, "tool_call_result", {"result": reply_result}
             )
+
+        for tc in stay_silent_calls:
+            reason = str(tc.args.get("reason") or "").strip()
+            await _tool_event(tc, "tool_call_started", {})
+            await _trajectory(
+                "stay_silent_planned",
+                {"round": attempts, "call_id": tc.id, "reason": reason},
+            )
+            if on_stay_silent is None:
+                raise RuntimeError("stay_silent callback is unavailable")
+            await on_stay_silent(reason)
+            silent_result = ToolResult(call_id=tc.id, content="ok: staying silent")
+            await _tool_event(tc, "tool_call_result", {"result": silent_result})
+            return LoopOutcome("", attempts, "stay_silent", replied_intermediate)
 
         for tc in file_reply_calls:
             workspace_path = str(tc.args.get("path") or "").strip()

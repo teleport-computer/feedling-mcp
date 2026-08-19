@@ -11,7 +11,7 @@ import conftest
 import db
 import provider_client
 from core import store as core_store
-from model_api_runtime.v2 import extraction, jobs_store, worker
+from model_api_runtime.v2 import extraction, jobs_store, profile_store, worker
 
 _BYOK = provider_client.ProviderConfig(
     provider="anthropic", model="claude-sonnet-4-test", api_key="sk-user", base_url="")
@@ -80,8 +80,10 @@ def _deps(**over):
             "ai_name": "小克", "user_name": "Z", "buckets": "B",
             "threads": "T", "identity": "I", "cards": "C",
             "card_items": [
-                {"id": "old-a", "summary": "计划去京都", "content": "想看红叶。"},
-                {"id": "old-b", "summary": "订了京都机票", "content": "11 月出发。"},
+                {"id": "old-a", "summary": "计划去京都", "content": "想看红叶。",
+                 "occurred_at": "2026-03-01T00:00:00Z"},
+                {"id": "old-b", "summary": "订了京都机票", "content": "11 月出发。",
+                 "occurred_at": "2026-05-01T00:00:00Z"},
             ]},
         build_memory_envelope=_envelope,
         apply_memory_actions=lambda uid, actions: {
@@ -111,6 +113,38 @@ def test_dream_is_a_lane_with_background_priority():
 
 
 @pytest.mark.parametrize("lane", ["capture", "dream"])
+def test_extraction_lane_passes_its_own_output_budget(monkeypatch, lane):
+    uid = f"u_x_budget_{lane}"
+    _seed_v2(uid)
+    jobs_store.enqueue_job(uid, lane)
+    job = jobs_store.claim_next_job("w")
+    seen = []
+
+    async def _fake_extract(**kwargs):
+        retry_prompt = kwargs["parse_retry"].build_truncation_prompt("P")
+        seen.append((kwargs["max_tokens"], retry_prompt))
+        return [], None
+
+    monkeypatch.setattr(extraction, "extract", _fake_extract)
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            _deps(),
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert len(seen) == 1
+    budget, retry_prompt = seen[0]
+    assert budget == extraction.max_output_tokens_for_lane(lane)
+    assert "截断" in retry_prompt
+    assert retry_prompt != "P"
+
+
+@pytest.mark.parametrize("lane", ["capture", "dream"])
 def test_extraction_lane_applies_actions_and_completes(monkeypatch, lane):
     uid = f"u_x_{lane}"
     _seed_v2(uid)
@@ -129,6 +163,13 @@ def test_extraction_lane_applies_actions_and_completes(monkeypatch, lane):
         }], None)
 
     monkeypatch.setattr(extraction, "extract", _fake_extract)
+    monkeypatch.setattr(
+        profile_store,
+        "repair_stuck_profile_retry",
+        lambda *_args, **_kwargs: pytest.fail(
+            "extraction success must not repair foreground provider state"
+        ),
+    )
     applied = {}
     ordering = []
 
@@ -167,7 +208,8 @@ def test_dream_blast_radius_fuse_fails_whole_job(monkeypatch):
     job = jobs_store.claim_next_job("w")
 
     cards = [
-        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}"}
+        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}",
+         "occurred_at": f"2026-07-{i + 1:02d}T00:00:00Z"}
         for i in range(15)
     ]
 
@@ -216,7 +258,8 @@ def test_dream_below_fuse_threshold_applies_normally(monkeypatch):
     job = jobs_store.claim_next_job("w")
 
     cards = [
-        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}"}
+        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}",
+         "occurred_at": f"2026-07-{i + 1:02d}T00:00:00Z"}
         for i in range(15)
     ]
 
@@ -255,6 +298,67 @@ def test_dream_below_fuse_threshold_applies_normally(monkeypatch):
     assert status == "completed"
     assert applied == {"n": 2}
     assert _job_row(job_id)[0] == "completed"
+
+
+def test_dream_missing_source_time_degrades_and_still_writes(monkeypatch):
+    """2026-08-17(Seven 定):一张源卡缺时间不再让整轮失败,改为退到已知的最晚。
+
+    ⚠️ 这是**端到端**的一条 —— 它同时证明降级留痕真的接在生产路径上,
+    而不是只在 helper 单测里传(那正是 codex2 审出的第①项)。
+    """
+    uid = "u_x_dream_missing_occurred_at"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+
+    async def _fake_extract(**_kwargs):
+        return ([{
+            "op": "merge",
+            "card_ids": ["old-a", "old-b"],
+            "rationale": "同一线索",
+            "result": {"summary": "s", "content": "c"},
+        }], None)
+
+    monkeypatch.setattr(extraction, "extract", _fake_extract)
+    applied = []
+    deps = _deps(
+        read_memory_context=lambda _uid: {
+            "ai_name": "小克", "user_name": "Z", "cards": "C",
+            "card_items": [
+                {"id": "old-a", "occurred_at": "2026-03-01T00:00:00Z"},
+                {"id": "old-b", "occurred_at": ""},
+            ],
+        },
+        # 夹具必须返回 {"status": "ok"} —— 返回 None 会被 _memory_write_result_counts
+        # 判成「全部失败」,于是撞上 memory_write_rejected,看起来像降级没生效。
+        # (原用例断言的是 failed,所以这个缺陷一直没暴露。)
+        apply_memory_actions=lambda _uid, actions: (
+            applied.extend(actions) or {"status": "ok"}
+        ),
+    )
+
+    class _Rec:
+        def __init__(self): self.events = []
+        async def record(self, kind, payload): self.events.append((kind, payload))
+        async def record_best_effort(self, kind, payload):
+            await self.record(kind, payload); return True
+
+    recorder = _Rec()
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt",
+        trajectory_recorder=recorder))
+
+    assert status != "failed", (
+        "一张源卡缺时间仍让整轮失败 —— 那正是要修掉的永久阻塞"
+    )
+    assert applied, "降级后应当照常产出动作"
+    payload = str(applied)
+    assert "2026-03-01T00:00:00Z" in payload, "没有退到已知的那张源卡时间"
+    # **生产接线守卫**:降级必须真的留痕。只在 helper 单测里传回调 = 零留痕
+    # (codex2 审出第①项)。拆掉 worker 里那行 action_kwargs 赋值,本断言必红。
+    assert any(
+        kind == "dream_source_time_degraded" for kind, _ in recorder.events
+    ), "降级没有进 trajectory —— 生产侧根本没接回调"
 
 
 @pytest.mark.parametrize("lane", ["capture", "dream"])
@@ -363,6 +467,58 @@ def test_extraction_failure_is_silent_no_bubble_no_error_chip(monkeypatch, lane)
     assert emitted == []                       # no user-visible status/error chip
     row = _job_row(job_id)
     assert row == ("failed", "extraction_failed:upstream_unavailable")
+
+
+def test_truncated_extraction_persists_content_free_failure_shape(monkeypatch):
+    uid = "u_x_truncated_dream"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    limit = extraction.DREAM_MAX_OUTPUT_TOKENS
+
+    async def _truncated(**kwargs):
+        kwargs["failure_detail_out"]({
+            "stop_reason": "length",
+            "completion_tokens": limit,
+            "max_tokens": kwargs["max_tokens"],
+        })
+        return None, "output_truncated"
+
+    class Recorder:
+        def __init__(self):
+            self.events = []
+
+        async def record(self, kind, payload):
+            self.events.append((kind, payload))
+
+        async def record_best_effort(self, kind, payload):
+            await self.record(kind, payload)
+            return True
+
+    recorder = Recorder()
+    monkeypatch.setattr(extraction, "extract", _truncated)
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            _deps(),
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+            trajectory_recorder=recorder,
+        )
+    )
+
+    assert status == "failed"
+    assert _job_row(job_id) == ("failed", "extraction_failed:output_truncated")
+    turn_error = next(payload for kind, payload in recorder.events if kind == "turn_exception")
+    assert turn_error == {
+        "stage": "extraction",
+        "error_class": "RuntimeError",
+        "error_code": "extraction_failed:output_truncated",
+        "stop_reason": "length",
+        "completion_tokens": limit,
+        "max_tokens": limit,
+    }
 
 
 def test_rejected_memory_write_fails_job_instead_of_marking_completed(monkeypatch):

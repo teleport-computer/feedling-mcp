@@ -30,6 +30,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
+import debug_trace  # noqa: E402
 from accounts import registry  # noqa: E402
 from admin import routes_asgi as admin_asgi  # noqa: E402
 from admin import memory_metadata  # noqa: E402
@@ -40,6 +41,7 @@ from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
 from conftest import configure_model_api_route  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
+from memory import actions as memory_actions  # noqa: E402
 
 ADMIN_TOKEN = "admin-test-token"
 ADMIN_PASSWORD = "admin-test-password"
@@ -151,6 +153,74 @@ def _norm_json(obj):
 def _norm_html(text: str) -> str:
     without_cache_note = _CACHE_NOTE_RE.sub("", text)
     return _TS_RE.sub("TS", without_cache_note)
+
+
+def test_memory_truncation_real_action_is_queryable_through_admin_data_track(
+    env,
+    monkeypatch,
+):
+    user_id, api_key = _register()
+    client = make_client()
+    enabled = client.post(
+        "/v1/debug/trace/enable",
+        headers={"X-API-Key": api_key},
+        json={"enabled": True},
+    )
+    assert enabled.status_code == 200
+
+    def fake_envelope(store, _inner, *, item_id=None):
+        memory_id = item_id or "memory_t074"
+        return {
+            "id": memory_id,
+            "body_ct": "ciphertext-only",
+            "nonce": "nonce",
+            "K_user": "wrapped-user-key",
+            "K_enclave": "wrapped-enclave-key",
+            "visibility": "shared",
+            "owner_user_id": store.user_id,
+        }, ""
+
+    monkeypatch.setattr(
+        memory_actions,
+        "_build_memory_envelope_for_store",
+        fake_envelope,
+    )
+    secret = "T074_REAL_ACTION_SECRET_MUST_NOT_REACH_ADMIN"
+    raw_content = ("z" * 5011) + secret
+    written = client.post(
+        "/v1/memory/actions",
+        headers={"X-API-Key": api_key},
+        json={"actions": [{
+            "type": "memory.add",
+            "memory": {
+                "summary": "Long action card",
+                "content": raw_content,
+                "source": "chat",
+            },
+        }]},
+    )
+    assert written.status_code == 200, written.get_data(as_text=True)
+
+    debug_trace._flush_pending_for_user(user_id)
+    status, payload = _asgi_json(
+        "GET",
+        "/v1/admin/data-track/debug"
+        "?q=memory.content.truncation&mode=flat&limit=10",
+        headers=_admin(),
+    )
+
+    assert status == 200
+    assert payload["summary"]["events_total"] == 1
+    event = payload["events"][0]
+    assert event["type"] == "memory.content.truncation"
+    assert event["detail"] == {
+        "route": "memory_actions",
+        "counts": {
+            "original_chars": len(raw_content),
+            "truncated_chars": len(raw_content) - 5000,
+        },
+    }
+    assert secret not in json.dumps(payload, ensure_ascii=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -265,6 +335,56 @@ def test_dau_day_selector_and_invalid_day_parity(env):
     f_bad = _flask_get_json(invalid_path, headers=_admin())
     a_bad = _asgi_json("GET", invalid_path, headers=_admin())
     assert f_bad == a_bad == (400, {"error": "invalid_day"})
+
+
+def test_events_day_selector_shape_and_invalid_day(env, monkeypatch):
+    raw = {
+        "proactive": [{
+            "route": "model_api", "lane": "heartbeat", "total": 3,
+            "success": 2, "failed": 1, "pending": 0, "median_dur": 4.5,
+        }],
+        "capture": [{
+            "route": "resident", "total": 7, "success": 5,
+            "failed": 2, "median_dur": 8.0,
+        }],
+        "genesis": [{
+            "route": "resident", "distill": "first", "total": 1,
+            "success": 1, "failed": 0,
+        }],
+        "reply": [{
+            "route": "model_api", "user_msgs": 4, "real_replies": 3,
+            "fallback_replies": 1, "median_latency": 2.0,
+        }],
+    }
+    seen_days = []
+
+    def fake_overview(*, day, tz="Asia/Shanghai"):
+        seen_days.append((day, tz))
+        return raw
+
+    monkeypatch.setattr(db, "admin_events_overview", fake_overview)
+    path = "/v1/admin/data-track/events?day=2035-05-06"
+    expected = {
+        "filters": {"day": "2035-05-06", "timezone": "Asia/Shanghai"},
+        **raw,
+    }
+    assert _flask_get_json(path, headers=_admin()) == (200, expected)
+    assert _asgi_json("GET", path, headers=_admin()) == (200, expected)
+    assert seen_days == [
+        ("2035-05-06", "Asia/Shanghai"),
+        ("2035-05-06", "Asia/Shanghai"),
+    ]
+
+    invalid_path = "/v1/admin/data-track/events?day=2035-02-30"
+    assert _flask_get_json(invalid_path, headers=_admin()) == (
+        400,
+        {"error": "invalid_day"},
+    )
+    assert _asgi_json("GET", invalid_path, headers=_admin()) == (
+        400,
+        {"error": "invalid_day"},
+    )
+    assert len(seen_days) == 2
 
 
 def test_user_detail_parity(env):
@@ -795,6 +915,7 @@ def test_admin_delete_user_archive_failure_aborts(env, monkeypatch):
     "path,method",
     [
         ("/v1/admin/data-track/summary", "GET"),
+        ("/v1/admin/data-track/events", "GET"),
         ("/admin/data-track", "GET"),
         ("/v1/admin/store/evict", "POST"),
         ("/v1/admin/users/usr_admin_delete/delete", "POST"),

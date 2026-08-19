@@ -17,9 +17,11 @@ import conftest
 import db
 import provider_client
 from capabilities import registry as cap_registry
+from capabilities import tool_schema as cap_tool_schema
 from provider_types import ToolResult, ToolSpec
 from core import store as core_store
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import tool_loop
 from model_api_runtime.v2 import worker
 
 pytestmark = pytest.mark.skipif(
@@ -294,6 +296,63 @@ def test_chat_tool_search_injects_full_schema_before_mcp_dispatch(monkeypatch):
     assert dispatched == [(_MCP_SPEC.name, {})]
 
 
+def test_chat_pressure_folded_platform_schema_is_searchable_and_protected(
+    monkeypatch,
+):
+    uid = "u_platform_tool_search"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    # One unrelated oversized manual forces the pressure form. workspace_read
+    # is then folded too, searched explicitly, and must return full next round.
+    monkeypatch.setitem(
+        cap_tool_schema.DESCRIPTIONS,
+        "identity_get",
+        "oversized optional manual " * 6_000,
+    )
+    monkeypatch.setattr(tool_loop, "_CATALOG", None)
+    pressure_config = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-sonnet-4-test",
+        api_key="sk-user-byok",
+        base_url="",
+        context_window_tokens=40_000,
+    )
+    calls = _script_provider(monkeypatch, [
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "find",
+                "name": "mcp_tool_search",
+                "args": {"names": ["workspace_read"]},
+            }],
+            "usage": {},
+        },
+        {"reply": "schema loaded", "tool_calls": [], "usage": {}},
+    ])
+    deps = _deps([
+        {"id": "m1", "ts": 10.0, "role": "user", "content": "read my file"}
+    ])
+
+    assert asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=pressure_config,
+        api_key=None,
+        runtime_token="rt-turn",
+    )) == "completed"
+
+    first = {spec.name: spec for spec in calls[0]["tools"]}
+    second = {spec.name: spec for spec in calls[1]["tools"]}
+    assert "mcp_tool_search" in first
+    assert first["workspace_read"].parameters["properties"] == {}
+    assert second["workspace_read"].parameters["required"] == ["path"]
+    assert second["identity_get"].parameters["properties"] == {}
+
+
 def test_chat_turn_keeps_mcp_usable_after_its_own_remote_result(
     monkeypatch,
 ):
@@ -399,6 +458,184 @@ def test_mcp_turn_usage_records_two_offered_and_two_consecutive_calls(monkeypatc
     }
     assert dispatched == [(_MCP_SPEC.name, {}), (_MCP_SPEC.name, {})]
     assert not any(key in usage[0]["detail"] for key in ("args", "result", "content"))
+
+
+def test_provider_roundtrip_trace_records_cap_closure_without_user_content(monkeypatch):
+    uid = "u_provider_roundtrip_cap"
+    sentinel = "PRIVATE_USER_SENTINEL_9ce12"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    dispatched = []
+    turn = _FakeMcpTurn(
+        [_MCP_SPEC],
+        dispatched,
+        read_only_names={_MCP_SPEC.name},
+    )
+    responses = [
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": f"mcp-{round_number}",
+                "name": _MCP_SPEC.name,
+                "args": {},
+            }],
+            "usage": {},
+        }
+        for round_number in range(1, worker._TURN_MAX_LLM_CALLS)
+    ]
+    responses.append({"reply": "done", "tool_calls": [], "usage": {}})
+    calls = _script_provider(monkeypatch, responses)
+    traces = []
+    deps = _deps(
+        [{"id": "m1", "ts": 10.0, "role": "user", "content": sentinel}],
+        load_mcp_turn=_make_load_turn_mcp(turn),
+        emit_debug_trace=lambda user_id, event_type, **fields: traces.append(
+            {"user_id": user_id, "type": event_type, **fields}
+        ),
+    )
+
+    assert asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    )) == "completed"
+
+    assert len(calls) == worker._TURN_MAX_LLM_CALLS == 15
+    assert calls[-1]["tool_choice"] == "none"
+    roundtrip = next(
+        trace for trace in traces if trace["type"] == "mcp.roundtrip.provider"
+    )
+    assert roundtrip["status"] == "warning"
+    assert roundtrip["detail"] == {
+        "lane": "chat",
+        "provider_roundtrips": 15,
+        "roundtrip_lens": "tool_loop_provider_round_excludes_transport_retries",
+        "terminal_text_round_reached": True,
+        "terminal_text_round_reason": "max_calls",
+        "force_text_fallback_reason": "none",
+        "empty_response_recovery_used": False,
+    }
+    assert sentinel not in repr(roundtrip)
+    assert not {
+        "content",
+        "prompt",
+        "reply",
+        "messages",
+        "args",
+        "result",
+    } & roundtrip["detail"].keys()
+
+
+def test_provider_roundtrip_trace_distinguishes_schema_fallback(monkeypatch):
+    uid = "u_provider_roundtrip_schema_fallback"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    provider_calls = []
+
+    async def reject_tools_once(config, messages, *, tools=None, **kwargs):
+        provider_calls.append({"tools": tools, **kwargs})
+        if len(provider_calls) == 1:
+            raise provider_client.ProviderError(
+                "provider rejected tool schema",
+                status_code=400,
+            )
+        return {"reply": "fallback done", "tool_calls": [], "usage": {}}
+
+    monkeypatch.setattr(
+        provider_client,
+        "chat_completion_async",
+        reject_tools_once,
+    )
+    traces = []
+    deps = _deps(
+        [{"id": "m1", "ts": 10.0, "role": "user", "content": "hello"}],
+        emit_debug_trace=lambda user_id, event_type, **fields: traces.append(
+            {"user_id": user_id, "type": event_type, **fields}
+        ),
+    )
+
+    assert asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    )) == "completed"
+
+    assert len(provider_calls) == 2
+    assert provider_calls[0]["tools"] is not None
+    assert provider_calls[1]["tools"] is None
+    roundtrip = next(
+        trace for trace in traces if trace["type"] == "mcp.roundtrip.provider"
+    )
+    assert roundtrip["detail"]["provider_roundtrips"] == 2
+    assert roundtrip["detail"]["terminal_text_round_reached"] is True
+    assert roundtrip["detail"]["terminal_text_round_reason"] == (
+        "force_text_fallback"
+    )
+    assert roundtrip["detail"]["force_text_fallback_reason"] == (
+        "tool_schema_rejected"
+    )
+    assert roundtrip["detail"]["empty_response_recovery_used"] is False
+
+
+def test_provider_roundtrip_trace_distinguishes_empty_response_recovery(monkeypatch):
+    uid = "u_provider_roundtrip_empty_recovery"
+    conftest.seed_user(uid)
+    _reset(uid)
+    turn_trace_id = "trace-roundtrip-empty-recovery"
+    jobs_store.enqueue_job(uid, "chat", trace_id=turn_trace_id)
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    calls = _script_provider(monkeypatch, [
+        {
+            "reply": "",
+            "reasoning": "private thinking",
+            "stop_reason": "max_tokens",
+            "tool_calls": [],
+            "usage": {},
+        },
+        {"reply": "recovered", "tool_calls": [], "usage": {}},
+    ])
+    traces = []
+    deps = _deps(
+        [{"id": "m1", "ts": 10.0, "role": "user", "content": "hello"}],
+        emit_debug_trace=lambda user_id, event_type, **fields: traces.append(
+            {"user_id": user_id, "type": event_type, **fields}
+        ),
+    )
+
+    assert asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    )) == "completed"
+
+    assert len(calls) == 2
+    roundtrip = next(
+        trace for trace in traces if trace["type"] == "mcp.roundtrip.provider"
+    )
+    assert roundtrip["detail"]["provider_roundtrips"] == 2
+    assert roundtrip["detail"]["terminal_text_round_reached"] is False
+    assert roundtrip["detail"]["terminal_text_round_reason"] == "none"
+    assert roundtrip["detail"]["force_text_fallback_reason"] == "none"
+    assert roundtrip["detail"]["empty_response_recovery_used"] is True
+    joinable = [
+        trace
+        for trace in traces
+        if trace["type"] in {
+            "provider.empty_response",
+            "mcp.roundtrip.provider",
+            "mcp.surface.provider",
+        }
+    ]
+    assert {trace["type"] for trace in joinable} == {
+        "provider.empty_response",
+        "mcp.roundtrip.provider",
+        "mcp.surface.provider",
+    }
+    assert {trace["trace_id"] for trace in joinable} == {turn_trace_id}
 
 
 def test_mcp_turn_usage_records_offered_but_zero_calls(monkeypatch):

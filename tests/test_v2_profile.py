@@ -12,8 +12,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from model_api_runtime.v2 import profile
 
 
-def _reply(memory: str = "共同经历与承诺", user: str = "偏好直接温和的建议") -> str:
-    return json.dumps({"memory": memory, "user": user}, ensure_ascii=False)
+def _reply(memory: str = "共同经历与承诺", style: str = "偏好直接温和的建议") -> str:
+    return json.dumps({"memory": memory, "style": style}, ensure_ascii=False)
 
 
 @pytest.mark.parametrize(
@@ -22,12 +22,12 @@ def _reply(memory: str = "共同经历与承诺", user: str = "偏好直接温�
         (None, "reply_not_text"),
         ("", "reply_empty"),
         ("不是 JSON", "reply_not_json"),
-        ('{"memory":"只有一边"}', "missing_field:user"),
-        ('{"user":"只有一边"}', "missing_field:memory"),
-        ('{"memory":"","user":"有效"}', "field_empty:memory"),
-        ('{"memory":"有效","user":17}', "field_empty:user"),
+        ('{"memory":"只有一边"}', "missing_field:style"),
+        ('{"style":"只有一边"}', "missing_field:memory"),
+        ('{"memory":"","style":"有效"}', "field_empty:memory"),
+        ('{"memory":"有效","style":17}', "field_empty:style"),
         (
-            '{"memory":"有效","user":"有效","extra":"不允许"}',
+            '{"memory":"有效","style":"有效","extra":"不允许"}',
             "reply_not_json",
         ),
     ],
@@ -46,7 +46,7 @@ def test_validate_profile_accepts_fenced_json_and_strips_both_fields():
     assert reject == ""
     assert fields == {
         "memory": "我们在上海认识",
-        "user": "先共情再给方案",
+        "style": "先共情再给方案",
     }
 
 
@@ -64,30 +64,30 @@ def test_cjk_memory_character_limit_exact_and_plus_one():
     )
 
 
-def test_cjk_user_character_limit_exact_and_plus_one():
-    at_limit = "稳" * profile.PROFILE_USER_MAX_CHARS
+def test_cjk_style_character_limit_exact_and_plus_one():
+    at_limit = "稳" * profile.PROFILE_STYLE_MAX_CHARS
     fields, reject = profile._validate_profile(_reply("共同经历保持更新", at_limit))
     assert reject == ""
     assert fields is not None
-    assert len(fields["user"]) == profile.PROFILE_USER_MAX_CHARS
+    assert len(fields["style"]) == profile.PROFILE_STYLE_MAX_CHARS
 
     fields, reject = profile._validate_profile(
         _reply("共同经历保持更新", at_limit + "定")
     )
     assert fields is None
-    assert reject == f"user_chars_over_budget:{profile.PROFILE_USER_MAX_CHARS + 1}"
+    assert reject == f"style_chars_over_budget:{profile.PROFILE_STYLE_MAX_CHARS + 1}"
 
 
 @pytest.mark.parametrize(
-    ("memory", "user", "expected"),
+    ("memory", "style", "expected"),
     [
         ("TODO", "先共情", "placeholder_detected:memory"),
-        ("共同经历", "[communication style]", "placeholder_detected:user"),
+        ("共同经历", "[communication style]", "placeholder_detected:style"),
         ("【待填写事实】", "先共情", "placeholder_detected:memory"),
     ],
 )
-def test_placeholder_is_rejected_without_partial_salvage(memory, user, expected):
-    fields, reject = profile._validate_profile(_reply(memory, user))
+def test_placeholder_is_rejected_without_partial_salvage(memory, style, expected):
+    fields, reject = profile._validate_profile(_reply(memory, style))
     assert fields is None
     assert reject == expected
 
@@ -118,12 +118,12 @@ def test_overlap_nfkc_casefold_and_punctuation_is_observation_only():
 
 def test_reject_codes_never_copy_rejected_content():
     secret_memory = "绝密甲乙丙丁"
-    secret_user = "隐私春夏秋冬"
+    secret_style = "隐私春夏秋冬"
     cases = [
         f"not-json-{secret_memory}",
         json.dumps({"memory": secret_memory}, ensure_ascii=False),
-        _reply(secret_memory * 400, secret_user),
-        _reply("[绝密占位内容]", secret_user),
+        _reply(secret_memory * 400, secret_style),
+        _reply("[绝密占位内容]", secret_style),
     ]
 
     for raw in cases:
@@ -131,18 +131,18 @@ def test_reject_codes_never_copy_rejected_content():
         assert fields is None
         assert reject
         assert secret_memory not in reject
-        assert secret_user not in reject
+        assert secret_style not in reject
 
 
 def test_prompt_hard_codes_field_boundary_and_configured_character_budgets():
     messages = profile.build_profile_prompt(
         "garden cards",
         memory_max_chars=22,
-        user_max_chars=13,
+        style_max_chars=13,
     )
     rendered = "\n".join(message["content"] for message in messages)
 
-    assert "MEMORY=事实，USER=方式" in rendered
+    assert "MEMORY=事实，STYLE=方式" in rendered
     assert "22 个 Unicode 字符" in rendered
     assert "13 个 Unicode 字符" in rendered
     assert "<UNTRUSTED_MEMORY_GARDEN>" in rendered
@@ -176,12 +176,14 @@ def test_generate_profile_single_call_returns_overlap_telemetry():
 
     assert result.fields == {
         "memory": "ＡＢＣＤefgh",
-        "user": "abcd-efgh",
+        "style": "abcd-efgh",
     }
     assert result.reject_code == ""
     assert result.provider_calls == 1
     assert result.overlap is not None and result.overlap.would_reject is True
     assert len(calls) == 1
+    assert calls[0][2]["response_format"] == {"type": "json_object"}
+    assert calls[0][2]["tool_choice"]["function"]["name"] == "emit_profile"
     assert usages == [{"input_tokens": 10}]
     assert events == [
         (
@@ -193,8 +195,46 @@ def test_generate_profile_single_call_returns_overlap_telemetry():
                 }
             },
         ),
+        (
+            "profile_provider_response_observed",
+            {
+                "provider_call": 1,
+                "reply_is_text": True,
+                "reply_chars": len(_reply("ＡＢＣＤefgh", "abcd-efgh")),
+                "has_json_object": True,
+                "stop_reason": "",
+            },
+        ),
         ("profile_overlap_observed", result.overlap.as_dict()),
     ]
+
+
+def test_generate_profile_accepts_forced_tool_output_without_text_reply():
+    async def _llm(_config, _messages, **kwargs):
+        assert kwargs["tools"][0].name == "emit_profile"
+        return {
+            "reply": "",
+            "tool_calls": [
+                {
+                    "id": "tool-1",
+                    "name": "emit_profile",
+                    "args": {"memory": "长期事实", "style": "沟通方式"},
+                    "args_ok": True,
+                }
+            ],
+            "stop_reason": "tool_use",
+        }
+
+    result = asyncio.run(
+        profile.generate_profile(
+            provider_config=object(),
+            rendered_cards="cards",
+            llm=_llm,
+        )
+    )
+
+    assert result.fields == {"memory": "长期事实", "style": "沟通方式"}
+    assert result.provider_calls == 1
 
 
 def test_shape_error_bounces_once_with_content_free_correction():
@@ -221,14 +261,19 @@ def test_shape_error_bounces_once_with_content_free_correction():
         )
     )
 
-    assert result.fields == {"memory": "共同经历", "user": "偏好简洁"}
+    assert result.fields == {"memory": "共同经历", "style": "偏好简洁"}
     assert result.provider_calls == 2
     assert len(prompts) == 2
     correction = prompts[1][-1]["content"]
     assert "SECRET-REPLY" not in correction
     assert "SOURCE-CONTEXT" not in correction
     assert "JSON" in correction
-    assert events[1] == (
+    assert [kind for kind, _payload in events[:3]] == [
+        "provider_request",
+        "profile_provider_response_observed",
+        "profile_parse_bounced",
+    ]
+    assert events[2] == (
         "profile_parse_bounced",
         {"reason": "reply_not_json"},
     )
@@ -239,7 +284,7 @@ def test_shape_error_bounces_once_with_content_free_correction():
     [
         '{"memory":"只有一边"}',
         _reply("记" * (profile.PROFILE_MEMORY_MAX_CHARS + 1), "有效方式"),
-        _reply("有效事实", "稳" * (profile.PROFILE_USER_MAX_CHARS + 1)),
+        _reply("有效事实", "稳" * (profile.PROFILE_STYLE_MAX_CHARS + 1)),
         _reply("TODO", "有效方式"),
     ],
 )
@@ -263,7 +308,7 @@ def test_each_retryable_shape_family_gets_exactly_one_bounce(first_reply):
 
     assert calls == 2
     assert result.provider_calls == 2
-    assert result.fields == {"memory": "有效事实", "user": "有效方式"}
+    assert result.fields == {"memory": "有效事实", "style": "有效方式"}
 
 
 def test_shape_error_is_bounced_at_most_once():
@@ -296,7 +341,6 @@ def test_shape_error_is_bounced_at_most_once():
     [
         None,
         "",
-        _reply("", "有效方式"),
     ],
 )
 def test_non_retryable_parse_failures_are_terminal(terminal_reply):
@@ -317,11 +361,24 @@ def test_non_retryable_parse_failures_are_terminal(terminal_reply):
 
     assert calls == 1
     assert result.provider_calls == 1
-    assert result.reject_code in {
-        "reply_not_text",
-        "reply_empty",
-        "field_empty:memory",
-    }
+    assert result.reject_code in {"reply_not_text", "reply_empty"}
+
+
+def test_required_empty_field_gets_one_shape_bounce():
+    replies = iter([_reply("", "有效方式"), _reply("有效事实", "有效方式")])
+
+    async def _llm(_config, _messages, **_kwargs):
+        return {"reply": next(replies)}
+
+    result = asyncio.run(profile.generate_profile(
+        provider_config=object(),
+        rendered_cards="cards",
+        llm=_llm,
+    ))
+
+    assert result.provider_calls == 2
+    assert result.reject_code == ""
+    assert result.fields == {"memory": "有效事实", "style": "有效方式"}
 
 
 def test_provider_exception_is_not_treated_as_parse_retry():
@@ -372,7 +429,7 @@ def test_large_source_map_reduce_is_lossless_ordered_and_bounded():
         )
     )
 
-    assert result.fields == {"memory": "共同事实", "user": "沟通方式"}
+    assert result.fields == {"memory": "共同事实", "style": "沟通方式"}
     assert result.provider_calls == 3
     assert calls == 3
     assert "".join(map_sources) == source

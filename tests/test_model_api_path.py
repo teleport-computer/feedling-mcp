@@ -27,7 +27,7 @@ from hosted import config_store as hosted_config_store  # noqa: E402
 from hosted import history_import  # noqa: E402
 from hosted import setup_core  # noqa: E402
 from identity import service as identity_service  # noqa: E402
-from model_api_runtime.v2 import jobs_store  # noqa: E402
+from model_api_runtime.v2 import jobs_store, prompt_frontier  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -478,16 +478,14 @@ def test_model_api_setup_persists_explicit_custom_prompt_frontier(
     assert repeated.get_json()["config"]["context_window_tokens"] == 32_768
 
 
-def test_model_api_setup_rejects_context_window_without_input_budget(
+def test_model_api_setup_replaces_metadata_below_runtime_floor(
     client, monkeypatch,
 ):
     user_id, api_key = _register(client)
     monkeypatch.setattr(
         provider_client,
         "test_provider_key",
-        lambda _cfg: (_ for _ in ()).throw(
-            AssertionError("invalid frontier must fail before provider I/O")
-        ),
+        lambda cfg: {"reply": "ok", "usage": {}},
     )
 
     setup = client.post(
@@ -503,9 +501,11 @@ def test_model_api_setup_rejects_context_window_without_input_budget(
         headers=_headers(api_key),
     )
 
-    assert setup.status_code == 400
-    assert setup.get_json()["error"] == "invalid_context_window_tokens"
-    assert db.model_api_routes_list(user_id) == []
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+    resolved = prompt_frontier.unaudited_default_context_window()
+    assert setup.get_json()["config"]["context_window_tokens"] == resolved
+    route = db.model_api_routes_list(user_id)[0]
+    assert route["context_window_tokens"] == resolved
 
 
 def test_model_api_setup_leaves_responses_support_false(client, monkeypatch):

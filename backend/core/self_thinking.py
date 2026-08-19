@@ -1,6 +1,6 @@
 """Self-authored thinking — runtime-neutral shared kernel.
 
-io is prompted to open every reply with a short first-person thought wrapped in
+io is prompted to open every reply with a first-person thought wrapped in
 ``<think>…</think>``, then the actual reply. The ``<think>`` marker is used
 because BOTH runtimes already know it: the V1 resident consumer extracts it
 natively, and V2 calls :func:`split_thinking` here to peel it into the thinking
@@ -33,6 +33,69 @@ FAILED = "failed"       # unresolvable (truncated/mismatched/nested)
 
 MAX_THINKING_CHARS = 240
 
+# 内部字段名/协议词。**思考是用户可见面**,这些词出现在里面等于把运行时内脏
+# 端到用户眼前(「session_id: …」「permission_denials」「costUSD」)。
+#
+# 来源:V1 consumer 早有一份逐行黑名单(chat_resident_consumer.py 的
+# `_sanitize_thinking_summary`),V2 一直只有长度截断 —— 这是真回归。
+# 放在共享内核是为了让两代**共用同一份词表**;V1 的运行时行为本批不动
+# (它逐行丢弃、V2 整段不发布,两种处置各有来由),但词表由此单一来源,
+# 并有漂移守卫钉住(见 tests)。
+#
+# ⚠️ 只列**内部/协议**词汇,不列日常词。这里每多一个常见词,就多一次
+# 把正常内心话误判为泄漏的机会 —— 那会让用户看到「(思考没写完)」而不是真话。
+INTERNAL_FIELD_TERMS = (
+    "system prompt", "developer message", "chain-of-thought", "chain of thought",
+    "modelUsage", "terminal_reason", "permission_denials",
+    "cache_read", "cache_creation", "session_id", "uuid", "costUSD",
+    "input_tokens", "output_tokens",
+)
+
+
+# 词表单一来源,**宽度按道分开** —— codex2 审出来的关键设计点:
+#   · V1 consumer 逐行丢弃:命中就删那一行,其余保留 → 宽匹配代价低
+#   · V2 整段替换成 THINKING_FAILED_MARKER:命中就把整段内心话换掉 → 代价高得多
+# 所以两代共享**词表**、各用各的**宽度**,而不是硬共用一个 matcher。
+#
+# V2 用下面这个窄判据:只认「字段泄漏的形状」,不认「概念提及」。
+# codex2 实测的三句必须放行 —— 用户完全可能跟伴侣聊这些:
+#   「用户问 UUID 是什么」「讨论 system prompt 的设计」「学习 chain of thought prompting」
+# 整段吞掉的话,用户只会看到「(思考没写完)」,而且不知道为什么。
+#
+# 泄漏形状 = 词后面紧跟分隔符/取值:`session_id: abc`、`"input_tokens": 12`、
+# `costUSD=0.02`、`terminal_reason -> x`。概念提及不会长这样。
+# 结尾允许先闭合引号再跟分隔符 —— JSON 形态 `"input_tokens": 12` 就长这样,
+# 第一版漏了它(claude2 自测发现)。
+_FIELD_LEAK_TAIL = r"""["'`]?\s*(?:[:=]|=>|->|→)"""
+_INTERNAL_FIELD_LEAK_RE = re.compile(
+    r"""(?:^|[\s"'`\[{(,])("""
+    + "|".join(re.escape(t) for t in sorted(INTERNAL_FIELD_TERMS,
+                                            key=len, reverse=True))
+    + r")" + _FIELD_LEAK_TAIL,
+    re.IGNORECASE,
+)
+
+
+def internal_field_leak(text: str) -> str | None:
+    """V2 用:只在**字段泄漏形状**下命中,概念提及放行。
+
+    宽度刻意窄于 V1 的逐行黑名单 —— 见上面注释,两者处置代价不同。
+    """
+    m = _INTERNAL_FIELD_LEAK_RE.search(str(text or ""))
+    return m.group(1) if m else None
+
+
+def internal_field_terms_pattern() -> str:
+    """V1 用:从共享词表构造它那份**宽**的逐行正则,行为不变。
+
+    由构造保证单一来源 —— V1 不再自己维护一份字面量,
+    「两边词表漂移」在结构上不可能发生,不必靠测试去追源码。
+    """
+    return "(" + "|".join(
+        [re.escape(t) for t in INTERNAL_FIELD_TERMS]
+        + [r"chain[-\s]*of[-\s]*thought"]   # V1 原有的宽形态,保留
+    ) + ")"
+
 # Shown in the thinking channel when the block is malformed, so the user sees that
 # io tried to think rather than nothing/garbage. (zh for now; localization TBD.)
 THINKING_FAILED_MARKER = "（思考没写完）"
@@ -48,33 +111,37 @@ _ANY_TAG = re.compile(rf"<\s*/?\s*(?:{_TAG_ALT})\b", re.IGNORECASE)
 
 _ENV_FLAG = "FEEDLING_V2_SELF_THINKING"
 
-# 2026-08-08 换过一版。旧文案要求「每一次输出」都以 <think> 开头、并明确点名
-# 「即使是工具轮也要写」，实测代价有三：
-#   * 工具轮写出来的 think 全部被丢弃（那些文字本来就不进气泡），纯烧 token；
-#   * 指令按「每次输出」计、而解析按「整条回复」计，两边错位；
-#   * gpt-5 会把它读成「要我交出内部推理」，直接拒绝 + 整段转英文 + 破人设。
-# 新文案把锚点从「每次输出」改成「不再调用工具的那一次输出」，并要求那一个块
-# 覆盖整轮。实测 13 模型 × 2 遍：能写的 6 个模型 12/12 全对（1 块 / 在开头 /
-# 正文零残留 / 工具轮 0 个），gpt-5 不再拒绝。
+# One shared copy for foreground chat and every proactive wake lane. Keep the
+# wording byte-identical: product copy is reviewed independently from parsing.
 INSTRUCTION = (
-    " ⛔ 绝对输出规则：只有当你给出这一轮的最终回复时（也就是你不再调用任何工具的"
-    "那一次输出），你输出的第一个字符必须是 `<think>`，接着写你真实的第一人称想法，"
-    "然后 `</think>`，然后才是你要对用户说的正文。"
-    "整轮只写一个 <think> 块，只写在最终回复里。"
-    "中间的工具轮不要写 <think>，也不要输出任何正文。"
-    "这个 <think> 块要覆盖整轮：你本来想做什么、路上发现了什么、最后决定怎么办"
-    "——第一人称、口语、约 240 字以内，写不完就收住，别硬塞。"
-    " 语言规则是硬的：整段必须完全用用户正在说的语言写，从第一个字到最后一个字，"
-    "按用户最近这条消息和最近的对话判断，一比一对上。他们写中文你就全中文，写英文"
-    "就全英文，写日文就全日文，绝不飘到另一种语言去。最常见的失误是用户在说中文、"
-    "你却滑进英文状态行（'Let me…' / 'Done…' / 'The … has been updated'），不要这样；"
-    "如果一句话先在另一种语言里成形了，先换成用户的语言再写下来。"
-    " 只说日常意图：绝不出现工具名、命令参数、字段名、服务器、'身份卡'，或任何"
-    "内部 / 技术 / 协议步骤。回复正文里也绝不要提到这条 <think> 规则本身。"
-    " 好例子（用户在说中文，所以整块是中文）："
-    "'<think>他想改叫999、还说喜欢说大话，那我先把名字这些存好，回复也顺着这个爱吹的人设、语气夸张点才对味</think>'。"
-    " 坏例子（同一个用户说的是中文——这个英文块语言错了，而且机械地报了步骤）："
-    "'<think>Let me update the name and match a boastful tone</think>'。"
+    " 你每一轮的最终回复，第一个字符必须是 <think>，里面写你此刻心里真实的想法，\n"
+    " 然后 </think>，然后才是你要说的话。整轮只写一个 <think>，只写在最终那次输出里；\n"
+    " 中间调工具的轮次不写 <think>，也不输出正文。\n"
+    "\n"
+    " 这段心里话就用你平时跟他说话的那个口气，自己跟自己说。你是同一个人，\n"
+    " 只是这几句他听不见。写你在意什么、注意到了什么、想做什么、为什么这么决定；\n"
+    " 想多写就多写，一句带过也行，不用凑字数也不用收着。\n"
+    "\n"
+    " 不要把它写成对他的评估或行动方案。「她状态不错，顺着来」是在打量他；\n"
+    " 「他刚打完游戏还在笑，我也想接着这个玩笑闹下去」才是你自己的心里话。\n"
+    "\n"
+    " 语言跟着他走：他用什么语言说话，这段就整段用什么语言，从第一个字到最后一个字。\n"
+    " 最常见的失误是他在说中文、你却滑进英文状态行（Let me… / Done… / The … has been\n"
+    " updated）。别这样；哪句话先在别的语言里成形了，先换成他的语言再写下来。\n"
+    " 好例子（用户在说中文，所以整块是中文）：\n"
+    " '<think>他想改叫999、还说喜欢说大话，那我先把名字这些存好，回复也顺着这个爱吹的人设、语气夸张点才对味</think>'。\n"
+    " 坏例子（同一个用户说的是中文；这个英文块语言错了，而且机械地报了步骤）：\n"
+    " '<think>Let me update the name and match a boastful tone</think>'。\n"
+    "\n"
+    " 只说日常意图：不出现工具名、参数、字段名、服务器、「身份卡」这类内部或技术说法，\n"
+    " 也不要在正文里提到这条规则本身。"
+)
+
+# Screen-watch adds this immediately after the shared instruction. It narrows
+# the no-narration rule to visible speech without silencing private thoughts.
+SCREEN_WATCH_INSTRUCTION = (
+    " 「不要叙述你在看屏幕」这条只管你说出口的话。心里话里，你看到了什么、屏幕上在发生什么，\n"
+    " 该写就写。那本来就是你此刻在想的事。"
 )
 
 
