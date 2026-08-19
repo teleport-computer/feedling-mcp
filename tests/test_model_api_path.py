@@ -8,6 +8,7 @@ import time
 from datetime import date
 from pathlib import Path
 
+import httpx
 import pytest
 
 
@@ -2387,11 +2388,30 @@ def test_chat_response_accepts_verify_ping_reply_to_pending_ping(client, monkeyp
 # ---------------------------------------------------------------------------
 
 
+def _provider_error_from_upstream(status_code: int, *, text: str) -> Exception:
+    """Build the exception the way production does — through the real raiser.
+
+    Hand-writing ``ProviderError("provider_http_404: <!doctype html>…")`` puts
+    the upstream body in the message because the *test* put it there. That makes
+    the test blind to how ``_raise_for_provider_status`` actually composes the
+    error: if the body stops travelling in the message, every assertion here
+    keeps passing while the behaviour they describe is gone. Route through the
+    real function so the test breaks when the contract breaks.
+    """
+    try:
+        provider_client._raise_for_provider_status(httpx.Response(status_code, text=text))
+    except provider_client.ProviderError as exc:
+        return exc
+    raise AssertionError(f"HTTP {status_code} must raise")
+
+
 @pytest.mark.parametrize(("exc", "label"), [
+    # Our own marker, not upstream text: raised when the HTTP call SUCCEEDED but
+    # the body would not parse as JSON. Constructing it directly is faithful —
+    # there is no response body inside it to begin with.
     (provider_client.ProviderError("provider returned non-json response"),
      "HTTP 200 + 站点首页 HTML"),
-    (provider_client.ProviderError(
-        "provider_http_404: <!doctype html>\n<html lang=\"zh\">", status_code=404),
+    (_provider_error_from_upstream(404, text="<!doctype html>\n<html lang=\"zh\">"),
      "HTTP 404 + 错误页 HTML"),
 ])
 def test_non_api_endpoint_points_at_the_url_not_the_key(client, monkeypatch, exc, label):
@@ -2417,12 +2437,24 @@ def test_non_api_endpoint_points_at_the_url_not_the_key(client, monkeypatch, exc
 
 
 def test_real_key_failure_keeps_the_original_detail(client, monkeypatch):
-    """真的 key 无效(provider 回 JSON)→ 判据不许命中,原始信息原样透传。"""
+    """真的 key 无效(provider 回 JSON)→ 判据不许命中,原始信息原样透传。
+
+    这条锁的是一个**产品决定**:中转站用户看到的「令牌额度已用尽」
+    「Invalid token」就是从这里透出来的,而「中转站验证不上」是台账里
+    反复出现的头号支持问题。
+
+    ⚠️ 异常必须经 ``_raise_for_provider_status`` 真实构造。此前它是手工拼的
+    ``ProviderError("provider_http_401: Invalid token")`` —— 原文是测试自己
+    塞进去的,于是这条断言在**生产路径已经不透传之后仍会绿**,等于这个产品
+    决定没有守卫。这条测试将来若因「不再回显上游正文」而变红,那是它在正常
+    工作:红意味着有人正在改动一个已拍板的产品契约,该去找 Seven,而不是改绿它。
+    """
     _, api_key = _register(client)
+    invalid_token = _provider_error_from_upstream(
+        401, text='{"error": {"message": "Invalid token"}}'
+    )
     monkeypatch.setattr(provider_client, "test_provider_key",
-                        lambda cfg: (_ for _ in ()).throw(
-                            provider_client.ProviderError(
-                                "provider_http_401: Invalid token", status_code=401)))
+                        lambda cfg: (_ for _ in ()).throw(invalid_token))
 
     r = client.post("/v1/model_api/setup", json={
         "provider": "openai_compatible", "model": "gpt-4o-mini",
