@@ -12196,8 +12196,9 @@ async def process_job(
                 raise RuntimeError("MCP mutation outcome was not durably recorded")
             evidence["status"] = str(outcome)
 
-        # User-MCP tool surface for THIS turn (chat lane only, mirroring the
-        # resident which gives claude `--mcp-config` on the chat lane only). The
+        # User-MCP tool surface for THIS turn. Chat and the four wake lanes both
+        # load one since T154 (before that this was chat-only, mirroring the
+        # resident's `--mcp-config`; the proactive companion had no外部 tools). The
         # loader lives in hosted (needs mcp_core/enclave) and is injected as
         # `deps.load_mcp_turn`; unwired (tests/legacy) → the empty turn. Loads the
         # user's enabled servers, decrypts them, and fetches each server's tools

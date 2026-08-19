@@ -296,6 +296,9 @@ def test_wake_offers_and_dispatches_mcp_tool(monkeypatch, lane):
     assert seen_load[0]["api_key"] is None
     assert seen_load[0]["runtime_token"] == "rt-wake-enclave"
     assert seen_load[0]["enclave_sem"] is enclave_sem
+    # 观测连线:装配层默认写 chat,调用点漏传的话 admin 里这条 wake 会伪装成
+    # 聊天轮。只测 wrapper 本身抓不到「调用点漏传」。
+    assert seen_load[0]["lane"] == lane
     offered = {spec.name for spec in calls[0]["tools"]}
     assert _MCP_SPEC.name in offered
     assert dispatched == [(_MCP_SPEC.name, {"where": "park"})]
@@ -708,16 +711,21 @@ def test_wake_mcp_instructions_reach_the_system_context_once(monkeypatch):
     ))
 
     assert status == "completed"
-    systems = [
-        str(message.get("content") or "")
-        for message in calls[0]["messages"]
-        if isinstance(message, dict) and message.get("role") == "system"
-    ]
-    assert systems, "wake turn had no system message at all"
-    joined = "\n".join(systems)
-    assert "开门时间是早上八点" in joined
-    # 两轮都注入 = 说明书随轮次翻倍。只许一次。
-    assert joined.count("开门时间是早上八点") == 1
+    assert len(calls) == 2, "expected two provider rounds"
+    for index, call in enumerate(calls):
+        systems = [
+            str(message.get("content") or "")
+            for message in call["messages"]
+            if isinstance(message, dict) and message.get("role") == "system"
+        ]
+        assert systems, f"round {index} had no system message at all"
+        joined = "\n".join(systems)
+        # 每一轮都该带(系统上下文每次重建),但**单个请求内不能翻倍** ——
+        # 只看第 0 轮是抓不到「随轮次累积」的。
+        assert joined.count("开门时间是早上八点") == 1, (
+            f"round {index}: instructions appeared "
+            f"{joined.count('开门时间是早上八点')} times"
+        )
 
 
 def test_wake_mcp_mutation_frontier_is_the_user_reply_cursor(monkeypatch):
@@ -737,14 +745,30 @@ def test_wake_mcp_mutation_frontier_is_the_user_reply_cursor(monkeypatch):
     assert jobs_store.mark_running(job_id, claimed_by=claimed_by)
     _spy_reply(monkeypatch)
 
-    # 新用户的 cursor 是 0 —— 直接断言它等于 0 会让「记成 0」的突变照样通过
-    # (我第一版就是这么假绿的)。先把它推到一个非零值。
+    # 复现原 bug 的形状,而不是随便造一个非零值:
+    # 一条已被回答的 user 行(reply cursor 停在这里)+ 之后一条 assistant 行。
+    # all-role 快照因此**大于** reply cursor —— 旧实现记 assistant 快照,
+    # 新实现记 user frontier,两者可区分。
+    # (我第一版把 cursor 人工设成 41 而 chat_max_seq 仍是 0,那既不是生产
+    #  不变量,也复现不了这个 bug。)
     store = core_store.get_store(uid)
+    now = 1_700_000_000.0
+    db.chat_append(uid, "m_user_answered", now, {
+        "id": "m_user_answered", "role": "user", "source": "chat",
+    }, 5000)
+    expected_seq = int(db.chat_seq_for_msg_id(uid, "m_user_answered"))
+    assert expected_seq > 0, "precondition: answered user row must have a seq"
+    db.chat_append(uid, "m_assistant_after", now + 1, {
+        "id": "m_assistant_after", "role": "openclaw", "source": "model_api",
+    }, 5000)
+    assert int(db.chat_max_seq(uid)) > expected_seq, (
+        "precondition: all-role snapshot must exceed the reply cursor, "
+        "otherwise the two implementations are indistinguishable"
+    )
     profile = db.get_blob_strict(uid, "model_api_runtime") or {}
-    profile[v2_cursor.CURSOR_KEY] = 41
+    profile[v2_cursor.CURSOR_KEY] = expected_seq
     db.set_blob(uid, "model_api_runtime", profile)
-    expected_seq = int(v2_cursor.load_seq(store))
-    assert expected_seq == 41, "precondition: cursor must be non-zero"
+    assert int(v2_cursor.load_seq(store)) == expected_seq
 
     turn = _FakeMcpTurn([_MCP_SPEC], [])
     _script_provider(monkeypatch, [

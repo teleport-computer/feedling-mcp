@@ -240,6 +240,8 @@ def test_chat_turn_offers_and_dispatches_configured_mcp_tool(monkeypatch):
     assert seen_load and seen_load[0]["user_id"] == uid
     assert seen_load[0]["runtime_token"] == "rt-turn"
     assert seen_load[0]["enclave_sem"] is enclave_sem
+    # 观测连线:chat 也必须显式传，否则只是撞上装配层默认值。
+    assert seen_load[0]["lane"] == "chat"
     # the MCP tool was offered to the provider in round 1
     assert any(s.name == "mcp__test__ping" for s in calls[0]["tools"])
     # the mcp__ call was routed to the MCP dispatcher (not the platform executor)
