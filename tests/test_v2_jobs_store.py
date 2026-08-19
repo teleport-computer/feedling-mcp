@@ -3002,3 +3002,196 @@ def test_foreground_chat_preempt_still_requeues_capture_that_wrote():
     assert [p.recovery for p in preempted] == ["requeued"]
     status, _attempts, _last_error = _job_row(job_id)
     assert status == "pending"
+
+
+def _terminal_outbox(job_id: int):
+    with db.get_pool().connection() as conn:
+        return conn.execute(
+            "SELECT error_code FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+
+
+def _preempt(uid: str):
+    with db.get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                return jobs_store.preempt_active_for_chat_on_cursor(
+                    cur, user_id=uid
+                )
+
+
+def test_preempt_unsafe_scheduled_keeps_its_delivery_obligation():
+    """被抢占终结的定时任务仍要落用户可见失败 —— 它有交付义务。
+
+    ⚠️ 这三件必须在调用方那个事务里当场做完:行一旦 superseded，独立 reaper
+    的扫描条件再也扫不到它，留给它等于永远不做。
+    """
+    uid = "u_js_preempt_sched_visible"
+    job_id = _stuck_wake(uid, "scheduled")
+    _record_durable_platform_effect(job_id, uid)
+
+    preempted = _preempt(uid)
+
+    assert [p.recovery for p in preempted] == ["terminal"]
+    assert _terminal_outbox(job_id) == ("foreground_chat_preempted",)
+
+
+def test_preempt_unsafe_scheduled_closes_out_a_dangling_mcp_attempt():
+    """worker 死在远端请求途中 → NULL outcome 记成 unknown，标签也要说明白。
+
+    留 NULL 会让后续判定把它当成「没发生过」。
+    """
+    uid = "u_js_preempt_sched_mcp"
+    job_id = _stuck_wake(uid, "scheduled")
+    jobs_store.start_mcp_mutation_attempt(
+        job_id,
+        user_id=uid,
+        claimed_by="w",
+        call_id="preempt-dangling",
+        tool_name="mcp__town__post",
+        input_frontier_seq=0,
+    )
+
+    preempted = _preempt(uid)
+
+    assert [p.recovery for p in preempted] == ["terminal"]
+    assert _terminal_outbox(job_id) == ("mcp_mutation_outcome_unknown",)
+    # ⚠️ 不能只断言 has_ambiguous:它对 NULL 和 'unknown' 都返回 True,
+    # 所以「没收口」和「收口成 unknown」在它眼里一样 —— 恒真断言。
+    # 必须直接读那一列。
+    with db.get_pool().connection() as conn:
+        outcomes = [
+            row[0] for row in conn.execute(
+                "SELECT outcome FROM v2_mcp_mutation_attempts WHERE job_id=%s",
+                (job_id,),
+            ).fetchall()
+        ]
+    assert outcomes == ["unknown"]
+    assert jobs_store.has_ambiguous_mcp_mutation(job_id=job_id) is True
+
+
+@pytest.mark.parametrize("lane", ["scheduled", "capture"])
+def test_preempt_pristine_job_creates_no_failure_obligation(lane):
+    """阴性对照:干净的让位不是失败，不该排用户可见 outbox。
+
+    没有这条，上面两条可能只是「抢占一律报失败」—— 那会把每一次正常让位
+    都变成用户看得见的错误。
+    """
+    uid = f"u_js_preempt_pristine_{lane}"
+    job_id = _stuck_wake(uid, lane)
+
+    preempted = _preempt(uid)
+
+    assert [p.recovery for p in preempted] == ["requeued"]
+    assert _terminal_outbox(job_id) is None
+
+
+def test_effect_enqueue_fence_refuses_a_stale_job_owner():
+    """平台写必须与 job 行锁线性化 —— 否则重投谓词有 TOCTOU 窗口。
+
+    竞态形状(codex 复核指出):worker 续租成功 → 恢复路径锁住 job、查到
+    「还没有 effect」于是重投 → 旧 worker 这才把 effect 插进去 → 同一个 job
+    重跑，副作用做两遍。`start_mcp_mutation_attempt` 早就用 job 行锁堵住了
+    远端写的同一个窗口，平台写此前没有。
+    """
+    from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
+
+    uid = "u_js_effect_fence"
+    job_id = _stuck_wake(uid, "heartbeat")
+
+    # 正常持有者:写得进去。
+    eid = v2_effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type="memory_encrypted_v1",
+        ordinal=0,
+        expected_generation=0,
+        payload={"ct": "x"},
+        input_frontier_seq=0,
+        claimed_by="w",
+    )
+    assert eid
+
+    # 同一条 effect 重放:幂等，不算被拒。
+    assert v2_effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type="memory_encrypted_v1",
+        ordinal=0,
+        expected_generation=0,
+        payload={"ct": "x"},
+        input_frontier_seq=0,
+        claimed_by="w",
+    ) == eid
+
+    # 换了持有者之后,旧 owner 再也写不进去 —— 且是抛错,不是静默 no-op:
+    # 静默会让模型以为写成功了。
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET claimed_by='someone-else' WHERE id=%s",
+            (job_id,),
+        )
+    with pytest.raises(RuntimeError):
+        v2_effect_outbox.enqueue_effect(
+            job_id=job_id,
+            user_id=uid,
+            effect_type="memory_encrypted_v1",
+            ordinal=1,
+            expected_generation=0,
+            payload={"ct": "y"},
+            input_frontier_seq=0,
+            claimed_by="w",
+        )
+
+
+def test_effect_enqueue_fence_refuses_after_the_job_is_terminalized():
+    """被抢占终结之后,旧 worker 的在途写必须写不进去。
+
+    这正是重投安全谓词依赖的那条不变量:恢复路径提交之后，源 job 不再
+    running，因此不可能再冒出新的持久写把「已判定 pristine」变成假的。
+    """
+    from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
+
+    uid = "u_js_effect_fence_after_preempt"
+    job_id = _stuck_wake(uid, "heartbeat")
+
+    preempted = _preempt(uid)
+    assert [p.recovery for p in preempted] == ["terminal"]
+
+    with pytest.raises(RuntimeError):
+        v2_effect_outbox.enqueue_effect(
+            job_id=job_id,
+            user_id=uid,
+            effect_type="memory_encrypted_v1",
+            ordinal=0,
+            expected_generation=0,
+            payload={"ct": "x"},
+            input_frontier_seq=0,
+            claimed_by="w",
+        )
+
+
+def test_effect_enqueue_without_fence_stays_unfenced():
+    """不传 claimed_by 的调用保持原语义 —— 本批不改 chat 的行为。
+
+    chat 由 `get_chat_mutation_recovery_barrier` 保护，走的是另一条不变量。
+    """
+    from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
+
+    uid = "u_js_effect_unfenced"
+    job_id = _stuck_wake(uid, "heartbeat")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET claimed_by='someone-else' WHERE id=%s",
+            (job_id,),
+        )
+    assert v2_effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type="memory_encrypted_v1",
+        ordinal=0,
+        expected_generation=0,
+        payload={"ct": "x"},
+        input_frontier_seq=0,
+    )

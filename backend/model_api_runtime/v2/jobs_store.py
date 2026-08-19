@@ -158,6 +158,11 @@ class PreemptedJob:
     lane: str
     claimed_by: str | None
     recovery: Literal["terminal", "requeued"]
+    # (user_id, source_job_id) pairs whose trajectory review runner this
+    # preemption recovered. The caller replays them into the TEE shadow mirror
+    # AFTER its transaction commits — marking pending mid-transaction would
+    # advertise a row that may still roll back.
+    recovered_reviews: tuple[tuple[str, str], ...] = ()
 # Chat admission and execution use separate columns and clocks. Pending rows
 # have a short queue deadline so an admitted turn cannot wait forever when the
 # fleet dies. Claim starts a distinct owner-fenced execution lease. Workers
@@ -798,19 +803,50 @@ def preempt_active_for_chat_on_cursor(
             )
         else:
             recovery = "terminal"
+            # 不安全的 scheduled 也要背上交付义务:它是「到点交付」,失败必须
+            # 让用户看见。普通抢占(pristine 的其它 lane)只是让位,没有失败可言。
+            unsafe_scheduled = lane == "scheduled"
             cur.execute(
                 "UPDATE agent_jobs SET status='superseded', finished_at=now(), "
-                "last_error='foreground_chat_preempted', claimed_by=NULL, "
+                "last_error=" + (
+                    "CASE WHEN EXISTS ("
+                    "  SELECT 1 FROM v2_mcp_mutation_attempts a "
+                    "  WHERE a.job_id=agent_jobs.id "
+                    "    AND (a.outcome IS NULL OR a.outcome='unknown')"
+                    ") THEN 'mcp_mutation_outcome_unknown' "
+                    "ELSE 'foreground_chat_preempted' END, "
+                    if unsafe_scheduled
+                    else "'foreground_chat_preempted', "
+                ) + "claimed_by=NULL, "
                 "claimed_at=NULL, started_at=NULL, lease_expires_at=NULL, "
                 "deadline_at=NULL "
                 "WHERE id=%s AND status=%s "
-                "AND claimed_by IS NOT DISTINCT FROM %s",
+                "AND claimed_by IS NOT DISTINCT FROM %s "
+                "RETURNING last_error",
                 (row["id"], row["status"], row["claimed_by"]),
             )
         if cur.rowcount != 1:
             raise RuntimeError(
                 f"active job ownership changed while preempting job {row['id']}"
             )
+        job_reviews: tuple[tuple[str, str], ...] = ()
+        if recovery == "terminal" and lane == "scheduled":
+            # ⚠️ 这三件必须在调用方那个事务里当场做完,不能留给独立的 reaper:
+            # 行已经是 superseded,reaper 的扫描条件再也扫不到它。
+            terminal_error = str(cur.fetchone()["last_error"])
+            cur.execute(
+                "UPDATE v2_mcp_mutation_attempts "
+                "SET outcome='unknown',resolved_at=clock_timestamp() "
+                "WHERE job_id=%s AND outcome IS NULL",
+                (int(row["id"]),),
+            )
+            _queue_terminal_failure_on_cursor(
+                cur, int(row["id"]), str(row["user_id"]), terminal_error
+            )
+            job_reviews = tuple(
+                _recover_review_runner_on_cursor(cur, int(row["id"]))
+            )
+            _queue_failure_review_on_cursor(cur, int(row["id"]))
         results.append(
             PreemptedJob(
                 job_id=int(row["id"]),
@@ -820,6 +856,7 @@ def preempt_active_for_chat_on_cursor(
                     None if row["claimed_by"] is None else str(row["claimed_by"])
                 ),
                 recovery=recovery,
+                recovered_reviews=job_reviews,
             )
         )
     return results

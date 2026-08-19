@@ -12741,6 +12741,23 @@ def chat_append_and_enqueue(
         # event is repaired by the parent reconciliation loop.
         from core import wake_bus as core_wake_bus
 
+        pending_reviews = [
+            pair
+            for preempted in _preempted_jobs
+            for pair in preempted.recovered_reviews
+        ]
+        if pending_reviews:
+            # 提交之后才 mark_pending:提交前标记等于向影子副本宣告一行可能
+            # 还会回滚的数据。与 `recover_killed_job` 的收尾同形。
+            from tee_shadow import mirror as _tee_mirror
+
+            for review_user_id, source_job_id in pending_reviews:
+                _tee_mirror.mark_pending(
+                    review_user_id,
+                    "v2_trajectory_reviews",
+                    source_job_id,
+                    "requeue",
+                )
         for preempted in _preempted_jobs:
             if preempted.claimed_by is None:
                 continue
@@ -15659,12 +15676,19 @@ def effect_enqueue(
     payload,
     *,
     input_frontier_seq: int | None = None,
+    claimed_by: str | None = None,
 ) -> bool:
     """Insert one row into the generation-fenced effect outbox (spec A4). The
     ON CONFLICT (effect_id) DO NOTHING is the idempotency guarantee: re-enqueuing
     the same logical effect (same job_id/effect_type/ordinal, or same
     generation/effect_type/key for control-plane effects) is a no-op. Returns
-    True if this call actually inserted the row, False if it already existed."""
+    True if this call actually inserted the row, False if it already existed.
+
+    ``claimed_by`` opts into the owner-fenced form: the source job row is
+    locked and rechecked (same user, still ``running``, same owner, live lease)
+    in the SAME transaction as the insert. Pass it from any lane whose replay
+    safety is decided by "did this job already write?" — see the comment at the
+    fenced branch below."""
     import json
     if input_frontier_seq is not None and (
         type(input_frontier_seq) is not int or input_frontier_seq < 0
@@ -15673,19 +15697,78 @@ def effect_enqueue(
             "input_frontier_seq must be a non-negative integer or None"
         )
     frontier_seq = input_frontier_seq
+    if claimed_by is None:
+        with get_pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO v2_effect_outbox "
+                    "(effect_id,user_id,job_id,effect_type,expected_generation,"
+                    " payload,input_frontier_seq) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (effect_id) DO NOTHING",
+                    (effect_id, user_id, job_id, effect_type,
+                     int(expected_generation), json.dumps(payload), frontier_seq),
+                )
+                inserted = cur.rowcount == 1
+        return inserted
+
+    from psycopg.rows import dict_row
+
+    # Owner-fenced form. Without it the replay-safety predicate has a TOCTOU
+    # window: a recovery path can lock the job row, see no durable effect, and
+    # requeue — while the old worker is still between its lease renewal and
+    # this bare INSERT. The row lands afterwards and the replayed turn repeats
+    # the side effect. `start_mcp_mutation_attempt` already closes the same
+    # window for remote writes by taking the job row lock in its own
+    # transaction; platform writes must be linearized the same way.
+    #
+    # Fails closed: a lost lease, a changed owner, or a job that is no longer
+    # running inserts nothing and returns False. The caller treats that as a
+    # write refusal, not as an idempotent no-op.
     with get_pool().connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO v2_effect_outbox "
-                "(effect_id,user_id,job_id,effect_type,expected_generation,payload,"
-                " input_frontier_seq) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s) "
-                "ON CONFLICT (effect_id) DO NOTHING",
-                (effect_id, user_id, job_id, effect_type, int(expected_generation),
-                 json.dumps(payload), frontier_seq),
-            )
-            inserted = cur.rowcount == 1
-    return inserted
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT user_id,status,claimed_by,lease_expires_at "
+                    "FROM agent_jobs WHERE id=%s FOR UPDATE",
+                    (job_id,),
+                )
+                row = cur.fetchone()
+                lease_valid = False
+                if row is not None and row["lease_expires_at"] is not None:
+                    cur.execute(
+                        "SELECT %s::timestamptz > clock_timestamp() AS valid",
+                        (row["lease_expires_at"],),
+                    )
+                    lease_valid = bool(cur.fetchone()["valid"])
+                if (
+                    row is None
+                    or str(row["user_id"]) != str(user_id)
+                    or str(row["status"]) != "running"
+                    or str(row["claimed_by"] or "") != str(claimed_by)
+                    or not lease_valid
+                ):
+                    return False
+                cur.execute(
+                    "INSERT INTO v2_effect_outbox "
+                    "(effect_id,user_id,job_id,effect_type,expected_generation,"
+                    " payload,input_frontier_seq) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (effect_id) DO NOTHING",
+                    (effect_id, user_id, job_id, effect_type,
+                     int(expected_generation), json.dumps(payload), frontier_seq),
+                )
+                if cur.rowcount == 1:
+                    return True
+                # ON CONFLICT DO NOTHING also yields rowcount 0 for a genuine
+                # retry of the same logical effect. Resolve it inside the same
+                # transaction so the caller can tell "already durable" from
+                # "the fence refused" without a second, racy round trip.
+                cur.execute(
+                    "SELECT 1 FROM v2_effect_outbox WHERE effect_id=%s",
+                    (effect_id,),
+                )
+                return cur.fetchone() is not None
 
 
 def effect_pending(user_id, *, due_prefix_only: bool = False) -> list[dict]:

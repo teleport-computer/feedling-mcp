@@ -8178,6 +8178,11 @@ async def _run_wake(
                     ordinal=prepared.ordinal,
                     expected_generation=gen,
                     payload=encrypted_payload,
+                    # 唤醒道的重投安全谓词判的就是「这个 job 写过没有」。
+                    # 裸 INSERT 不锁 source job,恢复路径可能在「已续租、
+                    # 尚未插入」的窗口里判定 pristine 并整轮重投。带 owner
+                    # 栅栏后,写入与 job 行锁在同一事务里线性化。
+                    claimed_by=claimed_by,
                 )
                 if enqueued_id != prepared.effect_id:
                     raise RuntimeError("tool effect id derivation mismatch")
@@ -8215,6 +8220,9 @@ async def _run_wake(
                     ordinal=prepared.ordinal,
                     expected_generation=gen,
                     payload=encrypted_payload,
+                    # 同上:批量工作区写也必须与 job 行锁线性化,否则谓词
+                    # 仍有 TOCTOU 窗口。
+                    claimed_by=claimed_by,
                 )
                 if enqueued_id != prepared.effect_id:
                     raise RuntimeError(

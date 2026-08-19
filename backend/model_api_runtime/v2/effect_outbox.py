@@ -304,12 +304,19 @@ def enqueue_effect(
     expected_generation,
     payload,
     input_frontier_seq: int | None = None,
+    claimed_by: str | None = None,
 ) -> str:
     """Producer-side entry to the generation-fenced outbox (spec C5 / PR A A4). Derives the
     deterministic effect_id, enqueues (ON CONFLICT DO NOTHING = retry-idempotent), returns the id.
-    PR C's tool loop is the first caller; the already-wired apply_pending_effects drains it."""
+    PR C's tool loop is the first caller; the already-wired apply_pending_effects drains it.
+
+    ``claimed_by`` takes the owner-fenced path: the source job row is locked and
+    rechecked in the same transaction as the insert, so a concurrent recovery
+    cannot see "no durable effect yet" and requeue a turn whose write is still
+    in flight. Raises when the fence refuses — a refused platform write must
+    surface as a turn failure, never as a silent no-op."""
     eid = _effect_id.derive(job_id=job_id, effect_type=effect_type, ordinal=ordinal)
-    db.effect_enqueue(
+    inserted = db.effect_enqueue(
         eid,
         user_id,
         job_id,
@@ -317,7 +324,19 @@ def enqueue_effect(
         expected_generation,
         payload,
         input_frontier_seq=input_frontier_seq,
+        claimed_by=claimed_by,
     )
+    if claimed_by is not None and not inserted:
+        # The fenced form already distinguishes "row is durable" (True) from
+        # "the fence refused" (False) inside its own transaction. A refusal is
+        # a lost lease / changed owner / no-longer-running job: it must surface
+        # as a turn failure, never as a silent no-op that leaves the model
+        # believing the write landed. Raised as a plain RuntimeError because
+        # this module must not import the worker (dependency direction); the
+        # worker's own classifier turns it into a terminal turn error.
+        raise RuntimeError(
+            "effect outbox refused a platform write from a stale job owner"
+        )
     return eid
 
 
