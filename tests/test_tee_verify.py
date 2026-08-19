@@ -754,3 +754,55 @@ def test_migration_seeded_singletons_constant_is_complete():
         f"{sorted(seeded - set(_MIGRATION_SEEDED_SINGLETONS))}\n"
         f"常量里有但扫描没发现（该表可能已改名/该 migration 已删，需要人工确认）："
         f"{sorted(set(_MIGRATION_SEEDED_SINGLETONS) - seeded)}")
+
+
+# 本守卫上线时就已存在的缺口。**只减不增**：新表/新列一律不许进这里，
+# 加进来就等于把「静默写默认值」重新合法化。
+#
+# genesis_import_jobs 的这几列是认领/租约状态（worker_claimed_by、
+# resident_heartbeat_at 等）。它们**可能是有意不镜像的**——认领状态属于运行时
+# 本地，跨库复制反而会造出两个认领者。但代码里没有写明这个意图，所以这里只记
+# 「已存在」，不替 genesis 的作者判断对错；已另行上报由该线确认。
+_PREEXISTING_COLUMN_GAPS = {
+    "genesis_import_jobs": {
+        "resident_attempts", "resident_claimed_at", "resident_consumer_id",
+        "resident_heartbeat_at", "worker_claimed_at", "worker_claimed_by",
+    },
+}
+
+
+def test_reconciler_columns_cover_the_whole_table():
+    """对账列表必须覆盖被对账表的**全部**列。
+
+    漏一列不会报错,后果却是静默的:扶正通道按列表 SELECT/INSERT,漏掉的列在
+    TEE 侧取默认值。test 的 primary 已经是 TEE,所以「被读的那一份」会悄悄少
+    掉那几列的真实值 —— 例如 0093 加的说话四列若不补进列表,面板上就是「谁都
+    没说过话」,而且两侧行数一致、verify 也不会喊。
+
+    这条守卫从 schema 反推,而不是再抄一份列名清单:抄的那份同样会漂。
+    """
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+    import db  # noqa: E402
+    from tee_shadow import reconciler  # noqa: E402
+
+    with db.get_pool().connection() as conn:
+        for table, (_pk, columns) in reconciler.TABLES.items():
+            actual = {
+                str(r[0]) for r in conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema='public' AND table_name=%s", (table,),
+                ).fetchall()
+            }
+            if not actual:
+                continue  # 该表不在本地 schema（例如仅 TEE 链建的表）
+            listed = {c.strip() for c in columns.split(",") if c.strip()}
+            missing = sorted(actual - listed - _PREEXISTING_COLUMN_GAPS.get(table, set()))
+            assert not missing, (
+                f"{table}: 这些列存在于 schema 但不在 reconciler 列表里，"
+                f"扶正会把它们写成默认值：{missing}"
+            )
+            unknown = sorted(listed - actual)
+            assert not unknown, f"{table}: 列表里有 schema 上不存在的列：{unknown}"
