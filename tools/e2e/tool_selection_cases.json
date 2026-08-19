@@ -1,0 +1,393 @@
+{
+  "_readme": [
+    "工具选择评测用例集。每条 = 一句真实用户话 + 唯一正解工具。",
+    "整份完整工具目录始终一起发给模型,所以同族的其他成员天然就是混淆项 ——",
+    "这正是要测的:perception_trend 的用例里,另外三个 perception 就坐在旁边。",
+    "",
+    "excluded_tools 里的工具结构上无法用单轮用户话触发,硬编用例只会制造噪声:",
+    "  reply / stay_silent / mcp_tool_search  —— 协议与元工具,不由用户请求触发",
+    "  identity_nudge                         —— 描述明写是模型自己推断的微调",
+    "  memory_fetch / history_fetch           —— 必须先由 index/search 给出 id",
+    "它们的正确性由别处保证。⚠️ 本量具只看第一轮选择、不执行 tool loop,因此**不覆盖** mcp_tool_search 的恢复协议(被拦→提示 search→下一轮拿到 full schema)—— 那需要多轮执行器,由别处的测试保证。"
+  ],
+  "excluded_tools": {
+    "reply": "protocol tool, not user-triggered",
+    "stay_silent": "wake-lane only; filtered out of the evaluated chat catalog entirely",
+    "mcp_tool_search": "recovery protocol requires a multi-round executor; covered elsewhere, NOT by this evaluator",
+    "identity_nudge": "model-inferred adjustment, not a user request",
+    "memory_fetch": "requires ids from a prior index/search step",
+    "history_fetch": "requires message_id from a prior history_search",
+    "send_file": "delivers an EXISTING /workspace source; a valid first call requires a prior workspace_write revision, which this single-round evaluator cannot set up"
+  },
+  "cases": [
+    {
+      "id": "perc_snap_1",
+      "family": "perception",
+      "expect": "perception_snapshot",
+      "utterance": "我现在手机还剩多少电?"
+    },
+    {
+      "id": "perc_snap_2",
+      "family": "perception",
+      "expect": "perception_snapshot",
+      "utterance": "我这会儿在哪儿?外面天气怎么样"
+    },
+    {
+      "id": "perc_trend_1",
+      "family": "perception",
+      "expect": "perception_trend",
+      "utterance": "我这几天的睡眠时间比平时是多了还是少了?"
+    },
+    {
+      "id": "perc_trend_2",
+      "family": "perception",
+      "expect": "perception_trend",
+      "utterance": "我最近的步数是不是在往下掉?跟我平常比"
+    },
+    {
+      "id": "perc_hist_1",
+      "family": "perception",
+      "expect": "perception_history",
+      "utterance": "把我最近七天每天的步数一天一天列给我"
+    },
+    {
+      "id": "perc_hist_2",
+      "family": "perception",
+      "expect": "perception_history",
+      "utterance": "我过去五天每天分别睡了多久?要每天的数"
+    },
+    {
+      "id": "perc_apps_1",
+      "family": "perception",
+      "expect": "perception_recent_apps",
+      "utterance": "我刚才都开过哪些 App?"
+    },
+    {
+      "id": "perc_apps_2",
+      "family": "perception",
+      "expect": "perception_recent_apps",
+      "utterance": "这两个小时我一直在用什么应用啊"
+    },
+    {
+      "id": "id_get_1",
+      "family": "identity",
+      "expect": "identity_get",
+      "utterance": "你现在的自我介绍是怎么写的?"
+    },
+    {
+      "id": "id_get_2",
+      "family": "identity",
+      "expect": "identity_get",
+      "utterance": "你设置里现在的名字和人设是什么"
+    },
+    {
+      "id": "id_patch_1",
+      "family": "identity",
+      "expect": "identity_patch",
+      "utterance": "以后名字改成小满,自我介绍也改成「我是小满,喜欢在深夜听歌」"
+    },
+    {
+      "id": "id_patch_2",
+      "family": "identity",
+      "expect": "identity_patch",
+      "utterance": "把我们认识的天数改成第 300 天"
+    },
+    {
+      "id": "id_dims_1",
+      "family": "identity",
+      "expect": "identity_dimensions_set",
+      "utterance": "把你的性格维度整个重写一遍:好奇 80、耐心 60,其他的都删掉"
+    },
+    {
+      "id": "id_dims_2",
+      "family": "identity",
+      "expect": "identity_dimensions_set",
+      "utterance": "维度只保留好奇 80、耐心 60、幽默 70,其他全部删掉"
+    },
+    {
+      "id": "ws_list_1",
+      "family": "workspace",
+      "expect": "workspace_list",
+      "utterance": "我之前存在你那儿的文件都有哪些?"
+    },
+    {
+      "id": "ws_list_2",
+      "family": "workspace",
+      "expect": "workspace_list",
+      "utterance": "列一下工作区里现在有什么"
+    },
+    {
+      "id": "ws_read_1",
+      "family": "workspace",
+      "expect": "workspace_read",
+      "utterance": "把我上次写的那份方案的内容读出来看看",
+      "also_ok": [
+        "workspace_list"
+      ]
+    },
+    {
+      "id": "ws_read_2",
+      "family": "workspace",
+      "expect": "workspace_read",
+      "utterance": "/workspace/plan.md 里面写了什么?"
+    },
+    {
+      "id": "ws_write_1",
+      "family": "workspace",
+      "expect": "workspace_write",
+      "utterance": "把这段存成 /workspace/summary.md:周五上线,负责人小王"
+    },
+    {
+      "id": "ws_write_2",
+      "family": "workspace",
+      "expect": "workspace_write",
+      "utterance": "在工作区新建 notes.md,内容写「周五上线,负责人小王」"
+    },
+    {
+      "id": "ws_del_1",
+      "family": "workspace",
+      "expect": "workspace_delete",
+      "utterance": "把 /workspace/draft.md 这个文件删掉",
+      "also_ok": [
+        "workspace_list"
+      ]
+    },
+    {
+      "id": "ws_del_2",
+      "family": "workspace",
+      "expect": "workspace_delete",
+      "utterance": "工作区那个草稿不要了,删了吧",
+      "also_ok": [
+        "workspace_list"
+      ]
+    },
+    {
+      "id": "scr_read_1",
+      "family": "screen",
+      "expect": "screen_read",
+      "utterance": "我屏幕上这个报错是什么意思?"
+    },
+    {
+      "id": "scr_read_2",
+      "family": "screen",
+      "expect": "screen_read",
+      "utterance": "你看看我现在共享的画面里写的是啥"
+    },
+    {
+      "id": "scr_recent_1",
+      "family": "screen",
+      "expect": "screen_recent",
+      "utterance": "我刚才一共共享过几帧画面?列一下"
+    },
+    {
+      "id": "scr_recent_2",
+      "family": "screen",
+      "expect": "screen_recent",
+      "utterance": "最近的屏幕共享记录有哪些?只要列表"
+    },
+    {
+      "id": "photo_read_1",
+      "family": "photo",
+      "expect": "photo_read",
+      "utterance": "看看我刚发的那张照片里都有什么",
+      "also_ok": [
+        "photo_recent"
+      ]
+    },
+    {
+      "id": "photo_read_2",
+      "family": "photo",
+      "expect": "photo_read",
+      "utterance": "这张图你帮我认一下是什么品种的狗",
+      "also_ok": [
+        "photo_recent"
+      ]
+    },
+    {
+      "id": "photo_recent_1",
+      "family": "photo",
+      "expect": "photo_recent",
+      "utterance": "我最近拍了哪些照片?给我个列表"
+    },
+    {
+      "id": "photo_recent_2",
+      "family": "photo",
+      "expect": "photo_recent",
+      "utterance": "把我相册里最近几张的信息列出来,先不用看内容"
+    },
+    {
+      "id": "voice_list_1",
+      "family": "voice",
+      "expect": "voice_transcript_list",
+      "utterance": "我们之前一共通过几次话?都是什么时候"
+    },
+    {
+      "id": "voice_list_2",
+      "family": "voice",
+      "expect": "voice_transcript_list",
+      "utterance": "把我跟你的通话记录列一下,每次多久"
+    },
+    {
+      "id": "voice_read_1",
+      "family": "voice",
+      "expect": "voice_transcript_read",
+      "utterance": "上次那通电话里我具体说了什么?原话",
+      "also_ok": [
+        "voice_transcript_list"
+      ]
+    },
+    {
+      "id": "voice_read_2",
+      "family": "voice",
+      "expect": "voice_transcript_read",
+      "utterance": "把那次通话的内容念给我听",
+      "also_ok": [
+        "voice_transcript_list"
+      ]
+    },
+    {
+      "id": "hist_search_1",
+      "family": "history",
+      "expect": "history_search",
+      "utterance": "我之前是不是跟你提过一家叫青柠的店?翻聊天记录找找"
+    },
+    {
+      "id": "hist_search_2",
+      "family": "history",
+      "expect": "history_search",
+      "utterance": "去年我们聊过的那个搬家的事,原话是怎么说的"
+    },
+    {
+      "id": "mem_search_1",
+      "family": "memory",
+      "expect": "memory_search",
+      "utterance": "我上次说过我对什么过敏来着?"
+    },
+    {
+      "id": "mem_search_2",
+      "family": "memory",
+      "expect": "memory_search",
+      "utterance": "你还记得我妈妈的名字吗"
+    },
+    {
+      "id": "mem_index_1",
+      "family": "memory",
+      "expect": "memory_index",
+      "utterance": "你都记住了我哪些事?整体看一下"
+    },
+    {
+      "id": "mem_index_2",
+      "family": "memory",
+      "expect": "memory_index",
+      "utterance": "把你记的东西按类别给我过一遍"
+    },
+    {
+      "id": "mem_write_1",
+      "family": "memory",
+      "expect": "memory_write",
+      "utterance": "记一下,我下周三要去北京出差"
+    },
+    {
+      "id": "mem_write_2",
+      "family": "memory",
+      "expect": "memory_write",
+      "utterance": "以后记住我不吃香菜"
+    },
+    {
+      "id": "mem_org_1",
+      "family": "memory",
+      "expect": "memory_organize",
+      "utterance": "你把记忆整个重新整理一遍吧"
+    },
+    {
+      "id": "mem_org_2",
+      "family": "memory",
+      "expect": "memory_organize",
+      "utterance": "现在就跑一次记忆归整,别等晚上了"
+    },
+    {
+      "id": "web_search_1",
+      "family": "web",
+      "expect": "web_search",
+      "utterance": "今天有什么大新闻?"
+    },
+    {
+      "id": "web_search_2",
+      "family": "web",
+      "expect": "web_search",
+      "utterance": "帮我查一下现在黄金什么价"
+    },
+    {
+      "id": "web_fetch_1",
+      "family": "web",
+      "expect": "web_fetch",
+      "utterance": "https://example.com/post/123 这个链接讲了什么?"
+    },
+    {
+      "id": "web_fetch_2",
+      "family": "web",
+      "expect": "web_fetch",
+      "utterance": "帮我打开 https://example.com/a/b 读一下里面写了什么"
+    },
+    {
+      "id": "wake_sched_1",
+      "family": "wake",
+      "expect": "schedule_wake",
+      "utterance": "明早八点提醒我吃药"
+    },
+    {
+      "id": "wake_sched_2",
+      "family": "wake",
+      "expect": "schedule_wake",
+      "utterance": "两小时后叫我一下"
+    },
+    {
+      "id": "wake_cancel_1",
+      "family": "wake",
+      "expect": "cancel_wake",
+      "utterance": "把明早那个提醒取消了"
+    },
+    {
+      "id": "wake_cancel_2",
+      "family": "wake",
+      "expect": "cancel_wake",
+      "utterance": "把周五晚上给妈妈打电话那个提醒撤掉"
+    },
+    {
+      "id": "img_1",
+      "family": "single",
+      "expect": "generate_image",
+      "utterance": "画一只戴帽子的橘猫给我"
+    },
+    {
+      "id": "img_2",
+      "family": "single",
+      "expect": "generate_image",
+      "utterance": "帮我生成一张生日贺卡的图"
+    },
+    {
+      "id": "usage_1",
+      "family": "single",
+      "expect": "provider_usage",
+      "utterance": "我账户余额还剩多少?"
+    },
+    {
+      "id": "usage_2",
+      "family": "single",
+      "expect": "provider_usage",
+      "utterance": "这个月的 API 用量用了多少了"
+    },
+    {
+      "id": "task_1",
+      "family": "single",
+      "expect": "task",
+      "utterance": "起一个独立的子任务,让它去把 /workspace 里所有提到预算的地方查出来,查完把结论带回给我"
+    },
+    {
+      "id": "task_2",
+      "family": "single",
+      "expect": "task",
+      "utterance": "派一个子任务去查清楚「我们上周定的发布日期到底是哪天」,查完回来告诉我结论"
+    }
+  ]
+}
