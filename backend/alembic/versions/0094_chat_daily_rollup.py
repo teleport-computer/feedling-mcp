@@ -94,13 +94,6 @@ CREATE TABLE IF NOT EXISTS chat_daily_rollup (
 CREATE INDEX IF NOT EXISTS ix_chat_daily_rollup_day
     ON chat_daily_rollup (day);
 
--- ⚠️ ``chat_message_archive`` 原有索引都以 (user_id, cleared_at/msg_id) 打头，
--- 给不出 ts 范围收窄。冻结与「今天」实时窗都按 ts 过滤 live ∪ archive，没有这
--- 个索引，实时窗会退化成 archive 全史顺扫——正是本期要消灭的形态，只是换了张表
--- （codex2 2026-08-19 要求补证）。与 ix_chat_messages_ts（0079）对称。
-CREATE INDEX IF NOT EXISTS ix_chat_message_archive_ts
-    ON chat_message_archive (ts);
-
 -- Coverage watermark, separate from lane_rollup_watermark on purpose: the two
 -- sources lose history in different ways, so one shared bound would be wrong
 -- for both. ``user_logs`` is ring-buffered, so its oldest days are simply gone.
@@ -127,15 +120,49 @@ CREATE TABLE IF NOT EXISTS chat_rollup_watermark (
 
 _DOWN = """
 DROP TABLE IF EXISTS chat_rollup_watermark;
-DROP INDEX IF EXISTS ix_chat_message_archive_ts;
 DROP INDEX IF EXISTS ix_chat_daily_rollup_day;
 DROP TABLE IF EXISTS chat_daily_rollup;
 """
 
 
+# ⚠️ 对 chat_message_archive 建索引必须 CONCURRENTLY。这张表正是因为可达全史
+# 量级才需要索引，普通 CREATE INDEX 会持锁阻塞写入（codex2 2026-08-19）。
+# 单用 IF NOT EXISTS 还会把 canceled build 留下的 invalid 壳当成建好了。
+# 配方与 0093/0025 一致（源自 0079）：autocommit_block + pg_index.indisvalid
+# 自检 + 无效壳先 DROP 再重建。
+_ARCHIVE_TS_INDEX = "ix_chat_message_archive_ts"
+_ARCHIVE_TS_DDL = (
+    f"CREATE INDEX CONCURRENTLY {_ARCHIVE_TS_INDEX} "
+    "ON chat_message_archive (ts)"
+)
+
+
+def _index_validity(name: str) -> bool | None:
+    """None = absent, False = an invalid shell left by a canceled build."""
+    row = op.get_bind().exec_driver_sql(
+        "SELECT idx.indisvalid FROM pg_class AS cls "
+        "JOIN pg_index AS idx ON idx.indexrelid=cls.oid "
+        f"WHERE cls.relkind='i' AND cls.relname='{name}' "
+        "AND pg_table_is_visible(cls.oid)"
+    ).fetchone()
+    return None if row is None else bool(row[0])
+
+
+def _create_archive_ts_index() -> None:
+    validity = _index_validity(_ARCHIVE_TS_INDEX)
+    with op.get_context().autocommit_block():
+        if validity is False:
+            op.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {_ARCHIVE_TS_INDEX}")
+        if validity is not True:
+            op.execute(_ARCHIVE_TS_DDL)
+
+
 def upgrade() -> None:
     op.execute(_UP)
+    _create_archive_ts_index()
 
 
 def downgrade() -> None:
+    with op.get_context().autocommit_block():
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS " + _ARCHIVE_TS_INDEX)
     op.execute(_DOWN)

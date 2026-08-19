@@ -5065,28 +5065,40 @@ _LANE_ROLLUP_ANON_DELETE_SQL = "DELETE FROM lane_daily_rollup WHERE user_id = %s
 # live 行若还在，它才是这条消息的现状。用 rank 列显式排序，不依赖 UNION 的
 # 任意顺序。
 def _chat_rollup_source(where: str) -> str:
-    """live ∪ archive 的联合源，**ts 谓词下推到两个分支内部**。
+    """live ∪ archive 的联合源，谓词下推 + **全局** live 优先。
 
-    ⚠️ 谓词必须在 DISTINCT ON 之前施加。DISTINCT ON 是优化屏障，外层的
-    ``ts >=`` 推不进去——实测 5 万行归档时，PG 会把 52000 行全部物化排序再过滤，
-    ts 索引完全用不上，「有界今日窗」实际在扫全史（正是本期要消灭的形态，只是
-    换了张表）。下推之后两侧各走自己的 ts 索引。
+    两个约束必须同时成立，任缺其一都出错：
 
-    去重仍按 (user_id, source_seq) 定胜、live 优先（rank 0）：UNION 去的是整行
-    重，同一条消息只要两侧 doc/ts 有任何差异就会双计（codex2 2026-08-19）。
+    ① **谓词下推**。ts 过滤必须在去重之前施加。DISTINCT ON 是优化屏障，外层
+       ``ts >=`` 推不进去——实测 5 万行归档时 PG 把 52000 行全部物化再过滤，
+       ts 索引完全用不上，「有界今日窗」实际在扫全史（要消灭的形态换了张表）。
 
-    ``where`` 里的占位符会出现**两次**（每个分支一次），调用方的参数要给两遍。
+    ② **live 优先必须是全局的，不是窗内的**。这两条放一起会打架，而打架的
+       后果是同一条消息被计两次：同一 (user_id, source_seq) 若 live 与 archive
+       的 ts 分处两个北京日，先在各分支过滤再去重 ⇒ 冻昨日时 live 被滤掉、
+       archive 入格；读今日时 archive 被滤掉、live 又入实时窗。codex2 在隔离库
+       实测复现（frozen_yesterday=1 且 today=1，同一 key 合计 2），破坏累计守恒。
+       我上一轮把它当「数据异常，可接受」——错了：它不是异常输入下的行为，
+       是这个查询结构自带的双计。
+
+    所以不用 DISTINCT ON，改成 archive 分支对**全部** live key 做反连接：
+    live 窗内行，UNION ALL archive 窗内且全局无同 key live 的行。live 即使落在
+    窗外也照样压住 archive，那条消息只会在 live 自己的那一天被计一次。
+    反连接走 chat_user_seq_idx (user_id, seq)，不引入新扫描。
+
+    ``where`` 里的占位符出现**两次**（每分支一次），调用方参数要给两遍。
     """
     return f"""(
-            SELECT DISTINCT ON (user_id, source_seq) user_id, source_seq, ts, doc
-            FROM (
-                SELECT user_id, seq AS source_seq, ts, doc, 0 AS rank
-                FROM chat_messages WHERE {where}
-                UNION ALL
-                SELECT user_id, source_seq, ts, doc, 1 AS rank
-                FROM chat_message_archive WHERE {where}
-            ) merged
-            ORDER BY user_id, source_seq, rank
+            SELECT user_id, seq AS source_seq, ts, doc
+            FROM chat_messages WHERE {where}
+            UNION ALL
+            SELECT a.user_id, a.source_seq, a.ts, a.doc
+            FROM chat_message_archive a
+            WHERE {where.replace('user_id', 'a.user_id').replace(' ts ', ' a.ts ')}
+              AND NOT EXISTS (
+                  SELECT 1 FROM chat_messages m
+                  WHERE m.user_id = a.user_id AND m.seq = a.source_seq
+              )
         )"""
 
 # ⚠️ 另有两族**硬删且不归档**的行（codex2 2026-08-19 指出），联合源救不回来：

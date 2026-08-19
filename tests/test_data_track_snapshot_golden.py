@@ -611,3 +611,48 @@ def test_summary_payload_exposes_coverage_at_top_level():
 
     source = inspect.getsource(data_track._data_track_payload)
     assert '"chat_coverage": db.chat_rollup_coverage()' in source
+
+
+def test_same_key_across_two_days_is_counted_once_not_twice(clean_chat_rollup):
+    """同一条消息不得同时进两个日格 —— 累计守恒。
+
+    codex2 在隔离库实测的反例:同一 (user_id, source_seq),live 的 ts 在今天、
+    archive 的 ts 在昨天。若「先各分支按窗过滤、再去重」,冻昨天时 live 被滤掉
+    ⇒ archive 入格;读今天时 archive 被滤掉 ⇒ live 又入实时窗;同一 key 合计 2。
+
+    我上一轮把它当「数据异常,可接受」是错的:它不是异常输入下的行为,是那个
+    查询结构**自带**的双计。修法是 live 优先必须**全局**生效(archive 分支对
+    全部 live key 反连接),而不是窗内生效。
+
+    ⚠️ 这条特意跨日,不能只测同日 +0.5s —— 同日那版反例根本触发不了这个洞。
+    """
+    from datetime import datetime, timedelta, timezone
+    from zoneinfo import ZoneInfo
+
+    uid = "usr_dt_golden_crossday"
+    seed_user(uid)
+    zone = ZoneInfo("Asia/Shanghai")
+    today_start = datetime.combine(datetime.now(zone).date(),
+                                   datetime.min.time(), tzinfo=zone)
+    live_ts = today_start.timestamp() + 3600          # 今天
+    archive_ts = today_start.timestamp() - 3600       # 昨天
+
+    db.chat_append(uid, "cd0", live_ts,
+                   {"id": "cd0", "role": "user", "source": "ios",
+                    "content_type": "text"}, 1000)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO chat_message_archive"
+            " (user_id, source_seq, msg_id, ts, doc, clear_generation)"
+            " SELECT user_id, seq, msg_id, %s, doc, 1 FROM chat_messages"
+            " WHERE user_id = %s", (archive_ts, uid))
+
+    db.freeze_completed_chat_days()
+    with db.get_pool().connection() as conn:
+        frozen = conn.execute(
+            "SELECT COALESCE(SUM(total),0) FROM chat_daily_rollup"
+            " WHERE user_id = %s", (uid,)).fetchone()[0]
+    live_total = db.admin_data_track_snapshot([uid])[uid]["chat"]["total"]
+    assert frozen + live_total == 1, (
+        f"同一 key 跨日被计了 {frozen + live_total} 次"
+        f"(冻结 {frozen} + 今日 {live_total}) —— live 优先没有全局生效")
