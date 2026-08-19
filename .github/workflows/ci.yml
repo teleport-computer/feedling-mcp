@@ -736,6 +736,7 @@ jobs:
             tests/test_v2_jobs_migration.py \
             tests/test_lane_rollup.py \
             tests/test_data_track_snapshot_golden.py \
+            tests/test_trace_write_stats.py \
             tests/test_v2_jobs_store.py \
             tests/test_v2_enclave_broker.py \
             tests/test_v2_job_lease_fencing.py \
