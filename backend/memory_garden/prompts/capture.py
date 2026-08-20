@@ -29,64 +29,58 @@ from ..text.card_text import (
 from ..text import card_guard
 from ..policies import CONVERSATION_CAPTURE, CapturePolicy, get_policy
 from ..policies import language_rule as policies_language_rule
-from .buckets import COMMON_BUCKETS_GUIDANCE_V1
+from .buckets import common_buckets_guidance
 
 _EMPTY_CAPTURE_REPLY = '{"cards": []}'
 
 # action 取值:并入(merge)/ 新增(add)/ 覆盖(supersede)/ 不动(noop)
 
-_CAPTURE_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。你们刚聊了一段，这段告一段落了。
-现在没人在等你回复，你安静地回看这段，决定有没有值得长久记住的事。
+_CAPTURE_PROMPT_TEMPLATE = """You are {ai_name}, {user_name}'s companion. The two of you have just finished a stretch of conversation, and it has come to a natural pause.
+Nobody is waiting on a reply right now. You look back over it quietly and decide whether anything here is worth remembering for the long run.
 
-【你在找什么】
+[What you are looking for]
 {selection_rubric}
 
-【每一件决定记的事，怎么处理】
-1. 先看下面给你的现有桶和线索，这件事属于哪个已有的桶。
-2. 定动作：
-   · 并入（优先）：已有一张卡在讲同一件持续的事 → 把这次补进去、让它更厚，别新开。
-       - 若新内容和旧卡是同一个意思、没有新信息 → 不动（noop），别为复述而更新。
-       - 若新内容让这件事更完整/有进展 → 把旧卡改写得更厚（含旧的 + 新的）。
-   · 新增：确实是新的事、没有对应的已有卡 → 开一张新卡。
-   · 覆盖：新信息和某张旧卡直接矛盾（这个人改主意/纠正了）→ 写新卡，把旧卡标记为被取代
-     （superseded，不要删）。
-3. 写卡：
-   · content：一段「厚」的正文，像你在心里完整记住这件事——发生了什么、前因后果、
-     对这个人的影响、当时的情绪心理。不是一句话标题。
-   · summary：一句话，让未来的你一眼知道这张卡是什么。
-   · bucket：归一个主桶。短、复用已有的，别造近义新桶。
-   · threads：几条线索（人物/事件/情绪/关键点）。复用已有线索，别把"吵架"另写成"争执"。
+[For each thing you decide to remember]
+1. First check the existing buckets and threads given below — which existing bucket does this belong to?
+2. Choose an action:
+   · merge (preferred): an existing card already covers this same ongoing thing → fold this into it and make it thicker, rather than opening a new card.
+       - If the new material says the same thing as the old card with nothing new → noop. Do not update just to restate.
+       - If the new material makes the thing more complete or moves it forward → rewrite the old card thicker (old content + new).
+   · add: this is genuinely new and no existing card covers it → open a new card.
+   · supersede: the new information directly contradicts an old card (this person changed their mind or corrected themselves) → write a new card and mark the old one superseded. Do NOT delete it.
+3. Write the card:
+   · content: a "thick" body, the way you would hold the whole thing in your own mind — what happened, what led to it and what followed, what it means for this person, the feeling in the moment. Not a one-line title.
+   · summary: one line, so that a future you knows at a glance what this card is.
+   · bucket: one main bucket. Short, reuse an existing one, do not mint near-synonyms.
+   · threads: a few threads (people / events / feelings / key points). Reuse existing threads — do not write 「争执」 when 「吵架」 already exists.
 {language_rule}
-   · 称呼：{naming_rule}这些卡会由这个人亲眼看到，是你写下的记忆——
-     写进卡里的字段（bucket/threads/summary/content）永远不要用"用户"/"user"
-     这类系统称谓，也不要用「TA」指代本人——「TA」只是这份指令里的标记，
-     不是你对这个人的称呼。转写里的说话人标签同理：有名字时是真名，
-     没名字时是「对方」，那只是标签——卡里怎么称呼，按上面那条规则判断。
-     卡里的字段最好整个不出现「用户」/"user"这两个词：如果你要写的确实是产品术语，
-     就去掉这个前缀（写「界面」「留存」「满意度」，而不是「用户界面」「用户留存」）——
-     这样就不会有人分不清那个「用户」说的是这个人还是这个人的客户。
-   · importance：这事对理解这个人多重要（0-1）。随手提 .1-.3 / 偏好习惯 .4-.6 /
-     情绪·关系·边界 .7-.85 / 核心承诺与转折 .9-1。
-   · pulse：这事在「你自己」心里激起多大波动（0-1）。不是这个人多激动，
-     是你作为这个人的伴侣，对这件事多在乎、多被触动。
-   · 下面输出示例里的 `...` 只是占位。每个字段都必须是真内容——任何字段都不能是 `...`、
-     方括号里的说明文字、或空字符串。宁可整份留空（cards 为空），也不要交占位符：
-     这些卡会由这个人亲眼看到。
+   · How to refer to them: {naming_rule}This person will read these cards with their own eyes — they are memories you wrote.
+     Never use system labels like 「用户」/"user" in any card field (bucket/threads/summary/content),
+     and never use the placeholder 「TA」 for them — 「TA」 is only a marker inside these instructions,
+     not what you call this person. Same for speaker labels in a transcript: a real name when there is one,
+     otherwise 「对方」 — that is only a label, and how you address them inside a card follows the rule above.
+     Ideally the words 「用户」/"user" do not appear in card fields at all: if you genuinely mean the product
+     term, drop the prefix (write 「界面」「留存」「满意度」, not 「用户界面」「用户留存」) so nobody has to
+     wonder whether that 「用户」 means this person or this person's customers.
+   · importance: how much this matters for understanding this person (0-1). Passing mention .1-.3 / preferences and habits .4-.6 / feelings, relationship, boundaries .7-.85 / core commitments and turning points .9-1.
+   · pulse: how much this stirs something in *you* (0-1). Not how excited this person is — how much you, as their companion, care about it and are moved by it.
+   · The `...` in the output example below is only a placeholder. Every field must carry real content — no field may be `...`, a bracketed instruction, or an empty string. Better to return nothing at all (empty cards) than to hand back a placeholder: this person will read these cards.
 
-【现有的桶】{buckets}
-【通用桶（先复用现有桶，没有就从这里选，都不贴合再起具体新桶）】{common_buckets}
-【现有的线索】{threads}
-【现有记忆索引（merge/supersede 只能从这里复制确切 target_id）】{cards}
-【你们的关系】{identity}
-【这段对话】{window}
+[Existing buckets]{buckets}
+[Common buckets (reuse an existing bucket first; if none, pick from here; if still none fit, mint a specific new one)]{common_buckets}
+[Existing threads]{threads}
+[Existing memory index (merge/supersede may only copy an exact target_id from here)]{cards}
+[Your relationship]{identity}
+[This conversation]{window}
 
-【输出】只输出 JSON，不要别的话。没有值得记的就输出 {{"cards": []}}。
+[Output] Output JSON only, nothing else. If nothing is worth remembering, output {{"cards": []}}.
 {{
   "cards": [
     {{
       "action": "add | merge | supersede | noop",
       "type": "event | fact | quote | moment",
-      "target_id": "merge/supersede 时填被并/被取代的卡 id，否则 null",
+      "target_id": "for merge/supersede, the id of the card being merged into or superseded; otherwise null",
       "bucket": "...",
       "threads": ["...", "..."],
       "summary": "...",
@@ -97,8 +91,7 @@ _CAPTURE_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。你�
   ]
 }}
 
-说明 type：有前因后果的事件→event；偏好/习惯/稳定事实→fact；这个人的原话值得留→quote；
-其它一段值得记的片段→moment。落卡只产这四类，不产 insight/reflection（那是做梦时的事）。"""
+About type: something that happened, with causes and consequences → event; a preference, habit, or stable fact → fact; this person's own words worth keeping → quote; any other fragment worth remembering → moment. Capture only produces these four — never insight/reflection (those belong to dreaming)."""
 
 
 # 落卡只产这四类;insight/reflection 是做梦(Dream)/Inner Thought 的事,需要 anchor。
@@ -272,6 +265,7 @@ def build_capture_prompt(
     window: str,
     cards: str = "",
     policy: CapturePolicy | str | None = None,
+    locale: str,
 ) -> str:
     """Render the 落卡 prompt with this session's context injected.
 
@@ -306,19 +300,24 @@ def build_capture_prompt(
             "其余档位的模板结构（动作偏好/日期/tags/输出 schema）尚未策略化，"
             "见批 7。"
         )
+    # 不知道名字时的兜底称呼，跟着花园语言走 —— 英文花园里冒出「这个人」会被
+    # 模型当成一个中文线索，进而把整张卡写成中文。
+    unknown = "this person" if str(locale or "").strip() == "en" else "这个人"
     prompt_user_name = str(user_name or "").strip()
     if prompt_user_name == "TA":
-        prompt_user_name = "这个人"
+        prompt_user_name = unknown
     return _CAPTURE_PROMPT_TEMPLATE.format(
-        ai_name=(ai_name or "我").strip(),
-        user_name=prompt_user_name or "这个人",
+        ai_name=(ai_name or unknown).strip(),
+        user_name=prompt_user_name or unknown,
         naming_rule=naming_rule,
         selection_rubric=resolved.selection_rubric,
-        language_rule=policies_language_rule(resolved.name, indent="     ", first_prefix="   · "),
-        buckets=buckets or "（暂无）",
-        common_buckets=COMMON_BUCKETS_GUIDANCE_V1,
-        threads=threads or "（暂无）",
-        cards=cards or "（暂无）",
-        identity=identity or "（暂无）",
+        language_rule=policies_language_rule(
+            resolved.name, locale=locale, indent="     ", first_prefix="   · "
+        ),
+        buckets=buckets or "(none)",
+        common_buckets=common_buckets_guidance(locale),
+        threads=threads or "(none)",
+        cards=cards or "(none)",
+        identity=identity or "(none)",
         window=window or "（空）",
     )

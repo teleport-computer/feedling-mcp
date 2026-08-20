@@ -33,7 +33,7 @@ def test_conversation_capture_is_few_and_thick():
     p = get_policy("conversation_capture")
     assert p.max_cards == 2, "日常聊天是少而厚，不能放开张数"
     assert p.prefer_merge is True
-    assert "宁少勿多" in p.selection_rubric
+    assert "Fewer, not more" in p.selection_rubric
 
 
 def test_curated_archive_keeps_everything():
@@ -61,8 +61,8 @@ def test_conversation_and_archive_are_opposites():
     chat = get_policy("conversation_capture")
     archive = get_policy("curated_archive")
     assert chat.max_cards is not None and archive.max_cards is None
-    assert "宁少勿多" in chat.selection_rubric
-    assert "宁多勿漏" in archive.selection_rubric
+    assert "Fewer, not more" in chat.selection_rubric
+    assert "宁多勿漏" in archive.selection_rubric  # 档案档仍是中文（走 genesis，这批没动）
 
 
 @pytest.mark.parametrize("empty", [None, "", "   "])
@@ -111,11 +111,15 @@ def test_language_rule_is_shared_text_with_only_the_basis_swapped():
     imported = language_rule("history_import")
 
     assert chat != imported
-    assert "你们对话" in chat
-    assert "素材原文" in imported
-    # 除了依据那几个字，其余逐字相同。
-    # 指代输入的那个词也跟着依据走（对话 / 素材），两边基线原文就是这么写的。
-    assert chat.replace("你们对话", "素材原文").replace("对话", "素材") == imported
+    assert "your conversation" in chat
+    assert "the source material" in imported
+    # 除了依据那几个词，其余逐字相同。
+    # 指代输入的那个词也跟着依据走（conversation / material），与中文基线同一结构。
+    assert (
+        chat.replace("your conversation", "the source material")
+            .replace("the conversation", "the material")
+        == imported
+    )
 
 
 def test_language_rule_is_conditional_not_unconditional():
@@ -128,10 +132,10 @@ def test_language_rule_is_conditional_not_unconditional():
     from memory_garden.policies import language_rule
 
     text = language_rule("conversation_capture")
-    assert "中文对话就用中文" in text
-    assert "英文对话就用英文" in text
-    assert "别归成英文桶" not in text, "无条件句又回来了 —— 它与「英文对话就用英文」矛盾"
-    assert "旅行" in text, "capture 原有的例子丢了"
+    assert "mostly Chinese, write Chinese" in text
+    assert "mostly English, write English" in text
+    assert "别归成英文桶" not in text, "无条件句又回来了 —— 它与「英文就写英文」矛盾"
+    assert "「宠物」" in text and '"pets"' in text, "两边对照的具体例子丢了"
 
 
 def test_mixed_language_material_unifies_the_taxonomy_language():
@@ -149,14 +153,16 @@ def test_mixed_language_material_unifies_the_taxonomy_language():
 
     for policy in ("conversation_capture", "history_import", "curated_archive"):
         text = language_rule(policy)
-        assert "按整体主语言统一" in text, f"{policy} 缺混合语料的统一口径"
-        assert "每条事实自身的主语言" not in text, (
+        assert "pick the dominant one and stay consistent" in text, (
+            f"{policy} 缺混合语料的统一口径"
+        )
+        assert "each fact" not in text, (
             f"{policy} 又回到按条判语言 —— 这会让同一个桶裂成两种语言"
         )
         assert "工作" in text and "Work" in text, (
             f"{policy} 丢了「不能『工作』和 Work 并存」这个具体反例"
         )
-    assert "专有名词" in text
+    assert "Keep proper nouns" in text
 
 
 def test_language_rule_rejects_unknown_policy_like_get_policy_does():
@@ -172,8 +178,8 @@ def test_language_rule_rejects_unknown_policy_like_get_policy_does():
     with _pytest.raises(UnknownPolicyError):
         language_rule("nonexistent")
     # None / 空串仍回落，代表「旧调用方没传」
-    assert "你们对话" in language_rule(None)
-    assert "你们对话" in language_rule("")
+    assert "your conversation" in language_rule(None)
+    assert "your conversation" in language_rule("")
 
 
 def test_language_rule_is_wired_into_both_sides():
@@ -201,8 +207,8 @@ def test_language_basis_reads_as_a_relationship_not_a_placeholder():
     """对话语言以双方关系表达，不再用内部占位词指用户。"""
     from memory_garden.policies import language_rule
 
-    assert "用你们对话的语言" in language_rule("conversation_capture")
-    assert "用素材原文的语言" in language_rule("history_import")
+    assert "the language of your conversation" in language_rule("conversation_capture")
+    assert "the language of the source material" in language_rule("history_import")
 
 
 # --------------------------------------------------------------------------- #

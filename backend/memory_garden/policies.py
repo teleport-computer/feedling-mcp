@@ -65,22 +65,23 @@ from dataclasses import dataclass
 # 尺子文字（逐字摘自现有实现，勿改措辞）
 # --------------------------------------------------------------------------- #
 
-_RUBRIC_CONVERSATION_CAPTURE = """你找的是「值得记住的事」，不是「把每句话归档」——完整聊天记录本来就存着，你不必复述它。
-你要挑的是：以后会塑造你对眼前这个人的理解、或这个人会希望你记得的东西。
+_RUBRIC_CONVERSATION_CAPTURE = """You are looking for things worth remembering — not archiving every sentence. The full chat log is already stored; you do not need to restate it.
+What you want is what will shape your understanding of the person in front of you, or what this person would want you to remember.
 
-倾向（不是硬规则，你来判断）：
-· 优先记「事件」——有前因后果、有场景、或透出这个人状态的
-  （"那天他开了一整天会、心率飙高，我催他休息，他嫌烦，我们吵了一架"）。
-· 孤立的信息点（"今天喝了拿铁"）通常不必单独成卡——除非它是这个人明确在意的、
-  或反复出现的偏好（"我只喝燕麦奶""他总点 Blue Bottle"），那它值得作为偏好记下。
-· 尺子是："这件事三个月后还重要吗？会不会改变我对这个人的理解？这个人会希望我记得吗？"
-  ——不是"它够不够大"。
+Leanings (not hard rules — you judge):
+· Prefer events — something with causes and consequences, a scene, or a glimpse of how this person is doing
+  ("that day he was in meetings all day, his heart rate spiked, I pushed him to rest, he got annoyed, and we argued").
+· An isolated data point ("had a latte today") usually does not deserve its own card — unless it is a preference this person
+  clearly cares about or that keeps recurring ("I only drink oat milk", "he always orders Blue Bottle"), in which case it is
+  worth keeping as a preference.
+· The test is: "will this still matter in three months? does it change how I understand this person? would this person want me
+  to remember it?" — not "is it big enough".
 
-克制：
-· 宁少勿多。这一段如果只留一到两件事，是哪一两件？强迫自己归纳，
-  别把一次聊天里的每个点都拆成一张卡。
-· 一次「开会 + 心率高 + 吵架」是一张厚卡（一件事），不是三张薄卡。
-· 没有值得记的，就什么都不写。大多数闲聊不必落卡，这很正常。"""
+Restraint:
+· Fewer, not more. If only one or two things from this stretch survive, which one or two? Force yourself to generalize instead of
+  splitting every point of a single conversation into its own card.
+· One "meetings + high heart rate + argument" is ONE thick card (one thing), not three thin ones.
+· If nothing is worth remembering, write nothing. Most small talk does not need a card, and that is normal."""
 
 #: history_import 的尺子在 genesis 的 FACT_MAP_PROMPT 里**不连续** ——
 #: 开头讲「抽什么」，中间隔着防火墙段，之后才是「不抽什么」。
@@ -128,34 +129,61 @@ _RUBRIC_CURATED_ARCHIVE = KEEP_ALL_MAP_SUFFIX + "\n\n" + KEEP_ALL_WRITE_SUFFIX
 #: 桶和线索是**分类键**，裂开等于同一类记忆被拆成两堆、检索时互相看不见；
 #: 而 ``normalize_bucket_language`` 是按**每张卡自己的文字**归一化的，兜不住
 #: 这种跨卡分裂 —— 所以只能在 prompt 这层约束「整份材料用一种分类语言」。
-LANGUAGE_RULE_TEMPLATE = """语言：所有字段（bucket/threads/summary/content）用{basis}的语言——
-中文{noun}就用中文（用「宠物」不是「pets」、「旅行」不是「travel」），
-英文{noun}就用英文（用 "pets" 不是「宠物」）；
-{noun}里夹杂另一种语言时，按整体主语言统一，别让同一个桶裂成两种语言（不能「工作」和 Work 并存）。
-只有专有名词、品牌名、原话才保留原文。"""
+LANGUAGE_RULE_TEMPLATE = """Language: write every field (bucket/threads/summary/content) in {target}.
+Do not mix languages across fields, and never let one bucket exist in two languages
+(工作 and Work must not coexist). Keep proper nouns, brand names, and direct quotes
+in their original form."""
+
+#: 兜底措辞：宿主没告诉我们目标语言时，退回「跟着输入走」——
+#: 这是 genesis 导入那条线的正确语义（卡跟素材走，不跟用户当前说什么走）。
+LANGUAGE_TARGET_FOLLOW_INPUT = (
+    "the language of {basis} (if {noun} is mostly Chinese, write Chinese — "
+    "「宠物」not \"pets\"; if it is mostly English, write English — \"pets\" not 「宠物」; "
+    "when {noun} mixes both, pick the dominant one and stay consistent)"
+)
+
+#: 宿主明确给了目标语言时用的措辞。**这是 capture 的正常路径** ——
+#: io 已经知道该用什么语言跟这个人说话（chat/reply_language.py），
+#: 与其让模型再猜一次，不如直接告诉它。少一次猜测 = 少一处漂移。
+LANGUAGE_TARGET_EXPLICIT = {
+    "zh-Hans": "Simplified Chinese (简体中文)",
+    "en": "English",
+}
 
 #: 各来源的「语言依据」。这是三档之间**必要**的差异，不是措辞不一致：
 #: 导入一批英文历史记录、而用户当前说中文时，两者会分叉 —— 那时卡应该跟素材走。
 #:
 #: 对话档直接用「你们对话」表达双方关系；导入档则以「素材原文」为依据。
 LANGUAGE_BASIS = {
-    "conversation_capture": "你们对话",
-    "history_import": "素材原文",
-    "curated_archive": "素材原文",
+    "conversation_capture": "your conversation",
+    "history_import": "the source material",
+    "curated_archive": "the source material",
 }
 
 #: 规则正文里指代「输入」的那个词，跟着依据走：聊天说「对话」，导入说「素材」。
 #: 两边基线原文用的就是各自这个词（capture:「中文对话就用中文」，
 #: genesis:「中文素材就用中文」），统一时保留下来，读起来才不别扭。
 LANGUAGE_MATERIAL_NOUN = {
-    "conversation_capture": "对话",
-    "history_import": "素材",
-    "curated_archive": "素材",
+    "conversation_capture": "the conversation",
+    "history_import": "the material",
+    "curated_archive": "the material",
 }
 
 
-def language_rule(policy_name: str, *, indent: str = "", first_prefix: str = "") -> str:
+def language_rule(
+    policy_name: str,
+    *,
+    locale: str | None = None,
+    indent: str = "",
+    first_prefix: str = "",
+) -> str:
     """按档位渲染语言规则。
+
+    ``locale`` 是**宿主已经算出来的目标语言**（"zh-Hans" / "en"）。给了就直接写死
+    在规则里，不让模型再猜一次 —— 这是 capture 的正常路径：io 早就知道该用什么
+    语言跟这个人说话，那个判断读了身份卡、历史记忆和已有桶名，比模型看一段窗口
+    猜得准。不给（或给了不认识的值）就退回「跟着输入的语言走」，那是导入那条线
+    的正确语义：一批英文历史记录该落成英文卡，哪怕这个人现在说中文。
 
     ``first_prefix`` / ``indent`` 让调用方套进自己的排版
     （capture 的模板是「   · 」开头的列表项，续行缩进 5 空格；
@@ -167,12 +195,15 @@ def language_rule(policy_name: str, *, indent: str = "", first_prefix: str = "")
     又从侧门放了进来（codex review 2026-08-14 指出）。
     """
     resolved = get_policy(policy_name)
-    text = LANGUAGE_RULE_TEMPLATE.format(
-        basis=LANGUAGE_BASIS.get(resolved.name, LANGUAGE_BASIS["conversation_capture"]),
-        noun=LANGUAGE_MATERIAL_NOUN.get(
-            resolved.name, LANGUAGE_MATERIAL_NOUN["conversation_capture"]
-        ),
-    )
+    target = LANGUAGE_TARGET_EXPLICIT.get(str(locale or "").strip())
+    if not target:
+        target = LANGUAGE_TARGET_FOLLOW_INPUT.format(
+            basis=LANGUAGE_BASIS.get(resolved.name, LANGUAGE_BASIS["conversation_capture"]),
+            noun=LANGUAGE_MATERIAL_NOUN.get(
+                resolved.name, LANGUAGE_MATERIAL_NOUN["conversation_capture"]
+            ),
+        )
+    text = LANGUAGE_RULE_TEMPLATE.format(target=target)
     lines = text.splitlines()
     out = [f"{first_prefix}{lines[0]}"]
     out.extend(f"{indent}{line}" for line in lines[1:])

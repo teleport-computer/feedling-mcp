@@ -23,6 +23,7 @@ def test_kernel_capture_prompt_takes_naming_rule_as_param():
         threads="老婆",
         identity="（暂无）",
         window="用户：今天开了一天会\n我：辛苦了",
+        locale="zh-Hans",
     )
     assert "io" in text
     assert "老王" in text
@@ -88,6 +89,7 @@ def test_compat_shell_preserves_original_naming_semantics():
         threads="老婆",
         identity="（暂无）",
         window="（空）",
+        locale="zh-Hans",
     )
     assert sanitized in text
     assert expected_rule in text

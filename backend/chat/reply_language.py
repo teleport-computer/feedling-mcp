@@ -150,6 +150,43 @@ def infer_reply_language_policy(
     return _policy("zh-Hans", "default", confidence=0.0)
 
 
+def infer_garden_language(
+    identity: dict | None,
+    *,
+    existing_buckets: str = "",
+    locale: str = "",
+    archive_language: str = "",
+) -> str:
+    """这个花园的分类语言（"zh-Hans" / "en"）—— 桶名、线索、卡片正文共用它。
+
+    为什么不直接用回复语言：**回复语言可以每轮变，花园语言不该变。** 这个人今天
+    用英文问一句，不该让他的花园里冒出一个 Work 桶，跟已有的「工作」并存 ——
+    桶是分类键，裂开等于同一类记忆被拆成两堆、检索时互相看不见。
+
+    所以证据里显式带上**已有的桶名**：花园现在是中文桶，判断就会继续给中文，
+    哪怕这一轮对话是英文的。第一次落卡（还没有任何桶）时才退回 identity /
+    locale / archive_language 那几级。
+
+    与 io 回复语言同源（``infer_reply_language_policy``），所以不会出现
+    「io 用英文跟你说话、却给你一个中文桶」这种自相矛盾。
+    """
+    # 已有桶优先，且**不走 infer_reply_language_policy 的证据门槛**。
+    # 那个门槛（32 字符）是给散文调的；桶名天生就短 —— "Work / Health / Pets"
+    # 只有 14 个拉丁字母，喂进去会被判成证据不足、回落成中文，
+    # 于是一个英文花园会突然开始长中文桶。实测踩到过。
+    buckets = str(existing_buckets or "")
+    if buckets.strip():
+        cjk = len(_CJK_RE.findall(buckets))
+        latin = len(_LATIN_RE.findall(buckets))
+        if cjk or latin:
+            return "zh-Hans" if cjk >= latin else "en"
+
+    # 还没有任何桶（新花园的第一张卡）才看身份卡 / locale / 归档语言。
+    return infer_reply_language_policy(
+        identity or {}, [], locale=locale, archive_language=archive_language
+    ).language
+
+
 def reply_language_system_line(policy: ReplyLanguagePolicy, *, proactive: bool = False) -> str:
     if policy.language == "en":
         return (

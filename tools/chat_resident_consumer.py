@@ -175,6 +175,7 @@ from memory.dream_prompt_v1 import (
 from memory_garden.prompts.migrate import build_migrate_prompt, parse_migrated_cards
 from chat.reply_language import (
     format_time_anchor,
+    infer_garden_language,
     infer_reply_language_policy,
     reply_language_system_line,
 )
@@ -13862,6 +13863,13 @@ def _process_capture_jobs(jobs: list) -> float:
             )
             continue
         buckets_text, threads_text = _capture_memory_terms_context()
+        # 花园的分类语言。已有桶优先 —— 一个花园只用一种语言的桶，
+        # 不因为这轮对话换了语言就长出并存的第二套。
+        capture_locale = infer_garden_language(
+            identity,
+            existing_buckets=buckets_text,
+            archive_language=str(_whoami_cache.get("archive_language") or "").strip(),
+        )
         prompt = build_capture_prompt(
             ai_name=ai_name,
             user_name=user_name,
@@ -13869,6 +13877,7 @@ def _process_capture_jobs(jobs: list) -> float:
             threads=threads_text,
             identity=identity_text,
             window=window_text,
+            locale=capture_locale,
         )
         try:
             (cards, err), bounce = _memory_agent_parse_with_bounce(
