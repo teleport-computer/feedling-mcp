@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS trace_events (
   subsystem TEXT NOT NULL,
   type TEXT NOT NULL,
   status TEXT NOT NULL,
+  outcome_class TEXT NOT NULL DEFAULT 'operational_failure',
   actor TEXT NOT NULL DEFAULT 'backend',
   lane TEXT,
   trace_id TEXT,

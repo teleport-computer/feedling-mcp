@@ -222,9 +222,10 @@ def test_source_derived_event_types_round_trip_through_current_writer(monkeypatc
         "ts",
         "subsystem",
         "type",
-        "actor",
-        "status",
-        "summary",
+            "actor",
+            "status",
+            "outcome_class",
+            "summary",
         "explain",
         "trace_id",
         "turn_id",
@@ -308,6 +309,25 @@ def test_records_when_flag_on_no_env_needed(monkeypatch):
     debug_trace.set_enabled(store, False)
     debug_trace.trace_event(store, subsystem="route", type="route.decided")
     assert len(debug_trace.read_trace(store)) == 2
+
+
+def test_outcome_class_defaults_validates_and_round_trips(monkeypatch):
+    store = _Store("usr_trace_outcome")
+    _reset(monkeypatch, store)
+    explicit = next(
+        item
+        for item in debug_trace.TRACE_OUTCOME_CLASSES
+        if item != debug_trace.TRACE_OUTCOME_DEFAULT
+    )
+    debug_trace.trace_event(
+        store, subsystem="route", type="explicit", outcome_class=explicit
+    )
+    debug_trace.trace_event(
+        store, subsystem="route", type="invalid", outcome_class="not-a-class"
+    )
+    events = debug_trace.read_trace(store)
+    assert events[0]["outcome_class"] == debug_trace.TRACE_OUTCOME_DEFAULT
+    assert events[1]["outcome_class"] == explicit
 
 
 def test_set_enabled_never_caches_a_failed_or_unreadable_write(monkeypatch):

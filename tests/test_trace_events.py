@@ -19,6 +19,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db  # noqa: E402
+import debug_trace  # noqa: E402
 import asgi.lifespan as lifespan_mod  # noqa: E402
 from accounts import registry  # noqa: E402
 from admin import admin_core, data_track  # noqa: E402
@@ -91,6 +92,11 @@ def test_migration_has_beijing_bounds_no_fk_and_stable_indexes():
             "FROM pg_class child WHERE child.relname=%s",
             (name,),
         ).fetchone()[0]
+        outcome_column = conn.execute(
+            "SELECT is_nullable,column_default FROM information_schema.columns "
+            "WHERE table_schema=current_schema() AND table_name='trace_events' "
+            "AND column_name='outcome_class'"
+        ).fetchone()
 
     assert not any(kind == "f" for kind, _ in constraints)
     assert any(kind == "p" and "PRIMARY KEY (id, ts)" in definition
@@ -99,6 +105,9 @@ def test_migration_has_beijing_bounds_no_fk_and_stable_indexes():
     assert any("(ts DESC, id DESC)" in definition for definition in indexes)
     assert any("(trace_id, ts DESC, id DESC)" in definition for definition in indexes)
     assert f"{today.isoformat()} 00:00:00+08" in bound
+    assert outcome_column == (
+        "NO", f"'{db.TRACE_OUTCOME_DEFAULT}'::text"
+    )
     migration = (
         Path(__file__).parents[1]
         / "backend/alembic_tee/versions/0033_trace_events.py"
@@ -118,8 +127,15 @@ def test_strict_insert_and_query_use_ts_id_order(tee_primary):
         assert [row["trace_id"] for row in rows] == ["second", "first"]
         assert rows[0]["detail"] == {"safe": True}
         assert rows[0]["content_excerpt"] == {"kind": "text", "chars": 3}
+        assert rows[0]["outcome_class"] == db.TRACE_OUTCOME_DEFAULT
     finally:
         db.delete_trace_events_for_user(uid)
+
+
+def test_trace_outcome_vocabulary_matches_runtime_dashboard():
+    assert debug_trace.TRACE_OUTCOME_CLASSES == data_track.RUNTIME_OUTCOME_CLASSES
+    assert debug_trace.TRACE_OUTCOME_DEFAULT == data_track.RUNTIME_OUTCOME_DEFAULT
+    assert debug_trace.TRACE_OUTCOME_DEFAULT in debug_trace.TRACE_OUTCOME_CLASSES
 
 
 def test_trace_survives_account_delete_and_remains_queryable_by_uid(tee_primary):

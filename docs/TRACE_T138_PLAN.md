@@ -7,6 +7,8 @@
 > 新表无用户外键，销号后 trace 保留，admin 必须能按已删 uid 直接检索。
 > 容量线按 60 GB 报警，可复用块 0 `trace_write_stats`，但不改它的表、
 > 函数或 `_TRACE_WRITE_STATS_MIN_MEASUREMENT_HOURS`。
+> `trace_events.outcome_class` 与 `agent_jobs` 运营失败率复用同一套四档词汇；
+> 两侧集合与默认值由跨模块测试守一致，测试本身不复制枚举值。
 >
 > 单写切换的失败不再沉默：进程当场记 ERROR 并置红；约 1 秒内将
 > `at_risk` 写入块 0；独立 monitor 最多 60 秒报警。如块 0 也不可写，

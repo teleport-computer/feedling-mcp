@@ -28,6 +28,8 @@ from zoneinfo import ZoneInfo
 import db
 
 DEBUG_TRACE_FLAG_BLOB = "v1_flow_trace_enabled"
+TRACE_OUTCOME_CLASSES = db.TRACE_OUTCOME_CLASSES
+TRACE_OUTCOME_DEFAULT = db.TRACE_OUTCOME_DEFAULT
 _READ_LIMIT_MAX = 2500
 _EXCERPT_FIELD_MAX = 2048
 _EXCERPT_EVENT_MAX = 8192
@@ -714,6 +716,7 @@ def trace_event(
     content_excerpt: dict[str, Any] | None = None,
     actor: str = "backend",
     status: str = "ok",
+    outcome_class: str = TRACE_OUTCOME_DEFAULT,
     trace_id: str = "",
     turn_id: str = "",
     job_id: str = "",
@@ -730,12 +733,16 @@ def trace_event(
             return
         now = time.time()
         verbose = os.environ.get("FEEDLING_DEBUG_VERBOSE", "").strip().lower() not in ("0", "false", "off", "no")
+        normalized_outcome = str(outcome_class or TRACE_OUTCOME_DEFAULT)
+        if normalized_outcome not in TRACE_OUTCOME_CLASSES:
+            normalized_outcome = TRACE_OUTCOME_DEFAULT
         event = {
             "ts": now,
             "subsystem": str(subsystem or "")[:40],
             "type": str(type or "")[:80],
             "actor": str(actor or "backend")[:40],
             "status": str(status or "ok")[:20],
+            "outcome_class": normalized_outcome,
             "summary": str(summary or "")[:300],
             "explain": str(explain or "")[:600],
             "trace_id": str(trace_id or "")[:120],
@@ -766,7 +773,7 @@ def read_trace(store, *, limit: int = 200, subsystem: str = "") -> list[dict]:
         limit=max(1, min(int(limit or 200), _READ_LIMIT_MAX)),
     )
     event_fields = (
-        "ts", "subsystem", "type", "actor", "status", "summary", "explain",
+        "ts", "subsystem", "type", "actor", "status", "outcome_class", "summary", "explain",
         "trace_id", "turn_id", "job_id", "detail", "dur_ms",
         "content_excerpt",
     )

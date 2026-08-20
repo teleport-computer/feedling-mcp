@@ -418,7 +418,11 @@ captured content excerpts are plaintext operational data inside the TEE trust
 boundary; they are not end-to-end encrypted user envelopes. The table has no
 foreign key to the account row: deleting an account intentionally leaves its
 recent trace queryable by exact uid for incident diagnosis until retention or
-an explicit operator trace clear removes it.
+an explicit operator trace clear removes it. Each event also carries the same
+outcome classification used by Runtime job reporting: operational failure,
+timeout, control flow, or safety suppression. Keeping that vocabulary shared
+prevents trace investigation and the operational failure-rate dashboard from
+assigning the same terminal outcome to different buckets.
 
 See the [Memory workflow](/docs/workflows/memory) for the complete envelope,
 selection, fetch, and action contracts.

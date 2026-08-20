@@ -3375,6 +3375,14 @@ _RUNTIME_FAILURE_CODE_MAX = 64
 # outbox 用的，admin 层不 import model_api_runtime，故在此单独定义）。
 _RUNTIME_FAILURE_CODE_RE = re.compile(r"^[a-z0-9_]+(:[a-z0-9_]+)?$")
 _RUNTIME_ERROR_CLASS_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+RUNTIME_OUTCOME_CLASS_LABELS = {
+    "operational_failure": "执行故障",
+    "timeout": "超时 / 失活",
+    "control": "控制切流",
+    "safety_suppression": "安全抑制",
+}
+RUNTIME_OUTCOME_CLASSES = frozenset(RUNTIME_OUTCOME_CLASS_LABELS)
+RUNTIME_OUTCOME_DEFAULT = "operational_failure"
 
 
 def _runtime_operational_rate(lane: dict):
@@ -4402,22 +4410,16 @@ def _render_runtime_health_page(
         merged: dict[tuple[str, str, str], int] = {}
         for item in lane.get("top_failures") or []:
             code = _runtime_failure_code(item.get("code"))
-            outcome_class = str(item.get("outcome_class") or "operational_failure")
-            if outcome_class not in {
-                "operational_failure", "timeout", "control", "safety_suppression"
-            }:
-                outcome_class = "operational_failure"
+            outcome_class = str(
+                item.get("outcome_class") or RUNTIME_OUTCOME_DEFAULT
+            )
+            if outcome_class not in RUNTIME_OUTCOME_CLASSES:
+                outcome_class = RUNTIME_OUTCOME_DEFAULT
             error_class = str(item.get("error_class") or "")
             if not _RUNTIME_ERROR_CLASS_RE.fullmatch(error_class):
                 error_class = ""
             key = (code, outcome_class, error_class)
             merged[key] = merged.get(key, 0) + int(item.get("count") or 0)
-        class_labels = {
-            "operational_failure": "执行故障",
-            "timeout": "超时 / 失活",
-            "control": "控制切流",
-            "safety_suppression": "安全抑制",
-        }
         for (code, outcome_class, error_class), count in sorted(
             merged.items(), key=lambda kv: kv[1], reverse=True
         ):
@@ -4428,7 +4430,7 @@ def _render_runtime_health_page(
             failure_rows.append(
                 "<tr>"
                 f"<td>{name}</td>"
-                f"<td>{class_labels[outcome_class]}</td>"
+                f"<td>{RUNTIME_OUTCOME_CLASS_LABELS[outcome_class]}</td>"
                 f"<td><code>{html.escape(code)}</code></td>"
                 f"<td>{error_class_html}</td>"
                 f"<td>{_fmt_count(count)}</td>"

@@ -6809,11 +6809,15 @@ def _mirror_proactive_settings_current(user_id: str) -> None:
 # --- Append-only TEE-primary debug trace (T184) --------------------------- #
 
 _TRACE_EVENT_COLUMNS = (
-    "id", "user_id", "ts", "subsystem", "type", "status", "actor",
+    "id", "user_id", "ts", "subsystem", "type", "status", "outcome_class", "actor",
     "lane", "trace_id", "turn_id", "job_id", "provider", "model",
     "enqueue_source", "summary", "explain", "detail", "content_excerpt",
     "dur_ms",
 )
+TRACE_OUTCOME_CLASSES = frozenset({
+    "operational_failure", "timeout", "control", "safety_suppression",
+})
+TRACE_OUTCOME_DEFAULT = "operational_failure"
 _TRACE_EVENTS_RETENTION_DAYS = 30
 _TRACE_EVENTS_MIN_FUTURE_DAYS = 7
 _TRACE_EVENTS_DEFAULT_STORAGE_BUDGET_BYTES = 60_000_000_000
@@ -6825,7 +6829,7 @@ def insert_trace_events_strict(
     *,
     clear_flag_kind: str = "v1_flow_trace_enabled",
 ) -> int:
-    """Insert one immutable row per event; raise on an unknown outcome.
+    """Insert one immutable row per event; normalize unknown outcome classes.
 
     This is intentionally not mirrored and not available in the RDS migration
     chain: after TEE-primary promotion ``trace_events`` has exactly one writer
@@ -6844,12 +6848,16 @@ def insert_trace_events_strict(
         except (TypeError, ValueError) as exc:
             raise ValueError("trace event ts must be numeric") from exc
         detail = raw.get("detail") if isinstance(raw.get("detail"), dict) else {}
+        outcome_class = str(raw.get("outcome_class") or TRACE_OUTCOME_DEFAULT)
+        if outcome_class not in TRACE_OUTCOME_CLASSES:
+            outcome_class = TRACE_OUTCOME_DEFAULT
         normalized.append((
             uid,
             event_ts,
             str(raw.get("subsystem") or ""),
             str(raw.get("type") or ""),
             str(raw.get("status") or ""),
+            outcome_class,
             str(raw.get("actor") or "backend"),
             str(raw.get("lane") or detail.get("lane") or "") or None,
             str(raw.get("trace_id") or "") or None,
@@ -6872,9 +6880,9 @@ def insert_trace_events_strict(
         return 0
     statement = (
         "INSERT INTO trace_events ("
-        "user_id,ts,subsystem,type,status,actor,lane,trace_id,turn_id,job_id,"
+        "user_id,ts,subsystem,type,status,outcome_class,actor,lane,trace_id,turn_id,job_id,"
         "provider,model,enqueue_source,summary,explain,detail,content_excerpt,dur_ms"
-        ") VALUES (%s,to_timestamp(%s),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+        ") VALUES (%s,to_timestamp(%s),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
     )
     with get_pool().connection() as conn:
         with conn.transaction(), conn.cursor() as cur:
@@ -6928,7 +6936,7 @@ def query_trace_events(
         params.append(float(since_epoch))
     if q:
         clauses.append(
-            "concat_ws(' ',user_id,trace_id,subsystem,type,status,summary,explain,"
+            "concat_ws(' ',user_id,trace_id,subsystem,type,status,outcome_class,summary,explain,"
             "detail::text,content_excerpt::text) ILIKE %s"
         )
         params.append(f"%{str(q)}%")

@@ -36,6 +36,9 @@ change must not be interpreted as an API guarantee.
   TEE boundary. Recent traces intentionally survive account deletion and remain
   available to an authorized administrator by exact uid until retention or an
   explicit trace clear removes them.
+  Trace outcomes reuse the Runtime job dashboard's failure, timeout, control,
+  and safety-suppression classification so per-event diagnosis and aggregate
+  operational failure rates use the same vocabulary.
 
 - **Managed TEE-primary promotion now verifies the voice-call lifecycle on the
   database that will receive Chat writes.** The TEE schema carries the same
