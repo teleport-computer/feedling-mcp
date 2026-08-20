@@ -206,6 +206,8 @@ services:
       # has passed; TEE_DATABASE_URL uses the non-DDL app role.
       TEE_DATABASE_URL: "${TEE_DATABASE_URL:-}"
       FEEDLING_TEE_DUAL_WRITE: "${FEEDLING_TEE_DUAL_WRITE:-}"
+      PLAINTEXT_SHADOW_DATABASE_URL: "${PLAINTEXT_SHADOW_DATABASE_URL:-}"
+      FEEDLING_PLAINTEXT_SHADOW_ENABLED: "${FEEDLING_PLAINTEXT_SHADOW_ENABLED:-0}"
       # Pre rollout lane for PR #131. The backend defaults this gate OFF and
       # accepts plaintext content shapes only for the exact value "1"; test and
       # prod manifests intentionally omit it. Per-user intent still decides
@@ -321,6 +323,7 @@ services:
       R2_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY:-}"
       R2_FRAMES_BUCKET: "${R2_FRAMES_BUCKET:-}"
       FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
+      FEEDLING_PLAINTEXT_SHADOW_ENABLED: "0"
       # Must match backend: otherwise whoami advertises effective=off while V2
       # fail-safe encrypts every reply from this separate process.
       FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "1"
