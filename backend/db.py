@@ -6868,6 +6868,232 @@ def append_blob_events_strict(
     return persisted
 
 
+# --- Append-only TEE-primary debug trace (T184) --------------------------- #
+
+_TRACE_EVENT_COLUMNS = (
+    "id", "user_id", "ts", "subsystem", "type", "status", "actor",
+    "lane", "trace_id", "turn_id", "job_id", "provider", "model",
+    "enqueue_source", "summary", "explain", "detail", "content_excerpt",
+    "dur_ms",
+)
+_TRACE_EVENTS_RETENTION_DAYS = 30
+_TRACE_EVENTS_MIN_FUTURE_DAYS = 7
+_TRACE_EVENTS_DEFAULT_STORAGE_BUDGET_BYTES = 60_000_000_000
+
+
+def insert_trace_events_strict(user_id: str, events: list[dict]) -> int:
+    """Insert one immutable row per event; raise on an unknown outcome.
+
+    This is intentionally not mirrored and not available in the RDS migration
+    chain: after TEE-primary promotion ``trace_events`` has exactly one writer
+    and one authoritative copy.  T184's traffic switch calls this helper in a
+    later batch; landing it with the additive schema keeps that cutover small.
+    """
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise ValueError("user_id is required")
+    normalized: list[tuple] = []
+    for raw in events:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            event_ts = float(raw.get("ts") or time.time())
+        except (TypeError, ValueError) as exc:
+            raise ValueError("trace event ts must be numeric") from exc
+        normalized.append((
+            uid,
+            event_ts,
+            str(raw.get("subsystem") or ""),
+            str(raw.get("type") or ""),
+            str(raw.get("status") or ""),
+            str(raw.get("actor") or "backend"),
+            str(raw.get("lane") or "") or None,
+            str(raw.get("trace_id") or "") or None,
+            str(raw.get("turn_id") or "") or None,
+            str(raw.get("job_id") or "") or None,
+            str(raw.get("provider") or "") or None,
+            str(raw.get("model") or "") or None,
+            str(raw.get("enqueue_source") or "") or None,
+            str(raw.get("summary") or "") or None,
+            str(raw.get("explain") or "") or None,
+            Jsonb(raw.get("detail") if isinstance(raw.get("detail"), dict) else {}),
+            Jsonb(
+                raw.get("content_excerpt")
+                if isinstance(raw.get("content_excerpt"), dict)
+                else {}
+            ),
+            float(raw["dur_ms"]) if raw.get("dur_ms") is not None else None,
+        ))
+    if not normalized:
+        return 0
+    statement = (
+        "INSERT INTO trace_events ("
+        "user_id,ts,subsystem,type,status,actor,lane,trace_id,turn_id,job_id,"
+        "provider,model,enqueue_source,summary,explain,detail,content_excerpt,dur_ms"
+        ") VALUES (%s,to_timestamp(%s),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+    )
+    with get_pool().connection() as conn:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.executemany(statement, normalized)
+    return len(normalized)
+
+
+def query_trace_events(
+    *,
+    user_id: str = "",
+    trace_id: str = "",
+    subsystem: str = "",
+    since_epoch: float = 0,
+    limit: int = 200,
+    offset: int = 0,
+) -> list[dict]:
+    """Read trace rows directly, including rows for a deleted account uid."""
+    from psycopg.rows import dict_row
+
+    clauses: list[str] = []
+    params: list = []
+    if user_id:
+        clauses.append("user_id=%s")
+        params.append(str(user_id))
+    if trace_id:
+        clauses.append("trace_id=%s")
+        params.append(str(trace_id))
+    if subsystem:
+        clauses.append("subsystem=%s")
+        params.append(str(subsystem))
+    if since_epoch:
+        clauses.append("ts>=to_timestamp(%s)")
+        params.append(float(since_epoch))
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    bounded_limit = max(1, min(int(limit or 200), 2500))
+    bounded_offset = max(0, int(offset or 0))
+    params.extend((bounded_limit, bounded_offset))
+    statement = (
+        "SELECT " + ",".join(_TRACE_EVENT_COLUMNS) + " FROM trace_events" +
+        where + " ORDER BY ts DESC,id DESC LIMIT %s OFFSET %s"
+    )
+    with get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(statement, params)
+            rows = cur.fetchall()
+    out: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        timestamp = item.get("ts")
+        if isinstance(timestamp, datetime):
+            item["ts"] = timestamp.timestamp()
+        out.append(item)
+    return out
+
+
+def delete_trace_events_for_user(user_id: str) -> int:
+    """Explicit debug-tool clear; account deletion must never call this."""
+    uid = str(user_id or "").strip()
+    if not uid:
+        return 0
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "WITH gone AS (DELETE FROM trace_events WHERE user_id=%s RETURNING 1) "
+            "SELECT count(*) FROM gone",
+            (uid,),
+        ).fetchone()
+    return int(row[0] if row else 0)
+
+
+def trace_events_partition_health(*, now_epoch: float | None = None) -> dict:
+    """Read-only degraded-state detector usable by the non-owner app role."""
+    now = float(now_epoch if now_epoch is not None else time.time())
+    today = datetime.fromtimestamp(now, ZoneInfo("Asia/Shanghai")).date()
+    raw_budget = os.environ.get(
+        "FEEDLING_TRACE_EVENTS_STORAGE_BUDGET_BYTES",
+        str(_TRACE_EVENTS_DEFAULT_STORAGE_BUDGET_BYTES),
+    )
+    try:
+        budget = max(1, int(raw_budget))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "FEEDLING_TRACE_EVENTS_STORAGE_BUDGET_BYTES must be a positive integer"
+        ) from exc
+    with get_pool().connection() as conn:
+        present = bool(conn.execute(
+            "SELECT to_regclass('trace_events') IS NOT NULL"
+        ).fetchone()[0])
+        if not present:
+            return {"ok": False, "issues": ["table_missing"]}
+        default_row = conn.execute(
+            "SELECT count(*), extract(epoch FROM min(ts)), "
+            "extract(epoch FROM max(ts)) FROM trace_events_default"
+        ).fetchone()
+        names = [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT child.relname FROM pg_inherits i "
+                "JOIN pg_class parent ON parent.oid=i.inhparent "
+                "JOIN pg_class child ON child.oid=i.inhrelid "
+                "WHERE parent.oid='trace_events'::regclass"
+            ).fetchall()
+        ]
+        storage_row = conn.execute(
+            "SELECT COALESCE(sum(pg_total_relation_size(relid)),0) "
+            "FROM pg_partition_tree('trace_events') WHERE isleaf"
+        ).fetchone()
+        peak_row = conn.execute(
+            "SELECT COALESCE(max(day_bytes),0) FROM ("
+            " SELECT day, sum(persisted_bytes) AS day_bytes "
+            " FROM trace_write_stats "
+            " WHERE day >= %s GROUP BY day"
+            ") measured",
+            ((today - timedelta(days=29)).isoformat(),),
+        ).fetchone()
+
+    partition_days: list[date] = []
+    for name in names:
+        match = re.fullmatch(r"trace_events_p(\d{8})", name)
+        if match:
+            partition_days.append(datetime.strptime(match.group(1), "%Y%m%d").date())
+    default_count = int(default_row[0] or 0)
+    partition_day_set = set(partition_days)
+    # A single bad-clock row may create a far-future partition during DEFAULT
+    # recovery.  MAX(day) would then hide a hole tomorrow, so the horizon is
+    # the consecutive run beginning today, not the furthest child name.
+    future_through: date | None = None
+    cursor_day = today
+    while cursor_day in partition_day_set:
+        future_through = cursor_day
+        cursor_day += timedelta(days=1)
+    oldest_day = min(partition_days) if partition_days else None
+    future_days = (future_through - today).days if future_through else -1
+    storage_bytes = int(storage_row[0] or 0)
+    peak_bytes_per_day = int(peak_row[0] or 0)
+    projected_retained_bytes = peak_bytes_per_day * _TRACE_EVENTS_RETENTION_DAYS
+    issues: list[str] = []
+    if default_count:
+        issues.append("default_partition_nonempty")
+    if future_days < _TRACE_EVENTS_MIN_FUTURE_DAYS:
+        issues.append("partition_horizon_low")
+    keep_from = today - timedelta(days=_TRACE_EVENTS_RETENTION_DAYS - 1)
+    if oldest_day is not None and oldest_day < keep_from:
+        issues.append("expired_partition_present")
+    if max(storage_bytes, projected_retained_bytes) > budget:
+        issues.append("storage_budget_exceeded")
+    return {
+        "ok": not issues,
+        "issues": issues,
+        "default_rows": default_count,
+        "default_min_ts": float(default_row[1]) if default_row[1] is not None else None,
+        "default_max_ts": float(default_row[2]) if default_row[2] is not None else None,
+        "partition_days": len(partition_days),
+        "oldest_partition_day": oldest_day.isoformat() if oldest_day else None,
+        "future_through": future_through.isoformat() if future_through else None,
+        "future_days": future_days,
+        "retention_days": _TRACE_EVENTS_RETENTION_DAYS,
+        "storage_bytes": storage_bytes,
+        "observed_peak_bytes_per_day": peak_bytes_per_day,
+        "projected_retained_bytes": projected_retained_bytes,
+        "storage_budget_bytes": budget,
+    }
+
+
 # --- Debug-trace write-rate ruler (T138 block 0) --------------------------- #
 
 # Absolute per-writer totals, not additive deltas.  A client can therefore

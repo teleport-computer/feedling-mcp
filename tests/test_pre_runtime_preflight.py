@@ -20,7 +20,11 @@ def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
     cfg.set_main_option("script_location", str(ROOT / "backend" / "alembic_tee"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0032_v2_job_recovery_events"]
+    assert script.get_heads() == ["0033_trace_events"]
+    assert (
+        script.get_revision("0033_trace_events").down_revision
+        == "0032_v2_job_recovery_events"
+    )
     assert (
         script.get_revision("0032_v2_job_recovery_events").down_revision
         == "0031_merge_voice_primary"

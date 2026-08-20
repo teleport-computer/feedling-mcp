@@ -1,7 +1,7 @@
 """Create the append-only trace_events table (replaces the per-user blob ring).
 
-Revision ID: 0032_trace_events
-Revises: 0031_merge_voice_primary
+Revision ID: 0033_trace_events
+Revises: 0032_v2_job_recovery_events
 
 The blob ring (``user_blobs`` one row = the whole ring) rewrote the entire JSON
 document on every event: O(n) per write, and a hard 2500-event cap that silently
@@ -40,8 +40,8 @@ maintenance costs a slow query, never a lost event.
 from alembic import op
 
 
-revision = "0032_trace_events"
-down_revision = "0031_merge_voice_primary"
+revision = "0033_trace_events"
+down_revision = "0032_v2_job_recovery_events"
 branch_labels = None
 depends_on = None
 
@@ -81,29 +81,40 @@ CREATE TABLE IF NOT EXISTS trace_events_default
 -- therefore means partition maintenance has fallen behind and must alarm --
 -- recovering costs a detach, a row move, and a re-attach.
 DO $$
-DECLARE d date;
+DECLARE
+  d date;
+  lower_bound timestamptz;
+  upper_bound timestamptz;
 BEGIN
   FOR d IN
-    SELECT generate_series(current_date - 1, current_date + 60, '1 day')::date
+    SELECT generate_series(
+      (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Shanghai')::date - 29,
+      (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Shanghai')::date + 60,
+      '1 day'
+    )::date
   LOOP
+    -- Partition days are product Beijing days, independent of the owner
+    -- connection's mutable TimeZone setting.
+    lower_bound := d::timestamp AT TIME ZONE 'Asia/Shanghai';
+    upper_bound := (d + 1)::timestamp AT TIME ZONE 'Asia/Shanghai';
     EXECUTE format(
       'CREATE TABLE IF NOT EXISTS trace_events_p%s '
       'PARTITION OF trace_events FOR VALUES FROM (%L) TO (%L)',
-      to_char(d, 'YYYYMMDD'), d, d + 1);
+      to_char(d, 'YYYYMMDD'), lower_bound, upper_bound);
   END LOOP;
 END $$;
 
 CREATE INDEX IF NOT EXISTS ix_trace_events_user_ts
-  ON trace_events (user_id, ts DESC);
+  ON trace_events (user_id, ts DESC, id DESC);
 CREATE INDEX IF NOT EXISTS ix_trace_events_trace_id
-  ON trace_events (trace_id) WHERE trace_id <> '';
+  ON trace_events (trace_id, ts DESC, id DESC) WHERE trace_id <> '';
 """
 
 _UPDATE_PREPARED_HEAD = """
 UPDATE server_config
 SET value = convert_to(
   jsonb_set(convert_from(value, 'UTF8')::jsonb, '{tee_heads}',
-            '["0032_trace_events"]'::jsonb)::text,
+            '["0033_trace_events"]'::jsonb)::text,
   'UTF8'
 )
 WHERE key = 'phase4_primary_prepared'

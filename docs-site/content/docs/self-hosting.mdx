@@ -391,7 +391,10 @@ operator will respond to a leaked client credential.
 - Do not expose admin/debug routes or internal ports through the public proxy.
 - Monitor authentication failures, `5xx`, database pool exhaustion, stale
   Runtime V2 per-pool heartbeats, slot restarts, Enclave waits, queue age, disk
-  use, and backup age.
+  use, backup age, and trace-partition health. Treat a non-empty
+  `trace_events_default` partition as degraded even when writes still succeed;
+  run partition maintenance with the database owner credential, never the
+  application role.
 - Keep unrelated tenant code and secrets out of a shared process runner.
 - Commission an isolation and abuse review before offering the deployment to
   untrusted public users.

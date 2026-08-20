@@ -399,14 +399,26 @@ encrypted and expires automatically.
 4. A `local_only` body remains client-readable but is unavailable to agent-side
    index and fetch operations.
 
-The bounded, operator-only debug trace distinguishes an executed memory search
-from an index overview. It records the returned-card count, requested limit, and
-a 12-hex SHA-256 prefix of the trimmed search query; it never records the query
+The operator-only debug trace distinguishes an executed memory search from an
+index overview. It records the returned-card count, requested limit, and a
+12-hex SHA-256 prefix of the trimmed search query; it never records the query
 text. Repeated Runtime V2 discovery calls that reuse an earlier result carry a
 separate content-free reuse flag. The fingerprint is operational metadata: it
 lets an authorized administrator compare whether two searches used the same
 trimmed query during the trace-retention window, but it is not ciphertext and
 must not be exposed through a public debug route.
+
+In the managed TEE-primary topology, each trace event is an append-only row in
+the authoritative TEE PostgreSQL database. Daily partitions use Beijing-day
+boundaries and retain 30 days. A default partition preserves events if rolling
+partition maintenance is late, but any row in that partition is a degraded
+state that the backend reports independently of the owner-only repair command.
+Trace summaries, explanations, bounded structured detail, and explicitly
+captured content excerpts are plaintext operational data inside the TEE trust
+boundary; they are not end-to-end encrypted user envelopes. The table has no
+foreign key to the account row: deleting an account intentionally leaves its
+recent trace queryable by exact uid for incident diagnosis until retention or
+an explicit operator trace clear removes it.
 
 See the [Memory workflow](/docs/workflows/memory) for the complete envelope,
 selection, fetch, and action contracts.
