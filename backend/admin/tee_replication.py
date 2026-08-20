@@ -31,6 +31,7 @@ import os
 import math
 import threading
 
+from plaintext_shadow import config as plaintext_shadow_config
 from tee_replicator import worker as tee_worker
 from tee_shadow import mirror
 from tee_shadow import reconciler as tee_reconciler
@@ -66,8 +67,14 @@ class Unconfigured(Exception):
 
 
 def _require_tee_configured() -> None:
-    if not os.environ.get("TEE_DATABASE_URL"):
-        raise Unconfigured()
+    try:
+        if plaintext_shadow_config.load_target() is not None:
+            return
+    except RuntimeError:
+        raise Unconfigured() from None
+    if os.environ.get("TEE_DATABASE_URL"):
+        return
+    raise Unconfigured()
 
 
 def _validate(action: str, table: str | None, dry_run, expected_stale=None, qps=None) -> None:

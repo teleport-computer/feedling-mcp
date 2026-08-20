@@ -61,7 +61,21 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0028_trace_write_stats_health"]
+    assert script.get_heads() == ["0029_plaintext_shadow_merge"]
+    assert set(
+        script.get_revision("0029_plaintext_shadow_merge").down_revision
+    ) == {
+        "0028_trace_write_stats_health",
+        "0027_plaintext_shadow_gates",
+    }
+    assert (
+        script.get_revision("0027_plaintext_shadow_gates").down_revision
+        == "0026_plaintext_shadow_control"
+    )
+    assert (
+        script.get_revision("0026_plaintext_shadow_control").down_revision
+        == "0025_lane_rollup_voice"
+    )
     assert (
         script.get_revision("0028_trace_write_stats_health").down_revision
         == "0027_trace_write_stats"

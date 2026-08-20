@@ -1016,6 +1016,44 @@ def recent_tee_sync_runs(limit: int = 50) -> list[dict]:
     return out
 
 
+def record_plaintext_shadow_sync_run(summary: dict) -> None:
+    """Persist only scalar decrypted-shadow health and per-table counts."""
+    columns = (
+        "duration_ms", "applied", "deleted", "retried", "quarantined",
+        "pending", "oldest_pending_seconds", "target_ok", "target_probe_ms",
+        "verify_ok",
+    )
+    values = [summary.get(column) for column in columns]
+    with get_pool().connection() as conn:
+        conn.execute(
+            f"INSERT INTO plaintext_shadow_sync_runs "
+            f"({', '.join(columns)}, table_metrics) "
+            f"VALUES ({', '.join(['%s'] * len(columns))}, %s)",
+            (*values, Jsonb(summary.get("table_metrics") or {})),
+        )
+
+
+def recent_plaintext_shadow_sync_runs(limit: int = 20) -> list[dict]:
+    columns = (
+        "id", "ran_at", "duration_ms", "applied", "deleted", "retried",
+        "quarantined", "pending", "oldest_pending_seconds", "target_ok",
+        "target_probe_ms", "verify_ok", "table_metrics",
+    )
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"SELECT {', '.join(columns)} FROM plaintext_shadow_sync_runs "
+            "ORDER BY id DESC LIMIT %s",
+            (max(1, min(int(limit), 100)),),
+        ).fetchall()
+    output = []
+    for row in rows:
+        item = dict(zip(columns, row))
+        if item["ran_at"] is not None:
+            item["ran_at"] = item["ran_at"].isoformat()
+        output.append(item)
+    return output
+
+
 # --- TEE reconcile resume cursors (see alembic 0018) ------------------------ #
 # A per-table keyset checkpoint so a backfill interrupted by a worker recycle /
 # deploy / crash resumes where it left off instead of restarting from row 1.

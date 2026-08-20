@@ -10,6 +10,17 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Managed production supports a separately gated decrypted PostgreSQL
+  shadow after TEE-primary promotion.** The TEE database remains authoritative;
+  source triggers capture content-free dirty keys and a singleton backend drain
+  writes an all-plaintext projection, including data from explicit encrypted-tier
+  accounts, to an independent target. Workers and runners receive no target
+  credential, failures remain durably retryable or quarantined, and the
+  production gate requires TLS PostgreSQL 17, matching schema, recent
+  backup/restore evidence, full backfill, an empty queue, and strict count,
+  content, and ciphertext-shape verification. The target and its backups are
+  explicitly plaintext recipients and are not application failover sources.
+
 - **An image-generation provider may now answer with a link, and the server
   retrieves it.** Some providers return `data[].url` from the image endpoint
   instead of inline bytes — measured on a relay that does this only for the 2K

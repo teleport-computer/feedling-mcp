@@ -612,13 +612,14 @@ jobs:
             tests/test_verify_enclave_domain.py \
             -v
 
-      - name: Run CI security tier 3 (59 files)
+      - name: Run CI security tier 3 (67 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
           python -m pytest \
             tests/test_account_recover.py \
             tests/test_account_reset_purges_all_tables.py \
+            tests/test_admin_plaintext_shadow.py \
             tests/test_admin_tee_replication.py \
             tests/test_agent_perception_route.py \
             tests/test_asgi_perception.py \
@@ -632,6 +633,7 @@ jobs:
             tests/test_chat_history_selfheal_blocked_by_nonempty_page.py \
             tests/test_content_export_world_book.py \
             tests/test_content_offloaded_bodies.py \
+            tests/test_database_topology_gate.py \
             tests/test_delete_user_cascades_all_tables.py \
             tests/test_frame_r2.py \
             tests/test_genesis_plaintext_routes.py \
@@ -641,6 +643,12 @@ jobs:
             tests/test_perception_recent_apps.py \
             tests/test_perception_recent_apps_flow.py \
             tests/test_perception_signal_state_v2.py \
+            tests/test_plaintext_shadow_change_capture.py \
+            tests/test_plaintext_shadow_config.py \
+            tests/test_plaintext_shadow_outbox.py \
+            tests/test_plaintext_shadow_scheduler.py \
+            tests/test_plaintext_shadow_schema.py \
+            tests/test_plaintext_shadow_target.py \
             tests/test_plaintext_job_exclusivity.py \
             tests/test_postgres_restore_wait.py \
             tests/test_screen_ws_revoked.py \
@@ -984,6 +992,7 @@ jobs:
               - 'deploy/docker-compose.phala.prod.runner.yaml'
               - 'deploy/e2b/runtime-v2/**'
               - 'deploy/pin-runtime-release.sh'
+              - 'deploy/check-database-topology.py'
               - 'deploy/prod-cvm-id.txt'
               - 'deploy/prod-runner-cvm-ids.txt'
               - 'deploy/list-prod-runner-cvm-ids.sh'
@@ -1017,6 +1026,7 @@ jobs:
               - 'deploy/docker-compose.phala.runner.yaml'
               - 'deploy/e2b/runtime-v2/**'
               - 'deploy/pin-runtime-release.sh'
+              - 'deploy/check-database-topology.py'
               - 'deploy/test-cvm-id.txt'
               - 'deploy/test-runner-cvm-id.txt'
               - 'deploy/publish-compose-hash.sh'
@@ -1076,6 +1086,11 @@ jobs:
           FEEDLING_ENCLAVE_URL:          ${{ vars.TEST_MAIN_ENCLAVE_URL }}
           FEEDLING_ADMIN_TOKEN:          ${{ secrets.FEEDLING_ADMIN_TOKEN }}
           FEEDLING_DATABASE_SCHEMA:      ${{ vars.TEST_FEEDLING_DATABASE_SCHEMA || 'rds' }}
+          PLAINTEXT_SHADOW_DATABASE_URL: ${{ secrets.TEST_PLAINTEXT_SHADOW_DATABASE_URL }}
+          FEEDLING_PLAINTEXT_SHADOW_ENABLED: ${{ vars.TEST_FEEDLING_PLAINTEXT_SHADOW_ENABLED || '0' }}
+          FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY: ${{ secrets.TEST_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY }}
+          TEE_DATABASE_URL:              ${{ secrets.TEST_TEE_DATABASE_URL }}
+          FEEDLING_TEE_DUAL_WRITE:       ${{ secrets.TEST_FEEDLING_TEE_DUAL_WRITE }}
           FEEDLING_V2_SANDBOX_PROVIDER:  ${{ vars.TEST_FEEDLING_V2_SANDBOX_PROVIDER || 'disabled' }}
           E2B_API_KEY:                    ${{ secrets.TEST_E2B_API_KEY || secrets.E2B_API_KEY }}
           FEEDLING_V2_E2B_TEMPLATE:       ${{ vars.TEST_FEEDLING_V2_E2B_TEMPLATE }}
@@ -1102,6 +1117,16 @@ jobs:
             rds|tee) ;;
             *) echo "::error::TEST_FEEDLING_DATABASE_SCHEMA must be exactly rds or tee"; missing=1 ;;
           esac
+          case "$FEEDLING_PLAINTEXT_SHADOW_ENABLED" in
+            0|1) ;;
+            *) echo "::error::TEST_FEEDLING_PLAINTEXT_SHADOW_ENABLED must be exactly 0 or 1"; missing=1 ;;
+          esac
+          if [ "$FEEDLING_PLAINTEXT_SHADOW_ENABLED" = "1" ]; then
+            if [ -z "$PLAINTEXT_SHADOW_DATABASE_URL" ] || [ -z "$FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY" ]; then
+              echo "::error::TEST plaintext shadow DSN and trusted evidence public key are required when enabled"
+              missing=1
+            fi
+          fi
           if [ "$FEEDLING_V2_SANDBOX_PROVIDER" = "e2b" ]; then
             if [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
               FEEDLING_V2_E2B_TEMPLATE=$(tr -d '[:space:]' < deploy/e2b/runtime-v2/template-tag.txt)
@@ -1161,6 +1186,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install --require-hashes -r backend/requirements.lock
+
+      - name: Validate TEST database topology without exposing DSNs
+        if: ${{ vars.TEST_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        env:
+          DATABASE_URL: ${{ secrets.TEST_DATABASE_URL }}
+          FEEDLING_DATABASE_SCHEMA: ${{ vars.TEST_FEEDLING_DATABASE_SCHEMA || 'rds' }}
+          PLAINTEXT_SHADOW_DATABASE_URL: ${{ secrets.TEST_PLAINTEXT_SHADOW_DATABASE_URL }}
+          FEEDLING_PLAINTEXT_SHADOW_ENABLED: ${{ vars.TEST_FEEDLING_PLAINTEXT_SHADOW_ENABLED || '0' }}
+          TEE_DATABASE_URL: ${{ secrets.TEST_TEE_DATABASE_URL }}
+          FEEDLING_TEE_DUAL_WRITE: ${{ secrets.TEST_FEEDLING_TEE_DUAL_WRITE }}
+        run: python deploy/check-database-topology.py
 
       - name: Require TEST TEE schema at release head before mutating either CVM
         if: ${{ vars.TEST_FEEDLING_DATABASE_SCHEMA == 'tee' }}
@@ -1297,6 +1333,9 @@ jobs:
           FEEDLING_DATABASE_SCHEMA:      ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA || 'rds' }}
           TEE_DATABASE_URL:              ${{ secrets.PROD_TEE_DATABASE_URL }}
           FEEDLING_TEE_DUAL_WRITE:       ${{ secrets.PROD_FEEDLING_TEE_DUAL_WRITE }}
+          PLAINTEXT_SHADOW_DATABASE_URL: ${{ secrets.PROD_PLAINTEXT_SHADOW_DATABASE_URL }}
+          FEEDLING_PLAINTEXT_SHADOW_ENABLED: ${{ vars.PROD_FEEDLING_PLAINTEXT_SHADOW_ENABLED || '0' }}
+          FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY: ${{ secrets.PROD_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
           FEEDLING_API_URL:              ${{ vars.PROD_MAIN_API_URL }}
           FEEDLING_ENCLAVE_URL:          ${{ vars.PROD_MAIN_ENCLAVE_URL }}
@@ -1333,6 +1372,16 @@ jobs:
             fi
             if [ -n "$FEEDLING_TEE_DUAL_WRITE" ]; then
               echo "::error::PROD_FEEDLING_TEE_DUAL_WRITE must be empty for TEE primary"
+              missing=1
+            fi
+          fi
+          case "$FEEDLING_PLAINTEXT_SHADOW_ENABLED" in
+            0|1) ;;
+            *) echo "::error::PROD_FEEDLING_PLAINTEXT_SHADOW_ENABLED must be exactly 0 or 1"; missing=1 ;;
+          esac
+          if [ "$FEEDLING_PLAINTEXT_SHADOW_ENABLED" = "1" ]; then
+            if [ -z "$PLAINTEXT_SHADOW_DATABASE_URL" ] || [ -z "$FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY" ]; then
+              echo "::error::PROD plaintext shadow DSN and trusted evidence public key are required when enabled"
               missing=1
             fi
           fi
@@ -1374,6 +1423,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install --require-hashes -r backend/requirements.lock
+
+      - name: Validate PROD database topology without exposing DSNs
+        if: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          FEEDLING_DATABASE_SCHEMA: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA || 'rds' }}
+          PLAINTEXT_SHADOW_DATABASE_URL: ${{ secrets.PROD_PLAINTEXT_SHADOW_DATABASE_URL }}
+          FEEDLING_PLAINTEXT_SHADOW_ENABLED: ${{ vars.PROD_FEEDLING_PLAINTEXT_SHADOW_ENABLED || '0' }}
+          TEE_DATABASE_URL: ${{ secrets.PROD_TEE_DATABASE_URL }}
+          FEEDLING_TEE_DUAL_WRITE: ${{ secrets.PROD_FEEDLING_TEE_DUAL_WRITE }}
+        run: python deploy/check-database-topology.py
 
       - name: Require PROD TEE schema at release head before mutating any CVM
         if: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA == 'tee' }}
@@ -1519,6 +1579,7 @@ jobs:
               - 'deploy/docker-compose.phala.pre.runner.yaml'
               - 'deploy/e2b/runtime-v2/**'
               - 'deploy/pin-runtime-release.sh'
+              - 'deploy/check-database-topology.py'
               - 'deploy/pre-cvm-id.txt'
               - 'deploy/pre-runner-cvm-id.txt'
               - 'deploy/publish-compose-hash.sh'
@@ -1586,6 +1647,12 @@ jobs:
           FEEDLING_API_URL:              ${{ vars.PRE_MAIN_API_URL }}
           FEEDLING_ENCLAVE_URL:          ${{ vars.PRE_MAIN_ENCLAVE_URL }}
           FEEDLING_ADMIN_TOKEN:          ${{ secrets.FEEDLING_ADMIN_TOKEN }}
+          FEEDLING_DATABASE_SCHEMA:      ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA || 'rds' }}
+          PLAINTEXT_SHADOW_DATABASE_URL: ${{ secrets.PRE_PLAINTEXT_SHADOW_DATABASE_URL }}
+          FEEDLING_PLAINTEXT_SHADOW_ENABLED: ${{ vars.PRE_FEEDLING_PLAINTEXT_SHADOW_ENABLED || '0' }}
+          FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY: ${{ secrets.PRE_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY }}
+          TEE_DATABASE_URL:              ${{ secrets.PRE_TEE_DATABASE_URL }}
+          FEEDLING_TEE_DUAL_WRITE:       ${{ secrets.PRE_FEEDLING_TEE_DUAL_WRITE }}
           FEEDLING_V2_SANDBOX_PROVIDER:  ${{ vars.PRE_FEEDLING_V2_SANDBOX_PROVIDER || 'disabled' }}
           E2B_API_KEY:                    ${{ secrets.PRE_E2B_API_KEY || secrets.E2B_API_KEY }}
           FEEDLING_V2_E2B_TEMPLATE:       ${{ vars.PRE_FEEDLING_V2_E2B_TEMPLATE }}
@@ -1608,6 +1675,20 @@ jobs:
             disabled|e2b) ;;
             *) echo "::error::pre sandbox provider must be exactly disabled or e2b"; missing=1 ;;
           esac
+          case "$FEEDLING_DATABASE_SCHEMA" in
+            rds|tee) ;;
+            *) echo "::error::PRE_FEEDLING_DATABASE_SCHEMA must be exactly rds or tee"; missing=1 ;;
+          esac
+          case "$FEEDLING_PLAINTEXT_SHADOW_ENABLED" in
+            0|1) ;;
+            *) echo "::error::PRE_FEEDLING_PLAINTEXT_SHADOW_ENABLED must be exactly 0 or 1"; missing=1 ;;
+          esac
+          if [ "$FEEDLING_PLAINTEXT_SHADOW_ENABLED" = "1" ]; then
+            if [ -z "$PLAINTEXT_SHADOW_DATABASE_URL" ] || [ -z "$FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY" ]; then
+              echo "::error::PRE plaintext shadow DSN and trusted evidence public key are required when enabled"
+              missing=1
+            fi
+          fi
           if [ "$FEEDLING_V2_SANDBOX_PROVIDER" = "e2b" ]; then
             if [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
               FEEDLING_V2_E2B_TEMPLATE=$(tr -d '[:space:]' < deploy/e2b/runtime-v2/template-tag.txt)
@@ -1647,6 +1728,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install --require-hashes -r backend/requirements.lock
+
+      - name: Validate PRE database topology without exposing DSNs
+        if: ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        env:
+          DATABASE_URL: ${{ secrets.PRE_DATABASE_URL }}
+          FEEDLING_DATABASE_SCHEMA: ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA || 'rds' }}
+          PLAINTEXT_SHADOW_DATABASE_URL: ${{ secrets.PRE_PLAINTEXT_SHADOW_DATABASE_URL }}
+          FEEDLING_PLAINTEXT_SHADOW_ENABLED: ${{ vars.PRE_FEEDLING_PLAINTEXT_SHADOW_ENABLED || '0' }}
+          TEE_DATABASE_URL: ${{ secrets.PRE_TEE_DATABASE_URL }}
+          FEEDLING_TEE_DUAL_WRITE: ${{ secrets.PRE_FEEDLING_TEE_DUAL_WRITE }}
+        run: python deploy/check-database-topology.py
 
       - name: Require PRE TEE schema at release head before mutating either CVM
         if: ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA == 'tee' }}
@@ -1755,10 +1847,48 @@ jobs:
   # iOS side: audit card sees new compose_hash and prompts consent. By
   # design — this is the trust boundary the user explicitly accepts.
   # =========================================================================
+  prod-plaintext-shadow-gate2:
+    name: authorize PROD plaintext shadow Gate 2
+    needs: [detect-cvm-changes, validate-prod-runner-topology]
+    if: |
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'push' &&
+      needs.detect-cvm-changes.outputs.cvm == 'true' &&
+      vars.PROD_FEEDLING_PLAINTEXT_SHADOW_ENABLED == '1'
+    runs-on: ubuntu-24.04
+    environment: prod-plaintext-shadow-gate2
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Phala CLI
+        run: npm install -g phala@1.1.19
+      - name: Require redacted preflight and strict verification on Gate 1
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+        run: |
+          CVM_ID=$(tr -d '[:space:]' < deploy/prod-cvm-id.txt)
+          test -n "$CVM_ID" || { echo "::error::prod CVM id is missing"; exit 1; }
+          phala ssh "$CVM_ID" --api-token "$PHALA_CLOUD_API_KEY" -- sh -lc '
+            BACKEND_ID=$(docker ps --filter label=com.docker.compose.service=backend --format "{{.ID}}" | head -n 1)
+            test -n "$BACKEND_ID" || exit 2
+            docker exec -e FEEDLING_PLAINTEXT_SHADOW_ENABLED=1 "$BACKEND_ID" python -m admin.plaintext_shadow preflight
+            docker exec -e FEEDLING_PLAINTEXT_SHADOW_ENABLED=1 "$BACKEND_ID" python -m admin.plaintext_shadow verify --require-green
+          ' > /tmp/plaintext-shadow-gate2.raw
+          tail -n 2 /tmp/plaintext-shadow-gate2.raw | jq -s \
+            '{preflight: .[0], verify: .[1]}' > plaintext-shadow-gate2.json
+      - name: Preserve Gate 2 verification evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-plaintext-shadow-gate2-${{ github.sha }}
+          path: plaintext-shadow-gate2.json
+          retention-days: 90
+
   deploy-cvm:
     name: deploy CVM
-    needs: [forge-test, python-tests, docker-build, docker-build-worker-deps, lint, dcap-python, detect-cvm-changes, validate-prod-runner-topology]
+    needs: [forge-test, python-tests, docker-build, docker-build-worker-deps, lint, dcap-python, detect-cvm-changes, validate-prod-runner-topology, prod-plaintext-shadow-gate2]
     if: |
+      always() && !failure() && !cancelled() &&
       github.ref == 'refs/heads/main' &&
       github.event_name == 'push' &&
       needs.detect-cvm-changes.outputs.cvm == 'true'
@@ -1924,6 +2054,9 @@ jobs:
           # 回填 —— 首开建议 PROD_FEEDLING_TEE_DUAL_WRITE 留空、健康后再挑低峰翻开。
           TEE_DATABASE_URL:        ${{ secrets.PROD_TEE_DATABASE_URL }}
           FEEDLING_TEE_DUAL_WRITE: ${{ secrets.PROD_FEEDLING_TEE_DUAL_WRITE }}
+          PLAINTEXT_SHADOW_DATABASE_URL: ${{ secrets.PROD_PLAINTEXT_SHADOW_DATABASE_URL }}
+          FEEDLING_PLAINTEXT_SHADOW_ENABLED: ${{ vars.PROD_FEEDLING_PLAINTEXT_SHADOW_ENABLED || '0' }}
+          FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY: ${{ secrets.PROD_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
           # Empty until the environment-specific admission rollout is activated.
@@ -1991,6 +2124,9 @@ jobs:
             -e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA" \
             -e "TEE_DATABASE_URL=$TEE_DATABASE_URL" \
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
+            -e "PLAINTEXT_SHADOW_DATABASE_URL=$PLAINTEXT_SHADOW_DATABASE_URL" \
+            -e "FEEDLING_PLAINTEXT_SHADOW_ENABLED=$FEEDLING_PLAINTEXT_SHADOW_ENABLED" \
+            -e "FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY=$FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_V2_NEW_USER_CUTOFF=$FEEDLING_V2_NEW_USER_CUTOFF" \
             -e "FEEDLING_EXPECTED_RUNNER_COUNT=$FEEDLING_EXPECTED_RUNNER_COUNT" \
@@ -2184,6 +2320,9 @@ jobs:
           # 加密 env 通道，不烧 compose_hash（同 DATABASE_URL）。
           TEE_DATABASE_URL:        ${{ secrets.TEST_TEE_DATABASE_URL }}
           FEEDLING_TEE_DUAL_WRITE: ${{ secrets.TEST_FEEDLING_TEE_DUAL_WRITE }}
+          PLAINTEXT_SHADOW_DATABASE_URL: ${{ secrets.TEST_PLAINTEXT_SHADOW_DATABASE_URL }}
+          FEEDLING_PLAINTEXT_SHADOW_ENABLED: ${{ vars.TEST_FEEDLING_PLAINTEXT_SHADOW_ENABLED || '0' }}
+          FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY: ${{ secrets.TEST_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           # Empty until the environment-specific admission rollout is activated.
@@ -2249,6 +2388,9 @@ jobs:
             -e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA" \
             -e "TEE_DATABASE_URL=$TEE_DATABASE_URL" \
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
+            -e "PLAINTEXT_SHADOW_DATABASE_URL=$PLAINTEXT_SHADOW_DATABASE_URL" \
+            -e "FEEDLING_PLAINTEXT_SHADOW_ENABLED=$FEEDLING_PLAINTEXT_SHADOW_ENABLED" \
+            -e "FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY=$FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_V2_NEW_USER_CUTOFF=$FEEDLING_V2_NEW_USER_CUTOFF" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
@@ -2589,6 +2731,9 @@ jobs:
           # new instance has passed schema, backup, and connectivity checks.
           TEE_DATABASE_URL:        ${{ secrets.PRE_TEE_DATABASE_URL }}
           FEEDLING_TEE_DUAL_WRITE: ${{ secrets.PRE_FEEDLING_TEE_DUAL_WRITE }}
+          PLAINTEXT_SHADOW_DATABASE_URL: ${{ secrets.PRE_PLAINTEXT_SHADOW_DATABASE_URL }}
+          FEEDLING_PLAINTEXT_SHADOW_ENABLED: ${{ vars.PRE_FEEDLING_PLAINTEXT_SHADOW_ENABLED || '0' }}
+          FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY: ${{ secrets.PRE_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           # Empty until the environment-specific admission rollout is activated.
@@ -2648,6 +2793,9 @@ jobs:
             -e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA" \
             -e "TEE_DATABASE_URL=$TEE_DATABASE_URL" \
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
+            -e "PLAINTEXT_SHADOW_DATABASE_URL=$PLAINTEXT_SHADOW_DATABASE_URL" \
+            -e "FEEDLING_PLAINTEXT_SHADOW_ENABLED=$FEEDLING_PLAINTEXT_SHADOW_ENABLED" \
+            -e "FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY=$FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_V2_NEW_USER_CUTOFF=$FEEDLING_V2_NEW_USER_CUTOFF" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
