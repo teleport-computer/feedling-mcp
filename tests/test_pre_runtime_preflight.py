@@ -184,6 +184,15 @@ def test_pre_release_gates_run_the_application_startup_contract():
     assert "Assert PRE application startup contract" in tee_migrate
 
 
+def test_tee_migrate_exposes_backend_package_to_upgrade_step():
+    source = TEE_MIGRATE_WORKFLOW.read_text()
+    step = source.split(
+        "      - name: Run alembic_tee upgrade head\n", 1
+    )[1].split("\n      - name:", 1)[0]
+
+    assert "PYTHONPATH: backend" in step
+
+
 def test_preflight_is_triggered_by_both_cvm_inventory_files():
     source = WORKFLOW.read_text()
     detection = _job(

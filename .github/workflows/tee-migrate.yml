@@ -87,6 +87,7 @@ jobs:
 
       - name: Run alembic_tee upgrade head
         env:
+          PYTHONPATH: backend
           ENVIRONMENT: ${{ inputs.environment }}
           TEST_DSN: ${{ secrets.TEST_TEE_MIGRATION_DSN }}
           PRE_DSN: ${{ secrets.PRE_TEE_MIGRATION_DSN }}
