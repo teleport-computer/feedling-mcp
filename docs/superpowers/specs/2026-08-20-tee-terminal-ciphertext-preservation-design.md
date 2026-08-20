@@ -167,7 +167,10 @@ a row can never be marked preserved without its destination row.
 
 For a destination key that already exists:
 
-- exact canonical equality is idempotent and allowed;
+- exact canonical equality is idempotent only when the pending row already has
+  a valid preservation marker;
+- an unpreserved terminal row with an exact destination row is blocking because
+  the tool cannot prove that it owns the row for a later revert;
 - any different row is a conflict and blocks the entire operation;
 - preservation never overwrites an existing plaintext projection.
 
@@ -223,6 +226,11 @@ destination row has changed. After TEE becomes primary, recovery follows the
 normal TEE backup/reverse-reconciliation runbook; this CLI is no longer a valid
 rollback tool.
 
+The initial apply rejects exact pre-existing destination rows unless the
+pending row already carries a valid preservation marker. Consequently, a valid
+marker proves that this operation created the destination row and revert may
+delete it without claiming unrelated pre-existing data.
+
 ## Security and Privacy
 
 - The CLI uses the source role read-only and the TEE owner role only for the
@@ -249,7 +257,8 @@ Automated tests must prove:
    calls;
 6. missing source/user, unknown table, and different destination rows block the
    complete transaction;
-7. exact existing rows make apply idempotent;
+7. exact existing rows make apply idempotent only with an existing valid
+   preservation marker; unmarked exact rows block to preserve revert ownership;
 8. strict verify audits all preserved rows and reports drift;
 9. Phase 4 blocks unpreserved/requeue/malformed rows but permits valid preserved
    markers while reporting their count;

@@ -337,6 +337,22 @@ def test_destination_conflict_blocks_instead_of_overwriting_plaintext(backend_en
     assert len(plan.rows) == 3
 
 
+def test_unmarked_exact_destination_blocks_to_keep_revert_ownership(backend_env):
+    """Revert must never delete an exact row that preservation did not create."""
+    uid, ids = _seed_four_terminal_rows()
+    contract = preservation.CONTRACTS["chat_messages"]
+    with db.get_pool().connection() as source, psycopg.connect(
+        os.environ["TEE_DATABASE_URL"], autocommit=True
+    ) as destination:
+        args = contract.args(uid, ids["chat_messages"])
+        source_row = tuple(source.execute(contract.source_fetch_sql, args).fetchone())
+        destination.execute(contract.insert_sql, contract.insert_args(source_row))
+        plan = preservation.build_plan(source, destination)
+
+    assert "unowned_exact_destination:chat_messages:1" in plan.blockers
+    assert len(plan.rows) == 3
+
+
 def test_later_source_mutation_requeues_a_preserved_row(backend_env, monkeypatch):
     """A preserved marker must not hide a later in-place source rewrite."""
     uid, ids = _seed_four_terminal_rows()

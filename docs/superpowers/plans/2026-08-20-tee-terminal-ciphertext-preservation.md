@@ -248,7 +248,9 @@ def test_apply_rejects_stale_compare_and_apply_guard(db_pair, count, digest):
 
 Also add tests that unknown tables, missing parents, missing source rows, and a
 different destination row make `plan.blockers` non-empty and prevent all
-writes.
+writes. An unpreserved terminal marker with an exact pre-existing destination
+row must also block: without an existing valid preservation marker, revert
+cannot prove that the preservation operation owns that row.
 
 - [ ] **Step 5: Run guard tests and verify RED**
 
@@ -265,7 +267,9 @@ Expected: FAIL because `apply_plan` and `PreservationRefused` do not exist.
 5. open one destination transaction;
 6. insert only absent rows using explicit column lists and
    `OVERRIDING SYSTEM VALUE` for Chat `seq`;
-7. leave exact destination rows untouched;
+7. leave exact destination rows untouched only when the current pending reason
+   is already a valid preservation marker; reject unmarked exact rows as
+   unowned;
 8. update each pending row with
    `encode_preserved_reason(row.row_sha256, row.original_reason)` using a
    `WHERE reason = %s` compare-and-swap;
@@ -327,7 +331,8 @@ assert pending_reasons(destination) == original_reasons
 ```
 
 Add refusal tests for an existing Phase 4 prepared marker, a destination row
-whose digest changed, wrong guard values, and malformed preserved markers.
+whose digest changed, wrong guard values, malformed preserved markers, and an
+unmarked exact destination row whose ownership cannot be proven.
 
 - [ ] **Step 2: Run revert tests and verify RED**
 
