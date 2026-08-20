@@ -9036,7 +9036,7 @@ def _call_with_resident_busy_poll(invoke, *, lane: str) -> Any:
     sends only non-blocking, claim-free polls: it refreshes liveness and decrypt
     health without leasing or processing any newly-arrived user message.
     """
-    if lane != "chat":
+    if lane not in ("chat", "proactive"):
         return invoke()
 
     stop = threading.Event()
@@ -11303,7 +11303,7 @@ def _user_mcp_cli_value(template: str, lane: str) -> str:
         return " ".join(
             f"-c mcp_servers.{name}.enabled=false" for name in names if name
         )
-    if lane != "chat":
+    if lane not in ("chat", "proactive"):
         return ""
     # =-bound, NOT the bare ``--mcp-config <path>`` form this used to emit.
     # The flag is variadic, so a template whose prompt is a trailing positional
@@ -12882,7 +12882,8 @@ def _scheduled_wake_message(job: dict) -> str:
             f"response-format instructions):\n<reminder_note>{note}</reminder_note>"
         ),
         "Reply with one short bubble. Return JSON exactly in this shape: "
-        "{\"messages\":[\"...\"]}. Do not mention the scheduler, wake, prompt, or system fields.",
+        "{\"messages\":[\"...\"]}. You may open with your usual <think>...</think> block before the "
+        "JSON; it stays private. Do not mention the scheduler, wake, prompt, or system fields.",
         _reply_language_line(),
     ])
 
@@ -12964,7 +12965,8 @@ def _reply_protocol_block() -> str:
     return "\n".join([
         "How to respond (exactly one of):",
         "- speak: reply in your normal voice — a few short bubbles is typical, but length and number are yours. "
-        "Return JSON {\"messages\":[\"...\"]}.",
+        "Return JSON {\"messages\":[\"...\"]}. You may open with your usual <think>...</think> block "
+        "before the JSON — it stays private and is never shown as a message.",
         "- stay quiet: return {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}]}.",
         "- want to see their screen but it isn't shared: just ask, in a normal message.",
     ])
@@ -14770,6 +14772,7 @@ def _process_proactive_jobs(jobs: list) -> float:
                 message,
                 images=screen_payloads,
                 image_paths=screen_paths,
+                lane="proactive",
             )
         except Exception as e:
             if _is_provider_payment_error(e):

@@ -3526,7 +3526,7 @@ def test_process_proactive_wake_routes_through_agent_and_posts_metadata(monkeypa
 
     captured = {}
 
-    def _agent(message, images=None, image_paths=None):
+    def _agent(message, images=None, image_paths=None, **_kwargs):
         captured["message"] = message
         captured["images"] = images
         captured["image_paths"] = image_paths
@@ -4535,7 +4535,7 @@ def test_process_proactive_v2_wake_routes_without_gate_judgment(monkeypatch):
 
     captured = {"posted": [], "statuses": []}
 
-    def _agent(message, images=None, image_paths=None):
+    def _agent(message, images=None, image_paths=None, **_kwargs):
         captured["message"] = message
         captured["images"] = images
         captured["image_paths"] = image_paths
@@ -4612,7 +4612,7 @@ def test_process_proactive_v2_sleep_marks_completed_without_post(monkeypatch):
     monkeypatch.setattr(
         crc,
         "call_agent",
-        lambda message, images=None, image_paths=None: {
+        lambda message, images=None, image_paths=None, **_kwargs: {
             "actions": [{"type": "proactive.sleep", "reason": "not helpful"}],
             "messages": [],
         },
@@ -4977,7 +4977,7 @@ def _degenerate_test_harness(monkeypatch, agent_result):
     monkeypatch.setattr(
         crc,
         "call_agent",
-        lambda message, images=None, image_paths=None: agent_result,
+        lambda message, images=None, image_paths=None, **_kwargs: agent_result,
     )
     monkeypatch.setattr(
         crc,
@@ -5353,7 +5353,7 @@ def test_process_proactive_malformed_json_reason_does_not_post(monkeypatch):
     monkeypatch.setattr(
         crc,
         "call_agent",
-        lambda message, images=None, image_paths=None: {
+        lambda message, images=None, image_paths=None, **_kwargs: {
             "messages": ['"reason":"用户一小时没回，该说的已经说了，继续给空间"\\n}\\n]\\n}'],
         },
     )
@@ -5393,7 +5393,7 @@ def test_process_proactive_malformed_speak_json_does_not_post_raw_protocol(monke
     monkeypatch.setattr(
         crc,
         "call_agent",
-        lambda message, images=None, image_paths=None: (
+        lambda message, images=None, image_paths=None, **_kwargs: (
             '"messages": ["这句如果解析失败，不能把 JSON 协议原样发出去"]'
         ),
     )
@@ -5431,7 +5431,7 @@ def test_process_proactive_fenced_sleep_action_does_not_post(monkeypatch):
     monkeypatch.setattr(
         crc,
         "call_agent",
-        lambda message, images=None, image_paths=None: (
+        lambda message, images=None, image_paths=None, **_kwargs: (
             "```json\n"
             "{\n"
             '  "actions": [\n'
@@ -5480,7 +5480,7 @@ def test_process_proactive_reason_only_result_marks_sleep_without_post(monkeypat
     monkeypatch.setattr(
         crc,
         "call_agent",
-        lambda message, images=None, image_paths=None: {
+        lambda message, images=None, image_paths=None, **_kwargs: {
             "reason": "用户刚才没有继续互动，保持安静",
         },
     )
@@ -5520,7 +5520,7 @@ def test_process_proactive_v2_request_broadcast_posts_visible_request(monkeypatc
     monkeypatch.setattr(
         crc,
         "call_agent",
-        lambda message, images=None, image_paths=None: {
+        lambda message, images=None, image_paths=None, **_kwargs: {
             "actions": [{
                 "type": "proactive.request_broadcast",
                 "reason": "screen sharing is off",
@@ -5561,7 +5561,7 @@ def test_process_proactive_native_action_only_send_message_posts(monkeypatch):
 
     captured = {"posted": [], "statuses": []}
 
-    def _agent(message, images=None, image_paths=None):
+    def _agent(message, images=None, image_paths=None, **_kwargs):
         captured["message"] = message
         captured["images"] = images
         captured["image_paths"] = image_paths
@@ -5638,7 +5638,7 @@ def test_process_introduction_job_writes_identity_before_first_greeting(monkeypa
         },
     }
 
-    def _agent(message, images=None, image_paths=None):
+    def _agent(message, images=None, image_paths=None, **_kwargs):
         events.append(("agent", message, images, image_paths))
         return {"actions": [action], "messages": ["我来了。"]}
 
@@ -5692,7 +5692,7 @@ def test_process_introduction_job_recovers_greeting_when_agent_omits_message(mon
         },
     }
 
-    def _agent(message, images=None, image_paths=None):
+    def _agent(message, images=None, image_paths=None, **_kwargs):
         events.append(("agent", message, images, image_paths))
         return {"actions": [action], "messages": []}
 
@@ -5769,7 +5769,7 @@ def test_process_proactive_native_schedule_and_cancel_actions_without_chat(monke
     monkeypatch.setattr(
         crc,
         "call_agent",
-        lambda message, images=None, image_paths=None: {
+        lambda message, images=None, image_paths=None, **_kwargs: {
             "actions": [
                 {
                     "type": "schedule_wake",
@@ -5905,7 +5905,7 @@ def test_native_proactive_prompt_injects_digest_and_native_tool_catalog(monkeypa
 
     captured = {"statuses": []}
 
-    def _agent(message, images=None, image_paths=None):
+    def _agent(message, images=None, image_paths=None, **_kwargs):
         captured["message"] = message
         return {"actions": [{"type": "sleep", "reason": "nothing to say"}], "messages": []}
 
@@ -11455,3 +11455,35 @@ def test_thinking_denylist_calls_through_to_shared_vocabulary(monkeypatch):
         "V1 没有走共享 helper —— 它多半还留着自己的本地 regex"
     )
     assert "第二行" in out, "V1 用的不是替身给的 pattern,说明有另一个词表来源"
+# ---------------------------------------------------------------------------
+# Proactive lane unification: cache-prefix alignment + <think> in wake replies
+# ---------------------------------------------------------------------------
+
+
+def test_user_mcp_cli_value_claude_proactive_matches_chat(monkeypatch):
+    monkeypatch.setattr(
+        crc,
+        "_user_mcp_applied",
+        {"fingerprint": "t", "servers": [{"name": "ob", "enabled": True}]},
+    )
+    template = 'claude --print {mcp} "{message}"'
+    chat = crc._user_mcp_cli_value(template, "chat")
+    proactive = crc._user_mcp_cli_value(template, "proactive")
+    assert chat, "chat lane must resolve an --mcp-config value"
+    assert proactive == chat, (
+        "proactive lane must produce the same argv prefix as chat "
+        "(prompt-cache alignment across lanes)"
+    )
+    assert crc._user_mcp_cli_value(template, "background") == ""
+    assert crc._user_mcp_cli_value(template, "capture") == ""
+
+
+def test_reply_protocol_block_permits_think_tag():
+    assert "<think>" in crc._reply_protocol_block()
+
+
+def test_scheduled_wake_message_permits_think_tag():
+    msg = crc._scheduled_wake_message(
+        {"scheduled_note": "remind about tea", "timezone": "America/New_York"}
+    )
+    assert "<think>" in msg
