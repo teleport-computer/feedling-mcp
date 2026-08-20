@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from dataclasses import asdict
 from datetime import datetime
 from typing import Any
@@ -447,23 +448,78 @@ def strict_report() -> dict:
 
 
 def status() -> dict:
-    policy = config.require_target()
-    with db.get_pool().connection() as conn:
-        pending, quarantined, oldest = conn.execute(
-            "SELECT count(*), count(*) FILTER (WHERE quarantined_at IS NOT NULL), "
-            "EXTRACT(epoch FROM now() - min(created_at)) "
-            "FROM plaintext_shadow_dirty_keys"
-        ).fetchone()
-        audit = change_capture.audit(conn)
-    with mirror.get_target_pool(policy).connection() as target:
-        target_ok = target.execute("SELECT 1").fetchone() == (1,)
+    target = config.load_target()
+    if target is None:
+        return {
+            "enabled": False,
+            "schema_head": _SCHEMA_HEAD,
+            "target_ok": False,
+            "trigger_audit_ok": None,
+            "pending_keys": 0,
+            "quarantined_keys": 0,
+            "oldest_pending_seconds": None,
+            "latest_run": None,
+            "latest_restore_evidence": None,
+            "failure_slugs": [],
+        }
+
+    failures: list[str] = []
+    pending = quarantined = 0
+    oldest = None
+    audit_ok = False
+    evidence = None
+    latest_run = None
+    try:
+        config.validate_startup()
+        with db.get_pool().connection() as conn:
+            pending, quarantined, oldest = conn.execute(
+                "SELECT count(*), "
+                "count(*) FILTER (WHERE quarantined_at IS NOT NULL), "
+                "EXTRACT(epoch FROM now() - min(created_at)) "
+                "FROM plaintext_shadow_dirty_keys"
+            ).fetchone()
+            audit_ok = change_capture.audit(conn).ok
+            row = conn.execute(
+                "SELECT restored_at, source_backup_at, expires_at, schema_head "
+                "FROM plaintext_shadow_restore_evidence "
+                "ORDER BY recorded_at DESC LIMIT 1"
+            ).fetchone()
+            if row:
+                evidence = {
+                    "restored_at": row[0].isoformat(),
+                    "source_backup_at": row[1].isoformat(),
+                    "expires_at": row[2].isoformat(),
+                    "schema_head": row[3],
+                    "fresh": _restore_evidence(conn),
+                }
+        runs = db.recent_plaintext_shadow_sync_runs(limit=1)
+        latest_run = runs[0] if runs else None
+    except Exception:  # noqa: BLE001 - status is fixed-shape and redacted
+        failures.append("primary_status_unavailable")
+    if not audit_ok:
+        failures.append("trigger_drift")
+
+    started = time.monotonic()
+    try:
+        with mirror.get_target_pool(target).connection() as conn:
+            target_ok = conn.execute("SELECT 1").fetchone() == (1,)
+    except Exception:  # noqa: BLE001
+        target_ok = False
+    target_probe_ms = round((time.monotonic() - started) * 1000, 2)
+    if not target_ok:
+        failures.append("target_unavailable")
     return {
         "enabled": True,
+        "schema_head": _SCHEMA_HEAD,
         "target_ok": target_ok,
-        "trigger_audit_ok": audit.ok,
+        "target_probe_ms": target_probe_ms,
+        "trigger_audit_ok": audit_ok,
         "pending_keys": int(pending),
         "quarantined_keys": int(quarantined),
         "oldest_pending_seconds": None if oldest is None else float(oldest),
+        "latest_run": latest_run,
+        "latest_restore_evidence": evidence,
+        "failure_slugs": sorted(set(failures)),
     }
 
 

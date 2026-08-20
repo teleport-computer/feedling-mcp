@@ -37,6 +37,7 @@ import db
 from admin import admin_core
 from admin import memory_metadata
 from admin import tee_replication as admin_tee_replication
+from admin import plaintext_shadow as admin_plaintext_shadow
 from asgi import threadpool
 from asgi.http import read_json_silent
 from model_api_runtime.v2 import jobs_store
@@ -394,6 +395,13 @@ async def tee_replication_status(request: Request):
         payload = await threadpool.run_db(admin_tee_replication.status_payload)
     except admin_tee_replication.Unconfigured:
         return JSONResponse({"error": "tee_database_unconfigured"}, status_code=503)
+    return JSONResponse(payload)
+
+
+@router.get("/v1/admin/plaintext-shadow/status")
+async def plaintext_shadow_status(request: Request):
+    _require_admin(request)
+    payload = await threadpool.run_db(admin_plaintext_shadow.status)
     return JSONResponse(payload)
 
 

@@ -12,6 +12,7 @@ test_tee_reconciler.py / test_tee_replicator_worker.py / test_tee_verify.py.
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 import time
@@ -333,6 +334,22 @@ def test_new_plaintext_shadow_target_satisfies_database_configuration(monkeypatc
     )
 
     tee_replication._require_tee_configured()
+
+
+def test_plaintext_shadow_status_is_admin_gated_and_redacted(client, monkeypatch):
+    monkeypatch.setenv("FEEDLING_PLAINTEXT_SHADOW_ENABLED", "0")
+    _set_admin_token(monkeypatch)
+    response = client.get("/v1/admin/plaintext-shadow/status")
+    assert response.status_code == 401
+
+    response = client.get(
+        "/v1/admin/plaintext-shadow/status", headers=_admin_headers()
+    )
+    assert response.status_code == 200
+    rendered = json.dumps(response.get_json())
+    assert "postgresql://" not in rendered
+    assert "body_ct" not in rendered
+    assert response.get_json()["enabled"] is False
 
 
 def test_dry_run_reconcile_plan_still_works_without_tee_database(client, monkeypatch):

@@ -83,6 +83,12 @@ def _start_tee_sync_leader() -> None:
     core_leader.run_singleton("tee-sync", tee_sync_scheduler.start)
 
 
+def _start_plaintext_shadow_leader() -> None:
+    from admin import plaintext_shadow_scheduler
+
+    plaintext_shadow_scheduler.start_elected()
+
+
 def _start_dau_snapshot_leader() -> None:
     """Freeze completed Beijing-day DAU rows on exactly one backend worker."""
     from admin import dau_snapshot_scheduler
@@ -111,6 +117,13 @@ def _start_lane_rollup_leader() -> None:
 
 @asynccontextmanager
 async def lifespan(app):
+    # Validate the topology even when this worker does not own background jobs.
+    # A malformed enabled configuration must fail startup consistently across
+    # every worker; an operational tick failure after this gate is isolated.
+    from plaintext_shadow import config as plaintext_shadow_config
+
+    plaintext_shadow_config.validate_startup()
+
     # (1) Threadpool limiter — off anyio's 40-token default (§5.2).
     threadpool.configure_thread_limiter()
 
@@ -181,9 +194,12 @@ async def lifespan(app):
         _start_runtime_reconciler_leader()
         _start_lane_rollup_leader()
         # (6b) TEE 影子库自动同步单例 — 仅在双写已接时选举（env 决定，接=重部署）。
+        from admin import plaintext_shadow_scheduler
         from tee_shadow import mirror as _tee_mirror
 
-        if _tee_mirror.enabled():
+        if plaintext_shadow_scheduler.should_start():
+            _start_plaintext_shadow_leader()
+        elif _tee_mirror.enabled():
             _start_tee_sync_leader()
 
     # (7) Independent V2 timeout watchdog. The worker process also runs this
