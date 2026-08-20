@@ -26,10 +26,12 @@
     apps=[] 和 disabled=true 的区别、baseline/delta 不要混为一谈）；
     其余讲「这个工具能读什么、怎么调用」的措辞留在 tool_schema.py。
 
-★ 尚未搬入（Task 6 负责，V1/自托管一侧）：
-  V1_GLANCE_HOWTO、V1_BOARD_HOWTO——对应 tools/chat_resident_consumer.py
-  里 native reach-out 的 glance/board 说明文案，本批（Task 5）不碰
-  tools/chat_resident_consumer.py，留给 Task 6 补进本文件。
+  - V1_GLANCE_HOWTO  <- tools/chat_resident_consumer.py
+    `_native_reachout_perception_context` 里 real_signal_context 的说明句
+    （"This is a low-resolution glance ..."）
+  - V1_BOARD_HOWTO  <- tools/chat_resident_consumer.py
+    `_native_reachout_perception_context` 里 cross_domain_board_json 后的
+    说明句（"Reading the board: ..."）
 """
 from __future__ import annotations
 
@@ -74,3 +76,23 @@ PERCEPTION_TOOL_NOTES: dict[str, str] = {
         "the current change from that baseline; do not conflate them."
     ),
 }
+
+# 出处：tools/chat_resident_consumer.py `_native_reachout_perception_context`
+V1_GLANCE_HOWTO = (
+    "This is a low-resolution glance, not a list of things to report. It helps you decide WHETHER to look closer "
+    "and WHERE — not what to say. Most fields you just note and move on; if one makes you want to understand the "
+    "moment better, pull the matching tool for detail. Treat missing fields as unknown."
+)
+
+# 出处：tools/chat_resident_consumer.py `_native_reachout_perception_context`
+V1_BOARD_HOWTO = (
+    "Reading the board: each domain (location/media/app/health/weather/mood/reminders/calendar/photos/screen) "
+    "is laid out evenly — health is just one entry, not the headline. Pick at most 2-3 things that stand out "
+    "to you; you may combine across domains, and prefer lived, human context (music, place, an app, a photo, "
+    "an overdue reminder) over the raw figures. Do NOT recite exact numbers (minutes, degrees, counts, sleep "
+    "figures) — use them only to notice what's genuinely about the user; if a number actually matters, pull "
+    "the tool for it. novelty hints (new_artist / long_dwell) are light factual context, not a directive. "
+    "If signals lean low or vulnerable (late hour, sad music, poor sleep), be lighter, not heavier — don't "
+    "diagnose, don't stack worries; one warm, light touch is enough. If nothing stands out, staying quiet is "
+    "equally fine."
+)
