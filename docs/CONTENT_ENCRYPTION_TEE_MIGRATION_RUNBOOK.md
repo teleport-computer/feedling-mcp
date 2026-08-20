@@ -78,6 +78,15 @@ must keep `FEEDLING_PLAINTEXT_SHADOW_ENABLED=0` and receive no shadow DSN; sourc
 database triggers capture their writes, and the elected main-backend scheduler
 is the sole drain owner.
 
+Every release that advances `alembic_tee` must apply that same release head to
+the decrypted-shadow target with `PLAINTEXT_SHADOW_MIGRATION_DATABASE_URL`
+before, or in the same maintenance window as, the TEE primary migration. This
+includes a TEE-primary-only table such as `trace_events`: the table is not added
+to shadow replication, but the exact-head gate still requires the target's
+schema version to advance. Migrating only the primary makes the elected drain
+stop deliberately on head mismatch; treat that stop as a failed deployment
+sequence, not as ordinary replication lag.
+
 The source control tables contain keys, generations, counters, timestamps, and
 fixed error slugs only. The drain claims dirty keys with short
 `FOR UPDATE SKIP LOCKED` transactions, re-reads the authoritative source row,

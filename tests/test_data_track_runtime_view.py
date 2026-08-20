@@ -1,6 +1,7 @@
 """Runtime 健康值班台：阈值判定与失败码清洗（纯函数，无需 PostgreSQL）。"""
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -588,6 +589,27 @@ def test_render_runtime_health_page_shows_capture_open_bucket(bound_request):
     assert "/ 3</td>" in html_out                 # 在飞 无特殊标记
 
 
+def test_render_runtime_health_page_explains_exact_watchdog_event_scope(
+    bound_request,
+):
+    html_out = _dt._render_runtime_health_page(
+        _payload(),
+        watchdog_recoveries={
+            "profile:requeued": 2,
+            "scheduled:terminal": 1,
+        },
+    )
+
+    assert "Watchdog 精确恢复" in html_out
+    assert "data-watchdog-lane='profile'" in html_out
+    assert "class='watchdog-requeued'>2</td>" in html_out
+    assert "data-watchdog-lane='scheduled'" in html_out
+    assert "class='watchdog-terminal'>1</td>" in html_out
+    assert "历史不可回填" in html_out
+    assert "准确性从事件表上线时刻起算" in html_out
+    assert "上线初期读数偏低不等于此前未发生" in html_out
+
+
 def test_runtime_view_renders_and_highlights_nav(client, monkeypatch):
     monkeypatch.setattr(_dt, "_runtime_health_summary", _fake_summary)
     page = client.get(
@@ -656,6 +678,16 @@ def test_runtime_health_summary_is_wired_to_jobs_store():
     from model_api_runtime.v2 import jobs_store
 
     assert _dt._runtime_health_summary is jobs_store.recent_runtime_health
+
+
+def test_runtime_watchdog_recoveries_is_wired_to_jobs_store():
+    import asgi_app  # noqa: F401
+    from model_api_runtime.v2 import jobs_store
+
+    assert (
+        _dt._runtime_watchdog_recoveries
+        is jobs_store.recent_watchdog_recovery_counts
+    )
 
 
 def test_runtime_view_degrades_to_error_card_not_500(client, monkeypatch):
@@ -1451,10 +1483,15 @@ def test_runtime_view_passes_same_window_to_user_report(monkeypatch):
         seen["users"] = kwargs["within_hours"]
         return _user_report()
 
+    def _watchdog(**kwargs):
+        seen["watchdog"] = kwargs["within_hours"]
+        return {}
+
     monkeypatch.setattr(_dt, "_runtime_health_summary", _health)
     monkeypatch.setattr(_dt, "_runtime_token_by_lane", _tokens_for_window)
     monkeypatch.setattr(_dt, "_runtime_delivery_health", _delivery_for_window)
     monkeypatch.setattr(_dt, "_runtime_user_report", _users)
+    monkeypatch.setattr(_dt, "_runtime_watchdog_recoveries", _watchdog)
 
     body = _admin_core.page_html("view=runtime&hours=168")
 
@@ -1463,8 +1500,105 @@ def test_runtime_view_passes_same_window_to_user_report(monkeypatch):
         "tokens": 168,
         "delivery": 168,
         "users": 168,
+        "watchdog": 168,
     }
     assert "用户交付可靠性" in body
+
+
+@pytest.mark.skipif(
+    not os.environ.get("DATABASE_URL"),
+    reason="final admin watchdog metric needs PostgreSQL",
+)
+def test_runtime_page_reads_committed_watchdog_event_and_real_outcome(
+    client, monkeypatch
+):
+    import db
+    from conftest import seed_user
+    from model_api_runtime.v2 import jobs_store
+
+    profile_uid = "u_t183_admin_watchdog_event_profile"
+    scheduled_uid = "u_t183_admin_watchdog_event_scheduled"
+    seed_user(profile_uid)
+    seed_user(scheduled_uid)
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM v2_job_recovery_events")
+        conn.execute(
+            "DELETE FROM agent_jobs WHERE user_id IN (%s,%s)",
+            (profile_uid, scheduled_uid),
+        )
+        for uid in (profile_uid, scheduled_uid):
+            conn.execute(
+                "INSERT INTO v2_runtime_state "
+                "(user_id,hosted_runtime_state,runtime_generation) "
+                "VALUES (%s,'v2',1) ON CONFLICT (user_id) DO UPDATE SET "
+                "hosted_runtime_state='v2',runtime_generation=1",
+                (uid,),
+            )
+    job_id, _ = jobs_store.enqueue_job(profile_uid, "profile")
+    claimed = jobs_store.claim_next_job("t183-profile", lanes={"profile"})
+    assert claimed is not None and int(claimed["id"]) == job_id
+    assert jobs_store.mark_running(job_id, claimed_by="t183-profile")
+    recovered = jobs_store.recover_killed_job(
+        job_id=job_id,
+        claimed_by="t183-profile",
+        reason="slot_watchdog_timeout",
+    )
+    assert recovered is not None and recovered["recovery"] == "requeued"
+
+    scheduled_job_id, _ = jobs_store.enqueue_job(scheduled_uid, "scheduled")
+    claimed = jobs_store.claim_next_job("t183-scheduled", lanes={"scheduled"})
+    assert claimed is not None and int(claimed["id"]) == scheduled_job_id
+    assert jobs_store.mark_running(
+        scheduled_job_id,
+        claimed_by="t183-scheduled",
+    )
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET attempt_count=%s WHERE id=%s",
+            (
+                jobs_store.SCHEDULED_LEASE_REQUEUE_MAX_ATTEMPTS,
+                scheduled_job_id,
+            ),
+        )
+    recovered = jobs_store.recover_killed_job(
+        job_id=scheduled_job_id,
+        claimed_by="t183-scheduled",
+        reason="slot_watchdog_timeout",
+    )
+    assert recovered is not None and recovered["recovery"] == "terminal"
+
+    monkeypatch.setattr(_dt, "_runtime_health_summary", _fake_summary)
+    monkeypatch.setattr(_dt, "_runtime_token_by_lane", lambda **_kw: None)
+    monkeypatch.setattr(_dt, "_runtime_delivery_health", lambda **_kw: None)
+    monkeypatch.setattr(_dt, "_runtime_user_report", lambda **_kw: None)
+    monkeypatch.setattr(
+        _dt,
+        "_runtime_watchdog_recoveries",
+        jobs_store.recent_watchdog_recovery_counts,
+    )
+    monkeypatch.setattr(
+        _admin_core.db,
+        "admin_lane_rollup",
+        lambda **_kw: {"stuck": {"rows": []}},
+    )
+
+    page = client.get(
+        "/admin/data-track?view=runtime&hours=24",
+        headers=_admin_headers(),
+    ).get_data(as_text=True)
+
+    exact_profile_row = (
+        "<tr data-watchdog-lane='profile'><td><b>profile</b></td>"
+        "<td class='watchdog-requeued'>1</td>"
+        "<td class='watchdog-terminal'>0</td></tr>"
+    )
+    exact_scheduled_row = (
+        "<tr data-watchdog-lane='scheduled'><td><b>scheduled</b></td>"
+        "<td class='watchdog-requeued'>0</td>"
+        "<td class='watchdog-terminal'>1</td></tr>"
+    )
+    assert exact_profile_row in page
+    assert exact_scheduled_row in page
 
 
 def test_runtime_user_report_failure_does_not_hide_health(monkeypatch):

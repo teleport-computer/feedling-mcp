@@ -153,6 +153,9 @@ _admin_data_track._runtime_health_summary = _v2_jobs_store.recent_runtime_health
 _admin_data_track._runtime_token_by_lane = _v2_jobs_store.recent_token_usage_by_lane
 _admin_data_track._runtime_delivery_health = _v2_jobs_store.recent_delivery_health
 _admin_data_track._runtime_user_report = _v2_jobs_store.recent_runtime_user_delivery_report
+_admin_data_track._runtime_watchdog_recoveries = (
+    _v2_jobs_store.recent_watchdog_recovery_counts
+)
 _admin_data_track._usage_report = _v2_jobs_store.usage_report_snapshot
 _chat_core.publish_voice_reply = _voice_results.store_reply_for_parent
 # V1's only per-turn evidence about a user's MCP servers is the consumer's

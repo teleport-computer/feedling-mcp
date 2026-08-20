@@ -33,6 +33,19 @@ change must not be interpreted as an API guarantee.
   Promotion now distinguishes fully audited preservation from unresolved,
   malformed, or requeued work, which remains blocking.
 
+- **Managed debug traces use append-only, 30-day TEE storage.** Each event is a
+  row in a Beijing-day PostgreSQL partition instead of a rewrite of a bounded
+  per-user JSON blob. A default partition keeps a late maintenance run from
+  dropping writes and is independently reported as degraded; owner-only
+  maintenance repairs that partition and removes expired days. Trace fields and
+  bounded content excerpts are plaintext operational data within the managed
+  TEE boundary. Recent traces intentionally survive account deletion and remain
+  available to an authorized administrator by exact uid until retention or an
+  explicit trace clear removes them.
+  Trace outcomes reuse the Runtime job dashboard's failure, timeout, control,
+  and safety-suppression classification so per-event diagnosis and aggregate
+  operational failure rates use the same vocabulary.
+
 - **Managed TEE-primary promotion now verifies the voice-call lifecycle on the
   database that will receive Chat writes.** The TEE schema carries the same
   durable cancel/finalize fence as the former primary, and the Phase-4 gate

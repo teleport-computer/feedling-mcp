@@ -1,23 +1,19 @@
-"""DB-backed concurrency coverage for the debug trace append boundary."""
+"""DB-backed concurrency coverage for append-only trace batches."""
 from __future__ import annotations
 
 import concurrent.futures
+import os
 import time
 
-import conftest
 import db
-import debug_trace
 
 
-def test_concurrent_trace_batches_preserve_every_event_across_writers(backend_env):
+def test_concurrent_trace_batches_preserve_every_event(backend_env, monkeypatch):
     uid = "usr_debug_trace_atomic_batches"
-    conftest.seed_user(uid)
-    with db.get_pool().connection() as conn:
-        conn.execute(
-            "DELETE FROM user_blobs WHERE user_id=%s AND kind=%s",
-            (uid, debug_trace.DEBUG_TRACE_BLOB),
-        )
-
+    original_url = os.environ["DATABASE_URL"]
+    db.close_pool()
+    monkeypatch.setenv("DATABASE_URL", os.environ["TEE_DATABASE_URL"])
+    monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "tee")
     now = time.time()
     batches = [
         [
@@ -26,23 +22,21 @@ def test_concurrent_trace_batches_preserve_every_event_across_writers(backend_en
         ]
         for batch in range(8)
     ]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        futures = [
-            pool.submit(
-                db.append_blob_events_strict,
-                uid,
-                debug_trace.DEBUG_TRACE_BLOB,
-                batch,
-                cutoff_ts=now - 60,
-                max_events=200,
-            )
-            for batch in batches
-        ]
-        for future in futures:
-            future.result(timeout=5)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [
+                pool.submit(db.insert_trace_events_strict, uid, batch)
+                for batch in batches
+            ]
+            for future in futures:
+                assert future.result(timeout=5) == 20
 
-    persisted = db.get_blob_strict(uid, debug_trace.DEBUG_TRACE_BLOB)
-    assert persisted[db._BLOB_REVISION_KEY] == len(batches)
-    assert {event["type"] for event in persisted["events"]} == {
-        f"{batch}:{item}" for batch in range(8) for item in range(20)
-    }
+        persisted = db.query_trace_events(user_id=uid, limit=200)
+        assert {event["type"] for event in persisted} == {
+            f"{batch}:{item}" for batch in range(8) for item in range(20)
+        }
+    finally:
+        db.delete_trace_events_for_user(uid)
+        db.close_pool()
+        monkeypatch.setenv("DATABASE_URL", original_url)
+        monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "rds")

@@ -2272,33 +2272,14 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     return payload
 
 
-def _debug_trace_events_from_blobs(
-    user_id: str,
-    enabled_raw,
-    raw,
-) -> tuple[bool, list[dict]]:
+def _debug_trace_enabled(enabled_raw) -> bool:
     if debug_trace._hard_disabled():
-        enabled = False
-    elif isinstance(enabled_raw, dict) and "enabled" in enabled_raw:
-        enabled = bool(enabled_raw.get("enabled"))
-    elif enabled_raw is None:
-        enabled = debug_trace._default_enabled()
-    else:
-        enabled = bool(enabled_raw)
-    raw = raw or {}
-    events = raw.get("events") if isinstance(raw, dict) and isinstance(raw.get("events"), list) else []
-    out = []
-    for e in events:
-        if not isinstance(e, dict):
-            continue
-        ev = dict(e)
-        ev["user_id"] = user_id
-        try:
-            ev["ts"] = float(ev.get("ts") or 0)
-        except (TypeError, ValueError):
-            ev["ts"] = 0.0
-        out.append(ev)
-    return enabled, out
+        return False
+    if isinstance(enabled_raw, dict) and "enabled" in enabled_raw:
+        return bool(enabled_raw.get("enabled"))
+    if enabled_raw is None:
+        return debug_trace._default_enabled()
+    return bool(enabled_raw)
 
 
 def _debug_trace_stem(event_type: str) -> str:
@@ -2622,7 +2603,7 @@ def _debug_event_public_json(ev: dict) -> dict:
 
 
 def _debug_filter_options(events: list[dict]) -> dict:
-    """Build stable filter choices from the current ring-buffer sample."""
+    """Build stable filter choices from the bounded table-query sample."""
     subsystems = sorted({str(e.get("subsystem") or "").strip() for e in events if str(e.get("subsystem") or "").strip()})
     statuses = sorted({str(e.get("status") or "").strip().lower() for e in events if str(e.get("status") or "").strip()})
     preferred_subsystems = ["route", "context", "agent", "memory", "genesis", "debug_trace"]
@@ -2665,49 +2646,61 @@ def _data_track_debug_payload() -> dict:
     since_epoch = float(filters.get("since_epoch") or 0)
 
     with registry._users_lock:
-        users = [dict(u) for u in registry._users if u.get("user_id")]
-    if user_filter:
-        users = [u for u in users if str(u.get("user_id") or "") == user_filter]
+        live_users = {
+            str(user.get("user_id") or ""): dict(user)
+            for user in registry._users
+            if user.get("user_id")
+            and (
+                not user_filter
+                or str(user.get("user_id") or "") == user_filter
+            )
+        }
 
-    user_ids = [str(user.get("user_id") or "") for user in users]
-    trace_blobs = db.get_blobs_for_users(
-        user_ids,
-        ["v1_flow_trace_enabled", "v1_flow_trace"],
+    # Direct table scan is bounded and filter-aware. Crucially, it begins from
+    # trace rows rather than the live account registry, so an exact deleted uid
+    # remains reachable for the 30-day incident window (T184 D7).
+    scan_limit = 50_000
+    all_events_raw = db.query_trace_events(
+        user_id=user_filter,
+        trace_id_contains=trace_filter,
+        subsystem=subsystem_filter,
+        q=q,
+        since_epoch=since_epoch,
+        limit=scan_limit,
     )
+    event_user_ids = {
+        str(event.get("user_id") or "")
+        for event in all_events_raw
+        if event.get("user_id")
+    }
+    user_ids = sorted(set(live_users) | event_user_ids)
+    trace_flags = db.get_blobs_for_users(user_ids, [debug_trace.DEBUG_TRACE_FLAG_BLOB])
 
-    all_events_raw: list[dict] = []
-    all_events: list[dict] = []
+    all_events = list(all_events_raw)
     user_rows: dict[str, dict] = {}
-    for user in users:
-        uid = str(user.get("user_id") or "")
-        enabled, events = _debug_trace_events_from_blobs(
-            uid,
-            trace_blobs.get((uid, "v1_flow_trace_enabled")),
-            trace_blobs.get((uid, "v1_flow_trace")),
+    for uid in user_ids:
+        user = live_users.get(uid) or {}
+        enabled = (
+            _debug_trace_enabled(
+                trace_flags.get((uid, debug_trace.DEBUG_TRACE_FLAG_BLOB))
+            )
+            if uid in live_users
+            else False
         )
-        all_events_raw.extend(events)
-        matching = []
-        for ev in events:
-            if since_epoch and float(ev.get("ts") or 0) < since_epoch:
-                continue
-            if subsystem_filter and str(ev.get("subsystem") or "") != subsystem_filter:
-                continue
-            if trace_filter and trace_filter not in str(ev.get("trace_id") or ""):
-                continue
-            if q and q not in _debug_trace_search_text(ev):
-                continue
-            matching.append(ev)
+        matching = [
+            event for event in all_events if str(event.get("user_id") or "") == uid
+        ]
         if matching or enabled:
             latest = max((float(e.get("ts") or 0) for e in matching), default=0)
             user_rows[uid] = {
                 "user_id": uid,
                 "principal_id": user.get("principal_id") or "",
                 "enabled": enabled,
+                "account_present": uid in live_users,
                 "events": len(matching),
                 "last_ts": latest,
                 "last_at": core_util._epoch_to_iso(latest),
             }
-        all_events.extend(matching)
 
     all_events = sorted(all_events, key=lambda e: float(e.get("ts") or 0), reverse=True)
     turns = _debug_trace_group_turns(all_events)
@@ -2752,7 +2745,7 @@ def _data_track_debug_payload() -> dict:
     return {
         "summary": {
             "generated_at": datetime.now().isoformat(),
-            "users_scanned": len(users),
+            "users_scanned": len(user_ids),
             "users_with_events": sum(1 for u in users_out if int(u.get("events") or 0) > 0),
             "events_total": len(all_events),
             "turns_total": len(turns),
@@ -2760,6 +2753,7 @@ def _data_track_debug_payload() -> dict:
             "turns_returned": len(turns_out),
             "stalled_turns": sum(1 for t in turns if t.get("terminal_status") == "stalled"),
             "error_turns": sum(1 for t in turns if t.get("terminal_status") == "error"),
+            "scan_truncated": len(all_events_raw) >= scan_limit,
         },
         "filters": {
             "since": filters.get("since", ""),
@@ -3381,6 +3375,14 @@ _RUNTIME_FAILURE_CODE_MAX = 64
 # outbox 用的，admin 层不 import model_api_runtime，故在此单独定义）。
 _RUNTIME_FAILURE_CODE_RE = re.compile(r"^[a-z0-9_]+(:[a-z0-9_]+)?$")
 _RUNTIME_ERROR_CLASS_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+RUNTIME_OUTCOME_CLASS_LABELS = {
+    "operational_failure": "执行故障",
+    "timeout": "超时 / 失活",
+    "control": "控制切流",
+    "safety_suppression": "安全抑制",
+}
+RUNTIME_OUTCOME_CLASSES = frozenset(RUNTIME_OUTCOME_CLASS_LABELS)
+RUNTIME_OUTCOME_DEFAULT = "operational_failure"
 
 
 def _runtime_operational_rate(lane: dict):
@@ -3711,6 +3713,10 @@ def _runtime_delivery_health(*, within_hours: int = 24) -> dict:
 # stub content-free so Admin can render safely before that binding is installed.
 def _runtime_user_report(*, within_hours: int = 24) -> dict:
     return {"window_hours": within_hours, "users": []}
+
+
+def _runtime_watchdog_recoveries(*, within_hours: int = 24) -> dict[str, int]:
+    return {}
 
 
 # Injected by the assembly layer (asgi_app.py); the real implementation is
@@ -4054,12 +4060,64 @@ def _render_stuck_block(stuck: dict | None) -> str:
     return head + "".join(body) + "</section>"
 
 
+def _render_watchdog_recovery_events(
+    counts: dict[str, int] | None,
+    *,
+    within_hours: int,
+) -> str:
+    scope = (
+        "分子 = 所选窗口内 recover_killed_job 已完成状态转移，并在同一事务追加的 "
+        "slot_watchdog_timeout 事件；requeued/terminal 取事件记录的真实 recovery，"
+        "不按 lane 名猜。"
+    )
+    history = (
+        "历史不可回填，准确性从事件表上线时刻起算；上线初期读数偏低不等于此前未发生。"
+    )
+    if counts is None:
+        return (
+            "<div class='note-box'><b>Watchdog recovery 事件数据不可用。</b>"
+            f"{html.escape(scope)} {html.escape(history)}</div>"
+        )
+
+    by_lane: dict[str, dict[str, int]] = {}
+    for raw_key, raw_count in counts.items():
+        lane, separator, recovery = str(raw_key).rpartition(":")
+        if not separator or not lane or recovery not in {"requeued", "terminal"}:
+            continue
+        bucket = by_lane.setdefault(lane, {"requeued": 0, "terminal": 0})
+        bucket[recovery] += max(0, int(raw_count or 0))
+
+    rows = []
+    for lane in sorted(by_lane):
+        bucket = by_lane[lane]
+        escaped_lane = html.escape(lane)
+        rows.append(
+            f"<tr data-watchdog-lane='{html.escape(lane, quote=True)}'>"
+            f"<td><b>{escaped_lane}</b></td>"
+            f"<td class='watchdog-requeued'>{bucket['requeued']}</td>"
+            f"<td class='watchdog-terminal'>{bucket['terminal']}</td>"
+            "</tr>"
+        )
+    body = "".join(rows) or (
+        "<tr><td colspan='3' class='muted'>窗口内新事件账本无 recovery 记录；"
+        "这不代表事件表上线前为零。</td></tr>"
+    )
+    return (
+        f"<div class='muted'>近 {int(within_hours)} 小时。{html.escape(scope)} "
+        f"<b>{html.escape(history)}</b></div>"
+        "<div class='table-wrap'><table><thead><tr><th>Lane</th>"
+        "<th>杀掉并重投</th><th>杀掉后终结</th></tr></thead>"
+        f"<tbody>{body}</tbody></table></div>"
+    )
+
+
 def _render_runtime_health_page(
     payload: dict,
     tokens: dict | None = None,
     delivery: dict | None = None,
     user_report: dict | None = None,
     stuck: dict | None = None,
+    watchdog_recoveries: dict[str, int] | None = None,
 ) -> str:
     """Runtime V2 全 lane 运行时健康值班台（?view=runtime）。
 
@@ -4067,9 +4125,9 @@ def _render_runtime_health_page(
     （日报送达率，按天）。heartbeat lane 两页都出现但口径不同，故本页该行给出
     指向日报页的链接。
 
-    ``tokens`` / ``delivery`` / ``user_report`` 都可能是 None（各自独立的失败域，
-    见 admin_core）：取不到时对应区块显「暂不可用」，不得把 None 渲染成 0——0
-    是"确认过是零"。
+    ``tokens`` / ``delivery`` / ``user_report`` / ``watchdog_recoveries`` 都可能
+    是 None（各自独立的失败域，见 admin_core）：取不到时对应区块显「暂不可用」，
+    不得把 None 渲染成 0——0 是"确认过是零"。
     """
     service_level, service_reasons = _runtime_service_level(payload, delivery)
     if delivery is None and service_level == "ok":
@@ -4184,6 +4242,10 @@ def _render_runtime_health_page(
             _fmt_duration_sec(pool_age),
         ),
     ])
+    watchdog_section = _render_watchdog_recovery_events(
+        watchdog_recoveries,
+        within_hours=window_hours,
+    )
 
     # 交付区块：唯一能看出「job 判成功但产物没到用户」的地方。取不到时明说取不到，
     # 不拿 0 顶替——这个区块显示 0 的含义是"队列是空的、一切送达了"，与"数据取不到"
@@ -4348,22 +4410,16 @@ def _render_runtime_health_page(
         merged: dict[tuple[str, str, str], int] = {}
         for item in lane.get("top_failures") or []:
             code = _runtime_failure_code(item.get("code"))
-            outcome_class = str(item.get("outcome_class") or "operational_failure")
-            if outcome_class not in {
-                "operational_failure", "timeout", "control", "safety_suppression"
-            }:
-                outcome_class = "operational_failure"
+            outcome_class = str(
+                item.get("outcome_class") or RUNTIME_OUTCOME_DEFAULT
+            )
+            if outcome_class not in RUNTIME_OUTCOME_CLASSES:
+                outcome_class = RUNTIME_OUTCOME_DEFAULT
             error_class = str(item.get("error_class") or "")
             if not _RUNTIME_ERROR_CLASS_RE.fullmatch(error_class):
                 error_class = ""
             key = (code, outcome_class, error_class)
             merged[key] = merged.get(key, 0) + int(item.get("count") or 0)
-        class_labels = {
-            "operational_failure": "执行故障",
-            "timeout": "超时 / 失活",
-            "control": "控制切流",
-            "safety_suppression": "安全抑制",
-        }
         for (code, outcome_class, error_class), count in sorted(
             merged.items(), key=lambda kv: kv[1], reverse=True
         ):
@@ -4374,7 +4430,7 @@ def _render_runtime_health_page(
             failure_rows.append(
                 "<tr>"
                 f"<td>{name}</td>"
-                f"<td>{class_labels[outcome_class]}</td>"
+                f"<td>{RUNTIME_OUTCOME_CLASS_LABELS[outcome_class]}</td>"
                 f"<td><code>{html.escape(code)}</code></td>"
                 f"<td>{error_class_html}</td>"
                 f"<td>{_fmt_count(count)}</td>"
@@ -4451,6 +4507,8 @@ def _render_runtime_health_page(
   {empty_note}
   <h2>Worker 池</h2>
   <section class="metrics">{pool_metrics}</section>
+  <h2>Watchdog 精确恢复</h2>
+  {watchdog_section}
   <h2>端到端交付</h2>
   <div class="muted">job 判 completed 只证明回合跑完了，不证明产物到达用户。
   这里是副作用与失败回包的投递积压——<b>积压条数不参与总体档位，只有"堵了多久"参与</b>
@@ -8500,8 +8558,8 @@ def _render_data_track_debug_page(payload: dict) -> str:
         )
     limit_options = []
     current_limit = str(pagination.get("limit") or filters.get("limit") or 100)
-    # Ring depth is debug_trace._MAX_EVENTS (2500); stopping the picker at 500
-    # meant a full 48h trace could not be read out from the panel at all.
+    # Keep a large drill-down option; storage retention is time-based now, so
+    # this controls only one response rather than the amount retained.
     for value in ("50", "100", "200", "500", "1000", "2500"):
         selected = "selected" if current_limit == value else ""
         limit_options.append(f'<option value="{value}" {selected}>{value}</option>')
@@ -8634,7 +8692,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
 <body>
 <main>
   <h1>Feedling Debug Logs</h1>
-  <div class="muted">Admin-only beta debug view. Reads existing per-user v1_flow_trace ring buffers; no instrumentation writes here. Generated {html.escape(_bj_iso(summary["generated_at"]))}.</div>
+  <div class="muted">Admin-only debug view. Reads the append-only TEE trace table; no instrumentation writes here. Generated {html.escape(_bj_iso(summary["generated_at"]))}.</div>
   {_render_data_track_view_nav("debug")}
   <section class="metrics">{metrics}</section>
   <div class="modebar">
@@ -8643,7 +8701,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
       <a class="sort-button {'active' if mode == 'timeline' else ''}" href="{html.escape(mode_href('timeline'), quote=True)}">Timeline</a>
       <span class="muted">Flat 用来扫全局异常；Timeline 用来看一次聊天怎么走完。</span>
     </div>
-    <span class="muted">{hint('页面每 30 秒自动刷新。所有数据来自已有 v1_flow_trace ring buffer，不会写新埋点。')} auto refresh</span>
+    <span class="muted">{hint('页面每 30 秒自动刷新。所有数据来自 append-only trace_events 表，不会写新埋点。')} auto refresh</span>
   </div>
   <h2>Filter debug logs {hint('先按 user 或 status 收窄，再用 q 搜 prompt/reply/tokens/explain；点 trace 可进入单轮链路。')}</h2>
   <form class="toolbar" method="get" action="/admin/data-track">
@@ -8661,7 +8719,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
       <option value="blocked" {is_selected("status", "blocked")}>blocked</option>
       <option value="stalled" {is_selected("status", "stalled")}>stalled</option>
     </select></div>
-    <div class="field"><label>Since {hint('支持 ISO 时间或 epoch；空着就是 ring buffer 里全部。')}</label><input name="since" placeholder="2026-07-04T00:00:00" value="{input_value('since')}"></div>
+    <div class="field"><label>Since {hint('支持 ISO 时间或 epoch；空着就是当前 30 天保留窗口。')}</label><input name="since" placeholder="2026-07-04T00:00:00" value="{input_value('since')}"></div>
     <div class="field"><label>Search {hint('会搜 type/explain/detail/content_excerpt，能查明文 excerpt。')}</label><input name="q" placeholder="prompt / reply / token / error" value="{input_value('q')}"></div>
     <button type="submit">Search</button>
   </form>
