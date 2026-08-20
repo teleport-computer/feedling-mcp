@@ -672,6 +672,7 @@ jobs:
             tests/test_voice_finalize_db.py \
             tests/test_voice_gateway.py \
             tests/test_voice_revision_latest_wins.py \
+            tests/test_voice_tee_primary.py \
             tests/test_voice_transcript_outbound_gate.py \
             tests/test_worldbook_match.py \
             tests/test_worldbook_readside_core.py \
