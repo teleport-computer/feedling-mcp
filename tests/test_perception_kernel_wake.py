@@ -13,6 +13,8 @@ import ast
 import pathlib
 import sys
 
+import pytest
+
 # Self-contained sys.path bootstrap (mirrors tests/test_perception_kernel_catalog.py):
 # conftest.py only adds backend/ to sys.path inside its DB-provisioning try-block,
 # so on a no-Postgres machine this file must add backend/ itself.
@@ -60,12 +62,59 @@ def test_motion_is_not_a_significant_change():
     assert wake.is_significant_change("motion_state", "still", "walking") is False
 
 
-def test_place_label_change_is_significant():
-    assert wake.is_significant_change("location_signal", "home", "office") is True
+def test_place_label_change_is_never_significant():
+    # place_label 在 NOT_WAKE_WORTHY_SIGNALS 里——即使值真的变了（home -> office），
+    # 也不算「值得注意的变化」。原测试名叫 place_label 却传的是 "location_signal"
+    # （一个不存在于 catalog 里的占位名，恰好也不在拒绝名单里，于是断言 True
+    # 蒙混过关）——名字和断言的语义正好相反，改成对 place_label 本身的真实断言。
+    assert wake.is_significant_change("place_label", "home", "office") is False
 
 
 def test_same_value_is_never_significant():
     assert wake.is_significant_change("location_signal", "office", "office") is False
+
+
+# ---------------------------------------------------------------------------
+# 直接钉住 is_wake_worthy_signal 的契约：这是真正接线的那个函数
+# （differ_v2.py:179 的 _events_for 调它），不是 is_significant_change。
+# ---------------------------------------------------------------------------
+# 这条测试的存在理由：本批最初的计划是一个 catalog 驱动的判据（白名单——只有
+# catalog.SIGNALS 里的 key 才算 wake-worthy）。catalog.SIGNALS 装的是 iOS 上报
+# 字段名，和下面这七个真实叫醒信号的名字交集为空，所以那版实现会让每一个真实
+# durable wake 信号都被判成「不算」——线上会静默停发全部 V2 叫醒事件，而当时
+# 已有的 55 个回归测试全绿，没有一个测试直接对着 is_wake_worthy_signal 断言过
+# 这七个信号该返回 True。是实现者拒绝照抄那版计划才被发现的。这里把「五项拒绝 +
+# 七个真实 wake 信号默认允许 + 未知名字默认允许」的契约钉死，防止同类回归再次
+# 骗过测试套件。
+@pytest.mark.parametrize(
+    "signal",
+    sorted(wake.NOT_WAKE_WORTHY_SIGNALS),
+)
+def test_deny_listed_signals_are_never_wake_worthy(signal: str):
+    assert wake.is_wake_worthy_signal(signal) is False
+
+
+@pytest.mark.parametrize(
+    "signal",
+    [
+        # 三个 anchor（differ_v2._ANCHOR_SIGNALS）
+        "connectivity_anchor",
+        "wifi_anchor",
+        "bluetooth_anchor",
+        # 其余真实 durable wake 信号（differ_v2._DURABLE_WAKE_SIGNALS）
+        "unlock_after_absence",
+        "screen_phash",
+        "photo_added",
+        "broadcast_state",
+    ],
+)
+def test_durable_wake_signals_default_allow(signal: str):
+    assert wake.is_wake_worthy_signal(signal) is True
+
+
+def test_unknown_signal_name_defaults_to_allow():
+    # 默认允许 + 明确拒绝名单，不是白名单——没见过的名字一律放行。
+    assert wake.is_wake_worthy_signal("some_future_signal_nobody_added_yet") is True
 
 
 def test_kernel_vocabulary_does_not_collide_with_the_two_io_wake_kind_sets():
@@ -206,4 +255,40 @@ def test_wake_unwired_names_stay_unreferenced_outside_the_kernel():
         _UNWIRED_GUARD_MESSAGE.format(name=name, hits="; ".join(offenders))
         for name in _WAKE_UNWIRED_NAMES
         if any(name in entry for entry in offenders)
+    )
+
+
+# ---------------------------------------------------------------------------
+# 上面那条参数化用的是手抄的信号名，挡不住「differ_v2 以后又加了一个信号、内核
+# 不知道」这种漂移 —— 而坑①正是两套词表漂移造成的。这条直接从 differ_v2 的源码
+# 里把真实名单读出来比对，differ_v2 加信号时它自动跟上。
+#
+# 用 AST 读源码而不是 import：differ_v2 会一路 import 到 db，import 进来这个文件
+# 就变成依赖 Postgres 的测试，不能再留在 conftest 的 _PURE_UNIT 白名单里。
+def _durable_wake_signals_from_source() -> set[str]:
+    source = (_BACKEND / "perception" / "differ_v2.py").read_text(encoding="utf-8")
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Assign):
+            continue
+        targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        if "_DURABLE_WAKE_SIGNALS" not in targets:
+            continue
+        call = node.value
+        if not (isinstance(call, ast.Call) and call.args):
+            continue
+        return {
+            elt.value
+            for elt in ast.walk(call.args[0])
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+        }
+    raise AssertionError("differ_v2.py 里找不到 _DURABLE_WAKE_SIGNALS —— 它被改名或删了？")
+
+
+def test_every_real_durable_wake_signal_is_wake_worthy():
+    signals = _durable_wake_signals_from_source()
+    assert signals, "解析出来是空集，说明解析逻辑跟不上 differ_v2 的写法了"
+    rejected = sorted(s for s in signals if not wake.is_wake_worthy_signal(s))
+    assert not rejected, (
+        "这些真实叫醒信号被内核判成了「不值得叫醒」，线上会静默停发对应的 wake："
+        f"{rejected}"
     )
