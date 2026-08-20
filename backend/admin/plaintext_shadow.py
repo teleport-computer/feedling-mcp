@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import hashlib
 import json
@@ -13,6 +14,8 @@ from datetime import datetime
 from typing import Any
 
 import db
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from plaintext_shadow import change_capture, config, outbox
 from psycopg import sql
 from psycopg.types.json import Jsonb
@@ -21,7 +24,7 @@ from tee_replicator import worker
 from tee_shadow import mirror, reconciler, snapshot, table_registry, verify
 
 
-_SCHEMA_HEAD = "0026_plaintext_shadow_control"
+_SCHEMA_HEAD = "0027_plaintext_shadow_gates"
 _INSERT_SHAPE = re.compile(
     r"INSERT\s+INTO\s+([a-zA-Z0-9_]+)\s*\((.*?)\)\s*"
     r"(?:OVERRIDING\s+SYSTEM\s+VALUE\s*)?VALUES",
@@ -34,6 +37,48 @@ def _fingerprint(value: str) -> str:
 def _endpoint_fingerprint(dsn: str) -> str:
     host, port, database = config._database_identity(dsn)
     return _fingerprint(f"{host}:{port}/{database}")
+
+
+def _live_database_fingerprint(conn) -> str:
+    row = conn.execute(
+        "SELECT current_database(), oid, COALESCE(inet_server_addr()::text, 'local'), "
+        "COALESCE(inet_server_port(), 0) FROM pg_database "
+        "WHERE datname=current_database()"
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("live database identity unavailable")
+    return _fingerprint(":".join(str(value) for value in row))
+
+
+def _infra_public_key() -> tuple[Ed25519PublicKey, str]:
+    raw_value = os.environ.get(
+        "FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY", ""
+    ).strip()
+    try:
+        raw = base64.b64decode(raw_value, validate=True)
+        key = Ed25519PublicKey.from_public_bytes(raw)
+    except Exception as exc:
+        raise RuntimeError("trusted infrastructure evidence key is invalid") from exc
+    return key, _fingerprint(raw.hex())
+
+
+def _verified_infra_attestation(payload_b64: str, signature_b64: str) -> tuple[dict, str, str]:
+    key, key_fingerprint = _infra_public_key()
+    try:
+        payload_bytes = base64.b64decode(payload_b64, validate=True)
+        signature = base64.b64decode(signature_b64, validate=True)
+        key.verify(signature, payload_bytes)
+        payload = json.loads(payload_bytes)
+    except (ValueError, InvalidSignature, json.JSONDecodeError) as exc:
+        raise RuntimeError("trusted infrastructure evidence signature is invalid") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("trusted infrastructure evidence payload is invalid")
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    if payload_bytes != canonical:
+        raise RuntimeError("trusted infrastructure evidence payload is not canonical JSON")
+    return payload, key_fingerprint, "sha256:" + hashlib.sha256(signature).hexdigest()
 
 
 def _head(conn) -> str | None:
@@ -52,6 +97,7 @@ def _restore_evidence(
     target_fingerprint: str | None = None,
     minimum_capacity_bytes: int = 0,
     target_connection_limit: int = 0,
+    attestation_key_fingerprint: str | None = None,
 ) -> bool:
     clauses = [
         "expires_at > now()",
@@ -69,6 +115,9 @@ def _restore_evidence(
     if target_connection_limit:
         clauses.append("target_connection_limit=%s")
         params.append(target_connection_limit)
+    if attestation_key_fingerprint is not None:
+        clauses.append("attestation_key_fingerprint=%s")
+        params.append(attestation_key_fingerprint)
     row = conn.execute(
         "SELECT EXISTS (SELECT 1 FROM plaintext_shadow_restore_evidence "
         f"WHERE {' AND '.join(clauses)})",
@@ -92,8 +141,14 @@ def preflight() -> dict:
     ).connection() as target:
         try:
             config.validate_live_topology(primary, target)
-        except RuntimeError:
+        except config.DatabaseAliasError:
             failures.append("primary_shadow_alias")
+        except config.LiveTopologyCheckError:
+            failures.append("live_topology_check_failed")
+        primary_live_fingerprint = _live_database_fingerprint(primary)
+        target_live_fingerprint = _live_database_fingerprint(target)
+        result["primary_live_fingerprint"] = primary_live_fingerprint
+        result["target_live_fingerprint"] = target_live_fingerprint
         primary_head = _head(primary)
         target_head = _head(target)
         result["primary_head"] = primary_head
@@ -149,11 +204,17 @@ def preflight() -> dict:
         result["trigger_audit_ok"] = trigger_report.ok
         if not trigger_report.ok:
             failures.append("trigger_drift")
-        evidence_ok = _restore_evidence(
+        try:
+            _key, attestation_key_fingerprint = _infra_public_key()
+        except RuntimeError:
+            attestation_key_fingerprint = None
+            failures.append("trusted_infrastructure_key_missing")
+        evidence_ok = attestation_key_fingerprint is not None and _restore_evidence(
             primary,
-            target_fingerprint=result["target_fingerprint"],
+            target_fingerprint=target_live_fingerprint,
             minimum_capacity_bytes=max(primary_bytes * 2, target_bytes),
             target_connection_limit=max_connections,
+            attestation_key_fingerprint=attestation_key_fingerprint,
         )
         result["restore_evidence_ok"] = evidence_ok
         if not evidence_ok:
@@ -164,9 +225,18 @@ def preflight() -> dict:
     return result
 
 
+def _positive_int_claim(payload: dict, name: str) -> int:
+    value = payload.get(name)
+    if type(value) is not int or value <= 0:
+        raise RuntimeError(f"trusted infrastructure evidence {name} is invalid")
+    return value
+
+
 def record_restore_evidence(args) -> dict:
     policy = config.require_target()
-    target_fingerprint = _endpoint_fingerprint(policy.dsn)
+    payload, key_fingerprint, signature_digest = _verified_infra_attestation(
+        args.attestation_payload_b64, args.attestation_signature_b64
+    )
     with db.get_pool().connection() as primary, mirror.get_target_pool(
         policy
     ).connection() as target:
@@ -174,26 +244,59 @@ def record_restore_evidence(args) -> dict:
         target_connection_limit = int(
             target.execute("SHOW max_connections").fetchone()[0]
         )
+        target_fingerprint = _live_database_fingerprint(target)
+    required = {
+        "restored_at",
+        "source_backup_at",
+        "schema_head",
+        "verifier_digest",
+        "backup_artifact_digest",
+        "target_fingerprint",
+        "target_capacity_bytes",
+        "target_connection_limit",
+        "ha_verified",
+        "expires_at",
+    }
+    if set(payload) != required:
+        raise RuntimeError("trusted infrastructure evidence payload keys are invalid")
+    if payload["schema_head"] != _SCHEMA_HEAD:
+        raise RuntimeError("trusted infrastructure evidence schema head is stale")
+    if payload["target_fingerprint"] != target_fingerprint:
+        raise RuntimeError("trusted infrastructure evidence target identity is stale")
+    target_capacity_bytes = _positive_int_claim(payload, "target_capacity_bytes")
+    attested_connection_limit = _positive_int_claim(
+        payload, "target_connection_limit"
+    )
+    if attested_connection_limit != target_connection_limit:
+        raise RuntimeError("trusted infrastructure evidence connection limit is stale")
+    if payload["ha_verified"] is not True:
+        raise RuntimeError("trusted infrastructure evidence does not verify HA")
+    for digest_name in ("verifier_digest", "backup_artifact_digest"):
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(payload[digest_name])):
+            raise RuntimeError("trusted infrastructure evidence digest is invalid")
     values = (
-        _parse_time(args.restored_at),
-        _parse_time(args.source_backup_at),
-        args.schema_head,
-        args.verifier_digest,
-        args.backup_artifact_digest,
+        _parse_time(payload["restored_at"]),
+        _parse_time(payload["source_backup_at"]),
+        payload["schema_head"],
+        payload["verifier_digest"],
+        payload["backup_artifact_digest"],
         target_fingerprint,
-        int(args.target_capacity_bytes),
+        target_capacity_bytes,
         target_connection_limit,
-        args.ha_verified == "true",
+        True,
+        key_fingerprint,
+        signature_digest,
         args.operator_id,
-        _parse_time(args.expires_at),
+        _parse_time(payload["expires_at"]),
     )
     with db.get_pool().connection() as conn:
         row = conn.execute(
             "INSERT INTO plaintext_shadow_restore_evidence "
             "(restored_at, source_backup_at, schema_head, verifier_digest, "
             "backup_artifact_digest, target_fingerprint, target_capacity_bytes, "
-            "target_connection_limit, ha_verified, operator_id, expires_at) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            "target_connection_limit, ha_verified, attestation_key_fingerprint, "
+            "attestation_signature_digest, operator_id, expires_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
             values,
         ).fetchone()
     return {"ok": True, "evidence_id": int(row[0])}
@@ -448,6 +551,11 @@ def _strict_extended_content(policy) -> tuple[int, int]:
                 if expected is None:
                     mismatches += 1
                     continue
+                if table == "identity":
+                    # The INSERT column list includes ``kind``, but its VALUES
+                    # clause uses the SQL literal 'identity' rather than a
+                    # placeholder returned by upsert_args.
+                    expected = (expected[0], "identity", expected[1])
                 actual = target.execute(target_select, key_values).fetchone()
                 if actual is None or _normal(expected) != _normal(actual):
                     mismatches += 1
@@ -591,7 +699,10 @@ def status() -> dict:
                     "source_backup_at": row[1].isoformat(),
                     "expires_at": row[2].isoformat(),
                     "schema_head": row[3],
-                    "fresh": _restore_evidence(conn),
+                    # This is only the time/HA portion. The authoritative
+                    # endpoint/capacity/connection binding is reported by
+                    # preflight and must not be implied by status.
+                    "time_fresh": _restore_evidence(conn),
                 }
         runs = db.recent_plaintext_shadow_sync_runs(limit=1)
         latest_run = runs[0] if runs else None
@@ -629,13 +740,8 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("preflight")
     evidence = commands.add_parser("record-restore-evidence")
-    for name in (
-        "restored-at", "source-backup-at", "schema-head", "verifier-digest",
-        "backup-artifact-digest", "target-capacity-bytes", "operator-id",
-        "expires-at",
-    ):
+    for name in ("attestation-payload-b64", "attestation-signature-b64", "operator-id"):
         evidence.add_argument(f"--{name}", required=True)
-    evidence.add_argument("--ha-verified", required=True, choices=("true", "false"))
     commands.add_parser("install-triggers")
     commands.add_parser("backfill")
     drain_cmd = commands.add_parser("drain")

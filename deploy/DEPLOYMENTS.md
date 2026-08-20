@@ -822,7 +822,10 @@ inventory, and fresh recorded restore evidence. Verification is green only with
 exact counts/content, no ciphertext-envelope shapes in the target, no pending or
 quarantined dirty keys, and fresh backup/restore evidence bound to the target
 fingerprint, backup artifact digest, declared capacity, connection limit, and
-HA attestation. Scheduler health is a post-enable observation gate, not a
+HA attestation. The evidence is accepted only as an Ed25519-signed canonical
+JSON payload verified with
+`FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY`; the operator CLI no
+longer accepts those infrastructure facts as unsigned flags. Scheduler health is a post-enable observation gate, not a
 pre-deploy input; require at least one green elected run before closing the
 change window. These
 commands emit only fixed slugs, fingerprints, and scalars; do not add shell

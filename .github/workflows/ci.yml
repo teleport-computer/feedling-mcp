@@ -1073,6 +1073,7 @@ jobs:
           FEEDLING_DATABASE_SCHEMA:      ${{ vars.TEST_FEEDLING_DATABASE_SCHEMA || 'rds' }}
           PLAINTEXT_SHADOW_DATABASE_URL: ${{ secrets.TEST_PLAINTEXT_SHADOW_DATABASE_URL }}
           FEEDLING_PLAINTEXT_SHADOW_ENABLED: ${{ vars.TEST_FEEDLING_PLAINTEXT_SHADOW_ENABLED || '0' }}
+          FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY: ${{ secrets.TEST_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY }}
           TEE_DATABASE_URL:              ${{ secrets.TEST_TEE_DATABASE_URL }}
           FEEDLING_TEE_DUAL_WRITE:       ${{ secrets.TEST_FEEDLING_TEE_DUAL_WRITE }}
           FEEDLING_V2_SANDBOX_PROVIDER:  ${{ vars.TEST_FEEDLING_V2_SANDBOX_PROVIDER || 'disabled' }}
@@ -1105,9 +1106,11 @@ jobs:
             0|1) ;;
             *) echo "::error::TEST_FEEDLING_PLAINTEXT_SHADOW_ENABLED must be exactly 0 or 1"; missing=1 ;;
           esac
-          if [ "$FEEDLING_PLAINTEXT_SHADOW_ENABLED" = "1" ] && [ -z "$PLAINTEXT_SHADOW_DATABASE_URL" ]; then
-            echo "::error::TEST_PLAINTEXT_SHADOW_DATABASE_URL is required when enabled"
-            missing=1
+          if [ "$FEEDLING_PLAINTEXT_SHADOW_ENABLED" = "1" ]; then
+            if [ -z "$PLAINTEXT_SHADOW_DATABASE_URL" ] || [ -z "$FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY" ]; then
+              echo "::error::TEST plaintext shadow DSN and trusted evidence public key are required when enabled"
+              missing=1
+            fi
           fi
           if [ "$FEEDLING_V2_SANDBOX_PROVIDER" = "e2b" ]; then
             if [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
@@ -1317,6 +1320,7 @@ jobs:
           FEEDLING_TEE_DUAL_WRITE:       ${{ secrets.PROD_FEEDLING_TEE_DUAL_WRITE }}
           PLAINTEXT_SHADOW_DATABASE_URL: ${{ secrets.PROD_PLAINTEXT_SHADOW_DATABASE_URL }}
           FEEDLING_PLAINTEXT_SHADOW_ENABLED: ${{ vars.PROD_FEEDLING_PLAINTEXT_SHADOW_ENABLED || '0' }}
+          FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY: ${{ secrets.PROD_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
           FEEDLING_API_URL:              ${{ vars.PROD_MAIN_API_URL }}
           FEEDLING_ENCLAVE_URL:          ${{ vars.PROD_MAIN_ENCLAVE_URL }}
@@ -1360,9 +1364,11 @@ jobs:
             0|1) ;;
             *) echo "::error::PROD_FEEDLING_PLAINTEXT_SHADOW_ENABLED must be exactly 0 or 1"; missing=1 ;;
           esac
-          if [ "$FEEDLING_PLAINTEXT_SHADOW_ENABLED" = "1" ] && [ -z "$PLAINTEXT_SHADOW_DATABASE_URL" ]; then
-            echo "::error::PROD_PLAINTEXT_SHADOW_DATABASE_URL is required when enabled"
-            missing=1
+          if [ "$FEEDLING_PLAINTEXT_SHADOW_ENABLED" = "1" ]; then
+            if [ -z "$PLAINTEXT_SHADOW_DATABASE_URL" ] || [ -z "$FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY" ]; then
+              echo "::error::PROD plaintext shadow DSN and trusted evidence public key are required when enabled"
+              missing=1
+            fi
           fi
           if [ "$FEEDLING_V2_SANDBOX_PROVIDER" = "e2b" ]; then
             if [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
@@ -1629,6 +1635,7 @@ jobs:
           FEEDLING_DATABASE_SCHEMA:      ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA || 'rds' }}
           PLAINTEXT_SHADOW_DATABASE_URL: ${{ secrets.PRE_PLAINTEXT_SHADOW_DATABASE_URL }}
           FEEDLING_PLAINTEXT_SHADOW_ENABLED: ${{ vars.PRE_FEEDLING_PLAINTEXT_SHADOW_ENABLED || '0' }}
+          FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY: ${{ secrets.PRE_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY }}
           TEE_DATABASE_URL:              ${{ secrets.PRE_TEE_DATABASE_URL }}
           FEEDLING_TEE_DUAL_WRITE:       ${{ secrets.PRE_FEEDLING_TEE_DUAL_WRITE }}
           FEEDLING_V2_SANDBOX_PROVIDER:  ${{ vars.PRE_FEEDLING_V2_SANDBOX_PROVIDER || 'disabled' }}
@@ -1661,9 +1668,11 @@ jobs:
             0|1) ;;
             *) echo "::error::PRE_FEEDLING_PLAINTEXT_SHADOW_ENABLED must be exactly 0 or 1"; missing=1 ;;
           esac
-          if [ "$FEEDLING_PLAINTEXT_SHADOW_ENABLED" = "1" ] && [ -z "$PLAINTEXT_SHADOW_DATABASE_URL" ]; then
-            echo "::error::PRE_PLAINTEXT_SHADOW_DATABASE_URL is required when enabled"
-            missing=1
+          if [ "$FEEDLING_PLAINTEXT_SHADOW_ENABLED" = "1" ]; then
+            if [ -z "$PLAINTEXT_SHADOW_DATABASE_URL" ] || [ -z "$FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY" ]; then
+              echo "::error::PRE plaintext shadow DSN and trusted evidence public key are required when enabled"
+              missing=1
+            fi
           fi
           if [ "$FEEDLING_V2_SANDBOX_PROVIDER" = "e2b" ]; then
             if [ -z "$FEEDLING_V2_E2B_TEMPLATE" ]; then
@@ -2032,6 +2041,7 @@ jobs:
           FEEDLING_TEE_DUAL_WRITE: ${{ secrets.PROD_FEEDLING_TEE_DUAL_WRITE }}
           PLAINTEXT_SHADOW_DATABASE_URL: ${{ secrets.PROD_PLAINTEXT_SHADOW_DATABASE_URL }}
           FEEDLING_PLAINTEXT_SHADOW_ENABLED: ${{ vars.PROD_FEEDLING_PLAINTEXT_SHADOW_ENABLED || '0' }}
+          FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY: ${{ secrets.PROD_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
           # Empty until the environment-specific admission rollout is activated.
@@ -2101,6 +2111,7 @@ jobs:
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
             -e "PLAINTEXT_SHADOW_DATABASE_URL=$PLAINTEXT_SHADOW_DATABASE_URL" \
             -e "FEEDLING_PLAINTEXT_SHADOW_ENABLED=$FEEDLING_PLAINTEXT_SHADOW_ENABLED" \
+            -e "FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY=$FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_V2_NEW_USER_CUTOFF=$FEEDLING_V2_NEW_USER_CUTOFF" \
             -e "FEEDLING_EXPECTED_RUNNER_COUNT=$FEEDLING_EXPECTED_RUNNER_COUNT" \
@@ -2296,6 +2307,7 @@ jobs:
           FEEDLING_TEE_DUAL_WRITE: ${{ secrets.TEST_FEEDLING_TEE_DUAL_WRITE }}
           PLAINTEXT_SHADOW_DATABASE_URL: ${{ secrets.TEST_PLAINTEXT_SHADOW_DATABASE_URL }}
           FEEDLING_PLAINTEXT_SHADOW_ENABLED: ${{ vars.TEST_FEEDLING_PLAINTEXT_SHADOW_ENABLED || '0' }}
+          FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY: ${{ secrets.TEST_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           # Empty until the environment-specific admission rollout is activated.
@@ -2363,6 +2375,7 @@ jobs:
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
             -e "PLAINTEXT_SHADOW_DATABASE_URL=$PLAINTEXT_SHADOW_DATABASE_URL" \
             -e "FEEDLING_PLAINTEXT_SHADOW_ENABLED=$FEEDLING_PLAINTEXT_SHADOW_ENABLED" \
+            -e "FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY=$FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_V2_NEW_USER_CUTOFF=$FEEDLING_V2_NEW_USER_CUTOFF" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
@@ -2705,6 +2718,7 @@ jobs:
           FEEDLING_TEE_DUAL_WRITE: ${{ secrets.PRE_FEEDLING_TEE_DUAL_WRITE }}
           PLAINTEXT_SHADOW_DATABASE_URL: ${{ secrets.PRE_PLAINTEXT_SHADOW_DATABASE_URL }}
           FEEDLING_PLAINTEXT_SHADOW_ENABLED: ${{ vars.PRE_FEEDLING_PLAINTEXT_SHADOW_ENABLED || '0' }}
+          FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY: ${{ secrets.PRE_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           # Empty until the environment-specific admission rollout is activated.
@@ -2766,6 +2780,7 @@ jobs:
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
             -e "PLAINTEXT_SHADOW_DATABASE_URL=$PLAINTEXT_SHADOW_DATABASE_URL" \
             -e "FEEDLING_PLAINTEXT_SHADOW_ENABLED=$FEEDLING_PLAINTEXT_SHADOW_ENABLED" \
+            -e "FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY=$FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_V2_NEW_USER_CUTOFF=$FEEDLING_V2_NEW_USER_CUTOFF" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \

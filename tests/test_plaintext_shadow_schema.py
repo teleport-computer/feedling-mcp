@@ -52,7 +52,7 @@ def test_plaintext_shadow_control_revision_is_head() -> None:
         os.environ["TEE_DATABASE_URL"],
         "SELECT version_num FROM alembic_tee_version",
     )
-    assert rows == [("0026_plaintext_shadow_control",)]
+    assert rows == [("0027_plaintext_shadow_gates",)]
 
 
 def test_dirty_key_control_plane_contains_no_content_columns() -> None:
@@ -96,6 +96,8 @@ def test_sync_and_restore_evidence_are_scalar_only() -> None:
         "target_capacity_bytes",
         "target_connection_limit",
         "ha_verified",
+        "attestation_key_fingerprint",
+        "attestation_signature_digest",
         "operator_id",
         "expires_at",
         "recorded_at",

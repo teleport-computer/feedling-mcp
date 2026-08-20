@@ -1,4 +1,4 @@
-"""frame_envelopes → TEE ``frames`` per-row replication (spec §4 / D4).
+"""frame_envelopes → managed ``frames`` per-row replication.
 
 Frames are the odd table out: the >150KB screenshot ciphertext must NOT land
 inline in a TEE row. Instead each frame's body is re-encrypted at the storage
@@ -11,15 +11,17 @@ Two RDS source shapes are handled identically:
     ``body_key`` = the legacy R2 object key; the ciphertext is fetched back and
     merged before re-encryption.
 
-Plaintext never leaves the enclave and this module never opens an envelope: it
-only moves ciphertext (RDS ``body_ct`` / R2 object) into the enclave storage
-endpoint and the resulting storage ciphertext into R2, then upserts the pointer.
+The legacy RDS-to-TEE path never opens plaintext in this module: it moves
+ciphertext into the enclave storage endpoint and writes an R2 ciphertext
+pointer. The post-promotion ``plaintext_all`` shadow is deliberately different:
+``replicate_plaintext`` receives decrypted bytes inside the managed CVM and
+writes them to the target's ``body_plaintext`` column.
 Decryptability is classified from envelope metadata alone (visibility +
 K_enclave), so local_only / no-K_enclave frames become PendingDeviceMigration
 (D1) without any enclave or R2 call — and dry_run classifies the same way with
 zero side effects.
 
-``replicate`` returns the 9-tuple matching worker's ``frames`` upsert_sql (so
+Both writers return the 10-tuple matching worker's ``frames`` upsert_sql (so
 the TEE write + cursor advance stay in worker's single batched transaction), or
 None for a dry_run "would copy" (no write).
 """

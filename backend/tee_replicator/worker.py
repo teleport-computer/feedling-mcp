@@ -514,7 +514,8 @@ def _reencrypt_with_retry(user_id: str, envelope: dict) -> dict:
 def _frames_row_writer(user_id: str, frame_id: str, sort_val, doc: dict,
                        dry_run: bool, target_policy: TargetPolicy | None = None):
     """_TABLES["frame_envelopes"].row_writer：委托 frames.replicate，注入带重试的
-    reencrypt 回调。返回 frames upsert_sql 的 9 元参数，或 dry_run 下 None。"""
+    回调。legacy target 返回 R2 ciphertext pointer；plaintext_all target 返回
+    inline body_plaintext。两者均返回 frames upsert_sql 的 10 元参数，dry_run 为 None。"""
     from tee_replicator import frames
 
     if target_policy is not None and target_policy.mode == "plaintext_all":
@@ -552,7 +553,7 @@ def _frames_row_writer(user_id: str, frame_id: str, sort_val, doc: dict,
 # frames：R2/inline 双形态 → 存储层重加密 → TEE frames 指针行（spec §4 / D4）。
 # 排序键 (ts, frame_id) 同 chat（numeric 游标）；unpack 把整行三形态字段打包进
 # "doc" 交给 row_writer。row_writer 委托 tee_replicator.frames.replicate，故这里
-# 无需 transform/upsert_args。upsert_sql 的 9 列与 frames.replicate 返回元组对齐，
+# 无需 transform/upsert_args。upsert_sql 的 10 列与 frames writer 返回元组对齐，
 # TEE 写 + 游标推进仍在 run_table 的单事务里（本体密文已先落 R2，只写指针）。
 #
 # requeue_delete_tee_sql：frame_envelopes 没有 requeue_fetch_sql（/v1/content/swap

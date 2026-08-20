@@ -27,7 +27,8 @@ done
 # decrypted-shadow credential; every runner compose must pin its local gate to
 # literal 0 and rely on primary-side dirty-key triggers.
 if ! grep -q 'PLAINTEXT_SHADOW_DATABASE_URL:' "$main_compose" \
-  || ! grep -q 'FEEDLING_PLAINTEXT_SHADOW_ENABLED:' "$main_compose"; then
+  || ! grep -q 'FEEDLING_PLAINTEXT_SHADOW_ENABLED:' "$main_compose" \
+  || ! grep -q 'FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY:' "$main_compose"; then
   echo "::error::$main_compose is missing plaintext-shadow Gate 2 inputs"
   exit 1
 fi

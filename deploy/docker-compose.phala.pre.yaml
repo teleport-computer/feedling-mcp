@@ -208,6 +208,7 @@ services:
       FEEDLING_TEE_DUAL_WRITE: "${FEEDLING_TEE_DUAL_WRITE:-}"
       PLAINTEXT_SHADOW_DATABASE_URL: "${PLAINTEXT_SHADOW_DATABASE_URL:-}"
       FEEDLING_PLAINTEXT_SHADOW_ENABLED: "${FEEDLING_PLAINTEXT_SHADOW_ENABLED:-0}"
+      FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY: "${FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY:-}"
       # Pre rollout lane for PR #131. The backend defaults this gate OFF and
       # accepts plaintext content shapes only for the exact value "1"; test and
       # prod manifests intentionally omit it. Per-user intent still decides

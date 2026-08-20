@@ -121,3 +121,12 @@ def test_live_identity_accepts_different_databases_on_same_server() -> None:
         os.environ["TEE_DATABASE_URL"]
     ) as shadow:
         config.validate_live_topology(primary, shadow)
+
+
+def test_live_identity_check_failure_is_not_reported_as_alias() -> None:
+    class BrokenConnection:
+        def execute(self, *_args, **_kwargs):
+            raise PermissionError("advisory locks denied")
+
+    with pytest.raises(config.LiveTopologyCheckError):
+        config.validate_live_topology(BrokenConnection(), BrokenConnection())

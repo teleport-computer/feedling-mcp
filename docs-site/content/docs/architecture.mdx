@@ -252,7 +252,10 @@ Enabling this projection is a second, protected deployment gate after TEE
 promotion. It requires a distinct TLS PostgreSQL 17 endpoint, matching schema,
 least-privilege roles, a recent backup-and-restore drill, a complete backfill,
 an empty change queue, exact count/content verification, and no ciphertext
-envelope shapes in the target. The target, its WAL, snapshots, replicas, and
+envelope shapes in the target. Backup artifact, capacity, connection-limit, HA,
+restore-verifier, and live target-identity claims must be supplied by the
+external infrastructure verification process as a signed attestation; unsigned
+operator-entered claims cannot authorize the gate. The target, its WAL, snapshots, replicas, and
 backups are all plaintext recipients. Access to any of them defeats the
 at-rest confidentiality provided by the encrypted tier in the primary, so they
 need independent credentials, retention, audit, and incident-response policy.

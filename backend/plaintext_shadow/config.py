@@ -22,6 +22,14 @@ class TargetPolicy:
     mode: Literal["plaintext_all"] = "plaintext_all"
 
 
+class DatabaseAliasError(RuntimeError):
+    """Both configured connections address the same live database."""
+
+
+class LiveTopologyCheckError(RuntimeError):
+    """The live database-identity proof could not be completed."""
+
+
 def _gate_enabled() -> bool:
     raw = os.environ.get("FEEDLING_PLAINTEXT_SHADOW_ENABLED", "0")
     if raw not in {"0", "1"}:
@@ -113,13 +121,13 @@ def validate_live_topology(primary, shadow) -> None:
         ).fetchone()
         shadow_locked = bool(row and row[0])
         if not shadow_locked:
-            raise RuntimeError(
+            raise DatabaseAliasError(
                 "primary and plaintext shadow resolve to the same live PostgreSQL database"
             )
-    except RuntimeError:
+    except DatabaseAliasError:
         raise
     except Exception as exc:
-        raise RuntimeError("live PostgreSQL identity check failed") from exc
+        raise LiveTopologyCheckError("live PostgreSQL identity check failed") from exc
     finally:
         if shadow_locked:
             try:
@@ -151,7 +159,7 @@ def validate_live_startup() -> None:
             target.dsn, connect_timeout=10
         ) as shadow:
             validate_live_topology(primary, shadow)
-    except RuntimeError:
+    except (DatabaseAliasError, LiveTopologyCheckError):
         raise
     except Exception as exc:
-        raise RuntimeError("live PostgreSQL identity check failed") from exc
+        raise LiveTopologyCheckError("live PostgreSQL identity check failed") from exc

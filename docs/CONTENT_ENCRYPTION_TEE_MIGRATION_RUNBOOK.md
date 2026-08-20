@@ -94,7 +94,11 @@ strict verification. Strict verification requires exact table counts and
 content projections, no unexpected ciphertext-envelope shapes, no pending or
 quarantined dirty keys, and fresh backup/restore evidence bound to the target
 fingerprint, backup artifact digest, declared capacity, connection limit, and
-HA attestation. After enabling Gate 2, observe at least one green scheduler run
+HA attestation. Those infrastructure facts must arrive as an Ed25519-signed
+canonical JSON payload from the external backup/provider verification process;
+`FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY` contains only the trusted
+raw public key in base64. The CLI rejects unsigned operator-entered capacity,
+HA, digest, or target-identity values. After enabling Gate 2, observe at least one green scheduler run
 before declaring the rollout complete. Operator output must contain
 fingerprints, scalars, and fixed slugs only;
 never print DSNs, passwords, keys, or row bodies.

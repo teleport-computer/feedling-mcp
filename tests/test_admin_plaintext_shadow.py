@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import uuid
@@ -7,10 +8,14 @@ from contextlib import contextmanager
 
 import psycopg
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from psycopg.types.json import Jsonb
 
 import db
 from admin import plaintext_shadow
 from plaintext_shadow.config import TargetPolicy
+from conftest import seed_user
 
 
 class _Pool:
@@ -206,7 +211,7 @@ def test_record_restore_evidence_has_no_free_form_note_argument():
                 "--source-backup-at",
                 "2026-08-20T00:00:00Z",
                 "--schema-head",
-                "0026_plaintext_shadow_control",
+                "0027_plaintext_shadow_gates",
                 "--verifier-digest",
                 "sha256:abc",
                 "--operator-id",
@@ -216,6 +221,50 @@ def test_record_restore_evidence_has_no_free_form_note_argument():
                 "--note",
                 "do not persist this",
             ]
+        )
+
+
+def test_infrastructure_evidence_requires_valid_ed25519_signature(monkeypatch):
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    monkeypatch.setenv(
+        "FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY",
+        base64.b64encode(public_key).decode(),
+    )
+    payload_bytes = b'{"proof":"external"}'
+    payload = base64.b64encode(payload_bytes).decode()
+
+    with pytest.raises(RuntimeError, match="signature is invalid"):
+        plaintext_shadow._verified_infra_attestation(
+            payload, base64.b64encode(b"not-a-signature").decode()
+        )
+
+    signature = private_key.sign(base64.b64decode(payload))
+    decoded, key_fingerprint, signature_digest = (
+        plaintext_shadow._verified_infra_attestation(
+            payload, base64.b64encode(signature).decode()
+        )
+    )
+    assert decoded == {"proof": "external"}
+    assert len(key_fingerprint) == 16
+    assert signature_digest.startswith("sha256:")
+
+    noncanonical = b'{"proof": "external"}'
+    with pytest.raises(RuntimeError, match="not canonical JSON"):
+        plaintext_shadow._verified_infra_attestation(
+            base64.b64encode(noncanonical).decode(),
+            base64.b64encode(private_key.sign(noncanonical)).decode(),
+        )
+
+
+@pytest.mark.parametrize("value", [True, "100", 0, -1])
+def test_infrastructure_evidence_rejects_non_positive_or_coerced_scalars(value):
+    with pytest.raises(RuntimeError, match="target_capacity_bytes"):
+        plaintext_shadow._positive_int_claim(
+            {"target_capacity_bytes": value}, "target_capacity_bytes"
         )
 
 
@@ -270,3 +319,33 @@ def test_snapshot_strict_digest_compares_common_columns_only():
             target.execute(
                 "DELETE FROM v2_worker_heartbeats WHERE worker_id=%s", (worker_id,)
             )
+
+
+def test_strict_identity_comparison_accounts_for_literal_kind(backend_env):
+    uid = f"strict-identity-{uuid.uuid4().hex}"
+    doc = {"id": "identity", "body": "Ada", "visibility": "shared"}
+    seed_user(uid, api_key_hash="strict-identity-hash", doc={})
+    policy = TargetPolicy(dsn=os.environ["TEE_DATABASE_URL"])
+    try:
+        with db.get_pool().connection() as source:
+            source.execute(
+                "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s,'identity',%s)",
+                (uid, Jsonb(doc)),
+            )
+        with psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as target:
+            target.execute(
+                "INSERT INTO users (user_id, doc) VALUES (%s, '{}'::jsonb) "
+                "ON CONFLICT (user_id) DO NOTHING",
+                (uid,),
+            )
+            target.execute(
+                "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s,'identity',%s)",
+                (uid, Jsonb(doc)),
+            )
+
+        assert plaintext_shadow._strict_extended_content(policy) == (0, 0)
+    finally:
+        with db.get_pool().connection() as source:
+            source.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+        with psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as target:
+            target.execute("DELETE FROM users WHERE user_id=%s", (uid,))

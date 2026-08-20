@@ -107,6 +107,7 @@ def test_all_main_composes_expose_gate_and_all_runners_force_it_off():
         text = (root / "deploy" / name).read_text()
         assert 'PLAINTEXT_SHADOW_DATABASE_URL: "${PLAINTEXT_SHADOW_DATABASE_URL:-}"' in text
         assert "FEEDLING_PLAINTEXT_SHADOW_ENABLED" in text
+        assert "FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY" in text
     for name in (
         "docker-compose.phala.runner.yaml",
         "docker-compose.phala.pre.runner.yaml",

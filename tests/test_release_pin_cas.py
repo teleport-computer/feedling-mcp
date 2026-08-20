@@ -60,6 +60,7 @@ def _make_release_repo(tmp_path: Path) -> ReleaseRepo:
         "    environment:\n"
         "      PLAINTEXT_SHADOW_DATABASE_URL: \"${PLAINTEXT_SHADOW_DATABASE_URL:-}\"\n"
         "      FEEDLING_PLAINTEXT_SHADOW_ENABLED: \"${FEEDLING_PLAINTEXT_SHADOW_ENABLED:-0}\"\n"
+        "      FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY: \"${FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY:-}\"\n"
         "  cpu-recorder:\n"
         "    image: ghcr.io/old-owner/feedling:deadbee\n"
         "  cpu-socket-proxy:\n"

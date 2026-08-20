@@ -268,6 +268,7 @@ services:
       FEEDLING_TEE_DUAL_WRITE: "${FEEDLING_TEE_DUAL_WRITE:-}"
       PLAINTEXT_SHADOW_DATABASE_URL: "${PLAINTEXT_SHADOW_DATABASE_URL:-}"
       FEEDLING_PLAINTEXT_SHADOW_ENABLED: "${FEEDLING_PLAINTEXT_SHADOW_ENABLED:-0}"
+      FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY: "${FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY:-}"
       # Cloudflare R2 (S3-compatible) offload for the heavy frame ciphertext
       # (backend/object_storage.py). Injected via `phala deploy -e R2_*=...`
       # (encrypted env channel). Empty default = feature OFF (body_ct stays
