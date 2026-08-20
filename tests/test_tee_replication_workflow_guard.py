@@ -47,6 +47,57 @@ def test_build_emits_typed_reflow_request():
     }
 
 
+def test_build_translates_prod_apply_confirmation_for_server():
+    result = _run(
+        "build",
+        env={
+            "ENVIRONMENT": "prod",
+            "ACTION": "replicate",
+            "TABLE_IN": "chat_messages",
+            "DRY_RUN_IN": "false",
+            "CONFIRM_IN": "MIGRATE-PROD",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "action": "replicate",
+        "table": "chat_messages",
+        "dry_run": False,
+        "confirm": "MIGRATE",
+        "qps": None,
+        "expected_stale": None,
+    }
+
+
+def test_build_rejects_prod_apply_without_prod_specific_confirmation():
+    for confirm in ("", "MIGRATE"):
+        result = _run(
+            "build",
+            env={
+                "ENVIRONMENT": "prod",
+                "ACTION": "replicate",
+                "TABLE_IN": "memory_moments",
+                "DRY_RUN_IN": "false",
+                "CONFIRM_IN": confirm,
+            },
+        )
+        assert result.returncode != 0
+        assert "MIGRATE-PROD" in result.stderr
+
+
+def test_build_rejects_unknown_environment():
+    result = _run(
+        "build",
+        env={
+            "ENVIRONMENT": "production",
+            "ACTION": "replicate",
+            "DRY_RUN_IN": "true",
+        },
+    )
+    assert result.returncode != 0
+    assert "ENVIRONMENT" in result.stderr
+
+
 def test_build_rejects_malformed_or_nonfinite_numbers():
     for name, value in (
         ("QPS_IN", "twenty"),

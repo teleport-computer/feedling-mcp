@@ -38,11 +38,21 @@ def _dry_run() -> bool:
 
 
 def build() -> int:
+    environment = os.environ.get("ENVIRONMENT", "test").strip()
+    if environment not in ("test", "prod"):
+        raise ValueError("ENVIRONMENT must be test or prod")
+    dry_run = _dry_run()
+    confirm = os.environ.get("CONFIRM_IN", "").strip()
+    if not dry_run:
+        expected = "MIGRATE-PROD" if environment == "prod" else "MIGRATE"
+        if confirm != expected:
+            raise ValueError(f"{environment} apply requires {expected}")
+        confirm = "MIGRATE"
     payload = {
         "action": os.environ.get("ACTION", "").strip(),
         "table": os.environ.get("TABLE_IN", "").strip() or None,
-        "dry_run": _dry_run(),
-        "confirm": os.environ.get("CONFIRM_IN", "").strip() or None,
+        "dry_run": dry_run,
+        "confirm": confirm or None,
         "qps": _optional_float("QPS_IN"),
         "expected_stale": _optional_int("EXPECTED_STALE_IN"),
     }
