@@ -2718,7 +2718,8 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
     """capture/dream prompt 要的记忆上下文（buckets/threads/identity/cards 明文串）。
 
     **每一项独立 try/except 降级为 ""**（spec §3.5）：任一子取数失败绝不清空其它项、绝不
-    抛——两个 prompt builder 对空串都会 fallback 到 "（暂无）"。buckets/threads/cards 走
+    抛——两个 prompt builder 对空串都会 fallback 到按 locale 的占位符（中文「（暂无）」/
+    英文 "(none)"）。buckets/threads/cards 走
     enclave readside（用 runtime token 认证，服务器不本地解密）；runtime token 铸造失败
     也只让这三项降级（token=""，post_enclave 会 raise 被各自 try 吞掉），不影响 identity。
 

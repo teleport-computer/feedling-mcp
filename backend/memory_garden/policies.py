@@ -65,6 +65,14 @@ from dataclasses import dataclass
 # 尺子文字（逐字摘自现有实现，勿改措辞）
 # --------------------------------------------------------------------------- #
 
+#: 「少而精」那条的**可引用短语**。
+#:
+#: 抽成常量是因为踩过：通话转写的抬头会显式推翻这条规则（一通电话的信息密度
+#: 远高于闲聊，实测 12 件值得记的事只留下 2 件），而它当时是**硬抄**了规则里的
+#: 那句中文。规则一改语言，抬头引用的句子就在提示词里不存在了 —— 推翻话术落空，
+#: 而且没有任何测试会红。引用方一律用这个常量。
+RESTRAINT_RULE_QUOTE = "Fewer, not more"
+
 _RUBRIC_CONVERSATION_CAPTURE = """You are looking for things worth remembering — not archiving every sentence. The full chat log is already stored; you do not need to restate it.
 What you want is what will shape your understanding of the person in front of you, or what this person would want you to remember.
 
