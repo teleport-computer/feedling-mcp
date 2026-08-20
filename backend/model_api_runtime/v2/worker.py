@@ -70,6 +70,7 @@ from capabilities import registry as cap_registry
 from capabilities import result_budget as cap_result_budget
 from capabilities import tool_schema as cap_tool_schema
 from chat.reply_language import (
+    infer_garden_language,
     infer_reply_language_policy,
     reply_language_system_line,
 )
@@ -10269,6 +10270,12 @@ async def _run_extraction(
             items, reason = [], None
         else:
             if lane == "capture":
+                # 花园的分类语言。已有桶优先 —— 一个花园只用一种语言的桶，
+                # 不因为这轮对话换了语言就长出并存的第二套。
+                # 与 V1 consumer 走同一个 helper，两条 runtime 不许各判各的。
+                capture_locale = infer_garden_language(
+                    None, existing_buckets=str(ctx.get("buckets") or "")
+                )
                 prompt = build_capture_prompt(
                     ai_name=ctx.get("ai_name", ""),
                     user_name=ctx.get("user_name", ""),
@@ -10277,6 +10284,7 @@ async def _run_extraction(
                     identity=ctx.get("identity", ""),
                     window=window,
                     cards=ctx.get("cards", ""),
+                    locale=capture_locale,
                 )
         if lane == "capture" and prompt_tail:
             await _ensure_capture_not_halted("provider_authorization")
