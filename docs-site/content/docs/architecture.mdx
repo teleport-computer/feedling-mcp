@@ -229,6 +229,16 @@ VM, CI connects with the migration role, checks the exact release head, and runs
 the application's startup assertion. A missing credential, stale head, or
 partial configuration therefore leaves the currently running release intact.
 
+The voice-call lifecycle fence follows the current Chat primary. Its
+`voice_call_sessions` table stores the per-call cancel/finalize state whose row
+and advisory locks serialize a late reply against hang-up. While RDS is primary,
+the small mutable table converges to the confidential-VM database through the
+snapshot lane; after promotion, voice and Chat write the same TEE-primary
+database directly. The Phase-4 preflight performs real create, cancel, and
+finalize transitions inside a forced-rollback transaction. A release can
+therefore not pass promotion with a reachable database whose voice lifecycle
+table or constraints are missing.
+
 Current FrameEnvelope v1 clients still require the original envelope metadata
 and object pointer. During promotion, the managed deployment therefore copies a
 temporary `frame_envelopes` compatibility bridge into the confidential-VM

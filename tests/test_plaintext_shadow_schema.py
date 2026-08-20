@@ -7,6 +7,7 @@ import psycopg
 import pytest
 
 from tee_shadow import table_registry
+from admin import plaintext_shadow
 
 
 def _fetchall(url: str, sql: str, params: tuple | None = None) -> list[tuple]:
@@ -53,7 +54,8 @@ def test_plaintext_shadow_control_revision_is_head() -> None:
         os.environ["TEE_DATABASE_URL"],
         "SELECT version_num FROM alembic_tee_version",
     )
-    assert rows == [("0029_plaintext_shadow_merge",)]
+    assert rows == [("0031_merge_voice_primary",)]
+    assert plaintext_shadow._SCHEMA_HEAD == "0031_merge_voice_primary"
 
 
 def test_dirty_key_control_plane_contains_no_content_columns() -> None:
