@@ -83,6 +83,12 @@ def _start_tee_sync_leader() -> None:
     core_leader.run_singleton("tee-sync", tee_sync_scheduler.start)
 
 
+def _start_plaintext_shadow_leader() -> None:
+    from admin import plaintext_shadow_scheduler
+
+    plaintext_shadow_scheduler.start_elected()
+
+
 def _start_dau_snapshot_leader() -> None:
     """Freeze completed Beijing-day DAU rows on exactly one backend worker."""
     from admin import dau_snapshot_scheduler
@@ -111,6 +117,13 @@ def _start_lane_rollup_leader() -> None:
 
 @asynccontextmanager
 async def lifespan(app):
+    # Validate the topology even when this worker does not own background jobs.
+    # A malformed enabled configuration must fail startup consistently across
+    # every worker; an operational tick failure after this gate is isolated.
+    from plaintext_shadow import config as plaintext_shadow_config
+
+    plaintext_shadow_config.validate_live_startup()
+
     # (1) Threadpool limiter — off anyio's 40-token default (§5.2).
     threadpool.configure_thread_limiter()
 
@@ -152,6 +165,14 @@ async def lifespan(app):
 
     await threadpool.run_db(accounts_registry.load_users)
 
+    # Register every gunicorn worker with T138's expiring success heartbeat,
+    # including an idle worker that has not happened to receive a trace yet.
+    # This is what lets the report enumerate the whole writer fleet instead of
+    # only whichever process the admin request happens to hit.
+    import debug_trace
+
+    debug_trace.start_trace_stats_writer()
+
     # (4b) Wire core.envelope's user-public-key lookup — mirrors app.py:412.
     #      `core.envelope.get_user_public_key` ships as a RuntimeError stub so
     #      core does not import accounts; the assembly layer must inject the real
@@ -181,9 +202,12 @@ async def lifespan(app):
         _start_runtime_reconciler_leader()
         _start_lane_rollup_leader()
         # (6b) TEE 影子库自动同步单例 — 仅在双写已接时选举（env 决定，接=重部署）。
+        from admin import plaintext_shadow_scheduler
         from tee_shadow import mirror as _tee_mirror
 
-        if _tee_mirror.enabled():
+        if plaintext_shadow_scheduler.should_start():
+            _start_plaintext_shadow_leader()
+        elif _tee_mirror.enabled():
             _start_tee_sync_leader()
 
     # (7) Independent V2 timeout watchdog. The worker process also runs this
@@ -216,6 +240,10 @@ async def lifespan(app):
     finally:
         # Shutdown: release parked waiters so in-flight polls return, drop the
         # hook, then close the async clients.
+        # T138: seal a gracefully retiring trace writer.  If the process dies
+        # before this point, its missing tombstone is deliberately visible as
+        # a stale success heartbeat in the cross-process rate report.
+        await threadpool.run_db(debug_trace.stop_trace_stats_writer)
         registry.wake_all()
         core_store.set_async_wake_hook(None)
         reaper_stop.set()

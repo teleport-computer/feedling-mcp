@@ -27,10 +27,10 @@ TAB_FOR_TYPE = {
 
 def _load_moments(store: UserStore) -> list:
     try:
-        return [to_v1_card(moment) for moment in db.memory_load(store.user_id)]
+        return [to_v1_card(moment) for moment in db.memory_load_strict(store.user_id)]
     except Exception as e:
         print(f"[{store.user_id}/memory] load failed: {e}")
-    return []
+        raise RuntimeError("memory_load_failed") from e
 
 
 def _salience_to_importance(value, default: float = 0.5) -> float:

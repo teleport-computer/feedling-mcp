@@ -26,6 +26,79 @@ change must not be interpreted as an API guarantee.
   Promotion now distinguishes fully audited preservation from unresolved,
   malformed, or requeued work, which remains blocking.
 
+- **Managed production supports a separately gated decrypted PostgreSQL
+  shadow after TEE-primary promotion.** The TEE database remains authoritative;
+  source triggers capture content-free dirty keys and a singleton backend drain
+  writes an all-plaintext projection, including data from explicit encrypted-tier
+  accounts, to an independent target. Workers and runners receive no target
+  credential, failures remain durably retryable or quarantined, and the
+  production gate requires TLS PostgreSQL 17, matching schema, recent
+  backup/restore evidence, full backfill, an empty queue, and strict count,
+  content, and ciphertext-shape verification. The target and its backups are
+  explicitly plaintext recipients and are not application failover sources.
+
+- **A `base_url` is now matched by host, not by string prefix.** Saving or
+  testing a model configuration previously accepted any `base_url` beginning
+  with `http://127.0.0.1`, which is a prefix and not a host: both
+  `http://127.0.0.1.evil.example` (the real host is `evil.example`) and
+  `http://127.0.0.1@evil.example` (`127.0.0.1` is only userinfo) were accepted
+  and sent the provider key to that host in cleartext. The URL is now parsed and
+  the host compared exactly, so those and similar disguises are refused. Two
+  consequences are user-visible. Credentials embedded in a `base_url`
+  (`https://user:pw@host/v1`) are now rejected on every scheme. And
+  `http://localhost:<port>` is now accepted where previously only
+  `http://127.0.0.1` was — the model-catalog endpoint already accepted it, and
+  the save path now uses that same check rather than a second, weaker one.
+  **This does not add address-level egress filtering:** an `https` `base_url`
+  pointing at a private or link-local address is accepted exactly as before.
+
+- **Persistence failures no longer look like successful memory, trace, or World
+  Book operations.** A Memory Garden index request returns `503` when its
+  database read fails instead of returning an empty garden; changing the debug
+  trace switch returns an error unless the stored setting can be read back; and
+  deleting a World Book entry returns `404` when the entry does not exist and a
+  server error when storage is unavailable, instead of always returning
+  `{\"ok\": true}`. Internal writes that only record cleanup or delivery
+  bookkeeping remain explicitly best-effort and do not rewrite an already-real
+  delivery outcome.
+
+- **Hosted Runtime V2 now exposes user MCP tools to every proactive wake lane
+  and applies a distinct live-screen authorization boundary.** Heartbeat,
+  scheduled, manual-wake, and screen-watch turns load the same bounded MCP
+  catalog and schema-recovery path as Chat. A turn carrying live screen pixels
+  keeps read-only user MCP tools but removes mutating MCP tools, web, and
+  `task`; reading private workspace or memory data still leaves both read-only
+  and mutating user MCP available under the user-selected-infrastructure trust
+  boundary. Scheduled wakes that already published a `reply`-tool bubble can
+  now promote that same encrypted bubble when the provider closes without more
+  text: user-input-consuming promotions advance the exact reply cursor, while
+  purely proactive promotions finish without moving it or creating a duplicate
+  message.
+
+- **An image-generation provider may now answer with a link, and the server
+  retrieves it.** Some providers return `data[].url` from the image endpoint
+  instead of inline bytes — measured on a relay that does this only for the 2K
+  variant of a model that is inline at lower resolutions. That response was
+  generated and billed, so the image is now fetched rather than discarded and
+  charged for again. **This is a change to what the server connects to:** a URL
+  chosen by a provider is now retrieved by Feedling. It is treated as untrusted
+  input and is fetched only under fixed rules — `https` only; every address the
+  hostname resolves to must be publicly routable, and the request is pinned to a
+  validated address with the hostname preserved for TLS, so a name that changes
+  between the check and the connection cannot redirect it inward; redirects are
+  never followed and only `200` is accepted; the response must be a PNG, JPEG or
+  WebP that actually decodes; the body is read undecoded under a byte ceiling
+  with a whole-operation deadline; and no Feedling credential, cookie or proxy
+  setting is involved. The retrieval does send the URL the provider chose,
+  including whatever path or query it encoded there. **Only the image endpoint's
+  `data[].url` is eligible — a link inside a chat reply is still never
+  fetched.** Byte, time and concurrency budgets are shared across all links in
+  one response rather than granted per link. A link that fails these checks is
+  skipped and the retrieval stops there; the request then fails if no usable
+  image remains, and never triggers a second, separately billed request. This
+  applies to every provider that answers the image endpoint with a link, not
+  only OpenAI-compatible relays.
+
 - **Image generation now works for more OpenAI-compatible relay routes.** Some
   routes whose provider is `openai_compatible` ended in
   `image_generation_invalid_output` even though the upstream request had already
@@ -37,9 +110,9 @@ change must not be interpreted as an API guarantee.
   failure is returned as-is instead of being retried on the other endpoint, so
   Feedling does not issue a second request after a failure that may represent
   paid work. Generated images are also accepted when a provider embeds them in
-  the reply text as an inline `data:` URL. **Only inline image bytes are ever
-  read — an `http(s)` image link in a provider response is ignored and is never
-  fetched by the server.** Endpoint selection and fallback routing for official
+  the reply text as an inline `data:` URL. An image link inside a chat reply is
+  still ignored and never fetched; the separate entry below covers the one place
+  a link is retrieved. Endpoint selection and fallback routing for official
   OpenAI and OpenRouter routes are unchanged; image-generation requests on
   provider wires that carry a token output budget now ask for that wire's
   existing ceiling, because the previous fixed budget could truncate an image

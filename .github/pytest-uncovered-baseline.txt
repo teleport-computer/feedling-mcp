@@ -51,7 +51,6 @@ tests/test_capabilities_registry.py
 tests/test_capabilities_types.py
 tests/test_capability_html_extract.py
 tests/test_capability_wake.py
-tests/test_capability_web.py
 tests/test_capture_daily.py
 tests/test_capture_dream_submit_seam.py
 tests/test_capture_failure_backoff.py
@@ -80,7 +79,6 @@ tests/test_context_memories.py
 tests/test_copytext.py
 tests/test_data_track.py
 tests/test_dau_snapshot_scheduler.py
-tests/test_db_health_timeouts.py
 tests/test_debug_trace_atomic.py
 tests/test_debug_trace_event_route.py
 tests/test_deploy_canary.py
@@ -132,7 +130,6 @@ tests/test_hosted_agent_runtime_cutover.py
 tests/test_hosted_agent_runtime_driver.py
 tests/test_hosted_runtime.py
 tests/test_image_generation_autonomy.py
-tests/test_image_generation_model.py
 tests/test_image_resize.py
 tests/test_introduction_db_atomic.py
 tests/test_introduction_enqueue_once.py
@@ -178,7 +175,6 @@ tests/test_prod_runner_health_config.py
 tests/test_provider_async_native.py
 tests/test_provider_attempt_ledger.py
 tests/test_provider_catalog_unit.py
-tests/test_provider_client.py
 tests/test_provider_client_async.py
 tests/test_provider_client_async_reliable.py
 tests/test_provider_health.py
@@ -281,7 +277,6 @@ tests/test_v2_summary_frontier_unit.py
 tests/test_v2_summary_store.py
 tests/test_v2_tail_anchor_store.py
 tests/test_v2_tail_anchor_unit.py
-tests/test_v2_trajectory_db.py
 tests/test_v2_trajectory_inspect_unit.py
 tests/test_v2_trajectory_unit.py
 tests/test_v2_turn_failure_supersede.py

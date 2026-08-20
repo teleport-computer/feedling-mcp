@@ -145,8 +145,51 @@ Memory write guidance:
 + MEMORY_WRITE_RULES_V1).strip()
 
 
+#: 桶名清单按语言取一份。**只取一份是重点，不是省事**：
+#:
+#: 旧做法是把中英两套桶一起塞进提示词、再叮嘱模型「只准挑一边」。实测约 1/3 的
+#: 中文记忆被贴上英文公共桶（用户十年前养过一只狗 → "Pets"），所以才有
+#: ``normalize_bucket_language`` 这个代码兜底。根因就是我们给了模型一个它不该做的
+#: 选择题 —— 宿主明明已经知道这个花园是什么语言。
+#:
+#: 现在只递一套：模型没得挑，也就挑不错。兜底仍然保留（模型自造缩写、旧卡回流），
+#: 但它从「常态纠错」退回成「异常兜底」。
+BUCKET_SETS = {
+    "zh-Hans": _COMMON_BUCKETS_ZH,
+    "en": _COMMON_BUCKETS_EN,
+}
+
+
+class UnknownBucketLocaleError(ValueError):
+    """宿主没说这个花园是什么语言，或者说了一个我们没有桶清单的语言。"""
+
+
+def bucket_list(locale: str) -> str:
+    """这个语言下的通用桶清单（一行、可直接注入提示词）。
+
+    **故意不给默认值。** 默认成中文，等于把 io 的产品分类法写死进通用内核——
+    外部使用者会莫名其妙继承一套中文桶，还不知道为什么（这正是边界文档里
+    「在 garden 里写死一个宿主专用的值，比放在宿主里更糟」那一条）。
+    对 io 自己也一样：漏传的调用点会当场炸出来，而不是安静地发错语言的桶。
+    """
+    key = str(locale or "").strip()
+    if key not in BUCKET_SETS:
+        raise UnknownBucketLocaleError(
+            f"没有 {locale!r} 的桶清单；可用：{sorted(BUCKET_SETS)}。"
+            "调用方必须显式给出这个花园的语言。"
+        )
+    return BUCKET_SETS[key]
+
+
 # Full bucket-convergence guidance injected into every card-creating prompt
 # (capture / migrate / genesis) so onboarding and capture steer toward the same set.
+#: ⏳ **过渡期遗留：同时列出中英两套桶的旧指引。**
+#:
+#: 只剩两个调用方，都是在 import 时就把提示词拼死的模块级常量，拿不到「这个用户
+#: 是什么语言」：``genesis/prompts.py`` 与 ``capabilities/tool_schema.py``。
+#: 把它们改成按调用渲染是独立一批活（见 FEATURE_LOG），不该混进这次。
+#:
+#: 新代码一律用 ``common_buckets_guidance(locale)``。这个常量清零之后就删掉。
 COMMON_BUCKETS_GUIDANCE_V1 = (
     "桶名要收敛、可复用,别每张卡都新起一个近义桶。优先从这组通用桶里选并复用——\n"
     "  中文记忆用:" + _COMMON_BUCKETS_ZH + "\n"
@@ -156,3 +199,22 @@ COMMON_BUCKETS_GUIDANCE_V1 = (
     "这些都不贴合,再起一个简短的具体桶(如 妈妈、房子);别造「工作/职业/事业」这种近义重复桶。"
     "\n" + MEMORY_CARD_LENGTH_RULE_V1
 ).strip()
+
+
+def common_buckets_guidance(locale: str) -> str:
+    """桶名指引。指令是英文（给模型看的），桶名清单是宿主那个语言的那一套。
+
+    ⚠️ 桶名清单本身**不翻译**：花园里已有的桶就是这些字，模型必须原样复用，
+    翻译一下就等于新起了一个桶。
+    """
+    return (
+        "Bucket names must converge and be reusable — do not mint a near-synonym "
+        "bucket for every card. Pick and reuse from this common set:\n"
+        "  " + bucket_list(locale) + "\n"
+        "Write the bucket as ONE short name, copied verbatim from the list above — "
+        "do not translate it, and never join two languages with a slash "
+        "(no 「健康/Health」, no 「宠物/Pets」).\n"
+        "If none of them fit, mint one short specific bucket (e.g. 妈妈 / the house). "
+        "Do not create near-duplicates of an existing bucket.\n"
+        + MEMORY_CARD_LENGTH_RULE_V1
+    ).strip()

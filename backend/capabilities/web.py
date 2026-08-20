@@ -12,10 +12,9 @@ external content.
 from __future__ import annotations
 
 from contextlib import contextmanager
-import ipaddress
 import os
 import re
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -79,62 +78,12 @@ def _blocked_url_kind(url: str) -> str | None:
 
 
 def _validated_pinned_ip(url: str) -> tuple[str | None, str | None]:
-    """Validate one URL hop and return the exact global address to connect to.
-
-    Merely resolving during validation and then giving the hostname back to an
-    HTTP client has a DNS-rebinding TOCTOU: the second resolution can point at
-    loopback/link-local/internal infrastructure.  Capture the addresses checked
-    by the shared guard and pin this request to one of them.  Every redirect is
-    independently revalidated and repinned by ``fetch``.
-    """
-    resolved: list[str] = []
-
-    def _recording_resolve(host: str) -> list[str]:
-        ips = [str(value) for value in _resolve_ips(host)]
-        resolved.extend(ips)
-        return ips
-
-    blocked = net_safety.blocked_url_kind(url, resolve=_recording_resolve)
-    if blocked is not None:
-        return blocked, None
-    host = urlparse(url).hostname or ""
-    try:
-        # Literal global IP: blocked_url_kind validated it without DNS.
-        return None, ipaddress.ip_address(host).compressed
-    except ValueError:
-        pass
-    if not resolved:  # defensive; blocked_url_kind normally returns "dns"
-        return "dns", None
-    return None, ipaddress.ip_address(resolved[0]).compressed
-
-
-def _ascii_authority(host: str, port: int | None) -> str:
-    try:
-        parsed_ip = ipaddress.ip_address(host)
-        rendered = (
-            f"[{parsed_ip.compressed}]"
-            if parsed_ip.version == 6
-            else parsed_ip.compressed
-        )
-    except ValueError:
-        rendered = host.encode("idna").decode("ascii")
-    return rendered + (f":{port}" if port is not None else "")
+    """Validate one hop and pin it to a checked address (see net_safety)."""
+    return net_safety.validated_pinned_ip(url, resolve=_resolve_ips)
 
 
 def _pinned_url(url: str, resolved_ip: str) -> tuple[str, str, str]:
-    parsed = urlparse(url)
-    original_host = parsed.hostname or ""
-    pinned_authority = _ascii_authority(resolved_ip, parsed.port)
-    host_header = _ascii_authority(original_host, parsed.port)
-    try:
-        sni_hostname = ipaddress.ip_address(original_host).compressed
-    except ValueError:
-        sni_hostname = original_host.encode("idna").decode("ascii")
-    return (
-        urlunparse(parsed._replace(netloc=pinned_authority)),
-        host_header,
-        sni_hostname,
-    )
+    return net_safety.pinned_url(url, resolved_ip)
 
 
 @contextmanager

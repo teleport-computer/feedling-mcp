@@ -427,6 +427,29 @@ def test_index_parity_with_stubbed_enclave(user, monkeypatch):
     assert f[1]["user_card_count"] == 1
 
 
+def test_index_database_failure_is_503_not_an_empty_success(user, monkeypatch):
+    _uid, api_key = user
+    events = []
+
+    def fail_pool():
+        raise OSError("database unavailable")
+
+    monkeypatch.setattr(db, "get_pool", fail_pool)
+    monkeypatch.setattr(
+        memory_core.debug_trace,
+        "trace_event",
+        lambda _store, **event: events.append(event),
+    )
+
+    status, body = _asgi(
+        "POST", "/v1/memory/index", headers=_headers(api_key), json_body={})
+
+    assert (status, body) == (503, {"error": "memory_load_failed"})
+    assert events[-1]["type"] == "memory.index.called"
+    assert events[-1]["status"] == "failed"
+    assert events[-1]["detail"]["reason"] == "memory_load_failed"
+
+
 def test_index_invalid_limit_400_parity(user):
     _uid, api_key = user
     f, a = _both("POST", "/v1/memory/index", api_key=api_key, json_body={"limit": -3})

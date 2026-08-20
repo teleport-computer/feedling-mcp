@@ -834,6 +834,9 @@ def save_all_users(users: list[dict]) -> None:
                 # ordering rationale (users DELETE first, merge second), same
                 # mirror statements appended from the same operation.
                 for removed_id in removed_ids:
+                    if chat_rollup_anonymize_user(conn, removed_id):
+                        mirror_group.append(
+                            (_CHAT_ROLLUP_DELETE_SQL, (removed_id,)))
                     if lane_rollup_anonymize_user(conn, removed_id):
                         mirror_group.append(
                             (_LANE_ROLLUP_ANON_MERGE_SQL,
@@ -889,9 +892,12 @@ def delete_user(user_id: str) -> bool:
             # freeze's cells are committed and visible to this merge; and any
             # later freeze finds no users row, so its guarded INSERT..SELECT
             # inserts nothing.
+            chat_cells = chat_rollup_anonymize_user(conn, user_id)
             anonymized = lane_rollup_anonymize_user(conn, user_id)
     from tee_shadow import mirror
     group: list[tuple[str, tuple]] = [(sql, (user_id,))]
+    if chat_cells:
+        group.append((_CHAT_ROLLUP_DELETE_SQL, (user_id,)))
     if anonymized:
         group.append((_LANE_ROLLUP_ANON_MERGE_SQL,
                       (_LANE_ROLLUP_DELETED_USER, user_id)))
@@ -1010,6 +1016,44 @@ def recent_tee_sync_runs(limit: int = 50) -> list[dict]:
     return out
 
 
+def record_plaintext_shadow_sync_run(summary: dict) -> None:
+    """Persist only scalar decrypted-shadow health and per-table counts."""
+    columns = (
+        "duration_ms", "applied", "deleted", "retried", "quarantined",
+        "pending", "oldest_pending_seconds", "target_ok", "target_probe_ms",
+        "verify_ok",
+    )
+    values = [summary.get(column) for column in columns]
+    with get_pool().connection() as conn:
+        conn.execute(
+            f"INSERT INTO plaintext_shadow_sync_runs "
+            f"({', '.join(columns)}, table_metrics) "
+            f"VALUES ({', '.join(['%s'] * len(columns))}, %s)",
+            (*values, Jsonb(summary.get("table_metrics") or {})),
+        )
+
+
+def recent_plaintext_shadow_sync_runs(limit: int = 20) -> list[dict]:
+    columns = (
+        "id", "ran_at", "duration_ms", "applied", "deleted", "retried",
+        "quarantined", "pending", "oldest_pending_seconds", "target_ok",
+        "target_probe_ms", "verify_ok", "table_metrics",
+    )
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"SELECT {', '.join(columns)} FROM plaintext_shadow_sync_runs "
+            "ORDER BY id DESC LIMIT %s",
+            (max(1, min(int(limit), 100)),),
+        ).fetchall()
+    output = []
+    for row in rows:
+        item = dict(zip(columns, row))
+        if item["ran_at"] is not None:
+            item["ran_at"] = item["ran_at"].isoformat()
+        output.append(item)
+    return output
+
+
 # --- TEE reconcile resume cursors (see alembic 0018) ------------------------ #
 # A per-table keyset checkpoint so a backfill interrupted by a worker recycle /
 # deploy / crash resumes where it left off instead of restarting from row 1.
@@ -1077,6 +1121,192 @@ def user_exists(user_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+_CHAT_SNAPSHOT_COUNT_KEYS = (
+    "total", "user_messages", "agent_messages", "image_messages",
+    "proactive_messages", "model_api_user_messages",
+    "model_api_agent_messages", "model_api_greetings",
+)
+_CHAT_SNAPSHOT_DIST_KEYS = ("by_role", "by_source", "by_content_type")
+
+
+def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
+    """Fill each user's ``chat`` block from frozen cells + today's live window.
+
+    Replaces five full-history GROUP BYs (measured 99-115s on prod, killed by
+    gunicorn's 120s timeout). The row shape is deliberately unchanged — the
+    data-track surface is server-rendered with no client fetch, so a key added
+    or dropped here breaks the page silently.
+
+    Two parts, and the split is the whole point:
+      · closed days — sum the frozen cells. They survive a later history clear,
+        which is why the numbers do not collapse when a user wipes their chat;
+      · today — one bounded query over the still-open day.
+    No unbounded historical scan remains.
+
+    ⚠️ These counts mean "how much happened", not "how much is still stored"
+    (Seven 2026-08-19). The read surface must label them cumulative.
+    """
+    zone = ZoneInfo("Asia/Shanghai")
+    today = datetime.now(zone).date()
+    day_start, _ = _lane_rollup_day_bounds(today, zone)
+    cutoff = day_start.timestamp()
+    sums = ", ".join(f"SUM({k})::int" for k in _CHAT_SNAPSHOT_COUNT_KEYS)
+    acc: dict[str, dict] = {}
+
+    # ⚠️ 两段的边界必须**互斥**：格子取 day < today，实时窗取 ts >= today 起点。
+    # 少了这个 day 上界，任何落在今天或之后的格子会被两边各数一次。冻结器只冻
+    # 已关闭的日子，正常情况下今天不会有格子——但「正常情况下不会」不是边界条件，
+    # 写出来才是。（本条是测试种子用了未来时刻、把这个重叠暴露出来后补的。）
+    for row in conn.execute(
+        f"""
+        SELECT user_id, {sums},
+               MIN(first_ts), MAX(last_ts), MAX(proactive_last_ts),
+               MAX(last_user_ts), MAX(last_agent_ts)
+        FROM chat_daily_rollup WHERE user_id = ANY(%s) AND day < %s
+        GROUP BY user_id
+        """,
+        (ids, today.isoformat()),
+    ).fetchall():
+        n = len(_CHAT_SNAPSHOT_COUNT_KEYS)
+        cell = {key: int(row[1 + i] or 0)
+                for i, key in enumerate(_CHAT_SNAPSHOT_COUNT_KEYS)}
+        for offset, key in enumerate(("first_ts", "last_ts", "proactive_last_ts",
+                                      "last_user_ts", "last_agent_ts")):
+            cell[key] = row[1 + n + offset]
+        acc[str(row[0])] = cell
+
+    for uid, folded in conn.execute(
+        """
+        SELECT user_id, jsonb_object_agg(src, buckets)
+        FROM (
+            SELECT user_id, src, jsonb_object_agg(k, v) AS buckets
+            FROM (
+                SELECT user_id, src, k, SUM(raw::int)::int AS v
+                FROM chat_daily_rollup,
+                LATERAL (VALUES ('by_role', by_role), ('by_source', by_source),
+                                ('by_content_type', by_content_type)) AS d(src, doc),
+                LATERAL jsonb_each_text(doc) AS e(k, raw)
+                WHERE user_id = ANY(%s) AND day < %s
+                GROUP BY user_id, src, k
+            ) per_key
+            GROUP BY user_id, src
+        ) per_src
+        GROUP BY user_id
+        """,
+        (ids, today.isoformat()),
+    ).fetchall():
+        cell = acc.setdefault(str(uid), {})
+        for key in _CHAT_SNAPSHOT_DIST_KEYS:
+            cell[key] = dict((folded or {}).get(key) or {})
+
+    # 当天还没冻结的那一段：单次有界查询，窗口就是今天。
+    for row in conn.execute(
+        f"""
+        SELECT user_id,{_CHAT_ROLLUP_COUNTS_SELECT}
+        FROM {_chat_rollup_source('user_id = ANY(%s) AND ts >= %s')} src
+        GROUP BY user_id
+        """,
+        (ids, cutoff, ids, cutoff),
+    ).fetchall():
+        n = len(_CHAT_SNAPSHOT_COUNT_KEYS)
+        cell = acc.setdefault(str(row[0]), {})
+        for i, key in enumerate(_CHAT_SNAPSHOT_COUNT_KEYS):
+            cell[key] = int(cell.get(key) or 0) + int(row[1 + i] or 0)
+        first = row[1 + n]
+        if first is not None and cell.get("first_ts") is None:
+            cell["first_ts"] = first
+        for offset, key in enumerate(("last_ts", "proactive_last_ts",
+                                      "last_user_ts", "last_agent_ts")):
+            live = row[2 + n + offset]
+            if live is not None and (cell.get(key) is None or live > cell[key]):
+                cell[key] = live
+
+    for field, target, extra in _CHAT_ROLLUP_DIST_FIELDS[:3]:
+        for uid, value, count in conn.execute(
+            f"""
+            SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
+                   COUNT(*)::int
+            FROM {_chat_rollup_source(f'user_id = ANY(%s) AND ts >= %s{extra}')} src
+            GROUP BY user_id, value
+            """,
+            (field, ids, cutoff, ids, cutoff),
+        ).fetchall():
+            bucket = acc.setdefault(str(uid), {}).setdefault(target, {})
+            bucket[str(value)] = bucket.get(str(value), 0) + int(count)
+
+    for uid, cell in acc.items():
+        if not cell.get("total"):
+            # 无聊天的用户不建 chat 键 —— 既有契约，前端按键存在与否分支。
+            continue
+        for key in _CHAT_SNAPSHOT_COUNT_KEYS:
+            cell.setdefault(key, 0)
+        for key in _CHAT_SNAPSHOT_DIST_KEYS:
+            cell.setdefault(key, {})
+        for key in ("first_ts", "last_ts", "proactive_last_ts",
+                    "last_user_ts", "last_agent_ts"):
+            cell.setdefault(key, None)
+        ensure(out, uid)["chat"] = cell
+
+
+def _chat_proactive_status_into(conn, ids: list[str], out: dict, ensure) -> None:
+    """proactive_extra 的两个 status 分布：冻结格子 + 今天实时窗。
+
+    与 ``_chat_rollup_into`` 分开只是因为它们挂在 ``proactive_extra`` 而不是
+    ``chat`` 下；口径、边界（day < today / ts >= today 起点）、来源（live ∪
+    archive）三者完全一致，共用同一组常量。
+    """
+    zone = ZoneInfo("Asia/Shanghai")
+    today = datetime.now(zone).date()
+    day_start, _ = _lane_rollup_day_bounds(today, zone)
+    cutoff = day_start.timestamp()
+    acc: dict[str, dict[str, dict[str, int]]] = {}
+
+    for uid, folded in conn.execute(
+        """
+        SELECT user_id, jsonb_object_agg(src, buckets)
+        FROM (
+            SELECT user_id, src, jsonb_object_agg(k, v) AS buckets
+            FROM (
+                SELECT user_id, src, k, SUM(raw::int)::int AS v
+                FROM chat_daily_rollup,
+                LATERAL (VALUES ('live_activity_status', live_activity_status),
+                                ('alert_status', alert_status)) AS d(src, doc),
+                LATERAL jsonb_each_text(doc) AS e(k, raw)
+                WHERE user_id = ANY(%s) AND day < %s
+                GROUP BY user_id, src, k
+            ) per_key
+            GROUP BY user_id, src
+        ) per_src
+        GROUP BY user_id
+        """,
+        (ids, today.isoformat()),
+    ).fetchall():
+        by = acc.setdefault(str(uid), {})
+        for key, buckets in (folded or {}).items():
+            by[str(key)] = {str(k): int(v) for k, v in (buckets or {}).items()}
+
+    for field, target, extra in _CHAT_ROLLUP_DIST_FIELDS[3:]:
+        for uid, value, count in conn.execute(
+            f"""
+            SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
+                   COUNT(*)::int
+            FROM {_chat_rollup_source(f'user_id = ANY(%s) AND ts >= %s{extra}')} src
+            GROUP BY user_id, value
+            """,
+            (field, ids, cutoff, ids, cutoff),
+        ).fetchall():
+            bucket = acc.setdefault(str(uid), {}).setdefault(target, {})
+            bucket[str(value)] = bucket.get(str(value), 0) + int(count)
+
+    for uid, by in acc.items():
+        if not any(by.values()):
+            continue
+        extra_block = ensure(out, uid).setdefault("proactive_extra", {})
+        for key, buckets in by.items():
+            if buckets:
+                extra_block[key] = buckets
+
+
 def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
     """Return metadata-only aggregate stats for a set of users.
 
@@ -1098,73 +1328,7 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
     }
     try:
         with get_pool().connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       COUNT(*)::int AS total,
-                       COUNT(*) FILTER (
-                         WHERE doc->>'role' = 'user'
-                           AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
-                       )::int AS user_messages,
-                       COUNT(*) FILTER (WHERE doc->>'role' IN ('agent', 'openclaw'))::int AS agent_messages,
-                       COUNT(*) FILTER (WHERE doc->>'content_type' = 'image')::int AS image_messages,
-                       COUNT(*) FILTER (WHERE doc->>'source' = 'agent_initiated_proactive')::int AS proactive_messages,
-                       COUNT(*) FILTER (WHERE doc->>'source' = 'model_api' AND doc->>'role' = 'user')::int AS model_api_user_messages,
-                       COUNT(*) FILTER (WHERE doc->>'source' = 'model_api' AND doc->>'role' IN ('agent', 'openclaw'))::int AS model_api_agent_messages,
-                       COUNT(*) FILTER (WHERE doc->>'source' = 'model_api' AND doc->>'model_api_kind' = 'onboarding_greeting')::int AS model_api_greetings,
-                       MIN(ts) AS first_ts,
-                       MAX(ts) AS last_ts,
-                       MAX(ts) FILTER (WHERE doc->>'source' = 'agent_initiated_proactive') AS proactive_last_ts,
-                       MAX(ts) FILTER (
-                         WHERE doc->>'role' = 'user'
-                           AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
-                       ) AS last_user_ts,
-                       MAX(ts) FILTER (WHERE doc->>'role' IN ('agent', 'openclaw')) AS last_agent_ts
-                FROM chat_messages
-                WHERE user_id = ANY(%s)
-                GROUP BY user_id
-                """,
-                (ids,),
-            ).fetchall()
-            for row in rows:
-                uid = row[0]
-                ensure(out, uid)["chat"] = {
-                    "total": row[1],
-                    "user_messages": row[2],
-                    "agent_messages": row[3],
-                    "image_messages": row[4],
-                    "proactive_messages": row[5],
-                    "model_api_user_messages": row[6],
-                    "model_api_agent_messages": row[7],
-                    "model_api_greetings": row[8],
-                    "first_ts": row[9],
-                    "last_ts": row[10],
-                    "proactive_last_ts": row[11],
-                    "last_user_ts": row[12],
-                    "last_agent_ts": row[13],
-                    "by_role": {},
-                    "by_source": {},
-                    "by_content_type": {},
-                }
-
-            for field, target in (
-                ("role", "by_role"),
-                ("source", "by_source"),
-                ("content_type", "by_content_type"),
-            ):
-                rows = conn.execute(
-                    """
-                    SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
-                           COUNT(*)::int
-                    FROM chat_messages
-                    WHERE user_id = ANY(%s)
-                    GROUP BY user_id, value
-                    """,
-                    (field, ids),
-                ).fetchall()
-                for uid, value, count in rows:
-                    chat = ensure(out, uid).setdefault("chat", {})
-                    chat.setdefault(target, {})[value] = count
+            _chat_rollup_into(conn, ids, out, ensure)
 
             rows = conn.execute(
                 """
@@ -1375,33 +1539,11 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                     "jobs_failed_by_reason", {}
                 )[reason] = count
 
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       COALESCE(NULLIF(doc->>'live_activity_status', ''), 'unknown') AS live_status,
-                       COUNT(*)::int
-                FROM chat_messages
-                WHERE user_id = ANY(%s) AND doc->>'source' = 'agent_initiated_proactive'
-                GROUP BY user_id, live_status
-                """,
-                (ids,),
-            ).fetchall()
-            for uid, status, count in rows:
-                ensure(out, uid).setdefault("proactive_extra", {}).setdefault("live_activity_status", {})[status] = count
-
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       COALESCE(NULLIF(doc->>'alert_status', ''), 'unknown') AS alert_status,
-                       COUNT(*)::int
-                FROM chat_messages
-                WHERE user_id = ANY(%s) AND doc->>'source' = 'agent_initiated_proactive'
-                GROUP BY user_id, alert_status
-                """,
-                (ids,),
-            ).fetchall()
-            for uid, status, count in rows:
-                ensure(out, uid).setdefault("proactive_extra", {}).setdefault("alert_status", {})[status] = count
+            # ⚠️ 这两个维度**必须**走格子，不能留原来的全史 GROUP BY。
+            # 把它们冻进格子却仍从 chat_messages 现算，等于新增列只写不读、
+            # 端点照样随全史增长——那正是本期要消灭的东西（codex2 2026-08-19
+            # 逮到我就是这么写的：写侧改了、读侧一行没动）。
+            _chat_proactive_status_into(conn, ids, out, ensure)
 
             rows = conn.execute(
                 """
@@ -4921,6 +5063,318 @@ ON CONFLICT (user_id, day, route, lane, enqueue_source) DO UPDATE SET
 _LANE_ROLLUP_ANON_DELETE_SQL = "DELETE FROM lane_daily_rollup WHERE user_id = %s"
 
 
+# --- 期 3b：chat 日格子（救活 data-track） --------------------------------- #
+#
+# admin_data_track_snapshot 对全部用户、全部历史现算，五处无时间窗的全史
+# GROUP BY，prod 实测 99-115s、被 gunicorn 120s 打死。这里把它挪到每日冻结。
+#
+# ⚠️ 格子的含义是「**那天发生过多少**」，不是「当前 live 集合还剩多少」。
+# Seven 2026-08-19 定的产品口径，理由是:后台是用来看用户有没有在用的，用户
+# 清空历史后统计跟着凭空少 500 条，面板就变成「这人几乎没用过」——那才是真误导。
+# 读侧列名必须写「累计发生」，不得写「当前条数」。
+#
+# ⚠️⚠️ 「能冻结」的理由与 lane_daily_rollup **不同**，不要混用论证:
+#   lane 能冻 = **源闭合**（终态 agent_jobs 行此后不再变）
+#   chat 能冻 = **问题本身是历史性的**（「08-18 发生了多少条」的答案不随之后
+#               的删除改变）——chat_messages 的源**并不闭合**，clear 会把行搬走。
+# 所以 ON CONFLICT DO NOTHING 在这里正确，但谁要是拿「源不可变」来论证它就错了。
+# 一旦有人把这些格子改成回答「现在还剩多少」，冻结立刻不成立，且必须引入变更
+# 追踪——因为删除**事后扫不出来**（行没了，没有任何后续扫描能看见它曾存在）。
+#
+# 口径逐字取自现有 snapshot 实现，否则 golden 会红（这正是 golden 的用处）。
+#
+# ⚠️ 历史源 = live + archive，**不能只扫 chat_messages**（codex2 2026-08-19）。
+# chat_clear 在权威事务里先把行搬进 chat_message_archive 再删 live（0052 建表，
+# 主键 (user_id, source_seq)）。若只扫 live：
+#   · 首次回填会永久漏掉上线前已经 clear 过的历史；
+#   · 当天这个还没冻的窗口，会在用户 clear 的瞬间数字骤降。
+# 两者都正好复现 Seven 要避免的那件事（清空历史后面板显示「这人几乎没用过」），
+# 只是范围更窄。既然口径是「那天发生过多少」，归档里的行也发生过。
+#
+# 按 (user_id, source_seq) 去重：搬迁瞬间同一条可能在两张表里同时出现，
+# UNION ALL 会双计。archive 的 PK 就是这个键，live 侧对应 seq。
+# ⚠️ 必须按 **(user_id, source_seq)** 定胜，不能用 UNION。
+# UNION 去的是**整行**重：只要同一条消息在 live 与 archive 两侧的 doc 或 ts 有
+# 任何差异（clear 事务搬行时补字段、R2 offload 把正文换成指针、时间戳精度），
+# 两行就都活下来、被计两次。codex2 2026-08-19 指出；我原先的测试复制的是**完全
+# 相同**的行，所以这个反例根本没被触发——又一次「样本没让被测分支走到」。
+#
+# precedence：live 胜。理由是 archive 行是 clear 那一刻的拷贝，之后不再更新；
+# live 行若还在，它才是这条消息的现状。用 rank 列显式排序，不依赖 UNION 的
+# 任意顺序。
+def _chat_rollup_source(where: str) -> str:
+    """live ∪ archive 的联合源，谓词下推 + **全局** live 优先。
+
+    两个约束必须同时成立，任缺其一都出错：
+
+    ① **谓词下推**。ts 过滤必须在去重之前施加。DISTINCT ON 是优化屏障，外层
+       ``ts >=`` 推不进去——实测 5 万行归档时 PG 把 52000 行全部物化再过滤，
+       ts 索引完全用不上，「有界今日窗」实际在扫全史（要消灭的形态换了张表）。
+
+    ② **live 优先必须是全局的，不是窗内的**。这两条放一起会打架，而打架的
+       后果是同一条消息被计两次：同一 (user_id, source_seq) 若 live 与 archive
+       的 ts 分处两个北京日，先在各分支过滤再去重 ⇒ 冻昨日时 live 被滤掉、
+       archive 入格；读今日时 archive 被滤掉、live 又入实时窗。codex2 在隔离库
+       实测复现（frozen_yesterday=1 且 today=1，同一 key 合计 2），破坏累计守恒。
+       我上一轮把它当「数据异常，可接受」——错了：它不是异常输入下的行为，
+       是这个查询结构自带的双计。
+
+    所以不用 DISTINCT ON，改成 archive 分支对**全部** live key 做反连接：
+    live 窗内行，UNION ALL archive 窗内且全局无同 key live 的行。live 即使落在
+    窗外也照样压住 archive，那条消息只会在 live 自己的那一天被计一次。
+    反连接走 chat_user_seq_idx (user_id, seq)，不引入新扫描。
+
+    ``where`` 里的占位符出现**两次**（每分支一次），调用方参数要给两遍。
+    """
+    return f"""(
+            SELECT user_id, seq AS source_seq, ts, doc
+            FROM chat_messages WHERE {where}
+            UNION ALL
+            SELECT a.user_id, a.source_seq, a.ts, a.doc
+            FROM chat_message_archive a
+            WHERE {where.replace('user_id', 'a.user_id').replace(' ts ', ' a.ts ')}
+              AND NOT EXISTS (
+                  SELECT 1 FROM chat_messages m
+                  WHERE m.user_id = a.user_id AND m.seq = a.source_seq
+              )
+        )"""
+
+# ⚠️ 另有两族**硬删且不归档**的行（codex2 2026-08-19 指出），联合源救不回来：
+#   · verify_ping 连通性自测消息 —— verify 循环结束即 GC（chat/chat_core.py）
+#   · 语音逐轮行 —— 通话 finalize 时删除，除非已被 V2 压实覆盖（voice/cleanup.py）
+# 这里**刻意不加过滤**，三条理由：
+#   1. 口径是「那天发生过多少」，它们当时确实在；
+#   2. 加过滤会改动 total / by_role / by_source / by_content_type / first_ts 的数，
+#      即改变前端今天显示的数字——那是产品变更，不该夹在提速改动里；
+#   3. 决定性由**生命周期**保证，不靠过滤：两族都在当日内被清掉，而 D 日要到
+#      D+1 才冻结，冻结时它们已不在，现算与冻结看到同一幅图。
+# ⚠️ 但第 3 条是「实践上成立」而非「机制上强制」：一次永不完成的 verify 会把 ping
+# 行留过夜，那时冻结会把它计进去——**与当时的现算完全一致**（所以不违反「提速不
+# 许改数」），只是那天的 total 多一条自测消息。两族各钉一条测试，让这是**被写下
+# 来的选择**而不是没人想过。⚠️ 我曾据「verify_ping 不进 user_messages」推断
+# 「删它不影响格子」——那是错的：它照样进 total 与三个分布。别再这样推。
+
+_CHAT_ROLLUP_USER_MSG_PRED = (
+    "doc->>'role' = 'user' AND COALESCE(doc->>'source','') "
+    "NOT IN ('verify_ping','resident_maintenance')"
+)
+_CHAT_ROLLUP_AGENT_PRED = "doc->>'role' IN ('agent','openclaw')"
+
+_CHAT_ROLLUP_COUNTS_SELECT = f"""
+       COUNT(*)::int AS total,
+       COUNT(*) FILTER (WHERE {_CHAT_ROLLUP_USER_MSG_PRED})::int AS user_messages,
+       COUNT(*) FILTER (WHERE {_CHAT_ROLLUP_AGENT_PRED})::int AS agent_messages,
+       COUNT(*) FILTER (WHERE doc->>'content_type' = 'image')::int AS image_messages,
+       COUNT(*) FILTER (WHERE doc->>'source' = 'agent_initiated_proactive')::int
+           AS proactive_messages,
+       COUNT(*) FILTER (WHERE doc->>'source' = 'model_api'
+                          AND doc->>'role' = 'user')::int AS model_api_user_messages,
+       COUNT(*) FILTER (WHERE doc->>'source' = 'model_api'
+                          AND {_CHAT_ROLLUP_AGENT_PRED})::int
+           AS model_api_agent_messages,
+       COUNT(*) FILTER (WHERE doc->>'source' = 'model_api'
+                          AND doc->>'model_api_kind' = 'onboarding_greeting')::int
+           AS model_api_greetings,
+       MIN(ts) AS first_ts,
+       MAX(ts) AS last_ts,
+       MAX(ts) FILTER (WHERE doc->>'source' = 'agent_initiated_proactive')
+           AS proactive_last_ts,
+       MAX(ts) FILTER (WHERE {_CHAT_ROLLUP_USER_MSG_PRED}) AS last_user_ts,
+       MAX(ts) FILTER (WHERE {_CHAT_ROLLUP_AGENT_PRED}) AS last_agent_ts"""
+
+# 三个分布 + 两个 proactive 维度。后两个是 codex2 抓出来的漏扫:snapshot 里
+# live_activity_status / alert_status 各自还有一次**全史** GROUP BY（无窗、无
+# 索引），只格子化前面 16 个字段的话它们照样随历史线性增长，端点可能照样死。
+_CHAT_ROLLUP_DIST_FIELDS = (
+    ("role", "by_role", ""),
+    ("source", "by_source", ""),
+    ("content_type", "by_content_type", ""),
+    ("live_activity_status", "live_activity_status",
+     " AND doc->>'source' = 'agent_initiated_proactive'"),
+    ("alert_status", "alert_status",
+     " AND doc->>'source' = 'agent_initiated_proactive'"),
+)
+
+_CHAT_ROLLUP_MAX_DAYS_PER_TICK = 45
+
+
+def _chat_rollup_freeze_day(conn, *, day: date, zone: ZoneInfo,
+                            mirror_batch: list | None = None) -> int:
+    """Insert chat cells for one closed Beijing day. Idempotent
+    (ON CONFLICT DO NOTHING); returns how many cells were newly written."""
+    start, end = _lane_rollup_day_bounds(day, zone)
+    lo, hi = start.timestamp(), end.timestamp()
+    counts = conn.execute(
+        f"""
+        SELECT user_id,{_CHAT_ROLLUP_COUNTS_SELECT}
+        FROM {_chat_rollup_source('ts >= %s AND ts < %s')} src
+        GROUP BY user_id
+        """,
+        (lo, hi, lo, hi),
+    ).fetchall()
+    if not counts:
+        return 0
+
+    dists: dict[str, dict[str, dict[str, int]]] = {}
+    for field, target, extra in _CHAT_ROLLUP_DIST_FIELDS:
+        for uid, value, n in conn.execute(
+            f"""
+            SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
+                   COUNT(*)::int
+            FROM {_chat_rollup_source(f'ts >= %s AND ts < %s{extra}')} src
+            GROUP BY user_id, value
+            """,
+            (field, lo, hi, lo, hi),
+        ).fetchall():
+            dists.setdefault(str(uid), {}).setdefault(target, {})[str(value)] = int(n)
+
+    cell_sql = """
+            INSERT INTO chat_daily_rollup
+                (user_id, day, total, user_messages, agent_messages,
+                 image_messages, proactive_messages, model_api_user_messages,
+                 model_api_agent_messages, model_api_greetings,
+                 first_ts, last_ts, proactive_last_ts, last_user_ts,
+                 last_agent_ts, by_role, by_source, by_content_type,
+                 live_activity_status, alert_status)
+            SELECT u.user_id, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                   %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            FROM users u WHERE u.user_id = %s FOR KEY SHARE OF u
+            ON CONFLICT (user_id, day) DO NOTHING
+            RETURNING user_id
+            """
+    written = 0
+    day_s = day.isoformat()
+    for row in counts:
+        uid = str(row[0])
+        by = dists.get(uid, {})
+        params = (day_s, *row[1:], Jsonb(by.get("by_role", {})),
+                  Jsonb(by.get("by_source", {})),
+                  Jsonb(by.get("by_content_type", {})),
+                  Jsonb(by.get("live_activity_status", {})),
+                  Jsonb(by.get("alert_status", {})), uid)
+        if conn.execute(cell_sql, params).fetchone():
+            written += 1
+        if mirror_batch is not None:
+            mirror_batch.append((cell_sql, params))
+    return written
+
+
+def freeze_completed_chat_days(*, now_epoch: float | None = None,
+                               tz: str = "Asia/Shanghai") -> list[str]:
+    """Freeze chat cells for every closed Beijing day.
+
+    No lag is needed: a chat row's ``ts`` is fixed at insert, so once a day has
+    closed no new row can land in it. (The resident lane freezer needs 4h
+    because its terminal timestamps are patched into a doc after the fact.)
+    """
+    try:
+        zone = ZoneInfo(tz)
+        now = (datetime.fromtimestamp(float(now_epoch), zone)
+               if now_epoch is not None else datetime.now(zone))
+        last_completed = now.date() - timedelta(days=1)
+        frozen: list[str] = []
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT backfill_from, through_day FROM chat_rollup_watermark "
+                "WHERE scope = 'chat'",
+            ).fetchone()
+            if row:
+                backfill_from = row[0]
+                cursor = date.fromisoformat(row[1]) + timedelta(days=1)
+            else:
+                oldest = conn.execute(
+                    "SELECT LEAST("
+                    " (SELECT MIN(ts) FROM chat_messages),"
+                    " (SELECT MIN(ts) FROM chat_message_archive))",
+                ).fetchone()
+                if not oldest or oldest[0] is None:
+                    return []
+                cursor = datetime.fromtimestamp(float(oldest[0]), zone).date()
+                backfill_from = cursor.isoformat()
+            steps = 0
+            watermark_sql = """
+                    INSERT INTO chat_rollup_watermark
+                        (scope, backfill_from, through_day)
+                    VALUES ('chat', %s, %s)
+                    ON CONFLICT (scope) DO UPDATE
+                        SET through_day = EXCLUDED.through_day, frozen_at = now()
+                    """
+            from tee_shadow import mirror
+            while cursor <= last_completed and steps < _CHAT_ROLLUP_MAX_DAYS_PER_TICK:
+                mirror_batch: list[tuple[str, tuple]] = []
+                _chat_rollup_freeze_day(conn, day=cursor, zone=zone,
+                                        mirror_batch=mirror_batch)
+                wm_params = (backfill_from, cursor.isoformat())
+                conn.execute(watermark_sql, wm_params)
+                mirror_batch.append((watermark_sql, wm_params))
+                mirror.execute_many(mirror_batch)
+                frozen.append(cursor.isoformat())
+                cursor += timedelta(days=1)
+                steps += 1
+        return frozen
+    except Exception as e:
+        log.error("[db] freeze_completed_chat_days failed: %s", e)
+        return []
+
+
+_CHAT_ROLLUP_DELETE_SQL = "DELETE FROM chat_daily_rollup WHERE user_id = %s"
+
+
+def chat_rollup_coverage(*, tz: str = "Asia/Shanghai") -> dict:
+    """覆盖范围，给读侧与面板用（Seven 2026-08-19 定 A：照常给数 + 标注缺口）。
+
+    刻意**不塞进 admin_data_track_snapshot 的每个用户行**：那份返回按 user_id
+    键控，加一个非 uid 的顶层键会让所有 ``for uid, row in ...`` 的调用方拿到一个
+    假用户；而每行各存一份既冗余，又会让读的人以为覆盖是 per-user 的。
+
+    ``complete=False`` 表示冻结器还没把已关闭的日子追平，此时端点给出的历史数字
+    是偏低的。面板必须把这件事显示出来——一个数字旁边没有它的覆盖范围就会被当成
+    全量，那正是 A 口径要避免的误读。
+    """
+    zone = ZoneInfo(tz)
+    expected = (datetime.now(zone).date() - timedelta(days=1)).isoformat()
+    blank = {"backfill_from": None, "through_day": None,
+             "expected_through_day": expected, "complete": False}
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT backfill_from, through_day FROM chat_rollup_watermark "
+                "WHERE scope = 'chat'",
+            ).fetchone()
+    except Exception as e:  # noqa: BLE001 — 覆盖信息缺失本身就是要显示的状态
+        log.error("[db] chat_rollup_coverage failed: %s", e)
+        return blank
+    if not row:
+        return blank
+    return {
+        "backfill_from": str(row[0]),
+        "through_day": str(row[1]),
+        "expected_through_day": expected,
+        "complete": str(row[1]) >= expected,
+    }
+
+
+def chat_rollup_anonymize_user(conn, user_id: str) -> int:
+    """Drop one user's chat cells on account deletion.
+
+    Unlike ``lane_rollup_anonymize_user`` these are NOT merged into an
+    anonymous bucket: chat cells carry per-user activity shape (first/last
+    timestamps, source mix), and summing that across deleted accounts produces
+    a row nobody can interpret. The lane cells merge because they are pure
+    outcome counts. Deleting is also what the live-set reading expects — a
+    deleted account has no activity to report.
+    """
+    if not user_id:
+        return 0
+    n = conn.execute(
+        "SELECT COUNT(*) FROM chat_daily_rollup WHERE user_id = %s", (user_id,),
+    ).fetchone()[0]
+    if not n:
+        return 0
+    conn.execute("DELETE FROM chat_daily_rollup WHERE user_id = %s", (user_id,))
+    return int(n)
+
+
 def lane_rollup_anonymize_user(conn, user_id: str) -> int:
     """Merge one user's frozen cells into the anonymous 'deleted' rows and
     drop the originals. Runs on the caller's connection so delete_user_data
@@ -6222,13 +6676,15 @@ def set_blob_if_unchanged(
 
 
 def set_blob(user_id: str, kind: str, doc) -> None:
+    """Persist a singleton blob or raise on primary-database failure.
+
+    Callers whose outward contract is genuinely best-effort must opt into
+    :func:`set_blob_best_effort` explicitly.  Keeping the default primitive
+    strict prevents a failed write from being followed by a success response.
+    """
     sql = ("INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
            "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc")
-    try:
-        set_blob_strict(user_id, kind, doc)
-    except Exception as e:
-        log.error("[db] set_blob(%s,%s) failed: %s", user_id, kind, e)
-        return
+    set_blob_strict(user_id, kind, doc)
     from tee_shadow import mirror
     # identity 归 tee_replicator 明文化管辖：RDS 里是 E2E 密文信封、TEE 里是
     # replicator 落的明文版本。这里若把密文信封原样镜像进 TEE user_blobs，就会
@@ -6250,6 +6706,26 @@ def set_blob(user_id: str, kind: str, doc) -> None:
         _mirror_proactive_settings_current(user_id)
     elif kind not in ("identity", "consumer_state"):
         mirror.execute(sql, (user_id, kind, Jsonb(doc)))
+
+
+def set_blob_best_effort(user_id: str, kind: str, doc) -> bool:
+    """Persist a blob when failure must not rewrite an already-true outcome.
+
+    Returns whether the primary write committed.  The explicit name and boolean
+    result make these exceptional call sites auditable; failures are still
+    visible to operators in the service log.
+    """
+    try:
+        set_blob(user_id, kind, doc)
+    except Exception as exc:  # noqa: BLE001 - this is the explicit fail-soft API
+        log.error(
+            "[db] set_blob_best_effort(%s,%s) failed: %s",
+            user_id,
+            kind,
+            exc,
+        )
+        return False
+    return True
 
 
 def _mirror_persisted_blob(user_id: str, kind: str, doc) -> None:
@@ -6390,6 +6866,350 @@ def append_blob_events_strict(
             )
     _mirror_persisted_blob(user_id, kind, persisted)
     return persisted
+
+
+# --- Debug-trace write-rate ruler (T138 block 0) --------------------------- #
+
+# Absolute per-writer totals, not additive deltas.  A client can therefore
+# safely retry after commit ambiguity: GREATEST(same total) is idempotent.
+_TRACE_WRITE_STATS_UPSERT_SQL = """
+INSERT INTO trace_write_stats (
+    day, writer_id, subsystem, event_type, lane,
+    persisted_events, persisted_bytes,
+    known_drop_events, known_drop_bytes,
+    at_risk_events, at_risk_bytes,
+    first_seen_at, updated_at
+) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,to_timestamp(%s),now())
+ON CONFLICT (day, writer_id, subsystem, event_type, lane) DO UPDATE SET
+    persisted_events = GREATEST(
+        trace_write_stats.persisted_events, EXCLUDED.persisted_events),
+    persisted_bytes = GREATEST(
+        trace_write_stats.persisted_bytes, EXCLUDED.persisted_bytes),
+    known_drop_events = GREATEST(
+        trace_write_stats.known_drop_events, EXCLUDED.known_drop_events),
+    known_drop_bytes = GREATEST(
+        trace_write_stats.known_drop_bytes, EXCLUDED.known_drop_bytes),
+    at_risk_events = GREATEST(
+        trace_write_stats.at_risk_events, EXCLUDED.at_risk_events),
+    at_risk_bytes = GREATEST(
+        trace_write_stats.at_risk_bytes, EXCLUDED.at_risk_bytes),
+    first_seen_at = LEAST(
+        trace_write_stats.first_seen_at, EXCLUDED.first_seen_at),
+    updated_at = now()
+"""
+
+_TRACE_WRITE_STATS_HEALTH_UPSERT_SQL = """
+INSERT INTO trace_write_stats_health (
+    writer_id, process_started_at, last_success_at, last_failure_at,
+    failures_total, max_consecutive_failures, dirty_rows, stopped_at, updated_at
+) VALUES (%s,to_timestamp(%s),now(),to_timestamp(%s),%s,%s,%s,NULL,now())
+ON CONFLICT (writer_id) DO UPDATE SET
+    process_started_at = LEAST(
+        trace_write_stats_health.process_started_at,
+        EXCLUDED.process_started_at),
+    last_success_at = now(),
+    last_failure_at = CASE
+        WHEN EXCLUDED.last_failure_at IS NULL
+            THEN trace_write_stats_health.last_failure_at
+        WHEN trace_write_stats_health.last_failure_at IS NULL
+            THEN EXCLUDED.last_failure_at
+        ELSE GREATEST(
+            trace_write_stats_health.last_failure_at,
+            EXCLUDED.last_failure_at)
+    END,
+    failures_total = GREATEST(
+        trace_write_stats_health.failures_total,
+        EXCLUDED.failures_total),
+    max_consecutive_failures = GREATEST(
+        trace_write_stats_health.max_consecutive_failures,
+        EXCLUDED.max_consecutive_failures),
+    dirty_rows = EXCLUDED.dirty_rows,
+    updated_at = now()
+"""
+
+_TRACE_WRITE_STATS_HEALTH_STOP_SQL = """
+UPDATE trace_write_stats_health
+SET stopped_at = now(), updated_at = now()
+WHERE writer_id = %s AND stopped_at IS NULL AND dirty_rows = 0
+"""
+
+_TRACE_WRITE_STATS_MIN_MEASUREMENT_HOURS = 7 * 24
+# Shared with debug_trace's writer loop. Keep the producer cadence and the
+# reader's stale threshold on one source of truth so a cadence change cannot
+# make every healthy writer look stale.
+TRACE_WRITE_STATS_HEARTBEAT_SEC = 60.0
+_TRACE_WRITE_STATS_HEALTH_STALE_SEC = 3 * TRACE_WRITE_STATS_HEARTBEAT_SEC
+# The health window's upper bound exists to keep a future-dated row out of a
+# fixed-``now`` report.  It must NOT be zero-tolerance: ``last_success_at`` is
+# stamped by the DATABASE clock while ``now`` comes from the READER's clock, so
+# an exact ``<= now`` drops the row a healthy writer just wrote whenever the
+# reader lags the database at all — and a dropped health row reads as
+# "unregistered writer", i.e. the gate reports a registration failure that did
+# not happen.  A day of slack is far beyond any real app/RDS/CVM skew while
+# still shorter than the gaps between the report's own fixed test instants.
+_TRACE_WRITE_STATS_HEALTH_FUTURE_TOLERANCE_SEC = 86400.0
+
+# Losses that happen BEFORE an event reaches this process cannot land in any of
+# the three precision classes — they are not ``queue.Full`` and not a failed
+# flush, they simply never arrive.  The resident route is the known instance and
+# it is a real one, so the ruler states it next to the number instead of filing
+# it in a document: a caveat the reader has to go looking for is a caveat nobody
+# applies.  Add an entry here when a new pre-arrival loss channel is found.
+_TRACE_WRITE_STATS_COVERAGE_CAVEATS = (
+    {
+        "scope": "resident_route",
+        "effect": "measured volume is a lower bound",
+        "site": "tools/chat_resident_consumer.py::_post_debug_trace_event",
+        "why_invisible": (
+            "the resident consumer posts each trace event over HTTP with a 2s "
+            "timeout and swallows every exception, so a slow backend makes it "
+            "drop events that never reach this process at all"
+        ),
+        "implication": (
+            "capacity sized from this peak is not an upper bound for resident "
+            "users; the gap is unquantified, not zero"
+        ),
+    },
+)
+
+
+def upsert_trace_write_stats(
+    rows: list[tuple], *, writer_health: tuple | None = None,
+) -> None:
+    """Persist absolute trace-rate counters and best-effort mirror them.
+
+    Each row is ``(day, writer_id, subsystem, event_type, lane,
+    persisted_events, persisted_bytes, known_drop_events, known_drop_bytes,
+    at_risk_events, at_risk_bytes, first_seen_epoch)``.  The primary batch is
+    atomic; replay is safe even if the caller cannot tell whether a prior
+    commit succeeded.
+    """
+    if not rows and writer_health is None:
+        return
+    normalized = [tuple(row) for row in rows]
+    with get_pool().connection() as conn:
+        with conn.transaction(), conn.cursor() as cur:
+            if normalized:
+                cur.executemany(_TRACE_WRITE_STATS_UPSERT_SQL, normalized)
+            if writer_health is not None:
+                cur.execute(
+                    _TRACE_WRITE_STATS_HEALTH_UPSERT_SQL,
+                    tuple(writer_health),
+                )
+    from tee_shadow import mirror
+    statements = [
+        (_TRACE_WRITE_STATS_UPSERT_SQL, params) for params in normalized
+    ]
+    if writer_health is not None:
+        statements.append((
+            _TRACE_WRITE_STATS_HEALTH_UPSERT_SQL,
+            tuple(writer_health),
+        ))
+    mirror.execute_many(statements)
+
+
+def stop_trace_write_stats_writer(writer_id: str) -> None:
+    """Mark one gracefully exiting writer; an abnormal exit stays stale."""
+    if not writer_id:
+        return
+    params = (str(writer_id),)
+    with get_pool().connection() as conn:
+        conn.execute(_TRACE_WRITE_STATS_HEALTH_STOP_SQL, params)
+    from tee_shadow import mirror
+    mirror.execute(_TRACE_WRITE_STATS_HEALTH_STOP_SQL, params)
+
+
+def trace_write_stats_measurement(
+    *, days: int = 7, now_epoch: float | None = None,
+) -> dict:
+    """Return the fixed peak-based capacity ruler for recent trace writes.
+
+    No average is emitted deliberately: permanent retention must be sized from
+    the observed daily peak.  ``confirmed`` is the persisted lower bound;
+    ``conservative`` adds known queue drops and commit-ambiguous at-risk rows.
+    At-risk events may already be in the persisted count, so the latter is an
+    upper observation, not a claim that those events were lost.
+    """
+    window_days = max(1, min(int(days or 7), 90))
+    now = float(now_epoch if now_epoch is not None else time.time())
+    zone = ZoneInfo("Asia/Shanghai")
+    today = datetime.fromtimestamp(now, zone).date()
+    since_day = (today - timedelta(days=window_days - 1)).isoformat()
+    with get_pool().connection() as conn:
+        started = conn.execute(
+            "SELECT extract(epoch FROM MIN(first_seen_at)) "
+            "FROM trace_write_stats"
+        ).fetchone()
+        rows = conn.execute(
+            "SELECT day, subsystem, event_type, lane, "
+            "SUM(persisted_events), SUM(persisted_bytes), "
+            "SUM(known_drop_events), SUM(known_drop_bytes), "
+            "SUM(at_risk_events), SUM(at_risk_bytes) "
+            "FROM trace_write_stats WHERE day >= %s "
+            "GROUP BY day, subsystem, event_type, lane "
+            "ORDER BY day, subsystem, event_type, lane",
+            (since_day,),
+        ).fetchall()
+        health_rows = conn.execute(
+            "SELECT writer_id, "
+            "extract(epoch FROM process_started_at), "
+            "extract(epoch FROM last_success_at), "
+            "extract(epoch FROM last_failure_at), failures_total, "
+            "max_consecutive_failures, dirty_rows, "
+            "extract(epoch FROM stopped_at) "
+            "FROM trace_write_stats_health "
+            "WHERE COALESCE(stopped_at, last_success_at) >= to_timestamp(%s) "
+            "AND COALESCE(stopped_at, last_success_at) <= to_timestamp(%s) "
+            "ORDER BY process_started_at, writer_id",
+            (
+                now - _TRACE_WRITE_STATS_MIN_MEASUREMENT_HOURS * 3600,
+                now + _TRACE_WRITE_STATS_HEALTH_FUTURE_TOLERANCE_SEC,
+            ),
+        ).fetchall()
+        measured_writer_rows = conn.execute(
+            "SELECT DISTINCT writer_id FROM trace_write_stats "
+            "WHERE day >= %s ORDER BY writer_id",
+            ((today - timedelta(days=6)).isoformat(),),
+        ).fetchall()
+
+    started_epoch = (
+        float(started[0]) if started is not None and started[0] is not None else None
+    )
+    daily: dict[str, dict[str, int]] = {}
+    breakdown: list[dict] = []
+    fields = (
+        "persisted_events", "persisted_bytes",
+        "known_drop_events", "known_drop_bytes",
+        "at_risk_events", "at_risk_bytes",
+    )
+    for row in rows:
+        values = [int(row[index] or 0) for index in range(4, 10)]
+        item = {
+            "day": str(row[0]), "subsystem": str(row[1]),
+            "event_type": str(row[2]), "lane": str(row[3]),
+            **dict(zip(fields, values)),
+        }
+        item["conservative_events"] = (
+            item["persisted_events"] + item["known_drop_events"]
+            + item["at_risk_events"]
+        )
+        item["conservative_bytes"] = (
+            item["persisted_bytes"] + item["known_drop_bytes"]
+            + item["at_risk_bytes"]
+        )
+        breakdown.append(item)
+        totals = daily.setdefault(
+            item["day"], {field: 0 for field in fields}
+        )
+        for field in fields:
+            totals[field] += item[field]
+
+    rendered_daily = []
+    for day, totals in sorted(daily.items()):
+        rendered_daily.append({
+            "day": day,
+            **totals,
+            "conservative_events": (
+                totals["persisted_events"] + totals["known_drop_events"]
+                + totals["at_risk_events"]
+            ),
+            "conservative_bytes": (
+                totals["persisted_bytes"] + totals["known_drop_bytes"]
+                + totals["at_risk_bytes"]
+            ),
+        })
+    peak = max(
+        rendered_daily,
+        key=lambda item: (item["conservative_bytes"], item["day"]),
+        default=None,
+    )
+    elapsed_hours = (
+        max(0.0, (now - started_epoch) / 3600.0)
+        if started_epoch is not None else 0.0
+    )
+    writer_health = []
+    health_writer_ids = set()
+    stale_writer_ids = []
+    for row in health_rows:
+        writer_id = str(row[0])
+        health_writer_ids.add(writer_id)
+        last_success_epoch = float(row[2])
+        stopped_epoch = float(row[7]) if row[7] is not None else None
+        success_age_sec = max(0.0, now - last_success_epoch)
+        stale = (
+            stopped_epoch is None
+            and success_age_sec > _TRACE_WRITE_STATS_HEALTH_STALE_SEC
+        )
+        if stale:
+            stale_writer_ids.append(writer_id)
+        writer_health.append({
+            "writer_id": writer_id,
+            "process_started_epoch": float(row[1]),
+            "last_success_epoch": last_success_epoch,
+            "last_failure_epoch": (
+                float(row[3]) if row[3] is not None else None
+            ),
+            "failures_total": int(row[4] or 0),
+            "max_consecutive_failures": int(row[5] or 0),
+            # A successful production flush publishes zero here as a durable
+            # drain acknowledgement. A failing writer's real backlog remains
+            # process-local, so once its heartbeat is stale even that stored
+            # zero is no longer current evidence and must become unknown.
+            "dirty_rows": None if stale else int(row[6] or 0),
+            "dirty_rows_status": "unknown_stale" if stale else "current",
+            "last_success_age_sec": round(success_age_sec, 3),
+            "missed_heartbeat_intervals": (
+                int(success_age_sec // TRACE_WRITE_STATS_HEARTBEAT_SEC)
+                if stale else 0
+            ),
+            "stopped_epoch": stopped_epoch,
+            "status": "stopped" if stopped_epoch is not None else (
+                "stale" if stale else "healthy"
+            ),
+        })
+    caveats = [dict(entry) for entry in _TRACE_WRITE_STATS_COVERAGE_CAVEATS]
+    measured_writer_ids = {str(row[0]) for row in measured_writer_rows}
+    unregistered_writer_ids = sorted(measured_writer_ids - health_writer_ids)
+    health_complete = (
+        bool(writer_health)
+        and not stale_writer_ids
+        and not unregistered_writer_ids
+    )
+    return {
+        "timezone": "Asia/Shanghai",
+        "window_days": window_days,
+        "measurement_started_epoch": started_epoch,
+        "measurement_elapsed_hours": round(elapsed_hours, 3),
+        # ``days`` controls only the rendered detail window.  Seven's minimum
+        # observation gate is fixed at seven real days and must not be
+        # weakenable via ``--days 1`` on the report CLI.
+        "minimum_measurement_hours": _TRACE_WRITE_STATS_MIN_MEASUREMENT_HOURS,
+        "measurement_ready": (
+            elapsed_hours >= _TRACE_WRITE_STATS_MIN_MEASUREMENT_HOURS
+            and health_complete
+        ),
+        "writer_health": {
+            "heartbeat_interval_sec": TRACE_WRITE_STATS_HEARTBEAT_SEC,
+            "stale_after_sec": _TRACE_WRITE_STATS_HEALTH_STALE_SEC,
+            "complete": health_complete,
+            "stale_writer_ids": stale_writer_ids,
+            "unregistered_writer_ids": unregistered_writer_ids,
+            "writers": writer_health,
+        },
+        "capacity_basis": "daily_peak_not_average",
+        # The caveats ride along with ``peak`` as well as sitting at the top
+        # level.  ``peak`` is the single number capacity planning reads, and a
+        # limitation that lives one level away from the number it limits is one
+        # nobody applies.
+        "coverage_caveats": caveats,
+        "peak": None if peak is None else {**peak, "coverage_caveats": caveats},
+        "daily": rendered_daily,
+        "breakdown": breakdown,
+        "crash_gap": (
+            "abnormal-exit loss is not countable here; correlate process "
+            "liveness to identify the unknown time window"
+        ),
+    }
 
 
 def patch_blob_strict(
@@ -11921,6 +12741,23 @@ def chat_append_and_enqueue(
         # event is repaired by the parent reconciliation loop.
         from core import wake_bus as core_wake_bus
 
+        pending_reviews = [
+            pair
+            for preempted in _preempted_jobs
+            for pair in preempted.recovered_reviews
+        ]
+        if pending_reviews:
+            # 提交之后才 mark_pending:提交前标记等于向影子副本宣告一行可能
+            # 还会回滚的数据。与 `recover_killed_job` 的收尾同形。
+            from tee_shadow import mirror as _tee_mirror
+
+            for review_user_id, source_job_id in pending_reviews:
+                _tee_mirror.mark_pending(
+                    review_user_id,
+                    "v2_trajectory_reviews",
+                    source_job_id,
+                    "requeue",
+                )
         for preempted in _preempted_jobs:
             if preempted.claimed_by is None:
                 continue
@@ -13046,23 +13883,29 @@ def memory_profile_source_stats(user_id: str) -> tuple[int, str]:
     return int(row[0] or 0), str(row[1] or "")
 
 
-def memory_load(user_id: str) -> list[dict]:
-    try:
-        context = _memory_mutation_context(user_id)
-        if context is not None:
-            rows = context[0].execute(
+def memory_load_strict(user_id: str) -> list[dict]:
+    """Load Memory Garden envelopes or propagate the database failure."""
+    context = _memory_mutation_context(user_id)
+    if context is not None:
+        rows = context[0].execute(
+            "SELECT doc FROM memory_moments WHERE user_id = %s "
+            "ORDER BY occurred_at, moment_id",
+            (user_id,),
+        ).fetchall()
+    else:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
                 "SELECT doc FROM memory_moments WHERE user_id = %s "
                 "ORDER BY occurred_at, moment_id",
                 (user_id,),
             ).fetchall()
-        else:
-            with get_pool().connection() as conn:
-                rows = conn.execute(
-                    "SELECT doc FROM memory_moments WHERE user_id = %s "
-                    "ORDER BY occurred_at, moment_id",
-                    (user_id,),
-                ).fetchall()
-        return [r[0] for r in rows]
+    return [r[0] for r in rows]
+
+
+def memory_load(user_id: str) -> list[dict]:
+    """Legacy fail-soft loader; user-visible reads use ``memory_load_strict``."""
+    try:
+        return memory_load_strict(user_id)
     except Exception as e:
         log.error("[db] memory_load(%s) failed: %s", user_id, e)
         return []
@@ -13277,14 +14120,11 @@ def world_book_upsert(user_id: str, entry_id: str, updated_at: str, doc: dict) -
     return True
 
 
-def world_book_delete(user_id: str, entry_id: str) -> bool:
+def world_book_delete_strict(user_id: str, entry_id: str) -> bool:
+    """Delete one World Book row, returning existence and propagating failure."""
     sql = "DELETE FROM world_book_entries WHERE user_id = %s AND entry_id = %s"
-    try:
-        with get_pool().connection() as conn:
-            cur = conn.execute(sql, (user_id, entry_id))
-    except Exception as e:
-        log.error("[db] world_book_delete(%s,%s) failed: %s", user_id, entry_id, e)
-        return False
+    with get_pool().connection() as conn:
+        cur = conn.execute(sql, (user_id, entry_id))
     from tee_shadow import mirror
     mirror.execute_many([
         (sql, (user_id, entry_id)),
@@ -13292,6 +14132,15 @@ def world_book_delete(user_id: str, entry_id: str) -> bool:
          "AND table_name = 'world_book_entries' AND item_id = %s", (user_id, entry_id)),
     ])
     return cur.rowcount > 0
+
+
+def world_book_delete(user_id: str, entry_id: str) -> bool:
+    """Legacy fail-soft World Book delete; strict callers use the named API."""
+    try:
+        return world_book_delete_strict(user_id, entry_id)
+    except Exception as exc:  # noqa: BLE001 - compatibility fail-soft wrapper
+        log.error("[db] world_book_delete(%s,%s) failed: %s", user_id, entry_id, exc)
+        return False
 
 
 def world_book_replace_all(user_id: str, entries: list[dict]) -> None:
@@ -14649,6 +15498,7 @@ def delete_user_data(user_id: str) -> None:
                 # frozen cells are anonymize-merged into user_id='deleted'
                 # instead of dropped (Seven 2026-08-18) so aggregate history
                 # stays true while the per-user linkage dies with the account.
+                chat_cells_dropped = chat_rollup_anonymize_user(conn, user_id)
                 anonymized_cells = lane_rollup_anonymize_user(conn, user_id)
     except Exception as e:
         log.error("[db] delete_user_data(%s) failed: %s", user_id, e)
@@ -14682,6 +15532,12 @@ def delete_user_data(user_id: str) -> None:
     # re-deriving it table-by-table.
     mirror_group.append(
         ("DELETE FROM tee_pending_device_migration WHERE user_id = %s", (user_id,)))
+    if chat_cells_dropped:
+        # Chat cells are dropped, not merged: they carry per-user activity
+        # shape (first/last timestamps, source mix), and summing that across
+        # deleted accounts yields a row nobody can read. The lane cells merge
+        # because they are pure outcome counts.
+        mirror_group.append((_CHAT_ROLLUP_DELETE_SQL, (user_id,)))
     if anonymized_cells:
         # Same additive merge + delete replayed on TEE: additive statements
         # take two consistent stores to the same end state.
@@ -14820,12 +15676,23 @@ def effect_enqueue(
     payload,
     *,
     input_frontier_seq: int | None = None,
+    claimed_by: str | None = None,
 ) -> bool:
     """Insert one row into the generation-fenced effect outbox (spec A4). The
     ON CONFLICT (effect_id) DO NOTHING is the idempotency guarantee: re-enqueuing
     the same logical effect (same job_id/effect_type/ordinal, or same
     generation/effect_type/key for control-plane effects) is a no-op. Returns
-    True if this call actually inserted the row, False if it already existed."""
+    返回值按分支不同,别混用:
+      * unfenced(``claimed_by is None``)—— True=本次插入,False=已存在。
+      * fenced —— True=**这条 effect 已持久**(本次插入或幂等重放都算),
+        False=**栅栏拒绝**(租约丢失/换了持有者/job 不再 running)。
+        fenced 分支下 False 绝不是「已存在」,调用方必须当成写被拒绝。
+
+    ``claimed_by`` opts into the owner-fenced form: the source job row is
+    locked and rechecked (same user, still ``running``, same owner, live lease)
+    in the SAME transaction as the insert. Pass it from any lane whose replay
+    safety is decided by "did this job already write?" — see the comment at the
+    fenced branch below."""
     import json
     if input_frontier_seq is not None and (
         type(input_frontier_seq) is not int or input_frontier_seq < 0
@@ -14834,19 +15701,78 @@ def effect_enqueue(
             "input_frontier_seq must be a non-negative integer or None"
         )
     frontier_seq = input_frontier_seq
+    if claimed_by is None:
+        with get_pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO v2_effect_outbox "
+                    "(effect_id,user_id,job_id,effect_type,expected_generation,"
+                    " payload,input_frontier_seq) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (effect_id) DO NOTHING",
+                    (effect_id, user_id, job_id, effect_type,
+                     int(expected_generation), json.dumps(payload), frontier_seq),
+                )
+                inserted = cur.rowcount == 1
+        return inserted
+
+    from psycopg.rows import dict_row
+
+    # Owner-fenced form. Without it the replay-safety predicate has a TOCTOU
+    # window: a recovery path can lock the job row, see no durable effect, and
+    # requeue — while the old worker is still between its lease renewal and
+    # this bare INSERT. The row lands afterwards and the replayed turn repeats
+    # the side effect. `start_mcp_mutation_attempt` already closes the same
+    # window for remote writes by taking the job row lock in its own
+    # transaction; platform writes must be linearized the same way.
+    #
+    # Fails closed: a lost lease, a changed owner, or a job that is no longer
+    # running inserts nothing and returns False. The caller treats that as a
+    # write refusal, not as an idempotent no-op.
     with get_pool().connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO v2_effect_outbox "
-                "(effect_id,user_id,job_id,effect_type,expected_generation,payload,"
-                " input_frontier_seq) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s) "
-                "ON CONFLICT (effect_id) DO NOTHING",
-                (effect_id, user_id, job_id, effect_type, int(expected_generation),
-                 json.dumps(payload), frontier_seq),
-            )
-            inserted = cur.rowcount == 1
-    return inserted
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT user_id,status,claimed_by,lease_expires_at "
+                    "FROM agent_jobs WHERE id=%s FOR UPDATE",
+                    (job_id,),
+                )
+                row = cur.fetchone()
+                lease_valid = False
+                if row is not None and row["lease_expires_at"] is not None:
+                    cur.execute(
+                        "SELECT %s::timestamptz > clock_timestamp() AS valid",
+                        (row["lease_expires_at"],),
+                    )
+                    lease_valid = bool(cur.fetchone()["valid"])
+                if (
+                    row is None
+                    or str(row["user_id"]) != str(user_id)
+                    or str(row["status"]) != "running"
+                    or str(row["claimed_by"] or "") != str(claimed_by)
+                    or not lease_valid
+                ):
+                    return False
+                cur.execute(
+                    "INSERT INTO v2_effect_outbox "
+                    "(effect_id,user_id,job_id,effect_type,expected_generation,"
+                    " payload,input_frontier_seq) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (effect_id) DO NOTHING",
+                    (effect_id, user_id, job_id, effect_type,
+                     int(expected_generation), json.dumps(payload), frontier_seq),
+                )
+                if cur.rowcount == 1:
+                    return True
+                # ON CONFLICT DO NOTHING also yields rowcount 0 for a genuine
+                # retry of the same logical effect. Resolve it inside the same
+                # transaction so the caller can tell "already durable" from
+                # "the fence refused" without a second, racy round trip.
+                cur.execute(
+                    "SELECT 1 FROM v2_effect_outbox WHERE effect_id=%s",
+                    (effect_id,),
+                )
+                return cur.fetchone() is not None
 
 
 def effect_pending(user_id, *, due_prefix_only: bool = False) -> list[dict]:

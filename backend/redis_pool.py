@@ -1,4 +1,10 @@
-"""进程内共享的 Redis 连接池（TEE Redis CVM 客户端）。
+"""已废弃的 Redis 连接池（TEE Redis CVM 客户端）。
+
+.. deprecated:: 2026-08-20
+   三套 Redis CVM 已暂停，且本模块从未接入业务请求路径。实现暂时保留用于
+   审计和未来评估，但 ``redis_configured()`` 固定返回 ``False``，
+   ``get_redis()`` 固定拒绝构造客户端。重新启用前必须先完成新的接入 spec、
+   恢复基础设施与监控，并移除这里的退役门禁。
 
 低层基础设施客户端，**无业务依赖**——与 object_storage.py / db.py 同层，
 任何领域包都可向下 import（依赖方向见 CONTRIBUTING.md §2）。使用规范
@@ -46,14 +52,15 @@ _DEFAULT_PORT = 443
 # 超上限时抛错 → 调用方降级 PG（缓存可接受）；某条热路径真需要再调 REDIS_MAX_CONNECTIONS。
 _DEFAULT_MAX_CONNECTIONS = 16
 
+_DEPRECATION_MESSAGE = (
+    "redis_deprecated: Redis 基础设施已于 2026-08-20 暂停，客户端入口已退役；"
+    "重新启用前需先完成新的接入 spec 和基础设施评审"
+)
+
 
 def redis_configured() -> bool:
-    """本环境是否配了 Redis。没配时调用方应完全走 PG，不碰 Redis。
-
-    以 REDIS_HOST 为准（口令/CA 缺失属配置错误，会在 get_redis() 里显式报错，
-    而不是在这里静默判为「未配置」）。
-    """
-    return bool(os.environ.get("REDIS_HOST"))
+    """退役期间固定返回 ``False``，即使遗留环境变量仍然存在。"""
+    return False
 
 
 def _ca_certs_path() -> Optional[str]:
@@ -122,17 +129,8 @@ def _build_client() -> "aioredis.Redis":
 
 
 def get_redis() -> "aioredis.Redis":
-    """返回进程内共享的池化 async Redis 客户端（首调惰性构造）。
-
-    构造不建立连接（redis-py 在首条命令时才连），故本函数不阻塞、不发网络。
-    未配置 REDIS_HOST 时抛 RuntimeError —— 调用方应先 redis_configured() 判断。
-    """
-    global _client
-    if _client is None:
-        with _lock:
-            if _client is None:
-                _client = _build_client()
-    return _client
+    """拒绝构造客户端；实现仅为未来重新评审保留。"""
+    raise RuntimeError(_DEPRECATION_MESSAGE)
 
 
 async def close_redis() -> None:

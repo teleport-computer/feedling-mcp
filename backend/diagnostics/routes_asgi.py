@@ -127,7 +127,10 @@ async def debug_trace_read(request: Request, auth: AuthResult = Depends(require_
     return JSONResponse(body, status_code=status)
 
 
-@router.post("/v1/debug/trace/enable")
+@router.post(
+    "/v1/debug/trace/enable",
+    responses={500: {"description": "Trace preference could not be persisted"}},
+)
 async def debug_trace_enable(request: Request, auth: AuthResult = Depends(require_auth)):
     payload = (await _read_json_silent(request)) or {}
     body, status = await threadpool.run_db(

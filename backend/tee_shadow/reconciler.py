@@ -15,7 +15,9 @@ import logging
 
 import db
 from psycopg import errors as pg_errors
+from psycopg import sql
 from psycopg.types.json import Jsonb
+from plaintext_shadow.config import TargetPolicy
 from tee_shadow import mirror
 
 log = logging.getLogger("feedling.tee_shadow")
@@ -73,11 +75,44 @@ TABLES: dict[str, tuple[tuple[str, ...], str]] = {
     "lane_daily_rollup": (
         ("user_id", "day", "route", "lane", "enqueue_source"),
         "user_id, day, route, lane, enqueue_source, completed, failed, "
-        "expired, superseded, failure_codes, frozen_at",
+        "expired, superseded, failure_codes, "
+        # ⚠️ 说话四列（0093 / tee 0025）必须列在这里。漏列**不会报错**——扶正
+        # 会把它们按默认值 0 写进 TEE，而 test 的 primary 就是 TEE，于是被读的
+        # 那一份悄悄变成「谁都没说过话」。列漂移交给
+        # test_reconciler_columns_cover_the_whole_table 守，别再靠人记得改这行。
+        "spoke, spoke_completed, silent_declared, silent_undeclared, "
+        "frozen_at",
     ),
     "lane_rollup_watermark": (
         ("route",),
-        "route, backfill_from, through_day, frozen_at",
+        "route, backfill_from, through_day, voice_from, frozen_at",
+    ),
+    # 聊天格子（0094 / tee 0026）。同样写后不变、语句幂等，按 PK 对齐即收敛。
+    "chat_daily_rollup": (
+        ("user_id", "day"),
+        "user_id, day, total, user_messages, agent_messages, image_messages, "
+        "proactive_messages, model_api_user_messages, "
+        "model_api_agent_messages, model_api_greetings, first_ts, last_ts, "
+        "proactive_last_ts, last_user_ts, last_agent_ts, by_role, by_source, "
+        "by_content_type, live_activity_status, alert_status, frozen_at",
+    ),
+    "chat_rollup_watermark": (
+        ("scope",),
+        "scope, backfill_from, through_day, frozen_at",
+    ),
+    # T138 块0的速率尺子。每个 writer_id 写自己的单调绝对值，热镜像可安全重放；
+    # reconciler 仍负责把影子写失败后的旧值扶正到源库终值。
+    "trace_write_stats": (
+        ("day", "writer_id", "subsystem", "event_type", "lane"),
+        "day, writer_id, subsystem, event_type, lane, persisted_events, "
+        "persisted_bytes, known_drop_events, known_drop_bytes, at_risk_events, "
+        "at_risk_bytes, first_seen_at, updated_at",
+    ),
+    "trace_write_stats_health": (
+        ("writer_id",),
+        "writer_id, process_started_at, last_success_at, last_failure_at, "
+        "failures_total, max_consecutive_failures, dirty_rows, stopped_at, "
+        "updated_at",
     ),
 }
 
@@ -111,6 +146,12 @@ _IDENTITY_TABLES: dict[str, str] = {"user_logs": "seq", "notify_relay_logs": "id
 BATCH = 1000
 
 
+def _target_pool(target_policy: TargetPolicy | None = None):
+    if target_policy is None:
+        return mirror.get_tee_pool()
+    return mirror.get_target_pool(target_policy)
+
+
 def _wrap_jsonb(row: tuple) -> tuple:
     """psycopg3 读回的 jsonb 值是普通 dict 或 list（JSON 数组，例如
     global_blobs 的 access_link_tokens 整个 doc 就是顶层数组）；原样作为参数
@@ -134,7 +175,12 @@ def _json_safe_cursor(vals: tuple) -> list | None:
     return out
 
 
-def reconcile_table(table: str, *, prune: bool = True) -> dict:
+def reconcile_table(
+    table: str,
+    *,
+    prune: bool = True,
+    target_policy: TargetPolicy | None = None,
+) -> dict:
     pk, cols = TABLES[table]
     col_list = [c.strip() for c in cols.split(",")]
     pk_idx = [col_list.index(c) for c in pk]
@@ -161,7 +207,7 @@ def reconcile_table(table: str, *, prune: bool = True) -> dict:
                          f"ORDER BY {order_by} LIMIT %s")
 
     copied = pruned = rds_rows = 0
-    with db.get_pool().connection() as src, mirror.get_tee_pool().connection() as dst:
+    with db.get_pool().connection() as src, _target_pool(target_policy).connection() as dst:
         # Keyset pagination on the pk (not a server-side named cursor): both
         # pools run autocommit=True, and named cursors need an explicit
         # transaction wrapper under autocommit — plain LIMIT/keyset avoids
@@ -272,6 +318,89 @@ def reconcile_table(table: str, *, prune: bool = True) -> dict:
               "skipped": skipped, "rds_rows": rds_rows, "tee_rows": tee_rows}
     log.info("[reconcile] %s", report)
     return report
+
+
+def reconcile_keys(
+    table: str,
+    keys: list[dict],
+    *,
+    target_policy: TargetPolicy | None = None,
+) -> dict:
+    """Re-read and converge current rows for MIRROR-lane dirty keys."""
+    if table not in TABLES:
+        raise RuntimeError(f"mirror keyed replay is not configured for {table}")
+    if any(not key for key in keys):
+        return reconcile_table(table, target_policy=target_policy)
+
+    pk, cols = TABLES[table]
+    col_list = [column.strip() for column in cols.split(",")]
+    missing = [sorted(set(pk) - set(key)) for key in keys]
+    if any(missing):
+        raise ValueError("dirty key does not match mirror primary key")
+
+    identifiers = sql.SQL(", ").join(sql.Identifier(column) for column in col_list)
+    predicates = sql.SQL(" AND ").join(
+        sql.SQL("{} = %s").format(sql.Identifier(column)) for column in pk
+    )
+    select_sql = sql.SQL("SELECT {} FROM {} WHERE {}").format(
+        identifiers, sql.Identifier(table), predicates
+    )
+    delete_sql = sql.SQL("DELETE FROM {} WHERE {}").format(
+        sql.Identifier(table), predicates
+    )
+    placeholders = sql.SQL(", ").join(sql.Placeholder() for _ in col_list)
+    conflicts = sql.SQL(", ").join(sql.Identifier(column) for column in pk)
+    non_pk = [column for column in col_list if column not in pk]
+    if non_pk:
+        action = sql.SQL("DO UPDATE SET {} ").format(
+            sql.SQL(", ").join(
+                sql.SQL("{} = EXCLUDED.{}").format(
+                    sql.Identifier(column), sql.Identifier(column)
+                )
+                for column in non_pk
+            )
+        )
+    else:
+        action = sql.SQL("DO NOTHING")
+    overriding = (
+        sql.SQL(" OVERRIDING SYSTEM VALUE")
+        if table in _IDENTITY_TABLES
+        else sql.SQL("")
+    )
+    upsert_sql = sql.SQL(
+        "INSERT INTO {} ({}){} VALUES ({}) ON CONFLICT ({}) {}"
+    ).format(
+        sql.Identifier(table),
+        identifiers,
+        overriding,
+        placeholders,
+        conflicts,
+        action,
+    )
+
+    applied = deleted = 0
+    with db.get_pool().connection() as src, _target_pool(target_policy).connection() as dst:
+        for key in keys:
+            params = tuple(key[column] for column in pk)
+            # consumer_state is intentionally outside the mirror scope.
+            row = None if table == "user_blobs" and key.get("kind") == "consumer_state" else src.execute(
+                select_sql, params
+            ).fetchone()
+            with dst.transaction():
+                if row is None:
+                    deleted += dst.execute(delete_sql, params).rowcount
+                else:
+                    dst.execute(upsert_sql, _wrap_jsonb(row))
+                    applied += 1
+
+        seq_col = _IDENTITY_TABLES.get(table)
+        if seq_col and applied:
+            dst.execute(
+                f"SELECT setval(pg_get_serial_sequence(%s, %s), "
+                f"GREATEST((SELECT COALESCE(MAX({seq_col}), 1) FROM {table}), 1))",
+                (table, seq_col),
+            )
+    return {"table": table, "applied": applied, "deleted": deleted}
 
 
 def reconcile_all() -> list[dict]:

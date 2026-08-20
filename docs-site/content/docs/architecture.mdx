@@ -42,6 +42,7 @@ deployment topology.
 | Managed CPU recorder | Retain bounded host and per-container CPU history without a public endpoint | Infrastructure identifiers and numeric CPU/load samples only; no application content |
 | Model or push provider | Perform user-selected inference or device delivery | The plaintext and delivery material required by that external service |
 | ElevenLabs voice service | Transcribe and segment speech, manage interruption, and synthesize the selected voice | Call audio, transcript text, and the assistant text returned for speech |
+| Provider-chosen image URL | Serve a generated image that the provider returned as a link instead of inline bytes | The URL the provider chose — including any path or query it encoded — plus ordinary request metadata such as the Host header and the deployment's outbound address. No Feedling-held credential, cookie, prompt, or request body is attached. Only the image endpoint's `data[].url` is eligible, it must resolve to a publicly routable address, redirects are not followed, and the bytes must decode as a PNG, JPEG or WebP within fixed size and time budgets |
 
 The component that stores a record is therefore not always the component that
 can interpret its protected body. Conversely, “encrypted at rest” does not mean
@@ -94,6 +95,15 @@ transcript. Only summary-covered replay is optional; uncovered rows are never
 clipped. If the required core is too large, the runner first compacts only a
 safe answered prefix and rebuilds the prompt from the new durable watermark.
 
+Replies emitted through the model's `reply` tool are persisted immediately as
+intermediate bubbles. If a scheduled wake then closes with no additional text,
+Runtime V2 promotes the last eligible bubble by reusing its encrypted envelope
+rather than creating a duplicate message. A promotion that consumed a newly
+folded user turn advances the reply cursor through that exact sequence; a purely
+proactive promotion terminalizes the wake without advancing the cursor. Both
+forms recheck the source-job owner and input frontier in the publication
+transaction.
+
 Every Chat and proactive wake turn decrypts the current agent identity card just
 in time and places its complete readable view in the trusted system prefix. An
 absent, unreadable, local-only, or still-default card falls back to the encrypted
@@ -124,7 +134,8 @@ decrypted for search. Every call is bounded by row, byte, and deadline budgets
 with an authenticated resumable cursor, and an incomplete scan is reported as
 incomplete rather than as an empty result. These tools are never offered to
 proactive wake lanes or subagents; a turn that reads history drops outbound
-web/MCP/task tools for the following round, and a deployment kill switch
+web and `task` tools for the following round while user-configured MCP tools
+remain available, and a deployment kill switch
 removes the capability entirely without touching the normal chat path.
 
 Runtime V2 coverage accounting is permanently metadata-only. Maintenance and
@@ -208,9 +219,9 @@ schema contract together. In the promoted mode, application startup performs a
 read-only assertion against `alembic_tee_version`; it never applies the legacy
 RDS migration chain with the application role. Startup also requires the
 head-bound frozen-prepare marker and enabled Chat lifecycle triggers, so a
-schema-only or partial cutover fails closed. Shadow dual-write and its
-reconciliation scheduler are disabled in this mode, including when stale
-shadow variables remain present.
+schema-only or partial cutover fails closed. The legacy RDS-to-TEE shadow
+dual-write and its reconciliation scheduler are disabled in this mode,
+including when stale legacy shadow variables remain present.
 
 Managed release units pass the same schema selector to the API, in-CVM worker,
 and independent runner. Before a TEE-primary deployment mutates any confidential
@@ -240,6 +251,37 @@ lossless switch-back target only until the first write reaches the promoted
 database. After that boundary, rollback requires a stopped-write reverse
 reconciliation or restore; changing only the connection string would discard
 new and updated rows and could resurrect deleted state.
+
+### Decrypted plaintext shadow
+
+After TEE-primary promotion, the managed topology can optionally maintain an
+independent PostgreSQL projection for operational recovery and inspection. The
+TEE database remains the only application primary. Source triggers record
+content-free dirty keys, and a singleton scheduler in the main backend re-reads
+the authoritative rows, decrypts encrypted envelopes inside the managed
+confidential-VM boundary, and writes their plaintext projection to the shadow.
+This applies even to accounts whose content-encryption preference is explicitly
+`on`; the shadow is deliberately an all-plaintext recipient.
+
+The plaintext shadow is not queried by public APIs, hosted workers, or resident
+runners and is not a failover database. Those release units do not receive its
+credential. If it is unavailable, application traffic continues against the
+TEE primary while source-side dirty keys retry with bounded backoff; repeated
+failures quarantine a key for operator review instead of dropping it.
+
+Enabling this projection is a second, protected deployment gate after TEE
+promotion. It requires a distinct TLS PostgreSQL 17 endpoint, matching schema,
+least-privilege roles, a recent backup-and-restore drill, a complete backfill,
+an empty change queue, exact count/content verification, and no ciphertext
+envelope shapes in the target. Backup artifact, capacity, connection-limit, HA,
+restore-verifier, and live target-identity claims must be supplied by the
+external infrastructure verification process as a signed attestation; unsigned
+operator-entered claims cannot authorize the gate. The canonical payload and
+full signature remain in the primary and are verified again on every preflight;
+application and replication roles cannot directly modify evidence rows. The target, its WAL, snapshots, replicas, and
+backups are all plaintext recipients. Access to any of them defeats the
+at-rest confidentiality provided by the encrypted tier in the primary, so they
+need independent credentials, retention, audit, and incident-response policy.
 
 The staged worker refreshes after a successful dream write, after Runtime V2
 cutover, and best-effort after Chat when a profile is missing, eligible for
@@ -602,8 +644,9 @@ reply, recursive task, mutating MCP, platform-effect, or workspace-write
 surface. Multiple independent children may run in parallel and return bounded
 results to the parent.
 
-Runtime V2 builds a bounded MCP catalog once per Chat turn after loading each
-enabled server. A server with `resident=false` contributes qualified tool names,
+Runtime V2 builds a bounded MCP catalog once per Chat or proactive wake turn
+after loading each enabled server. A server with `resident=false` contributes
+qualified tool names,
 short descriptions, and closed empty parameter shells; complete schemas remain
 in process memory. The platform `mcp_tool_search` tool can resolve only names
 already admitted to that catalog. The provider loop freezes those names at turn
@@ -614,7 +657,7 @@ mutation-attempt marker. `resident=true` supplies complete schemas from the
 first provider round instead.
 
 Enabled user MCP servers are treated as user-selected infrastructure. Their
-bounded streamable-HTTP `instructions` may enter the Chat system context, and
+bounded streamable-HTTP `instructions` may enter the Chat or wake system context, and
 MCP tools are not removed merely because a turn has read private application
 data or observed an earlier MCP result. This permits multi-step remote memory
 flows, but also means model-selected arguments can carry private context to any
@@ -664,9 +707,11 @@ states are admitted optimistically; a confirmed rejection is learned by the
 screen-only text fallback. The official resident path still requires a setup
 probe `ok` signal. Screen content is evidence only and
 cannot supply requirements or instructions. A turn receiving screen pixels has
-web, MCP, and `task` removed before its first provider call; an image-rejection
+web, mutating MCP, and `task` removed before its first provider call; read-only
+user MCP remains available. An image-rejection
 retry stays behind the same fence. After any other explicit text-bearing private
-read, those outbound tools are removed for the remainder of the turn. Numeric
+read, web and `task` are removed for the remainder of the turn while
+user-configured MCP remains available, including mutations. Numeric
 health snapshot/trend reads remain compatible with outbound work.
 
 ### Runtime V2 prompt caching
@@ -685,8 +730,9 @@ profile checkpoint.
 
 Editable `/memory/WORKING.md` is encrypted persistent state, but it is pull-only
 through `workspace_read`, not silently injected into future prompts or cache
-prefixes. After private workspace state is read, later outbound web, MCP, and
-`task` tools are unavailable for the remainder of that turn.
+prefixes. After private workspace state is read, later outbound web and `task`
+tools are unavailable for the remainder of that turn. User-configured MCP tools
+remain available under the separate user-infrastructure trust boundary.
 
 The current Pre canary proves an OpenRouter cache read over a stable synthetic
 conversation prefix. Native Bedrock and the deployed trusted-skills boundary

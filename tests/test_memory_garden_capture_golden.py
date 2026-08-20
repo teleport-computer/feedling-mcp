@@ -1,14 +1,19 @@
-"""落卡 prompt 的基线快照 —— 守「行为逐字节不变」。
+"""落卡 prompt 的基线快照 —— 守「行为不再意外漂移」。
 
-fixture 里的五组文本是在 **origin/test 基线的 checkout 上**跑出来的，
-比对的是 io 侧兼容壳 ``memory.capture_prompt_v1.build_capture_prompt``
-（它的签名在基线与本分支上完全一致，所以能端到端对比）。
+⚠️ **2026-08-20 换了一代基线。** 之前这份 fixture 是提取前的中文原文，测试用
+「除语言段外逐字节相同」的方式证明重构没改行为。这次把整套指令换成英文
+（桶名只发一套、语言由宿主指定），那种对照方式失效了 —— 差异是全局的，不是
+局部的，继续做局部剥离只会把真回归也剥掉。
 
-覆盖的边界：典型输入 / 全空 / 中英混合 / 名字带前后空格（走 sanitize）/
-正文里含花括号（会撞 ``str.format``）。
+所以基线重新生成自本分支。**重新生成 golden 是能掩盖真回归的动作**，因此下面
+补了一组「守意图」的断言：它们直接检查这次改动想要的性质（指令是英文、桶名只
+发一套、语言被显式指定、称呼规则跟着花园语言走），而不是只比对一个不透明的
+字符串。fixture 负责挡后续的意外漂移，断言负责挡「基线本身就是错的」。
 
-这些一旦红，说明模板结构、默认档措辞、或称呼装配被改动了 —— 那是行为变更，
-不能混在重构批次里悄悄发生。
+比对的是 io 侧兼容壳 ``memory.capture_prompt_v1.build_capture_prompt``。
+
+覆盖的边界：典型输入 / 全空 / 中英混合但花园是中文 / 真英文花园 /
+名字带前后空格（走 sanitize）/ 正文里含花括号（会撞 ``str.format``）。
 """
 from __future__ import annotations
 
@@ -38,10 +43,12 @@ CASES: dict[str, dict] = {
         identity="认识 214 天，伴侣关系",
         window="用户：今天开了一天会，心率一直很高\n我：辛苦了，早点休息",
         cards="卡1: 老婆是重庆人",
+        locale="zh-Hans",
     ),
     "all_empty": dict(
         ai_name="", user_name="", buckets="", threads="",
         identity="", window="", cards="",
+        locale="zh-Hans",
     ),
     "mixed_language": dict(
         ai_name="Iris",
@@ -51,6 +58,17 @@ CASES: dict[str, dict] = {
         identity="met 30 days ago",
         window="user: shipped the migration today\nme: nice, 辛苦了",
         cards="c1: prefers oat milk",
+        locale="zh-Hans",  # 混合语料但花园是中文桶 —— 桶不许因此裂开
+    ),
+    "english_garden": dict(
+        ai_name="Iris",
+        user_name="Alex",
+        buckets="Work / Health / Pets",
+        threads="standup, running",
+        identity="met 30 days ago",
+        window="user: bombed the interview today, feeling rough\nme: want to talk about it?",
+        cards="c1: prefers oat milk",
+        locale="en",
     ),
     "name_needs_sanitize": dict(
         ai_name="  io  ",
@@ -60,6 +78,7 @@ CASES: dict[str, dict] = {
         identity="（暂无）",
         window="用户：随便聊聊\n我：好啊",
         cards="",
+        locale="zh-Hans",
     ),
     "braces_in_content": dict(
         ai_name="io",
@@ -69,6 +88,7 @@ CASES: dict[str, dict] = {
         identity="（暂无）",
         window='用户：这个 JSON {"a": 1} 报错了\n我：我看看',
         cards='卡1: 他在调 {"cards": []} 的解析',
+        locale="zh-Hans",
     ),
 }
 
@@ -81,60 +101,88 @@ def test_fixture_covers_every_case():
     assert set(_baseline()) == set(CASES), "fixture 与用例集合不同步"
 
 
-#: 语言规则统一（2026-08-14）之后，产出与基线的差异**只允许出现在语言那一段**。
-#: 基线快照仍是改造前的原文，不更新 —— 它的价值就在于持续证明「只改了那一段」。
-_LANG_BLOCK_MARKERS = ("   · 语言：", "   · 称呼：")
+@pytest.mark.parametrize("case_name", sorted(CASES))
+def test_prompt_is_byte_identical_to_baseline(case_name):
+    """逐字节不变 —— 挡后续的意外漂移。
 
-_T100_WORDING_PAIRS = (
-    ("你刚和 TA 聊了一段", "你们刚聊了一段"),
-    ("（TA 改主意/纠正了）", "（这个人改主意/纠正了）"),
-    ("对 TA 的影响", "对这个人的影响"),
-    ("这些卡是 TA 会亲眼看到的、你写下的记忆", "这些卡会由这个人亲眼看到，是你写下的记忆"),
-    ("不是你对 TA 本人的称呼", "不是你对这个人的称呼"),
-    ("说的是 TA 还是 TA 的客户", "说的是这个人还是这个人的客户"),
-    ("这事对理解 TA 多重要", "这事对理解这个人多重要"),
-    ("不是 TA 多激动", "不是这个人多激动"),
-    ("你作为 TA 的伴侣", "你作为这个人的伴侣"),
-    ("这些卡 TA 会亲眼看到", "这些卡会由这个人亲眼看到"),
-    ("你和 TA 的关系", "你们的关系"),
-    ("TA 的原话值得留", "这个人的原话值得留"),
-    ("塑造你对 TA 的理解、或 TA 会希望你记得", "塑造你对眼前这个人的理解、或这个人会希望你记得"),
-    ("透出 TA 状态", "透出这个人状态"),
-    ("它是 TA 明确在意的", "它是这个人明确在意的"),
-    ("改变我对 TA 的理解？TA 会希望我记得吗？", "改变我对这个人的理解？这个人会希望我记得吗？"),
-)
-
-
-def _apply_t100_wording(text: str) -> str:
-    for old, new in _T100_WORDING_PAIRS:
-        assert old in text, f"T100 基线措辞缺失：{old}"
-        text = text.replace(old, new)
-    return text.replace("——TA 的伴侣", "——这个人 的伴侣")
-
-
-def _strip_language_block(text: str) -> str:
-    start = text.index(_LANG_BLOCK_MARKERS[0])
-    end = text.index(_LANG_BLOCK_MARKERS[1])
-    return text[:start] + text[end:]
+    这条红了不一定是 bug，但一定是**行为变更**：要么它是你有意改的（那就连同
+    下面那组「守意图」断言一起更新，并重新生成 fixture），要么它是别处改动
+    漏出来的副作用（那就是回归）。两者都不该悄悄发生。
+    """
+    assert build_via_shell(**CASES[case_name]) == _baseline()[case_name]["text"]
 
 
 @pytest.mark.parametrize("case_name", sorted(CASES))
-def test_everything_except_the_language_block_is_byte_identical_to_baseline(case_name):
-    """除语言段外逐字节不变 —— 守住「这次只动了语言那一段」。"""
-    expected = _apply_t100_wording(_baseline()[case_name]["text"])
-    actual = build_via_shell(**CASES[case_name])
-    assert _strip_language_block(actual) == _strip_language_block(expected)
-
-
-@pytest.mark.parametrize("case_name", sorted(CASES))
-def test_language_block_now_comes_from_the_shared_rule(case_name):
-    """语言段本身换成了共用规则（capture 与 genesis 同源）。"""
+def test_language_block_comes_from_the_shared_rule(case_name):
+    """语言段来自共用规则，且**目标语言是被指定的、不是让模型猜的**。"""
     from memory_garden.policies import language_rule
 
+    locale = CASES[case_name]["locale"]
     actual = build_via_shell(**CASES[case_name])
-    assert language_rule("conversation_capture", indent="     ", first_prefix="   · ") in actual
-    # 旧的内联文本不许再出现
+    assert language_rule(
+        "conversation_capture", locale=locale, indent="     ", first_prefix="   · "
+    ) in actual
+    # 「跟着对话的语言走」那种让模型自己判的措辞不许再出现在 capture 里 ——
+    # 宿主已经算出来了，再让模型猜一次就是多一处漂移点。
+    assert "the language of your conversation" not in actual
     assert "用 TA 跟你对话的语言记" not in actual
+
+
+@pytest.mark.parametrize("case_name", sorted(CASES))
+def test_only_one_bucket_language_is_offered(case_name):
+    """桶名只发一套 —— 这次改动的核心。
+
+    旧做法把中英两套桶一起塞进去让模型挑，实测约 1/3 的中文记忆被贴上英文桶，
+    才需要 ``normalize_bucket_language`` 常态纠错。给模型一个它不该做的选择题，
+    它就会做错。
+    """
+    from memory_garden.prompts.buckets import BUCKET_SETS
+
+    locale = CASES[case_name]["locale"]
+    actual = build_via_shell(**CASES[case_name])
+    other = "en" if locale == "zh-Hans" else "zh-Hans"
+    assert BUCKET_SETS[locale] in actual, "该发的那套桶不见了"
+    assert BUCKET_SETS[other] not in actual, "另一套桶又被塞进来了 —— 模型会挑错"
+
+
+@pytest.mark.parametrize("case_name", sorted(CASES))
+def test_naming_rule_follows_the_garden_language(case_name):
+    """称呼规则跟着花园语言走。
+
+    它整段会原样插进提示词。英文花园里插一段中文，等于给模型发混合信号 ——
+    实测最容易让它顺着写出中文卡。
+    """
+    actual = build_via_shell(**CASES[case_name])
+    marker = "How to refer to them: "
+    rule = actual[actual.index(marker) + len(marker):].split("\n", 1)[0]
+    if CASES[case_name]["locale"] == "en":
+        assert rule.startswith("Refer to ") or rule.startswith("If the material")
+    else:
+        assert "「" in rule or "不要用" in rule
+
+
+def test_instructions_are_english_and_only_literals_stay_chinese():
+    """指令是英文；剩下的中文必须都是**不该翻译的字面串**。
+
+    桶名、禁用词举例（「用户」「TA」）、线索举例 —— 这些是模型要照抄或要避开的
+    具体字符串，翻译了就是教错。除此之外的中文说明都算漏网。
+    """
+    import re
+
+    text = build_via_shell(**CASES["all_empty"])  # 全空 = 只剩模板本身
+    chinese_runs = re.findall(r"[一-鿿]{2,}", text)
+    allowed = set(
+        "工作 目标与成长 家庭 朋友 宠物 我们的关系 情绪与安抚 偏好与边界 "
+        "个性与价值观 健康 爱好 金钱 饮食 地点与旅行 用户 对方 争执 吵架 "
+        "妈妈 界面 留存 满意度 用户界面 用户留存 健康 简体中文 这个人 "
+        "不要用 指代本人的 猜测性别的他 也不要用第二人称 来指代本人 "
+        "如果材料里明确出现了本人希望被称呼的名字 就用那个名字 "
+        "没有名字时优先省略主语 例如 常在深夜写代码 累了会突然沉默 "
+        "需要主语时 按身份卡 你们的关系 旧卡和对话里的线索判断性别 "
+        "用 或 线索不足以判断 才用中性的".split()
+    )
+    leaked = [run for run in chinese_runs if run not in allowed]
+    assert not leaked, f"这些中文说明没翻译干净：{sorted(set(leaked))}"
 
 
 @pytest.mark.parametrize("policy_name", [None, "", "conversation_capture"])
@@ -148,15 +196,14 @@ def test_kernel_default_and_fallbacks_match_baseline_typical(policy_name):
 
     args = dict(CASES["typical"])
     raw_name = args.pop("user_name")
+    locale = args["locale"]
     text = build_via_kernel(
         user_name=sanitize_user_name(raw_name),
-        naming_rule=_naming_rule(raw_name),
+        naming_rule=_naming_rule(raw_name, locale=locale),
         policy=policy_name,
         **args,
     )
-    assert _strip_language_block(text) == _strip_language_block(
-        _apply_t100_wording(_baseline()["typical"]["text"])
-    )
+    assert text == _baseline()["typical"]["text"]
     # 三种传法（没传 / 空串 / 显式默认档）必须产出完全同一份
     assert text == build_via_shell(**CASES["typical"])
 
@@ -168,7 +215,7 @@ def _kernel_args() -> dict:
     raw_name = args.pop("user_name")
     return dict(
         user_name=sanitize_user_name(raw_name),
-        naming_rule=_naming_rule(raw_name),
+        naming_rule=_naming_rule(raw_name, locale=args["locale"]),
         **args,
     )
 

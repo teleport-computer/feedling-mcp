@@ -13,7 +13,7 @@ scheduler、verify、snapshot 三处消费，必须能在任何上下文里安�
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 # 热路径双写：写主库的同时经 tee_shadow.mirror.execute 尽力而为地写 TEE。
 # 适用于低频写的明文运维表。
@@ -49,6 +49,16 @@ class Entry:
     # True = 这张表不由 alembic 迁移链创建（人工 SQL 建的，如一次性备份表）。
     # 守卫据此放行"注册表里有、迁移链里没有"的条目；不标就当成表名打错。
     manual: bool = False
+    # Plaintext-shadow dirty-key capture records these identifiers only.  They
+    # are asserted against pg_catalog so a schema change cannot silently make
+    # replay address the wrong row.
+    key_columns: tuple[str, ...] = ()
+    # Most targets keep the source name.  frame_envelopes is transformed into
+    # the historical `frames` plaintext shape.
+    destination_table: str | None = None
+    # None means capture the real primary key.  An empty tuple means a table-
+    # level dirty marker: required when the primary key itself is a secret.
+    capture_key_columns: tuple[str, ...] | None = None
     # None = 按 lane 推导（非 SKIP 必需、SKIP 不必需）。SKIP lane 上的
     # TEE-primary 本地 staging/观测表必须显式 True，避免复制策略被误当成 DDL 豁免。
     required_in_tee: bool | None = None
@@ -99,6 +109,32 @@ REGISTRY: dict[str, Entry] = {
         MIRROR,
         "格子覆盖水位（每 route 一行，through_day 原地 UPDATE），与当日格子同组"
         "镜像——TEE 侧水位若滞后，cutover 后会把「已冻结」误读成「记录史之前」",
+    ),
+    "chat_daily_rollup": Entry(
+        MIRROR,
+        "按用户×北京日的聊天冻结格子（0094/tee 0026），救 data-track 用（现算全史"
+        "在 prod 实测 99-115s、被 gunicorn 120s 打死）。与 lane 格子同理永久增长，"
+        "不能走 SNAPSHOT。⚠️ 内容是「那天发生过多少」而非「当前 live 还剩多少」"
+        "（Seven 2026-08-19 定），源含 chat_messages + chat_message_archive，"
+        "所以清空历史不会让数字掉下去；ON CONFLICT DO NOTHING，按日整组镜像",
+    ),
+    "chat_rollup_watermark": Entry(
+        MIRROR,
+        "聊天格子覆盖水位（单行 scope='chat'），与当日格子同组镜像；独立于 "
+        "lane_rollup_watermark——两个源丢历史的方式不同，共用一行会把更悲观的"
+        "下界强加给两边",
+    ),
+    "trace_write_stats": Entry(
+        MIRROR,
+        "T138 块0的永久日速率尺子（RDS 0095/TEE 0027）；test primary 必须直接写"
+        "TEE，RDS-primary 期间则以每进程启动实例的单调绝对值幂等热镜像。行按日永久"
+        "增长，不能进 20 万行硬阀的 SNAPSHOT；reconciler 按复合主键扶正漏镜像",
+    ),
+    "trace_write_stats_health": Entry(
+        MIRROR,
+        "T138 尺子每个进程 writer 的成功心跳（RDS 0096/TEE 0028）；失败时不依赖"
+        "同一坏通道写失败态，而由 last_success_at 自然过期。每 writer 单行原地更新，"
+        "热镜像并由 reconciler 按 writer_id 扶正",
     ),
 
     # ---------------------------------------------------------------- #
@@ -287,6 +323,103 @@ REGISTRY: dict[str, Entry] = {
         SKIP, "2026-07-10 单用户事故的一次性人工备份表，非生产数据", manual=True),
     "bak_20260710_usr5d4a_users": Entry(
         SKIP, "2026-07-10 单用户事故的一次性人工备份表，非生产数据", manual=True),
+}
+
+
+# Authoritative primary-key inventory for content-free change capture.  Keep
+# this static: deriving it at runtime would make a compromised/mis-migrated
+# database define what the replication code is allowed to address.  The test
+# suite compares every value with a freshly migrated PostgreSQL catalog.
+_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    "server_config": ("key",),
+    "global_blobs": ("key",),
+    "users": ("user_id",),
+    "user_blobs": ("user_id", "kind"),
+    "user_logs": ("user_id", "stream", "seq"),
+    "perception_items": ("user_id", "kind", "item_id"),
+    "perception_daily": ("user_id", "date", "signal"),
+    "copytext_strings": ("key", "lang"),
+    "copytext_meta": ("id",),
+    "genesis_import_jobs": ("user_id", "job_id"),
+    "genesis_import_outputs": ("user_id", "job_id", "output_type"),
+    "notify_relay_configs": ("auth_token",),
+    "notify_relay_logs": ("id",),
+    "lane_daily_rollup": ("user_id", "day", "route", "lane", "enqueue_source"),
+    "lane_rollup_watermark": ("route",),
+    "chat_daily_rollup": ("user_id", "day"),
+    "chat_rollup_watermark": ("scope",),
+    "trace_write_stats": ("day", "writer_id", "subsystem", "event_type", "lane"),
+    "trace_write_stats_health": ("writer_id",),
+    "chat_messages": ("user_id", "msg_id"),
+    "memory_moments": ("user_id", "moment_id"),
+    "world_book_entries": ("user_id", "entry_id"),
+    "frame_envelopes": ("user_id", "frame_id"),
+    "chat_message_archive": ("user_id", "source_seq"),
+    "v2_trajectory_events": ("job_id", "event_index"),
+    "model_api_credentials": ("id",),
+    "v2_conversation_summary": ("user_id",),
+    "v2_conversation_summary_segments": ("segment_id",),
+    "v2_trajectory_reviews": ("source_job_id",),
+    "v2_workspace_entries": ("user_id", "path"),
+    "agent_action_queue": ("id",),
+    "agent_jobs": ("id",),
+    "agent_runtime_instances": ("user_id",),
+    "agent_runtime_supervisor_heartbeats": ("owner",),
+    "agent_status_events": ("id",),
+    "chat_turn_activity_events": ("id",),
+    "chat_r2_cleanup": ("body_key",),
+    "chat_r2_lifecycle": ("user_id",),
+    "dau_daily_snapshot": ("day",),
+    "model_api_routes": ("id",),
+    "perception_signal_state_v2": ("user_id", "signal"),
+    "provider_health": ("user_id",),
+    "retention_cohort_snapshot": ("cohort_week", "period_index"),
+    "runtime_state": ("user_id",),
+    "user_growth_daily_snapshot": ("day",),
+    "v2_capture_batches": ("id",),
+    "v2_chat_tail_anchor": ("user_id",),
+    "v2_effect_outbox": ("effect_id",),
+    "v2_effect_sink_applied": ("effect_id",),
+    "v2_mcp_mutation_attempts": ("job_id", "call_key"),
+    "v2_runtime_control": ("id",),
+    "v2_runtime_state": ("user_id",),
+    "v2_sandbox_usage_events": ("id",),
+    "v2_terminal_failure_outbox": ("job_id",),
+    "v2_trajectory_access_audit": ("id",),
+    "v2_trajectory_streams": ("job_id",),
+    "v2_turn_metrics": ("id",),
+    "v2_usage_daily_dimensions": ("id",),
+    "v2_usage_daily_users": ("id",),
+    "v2_usage_rollup_watermarks": ("rollup_name",),
+    "v2_user_allowlist": ("user_id",),
+    "v2_wake_schedule": ("user_id",),
+    "v2_worker_heartbeats": ("worker_id",),
+    "voice_call_sessions": ("user_id", "call_id"),
+    "voice_transcripts": ("user_id", "call_id"),
+}
+
+_capture_tables = {
+    name for name, entry in REGISTRY.items() if entry.lane not in (SKIP, LOGICAL)
+}
+if set(_PRIMARY_KEYS) != _capture_tables:
+    missing = sorted(_capture_tables - set(_PRIMARY_KEYS))
+    extra = sorted(set(_PRIMARY_KEYS) - _capture_tables)
+    raise RuntimeError(
+        f"plaintext shadow key registry mismatch: missing={missing} extra={extra}"
+    )
+
+REGISTRY = {
+    name: replace(
+        entry,
+        key_columns=_PRIMARY_KEYS.get(name, ()),
+        destination_table="frames" if name == "frame_envelopes" else name,
+        capture_key_columns=(
+            ()
+            if name in {"notify_relay_configs", "chat_r2_cleanup"}
+            else _PRIMARY_KEYS.get(name, ())
+        ),
+    )
+    for name, entry in REGISTRY.items()
 }
 
 

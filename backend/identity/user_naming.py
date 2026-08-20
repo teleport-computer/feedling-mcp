@@ -33,9 +33,30 @@ def sanitize_user_name(user_name: str) -> str:
     return name
 
 
-def _naming_rule(user_name: str) -> str:
-    """Render the canonical rule for user-visible memory prose."""
+def _naming_rule(user_name: str, *, locale: str = "zh-Hans") -> str:
+    """Render the canonical rule for user-visible memory prose.
+
+    ``locale`` 决定这段规则本身用什么语言写。**它必须跟卡的目标语言一致** ——
+    这段会原样插进落卡提示词，英文花园里插一段中文，模型多半就顺着写中文卡了
+    （提示词里任何一处语言不一致都是在给模型发混合信号）。
+    """
     name = sanitize_user_name(user_name)
+    if str(locale or "").strip() == "en":
+        if name != "TA":
+            return (
+                f"Refer to {name} by the name \"{name}\". "
+                "Never use 「用户」/\"user\", the placeholder 「TA」, a guessed he/she, "
+                "or the second person \"you\" for them."
+            )
+        return (
+            "If the material clearly shows the name this person wants to be called, use it; "
+            "otherwise prefer dropping the subject entirely (\"often codes late at night, "
+            "goes quiet when tired\"). When a subject is unavoidable, infer gender from the "
+            "identity card, your relationship, older cards, and the conversation, and use "
+            "\"he\" or \"she\"; only when the evidence is too thin, use a neutral referent. "
+            "Never use 「用户」/\"user\", the placeholder 「TA」, or the second person \"you\" "
+            "for them."
+        )
     if name != "TA":
         return (
             f"提到 {name} 就用「{name}」这个名字。"

@@ -1537,6 +1537,37 @@ def test_resident_spoke_survives_a_terminal_patch_days_after_delivery(clean_roll
     )
 
 
+def test_archive_ts_index_is_built_concurrently_on_both_chains():
+    """chat_message_archive 是可达全史量级的大表 —— 建索引必须 CONCURRENTLY。
+
+    普通 CREATE INDEX 会持锁阻塞写入,而这张表**正因为大**才需要索引;
+    单用 IF NOT EXISTS 还会把 canceled build 留下的 invalid 壳当成建好了
+    (codex2 2026-08-19)。两链必须一致。
+    """
+    import importlib.util
+    from pathlib import Path as _P
+
+    def _load(rel: str, name: str):
+        spec = importlib.util.spec_from_file_location(
+            name, _P(__file__).parent.parent / rel)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    rds = _load("backend/alembic/versions/0094_chat_daily_rollup.py", "rds94")
+    tee = _load("backend/alembic_tee/versions/0026_chat_daily_rollup.py", "tee26")
+
+    assert rds._ARCHIVE_TS_DDL == tee._ARCHIVE_TS_DDL
+    assert "CONCURRENTLY" in rds._ARCHIVE_TS_DDL
+    for source in ("backend/alembic/versions/0094_chat_daily_rollup.py",
+                   "backend/alembic_tee/versions/0026_chat_daily_rollup.py"):
+        text = (_P(__file__).parent.parent / source).read_text()
+        assert "autocommit_block()" in text
+        assert "indisvalid" in text, "缺 invalid 壳自检"
+        assert "DROP INDEX CONCURRENTLY IF EXISTS" in text
+        assert "_create_archive_ts_index()" in text, "建了函数但没在 upgrade 里调"
+
+
 def test_the_resident_anchor_has_an_index_to_stand_on():
     """The windowless anchor is only affordable because 0093/0025 build a
     partial expression index; without it each freeze degrades into a per-job

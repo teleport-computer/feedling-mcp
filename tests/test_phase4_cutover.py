@@ -229,8 +229,6 @@ def test_phase4_prepare_copies_frame_bridge_and_aligns_sequences(monkeypatch):
                         sql.Identifier(database)
                     )
                 )
-
-
 def test_phase4_pending_gate_blocks_every_unaudited_reason(backend_env):
     import db
     from admin import phase4_cutover

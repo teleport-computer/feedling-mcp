@@ -2198,8 +2198,13 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         lane="chat",
         within_days=int(filters.get("days") or 30),
     )
+    # 聊天数字的覆盖范围。顶层一份，**不进每个用户行**：那份返回按 user_id 键控，
+    # 加非 uid 的键会让调用方拿到一个假用户；每行各存一份既冗余，又会让人以为
+    # 覆盖是 per-user 的。complete=False 时页面必须显示缺口——一个数字旁边没有
+    # 它的覆盖范围就会被当成全量，这正是 Seven 定 A 时要避免的那种误读。
     summary = {
         "generated_at": datetime.now().isoformat(),
+        "chat_coverage": db.chat_rollup_coverage(),
         "users_total": len(rows),
         "activated_total": activated,
         "human_active_1d": human_active_1d,
@@ -3979,6 +3984,34 @@ _HOME_WIDGET_CSS = """
 """
 
 _HOME_PAGE_CSS = _RUNTIME_PAGE_CSS + _HOME_WIDGET_CSS
+
+
+def _render_chat_coverage_note(coverage: dict | None) -> str:
+    """Chat 数字的覆盖范围 —— **必须肉眼可见**（Seven 2026-08-19 定 A）。
+
+    这些数字来自每日冻结的格子，含义是「那天发生过多少」而非「当前还剩多少」，
+    所以列名是「累计发生」。冻结器落后时数字会偏低：A 口径要求**照常给数、但把
+    缺口写出来**，而不是让偏低的数冒充全量。一个数字旁边没有它的覆盖范围，就会
+    被当成全量——这正是这行字存在的唯一理由，不是装饰。
+    """
+    if not coverage:
+        return ("<div class='muted section-intro'>Chat 覆盖范围暂不可用"
+                "（读取失败）—— 下方聊天数字可能不完整。</div>")
+    through = str(coverage.get("through_day") or "")
+    expected = str(coverage.get("expected_through_day") or "")
+    backfill = str(coverage.get("backfill_from") or "")
+    if not through:
+        return ("<div class='muted section-intro'>⚠️ Chat 日格子<b>尚未冻结任何一天</b>，"
+                f"下方「累计发生」只含今天的实时数据（应覆盖到 {html.escape(expected)}）。"
+                "历史数字缺失，不是「这些用户没说过话」。</div>")
+    if not coverage.get("complete"):
+        return ("<div class='muted section-intro'>⚠️ Chat 冻结落后："
+                f"已覆盖 {html.escape(backfill)} … {html.escape(through)}，"
+                f"应到 {html.escape(expected)}。"
+                "下方「累计发生」<b>偏低</b>，缺的是这段区间。</div>")
+    return ("<div class='muted section-intro'>Chat「累计发生」= 那天发生过多少"
+            "（清空历史不会让它下降），非当前剩余条数。覆盖 "
+            f"{html.escape(backfill)} … {html.escape(through)}。</div>")
 
 
 def _render_stuck_block(stuck: dict | None) -> str:
@@ -7013,10 +7046,11 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
 	    <button type="submit">打开用户详情</button>
 	  </form>
 	  <div class="toolbar"><input id="q" placeholder="筛选 UID、route、runtime state、stage"></div>
+	  {_render_chat_coverage_note(summary.get("chat_coverage"))}
 	  <div class="sortbar">{sort_controls}</div>
 	  {pager}
 	  <div class="table-wrap"><table id="users">
-    <thead><tr><th>User</th><th>Onboarding route</th><th>实际 Runtime</th><th>连接</th><th>Onboarding</th><th>Steps</th><th>Chat</th><th>Memory</th><th>Proactive 心跳/屏幕(fail)</th><th>Last activity</th></tr></thead>
+    <thead><tr><th>User</th><th>Onboarding route</th><th>实际 Runtime</th><th>连接</th><th>Onboarding</th><th>Steps</th><th>Chat 累计发生</th><th>Memory</th><th>Proactive 心跳/屏幕(fail)</th><th>Last activity</th></tr></thead>
     <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='10' class='muted'>No users yet.</td></tr>"}</tbody>
   </table></div>
 </main>

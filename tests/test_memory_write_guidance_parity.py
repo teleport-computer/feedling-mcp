@@ -145,6 +145,7 @@ def test_memory_card_length_rule_reaches_capture_prompt():
         threads="（暂无）",
         identity="（暂无）",
         window="一段对话",
+        locale="zh-Hans",
     )
 
     _assert_exact_length_rule_once(prompt)

@@ -124,7 +124,10 @@ def test_synced_lane_cannot_opt_out_of_tee_schema():
 
 def test_voice_call_sessions_use_snapshot_lane():
     """The source lifecycle state must converge before primary promotion."""
-    assert reg.REGISTRY["voice_call_sessions"].lane == reg.SNAPSHOT
+    entry = reg.REGISTRY["voice_call_sessions"]
+    assert entry.lane == reg.SNAPSHOT
+    assert entry.key_columns == ("user_id", "call_id")
+    assert entry.capture_key_columns == ("user_id", "call_id")
 
 
 def test_skip_entries_must_justify():

@@ -20,7 +20,39 @@ def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
     cfg.set_main_option("script_location", str(ROOT / "backend" / "alembic_tee"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0030_voice_call_sessions_primary"]
+    assert script.get_heads() == ["0031_merge_voice_primary"]
+    assert set(
+        script.get_revision("0031_merge_voice_primary").down_revision
+    ) == {
+        "0029_plaintext_shadow_merge",
+        "0030_voice_call_sessions_primary",
+    }
+    assert set(
+        script.get_revision("0029_plaintext_shadow_merge").down_revision
+    ) == {
+        "0028_trace_write_stats_health",
+        "0027_plaintext_shadow_gates",
+    }
+    assert (
+        script.get_revision("0027_plaintext_shadow_gates").down_revision
+        == "0026_plaintext_shadow_control"
+    )
+    assert (
+        script.get_revision("0026_plaintext_shadow_control").down_revision
+        == "0025_lane_rollup_voice"
+    )
+    assert (
+        script.get_revision("0028_trace_write_stats_health").down_revision
+        == "0027_trace_write_stats"
+    )
+    assert (
+        script.get_revision("0027_trace_write_stats").down_revision
+        == "0026_chat_daily_rollup"
+    )
+    assert (
+        script.get_revision("0026_chat_daily_rollup").down_revision
+        == "0025_lane_rollup_voice"
+    )
     assert (
         script.get_revision("0030_voice_call_sessions_primary").down_revision
         == "0025_lane_rollup_voice"
@@ -160,6 +192,15 @@ def test_pre_release_gates_run_the_application_startup_contract():
         assert "db.init_schema()" in source
 
     assert "Assert PRE application startup contract" in tee_migrate
+
+
+def test_tee_migrate_exposes_backend_package_to_upgrade_step():
+    source = TEE_MIGRATE_WORKFLOW.read_text()
+    step = source.split(
+        "      - name: Run alembic_tee upgrade head\n", 1
+    )[1].split("\n      - name:", 1)[0]
+
+    assert "PYTHONPATH: backend" in step
 
 
 def test_preflight_is_triggered_by_both_cvm_inventory_files():

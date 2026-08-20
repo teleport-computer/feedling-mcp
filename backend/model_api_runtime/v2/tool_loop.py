@@ -603,7 +603,7 @@ async def run_tool_loop(
     on_file_requirement_changed=None,
     outbound_blocking_read_tool_names=None,
     outbound_blocking_read_tool_predicate=None,
-    initial_outbound_tools_blocked: bool = False,
+    initial_screen_pixels_blocked: bool = False,
     tagged_image_message_key: str = "",
     on_tagged_images_rejected=None,
     max_tool_calls_per_round: int = DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
@@ -747,7 +747,11 @@ async def run_tool_loop(
     final_reply_correction_instruction = ""
     external_content_seen = False
     mutation_outcome_unknown = False
-    outbound_tools_blocked = bool(initial_outbound_tools_blocked)
+    # Keep the two provenance sources separate. Screen pixels are an
+    # untrusted, system-chosen input and therefore fence mutating user MCP;
+    # private reads retain the 2026-08-12 user-selected-MCP relaxation.
+    screen_pixels_blocked = bool(initial_screen_pixels_blocked)
+    private_read_seen = False
     tagged_image_fallback_active = False
     file_requirement_message_state = [
         dict(message)
@@ -1063,7 +1067,10 @@ async def run_tool_loop(
                 force_text_fallback_reason or "terminal_text_round"
             )
         elif (
-            external_content_seen or mutation_outcome_unknown or outbound_tools_blocked
+            external_content_seen
+            or mutation_outcome_unknown
+            or screen_pixels_blocked
+            or private_read_seen
         ):
             # Web results are untrusted model input. Once one is present, page
             # text cannot spend the original write authorization or choose a
@@ -1095,13 +1102,21 @@ async def run_tool_loop(
             if mutation_outcome_unknown:
                 blocked_tools.update(_PLATFORM_MUTATION_TOOLS)
                 blocked_tools.update(mutating_mcp_names)
+            # Screen pixels are not a user-selected destination or trusted
+            # instruction source. They may influence read-only user MCP, but
+            # cannot authorize a mutation or choose a fresh outbound target.
+            if screen_pixels_blocked:
+                blocked_tools.update({"web_search", "web_fetch"})
+                blocked_tools.add(tool_schema.TASK_TOOL)
+                blocked_tools.update(mutating_mcp_names)
             # A private read may expose persona, workspace/artifact, or memory
             # content. That observation cannot influence a later platform-owned
-            # query/URL/task call. User-selected MCP endpoints remain available.
-            # Local durable edits remain available:
-            # read-then-edit is a core workspace/working-memory workflow and
-            # still carries the original user/wake seed plus generation fence.
-            if outbound_tools_blocked:
+            # query/URL/task call. User-selected MCP endpoints remain available,
+            # including mutations, under the 2026-08-12 trust-boundary decision.
+            # Local durable edits remain available: read-then-edit is a core
+            # workspace/working-memory workflow and still carries the original
+            # user/wake seed plus generation fence.
+            if private_read_seen:
                 blocked_tools.update({"web_search", "web_fetch"})
                 # ⚠️ 同一次放宽(2026-08-12):读过私密内容之后,user-MCP 也不再下架。
                 #
@@ -2441,7 +2456,7 @@ async def run_tool_loop(
         if any(_read_blocks_later_outbound(tc) for tc in dispatch_calls):
             # Same-batch outbound calls were selected before the model observed
             # this result. Only subsequent rounds are data-dependent and fenced.
-            outbound_tools_blocked = True
+            private_read_seen = True
 
         transcript.append(
             ToolExchange(

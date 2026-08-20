@@ -1,7 +1,12 @@
+import os
+import uuid
 from pathlib import Path
 
+import psycopg
+from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+from psycopg import sql
 
 
 ROOT = Path(__file__).parent.parent
@@ -14,9 +19,26 @@ def _scripts(tree: str) -> ScriptDirectory:
     return ScriptDirectory.from_config(cfg)
 
 
+def _database_url(base: str, database: str) -> str:
+    prefix, _, _ = base.rpartition("/")
+    return f"{prefix}/{database}"
+
+
 def test_rds_pre_and_test_heads_converge():
     script = _scripts("alembic")
-    assert script.get_heads() == ["0093_lane_rollup_voice"]
+    assert script.get_heads() == ["0096_trace_write_stats_health"]
+    assert (
+        script.get_revision("0096_trace_write_stats_health").down_revision
+        == "0095_trace_write_stats"
+    )
+    assert (
+        script.get_revision("0095_trace_write_stats").down_revision
+        == "0094_chat_daily_rollup"
+    )
+    assert (
+        script.get_revision("0094_chat_daily_rollup").down_revision
+        == "0093_lane_rollup_voice"
+    )
     assert (
         script.get_revision("0093_lane_rollup_voice").down_revision
         == "0092_lane_rollup_safe_ts"
@@ -49,7 +71,39 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0030_voice_call_sessions_primary"]
+    assert script.get_heads() == ["0031_merge_voice_primary"]
+    assert set(
+        script.get_revision("0031_merge_voice_primary").down_revision
+    ) == {
+        "0029_plaintext_shadow_merge",
+        "0030_voice_call_sessions_primary",
+    }
+    assert set(
+        script.get_revision("0029_plaintext_shadow_merge").down_revision
+    ) == {
+        "0028_trace_write_stats_health",
+        "0027_plaintext_shadow_gates",
+    }
+    assert (
+        script.get_revision("0027_plaintext_shadow_gates").down_revision
+        == "0026_plaintext_shadow_control"
+    )
+    assert (
+        script.get_revision("0026_plaintext_shadow_control").down_revision
+        == "0025_lane_rollup_voice"
+    )
+    assert (
+        script.get_revision("0028_trace_write_stats_health").down_revision
+        == "0027_trace_write_stats"
+    )
+    assert (
+        script.get_revision("0027_trace_write_stats").down_revision
+        == "0026_chat_daily_rollup"
+    )
+    assert (
+        script.get_revision("0026_chat_daily_rollup").down_revision
+        == "0025_lane_rollup_voice"
+    )
     assert (
         script.get_revision("0030_voice_call_sessions_primary").down_revision
         == "0025_lane_rollup_voice"
@@ -122,6 +176,86 @@ def test_tee_migrations_reuse_the_rds_contract_sql():
         == rds.get_revision("0093_lane_rollup_voice").module._UP
     )
     assert (
+        tee.get_revision("0026_chat_daily_rollup").module._UP
+        == rds.get_revision("0094_chat_daily_rollup").module._UP
+    )
+    assert (
+        tee.get_revision("0027_trace_write_stats").module._UP
+        == rds.get_revision("0095_trace_write_stats").module._UP
+    )
+    assert (
+        tee.get_revision("0028_trace_write_stats_health").module._UP
+        == rds.get_revision("0096_trace_write_stats_health").module._UP
+    )
+    assert (
         tee.get_revision("0030_voice_call_sessions_primary").module._UP
         == rds.get_revision("0081_voice_call_sessions").module._UP
     )
+
+
+def test_tee_0029_upgrades_to_voice_merge_head(monkeypatch):
+    """A live TEST-shaped database must converge without duplicate voice DDL."""
+    admin_url = os.environ.get(
+        "FEEDLING_TEST_PG",
+        "postgresql://postgres:test@127.0.0.1:55432/postgres",
+    )
+    database = f"tee_voice_merge_{uuid.uuid4().hex[:10]}"
+    database_url = _database_url(admin_url, database)
+    cfg = Config(str(ROOT / "backend/alembic_tee/alembic.ini"))
+    cfg.set_main_option("script_location", str(ROOT / "backend/alembic_tee"))
+
+    with psycopg.connect(admin_url, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
+
+    monkeypatch.setenv("TEE_MIGRATION_DATABASE_URL", database_url)
+    try:
+        command.upgrade(cfg, "0029_plaintext_shadow_merge")
+        with psycopg.connect(database_url, autocommit=True) as conn:
+            assert conn.execute(
+                "SELECT to_regclass('public.voice_call_sessions')"
+            ).fetchone() == (None,)
+            conn.execute(
+                "INSERT INTO plaintext_shadow_restore_evidence "
+                "(restored_at,source_backup_at,schema_head,verifier_digest,"
+                "backup_artifact_digest,target_fingerprint,target_capacity_bytes,"
+                "target_connection_limit,ha_verified,attestation_key_fingerprint,"
+                "attestation_signature_digest,operator_id,expires_at) VALUES "
+                "(now() - interval '1 hour',now() - interval '2 hours',"
+                "'0029_plaintext_shadow_merge','sha256:test','sha256:backup',"
+                "'target:test',1,1,true,'key:test','signature:test',"
+                "'test-operator',now() + interval '1 day')"
+            )
+            conn.execute(
+                "INSERT INTO server_config(key,value) VALUES "
+                "('phase4_primary_prepared',convert_to(%s,'UTF8')) "
+                "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+                ('{"prepared":true,"tee_heads":["0029_plaintext_shadow_merge"]}',),
+            )
+
+        command.upgrade(cfg, "head")
+        with psycopg.connect(database_url, autocommit=True) as conn:
+            assert conn.execute(
+                "SELECT version_num FROM alembic_tee_version"
+            ).fetchall() == [("0031_merge_voice_primary",)]
+            assert conn.execute(
+                "SELECT to_regclass('public.voice_call_sessions')"
+            ).fetchone() == ("voice_call_sessions",)
+            assert conn.execute(
+                "SELECT count(*) FROM plaintext_shadow_restore_evidence"
+            ).fetchone() == (0,)
+            assert conn.execute(
+                "SELECT convert_from(value,'UTF8')::jsonb->'tee_heads' "
+                "FROM server_config WHERE key='phase4_primary_prepared'"
+            ).fetchone() == (["0031_merge_voice_primary"],)
+    finally:
+        with psycopg.connect(admin_url, autocommit=True) as admin:
+            admin.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname=%s",
+                (database,),
+            )
+            admin.execute(
+                sql.SQL("DROP DATABASE IF EXISTS {}").format(
+                    sql.Identifier(database)
+                )
+            )

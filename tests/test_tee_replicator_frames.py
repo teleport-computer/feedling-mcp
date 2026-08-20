@@ -27,6 +27,7 @@ import db  # noqa: E402
 import object_storage  # noqa: E402
 from tee_replicator import frames as frames_mod  # noqa: E402
 from tee_replicator import worker  # noqa: E402
+from plaintext_shadow.config import TargetPolicy  # noqa: E402
 from conftest import seed_user  # noqa: E402
 
 KEY_VERSION = "v1"
@@ -168,6 +169,39 @@ def test_inline_legacy_row_same_result(backend_env, r2):
     # no ciphertext body ever lands in a TEE frames row (meta is pointer-only)
     leak = _tee("SELECT count(*) FROM frames WHERE user_id=%s AND meta ? 'body_ct'", (uid,))
     assert leak[0][0] == 0
+
+
+def test_plaintext_all_target_stores_decrypted_frame_inline(
+    backend_env, r2, monkeypatch
+):
+    _reset_cursor()
+    uid = f"usr_{uuid.uuid4().hex[:8]}"
+    _seed(uid)
+    _insert_inline(uid, "ab" * 8, 10.0, "AAA")
+    monkeypatch.setattr(
+        worker,
+        "_make_decrypt",
+        lambda _uid: lambda _envelope, purpose=None: b"decrypted-frame-bytes",
+    )
+    worker._decrypt_cache.clear()
+
+    report = worker.run_table(
+        "frame_envelopes",
+        qps=1000,
+        target_policy=TargetPolicy(dsn=os.environ["TEE_DATABASE_URL"]),
+    )
+
+    assert report["copied"] == 1
+    row = _tee(
+        "SELECT body_plaintext, body_storage_key, body_sha256, body_size_bytes "
+        "FROM frames WHERE user_id=%s AND frame_id=%s",
+        (uid, "ab" * 8),
+    )[0]
+    assert bytes(row[0]) == b"decrypted-frame-bytes"
+    assert row[1] is None
+    assert row[2] == hashlib.sha256(b"decrypted-frame-bytes").hexdigest()
+    assert row[3] == len(b"decrypted-frame-bytes")
+    assert r2.tee_puts == []
 
 
 def test_local_only_goes_to_pending(backend_env, r2, monkeypatch):

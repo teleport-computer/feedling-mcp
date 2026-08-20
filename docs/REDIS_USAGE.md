@@ -1,12 +1,17 @@
 # Redis 使用文档与规范
 
+> [!CAUTION]
+> **已废弃并暂停（2026-08-20）**：test/pre/prod 三套 Redis CVM 已停止，
+> 部署与监控 workflow 已禁用，`backend/redis_pool.py` 固定拒绝构造客户端。
+> 本文仅作为历史设计与未来重新评审的输入，不再是可直接采用的接入指南。
+> 恢复前必须另开 spec，确认真实业务用途、故障降级、容量与监控方案，然后同时
+> 恢复 CVM、workflow 和客户端门禁。
+>
 > 面向**接入 Redis 的后端开发者**。基础设施开通/运维见
 > `deploy/DEPLOYMENTS.md`「TEE Redis」章节；连接池实现见
 > `backend/redis_pool.py`；架构取舍见本文 §0-1 与 `docs/CHANGELOG.md`。
 >
-> **当前零流量**：三台 CVM（test/pre/prod）已 running、待命，**没有任何业务
-> 代码引用 Redis**。任何一类接入（缓存 / 队列 / 锁）都各自另开 spec，并把
-> 本文的规范列为前置条件。
+> **退役时仍为零流量**：没有任何业务代码引用 Redis。
 
 ---
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
 import copy
 import http.cookiejar as _cookiejar
@@ -17,7 +18,12 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
-from generated_image import MAX_GENERATED_IMAGES_PER_REPLY
+import generated_image
+import safe_url_fetch
+from generated_image import (
+    MAX_GENERATED_IMAGE_SOURCE_BYTES,
+    MAX_GENERATED_IMAGES_PER_REPLY,
+)
 from provider_types import ToolExchange
 
 if TYPE_CHECKING:
@@ -49,6 +55,9 @@ _MAX_PG_BIGINT = (1 << 63) - 1
 # bytes are billed against that same completion budget, so image requests ask
 # for the ceiling rather than a text-sized slice.
 IMAGE_OUTPUT_MAX_TOKENS = 8192
+# One wall-clock budget for every link in a single image response, so a handful
+# of slow links cannot each add a fresh fetch deadline to the turn.
+IMAGE_LINK_TOTAL_DEADLINE_SECONDS = 45.0
 
 
 def classify_provider_error(exc: BaseException) -> str:
@@ -366,15 +375,26 @@ def validate_config(
         raise ProviderError("model required")
     if provider == "openai_compatible" and not base_url:
         raise ProviderError("base_url required for openai_compatible")
-    # NOTE (owner): this startswith() loopback check has the SAME latent
-    # prefix-forgery flaw fixed in validate_catalog_target / _validate_egress_url
-    # ("http://127.0.0.1.evil.example" and "http://127.0.0.1@evil.example" both
-    # pass). Left untouched here to avoid changing the normal save/test path;
-    # migrate this to _validate_egress_url when that path is next revisited.
-    if base_url and not (
-        base_url.startswith("https://") or base_url.startswith("http://127.0.0.1")
-    ):
-        raise ProviderError("base_url must be https:// or local http://127.0.0.1")
+    # This is the migration the owner's NOTE here asked for: the save/test path
+    # used to approve the base_url with startswith(), which reads a prefix rather
+    # than a host. "http://127.0.0.1.evil.example" (real host evil.example) and
+    # "http://127.0.0.1@evil.example" (127.0.0.1 is userinfo) both begin with
+    # "http://127.0.0.1" and both sent the user's provider key in cleartext to
+    # someone else's server. Our users routinely paste relay base_urls handed to
+    # them by third parties, so a URL disguised as loopback is a plausible way in,
+    # not a theoretical one.
+    #
+    # The structured check already existed one screen down and the catalog path
+    # already used it; the bug survived because the two paths disagreed. Sharing
+    # one parser is the point — a third dialect would leave the same seam.
+    #
+    # SCOPE: this fixes how the cleartext-loopback allowlist is parsed and matched.
+    # It is NOT an SSRF fix. https targets are still accepted without any address
+    # check at all, so https://10.0.0.5/v1 and https://169.254.169.254/latest pass
+    # today and still pass after this change. That gap is a separate, larger piece
+    # of work waiting on a product ruling about private-network and proxy support.
+    if base_url:
+        _validate_egress_url(base_url)
     if not base_url:
         base_url = default_base_url(provider)
     if not base_url:
@@ -2880,16 +2900,124 @@ def _extract_openai_compatible_media(body: dict[str, Any]) -> list[dict]:
     return media
 
 
+def _dedicated_image_links(body: dict[str, Any]) -> list[str]:
+    """The https links a dedicated Images response offered instead of bytes.
+
+    Only this response shape is eligible for a fetch. A link inside a chat
+    reply stays ignored: chat text is model-authored, and no measured relay
+    needs it — every relay that answers chat with a link also serves the
+    dedicated endpoint, which returns the bytes directly.
+    """
+    links: list[str] = []
+    rows = body.get("data")
+    if not isinstance(rows, list):
+        return links
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        url = str(row.get("url") or "").strip()
+        if url.lower().startswith("https://"):
+            links.append(url)
+            if len(links) >= MAX_GENERATED_IMAGES_PER_REPLY:
+                break
+    return links
+
+
+async def _fetch_dedicated_image_links(links: list[str], *, model: str) -> list[dict]:
+    """Fetch provider-chosen image links, one at a time, and prove each decodes.
+
+    A content-type header is a filter, not evidence: the setup probe that marks
+    a route usable only checks that media came back, so bytes that never decode
+    would mark a route "ok" and fail later in a real chat.
+
+    Three budgets are shared across the whole response rather than granted per
+    link: bytes (four links must not pull four times the single-image ceiling),
+    wall clock (four slow links must not extend the turn four deadlines), and
+    concurrency of one (a hostile URL must not fan out connections).
+
+    A fetch that fails stops the loop. Bytes already pulled by a failed
+    download cannot be counted — the failure carries no length — so continuing
+    would hand the next link a budget that is silently wrong.
+    """
+    media: list[dict] = []
+    remaining_bytes = MAX_GENERATED_IMAGE_SOURCE_BYTES
+    deadline = time.monotonic() + IMAGE_LINK_TOTAL_DEADLINE_SECONDS
+    for url in links:
+        remaining_time = deadline - time.monotonic()
+        if remaining_bytes <= 0 or remaining_time <= 0:
+            log.warning(
+                "[image-generation] image link budget exhausted model=%s "
+                "bytes_left=%s seconds_left=%.1f",
+                str(model or "")[:96],
+                remaining_bytes,
+                remaining_time,
+            )
+            break
+        try:
+            fetched = await safe_url_fetch.fetch_image_bytes_async(
+                url,
+                max_bytes=remaining_bytes,
+                deadline_seconds=min(
+                    remaining_time, safe_url_fetch.DEFAULT_DEADLINE_SECONDS
+                ),
+            )
+        except safe_url_fetch.UnsafeURLError as exc:
+            # `exc` is a stable slug by construction; the URL never appears.
+            log.warning(
+                "[image-generation] refused provider image link reason=%s model=%s",
+                str(exc)[:64],
+                str(model or "")[:96],
+            )
+            break
+        # Charged the moment the bytes exist, not once they prove decodable:
+        # undecodable downloads are exactly what an attacker would send, and
+        # charging them later would let each one refill the budget.
+        remaining_bytes -= len(fetched.data)
+        try:
+            # Decoding a 25MB image is CPU-bound and attacker-sized; on the
+            # event loop it would stall every other turn in this process.
+            normalized = await asyncio.to_thread(
+                generated_image.normalize_generated_image,
+                fetched.data,
+                declared_mime=fetched.mime_type,
+                name="",
+                index=len(media) + 1,
+            )
+        except Exception as exc:  # noqa: BLE001 - undecodable bytes are not an image
+            log.warning(
+                "[image-generation] provider image link did not decode "
+                "error=%s model=%s",
+                type(exc).__name__,
+                str(model or "")[:96],
+            )
+            continue
+        item = _inline_media_item(
+            base64.b64encode(normalized.data).decode("ascii"),
+            normalized.mime_type,
+        )
+        if item is not None:
+            media.append(item)
+            if len(media) >= MAX_GENERATED_IMAGES_PER_REPLY:
+                break
+    return media
+
+
 def _parse_openrouter_images_body(
     body: dict[str, Any],
     *,
     provider: str = "openrouter",
     model: str,
+    fetched_media: list[dict] | None = None,
 ) -> dict[str, Any]:
     """Normalize a dedicated OpenAI-style Images API response as terminal media."""
-    media = _extract_openai_compatible_media(body)
+    media = _extract_openai_compatible_media(body) or list(fetched_media or [])
     if not media:
-        raise ProviderError("provider response had no usable image")
+        # Same code the chat wire raises for the same meaning: the provider
+        # answered, but not with an image we can use. As a generic error this
+        # mapped to "test failed" — i.e. retry — and every retry is billed.
+        exc = ProviderError("image_generation_invalid_output")
+        exc.feedling_error_class = "provider_incompatible"
+        raise exc
     return {
         "reply": "",
         "reasoning": "",
@@ -3816,7 +3944,10 @@ def validate_catalog_target(provider: str, base_url: str = "") -> tuple[str, str
     return provider, base_url
 
 
-_CATALOG_LOOPBACK_HOSTS = {"127.0.0.1", "localhost"}
+# Named for what it gates, not for the caller that happened to need it first:
+# both the model-catalog path and the save/test path validate through here, and
+# tying the name to one of them is how they drifted apart before.
+_CLEARTEXT_ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
 
 
 def _validate_egress_url(base_url: str) -> None:
@@ -3829,8 +3960,30 @@ def _validate_egress_url(base_url: str) -> None:
     ``evil.example``) pass a prefix check and would send the provider key in
     plaintext to the attacker. urlsplit resolves the true ``hostname`` and lets
     us forbid userinfo outright.
+
+    What this does and does not decide, stated plainly because the name is
+    broader than the check:
+
+    * it decides **which cleartext http targets are allowed** — only the exact
+      hosts above, so ``127.0.0.1.evil.example``, ``127.0.0.1@evil.example``,
+      a trailing-dot ``127.0.0.1.``, ``127.0.0.2`` and ``[::1]`` are all refused;
+    * it rejects userinfo on **every** scheme, https included, because
+      credentials in a URL are both a leak and a way to disguise the real host;
+    * it does **not** look at addresses for https targets. ``https://10.0.0.5``
+      and ``https://169.254.169.254`` pass. Address-level egress policy does not
+      exist on this path yet; nothing here should be read as providing it.
     """
-    parts = urlsplit(base_url)
+    try:
+        parts = urlsplit(base_url)
+    except ValueError as exc:
+        # A malformed authority makes urlsplit raise instead of returning
+        # something we can judge: "http://[::1" never closes the bracket, and on
+        # 3.11+ urlsplit also rejects a bracketed host that is not an address.
+        # Both callers of validate_config catch only ProviderError, so an
+        # escaping ValueError turns a mistyped base_url into a 500 rather than
+        # the 400 every other rejected value gets. The prefix check this
+        # replaced never parsed the URL, so it could not raise at all.
+        raise ProviderError("base_url must be https:// or local http://127.0.0.1") from exc
     scheme = parts.scheme.lower()
     if scheme not in ("https", "http"):
         raise ProviderError("base_url must be https:// or local http://127.0.0.1")
@@ -3839,8 +3992,16 @@ def _validate_egress_url(base_url: str) -> None:
     if parts.username or parts.password or "@" in (parts.netloc or ""):
         raise ProviderError("base_url must be https:// or local http://127.0.0.1")
     if scheme == "http":
-        host = (parts.hostname or "").lower()
-        if host not in _CATALOG_LOOPBACK_HOSTS:
+        try:
+            host = (parts.hostname or "").lower()
+        except ValueError as exc:
+            # `.hostname` can reject a bracketed authority that urlsplit let
+            # through — which of the two raises depends on the interpreter, so
+            # the guarantee ("this function raises ProviderError or nothing")
+            # has to hold at both points rather than at whichever one happens to
+            # fire on the machine running the tests.
+            raise ProviderError("base_url must be https:// or local http://127.0.0.1") from exc
+        if host not in _CLEARTEXT_ALLOWED_HOSTS:
             raise ProviderError("base_url must be https:// or local http://127.0.0.1")
 
 
@@ -4332,12 +4493,23 @@ async def _chat_completion_async_impl(
                 raise ProviderError("provider returned non-json response") from exc
             if not isinstance(body, dict):
                 raise ProviderError("provider returned non-object response")
-            # A 2xx that carried no inline image (e.g. a URL-only answer) is a
-            # real answer too: it was billed, so it must not be paid for twice.
+            # Some providers answer this endpoint with a link rather than bytes
+            # (measured: one relay does it only for its 2K variant of a model
+            # that is inline at lower resolutions). The image was generated and
+            # billed either way, so it is fetched — under safe_url_fetch's
+            # rules — instead of being thrown away and charged again.
+            fetched_media: list[dict] = []
+            if not _extract_openai_compatible_media(body):
+                fetched_media = await _fetch_dedicated_image_links(
+                    _dedicated_image_links(body), model=request_model
+                )
+            # A 2xx that carried nothing usable at all is a real answer too: it
+            # was billed, so it must not be paid for twice on the chat wire.
             return _parse_openrouter_images_body(
                 body,
                 provider=provider,
                 model=request_model,
+                fetched_media=fetched_media,
             )
         log.info(
             "[image-generation] dedicated image endpoint declined this model, "

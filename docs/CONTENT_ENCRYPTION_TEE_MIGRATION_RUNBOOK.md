@@ -20,7 +20,11 @@ or content-key baselines between environments.
   set. A worker missing the preference resolver fails safe to encryption and
   leaves unexpected ciphertext in an `off` account.
 - Switch `FEEDLING_DATABASE_SCHEMA=tee` and the TEE app DSN on main and runner
-  together. Shadow dual-write must be off after promotion.
+  together. The legacy RDS-to-TEE shadow dual-write must be off after promotion.
+- A post-promotion plaintext shadow is a separate topology. The promoted TEE
+  database remains authoritative; the shadow is never a failover source and
+  receives a decrypted projection of every supported content row, including
+  rows owned by accounts whose explicit preference is `on`.
 
 ## Supported surfaces
 
@@ -49,7 +53,71 @@ and attachment plaintext binary uses strict `body_b64`; large objects may use a
    ciphertext using the guarded procedure below, run strict verification, then
    perform Phase 4 and switch both units to TEE.
 7. Open `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` only after compatible clients and
-   regression evidence exist, one environment at a time.
+   regression evidence exist, one environment at a time. This per-user write
+   gate is independent from the all-plaintext shadow described below.
+
+## Post-promotion plaintext shadow
+
+The release has two explicit production gates:
+
+1. **Gate 1 — TEE primary.** Promote the current TEE PostgreSQL database to
+   `DATABASE_URL`, set `FEEDLING_DATABASE_SCHEMA=tee` for every release unit,
+   remove the legacy `TEE_DATABASE_URL` dual-write wiring, and verify encrypted
+   canaries, backups, the exact migration head, and the prepared marker.
+2. **Gate 2 — decrypted shadow.** Only after Gate 1 is healthy, provide an
+   independent PostgreSQL 17 app DSN as `PLAINTEXT_SHADOW_DATABASE_URL` and set
+   `FEEDLING_PLAINTEXT_SHADOW_ENABLED=1` on the main backend. The protected CI
+   environment runs `python -m admin.plaintext_shadow preflight` followed by
+   `python -m admin.plaintext_shadow verify --require-green` before deployment.
+
+Gate 2 fails closed unless the source is a TEE primary, source and target are
+different databases, both schema heads match the release, TLS is enabled, the
+target is writable, capture triggers match the audited inventory, and a recent
+restore drill has been recorded. The pooled worker and every independent runner
+must keep `FEEDLING_PLAINTEXT_SHADOW_ENABLED=0` and receive no shadow DSN; source
+database triggers capture their writes, and the elected main-backend scheduler
+is the sole drain owner.
+
+The source control tables contain keys, generations, counters, timestamps, and
+fixed error slugs only. The drain claims dirty keys with short
+`FOR UPDATE SKIP LOCKED` transactions, re-reads the authoritative source row,
+decrypts every ciphertext-bearing configuration, and idempotently upserts or
+deletes the target row. Retry delay is bounded exponential backoff; 20 failed
+attempts quarantine the key for operator review. Explicit `content_encryption=on`
+does not preserve ciphertext in this target: the target policy is
+`plaintext_all`.
+
+Before enabling Gate 2, create separate least-privilege migration and app roles,
+prove backup and restore from the new target, record only content-free evidence,
+run a full backfill, drain through the captured high-water generation, and run
+strict verification. Strict verification requires exact table counts and
+content projections, no unexpected ciphertext-envelope shapes, no pending or
+quarantined dirty keys, and fresh backup/restore evidence bound to the target
+fingerprint, backup artifact digest, declared capacity, connection limit, and
+HA attestation. Those infrastructure facts must arrive as an Ed25519-signed
+canonical JSON payload from the external backup/provider verification process;
+`FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY` contains only the trusted
+raw public key in base64. The CLI rejects unsigned operator-entered capacity,
+HA, digest, or target-identity values. The primary persists the canonical
+payload and full signature, and every preflight re-verifies them before
+comparing the signed claims with the live target. The `app` and legacy
+`tee_replicator` roles have no direct evidence-table DML; the app can only call
+the controlled evidence recorder. After enabling Gate 2, observe at least one green scheduler run
+before declaring the rollout complete. Operator output must contain
+fingerprints, scalars, and fixed slugs only;
+never print DSNs, passwords, keys, or row bodies.
+
+The plaintext shadow and all of its backups are plaintext recipients. Do not
+promote it to primary, use it as a production failover, or route application
+reads to it. If the target is unavailable, keep Gate 1 serving from the TEE
+primary while the durable source-side queue retries. Disable Gate 2 to stop new
+drains; removal of capture triggers is a separate explicit operator action.
+
+Rotate any bootstrap or previously disclosed administrator credential only
+after replacement least-privilege roles have connected successfully and backup
+and restore evidence is green. Rotation is not a substitute for replacing the
+application DSN and must not be attempted while the database endpoint is
+unreachable.
 
 ## Phase 4 maintenance window
 
