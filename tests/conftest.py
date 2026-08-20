@@ -434,6 +434,9 @@ if not _provisioned:
         # 字段投影/权限判据/一瞥等价性(2026-08-19, 感知内核提取 Task 3)。纯:import
         # 两侧模块比对对象同一性 + 纯函数调用,零 DB/零网络。自带 sys.path 引导。
         "test_perception_kernel_projection.py",
+        # 叫醒判据(2026-08-19, 感知内核提取 Task 7)。纯:只 import
+        # perception_kernel.wake 调纯函数,零 DB/零网络/零时钟(时间由测试传入)。
+        "test_perception_kernel_wake.py",
     }
     collect_ignore = sorted(
         f

@@ -13,6 +13,7 @@ import os
 from typing import Any, Literal
 
 import db
+from perception_kernel import wake as wake_kernel
 
 
 log = logging.getLogger("perception.signal_state_v2")
@@ -179,7 +180,10 @@ def observe_signal_state(
                             last_seen_at=previous_seen,
                             last_changed_at=previous_changed,
                         )
-                    if observed < previous_seen:
+                    # 先后判断（迟到 / 撞点 / 正常）是判据，搬进内核；
+                    # 行锁、事务、HMAC 指纹比对留在这里，一行不动。
+                    order = wake_kernel.observation_order(observed, previous_seen)
+                    if order == wake_kernel.OBSERVATION_STALE:
                         return _decision(
                             "stale",
                             fingerprint=previous_fingerprint,
@@ -198,7 +202,7 @@ def observe_signal_state(
                     else:
                         if (
                             _unknown_key_rebaseline_enabled()
-                            and observed > previous_seen
+                            and order == wake_kernel.OBSERVATION_NEWER
                         ):
                             conn.execute(
                                 "UPDATE perception_signal_state_v2 "
@@ -224,7 +228,7 @@ def observe_signal_state(
                                 last_changed_at=observed,
                             )
                         return _error("unknown_fingerprint_key")
-                    if observed == previous_seen:
+                    if order == wake_kernel.OBSERVATION_SAME_TS:
                         if not hmac.compare_digest(
                             comparable_fingerprint, previous_fingerprint
                         ):
