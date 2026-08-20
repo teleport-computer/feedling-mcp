@@ -14,6 +14,7 @@ import json
 import re
 from collections import Counter
 from dataclasses import dataclass
+from typing import Sequence
 
 from psycopg.types.json import Jsonb
 
@@ -105,6 +106,23 @@ class PreservationPlan:
     sha256: str
     counts: dict[str, int]
     blockers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PreservedPending:
+    user_id: str
+    table: str
+    item_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class PreservationAudit:
+    preserved: int
+    counts: dict[str, int]
+    sha256: str
+    mismatches: tuple[str, ...]
+    valid_keys: frozenset[tuple[str, str, str]]
 
 
 class PreservationRefused(RuntimeError):
@@ -337,6 +355,79 @@ def build_revert_plan(source, destination) -> PreservationPlan:
         )
 
     return _finish_plan(rows, counts, blocker_counts)
+
+
+def audit_preserved(
+    source,
+    destination,
+    markers: Sequence[PreservedPending],
+) -> PreservationAudit:
+    """Audit every preserved marker against its exact raw source and target."""
+    valid_rows: list[PlannedRow] = []
+    counts: Counter[str] = Counter()
+    mismatch_counts: Counter[tuple[str, str]] = Counter()
+    valid_keys: set[tuple[str, str, str]] = set()
+
+    for marker in sorted(
+        markers, key=lambda row: (row.table, row.user_id, row.item_id)
+    ):
+        parsed = parse_preserved_reason(marker.reason)
+        if parsed is None:
+            mismatch_counts[("malformed_preserved_marker", marker.table)] += 1
+            continue
+        marker_digest, original_reason = parsed
+        contract = CONTRACTS.get(marker.table)
+        if contract is None:
+            mismatch_counts[("unknown_table", marker.table)] += 1
+            continue
+        args = contract.args(marker.user_id, marker.item_id)
+        source_row = source.execute(contract.source_fetch_sql, args).fetchone()
+        if source_row is None:
+            mismatch_counts[("missing_source", marker.table)] += 1
+            continue
+        source_tuple = tuple(source_row)
+        row_sha256 = canonical_row_sha256(marker.table, source_tuple)
+        if marker_digest != row_sha256:
+            mismatch_counts[("marker_digest_mismatch", marker.table)] += 1
+            continue
+        destination_row = destination.execute(
+            contract.destination_fetch_sql, args
+        ).fetchone()
+        if destination_row is None:
+            mismatch_counts[("missing_preserved_destination", marker.table)] += 1
+            continue
+        if tuple(destination_row) != source_tuple:
+            mismatch_counts[("destination_conflict", marker.table)] += 1
+            continue
+        if marker.table == "frame_envelopes" and destination.execute(
+            "SELECT 1 FROM frames WHERE user_id=%s AND frame_id=%s",
+            (marker.user_id, marker.item_id),
+        ).fetchone() is not None:
+            mismatch_counts[("duplicate_frame_representation", marker.table)] += 1
+            continue
+        valid_rows.append(
+            PlannedRow(
+                table=marker.table,
+                user_id=marker.user_id,
+                item_id=marker.item_id,
+                original_reason=original_reason,
+                current_reason=marker.reason,
+                source_row=source_tuple,
+                row_sha256=row_sha256,
+                destination_state="exact",
+            )
+        )
+        counts[marker.table] += 1
+        valid_keys.add((marker.table, marker.user_id, marker.item_id))
+
+    plan = _finish_plan(valid_rows, counts, mismatch_counts)
+    return PreservationAudit(
+        preserved=len(valid_rows),
+        counts=plan.counts,
+        sha256=plan.sha256,
+        mismatches=plan.blockers,
+        valid_keys=frozenset(valid_keys),
+    )
 
 
 def _assert_approved(

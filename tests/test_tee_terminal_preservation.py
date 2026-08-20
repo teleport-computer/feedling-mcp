@@ -412,6 +412,50 @@ def test_revert_plan_blocks_destination_drift_and_malformed_markers(backend_env)
     assert "malformed_preserved_marker:memory_moments:1" in revert.blockers
 
 
+def test_audit_preserved_checks_every_raw_destination_row(backend_env):
+    """The strict verifier must audit all four raw families without decrypting."""
+    uid, ids = _seed_four_terminal_rows()
+    with db.get_pool().connection() as source, psycopg.connect(
+        os.environ["TEE_DATABASE_URL"], autocommit=True
+    ) as destination:
+        plan = preservation.build_plan(source, destination)
+        preservation.apply_plan(
+            source, destination, plan,
+            expected_count=4, expected_plan_sha256=plan.sha256,
+        )
+        markers = [
+            preservation.PreservedPending(
+                user_id=row.user_id,
+                table=row.table,
+                item_id=row.item_id,
+                reason=destination.execute(
+                    "SELECT reason FROM tee_pending_device_migration "
+                    "WHERE user_id=%s AND table_name=%s AND item_id=%s",
+                    (row.user_id, row.table, row.item_id),
+                ).fetchone()[0],
+            )
+            for row in plan.rows
+        ]
+        audit = preservation.audit_preserved(source, destination, markers)
+
+        assert audit.preserved == 4
+        assert audit.counts == plan.counts
+        assert audit.sha256 == plan.sha256
+        assert audit.mismatches == ()
+        assert len(audit.valid_keys) == 4
+
+        destination.execute(
+            "UPDATE chat_messages SET doc=%s WHERE user_id=%s AND msg_id=%s",
+            (Jsonb({"drift": True}), uid, ids["chat_messages"]),
+        )
+        drifted = preservation.audit_preserved(source, destination, markers)
+
+    assert drifted.preserved == 3
+    assert drifted.mismatches == ("destination_conflict:chat_messages:1",)
+    assert uid not in repr(drifted.mismatches)
+    assert ids["chat_messages"] not in repr(drifted.mismatches)
+
+
 @pytest.mark.parametrize(
     ("expected_count", "expected_digest"),
     [(3, None), (4, "b" * 64)],
