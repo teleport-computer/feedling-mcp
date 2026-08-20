@@ -219,6 +219,9 @@ def build_plan(source, destination) -> PreservationPlan:
                 continue
             destination_state = "absent"
         elif tuple(destination_row) == source_tuple:
+            if marker_digest is None:
+                blocker_counts[("unowned_exact_destination", table)] += 1
+                continue
             destination_state = "exact"
         else:
             blocker_counts[("destination_conflict", table)] += 1
