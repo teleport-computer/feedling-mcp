@@ -14,6 +14,7 @@ from plaintext_shadow.config import TargetPolicy
 from tee_replicator import transforms
 from tee_replicator import worker
 from tee_shadow import mirror
+from tee_shadow import reconciler
 
 
 @pytest.fixture(autouse=True)
@@ -204,3 +205,31 @@ def test_keyed_replay_reads_current_row_and_propagates_delete(
             "SELECT count(*) FROM chat_messages WHERE user_id=%s AND msg_id=%s",
             (uid, msg_id),
         ).fetchone() == (0,)
+
+
+def test_mirror_keyed_replay_reads_current_row_and_propagates_delete() -> None:
+    key = f"mirror-key-{uuid.uuid4().hex}"
+    policy = TargetPolicy(dsn=os.environ["TEE_DATABASE_URL"])
+    with db.get_pool().connection() as source:
+        source.execute(
+            "INSERT INTO server_config (key, value) VALUES (%s, %s)",
+            (key, b"latest"),
+        )
+    with psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as target:
+        target.execute("DELETE FROM server_config WHERE key=%s", (key,))
+
+    copied = reconciler.reconcile_keys(
+        "server_config", [{"key": key}], target_policy=policy
+    )
+    assert copied == {"table": "server_config", "applied": 1, "deleted": 0}
+    with psycopg.connect(os.environ["TEE_DATABASE_URL"]) as target:
+        assert target.execute(
+            "SELECT value FROM server_config WHERE key=%s", (key,)
+        ).fetchone() == (b"latest",)
+
+    with db.get_pool().connection() as source:
+        source.execute("DELETE FROM server_config WHERE key=%s", (key,))
+    deleted = reconciler.reconcile_keys(
+        "server_config", [{"key": key}], target_policy=policy
+    )
+    assert deleted == {"table": "server_config", "applied": 0, "deleted": 1}

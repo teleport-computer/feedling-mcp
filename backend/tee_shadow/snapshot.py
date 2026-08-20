@@ -20,6 +20,7 @@ import logging
 from psycopg import sql
 
 import db
+from plaintext_shadow.config import TargetPolicy
 from tee_shadow import mirror
 from tee_shadow import table_registry as reg
 
@@ -198,7 +199,9 @@ def _merge_payload(
     ))
 
 
-def snapshot_table(table: str) -> dict:
+def snapshot_table(
+    table: str, *, target_policy: TargetPolicy | None = None
+) -> dict:
     """整表替换一张 SNAPSHOT lane 的表。绝不抛——失败信息落在返回值里。"""
     rep = {
         "table": table, "rows": 0, "ok": False, "error": None,
@@ -214,7 +217,12 @@ def snapshot_table(table: str) -> dict:
                 log.warning("[tee-snapshot] %s: %s", table, rep["error"])
                 return rep
             rds_cols = _columns(src, table)
-            with mirror.get_tee_pool().connection() as tee_probe:
+            target_pool = (
+                mirror.get_tee_pool()
+                if target_policy is None
+                else mirror.get_target_pool(target_policy)
+            )
+            with target_pool.connection() as tee_probe:
                 tee_cols = _columns(tee_probe, table)
                 pk_cols = _primary_key_columns(tee_probe, table)
 
@@ -247,7 +255,12 @@ def snapshot_table(table: str) -> dict:
 
             payload = _stream_rows(src, table, common)
 
-        with mirror.get_tee_pool().connection() as dst:
+        target_pool = (
+            mirror.get_tee_pool()
+            if target_policy is None
+            else mirror.get_target_pool(target_policy)
+        )
+        with target_pool.connection() as dst:
             # 显式事务：stage COPY、UPSERT 与 prune 要么一起生效、要么一起回滚。
             with dst.transaction():
                 _merge_payload(dst, table, common, pk_cols, payload)
