@@ -138,6 +138,91 @@ def test_trace_outcome_vocabulary_matches_runtime_dashboard():
     assert debug_trace.TRACE_OUTCOME_DEFAULT in debug_trace.TRACE_OUTCOME_CLASSES
 
 
+def test_outcome_classifier_is_shared_with_the_ops_dashboard():
+    """The dashboard and the trace layer must not classify the same job apart.
+
+    Classification used to live only inside the dashboard query, so nothing
+    stopped a second reader from deriving its own answer and calling a
+    deliberate suppression a real failure on one screen but not the other.
+    """
+    from model_api_runtime.v2 import jobs_store
+
+    for code in jobs_store.CONTROL_OUTCOME_CODES:
+        assert jobs_store.terminal_outcome_class(code) == "control"
+    for code in jobs_store.SAFETY_SUPPRESSION_CODES:
+        assert jobs_store.terminal_outcome_class(code) == "safety_suppression"
+    for code in jobs_store.TIMEOUT_OUTCOME_CODES:
+        assert jobs_store.terminal_outcome_class(code) == "timeout"
+    # An unclassified code stays operational rather than being guessed into a
+    # bucket that would quietly excuse it from the failure rate.
+    assert jobs_store.terminal_outcome_class("something_new") == "operational_failure"
+    assert jobs_store.terminal_outcome_class("") == "operational_failure"
+    # Whatever it returns must be a member of the one shared vocabulary.
+    every_code = (
+        jobs_store.CONTROL_OUTCOME_CODES
+        | jobs_store.SAFETY_SUPPRESSION_CODES
+        | jobs_store.TIMEOUT_OUTCOME_CODES
+        | {"anything_else"}
+    )
+    assert {jobs_store.terminal_outcome_class(c) for c in every_code} <= debug_trace.TRACE_OUTCOME_CLASSES
+
+
+def test_detail_list_caps_cannot_drift_past_the_silent_ceiling():
+    """A caller cap above the ceiling makes its own truncated flag lie."""
+    from model_api_runtime.v2 import serve_worker
+
+    assert serve_worker._MCP_CATALOG_MAX_TOOLS <= debug_trace._DETAIL_MAX_LIST
+
+    names = [f"tool_{i}" for i in range(debug_trace._DETAIL_MAX_LIST + 14)]
+    bounded = debug_trace.bounded_names("collapsed_names", names)
+    # Survives _safe_detail without losing anything it did not admit to losing.
+    safe = debug_trace._safe_detail(bounded)
+    assert safe["collapsed_names"] == bounded["collapsed_names"]
+    assert safe["collapsed_names_truncated"] is True
+    assert safe["collapsed_names_total"] == len(names)
+    # A caller asking for more than the ceiling is clamped, not silently obeyed.
+    assert len(debug_trace.bounded_names("k", names, cap=999)["k"]) <= debug_trace._DETAIL_MAX_LIST
+
+
+def test_emit_payload_forwards_job_id_and_outcome_class(tee_primary, monkeypatch):
+    """Both columns existed and were written, but nobody forwarded them.
+
+    A green suite proved only that nothing regressed; it could not tell us the
+    taxonomy was never populated.  This pins the forwarding itself, so removing
+    it goes red instead of silently returning every row to the default.
+    """
+    from diagnostics import diagnostics_core
+
+    class _Store:
+        def __init__(self, uid): self.user_id = uid
+
+    uid = _uid()
+    db.upsert_user({"user_id": uid, "created_at": datetime.now(_ZONE).isoformat()})
+    store = _Store(uid)
+    try:
+        debug_trace.set_enabled(store, True)
+        diagnostics_core.emit_trace_event_payload(store, {"event": {
+            "subsystem": "agent", "type": "agent.job.terminal", "status": "error",
+            "job_id": "job-4491", "outcome_class": "safety_suppression",
+        }})
+        # An unknown class must degrade to the default rather than reach the
+        # column, because this path also accepts untrusted resident payloads.
+        diagnostics_core.emit_trace_event_payload(store, {"event": {
+            "subsystem": "agent", "type": "agent.job.terminal", "status": "error",
+            "job_id": "job-4492", "outcome_class": "not-a-real-class",
+        }})
+        # read_trace flushes the pending queue for this user before reading.
+        debug_trace.read_trace(store)
+
+        rows = {r["job_id"]: r for r in db.query_trace_events(user_id=uid)}
+        assert rows["job-4491"]["outcome_class"] == "safety_suppression"
+        assert rows["job-4492"]["outcome_class"] == debug_trace.TRACE_OUTCOME_DEFAULT
+    finally:
+        db.delete_trace_events_for_user(uid)
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
 def test_trace_survives_account_delete_and_remains_queryable_by_uid(tee_primary):
     uid = _uid()
     db.upsert_user({"user_id": uid, "created_at": datetime.now(_ZONE).isoformat()})

@@ -34,6 +34,13 @@ _READ_LIMIT_MAX = 2500
 _EXCERPT_FIELD_MAX = 2048
 _EXCERPT_EVENT_MAX = 8192
 _TRUNC_MARK = "…(truncated)"
+# Named so callers can import the real ceiling instead of carrying their own
+# copy of it.  A caller whose cap exceeds these silently loses items inside
+# _safe_detail while its own "truncated" field still reports False.
+_DETAIL_MAX_KEYS = 20
+_DETAIL_MAX_STR = 200
+_DETAIL_MAX_LIST = 20
+_DETAIL_MAX_ITEM = 80
 _FLAG_CACHE_TTL = 30.0
 _QUEUE_MAX = 5000
 _FLUSH_BATCH_MAX = 100
@@ -807,16 +814,37 @@ def _safe_detail(detail: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(detail, dict):
         return {}
     out: dict[str, Any] = {}
-    for k, v in list(detail.items())[:20]:
+    for k, v in list(detail.items())[:_DETAIL_MAX_KEYS]:
         key = str(k)[:40]
         if isinstance(v, (int, float, bool)):
             out[key] = v
         elif isinstance(v, str):
-            out[key] = v[:200]
+            out[key] = v[:_DETAIL_MAX_STR]
         elif isinstance(v, list):
-            out[key] = [str(x)[:80] for x in v[:20]]
+            out[key] = [str(x)[:_DETAIL_MAX_ITEM] for x in v[:_DETAIL_MAX_LIST]]
         elif isinstance(v, dict):
-            out[key] = {str(kk)[:40]: (vv if isinstance(vv, (int, float, bool)) else str(vv)[:80]) for kk, vv in list(v.items())[:20]}
+            out[key] = {
+                str(kk)[:40]: (vv if isinstance(vv, (int, float, bool)) else str(vv)[:_DETAIL_MAX_ITEM])
+                for kk, vv in list(v.items())[:_DETAIL_MAX_KEYS]
+            }
         else:
-            out[key] = str(v)[:80]
+            out[key] = str(v)[:_DETAIL_MAX_ITEM]
     return out
+
+
+def bounded_names(key: str, names, *, cap: int = _DETAIL_MAX_LIST) -> dict[str, Any]:
+    """Emit a name list that admits it was cut, instead of quietly being cut.
+
+    ``_safe_detail`` caps every list at ``_DETAIL_MAX_LIST`` with no marker, so a
+    caller that carried its own larger cap could report ``truncated: False``
+    while items had already been dropped underneath it -- the record claiming
+    completeness precisely when it was not complete.  Callers that need a name
+    set must route it through here and must not exceed the underlying cap.
+    """
+    items = [str(n) for n in (names or [])]
+    cap = max(0, min(int(cap), _DETAIL_MAX_LIST))
+    return {
+        key: items[:cap],
+        f"{key}_truncated": len(items) > cap,
+        f"{key}_total": len(items),
+    }

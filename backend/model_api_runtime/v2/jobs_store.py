@@ -306,6 +306,57 @@ def _terminal_error_class(error: object, error_class: object = "") -> str:
     return "unknown"
 
 
+# Keep this list content-free and deliberately narrow: an unknown code stays
+# operational until somebody classifies it explicitly.  These are visible
+# outcomes but are not interchangeable with a provider/worker/runtime failure on
+# an operations dashboard.
+CONTROL_OUTCOME_CODES = frozenset({
+    "runtime_mode_changed",
+    "turns_halted",
+    "capture_disabled",
+    "dream_disabled",
+    "profile_disabled",
+    "maintenance_disabled",
+    "heartbeat_disabled",
+    "scheduled_disabled",
+    "manual_wake_disabled",
+})
+SAFETY_SUPPRESSION_CODES = frozenset({
+    "wake_failed:degenerate_reply_suppressed",
+    "wake_failed:protocol_fragment_suppressed",
+    "wake_failed:malformed_self_thinking_suppressed",
+})
+TIMEOUT_OUTCOME_CODES = frozenset({
+    "queue_timeout",
+    "lease_timeout",
+    "runtime_expired",
+})
+
+
+def terminal_outcome_class(error_code: str) -> str:
+    """Map a terminal error code to the shared four-value outcome taxonomy.
+
+    This lived inside the operations-dashboard query as two local frozensets, so
+    the dashboard was the only thing that could tell a deliberate control
+    outcome from a real failure.  Trace rows carry the same taxonomy now, and if
+    the two derived it independently they could disagree about the very same
+    job -- one screen calling a suppression a failure while the other did not.
+    One function, both readers.
+
+    ``outcome_class`` has no success member: it is only meaningful when the
+    event being classified is itself a failure.  Callers must not stamp it on a
+    ``status="ok"`` event.
+    """
+    code = str(error_code or "")
+    if code in CONTROL_OUTCOME_CODES:
+        return "control"
+    if code in SAFETY_SUPPRESSION_CODES:
+        return "safety_suppression"
+    if code in TIMEOUT_OUTCOME_CODES:
+        return "timeout"
+    return "operational_failure"
+
+
 def _pool():
     return db.get_pool()
 
@@ -5786,23 +5837,8 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
     # interchangeable with a provider/worker/runtime failure on an operations
     # dashboard.  Keep this list content-free and deliberately narrow: an unknown
     # code stays operational until somebody classifies it explicitly.
-    control_outcome_codes = frozenset({
-        "runtime_mode_changed",
-        "turns_halted",
-        "capture_disabled",
-        "dream_disabled",
-        "profile_disabled",
-        "maintenance_disabled",
-        "heartbeat_disabled",
-        "scheduled_disabled",
-        "manual_wake_disabled",
-    })
-    safety_suppression_codes = frozenset({
-        "wake_failed:degenerate_reply_suppressed",
-        "wake_failed:protocol_fragment_suppressed",
-        "wake_failed:malformed_self_thinking_suppressed",
-    })
-
+    # Classification now lives at module level (``terminal_outcome_class``) so
+    # the trace layer and this dashboard cannot drift apart.
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -5904,14 +5940,7 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
     failures_by_lane: dict[str, list[dict]] = {}
     for row in failure_rows:
         code = str(row["last_error"] or "")
-        if code in control_outcome_codes:
-            outcome_class = "control"
-        elif code in safety_suppression_codes:
-            outcome_class = "safety_suppression"
-        elif code in {"queue_timeout", "lease_timeout", "runtime_expired"}:
-            outcome_class = "timeout"
-        else:
-            outcome_class = "operational_failure"
+        outcome_class = terminal_outcome_class(code)
         failures_by_lane.setdefault(str(row["lane"] or ""), []).append({
             "code": code,
             "error_class": str(row.get("error_class") or ""),

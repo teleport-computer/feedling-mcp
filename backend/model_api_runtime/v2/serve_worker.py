@@ -4528,7 +4528,14 @@ def _record_extraction_status(
 _LAST_MCP_CATALOG_FINGERPRINT: dict[str, str] = {}
 _MCP_CATALOG_FINGERPRINT_MAX_USERS = 4096
 _MCP_CATALOG_DESC_CHARS = 160
-_MCP_CATALOG_MAX_TOOLS = 60
+# Must not exceed debug_trace._DETAIL_MAX_LIST: _safe_detail caps every list at
+# that number and leaves no marker, so a larger cap here reported
+# catalog_truncated=False while entries had already been dropped underneath --
+# the field asserting completeness exactly when the record was incomplete.
+# Kept as a literal because debug_trace is imported lazily inside functions
+# here; test_detail_list_caps_cannot_drift_past_the_silent_ceiling pins the
+# relationship instead, so raising this without raising the ceiling goes red.
+_MCP_CATALOG_MAX_TOOLS = 20
 
 
 def _remember_mcp_catalog_fingerprint(user_id: str, fingerprint: str) -> None:
@@ -4687,9 +4694,10 @@ async def _load_mcp_turn_observed(store, *, lane: str = "chat", **kwargs):
 
 
 def _emit_v2_debug_trace(store, event_type: str, *, status: str,
-                         summary: str, explain: str, detail: dict,
+                         detail: dict, summary: str = "", explain: str = "",
                          dur_ms: float | None = None,
-                         trace_id: str = "") -> None:
+                         trace_id: str = "", job_id: str = "",
+                         outcome_class: str = "") -> None:
     from diagnostics import diagnostics_core
 
     event = {
@@ -4699,6 +4707,12 @@ def _emit_v2_debug_trace(store, event_type: str, *, status: str,
     }
     if dur_ms is not None:
         event["dur_ms"] = dur_ms
+    # Added only when supplied, so the ~40 existing call sites keep emitting a
+    # byte-identical payload.
+    if job_id:
+        event["job_id"] = str(job_id)
+    if outcome_class:
+        event["outcome_class"] = str(outcome_class)
     diagnostics_core.emit_trace_event_payload(store, {"event": event})
 
 
