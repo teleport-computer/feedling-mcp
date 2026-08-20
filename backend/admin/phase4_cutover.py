@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import json
 import os
+import uuid
 from pathlib import Path
 from typing import Iterable
 
@@ -107,6 +108,66 @@ def _drain_counts(conn: psycopg.Connection) -> dict[str, int]:
     return {
         name: int(conn.execute(query).fetchone()[0])
         for name, query in _DRAIN_GATES.items()
+    }
+
+
+def _voice_session_smoke(
+    destination: psycopg.Connection,
+) -> dict[str, object]:
+    """Exercise the TEE-primary voice fence without leaving probe rows."""
+    suffix = uuid.uuid4().hex
+    user_id = f"usr_phase4_voice_{suffix}"
+    cancel_call = f"cancel-{suffix}"
+    finalize_call = f"finalize-{suffix}"
+    with destination.transaction(force_rollback=True):
+        destination.execute(
+            "INSERT INTO users (user_id,created_at,doc) VALUES (%s,'',%s)",
+            (user_id, Jsonb({"user_id": user_id})),
+        )
+        destination.execute(
+            "INSERT INTO voice_call_sessions (user_id,call_id,status) "
+            "VALUES (%s,%s,'active')",
+            (user_id, cancel_call),
+        )
+        destination.execute(
+            "UPDATE voice_call_sessions SET status='cancelled',"
+            "cancel_reason='promotion_smoke',ended_at=now() "
+            "WHERE user_id=%s AND call_id=%s AND status='active'",
+            (user_id, cancel_call),
+        )
+        destination.execute(
+            "INSERT INTO voice_call_sessions (user_id,call_id,status) "
+            "VALUES (%s,%s,'finalizing')",
+            (user_id, finalize_call),
+        )
+        destination.execute(
+            "UPDATE voice_call_sessions SET status='finalized',ended_at=now() "
+            "WHERE user_id=%s AND call_id=%s AND status='finalizing'",
+            (user_id, finalize_call),
+        )
+        downgraded = destination.execute(
+            "UPDATE voice_call_sessions SET status='cancelled' "
+            "WHERE user_id=%s AND call_id=%s "
+            "AND status NOT IN ('finalizing','finalized')",
+            (user_id, finalize_call),
+        ).rowcount
+        rows = dict(
+            destination.execute(
+                "SELECT call_id,status FROM voice_call_sessions "
+                "WHERE user_id=%s",
+                (user_id,),
+            ).fetchall()
+        )
+        expected = {
+            cancel_call: "cancelled",
+            finalize_call: "finalized",
+        }
+        if rows != expected or downgraded != 0:
+            raise RuntimeError("TEE voice session lifecycle smoke failed")
+    return {
+        "ok": True,
+        "cancel_winner": "cancelled",
+        "finalize_winner": "finalized",
     }
 
 
@@ -355,6 +416,7 @@ def run(*, apply: bool, writes_frozen: bool) -> dict[str, object]:
                 f"expected={sorted(expected_heads)} actual={sorted(actual_heads)}"
             )
 
+        voice_session_smoke = _voice_session_smoke(destination)
         drain = _drain_counts(source)
         pending_gate = _pending_gate(source, destination)
         drain["tee_pending_device_migration_blocking"] = int(
@@ -367,6 +429,7 @@ def run(*, apply: bool, writes_frozen: bool) -> dict[str, object]:
             "source": source_fingerprint,
             "destination": destination_fingerprint,
             "tee_heads": sorted(actual_heads),
+            "voice_session_smoke": voice_session_smoke,
             "drain": drain,
             "blockers": blockers,
             **pending_gate,

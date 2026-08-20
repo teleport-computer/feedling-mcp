@@ -6,6 +6,7 @@ import os
 import uuid
 
 import psycopg
+import pytest
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
@@ -163,6 +164,11 @@ def test_phase4_prepare_copies_frame_bridge_and_aligns_sequences(monkeypatch):
         assert report["preserved_plan_sha256"]
         assert report["frame_bridge"]["rows"] == 2
         assert report["chat_storage_generations"]["rows"] == 2
+        assert report["voice_session_smoke"] == {
+            "ok": True,
+            "cancel_winner": "cancelled",
+            "finalize_winner": "finalized",
+        }
         assert report["primary_contract"]["marker"][
             "tee_terminal_ciphertext_preserved"
         ] == 2
@@ -206,6 +212,10 @@ def test_phase4_prepare_copies_frame_bridge_and_aligns_sequences(monkeypatch):
             assert destination.execute(
                 "SELECT to_regclass('public.alembic_version')"
             ).fetchone()[0] is None
+            assert destination.execute(
+                "SELECT count(*) FROM users "
+                "WHERE user_id LIKE 'usr_phase4_voice_%'"
+            ).fetchone()[0] == 0
     finally:
         with psycopg.connect(admin_url, autocommit=True) as admin:
             for database in (source_name, destination_name):
@@ -261,3 +271,17 @@ def test_phase4_pending_gate_blocks_every_unaudited_reason(backend_env):
 
         tee.execute("DELETE FROM tee_pending_device_migration")
         tee.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
+def test_phase4_voice_session_smoke_fails_closed_when_table_is_missing(backend_env):
+    """A green schema head cannot hide a missing runtime-critical voice table."""
+    from admin import phase4_cutover
+
+    with psycopg.connect(os.environ["TEE_DATABASE_URL"]) as tee:
+        with tee.transaction(force_rollback=True):
+            tee.execute(
+                "ALTER TABLE voice_call_sessions "
+                "RENAME TO voice_call_sessions_missing_probe"
+            )
+            with pytest.raises(psycopg.errors.UndefinedTable):
+                phase4_cutover._voice_session_smoke(tee)
