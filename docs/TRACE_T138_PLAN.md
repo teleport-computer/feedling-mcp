@@ -19,6 +19,18 @@
 >
 > 下文是 T138 时的历史分块文档；其中 48 小时 ring/union 过渡、
 > RDS 双链与保留期未定等描述均不再是 T184 的实施依据。
+>
+> C 清理先用
+> `cd backend && python -m admin.trace_events_cleanup --environment test` dry-run。
+> 真正执行前必须同时满足：B 已合入，merge SHA 对应的 `CI` workflow
+> 中 `test_api.py (multi-tenant)` job 是 completed/success；旧 writer 回退窗口已关闭；
+> 显式传 `--execute --rollback-window-closed --validated-merge-sha <40位 SHA>`、
+> `--multi-tenant-ci-success`、dry-run 输出的
+> `--expected-database-fingerprint`、`--expected-rows`、
+> `--expected-document-bytes` 和环境对应的确认句。
+> prod 还必须传 `--seven-approval-reference` 记录 Seven 的明示批准。
+> 该工具只删旧事件 blob，不删 `v1_flow_trace_enabled`；它只连
+> `TEE_MIGRATION_DATABASE_URL`，RDS 退役不在 T184 范围。未满足上述门禁时只许 dry-run。
 
 > ## ⚠️ 2026-08-20 订正：本文的「7 天测量窗」方法已被 Seven 取消
 >
