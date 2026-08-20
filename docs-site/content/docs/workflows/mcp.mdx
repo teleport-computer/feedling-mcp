@@ -45,6 +45,21 @@ destinations retain their separate outbound fences, and a timed-out MCP mutation
 with an unknown outcome still blocks later mutating MCP calls in that turn to
 avoid duplicate remote effects.
 
+Hosted Runtime V2 offers the bounded MCP catalog in foreground Chat and in all
+proactive wake lanes: heartbeat, scheduled reminders, manual wake, and screen
+watch. Background turns load the same encrypted server configuration with a
+scoped runtime credential; no user API key is present in that turn. Tool-schema
+search and the configured read-only approvals work the same way across these
+lanes. A wake can therefore perform multi-step MCP work, subject to the same
+turn budgets and mutation-attempt fencing as Chat.
+
+Live screen pixels have a narrower authorization rule than an ordinary private
+read. A Chat or screen-watch turn that receives pixels keeps approved read-only
+MCP tools but removes mutating MCP tools, along with web and `task`, before its
+first provider call. This restriction comes from the pixel provenance, not from
+reading private workspace, memory, or MCP output; those later reads continue to
+leave both read-only and mutating user MCP tools available.
+
 ## Add or update a server
 
 ```http

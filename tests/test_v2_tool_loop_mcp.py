@@ -37,7 +37,7 @@ def _run(
     extra_mutating_tool_names=None,
     outbound_blocking_read_tool_predicate=None,
     refresh_extra_tool_specs=None,
-    initial_outbound_tools_blocked=False,
+    initial_screen_pixels_blocked=False,
 ):
     if extra_mutating_tool_names is None:
         extra_mutating_tool_names = {
@@ -73,7 +73,7 @@ def _run(
             outbound_blocking_read_tool_predicate=(
                 outbound_blocking_read_tool_predicate
             ),
-            initial_outbound_tools_blocked=initial_outbound_tools_blocked,
+            initial_screen_pixels_blocked=initial_screen_pixels_blocked,
         ))
     finally:
         provider_client.chat_completion_async = orig
@@ -605,30 +605,16 @@ def test_user_mcp_budget_is_not_atomic():
     assert kept.content.startswith("x")
 
 
-def test_outbound_blocked_round_keeps_user_mcp_but_drops_web_and_task():
-    """出站封锁的那一轮:web/web_fetch/task 被摘,**用户自选 MCP 保留**。
-
-    ⚠️ 这是一条 characterization test —— 它记录的是**已上线的现状**,不是
-    我们主张的理想边界。
+def test_screen_pixels_keep_read_mcp_but_drop_mutating_mcp_web_and_task():
+    """屏幕像素轮保留只读 MCP,摘掉写 MCP 与模型自选的出站工具。
 
     ⚠️ 上面那个阴性对照不是装饰。我第一版只断言「web/task 不在」,而这个夹具
     的目录**本来就可能不含它们** —— 「某物不存在」的断言在该物从未存在的
     环境里恒真,不报错、不变红、看起来完全像一次成功验证。翻转开关跑第二遍
     才能把「被摘了」和「从来没进来」分开。
 
-    来源:`57b4aedb`(2026-08-12,「用户自建 MCP 不再被出站围栏下架」)。
-    分界线是「谁选的目的地」:web/task 的目的地是**模型**挑的,MCP 服务器是
-    **用户**自己配的。`docs/MCP_TRUST_BOUNDARY.md` 记着 Seven 明确接受了这个
-    风险。
-
-    ⚠️ 但公开的 `docs-site/.../architecture.mdx` 至今仍写着「收到屏幕像素的
-    那一轮会移除 web、MCP 和 task」—— **那句话自 08-12 起就与实现不符**,而且
-    不只对唤醒道不符,对前台聊天就不符(chat 同样用
-    `initial_outbound_tools_blocked=(screen_frame_message is not None)`)。
-    在此之前**没有任何测试钉住这段行为**,我是靠临时探针才确认的。
-
-    Seven 若裁定「屏幕像素轮要单独禁 MCP」,**这条用例要反转,并且 chat 和
-    wake 必须一起改** —— 不能只改唤醒道。
+    屏幕像素与 private-read provenance 必须分开:后者继续沿用 08-12 决策,
+    user-MCP 读写都保留;前者按策略 C 只能保留只读 user-MCP。
     """
     responses = iter([{"reply": "ok", "tool_calls": [], "usage": {}}])
 
@@ -643,7 +629,7 @@ def test_outbound_blocked_round_keeps_user_mcp_but_drops_web_and_task():
         # 只读与写各一个:例外覆盖两者,不是只放读的进来。
         extra_mutating_tool_names={MCP_WRITE_SPEC.name},
         provider_tools=provider_tools,
-        initial_outbound_tools_blocked=True,
+        initial_screen_pixels_blocked=True,
     )
 
     # 阴性对照:同一夹具、只翻转那一个开关。没有它,「web 不在」可能只是
@@ -655,7 +641,7 @@ def test_outbound_blocked_round_keeps_user_mcp_but_drops_web_and_task():
         extra_tool_specs=(MCP_SPEC, MCP_WRITE_SPEC),
         extra_mutating_tool_names={MCP_WRITE_SPEC.name},
         provider_tools=control_tools,
-        initial_outbound_tools_blocked=False,
+        initial_screen_pixels_blocked=False,
     )
     control = {spec.name for spec in (control_tools[0] or ())}
     assert {"web_search", "web_fetch", "task"} <= control, (
@@ -665,7 +651,7 @@ def test_outbound_blocked_round_keeps_user_mcp_but_drops_web_and_task():
 
     offered = {spec.name for spec in (provider_tools[0] or ())}
     assert MCP_SPEC.name in offered, "read-only user MCP must survive the fence"
-    assert MCP_WRITE_SPEC.name in offered, "mutating user MCP survives too"
+    assert MCP_WRITE_SPEC.name not in offered, "screen pixels must fence MCP writes"
     # 前置条件:这一轮确实处在出站封锁形态,否则上面两条恒真。
     assert "web_search" not in offered
     assert "web_fetch" not in offered

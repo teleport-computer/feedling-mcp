@@ -347,23 +347,35 @@ def enqueue_reply_promotion(
     user_id,
     expected_generation,
     payload,
+    effect_type: str = FINAL_REPLY_EFFECT_TYPE,
+    claimed_by: str | None = None,
 ) -> str:
     """Enqueue the deterministic terminal half of an intermediate reply.
 
     The source intermediate effect, rather than an in-process ordinal, is the
     durable idempotency key.  This keeps promotion stable across lease recovery.
     """
+    if effect_type not in {
+        FINAL_REPLY_EFFECT_TYPE,
+        TERMINAL_REPLY_EFFECT_TYPE,
+    }:
+        raise ValueError("reply promotion must be final or terminal")
     eid = _effect_id.derive_reply_promotion(
         intermediate_effect_id=intermediate_effect_id,
     )
-    db.effect_enqueue(
+    inserted = db.effect_enqueue(
         eid,
         user_id,
         job_id,
-        FINAL_REPLY_EFFECT_TYPE,
+        effect_type,
         expected_generation,
         payload,
+        claimed_by=claimed_by,
     )
+    if claimed_by is not None and not inserted:
+        raise RuntimeError(
+            "reply promotion refused from a stale job owner"
+        )
     return eid
 
 
@@ -867,7 +879,7 @@ def last_promotable_intermediate_reply(
             " SELECT 1 FROM v2_effect_outbox promotion "
             " WHERE promotion.user_id=source.user_id "
             " AND promotion.job_id=source.job_id "
-            " AND promotion.effect_type=%s "
+            " AND promotion.effect_type IN (%s,%s) "
             " AND promotion.status='discarded' "
             " AND promotion.payload->>%s=source.effect_id"
             ") ORDER BY source.enqueue_seq DESC LIMIT 1",
@@ -876,6 +888,7 @@ def last_promotable_intermediate_reply(
                 job_id,
                 INTERMEDIATE_REPLY_EFFECT_TYPE,
                 FINAL_REPLY_EFFECT_TYPE,
+                TERMINAL_REPLY_EFFECT_TYPE,
                 PROMOTED_INTERMEDIATE_EFFECT_ID_KEY,
             ),
         ).fetchone()

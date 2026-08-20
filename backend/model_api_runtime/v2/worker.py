@@ -8671,11 +8671,13 @@ async def _run_wake(
         thinking_trace_emitted = False
         language_trace_emitted = False
         wake_self_thinking_failed = False
+        last_promotable_reply_text = ""
 
         async def _on_reply(text: str, *, final: bool, reasoning: str = "") -> None:
             nonlocal thinking_trace_emitted, language_trace_emitted
             nonlocal shadow_decision_allowed
             nonlocal wake_self_thinking_failed
+            nonlocal last_promotable_reply_text
             text = str(text or "").strip()
             wake_self_thinking_failed = False
             # Self-authored thinking (same mechanism as the chat lane): peel a leading
@@ -9038,6 +9040,8 @@ async def _run_wake(
                         log.warning(
                             "[v2.worker] wake reply push slot build failed user=%s: %s",
                             user_id, e)
+                    if not final:
+                        last_promotable_reply_text = text
                 if status == "applied":
                     if tm is not None:
                         tm.record_visible_reply()
@@ -9174,6 +9178,170 @@ async def _run_wake(
                 {**row, "role": "user"} for row in rows
             )
             return rows
+
+        async def _on_promote_last_wake_intermediate() -> bool:
+            """Close a scheduled wake through its last durable reply bubble."""
+            nonlocal thinking_trace_emitted, language_trace_emitted
+            nonlocal shadow_decision_allowed
+
+            if not seq_native or lane != "scheduled":
+                return False
+            await _fence_wake_effect("reply promotion")
+            receipt = await asyncio.to_thread(
+                v2_effect_outbox.last_promotable_intermediate_reply,
+                user_id=user_id,
+                job_id=job_id,
+            )
+            if receipt is None:
+                return False
+
+            source_effect_id = str(receipt["effect_id"])
+            payload = dict(receipt["payload"])
+            payload.pop(v2_effect_outbox.REPLY_SOURCE_FENCE_KEY, None)
+            consumed_seq = (
+                int(cursor_box["seq"])
+                if int(cursor_box["seq"]) > int(wake_start_seq)
+                else None
+            )
+            if consumed_seq is not None:
+                effect_type = v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE
+                payload["reply_through_seq"] = consumed_seq
+                payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
+                    "claimed_by": claimed_by,
+                    "input_generation": int(wake_observed_generation),
+                    "through_seq": consumed_seq,
+                }
+            else:
+                effect_type = v2_effect_outbox.TERMINAL_REPLY_EFFECT_TYPE
+                payload.pop("reply_through_seq", None)
+                payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
+                    "claimed_by": claimed_by,
+                    "input_generation": int(wake_observed_generation),
+                    "observed_user_seq": int(cursor_box["seq"]),
+                }
+            payload[
+                v2_effect_outbox.PROMOTED_INTERMEDIATE_EFFECT_ID_KEY
+            ] = source_effect_id
+            if scheduled_activity_events:
+                payload.update(
+                    _activity_extra(
+                        scheduled_activity_events,
+                        turn_id=f"scheduled:{job_id}",
+                        job_id=int(job_id),
+                    )
+                )
+
+            delivery_started_ns = time.monotonic_ns()
+            effect_id = await asyncio.to_thread(
+                v2_effect_outbox.enqueue_reply_promotion,
+                intermediate_effect_id=source_effect_id,
+                job_id=job_id,
+                user_id=user_id,
+                expected_generation=gen,
+                payload=payload,
+                effect_type=effect_type,
+                claimed_by=claimed_by,
+            )
+            if deps.apply_pending_effects is not None:
+                await asyncio.to_thread(deps.apply_pending_effects, user_id)
+            disposition = await asyncio.to_thread(
+                v2_effect_outbox.get_effect_disposition,
+                effect_id,
+                user_id=user_id,
+                job_id=job_id,
+                effect_type=effect_type,
+            )
+            status = "missing" if disposition is None else disposition["status"]
+            last_error = "" if disposition is None else disposition["last_error"]
+            await _record_trajectory(
+                trajectory_recorder,
+                "reply_effect_disposition",
+                {
+                    "effect_id": effect_id,
+                    "effect_type": effect_type,
+                    "final": True,
+                    "promoted_intermediate": True,
+                    "status": status,
+                    "last_error": last_error,
+                    "duration_ms": round(
+                        max(0, time.monotonic_ns() - delivery_started_ns)
+                        / 1_000_000.0,
+                        3,
+                    ),
+                },
+                best_effort=True,
+            )
+            if status == "applied":
+                source_status = await asyncio.to_thread(
+                    jobs_store.get_job_status,
+                    job_id,
+                    user_id=user_id,
+                    claimed_by=claimed_by,
+                )
+                if source_status != "completed":
+                    raise RuntimeError(
+                        "promoted wake reply applied without completing source job"
+                    )
+                shadow_decision_allowed = True
+                if not thinking_trace_emitted:
+                    thinking_trace_emitted = True
+                    await _emit_thinking_surfaced_trace(
+                        deps.emit_debug_trace,
+                        user_id,
+                        provider_config,
+                        lane="wake",
+                        branch="none",
+                        chars=0,
+                    )
+                if not language_trace_emitted:
+                    language_trace_emitted = True
+                    await _emit_reply_language_follow_trace(
+                        deps.emit_debug_trace,
+                        user_id,
+                        user_rows=language_user_rows,
+                        visible_reply=last_promotable_reply_text,
+                        lane="wake",
+                    )
+                return True
+            if (
+                status == "discarded"
+                and last_error == v2_effect_outbox.WAKE_REPLY_CHAT_COLLISION
+            ):
+                return True
+            if (
+                status == "discarded"
+                and last_error == v2_effect_outbox.FINAL_REPLY_INPUT_ADVANCED
+            ):
+                raise v2_tool_loop.FinalReplySuperseded()
+            if (
+                status == "discarded"
+                and last_error
+                == v2_effect_outbox.FINAL_REPLY_SOURCE_JOB_INACTIVE
+            ):
+                raise LostJobLease(
+                    "wake source job became inactive before reply promotion"
+                )
+            if (
+                status == "discarded"
+                and last_error == v2_effect_outbox.FINAL_REPLY_INVALID_FENCE
+            ):
+                raise RuntimeError("invalid promoted wake reply fence")
+            if status == "discarded" and last_error in {
+                v2_effect_outbox.EFFECT_RUNTIME_STATE_CHANGED,
+                v2_effect_outbox.EFFECT_RUNTIME_GENERATION_CHANGED,
+            }:
+                code = (
+                    "runtime_mode_changed"
+                    if last_error == v2_effect_outbox.EFFECT_RUNTIME_STATE_CHANGED
+                    else "runtime_generation_changed"
+                )
+                await _fail_runtime_fence(
+                    code,
+                    "runtime ownership changed before wake reply promotion",
+                )
+            raise RuntimeError(
+                "promoted wake reply effect not durably applied: " + status
+            )
 
         # ── 世界书:主动开口的四条道也要认得这个世界（Seven 2026-08-10）
         #
@@ -9390,6 +9558,11 @@ async def _run_wake(
                 memory_delete_allowed=False,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,
+                on_promote_last_intermediate=(
+                    _on_promote_last_wake_intermediate
+                    if lane == "scheduled"
+                    else None
+                ),
                 fold_new_messages=fold_new_messages,
                 add_usage=_add_usage,
                 max_calls=_TURN_MAX_LLM_CALLS,
@@ -9462,7 +9635,7 @@ async def _run_wake(
                 prompt_estimator_utf8_bytes_per_token=(
                     PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
                 ),
-                initial_outbound_tools_blocked=(screen_frame_message is not None),
+                initial_screen_pixels_blocked=(screen_frame_message is not None),
                 tagged_image_message_key=v2_screen_chat.MESSAGE_TAG,
                 on_tagged_images_rejected=(
                     _on_wake_screen_images_rejected
@@ -14082,7 +14255,7 @@ async def process_job(
             disabled_tool_names=disabled_tool_names_for_turn,
             outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
             outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
-            initial_outbound_tools_blocked=(screen_frame_message is not None),
+            initial_screen_pixels_blocked=(screen_frame_message is not None),
             tagged_image_message_key=v2_screen_chat.MESSAGE_TAG,
             on_tagged_images_rejected=_on_screen_images_rejected,
             max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,

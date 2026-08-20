@@ -46,6 +46,19 @@ change must not be interpreted as an API guarantee.
   bookkeeping remain explicitly best-effort and do not rewrite an already-real
   delivery outcome.
 
+- **Hosted Runtime V2 now exposes user MCP tools to every proactive wake lane
+  and applies a distinct live-screen authorization boundary.** Heartbeat,
+  scheduled, manual-wake, and screen-watch turns load the same bounded MCP
+  catalog and schema-recovery path as Chat. A turn carrying live screen pixels
+  keeps read-only user MCP tools but removes mutating MCP tools, web, and
+  `task`; reading private workspace or memory data still leaves both read-only
+  and mutating user MCP available under the user-selected-infrastructure trust
+  boundary. Scheduled wakes that already published a `reply`-tool bubble can
+  now promote that same encrypted bubble when the provider closes without more
+  text: user-input-consuming promotions advance the exact reply cursor, while
+  purely proactive promotions finish without moving it or creating a duplicate
+  message.
+
 - **An image-generation provider may now answer with a link, and the server
   retrieves it.** Some providers return `data[].url` from the image endpoint
   instead of inline bytes — measured on a relay that does this only for the 2K

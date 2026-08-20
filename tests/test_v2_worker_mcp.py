@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -35,6 +36,11 @@ _MCP_SPEC = ToolSpec(name="mcp__test__ping", description="ping the test server",
 _MCP_SPEC_TWO = ToolSpec(
     name="mcp__test__status",
     description="read test server status",
+    parameters={"type": "object", "properties": {}},
+)
+_MCP_WRITE_SPEC = ToolSpec(
+    name="mcp__test__write",
+    description="mutate test server state",
     parameters={"type": "object", "properties": {}},
 )
 
@@ -1098,3 +1104,94 @@ def test_chat_refuses_folded_platform_call_before_dispatch(monkeypatch):
         and cap_tool_schema.MCP_TOOL_SEARCH_TOOL in text
         for text in texts
     )
+
+
+def _run_chat_screen_with_mcp(monkeypatch, uid, *, with_frames: bool):
+    """Drive the production chat screen-frame source into the real tool loop."""
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("screen-mcp-chat-test")
+    _patch_real_write(monkeypatch)
+    monkeypatch.setattr(worker, "_report_turn_progress", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        worker,
+        "_screen_share_grounding",
+        lambda _uid: {"active": True, "latest_frame_age_sec": 1},
+    )
+    frames = [{"id": "f1", "ts": time.time()}] if with_frames else []
+    monkeypatch.setattr(worker.db, "frame_list_meta", lambda _uid: frames)
+    monkeypatch.setattr(
+        worker.db,
+        "model_api_active_route_vision_verdict",
+        lambda _uid: {"supported": True},
+    )
+
+    calls = _script_provider(monkeypatch, [{
+        "reply": "看到了。",
+        "tool_calls": [],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }])
+    turn = _FakeMcpTurn(
+        [_MCP_SPEC, _MCP_WRITE_SPEC],
+        [],
+        read_only_names={_MCP_SPEC.name},
+    )
+    deps = _deps(
+        [{"id": "m1", "ts": 10.0, "role": "user", "content": "你能看到吗？"}],
+        load_mcp_turn=_make_load_turn_mcp(turn),
+    )
+    deps.read_screen_frames = lambda _uid, _frame_ids: {
+        "frames": {
+            "f1": {
+                "image_b64": "AAAA",
+                "image_mime": "image/jpeg",
+                "ocr_text": "untrusted screen text",
+                "app": "Notes",
+                "ts": time.time(),
+            }
+        },
+        "cache_hits": 0,
+        "cache_misses": 1,
+    }
+
+    assert asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    )) == "completed"
+    carried_pixels = any(
+        message.get(worker.v2_screen_chat.MESSAGE_TAG) is True
+        for message in calls[0]["messages"]
+    )
+    offered = {spec.name for spec in calls[0]["tools"]}
+    return offered, carried_pixels
+
+
+def test_chat_live_pixels_keep_read_mcp_but_drop_write_web_and_task(monkeypatch):
+    """Production chat call-site derives the screen policy bit from pixels."""
+    control, control_pixels = _run_chat_screen_with_mcp(
+        monkeypatch,
+        "u_chat_screen_mcp_control",
+        with_frames=False,
+    )
+    assert not control_pixels
+    assert {
+        "web_search",
+        "web_fetch",
+        cap_tool_schema.TASK_TOOL,
+        _MCP_SPEC.name,
+        _MCP_WRITE_SPEC.name,
+    } <= control
+
+    offered, carried_pixels = _run_chat_screen_with_mcp(
+        monkeypatch,
+        "u_chat_screen_mcp_pixels",
+        with_frames=True,
+    )
+    assert carried_pixels, "target round must actually carry screen pixels"
+    assert {"web_search", "web_fetch", cap_tool_schema.TASK_TOOL}.isdisjoint(offered)
+    assert _MCP_SPEC.name in offered, "read-only user MCP survives the pixel fence"
+    assert _MCP_WRITE_SPEC.name not in offered, "screen pixels must fence MCP writes"
