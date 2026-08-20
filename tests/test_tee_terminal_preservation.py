@@ -77,10 +77,18 @@ def _clean_preservation_rows(backend_env):
     """Keep whole-database planning deterministic in the shared test DBs."""
     with psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as tee:
         tee.execute("DELETE FROM tee_pending_device_migration")
+        tee.execute(
+            "DELETE FROM server_config WHERE key=%s",
+            (db._TEE_PRIMARY_PREPARED_KEY,),
+        )
         tee.execute("DELETE FROM users WHERE user_id LIKE 'usr_preserve_%'")
     yield
     with psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as tee:
         tee.execute("DELETE FROM tee_pending_device_migration")
+        tee.execute(
+            "DELETE FROM server_config WHERE key=%s",
+            (db._TEE_PRIMARY_PREPARED_KEY,),
+        )
         tee.execute("DELETE FROM users WHERE user_id LIKE 'usr_preserve_%'")
     with db.get_pool().connection() as source:
         source.execute("DELETE FROM users WHERE user_id LIKE 'usr_preserve_%'")
@@ -300,6 +308,142 @@ def test_apply_is_idempotent_after_exact_preservation(backend_env):
         assert second["inserted"] == 0
         assert second["already_exact"] == 4
         assert second["plan_sha256"] == first["plan_sha256"]
+
+
+def test_revert_deletes_only_owned_rows_and_restores_original_reasons(backend_env):
+    """Before cutover, an exact preservation operation must be fully reversible."""
+    uid, _ids = _seed_four_terminal_rows()
+    with db.get_pool().connection() as source, psycopg.connect(
+        os.environ["TEE_DATABASE_URL"], autocommit=True
+    ) as destination:
+        original_reasons = dict(
+            destination.execute(
+                "SELECT table_name,reason FROM tee_pending_device_migration "
+                "WHERE user_id=%s ORDER BY table_name",
+                (uid,),
+            ).fetchall()
+        )
+        apply = preservation.build_plan(source, destination)
+        preservation.apply_plan(
+            source,
+            destination,
+            apply,
+            expected_count=4,
+            expected_plan_sha256=apply.sha256,
+        )
+        revert = preservation.build_revert_plan(source, destination)
+        report = preservation.revert_plan(
+            source,
+            destination,
+            revert,
+            expected_count=4,
+            expected_plan_sha256=revert.sha256,
+        )
+
+        assert report == {
+            "ok": True,
+            "reverted": 4,
+            "counts": apply.counts,
+            "plan_sha256": apply.sha256,
+        }
+        for table, contract in preservation.CONTRACTS.items():
+            assert destination.execute(
+                contract.destination_fetch_sql,
+                contract.args(uid, uid if contract.by_user_only else _ids[table]),
+            ).fetchone() is None
+        assert dict(
+            destination.execute(
+                "SELECT table_name,reason FROM tee_pending_device_migration "
+                "WHERE user_id=%s ORDER BY table_name",
+                (uid,),
+            ).fetchall()
+        ) == original_reasons
+
+
+def test_revert_refuses_after_phase4_prepared_marker(backend_env):
+    """Once cutover preparation exists, the release-local rollback is retired."""
+    _seed_four_terminal_rows()
+    with db.get_pool().connection() as source, psycopg.connect(
+        os.environ["TEE_DATABASE_URL"], autocommit=True
+    ) as destination:
+        apply = preservation.build_plan(source, destination)
+        preservation.apply_plan(
+            source, destination, apply,
+            expected_count=4, expected_plan_sha256=apply.sha256,
+        )
+        destination.execute(
+            "INSERT INTO server_config (key,value) VALUES (%s,%s)",
+            (db._TEE_PRIMARY_PREPARED_KEY, b"{}"),
+        )
+        revert = preservation.build_revert_plan(source, destination)
+
+        assert "phase4_already_prepared:all:1" in revert.blockers
+        with pytest.raises(preservation.PreservationRefused):
+            preservation.revert_plan(
+                source, destination, revert,
+                expected_count=4, expected_plan_sha256=revert.sha256,
+            )
+
+
+def test_revert_plan_blocks_destination_drift_and_malformed_markers(backend_env):
+    """Revert fails closed instead of deleting changed or unauditable rows."""
+    uid, ids = _seed_four_terminal_rows()
+    with db.get_pool().connection() as source, psycopg.connect(
+        os.environ["TEE_DATABASE_URL"], autocommit=True
+    ) as destination:
+        apply = preservation.build_plan(source, destination)
+        preservation.apply_plan(
+            source, destination, apply,
+            expected_count=4, expected_plan_sha256=apply.sha256,
+        )
+        destination.execute(
+            "UPDATE chat_messages SET doc=%s WHERE user_id=%s AND msg_id=%s",
+            (Jsonb({"changed": True}), uid, ids["chat_messages"]),
+        )
+        destination.execute(
+            "UPDATE tee_pending_device_migration "
+            "SET reason='preserved_ciphertext:v1:malformed' "
+            "WHERE user_id=%s AND table_name='memory_moments'",
+            (uid,),
+        )
+        revert = preservation.build_revert_plan(source, destination)
+
+    assert "destination_conflict:chat_messages:1" in revert.blockers
+    assert "malformed_preserved_marker:memory_moments:1" in revert.blockers
+
+
+@pytest.mark.parametrize(
+    ("expected_count", "expected_digest"),
+    [(3, None), (4, "b" * 64)],
+)
+def test_revert_rejects_stale_compare_and_apply_guard(
+    backend_env, expected_count, expected_digest
+):
+    """A stale revert approval cannot delete any preserved destination rows."""
+    uid, _ids = _seed_four_terminal_rows()
+    with db.get_pool().connection() as source, psycopg.connect(
+        os.environ["TEE_DATABASE_URL"], autocommit=True
+    ) as destination:
+        apply = preservation.build_plan(source, destination)
+        preservation.apply_plan(
+            source, destination, apply,
+            expected_count=4, expected_plan_sha256=apply.sha256,
+        )
+        revert = preservation.build_revert_plan(source, destination)
+        before = destination.execute(
+            "SELECT count(*) FROM chat_messages WHERE user_id=%s", (uid,)
+        ).fetchone()[0]
+        with pytest.raises(preservation.PreservationRefused):
+            preservation.revert_plan(
+                source,
+                destination,
+                revert,
+                expected_count=expected_count,
+                expected_plan_sha256=expected_digest or revert.sha256,
+            )
+        assert destination.execute(
+            "SELECT count(*) FROM chat_messages WHERE user_id=%s", (uid,)
+        ).fetchone()[0] == before
 
 
 def test_missing_parent_blocks_without_exposing_identifiers(backend_env):

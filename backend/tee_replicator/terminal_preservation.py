@@ -27,6 +27,7 @@ class _Contract:
     source_fetch_sql: str
     destination_fetch_sql: str
     insert_sql: str
+    delete_sql: str
     json_indices: tuple[int, ...]
     by_user_only: bool = False
 
@@ -49,6 +50,7 @@ CONTRACTS: dict[str, _Contract] = {
         "INSERT INTO chat_messages "
         "(user_id,msg_id,ts,doc,seq,storage_generation) "
         "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s,%s)",
+        "DELETE FROM chat_messages WHERE user_id=%s AND msg_id=%s",
         (3,),
     ),
     "memory_moments": _Contract(
@@ -58,6 +60,7 @@ CONTRACTS: dict[str, _Contract] = {
         "WHERE user_id=%s AND moment_id=%s",
         "INSERT INTO memory_moments (user_id,moment_id,occurred_at,doc) "
         "VALUES (%s,%s,%s,%s)",
+        "DELETE FROM memory_moments WHERE user_id=%s AND moment_id=%s",
         (3,),
     ),
     "identity": _Contract(
@@ -66,6 +69,7 @@ CONTRACTS: dict[str, _Contract] = {
         "SELECT user_id,kind,doc FROM user_blobs "
         "WHERE user_id=%s AND kind='identity'",
         "INSERT INTO user_blobs (user_id,kind,doc) VALUES (%s,%s,%s)",
+        "DELETE FROM user_blobs WHERE user_id=%s AND kind='identity'",
         (2,),
         by_user_only=True,
     ),
@@ -77,6 +81,7 @@ CONTRACTS: dict[str, _Contract] = {
         "INSERT INTO frame_envelopes "
         "(user_id,frame_id,ts,doc,env_meta,body_key) "
         "VALUES (%s,%s,%s,%s,%s,%s)",
+        "DELETE FROM frame_envelopes WHERE user_id=%s AND frame_id=%s",
         (3, 4),
     ),
 }
@@ -165,6 +170,30 @@ def _reason_class(reason: str) -> str:
     return reason
 
 
+def _finish_plan(
+    rows: list[PlannedRow],
+    counts: Counter[str],
+    blocker_counts: Counter[tuple[str, str]],
+) -> PreservationPlan:
+    digest_payload = [
+        [row.table, row.row_sha256, _reason_class(row.original_reason)]
+        for row in rows
+    ]
+    plan_sha256 = hashlib.sha256(
+        json.dumps(digest_payload, separators=(",", ":")).encode()
+    ).hexdigest()
+    blockers = tuple(
+        f"{code}:{table}:{count}"
+        for (code, table), count in sorted(blocker_counts.items())
+    )
+    return PreservationPlan(
+        rows=tuple(rows),
+        sha256=plan_sha256,
+        counts=dict(sorted(counts.items())),
+        blockers=blockers,
+    )
+
+
 def build_plan(source, destination) -> PreservationPlan:
     """Build a stable, read-only plan for all currently terminal markers."""
     pending = destination.execute(
@@ -239,23 +268,75 @@ def build_plan(source, destination) -> PreservationPlan:
             )
         )
 
-    digest_payload = [
-        [row.table, row.row_sha256, _reason_class(row.original_reason)]
-        for row in rows
-    ]
-    plan_sha256 = hashlib.sha256(
-        json.dumps(digest_payload, separators=(",", ":")).encode()
-    ).hexdigest()
-    blockers = tuple(
-        f"{code}:{table}:{count}"
-        for (code, table), count in sorted(blocker_counts.items())
-    )
-    return PreservationPlan(
-        rows=tuple(rows),
-        sha256=plan_sha256,
-        counts=dict(sorted(counts.items())),
-        blockers=blockers,
-    )
+    return _finish_plan(rows, counts, blocker_counts)
+
+
+def build_revert_plan(source, destination) -> PreservationPlan:
+    """Plan an exact pre-cutover revert of rows owned by preservation markers."""
+    pending = destination.execute(
+        "SELECT user_id,table_name,item_id,reason "
+        "FROM tee_pending_device_migration "
+        "WHERE reason LIKE 'preserved_ciphertext:%' "
+        "ORDER BY table_name,user_id,item_id"
+    ).fetchall()
+    rows: list[PlannedRow] = []
+    counts: Counter[str] = Counter()
+    blocker_counts: Counter[tuple[str, str]] = Counter()
+
+    prepared = destination.execute(
+        "SELECT 1 FROM server_config WHERE key='phase4_primary_prepared'"
+    ).fetchone()
+    if prepared is not None:
+        blocker_counts[("phase4_already_prepared", "all")] += 1
+
+    for raw_user_id, raw_table, raw_item_id, raw_reason in pending:
+        user_id = str(raw_user_id)
+        table = str(raw_table)
+        item_id = str(raw_item_id)
+        reason = str(raw_reason or "")
+        counts[table] += 1
+        parsed_marker = parse_preserved_reason(reason)
+        if parsed_marker is None:
+            blocker_counts[("malformed_preserved_marker", table)] += 1
+            continue
+        marker_digest, original_reason = parsed_marker
+        contract = CONTRACTS.get(table)
+        if contract is None:
+            blocker_counts[("unknown_table", table)] += 1
+            continue
+        args = contract.args(user_id, item_id)
+        source_row = source.execute(contract.source_fetch_sql, args).fetchone()
+        if source_row is None:
+            blocker_counts[("missing_source", table)] += 1
+            continue
+        source_tuple = tuple(source_row)
+        row_sha256 = canonical_row_sha256(table, source_tuple)
+        if marker_digest != row_sha256:
+            blocker_counts[("marker_digest_mismatch", table)] += 1
+            continue
+        destination_row = destination.execute(
+            contract.destination_fetch_sql, args
+        ).fetchone()
+        if destination_row is None:
+            blocker_counts[("missing_preserved_destination", table)] += 1
+            continue
+        if tuple(destination_row) != source_tuple:
+            blocker_counts[("destination_conflict", table)] += 1
+            continue
+        rows.append(
+            PlannedRow(
+                table=table,
+                user_id=user_id,
+                item_id=item_id,
+                original_reason=original_reason,
+                current_reason=reason,
+                source_row=source_tuple,
+                row_sha256=row_sha256,
+                destination_state="exact",
+            )
+        )
+
+    return _finish_plan(rows, counts, blocker_counts)
 
 
 def _assert_approved(
@@ -327,6 +408,75 @@ def apply_plan(
         "preserved": marked,
         "inserted": inserted,
         "already_exact": exact,
+        "counts": live_plan.counts,
+        "plan_sha256": live_plan.sha256,
+    }
+
+
+def revert_plan(
+    source,
+    destination,
+    plan: PreservationPlan,
+    *,
+    expected_count: int,
+    expected_plan_sha256: str,
+) -> dict:
+    """Atomically remove owned preserved rows and restore terminal markers."""
+    _assert_approved(
+        plan,
+        expected_count=expected_count,
+        expected_plan_sha256=expected_plan_sha256,
+    )
+    with source.transaction():
+        source.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        with destination.transaction():
+            destination.execute("LOCK TABLE server_config IN SHARE MODE")
+            live_plan = build_revert_plan(source, destination)
+            _assert_approved(
+                live_plan,
+                expected_count=expected_count,
+                expected_plan_sha256=expected_plan_sha256,
+            )
+            reverted = 0
+            for row in live_plan.rows:
+                contract = CONTRACTS[row.table]
+                args = contract.args(row.user_id, row.item_id)
+                marker_row = destination.execute(
+                    "SELECT reason FROM tee_pending_device_migration "
+                    "WHERE user_id=%s AND table_name=%s AND item_id=%s FOR UPDATE",
+                    (row.user_id, row.table, row.item_id),
+                ).fetchone()
+                if marker_row is None or str(marker_row[0]) != row.current_reason:
+                    raise PreservationRefused("preservation_marker_changed")
+                destination_row = destination.execute(
+                    f"{contract.destination_fetch_sql} FOR UPDATE", args
+                ).fetchone()
+                if (
+                    destination_row is None
+                    or tuple(destination_row) != row.source_row
+                    or canonical_row_sha256(row.table, tuple(destination_row))
+                    != row.row_sha256
+                ):
+                    raise PreservationRefused("preserved_destination_changed")
+                if destination.execute(contract.delete_sql, args).rowcount != 1:
+                    raise PreservationRefused("preserved_destination_changed")
+                changed = destination.execute(
+                    "UPDATE tee_pending_device_migration SET reason=%s,marked_at=now() "
+                    "WHERE user_id=%s AND table_name=%s AND item_id=%s AND reason=%s",
+                    (
+                        row.original_reason,
+                        row.user_id,
+                        row.table,
+                        row.item_id,
+                        row.current_reason,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise PreservationRefused("preservation_marker_changed")
+                reverted += 1
+    return {
+        "ok": True,
+        "reverted": reverted,
         "counts": live_plan.counts,
         "plan_sha256": live_plan.sha256,
     }
