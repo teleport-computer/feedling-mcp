@@ -136,9 +136,8 @@ def _seed_all_per_user_tables(user_id: str) -> None:
         )
         conn.execute(
             "INSERT INTO user_blobs (user_id,kind,doc) VALUES "
-            "(%s,'v1_flow_trace_enabled','{\"enabled\": true}'::jsonb),"
-            "(%s,'v1_flow_trace','{\"v\": 1, \"events\": [{\"type\": \"contract\"}]}'::jsonb)",
-            (user_id, user_id),
+            "(%s,'v1_flow_trace_enabled','{\"enabled\": true}'::jsonb)",
+            (user_id,),
         )
         conn.execute(
             "INSERT INTO v2_chat_tail_anchor (user_id, anchor_seq) "

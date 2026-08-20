@@ -4460,7 +4460,7 @@ def _lane_rollup_freeze_day(conn, *, day: date, zone: ZoneInfo,
     forever and would hit snapshot's 200k MAX_ROWS hard stop).
 
     Source is ``agent_jobs`` — the business terminal-state table, deliberately
-    NOT the trace ring: traces can be missing (that is pillar-① of the trace
+    NOT the debug trace store: traces can be missing (that is pillar-① of the trace
     overhaul), and statistics must not be built on something that can be
     missing. Bucketing is by ``finished_at`` (terminal transitions stamp
     ``finished_at=now()``), so once a day has closed no new row can ever land
@@ -6372,7 +6372,7 @@ def admin_api_key_stats() -> dict:
 
 
 _BLOB_REVISION_KEY = "_rds_revision"
-_REVISIONED_BLOB_KINDS = frozenset({"model_api_runtime", "v1_flow_trace"})
+_REVISIONED_BLOB_KINDS = frozenset({"model_api_runtime"})
 
 
 def _blob_revision(doc) -> int:
@@ -6806,68 +6806,6 @@ def _mirror_proactive_settings_current(user_id: str) -> None:
         )
 
 
-def append_blob_events_strict(
-    user_id: str,
-    kind: str,
-    new_events: list[dict],
-    *,
-    cutoff_ts: float,
-    max_events: int,
-):
-    """Atomically append a bounded event batch to one blob ring.
-
-    The row lock covers the read, merge, and full-document update. That makes
-    the operation safe across threads, workers, and processes, unlike the
-    legacy ``get_blob`` + ``set_blob`` pair. A monotonic document revision also
-    orders the post-commit TEE mirrors.
-    """
-    incoming = [dict(event) for event in new_events if isinstance(event, dict)]
-    if not incoming:
-        return get_blob_strict(user_id, kind)
-    cap = max(1, int(max_events))
-    cutoff = float(cutoff_ts)
-    with get_pool().connection() as conn:
-        with conn.transaction():
-            conn.execute(
-                "INSERT INTO user_blobs (user_id,kind,doc) "
-                "VALUES (%s,%s,'{}'::jsonb) "
-                "ON CONFLICT (user_id,kind) DO NOTHING",
-                (user_id, kind),
-            )
-            row = conn.execute(
-                "SELECT doc FROM user_blobs "
-                "WHERE user_id=%s AND kind=%s FOR UPDATE",
-                (user_id, kind),
-            ).fetchone()
-            current = (
-                row["doc"] if isinstance(row, dict) else row[0]
-            ) if row is not None else {}
-            events = (
-                list(current.get("events"))
-                if isinstance(current, dict)
-                and isinstance(current.get("events"), list)
-                else []
-            )
-            events.extend(incoming)
-            retained = [
-                event
-                for event in events
-                if isinstance(event, dict)
-                and float(event.get("ts") or 0) >= cutoff
-            ][-cap:]
-            persisted = {
-                "v": 1,
-                "events": retained,
-                _BLOB_REVISION_KEY: _next_blob_revision(current),
-            }
-            conn.execute(
-                "UPDATE user_blobs SET doc=%s WHERE user_id=%s AND kind=%s",
-                (Jsonb(persisted), user_id, kind),
-            )
-    _mirror_persisted_blob(user_id, kind, persisted)
-    return persisted
-
-
 # --- Append-only TEE-primary debug trace (T184) --------------------------- #
 
 _TRACE_EVENT_COLUMNS = (
@@ -6881,7 +6819,12 @@ _TRACE_EVENTS_MIN_FUTURE_DAYS = 7
 _TRACE_EVENTS_DEFAULT_STORAGE_BUDGET_BYTES = 60_000_000_000
 
 
-def insert_trace_events_strict(user_id: str, events: list[dict]) -> int:
+def insert_trace_events_strict(
+    user_id: str,
+    events: list[dict],
+    *,
+    clear_flag_kind: str = "v1_flow_trace_enabled",
+) -> int:
     """Insert one immutable row per event; raise on an unknown outcome.
 
     This is intentionally not mirrored and not available in the RDS migration
@@ -6900,6 +6843,7 @@ def insert_trace_events_strict(user_id: str, events: list[dict]) -> int:
             event_ts = float(raw.get("ts") or time.time())
         except (TypeError, ValueError) as exc:
             raise ValueError("trace event ts must be numeric") from exc
+        detail = raw.get("detail") if isinstance(raw.get("detail"), dict) else {}
         normalized.append((
             uid,
             event_ts,
@@ -6907,16 +6851,16 @@ def insert_trace_events_strict(user_id: str, events: list[dict]) -> int:
             str(raw.get("type") or ""),
             str(raw.get("status") or ""),
             str(raw.get("actor") or "backend"),
-            str(raw.get("lane") or "") or None,
+            str(raw.get("lane") or detail.get("lane") or "") or None,
             str(raw.get("trace_id") or "") or None,
             str(raw.get("turn_id") or "") or None,
             str(raw.get("job_id") or "") or None,
-            str(raw.get("provider") or "") or None,
-            str(raw.get("model") or "") or None,
-            str(raw.get("enqueue_source") or "") or None,
+            str(raw.get("provider") or detail.get("provider") or "") or None,
+            str(raw.get("model") or detail.get("model") or "") or None,
+            str(raw.get("enqueue_source") or detail.get("enqueue_source") or "") or None,
             str(raw.get("summary") or "") or None,
             str(raw.get("explain") or "") or None,
-            Jsonb(raw.get("detail") if isinstance(raw.get("detail"), dict) else {}),
+            Jsonb(detail),
             Jsonb(
                 raw.get("content_excerpt")
                 if isinstance(raw.get("content_excerpt"), dict)
@@ -6934,15 +6878,30 @@ def insert_trace_events_strict(user_id: str, events: list[dict]) -> int:
     )
     with get_pool().connection() as conn:
         with conn.transaction(), conn.cursor() as cur:
-            cur.executemany(statement, normalized)
-    return len(normalized)
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s,184))",
+                (uid,),
+            )
+            row = cur.execute(
+                "SELECT CASE WHEN doc->>'cleared_at' ~ "
+                "'^[0-9]+([.][0-9]+)?$' THEN (doc->>'cleared_at')::double precision "
+                "ELSE 0 END FROM user_blobs WHERE user_id=%s AND kind=%s",
+                (uid, str(clear_flag_kind)),
+            ).fetchone()
+            cleared_at = float(row[0] or 0) if row else 0.0
+            eligible = [params for params in normalized if params[1] > cleared_at]
+            if eligible:
+                cur.executemany(statement, eligible)
+    return len(eligible)
 
 
 def query_trace_events(
     *,
     user_id: str = "",
     trace_id: str = "",
+    trace_id_contains: str = "",
     subsystem: str = "",
+    q: str = "",
     since_epoch: float = 0,
     limit: int = 200,
     offset: int = 0,
@@ -6958,14 +6917,23 @@ def query_trace_events(
     if trace_id:
         clauses.append("trace_id=%s")
         params.append(str(trace_id))
+    if trace_id_contains:
+        clauses.append("trace_id ILIKE %s")
+        params.append(f"%{str(trace_id_contains)}%")
     if subsystem:
         clauses.append("subsystem=%s")
         params.append(str(subsystem))
     if since_epoch:
         clauses.append("ts>=to_timestamp(%s)")
         params.append(float(since_epoch))
+    if q:
+        clauses.append(
+            "concat_ws(' ',user_id,trace_id,subsystem,type,status,summary,explain,"
+            "detail::text,content_excerpt::text) ILIKE %s"
+        )
+        params.append(f"%{str(q)}%")
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
-    bounded_limit = max(1, min(int(limit or 200), 2500))
+    bounded_limit = max(1, min(int(limit or 200), 50_000))
     bounded_offset = max(0, int(offset or 0))
     params.extend((bounded_limit, bounded_offset))
     statement = (
@@ -6997,6 +6965,49 @@ def delete_trace_events_for_user(user_id: str) -> int:
             "SELECT count(*) FROM gone",
             (uid,),
         ).fetchone()
+    return int(row[0] if row else 0)
+
+
+def clear_trace_events_strict(
+    user_id: str,
+    *,
+    flag_kind: str,
+    cleared_at: float,
+    enabled_if_missing: bool,
+) -> int:
+    """Linearizable user clear; delayed older batches cannot reappear."""
+    uid = str(user_id or "").strip()
+    if not uid:
+        return 0
+    cutoff = float(cleared_at)
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s,184))",
+                (uid,),
+            )
+            conn.execute(
+                "INSERT INTO user_blobs(user_id,kind,doc) VALUES (%s,%s,%s) "
+                "ON CONFLICT(user_id,kind) DO UPDATE SET doc=jsonb_set("
+                "COALESCE(user_blobs.doc,'{}'::jsonb),'{cleared_at}',"
+                "to_jsonb(%s::double precision),true)",
+                (
+                    uid,
+                    str(flag_kind),
+                    Jsonb({
+                        "enabled": bool(enabled_if_missing),
+                        "cleared_at": cutoff,
+                    }),
+                    cutoff,
+                ),
+            )
+            row = conn.execute(
+                "WITH gone AS ("
+                " DELETE FROM trace_events WHERE user_id=%s "
+                " AND ts<=to_timestamp(%s) RETURNING 1"
+                ") SELECT count(*) FROM gone",
+                (uid, cutoff),
+            ).fetchone()
     return int(row[0] if row else 0)
 
 
@@ -7045,6 +7056,11 @@ def trace_events_partition_health(*, now_epoch: float | None = None) -> dict:
             ") measured",
             ((today - timedelta(days=29)).isoformat(),),
         ).fetchone()
+        at_risk_row = conn.execute(
+            "SELECT COALESCE(sum(at_risk_events),0), "
+            "COALESCE(sum(at_risk_bytes),0) FROM trace_write_stats WHERE day=%s",
+            (today.isoformat(),),
+        ).fetchone()
 
     partition_days: list[date] = []
     for name in names:
@@ -7066,6 +7082,8 @@ def trace_events_partition_health(*, now_epoch: float | None = None) -> dict:
     storage_bytes = int(storage_row[0] or 0)
     peak_bytes_per_day = int(peak_row[0] or 0)
     projected_retained_bytes = peak_bytes_per_day * _TRACE_EVENTS_RETENTION_DAYS
+    at_risk_events = int(at_risk_row[0] or 0)
+    at_risk_bytes = int(at_risk_row[1] or 0)
     issues: list[str] = []
     if default_count:
         issues.append("default_partition_nonempty")
@@ -7076,6 +7094,8 @@ def trace_events_partition_health(*, now_epoch: float | None = None) -> dict:
         issues.append("expired_partition_present")
     if max(storage_bytes, projected_retained_bytes) > budget:
         issues.append("storage_budget_exceeded")
+    if at_risk_events:
+        issues.append("trace_write_at_risk")
     return {
         "ok": not issues,
         "issues": issues,
@@ -7091,6 +7111,8 @@ def trace_events_partition_health(*, now_epoch: float | None = None) -> dict:
         "observed_peak_bytes_per_day": peak_bytes_per_day,
         "projected_retained_bytes": projected_retained_bytes,
         "storage_budget_bytes": budget,
+        "at_risk_events_today": at_risk_events,
+        "at_risk_bytes_today": at_risk_bytes,
     }
 
 

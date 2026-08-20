@@ -1,4 +1,4 @@
-"""v1 flow trace — per-user observability ring buffer (M0).
+"""Per-user append-only flow trace.
 
 Turns "I feel like the flow ran" into "I did X, the panel shows event Y, so the
 path objectively ran." Covers host(agent_runtime) + vps(resident consumer) +
@@ -27,29 +27,11 @@ from zoneinfo import ZoneInfo
 
 import db
 
-DEBUG_TRACE_BLOB = "v1_flow_trace"
 DEBUG_TRACE_FLAG_BLOB = "v1_flow_trace_enabled"
-# Ring depth. Sized against the 48h TTL below: the point of the ring is to still
-# hold yesterday's failure when a tester reports it this morning.
-#
-# 2026-08-10: raised 500→2500 (verbose 200→1000) together with the bulk-decrypt
-# coalescing in core/enclave.py. The cap alone was never the real limit — 182 of
-# 200 retained events for an active user were per-row `v2_chat_read` decrypts, so
-# a single chat turn evicted the ring and the panel showed a 1-second window.
-# Noise removal buys ~10x; the depth increase buys the rest of the 48 hours.
-#
-# Cost: recording is default-on for every user, and the ring is ONE jsonb doc
-# rewritten under a row lock per flush — so depth is paid on every write, by
-# everyone. At ~400 bytes/event 2500 events is ~1MB worst case, and only for a
-# user who actually generates that much in 48h; a typical user stays far below
-# the cap and pays nothing extra. Do not raise this much further without moving
-# the ring to an append-only table — the rewrite cost is linear in depth.
-_MAX_EVENTS = 2500
-_MAX_EVENTS_VERBOSE = 1000
+_READ_LIMIT_MAX = 2500
 _EXCERPT_FIELD_MAX = 2048
 _EXCERPT_EVENT_MAX = 8192
 _TRUNC_MARK = "…(truncated)"
-_TTL_SEC = 48 * 3600  # beta debug retention: enough to inspect yesterday's reports
 _FLAG_CACHE_TTL = 30.0
 _QUEUE_MAX = 5000
 _FLUSH_BATCH_MAX = 100
@@ -70,6 +52,13 @@ _worker_started = False
 _dropped_lock = threading.Lock()
 _dropped_by_uid: dict[str, int] = {}
 _at_risk_by_uid: dict[str, int] = {}
+_write_failure_lock = threading.Lock()
+_write_failures_total = 0
+_write_consecutive_failures = 0
+_write_last_failure_at = 0.0
+_write_last_success_at = 0.0
+_write_last_error = ""
+_write_last_error_log_at = 0.0
 
 # T138 block 0 rate ruler.  Values are monotonic absolute totals for one
 # process-start writer id.  The database uses GREATEST on conflict, so retrying
@@ -151,7 +140,9 @@ def set_enabled(store, enabled: bool) -> dict:
     if not uid:
         raise ValueError("debug_trace_user_id_required")
     doc = {"enabled": bool(enabled), "updated_at": time.time()}
-    db.set_blob(uid, DEBUG_TRACE_FLAG_BLOB, doc)
+    # Preserve the clear tombstone: replacing this document could let a delayed
+    # pre-clear batch become eligible again after a toggle.
+    db.patch_blob_strict(uid, DEBUG_TRACE_FLAG_BLOB, doc)
     persisted = db.get_blob_strict(uid, DEBUG_TRACE_FLAG_BLOB)
     if not isinstance(persisted, dict) or persisted.get("enabled") is not bool(enabled):
         raise RuntimeError("debug_trace_flag_write_not_visible")
@@ -235,6 +226,64 @@ def _take_at_risk_marker(uid: str) -> int:
         return 0
     with _dropped_lock:
         return int(_at_risk_by_uid.pop(uid, 0) or 0)
+
+
+def _record_write_failure(exc: Exception, *, events: int) -> None:
+    """Make a single-write failure immediately red without breaking product flow."""
+    global _write_failures_total, _write_consecutive_failures
+    global _write_last_failure_at, _write_last_error, _write_last_error_log_at
+    now = time.time()
+    code = type(exc).__name__.lower()
+    with _write_failure_lock:
+        _write_failures_total += 1
+        _write_consecutive_failures += 1
+        _write_last_failure_at = now
+        _write_last_error = code
+        should_log = (
+            _write_last_error_log_at <= 0
+            or now - _write_last_error_log_at >= _STATS_FAILURE_LOG_INTERVAL_SEC
+        )
+        if should_log:
+            _write_last_error_log_at = now
+        total = _write_failures_total
+        consecutive = _write_consecutive_failures
+    if should_log:
+        log.error(
+            "[debug-trace] trace_events insert failed total=%d consecutive=%d "
+            "events=%d code=%s; outcome unknown, durable at-risk alarm pending",
+            total,
+            consecutive,
+            events,
+            code,
+        )
+
+
+def _record_write_success() -> None:
+    global _write_consecutive_failures, _write_last_success_at, _write_last_error
+    now = time.time()
+    with _write_failure_lock:
+        recovered = _write_consecutive_failures
+        _write_consecutive_failures = 0
+        _write_last_success_at = now
+        _write_last_error = ""
+    if recovered:
+        log.info(
+            "[debug-trace] trace_events insert recovered after_failures=%d",
+            recovered,
+        )
+
+
+def trace_storage_health() -> dict[str, Any]:
+    """Process-local fast signal; the partition monitor reads durable stats."""
+    with _write_failure_lock:
+        return {
+            "healthy": _write_consecutive_failures == 0,
+            "failures_total": _write_failures_total,
+            "consecutive_failures": _write_consecutive_failures,
+            "last_failure_at": _write_last_failure_at or None,
+            "last_success_at": _write_last_success_at or None,
+            "last_error": _write_last_error,
+        }
 
 
 def _stats_identity_locked() -> str:
@@ -461,7 +510,6 @@ def _append_events(uid: str, new_events: list[dict[str, Any]]) -> None:
         if not is_enabled(store):
             return
         now = time.time()
-        verbose = verbose_enabled(store)
     except Exception:
         return
     dropped = _take_dropped(uid)
@@ -500,19 +548,11 @@ def _append_events(uid: str, new_events: list[dict[str, Any]]) -> None:
         })
     original_count = len(new_events)
     new_events = markers + new_events
-    cutoff = now - _TTL_SEC
-    cap = _MAX_EVENTS_VERBOSE if verbose else _MAX_EVENTS
     try:
-        db.append_blob_events_strict(
-            uid,
-            DEBUG_TRACE_BLOB,
-            new_events,
-            cutoff_ts=cutoff,
-            max_events=cap,
-        )
-    except Exception:
-        # Restore only the legacy queue-full marker backlog.  The failed flush
-        # is outcome-unknown, not another known drop.
+        inserted = db.insert_trace_events_strict(uid, new_events)
+    except Exception as exc:
+        # Restore only the queue-full marker backlog. The failed flush is
+        # outcome-unknown, not another known drop.
         if dropped:
             _record_drop(uid, dropped)
         # Keep the prior unknown count plus this attempt's product events and
@@ -523,8 +563,14 @@ def _append_events(uid: str, new_events: list[dict[str, Any]]) -> None:
             at_risk + original_count + (1 if dropped else 0),
         )
         _record_trace_stats(new_events, outcome="at_risk")
+        _record_write_failure(exc, events=len(new_events))
     else:
-        _record_trace_stats(new_events, outcome="persisted")
+        # A clear tombstone can intentionally reject a delayed pre-clear batch.
+        # Never label those rows persisted. A partially eligible batch is rare
+        # and deliberately omitted from the capacity ruler rather than guessed.
+        if inserted == len(new_events):
+            _record_trace_stats(new_events, outcome="persisted")
+        _record_write_success()
 
 
 def _flush_batch(batch: list[tuple[str, dict[str, Any]]]) -> None:
@@ -647,8 +693,7 @@ def _flush_pending_for_user(uid: str, *, timeout: float = 0.5) -> None:
     # "everything enqueued so far is readable" linearization point. Do not
     # drain or append here: a reader-side drain either acks items before
     # they are written (a concurrent reader then early-returns stale) or
-    # races the worker's get_blob→extend→set_blob with a second unlocked
-    # RMW and loses events.
+    # creates a second writer whose ordering relative to clear is undefined.
     deadline = time.monotonic() + max(0.0, timeout)
     with _pending_condition:
         while _pending_by_uid.get(uid, 0) > 0:
@@ -674,7 +719,7 @@ def trace_event(
     job_id: str = "",
     dur_ms: float | None = None,
 ) -> None:
-    """Append one flow event to the per-user ring buffer — no-op unless enabled.
+    """Append one flow event to the TEE trace table — no-op unless enabled.
 
     Best-effort: never raises (debug must not break the request path)."""
     try:
@@ -715,20 +760,38 @@ def read_trace(store, *, limit: int = 200, subsystem: str = "") -> list[dict]:
     if not uid:
         return []
     _flush_pending_for_user(uid)
-    buf = db.get_blob(uid, DEBUG_TRACE_BLOB) or {}
-    events = buf.get("events") if isinstance(buf, dict) and isinstance(buf.get("events"), list) else []
-    if subsystem:
-        events = [e for e in events if str(e.get("subsystem") or "") == subsystem]
-    events = sorted(events, key=lambda e: float(e.get("ts") or 0), reverse=True)
-    return events[: max(1, min(int(limit or 200), _MAX_EVENTS))]
+    rows = db.query_trace_events(
+        user_id=uid,
+        subsystem=subsystem,
+        limit=max(1, min(int(limit or 200), _READ_LIMIT_MAX)),
+    )
+    event_fields = (
+        "ts", "subsystem", "type", "actor", "status", "summary", "explain",
+        "trace_id", "turn_id", "job_id", "detail", "dur_ms",
+        "content_excerpt",
+    )
+    events = [
+        {key: row[key] for key in event_fields if key in row}
+        for row in rows
+    ]
+    for event in events:
+        if not event.get("content_excerpt"):
+            event.pop("content_excerpt", None)
+    return events
 
 
 def clear_trace(store) -> None:
     uid = getattr(store, "user_id", "") or ""
     if uid:
-        # Share the append path's row ordering + mirror revision so a delayed
-        # pre-clear TEE batch cannot resurrect events after the clear lands.
-        db.patch_blob_strict(uid, DEBUG_TRACE_BLOB, {"v": 1, "events": []})
+        # Wait for this process's already-accepted events, then explicitly
+        # remove rows. Account deletion deliberately does NOT call this.
+        _flush_pending_for_user(uid)
+        db.clear_trace_events_strict(
+            uid,
+            flag_kind=DEBUG_TRACE_FLAG_BLOB,
+            cleared_at=time.time(),
+            enabled_if_missing=is_enabled(store),
+        )
 
 
 def _safe_detail(detail: dict[str, Any] | None) -> dict[str, Any]:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time as pytime
 import uuid
 from datetime import datetime, time, timedelta
 from pathlib import Path
@@ -19,9 +20,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db  # noqa: E402
 import asgi.lifespan as lifespan_mod  # noqa: E402
+from accounts import registry  # noqa: E402
+from admin import admin_core, data_track  # noqa: E402
 from admin import trace_events_monitor as monitor  # noqa: E402
 from admin import trace_events_partitions as partitions  # noqa: E402
 from core import leader as core_leader  # noqa: E402
+from core.reqctx import bind  # noqa: E402
 
 
 _ZONE = ZoneInfo("Asia/Shanghai")
@@ -91,6 +95,7 @@ def test_migration_has_beijing_bounds_no_fk_and_stable_indexes():
     assert any(kind == "p" and "PRIMARY KEY (id, ts)" in definition
                for kind, definition in constraints)
     assert any("(user_id, ts DESC, id DESC)" in definition for definition in indexes)
+    assert any("(ts DESC, id DESC)" in definition for definition in indexes)
     assert any("(trace_id, ts DESC, id DESC)" in definition for definition in indexes)
     assert f"{today.isoformat()} 00:00:00+08" in bound
     migration = (
@@ -129,6 +134,83 @@ def test_trace_survives_account_delete_and_remains_queryable_by_uid(tee_primary)
         rows = db.query_trace_events(user_id=uid)
         assert len(rows) == 1
         assert rows[0]["user_id"] == uid
+        with registry._users_lock:
+            registry._users[:] = [
+                user for user in registry._users if user.get("user_id") != uid
+            ]
+        with bind(f"view=debug&mode=flat&user_id={uid}"):
+            admin_payload = data_track._data_track_debug_payload()
+        assert [event["user_id"] for event in admin_payload["events"]] == [uid]
+        assert len(admin_payload["users"]) == 1
+        deleted_user = admin_payload["users"][0]
+        assert deleted_user["user_id"] == uid
+        assert deleted_user["account_present"] is False
+        assert deleted_user["events"] == 1
+        assert deleted_user["last_ts"] == rows[0]["ts"]
+        html = admin_core.page_html(f"view=debug&mode=flat&user_id={uid}")
+        assert uid in html
+        assert "agent.test" in html
+    finally:
+        db.delete_trace_events_for_user(uid)
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
+def test_clear_tombstone_rejects_delayed_batch_and_preserves_toggle(tee_primary):
+    uid = _uid()
+    cutoff = pytime.time()
+    db.upsert_user({"user_id": uid, "created_at": datetime.now(_ZONE).isoformat()})
+    try:
+        db.patch_blob_strict(
+            uid,
+            "v1_flow_trace_enabled",
+            {"enabled": True},
+        )
+        assert db.insert_trace_events_strict(
+            uid, [_event(ts=cutoff - 10, trace_id="before")]
+        ) == 1
+        assert db.clear_trace_events_strict(
+            uid,
+            flag_kind="v1_flow_trace_enabled",
+            cleared_at=cutoff,
+            enabled_if_missing=True,
+        ) == 1
+        assert db.insert_trace_events_strict(
+            uid, [_event(ts=cutoff - 1, trace_id="delayed-before")]
+        ) == 0
+        assert db.insert_trace_events_strict(
+            uid, [_event(ts=cutoff + 1, trace_id="after")]
+        ) == 1
+        assert [row["trace_id"] for row in db.query_trace_events(user_id=uid)] == [
+            "after"
+        ]
+        flag = db.get_blob_strict(uid, "v1_flow_trace_enabled")
+        assert flag["enabled"] is True
+        assert flag["cleared_at"] == cutoff
+    finally:
+        db.delete_trace_events_for_user(uid)
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
+def test_clear_tombstone_preserves_disabled_default_for_missing_flag(
+    tee_primary, monkeypatch
+):
+    uid = _uid()
+    cutoff = pytime.time()
+    monkeypatch.setenv("FEEDLING_V1_FLOW_TRACE_DEFAULT", "0")
+    db.upsert_user({"user_id": uid, "created_at": datetime.now(_ZONE).isoformat()})
+    try:
+        assert db.clear_trace_events_strict(
+            uid,
+            flag_kind="v1_flow_trace_enabled",
+            cleared_at=cutoff,
+            enabled_if_missing=False,
+        ) == 0
+        assert db.get_blob_strict(uid, "v1_flow_trace_enabled") == {
+            "enabled": False,
+            "cleared_at": cutoff,
+        }
     finally:
         db.delete_trace_events_for_user(uid)
         with db.get_pool().connection() as conn:
@@ -208,6 +290,26 @@ def test_capacity_budget_is_an_independent_red_signal(tee_primary, monkeypatch):
     monkeypatch.setenv("FEEDLING_TRACE_EVENTS_STORAGE_BUDGET_BYTES", "1")
     report = db.trace_events_partition_health()
     assert "storage_budget_exceeded" in report["issues"]
+
+
+def test_durable_at_risk_counter_is_red_within_monitor_cadence(
+    tee_primary, monkeypatch,
+):
+    today = datetime.now(_ZONE).date().isoformat()
+    writer = "t184-at-risk-" + uuid.uuid4().hex
+    try:
+        db.upsert_trace_write_stats([(
+            today, writer, "agent", "agent.test", "heartbeat",
+            0, 0, 0, 0, 2, 200, pytime.time(),
+        )])
+        report = db.trace_events_partition_health()
+        assert "trace_write_at_risk" in report["issues"]
+        assert report["at_risk_events_today"] >= 2
+        monkeypatch.delenv("FEEDLING_TRACE_EVENTS_MONITOR_INTERVAL_SEC", raising=False)
+        assert monitor._interval() == 60.0
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM trace_write_stats WHERE writer_id=%s", (writer,))
 
 
 def test_monitor_start_spawns_daemon_thread(monkeypatch):

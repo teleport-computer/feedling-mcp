@@ -22,7 +22,7 @@ def _b64(raw: bytes) -> str:
 
 
 @pytest.fixture()
-def client(tmp_path, monkeypatch):
+def client(tmp_path, monkeypatch, tee_primary):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     debug_trace._flag_cache.clear()
     registry._users[:] = []

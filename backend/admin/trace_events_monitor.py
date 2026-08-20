@@ -17,7 +17,7 @@ def _interval() -> float:
     try:
         return max(
             60.0,
-            float(os.environ.get("FEEDLING_TRACE_EVENTS_MONITOR_INTERVAL_SEC", "300")),
+            float(os.environ.get("FEEDLING_TRACE_EVENTS_MONITOR_INTERVAL_SEC", "60")),
         )
     except (TypeError, ValueError):
         return 300.0
@@ -41,7 +41,8 @@ def _tick(*, now_epoch: float | None = None) -> dict:
         log.error(
             "[trace-events] degraded issues=%s default_rows=%s "
             "default_min_ts=%s default_max_ts=%s future_days=%s "
-            "storage_bytes=%s projected_retained_bytes=%s budget_bytes=%s",
+            "storage_bytes=%s projected_retained_bytes=%s budget_bytes=%s "
+            "at_risk_events_today=%s at_risk_bytes_today=%s",
             ",".join(report.get("issues") or []),
             report.get("default_rows"),
             report.get("default_min_ts"),
@@ -50,6 +51,8 @@ def _tick(*, now_epoch: float | None = None) -> dict:
             report.get("storage_bytes"),
             report.get("projected_retained_bytes"),
             report.get("storage_budget_bytes"),
+            report.get("at_risk_events_today"),
+            report.get("at_risk_bytes_today"),
         )
     return report
 

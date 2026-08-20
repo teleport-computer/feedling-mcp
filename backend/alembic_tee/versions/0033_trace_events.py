@@ -106,6 +106,8 @@ END $$;
 
 CREATE INDEX IF NOT EXISTS ix_trace_events_user_ts
   ON trace_events (user_id, ts DESC, id DESC);
+CREATE INDEX IF NOT EXISTS ix_trace_events_ts
+  ON trace_events (ts DESC, id DESC);
 CREATE INDEX IF NOT EXISTS ix_trace_events_trace_id
   ON trace_events (trace_id, ts DESC, id DESC) WHERE trace_id <> '';
 """

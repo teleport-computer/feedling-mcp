@@ -1,5 +1,25 @@
 # T138 还有多少事
 
+> ## ✅ 2026-08-20 T184 实施决议（优先于本文历史方案）
+>
+> Seven 已定案：`trace_events` 只落 TEE，保留 30 天，不迁移旧 blob，
+> 不做 union read 或 double-write；停写旧 blob 不等于清理，旧数据由 C 显式删除。
+> 新表无用户外键，销号后 trace 保留，admin 必须能按已删 uid 直接检索。
+> 容量线按 60 GB 报警，可复用块 0 `trace_write_stats`，但不改它的表、
+> 函数或 `_TRACE_WRITE_STATS_MIN_MEASUREMENT_HOURS`。
+>
+> 单写切换的失败不再沉默：进程当场记 ERROR 并置红；约 1 秒内将
+> `at_risk` 写入块 0；独立 monitor 最多 60 秒报警。如块 0 也不可写，
+> 既有 writer-health 最多 180 秒变 stale。回滚时设
+> `FEEDLING_V1_FLOW_TRACE_DISABLED=1` 并重启，只暂停 trace 流量，不阻断业务；
+> 不部署会重开旧 blob writer 的版本，也不从旧 blob 补数。修复 TEE
+> 写入后重新部署单写版本，再撤销 kill switch。
+> 每次发布前必须让 TEE shadow 也到同一 migration head，否则 exact-head gate
+> 应当故意阻断 drain。C 的生产删除须 Seven 再次明示批准。
+>
+> 下文是 T138 时的历史分块文档；其中 48 小时 ring/union 过渡、
+> RDS 双链与保留期未定等描述均不再是 T184 的实施依据。
+
 > ## ⚠️ 2026-08-20 订正：本文的「7 天测量窗」方法已被 Seven 取消
 >
 > **正文保持过审时的原样、未改一字**（codex2 设计审三轮，APPROVED @ `2d5f3955`）。

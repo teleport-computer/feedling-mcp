@@ -6068,7 +6068,7 @@ async def _emit_thinking_surfaced_trace(
     safe_chars = max(0, int(chars))
     # ``model`` is user-configurable for compatible relays.  Match the existing
     # plaintext thinking metadata bound instead of letting an arbitrary string
-    # expand the server-visible trace ring.
+    # expand the server-visible trace payload.
     model = str(getattr(provider_config, "model", "") or "").strip()[:96]
     try:
         await asyncio.to_thread(

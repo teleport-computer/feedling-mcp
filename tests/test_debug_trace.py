@@ -24,8 +24,9 @@ class _Store:
 def _reset(monkeypatch, store):
     debug_trace._flag_cache.clear()
     monkeypatch.setattr(debug_trace, "_record_trace_stats", lambda *_args, **_kwargs: None)
-    # isolate DB blobs to an in-memory dict so the test never needs Postgres
+    # Keep the per-user flag in a blob, but model trace_events as immutable rows.
     blobs: dict = {}
+    rows: dict[str, list[dict]] = {}
     monkeypatch.setattr(db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
     monkeypatch.setattr(db, "get_blob_strict", lambda uid, kind: blobs.get((uid, kind)))
     monkeypatch.setattr(db, "set_blob", lambda uid, kind, doc: blobs.__setitem__((uid, kind), doc))
@@ -38,15 +39,31 @@ def _reset(monkeypatch, store):
 
     monkeypatch.setattr(db, "patch_blob_strict", patch_blob)
 
-    def append_events(uid, kind, new_events, *, cutoff_ts, max_events):
-        current = blobs.get((uid, kind)) or {}
-        events = list(current.get("events") or []) + list(new_events)
-        events = [event for event in events if event.get("ts", 0) >= cutoff_ts]
-        persisted = {"v": 1, "events": events[-max_events:]}
-        blobs[(uid, kind)] = persisted
-        return persisted
+    def insert_events(uid, new_events):
+        target = rows.setdefault(uid, [])
+        for event in new_events:
+            target.append({**event, "user_id": uid, "id": len(target) + 1})
+        return len(new_events)
 
-    monkeypatch.setattr(db, "append_blob_events_strict", append_events)
+    def query_events(*, user_id="", subsystem="", limit=200, offset=0, **_kwargs):
+        events = list(rows.get(user_id, []))
+        if subsystem:
+            events = [event for event in events if event.get("subsystem") == subsystem]
+        events.sort(key=lambda event: (event.get("ts", 0), event.get("id", 0)), reverse=True)
+        return events[offset:offset + limit]
+
+    def delete_events(uid):
+        return len(rows.pop(uid, []))
+
+    monkeypatch.setattr(db, "insert_trace_events_strict", insert_events)
+    monkeypatch.setattr(db, "query_trace_events", query_events)
+    monkeypatch.setattr(db, "delete_trace_events_for_user", delete_events)
+    monkeypatch.setattr(
+        db,
+        "clear_trace_events_strict",
+        lambda uid, **_kwargs: delete_events(uid),
+    )
+    blobs["trace_rows"] = rows
     return blobs
 
 
@@ -249,7 +266,7 @@ def test_default_on_records_no_env_needed(monkeypatch):
     debug_trace.trace_event(store, subsystem="route", type="route.decided", summary="x")
     assert debug_trace.is_enabled(store) is True
     assert debug_trace.read_trace(store)[0]["type"] == "route.decided"
-    assert (store.user_id, debug_trace.DEBUG_TRACE_BLOB) in blobs
+    assert store.user_id in blobs["trace_rows"]
 
 
 def test_default_can_be_restored_to_opt_in_with_env(monkeypatch):
@@ -260,7 +277,7 @@ def test_default_can_be_restored_to_opt_in_with_env(monkeypatch):
     debug_trace.trace_event(store, subsystem="route", type="route.decided", summary="x")
     assert debug_trace.is_enabled(store) is False
     assert debug_trace.read_trace(store) == []
-    assert (store.user_id, debug_trace.DEBUG_TRACE_BLOB) not in blobs
+    assert store.user_id not in blobs["trace_rows"]
     debug_trace.set_enabled(store, True)
     debug_trace.trace_event(store, subsystem="route", type="route.decided", summary="x")
     assert debug_trace.read_trace(store)[0]["type"] == "route.decided"
@@ -305,7 +322,7 @@ def test_set_enabled_never_caches_a_failed_or_unreadable_write(monkeypatch):
         debug_trace.set_enabled(store, True)
     assert store.user_id not in debug_trace._flag_cache
 
-    monkeypatch.setattr(debug_trace.db, "set_blob", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(debug_trace.db, "patch_blob_strict", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(debug_trace.db, "get_blob_strict", lambda *_args, **_kwargs: None)
     with pytest.raises(RuntimeError, match="debug_trace_flag_write_not_visible"):
         debug_trace.set_enabled(store, True)
@@ -374,25 +391,8 @@ class FakeStore:
 
 
 def _reset_verbose(monkeypatch):
-    """In-memory blob store + force gate ON."""
-    blobs = {}
-    monkeypatch.setattr(debug_trace.db, "get_blob", lambda uid, k: blobs.get((uid, k)))
-    monkeypatch.setattr(debug_trace.db, "get_blob_strict", lambda uid, k: blobs.get((uid, k)))
-    monkeypatch.setattr(
-        debug_trace.db,
-        "set_blob",
-        lambda uid, k, v: blobs.__setitem__((uid, k), v),
-    )
-
-    def append_events(uid, kind, new_events, *, cutoff_ts, max_events):
-        current = blobs.get((uid, kind)) or {}
-        events = list(current.get("events") or []) + list(new_events)
-        events = [event for event in events if event.get("ts", 0) >= cutoff_ts]
-        persisted = {"v": 1, "events": events[-max_events:]}
-        blobs[(uid, kind)] = persisted
-        return persisted
-
-    monkeypatch.setattr(debug_trace.db, "append_blob_events_strict", append_events)
+    """In-memory append-only rows + force gate ON."""
+    blobs = _reset(monkeypatch, FakeStore())
     monkeypatch.setattr(debug_trace, "_hard_disabled", lambda: False)
     debug_trace._flag_cache.clear()
     return blobs
@@ -424,31 +424,20 @@ def test_content_excerpt_field_truncation(monkeypatch):
     assert ev["content_excerpt"]["prompt"].endswith("…(truncated)")
 
 
-def test_verbose_ring_cap(monkeypatch):
-    """环深从模块读,样本按环深推导 —— 别写死。
-
-    这条曾写死 `== 200`。2026-08-10 把 verbose 环深从 200 提到 1000 之后它必然
-    失配,而 `test_debug_trace.py` 当时既不在 conftest 的 `_PURE_UNIT`、又在
-    `.github/pytest-uncovered-baseline.txt` 里 —— 两份名单都没有 ⇒ **CI 从来
-    不跑它**,于是那次改动带着一条红上线,没有任何人看见。
-
-    写死常量还有个更隐蔽的坏处:样本数(260)也是照着旧环深挑的。环深一变大,
-    样本就不再超限,闸根本不会被触发 —— 那时测试会**照常变绿**,而它其实什么
-    都没验到。所以样本必须由环深推出来,并显式断言确实超限。
-    """
+def test_verbose_events_are_not_evicted_at_the_old_ring_cap(monkeypatch):
+    """Append-only storage must retain more than the old verbose cap (1000)."""
     _reset_verbose(monkeypatch)
     store = FakeStore()
     debug_trace.set_enabled(store, True)
     monkeypatch.delenv("FEEDLING_DEBUG_VERBOSE", raising=False)
 
-    cap = debug_trace._MAX_EVENTS_VERBOSE
-    written = cap + 60
-    assert written > cap, "样本没超过环深,裁剪逻辑根本不会被触发"
+    written = 1060
+    assert debug_trace._READ_LIMIT_MAX >= written
 
     for i in range(written):
         debug_trace.trace_event(store, subsystem="route", type=f"t{i}")
 
-    assert len(debug_trace.read_trace(store, limit=written)) == cap
+    assert len(debug_trace.read_trace(store, limit=written)) == written
 
 
 class _FakeEnclaveResponse:
