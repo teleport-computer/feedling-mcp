@@ -5,6 +5,8 @@ import json
 import os
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import psycopg
 import pytest
@@ -266,6 +268,132 @@ def test_infrastructure_evidence_rejects_non_positive_or_coerced_scalars(value):
         plaintext_shadow._positive_int_claim(
             {"target_capacity_bytes": value}, "target_capacity_bytes"
         )
+
+
+@pytest.mark.parametrize("bad_time", ["2026-08-20T00:00:00", 123])
+def test_restore_claims_normalize_malformed_timestamps_to_runtime_error(bad_time):
+    payload = {
+        "backup_artifact_digest": "sha256:" + "a" * 64,
+        "expires_at": "2026-08-21T00:00:00Z",
+        "ha_verified": True,
+        "restored_at": bad_time,
+        "schema_head": plaintext_shadow._SCHEMA_HEAD,
+        "source_backup_at": "2026-08-19T00:00:00Z",
+        "target_capacity_bytes": 1,
+        "target_connection_limit": 1,
+        "target_fingerprint": "target",
+        "verifier_digest": "sha256:" + "b" * 64,
+    }
+    with pytest.raises(RuntimeError, match="timestamp"):
+        plaintext_shadow._validated_restore_claims(
+            payload, target_fingerprint="target", target_connection_limit=1
+        )
+
+
+def _signed_restore_claims(monkeypatch):
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    monkeypatch.setenv(
+        "FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY",
+        base64.b64encode(public_key).decode(),
+    )
+    primary_dsn = os.environ["TEE_DATABASE_URL"]
+    policy = TargetPolicy(dsn=os.environ["DATABASE_URL"])
+    monkeypatch.setenv("DATABASE_URL", primary_dsn)
+    monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "tee")
+    monkeypatch.delenv("TEE_DATABASE_URL")
+    monkeypatch.delenv("FEEDLING_TEE_DUAL_WRITE", raising=False)
+    monkeypatch.setenv("PLAINTEXT_SHADOW_DATABASE_URL", policy.dsn)
+    monkeypatch.setenv("FEEDLING_PLAINTEXT_SHADOW_ENABLED", "1")
+    monkeypatch.setattr(plaintext_shadow.db, "get_pool", lambda: _Pool(primary_dsn))
+    with psycopg.connect(policy.dsn) as target:
+        target_fingerprint = plaintext_shadow._live_database_fingerprint(target)
+        connection_limit = int(target.execute("SHOW max_connections").fetchone()[0])
+    now = datetime.now(timezone.utc)
+    claims = {
+        "backup_artifact_digest": "sha256:" + "a" * 64,
+        "expires_at": (now + timedelta(hours=1)).isoformat(),
+        "ha_verified": True,
+        "restored_at": (now - timedelta(minutes=1)).isoformat(),
+        "schema_head": plaintext_shadow._SCHEMA_HEAD,
+        "source_backup_at": (now - timedelta(minutes=2)).isoformat(),
+        "target_capacity_bytes": 1_000_000_000,
+        "target_connection_limit": connection_limit,
+        "target_fingerprint": target_fingerprint,
+        "verifier_digest": "sha256:" + "b" * 64,
+    }
+    payload = json.dumps(
+        claims, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+    signature = private_key.sign(payload)
+    return policy, claims, payload, signature
+
+
+def test_restore_evidence_rejects_direct_unsigned_database_row(monkeypatch):
+    policy, claims, _payload, _signature = _signed_restore_claims(monkeypatch)
+    _key, key_fingerprint = plaintext_shadow._infra_public_key()
+    with db.get_pool().connection() as primary:
+        row = primary.execute(
+            "INSERT INTO plaintext_shadow_restore_evidence "
+            "(restored_at, source_backup_at, schema_head, verifier_digest, "
+            "backup_artifact_digest, target_fingerprint, target_capacity_bytes, "
+            "target_connection_limit, ha_verified, attestation_key_fingerprint, "
+            "attestation_signature_digest, operator_id, expires_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,true,%s,%s,%s,%s) RETURNING id",
+            (
+                claims["restored_at"], claims["source_backup_at"],
+                claims["schema_head"], claims["verifier_digest"],
+                claims["backup_artifact_digest"], claims["target_fingerprint"],
+                claims["target_capacity_bytes"], claims["target_connection_limit"],
+                key_fingerprint, "sha256:" + "c" * 64, "direct-sql",
+                claims["expires_at"],
+            ),
+        ).fetchone()
+        try:
+            assert not plaintext_shadow._restore_evidence(
+                primary,
+                target_fingerprint=claims["target_fingerprint"],
+                minimum_capacity_bytes=claims["target_capacity_bytes"],
+                target_connection_limit=claims["target_connection_limit"],
+                attestation_key_fingerprint=key_fingerprint,
+            )
+        finally:
+            primary.execute(
+                "DELETE FROM plaintext_shadow_restore_evidence WHERE id=%s", (row[0],)
+            )
+
+
+def test_restore_evidence_rejects_claim_tampered_after_signature(monkeypatch):
+    policy, claims, payload, signature = _signed_restore_claims(monkeypatch)
+    args = SimpleNamespace(
+        attestation_payload_b64=base64.b64encode(payload).decode(),
+        attestation_signature_b64=base64.b64encode(signature).decode(),
+        operator_id="signed-test",
+    )
+    result = plaintext_shadow.record_restore_evidence(args)
+    _key, key_fingerprint = plaintext_shadow._infra_public_key()
+    with db.get_pool().connection() as primary:
+        try:
+            primary.execute(
+                "UPDATE plaintext_shadow_restore_evidence "
+                "SET target_capacity_bytes=target_capacity_bytes+1 WHERE id=%s",
+                (result["evidence_id"],),
+            )
+            assert not plaintext_shadow._restore_evidence(
+                primary,
+                target_fingerprint=claims["target_fingerprint"],
+                minimum_capacity_bytes=claims["target_capacity_bytes"],
+                target_connection_limit=claims["target_connection_limit"],
+                attestation_key_fingerprint=key_fingerprint,
+            )
+        finally:
+            primary.execute(
+                "DELETE FROM plaintext_shadow_restore_evidence WHERE id=%s",
+                (result["evidence_id"],),
+            )
 
 
 def test_every_strict_ciphertext_table_has_inspectable_upsert_shape():

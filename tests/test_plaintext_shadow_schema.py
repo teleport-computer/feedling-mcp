@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import psycopg
 import pytest
@@ -98,6 +99,8 @@ def test_sync_and_restore_evidence_are_scalar_only() -> None:
         "ha_verified",
         "attestation_key_fingerprint",
         "attestation_signature_digest",
+        "attestation_payload",
+        "attestation_signature",
         "operator_id",
         "expires_at",
         "recorded_at",
@@ -117,6 +120,31 @@ def test_capture_function_exists_but_migration_installs_no_table_triggers() -> N
     )
     assert function_rows == [(1,)]
     assert trigger_rows == [(0,)]
+
+
+def test_restore_evidence_writer_is_security_definer_and_not_public() -> None:
+    rows = _fetchall(
+        os.environ["TEE_DATABASE_URL"],
+        "SELECT prosecdef, EXISTS ("
+        "SELECT 1 FROM aclexplode(COALESCE(p.proacl, acldefault('f', p.proowner))) "
+        "WHERE grantee=0 AND privilege_type='EXECUTE') FROM pg_proc AS p "
+        "JOIN pg_namespace AS n ON n.oid=p.pronamespace "
+        "WHERE n.nspname='public' "
+        "AND p.proname='feedling_record_plaintext_shadow_restore_evidence'",
+    )
+    assert len(rows) == 1
+    security_definer, public_can_execute = rows[0]
+    assert security_definer is True
+    assert public_can_execute is False
+
+
+def test_restore_evidence_migration_revokes_direct_writer_roles() -> None:
+    migration = (
+        Path(__file__).parents[1]
+        / "backend/alembic_tee/versions/0027_plaintext_shadow_gates.py"
+    ).read_text()
+    assert "ARRAY['app', 'tee_replicator']" in migration
+    assert "REVOKE INSERT, UPDATE, DELETE, TRUNCATE" in migration
 
 
 def test_every_synced_table_declares_its_real_primary_key() -> None:

@@ -10,7 +10,7 @@ import os
 import re
 import time
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import db
@@ -62,11 +62,11 @@ def _infra_public_key() -> tuple[Ed25519PublicKey, str]:
     return key, _fingerprint(raw.hex())
 
 
-def _verified_infra_attestation(payload_b64: str, signature_b64: str) -> tuple[dict, str, str]:
+def _verified_infra_attestation_bytes(
+    payload_bytes: bytes, signature: bytes
+) -> tuple[dict, str, str]:
     key, key_fingerprint = _infra_public_key()
     try:
-        payload_bytes = base64.b64decode(payload_b64, validate=True)
-        signature = base64.b64decode(signature_b64, validate=True)
         key.verify(signature, payload_bytes)
         payload = json.loads(payload_bytes)
     except (ValueError, InvalidSignature, json.JSONDecodeError) as exc:
@@ -79,6 +79,17 @@ def _verified_infra_attestation(payload_b64: str, signature_b64: str) -> tuple[d
     if payload_bytes != canonical:
         raise RuntimeError("trusted infrastructure evidence payload is not canonical JSON")
     return payload, key_fingerprint, "sha256:" + hashlib.sha256(signature).hexdigest()
+
+
+def _verified_infra_attestation(
+    payload_b64: str, signature_b64: str
+) -> tuple[dict, str, str]:
+    try:
+        payload_bytes = base64.b64decode(payload_b64, validate=True)
+        signature = base64.b64decode(signature_b64, validate=True)
+    except ValueError as exc:
+        raise RuntimeError("trusted infrastructure evidence signature is invalid") from exc
+    return _verified_infra_attestation_bytes(payload_bytes, signature)
 
 
 def _head(conn) -> str | None:
@@ -99,31 +110,54 @@ def _restore_evidence(
     target_connection_limit: int = 0,
     attestation_key_fingerprint: str | None = None,
 ) -> bool:
-    clauses = [
-        "expires_at > now()",
-        "source_backup_at >= now() - interval '24 hours'",
-        "schema_head=%s",
-        "ha_verified",
-    ]
-    params: list[Any] = [_SCHEMA_HEAD]
-    if target_fingerprint is not None:
-        clauses.append("target_fingerprint=%s")
-        params.append(target_fingerprint)
-    if minimum_capacity_bytes:
-        clauses.append("target_capacity_bytes >= %s")
-        params.append(minimum_capacity_bytes)
-    if target_connection_limit:
-        clauses.append("target_connection_limit=%s")
-        params.append(target_connection_limit)
-    if attestation_key_fingerprint is not None:
-        clauses.append("attestation_key_fingerprint=%s")
-        params.append(attestation_key_fingerprint)
-    row = conn.execute(
-        "SELECT EXISTS (SELECT 1 FROM plaintext_shadow_restore_evidence "
-        f"WHERE {' AND '.join(clauses)})",
-        tuple(params),
-    ).fetchone()
-    return bool(row and row[0])
+    rows = conn.execute(
+        "SELECT restored_at, source_backup_at, schema_head, verifier_digest, "
+        "backup_artifact_digest, target_fingerprint, target_capacity_bytes, "
+        "target_connection_limit, ha_verified, attestation_key_fingerprint, "
+        "attestation_signature_digest, expires_at, attestation_payload, "
+        "attestation_signature FROM plaintext_shadow_restore_evidence"
+    ).fetchall()
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        payload_bytes, signature = row[12], row[13]
+        if payload_bytes is None or signature is None:
+            continue
+        try:
+            payload, key_fingerprint, signature_digest = (
+                _verified_infra_attestation_bytes(bytes(payload_bytes), bytes(signature))
+            )
+            claims = _validated_restore_claims(
+                payload,
+                target_fingerprint=target_fingerprint,
+                target_connection_limit=target_connection_limit,
+            )
+        except RuntimeError:
+            continue
+        if attestation_key_fingerprint is not None and (
+            key_fingerprint != attestation_key_fingerprint
+        ):
+            continue
+        if claims["target_capacity_bytes"] < minimum_capacity_bytes:
+            continue
+        if claims["expires_at"] <= now:
+            continue
+        if claims["source_backup_at"] < now - timedelta(hours=24):
+            continue
+        stored = (
+            row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7],
+            row[8], row[9], row[10], row[11],
+        )
+        expected = (
+            claims["restored_at"], claims["source_backup_at"],
+            claims["schema_head"], claims["verifier_digest"],
+            claims["backup_artifact_digest"], claims["target_fingerprint"],
+            claims["target_capacity_bytes"], claims["target_connection_limit"],
+            claims["ha_verified"], key_fingerprint, signature_digest,
+            claims["expires_at"],
+        )
+        if stored == expected:
+            return True
+    return False
 
 
 def preflight() -> dict:
@@ -200,6 +234,27 @@ def preflight() -> dict:
         if connection_headroom < 10:
             failures.append("target_connection_headroom")
 
+        evidence_direct_dml = bool(
+            primary.execute(
+                "SELECT has_table_privilege(current_user, "
+                "'plaintext_shadow_restore_evidence', "
+                "'INSERT,UPDATE,DELETE,TRUNCATE')"
+            ).fetchone()[0]
+        )
+        evidence_recorder_available = bool(
+            primary.execute(
+                "SELECT has_function_privilege(current_user, "
+                "'feedling_record_plaintext_shadow_restore_evidence("
+                "bytea,bytea,text,text,text)', 'EXECUTE')"
+            ).fetchone()[0]
+        )
+        result["restore_evidence_direct_dml_blocked"] = not evidence_direct_dml
+        result["restore_evidence_recorder_available"] = evidence_recorder_available
+        if evidence_direct_dml:
+            failures.append("restore_evidence_direct_dml_allowed")
+        if not evidence_recorder_available:
+            failures.append("restore_evidence_recorder_unavailable")
+
         trigger_report = change_capture.audit(primary)
         result["trigger_audit_ok"] = trigger_report.ok
         if not trigger_report.ok:
@@ -232,10 +287,71 @@ def _positive_int_claim(payload: dict, name: str) -> int:
     return value
 
 
+_RESTORE_CLAIM_KEYS = {
+    "restored_at",
+    "source_backup_at",
+    "schema_head",
+    "verifier_digest",
+    "backup_artifact_digest",
+    "target_fingerprint",
+    "target_capacity_bytes",
+    "target_connection_limit",
+    "ha_verified",
+    "expires_at",
+}
+
+
+def _validated_restore_claims(
+    payload: dict,
+    *,
+    target_fingerprint: str | None,
+    target_connection_limit: int,
+) -> dict:
+    if set(payload) != _RESTORE_CLAIM_KEYS:
+        raise RuntimeError("trusted infrastructure evidence payload keys are invalid")
+    if payload["schema_head"] != _SCHEMA_HEAD:
+        raise RuntimeError("trusted infrastructure evidence schema head is stale")
+    if target_fingerprint is not None and (
+        payload["target_fingerprint"] != target_fingerprint
+    ):
+        raise RuntimeError("trusted infrastructure evidence target identity is stale")
+    target_capacity_bytes = _positive_int_claim(payload, "target_capacity_bytes")
+    attested_connection_limit = _positive_int_claim(
+        payload, "target_connection_limit"
+    )
+    if target_connection_limit and (
+        attested_connection_limit != target_connection_limit
+    ):
+        raise RuntimeError("trusted infrastructure evidence connection limit is stale")
+    if payload["ha_verified"] is not True:
+        raise RuntimeError("trusted infrastructure evidence does not verify HA")
+    for digest_name in ("verifier_digest", "backup_artifact_digest"):
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(payload[digest_name])):
+            raise RuntimeError("trusted infrastructure evidence digest is invalid")
+    restored_at = _parse_time(payload["restored_at"])
+    source_backup_at = _parse_time(payload["source_backup_at"])
+    expires_at = _parse_time(payload["expires_at"])
+    if not source_backup_at <= restored_at < expires_at:
+        raise RuntimeError("trusted infrastructure evidence time order is invalid")
+    return {
+        **payload,
+        "restored_at": restored_at,
+        "source_backup_at": source_backup_at,
+        "expires_at": expires_at,
+        "target_capacity_bytes": target_capacity_bytes,
+        "target_connection_limit": attested_connection_limit,
+    }
+
+
 def record_restore_evidence(args) -> dict:
     policy = config.require_target()
-    payload, key_fingerprint, signature_digest = _verified_infra_attestation(
-        args.attestation_payload_b64, args.attestation_signature_b64
+    try:
+        payload_bytes = base64.b64decode(args.attestation_payload_b64, validate=True)
+        signature = base64.b64decode(args.attestation_signature_b64, validate=True)
+    except ValueError as exc:
+        raise RuntimeError("trusted infrastructure evidence signature is invalid") from exc
+    payload, key_fingerprint, signature_digest = _verified_infra_attestation_bytes(
+        payload_bytes, signature
     )
     with db.get_pool().connection() as primary, mirror.get_target_pool(
         policy
@@ -245,69 +361,34 @@ def record_restore_evidence(args) -> dict:
             target.execute("SHOW max_connections").fetchone()[0]
         )
         target_fingerprint = _live_database_fingerprint(target)
-    required = {
-        "restored_at",
-        "source_backup_at",
-        "schema_head",
-        "verifier_digest",
-        "backup_artifact_digest",
-        "target_fingerprint",
-        "target_capacity_bytes",
-        "target_connection_limit",
-        "ha_verified",
-        "expires_at",
-    }
-    if set(payload) != required:
-        raise RuntimeError("trusted infrastructure evidence payload keys are invalid")
-    if payload["schema_head"] != _SCHEMA_HEAD:
-        raise RuntimeError("trusted infrastructure evidence schema head is stale")
-    if payload["target_fingerprint"] != target_fingerprint:
-        raise RuntimeError("trusted infrastructure evidence target identity is stale")
-    target_capacity_bytes = _positive_int_claim(payload, "target_capacity_bytes")
-    attested_connection_limit = _positive_int_claim(
-        payload, "target_connection_limit"
-    )
-    if attested_connection_limit != target_connection_limit:
-        raise RuntimeError("trusted infrastructure evidence connection limit is stale")
-    if payload["ha_verified"] is not True:
-        raise RuntimeError("trusted infrastructure evidence does not verify HA")
-    for digest_name in ("verifier_digest", "backup_artifact_digest"):
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(payload[digest_name])):
-            raise RuntimeError("trusted infrastructure evidence digest is invalid")
-    values = (
-        _parse_time(payload["restored_at"]),
-        _parse_time(payload["source_backup_at"]),
-        payload["schema_head"],
-        payload["verifier_digest"],
-        payload["backup_artifact_digest"],
-        target_fingerprint,
-        target_capacity_bytes,
-        target_connection_limit,
-        True,
-        key_fingerprint,
-        signature_digest,
-        args.operator_id,
-        _parse_time(payload["expires_at"]),
+    _validated_restore_claims(
+        payload,
+        target_fingerprint=target_fingerprint,
+        target_connection_limit=target_connection_limit,
     )
     with db.get_pool().connection() as conn:
         row = conn.execute(
-            "INSERT INTO plaintext_shadow_restore_evidence "
-            "(restored_at, source_backup_at, schema_head, verifier_digest, "
-            "backup_artifact_digest, target_fingerprint, target_capacity_bytes, "
-            "target_connection_limit, ha_verified, attestation_key_fingerprint, "
-            "attestation_signature_digest, operator_id, expires_at) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-            values,
+            "SELECT feedling_record_plaintext_shadow_restore_evidence("
+            "%s,%s,%s,%s,%s)",
+            (
+                payload_bytes, signature, key_fingerprint, signature_digest,
+                args.operator_id,
+            ),
         ).fetchone()
     return {"ok": True, "evidence_id": int(row[0])}
 
 
 def _parse_time(raw: str) -> datetime:
-    value = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
-    parsed = datetime.fromisoformat(value)
-    if parsed.tzinfo is None:
-        raise ValueError("timestamp must include a timezone")
-    return parsed
+    try:
+        if not isinstance(raw, str):
+            raise TypeError("timestamp must be a string")
+        value = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            raise ValueError("timestamp must include a timezone")
+        return parsed
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("trusted infrastructure evidence timestamp is invalid") from exc
 
 
 def install_triggers() -> dict:

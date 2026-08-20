@@ -825,7 +825,11 @@ fingerprint, backup artifact digest, declared capacity, connection limit, and
 HA attestation. The evidence is accepted only as an Ed25519-signed canonical
 JSON payload verified with
 `FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY`; the operator CLI no
-longer accepts those infrastructure facts as unsigned flags. Scheduler health is a post-enable observation gate, not a
+longer accepts those infrastructure facts as unsigned flags. The canonical
+payload and full signature remain in the primary so every preflight can verify
+them again; direct evidence-table DML is revoked from `app` and
+`tee_replicator`, and app writes use the constrained recorder function.
+Scheduler health is a post-enable observation gate, not a
 pre-deploy input; require at least one green elected run before closing the
 change window. These
 commands emit only fixed slugs, fingerprints, and scalars; do not add shell

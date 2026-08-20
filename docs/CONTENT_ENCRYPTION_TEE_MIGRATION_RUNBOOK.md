@@ -98,7 +98,11 @@ HA attestation. Those infrastructure facts must arrive as an Ed25519-signed
 canonical JSON payload from the external backup/provider verification process;
 `FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY` contains only the trusted
 raw public key in base64. The CLI rejects unsigned operator-entered capacity,
-HA, digest, or target-identity values. After enabling Gate 2, observe at least one green scheduler run
+HA, digest, or target-identity values. The primary persists the canonical
+payload and full signature, and every preflight re-verifies them before
+comparing the signed claims with the live target. The `app` and legacy
+`tee_replicator` roles have no direct evidence-table DML; the app can only call
+the controlled evidence recorder. After enabling Gate 2, observe at least one green scheduler run
 before declaring the rollout complete. Operator output must contain
 fingerprints, scalars, and fixed slugs only;
 never print DSNs, passwords, keys, or row bodies.

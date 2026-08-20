@@ -255,7 +255,9 @@ an empty change queue, exact count/content verification, and no ciphertext
 envelope shapes in the target. Backup artifact, capacity, connection-limit, HA,
 restore-verifier, and live target-identity claims must be supplied by the
 external infrastructure verification process as a signed attestation; unsigned
-operator-entered claims cannot authorize the gate. The target, its WAL, snapshots, replicas, and
+operator-entered claims cannot authorize the gate. The canonical payload and
+full signature remain in the primary and are verified again on every preflight;
+application and replication roles cannot directly modify evidence rows. The target, its WAL, snapshots, replicas, and
 backups are all plaintext recipients. Access to any of them defeats the
 at-rest confidentiality provided by the encrypted tier in the primary, so they
 need independent credentials, retention, audit, and incident-response policy.
