@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import io
 import logging
+from contextlib import nullcontext
 
 from psycopg import sql
 
@@ -34,6 +35,17 @@ MAX_ROWS = 200_000
 # Keep this pure-data ordering explicit: snapshot_order() is also consumed by
 # the admin dry-run path, which must not open a TEE connection merely to plan.
 _PARENT_FIRST = ("users", "agent_jobs")
+
+# Partial unique indexes enforce one selected route per user.  During a route
+# handoff both rows are retained: the old owner flips true→false while its peer
+# flips false→true.  PostgreSQL checks a non-deferrable unique index row by row,
+# so one bulk UPDATE may promote the peer first and fail.  Release only these
+# audited boolean owners in an earlier statement; doing this for arbitrary
+# booleans would be unsafe for a future partial index whose predicate selects
+# false instead of true.
+_RELEASE_BEFORE_PROMOTE: dict[str, tuple[str, ...]] = {
+    "model_api_routes": ("is_active", "is_vision", "is_image_generation"),
+}
 
 
 def snapshot_order() -> tuple[str, ...]:
@@ -156,6 +168,21 @@ def _merge_payload(
             )
             for c in mutable_cols
         )
+        for release_col in _RELEASE_BEFORE_PROMOTE.get(table, ()):
+            if release_col not in mutable_cols:
+                continue
+            release_ident = sql.Identifier(release_col)
+            dst.execute(sql.SQL(
+                "UPDATE {} AS target SET {} = FALSE FROM {} AS staged "
+                "WHERE {} AND target.{} IS TRUE AND staged.{} IS FALSE"
+            ).format(
+                table_ident,
+                release_ident,
+                stage_ident,
+                retained_key_match,
+                release_ident,
+                release_ident,
+            ))
         # Release secondary/partial unique keys held by retained rows before
         # the UPSERT is allowed to insert new primary keys.  This covers the
         # live shape where an existing owner is disabled before its replacement
@@ -200,7 +227,7 @@ def _merge_payload(
 
 
 def snapshot_table(
-    table: str, *, target_policy: TargetPolicy | None = None
+    table: str, *, target_policy: TargetPolicy | None = None, source_conn=None
 ) -> dict:
     """整表替换一张 SNAPSHOT lane 的表。绝不抛——失败信息落在返回值里。"""
     rep = {
@@ -208,7 +235,12 @@ def snapshot_table(
         "missing_in_tee": [], "missing_in_rds": [],
     }
     try:
-        with db.get_pool().connection() as src:
+        source_context = (
+            db.get_pool().connection()
+            if source_conn is None
+            else nullcontext(source_conn)
+        )
+        with source_context as src:
             n = _row_count(src, table)
             if n > MAX_ROWS:
                 rep["error"] = (
@@ -273,17 +305,27 @@ def snapshot_table(
 
 
 def snapshot_all() -> dict:
-    """刷完整条 SNAPSHOT lane。单表失败不中断其余表。"""
+    """刷完整条 SNAPSHOT lane。单表失败不中断其余表。
+
+    All source tables share one repeatable-read snapshot.  Without that
+    boundary, an online parent+child insert between two table reads can make
+    the child newer than the parent copied to TEE and fail its foreign key.
+    """
     tables = []
     copied = 0
     failures = 0
-    for table in snapshot_order():
-        rep = snapshot_table(table)
-        tables.append(rep)
-        if rep["ok"]:
-            copied += rep["rows"]
-        else:
-            failures += 1
+    with db.get_pool().connection() as src:
+        with src.transaction():
+            src.execute(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+            )
+            for table in snapshot_order():
+                rep = snapshot_table(table, source_conn=src)
+                tables.append(rep)
+                if rep["ok"]:
+                    copied += rep["rows"]
+                else:
+                    failures += 1
     log.info("[tee-snapshot] done: tables=%d copied=%d failures=%d",
              len(tables), copied, failures)
     return {"tables": tables, "copied": copied, "failures": failures}

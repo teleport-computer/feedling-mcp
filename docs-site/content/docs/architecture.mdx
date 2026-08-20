@@ -529,6 +529,17 @@ preference, and precedence is `body_ct`, then `body_b64`, then `body`. The
 [`/v1/content/swap`](/docs/workflows/memory) endpoint converts existing inline
 records between encrypted and plaintext shapes.
 
+During a managed TEE-database promotion, historical ciphertext that has reached
+an explicitly terminal decrypt state can be retained without pretending it was
+converted to plaintext. The migration copies the original raw row, records a
+versioned digest marker, and audits every preserved source/destination pair.
+This does not change the account's `content_encryption` preference, manufacture
+an enclave-readable key, or make the service able to open ciphertext it could
+not previously decrypt. A device can still read such a record only when its
+`K_user` remains valid. Promotion gates distinguish these fully audited rows
+from unresolved, malformed, or requeued work; only audited preservation is
+eligible for the migration waiver.
+
 This routing rule is also a service boundary, not only a decoding convenience.
 Normal backend and hosted-runtime workflows do not submit `body` or `body_b64`
 to enclave decrypt or readside endpoints. Batch features such as Memory,
@@ -795,6 +806,13 @@ The custom-domain route has a deliberately disclosed plaintext hop between
 measured TDX CVM, not a public-network hop; its protection relies on that CVM
 boundary rather than a second TLS layer. Cloudflare manages DNS-01 records only
 and does not proxy this traffic.
+
+Ingress certificates persist on an encrypted application volume while the
+container root filesystem is replaceable. On restart, the managed compose
+reuses that material only after checking certificate lifetime and private-key
+matching; otherwise the upstream DNS-01 bootstrap runs normally. Successful
+reuse starts the proxy immediately and leaves renewal to the image's background
+renewal daemon.
 
 Clients using the custom domain must verify both the ingress certificate-evidence
 bundle and the enclave attestation bundle, in addition to ordinary WebPKI, before

@@ -58,6 +58,56 @@ services:
   # certificate authority.
   ingress:
     image: dstacktee/dstack-ingress:2.2@sha256:d05a7b343c37c1cca1bba8dbf7e8f3c6d2118158af2d41c455103796db4f67f0
+    # dstack-ingress keeps /.bootstrapped on its ephemeral root filesystem.
+    # Recreate that marker only when every persisted certificate is healthy and
+    # matches its private key; otherwise preserve the upstream full bootstrap.
+    entrypoint:
+      - /bin/bash
+      - -euo
+      - pipefail
+      - -c
+      - |
+        cert_root="$${INGRESS_CERT_ROOT:-/etc/letsencrypt}"
+        bootstrap_marker="$${INGRESS_BOOTSTRAP_MARKER:-/.bootstrapped}"
+        venv_marker="$${INGRESS_VENV_MARKER:-/.venv_bootstrapped}"
+        certbot_bin="$${INGRESS_CERTBOT_BIN:-/opt/app-venv/bin/certbot}"
+        upstream_entrypoint="$${INGRESS_UPSTREAM_ENTRYPOINT:-/scripts/entrypoint.sh}"
+        min_validity="$${INGRESS_CERT_MIN_VALIDITY_SEC:-604800}"
+
+        certificate_is_reusable() {
+          local domain="$$1"
+          local cert="$$cert_root/live/$$domain/fullchain.pem"
+          local key="$$cert_root/live/$$domain/privkey.pem"
+          local cert_pub key_pub
+          [[ -s "$$cert" && -s "$$key" ]] || return 1
+          openssl x509 -checkend "$$min_validity" -noout -in "$$cert" >/dev/null 2>&1 || return 1
+          cert_pub="$$(openssl x509 -in "$$cert" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum)" || return 1
+          key_pub="$$(openssl pkey -in "$$key" -pubout -outform DER 2>/dev/null | sha256sum)" || return 1
+          [[ "$$cert_pub" == "$$key_pub" ]]
+        }
+
+        reusable=true
+        found_domain=false
+        while IFS= read -r domain; do
+          [[ -n "$$domain" ]] || continue
+          found_domain=true
+          if ! certificate_is_reusable "$$domain"; then
+            reusable=false
+            break
+          fi
+        done <<< "$${DOMAINS:-}"
+
+        if [[ "$$found_domain" == true && "$$reusable" == true ]]; then
+          touch "$$bootstrap_marker"
+          if [[ -x "$$certbot_bin" ]]; then
+            touch "$$venv_marker"
+          fi
+          echo "Reusing persisted ingress certificates; renewal remains background-managed"
+        fi
+
+        exec "$$upstream_entrypoint" "$$@"
+      - --
+    command: ["haproxy", "-W", "-f", "/etc/haproxy/haproxy.cfg"]
     restart: unless-stopped
     ports:
       - "443:443"

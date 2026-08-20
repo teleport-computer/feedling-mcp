@@ -40,6 +40,15 @@ operators with either form of storage access are plaintext recipients. Decide th
 tier deliberately for the deployment, not per user, when the host operator is not
 the data subject.
 
+A managed migration may preserve a historical ciphertext envelope verbatim
+when its enclave recipient can no longer decrypt it. That is a data-retention
+mechanism, not key recovery: it does not grant the host or enclave new plaintext
+access, and device readability still depends on a valid user recipient key.
+Migration tooling must keep this state distinct from unresolved replication and
+must not silently change an account's encryption preference. Self-hosted
+operators adopting an equivalent workflow should require exact source/target
+digests, an explicit write approval, and a tested pre-cutover rollback boundary.
+
 ### Managed enclave-domain access is a separate trust model
 
 The managed custom domain is available only when the endpoint is behind
