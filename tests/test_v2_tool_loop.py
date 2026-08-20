@@ -399,7 +399,7 @@ def test_initial_outbound_fence_is_armed_before_first_provider_call(monkeypatch)
         fold_new_messages=_RecordingFold([]),
         add_usage=_noop_add_usage,
         max_calls=2,
-        initial_outbound_tools_blocked=True,
+        initial_screen_pixels_blocked=True,
     ))
 
     offered = {spec.name for spec in (provider.calls[0]["tools"] or ())}
@@ -425,7 +425,7 @@ def test_foreground_screen_context_does_not_remove_write_surface(monkeypatch):
         fold_new_messages=_RecordingFold([]),
         add_usage=_noop_add_usage,
         max_calls=2,
-        initial_outbound_tools_blocked=False,
+        initial_screen_pixels_blocked=False,
     ))
 
     offered = {spec.name for spec in provider.calls[0]["tools"]}

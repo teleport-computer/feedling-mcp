@@ -387,6 +387,11 @@ def test_wake_memory_write_is_authorized_applied_and_not_refused(monkeypatch):
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "manual_wake")
     job = jobs_store.claim_next_job("w")
+    # 生产的 `process_job` 在派给 `_run_wake` 之前必定先 `mark_running`。
+    # 平台写的 owner 栅栏(T154)和 `start_mcp_mutation_attempt` 一样要求
+    # status='running' + 有效租约,所以直接调 `_run_wake` 的测试必须自己补上
+    # 这次状态迁移 —— 否则测的是一个生产里不存在的状态。
+    assert jobs_store.mark_running(job_id, claimed_by=job["claimed_by"])
 
     _patch_real_write(monkeypatch)
     _patch_tool_effect_encryption(monkeypatch)
@@ -572,6 +577,11 @@ def test_wake_mixed_valid_invalid_workspace_batch_applies_valid_call(
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "manual_wake")
     job = jobs_store.claim_next_job("w-mixed-workspace")
+    # 生产的 `process_job` 在派给 `_run_wake` 之前必定先 `mark_running`。
+    # 平台写的 owner 栅栏(T154)和 `start_mcp_mutation_attempt` 一样要求
+    # status='running' + 有效租约,所以直接调 `_run_wake` 的测试必须自己补上
+    # 这次状态迁移 —— 否则测的是一个生产里不存在的状态。
+    assert jobs_store.mark_running(job_id, claimed_by=job["claimed_by"])
     _patch_tool_effect_encryption(monkeypatch)
     captured = {}
 

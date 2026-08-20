@@ -15,6 +15,7 @@ import asyncio
 import base64
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -28,6 +29,7 @@ import worldbook_match
 from admin import data_track as admin_data_track
 from provider_types import ToolCall, ToolExchange
 from capabilities import registry as cap_registry
+from capabilities import tool_schema as cap_tool_schema
 from core import envelope as core_envelope
 from core import self_thinking
 from core import store as core_store
@@ -39,6 +41,7 @@ from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import language_follow
 from model_api_runtime.v2 import profile_store
 from model_api_runtime.v2 import serve_worker
+from model_api_runtime.v2 import tool_loop
 from model_api_runtime.v2 import worker
 
 pytestmark = pytest.mark.skipif(
@@ -3767,3 +3770,68 @@ def test_half_open_halt_gives_the_still_working_tool_a_collateral_error(monkeypa
     contents = _tool_result_contents(calls[1])
     assert "error: web_tool_halted" in contents           # search: really halted
     assert "error: batch_cancelled_web_halted" in contents  # fetch: collateral
+
+
+def test_child_subagent_tool_schemas_are_protected_from_folding(monkeypatch):
+    """子 agent 的 7 件工具全部标为「不可折叠」。
+
+    为什么必须是保护、而不是折叠+恢复:子 agent 的整个工具面只有 7 件,其中
+    只有 `memory_search` 是常驻;而 `mcp_tool_search` **不在**
+    `_SUBAGENT_ALLOWED_TOOLS` 里 —— 一旦被折成空参数表,它没有任何取回口,
+    表现是「看着工具名填不出参数」,在系统里和「模型自己不想调」无法区分。
+
+    ⚠️ 这条是**结构性**断言,不是端到端复现。我没能构造出真正让子轮折叠的
+    用例:7 份说明书合计约 1k token,要触发折叠需要模型写出 20k token 级别的
+    task prompt。所以这里钉住的是契约本身(保护集 == 全部 7 件)与它的三个
+    前提(工具面是这 7 件、只有一件常驻、没有 mcp_tool_search);任何一条被
+    改动,这个保护的必要性就变了,应当重新判断而不是照旧。
+    """
+    from model_api_runtime.v2 import tool_surface as v2_tool_surface
+
+    allowed = set(worker._SUBAGENT_ALLOWED_TOOLS)
+    assert len(allowed) == 7
+    # 前提一:没有恢复口。
+    assert cap_tool_schema.MCP_TOOL_SEARCH_TOOL not in allowed
+    # 前提二:只有一件是常驻工具,其余 6 件都在可折叠面上。
+    assert allowed & set(v2_tool_surface.RESIDENT_TOOL_NAMES) == {"memory_search"}
+
+    uid = "u_child_protected"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-child-protect")
+    _patch_real_write(monkeypatch)
+
+    seen_child_kwargs = []
+    real_run_tool_loop = worker.v2_tool_loop.run_tool_loop
+
+    async def _spy(**kwargs):
+        if kwargs.get("allow_reply_tool") is False:
+            seen_child_kwargs.append(kwargs)
+        return await real_run_tool_loop(**kwargs)
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", _spy)
+
+    responses = iter([
+        _tool_round(_tc("task-1", "task", prompt="Check the workspace.")),
+        _text_round("child evidence"),
+        _text_round("parent answer"),
+    ])
+
+    async def provider(config, messages, *, tools=None, **_kwargs):
+        return next(responses)
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    deps = _deps(messages=[
+        {"id": "m1", "ts": 10.0, "role": "user", "content": "check it"},
+    ])
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert len(seen_child_kwargs) == 1
+    protect = seen_child_kwargs[0].get("refresh_protected_extra_tool_names")
+    assert callable(protect), "child loop must declare a protected-name source"
+    assert set(protect()) == allowed

@@ -770,6 +770,7 @@ jobs:
             tests/test_lane_rollup.py \
             tests/test_data_track_snapshot_golden.py \
             tests/test_v2_jobs_store.py \
+            tests/test_v2_trajectory_db.py \
             tests/test_v2_enclave_broker.py \
             tests/test_v2_job_lease_fencing.py \
             tests/test_v2_pool_config.py \
@@ -799,6 +800,7 @@ jobs:
             tests/test_v2_turn_budget_defaults.py \
             tests/test_v2_tool_loop_mcp.py \
             tests/test_v2_worker_mcp.py \
+            tests/test_v2_wake_mcp.py \
             tests/test_v2_worker_tool_loop.py \
             tests/test_v2_wake_worker.py \
             tests/test_v2_wake_schedule.py \
