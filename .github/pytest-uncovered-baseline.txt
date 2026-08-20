@@ -130,7 +130,6 @@ tests/test_hosted_agent_runtime_cutover.py
 tests/test_hosted_agent_runtime_driver.py
 tests/test_hosted_runtime.py
 tests/test_image_generation_autonomy.py
-tests/test_image_generation_model.py
 tests/test_image_resize.py
 tests/test_introduction_db_atomic.py
 tests/test_introduction_enqueue_once.py
