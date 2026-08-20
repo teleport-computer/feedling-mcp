@@ -431,6 +431,9 @@ if not _provisioned:
         # 感知能力表等价性(2026-08-19, 感知内核提取 Task 2)。纯:import 两个
         # 声明模块比对对象同一性 + 字典遍历,零 DB/零网络。
         "test_perception_kernel_catalog.py",
+        # 字段投影/权限判据/一瞥等价性(2026-08-19, 感知内核提取 Task 3)。纯:import
+        # 两侧模块比对对象同一性 + 纯函数调用,零 DB/零网络。自带 sys.path 引导。
+        "test_perception_kernel_projection.py",
     }
     collect_ignore = sorted(
         f
