@@ -428,6 +428,9 @@ if not _provisioned:
         # V2 模块级常量字符串 + 调用 chat_resident_consumer 的一个纯函数,
         # 不碰 DB/网络。自带 sys.path 引导(backend/ + tools/)。
         "test_perception_prompt_golden.py",
+        # 感知能力表等价性(2026-08-19, 感知内核提取 Task 2)。纯:import 两个
+        # 声明模块比对对象同一性 + 字典遍历,零 DB/零网络。
+        "test_perception_kernel_catalog.py",
     }
     collect_ignore = sorted(
         f
