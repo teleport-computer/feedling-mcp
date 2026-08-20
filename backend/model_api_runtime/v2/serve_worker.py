@@ -4586,7 +4586,7 @@ def _mcp_catalog_fingerprint_if_new(store) -> str:
     return fingerprint
 
 
-async def _load_mcp_turn_observed(store, **kwargs):
+async def _load_mcp_turn_observed(store, *, lane: str = "chat", **kwargs):
     """`mcp_tools.load_turn_mcp` + 把本轮工具面写进 admin 可见的 debug trace。
 
     为什么包在装配层而不是 loader 里:loader 在 `hosted`,worker 是依赖洁净的
@@ -4596,6 +4596,12 @@ async def _load_mcp_turn_observed(store, **kwargs):
     usr_1baf(2026-08-09)报「MCP 测试连接通过、AI 却说搜不到」时,pi 那条路已经
     有 mcp.surface.* 埋点、一眼能看到每台注册了几个,**V2 这条什么都没有**,
     只能靠读代码猜。事件名与 pi 侧刻意保持一致,同一套排查方法两条 lane 通用。
+
+    ``lane`` 是**纯观测参数**,不下传给 loader —— 它只决定 trace 的 detail.lane。
+    T154 之前这里写死 `"chat"`;唤醒道接上 MCP 之后复用同一个 deps,四条 wake
+    lane 的 `mcp.surface.resolved` 会全部自报成 chat,和同一轮的
+    `mcp.turn.usage`(带真实 lane)互相矛盾。默认值保留 chat 只是为了未指定的
+    旧调用点,生产两处都显式传。
     """
     turn = await mcp_tools.load_turn_mcp(store, **kwargs)
     catalog_fingerprint = ""
@@ -4650,8 +4656,8 @@ async def _load_mcp_turn_observed(store, **kwargs):
                        "每台仍有代表工具。detail.per_server 是「注册数/发现数」"
                        if dropped else "")
                 ),
-                detail={"driver": "v2", "lane": "chat", **summary,
-                        **catalog_detail},
+                detail={"driver": "v2", "lane": str(lane or "chat"),
+                        **summary, **catalog_detail},
             )
             # 指纹只在 trace **确实发出去之后**才记。写在前面的话,某轮加载失败
             # 或 trace 写失败就会把这个指纹永久吃掉,后面恢复了也不再记明细
