@@ -10,6 +10,29 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Model provider HTTPS base URLs now fail closed when they resolve inward.**
+  Saving, testing, listing models, and runtime provider calls reject an explicit
+  HTTPS `base_url` when any DNS answer is private, loopback, link-local,
+  reserved, multicast, invalid, empty, or unresolvable. The exact
+  `http://127.0.0.1` and `http://localhost` development allowlist is unchanged.
+  Explicit URLs are resolved on every validation without a process cache; this
+  adds a synchronous DNS lookup to runtime calls but avoids the larger
+  rebinding window created by checking only when a route is saved. The HTTP
+  client still performs its own resolution, so deployment-level egress controls
+  remain the final defense against a DNS change between validation and connect.
+  A self-hosted operator whose HTTPS model server is intentionally on a LAN can
+  set `FEEDLING_PROVIDER_ALLOW_PRIVATE_BASE_URLS=1`; this disables the address
+  filter for provider calls and usage probes but does not broaden the cleartext
+  allowlist. Self-hosted deployments are not observable by the project, so we
+  cannot measure who needs this exception or detect when a future change breaks
+  their configuration; operators must test it at their exact deployed commit.
+
+- **Model provider base URLs now reject invalid TCP ports before any outbound
+  request.** Saving, testing, or listing models for a route with a non-numeric,
+  zero, or out-of-range explicit port now returns the existing client-input
+  error path instead of accepting a URL that would fail later in the HTTP
+  client. Explicit ports from `1` through `65535` remain valid.
+
 - **Managed deployments reuse healthy persisted ingress certificates without
   blocking public traffic on an unnecessary ACME renewal.** A recreated ingress
   verifies that every stored certificate is valid for at least seven days and
@@ -69,9 +92,8 @@ change must not be interpreted as an API guarantee.
   (`https://user:pw@host/v1`) are now rejected on every scheme. And
   `http://localhost:<port>` is now accepted where previously only
   `http://127.0.0.1` was — the model-catalog endpoint already accepted it, and
-  the save path now uses that same check rather than a second, weaker one.
-  **This does not add address-level egress filtering:** an `https` `base_url`
-  pointing at a private or link-local address is accepted exactly as before.
+  the save path now uses that same check rather than a second, weaker one. The
+  HTTPS address policy described above is applied after this structural check.
 
 - **Persistence failures no longer look like successful memory, trace, or World
   Book operations.** A Memory Garden index request returns `503` when its

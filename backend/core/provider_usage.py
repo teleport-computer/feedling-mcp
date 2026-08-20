@@ -83,7 +83,13 @@ def build_payload(provider: str, adapter: str, metrics: dict, *, error: str | No
 
 
 def allow_private() -> bool:
-    return os.environ.get("FEEDLING_PROVIDER_USAGE_ALLOW_PRIVATE", "0").strip() == "1"
+    # The general provider-base-url switch keeps model calls and the companion
+    # usage probe on one self-host policy. Retain the older usage-only switch so
+    # existing deployments do not lose their explicitly granted exception.
+    return (
+        provider_client.private_provider_base_urls_allowed()
+        or os.environ.get("FEEDLING_PROVIDER_USAGE_ALLOW_PRIVATE", "0").strip() == "1"
+    )
 
 
 def _make_client() -> httpx.AsyncClient:

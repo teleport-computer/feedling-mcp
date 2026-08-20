@@ -5141,7 +5141,8 @@
             }
           }
         },
-        "x-feedling-contract-level": "compatibility"
+        "x-feedling-contract-level": "compatibility",
+        "description": "Create a model route. A base_url with an explicit port accepts only integer ports from 1 through 65535. By default every HTTPS DNS answer must be publicly reachable."
       }
     },
     "/v1/model_api/routes/{route_id}": {
@@ -5418,7 +5419,7 @@
           }
         },
         "x-feedling-contract-level": "compatibility",
-        "description": "Create or update the active hosted model route. context_window_tokens is treated as route metadata: a value below Runtime V2's deployment-tunable trust floor (32,768 by default) falls through to the audited-family or unaudited-route default rather than becoming the prompt budget. The resolved value is returned and persisted."
+        "description": "Create or update the active hosted model route. context_window_tokens is treated as route metadata: a value below Runtime V2's deployment-tunable trust floor (32,768 by default) falls through to the audited-family or unaudited-route default rather than becoming the prompt budget. The resolved value is returned and persisted. A base_url with an explicit port accepts only integer ports from 1 through 65535. By default every HTTPS DNS answer must be publicly reachable."
       }
     },
     "/v1/model_api/test": {
@@ -5493,7 +5494,7 @@
           "Model API"
         ],
         "x-feedling-contract-level": "documented",
-        "description": "Query the caller's active model_api provider for balance/usage, live on every call — never cached and never stored. Uses the same decrypted provider key as chat, decrypted server-side just for this request. Which of the five fixed metrics (balance, remaining, usage_total, usage_today, usage_month) actually populate depends on the provider/adapter: DeepSeek and OpenRouter are queried through their official APIs; an openai_compatible relay/中转站 is queried through its dashboard-style endpoints when reachable, and is skipped with error=usage_blocked_url if it resolves to a private/loopback address. Metrics the adapter cannot report are status=\"unsupported\", not omitted."
+        "description": "Query the caller's active model_api provider for balance/usage, live on every call — never cached and never stored. Uses the same decrypted provider key as chat, decrypted server-side just for this request. Which of the five fixed metrics (balance, remaining, usage_total, usage_today, usage_month) actually populate depends on the provider/adapter: DeepSeek and OpenRouter are queried through their official APIs; an openai_compatible relay/中转站 is queried through its dashboard-style endpoints when reachable, and is skipped by default with error=usage_blocked_url if it resolves to a private/loopback address; a self-host deployment can explicitly opt into its private-provider escape. Metrics the adapter cannot report are status=\"unsupported\", not omitted."
       }
     },
     "/v1/notices": {
@@ -8876,7 +8877,7 @@
           },
           "base_url": {
             "type": "string",
-            "description": "Override base URL. Required for `openai_compatible`; must be `https://` or local `http://127.0.0.1`."
+            "description": "Override base URL. Required for `openai_compatible`; must be `https://` or local `http://127.0.0.1`. An explicit port must be an integer from 1 through 65535. By default every HTTPS DNS answer must be publicly reachable."
           },
           "api_key": {
             "type": "string",
@@ -10072,7 +10073,8 @@
           },
           "base_url": {
             "type": "string",
-            "format": "uri"
+            "format": "uri",
+            "description": "An explicit port must be an integer from 1 through 65535. By default every HTTPS DNS answer must be publicly reachable."
           },
           "context_window_tokens": {
             "type": "integer",
@@ -10166,7 +10168,8 @@
           },
           "base_url": {
             "type": "string",
-            "format": "uri"
+            "format": "uri",
+            "description": "An explicit port must be an integer from 1 through 65535. By default every HTTPS DNS answer must be publicly reachable."
           },
           "context_window_tokens": {
             "type": "integer",

@@ -637,6 +637,25 @@ def _reset_enclave_http_client():
 
 
 @pytest.fixture(autouse=True)
+def _stable_provider_base_url_dns(monkeypatch):
+    """Keep provider tests independent of real, proxy, and synthetic DNS.
+
+    Production still calls ``core.net_safety.resolve_ips``. Focused provider
+    URL tests replace this seam with private, mixed, invalid, and failing
+    answers; every unrelated test gets one known-public address so its mocked
+    HTTP provider remains the only behavior under test.
+    """
+    import provider_client
+
+    monkeypatch.delenv("FEEDLING_PROVIDER_ALLOW_PRIVATE_BASE_URLS", raising=False)
+    monkeypatch.setattr(
+        provider_client.net_safety,
+        "resolve_ips",
+        lambda _host: ["8.8.8.8"],
+    )
+
+
+@pytest.fixture(autouse=True)
 def _reset_admin_page_cache():
     """Clear admin_core's 60s page-html TTL cache between tests.
 

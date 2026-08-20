@@ -126,6 +126,10 @@ services:
       #     the var is unset. There is still NO silent file fallback: if unset
       #     at runtime the backend fails fast at startup (db.py raises). ---
       DATABASE_URL: "${DATABASE_URL:-}"
+      # --- SELF-HOST SECURITY ESCAPE: intentional HTTPS LAN model server.
+      #     Exact "1" only; default closed. This changes the egress trust
+      #     boundary and is not a Category (A) cosmetic override. ---
+      FEEDLING_PROVIDER_ALLOW_PRIVATE_BASE_URLS: "${FEEDLING_PROVIDER_ALLOW_PRIVATE_BASE_URLS:-0}"
       # --- MUTABLE: category (A), not security-relevant ---
       FEEDLING_PUBLIC_BASE_URL: "${FEEDLING_PUBLIC_BASE_URL:-}"
       FEEDLING_PUSH_COOLDOWN_SEC: "${FEEDLING_PUSH_COOLDOWN_SEC:-300}"
