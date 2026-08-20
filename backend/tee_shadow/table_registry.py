@@ -65,9 +65,12 @@ class Entry:
 
     @property
     def tee_required(self) -> bool:
-        if self.required_in_tee is not None:
-            return self.required_in_tee
-        return self.lane != SKIP
+        # A replicated lane cannot opt out: its destination table is part of
+        # the replication contract.  The override exists only to pull a
+        # primary-local SKIP table into the TEE schema guard.
+        if self.lane != SKIP:
+            return True
+        return self.required_in_tee is True
 
 
 REGISTRY: dict[str, Entry] = {

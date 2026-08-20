@@ -112,6 +112,16 @@ def test_tee_required_tables_include_synced_and_primary_local_tables():
     }.isdisjoint(required)
 
 
+def test_synced_lane_cannot_opt_out_of_tee_schema():
+    """A mistaken override must not recreate the synced-without-DDL failure."""
+    entry = reg.Entry(
+        reg.SNAPSHOT,
+        "test contract",
+        required_in_tee=False,
+    )
+    assert entry.tee_required is True
+
+
 def test_voice_call_sessions_use_snapshot_lane():
     """The source lifecycle state must converge before primary promotion."""
     assert reg.REGISTRY["voice_call_sessions"].lane == reg.SNAPSHOT
