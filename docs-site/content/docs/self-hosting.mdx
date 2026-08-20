@@ -372,6 +372,10 @@ operator will respond to a leaked client credential.
 - Back up the database and object storage before applying a new image.
 - Review Alembic migrations for forward and rollback implications; do not assume
   every data migration is automatically reversible.
+- If the managed decrypted shadow is enabled, apply every new `alembic_tee`
+  head to that target before, or in the same maintenance window as, the TEE
+  primary. The exact-head gate deliberately stops replication on a mismatch,
+  even when a new primary-only table is not itself shadow-replicated.
 - Stage the exact image and configuration against a restored copy of production
   data with credentials disabled or replaced.
 - Keep the prior image and configuration, but do not roll application code back
