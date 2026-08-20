@@ -820,7 +820,11 @@ Preflight requires distinct source/target identities, TLS, PostgreSQL 17,
 matching `alembic_tee` heads, a writable target role, exact capture-trigger
 inventory, and fresh recorded restore evidence. Verification is green only with
 exact counts/content, no ciphertext-envelope shapes in the target, no pending or
-quarantined dirty keys, and healthy backup/restore and scheduler evidence. These
+quarantined dirty keys, and fresh backup/restore evidence bound to the target
+fingerprint, backup artifact digest, declared capacity, connection limit, and
+HA attestation. Scheduler health is a post-enable observation gate, not a
+pre-deploy input; require at least one green elected run before closing the
+change window. These
 commands emit only fixed slugs, fingerprints, and scalars; do not add shell
 tracing around DSNs or credentials.
 

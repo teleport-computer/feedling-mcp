@@ -512,10 +512,35 @@ def _reencrypt_with_retry(user_id: str, envelope: dict) -> dict:
 
 
 def _frames_row_writer(user_id: str, frame_id: str, sort_val, doc: dict,
-                       dry_run: bool):
+                       dry_run: bool, target_policy: TargetPolicy | None = None):
     """_TABLES["frame_envelopes"].row_writer：委托 frames.replicate，注入带重试的
     reencrypt 回调。返回 frames upsert_sql 的 9 元参数，或 dry_run 下 None。"""
     from tee_replicator import frames
+
+    if target_policy is not None and target_policy.mode == "plaintext_all":
+        def decrypt(envelope: dict) -> bytes:
+            fn = _get_decrypt(user_id)
+            last: Exception | None = None
+            for _ in range(_RETRIES + 1):
+                try:
+                    return fn(envelope, purpose="plaintext_shadow_frame")
+                except Exception as exc:  # noqa: BLE001
+                    if _is_permanent_decrypt_failure(exc):
+                        raise transforms.PermanentDecryptFailure(str(exc)) from exc
+                    last = exc
+                    if _is_auth_error(exc):
+                        fn = _get_decrypt(user_id, fresh=True)
+            assert last is not None
+            raise last
+
+        return frames.replicate_plaintext(
+            user_id,
+            frame_id,
+            float(sort_val or 0.0),
+            doc,
+            decrypt,
+            dry_run=dry_run,
+        )
 
     def reencrypt(envelope: dict, key_version: str) -> dict:
         return _reencrypt_with_retry(user_id, envelope)
@@ -546,13 +571,14 @@ _TABLES["frame_envelopes"] = _Table(
     cursor_kind="numeric",
     upsert_sql=(
         "INSERT INTO frames (user_id, frame_id, ts, meta, body_storage_key, "
-        "body_storage_key_version, body_mime, body_sha256, body_size_bytes) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "body_storage_key_version, body_mime, body_sha256, body_size_bytes, "
+        "body_plaintext) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
         "ON CONFLICT (user_id, frame_id) DO UPDATE SET ts=EXCLUDED.ts, meta=EXCLUDED.meta, "
         "body_storage_key=EXCLUDED.body_storage_key, "
         "body_storage_key_version=EXCLUDED.body_storage_key_version, "
         "body_mime=EXCLUDED.body_mime, body_sha256=EXCLUDED.body_sha256, "
-        "body_size_bytes=EXCLUDED.body_size_bytes"),
+        "body_size_bytes=EXCLUDED.body_size_bytes, "
+        "body_plaintext=EXCLUDED.body_plaintext"),
     unpack=lambda r: (r[0], r[1], r[2], {"doc": r[3], "env_meta": r[4], "body_key": r[5]}),
     row_writer=_frames_row_writer,
     requeue_delete_tee_sql="DELETE FROM frames WHERE user_id = %s AND frame_id = %s",
@@ -1290,7 +1316,9 @@ def _produce_write(
     抛 PendingDeviceMigration / 其余异常的语义与 decrypt 路径一致，供 run_table
     的 freeze/pending 共用。"""
     if cfg.row_writer is not None:
-        return cfg.row_writer(user_id, item_id, sort_val, doc, dry_run)
+        return cfg.row_writer(
+            user_id, item_id, sort_val, doc, dry_run, target_policy
+        )
     pt_doc = _transform_with_retry(cfg, doc, user_id, target_policy)
     return cfg.upsert_args(user_id, item_id, sort_val, pt_doc)
 

@@ -122,7 +122,7 @@ async def lifespan(app):
     # every worker; an operational tick failure after this gate is isolated.
     from plaintext_shadow import config as plaintext_shadow_config
 
-    plaintext_shadow_config.validate_startup()
+    plaintext_shadow_config.validate_live_startup()
 
     # (1) Threadpool limiter — off anyio's 40-token default (§5.2).
     threadpool.configure_thread_limiter()

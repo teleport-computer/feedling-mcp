@@ -46,13 +46,33 @@ def _head(conn) -> str | None:
     return None if version is None else str(version[0])
 
 
-def _restore_evidence(conn) -> bool:
+def _restore_evidence(
+    conn,
+    *,
+    target_fingerprint: str | None = None,
+    minimum_capacity_bytes: int = 0,
+    target_connection_limit: int = 0,
+) -> bool:
+    clauses = [
+        "expires_at > now()",
+        "source_backup_at >= now() - interval '24 hours'",
+        "schema_head=%s",
+        "ha_verified",
+    ]
+    params: list[Any] = [_SCHEMA_HEAD]
+    if target_fingerprint is not None:
+        clauses.append("target_fingerprint=%s")
+        params.append(target_fingerprint)
+    if minimum_capacity_bytes:
+        clauses.append("target_capacity_bytes >= %s")
+        params.append(minimum_capacity_bytes)
+    if target_connection_limit:
+        clauses.append("target_connection_limit=%s")
+        params.append(target_connection_limit)
     row = conn.execute(
         "SELECT EXISTS (SELECT 1 FROM plaintext_shadow_restore_evidence "
-        "WHERE expires_at > now() "
-        "AND source_backup_at >= now() - interval '24 hours' "
-        "AND schema_head=%s)",
-        (_SCHEMA_HEAD,),
+        f"WHERE {' AND '.join(clauses)})",
+        tuple(params),
     ).fetchone()
     return bool(row and row[0])
 
@@ -70,6 +90,10 @@ def preflight() -> dict:
     with db.get_pool().connection() as primary, mirror.get_target_pool(
         policy
     ).connection() as target:
+        try:
+            config.validate_live_topology(primary, target)
+        except RuntimeError:
+            failures.append("primary_shadow_alias")
         primary_head = _head(primary)
         target_head = _head(target)
         result["primary_head"] = primary_head
@@ -109,14 +133,28 @@ def preflight() -> dict:
         )
         result["primary_bytes"] = primary_bytes
         result["target_bytes"] = target_bytes
-        if target_bytes <= 0:
-            failures.append("target_capacity_unknown")
+        max_connections = int(target.execute("SHOW max_connections").fetchone()[0])
+        active_connections = int(
+            target.execute(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database()"
+            ).fetchone()[0]
+        )
+        connection_headroom = max_connections - active_connections
+        result["target_max_connections"] = max_connections
+        result["target_connection_headroom"] = connection_headroom
+        if connection_headroom < 10:
+            failures.append("target_connection_headroom")
 
         trigger_report = change_capture.audit(primary)
         result["trigger_audit_ok"] = trigger_report.ok
         if not trigger_report.ok:
             failures.append("trigger_drift")
-        evidence_ok = _restore_evidence(primary)
+        evidence_ok = _restore_evidence(
+            primary,
+            target_fingerprint=result["target_fingerprint"],
+            minimum_capacity_bytes=max(primary_bytes * 2, target_bytes),
+            target_connection_limit=max_connections,
+        )
         result["restore_evidence_ok"] = evidence_ok
         if not evidence_ok:
             failures.append("restore_evidence_missing")
@@ -127,11 +165,25 @@ def preflight() -> dict:
 
 
 def record_restore_evidence(args) -> dict:
+    policy = config.require_target()
+    target_fingerprint = _endpoint_fingerprint(policy.dsn)
+    with db.get_pool().connection() as primary, mirror.get_target_pool(
+        policy
+    ).connection() as target:
+        config.validate_live_topology(primary, target)
+        target_connection_limit = int(
+            target.execute("SHOW max_connections").fetchone()[0]
+        )
     values = (
         _parse_time(args.restored_at),
         _parse_time(args.source_backup_at),
         args.schema_head,
         args.verifier_digest,
+        args.backup_artifact_digest,
+        target_fingerprint,
+        int(args.target_capacity_bytes),
+        target_connection_limit,
+        args.ha_verified == "true",
         args.operator_id,
         _parse_time(args.expires_at),
     )
@@ -139,7 +191,9 @@ def record_restore_evidence(args) -> dict:
         row = conn.execute(
             "INSERT INTO plaintext_shadow_restore_evidence "
             "(restored_at, source_backup_at, schema_head, verifier_digest, "
-            "operator_id, expires_at) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
+            "backup_artifact_digest, target_fingerprint, target_capacity_bytes, "
+            "target_connection_limit, ha_verified, operator_id, expires_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
             values,
         ).fetchone()
     return {"ok": True, "evidence_id": int(row[0])}
@@ -225,28 +279,45 @@ def _require_trigger_audit() -> None:
             raise RuntimeError("plaintext shadow trigger audit is not green")
 
 
+def _require_live_topology(policy) -> None:
+    with db.get_pool().connection() as primary, mirror.get_target_pool(
+        policy
+    ).connection() as target:
+        config.validate_live_topology(primary, target)
+
+
 def backfill() -> dict:
     policy = config.require_target()
+    _require_live_topology(policy)
     _require_trigger_audit()
     high_water = _capture_high_water()
     mirror_reports = _backfill_mirror(policy)
     ciphertext_reports = _backfill_ciphertext(policy)
     snapshot_reports = _backfill_snapshot(policy)
     drain_report = _drain_to_high_water(high_water)
-    failures = sum(not report.get("ok", True) for report in snapshot_reports)
+    snapshot_failures = sum(not report.get("ok", True) for report in snapshot_reports)
+    ciphertext_failures = sum(
+        int(report.get(field, 0))
+        for report in ciphertext_reports
+        for field in ("pending", "errors", "skipped", "quarantined")
+    )
     return {
-        "ok": failures == 0 and drain_report["pending_through_high_water"] == 0,
+        "ok": snapshot_failures == 0
+        and ciphertext_failures == 0
+        and drain_report["pending_through_high_water"] == 0,
         "high_water_generation": high_water,
         "mirror_tables": len(mirror_reports),
         "ciphertext_tables": len(ciphertext_reports),
         "snapshot_tables": len(snapshot_reports),
-        "snapshot_failures": failures,
+        "snapshot_failures": snapshot_failures,
+        "ciphertext_failures": ciphertext_failures,
         "drain": drain_report,
     }
 
 
 def drain(limit: int = 500) -> dict:
-    config.require_target()
+    policy = config.require_target()
+    _require_live_topology(policy)
     return asdict(outbox.drain_once(limit=limit))
 
 
@@ -301,6 +372,8 @@ def _normal(value):
         return _normal(value.obj)
     if isinstance(value, datetime):
         return value.isoformat()
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
     if isinstance(value, dict):
         return {key: _normal(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -309,31 +382,41 @@ def _normal(value):
 
 
 def _strict_extended_content(policy) -> tuple[int, int]:
-    """Compare fully decrypted row shapes skipped by the legacy verifier."""
-    extended = {
-        name
-        for name, cfg in verify._CIPHERTEXT_TABLES.items()
-        if cfg.get("kind") is None
-    }
+    """Compare every current decryptable row, not a legacy random sample."""
+    extended = set(verify._CIPHERTEXT_TABLES)
     mismatches = decrypt_failures = 0
     with db.get_pool().connection() as source, mirror.get_target_pool(
         policy
     ).connection() as target:
         for table in sorted(extended):
             cfg = worker._TABLES[table]
-            entry = table_registry.REGISTRY[table]
-            key_columns = entry.key_columns
+            verify_cfg = verify._CIPHERTEXT_TABLES[table]
+            source_table = verify_cfg["rds_table"]
+            source_where = (
+                sql.SQL(" WHERE ") + sql.SQL(verify_cfg["rds_where"])
+                if verify_cfg.get("rds_where")
+                else sql.SQL("")
+            )
+            if table == "identity":
+                key_columns = ("user_id",)
+            else:
+                key_columns = table_registry.REGISTRY[table].key_columns
             key_rows = source.execute(
-                sql.SQL("SELECT {} FROM {}").format(
+                sql.SQL("SELECT {} FROM {}{}").format(
                     sql.SQL(", ").join(sql.Identifier(key) for key in key_columns),
-                    sql.Identifier(table),
+                    sql.Identifier(source_table),
+                    source_where,
                 )
             ).fetchall()
             target_table, columns = _upsert_shape(cfg)
-            target_keys = entry.key_columns
+            target_keys = key_columns
             target_where = sql.SQL(" AND ").join(
                 sql.SQL("{}=%s").format(sql.Identifier(key)) for key in target_keys
             )
+            if verify_cfg.get("tee_where"):
+                target_where = target_where + sql.SQL(" AND ") + sql.SQL(
+                    verify_cfg["tee_where"]
+                )
             target_select = sql.SQL("SELECT {} FROM {} WHERE {}").format(
                 sql.SQL(", ").join(sql.Identifier(column) for column in columns),
                 sql.Identifier(target_table),
@@ -401,6 +484,18 @@ def _strict_snapshot_mismatch_count(policy, *, tables=None) -> int:
     return mismatches
 
 
+def _target_pending_counts(policy) -> tuple[int, int, int]:
+    """Return total, terminal, and requeue legacy target markers."""
+    with mirror.get_target_pool(policy).connection() as target:
+        row = target.execute(
+            "SELECT count(*), "
+            "count(*) FILTER (WHERE reason IS NULL OR reason NOT LIKE 'requeue%'), "
+            "count(*) FILTER (WHERE reason LIKE 'requeue%') "
+            "FROM tee_pending_device_migration"
+        ).fetchone()
+    return tuple(int(value) for value in row)
+
+
 def strict_report() -> dict:
     policy = config.require_target()
     failures: list[str] = []
@@ -415,6 +510,9 @@ def strict_report() -> dict:
         failures.append("pending_keys")
     if quarantined:
         failures.append("quarantined_keys")
+    target_pending, target_terminal, target_requeue = _target_pending_counts(policy)
+    if target_pending:
+        failures.append("target_pending_rows")
 
     consistency = verify.run(sample_rate=1.0)
     if not consistency.get("strict_ok", consistency.get("ok", False)):
@@ -439,6 +537,9 @@ def strict_report() -> dict:
         "failure_slugs": sorted(set(failures)),
         "pending_keys": int(pending),
         "quarantined_keys": int(quarantined),
+        "target_pending_rows": target_pending,
+        "target_terminal_rows": target_terminal,
+        "target_requeue_rows": target_requeue,
         "content_mismatches": mismatch_count,
         "unexpected_ciphertext_rows": ciphertext_count,
         "extended_content_mismatches": extended_mismatches,
@@ -530,9 +631,11 @@ def _parser() -> argparse.ArgumentParser:
     evidence = commands.add_parser("record-restore-evidence")
     for name in (
         "restored-at", "source-backup-at", "schema-head", "verifier-digest",
-        "operator-id", "expires-at",
+        "backup-artifact-digest", "target-capacity-bytes", "operator-id",
+        "expires-at",
     ):
         evidence.add_argument(f"--{name}", required=True)
+    evidence.add_argument("--ha-verified", required=True, choices=("true", "false"))
     commands.add_parser("install-triggers")
     commands.add_parser("backfill")
     drain_cmd = commands.add_parser("drain")

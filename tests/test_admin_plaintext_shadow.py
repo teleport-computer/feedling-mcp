@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from contextlib import contextmanager
 
 import psycopg
 import pytest
@@ -10,6 +11,16 @@ import pytest
 import db
 from admin import plaintext_shadow
 from plaintext_shadow.config import TargetPolicy
+
+
+class _Pool:
+    def __init__(self, dsn):
+        self.dsn = dsn
+
+    @contextmanager
+    def connection(self):
+        with psycopg.connect(self.dsn, autocommit=True) as conn:
+            yield conn
 
 
 def test_preflight_redacts_dsn_on_configuration_failure(monkeypatch, capsys):
@@ -81,6 +92,7 @@ def test_backfill_uses_explicit_plaintext_all_target(monkeypatch):
     calls = []
     policy = object()
     monkeypatch.setattr(plaintext_shadow.config, "require_target", lambda: policy)
+    monkeypatch.setattr(plaintext_shadow, "_require_live_topology", lambda _policy: None)
     monkeypatch.setattr(plaintext_shadow, "_require_trigger_audit", lambda: None)
     monkeypatch.setattr(plaintext_shadow, "_capture_high_water", lambda: 41)
     monkeypatch.setattr(
@@ -116,6 +128,74 @@ def test_backfill_uses_explicit_plaintext_all_target(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize("field", ["pending", "errors", "skipped", "quarantined"])
+def test_backfill_fails_closed_on_incomplete_ciphertext_report(monkeypatch, field):
+    policy = object()
+    monkeypatch.setattr(plaintext_shadow.config, "require_target", lambda: policy)
+    monkeypatch.setattr(plaintext_shadow, "_require_live_topology", lambda _policy: None)
+    monkeypatch.setattr(plaintext_shadow, "_require_trigger_audit", lambda: None)
+    monkeypatch.setattr(plaintext_shadow, "_capture_high_water", lambda: 9)
+    monkeypatch.setattr(plaintext_shadow, "_backfill_mirror", lambda _policy: [])
+    monkeypatch.setattr(
+        plaintext_shadow,
+        "_backfill_ciphertext",
+        lambda _policy: [{"table": "chat_messages", field: 1}],
+    )
+    monkeypatch.setattr(plaintext_shadow, "_backfill_snapshot", lambda _policy: [])
+    monkeypatch.setattr(
+        plaintext_shadow,
+        "_drain_to_high_water",
+        lambda _high_water: {"pending_through_high_water": 0},
+    )
+
+    report = plaintext_shadow.backfill()
+
+    assert report["ok"] is False
+    assert report["ciphertext_failures"] == 1
+
+
+def test_strict_report_rejects_legacy_target_pending(backend_env, monkeypatch):
+    policy = TargetPolicy(dsn=os.environ["TEE_DATABASE_URL"])
+    monkeypatch.setattr(
+        plaintext_shadow.db,
+        "get_pool",
+        lambda: _Pool(os.environ["TEE_DATABASE_URL"]),
+    )
+    uid = f"strict-pending-{uuid.uuid4().hex}"
+    with psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as target:
+        target.execute(
+            "INSERT INTO tee_pending_device_migration "
+            "(user_id, table_name, item_id, reason) VALUES (%s,%s,%s,%s)",
+            (uid, "chat_messages", "msg", "decrypt_failed:test"),
+        )
+    try:
+        monkeypatch.setattr(plaintext_shadow.config, "require_target", lambda: policy)
+        monkeypatch.setattr(
+            plaintext_shadow,
+            "preflight",
+            lambda: {"ok": True, "failure_slugs": []},
+        )
+        monkeypatch.setattr(
+            plaintext_shadow.verify,
+            "run",
+            lambda **_kwargs: {"ok": True, "strict_ok": True, "mismatches": []},
+        )
+        monkeypatch.setattr(plaintext_shadow, "_unexpected_ciphertext_count", lambda _p: 0)
+        monkeypatch.setattr(plaintext_shadow, "_strict_extended_content", lambda _p: (0, 0))
+        monkeypatch.setattr(plaintext_shadow, "_strict_snapshot_mismatch_count", lambda _p: 0)
+
+        report = plaintext_shadow.strict_report()
+
+        assert report["ok"] is False
+        assert report["target_pending_rows"] >= 1
+        assert "target_pending_rows" in report["failure_slugs"]
+    finally:
+        with psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as target:
+            target.execute(
+                "DELETE FROM tee_pending_device_migration WHERE user_id=%s", (uid,)
+            )
+
+
 def test_record_restore_evidence_has_no_free_form_note_argument():
     with pytest.raises(SystemExit):
         plaintext_shadow.main(
@@ -139,14 +219,11 @@ def test_record_restore_evidence_has_no_free_form_note_argument():
         )
 
 
-def test_every_extended_ciphertext_table_has_inspectable_upsert_shape():
-    extended = {
-        name
-        for name, cfg in plaintext_shadow.verify._CIPHERTEXT_TABLES.items()
-        if cfg.get("kind") is None
-    }
-    assert extended
-    for table in extended:
+def test_every_strict_ciphertext_table_has_inspectable_upsert_shape():
+    strict_tables = set(plaintext_shadow.verify._CIPHERTEXT_TABLES)
+    assert strict_tables
+    assert {"chat_messages", "memory_moments", "identity"} <= strict_tables
+    for table in strict_tables:
         target, columns = plaintext_shadow._upsert_shape(
             plaintext_shadow.worker._TABLES[table]
         )

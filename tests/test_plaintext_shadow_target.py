@@ -35,9 +35,11 @@ def _enable_new_target(monkeypatch: pytest.MonkeyPatch) -> TargetPolicy:
     return TargetPolicy(dsn=os.environ["TEE_DATABASE_URL"])
 
 
-def test_new_target_is_enabled_in_tee_primary_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_legacy_hot_mirror_is_disabled_in_tee_primary_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _enable_new_target(monkeypatch)
-    assert mirror.enabled() is True
+    assert mirror.enabled() is False
 
 
 def test_stale_legacy_target_remains_disabled_in_tee_primary_mode(
@@ -59,7 +61,9 @@ def test_target_pool_uses_plaintext_shadow_dsn(monkeypatch: pytest.MonkeyPatch) 
     assert target_name == expected_name
 
 
-def test_hot_mirror_writes_new_target_in_tee_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_hot_mirror_cannot_write_new_target_in_tee_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _enable_new_target(monkeypatch)
     key = f"plaintext-shadow-target-{uuid.uuid4().hex}"
     try:
@@ -70,7 +74,7 @@ def test_hot_mirror_writes_new_target_in_tee_mode(monkeypatch: pytest.MonkeyPatc
         with psycopg.connect(os.environ["TEE_DATABASE_URL"]) as conn:
             assert conn.execute(
                 "SELECT value FROM server_config WHERE key=%s", (key,)
-            ).fetchone() == (b"value",)
+            ).fetchone() is None
     finally:
         with psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as conn:
             conn.execute("DELETE FROM server_config WHERE key=%s", (key,))

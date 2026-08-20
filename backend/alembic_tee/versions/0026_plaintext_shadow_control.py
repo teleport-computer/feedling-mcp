@@ -19,6 +19,8 @@ depends_on = None
 
 
 _UP = r"""
+ALTER TABLE frames ADD COLUMN IF NOT EXISTS body_plaintext BYTEA;
+
 CREATE SEQUENCE IF NOT EXISTS plaintext_shadow_generation_seq AS BIGINT;
 
 CREATE TABLE IF NOT EXISTS plaintext_shadow_dirty_keys (
@@ -69,6 +71,11 @@ CREATE TABLE IF NOT EXISTS plaintext_shadow_restore_evidence (
     source_backup_at  TIMESTAMPTZ NOT NULL,
     schema_head       TEXT        NOT NULL,
     verifier_digest   TEXT        NOT NULL,
+    backup_artifact_digest TEXT   NOT NULL,
+    target_fingerprint TEXT       NOT NULL,
+    target_capacity_bytes BIGINT  NOT NULL,
+    target_connection_limit INTEGER NOT NULL,
+    ha_verified       BOOLEAN     NOT NULL,
     operator_id       TEXT        NOT NULL,
     expires_at        TIMESTAMPTZ NOT NULL,
     recorded_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -77,7 +84,11 @@ CREATE TABLE IF NOT EXISTS plaintext_shadow_restore_evidence (
     CONSTRAINT plaintext_shadow_restore_expiry
         CHECK (expires_at > restored_at),
     CONSTRAINT plaintext_shadow_restore_scalars_nonempty
-        CHECK (schema_head <> '' AND verifier_digest <> '' AND operator_id <> '')
+        CHECK (schema_head <> '' AND verifier_digest <> ''
+               AND backup_artifact_digest <> '' AND target_fingerprint <> ''
+               AND operator_id <> ''),
+    CONSTRAINT plaintext_shadow_restore_capacity_positive
+        CHECK (target_capacity_bytes > 0 AND target_connection_limit > 0)
 );
 
 CREATE OR REPLACE FUNCTION feedling_capture_plaintext_shadow_change()

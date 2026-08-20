@@ -144,6 +144,7 @@ def drain_once(*, limit: int = 500) -> DrainReport:
     # A snapshot is already table-wide.  Apply it once per claimed table, but
     # generation-safe acknowledge every marker represented by that run.
     snapshot_results: dict[str, dict] = {}
+    folded_snapshots: set[str] = set()
     for row in rows:
         try:
             entry = table_registry.REGISTRY.get(row.table_name)
@@ -157,7 +158,11 @@ def drain_once(*, limit: int = 500) -> DrainReport:
                     raise RuntimeError("plaintext shadow snapshot failed")
             else:
                 result = apply_key(row, target_policy=target_policy)
-            _fold(report, result)
+            if entry is None or entry.lane != table_registry.SNAPSHOT:
+                _fold(report, result)
+            elif row.table_name not in folded_snapshots:
+                _fold(report, result)
+                folded_snapshots.add(row.table_name)
             if int((result or {}).get("pending", 0) or 0):
                 if _quarantine(row, "pending_device_migration"):
                     report.quarantined += 1

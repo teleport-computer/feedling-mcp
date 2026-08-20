@@ -25,6 +25,9 @@ None for a dry_run "would copy" (no write).
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+
 from psycopg.types.json import Jsonb
 
 import object_storage
@@ -34,8 +37,9 @@ KEY_VERSION = "v1"
 
 # AEAD payload + wrap keys + envelope version/fingerprints: opaque crypto fields
 # that must never survive into a TEE ``frames.meta`` (mirrors transforms).
-_CRYPTO_FIELDS = {"v", "body_ct", "nonce", "K_user", "K_enclave",
-                  "enclave_pk_fpr", "content_pk_fpr"}
+_CRYPTO_FIELDS = {"v", "body_ct", "body_b64", "nonce", "K_user", "K_enclave",
+                  "enclave_pk_fpr", "content_pk_fpr", "body_object_format",
+                  "body_sha256", "body_size_bytes", "body_key"}
 # Candidate top-level mime hints (screen frames carry the real image_mime inside
 # the ciphertext, so this is best-effort — body_mime is nullable).
 _MIME_FIELDS = ("content_type", "image_mime", "mime")
@@ -99,4 +103,65 @@ def replicate(user_id: str, frame_id: str, ts: float, row: dict, reencrypt,
     meta = _meta_from(envelope)
     return (user_id, frame_id, ts, Jsonb(meta), storage_key,
             resp.get("key_version") or KEY_VERSION, _body_mime(meta),
-            resp.get("sha256"), resp.get("size"))
+            resp.get("sha256"), resp.get("size"), None)
+
+
+def replicate_plaintext(
+    user_id: str,
+    frame_id: str,
+    ts: float,
+    row: dict,
+    decrypt,
+    *,
+    dry_run: bool = False,
+):
+    """Produce one inline plaintext frame row for a ``plaintext_all`` target."""
+    doc = row.get("doc")
+    env_meta = row.get("env_meta")
+    body_key = row.get("body_key")
+    meta_src = dict(doc if doc is not None else (env_meta or {}))
+    body_b64 = None
+    if body_key:
+        body_b64 = object_storage.get_frame_body_strict(user_id, frame_id)
+        if body_b64 is None:
+            raise PendingDeviceMigration("r2_body_missing_orphan")
+    elif isinstance(doc, dict):
+        body_b64 = doc.get("body_b64")
+
+    is_plaintext = bool(body_b64) and (
+        "body_b64" in (doc or {})
+        or meta_src.get("body_object_format") == "plaintext_v1"
+    )
+    if not is_plaintext and not _decryptable(meta_src):
+        raise PendingDeviceMigration(frame_id)
+    if dry_run:
+        return None
+
+    if is_plaintext:
+        try:
+            plaintext = base64.b64decode(str(body_b64), validate=True)
+        except Exception as exc:
+            raise ValueError("plaintext frame body is not strict base64") from exc
+        expected_size = meta_src.get("body_size_bytes")
+        expected_sha = meta_src.get("body_sha256")
+        if expected_size is not None and int(expected_size) != len(plaintext):
+            raise ValueError("plaintext frame size mismatch")
+        if expected_sha and hashlib.sha256(plaintext).hexdigest() != expected_sha:
+            raise ValueError("plaintext frame digest mismatch")
+    else:
+        envelope = {**meta_src, "body_ct": body_b64} if body_key else dict(doc or {})
+        plaintext = decrypt(envelope)
+
+    meta = _meta_from(meta_src)
+    return (
+        user_id,
+        frame_id,
+        ts,
+        Jsonb(meta),
+        None,
+        None,
+        _body_mime(meta),
+        hashlib.sha256(plaintext).hexdigest(),
+        len(plaintext),
+        plaintext,
+    )

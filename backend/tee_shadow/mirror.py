@@ -20,14 +20,12 @@ _failures_lock = threading.Lock()
 
 
 def enabled() -> bool:
-    target = plaintext_shadow_config.load_target()
-    if target is not None:
-        plaintext_shadow_config.validate_startup()
-        return True
-    # Once DATABASE_URL is the promoted TEE database there is no shadow target.
-    # Fail closed even if stale rollout secrets still carry the old dual-write
-    # flag/DSN; otherwise a request could write the primary twice or resurrect
-    # the Phase-3 scheduler after cutover.
+    # The hot mirror belongs only to the legacy RDS-to-TEE shadow phase. Once
+    # DATABASE_URL is the promoted TEE primary, every plaintext-shadow mutation
+    # must flow through source triggers and generation-fenced current-row replay.
+    # Allowing these post-commit best-effort writes to target the same database
+    # would let a delayed older request overwrite a newer replay after its dirty
+    # key had already been acknowledged.
     if os.environ.get("FEEDLING_DATABASE_SCHEMA", "rds").strip().lower() == "tee":
         return False
     return os.environ.get("FEEDLING_TEE_DUAL_WRITE", "") == "1" and bool(

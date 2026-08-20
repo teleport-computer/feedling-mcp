@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+
+import psycopg
 import pytest
 
 from plaintext_shadow import config
@@ -105,3 +108,16 @@ def test_distinct_tee_shadow_returns_plaintext_all_policy(
 
     assert target == config.TargetPolicy(dsn=shadow_dsn, mode="plaintext_all")
 
+
+def test_live_identity_rejects_hostname_aliases_to_same_database() -> None:
+    dsn = os.environ["FEEDLING_TEST_PG"]
+    with psycopg.connect(dsn) as primary, psycopg.connect(dsn) as shadow:
+        with pytest.raises(RuntimeError, match="same live PostgreSQL database"):
+            config.validate_live_topology(primary, shadow)
+
+
+def test_live_identity_accepts_different_databases_on_same_server() -> None:
+    with psycopg.connect(os.environ["FEEDLING_TEST_PG"]) as primary, psycopg.connect(
+        os.environ["TEE_DATABASE_URL"]
+    ) as shadow:
+        config.validate_live_topology(primary, shadow)

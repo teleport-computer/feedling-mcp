@@ -118,29 +118,61 @@ def _decode_trigger_args(value) -> tuple[str, ...]:
 
 
 def audit(conn) -> AuditReport:
-    """Compare live trigger names, state, and arguments with the registry."""
+    """Compare the complete live trigger semantics with the registry."""
     entries = _entries()
     rows = conn.execute(
-        "SELECT cls.relname, trg.tgname, trg.tgenabled, trg.tgargs "
+        "SELECT cls.relname, trg.tgname, trg.tgenabled, trg.tgargs, trg.tgtype, "
+        "proc.proname, proc_ns.nspname "
         "FROM pg_trigger AS trg "
         "JOIN pg_class AS cls ON cls.oid=trg.tgrelid "
         "JOIN pg_namespace AS ns ON ns.oid=cls.relnamespace "
+        "JOIN pg_proc AS proc ON proc.oid=trg.tgfoid "
+        "JOIN pg_namespace AS proc_ns ON proc_ns.oid=proc.pronamespace "
         "WHERE NOT trg.tgisinternal AND ns.nspname='public' "
         "AND trg.tgname LIKE 'plaintext_shadow_capture_%%'"
     ).fetchall()
-    live = {table: (name, enabled, _decode_trigger_args(args)) for table, name, enabled, args in rows}
+    by_table: dict[str, list[tuple]] = {}
+    for row in rows:
+        by_table.setdefault(row[0], []).append(row[1:])
 
-    missing = tuple(sorted(set(entries) - set(live)))
-    unexpected = tuple(sorted(name for table, (name, _enabled, _args) in live.items() if table not in entries))
-    disabled = tuple(sorted(table for table, (_name, enabled, _args) in live.items() if table in entries and enabled != "O"))
+    missing = tuple(
+        sorted(
+            table
+            for table in entries
+            if not any(row[0] == _trigger_name(table) for row in by_table.get(table, ()))
+        )
+    )
+    unexpected = tuple(
+        sorted(
+            row[1]
+            for row in rows
+            if row[0] not in entries or row[1] != _trigger_name(row[0])
+        )
+    )
+    disabled = tuple(
+        sorted(
+            table
+            for table in entries
+            for name, enabled, *_rest in by_table.get(table, ())
+            if name == _trigger_name(table) and enabled != "O"
+        )
+    )
     mismatched = tuple(
         sorted(
             table
             for table, entry in entries.items()
-            if table in live
+            if table in by_table
             and (
-                live[table][0] != _trigger_name(table)
-                or live[table][2] != (entry.capture_key_columns or ())
+                len(by_table[table]) != 1
+                or by_table[table][0][0] != _trigger_name(table)
+                or _decode_trigger_args(by_table[table][0][2])
+                != (entry.capture_key_columns or ())
+                # PostgreSQL tgtype bits: ROW=1, INSERT=4, DELETE=8,
+                # UPDATE=16. Exact AFTER ROW INSERT|UPDATE|DELETE is 29.
+                or by_table[table][0][3] != 29
+                or by_table[table][0][4]
+                != "feedling_capture_plaintext_shadow_change"
+                or by_table[table][0][5] != "public"
                 or _primary_key(conn, table) != entry.key_columns
             )
         )
@@ -170,4 +202,3 @@ def remove(conn) -> None:
                     sql.Identifier(trigger), sql.Identifier(table)
                 )
             )
-

@@ -140,3 +140,34 @@ def test_audit_reports_disabled_and_remove_clears_triggers(capture_conn) -> None
     ).fetchone()
     assert remaining == (0,)
 
+
+def test_audit_rejects_trigger_with_incomplete_event_semantics(capture_conn) -> None:
+    change_capture.install(capture_conn)
+    capture_conn.execute(
+        "DROP TRIGGER plaintext_shadow_capture_server_config ON server_config"
+    )
+    capture_conn.execute(
+        "CREATE TRIGGER plaintext_shadow_capture_server_config "
+        "AFTER INSERT ON server_config FOR EACH ROW EXECUTE FUNCTION "
+        "feedling_capture_plaintext_shadow_change('key')"
+    )
+
+    report = change_capture.audit(capture_conn)
+
+    assert report.ok is False
+    assert "server_config" in report.mismatched
+
+
+def test_audit_rejects_duplicate_prefixed_trigger(capture_conn) -> None:
+    change_capture.install(capture_conn)
+    capture_conn.execute(
+        "CREATE TRIGGER plaintext_shadow_capture_server_config_duplicate "
+        "AFTER INSERT OR UPDATE OR DELETE ON server_config FOR EACH ROW "
+        "EXECUTE FUNCTION feedling_capture_plaintext_shadow_change('key')"
+    )
+
+    report = change_capture.audit(capture_conn)
+
+    assert report.ok is False
+    assert "server_config" in report.mismatched
+    assert "plaintext_shadow_capture_server_config_duplicate" in report.unexpected

@@ -207,12 +207,14 @@ def test_snapshot_table_is_applied_once_per_claimed_batch(primary_pool, monkeypa
     monkeypatch.setattr(
         outbox,
         "apply_key",
-        lambda row, **_kwargs: calls.append(row.table_name) or {"ok": True},
+        lambda row, **_kwargs: calls.append(row.table_name)
+        or {"ok": True, "applied": 5},
     )
 
     report = outbox.drain_once(limit=10)
 
     assert report.claimed == 2
+    assert report.applied == 5
     assert calls == ["agent_jobs"]
     assert _row(primary_pool) is None
 

@@ -92,8 +92,11 @@ prove backup and restore from the new target, record only content-free evidence,
 run a full backfill, drain through the captured high-water generation, and run
 strict verification. Strict verification requires exact table counts and
 content projections, no unexpected ciphertext-envelope shapes, no pending or
-quarantined dirty keys, fresh backup/restore evidence, and a green scheduler
-run. Operator output must contain fingerprints, scalars, and fixed slugs only;
+quarantined dirty keys, and fresh backup/restore evidence bound to the target
+fingerprint, backup artifact digest, declared capacity, connection limit, and
+HA attestation. After enabling Gate 2, observe at least one green scheduler run
+before declaring the rollout complete. Operator output must contain
+fingerprints, scalars, and fixed slugs only;
 never print DSNs, passwords, keys, or row bodies.
 
 The plaintext shadow and all of its backups are plaintext recipients. Do not

@@ -7,6 +7,7 @@ not a fallback here.
 from __future__ import annotations
 
 import os
+import secrets
 from dataclasses import dataclass
 from typing import Literal
 
@@ -88,3 +89,69 @@ def validate_startup() -> None:
         raise RuntimeError(
             "DATABASE_URL and PLAINTEXT_SHADOW_DATABASE_URL must identify different PostgreSQL databases"
         )
+
+
+def validate_live_topology(primary, shadow) -> None:
+    """Prove two live connections do not address the same PostgreSQL database.
+
+    Conninfo comparison is only an early typo guard: DNS aliases and database
+    proxies can expose the same database through different client strings. A
+    session advisory lock is scoped to a live database, so a second connection
+    to that same database cannot acquire the challenge while the source holds
+    it. Different databases, including databases on one cluster, have separate
+    advisory-lock namespaces.
+    """
+    namespace = 0x504C5348  # "PLSH", signed-int32 safe and content-free.
+    challenge = secrets.randbelow(2**31 - 1)
+    source_locked = False
+    shadow_locked = False
+    try:
+        primary.execute("SELECT pg_advisory_lock(%s, %s)", (namespace, challenge))
+        source_locked = True
+        row = shadow.execute(
+            "SELECT pg_try_advisory_lock(%s, %s)", (namespace, challenge)
+        ).fetchone()
+        shadow_locked = bool(row and row[0])
+        if not shadow_locked:
+            raise RuntimeError(
+                "primary and plaintext shadow resolve to the same live PostgreSQL database"
+            )
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError("live PostgreSQL identity check failed") from exc
+    finally:
+        if shadow_locked:
+            try:
+                shadow.execute(
+                    "SELECT pg_advisory_unlock(%s, %s)", (namespace, challenge)
+                )
+            except Exception:
+                pass
+        if source_locked:
+            try:
+                primary.execute(
+                    "SELECT pg_advisory_unlock(%s, %s)", (namespace, challenge)
+                )
+            except Exception:
+                pass
+
+
+def validate_live_startup() -> None:
+    """Run static and live topology checks before an enabled process starts."""
+    validate_startup()
+    target = load_target()
+    if target is None:
+        return
+    import psycopg
+
+    primary_dsn = os.environ["DATABASE_URL"].strip()
+    try:
+        with psycopg.connect(primary_dsn, connect_timeout=10) as primary, psycopg.connect(
+            target.dsn, connect_timeout=10
+        ) as shadow:
+            validate_live_topology(primary, shadow)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError("live PostgreSQL identity check failed") from exc
