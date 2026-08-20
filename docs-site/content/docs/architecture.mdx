@@ -529,6 +529,17 @@ preference, and precedence is `body_ct`, then `body_b64`, then `body`. The
 [`/v1/content/swap`](/docs/workflows/memory) endpoint converts existing inline
 records between encrypted and plaintext shapes.
 
+During a managed TEE-database promotion, historical ciphertext that has reached
+an explicitly terminal decrypt state can be retained without pretending it was
+converted to plaintext. The migration copies the original raw row, records a
+versioned digest marker, and audits every preserved source/destination pair.
+This does not change the account's `content_encryption` preference, manufacture
+an enclave-readable key, or make the service able to open ciphertext it could
+not previously decrypt. A device can still read such a record only when its
+`K_user` remains valid. Promotion gates distinguish these fully audited rows
+from unresolved, malformed, or requeued work; only audited preservation is
+eligible for the migration waiver.
+
 This routing rule is also a service boundary, not only a decoding convenience.
 Normal backend and hosted-runtime workflows do not submit `body` or `body_b64`
 to enclave decrypt or readside endpoints. Batch features such as Memory,
