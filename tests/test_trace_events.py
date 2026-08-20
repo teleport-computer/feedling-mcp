@@ -74,6 +74,7 @@ def test_migration_has_beijing_bounds_no_fk_and_stable_indexes():
     today = datetime.now(_ZONE).date()
     name = f"trace_events_p{today:%Y%m%d}"
     with psycopg.connect(os.environ["TEE_DATABASE_URL"]) as conn:
+        conn.execute("SET LOCAL TIME ZONE 'Asia/Shanghai'")
         constraints = conn.execute(
             "SELECT contype,pg_get_constraintdef(oid,true) FROM pg_constraint "
             "WHERE conrelid='trace_events'::regclass ORDER BY contype,conname"
