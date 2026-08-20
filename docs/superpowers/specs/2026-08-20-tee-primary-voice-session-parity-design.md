@@ -121,7 +121,8 @@ TEE 迁移的既有策略：不支持在线逆迁移，回滚使用迁移前备�
 
 新增 `required_in_tee: bool | None = None`：
 
-- 未显式设置时，非 `SKIP` lane 推导为 `True`，`SKIP` 推导为 `False`，保持现有条目兼容。
+- 非 `SKIP` lane 永远推导为 `True`，不能用显式 false 绕过 DDL 守卫；`SKIP` 默认推导为
+  `False`，保持现有条目兼容。
 - TEE-primary 本地表在 `SKIP` lane 上显式设为 `True`。
 - `manual=True` 只描述来源不在迁移链，不能自动豁免 `required_in_tee`。
 - 提供 `tee_required_tables()` 作为 schema guard 的唯一查询入口。

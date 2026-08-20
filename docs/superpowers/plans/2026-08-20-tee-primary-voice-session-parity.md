@@ -230,9 +230,9 @@ class Entry:
 
     @property
     def tee_required(self) -> bool:
-        if self.required_in_tee is not None:
-            return self.required_in_tee
-        return self.lane != SKIP
+        if self.lane != SKIP:
+            return True
+        return self.required_in_tee is True
 
 
 def tee_required_tables() -> tuple[str, ...]:
