@@ -92,7 +92,7 @@ def test_diagnostics_payload_routes_ledger_without_trace_ring(monkeypatch):
         diagnostics_core.debug_trace,
         "trace_event",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("provider attempts must not enter the trace ring")
+            AssertionError("provider attempts must not enter the debug trace store")
         ),
     )
     monkeypatch.setattr(

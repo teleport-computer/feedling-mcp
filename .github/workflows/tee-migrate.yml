@@ -104,6 +104,24 @@ jobs:
           export TEE_MIGRATION_DATABASE_URL="${DSN}&sslrootcert=/tmp/tee-ca.crt"
           python -m backend.alembic_tee upgrade
 
+      - name: Maintain trace event partitions
+        env:
+          PYTHONPATH: backend
+          ENVIRONMENT: ${{ inputs.environment }}
+          TEST_DSN: ${{ secrets.TEST_TEE_MIGRATION_DSN }}
+          PRE_DSN: ${{ secrets.PRE_TEE_MIGRATION_DSN }}
+          PROD_DSN: ${{ secrets.PROD_TEE_MIGRATION_DSN }}
+        run: |
+          case "$ENVIRONMENT" in
+            test) DSN="$TEST_DSN" ;;
+            pre)  DSN="$PRE_DSN" ;;
+            prod) DSN="$PROD_DSN" ;;
+            *) echo "::error::unknown environment: $ENVIRONMENT"; exit 1 ;;
+          esac
+          test -n "$DSN" || { echo "::error::${ENVIRONMENT} 的 TEE_MIGRATION_DSN secret 为空或未创建"; exit 1; }
+          export TEE_MIGRATION_DATABASE_URL="${DSN}&sslrootcert=/tmp/tee-ca.crt"
+          python -m admin.trace_events_partitions
+
       - name: Assert version == code head
         env:
           ENVIRONMENT: ${{ inputs.environment }}

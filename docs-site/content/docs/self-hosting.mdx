@@ -372,6 +372,10 @@ operator will respond to a leaked client credential.
 - Back up the database and object storage before applying a new image.
 - Review Alembic migrations for forward and rollback implications; do not assume
   every data migration is automatically reversible.
+- If the managed decrypted shadow is enabled, apply every new `alembic_tee`
+  head to that target before, or in the same maintenance window as, the TEE
+  primary. The exact-head gate deliberately stops replication on a mismatch,
+  even when a new primary-only table is not itself shadow-replicated.
 - Stage the exact image and configuration against a restored copy of production
   data with credentials disabled or replaced.
 - Keep the prior image and configuration, but do not roll application code back
@@ -391,7 +395,10 @@ operator will respond to a leaked client credential.
 - Do not expose admin/debug routes or internal ports through the public proxy.
 - Monitor authentication failures, `5xx`, database pool exhaustion, stale
   Runtime V2 per-pool heartbeats, slot restarts, Enclave waits, queue age, disk
-  use, and backup age.
+  use, backup age, and trace-partition health. Treat a non-empty
+  `trace_events_default` partition as degraded even when writes still succeed;
+  run partition maintenance with the database owner credential, never the
+  application role.
 - Keep unrelated tenant code and secrets out of a shared process runner.
 - Commission an isolation and abuse review before offering the deployment to
   untrusted public users.

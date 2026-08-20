@@ -709,6 +709,27 @@ def backend_env(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
+def tee_primary(monkeypatch):
+    """Run a focused endpoint test against the migrated TEE-primary schema.
+
+    Generic backend tests intentionally use the legacy-chain database so both
+    migration families stay covered. T184 trace_events exists only in TEE, so
+    real trace endpoint tests opt into the topology they run under in test/prod.
+    """
+    import db
+
+    original_url = os.environ["DATABASE_URL"]
+    original_schema = os.environ.get("FEEDLING_DATABASE_SCHEMA", "rds")
+    db.close_pool()
+    monkeypatch.setenv("DATABASE_URL", os.environ["TEE_DATABASE_URL"])
+    monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "tee")
+    yield
+    db.close_pool()
+    monkeypatch.setenv("DATABASE_URL", original_url)
+    monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", original_schema)
+
+
+@pytest.fixture()
 def client(backend_env):
     """Sync HTTP client over the real assembled ASGI app, on fresh state."""
     from asgi_test_client import make_client

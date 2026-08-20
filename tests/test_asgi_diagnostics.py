@@ -257,7 +257,7 @@ def test_admin_read_r2_on_parity(env, monkeypatch):
 # flow-trace debug endpoints (GET/DELETE /v1/debug/trace, POST enable)
 # --------------------------------------------------------------------------- #
 
-def test_trace_read_parity(env):
+def test_trace_read_parity(env, tee_primary):
     _uid, api_key = _register()
     f = _flask_get("/v1/debug/trace", headers=_key(api_key))
     a = _asgi("GET", "/v1/debug/trace", headers=_key(api_key))
@@ -314,7 +314,7 @@ def test_trace_enable_empty_body_degrades_parity(env):
     assert f == (200, {"enabled": False, "deploy_enabled": True})
 
 
-def test_trace_clear_parity(env):
+def test_trace_clear_parity(env, tee_primary):
     _uid, api_key = _register()
     f = _flask_delete("/v1/debug/trace", headers=_key(api_key))
     a = _asgi("DELETE", "/v1/debug/trace", headers=_key(api_key))
@@ -322,7 +322,7 @@ def test_trace_clear_parity(env):
     assert f == (200, {"status": "ok"})
 
 
-def test_trace_enable_then_read_reflects_state(env):
+def test_trace_enable_then_read_reflects_state(env, tee_primary):
     _uid, api_key = _register()
     _asgi("POST", "/v1/debug/trace/enable", headers=_key(api_key), json={"enabled": True})
     status, body = _asgi("GET", "/v1/debug/trace", headers=_key(api_key))
