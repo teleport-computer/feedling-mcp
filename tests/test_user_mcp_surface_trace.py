@@ -433,13 +433,39 @@ def test_codex_without_config_home_is_reported_as_not_wired():
 
 
 def test_wiring_trace_is_silent_when_there_is_nothing_to_report():
-    """后台轮次、没有启用的服务器、非 claude/codex driver —— 都不该出声。
+    """拿不到 MCP 的道、没有启用的服务器、非 claude/codex driver —— 都不该出声。
 
     每轮刷一条假告警会把 200 条的 trace 环冲掉,真问题反而看不见。
+
+    ⚠️ 2026-08-21(T190):静默那一档原来举的例子是 `lane="proactive"`。
+    方案 A 之后 **proactive 会真的拿到 MCP**,所以它一旦没接上就是**真故障**,
+    必须出声 —— 见下面 `test_wiring_trace_reports_missing_on_the_proactive_lane`。
+    这里的例子换成 `background`:它仍然完全不接 MCP,报 missing 才是假告警。
+    **这条改的是"举哪个例子",没有放宽任何告警。**
     """
-    assert _wiring(["claude", "--print"], lane="proactive") == []
+    assert _wiring(["claude", "--print"], lane="background") == []
     assert _wiring(["claude", "--print"], enabled=()) == []
     assert _wiring(["pi", "--mode", "json"]) == []
+
+
+def test_wiring_trace_reports_missing_on_the_proactive_lane():
+    """主动道拿得到 MCP(T190 方案 A),所以没接上必须报 missing。
+
+    上一条用例把 proactive 当成"本来就该静默"的例子,那是 T190 之前的事实。
+    如果有人为了让那条变绿而把 proactive 排除出埋点,这条会红。
+    """
+    # ⚠️ `_wiring` 返回的是 (event_type, kwargs) —— 取 e[0]。
+    # 我第一版写成 e[1],断言拿整个 kwargs dict 去比字符串,永远不等:
+    # 它红得像"实现坏了",实际是我的读法错了。
+    events = _wiring(["claude", "--print"], lane="proactive")
+    assert [e[0] for e in events] == ["mcp.surface.missing"]
+
+    # 阴性对照:同一条道、接上了 → 报 wired,证明它不是恒报 missing
+    wired = _wiring(
+        ["claude", "--print", "--mcp-config=/tmp/x.json", "--allowed-tools=mcp__tavily__*"],
+        lane="proactive",
+    )
+    assert [e[0] for e in wired] == ["mcp.surface.wired"]
 
 
 # --- postflight:CLI 自报的注册结果 ------------------------------------------
