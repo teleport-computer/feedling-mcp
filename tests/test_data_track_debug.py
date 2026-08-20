@@ -306,6 +306,26 @@ def test_debug_payload_groups_multi_user_trace_and_marks_stalled(monkeypatch):
     with bind("view=debug"):
         payload = data_track._data_track_debug_payload()
 
+    assert set(payload) == {
+        "summary",
+        "filters",
+        "options",
+        "pagination",
+        "users",
+        "turns",
+        "events",
+    }
+    assert set(payload["summary"]) == {
+        "generated_at",
+        "users_scanned",
+        "users_with_events",
+        "events_total",
+        "turns_total",
+        "events_returned",
+        "turns_returned",
+        "stalled_turns",
+        "error_turns",
+    }
     assert payload["summary"]["users_with_events"] == 2
     assert payload["summary"]["events_total"] == 5
     assert [u["user_id"] for u in payload["users"]] == ["user_b", "user_a"]

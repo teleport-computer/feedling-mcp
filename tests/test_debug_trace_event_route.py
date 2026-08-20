@@ -52,6 +52,26 @@ def _enable_trace(client, api_key: str) -> None:
     assert res.status_code == 200, res.get_data(as_text=True)
 
 
+def test_enable_write_failure_must_not_claim_enabled(client, monkeypatch):
+    user_id, api_key = _register(client)
+
+    real_set_blob = debug_trace.db.set_blob
+
+    def silently_drop_only_trace_flag(uid, kind, doc):
+        if kind == debug_trace.DEBUG_TRACE_FLAG_BLOB:
+            return None
+        return real_set_blob(uid, kind, doc)
+
+    monkeypatch.setattr(debug_trace.db, "set_blob", silently_drop_only_trace_flag)
+    with pytest.raises(RuntimeError, match="^debug_trace_flag_write_not_visible$"):
+        client.post(
+            "/v1/debug/trace/enable",
+            headers=_headers(api_key),
+            json={"enabled": True},
+        )
+    assert user_id not in debug_trace._flag_cache
+
+
 def test_emit_event_records(client):
     _user_id, api_key = _register(client)
     _enable_trace(client, api_key)
