@@ -1,3 +1,7 @@
+# DEPRECATED 2026-08-20：三套 Redis CVM 已暂停且仍为零业务流量。
+# 触发器已禁用，保留实现仅供审计/未来重新评审；恢复前必须先更新接入 spec、
+# 基础设施状态与监控，再显式恢复 workflow_dispatch。
+#
 # .github/workflows/redis-deploy.yml — redis CVM 手动部署（绝不并入 merge 自动部署）
 #
 # 环境三选一 → 自动映射 Phala 账号：
@@ -10,7 +14,7 @@
 #
 # 首次开通不走本 workflow：cvm-id 文件读不到就失败，绝不静默新建 CVM
 # （新建 CVM = 换钥事故，见 DEPLOYMENTS.md「新建 runner CVM 换掉主 enclave 钥」）。
-name: Deploy Redis CVM
+name: Deprecated — Deploy Redis CVM
 on:
   workflow_dispatch:
     inputs:
@@ -19,13 +23,14 @@ on:
         options: [test, pre, prod]
         required: true
       confirm:
-        description: '输入 DEPLOY-REDIS（prod 需输入 DEPLOY-REDIS-PROD）确认（防误触）'
+        description: '已废弃：触发后 job 会跳过，不会部署'
         required: true
 permissions:
   contents: read
   packages: write
 jobs:
   deploy:
+    if: ${{ false }} # DEPRECATED：恢复前先完成新 spec，并移除此门禁
     runs-on: ubuntu-latest
     concurrency: redis-deploy-${{ github.event.inputs.environment }}
     steps:

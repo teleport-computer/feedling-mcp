@@ -877,14 +877,20 @@ CVM 磁盘创建时定死、事后扩容麻烦，故按「未来可能指向 pro
 
 ## TEE Redis（test + pre + prod）
 
+> [!CAUTION]
+> **已废弃并暂停（2026-08-20）**：三台 CVM 已停止，部署与监控 workflow
+> 已禁用，客户端入口也已退役。CVM id、磁盘和下述 runbook 暂时保留用于审计与
+> 可回滚恢复；不要按本节直接重新启动。恢复前必须先完成新的接入 spec，并同步恢复
+> 监控与 `backend/redis_pool.py` 的门禁。
+
 **接入方看这里**：`docs/REDIS_USAGE.md`（连接池 `backend/redis_pool.py` +
 使用规范：`IO:` 前缀命名、强制 TTL、read-through）。本章节只讲开通/运维。
 （早期设计 spec/plan 建成后已删，架构取舍见 `docs/REDIS_USAGE.md` §0-1 与
 `docs/CHANGELOG.md` 的 07-24 / 07-25 条目。）
 
-**当前状态**：三台 CVM 已开通、running，冒烟 ALL GREEN，**零业务流量**
-（没有任何业务代码引用 Redis，接入各自另开 spec）。CVM id 已写进
-`deploy/*-redis-cvm-id.txt`，日常更新走 `redis-deploy.yml`。
+**退役状态**：三台 CVM 已开通后于 2026-08-20 停止，停机时仍为**零业务流量**
+（没有任何业务代码引用 Redis）。CVM id 仍保留在
+`deploy/*-redis-cvm-id.txt`；`redis-deploy.yml` 已禁用，不能日常更新或误启动。
 
 **⚠️ 无离线备份是刻意的设计，不是遗漏。** Redis 在本架构里是**纯临时层**：
 缓存、队列/唤醒总线、分布式锁——三类用途的数据全部可从 Postgres 重建

@@ -47,6 +47,17 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-20 — TEE Redis 暂停并标记废弃
+
+test / pre / prod 三套 Redis CVM 在持续零业务流量的状态下停止。全仓确认没有
+请求路径引用 Redis；Postgres 始终是权威源，Redis 也没有离线备份或不可重建数据，
+因此停机不影响现有业务正确性。
+
+同时禁用 Redis 部署与定时监控 workflow，并给 `backend/redis_pool.py` 加退役门禁：
+`redis_configured()` 固定返回 false，`get_redis()` 明确报 `redis_deprecated`。
+实现、CVM id 和磁盘暂时保留以便审计和回滚；未来如需恢复，必须先另开接入 spec，
+重新评审真实用途、故障降级、容量和监控，再同时恢复三层门禁。
+
 ## 2026-08-19 — PROD 备份恢复门禁等待 WAL 真正回放完成
 
 **[DONE] 恢复流程不再把 `pg_ctl -w` 误当成 archive recovery 完成。**

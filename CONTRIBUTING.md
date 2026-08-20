@@ -102,9 +102,10 @@ backend/
                     ← 底层独立模块，保持无业务依赖
 ```
 
-> **接入 Redis（缓存 / 锁 / 队列）**：连接池封装在 `backend/redis_pool.py`
-> （用 `redis_pool.get_redis()`，别自己 new 客户端）；命名 / TTL / read-through
-> 等使用规范见 **`docs/REDIS_USAGE.md`**。当前零流量，接入各自另开 spec。
+> **Redis 已废弃并暂停（2026-08-20）**：三套 CVM 均已停止，
+> `backend/redis_pool.py` 的入口固定拒绝构造客户端。不要接入缓存 / 锁 / 队列；
+> 如需恢复，必须另开 spec，重新评审 `docs/REDIS_USAGE.md` 的约束、基础设施与监控，
+> 再显式移除退役门禁。
 
 **决策表——你的代码属于哪里：**
 
