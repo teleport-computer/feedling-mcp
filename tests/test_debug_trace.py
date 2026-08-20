@@ -1,8 +1,10 @@
 """v1 flow trace: beta default-on recording with deploy/per-user safety valves."""
+import ast
 import os
 import queue
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 from core import enclave as core_enclave  # noqa: E402
 import db  # noqa: E402
 import debug_trace  # noqa: E402
+from diagnostics import diagnostics_core  # noqa: E402
 
 
 class _Store:
@@ -20,11 +23,20 @@ class _Store:
 
 def _reset(monkeypatch, store):
     debug_trace._flag_cache.clear()
+    monkeypatch.setattr(debug_trace, "_record_trace_stats", lambda *_args, **_kwargs: None)
     # isolate DB blobs to an in-memory dict so the test never needs Postgres
     blobs: dict = {}
     monkeypatch.setattr(db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
     monkeypatch.setattr(db, "get_blob_strict", lambda uid, kind: blobs.get((uid, kind)))
     monkeypatch.setattr(db, "set_blob", lambda uid, kind, doc: blobs.__setitem__((uid, kind), doc))
+
+    def patch_blob(uid, kind, patch, **_kwargs):
+        persisted = dict(blobs.get((uid, kind)) or {})
+        persisted.update(patch)
+        blobs[(uid, kind)] = persisted
+        return persisted
+
+    monkeypatch.setattr(db, "patch_blob_strict", patch_blob)
 
     def append_events(uid, kind, new_events, *, cutoff_ts, max_events):
         current = blobs.get((uid, kind)) or {}
@@ -36,6 +48,198 @@ def _reset(monkeypatch, store):
 
     monkeypatch.setattr(db, "append_blob_events_strict", append_events)
     return blobs
+
+
+def _source_trace_call_contract() -> tuple[set[str], list[str]]:
+    """Derive the writer contract from production callsites, not a copied list."""
+    backend = Path(__file__).resolve().parents[1] / "backend"
+    derived_types: set[str] = set()
+    unresolved_type_expressions: list[str] = []
+
+    def string_literals(node: ast.AST) -> set[str]:
+        return {
+            child.value
+            for child in ast.walk(node)
+            if isinstance(child, ast.Constant) and isinstance(child.value, str)
+        }
+
+    def assigned_names(node: ast.Assign | ast.AnnAssign) -> set[str]:
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        return {target.id for target in targets if isinstance(target, ast.Name)}
+
+    for path in sorted(backend.rglob("*.py")):
+        if path.name == "debug_trace.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        functions = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+        module_constants: dict[str, set[str]] = {}
+        for statement in tree.body:
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                values = string_literals(statement.value)
+                for name in assigned_names(statement):
+                    if values:
+                        module_constants[name] = values
+
+        for node in calls:
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "trace_event"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "debug_trace"
+            ):
+                continue
+            type_arg = next((kw.value for kw in node.keywords if kw.arg == "type"), None)
+            assert type_arg is not None, f"{path}:{node.lineno} omits trace type="
+            values: set[str] = set()
+            if isinstance(type_arg, ast.Constant) and isinstance(type_arg.value, str):
+                values.add(type_arg.value)
+            elif isinstance(type_arg, ast.Name):
+                values.update(module_constants.get(type_arg.id, set()))
+                enclosing = [
+                    function
+                    for function in functions
+                    if function.lineno <= node.lineno <= (function.end_lineno or function.lineno)
+                ]
+                function = min(
+                    enclosing,
+                    key=lambda item: (item.end_lineno or item.lineno) - item.lineno,
+                    default=None,
+                )
+                if function is not None:
+                    for assignment in ast.walk(function):
+                        if (
+                            isinstance(assignment, (ast.Assign, ast.AnnAssign))
+                            and type_arg.id in assigned_names(assignment)
+                        ):
+                            values.update(string_literals(assignment.value))
+                    parameter_names = [arg.arg for arg in function.args.args]
+                    if type_arg.id in parameter_names:
+                        index = parameter_names.index(type_arg.id)
+                        for caller in calls:
+                            calls_helper = (
+                                isinstance(caller.func, ast.Name)
+                                and caller.func.id == function.name
+                            ) or (
+                                isinstance(caller.func, ast.Attribute)
+                                and caller.func.attr == function.name
+                            )
+                            if not calls_helper:
+                                continue
+                            actual = (
+                                caller.args[index]
+                                if index < len(caller.args)
+                                else next(
+                                    (
+                                        keyword.value
+                                        for keyword in caller.keywords
+                                        if keyword.arg == type_arg.id
+                                    ),
+                                    None,
+                                )
+                            )
+                            if actual is None:
+                                continue
+                            values.update(string_literals(actual))
+                            if isinstance(actual, ast.Name):
+                                values.update(module_constants.get(actual.id, set()))
+            if values:
+                derived_types.update(values)
+            else:
+                unresolved_type_expressions.append(
+                    f"{path.relative_to(backend)}:{ast.unparse(type_arg)}"
+                )
+    return derived_types, unresolved_type_expressions
+
+
+def test_source_derived_event_types_round_trip_through_current_writer(monkeypatch):
+    """Freeze the pre-migration writer/read contract without a hand-kept enum.
+
+    Literal event types are discovered from every production callsite at test
+    time.  A dynamic sentinel covers helper/HTTP callsites whose type is supplied
+    at runtime.  A future table writer must preserve the same output contract.
+    """
+    store = _Store("usr_trace_contract")
+    _reset(monkeypatch, store)
+    monkeypatch.setenv("FEEDLING_V1_FLOW_TRACE", "1")
+    monkeypatch.setenv("FEEDLING_DEBUG_VERBOSE", "1")
+    derived_types, dynamic_expressions = _source_trace_call_contract()
+    assert derived_types, "production trace callsite discovery found no event types"
+    assert dynamic_expressions == [
+        "diagnostics/diagnostics_core.py:str(ev.get('type') or '')"
+    ], "only the authenticated HTTP event bridge may accept an arbitrary type"
+
+    event_types = sorted(derived_types | {"contract.dynamic.type"})
+    for index, event_type in enumerate(event_types):
+        debug_trace.trace_event(
+            store,
+            subsystem="contract",
+            type=event_type,
+            actor="contract-test",
+            status="warning",
+            summary="summary",
+            explain="explain",
+            trace_id=f"trace-{index}",
+            turn_id=f"turn-{index}",
+            job_id=f"job-{index}",
+            detail={"counts": {"items": index}, "reason": "contract"},
+            content_excerpt={"reply": "visible excerpt"},
+            dur_ms=12.34,
+        )
+
+    payload, status = diagnostics_core.read_trace_payload(
+        store, limit=len(event_types), subsystem="contract"
+    )
+    assert status == 200
+    assert set(payload) == {"enabled", "deploy_enabled", "verbose", "events"}
+    assert payload["enabled"] is True
+    assert payload["deploy_enabled"] is True
+    assert payload["verbose"] is True
+    assert {event["type"] for event in payload["events"]} == set(event_types)
+    expected_fields = {
+        "ts",
+        "subsystem",
+        "type",
+        "actor",
+        "status",
+        "summary",
+        "explain",
+        "trace_id",
+        "turn_id",
+        "job_id",
+        "detail",
+        "dur_ms",
+        "content_excerpt",
+    }
+    for event in payload["events"]:
+        assert set(event) == expected_fields
+        assert event["subsystem"] == "contract"
+        assert event["actor"] == "contract-test"
+        assert event["status"] == "warning"
+        assert event["summary"] == "summary"
+        assert event["explain"] == "explain"
+        assert event["dur_ms"] == 12.3
+        assert event["content_excerpt"] == {"reply": "visible excerpt"}
+
+
+def test_clear_removes_persisted_events_keeps_toggle_and_allows_new_events(monkeypatch):
+    store = _Store("usr_trace_clear_contract")
+    blobs = _reset(monkeypatch, store)
+    debug_trace.set_enabled(store, True)
+    debug_trace.trace_event(store, subsystem="route", type="before.clear")
+    assert [event["type"] for event in debug_trace.read_trace(store)] == ["before.clear"]
+
+    debug_trace.clear_trace(store)
+
+    assert debug_trace.read_trace(store) == []
+    assert blobs[(store.user_id, debug_trace.DEBUG_TRACE_FLAG_BLOB)]["enabled"] is True
+    debug_trace.trace_event(store, subsystem="route", type="after.clear")
+    assert [event["type"] for event in debug_trace.read_trace(store)] == ["after.clear"]
 
 
 def test_default_on_records_no_env_needed(monkeypatch):
@@ -174,7 +378,11 @@ def _reset_verbose(monkeypatch):
     blobs = {}
     monkeypatch.setattr(debug_trace.db, "get_blob", lambda uid, k: blobs.get((uid, k)))
     monkeypatch.setattr(debug_trace.db, "get_blob_strict", lambda uid, k: blobs.get((uid, k)))
-    monkeypatch.setattr(debug_trace.db, "set_blob", lambda uid, k, v: blobs.__setitem__((uid, k), v))
+    monkeypatch.setattr(
+        debug_trace.db,
+        "set_blob",
+        lambda uid, k, v: blobs.__setitem__((uid, k), v),
+    )
 
     def append_events(uid, kind, new_events, *, cutoff_ts, max_events):
         current = blobs.get((uid, kind)) or {}
