@@ -409,9 +409,9 @@ def test_io_shell_reexports_the_same_objects():
 
 
 def test_capability_and_signal_counts_match_baseline():
-    # 基线值：22 个能力、20 个信号（origin/test@d9a54e00）。
+    # 基线值：21 个能力、20 个信号（origin/test@d9a54e00）。
     # 这两个数字变了就是加/删了能力 —— 本批不许发生。
-    assert len(kernel_catalog.CAPABILITIES) == 22
+    assert len(kernel_catalog.CAPABILITIES) == 21
     assert len(kernel_catalog.SIGNALS) == 20
 
 
