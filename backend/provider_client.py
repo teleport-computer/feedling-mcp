@@ -3973,7 +3973,17 @@ def _validate_egress_url(base_url: str) -> None:
       and ``https://169.254.169.254`` pass. Address-level egress policy does not
       exist on this path yet; nothing here should be read as providing it.
     """
-    parts = urlsplit(base_url)
+    try:
+        parts = urlsplit(base_url)
+    except ValueError as exc:
+        # A malformed authority makes urlsplit raise instead of returning
+        # something we can judge: "http://[::1" never closes the bracket, and on
+        # 3.11+ urlsplit also rejects a bracketed host that is not an address.
+        # Both callers of validate_config catch only ProviderError, so an
+        # escaping ValueError turns a mistyped base_url into a 500 rather than
+        # the 400 every other rejected value gets. The prefix check this
+        # replaced never parsed the URL, so it could not raise at all.
+        raise ProviderError("base_url must be https:// or local http://127.0.0.1") from exc
     scheme = parts.scheme.lower()
     if scheme not in ("https", "http"):
         raise ProviderError("base_url must be https:// or local http://127.0.0.1")
@@ -3982,7 +3992,15 @@ def _validate_egress_url(base_url: str) -> None:
     if parts.username or parts.password or "@" in (parts.netloc or ""):
         raise ProviderError("base_url must be https:// or local http://127.0.0.1")
     if scheme == "http":
-        host = (parts.hostname or "").lower()
+        try:
+            host = (parts.hostname or "").lower()
+        except ValueError as exc:
+            # `.hostname` can reject a bracketed authority that urlsplit let
+            # through — which of the two raises depends on the interpreter, so
+            # the guarantee ("this function raises ProviderError or nothing")
+            # has to hold at both points rather than at whichever one happens to
+            # fire on the machine running the tests.
+            raise ProviderError("base_url must be https:// or local http://127.0.0.1") from exc
         if host not in _CLEARTEXT_ALLOWED_HOSTS:
             raise ProviderError("base_url must be https:// or local http://127.0.0.1")
 
