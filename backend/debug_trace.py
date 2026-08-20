@@ -14,11 +14,16 @@ deploy-wide kill switch, and a per-user flag can still opt a user out.
 """
 from __future__ import annotations
 
+import json
+import logging
 import os
 import queue
 import threading
 import time
+import uuid
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import db
 
@@ -49,6 +54,11 @@ _FLAG_CACHE_TTL = 30.0
 _QUEUE_MAX = 5000
 _FLUSH_BATCH_MAX = 100
 _FLUSH_WAIT_SEC = 0.25
+_STATS_RETRY_SEC = 1.0
+_STATS_HEARTBEAT_SEC = db.TRACE_WRITE_STATS_HEARTBEAT_SEC
+_STATS_FAILURE_LOG_INTERVAL_SEC = 60.0
+_STATS_ZONE = ZoneInfo("Asia/Shanghai")
+log = logging.getLogger("feedling.debug_trace")
 
 # subsystem ∈ memory|genesis|identity|route|voice|perception|proactive|fallback|account
 # actor     ∈ host_agent_runtime|vps_resident|backend|ios
@@ -59,6 +69,25 @@ _worker_lock = threading.Lock()
 _worker_started = False
 _dropped_lock = threading.Lock()
 _dropped_by_uid: dict[str, int] = {}
+_at_risk_by_uid: dict[str, int] = {}
+
+# T138 block 0 rate ruler.  Values are monotonic absolute totals for one
+# process-start writer id.  The database uses GREATEST on conflict, so retrying
+# after an ambiguous commit cannot double-count.  A fork/restart gets a new
+# writer id and a fresh in-memory map; old database rows remain summable.
+_stats_lock = threading.Lock()
+_stats_pid = -1
+_stats_writer_id = ""
+_stats_process_started_at = 0.0
+_stats_totals: dict[tuple[str, str, str, str], list[int]] = {}
+_stats_flushed: dict[tuple[str, str, str, str], tuple[int, ...]] = {}
+_stats_first_seen: dict[tuple[str, str, str, str], float] = {}
+_stats_flush_failures_total = 0
+_stats_flush_consecutive_failures = 0
+_stats_last_flush_failure_at = 0.0
+_stats_last_flush_success_at = 0.0
+_stats_last_flush_error = ""
+_stats_last_failure_warning_at = 0.0
 # Count events from enqueue until either the background worker or a synchronous
 # debug read has finished persisting them. Queue emptiness is insufficient: the
 # worker removes an item before its 250ms batching window, so a concurrent GET
@@ -188,32 +217,288 @@ def _take_dropped(uid: str) -> int:
         return int(_dropped_by_uid.pop(uid, 0) or 0)
 
 
+def _record_at_risk_marker(uid: str, count: int) -> None:
+    if not uid:
+        return
+    with _dropped_lock:
+        _at_risk_by_uid[uid] = (
+            _at_risk_by_uid.get(uid, 0) + max(1, int(count or 1))
+        )
+
+
+def _take_at_risk_marker(uid: str) -> int:
+    if not uid:
+        return 0
+    with _dropped_lock:
+        return int(_at_risk_by_uid.pop(uid, 0) or 0)
+
+
+def _stats_identity_locked() -> str:
+    global _stats_pid, _stats_writer_id, _stats_process_started_at
+    global _stats_flush_failures_total, _stats_flush_consecutive_failures
+    global _stats_last_flush_failure_at, _stats_last_flush_success_at
+    global _stats_last_flush_error, _stats_last_failure_warning_at
+    pid = os.getpid()
+    if _stats_pid != pid:
+        _stats_pid = pid
+        _stats_writer_id = f"{pid}:{uuid.uuid4().hex}"
+        _stats_process_started_at = time.time()
+        _stats_totals.clear()
+        _stats_flushed.clear()
+        _stats_first_seen.clear()
+        _stats_flush_failures_total = 0
+        _stats_flush_consecutive_failures = 0
+        _stats_last_flush_failure_at = 0.0
+        _stats_last_flush_success_at = 0.0
+        _stats_last_flush_error = ""
+        _stats_last_failure_warning_at = 0.0
+    return _stats_writer_id
+
+
+def _stats_event_key(event: dict[str, Any]) -> tuple[str, str, str, str]:
+    try:
+        ts = float(event.get("ts") or time.time())
+        day = datetime.fromtimestamp(ts, _STATS_ZONE).date().isoformat()
+    except (OverflowError, OSError, TypeError, ValueError):
+        day = datetime.now(_STATS_ZONE).date().isoformat()
+    detail = event.get("detail") if isinstance(event.get("detail"), dict) else {}
+    lane = str(event.get("lane") or detail.get("lane") or "unknown")[:40]
+    return (
+        day,
+        str(event.get("subsystem") or "unknown")[:40],
+        str(event.get("type") or "unknown")[:80],
+        lane or "unknown",
+    )
+
+
+def _stats_event_bytes(event: dict[str, Any]) -> int:
+    """Deterministic UTF-8 JSON payload size, not PostgreSQL row/index bytes."""
+    return len(json.dumps(
+        event, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8"))
+
+
+def _record_trace_stats(
+    events: list[dict[str, Any]], *, outcome: str,
+) -> None:
+    """Accumulate one precision class without ever affecting product flow."""
+    if outcome not in {"persisted", "known_drop", "at_risk"}:
+        return
+    try:
+        measured = [
+            (_stats_event_key(event), _stats_event_bytes(event), float(event.get("ts") or time.time()))
+            for event in events if isinstance(event, dict)
+        ]
+        with _stats_lock:
+            _stats_identity_locked()
+            for key, size, seen_at in measured:
+                totals = _stats_totals.setdefault(key, [0, 0, 0, 0, 0, 0])
+                offset = {"persisted": 0, "known_drop": 2, "at_risk": 4}[outcome]
+                totals[offset] += 1
+                totals[offset + 1] += size
+                _stats_first_seen[key] = min(
+                    _stats_first_seen.get(key, seen_at), seen_at,
+                )
+    except Exception:
+        pass
+
+
+def _flush_trace_stats() -> None:
+    """Best-effort flush of changed absolute totals; failures remain dirty."""
+    global _stats_flush_failures_total, _stats_flush_consecutive_failures
+    global _stats_last_flush_failure_at, _stats_last_flush_success_at
+    global _stats_last_flush_error, _stats_last_failure_warning_at
+    writer_id = "unknown"
+    dirty_rows = 0
+    try:
+        now = time.time()
+        with _stats_lock:
+            writer_id = _stats_identity_locked()
+            snapshots = {
+                key: tuple(values)
+                for key, values in _stats_totals.items()
+                if tuple(values) != _stats_flushed.get(key)
+            }
+            dirty_rows = len(snapshots)
+            rows = [
+                (*key[:1], writer_id, *key[1:], *values, _stats_first_seen[key])
+                for key, values in snapshots.items()
+            ]
+            heartbeat_due = (
+                bool(rows)
+                or _stats_last_flush_success_at <= 0
+                or now - _stats_last_flush_success_at >= _STATS_HEARTBEAT_SEC
+            )
+            if not heartbeat_due:
+                return
+            writer_health = (
+                writer_id,
+                _stats_process_started_at,
+                _stats_last_flush_failure_at or None,
+                _stats_flush_failures_total,
+                _stats_flush_consecutive_failures,
+                0,
+            )
+        db.upsert_trace_write_stats(rows, writer_health=writer_health)
+        recovered_failures = 0
+        recovered_after = 0.0
+        now = time.time()
+        with _stats_lock:
+            if writer_id != _stats_identity_locked():
+                return
+            for key, values in snapshots.items():
+                _stats_flushed[key] = values
+            recovered_failures = _stats_flush_consecutive_failures
+            if recovered_failures and _stats_last_flush_failure_at:
+                recovered_after = max(0.0, now - _stats_last_flush_failure_at)
+            _stats_flush_consecutive_failures = 0
+            _stats_last_flush_success_at = now
+            _stats_last_flush_error = ""
+        if recovered_failures:
+            log.info(
+                "[debug-trace-stats] flush recovered writer=%s "
+                "after_failures=%d recovery_sec=%.1f",
+                writer_id,
+                recovered_failures,
+                recovered_after,
+            )
+    except Exception as exc:
+        now = time.time()
+        error_code = type(exc).__name__.lower()
+        with _stats_lock:
+            _stats_flush_failures_total += 1
+            _stats_flush_consecutive_failures += 1
+            _stats_last_flush_failure_at = now
+            _stats_last_flush_error = error_code
+            should_warn = (
+                _stats_last_failure_warning_at <= 0
+                or now - _stats_last_failure_warning_at
+                >= _STATS_FAILURE_LOG_INTERVAL_SEC
+            )
+            if should_warn:
+                _stats_last_failure_warning_at = now
+            total = _stats_flush_failures_total
+            consecutive = _stats_flush_consecutive_failures
+        if should_warn:
+            log.warning(
+                "[debug-trace-stats] persistent counter flush failed "
+                "writer=%s total=%d consecutive=%d dirty_rows=%d code=%s; "
+                "absolute totals remain dirty for idempotent retry",
+                writer_id,
+                total,
+                consecutive,
+                dirty_rows,
+                error_code,
+            )
+
+
+def trace_stats_health() -> dict[str, Any]:
+    """Process-local detail; the durable report uses expiring success heartbeats."""
+    with _stats_lock:
+        writer_id = _stats_identity_locked()
+        dirty_rows = sum(
+            tuple(values) != _stats_flushed.get(key)
+            for key, values in _stats_totals.items()
+        )
+        return {
+            "writer_id": writer_id,
+            "dirty_rows": dirty_rows,
+            "failures_total": _stats_flush_failures_total,
+            "consecutive_failures": _stats_flush_consecutive_failures,
+            "last_failure_at": _stats_last_flush_failure_at or None,
+            "last_success_at": _stats_last_flush_success_at or None,
+            "last_error": _stats_last_flush_error,
+            "healthy": _stats_flush_consecutive_failures == 0,
+        }
+
+
+def stop_trace_stats_writer() -> None:
+    """Best-effort graceful tombstone; a crash deliberately remains stale."""
+    with _stats_lock:
+        if _stats_pid != os.getpid() or not _stats_writer_id:
+            return
+    _flush_trace_stats()
+    with _stats_lock:
+        writer_id = _stats_writer_id
+        dirty_rows = sum(
+            tuple(values) != _stats_flushed.get(key)
+            for key, values in _stats_totals.items()
+        )
+        consecutive_failures = _stats_flush_consecutive_failures
+    # A tombstone is affirmative evidence that this writer drained cleanly.
+    # Never publish it after the fail-open final flush left anything dirty;
+    # keeping the row open lets last_success_at expire into the honest stale
+    # state instead of hiding an unknown shutdown gap as graceful.
+    if dirty_rows or consecutive_failures:
+        log.warning(
+            "[debug-trace-stats] writer stop remains unstopped "
+            "writer=%s dirty_rows=%d consecutive_failures=%d",
+            writer_id,
+            dirty_rows,
+            consecutive_failures,
+        )
+        return
+    try:
+        db.stop_trace_write_stats_writer(writer_id)
+    except Exception as exc:
+        log.warning(
+            "[debug-trace-stats] graceful writer stop was not persisted "
+            "writer=%s code=%s",
+            writer_id,
+            type(exc).__name__.lower(),
+        )
+
+
 def _append_events(uid: str, new_events: list[dict[str, Any]]) -> None:
     if not uid or not new_events:
         return
+    store = type("_TraceStore", (), {"user_id": uid})()
     try:
-        store = type("_TraceStore", (), {"user_id": uid})()
         if not is_enabled(store):
             return
         now = time.time()
         verbose = verbose_enabled(store)
-        dropped = _take_dropped(uid)
-        if dropped:
-            new_events = [{
-                "ts": now,
-                "subsystem": "debug_trace",
-                "type": "debug_trace.dropped",
-                "actor": "backend",
-                "status": "warn",
-                "summary": f"dropped {dropped} debug trace events",
-                "explain": "Debug trace queue was full; events were dropped so product flow stayed non-blocking.",
-                "trace_id": "",
-                "turn_id": "",
-                "job_id": "",
-                "detail": {"dropped": dropped},
-            }] + new_events
-        cutoff = now - _TTL_SEC
-        cap = _MAX_EVENTS_VERBOSE if verbose else _MAX_EVENTS
+    except Exception:
+        return
+    dropped = _take_dropped(uid)
+    at_risk = _take_at_risk_marker(uid)
+    markers: list[dict[str, Any]] = []
+    if dropped:
+        markers.append({
+            "ts": now,
+            "subsystem": "debug_trace",
+            "type": "debug_trace.dropped",
+            "actor": "backend",
+            "status": "warn",
+            "summary": f"dropped {dropped} debug trace events",
+            "explain": "Debug trace queue was full; events were dropped so product flow stayed non-blocking.",
+            "trace_id": "",
+            "turn_id": "",
+            "job_id": "",
+            "detail": {"dropped": dropped},
+        })
+    if at_risk:
+        markers.append({
+            "ts": now,
+            "subsystem": "debug_trace",
+            "type": "debug_trace.at_risk",
+            "actor": "backend",
+            "status": "warn",
+            "summary": f"{at_risk} debug trace events had unknown storage outcome",
+            "explain": (
+                "A debug trace flush raised after the batch was handed to storage; "
+                "the events may or may not have committed."
+            ),
+            "trace_id": "",
+            "turn_id": "",
+            "job_id": "",
+            "detail": {"at_risk": at_risk},
+        })
+    original_count = len(new_events)
+    new_events = markers + new_events
+    cutoff = now - _TTL_SEC
+    cap = _MAX_EVENTS_VERBOSE if verbose else _MAX_EVENTS
+    try:
         db.append_blob_events_strict(
             uid,
             DEBUG_TRACE_BLOB,
@@ -222,7 +507,20 @@ def _append_events(uid: str, new_events: list[dict[str, Any]]) -> None:
             max_events=cap,
         )
     except Exception:
-        _record_drop(uid, len(new_events))
+        # Restore only the legacy queue-full marker backlog.  The failed flush
+        # is outcome-unknown, not another known drop.
+        if dropped:
+            _record_drop(uid, dropped)
+        # Keep the prior unknown count plus this attempt's product events and
+        # queue-drop marker (if any); do not recursively count the at-risk
+        # marker whose sole purpose is to carry that prior count forward.
+        _record_at_risk_marker(
+            uid,
+            at_risk + original_count + (1 if dropped else 0),
+        )
+        _record_trace_stats(new_events, outcome="at_risk")
+    else:
+        _record_trace_stats(new_events, outcome="persisted")
 
 
 def _flush_batch(batch: list[tuple[str, dict[str, Any]]]) -> None:
@@ -233,11 +531,17 @@ def _flush_batch(batch: list[tuple[str, dict[str, Any]]]) -> None:
         _append_events(uid, events)
 
 
-def _worker_loop() -> None:
+def _worker_loop(
+    event_queue: "queue.Queue[tuple[str, dict[str, Any]]]" | None = None,
+) -> None:
+    # Bind one queue object for this worker's whole lifetime.  Re-reading the
+    # module global each iteration can silently turn a test/reset replacement
+    # into a second live input queue, violating the sole-writer contract.
+    owned_queue = event_queue if event_queue is not None else _event_queue
     while True:
         batch: list[tuple[str, dict[str, Any]]] = []
         try:
-            item = _event_queue.get()
+            item = owned_queue.get()
             batch = [item]
             deadline = time.monotonic() + _FLUSH_WAIT_SEC
             while len(batch) < _FLUSH_BATCH_MAX:
@@ -245,7 +549,7 @@ def _worker_loop() -> None:
                 if timeout <= 0:
                     break
                 try:
-                    batch.append(_event_queue.get(timeout=timeout))
+                    batch.append(owned_queue.get(timeout=timeout))
                 except queue.Empty:
                     break
             try:
@@ -255,7 +559,7 @@ def _worker_loop() -> None:
                 # worker's in-flight batch via unfinished_tasks — without it a
                 # debug read racing this batching window returns stale data.
                 for _ in batch:
-                    _event_queue.task_done()
+                    owned_queue.task_done()
         except Exception:
             pass
         finally:
@@ -270,6 +574,13 @@ def _worker_loop() -> None:
                     _pending_condition.notify_all()
 
 
+def _stats_worker_loop() -> None:
+    """Retry dirty counters independently of the trace queue's sole writer."""
+    while True:
+        time.sleep(_STATS_RETRY_SEC)
+        _flush_trace_stats()
+
+
 def _ensure_worker_started() -> None:
     global _worker_started
     if _worker_started:
@@ -277,8 +588,23 @@ def _ensure_worker_started() -> None:
     with _worker_lock:
         if _worker_started:
             return
-        threading.Thread(target=_worker_loop, name="debug-trace-flush", daemon=True).start()
+        threading.Thread(
+            target=_worker_loop,
+            args=(_event_queue,),
+            name="debug-trace-flush",
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=_stats_worker_loop,
+            name="debug-trace-stats-flush",
+            daemon=True,
+        ).start()
         _worker_started = True
+
+
+def start_trace_stats_writer() -> None:
+    """Register this service process as a ruler writer via its stats loop."""
+    _ensure_worker_started()
 
 
 def _enqueue(uid: str, event: dict[str, Any]) -> None:
@@ -296,6 +622,7 @@ def _enqueue(uid: str, event: dict[str, Any]) -> None:
                 _pending_by_uid.pop(uid, None)
             _pending_condition.notify_all()
         _record_drop(uid)
+        _record_trace_stats([event], outcome="known_drop")
 
 
 def _flush_pending_for_user(uid: str, *, timeout: float = 0.5) -> None:

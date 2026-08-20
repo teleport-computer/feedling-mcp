@@ -51,7 +51,6 @@ tests/test_capabilities_registry.py
 tests/test_capabilities_types.py
 tests/test_capability_html_extract.py
 tests/test_capability_wake.py
-tests/test_capability_web.py
 tests/test_capture_daily.py
 tests/test_capture_dream_submit_seam.py
 tests/test_capture_failure_backoff.py
@@ -178,7 +177,6 @@ tests/test_prod_runner_health_config.py
 tests/test_provider_async_native.py
 tests/test_provider_attempt_ledger.py
 tests/test_provider_catalog_unit.py
-tests/test_provider_client.py
 tests/test_provider_client_async.py
 tests/test_provider_client_async_reliable.py
 tests/test_provider_health.py

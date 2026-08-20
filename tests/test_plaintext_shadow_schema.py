@@ -53,7 +53,7 @@ def test_plaintext_shadow_control_revision_is_head() -> None:
         os.environ["TEE_DATABASE_URL"],
         "SELECT version_num FROM alembic_tee_version",
     )
-    assert rows == [("0027_plaintext_shadow_gates",)]
+    assert rows == [("0029_plaintext_shadow_merge",)]
 
 
 def test_dirty_key_control_plane_contains_no_content_columns() -> None:

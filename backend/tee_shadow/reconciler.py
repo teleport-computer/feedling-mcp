@@ -46,7 +46,8 @@ TABLES: dict[str, tuple[tuple[str, ...], str]] = {
         "user_id, job_id, status, source_kind, file_manifest_hash, total_chunks, "
         "received_chunks, processed_chunks, total_bytes, received_bytes, privacy_mode, "
         "metadata, output, memory_action_count, identity_status, persona_ref, "
-        "persona_sha256, error, created_at, updated_at, finalized_at, completed_at",
+        "persona_sha256, error, created_at, updated_at, finalized_at, completed_at, "
+        "worker_claimed_by, worker_claimed_at",
     ),
     # PK 有三列 (user_id, job_id, output_type)，不是两列；且没有单一 doc 列。
     "genesis_import_outputs": (
@@ -74,11 +75,44 @@ TABLES: dict[str, tuple[tuple[str, ...], str]] = {
     "lane_daily_rollup": (
         ("user_id", "day", "route", "lane", "enqueue_source"),
         "user_id, day, route, lane, enqueue_source, completed, failed, "
-        "expired, superseded, failure_codes, frozen_at",
+        "expired, superseded, failure_codes, "
+        # ⚠️ 说话四列（0093 / tee 0025）必须列在这里。漏列**不会报错**——扶正
+        # 会把它们按默认值 0 写进 TEE，而 test 的 primary 就是 TEE，于是被读的
+        # 那一份悄悄变成「谁都没说过话」。列漂移交给
+        # test_reconciler_columns_cover_the_whole_table 守，别再靠人记得改这行。
+        "spoke, spoke_completed, silent_declared, silent_undeclared, "
+        "frozen_at",
     ),
     "lane_rollup_watermark": (
         ("route",),
-        "route, backfill_from, through_day, frozen_at",
+        "route, backfill_from, through_day, voice_from, frozen_at",
+    ),
+    # 聊天格子（0094 / tee 0026）。同样写后不变、语句幂等，按 PK 对齐即收敛。
+    "chat_daily_rollup": (
+        ("user_id", "day"),
+        "user_id, day, total, user_messages, agent_messages, image_messages, "
+        "proactive_messages, model_api_user_messages, "
+        "model_api_agent_messages, model_api_greetings, first_ts, last_ts, "
+        "proactive_last_ts, last_user_ts, last_agent_ts, by_role, by_source, "
+        "by_content_type, live_activity_status, alert_status, frozen_at",
+    ),
+    "chat_rollup_watermark": (
+        ("scope",),
+        "scope, backfill_from, through_day, frozen_at",
+    ),
+    # T138 块0的速率尺子。每个 writer_id 写自己的单调绝对值，热镜像可安全重放；
+    # reconciler 仍负责把影子写失败后的旧值扶正到源库终值。
+    "trace_write_stats": (
+        ("day", "writer_id", "subsystem", "event_type", "lane"),
+        "day, writer_id, subsystem, event_type, lane, persisted_events, "
+        "persisted_bytes, known_drop_events, known_drop_bytes, at_risk_events, "
+        "at_risk_bytes, first_seen_at, updated_at",
+    ),
+    "trace_write_stats_health": (
+        ("writer_id",),
+        "writer_id, process_started_at, last_success_at, last_failure_at, "
+        "failures_total, max_consecutive_failures, dirty_rows, stopped_at, "
+        "updated_at",
     ),
 }
 

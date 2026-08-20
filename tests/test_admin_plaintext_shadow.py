@@ -213,7 +213,7 @@ def test_record_restore_evidence_has_no_free_form_note_argument():
                 "--source-backup-at",
                 "2026-08-20T00:00:00Z",
                 "--schema-head",
-                "0027_plaintext_shadow_gates",
+                "0029_plaintext_shadow_merge",
                 "--verifier-digest",
                 "sha256:abc",
                 "--operator-id",

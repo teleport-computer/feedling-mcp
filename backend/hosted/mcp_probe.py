@@ -33,14 +33,12 @@ URL itself.
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import contextlib
 import hashlib
 import ipaddress
 import json
 import socket
 import ssl
-import threading
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 
@@ -89,13 +87,8 @@ _WALL_TIMEOUT = 45.0
 _PROTOCOL_VERSION = "2025-03-26"
 _MAX_RESPONSE_BYTES = 1024 * 1024
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
-_DNS_WORKERS = 8
-_DNS_MAX_PENDING = 32
-_DNS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=_DNS_WORKERS,
-    thread_name_prefix="feedling-mcp-dns",
-)
-_DNS_SUBMISSION_SLOTS = threading.BoundedSemaphore(_DNS_MAX_PENDING)
+# The bounded DNS pool now lives in core.net_safety (shared with every other
+# backend-originated resolution of an externally supplied hostname).
 # Ceiling on bytes read from any one SSE stream while hunting for a frame —
 # a stream that pings forever must exhaust this (or the wall clock), not RAM.
 _MAX_SSE_BYTES = 262144
@@ -293,30 +286,23 @@ def _pin_public_target(url: str) -> _PinnedTarget:
 
 
 async def _pin_public_target_async(url: str) -> _PinnedTarget:
-    """Resolve on a dedicated, submission-bounded executor.
+    """Resolve on the shared dedicated, submission-bounded DNS executor.
 
     Cancelling ``getaddrinfo`` cannot stop its native worker thread. Keeping
     those calls off asyncio's shared default executor prevents hostile MCP DNS
     from silently exhausting unrelated provider/enclave work. The submission
     semaphore also prevents an unbounded executor queue while the resolver is
     degraded; excess work fails closed and the server is skipped for this turn.
-    """
-    if not _DNS_SUBMISSION_SLOTS.acquire(blocking=False):
-        raise ProbeError("dns_busy", "resolver capacity exhausted")
-    try:
-        future = _DNS_EXECUTOR.submit(_pin_public_target, url)
-    except Exception:
-        _DNS_SUBMISSION_SLOTS.release()
-        raise ProbeError("dns", "DNS resolver unavailable") from None
 
-    future.add_done_callback(lambda _future: _DNS_SUBMISSION_SLOTS.release())
+    The pool itself lives in ``core.net_safety`` so every backend-originated
+    resolution of an externally supplied hostname shares one bounded budget.
+    """
     try:
-        return await asyncio.wrap_future(future)
-    except asyncio.CancelledError:
-        # This cancels queued work when possible. A running getaddrinfo remains
-        # bounded by the dedicated worker count and releases its slot on finish.
-        future.cancel()
-        raise
+        return await net_safety.run_on_dns_executor(_pin_public_target, url)
+    except net_safety.ResolverBusy:
+        raise ProbeError("dns_busy", "resolver capacity exhausted") from None
+    except net_safety.ResolverUnavailable:
+        raise ProbeError("dns", "DNS resolver unavailable") from None
 
 
 def blocked_url_kind(url: str) -> str | None:

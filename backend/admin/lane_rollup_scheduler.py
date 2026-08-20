@@ -42,6 +42,17 @@ def _tick(*, now_epoch: float | None = None) -> list[str]:
                      ",".join(resident))
     except Exception as e:  # noqa: BLE001
         log.warning("[lane-rollup] resident tick failed: %s", e)
+    # chat cells (期3b) ride the same leader tick, in their own failure domain.
+    # Without this the data-track endpoint reads empty history forever — the
+    # freeze is the ONLY thing that fills it, so an unwired scheduler looks
+    # exactly like "these users never talked".
+    try:
+        chat = db.freeze_completed_chat_days(
+            now_epoch=now_epoch, tz="Asia/Shanghai")
+        if chat:
+            log.info("[lane-rollup] froze chat Beijing days: %s", ",".join(chat))
+    except Exception as e:  # noqa: BLE001
+        log.warning("[lane-rollup] chat tick failed: %s", e)
     return frozen
 
 
