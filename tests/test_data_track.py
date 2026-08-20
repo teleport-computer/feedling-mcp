@@ -1715,7 +1715,7 @@ def test_provider_attempts_detail_is_bounded_and_reports_more(monkeypatch):
     detail = _dt._provider_attempts_detail(SimpleNamespace(user_id="usr_ledger"))
 
     assert calls == [("usr_ledger", "provider_attempts", 201)]
-    assert detail["coverage"] == "chat_turns_only"
+    assert detail["coverage"] == "provider_runtime_and_model_api_probes"
     assert detail["has_more"] is True
     assert len(detail["attempts"]) == 200
     assert detail["attempts"][0]["attempt_n"] == 2

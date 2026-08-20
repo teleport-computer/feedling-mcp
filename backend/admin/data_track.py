@@ -1528,7 +1528,7 @@ def _provider_attempts_detail(store: UserStore) -> dict:
         limit=_PROVIDER_ATTEMPT_DETAIL_LIMIT + 1,
     )
     return {
-        "coverage": "chat_turns_only",
+        "coverage": "provider_runtime_and_model_api_probes",
         "attempts": rows[-_PROVIDER_ATTEMPT_DETAIL_LIMIT:],
         "has_more": len(rows) > _PROVIDER_ATTEMPT_DETAIL_LIMIT,
     }
@@ -1537,11 +1537,9 @@ def _provider_attempts_detail(store: UserStore) -> dict:
 def _v2_chat_failures_detail(user_id: str) -> dict:
     """Why this user's V2 chat turns failed.
 
-    Complements ``provider_attempt_ledger``, which is V1-only
-    (``coverage: chat_turns_only`` is written by the runner, and the V2
-    package contains no ledger writes at all). Reading the two together is
-    the whole point: a V2 user's ledger goes silent at the moment of the
-    cutover, so silence there means "switched", not "no provider call".
+    Complements ``provider_attempt_ledger``. The ledger covers resident chat,
+    Runtime V2 provider calls, and hosted model-API setup/test probes; this view
+    adds the job-level terminal failure shape for V2 chat.
     """
     try:
         from model_api_runtime.v2 import jobs_store as _v2_jobs_store
