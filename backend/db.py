@@ -6927,6 +6927,29 @@ _TRACE_WRITE_STATS_HEALTH_STALE_SEC = 3 * TRACE_WRITE_STATS_HEARTBEAT_SEC
 # still shorter than the gaps between the report's own fixed test instants.
 _TRACE_WRITE_STATS_HEALTH_FUTURE_TOLERANCE_SEC = 86400.0
 
+# Losses that happen BEFORE an event reaches this process cannot land in any of
+# the three precision classes — they are not ``queue.Full`` and not a failed
+# flush, they simply never arrive.  The resident route is the known instance and
+# it is a real one, so the ruler states it next to the number instead of filing
+# it in a document: a caveat the reader has to go looking for is a caveat nobody
+# applies.  Add an entry here when a new pre-arrival loss channel is found.
+_TRACE_WRITE_STATS_COVERAGE_CAVEATS = (
+    {
+        "scope": "resident_route",
+        "effect": "measured volume is a lower bound",
+        "site": "tools/chat_resident_consumer.py::_post_debug_trace_event",
+        "why_invisible": (
+            "the resident consumer posts each trace event over HTTP with a 2s "
+            "timeout and swallows every exception, so a slow backend makes it "
+            "drop events that never reach this process at all"
+        ),
+        "implication": (
+            "capacity sized from this peak is not an upper bound for resident "
+            "users; the gap is unquantified, not zero"
+        ),
+    },
+)
+
 
 def upsert_trace_write_stats(
     rows: list[tuple], *, writer_health: tuple | None = None,
@@ -7122,6 +7145,7 @@ def trace_write_stats_measurement(
                 "stale" if stale else "healthy"
             ),
         })
+    caveats = [dict(entry) for entry in _TRACE_WRITE_STATS_COVERAGE_CAVEATS]
     measured_writer_ids = {str(row[0]) for row in measured_writer_rows}
     unregistered_writer_ids = sorted(measured_writer_ids - health_writer_ids)
     health_complete = (
@@ -7151,7 +7175,12 @@ def trace_write_stats_measurement(
             "writers": writer_health,
         },
         "capacity_basis": "daily_peak_not_average",
-        "peak": peak,
+        # The caveats ride along with ``peak`` as well as sitting at the top
+        # level.  ``peak`` is the single number capacity planning reads, and a
+        # limitation that lives one level away from the number it limits is one
+        # nobody applies.
+        "coverage_caveats": caveats,
+        "peak": None if peak is None else {**peak, "coverage_caveats": caveats},
         "daily": rendered_daily,
         "breakdown": breakdown,
         "crash_gap": (

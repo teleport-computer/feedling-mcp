@@ -3,15 +3,52 @@ from __future__ import annotations
 
 import queue
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db
 import debug_trace
 import conftest
+
+
+@pytest.fixture(autouse=True)
+def _start_each_case_from_an_empty_ruler_table():
+    """Best-effort cleanup for LOCAL whole-suite runs. CI gives this file its
+    own database instead — see the dedicated step in .github/workflows/ci.yml.
+
+    ``measurement_started_epoch`` is ``MIN(first_seen_at)`` over the WHOLE
+    table, with no window.  That is right in production ("when did the ruler
+    first record anything") and unusable in a shared test database: one row
+    another file left drags the floor back to real time, so a case that freezes
+    ``now`` in 2027 reads its elapsed window as ~4300 hours instead of 25 and
+    the seven-day gate assertion fails for a reason unrelated to the gate.
+
+    A global metric deserves a global assertion; what it needs is an exclusive
+    database, exactly as ``tests/test_admin_usage.py`` already documents for the
+    same reason.  So the real fix is the separate CI step, and this fixture only
+    removes rows that are already there.
+
+    ⚠️ It does NOT close the in-flight race codex2 reproduced: the flusher
+    releases ``_stats_lock`` before ``db.upsert_trace_write_stats``, so a write
+    already inside that call can still land after this delete.  This file never
+    starts that thread (``_ensure_worker_started`` is stubbed before the only
+    ``_enqueue``), so the window needs another file's thread plus a shared
+    process — which is precisely the arrangement the CI step removes.
+    """
+    def _purge() -> None:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM trace_write_stats")
+            conn.execute("DELETE FROM trace_write_stats_health")
+
+    _purge()
+    yield
+    _purge()
 
 
 def _reset_stats(monkeypatch, *, pid: int = 4242) -> None:
@@ -579,6 +616,66 @@ def test_reader_clock_behind_the_database_is_not_a_missing_registration(
         # Cleanup belongs in ``finally``: a failure that leaves health rows
         # behind cascades into every later fixed-``now`` case in this file and
         # buries the one assertion that actually broke.
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM trace_write_stats WHERE day=%s", (day,))
+        _delete_health(writer)
+
+
+def test_the_resident_lower_bound_rides_with_the_number_it_limits(backend_env):
+    """A pre-arrival loss channel must be stated where the number is read.
+
+    Events the resident consumer drops client-side never reach this process, so
+    they land in none of the three precision classes — the ruler cannot count
+    them and must not imply it did.  The caveat therefore sits BOTH at the top
+    level and inside ``peak``: ``peak`` is the one number capacity planning
+    reads, and a limitation that lives one level away from the number it limits
+    is one nobody applies.
+    """
+    zone = ZoneInfo("Asia/Shanghai")
+    now = datetime(2027, 6, 15, 12, tzinfo=zone).timestamp()
+    first_seen = now - 8 * 86400
+    day = "2027-06-15"
+    writer = "writer-caveat"
+    try:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM trace_write_stats WHERE day=%s", (day,))
+        _delete_health(writer)
+        db.upsert_trace_write_stats([(
+            day, writer, "agent", "caveat", "chat",
+            3, 300, 0, 0, 0, 0, first_seen,
+        )])
+        _insert_health(writer, started_at=first_seen, last_success_at=now)
+
+        report = db.trace_write_stats_measurement(days=7, now_epoch=now)
+
+        # Derived from the module, never re-typed here: a hand-copied expectation
+        # keeps passing after the thing it guards is emptied.
+        expected_scopes = sorted(
+            entry["scope"] for entry in db._TRACE_WRITE_STATS_COVERAGE_CAVEATS
+        )
+        assert expected_scopes, "the ruler must declare its known blind channels"
+        assert "resident_route" in expected_scopes
+
+        for where in (report, report["peak"]):
+            got = where.get("coverage_caveats")
+            assert got, "coverage caveats must ride with the number"
+            assert sorted(c["scope"] for c in got) == expected_scopes
+            for entry in got:
+                assert entry["why_invisible"]
+                assert entry["implication"]
+
+        # Mutating what the report handed back must not reach the constant.
+        # Clearing the list alone would NOT prove this — a shallow ``list(...)``
+        # survives that untouched — so reach into an entry, which is precisely
+        # what a shallow copy would still share.
+        report["coverage_caveats"][0]["why_invisible"] = "clobbered by a caller"
+        again = db.trace_write_stats_measurement(days=7, now_epoch=now)
+        assert sorted(c["scope"] for c in again["coverage_caveats"]) == expected_scopes
+        assert all(
+            entry["why_invisible"] != "clobbered by a caller"
+            for entry in again["coverage_caveats"]
+        )
+    finally:
         with db.get_pool().connection() as conn:
             conn.execute("DELETE FROM trace_write_stats WHERE day=%s", (day,))
         _delete_health(writer)

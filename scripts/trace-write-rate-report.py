@@ -22,6 +22,15 @@ def main() -> int:
     args = parser.parse_args()
     report = db.trace_write_stats_measurement(days=args.days)
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    # Repeated on stderr because whoever runs this for a capacity decision reads
+    # the peak, not the whole document.  The limitation has to arrive with the
+    # number or it does not arrive at all.
+    for caveat in report.get("coverage_caveats") or ():
+        print(
+            f"[lower-bound] {caveat['scope']}: {caveat['effect']} "
+            f"— {caveat['why_invisible']}",
+            file=sys.stderr,
+        )
     return 0 if report["measurement_ready"] else 2
 
 
