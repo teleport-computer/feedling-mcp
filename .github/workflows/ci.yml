@@ -448,6 +448,18 @@ jobs:
             tests/test_memory_garden_dreaming.py \
             -v
 
+      - name: Perception kernel unit tests
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m pytest \
+            tests/test_perception_kernel_catalog.py \
+            tests/test_perception_kernel_projection.py \
+            tests/test_perception_kernel_purity.py \
+            tests/test_perception_kernel_wake.py \
+            tests/test_perception_prompt_golden.py \
+            -v
+
       - name: Guard top-level pytest discovery coverage
         run: |
           export LC_ALL=C

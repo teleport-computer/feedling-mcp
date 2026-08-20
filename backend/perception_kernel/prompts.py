@@ -21,10 +21,13 @@
   - V2_PERCEPTION_PROTOCOL_POLICY  <- model_api_runtime/v2/context.py
     `_RUNTIME_PERCEPTION_PROTOCOL_POLICY`
   - PERCEPTION_TOOL_NOTES  <- backend/capabilities/tool_schema.py
-    DESCRIPTIONS 里四个 perception_* 工具描述中，专讲「这个返回值该怎么
-    解读」的那一句（例如 app 字段只是 15 分钟内的开合事件、
+    DESCRIPTIONS 里四个 perception_* 工具描述中的三个，专讲「这个返回值该
+    怎么解读」的那一句（例如 app 字段只是 15 分钟内的开合事件、
     apps=[] 和 disabled=true 的区别、baseline/delta 不要混为一谈）；
     其余讲「这个工具能读什么、怎么调用」的措辞留在 tool_schema.py。
+    第四个 perception_history 没有条目：它的描述里本来就没有一句
+    「这个返回值该怎么解读」——本身只讲调用方式/参数，没有解读分句可搬，
+    不是遗漏。
 
   - V1_GLANCE_HOWTO  <- tools/chat_resident_consumer.py
     `_native_reachout_perception_context` 里 real_signal_context 的说明句
@@ -60,8 +63,11 @@ V2_PERCEPTION_PROTOCOL_POLICY = (
 )
 
 # 出处：backend/capabilities/tool_schema.py DESCRIPTIONS 里四个
-# perception_* 工具描述中「怎么解读这份返回值」的那一句；每个工具描述其余
-# 讲调用方式/参数默认值的文案留在 tool_schema.py 原地拼接。
+# perception_* 工具描述中的三个（perception_snapshot/perception_recent_apps/
+# perception_trend）「怎么解读这份返回值」的那一句；每个工具描述其余讲调用
+# 方式/参数默认值的文案留在 tool_schema.py 原地拼接。第四个
+# perception_history 没有条目——它的描述本来就没有「怎么解读」这句可搬，
+# 不是漏搬。
 PERCEPTION_TOOL_NOTES: dict[str, str] = {
     "perception_snapshot": (
         "The app field is only the latest open/close event observed "

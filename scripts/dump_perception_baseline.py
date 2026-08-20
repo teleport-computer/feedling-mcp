@@ -9,11 +9,12 @@ origin/test checkout 里 import，与其余条目走同一条 provenance，不�
 "当前分支这个文件是否被改过"这类会漂移的前提。
 
 （2026-08-20 复核记录：曾有过"当前分支 tool_schema.py 未改动，working tree
-内容等于 origin/test 基线"的假设——实测不成立：分支落后 origin/test 126 个
-提交，其中两个改过 tool_schema.py 的其它工具描述（identity_dimensions_set/
+内容等于 origin/test 基线"的假设——实测不成立：当时分支落后 origin/test，
+其间有提交改过 tool_schema.py 的其它工具描述（identity_dimensions_set/
 history_search/MEMORY_ORGANIZE_TOOL/MCP_TOOL_SEARCH_TOOL），只是恰好都不在
-感知工具那四条里。为避免这条 provenance 假设以后失效，改为始终从 origin/test
-的 checkout 直接 import，不依赖当前分支的工作区文件。）
+感知工具那四条里。为避免这条 provenance 假设以后再失效，改为始终从
+origin/test 的 checkout 直接 import，不依赖当前分支的工作区文件——这份
+`prompt_baseline.json` 已按此方式核对过，与基线文本逐字节一致。）
 """
 from __future__ import annotations
 

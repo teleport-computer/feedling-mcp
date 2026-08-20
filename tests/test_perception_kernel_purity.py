@@ -2,6 +2,10 @@
 
 结构判据（AST 里有没有这个 import），不判语义、不判风格：误伤为零。
 照抄 tests/test_memory_garden_purity.py 的做法。
+
+★ 禁止名单不止 backend/ 下的顶层模块——tools/（例如
+  ``chat_resident_consumer``）也是 io 侧代码，内核同样不许 import。
+  两边各扫一遍顶层名字，合并成一个禁止集合。
 """
 from __future__ import annotations
 
@@ -10,15 +14,16 @@ import pathlib
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _BACKEND_ROOT = _REPO_ROOT / "backend"
+_TOOLS_ROOT = _REPO_ROOT / "tools"
 _KERNEL_ROOT = _BACKEND_ROOT / "perception_kernel"
 
 _ALLOWED_THIRD_PARTY: frozenset[str] = frozenset({"core"})
 _NOT_IO = {"perception_kernel", "memory_garden", "core"}
 
 
-def _backend_top_level_names() -> frozenset[str]:
+def _top_level_names(root: pathlib.Path) -> frozenset[str]:
     names: set[str] = set()
-    for entry in _BACKEND_ROOT.iterdir():
+    for entry in root.iterdir():
         if entry.name.startswith((".", "_")) or entry.name in _NOT_IO:
             continue
         if entry.is_dir() and (entry / "__init__.py").exists():
@@ -26,6 +31,10 @@ def _backend_top_level_names() -> frozenset[str]:
         elif entry.is_file() and entry.suffix == ".py":
             names.add(entry.stem)
     return frozenset(names - _ALLOWED_THIRD_PARTY)
+
+
+def _backend_top_level_names() -> frozenset[str]:
+    return _top_level_names(_BACKEND_ROOT) | _top_level_names(_TOOLS_ROOT)
 
 
 def _imported_roots(path: pathlib.Path) -> set[str]:
