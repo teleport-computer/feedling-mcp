@@ -612,13 +612,14 @@ jobs:
             tests/test_verify_enclave_domain.py \
             -v
 
-      - name: Run CI security tier 3 (59 files)
+      - name: Run CI security tier 3 (67 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
           python -m pytest \
             tests/test_account_recover.py \
             tests/test_account_reset_purges_all_tables.py \
+            tests/test_admin_plaintext_shadow.py \
             tests/test_admin_tee_replication.py \
             tests/test_agent_perception_route.py \
             tests/test_asgi_perception.py \
@@ -632,6 +633,7 @@ jobs:
             tests/test_chat_history_selfheal_blocked_by_nonempty_page.py \
             tests/test_content_export_world_book.py \
             tests/test_content_offloaded_bodies.py \
+            tests/test_database_topology_gate.py \
             tests/test_delete_user_cascades_all_tables.py \
             tests/test_frame_r2.py \
             tests/test_genesis_plaintext_routes.py \
@@ -641,6 +643,12 @@ jobs:
             tests/test_perception_recent_apps.py \
             tests/test_perception_recent_apps_flow.py \
             tests/test_perception_signal_state_v2.py \
+            tests/test_plaintext_shadow_change_capture.py \
+            tests/test_plaintext_shadow_config.py \
+            tests/test_plaintext_shadow_outbox.py \
+            tests/test_plaintext_shadow_scheduler.py \
+            tests/test_plaintext_shadow_schema.py \
+            tests/test_plaintext_shadow_target.py \
             tests/test_plaintext_job_exclusivity.py \
             tests/test_postgres_restore_wait.py \
             tests/test_screen_ws_revoked.py \
