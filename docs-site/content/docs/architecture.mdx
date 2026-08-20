@@ -208,9 +208,9 @@ schema contract together. In the promoted mode, application startup performs a
 read-only assertion against `alembic_tee_version`; it never applies the legacy
 RDS migration chain with the application role. Startup also requires the
 head-bound frozen-prepare marker and enabled Chat lifecycle triggers, so a
-schema-only or partial cutover fails closed. Shadow dual-write and its
-reconciliation scheduler are disabled in this mode, including when stale
-shadow variables remain present.
+schema-only or partial cutover fails closed. The legacy RDS-to-TEE shadow
+dual-write and its reconciliation scheduler are disabled in this mode,
+including when stale legacy shadow variables remain present.
 
 Managed release units pass the same schema selector to the API, in-CVM worker,
 and independent runner. Before a TEE-primary deployment mutates any confidential
@@ -230,6 +230,32 @@ lossless switch-back target only until the first write reaches the promoted
 database. After that boundary, rollback requires a stopped-write reverse
 reconciliation or restore; changing only the connection string would discard
 new and updated rows and could resurrect deleted state.
+
+### Decrypted plaintext shadow
+
+After TEE-primary promotion, the managed topology can optionally maintain an
+independent PostgreSQL projection for operational recovery and inspection. The
+TEE database remains the only application primary. Source triggers record
+content-free dirty keys, and a singleton scheduler in the main backend re-reads
+the authoritative rows, decrypts encrypted envelopes inside the managed
+confidential-VM boundary, and writes their plaintext projection to the shadow.
+This applies even to accounts whose content-encryption preference is explicitly
+`on`; the shadow is deliberately an all-plaintext recipient.
+
+The plaintext shadow is not queried by public APIs, hosted workers, or resident
+runners and is not a failover database. Those release units do not receive its
+credential. If it is unavailable, application traffic continues against the
+TEE primary while source-side dirty keys retry with bounded backoff; repeated
+failures quarantine a key for operator review instead of dropping it.
+
+Enabling this projection is a second, protected deployment gate after TEE
+promotion. It requires a distinct TLS PostgreSQL 17 endpoint, matching schema,
+least-privilege roles, a recent backup-and-restore drill, a complete backfill,
+an empty change queue, exact count/content verification, and no ciphertext
+envelope shapes in the target. The target, its WAL, snapshots, replicas, and
+backups are all plaintext recipients. Access to any of them defeats the
+at-rest confidentiality provided by the encrypted tier in the primary, so they
+need independent credentials, retention, audit, and incident-response policy.
 
 The staged worker refreshes after a successful dream write, after Runtime V2
 cutover, and best-effort after Chat when a profile is missing, eligible for

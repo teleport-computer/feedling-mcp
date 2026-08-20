@@ -237,6 +237,7 @@ certificate-chain 与 hostname 验证；不得改成 unverified context、`verif
 | WS ingest | `wss://9798850e096d770293c67305c6cfdceed68c1d28-9998.dstack-pha-prod9.phala.network/ingest` |
 | TLS model | `api.feedling.app` terminates at `dstack-ingress`; `/attestation` keeps its own dstack-KMS-derived TLS on `:5003` for iOS pinning. |
 | Database promotion wiring | The staged production workflow defaults `PROD_FEEDLING_DATABASE_SCHEMA` to `rds` and forwards the same selector to the backend, in-CVM `serve-worker`, and every independent runner. Selecting `tee` is fail-closed before any CVM mutation: CI requires the owner migration DSN and CA, proves the owner/app DSNs target the same database, requires the deployed `DATABASE_URL` role to be `app`, checks the exact `alembic_tee` head, and runs the Phase-4 startup contract. `PROD_TEE_DATABASE_URL` and `PROD_FEEDLING_TEE_DUAL_WRITE` must both be empty in primary mode. This row describes release wiring, not evidence that the live production database has already been promoted. |
+| Plaintext shadow Gate 2 | Source wiring supports `PROD_PLAINTEXT_SHADOW_DATABASE_URL` plus the literal `PROD_FEEDLING_PLAINTEXT_SHADOW_ENABLED` gate. This is separate from Gate 1 and is not evidence that the live target is enabled. When the gate is `1`, the protected `prod-plaintext-shadow-gate2` environment runs redacted `preflight` and strict `verify --require-green` against the already-running Gate-1 backend before deployment. The main backend alone receives the target DSN and owns the singleton drain; `serve-worker` and every independent runner force the gate to `0` and receive no target credential. The TEE database stays primary and the target is an all-plaintext projection, never a failover source. |
 | MCP pubkey pin | Retired in prod9 architecture: `mcp_tls_cert_pubkey_fingerprint_hex` is empty by design; content-layer envelopes sealed to `enclave_content_pk` are the privacy boundary. |
 | **Enclave content pk** | `2d642ec1f54719d8c6088e8cbaf394961cb804a533bd4d7366d48d1d543f5620` — **THE prod9 content-key baseline.** Verified against live `/attestation` 2026-07-03. Envelope `enclave_pk_fpr` = `sha256(pk)[:16]` = `50f9a01800d4a230de85507d25b86eb1`, a constant stamped on envelopes April→July → the enclave content key has **never changed**. ⚠️ Do NOT confuse with the retired prod5 value `f50c90f7…` (app `051a174f`) that still appears in the Phase A/B tables below — that is a different, dead CVM and is NOT this baseline. |
 | mr-kms | `692afc6d7a86a32cfc1ebd9cad1a576aab012bab46986ba609bc8d6407270572` (live `/attestation` 2026-07-03) |
@@ -790,6 +791,44 @@ and refuses to boot if the prepare was skipped or only partially completed.
 The complete encrypted/plaintext two-account release order, inventory queries,
 and test/prod promotion checklist are in
 `docs/CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md`.
+
+### TEE-primary to plaintext-shadow release gates
+
+This topology replaces the old meaning of “TEE shadow.” Gate 1 promotes the
+current TEE database to the authoritative `DATABASE_URL` and disables the
+legacy RDS-to-TEE replicator. Gate 2 points the new plaintext-shadow subsystem at
+a different PostgreSQL 17 database. It decrypts supported ciphertext-bearing
+rows before writing, including rows for users with explicit
+`content_encryption=on`; it never changes the source row or the user's effective
+write preference.
+
+Provision `PLAINTEXT_SHADOW_MIGRATION_DATABASE_URL` only for schema migration and
+operator commands, and `PLAINTEXT_SHADOW_DATABASE_URL` as a separate app role for
+the running main backend. Do not inject either credential into `serve-worker` or
+runner deployments. Before changing the Gate-2 variable to `1`, run from the
+exact release image:
+
+```bash
+cd backend
+python -m admin.plaintext_shadow preflight
+python -m admin.plaintext_shadow backfill
+python -m admin.plaintext_shadow drain
+python -m admin.plaintext_shadow verify --require-green
+```
+
+Preflight requires distinct source/target identities, TLS, PostgreSQL 17,
+matching `alembic_tee` heads, a writable target role, exact capture-trigger
+inventory, and fresh recorded restore evidence. Verification is green only with
+exact counts/content, no ciphertext-envelope shapes in the target, no pending or
+quarantined dirty keys, and healthy backup/restore and scheduler evidence. These
+commands emit only fixed slugs, fingerprints, and scalars; do not add shell
+tracing around DSNs or credentials.
+
+Target outage does not justify failing over application reads. Leave Gate 1
+serving, allow durable source-side retries, and repair or replace the target.
+Rotate the previously exposed bootstrap administrator password only after new
+least-privilege migration/app credentials and a restore drill succeed against
+the repaired endpoint.
 
 ### 磁盘 sizing 依据（实测 2026-07-13，prod RDS）
 
