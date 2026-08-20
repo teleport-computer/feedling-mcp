@@ -22,6 +22,7 @@ from proactive.tool_executor_v2 import (
     ToolRuntimeAdaptersV2,
     TOOL_TRACE_STREAM_V2,
     combined_runtime_adapters_v2,
+    default_tool_runtime_adapters_v2,
 )
 
 
@@ -137,6 +138,36 @@ def test_executor_runs_minimum_available_tools_with_injected_action_adapter():
     assert results[8].result["memories"][0]["id"] == "mem_1"
     assert results[9].result["memories"][0]["id"] == "mem_2"
     assert sent == [("u1", "hello", {"text": "hello"})]
+
+
+def test_default_memory_adapter_surfaces_database_failure_as_agent_tool_error(monkeypatch):
+    def fail_pool():
+        raise RuntimeError("memory database unavailable")
+
+    monkeypatch.setattr("proactive.tool_executor_v2.db.get_pool", fail_pool)
+
+    calls = (
+        ToolCallV2("memory.index", user_id="usr_memory_failure"),
+        ToolCallV2(
+            "memory.fetch",
+            user_id="usr_memory_failure",
+            args={"ids": ["mem_1"]},
+        ),
+    )
+    for call in calls:
+        result = ToolExecutorV2(
+            adapters=default_tool_runtime_adapters_v2(),
+        ).execute(call)
+        agent_result = result.as_dict()
+
+        assert agent_result["ok"] is False
+        assert agent_result["outcome"] == "error"
+        assert agent_result["result"] == {}
+        assert agent_result["error_code"] == "RuntimeError"
+        assert agent_result["error_message"] == "memory_load_failed"
+        assert agent_result["needs_background"] is False
+        assert agent_result["trace"]["outcome"] == "error"
+        assert "memories" not in agent_result["result"]
 
 
 def test_weather_and_health_tools_read_ios_snapshot_fields():

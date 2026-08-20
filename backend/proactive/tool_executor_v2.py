@@ -199,7 +199,10 @@ def default_tool_runtime_adapters_v2() -> ToolRuntimeAdaptersV2:
     def memory_load(user_id: str) -> Sequence[Mapping[str, Any]]:
         import db
 
-        return db.memory_load(user_id)
+        try:
+            return db.memory_load_strict(user_id)
+        except Exception as exc:
+            raise RuntimeError("memory_load_failed") from exc
 
     return ToolRuntimeAdaptersV2(
         perception_snapshot=perception_snapshot,
