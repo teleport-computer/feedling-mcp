@@ -17,12 +17,21 @@ def _empty_plan() -> preservation.PreservationPlan:
     )
 
 
-def _wire_connections(monkeypatch, *, same_source=False, owner_mismatch=False):
+def _wire_connections(
+    monkeypatch,
+    *,
+    same_source=False,
+    owner_mismatch=False,
+    include_owner=True,
+):
     source, app, owner = Mock(name="source"), Mock(name="app"), Mock(name="owner")
-    connections = iter((source, app, owner))
+    connections = iter((source, app, owner) if include_owner else (source, app))
     monkeypatch.setenv("DATABASE_URL", "postgresql://source")
     monkeypatch.setenv("TEE_DATABASE_URL", "postgresql://tee-app")
-    monkeypatch.setenv("TEE_MIGRATION_DATABASE_URL", "postgresql://tee-owner")
+    if include_owner:
+        monkeypatch.setenv("TEE_MIGRATION_DATABASE_URL", "postgresql://tee-owner")
+    else:
+        monkeypatch.delenv("TEE_MIGRATION_DATABASE_URL", raising=False)
     monkeypatch.setattr(
         cli.psycopg,
         "connect",
@@ -42,7 +51,7 @@ def _wire_connections(monkeypatch, *, same_source=False, owner_mismatch=False):
 
 
 def test_cli_defaults_to_read_only_dry_run(monkeypatch):
-    source, app, _owner = _wire_connections(monkeypatch)
+    source, app, _owner = _wire_connections(monkeypatch, include_owner=False)
     build_plan = Mock(return_value=_empty_plan())
     monkeypatch.setattr(preservation, "build_plan", build_plan)
 
@@ -142,18 +151,19 @@ def test_cli_rejects_database_fingerprint_mismatch(
         owner_mismatch=owner_mismatch,
     )
 
+    kwargs = dict(
+        apply=owner_mismatch,
+        revert=False,
+        confirm="PRESERVE-TERMINAL-CIPHERTEXT" if owner_mismatch else None,
+        expected_count=0 if owner_mismatch else None,
+        expected_plan_sha256="a" * 64 if owner_mismatch else None,
+    )
     with pytest.raises(RuntimeError, match=match):
-        cli.run(
-            apply=False,
-            revert=False,
-            confirm=None,
-            expected_count=None,
-            expected_plan_sha256=None,
-        )
+        cli.run(**kwargs)
 
 
 def test_cli_rejects_tee_schema_head_mismatch(monkeypatch):
-    _wire_connections(monkeypatch)
+    _wire_connections(monkeypatch, include_owner=False)
     monkeypatch.setattr(cli, "_actual_tee_heads", lambda _conn: {"old"})
 
     with pytest.raises(RuntimeError, match="schema is not at head"):
