@@ -79,7 +79,6 @@ tests/test_context_memories.py
 tests/test_copytext.py
 tests/test_data_track.py
 tests/test_dau_snapshot_scheduler.py
-tests/test_db_health_timeouts.py
 tests/test_debug_trace_atomic.py
 tests/test_debug_trace_event_route.py
 tests/test_deploy_canary.py

@@ -4319,6 +4319,9 @@
               }
             }
           },
+          "503": {
+            "description": "Memory storage or readside unavailable"
+          },
           "default": {
             "description": "Error response.",
             "content": {
@@ -8608,6 +8611,12 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "World Book entry not found"
+          },
+          "500": {
+            "description": "World Book storage failure"
           },
           "default": {
             "description": "Error response.",

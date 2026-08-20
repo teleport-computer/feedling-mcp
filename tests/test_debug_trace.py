@@ -23,6 +23,7 @@ def _reset(monkeypatch, store):
     # isolate DB blobs to an in-memory dict so the test never needs Postgres
     blobs: dict = {}
     monkeypatch.setattr(db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+    monkeypatch.setattr(db, "get_blob_strict", lambda uid, kind: blobs.get((uid, kind)))
     monkeypatch.setattr(db, "set_blob", lambda uid, kind, doc: blobs.__setitem__((uid, kind), doc))
 
     def append_events(uid, kind, new_events, *, cutoff_ts, max_events):
@@ -86,6 +87,25 @@ def test_records_when_flag_on_no_env_needed(monkeypatch):
     debug_trace.set_enabled(store, False)
     debug_trace.trace_event(store, subsystem="route", type="route.decided")
     assert len(debug_trace.read_trace(store)) == 2
+
+
+def test_set_enabled_never_caches_a_failed_or_unreadable_write(monkeypatch):
+    store = _Store("usr_trace_failure")
+    debug_trace._flag_cache.clear()
+
+    def fail_pool():
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(debug_trace.db, "get_pool", fail_pool)
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        debug_trace.set_enabled(store, True)
+    assert store.user_id not in debug_trace._flag_cache
+
+    monkeypatch.setattr(debug_trace.db, "set_blob", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(debug_trace.db, "get_blob_strict", lambda *_args, **_kwargs: None)
+    with pytest.raises(RuntimeError, match="debug_trace_flag_write_not_visible"):
+        debug_trace.set_enabled(store, True)
+    assert store.user_id not in debug_trace._flag_cache
 
 
 def test_detail_is_size_bounded_metadata(monkeypatch):
@@ -153,6 +173,7 @@ def _reset_verbose(monkeypatch):
     """In-memory blob store + force gate ON."""
     blobs = {}
     monkeypatch.setattr(debug_trace.db, "get_blob", lambda uid, k: blobs.get((uid, k)))
+    monkeypatch.setattr(debug_trace.db, "get_blob_strict", lambda uid, k: blobs.get((uid, k)))
     monkeypatch.setattr(debug_trace.db, "set_blob", lambda uid, k, v: blobs.__setitem__((uid, k), v))
 
     def append_events(uid, kind, new_events, *, cutoff_ts, max_events):

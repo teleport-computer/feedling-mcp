@@ -25,6 +25,7 @@ import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+import db  # noqa: E402
 from accounts import registry  # noqa: E402
 from asgi import middleware  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
@@ -113,9 +114,17 @@ def _flask_delete(path: str, headers: dict | None = None):
     return res.status_code, res.get_json(silent=True)
 
 
-def _asgi(method: str, path: str, *, headers=None, json_body=None):
+def _asgi(
+    method: str,
+    path: str,
+    *,
+    headers=None,
+    json_body=None,
+    raise_app_exceptions=True,
+):
     async def go():
-        transport = httpx.ASGITransport(app=_ASGI)
+        transport = httpx.ASGITransport(
+            app=_ASGI, raise_app_exceptions=raise_app_exceptions)
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
             kw: dict = {}
             if json_body is not None:
@@ -225,10 +234,51 @@ def test_delete_missing_id_400_parity(user):
 
 
 def test_delete_ok_parity(user):
-    _uid, api_key = user
+    uid, api_key = user
+    env = _env(uid, "wbX")
+
+    assert _flask_post(
+        "/v1/worldbook/upsert", headers=_headers(api_key), json_body=env
+    )[0] == 200
     f = _flask_delete("/v1/worldbook/delete?id=wbX", _headers(api_key))
+
+    assert _asgi(
+        "POST", "/v1/worldbook/upsert", headers=_headers(api_key), json_body=env
+    )[0] == 200
     a = _asgi("DELETE", "/v1/worldbook/delete?id=wbX", headers=_headers(api_key))
     assert f == a == (200, {"ok": True})
+
+
+def test_delete_missing_entry_is_404_parity(user):
+    _uid, api_key = user
+    f = _flask_delete("/v1/worldbook/delete?id=missing", _headers(api_key))
+    a = _asgi("DELETE", "/v1/worldbook/delete?id=missing", headers=_headers(api_key))
+    assert f == a == (404, {"error": "world book entry not found"})
+
+
+def test_delete_storage_failure_is_500_and_keeps_local_entry(user, monkeypatch):
+    uid, api_key = user
+    env = _env(uid, "wb-failure")
+    assert _asgi(
+        "POST", "/v1/worldbook/upsert", headers=_headers(api_key), json_body=env
+    )[0] == 200
+
+    def fail_pool():
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(db, "get_pool", fail_pool)
+    status, body = _asgi(
+        "DELETE",
+        "/v1/worldbook/delete?id=wb-failure",
+        headers=_headers(api_key),
+        raise_app_exceptions=False,
+    )
+
+    assert status == 500
+    assert body["error"] == "internal_error"
+    assert "ok" not in body
+    store = core_store.get_store(uid)
+    assert any(item.get("id") == "wb-failure" for item in store.world_books)
 
 
 # --------------------------------------------------------------------------- #

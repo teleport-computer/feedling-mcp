@@ -148,10 +148,14 @@ def is_enabled(store) -> bool:
 
 def set_enabled(store, enabled: bool) -> dict:
     uid = getattr(store, "user_id", "") or ""
+    if not uid:
+        raise ValueError("debug_trace_user_id_required")
     doc = {"enabled": bool(enabled), "updated_at": time.time()}
-    if uid:
-        db.set_blob(uid, DEBUG_TRACE_FLAG_BLOB, doc)
-        _flag_cache[uid] = (bool(enabled), time.time() + _FLAG_CACHE_TTL)
+    db.set_blob(uid, DEBUG_TRACE_FLAG_BLOB, doc)
+    persisted = db.get_blob_strict(uid, DEBUG_TRACE_FLAG_BLOB)
+    if not isinstance(persisted, dict) or persisted.get("enabled") is not bool(enabled):
+        raise RuntimeError("debug_trace_flag_write_not_visible")
+    _flag_cache[uid] = (bool(enabled), time.time() + _FLAG_CACHE_TTL)
     return doc
 
 

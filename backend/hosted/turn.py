@@ -49,7 +49,9 @@ def _state_pending_items(store: UserStore) -> list[dict]:
         if isinstance(item, dict) and float(item.get("expires_at") or 0) > now
     ]
     if clean != items:
-        db.set_blob(store.user_id, _STATE_PENDING_BLOB, {"items": clean})
+        # Expiry pruning is hygiene only; the returned in-memory view is already
+        # clean, so a persistence failure must not fail the current turn.
+        db.set_blob_best_effort(store.user_id, _STATE_PENDING_BLOB, {"items": clean})
     return clean
 
 

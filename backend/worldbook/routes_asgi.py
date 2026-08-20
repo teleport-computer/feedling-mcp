@@ -69,7 +69,13 @@ async def worldbook_match(request: Request, auth: AuthResult = Depends(require_a
     return JSONResponse(body, status_code=status)
 
 
-@router.delete("/v1/worldbook/delete")
+@router.delete(
+    "/v1/worldbook/delete",
+    responses={
+        404: {"description": "World Book entry not found"},
+        500: {"description": "World Book storage failure"},
+    },
+)
 async def worldbook_delete(request: Request, auth: AuthResult = Depends(require_auth)):
     body, status = await threadpool.run_db(
         worldbook_core.delete, auth.store, request.query_params.get("id"))

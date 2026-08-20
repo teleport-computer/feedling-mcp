@@ -6676,13 +6676,15 @@ def set_blob_if_unchanged(
 
 
 def set_blob(user_id: str, kind: str, doc) -> None:
+    """Persist a singleton blob or raise on primary-database failure.
+
+    Callers whose outward contract is genuinely best-effort must opt into
+    :func:`set_blob_best_effort` explicitly.  Keeping the default primitive
+    strict prevents a failed write from being followed by a success response.
+    """
     sql = ("INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
            "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc")
-    try:
-        set_blob_strict(user_id, kind, doc)
-    except Exception as e:
-        log.error("[db] set_blob(%s,%s) failed: %s", user_id, kind, e)
-        return
+    set_blob_strict(user_id, kind, doc)
     from tee_shadow import mirror
     # identity 归 tee_replicator 明文化管辖：RDS 里是 E2E 密文信封、TEE 里是
     # replicator 落的明文版本。这里若把密文信封原样镜像进 TEE user_blobs，就会
@@ -6704,6 +6706,26 @@ def set_blob(user_id: str, kind: str, doc) -> None:
         _mirror_proactive_settings_current(user_id)
     elif kind not in ("identity", "consumer_state"):
         mirror.execute(sql, (user_id, kind, Jsonb(doc)))
+
+
+def set_blob_best_effort(user_id: str, kind: str, doc) -> bool:
+    """Persist a blob when failure must not rewrite an already-true outcome.
+
+    Returns whether the primary write committed.  The explicit name and boolean
+    result make these exceptional call sites auditable; failures are still
+    visible to operators in the service log.
+    """
+    try:
+        set_blob(user_id, kind, doc)
+    except Exception as exc:  # noqa: BLE001 - this is the explicit fail-soft API
+        log.error(
+            "[db] set_blob_best_effort(%s,%s) failed: %s",
+            user_id,
+            kind,
+            exc,
+        )
+        return False
+    return True
 
 
 def _mirror_persisted_blob(user_id: str, kind: str, doc) -> None:
@@ -13844,23 +13866,29 @@ def memory_profile_source_stats(user_id: str) -> tuple[int, str]:
     return int(row[0] or 0), str(row[1] or "")
 
 
-def memory_load(user_id: str) -> list[dict]:
-    try:
-        context = _memory_mutation_context(user_id)
-        if context is not None:
-            rows = context[0].execute(
+def memory_load_strict(user_id: str) -> list[dict]:
+    """Load Memory Garden envelopes or propagate the database failure."""
+    context = _memory_mutation_context(user_id)
+    if context is not None:
+        rows = context[0].execute(
+            "SELECT doc FROM memory_moments WHERE user_id = %s "
+            "ORDER BY occurred_at, moment_id",
+            (user_id,),
+        ).fetchall()
+    else:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
                 "SELECT doc FROM memory_moments WHERE user_id = %s "
                 "ORDER BY occurred_at, moment_id",
                 (user_id,),
             ).fetchall()
-        else:
-            with get_pool().connection() as conn:
-                rows = conn.execute(
-                    "SELECT doc FROM memory_moments WHERE user_id = %s "
-                    "ORDER BY occurred_at, moment_id",
-                    (user_id,),
-                ).fetchall()
-        return [r[0] for r in rows]
+    return [r[0] for r in rows]
+
+
+def memory_load(user_id: str) -> list[dict]:
+    """Legacy fail-soft loader; user-visible reads use ``memory_load_strict``."""
+    try:
+        return memory_load_strict(user_id)
     except Exception as e:
         log.error("[db] memory_load(%s) failed: %s", user_id, e)
         return []
@@ -14075,14 +14103,11 @@ def world_book_upsert(user_id: str, entry_id: str, updated_at: str, doc: dict) -
     return True
 
 
-def world_book_delete(user_id: str, entry_id: str) -> bool:
+def world_book_delete_strict(user_id: str, entry_id: str) -> bool:
+    """Delete one World Book row, returning existence and propagating failure."""
     sql = "DELETE FROM world_book_entries WHERE user_id = %s AND entry_id = %s"
-    try:
-        with get_pool().connection() as conn:
-            cur = conn.execute(sql, (user_id, entry_id))
-    except Exception as e:
-        log.error("[db] world_book_delete(%s,%s) failed: %s", user_id, entry_id, e)
-        return False
+    with get_pool().connection() as conn:
+        cur = conn.execute(sql, (user_id, entry_id))
     from tee_shadow import mirror
     mirror.execute_many([
         (sql, (user_id, entry_id)),
@@ -14090,6 +14115,15 @@ def world_book_delete(user_id: str, entry_id: str) -> bool:
          "AND table_name = 'world_book_entries' AND item_id = %s", (user_id, entry_id)),
     ])
     return cur.rowcount > 0
+
+
+def world_book_delete(user_id: str, entry_id: str) -> bool:
+    """Legacy fail-soft World Book delete; strict callers use the named API."""
+    try:
+        return world_book_delete_strict(user_id, entry_id)
+    except Exception as exc:  # noqa: BLE001 - compatibility fail-soft wrapper
+        log.error("[db] world_book_delete(%s,%s) failed: %s", user_id, entry_id, exc)
+        return False
 
 
 def world_book_replace_all(user_id: str, entries: list[dict]) -> None:

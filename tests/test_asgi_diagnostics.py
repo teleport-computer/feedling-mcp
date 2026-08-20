@@ -28,6 +28,7 @@ from asgi import middleware  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
+import debug_trace  # noqa: E402
 from diagnostics import routes_asgi as diag_asgi  # noqa: E402
 from diagnostics import storage as diag_storage  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
@@ -107,9 +108,10 @@ def _flask_upload(api_key, content, meta=None):
     return res.status_code, res.get_json(silent=True)
 
 
-def _asgi(method, path, headers=None, **kw):
+def _asgi(method, path, headers=None, *, raise_app_exceptions=True, **kw):
     async def go():
-        transport = httpx.ASGITransport(app=_ASGI)
+        transport = httpx.ASGITransport(
+            app=_ASGI, raise_app_exceptions=raise_app_exceptions)
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
             resp = await client.request(method, path, headers=headers or {}, **kw)
             body = None
@@ -277,6 +279,28 @@ def test_trace_enable_parity(env):
     a = _asgi("POST", "/v1/debug/trace/enable", headers=_key(api_key), json={"enabled": True})
     assert f == a
     assert f == (200, {"enabled": True, "deploy_enabled": True})
+
+
+def test_trace_enable_write_failure_is_500_and_not_cached(env, monkeypatch):
+    uid, api_key = _register()
+    debug_trace._flag_cache.pop(uid, None)
+
+    def fail_pool():
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(debug_trace.db, "get_pool", fail_pool)
+    status, body = _asgi(
+        "POST",
+        "/v1/debug/trace/enable",
+        headers=_key(api_key),
+        raise_app_exceptions=False,
+        json={"enabled": True},
+    )
+
+    assert status == 500
+    assert body["error"] == "internal_error"
+    assert "enabled" not in body
+    assert uid not in debug_trace._flag_cache
 
 
 def test_trace_enable_empty_body_degrades_parity(env):
