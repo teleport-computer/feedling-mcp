@@ -730,6 +730,51 @@ def test_review_global_admission_cap_keeps_overflow_trajectory_only(monkeypatch)
     assert runners == [(admitted[0],)]
 
 
+def test_eager_recovery_releases_claimed_review_before_requeuing_runner():
+    uid = "u_trajectory_review_eager_recovery"
+    source_job_id, _job = _source_job(uid)
+    assert jobs_store.mark_failed(
+        source_job_id,
+        "turn_failed:timeouterror",
+        claimed_by="worker-source",
+    )
+
+    runner = jobs_store.claim_next_job("worker-review", lanes={"trajectory_review"})
+    assert runner is not None and runner["lane"] == "trajectory_review"
+    assert jobs_store.mark_running(runner["id"], claimed_by="worker-review")
+    claimed = jobs_store.claim_failure_review(
+        uid,
+        runner_job_id=runner["id"],
+        claimed_by="worker-review",
+    )
+    assert claimed is not None and claimed["status"] == "running"
+
+    recovered = jobs_store.recover_killed_job(
+        job_id=runner["id"],
+        claimed_by="worker-review",
+    )
+    assert recovered == {
+        "job_id": runner["id"],
+        "user_id": uid,
+        "lane": "trajectory_review",
+        "recovery": "requeued",
+    }
+
+    with db.get_pool().connection() as conn:
+        pending_review = conn.execute(
+            "SELECT source_job_id,status,claimed_by_job_id "
+            "FROM v2_trajectory_reviews WHERE source_job_id=%s AND user_id=%s "
+            "AND status='pending'",
+            (source_job_id, uid),
+        ).fetchone()
+        pending_runner = conn.execute(
+            "SELECT status,claimed_by FROM agent_jobs WHERE id=%s",
+            (runner["id"],),
+        ).fetchone()
+    assert pending_review == (source_job_id, "pending", None)
+    assert pending_runner == ("pending", None)
+
+
 def test_terminal_failure_queues_review_in_same_lifecycle_and_recovers_crash():
     uid = "u_trajectory_review_recovery"
     source_job_id, _job = _source_job(uid)

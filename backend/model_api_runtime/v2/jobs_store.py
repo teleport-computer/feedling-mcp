@@ -1960,6 +1960,9 @@ def recover_killed_job(
                     )
                     if cur.rowcount != 1:
                         return None
+                    recovered_reviews = _recover_review_runner_on_cursor(
+                        cur, int(job_id)
+                    )
                 result = {
                     "job_id": int(job_id),
                     "user_id": str(row["user_id"]),
