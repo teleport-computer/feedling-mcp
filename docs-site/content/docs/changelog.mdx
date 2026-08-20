@@ -10,6 +10,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Managed deployments reuse healthy persisted ingress certificates without
+  blocking public traffic on an unnecessary ACME renewal.** A recreated ingress
+  verifies that every stored certificate is valid for at least seven days and
+  matches its private key before restoring the image's ephemeral bootstrap
+  marker; missing, expiring, or mismatched material still takes the full
+  fail-closed issuance path. Production runner deployment also remains part of
+  the same release unit when an optional upstream authorization gate is skipped.
+
 - **Managed TEE database promotion can retain terminal historical ciphertext
   without changing account encryption preferences.** The migration copies the
   original raw envelope only after an exact count-and-digest approval, records a
