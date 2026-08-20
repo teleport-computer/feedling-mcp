@@ -421,6 +421,10 @@ if not _provisioned:
         "test_pytest_coverage_ratchet.py",
         # Phase A CI 执行证据量具：临时文件 + 子进程 pytest，不碰 DB/网络。
         "test_ci_execution_evidence.py",
+        # 感知 prompt 基线快照(2026-08-19, 感知内核提取 Task 0)。纯:比对
+        # V2 模块级常量字符串 + 调用 chat_resident_consumer 的一个纯函数,
+        # 不碰 DB/网络。自带 sys.path 引导(backend/ + tools/)。
+        "test_perception_prompt_golden.py",
     }
     collect_ignore = sorted(
         f
