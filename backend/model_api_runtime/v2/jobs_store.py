@@ -306,6 +306,99 @@ def _terminal_error_class(error: object, error_class: object = "") -> str:
     return "unknown"
 
 
+# Keep this list content-free and deliberately narrow: an unknown code stays
+# operational until somebody classifies it explicitly.  These are visible
+# outcomes but are not interchangeable with a provider/worker/runtime failure on
+# an operations dashboard.
+CONTROL_OUTCOME_CODES = frozenset({
+    "runtime_mode_changed",
+    "turns_halted",
+    "capture_disabled",
+    "dream_disabled",
+    "profile_disabled",
+    "maintenance_disabled",
+    "heartbeat_disabled",
+    "scheduled_disabled",
+    "manual_wake_disabled",
+})
+SILENT_BY_CHOICE_OUTCOME_CODE = "wake_failed:explicit_silence_suppressed"
+SAFETY_SUPPRESSION_CODES = frozenset({
+    SILENT_BY_CHOICE_OUTCOME_CODE,
+    "wake_failed:degenerate_reply_suppressed",
+    "wake_failed:protocol_fragment_suppressed",
+    "wake_failed:malformed_self_thinking_suppressed",
+})
+TIMEOUT_OUTCOME_CODES = frozenset({
+    "queue_timeout",
+    "lease_timeout",
+    "runtime_expired",
+})
+
+
+# Wired by the assembly layer, never imported here: jobs_store sits below
+# debug_trace and must not reach upward for it.  Left None in contexts that do
+# not wire it (tests, tools), where enqueue must still work.
+on_job_enqueued = None
+
+
+def _notify_job_enqueued(
+    user_id: str,
+    lane: str,
+    *,
+    reason: str,
+    trace_id: str,
+    result: tuple | None = None,
+) -> None:
+    """Fire the enqueue hook once the write is durable, for real inserts only.
+
+    ``coalesce_or_insert_on_cursor`` returns ``(job_id, coalesced)``.  A
+    coalesced call coalesces new input into an *existing* row and keeps that
+    row's original trace_id, so emitting here would (a) call something
+    "enqueued" that enqueued nothing and (b) publish this call's trace_id while
+    the terminal event later carries the row's older one -- breaking the very
+    id-equality join this pair exists to provide.
+
+    Deliberately skips ``chat``: already traced on its own send path, and by far
+    the highest-volume producer.
+
+    An enqueue must never fail because its trace failed, so everything is
+    swallowed -- this sits next to a database transaction and is the one new
+    call site that could otherwise take a write down with it.
+    """
+    if on_job_enqueued is None or lane == "chat":
+        return
+    if result is not None and len(result) > 1 and result[1]:
+        return  # coalesced into an existing job: not an enqueue
+    try:
+        on_job_enqueued(user_id, lane, reason=reason, trace_id=trace_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("[jobs_store] enqueue trace hook failed: %s", exc)
+
+
+def terminal_outcome_class(error_code: str) -> str:
+    """Map a terminal error code to the shared four-value outcome taxonomy.
+
+    This lived inside the operations-dashboard query as two local frozensets, so
+    the dashboard was the only thing that could tell a deliberate control
+    outcome from a real failure.  Trace rows carry the same taxonomy now, and if
+    the two derived it independently they could disagree about the very same
+    job -- one screen calling a suppression a failure while the other did not.
+    One function, both readers.
+
+    ``outcome_class`` has no success member: it is only meaningful when the
+    event being classified is itself a failure.  Callers must not stamp it on a
+    ``status="ok"`` event.
+    """
+    code = str(error_code or "")
+    if code in CONTROL_OUTCOME_CODES:
+        return "control"
+    if code in SAFETY_SUPPRESSION_CODES:
+        return "safety_suppression"
+    if code in TIMEOUT_OUTCOME_CODES:
+        return "timeout"
+    return "operational_failure"
+
+
 def _pool():
     return db.get_pool()
 
@@ -911,6 +1004,11 @@ def enqueue_job(
     if priority is None:
         priority = LANE_PRIORITY.get(lane, 0)
 
+    # The result is captured and returned *after* the transaction closes so the
+    # enqueue hook below cannot observe a write that later rolls back: a trace
+    # row claiming a job exists, for a job that does not, is worse than no row.
+    result = None
+    committed = False
     for _ in range(3):
         try:
             with _pool().connection() as conn:
@@ -931,7 +1029,7 @@ def enqueue_job(
                                 effective_generation = int(
                                     control["runtime_generation"]
                                 )
-                        return coalesce_or_insert_on_cursor(
+                        result = coalesce_or_insert_on_cursor(
                             cur,
                             user_id,
                             lane,
@@ -941,8 +1039,13 @@ def enqueue_job(
                             deadline_at=deadline_at,
                             expected_generation=effective_generation,
                         )
+            committed = True
+            break
         except psycopg.errors.UniqueViolation:
             continue  # 并发 racer 抢先建了 active job；重读并 coalesce
+    if committed:
+        _notify_job_enqueued(user_id, lane, reason=reason, trace_id=trace_id, result=result)
+        return result
     # A very busy terminal/enqueue race can exhaust the optimistic retries.
     # The fallback must still record that new input arrived; merely returning
     # the row id would let finalization miss the follow-up generation.
@@ -962,7 +1065,7 @@ def enqueue_job(
                         and str(control["hosted_runtime_state"]) == "v2"
                     ):
                         effective_generation = int(control["runtime_generation"])
-                return coalesce_or_insert_on_cursor(
+                result = coalesce_or_insert_on_cursor(
                     cur,
                     user_id,
                     lane,
@@ -972,6 +1075,8 @@ def enqueue_job(
                     deadline_at=deadline_at,
                     expected_generation=effective_generation,
                 )
+    _notify_job_enqueued(user_id, lane, reason=reason, trace_id=trace_id, result=result)
+    return result
 
 
 def enqueue_job_with_context_log(
@@ -1050,6 +1155,14 @@ def enqueue_job_with_context_log(
         raise RuntimeError("could not atomically enqueue job context")
 
     job_id, coalesced, seq, payload = inserted
+    # Fired here, before the mirror write: the authoritative job is already
+    # durable at this point, and a mirror failure must not be able to swallow
+    # the enqueue event for a job that really exists.  The hook is fail-open, so
+    # putting it first cannot harm the mirror either.
+    _notify_job_enqueued(
+        user_id, lane, reason=reason or "", trace_id=trace_id or "",
+        result=(job_id, coalesced),
+    )
     from tee_shadow import mirror
 
     mirror.execute(
@@ -4375,6 +4488,26 @@ def get_chat_mutation_recovery_barrier(
     }
 
 
+def get_terminal_snapshot(job_id, *, user_id: str) -> dict | None:
+    """Read the durable terminal state of one job.
+
+    Terminal attribution must come from the row, not from the claim snapshot
+    the worker is holding: ``mark_failed``/``reschedule`` write the database and
+    never write back into that dict, so a caller reading the snapshot gets an
+    empty code for a fresh job and the PREVIOUS attempt's error for a retried
+    one -- blaming this failure on the wrong cause.
+    """
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT status, last_error FROM agent_jobs "
+                "WHERE id=%s AND user_id=%s",
+                (job_id, str(user_id)),
+            )
+            row = cur.fetchone()
+    return dict(row) if row else None
+
+
 def get_job_status(
     job_id,
     *,
@@ -5786,23 +5919,8 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
     # interchangeable with a provider/worker/runtime failure on an operations
     # dashboard.  Keep this list content-free and deliberately narrow: an unknown
     # code stays operational until somebody classifies it explicitly.
-    control_outcome_codes = frozenset({
-        "runtime_mode_changed",
-        "turns_halted",
-        "capture_disabled",
-        "dream_disabled",
-        "profile_disabled",
-        "maintenance_disabled",
-        "heartbeat_disabled",
-        "scheduled_disabled",
-        "manual_wake_disabled",
-    })
-    safety_suppression_codes = frozenset({
-        "wake_failed:degenerate_reply_suppressed",
-        "wake_failed:protocol_fragment_suppressed",
-        "wake_failed:malformed_self_thinking_suppressed",
-    })
-
+    # Classification now lives at module level (``terminal_outcome_class``) so
+    # the trace layer and this dashboard cannot drift apart.
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -5904,14 +6022,7 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
     failures_by_lane: dict[str, list[dict]] = {}
     for row in failure_rows:
         code = str(row["last_error"] or "")
-        if code in control_outcome_codes:
-            outcome_class = "control"
-        elif code in safety_suppression_codes:
-            outcome_class = "safety_suppression"
-        elif code in {"queue_timeout", "lease_timeout", "runtime_expired"}:
-            outcome_class = "timeout"
-        else:
-            outcome_class = "operational_failure"
+        outcome_class = terminal_outcome_class(code)
         failures_by_lane.setdefault(str(row["lane"] or ""), []).append({
             "code": code,
             "error_class": str(row.get("error_class") or ""),

@@ -20,6 +20,7 @@ import provider_client  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
 from hosted import config_store as hosted_config_store  # noqa: E402
+from hosted import setup_core  # noqa: E402
 
 _ENV = {"v": 1, "body_ct": "ct", "nonce": "n"}
 
@@ -53,6 +54,192 @@ def fake_enclave(monkeypatch):
     monkeypatch.setattr(
         core_enclave, "_decrypt_envelope_via_enclave",
         lambda envelope, api_key, purpose="", **kw: b"sk-plain-key")
+
+
+def _capture_model_api_probe(monkeypatch):
+    traces = []
+    attempts = []
+    monkeypatch.setattr(
+        setup_core.debug_trace,
+        "trace_event",
+        lambda store, **event: traces.append(
+            {"user_id": store.user_id, **event}
+        ),
+    )
+    monkeypatch.setattr(
+        setup_core.provider_attempt_ledger,
+        "record_runtime_attempt",
+        lambda user_id, **attempt: attempts.append(
+            {"user_id": user_id, **attempt}
+        ) or True,
+    )
+    monkeypatch.setattr(setup_core, "_kick_setup_main_vision_test", lambda *a, **k: None)
+    return traces, attempts
+
+
+def test_probe_outcome_only_whitelists_the_internal_invalid_output_sentinel(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        provider_client,
+        "classify_provider_error",
+        lambda _exc: "auth_invalid",
+    )
+
+    assert setup_core._model_api_probe_error(
+        provider_client.ProviderError("invalid_output")
+    ) == ("invalid_output", "auth_invalid")
+    outcome, error_class = setup_core._model_api_probe_error(
+        provider_client.ProviderError("sk-live-deadbeef123")
+    )
+    assert (outcome, error_class) == ("auth_invalid", "auth_invalid")
+    assert "deadbeef" not in outcome
+
+
+def test_setup_provider_probe_records_paid_attempt_and_usage(
+        client, fake_envelope, fake_enclave, monkeypatch):
+    uid, headers = _register(client)
+    traces, attempts = _capture_model_api_probe(monkeypatch)
+    monkeypatch.setattr(
+        provider_client,
+        "test_provider_key",
+        lambda cfg: {
+            "raw_id": "req_setup_1",
+            "usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": 3,
+                "total_tokens": 14,
+            },
+        },
+    )
+
+    response = client.post(
+        "/v1/model_api/setup",
+        headers=headers,
+        json={
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-5",
+            "api_key": "sk-ant-xxx",
+        },
+    )
+
+    assert response.status_code == 200, response.get_data(as_text=True)
+    assert [event["type"] for event in traces] == [
+        "model_api.provider_probe.started",
+        "model_api.provider_probe.finished",
+    ]
+    assert traces[0]["trace_id"] == traces[1]["trace_id"]
+    assert traces[0]["trace_id"].startswith("model_api_probe:")
+    assert traces[1]["detail"] == {
+        "operation": "setup",
+        "phase": "finished",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "usage": {
+            "input_tokens": 11,
+            "output_tokens": 3,
+            "total_tokens": 14,
+        },
+    }
+    assert attempts == [{
+        "user_id": uid,
+        "parent_key": traces[0]["trace_id"],
+        "trigger": "model_api_probe",
+        "outcome": "ok",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "lane": "setup",
+        "runtime": "hosted_setup",
+        "input_tokens": 11,
+        "output_tokens": 3,
+        "total_tokens": 14,
+        "provider_request_id": "req_setup_1",
+    }]
+
+
+def test_setup_invalid_output_is_attributable_before_any_config_write(
+        client, fake_envelope, fake_enclave, monkeypatch):
+    uid, headers = _register(client)
+    traces, attempts = _capture_model_api_probe(monkeypatch)
+
+    def _invalid_output(_cfg):
+        raise provider_client.ProviderError("invalid_output")
+
+    monkeypatch.setattr(provider_client, "test_provider_key", _invalid_output)
+
+    response = client.post(
+        "/v1/model_api/setup",
+        headers=headers,
+        json={
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-5",
+            "api_key": "sk-ant-xxx",
+        },
+    )
+
+    assert response.status_code == 400, response.get_data(as_text=True)
+    assert response.get_json()["error"] == "provider_test_failed"
+    assert db.model_api_credentials_list(uid) == []
+    assert db.model_api_routes_list(uid) == []
+    assert [event["type"] for event in traces] == [
+        "model_api.provider_probe.started",
+        "model_api.provider_probe.finished",
+    ]
+    assert traces[1]["status"] == "error"
+    assert traces[1]["outcome_class"] == "operational_failure"
+    assert traces[1]["detail"]["error_class"] == "transient"
+    assert attempts[0]["parent_key"] == traces[0]["trace_id"]
+    assert attempts[0]["outcome"] == "invalid_output"
+    assert attempts[0]["lane"] == "setup"
+
+
+def test_manual_provider_probe_failure_records_same_trace_runtime_fence(
+        client, fake_envelope, fake_enclave, monkeypatch):
+    uid, headers = _register(client)
+    monkeypatch.setattr(
+        provider_client,
+        "test_provider_key",
+        lambda cfg: {"usage": {"total_tokens": 1}},
+    )
+    setup = client.post(
+        "/v1/model_api/setup",
+        headers=headers,
+        json={
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-5",
+            "api_key": "sk-ant-xxx",
+        },
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    traces, attempts = _capture_model_api_probe(monkeypatch)
+    fences = []
+
+    def _invalid_output(_cfg):
+        raise provider_client.ProviderError("invalid_output")
+
+    monkeypatch.setattr(provider_client, "test_provider_key", _invalid_output)
+    monkeypatch.setattr(
+        hosted_config_store,
+        "prepare_model_api_delete",
+        lambda store: fences.append(store.user_id),
+    )
+
+    response = client.post("/v1/model_api/test", headers=headers)
+
+    assert response.status_code == 400, response.get_data(as_text=True)
+    assert fences == [uid]
+    assert [event["type"] for event in traces] == [
+        "model_api.provider_probe.started",
+        "model_api.provider_probe.finished",
+        "model_api.provider_probe.runtime_fenced",
+    ]
+    assert len({event["trace_id"] for event in traces}) == 1
+    assert traces[-1]["status"] == "warning"
+    assert traces[-1]["outcome_class"] == "control"
+    assert attempts[0]["parent_key"] == traces[-1]["trace_id"]
+    assert attempts[0]["outcome"] == "invalid_output"
+    assert attempts[0]["lane"] == "test"
 
 
 def test_setup_is_idempotent_and_does_not_accumulate_routes(

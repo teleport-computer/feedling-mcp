@@ -165,3 +165,23 @@ _chat_core.publish_voice_reply = _voice_results.store_reply_for_parent
 # `mcp.surface.registered` trace. Wired (not imported) because diagnostics sits
 # below hosted — see diagnostics_core.on_mcp_surface_registered.
 _diagnostics_core.on_mcp_surface_registered = _hosted_mcp_status.record_from_registered_trace
+
+
+def _emit_job_enqueued_trace(user_id: str, lane: str, *, reason: str, trace_id: str) -> None:
+    """Enqueue half of the wake enqueue->terminal pair for jobs enqueued by the
+    web process (manual_wake and friends). Wired, not imported: jobs_store sits
+    below debug_trace. The worker process wires the same hook in
+    serve_worker.wire_assembly, so both producers are covered."""
+    from core import store as _wire_core_store
+
+    _diagnostics_core.emit_trace_event_payload(
+        _wire_core_store.get_store(user_id),
+        {"event": {
+            "subsystem": "agent", "type": "agent.job.enqueued", "status": "ok",
+            "actor": "hosted_v2", "trace_id": str(trace_id or ""),
+            "detail": {"lane": lane, "reason": reason, "enqueue_source": lane},
+        }},
+    )
+
+
+_v2_jobs_store.on_job_enqueued = _emit_job_enqueued_trace

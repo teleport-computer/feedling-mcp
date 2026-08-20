@@ -12,6 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from core import self_thinking  # noqa: E402
+from model_api_runtime.v2 import jobs_store  # noqa: E402
 from model_api_runtime.v2 import tool_loop  # noqa: E402
 from model_api_runtime.v2 import worker  # noqa: E402
 from model_api_runtime.v2 import language_follow  # noqa: E402
@@ -712,6 +713,48 @@ def test_empty_provider_response_has_dedicated_admin_timeline_label():
         "type": "provider.empty_response",
         "subsystem": "agent",
     }) == ("🕳️", "空回复诊断")
+
+
+def test_silent_reply_events_are_content_free_admin_readable_and_distinct():
+    from admin import data_track
+
+    # Public trace causes and durable agent_jobs.last_error codes are separate
+    # key spaces. The shared classifier accepts only the stable code, so adding
+    # this trace event cannot silently reclassify a bare panel error code.
+    assert jobs_store.terminal_outcome_class("suppressed") == "operational_failure"
+    assert (
+        jobs_store.terminal_outcome_class(
+            jobs_store.SILENT_BY_CHOICE_OUTCOME_CODE
+        )
+        == "safety_suppression"
+    )
+    choice = {
+        "type": "reply.silent_by_choice",
+        "subsystem": "agent",
+        "detail": {"lane": "heartbeat", "cause": "suppressed"},
+    }
+    empty = {
+        "type": "reply.silent_empty_response",
+        "subsystem": "agent",
+        "detail": {
+            "lane": "heartbeat",
+            "cause": "empty_response",
+            "stop_reason": "end_turn",
+            "has_visible_text": False,
+            "reasoning_present": True,
+            "tool_call_count": 0,
+            "completion_tokens": 1,
+        },
+    }
+
+    assert data_track._debug_event_public_json(choice)["detail"] == choice["detail"]
+    assert data_track._debug_event_public_json(empty)["detail"] == empty["detail"]
+    assert data_track._debug_friendly_step(choice) == (
+        "🤫", "主动静默 · 模型选择"
+    )
+    assert data_track._debug_friendly_step(empty) == (
+        "🕳️", "主动静默 · 空响应"
+    )
 
 
 def test_provider_roundtrip_trace_closed_enums_are_admin_readable():

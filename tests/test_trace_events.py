@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 import time as pytime
+import types
 import uuid
 from datetime import datetime, time, timedelta
 from pathlib import Path
@@ -136,6 +137,320 @@ def test_trace_outcome_vocabulary_matches_runtime_dashboard():
     assert debug_trace.TRACE_OUTCOME_CLASSES == data_track.RUNTIME_OUTCOME_CLASSES
     assert debug_trace.TRACE_OUTCOME_DEFAULT == data_track.RUNTIME_OUTCOME_DEFAULT
     assert debug_trace.TRACE_OUTCOME_DEFAULT in debug_trace.TRACE_OUTCOME_CLASSES
+
+
+@pytest.mark.parametrize("lane,outcome,expect_status,expect_class", [
+    ("heartbeat", "completed", "ok", None),
+    ("heartbeat", "failed", "error", "operational_failure"),
+    ("scheduled", "rescheduled", "warning", None),
+    ("manual_wake", "failed", "error", "control"),
+])
+def test_terminal_trace_reuses_the_job_trace_id(
+    lane, outcome, expect_status, expect_class, monkeypatch
+):
+    """Both halves must be joinable, not merely both present.
+
+    Two events that each exist but carry different ids satisfy "we emit at both
+    ends" while still answering nothing -- which is the failure this whole item
+    exists to remove.
+    """
+    import asyncio as _asyncio
+    from model_api_runtime.v2 import worker, jobs_store
+
+    captured = []
+
+    def _emit(user_id, event_type, **kwargs):
+        captured.append((user_id, event_type, kwargs))
+
+    # Attribution comes from the durable row, never the claim snapshot.
+    durable_error = "manual_wake_disabled" if expect_class == "control" else "boom"
+    # The durable vocabulary is the row's, not the body's: a rescheduled turn
+    # leaves the row pending, which is why the emitter checks it rather than
+    # trusting the returned outcome string.
+    durable_status = {"rescheduled": "pending"}.get(outcome, outcome)
+    monkeypatch.setattr(
+        jobs_store, "get_terminal_snapshot",
+        lambda job_id, *, user_id: {"status": durable_status, "last_error": durable_error},
+    )
+    job = {
+        "id": 4242, "user_id": "usr_term", "lane": lane,
+        "trace_id": "trace-abc-123",
+    }
+    deps = types.SimpleNamespace(emit_debug_trace=_emit)
+    _asyncio.run(worker._emit_job_terminal_trace(deps, job, outcome))
+
+    assert len(captured) == 1
+    user_id, event_type, kwargs = captured[0]
+    assert event_type == "agent.job.terminal"
+    assert kwargs["trace_id"] == job["trace_id"]      # the load-bearing one
+    assert kwargs["job_id"] == "4242"
+    assert kwargs["status"] == expect_status
+    assert kwargs["detail"]["lane"] == lane
+    if expect_class is None:
+        # outcome_class has no success member, so an ok/warning terminal must
+        # not claim a failure classification.
+        assert "outcome_class" not in kwargs
+    else:
+        assert kwargs["outcome_class"] == expect_class
+
+
+def test_drained_turn_does_not_emit_an_invented_failure(monkeypatch):
+    """A cancelled turn is drained, not failed.
+
+    An earlier version used `finally`, which also runs for CancelledError and
+    published outcome="failed" for a turn that never reached a terminal state --
+    manufacturing a failure that did not happen, in the exact table people would
+    later use to count failures.
+    """
+    import asyncio as _asyncio
+    from model_api_runtime.v2 import worker
+
+    captured = []
+    monkeypatch.setattr(
+        worker, "_emit_job_terminal_trace",
+        lambda deps, job, outcome: captured.append(outcome) or _noop(),
+    )
+
+    async def _noop():
+        return None
+
+    async def _cancelled(job, deps, *, enclave_sem=None):
+        raise _asyncio.CancelledError()
+
+    monkeypatch.setattr(worker, "_run_turn_body", _cancelled)
+    with pytest.raises(_asyncio.CancelledError):
+        _asyncio.run(worker._run_turn({"id": 1, "user_id": "u", "lane": "heartbeat"}, None))
+    assert captured == []
+
+
+@pytest.mark.parametrize("durable_status", ["running", "completed", "claimed"])
+def test_body_failure_without_a_terminal_row_emits_nothing(durable_status, monkeypatch):
+    """A body that stopped is not a job that is terminal.
+
+    On LostJobLease the winning lifecycle owns terminal visibility and the row
+    may already be completed; trajectory review also returns "failed" when
+    mark_running loses.  Emitting on the body's word alone would publish a
+    failure for a job that actually succeeded.
+    """
+    import asyncio as _asyncio
+    from model_api_runtime.v2 import worker, jobs_store
+
+    captured = []
+    monkeypatch.setattr(
+        jobs_store, "get_terminal_snapshot",
+        lambda job_id, *, user_id: {"status": durable_status, "last_error": ""},
+    )
+    deps = types.SimpleNamespace(
+        emit_debug_trace=lambda uid, et, **kw: captured.append(kw))
+    _asyncio.run(worker._emit_job_terminal_trace(
+        deps, {"id": 5, "user_id": "u", "lane": "heartbeat", "trace_id": "t"}, "failed"))
+    assert captured == []
+
+
+def test_enqueue_rollback_leaves_no_job_and_fires_no_hook(tee_primary, monkeypatch):
+    """The hook must sit outside the transaction.
+
+    A trace claiming a job exists, for a job that rolled back, is worse than no
+    trace at all -- so this drives a real INSERT and then fails the transaction.
+    """
+    from model_api_runtime.v2 import jobs_store
+
+    uid = _uid()
+    db.upsert_user({"user_id": uid, "created_at": datetime.now(_ZONE).isoformat()})
+    calls = []
+    real = jobs_store.coalesce_or_insert_on_cursor
+
+    def _insert_then_fail(cur, user_id, lane, **kwargs):
+        real(cur, user_id, lane, **kwargs)     # the row really is written...
+        raise RuntimeError("transaction dies after insert")
+
+    monkeypatch.setattr(jobs_store, "coalesce_or_insert_on_cursor", _insert_then_fail)
+    monkeypatch.setattr(jobs_store, "on_job_enqueued",
+                        lambda *a, **k: calls.append(a))
+    try:
+        with pytest.raises(RuntimeError):
+            jobs_store.enqueue_job(uid, "heartbeat", reason="tick", trace_id="t-roll")
+        assert calls == []                      # no event for a job that vanished
+        with db.get_pool().connection() as conn:
+            left = conn.execute(
+                "SELECT count(*) FROM agent_jobs WHERE user_id=%s", (uid,)
+            ).fetchone()[0]
+        assert left == 0                        # ...and the insert really rolled back
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM agent_jobs WHERE user_id=%s", (uid,))
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
+def test_coalesced_enqueue_is_not_reported_as_an_enqueue():
+    """Coalescing folds input into an existing row and keeps that row's
+    trace_id, so emitting here would both name a non-event and publish an id the
+    terminal event will never carry -- breaking the join it exists to provide."""
+    from model_api_runtime.v2 import jobs_store
+
+    calls = []
+    original = jobs_store.on_job_enqueued
+    jobs_store.on_job_enqueued = lambda uid, lane, **kw: calls.append(kw)
+    try:
+        jobs_store._notify_job_enqueued(
+            "u", "scheduled", reason="r", trace_id="new-id", result=(7, True))
+        assert calls == []                      # coalesced: nothing was enqueued
+        jobs_store._notify_job_enqueued(
+            "u", "scheduled", reason="r", trace_id="new-id", result=(8, False))
+        assert calls == [{"reason": "r", "trace_id": "new-id"}]
+    finally:
+        jobs_store.on_job_enqueued = original
+
+
+def test_terminal_attribution_reads_the_durable_row_not_the_claim_snapshot(monkeypatch):
+    """mark_failed writes the row, never the worker's dict.
+
+    Trusting the snapshot gives a fresh job an empty code and a retried job the
+    PREVIOUS attempt's error -- a wrong attribution, which is worse than none.
+    """
+    import asyncio as _asyncio
+    from model_api_runtime.v2 import worker, jobs_store
+
+    captured = []
+    monkeypatch.setattr(
+        jobs_store, "get_terminal_snapshot",
+        lambda job_id, *, user_id: {"status": "failed", "last_error": "turns_halted"},
+    )
+    deps = types.SimpleNamespace(
+        emit_debug_trace=lambda uid, et, **kw: captured.append(kw))
+    stale = {"id": 9, "user_id": "u", "lane": "heartbeat", "trace_id": "t",
+             "last_error": "previous_attempt_boom"}
+    _asyncio.run(worker._emit_job_terminal_trace(deps, stale, "failed"))
+
+    assert captured[0]["detail"]["error_code"] == "turns_halted"
+    assert captured[0]["outcome_class"] == "control"   # not operational_failure
+
+
+def test_terminal_trace_skips_chat_and_survives_a_broken_sink():
+    import asyncio as _asyncio
+    from model_api_runtime.v2 import worker
+
+    seen = []
+    deps = types.SimpleNamespace(emit_debug_trace=lambda *a, **k: seen.append(a))
+    _asyncio.run(worker._emit_job_terminal_trace(
+        deps, {"id": 1, "user_id": "u", "lane": "chat", "trace_id": "t"}, "failed"))
+    assert seen == []  # chat is traced on its own send path
+
+    def _boom(*a, **k):
+        raise RuntimeError("sink down")
+
+    # A turn must not fail because its observability failed.
+    _asyncio.run(worker._emit_job_terminal_trace(
+        types.SimpleNamespace(emit_debug_trace=_boom),
+        {"id": 2, "user_id": "u", "lane": "heartbeat", "trace_id": "t"}, "failed"))
+
+
+def test_enqueue_hook_fires_after_commit_and_skips_chat():
+    """A trace claiming a job exists, for a job that rolled back, is worse than
+    no trace -- so the hook must sit outside the transaction."""
+    from model_api_runtime.v2 import jobs_store
+
+    calls = []
+    original = jobs_store.on_job_enqueued
+    jobs_store.on_job_enqueued = lambda uid, lane, **kw: calls.append((uid, lane, kw))
+    try:
+        jobs_store._notify_job_enqueued("u1", "chat", reason="r", trace_id="t")
+        assert calls == []  # highest-volume lane, already traced elsewhere
+        jobs_store._notify_job_enqueued("u1", "heartbeat", reason="tick", trace_id="t9")
+        assert calls == [("u1", "heartbeat", {"reason": "tick", "trace_id": "t9"})]
+
+        def _boom(*a, **k):
+            raise RuntimeError("hook down")
+
+        jobs_store.on_job_enqueued = _boom
+        jobs_store._notify_job_enqueued("u1", "heartbeat", reason="r", trace_id="t")
+    finally:
+        jobs_store.on_job_enqueued = original
+
+
+def test_outcome_classifier_is_shared_with_the_ops_dashboard():
+    """The dashboard and the trace layer must not classify the same job apart.
+
+    Classification used to live only inside the dashboard query, so nothing
+    stopped a second reader from deriving its own answer and calling a
+    deliberate suppression a real failure on one screen but not the other.
+    """
+    from model_api_runtime.v2 import jobs_store
+
+    for code in jobs_store.CONTROL_OUTCOME_CODES:
+        assert jobs_store.terminal_outcome_class(code) == "control"
+    for code in jobs_store.SAFETY_SUPPRESSION_CODES:
+        assert jobs_store.terminal_outcome_class(code) == "safety_suppression"
+    for code in jobs_store.TIMEOUT_OUTCOME_CODES:
+        assert jobs_store.terminal_outcome_class(code) == "timeout"
+    # An unclassified code stays operational rather than being guessed into a
+    # bucket that would quietly excuse it from the failure rate.
+    assert jobs_store.terminal_outcome_class("something_new") == "operational_failure"
+    assert jobs_store.terminal_outcome_class("") == "operational_failure"
+    # Whatever it returns must be a member of the one shared vocabulary.
+    every_code = (
+        jobs_store.CONTROL_OUTCOME_CODES
+        | jobs_store.SAFETY_SUPPRESSION_CODES
+        | jobs_store.TIMEOUT_OUTCOME_CODES
+        | {"anything_else"}
+    )
+    assert {jobs_store.terminal_outcome_class(c) for c in every_code} <= debug_trace.TRACE_OUTCOME_CLASSES
+
+
+def test_detail_list_caps_cannot_drift_past_the_silent_ceiling():
+    """A caller cap above the ceiling makes its own truncated flag lie."""
+    from model_api_runtime.v2 import serve_worker
+
+    assert serve_worker._MCP_CATALOG_MAX_TOOLS <= debug_trace._DETAIL_MAX_LIST
+
+    names = [f"tool_{i}" for i in range(debug_trace._DETAIL_MAX_LIST + 14)]
+    bounded = debug_trace.bounded_names("collapsed_names", names)
+    # Survives _safe_detail without losing anything it did not admit to losing.
+    safe = debug_trace._safe_detail(bounded)
+    assert safe["collapsed_names"] == bounded["collapsed_names"]
+    assert safe["collapsed_names_truncated"] is True
+    assert safe["collapsed_names_total"] == len(names)
+    # A caller asking for more than the ceiling is clamped, not silently obeyed.
+    assert len(debug_trace.bounded_names("k", names, cap=999)["k"]) <= debug_trace._DETAIL_MAX_LIST
+
+
+def test_emit_payload_forwards_job_id_and_outcome_class(tee_primary, monkeypatch):
+    """Both columns existed and were written, but nobody forwarded them.
+
+    A green suite proved only that nothing regressed; it could not tell us the
+    taxonomy was never populated.  This pins the forwarding itself, so removing
+    it goes red instead of silently returning every row to the default.
+    """
+    from diagnostics import diagnostics_core
+
+    class _Store:
+        def __init__(self, uid): self.user_id = uid
+
+    uid = _uid()
+    db.upsert_user({"user_id": uid, "created_at": datetime.now(_ZONE).isoformat()})
+    store = _Store(uid)
+    try:
+        debug_trace.set_enabled(store, True)
+        diagnostics_core.emit_trace_event_payload(store, {"event": {
+            "subsystem": "agent", "type": "agent.job.terminal", "status": "error",
+            "job_id": "job-4491", "outcome_class": "safety_suppression",
+        }})
+        # An unknown class must degrade to the default rather than reach the
+        # column, because this path also accepts untrusted resident payloads.
+        diagnostics_core.emit_trace_event_payload(store, {"event": {
+            "subsystem": "agent", "type": "agent.job.terminal", "status": "error",
+            "job_id": "job-4492", "outcome_class": "not-a-real-class",
+        }})
+        # read_trace flushes the pending queue for this user before reading.
+        debug_trace.read_trace(store)
+
+        rows = {r["job_id"]: r for r in db.query_trace_events(user_id=uid)}
+        assert rows["job-4491"]["outcome_class"] == "safety_suppression"
+        assert rows["job-4492"]["outcome_class"] == debug_trace.TRACE_OUTCOME_DEFAULT
+    finally:
+        db.delete_trace_events_for_user(uid)
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
 
 
 def test_trace_survives_account_delete_and_remains_queryable_by_uid(tee_primary):

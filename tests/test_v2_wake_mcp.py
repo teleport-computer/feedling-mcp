@@ -463,7 +463,9 @@ def test_wake_tool_search_injects_full_mcp_schema_before_dispatch(monkeypatch):
     uid = "u_wake_folded_mcp"
     conftest.seed_user(uid)
     _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    job_id, _ = jobs_store.enqueue_job(
+        uid, "heartbeat", trace_id="trace-schema-wake"
+    )
     claimed_by = _claim(job_id)
     _spy_reply(monkeypatch)
 
@@ -489,9 +491,15 @@ def test_wake_tool_search_injects_full_mcp_schema_before_dispatch(monkeypatch):
         {"reply": "逛完了", "tool_calls": [], "usage": {}},
     ])
     deps = _wake_deps(tail=_TAIL, load_mcp_turn=_make_load_turn_mcp(turn))
+    schema_events = []
+    deps.emit_schema_surface_trace = (
+        lambda user_id, event_type, **kwargs:
+        schema_events.append((user_id, event_type, kwargs))
+    )
 
     status = asyncio.run(worker._run_wake(
         job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(2), claimed_by,
+        trace_id="trace-schema-wake",
     ))
 
     assert status == "completed"
@@ -500,6 +508,15 @@ def test_wake_tool_search_injects_full_mcp_schema_before_dispatch(monkeypatch):
     assert first[_MCP_SPEC.name].parameters["properties"] == {}
     assert second[_MCP_SPEC.name] == _MCP_SPEC
     assert dispatched == [(_MCP_SPEC.name, {"where": "市集"})]
+    assert [event[1] for event in schema_events] == [
+        "mcp.surface.schema_folded",
+        "mcp.surface.schema_recovered",
+    ]
+    assert {event[2]["lane"] for event in schema_events} == {"heartbeat"}
+    assert {event[2]["trace_id"] for event in schema_events} == {
+        "trace-schema-wake"
+    }
+    assert {event[2]["job_id"] for event in schema_events} == {str(job_id)}
 
 
 def test_wake_refuses_unresolved_mcp_call_before_remote_request(monkeypatch):

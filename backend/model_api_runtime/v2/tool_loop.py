@@ -1656,6 +1656,33 @@ async def run_tool_loop(
         pr = ProviderResponse.from_result(result)
 
         if (
+            not require_reply
+            and not pr.text.strip()
+            and not pr.tool_calls
+            and not pr.media
+        ):
+            # A weak wake deliberately accepts a provider success with no
+            # semantic output.  Record that fact before the ordinary final
+            # reply callback no-ops on empty text; otherwise it is
+            # indistinguishable from an explicit stay_silent tool choice.
+            await _trajectory(
+                "empty_provider_response",
+                {
+                    "round": attempts,
+                    "reason": "empty_provider_success",
+                    "response_shape": _empty_response_shape(pr),
+                    "action": "accept_silent_empty",
+                },
+            )
+            if on_empty_provider_response is not None:
+                try:
+                    await on_empty_provider_response(_empty_response_shape(pr))
+                except Exception:
+                    # Diagnostics are best-effort and cannot change the weak
+                    # wake's established require_reply=False success policy.
+                    pass
+
+        if (
             final_reply_correction_request is not None
             and (not pr.text.strip() or upstream_response_envelope)
             and not pr.tool_calls

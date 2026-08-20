@@ -181,8 +181,16 @@ def emit_trace_event_payload(store, payload):
         content_excerpt=ev.get("content_excerpt") if isinstance(ev.get("content_excerpt"), dict) else None,
         actor=str(ev.get("actor") or "vps_resident"),
         status=str(ev.get("status") or "ok"),
+        # Both columns exist and insert_trace_events_strict writes them, but
+        # nothing forwarded them here -- so every event arriving on this path
+        # landed with job_id NULL and outcome_class at its default, which made
+        # the taxonomy inert rather than wrong.  Untrusted resident payloads are
+        # safe: trace_event and insert_trace_events_strict each normalise an
+        # unknown class back to the default.
+        outcome_class=str(ev.get("outcome_class") or db.TRACE_OUTCOME_DEFAULT),
         trace_id=str(ev.get("trace_id") or ""),
         turn_id=str(ev.get("turn_id") or ""),
+        job_id=str(ev.get("job_id") or ""),
         dur_ms=dur,
     )
     if (str(ev.get("type") or "") == _MCP_REGISTERED_EVENT
