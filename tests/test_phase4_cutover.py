@@ -19,6 +19,7 @@ def test_phase4_prepare_copies_frame_bridge_and_aligns_sequences(monkeypatch):
     import db
     from admin import phase4_cutover
     from alembic_tee import upgrade_head
+    from tee_replicator import terminal_preservation as preservation
 
     admin_url = os.environ.get(
         "FEEDLING_TEST_PG",
@@ -60,6 +61,33 @@ def test_phase4_prepare_copies_frame_bridge_and_aligns_sequences(monkeypatch):
                 "VALUES (%s, 'chat-1', 1, %s, 7)",
                 (uid, Jsonb({"id": "chat-1", "body_ct": "ciphertext"})),
             )
+            source.execute(
+                "INSERT INTO chat_messages (user_id,msg_id,ts,doc) "
+                "VALUES (%s,'preserved-chat',2,%s)",
+                (uid, Jsonb({"id": "preserved-chat", "body_ct": "raw-chat"})),
+            )
+            source.execute(
+                "INSERT INTO frame_envelopes "
+                "(user_id,frame_id,ts,doc,env_meta,body_key) "
+                "VALUES (%s,'preserved-frame',2,%s,%s,'raw/body-key')",
+                (
+                    uid,
+                    Jsonb({"id": "preserved-frame", "body_ct": "raw-frame"}),
+                    Jsonb({"ciphertext": True}),
+                ),
+            )
+            preserved_chat = tuple(
+                source.execute(
+                    preservation.CONTRACTS["chat_messages"].source_fetch_sql,
+                    (uid, "preserved-chat"),
+                ).fetchone()
+            )
+            preserved_frame = tuple(
+                source.execute(
+                    preservation.CONTRACTS["frame_envelopes"].source_fetch_sql,
+                    (uid, "preserved-frame"),
+                ).fetchone()
+            )
             job_id = source.execute(
                 "INSERT INTO agent_jobs (user_id, lane, status) "
                 "VALUES (%s, 'chat', 'completed') RETURNING id",
@@ -96,12 +124,51 @@ def test_phase4_prepare_copies_frame_bridge_and_aligns_sequences(monkeypatch):
                 "VALUES (%s, 'chat-1', 1, %s)",
                 (uid, Jsonb({"id": "chat-1", "body": "plaintext"})),
             )
+            destination.execute(
+                preservation.CONTRACTS["chat_messages"].insert_sql,
+                preservation.CONTRACTS["chat_messages"].insert_args(preserved_chat),
+            )
+            destination.execute(
+                preservation.CONTRACTS["frame_envelopes"].insert_sql,
+                preservation.CONTRACTS["frame_envelopes"].insert_args(preserved_frame),
+            )
+            destination.execute(
+                "INSERT INTO tee_pending_device_migration "
+                "(user_id,table_name,item_id,reason) VALUES "
+                "(%s,'chat_messages','preserved-chat',%s),"
+                "(%s,'frame_envelopes','preserved-frame',%s)",
+                (
+                    uid,
+                    preservation.encode_preserved_reason(
+                        preservation.canonical_row_sha256(
+                            "chat_messages", preserved_chat
+                        ),
+                        "decrypt_failed:historical",
+                    ),
+                    uid,
+                    preservation.encode_preserved_reason(
+                        preservation.canonical_row_sha256(
+                            "frame_envelopes", preserved_frame
+                        ),
+                        "pdm:no_k_enclave",
+                    ),
+                ),
+            )
 
         report = phase4_cutover.run(apply=True, writes_frozen=True)
         assert report["ok"] is True
         assert not any(report["drain"].values())
-        assert report["frame_bridge"]["rows"] == 1
-        assert report["chat_storage_generations"]["rows"] == 1
+        assert report["tee_pending_device_migration_blocking"] == 0
+        assert report["tee_terminal_ciphertext_preserved"] == 2
+        assert report["preserved_plan_sha256"]
+        assert report["frame_bridge"]["rows"] == 2
+        assert report["chat_storage_generations"]["rows"] == 2
+        assert report["primary_contract"]["marker"][
+            "tee_terminal_ciphertext_preserved"
+        ] == 2
+        assert report["primary_contract"]["marker"][
+            "preserved_plan_sha256"
+        ] == report["preserved_plan_sha256"]
         assert set(report["primary_contract"]["enabled_triggers"]) == {
             "chat_messages_retire_r2_body",
             "chat_message_archive_retire_r2_body",
@@ -126,6 +193,10 @@ def test_phase4_prepare_copies_frame_bridge_and_aligns_sequences(monkeypatch):
                 "WHERE user_id=%s AND msg_id='chat-1'",
                 (uid,),
             ).fetchone()[0] == 7
+            assert destination.execute(
+                "SELECT count(*) FROM tee_pending_device_migration "
+                "WHERE reason LIKE 'preserved_ciphertext:v1:%'"
+            ).fetchone()[0] == 2
             next_seq = destination.execute(
                 "INSERT INTO user_logs (user_id, stream, doc) "
                 "VALUES (%s, 'test', '{}'::jsonb) RETURNING seq",
@@ -148,3 +219,45 @@ def test_phase4_prepare_copies_frame_bridge_and_aligns_sequences(monkeypatch):
                         sql.Identifier(database)
                     )
                 )
+
+
+def test_phase4_pending_gate_blocks_every_unaudited_reason(backend_env):
+    import db
+    from admin import phase4_cutover
+    from tee_replicator import terminal_preservation as preservation
+
+    uid = f"usr_phase4_gate_{uuid.uuid4().hex[:12]}"
+    with psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as tee:
+        tee.execute("DELETE FROM tee_pending_device_migration")
+        tee.execute(
+            "INSERT INTO users (user_id,created_at,doc) VALUES (%s,'',%s)",
+            (uid, Jsonb({"user_id": uid})),
+        )
+        tee.execute(
+            "INSERT INTO tee_pending_device_migration "
+            "(user_id,table_name,item_id,reason) VALUES "
+            "(%s,'chat_messages','terminal','pdm:no_k_enclave'),"
+            "(%s,'chat_messages','requeue','requeue:source_updated'),"
+            "(%s,'chat_messages','malformed','preserved_ciphertext:v1:bad'),"
+            "(%s,'chat_messages','missing-source',%s)",
+            (
+                uid,
+                uid,
+                uid,
+                uid,
+                preservation.encode_preserved_reason(
+                    "a" * 64, "decrypt_failed:historical"
+                ),
+            ),
+        )
+        with db.get_pool().connection() as source:
+            gate = phase4_cutover._pending_gate(source, tee)
+
+        assert gate["tee_pending_device_migration_blocking"] == 4
+        assert gate["tee_terminal_ciphertext_preserved"] == 0
+        assert gate["preserved_mismatches"] == [
+            "missing_source:chat_messages:1"
+        ]
+
+        tee.execute("DELETE FROM tee_pending_device_migration")
+        tee.execute("DELETE FROM users WHERE user_id=%s", (uid,))

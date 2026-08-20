@@ -35,11 +35,12 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+from dataclasses import dataclass
 from typing import Callable
 
 import db
 import object_storage
-from tee_replicator import transforms
+from tee_replicator import terminal_preservation, transforms
 from tee_replicator import worker as _worker
 from tee_shadow import mirror, reconciler
 from tee_shadow import table_registry as reg
@@ -238,10 +239,17 @@ def _pending_rows(cfg: dict) -> list[tuple[str, str, str]]:
             "WHERE table_name = %s", (cfg["pending_table"],)).fetchall()
 
 
+@dataclass(frozen=True)
+class PendingSplit:
+    terminal: list[tuple[str, str]]
+    preserved: list[terminal_preservation.PreservedPending]
+    requeue_backlog: int
+
+
 def _split_pending(
     pending_rows: list[tuple[str, str, str]],
-) -> tuple[list[tuple[str, str]], int]:
-    """Split a table's pending rows into (terminal rows, requeue backlog count).
+) -> PendingSplit:
+    """Split pending rows into terminal, valid preserved, and requeue groups.
 
     Only TERMINAL reasons (``NOT LIKE 'requeue%'`` — ``visibility_local_only``,
     or a PendingDeviceMigration-derived ``pdm:...`` reason, see
@@ -270,15 +278,40 @@ def _split_pending(
     --table <t>` to drain the requeue lane (backlog should read 0) before
     treating a subsequent `verify` run's `ok` as a hard gate — see
     deploy/DEPLOYMENTS.md's TEE Postgres Phase 1 acceptance note.
+
+    Valid preservation markers receive a complete raw source/destination audit
+    in ``run`` and are excluded from both terminal compensation and sampling.
+    Malformed preservation-like reasons remain terminal and are also surfaced
+    as preservation mismatches, so they cannot look like an audited waiver.
     """
-    terminal = [(uid, iid) for uid, iid, reason in pending_rows
-                if not (reason or "").startswith("requeue")]
+    terminal: list[tuple[str, str]] = []
+    preserved: list[terminal_preservation.PreservedPending] = []
+    for uid, iid, reason in pending_rows:
+        value = str(reason or "")
+        if value.startswith("requeue"):
+            continue
+        if terminal_preservation.parse_preserved_reason(value) is not None:
+            preserved.append(
+                terminal_preservation.PreservedPending(
+                    user_id=str(uid), table="", item_id=str(iid), reason=value
+                )
+            )
+        else:
+            terminal.append((uid, iid))
     requeue_backlog = sum(1 for _uid, _iid, reason in pending_rows
                           if (reason or "").startswith("requeue"))
-    return terminal, requeue_backlog
+    return PendingSplit(
+        terminal=terminal,
+        preserved=preserved,
+        requeue_backlog=requeue_backlog,
+    )
 
 
-def _ciphertext_table_report(cfg: dict, pending_rows: list[tuple[str, str]]) -> dict:
+def _ciphertext_table_report(
+    cfg: dict,
+    pending_rows: list[tuple[str, str]],
+    preserved_rows: list[tuple[str, str]] | None = None,
+) -> dict:
     rds_where = f" WHERE {cfg['rds_where']}" if cfg.get("rds_where") else ""
     tee_where = f" WHERE {cfg['tee_where']}" if cfg.get("tee_where") else ""
     with db.get_pool().connection() as src, mirror.get_tee_pool().connection() as dst:
@@ -288,10 +321,18 @@ def _ciphertext_table_report(cfg: dict, pending_rows: list[tuple[str, str]]) -> 
         tee_counts = dict(dst.execute(
             f"SELECT user_id, count(*) FROM {cfg['tee_table']}{tee_where} "
             "GROUP BY user_id").fetchall())
+    projected_tee_rows = sum(tee_counts.values())
+    if cfg["kind"] == "frames":
+        for uid, _iid in preserved_rows or []:
+            tee_counts[uid] = tee_counts.get(uid, 0) + 1
     pending_counts: dict[str, int] = {}
     for uid, _iid in pending_rows:
         pending_counts[uid] = pending_counts.get(uid, 0) + 1
-    return _table_report(rds_counts, tee_counts, pending_counts)
+    report = _table_report(rds_counts, tee_counts, pending_counts)
+    if cfg["kind"] == "frames":
+        report["projected_tee_rows"] = projected_tee_rows
+        report["preserved_bridge_rows"] = len(preserved_rows or [])
+    return report
 
 
 def _diff_docs(table: str, user_id: str, item_id: str, expected: dict, actual, prefix: str = "") -> list[dict]:
@@ -541,10 +582,57 @@ def run(*, sample_rate: float = 0.02) -> dict:
                 "rows_ok": _rows_ok_advisory(rds_n, tee_n),
             }
 
+    split_by_key: dict[str, PendingSplit] = {}
+    preserved_markers: list[terminal_preservation.PreservedPending] = []
+    malformed_counts: dict[str, int] = {}
     for key, cfg in _CIPHERTEXT_TABLES.items():
         pending_rows = _pending_rows(cfg)
-        terminal_rows, requeue_backlog = _split_pending(pending_rows)
-        table_report = _ciphertext_table_report(cfg, terminal_rows)
+        split = _split_pending(pending_rows)
+        split_by_key[key] = split
+        preserved_markers.extend(
+            terminal_preservation.PreservedPending(
+                user_id=row.user_id,
+                table=cfg["pending_table"],
+                item_id=row.item_id,
+                reason=row.reason,
+            )
+            for row in split.preserved
+        )
+        malformed = sum(
+            1
+            for _uid, _iid, reason in pending_rows
+            if str(reason or "").startswith("preserved_ciphertext:")
+            and terminal_preservation.parse_preserved_reason(str(reason or "")) is None
+        )
+        if malformed:
+            malformed_counts[cfg["pending_table"]] = malformed
+
+    with db.get_pool().connection() as src, mirror.get_tee_pool().connection() as dst:
+        preserved_audit = terminal_preservation.audit_preserved(
+            src, dst, preserved_markers
+        )
+    preserved_mismatches = list(preserved_audit.mismatches)
+    preserved_mismatches.extend(
+        f"malformed_preserved_marker:{table}:{count}"
+        for table, count in sorted(malformed_counts.items())
+    )
+
+    blocking_pending = 0
+    for key, cfg in _CIPHERTEXT_TABLES.items():
+        split = split_by_key[key]
+        terminal_rows = split.terminal
+        requeue_backlog = split.requeue_backlog
+        blocking_pending += len(terminal_rows) + requeue_backlog
+        valid_preserved = [
+            (row.user_id, row.item_id)
+            for row in split.preserved
+            if (cfg["pending_table"], row.user_id, row.item_id)
+            in preserved_audit.valid_keys
+        ]
+        blocking_pending += len(split.preserved) - len(valid_preserved)
+        table_report = _ciphertext_table_report(
+            cfg, terminal_rows, valid_preserved
+        )
         # Informational only — does NOT feed rows_ok/ok (see _split_pending's
         # docstring for why requeue rows are excluded from the row-count
         # equation itself).
@@ -572,10 +660,24 @@ def run(*, sample_rate: float = 0.02) -> dict:
             # 写死读 doc，参数化是独立一档工作。行数核算已能抓住整表失联。
             continue
         if cfg["kind"] == "frames":
-            mismatches.extend(_sample_frames(key, cfg, sample_rate, terminal_rows))
+            mismatches.extend(
+                _sample_frames(
+                    key,
+                    cfg,
+                    sample_rate,
+                    terminal_rows + valid_preserved,
+                )
+            )
         else:
             mismatches.extend(
-                _sample_ciphertext_content(key, cfg, sample_rate, terminal_rows, decrypt_cache))
+                _sample_ciphertext_content(
+                    key,
+                    cfg,
+                    sample_rate,
+                    terminal_rows + valid_preserved,
+                    decrypt_cache,
+                )
+            )
 
     rows_ok = all(t["rows_ok"] for t in tables.values())
     # strict_ok：忽略 advisory 放宽，逐表的严格判据是否全过。表没有单独的
@@ -590,9 +692,25 @@ def run(*, sample_rate: float = 0.02) -> dict:
         k for k, t in tables.items() if not t.get("strict_rows_ok", t["rows_ok"]))
     strict_ok = not strict_fail_tables
     report = {
-        "tables": tables, "mismatches": mismatches, "ok": rows_ok and not mismatches,
+        "tables": tables,
+        "mismatches": mismatches,
+        "ok": rows_ok and not mismatches and not preserved_mismatches,
         "strict_ok": strict_ok,
+        "preserved_ciphertext": preserved_audit.preserved,
+        "preserved_plan_sha256": preserved_audit.sha256,
+        "preserved_mismatches": preserved_mismatches,
+        "blocking_pending": blocking_pending,
     }
-    log.info("[verify] ok=%s strict_ok=%s tables=%d mismatches=%d strict_fail=%s",
-              report["ok"], strict_ok, len(tables), len(mismatches), strict_fail_tables)
+    log.info(
+        "[verify] ok=%s strict_ok=%s tables=%d mismatches=%d "
+        "preserved=%d preserved_mismatches=%d blocking_pending=%d strict_fail=%s",
+        report["ok"],
+        strict_ok,
+        len(tables),
+        len(mismatches),
+        preserved_audit.preserved,
+        len(preserved_mismatches),
+        blocking_pending,
+        strict_fail_tables,
+    )
     return report

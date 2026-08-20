@@ -71,7 +71,10 @@ def _patch(monkeypatch):
 _TEE_ALIAS = {cfg["rds_table"]: cfg["tee_table"] for cfg in verify._CIPHERTEXT_TABLES.values()}
 _RDS_TABLES = sorted(t for t in verify.covered_tables()
                       if t not in reg.PSEUDO_CIPHERTEXT_TABLES)
-_TEE_TABLES = [_TEE_ALIAS.get(t, t) for t in _RDS_TABLES] + ["tee_pending_device_migration"]
+_TEE_TABLES = [_TEE_ALIAS.get(t, t) for t in _RDS_TABLES] + [
+    "frame_envelopes",
+    "tee_pending_device_migration",
+]
 
 # Tables within verify's covered scope that an RDS migration seeds with an
 # UNCONDITIONAL constant row at apply time (not a backfill FROM another
@@ -373,6 +376,119 @@ def test_pending_rows_count_toward_the_reconciliation_equation(backend_env):
     assert chat_report["requeue_backlog"] == 0
     assert report["ok"] is True
     assert report["mismatches"] == []
+
+
+def test_pending_split_separates_terminal_preserved_and_requeue():
+    from tee_replicator import terminal_preservation as preservation
+
+    marker = preservation.encode_preserved_reason(
+        "a" * 64, "decrypt_failed:historical"
+    )
+    split = verify._split_pending(
+        [
+            ("terminal-user", "terminal-item", "pdm:no_k_enclave"),
+            ("preserved-user", "preserved-item", marker),
+            ("requeue-user", "requeue-item", "requeue:source_updated"),
+            (
+                "malformed-user",
+                "malformed-item",
+                "preserved_ciphertext:v1:malformed",
+            ),
+        ]
+    )
+
+    assert split.terminal == [
+        ("terminal-user", "terminal-item"),
+        ("malformed-user", "malformed-item"),
+    ]
+    assert [(row.user_id, row.item_id) for row in split.preserved] == [
+        ("preserved-user", "preserved-item")
+    ]
+    assert split.requeue_backlog == 1
+
+
+def test_verify_fully_audits_preserved_chat_and_frame_bridge(backend_env):
+    from tee_replicator import terminal_preservation as preservation
+
+    uid = f"usr_{uuid.uuid4().hex[:8]}"
+    _seed(uid)
+    chat_doc = _insert_rds_chat(uid, "preserved-chat", 10.0, "ciphertext")
+    frame_doc = {
+        "id": "preserved-frame",
+        "body_ct": "frame-ciphertext",
+        "owner_user_id": uid,
+    }
+    with db.get_pool().connection() as source:
+        source.execute(
+            "INSERT INTO frame_envelopes (user_id,frame_id,ts,doc,env_meta,body_key) "
+            "VALUES (%s,'preserved-frame',11,%s,%s,'raw/body-key')",
+            (uid, Jsonb(frame_doc), Jsonb({"ciphertext": True})),
+        )
+        chat_row = tuple(
+            source.execute(
+                preservation.CONTRACTS["chat_messages"].source_fetch_sql,
+                (uid, "preserved-chat"),
+            ).fetchone()
+        )
+        frame_row = tuple(
+            source.execute(
+                preservation.CONTRACTS["frame_envelopes"].source_fetch_sql,
+                (uid, "preserved-frame"),
+            ).fetchone()
+        )
+    with psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as tee:
+        tee.execute(
+            preservation.CONTRACTS["chat_messages"].insert_sql,
+            preservation.CONTRACTS["chat_messages"].insert_args(chat_row),
+        )
+        tee.execute(
+            preservation.CONTRACTS["frame_envelopes"].insert_sql,
+            preservation.CONTRACTS["frame_envelopes"].insert_args(frame_row),
+        )
+        tee.execute(
+            "INSERT INTO tee_pending_device_migration "
+            "(user_id,table_name,item_id,reason) VALUES "
+            "(%s,'chat_messages','preserved-chat',%s),"
+            "(%s,'frame_envelopes','preserved-frame',%s)",
+            (
+                uid,
+                preservation.encode_preserved_reason(
+                    preservation.canonical_row_sha256("chat_messages", chat_row),
+                    "decrypt_failed:historical",
+                ),
+                uid,
+                preservation.encode_preserved_reason(
+                    preservation.canonical_row_sha256("frame_envelopes", frame_row),
+                    "pdm:no_k_enclave",
+                ),
+            ),
+        )
+
+    report = verify.run(sample_rate=1.0)
+
+    assert report["ok"] is True
+    assert report["preserved_ciphertext"] == 2
+    assert report["preserved_mismatches"] == []
+    assert report["blocking_pending"] == 0
+    assert report["tables"]["chat_messages"]["rows_ok"] is True
+    assert report["tables"]["frame_envelopes"]["tee_rows"] == 1
+    assert report["tables"]["frame_envelopes"]["rows_ok"] is True
+    assert chat_doc["body_ct"] == "ciphertext"
+
+    with psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as tee:
+        tee.execute(
+            "UPDATE chat_messages SET doc=%s "
+            "WHERE user_id=%s AND msg_id='preserved-chat'",
+            (Jsonb({"drift": True}), uid),
+        )
+    drifted = verify.run(sample_rate=1.0)
+
+    assert drifted["ok"] is False
+    assert drifted["preserved_ciphertext"] == 1
+    assert drifted["preserved_mismatches"] == [
+        "destination_conflict:chat_messages:1"
+    ]
+    assert drifted["blocking_pending"] == 1
 
 
 def test_requeue_pending_row_excluded_from_equation_but_counted_as_backlog(backend_env):
