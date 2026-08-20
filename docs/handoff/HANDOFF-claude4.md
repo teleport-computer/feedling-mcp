@@ -22,7 +22,8 @@
 
 | PR | 状态 |
 |---|---|
-| **#301** T152 base_url 按 host 匹配 | 已 rebase 解冲突,重跑 311 passed,**只差 `test_api.py (multi-tenant)` 这一项 CI**;绿即可合(Seven 已授权"该合的就合了") |
+| **#301** T152 base_url 按 host 匹配 | **已合 `d7569075`** |
+| **#308** 畸形 base_url 回 400(收 #301 引入的 500 回归) | **已合 `e7510331`**,双签 tree `2c48d524`,合后在 3.10 复验 ValueError 逃逸数=0 |
 
 ⚠️ #301 rebase 时与 `test` 上"TEE 明文影子库"那条 changelog 撞在 Unreleased 顶部,
 **已保留两条**,没有覆盖对方。合并后确认 changelog 里两条都在。
@@ -118,7 +119,41 @@ naive 写法 `addr = ns.get_extra_info('server_addr')` 在异步下拿到 `None`
 ⇒ **不能用 `merged_by` / 评论作者判断某个操作是不是 Seven 本人做的。**
 后果是:agent 的越权操作会自动挂到她头上,**还免于复核**。
 
-### 3.6 手工伪造异常的测试
+### 3.6 双签 trailer 的 token 不能带括号(会废掉整块)
+
+隔离空仓实测:
+
+    Co-Authored-By: X <x@y>
+    Double-signed(p4): tree=abc codex+claude
+    → git log --format='%(trailers:only=true)'  ==  (空)
+
+    Double-signed-p4: tree=abc codex+claude
+    → 两行都正常解析
+
+git 的 trailer token 只认字母数字与 `-`。**一旦块里有一行不是合法 trailer,
+整块都不算 trailer** —— 连 `Co-Authored-By` 都跟着消失。
+
+⇒ 后果是"PR 上看着有双签,机器上查不到",正是**记录与实际不符**那个形状,
+而贴 trailer 的目的恰恰是让它可校验。阶段标识要放进 `-p4` 这样的合法 token
+或放进 value,**不要放进 token 的括号里**。
+
+### 3.7 结论会随 Python 版本翻转
+
+`https://[gg::1]/v1`(括号闭合但不是地址):
+
+    3.10.10  urlsplit 通过,.hostname 返回 'gg::1'  → 被接受
+    3.12.11  urlsplit 直接 ValueError
+
+3.11+ 的 `urlsplit` 会用 `ipaddress` 校验括号主机。**CI 是 3.12**
+(ci.yml 三处 `python-version: "3.12"`),本机 `python3` 是 **3.10.10**,
+`/tmp/py312-feedling/bin/python` 是 3.12.11。线上镜像按 digest 钉死,未确认。
+
+本窗口 claude4 与 codex4 曾据此得出相反结论,**两边都没测错**。
+⇒ **报 URL 解析类结论时必须带解释器版本**;涉及版本差异的断言只锁
+"不许抛 ValueError"这类不变量,**不要锁"接受还是拒绝"** ——
+锁死等于把跑测试那台机器的答案当成产品契约。
+
+### 3.8 手工伪造异常的测试
 
 已修 5 处(`test_model_api_path`×2、`test_v2_tool_loop`×2、
 `test_provider_malformed_tool_fallback`、`test_v2_worker_mcp`),它们直接
