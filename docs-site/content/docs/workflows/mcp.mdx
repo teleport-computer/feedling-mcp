@@ -54,11 +54,22 @@ lanes. A wake can therefore perform multi-step MCP work, subject to the same
 turn budgets and mutation-attempt fencing as Chat.
 
 Live screen pixels have a narrower authorization rule than an ordinary private
-read. A Chat or screen-watch turn that receives pixels keeps approved read-only
-MCP tools but removes mutating MCP tools, along with web and `task`, before its
-first provider call. This restriction comes from the pixel provenance, not from
-reading private workspace, memory, or MCP output; those later reads continue to
-leave both read-only and mutating user MCP tools available.
+read in **Hosted Runtime V2**. A hosted Chat or screen-watch turn that receives
+pixels keeps approved read-only MCP tools but removes mutating MCP tools, along
+with web and `task`, before its first provider call. This restriction comes from
+the pixel provenance, not from reading private workspace, memory, or MCP output;
+those later reads continue to leave both read-only and mutating user MCP tools
+available.
+
+The **independent resident/CLI path** deliberately uses a different screen
+policy. Under the explicit 2026-08-21 boundary decision, foreground Chat and
+proactive screen turns retain both read-only and mutating user MCP tools. A
+server the user selected, configured, and authenticated is treated as the
+user's infrastructure, not as a model-discovered outbound destination. This is
+an intentional difference from the hosted policy, not a resident compatibility
+gap. Platform web egress remains fenced: screen turns still pass
+`FEEDLING_OUTBOUND_FENCE=1`, and `io_cli` rejects platform `web_search` and
+`web_fetch` before any HTTP request.
 
 ## Add or update a server
 

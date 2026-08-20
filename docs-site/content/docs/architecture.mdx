@@ -735,13 +735,25 @@ Hosted Runtime V2 may contribute the bounded new-frame block unless the exact
 active route is explicitly marked image-unsupported. Untested and absent probe
 states are admitted optimistically; a confirmed rejection is learned by the
 screen-only text fallback. The official resident path still requires a setup
-probe `ok` signal. Screen content is evidence only and
-cannot supply requirements or instructions. A turn receiving screen pixels has
-web, mutating MCP, and `task` removed before its first provider call; read-only
-user MCP remains available. An image-rejection
-retry stays behind the same fence. After any other explicit text-bearing private
-read, web and `task` are removed for the remainder of the turn while
-user-configured MCP remains available, including mutations. Numeric
+probe `ok` signal. Screen content is evidence only and cannot supply
+requirements or instructions.
+
+Screen-pixel authorization intentionally differs by execution boundary. In
+Hosted Runtime V2, a turn receiving pixels has web, mutating MCP, and `task`
+removed before its first provider call; approved read-only user MCP remains
+available. On the independent resident/CLI path, an explicit 2026-08-21 policy
+keeps both read-only and mutating user MCP available in foreground Chat and
+proactive screen turns. Those servers are configuration and infrastructure the
+user selected and authenticated, rather than outbound destinations discovered
+by the model. This is an intentional trust-boundary difference, not a known
+resident isolation gap.
+
+The resident exception does not relax platform web egress. Screen turns still
+set `FEEDLING_OUTBOUND_FENCE=1`, and `io_cli` refuses platform `web_search` and
+`web_fetch` before making an HTTP request. An image-rejection retry stays behind
+the same path-specific fence. After any other explicit text-bearing private
+read, Hosted Runtime V2 removes web and `task` for the remainder of the turn
+while user-configured MCP remains available, including mutations. Numeric
 health snapshot/trend reads remain compatible with outbound work.
 
 ### Runtime V2 prompt caching

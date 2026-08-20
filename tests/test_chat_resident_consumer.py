@@ -2645,9 +2645,20 @@ def test_prepare_hermes_cli_first_turn_removes_continue(monkeypatch):
     assert "--resume" not in cmd
 
 
-def test_prepare_cli_outbound_fence_strips_literal_mcp_config(
+def test_prepare_cli_outbound_fence_keeps_literal_mcp_config(
     monkeypatch, tmp_path
 ):
+    """⚠️ 这条用例 2026-08-21 **反向**了(Seven 方案 A),不是被顺手改绿的。
+
+    原名 ``..._strips_literal_mcp_config``,锁的是「屏幕像素轮把操作员手写的
+    ``--mcp-config`` 也剥掉」。方案 A 裁定:用户自己配置并认证过的 MCP 服务器
+    是**用户的基础设施**,不是模型选的出站目的地,屏幕轮不再摘它 —— 占位符写法
+    与手写写法必须同口径,否则「保留用户 MCP」只对一半用户成立,而两条道的
+    argv 一旦不同,cache 也照样对不上。
+
+    平台出站封锁**不在这条用例的范围内**,它走环境变量:见
+    ``test_pixel_turn_child_env_carries_both_lane_and_fence``。
+    """
     mcp_file = tmp_path / "mcp.json"
     mcp_file.write_text("{}")
     monkeypatch.setattr(
@@ -2659,8 +2670,8 @@ def test_prepare_cli_outbound_fence_strips_literal_mcp_config(
 
     cmd, _stdin = crc._prepare_cli_command("hello", outbound_fence=True)
 
-    assert "--mcp-config" not in cmd
-    assert str(mcp_file) not in cmd
+    assert "--mcp-config" in cmd
+    assert str(mcp_file) in cmd
 
 
 def _setup_hermes_session_cli(monkeypatch, tmp_path, *, session_id: str, session_doc: str | None):
@@ -3526,7 +3537,7 @@ def test_process_proactive_wake_routes_through_agent_and_posts_metadata(monkeypa
 
     captured = {}
 
-    def _agent(message, images=None, image_paths=None):
+    def _agent(message, images=None, image_paths=None, **_kwargs):
         captured["message"] = message
         captured["images"] = images
         captured["image_paths"] = image_paths
@@ -4535,7 +4546,7 @@ def test_process_proactive_v2_wake_routes_without_gate_judgment(monkeypatch):
 
     captured = {"posted": [], "statuses": []}
 
-    def _agent(message, images=None, image_paths=None):
+    def _agent(message, images=None, image_paths=None, **_kwargs):
         captured["message"] = message
         captured["images"] = images
         captured["image_paths"] = image_paths
@@ -4612,7 +4623,7 @@ def test_process_proactive_v2_sleep_marks_completed_without_post(monkeypatch):
     monkeypatch.setattr(
         crc,
         "call_agent",
-        lambda message, images=None, image_paths=None: {
+        lambda message, images=None, image_paths=None, **_kwargs: {
             "actions": [{"type": "proactive.sleep", "reason": "not helpful"}],
             "messages": [],
         },
@@ -4977,7 +4988,7 @@ def _degenerate_test_harness(monkeypatch, agent_result):
     monkeypatch.setattr(
         crc,
         "call_agent",
-        lambda message, images=None, image_paths=None: agent_result,
+        lambda message, images=None, image_paths=None, **_kwargs: agent_result,
     )
     monkeypatch.setattr(
         crc,
@@ -5353,7 +5364,7 @@ def test_process_proactive_malformed_json_reason_does_not_post(monkeypatch):
     monkeypatch.setattr(
         crc,
         "call_agent",
-        lambda message, images=None, image_paths=None: {
+        lambda message, images=None, image_paths=None, **_kwargs: {
             "messages": ['"reason":"用户一小时没回，该说的已经说了，继续给空间"\\n}\\n]\\n}'],
         },
     )
@@ -5393,7 +5404,7 @@ def test_process_proactive_malformed_speak_json_does_not_post_raw_protocol(monke
     monkeypatch.setattr(
         crc,
         "call_agent",
-        lambda message, images=None, image_paths=None: (
+        lambda message, images=None, image_paths=None, **_kwargs: (
             '"messages": ["这句如果解析失败，不能把 JSON 协议原样发出去"]'
         ),
     )
@@ -5431,7 +5442,7 @@ def test_process_proactive_fenced_sleep_action_does_not_post(monkeypatch):
     monkeypatch.setattr(
         crc,
         "call_agent",
-        lambda message, images=None, image_paths=None: (
+        lambda message, images=None, image_paths=None, **_kwargs: (
             "```json\n"
             "{\n"
             '  "actions": [\n'
@@ -5480,7 +5491,7 @@ def test_process_proactive_reason_only_result_marks_sleep_without_post(monkeypat
     monkeypatch.setattr(
         crc,
         "call_agent",
-        lambda message, images=None, image_paths=None: {
+        lambda message, images=None, image_paths=None, **_kwargs: {
             "reason": "用户刚才没有继续互动，保持安静",
         },
     )
@@ -5520,7 +5531,7 @@ def test_process_proactive_v2_request_broadcast_posts_visible_request(monkeypatc
     monkeypatch.setattr(
         crc,
         "call_agent",
-        lambda message, images=None, image_paths=None: {
+        lambda message, images=None, image_paths=None, **_kwargs: {
             "actions": [{
                 "type": "proactive.request_broadcast",
                 "reason": "screen sharing is off",
@@ -5561,7 +5572,7 @@ def test_process_proactive_native_action_only_send_message_posts(monkeypatch):
 
     captured = {"posted": [], "statuses": []}
 
-    def _agent(message, images=None, image_paths=None):
+    def _agent(message, images=None, image_paths=None, **_kwargs):
         captured["message"] = message
         captured["images"] = images
         captured["image_paths"] = image_paths
@@ -5638,7 +5649,7 @@ def test_process_introduction_job_writes_identity_before_first_greeting(monkeypa
         },
     }
 
-    def _agent(message, images=None, image_paths=None):
+    def _agent(message, images=None, image_paths=None, **_kwargs):
         events.append(("agent", message, images, image_paths))
         return {"actions": [action], "messages": ["我来了。"]}
 
@@ -5692,7 +5703,7 @@ def test_process_introduction_job_recovers_greeting_when_agent_omits_message(mon
         },
     }
 
-    def _agent(message, images=None, image_paths=None):
+    def _agent(message, images=None, image_paths=None, **_kwargs):
         events.append(("agent", message, images, image_paths))
         return {"actions": [action], "messages": []}
 
@@ -5769,7 +5780,7 @@ def test_process_proactive_native_schedule_and_cancel_actions_without_chat(monke
     monkeypatch.setattr(
         crc,
         "call_agent",
-        lambda message, images=None, image_paths=None: {
+        lambda message, images=None, image_paths=None, **_kwargs: {
             "actions": [
                 {
                     "type": "schedule_wake",
@@ -5905,7 +5916,7 @@ def test_native_proactive_prompt_injects_digest_and_native_tool_catalog(monkeypa
 
     captured = {"statuses": []}
 
-    def _agent(message, images=None, image_paths=None):
+    def _agent(message, images=None, image_paths=None, **_kwargs):
         captured["message"] = message
         return {"actions": [{"type": "sleep", "reason": "nothing to say"}], "messages": []}
 
@@ -11455,3 +11466,499 @@ def test_thinking_denylist_calls_through_to_shared_vocabulary(monkeypatch):
         "V1 没有走共享 helper —— 它多半还留着自己的本地 regex"
     )
     assert "第二行" in out, "V1 用的不是替身给的 pattern,说明有另一个词表来源"
+
+
+# ---------------------------------------------------------------------------
+# T190 主动道与聊天道的 argv 前缀对齐(社区 PR #320 + Seven 2026-08-21 方案 A)
+#
+# 这一组的判据全部是「把实现改回去,谁会红」,不是「代码里有没有那一行」。
+# 上游 PR 的自测只调了 `_user_mcp_cli_value` 这个 helper —— 实测:把生产调用点的
+# `lane="proactive"` 整行删掉,它那 621 条**一条都不红**。所以下面第一条是
+# 从 production call site 出发的,不是从参数出发的。
+# ---------------------------------------------------------------------------
+
+
+def _proactive_job_fixture() -> dict:
+    return {
+        "schema_version": 2,
+        "job_id": "pj_lane",
+        "wake_id": "wake_lane",
+        "gate_decision_id": "gd_lane",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 456.0,
+        "trigger": "screen_tick",
+        "wake_kind": "screen",
+        "user_state": "default",
+        "ai_state": "present",
+        "broadcast_state": "on",
+        "current_app": "Docs",
+        "frame_ids": ["frame_1"],
+    }
+
+
+def test_proactive_production_call_site_tags_the_lane(monkeypatch):
+    """生产接线:`_process_proactive_jobs` 必须真的把 lane 交给 call_agent。
+
+    不传 lane 会静默默认成 "background" —— MCP 不下发、argv 前缀与聊天道不同,
+    两条道永远共享不了 prompt cache。而这个退化**没有任何外部症状**:
+    回复照发,只是每次都冷启动。所以它必须由测试钉住。
+    """
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    seen = {}
+
+    def _agent(message, images=None, image_paths=None, **kwargs):
+        seen["kwargs"] = kwargs
+        return ["我看到了这个时机。"]
+
+    monkeypatch.setattr(crc, "call_agent", _agent)
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: {"id": "msg_1"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc, "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: None,
+    )
+    monkeypatch.setattr(
+        crc, "_screen_context_for_frame_ids",
+        lambda frame_ids: ("screen: user is reading docs", [{"data": "x"}], ["/tmp/frame.jpg"]),
+    )
+    monkeypatch.setattr(
+        crc, "recent_chat_context_for_proactive", lambda limit=None: "- user: hi",
+    )
+
+    crc._process_proactive_jobs([_proactive_job_fixture()])
+
+    assert seen["kwargs"].get("lane") == "proactive", (
+        "主动道没有把 lane 传到 call_agent —— 它会退化成 background,"
+        "MCP 不下发且 argv 前缀与聊天道不同(冷启动回归,无外部症状)"
+    )
+
+
+def _argv_for(monkeypatch, lane: str, *, outbound_fence: bool, servers,
+              template: str = 'claude --print {mcp} "{message}"') -> list:
+    """⚠️ 必须走 `_prepare_cli_command`(生产入口),不能只走 `_render_cli_template`。
+
+    第一版我写在 `_render_cli_template` 上,它绿了 —— 而生产在那之后**还有一道
+    剥离**(`if outbound_fence:` 把 `--mcp-config` 与 pi 桥从 argv 里删掉),于是
+    「方案 A 已生效」这个结论是假的:屏幕轮两条道的 argv 仍然不同。
+    codex 复审抓到,这条注释留着,免得下一个人又把断言放低一层。
+    """
+    monkeypatch.setattr(crc, "_user_mcp_applied", {"fingerprint": "t", "servers": servers})
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", template)
+    monkeypatch.setattr(crc, "_strip_missing_mcp_config", lambda cmd: (cmd, ""))
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    cmd, _ = crc._prepare_cli_command(
+        "hi", image_paths=[], lane=lane, outbound_fence=outbound_fence,
+    )
+    return cmd
+
+
+def test_screen_pixel_turn_keeps_user_mcp_on_both_lanes(monkeypatch):
+    """方案 A(Seven 2026-08-21):屏幕像素轮不再摘用户自己的 MCP,两条道一致。
+
+    改前:聊天道被 `outbound_fence` 摘光、主动道不摘 ⇒ **屏幕轮两边 argv 不同**,
+    门铃/screen_watch 唤醒永远拿不到 warm cache —— 那正是这次要修的症状本身。
+    """
+    servers = [{"name": "ob", "enabled": True}]
+    chat_pixels = _argv_for(monkeypatch, "chat", outbound_fence=True, servers=servers)
+    proactive_pixels = _argv_for(monkeypatch, "proactive", outbound_fence=False, servers=servers)
+
+    assert any("--mcp-config" in part for part in chat_pixels), (
+        "聊天道的屏幕像素轮应当保留用户 MCP(方案 A)"
+    )
+    assert chat_pixels == proactive_pixels, (
+        "屏幕轮两条道的 argv 前缀必须逐字一致,否则 cache 仍然对不上"
+    )
+
+    # 阴性对照:没有启用任何 MCP 服务器时两边都不带 —— 证明上面的断言不是恒真
+    none_chat = _argv_for(monkeypatch, "chat", outbound_fence=True, servers=[])
+    assert not any("--mcp-config" in part for part in none_chat)
+    assert none_chat != chat_pixels
+
+
+def test_non_pixel_turn_prefix_matches_across_lanes(monkeypatch):
+    servers = [{"name": "ob", "enabled": True}]
+    chat = _argv_for(monkeypatch, "chat", outbound_fence=False, servers=servers)
+    proactive = _argv_for(monkeypatch, "proactive", outbound_fence=False, servers=servers)
+    background = _argv_for(monkeypatch, "background", outbound_fence=False, servers=servers)
+
+    assert chat == proactive
+    # 阴性对照:background/capture 这些道**没有**被放开,仍然不带 MCP。
+    # 少了这条,上面那个相等断言在"所有道都带 MCP"的实现下也会通过。
+    assert background != chat
+    assert not any("--mcp-config" in part for part in background)
+
+
+def test_busy_keepalive_covers_the_proactive_lane(monkeypatch):
+    """唤醒轮同样会跑过后端的 resident 新鲜度窗口,而唤醒失败对用户不可见。"""
+    polls = []
+    monkeypatch.setattr(crc, "RESIDENT_BUSY_POLL_INTERVAL_SEC", 0.01)
+    monkeypatch.setattr(crc, "_maybe_refresh_decrypt_health", lambda: None)
+    monkeypatch.setattr(
+        crc, "poll_chat",
+        lambda now, timeout=None, claim=True: polls.append((timeout, claim)),
+    )
+
+    def _slow():
+        time.sleep(0.08)
+        return "done"
+
+    assert crc._call_with_resident_busy_poll(_slow, lane="proactive") == "done"
+    assert polls, "proactive 轮没有发保活轮询(它和 chat 一样会跨过新鲜度窗口)"
+    polls.clear()
+    # 阴性对照:未被放开的道仍然不轮询
+    assert crc._call_with_resident_busy_poll(lambda: "x", lane="background") == "x"
+    assert not polls
+
+
+def test_wake_templates_share_the_foreground_thinking_switch(monkeypatch):
+    """`<think>` 在主动道是「允许」不是「强制」,但开关必须与前台是同一个。
+
+    分开写会产生一种没人预料得到的状态:前台已经关了、主动道还在 think。
+    """
+    from core import self_thinking as _st
+
+    monkeypatch.setattr(_st, "enabled", lambda: True)
+    monkeypatch.setattr(crc, "_supports_mandatory_self_thinking_v1", lambda: True)
+    on_protocol = crc._reply_protocol_block()
+    on_scheduled = crc._scheduled_wake_message({"scheduled_note": "喝茶", "timezone": "Asia/Shanghai"})
+    assert "<think>" in on_protocol
+    assert "<think>" in on_scheduled
+
+    # 同一个 kill switch 关掉 → 两个模板都不再提 <think>
+    monkeypatch.setattr(_st, "enabled", lambda: False)
+    assert "<think>" not in crc._reply_protocol_block()
+    assert "<think>" not in crc._scheduled_wake_message({"scheduled_note": "喝茶"})
+
+    # 模型不支持这套协议时同样不提(与前台同一条判据)
+    monkeypatch.setattr(_st, "enabled", lambda: True)
+    monkeypatch.setattr(crc, "_supports_mandatory_self_thinking_v1", lambda: False)
+    assert "<think>" not in crc._reply_protocol_block()
+    assert "<think>" not in crc._scheduled_wake_message({"scheduled_note": "喝茶"})
+
+    # 阴性对照:JSON 协议那句本身在四种情形下都还在,证明上面不是整段消失
+    assert '{"messages":["..."]}' in on_protocol
+
+
+def test_mcp_wiring_trace_covers_the_proactive_lane(monkeypatch):
+    """放开工具面就必须同时放开对它的观测。
+
+    这条埋点当初就是为了终结「MCP 一台都没到 agent、只能靠用户报」(PR#174)。
+    主动道现在也下发 MCP,如果埋点仍然只认 chat,就等于新增了一整条工具面
+    而 trace 里完全看不见它 —— 出问题时又回到靠用户报。
+    """
+    events = []
+    monkeypatch.setattr(
+        crc, "_emit_debug_trace",
+        lambda subsystem, type, **kwargs: events.append((subsystem, type, kwargs)),
+    )
+    monkeypatch.setattr(
+        crc, "_user_mcp_applied", {"fingerprint": "t", "servers": [{"name": "ob", "enabled": True}]},
+    )
+    wired_cmd = ["claude", "--print", "--mcp-config=/tmp/x.json", "--allowed-tools=mcp__ob__*"]
+
+    crc._trace_user_mcp_wiring(wired_cmd, trace_id="t1", lane="proactive")
+    assert [e[1] for e in events] == ["mcp.surface.wired"], (
+        "主动道的 MCP 接线没有被观测到"
+    )
+
+    # 阴性对照 ①:同一条道、没接线 → 必须报 missing(证明它不是恒报 wired)
+    events.clear()
+    crc._trace_user_mcp_wiring(["claude", "--print"], trace_id="t2", lane="proactive")
+    assert [e[1] for e in events] == ["mcp.surface.missing"]
+
+    # 阴性对照 ②:没有被放开工具面的道仍然不产生埋点(它本来就拿不到 MCP,
+    # 报 missing 会是假警报)
+    events.clear()
+    crc._trace_user_mcp_wiring(wired_cmd, trace_id="t3", lane="background")
+    assert events == []
+
+
+def test_proactive_pixel_turn_arms_the_platform_outbound_fence(monkeypatch):
+    """带屏幕像素的主动轮必须 armed 平台出站围栏。
+
+    聊天道一直这么做(`screen_pixel_turn`),主动道**从来没有** —— 它带着像素调用
+    却让 `outbound_fence` 保持默认 False,于是 `FEEDLING_OUTBOUND_FENCE=1` 到不了
+    子进程,io_cli 的 web_search/web_fetch 前置拒绝根本不会触发:
+    一次无人在场的屏幕轮可以拿着刚看到的私密像素去联网检索。
+    """
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    calls = []
+
+    def _agent(message, images=None, image_paths=None, **kwargs):
+        calls.append(kwargs)
+        return ["看到了。"]
+
+    monkeypatch.setattr(crc, "call_agent", _agent)
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: {"id": "m1"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    statuses = []
+    monkeypatch.setattr(
+        crc, "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: statuses.append((status, reason)),
+    )
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "- user: hi")
+
+    monkeypatch.setattr(
+        crc, "_screen_context_for_frame_ids",
+        lambda frame_ids: ("screen: docs", [{"data": "x"}], ["/tmp/f.jpg"]),
+    )
+    crc._process_proactive_jobs([_proactive_job_fixture()])
+    assert calls[-1].get("outbound_fence") is True, (
+        "带像素的主动轮没有 armed 平台出站围栏"
+    )
+
+    # 阴性对照:同一条道、没有像素 → 不该 armed(否则普通心跳也用不了 web)
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    calls.clear()
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: None)
+    # 关掉失败退避:同一进程里前面的用例可能已经把退避打开,那会让这一轮
+    # 根本走不到 call_agent —— 阴性对照就变成了「什么都没测」。
+    monkeypatch.setattr(crc, "_proactive_backing_off", lambda: False)
+    job = dict(
+        _proactive_job_fixture(),
+        job_id="pj_nopix", wake_id="wake_nopix",
+        # scheduled_wake:它被显式排除在合并/碰撞抑制之外(用户要的提醒必须送达),
+        # 所以这条阴性对照不会被上一轮的 carrier 吸走。
+        trigger="scheduled_wake", wake_kind="scheduled", frame_ids=[],
+        scheduled_note="喝茶",
+    )
+    crc._process_proactive_jobs([job])
+    assert calls, (
+        "阴性对照那一轮根本没走到 call_agent —— 这条对照是无效的;"
+        f"状态轨迹={statuses}"
+    )
+    assert calls[-1].get("outbound_fence") is None
+
+
+def test_pixel_turn_child_env_carries_both_lane_and_fence(monkeypatch, tmp_path):
+    """子进程环境:lane 与出站围栏必须同时到位,而 MCP argv 仍在(方案 A)。"""
+    seen = {}
+
+    def _fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        seen["env"] = kwargs.get("env") or {}
+        raise RuntimeError("stop after env capture")
+
+    monkeypatch.setattr(crc, "_user_mcp_applied", {"fingerprint": "t", "servers": [{"name": "ob", "enabled": True}]})
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude --print {mcp} "{message}"')
+    monkeypatch.setattr(crc, "_strip_missing_mcp_config", lambda cmd: (cmd, ""))
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc.subprocess, "run", _fake_run)
+
+    with pytest.raises(Exception):
+        crc.call_agent_cli("hi", lane="proactive", outbound_fence=True)
+
+    assert seen["env"].get("FEEDLING_AGENT_LANE") == "proactive"
+    assert seen["env"].get("FEEDLING_OUTBOUND_FENCE") == "1", (
+        "屏幕轮的平台出站围栏没有下发到子进程"
+    )
+    assert any("--mcp-config" in t for t in seen["cmd"]), (
+        "方案 A:同一轮里用户自配的 MCP 必须仍然在场"
+    )
+
+
+def test_legacy_template_injection_covers_the_proactive_lane(monkeypatch, tmp_path):
+    """没有 `{mcp}` 占位符的老模板,两条道也必须同口径(否则他们仍然冷启动)。"""
+    monkeypatch.setattr(crc, "_user_mcp_applied", {"fingerprint": "t", "servers": [{"name": "ob", "enabled": True}]})
+    cfg = tmp_path / "user_mcp.json"
+    cfg.write_text('{"mcpServers": {}}', encoding="utf-8")
+    monkeypatch.setattr(crc, "USER_MCP_FILE", str(cfg))
+    base = ["claude", "--print"]
+    chat = crc._inject_claude_user_mcp(list(base), "chat")
+    proactive = crc._inject_claude_user_mcp(list(base), "proactive")
+    background = crc._inject_claude_user_mcp(list(base), "background")
+
+    assert chat == proactive
+    assert chat != base, "老模板的 chat 轮本来就该被注入 —— 否则上面的相等是空对空"
+    assert background == base, "未放开的道不注入(阴性对照)"
+
+
+def test_thinking_only_wake_is_legal_silence_not_failure(monkeypatch):
+    """只写了 <think> 没写正文的唤醒轮 = 合法沉默,不是 empty_agent_reply 失败。
+
+    放开 think 让这条路径从冷路变成热路;记成 failed 会污染唤醒失败率,
+    而唤醒失败对用户不可见(2026-08-10 裁定),没人会发现。
+    """
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    statuses = []
+    posted = []
+
+    def _turn(*_a, **_k):
+        turn = crc.AgentTurn(messages=[], actions=[])
+        turn.thinking_summary = "他这会儿在忙,不打扰。"
+        turn.thinking_self_authored = True
+        return turn
+
+    monkeypatch.setattr(crc, "call_agent", _turn)
+    monkeypatch.setattr(crc, "_split_agent_turn", lambda result, max_items=None: result)
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: posted.append(reply) or {"id": "m"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc, "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: statuses.append((status, reason)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+
+    crc._process_proactive_jobs([_proactive_job_fixture()])
+
+    assert not posted, "只思考的那一轮不许发气泡"
+    terminal = statuses[-1]
+    assert terminal[0] == "completed", f"合法沉默被记成了 {terminal}"
+    assert terminal[1] == "thinking_only_silence"
+    assert all(s[0] != "failed" for s in statuses)
+
+
+def test_codex_driver_stops_disabling_mcp_on_the_proactive_lane(monkeypatch):
+    """codex 驱动:主动轮不再下发 `enabled=false`(方案 A 四驱动对齐)。
+
+    codex 没法按轮启用子集,所以「不禁用」就等于「给全部」——这正是方案 A 要的。
+    只改 claude 驱动的话,codex 用户的两条道 argv 仍然不同,冷启动照旧,
+    而公开文档已经写成 resident/CLI 路线整体口径。
+    """
+    monkeypatch.setattr(
+        crc, "_user_mcp_applied",
+        {"fingerprint": "t", "servers": [{"name": "ob", "enabled": True}]},
+    )
+    template = 'codex exec {mcp} "{message}"'
+    monkeypatch.setattr(crc, "_cli_template_is_pi", lambda: False)
+    monkeypatch.setattr(crc, "_cli_template_is_codex", lambda: True)
+
+    # codex 分支会 import 同目录的 user_mcp_materialize;测试进程里未必在 path 上,
+    # 塞一个只提供 effective_transport 的替身(它只用来筛掉 legacy-SSE 服务器)。
+    import sys, types
+    stub = types.ModuleType("user_mcp_materialize")
+    stub.effective_transport = lambda s: "http"
+    monkeypatch.setitem(sys.modules, "user_mcp_materialize", stub)
+
+    chat = crc._user_mcp_cli_value(template, "chat")
+    proactive = crc._user_mcp_cli_value(template, "proactive")
+    background = crc._user_mcp_cli_value(template, "background")
+
+    assert proactive == chat == "", "主动轮仍在下发禁用指令"
+    # 阴性对照:没被放开的道仍然禁用 —— 证明这条不是「所有道都返回空」
+    assert "enabled=false" in background
+
+
+def test_pi_driver_bridges_the_proactive_lane(monkeypatch, tmp_path):
+    """pi 驱动:主动轮也挂桥(方案 A 四驱动对齐,Seven 明确要求 pi 一起)。"""
+    bridge = tmp_path / "bridge.py"
+    bridge.write_text("# pi mcp bridge", encoding="utf-8")
+    monkeypatch.setattr(crc, "PI_MCP_BRIDGE_FILE", str(bridge))
+    monkeypatch.setattr(
+        crc, "_user_mcp_applied",
+        {"fingerprint": "t", "servers": [{"name": "ob", "enabled": True}]},
+    )
+    monkeypatch.setattr(crc, "_cli_template_is_pi", lambda: True)
+    template = 'pi run {mcp} "{message}"'
+
+    chat = crc._user_mcp_cli_value(template, "chat")
+    proactive = crc._user_mcp_cli_value(template, "proactive")
+    background = crc._user_mcp_cli_value(template, "background")
+
+    assert chat, "pi 的 chat 轮本来就该挂桥 —— 否则下面的相等是空对空"
+    assert proactive == chat
+    assert background == ""
+
+
+def test_scheduled_reminder_think_only_is_not_reported_as_delivered(monkeypatch):
+    """有交付义务的唤醒不许用"合法沉默"收场。
+
+    定时提醒是用户明确要求过的:模型只写了 <think> 就结束,用户**什么都没收到**。
+    如果这一轮记成 `completed / thinking_only_silence`,那就是**把一次没送达的提醒
+    报成了成功** —— 而唤醒失败对用户不可见,没有人会发现。
+    同族前车之鉴:`_run_wake` 曾对所有 wake lane 传 require_reply=False(修复 519ec0b8)。
+    """
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    statuses = []
+    posted = []
+
+    def _turn(*_a, **_k):
+        turn = crc.AgentTurn(messages=[], actions=[])
+        turn.thinking_summary = "他大概在忙。"
+        turn.thinking_self_authored = True
+        return turn
+
+    monkeypatch.setattr(crc, "call_agent", _turn)
+    monkeypatch.setattr(crc, "_split_agent_turn", lambda result, max_items=None: result)
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: posted.append(reply) or {"id": "m"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc, "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: statuses.append((status, reason)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+    monkeypatch.setattr(crc, "_proactive_backing_off", lambda: False)
+
+    job = dict(
+        _proactive_job_fixture(),
+        job_id="pj_sched", wake_id="wake_sched",
+        trigger="scheduled_wake", wake_kind="scheduled", frame_ids=[],
+        scheduled_note="提醒他喝茶",
+    )
+    crc._process_proactive_jobs([job])
+
+    assert not posted
+    terminal = statuses[-1]
+    assert terminal[0] != "completed", (
+        f"定时提醒的 think-only 轮被报成了成功交付:{terminal}"
+    )
+    assert terminal[1] != "thinking_only_silence"
+
+    # 阴性对照在**兄弟用例**里:`test_thinking_only_wake_is_legal_silence_not_failure`
+    # 用同样只有 thinking 的环境心跳断言 `completed / thinking_only_silence`。
+    # 两条合起来才证明这条守卫**只收窄了有交付义务的那一类**,没有把整条语义关掉。
+    # (不写在本用例内:同一次 `_process_proactive_jobs` 之后再投一条,会被上一轮的
+    #  carrier 以 `coalesced_into` 吸走 —— 那样的"对照"根本没执行到,等于没测。)
+
+
+def test_introduction_think_only_is_not_reported_as_delivered(monkeypatch):
+    """首次介绍同样有交付义务:那一轮的问候就是它存在的理由。
+
+    与 `test_scheduled_reminder_think_only_...` 是同一条不变量的另一半。
+    我第一版只测了定时提醒那半:实测把 `not is_introduction` 单独删掉时
+    **631 条一条都不红** —— 所以这条不是补充,是补一个真实的缺口。
+    """
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    statuses = []
+    posted = []
+
+    def _turn(*_a, **_k):
+        turn = crc.AgentTurn(messages=[], actions=[])
+        turn.thinking_summary = "第一次见面,想想说什么。"
+        turn.thinking_self_authored = True
+        return turn
+
+    monkeypatch.setattr(crc, "call_agent", _turn)
+    monkeypatch.setattr(crc, "_split_agent_turn", lambda result, max_items=None: result)
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: posted.append(reply) or {"id": "m"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc, "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: statuses.append((status, reason)),
+    )
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+    monkeypatch.setattr(crc, "_proactive_backing_off", lambda: False)
+
+    job = dict(
+        _proactive_job_fixture(),
+        job_id="pj_intro", wake_id="wake_intro",
+        job_kind="introduction", trigger="post_spawn_genesis",
+        wake_kind="introduction", frame_ids=[],
+    )
+    crc._process_proactive_jobs([job])
+
+    assert not posted
+    assert statuses, "introduction 那一轮根本没被处理 —— 这条用例是无效的"
+    terminal = statuses[-1]
+    assert terminal[1] != "thinking_only_silence", (
+        f"首次介绍的 think-only 轮被当成了合法沉默:{terminal}"
+    )
