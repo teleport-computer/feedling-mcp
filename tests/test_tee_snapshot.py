@@ -254,6 +254,47 @@ def test_snapshot_updates_retained_unique_owner_before_inserting_new_owner(
         ]
 
 
+def test_snapshot_releases_retained_partial_unique_owner_before_promoting_peer(
+        partial_unique_key_table, monkeypatch):
+    """A retained replacement may be visited before the retained old owner.
+
+    PostgreSQL enforces a partial unique index row by row.  A single bulk
+    UPDATE can therefore try to promote ``new-active`` before it demotes
+    ``retained-old``; the merge must explicitly release the old owner first.
+    """
+    with db.get_pool().connection() as c:
+        c.execute(
+            f"INSERT INTO {partial_unique_key_table} (id, user_id, is_active) VALUES "
+            "('new-active', 'user', TRUE), "
+            "('retained-old', 'user', FALSE)"
+        )
+    with mirror.get_tee_pool().connection() as c:
+        # Physical order is intentional: it reproduces the production plan
+        # that attempted to activate the replacement before demoting the old.
+        c.execute(
+            f"INSERT INTO {partial_unique_key_table} (id, user_id, is_active) VALUES "
+            "('new-active', 'user', FALSE), "
+            "('retained-old', 'user', TRUE)"
+        )
+
+    monkeypatch.setitem(
+        snapshot._RELEASE_BEFORE_PROMOTE,
+        partial_unique_key_table,
+        ("is_active",),
+    )
+    rep = snapshot.snapshot_table(partial_unique_key_table)
+
+    assert rep["ok"] is True
+    with mirror.get_tee_pool().connection() as c:
+        assert c.execute(
+            f"SELECT id, user_id, is_active FROM {partial_unique_key_table} "
+            "ORDER BY id"
+        ).fetchall() == [
+            ("new-active", "user", True),
+            ("retained-old", "user", False),
+        ]
+
+
 def test_snapshot_parent_update_preserves_external_child(fk_tables):
     """Refreshing a retained parent must update in place, not TRUNCATE it.
 
@@ -411,7 +452,7 @@ def test_snapshot_all_continues_past_a_failing_table(monkeypatch):
 
     calls = []
 
-    def fake(table):
+    def fake(table, **kwargs):
         calls.append(table)
         if table == "provider_health":
             return {"table": table, "rows": 0, "ok": False, "error": "boom"}
@@ -421,6 +462,52 @@ def test_snapshot_all_continues_past_a_failing_table(monkeypatch):
     rep = snapshot.snapshot_all()
     assert rep["failures"] == 1
     assert len(calls) == len(reg.tables_in_lane(reg.SNAPSHOT))
+
+
+def test_snapshot_all_reads_parent_and_child_from_one_source_snapshot(monkeypatch):
+    """A live parent+child insert between tables must wait for the next pass."""
+    parent = "_snap_consistent_parent"
+    child = "_snap_consistent_child"
+    for pool in (db.get_pool(), mirror.get_tee_pool()):
+        with pool.connection() as c:
+            c.execute(f"DROP TABLE IF EXISTS {child}")
+            c.execute(f"DROP TABLE IF EXISTS {parent}")
+            c.execute(f"CREATE TABLE {parent} (id TEXT PRIMARY KEY)")
+            c.execute(
+                f"CREATE TABLE {child} (id TEXT PRIMARY KEY, parent_id TEXT NOT NULL "
+                f"REFERENCES {parent}(id))"
+            )
+            c.execute(f"INSERT INTO {parent} (id) VALUES ('baseline')")
+
+    real_snapshot_table = snapshot.snapshot_table
+
+    def interleave_live_write(table, **kwargs):
+        rep = real_snapshot_table(table, **kwargs)
+        if table == parent:
+            with db.get_pool().connection() as c:
+                c.execute(f"INSERT INTO {parent} (id) VALUES ('new-parent')")
+                c.execute(
+                    f"INSERT INTO {child} (id, parent_id) "
+                    "VALUES ('new-child', 'new-parent')"
+                )
+        return rep
+
+    monkeypatch.setattr(snapshot, "snapshot_order", lambda: (parent, child))
+    monkeypatch.setattr(snapshot, "snapshot_table", interleave_live_write)
+    try:
+        rep = snapshot.snapshot_all()
+
+        assert rep["failures"] == 0
+        with mirror.get_tee_pool().connection() as c:
+            assert c.execute(f"SELECT id FROM {parent} ORDER BY id").fetchall() == [
+                ("baseline",),
+            ]
+            assert c.execute(f"SELECT id FROM {child}").fetchall() == []
+    finally:
+        for pool in (db.get_pool(), mirror.get_tee_pool()):
+            with pool.connection() as c:
+                c.execute(f"DROP TABLE IF EXISTS {child}")
+                c.execute(f"DROP TABLE IF EXISTS {parent}")
 
 
 @pytest.fixture

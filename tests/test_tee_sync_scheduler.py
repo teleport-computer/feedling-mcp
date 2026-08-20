@@ -53,12 +53,27 @@ def test_reconcile_runs_before_replicate_then_verify(calls):
     # BEFORE any ciphertext child replicate, or the children FK-fail.
     sched._sync_tick(do_reconcile=True)
     actions = [c[0] for c in calls]
-    assert actions == (["reconcile", "snapshot"]
-                       + ["replicate"] * len(sched._replicable_tables()) + ["verify"])
+    assert actions == (
+        ["reconcile", "snapshot"]
+        + ["replicate"] * len(sched._replicable_tables())
+        + ["snapshot"] * len(sched._POST_REPLICATE_SNAPSHOT_TABLES)
+        + ["verify"]
+    )
     reconcile = next(c for c in calls if c[0] == "reconcile")
     verify = next(c for c in calls if c[0] == "verify")
     assert reconcile[3] == "MIGRATE"
     assert verify[2] is False  # dry_run=False, verify is confirm-exempt
+
+
+def test_cross_lane_snapshot_children_retry_after_ciphertext_parents(calls):
+    """Cross-lane FK children need a final pass after parent replication."""
+    sched._sync_tick(do_reconcile=False)
+    first_replicate = next(i for i, c in enumerate(calls) if c[0] == "replicate")
+    for table in ("chat_turn_activity_events", "model_api_routes"):
+        positions = [i for i, c in enumerate(calls)
+                     if c[0] == "snapshot" and c[1] == table]
+        assert len(positions) == 1
+        assert positions[0] > first_replicate
 
 
 def test_reconcile_failure_does_not_block_replicate(monkeypatch):
@@ -129,7 +144,11 @@ def test_one_table_error_does_not_stop_the_pass(monkeypatch):
     sched._sync_tick(do_reconcile=False)
     # memory_moments raised a generic error but the loop continued past it;
     # snapshot runs unconditionally (not gated by do_reconcile) and comes first.
-    assert seen == ["snapshot"] + list(sched._replicable_tables())
+    assert seen == (
+        ["snapshot"]
+        + list(sched._replicable_tables())
+        + ["snapshot"] * len(sched._POST_REPLICATE_SNAPSHOT_TABLES)
+    )
 
 
 def test_start_spawns_a_daemon_thread(monkeypatch):
