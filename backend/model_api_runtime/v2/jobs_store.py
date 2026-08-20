@@ -1938,6 +1938,52 @@ def mark_expired(job_id, error: str = "runtime_expired") -> None:
                 user_id, "v2_trajectory_reviews", source_job_id, "requeue")
 
 
+def _record_job_recovery_event_on_cursor(
+    cur,
+    *,
+    job_id: int,
+    lane: str,
+    recovery: str,
+    reason: str,
+) -> dict[str, object]:
+    """Append the recovery fact inside the job transition transaction."""
+    cur.execute(
+        "INSERT INTO v2_job_recovery_events "
+        "(job_id,job_attempt_count,lane,recovery,reason) "
+        "SELECT id,attempt_count,%s,%s,%s FROM agent_jobs WHERE id=%s "
+        "RETURNING job_id,job_attempt_count,lane,recovery,reason,created_at",
+        (
+            str(lane),
+            str(recovery),
+            str(reason)[:500],
+            int(job_id),
+        ),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise RuntimeError("recovered job missing while recording recovery event")
+    return dict(row)
+
+
+def _mirror_job_recovery_event(event: dict[str, object]) -> None:
+    """Best-effort RDS-shadow copy; the primary insert already committed."""
+    from tee_shadow import mirror
+
+    mirror.execute(
+        "INSERT INTO v2_job_recovery_events "
+        "(job_id,job_attempt_count,lane,recovery,reason,created_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+        (
+            int(event["job_id"]),
+            int(event["job_attempt_count"]),
+            str(event["lane"]),
+            str(event["recovery"]),
+            str(event["reason"]),
+            event["created_at"],
+        ),
+    )
+
+
 def recover_killed_job(
     *,
     job_id: int,
@@ -1947,6 +1993,7 @@ def recover_killed_job(
     """Recover exactly one claim still owned by a killed slot generation."""
     recovered_reviews: list[tuple[str, str]] = []
     result: dict[str, object] | None = None
+    recovery_event: dict[str, object] | None = None
     with _pool().connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
@@ -2123,6 +2170,15 @@ def recover_killed_job(
                     "lane": lane,
                     "recovery": recovery,
                 }
+                recovery_event = _record_job_recovery_event_on_cursor(
+                    cur,
+                    job_id=int(job_id),
+                    lane=lane,
+                    recovery=recovery,
+                    reason=str(reason),
+                )
+    if recovery_event is not None:
+        _mirror_job_recovery_event(recovery_event)
     if recovered_reviews:
         from tee_shadow import mirror
 
@@ -4847,15 +4903,15 @@ def recent_watchdog_recovery_counts(*, within_hours: int = 24) -> dict[str, int]
     safe_hours = max(1, min(int(within_hours), 24 * 30))
     with _pool().connection() as conn:
         rows = conn.execute(
-            "SELECT lane, count(*) FROM agent_jobs "
-            "WHERE last_error='slot_watchdog_timeout' "
-            "AND COALESCE(finished_at,created_at) > "
-            "now()-make_interval(hours => %s) GROUP BY lane ORDER BY lane",
+            "SELECT lane,recovery,count(*) FROM v2_job_recovery_events "
+            "WHERE reason='slot_watchdog_timeout' AND created_at > "
+            "now()-make_interval(hours => %s) "
+            "GROUP BY lane,recovery ORDER BY lane,recovery",
             (safe_hours,),
         ).fetchall()
     return {
-        f"{str(lane)}:{'terminal' if str(lane) == 'chat' else 'requeued'}": int(count)
-        for lane, count in rows
+        f"{str(lane)}:{str(recovery)}": int(count)
+        for lane, recovery, count in rows
     }
 
 

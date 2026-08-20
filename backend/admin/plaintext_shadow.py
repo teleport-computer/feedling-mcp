@@ -24,7 +24,7 @@ from tee_replicator import worker
 from tee_shadow import mirror, reconciler, snapshot, table_registry, verify
 
 
-_SCHEMA_HEAD = "0031_merge_voice_primary"
+_SCHEMA_HEAD = "0032_v2_job_recovery_events"
 _INSERT_SHAPE = re.compile(
     r"INSERT\s+INTO\s+([a-zA-Z0-9_]+)\s*\((.*?)\)\s*"
     r"(?:OVERRIDING\s+SYSTEM\s+VALUE\s*)?VALUES",

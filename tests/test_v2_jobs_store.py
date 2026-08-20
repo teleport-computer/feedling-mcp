@@ -118,6 +118,7 @@ def _clean_agent_jobs_table(monkeypatch):
     monkeypatch.setenv("FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE", "64")
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM v2_wake_shadow_decisions")
+        conn.execute("DELETE FROM v2_job_recovery_events")
         conn.execute("DELETE FROM agent_jobs")
         conn.execute("DELETE FROM v2_runtime_state")
     yield
@@ -2010,9 +2011,15 @@ def test_recover_killed_chat_is_exact_and_queues_terminal_failure():
             "SELECT error_code FROM v2_terminal_failure_outbox WHERE job_id=%s",
             (chat_id,),
         ).fetchone()
+        event = conn.execute(
+            "SELECT lane,recovery,reason FROM v2_job_recovery_events "
+            "WHERE job_id=%s",
+            (chat_id,),
+        ).fetchone()
     assert chat == ("expired", "slot_watchdog_timeout", None)
     assert other == ("pending",)
     assert outbox == ("slot_watchdog_timeout",)
+    assert event == ("chat", "terminal", "slot_watchdog_timeout")
     assert jobs_store.recover_killed_job(
         job_id=chat_id, claimed_by="foreground-0:g7"
     ) is None
@@ -2042,7 +2049,53 @@ def test_recover_killed_background_requeues_exact_claim(lane):
             "FROM agent_jobs WHERE id=%s",
             (job_id,),
         ).fetchone()
+        event = conn.execute(
+            "SELECT lane,recovery,reason FROM v2_job_recovery_events "
+            "WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
     assert row == ("pending", "slot_watchdog_timeout", None, None)
+    assert event == (lane, "requeued", "slot_watchdog_timeout")
+
+
+def test_recover_killed_job_rolls_back_transition_and_event_together(monkeypatch):
+    uid = "u_js_watchdog_atomic_event"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "profile")
+    claimed = jobs_store.claim_next_job("profile-owner", lanes={"profile"})
+    assert claimed is not None and int(claimed["id"]) == job_id
+    assert jobs_store.mark_running(job_id, claimed_by="profile-owner")
+
+    original = jobs_store._record_job_recovery_event_on_cursor
+
+    def _insert_then_fail(cur, **kwargs):
+        original(cur, **kwargs)
+        raise RuntimeError("force rollback after recovery event insert")
+
+    monkeypatch.setattr(
+        jobs_store, "_record_job_recovery_event_on_cursor", _insert_then_fail
+    )
+
+    with pytest.raises(RuntimeError, match="force rollback"):
+        jobs_store.recover_killed_job(
+            job_id=job_id,
+            claimed_by="profile-owner",
+            reason="slot_watchdog_timeout",
+        )
+
+    with db.get_pool().connection() as conn:
+        job = conn.execute(
+            "SELECT status,attempt_count,last_error,claimed_by "
+            "FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+        event_count = conn.execute(
+            "SELECT count(*) FROM v2_job_recovery_events WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()[0]
+    assert job == ("running", 0, None, "profile-owner")
+    assert event_count == 0
 
 
 def test_recent_mean_service_sec_none_without_history():
@@ -2480,6 +2533,41 @@ def test_watchdog_recovery_expires_scheduled_once_requeue_budget_is_spent():
     assert status == "expired"
     assert attempts == jobs_store.SCHEDULED_LEASE_REQUEUE_MAX_ATTEMPTS + 1
     assert last_error == "slot_watchdog_timeout"
+    with db.get_pool().connection() as conn:
+        event = conn.execute(
+            "SELECT lane,recovery FROM v2_job_recovery_events WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+    assert event == ("scheduled", "terminal")
+
+
+def test_recent_watchdog_counts_use_event_outcome_reason_and_event_time():
+    now = datetime.now(timezone.utc)
+    with db.get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO v2_job_recovery_events "
+                "(job_id,job_attempt_count,lane,recovery,reason,created_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s)",
+                [
+                    (9001, 1, "profile", "requeued", "slot_watchdog_timeout", now),
+                    (9002, 4, "scheduled", "terminal", "slot_watchdog_timeout", now),
+                    (9003, 1, "capture", "requeued", "manual_recovery", now),
+                    (
+                        9004,
+                        1,
+                        "dream",
+                        "requeued",
+                        "slot_watchdog_timeout",
+                        datetime(2020, 1, 1, tzinfo=timezone.utc),
+                    ),
+                ],
+            )
+
+    assert jobs_store.recent_watchdog_recovery_counts(within_hours=24) == {
+        "profile:requeued": 1,
+        "scheduled:terminal": 1,
+    }
 
 
 @pytest.mark.parametrize("outcome", [None, "known"])
