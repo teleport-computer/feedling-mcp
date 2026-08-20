@@ -5003,6 +5003,9 @@ def _heartbeat_slot_state(
     snapshot_fn = getattr(supervisor, "snapshot", None)
     snapshot = snapshot_fn() if callable(snapshot_fn) else None
     return {
+        "configuration": {
+            "trajectory_review_enabled": jobs_store.trajectory_review_enabled(),
+        },
         "slot": {
             "stage": "starting" if snapshot is None else snapshot.stage,
             "busy": bool(snapshot is not None and snapshot.active_job is not None),
@@ -5075,7 +5078,14 @@ async def _heartbeat_loop(
                 capacity=0,
                 kind="turn",
                 pool=pool,
-                runtime_state={"slot": {"stage": "stopping", "busy": False}},
+                runtime_state={
+                    "configuration": {
+                        "trajectory_review_enabled": (
+                            jobs_store.trajectory_review_enabled()
+                        ),
+                    },
+                    "slot": {"stage": "stopping", "busy": False},
+                },
             )
         except Exception as e:  # noqa: BLE001 — shutdown must remain bounded
             log.warning("[v2.serve_worker] clear worker capacity failed: %s", e)
@@ -5104,6 +5114,11 @@ async def _fleet_heartbeat_loop(
                     for key, snapshot in snapshots.items()
                 )
                 runtime_state = {
+                    "configuration": {
+                        "trajectory_review_enabled": (
+                            jobs_store.trajectory_review_enabled()
+                        ),
+                    },
                     "slots": {
                         "configured": configured,
                         "healthy": capacity,
@@ -5191,6 +5206,11 @@ async def _fleet_heartbeat_loop(
                 kind="turn",
                 capacity=0,
                 runtime_state={
+                    "configuration": {
+                        "trajectory_review_enabled": (
+                            jobs_store.trajectory_review_enabled()
+                        ),
+                    },
                     "slots": {
                         "configured": configured,
                         "healthy": 0,

@@ -1550,6 +1550,15 @@ def _v2_chat_failures_detail(user_id: str) -> dict:
         return {"error": f"{type(e).__name__}:{str(e)[:120]}"}
 
 
+def _v2_recent_jobs_detail(user_id: str) -> dict:
+    """Recent content-free agent_jobs rows for one user's support view."""
+    try:
+        from model_api_runtime.v2 import jobs_store as _v2_jobs_store
+        return _v2_jobs_store.recent_jobs_for_user(user_id)
+    except Exception as e:  # noqa: BLE001 — observability must never 500 the page
+        return {"error": f"{type(e).__name__}:{str(e)[:120]}"}
+
+
 PROACTIVE_V1_LENS = "v1_proactive_jobs_log"
 PROACTIVE_V1_LENS_NOTE = (
     "V1 口径:proactive_jobs 日志 + source=agent_initiated_proactive 的聊天行。"
@@ -1863,6 +1872,7 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         row["notice_summaries"] = _notice_summaries(user_id)
         row["provider_attempt_ledger"] = _provider_attempts_detail(store)
         row["v2_chat_failures"] = _v2_chat_failures_detail(user_id)
+        row["v2_recent_jobs"] = _v2_recent_jobs_detail(user_id)
         row["v2_profile"] = _v2_profile_detail(user_id)
         row["memory_capture_validation"] = _memory_capture_validation_detail(store)
         _ps = store.load_proactive_settings()
@@ -3720,6 +3730,23 @@ def _runtime_watchdog_recoveries(*, within_hours: int = 24) -> dict[str, int]:
 
 
 # Injected by the assembly layer (asgi_app.py); the real implementation is
+# model_api_runtime.v2.jobs_store.trajectory_review_observability_snapshot.
+def _runtime_trajectory_reviews() -> dict:
+    return {
+        "generated_at": 0.0,
+        "heartbeat_within_sec": 30,
+        "runner_config": {
+            "current_enabled": None,
+            "observed_runners": 0,
+            "enabled_runners": 0,
+            "disabled_runners": 0,
+            "consistent": False,
+        },
+        "status_counts": {"pending": 0, "running": 0},
+    }
+
+
+# Injected by the assembly layer (asgi_app.py); the real implementation is
 # model_api_runtime.v2.jobs_store.usage_report_snapshot.  The stub keeps Admin
 # importable in isolation without reversing the admin -> Runtime V2 dependency.
 def _usage_report(query: admin_usage.UsageQuery) -> dict:
@@ -4111,6 +4138,64 @@ def _render_watchdog_recovery_events(
     )
 
 
+def _render_trajectory_review_observability(snapshot: dict | None) -> str:
+    if snapshot is None:
+        return (
+            "<div class='note-box'><b>Trajectory review 运行态暂不可用。</b>"
+            "页面不会用 admin 进程自己的环境变量冒充 runner 配置，也不会把未知显示成关闭。"
+            "</div>"
+        )
+    config = snapshot.get("runner_config") or {}
+    observed = int(config.get("observed_runners") or 0)
+    enabled_count = int(config.get("enabled_runners") or 0)
+    disabled_count = int(config.get("disabled_runners") or 0)
+    current = config.get("current_enabled")
+    if current is True:
+        switch_label = "开启"
+        switch_value = "true"
+        switch_cls = "ok"
+    elif current is False:
+        switch_label = "关闭"
+        switch_value = "false"
+        switch_cls = "muted"
+    elif observed:
+        switch_label = "runner 间不一致"
+        switch_value = "mixed"
+        switch_cls = "bad"
+    else:
+        switch_label = "未知（无新格式新鲜心跳）"
+        switch_value = "unknown"
+        switch_cls = "muted"
+
+    counts = snapshot.get("status_counts") or {}
+    pending = int(counts.get("pending") or 0)
+    running = int(counts.get("running") or 0)
+    heartbeat_window = int(snapshot.get("heartbeat_within_sec") or 30)
+    return (
+        "<div class='note-box trajectory-review-observability' "
+        f"data-trajectory-review-enabled='{switch_value}'>"
+        "<b>Runner 读取到的 trajectory_review 开关：</b> "
+        f"<span class='{switch_cls}'>{html.escape(switch_label)}</span>"
+        f"（近 {heartbeat_window} 秒 foreground runner 心跳：观察到 {observed}，"
+        f"开启 {enabled_count} / 关闭 {disabled_count}）。"
+        "该布尔由 runner 进程自身读取环境变量后写入心跳，<b>不是 admin 进程的 env</b>；"
+        "admin 与 runner 分进程或分容器时，这里仍只反映 runner 看到的值。"
+        "无心跳或多 runner 值冲突时页面不会猜。"
+        "</div>"
+        "<div class='muted'>Review 状态是数据库的<b>当前快照，不是历史累计</b>；"
+        "不随上方 hours 窗口切换。快照生成 "
+        f"{html.escape(_bj_iso(snapshot.get('generated_at')))}。</div>"
+        "<section class='metrics trajectory-review-status'>"
+        f"<div class='metric' data-review-status='pending'>"
+        f"<div class='metric-value'>{pending}</div>"
+        "<div class='metric-label'>Review pending（当前快照）</div></div>"
+        f"<div class='metric' data-review-status='running'>"
+        f"<div class='metric-value'>{running}</div>"
+        "<div class='metric-label'>Review running（当前快照）</div></div>"
+        + "</section>"
+    )
+
+
 def _render_runtime_health_page(
     payload: dict,
     tokens: dict | None = None,
@@ -4118,6 +4203,7 @@ def _render_runtime_health_page(
     user_report: dict | None = None,
     stuck: dict | None = None,
     watchdog_recoveries: dict[str, int] | None = None,
+    trajectory_reviews: dict | None = None,
 ) -> str:
     """Runtime V2 全 lane 运行时健康值班台（?view=runtime）。
 
@@ -4125,7 +4211,8 @@ def _render_runtime_health_page(
     （日报送达率，按天）。heartbeat lane 两页都出现但口径不同，故本页该行给出
     指向日报页的链接。
 
-    ``tokens`` / ``delivery`` / ``user_report`` / ``watchdog_recoveries`` 都可能
+    ``tokens`` / ``delivery`` / ``user_report`` / ``watchdog_recoveries`` /
+    ``trajectory_reviews`` 都可能
     是 None（各自独立的失败域，见 admin_core）：取不到时对应区块显「暂不可用」，
     不得把 None 渲染成 0——0 是"确认过是零"。
     """
@@ -4245,6 +4332,9 @@ def _render_runtime_health_page(
     watchdog_section = _render_watchdog_recovery_events(
         watchdog_recoveries,
         within_hours=window_hours,
+    )
+    trajectory_review_section = _render_trajectory_review_observability(
+        trajectory_reviews
     )
 
     # 交付区块：唯一能看出「job 判成功但产物没到用户」的地方。取不到时明说取不到，
@@ -4507,6 +4597,8 @@ def _render_runtime_health_page(
   {empty_note}
   <h2>Worker 池</h2>
   <section class="metrics">{pool_metrics}</section>
+  <h2>Trajectory review 运行态</h2>
+  {trajectory_review_section}
   <h2>Watchdog 精确恢复</h2>
   {watchdog_section}
   <h2>端到端交付</h2>
@@ -9426,6 +9518,46 @@ def _render_invalid_data_track_user_page(raw_user_id: str) -> str:
 </section></main></body></html>"""
 
 
+def _render_user_recent_jobs(user: dict) -> str:
+    report = user.get("v2_recent_jobs")
+    if not isinstance(report, dict) or report.get("error"):
+        return (
+            "<section><h2 class='daily-heading'>Runtime V2 最近任务</h2>"
+            "<div class='daily-summary'>任务快照暂不可用；不会把未知显示成零。</div>"
+            "</section>"
+        )
+    jobs = report.get("jobs") or []
+    rows = []
+    for job in jobs:
+        rows.append(
+            "<tr>"
+            f"<td>{int(job.get('job_id') or 0)}</td>"
+            f"<td>{html.escape(str(job.get('lane') or ''))}</td>"
+            f"<td>{html.escape(str(job.get('status') or ''))}</td>"
+            f"<td class='job-attempt-count'>{int(job.get('attempt_count') or 0)}</td>"
+            f"<td>{html.escape(_bj_iso(job.get('created_at')) or '—')}</td>"
+            f"<td>{html.escape(_bj_iso(job.get('finished_at')) or '—')}</td>"
+            "</tr>"
+        )
+    body = "".join(rows) or (
+        "<tr><td colspan='6' class='muted'>近 "
+        f"{int(report.get('window_hours') or 0)} 小时没有 Runtime V2 任务。</td></tr>"
+    )
+    more = (
+        "<div class='muted'>结果已截断；还有更早任务未显示。</div>"
+        if report.get("has_more") else ""
+    )
+    return (
+        "<section><h2 class='daily-heading'>Runtime V2 最近任务</h2>"
+        "<div class='daily-summary'><b>attempt_count</b> 直接显示现有 "
+        "<code>agent_jobs.attempt_count</code>，不是另建或推算的计数。</div>"
+        "<div class='table-wrap'><table class='runtime-user-jobs'>"
+        "<thead><tr><th>Job</th><th>Lane</th><th>Status</th>"
+        "<th>attempt_count</th><th>创建</th><th>终结</th></tr></thead>"
+        f"<tbody>{body}</tbody></table></div>{more}</section>"
+    )
+
+
 def _render_user_detail_page(user: dict) -> str:
     qs = _data_track_qs()
     back = f"/admin/data-track?{qs}" if qs else "/admin/data-track"
@@ -9475,6 +9607,10 @@ def _render_user_detail_page(user: dict) -> str:
     .daily-track span {{ display:block; height:100%; min-width:0; background:var(--accent); border-radius:4px; }}
     .daily-track.daily-zero {{ background:#e7e2de; border:1px dashed #c9beb6; box-sizing:border-box; }}
     .daily-note {{ margin-top:7px; font-size:12px; }}
+    .table-wrap {{ max-width:100%; overflow-x:auto; }}
+    .runtime-user-jobs {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); margin:10px 0 18px; }}
+    .runtime-user-jobs th,.runtime-user-jobs td {{ padding:9px 10px; border-bottom:1px solid var(--line); text-align:left; white-space:nowrap; }}
+    .runtime-user-jobs th {{ color:var(--muted); font-size:12px; }}
     .responder-alert {{ margin:10px 0; padding:11px 13px; color:#8f1711; background:#fff0ee; border:2px solid #c62f25; border-radius:8px; }}
   </style>
 </head>
@@ -9499,6 +9635,7 @@ def _render_user_detail_page(user: dict) -> str:
   <div class="muted">Responder 判据：{html.escape(str(responder.get('criteria') or 'unavailable'))}</div>
   {_render_screen_frames(user)}
   {_render_user_daily_usage(user)}
+  {_render_user_recent_jobs(user)}
   {_render_perception_permissions(user)}
   {_render_perception_freshness(user)}
   <div class="muted" style="margin-top:14px">以下所有时间已转北京时间(UTC+8) · 原始存储为 UTC。</div>

@@ -66,7 +66,10 @@ def test_heartbeat_records_full_capacity_when_child_alive_and_fresh(monkeypatch)
         "capacity": 1,
         "kind": "turn",
         "pool": "foreground",
-        "runtime_state": {"slot": {"stage": "starting", "busy": False}},
+        "runtime_state": {
+            "configuration": {"trajectory_review_enabled": False},
+            "slot": {"stage": "starting", "busy": False},
+        },
     }
 
 
@@ -78,7 +81,10 @@ def test_heartbeat_records_zero_capacity_when_child_dead(monkeypatch):
         "capacity": 0,
         "kind": "turn",
         "pool": "foreground",
-        "runtime_state": {"slot": {"stage": "starting", "busy": False}},
+        "runtime_state": {
+            "configuration": {"trajectory_review_enabled": False},
+            "slot": {"stage": "starting", "busy": False},
+        },
     }
 
 
@@ -96,7 +102,10 @@ def test_heartbeat_records_zero_capacity_when_progress_stale(monkeypatch):
         "capacity": 0,
         "kind": "turn",
         "pool": "foreground",
-        "runtime_state": {"slot": {"stage": "starting", "busy": False}},
+        "runtime_state": {
+            "configuration": {"trajectory_review_enabled": False},
+            "slot": {"stage": "starting", "busy": False},
+        },
     }
 
 
@@ -111,7 +120,10 @@ def test_heartbeat_records_full_capacity_when_progress_just_under_threshold(monk
         "capacity": 1,
         "kind": "turn",
         "pool": "foreground",
-        "runtime_state": {"slot": {"stage": "starting", "busy": False}},
+        "runtime_state": {
+            "configuration": {"trajectory_review_enabled": False},
+            "slot": {"stage": "starting", "busy": False},
+        },
     }
 
 
@@ -205,7 +217,10 @@ def test_heartbeat_survives_missing_last_progress_age_sec(monkeypatch):
         "capacity": 0,
         "kind": "turn",
         "pool": "foreground",
-        "runtime_state": {"slot": {"stage": "starting", "busy": False}},
+        "runtime_state": {
+            "configuration": {"trajectory_review_enabled": False},
+            "slot": {"stage": "starting", "busy": False},
+        },
     }
 
 
@@ -221,7 +236,10 @@ def test_heartbeat_writes_the_explicit_pool_identity(monkeypatch):
         "capacity": 1,
         "kind": "turn",
         "pool": "wake",
-        "runtime_state": {"slot": {"stage": "starting", "busy": False}},
+        "runtime_state": {
+            "configuration": {"trajectory_review_enabled": False},
+            "slot": {"stage": "starting", "busy": False},
+        },
     }
 
 
@@ -238,7 +256,10 @@ def test_heartbeat_runtime_state_exposes_stage_without_job_identity():
         _FakeSupervisor({"alive": True}, snapshot=snapshot)
     )
 
-    assert state == {"slot": {"stage": "profile.cards.batch", "busy": True}}
+    assert state == {
+        "configuration": {"trajectory_review_enabled": False},
+        "slot": {"stage": "profile.cards.batch", "busy": True},
+    }
     serialized = repr(state)
     assert "3694" not in serialized
     assert "worker:heavy" not in serialized

@@ -1352,6 +1352,7 @@ class _HealthySupervisor:
 
 def test_turn_heartbeat_advertises_slot_capacity(monkeypatch):
     calls = []
+    monkeypatch.setenv("FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED", "1")
     monkeypatch.setattr(
         jobs_store,
         "record_worker_heartbeat",
@@ -1378,6 +1379,7 @@ def test_turn_heartbeat_advertises_slot_capacity(monkeypatch):
             "kind": "turn",
             "pool": "foreground",
             "runtime_state": {
+                "configuration": {"trajectory_review_enabled": True},
                 "slot": {"stage": "starting", "busy": False}
             },
         },
@@ -1389,6 +1391,7 @@ def test_turn_heartbeat_advertises_slot_capacity(monkeypatch):
             "kind": "turn",
             "pool": "foreground",
             "runtime_state": {
+                "configuration": {"trajectory_review_enabled": True},
                 "slot": {"stage": "stopping", "busy": False}
             },
         },
