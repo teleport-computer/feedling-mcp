@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Managed TEE database promotion can retain terminal historical ciphertext
+  without changing account encryption preferences.** The migration copies the
+  original raw envelope only after an exact count-and-digest approval, records a
+  reversible audit marker, and verifies every preserved source/destination pair.
+  This preserves device readability when the user's key remains valid; it does
+  not repair an unusable enclave wrap or grant the service new plaintext access.
+  Promotion now distinguishes fully audited preservation from unresolved,
+  malformed, or requeued work, which remains blocking.
+
 - **Image generation now works for more OpenAI-compatible relay routes.** Some
   routes whose provider is `openai_compatible` ended in
   `image_generation_invalid_output` even though the upstream request had already
