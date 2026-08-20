@@ -639,6 +639,7 @@ def run(*, sample_rate: float = 0.02) -> dict:
             if (cfg["pending_table"], row.user_id, row.item_id)
             in preserved_audit.valid_keys
         ]
+        blocking_pending += len(split.preserved) - len(valid_preserved)
         table_report = _ciphertext_table_report(
             cfg, terminal_rows, valid_preserved
         )

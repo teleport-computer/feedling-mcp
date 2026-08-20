@@ -488,6 +488,7 @@ def test_verify_fully_audits_preserved_chat_and_frame_bridge(backend_env):
     assert drifted["preserved_mismatches"] == [
         "destination_conflict:chat_messages:1"
     ]
+    assert drifted["blocking_pending"] == 1
 
 
 def test_requeue_pending_row_excluded_from_equation_but_counted_as_backlog(backend_env):
