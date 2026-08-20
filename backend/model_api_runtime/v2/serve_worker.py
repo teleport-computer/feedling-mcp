@@ -4992,7 +4992,25 @@ def wire_assembly() -> None:
     core_wake_bus.register_handler("users", _reload_accounts_registry)
     core_wake_bus.register_handler("v2_jobs", v2_worker.on_v2_job_notify)
     core_wake_bus.register_job_cancel_handler(_JOB_CANCEL_ROUTER.handle)
+    jobs_store.on_job_enqueued = _emit_job_enqueued_trace
     core_wake_bus.start_listener()
+
+
+def _emit_job_enqueued_trace(user_id: str, lane: str, *, reason: str, trace_id: str) -> None:
+    """Enqueue half of the enqueue->terminal pair.
+
+    Wired rather than imported: jobs_store sits below debug_trace and must not
+    reach upward.  ``detail.lane`` and ``detail.enqueue_source`` are promoted to
+    real indexed columns by insert_trace_events_strict, so putting them in
+    detail is what populates them.
+    """
+    _emit_v2_debug_trace_for_user(
+        user_id,
+        "agent.job.enqueued",
+        status="ok",
+        trace_id=trace_id,
+        detail={"lane": lane, "reason": reason, "enqueue_source": lane},
+    )
 
 
 def build_health_app():

@@ -46,6 +46,7 @@ import posixpath
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -11698,7 +11699,8 @@ async def _ensure_prompt_coverage_or_degrade(
         _report_turn_progress("prompt_catchup_degraded")
         try:
             await asyncio.to_thread(
-                jobs_store.enqueue_job, user_id, "maintenance", reason="compaction"
+                jobs_store.enqueue_job, user_id, "maintenance",
+                reason="compaction", trace_id=uuid.uuid4().hex,
             )
             await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
         except Exception as enqueue_exc:  # noqa: BLE001
@@ -14501,7 +14503,8 @@ async def process_job(
         if tail and context.needs_compaction(tail, budget=_TAIL_BUDGET):
             try:
                 await asyncio.to_thread(
-                    jobs_store.enqueue_job, user_id, "maintenance", reason="compaction"
+                    jobs_store.enqueue_job, user_id, "maintenance",
+                    reason="compaction", trace_id=uuid.uuid4().hex,
                 )
             except Exception as e:  # noqa: BLE001 — 压缩入队失败绝不能拖垮已经写成的这条回复
                 log.warning(
@@ -14849,6 +14852,94 @@ async def process_job(
 
 
 async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
+    """Thin wrapper whose only job is to record the terminal half of the pair.
+
+    ``_run_turn_body`` has several terminal exits -- provider_unavailable
+    returns early, the extraction gate terminalizes on its own, the outer
+    ``except`` returns, and wake can return "rescheduled" -- and only one of
+    them recorded anything.  Emitting at each site means every future early
+    return is one more silent hole, so the wrapper emits once for all of them.
+
+    The signature is deliberately unchanged: many tests patch this seam.
+    """
+    outcome = await _run_turn_body(job, deps, enclave_sem=enclave_sem)
+    # Deliberately NOT a finally: a finally also runs for CancelledError and for
+    # any unhandled BaseException, and would then emit outcome="failed" for a
+    # turn that was merely drained -- inventing a failure that never happened.
+    # Every terminal path inside the body returns an outcome, so returning is
+    # the honest signal that a terminal state was reached.
+    await _emit_job_terminal_trace(deps, job, outcome)
+    return outcome
+
+
+async def _emit_job_terminal_trace(deps: TurnDeps, job: dict, outcome: str) -> None:
+    """Record the terminal half of the enqueue->terminal pair.
+
+    Carries the job's own ``trace_id`` rather than minting one: a fresh id
+    yields two events that both exist and cannot be joined, which looks like
+    success while answering nothing.  ``chat`` is skipped -- it is traced on its
+    own send path and is the highest-volume lane.
+    """
+    emit = getattr(deps, "emit_debug_trace", None)
+    lane = str(job.get("lane") or "")
+    if emit is None or lane == "chat":
+        return
+    try:
+        # The claim snapshot is stale by construction: mark_failed/reschedule
+        # write the durable row, never this dict.  Reading the snapshot would
+        # give a new job an empty code and a retried job the PREVIOUS attempt's
+        # error -- attributing this failure to the wrong cause, which is exactly
+        # the misclassification the taxonomy exists to prevent.
+        # The body returning "failed" means *this worker* stopped, which is not
+        # the same as the job being terminal: on LostJobLease the winning
+        # lifecycle owns terminal visibility and the row may already be
+        # completed, and trajectory review returns "failed" when mark_running
+        # loses.  Emitting on the body's word alone would publish a failure for
+        # a job that succeeded.  The durable row is the precondition, not a
+        # decoration.
+        durable = None
+        try:
+            durable = await asyncio.to_thread(
+                jobs_store.get_terminal_snapshot,
+                job.get("id"),
+                user_id=str(job.get("user_id") or ""),
+            )
+        except Exception:  # noqa: BLE001 — cannot confirm terminality: stay quiet
+            return
+        if not isinstance(durable, dict):
+            return
+        durable_status = str(durable.get("status") or "")
+        expected = {
+            "completed": {"completed"},
+            "failed": {"failed", "expired"},
+            "rescheduled": {"pending"},
+            "superseded": {"superseded"},
+        }.get(outcome, set())
+        if durable_status not in expected:
+            return
+        error_code = str(durable.get("last_error") or "")
+        status = {"completed": "ok", "rescheduled": "warning",
+                  "superseded": "warning"}.get(outcome, "error")
+        kwargs = {
+            "status": status,
+            "trace_id": str(job.get("trace_id") or ""),
+            "job_id": str(job.get("id") or ""),
+            "detail": {"lane": lane, "outcome": outcome, "error_code": error_code},
+        }
+        # outcome_class has no success member, so it is only meaningful on an
+        # actual failure.  rescheduled/superseded are warnings, not failures --
+        # stamping them would assert a failure classification that is not true
+        # of them, which is the same conflation this taxonomy exists to prevent.
+        if status == "error":
+            kwargs["outcome_class"] = jobs_store.terminal_outcome_class(error_code)
+        await asyncio.to_thread(
+            emit, str(job.get("user_id") or ""), "agent.job.terminal", **kwargs
+        )
+    except Exception as exc:  # noqa: BLE001 — observability must not fail a turn
+        log.warning("[v2.worker] terminal trace emit failed: %s", exc)
+
+
+async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
     """把一个已 claim 的 job 交给 `process_job` 之前，先做一次性的 enclave-bound 解析：
     单次解密 BYOK provider key（single-decrypt-per-turn）+ 铸一个
     enclave-auth runtime_token。resolve_provider 失败（未配置/解密失败等）直接 mark_failed，

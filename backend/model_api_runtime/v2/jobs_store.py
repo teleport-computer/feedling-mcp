@@ -333,6 +333,46 @@ TIMEOUT_OUTCOME_CODES = frozenset({
 })
 
 
+# Wired by the assembly layer, never imported here: jobs_store sits below
+# debug_trace and must not reach upward for it.  Left None in contexts that do
+# not wire it (tests, tools), where enqueue must still work.
+on_job_enqueued = None
+
+
+def _notify_job_enqueued(
+    user_id: str,
+    lane: str,
+    *,
+    reason: str,
+    trace_id: str,
+    result: tuple | None = None,
+) -> None:
+    """Fire the enqueue hook once the write is durable, for real inserts only.
+
+    ``coalesce_or_insert_on_cursor`` returns ``(job_id, coalesced)``.  A
+    coalesced call coalesces new input into an *existing* row and keeps that
+    row's original trace_id, so emitting here would (a) call something
+    "enqueued" that enqueued nothing and (b) publish this call's trace_id while
+    the terminal event later carries the row's older one -- breaking the very
+    id-equality join this pair exists to provide.
+
+    Deliberately skips ``chat``: already traced on its own send path, and by far
+    the highest-volume producer.
+
+    An enqueue must never fail because its trace failed, so everything is
+    swallowed -- this sits next to a database transaction and is the one new
+    call site that could otherwise take a write down with it.
+    """
+    if on_job_enqueued is None or lane == "chat":
+        return
+    if result is not None and len(result) > 1 and result[1]:
+        return  # coalesced into an existing job: not an enqueue
+    try:
+        on_job_enqueued(user_id, lane, reason=reason, trace_id=trace_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("[jobs_store] enqueue trace hook failed: %s", exc)
+
+
 def terminal_outcome_class(error_code: str) -> str:
     """Map a terminal error code to the shared four-value outcome taxonomy.
 
@@ -962,6 +1002,11 @@ def enqueue_job(
     if priority is None:
         priority = LANE_PRIORITY.get(lane, 0)
 
+    # The result is captured and returned *after* the transaction closes so the
+    # enqueue hook below cannot observe a write that later rolls back: a trace
+    # row claiming a job exists, for a job that does not, is worse than no row.
+    result = None
+    committed = False
     for _ in range(3):
         try:
             with _pool().connection() as conn:
@@ -982,7 +1027,7 @@ def enqueue_job(
                                 effective_generation = int(
                                     control["runtime_generation"]
                                 )
-                        return coalesce_or_insert_on_cursor(
+                        result = coalesce_or_insert_on_cursor(
                             cur,
                             user_id,
                             lane,
@@ -992,8 +1037,13 @@ def enqueue_job(
                             deadline_at=deadline_at,
                             expected_generation=effective_generation,
                         )
+            committed = True
+            break
         except psycopg.errors.UniqueViolation:
             continue  # 并发 racer 抢先建了 active job；重读并 coalesce
+    if committed:
+        _notify_job_enqueued(user_id, lane, reason=reason, trace_id=trace_id, result=result)
+        return result
     # A very busy terminal/enqueue race can exhaust the optimistic retries.
     # The fallback must still record that new input arrived; merely returning
     # the row id would let finalization miss the follow-up generation.
@@ -1013,7 +1063,7 @@ def enqueue_job(
                         and str(control["hosted_runtime_state"]) == "v2"
                     ):
                         effective_generation = int(control["runtime_generation"])
-                return coalesce_or_insert_on_cursor(
+                result = coalesce_or_insert_on_cursor(
                     cur,
                     user_id,
                     lane,
@@ -1023,6 +1073,8 @@ def enqueue_job(
                     deadline_at=deadline_at,
                     expected_generation=effective_generation,
                 )
+    _notify_job_enqueued(user_id, lane, reason=reason, trace_id=trace_id, result=result)
+    return result
 
 
 def enqueue_job_with_context_log(
@@ -1101,6 +1153,14 @@ def enqueue_job_with_context_log(
         raise RuntimeError("could not atomically enqueue job context")
 
     job_id, coalesced, seq, payload = inserted
+    # Fired here, before the mirror write: the authoritative job is already
+    # durable at this point, and a mirror failure must not be able to swallow
+    # the enqueue event for a job that really exists.  The hook is fail-open, so
+    # putting it first cannot harm the mirror either.
+    _notify_job_enqueued(
+        user_id, lane, reason=reason or "", trace_id=trace_id or "",
+        result=(job_id, coalesced),
+    )
     from tee_shadow import mirror
 
     mirror.execute(
@@ -4424,6 +4484,26 @@ def get_chat_mutation_recovery_barrier(
         "has_mcp": bool(row[1]),
         "has_platform": bool(row[2]),
     }
+
+
+def get_terminal_snapshot(job_id, *, user_id: str) -> dict | None:
+    """Read the durable terminal state of one job.
+
+    Terminal attribution must come from the row, not from the claim snapshot
+    the worker is holding: ``mark_failed``/``reschedule`` write the database and
+    never write back into that dict, so a caller reading the snapshot gets an
+    empty code for a fresh job and the PREVIOUS attempt's error for a retried
+    one -- blaming this failure on the wrong cause.
+    """
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT status, last_error FROM agent_jobs "
+                "WHERE id=%s AND user_id=%s",
+                (job_id, str(user_id)),
+            )
+            row = cur.fetchone()
+    return dict(row) if row else None
 
 
 def get_job_status(
