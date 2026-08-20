@@ -8,6 +8,7 @@ append-only 游标模型处理可变行要靠 requeue 补偿 + prune，成本线
 from __future__ import annotations
 
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -140,6 +141,69 @@ def test_snapshot_propagates_update_and_delete(sample_table):
     snapshot.snapshot_table(sample_table)
 
     assert _tee_rows(sample_table) == [("a", "changed")]
+
+
+def test_voice_call_sessions_snapshot_propagates_lifecycle_and_prunes():
+    """The real composite-key table must converge updates and tombstones."""
+    uid = f"usr_voice_snapshot_{uuid.uuid4().hex[:12]}"
+    try:
+        for pool in (db.get_pool(), mirror.get_tee_pool()):
+            with pool.connection() as conn:
+                conn.execute(
+                    "INSERT INTO users (user_id,created_at,doc) "
+                    "VALUES (%s,'','{}'::jsonb)",
+                    (uid,),
+                )
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO voice_call_sessions (user_id,call_id,status) VALUES "
+                "(%s,'cancel-me','active'),(%s,'delete-me','active')",
+                (uid, uid),
+            )
+        with mirror.get_tee_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO voice_call_sessions (user_id,call_id,status) "
+                "VALUES (%s,'stale-target','active')",
+                (uid,),
+            )
+
+        first = snapshot.snapshot_table("voice_call_sessions")
+        assert first["ok"] is True
+
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE voice_call_sessions SET status='cancelled',"
+                "cancel_reason='user_hangup',ended_at=now() "
+                "WHERE user_id=%s AND call_id='cancel-me'",
+                (uid,),
+            )
+            conn.execute(
+                "DELETE FROM voice_call_sessions "
+                "WHERE user_id=%s AND call_id='delete-me'",
+                (uid,),
+            )
+            conn.execute(
+                "INSERT INTO voice_call_sessions (user_id,call_id,status,ended_at) "
+                "VALUES (%s,'finalized','finalized',now())",
+                (uid,),
+            )
+
+        second = snapshot.snapshot_table("voice_call_sessions")
+        assert second["ok"] is True
+        with mirror.get_tee_pool().connection() as conn:
+            rows = conn.execute(
+                "SELECT call_id,status,cancel_reason "
+                "FROM voice_call_sessions WHERE user_id=%s ORDER BY call_id",
+                (uid,),
+            ).fetchall()
+        assert rows == [
+            ("cancel-me", "cancelled", "user_hangup"),
+            ("finalized", "finalized", ""),
+        ]
+    finally:
+        for pool in (db.get_pool(), mirror.get_tee_pool()):
+            with pool.connection() as conn:
+                conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
 
 
 def test_snapshot_releases_stale_secondary_unique_key_before_upsert(unique_key_table):
@@ -484,6 +548,11 @@ def test_users_is_snapshotted_before_per_user_tables():
     assert set(order) == snap
     if "users" in snap:
         assert order.index("users") == 0
+
+
+def test_voice_call_sessions_are_part_of_the_scheduled_snapshot_lane():
+    """Direct snapshot support is useless if the scheduler never calls it."""
+    assert "voice_call_sessions" in snapshot.snapshot_order()
 
 
 def test_snapshot_parents_are_ordered_before_known_children():

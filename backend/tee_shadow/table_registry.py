@@ -28,7 +28,9 @@ CIPHERTEXT = "CIPHERTEXT"
 # 补偿和 prune。
 SNAPSHOT = "SNAPSHOT"
 
-# 不同步。理由必填且必须具体（守卫会拒绝"暂不需要"这类含糊理由）。
+# 不做 RDS → TEE 数据复制。理由必填且必须具体（守卫会拒绝"暂不需要"这类
+# 含糊理由）。部分 TEE-primary 本地表仍会由 TEE 迁移链创建，并在切主后由应用
+# 本地写入；这类条目必须显式 required_in_tee=True。
 SKIP = "SKIP"
 
 # PG 原生逻辑复制。**预留，尚未实现**：需要把 RDS 的 rds.logical_replication
@@ -47,6 +49,15 @@ class Entry:
     # True = 这张表不由 alembic 迁移链创建（人工 SQL 建的，如一次性备份表）。
     # 守卫据此放行"注册表里有、迁移链里没有"的条目；不标就当成表名打错。
     manual: bool = False
+    # None = 按 lane 推导（非 SKIP 必需、SKIP 不必需）。SKIP lane 上的
+    # TEE-primary 本地 staging/观测表必须显式 True，避免复制策略被误当成 DDL 豁免。
+    required_in_tee: bool | None = None
+
+    @property
+    def tee_required(self) -> bool:
+        if self.required_in_tee is not None:
+            return self.required_in_tee
+        return self.lane != SKIP
 
 
 REGISTRY: dict[str, Entry] = {
@@ -220,16 +231,22 @@ REGISTRY: dict[str, Entry] = {
         SNAPSHOT, "V2 worker 心跳，UPDATE 密集，明文；T149/A：TEE 0004 派生漏 capacity CHECK"),
 
     # ---------------------------------------------------------------- #
-    # SKIP —— 永远不进 TEE。理由必须具体。
+    # SKIP —— 不做 RDS → TEE 数据复制。理由必须具体。
     # ---------------------------------------------------------------- #
     "alembic_version": Entry(
         SKIP, "RDS 迁移链自己的版本表；TEE 有独立的 alembic_tee_version，两条链互不感知"),
     "genesis_import_chunks": Entry(
-        SKIP, "入住导入的 staging 数据，冻结窗口内处理完即弃，非用户资产（上游 plan 已决定不复制）"),
+        SKIP,
+        "入住导入的 staging 数据，冻结窗口内处理完即弃，非用户资产；不搬 RDS 历史，"
+        "TEE-primary 后由当前主库本地产生",
+        required_in_tee=True,
+    ),
     "v2_wake_shadow_decisions": Entry(
         SKIP,
         "主动唤醒 A′ 影子观测；只含本地日期/时分、lane、放行与 APNs 告警投递布尔，"
-        "独立保留 90 天且不依赖 agent_jobs 生命周期，RDS Admin 报表是唯一消费者",
+        "独立保留 90 天且不依赖 agent_jobs 生命周期；不搬 RDS 历史，TEE-primary 后"
+        "由当前主库本地产生",
+        required_in_tee=True,
     ),
     "tee_sync_runs": Entry(
         SKIP, "TEE 同步自身的控制面/指标表，必须住在 RDS——复制到被它监控的库里没有意义"),
@@ -241,20 +258,21 @@ REGISTRY: dict[str, Entry] = {
         "memory_moments 同型。切读 TEE 后用户仍要能回看通话记录，所以必须复制",
     ),
     "voice_call_sessions": Entry(
-        SKIP,
-        "语音通话取消/finalize 的 RDS 并发控制面；只保存 call id、状态与结束原因，"
-        "回复落库 fence 必须和 RDS chat 写事务共库加锁，复制到 TEE 既不能参与互斥"
-        "也不是持久用户资产",
+        SNAPSHOT,
+        "语音取消/finalize 的当前主库并发控制面；RDS-primary 时整表快照保证切换前"
+        "状态与 tombstone 收敛，TEE-primary 后与 chat 写事务共库",
     ),
     "voice_turn_results": Entry(
         SKIP,
         "voice SSE 的 900 秒 AES-GCM 临时交接缓冲；非标准 content envelope，过期即删，"
-        "不是持久用户资产，复制只会制造不可消费的陈旧密文",
+        "不是持久用户资产，不搬 RDS 历史；TEE-primary 后由当前主库本地产生",
+        required_in_tee=True,
     ),
     "voice_turn_streams": Entry(
         SKIP,
         "voice SSE 增量的 900 秒 AES-GCM 临时流状态；非标准 content envelope，持续覆写"
-        "且过期即删，复制只会制造不可消费的陈旧密文",
+        "且过期即删，不搬 RDS 历史；TEE-primary 后由当前主库本地产生",
+        required_in_tee=True,
     ),
     "bak_20260710_usr450_blobs": Entry(
         SKIP, "2026-07-10 单用户事故的一次性人工备份表，非生产数据", manual=True),
@@ -277,6 +295,11 @@ def tables_in_lane(lane: str) -> tuple[str, ...]:
 def synced_tables() -> tuple[str, ...]:
     """所有会进 TEE 的表（即非 SKIP），按字典序。"""
     return tuple(sorted(t for t, e in REGISTRY.items() if e.lane != SKIP))
+
+
+def tee_required_tables() -> tuple[str, ...]:
+    """TEE-primary schema 必须具备的表，包含同步表与本地产生的 SKIP 表。"""
+    return tuple(sorted(t for t, entry in REGISTRY.items() if entry.tee_required))
 
 
 # worker._TABLES 里那些**不是 RDS 表名**的 key。
