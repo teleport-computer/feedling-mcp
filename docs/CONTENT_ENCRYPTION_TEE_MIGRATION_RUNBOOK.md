@@ -123,7 +123,19 @@ unreachable.
 
 Stop API writes, main `serve-worker`, and the independent runner. Drain Genesis
 chunks/jobs, voice handoffs, agent jobs, the action queue, both V2 outboxes, and
-pending TEE device migrations. From the exact release being promoted:
+pending TEE device migrations. Confirm that the migrated destination has both
+the release head and the voice lifecycle fence:
+
+```sql
+SELECT version_num FROM alembic_tee_version;
+SELECT to_regclass('public.voice_call_sessions');
+```
+
+The first query must return exactly the release's single TEE head and the second
+must return `voice_call_sessions`. Complete a TEST voice session
+create/cancel/finalize smoke before entering the production write freeze.
+
+From the exact release being promoted:
 
 ```bash
 cd backend
@@ -131,7 +143,9 @@ python -m admin.phase4_cutover
 python -m admin.phase4_cutover --apply --confirm-writes-frozen
 ```
 
-The first command is read-only. Apply requires the TEE owner DSN in
+The first command leaves no committed writes, but it requires the destination
+app role to execute a voice-session create/cancel/finalize smoke inside a
+forced-rollback transaction. Apply additionally requires the TEE owner DSN in
 `TEE_MIGRATION_DATABASE_URL`; it copies the frame bridge and Chat generation
 fences, aligns sequences, enables TEE contracts, and writes the head-bound
 prepared marker.

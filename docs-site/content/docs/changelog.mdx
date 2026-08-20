@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Managed TEE-primary promotion now verifies the voice-call lifecycle on the
+  database that will receive Chat writes.** The TEE schema carries the same
+  durable cancel/finalize fence as the former primary, and the Phase-4 gate
+  performs real state transitions in a forced-rollback transaction. A database
+  switch can no longer report healthy while the first voice session fails on a
+  missing lifecycle table.
+
 - **Managed production supports a separately gated decrypted PostgreSQL
   shadow after TEE-primary promotion.** The TEE database remains authoritative;
   source triggers capture content-free dirty keys and a singleton backend drain
@@ -69,7 +76,6 @@ change must not be interpreted as an API guarantee.
   image remains, and never triggers a second, separately billed request. This
   applies to every provider that answers the image endpoint with a link, not
   only OpenAI-compatible relays.
-
 - **Image generation now works for more OpenAI-compatible relay routes.** Some
   routes whose provider is `openai_compatible` ended in
   `image_generation_invalid_output` even though the upstream request had already
