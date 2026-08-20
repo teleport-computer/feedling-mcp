@@ -614,7 +614,7 @@ def test_capture_prompt_degrades_when_memory_context_is_missing(monkeypatch):
         job, _deps(read_memory_context=None), provider_config=_BYOK,
         api_key=None, runtime_token="rt"))
     assert status == "completed"
-    assert "（暂无）" in seen["prompt"]          # prompt builder's own fallback kicked in
+    assert "(none)" in seen["prompt"]           # prompt builder's own fallback kicked in
 
 
 def test_capture_prompt_includes_existing_card_ids(monkeypatch):

@@ -13294,7 +13294,13 @@ def _capture_post_json(
         return {}
 
 
-def _capture_context_text(value: Any, *, empty: str = "（暂无）") -> str:
+def _capture_context_text(value: Any, *, empty: str = "") -> str:
+    """空值一律交给内核兜 —— 别在这里塞一个写死语言的占位符。
+
+    踩过：这里默认返回「（暂无）」，于是内核按 locale 生成的占位符对 V1 永远
+    不生效，V1 的提示词里始终留着两个中文字。英文花园尤其明显 —— 一份全英文的
+    提示词里冒出「（暂无）」，等于给模型发混合语言信号。
+    """
     if value in (None, "", [], {}):
         return empty
     if isinstance(value, str):

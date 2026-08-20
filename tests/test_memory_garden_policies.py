@@ -356,3 +356,29 @@ def test_within_limit_is_untouched():
     for n in (0, 1, 2):
         cards, err = parse_capture_cards(_cards_json(n))
         assert len(cards) == n and err is None
+
+
+# --------------------------------------------------------------------------- #
+# 跨模块引用：别处引用提示词里的句子时，那句话必须真的还在
+# --------------------------------------------------------------------------- #
+
+
+def test_voice_call_header_quotes_a_phrase_that_is_actually_in_the_prompt():
+    """通话抬头推翻「少而精」那条规则时，引用的短语必须真的出现在提示词里。
+
+    **这条是踩出来的。** 抬头原本硬抄了规则里的那句中文（「宁少勿多、只留一到
+    两件」）。2026-08-20 把 rubric 换成英文之后，抬头引用的句子在提示词里已经
+    不存在了 —— 推翻话术落空，而一通电话的落卡数会掉回闲聊量纲（实测 12 件
+    值得记的事只留下 2 件）。当时没有任何测试会红。
+
+    引用方现在用 RESTRAINT_RULE_QUOTE 常量，这条守住常量与 rubric 不脱节。
+    """
+    from memory_garden.policies import RESTRAINT_RULE_QUOTE, get_policy
+    from voice.transcript_store import capture_window_header
+
+    rubric = get_policy("conversation_capture").selection_rubric
+    assert RESTRAINT_RULE_QUOTE in rubric, (
+        "RESTRAINT_RULE_QUOTE 在 rubric 里找不到 —— 引用它的地方会推翻一句不存在的规则"
+    )
+    header = capture_window_header(user_name="老王", ai_name="io", turn_count=42)
+    assert RESTRAINT_RULE_QUOTE in header, "通话抬头没在引用这个常量（可能又硬抄了）"
