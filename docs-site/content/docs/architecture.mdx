@@ -807,6 +807,13 @@ measured TDX CVM, not a public-network hop; its protection relies on that CVM
 boundary rather than a second TLS layer. Cloudflare manages DNS-01 records only
 and does not proxy this traffic.
 
+Ingress certificates persist on an encrypted application volume while the
+container root filesystem is replaceable. On restart, the managed compose
+reuses that material only after checking certificate lifetime and private-key
+matching; otherwise the upstream DNS-01 bootstrap runs normally. Successful
+reuse starts the proxy immediately and leaves renewal to the image's background
+renewal daemon.
+
 Clients using the custom domain must verify both the ingress certificate-evidence
 bundle and the enclave attestation bundle, in addition to ordinary WebPKI, before
 claiming security equivalent to direct fingerprint pinning. The existing

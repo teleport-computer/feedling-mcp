@@ -345,6 +345,16 @@ def test_prod_deploys_forward_one_database_schema_selector_to_every_database_cli
         assert '-e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA"' in deploy
 
 
+def test_prod_runner_runs_after_main_deploy_even_when_optional_ancestor_skips():
+    source = WORKFLOW.read_text()
+    runner = _job(source, "deploy-prod-runner-cvm", "notify-lark-prod-deploy")
+    header = "\n".join(runner.splitlines()[:14])
+
+    assert "always()" in header
+    assert "needs.deploy-cvm.result == 'success'" in header
+    assert "needs.detect-cvm-changes.outputs.cvm == 'true'" in header
+
+
 def test_prod_compose_forwards_database_schema_to_every_database_client():
     main = PROD_COMPOSE.read_text()
     backend = main.split("\n  backend:\n", 1)[1].split("\n  serve-worker:\n", 1)[0]

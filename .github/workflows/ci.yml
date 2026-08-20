@@ -3090,6 +3090,8 @@ jobs:
     name: deploy runner CVM (prod)
     needs: [deploy-cvm, detect-cvm-changes]
     if: |
+      always() &&
+      needs.deploy-cvm.result == 'success' &&
       github.ref == 'refs/heads/main' &&
       github.event_name == 'push' &&
       needs.detect-cvm-changes.outputs.cvm == 'true'

@@ -166,9 +166,10 @@ fail closed 为 `503 voice_gateway_not_configured`。
 2. **主 CVM**：原地部署新镜像（`backend` 双路由 + `serve-worker` 容器）。
    原地重部署不翻 KMS 钥（2026-07-05 实证：compose_hash 变但钥不翻）；仍需
    先走完 pre → test 全流程再碰 prod。
-3. **runner CVM：不动**。`deploy/docker-compose.phala.prod.runner.yaml`
-   本次仅做「文件追平现状」的一次性恢复提交，此后不再随主 CVM 部署改动
-   （除非未来任务显式改它）。
+3. **runner CVM：作为同一个 release unit 更新**。
+   `deploy/docker-compose.phala.prod.runner.yaml` 仍保持 V1 agent-runner
+   形态，但每次生产 CVM 变更都使用同一触发 commit 的镜像和数据库 selector；
+   optional Gate 2 被预期跳过时不能把 runner job 一并跳过。
 4. 部署完成瞬间：全员 fence 应为 `resident` → 行为与部署前完全一致
    （P3 验收点）；之后由 allowlist 逐步把个别账号切到 `v2`。
 
@@ -199,6 +200,12 @@ inside the measured TDX CVM → Docker-internal HTTP → `enclave-domain`; the f
 hop is plaintext, but remains inside that measured CVM rather than crossing a
 public network. Cloudflare manages DNS-01 records only and does not proxy this
 traffic.
+
+`dstack-ingress` 的证书目录是持久卷，但上游用来区分首次启动的
+`/.bootstrapped` 位于可替换的容器根文件系统。三套 managed compose 会先验证
+持久证书至少还有 7 天有效期且公钥与私钥匹配；全部通过才重建 marker、立即启动
+HAProxy，并继续使用镜像内的后台续期 daemon。证书缺失、临期或 key mismatch
+仍走完整 DNS-01 bootstrap，不能为了可用性绕过证书校验。
 
 Release clients using a custom domain must validate WebPKI, ingress certificate
 evidence, and enclave attestation as separate bundles before claiming security
