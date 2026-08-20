@@ -24,16 +24,22 @@ runtime、哪种传输协议无关。
 | `v2_wake_system` | V2 | 主动：`heartbeat` / `manual_wake` lane（`scheduled` 无提醒笔记时兜底、`screen_watch` 除外） | wake 回合的 `system_prompt`（经 `_wake_system_prompt_for_lane` 加自思考后缀、经 `context._join_policy_blocks` 拼语言策略），非 `_RUNTIME_CONTEXT_POLICY` 那层共享系统层 | `backend/model_api_runtime/v2/worker.py:876` `_WAKE_SYSTEM_PROMPT` | 内核（说的是"该不该开口、怎么用 perception_glance 判断"，与 role/协议无关） |
 | `v2_scheduled_wake_system` | V2 | 主动：`scheduled` lane 且确有到期提醒笔记时，替换上面那条 | 同上（`_run_wake` 内按 `wake_system_prompt` 变量整体替换） | `backend/model_api_runtime/v2/worker.py:902` `_SCHEDULED_WAKE_SYSTEM_PROMPT` | runtime（这是"把用户已设定的提醒念出来"的投递规则，不是感知判断——它甚至禁止沉默） |
 | `v2_runtime_perception_policy` | V2 | 前台聊天 + 全部主动 lane 共用 | `_RUNTIME_CONTEXT_POLICY` 的一段，拼进稳定/可缓存的 `system` role（`context.py:653` `trusted_parts.extend((system_prompt, _RUNTIME_CONTEXT_POLICY))`），对前台/主动都生效 | `backend/model_api_runtime/v2/context.py:147-162`（`_RUNTIME_PERCEPTION_BEHAVIOR_POLICY` + `_RUNTIME_PERCEPTION_PROTOCOL_POLICY` 合并成 `_RUNTIME_PERCEPTION_POLICY`） | 内核（"把事实用进回答别汇报来源""glance 是低分辨率事实板别逐项播报"——纯感知解读规则） |
-| `v1_reachout_context` / `v1_reachout_context_empty` | V1 | 主动：resident consumer 的 native reach-out（proactive job，等价于 V2 的 wake） | 不分 role——V1 单消息串拼进 `_message_for_proactive_job`（`tools/chat_resident_consumer.py:12889`）整体发给 CLI/HTTP agent 的 query 文本里 | `tools/chat_resident_consumer.py:13011` `_native_reachout_perception_context()`（纯函数，固定输入调用取值） | 内核（"这是低分辨率一瞥、别逐项播报、挑 2-3 个有共鸣的、数字别念、信号偏低要轻拿轻放"——和 V2 的 `_RUNTIME_PERCEPTION_POLICY`/`_WAKE_SYSTEM_PROMPT` 是同一件事的 V1 版本） |
+| `v1_reachout_context` / `v1_reachout_context_empty` / `v1_reachout_context_change_only` | V1 | 主动：resident consumer 的 native reach-out（proactive job，等价于 V2 的 wake） | 不分 role——V1 单消息串拼进 `_message_for_proactive_job`（`tools/chat_resident_consumer.py:12889`）整体发给 CLI/HTTP agent 的 query 文本里 | `tools/chat_resident_consumer.py:13011` `_native_reachout_perception_context()`（纯函数，固定输入调用取值） | 内核（"这是低分辨率一瞥、别逐项播报、挑 2-3 个有共鸣的、数字别念、信号偏低要轻拿轻放"——和 V2 的 `_RUNTIME_PERCEPTION_POLICY`/`_WAKE_SYSTEM_PROMPT` 是同一件事的 V1 版本） |
+| `v2_tool_schema_perception`（dict：`perception_snapshot`/`perception_recent_apps`/`perception_trend`/`perception_history` 四条） | V2 | 前台聊天 + 全部主动 lane 共用（工具目录不分回合种类，任何回合都能看到并调用） | 不是 `system_prompt` 拼接文本，而是各工具在 tool-calling 协议里的 `description` 字段（模型据此决定何时调用该工具，不是常驻上下文） | `backend/capabilities/tool_schema.py` 的 `DESCRIPTIONS` 字典（Task 5 要挪走的对象） | 内核（说的是"这个工具该在什么情境下调、返回什么粒度"——和感知判断是同一件事，只是挂在 tool description 而非 system prompt 上；Task 5 会把它们逐个搬进内核包） |
 
 ## 备注
 
 - `v1_reachout_context_empty` 不是独立资产，是同一个函数在 `presence={}, change=[], domains=None`
   时的空输入分支输出，用来锁住"什么都没有时"的兜底文案（`cross_domain_board_json: {}` 那条路），
   防止后续重构悄悄改动空态分支。
+- `v1_reachout_context_change_only`（`presence` 非空、`change` 非空、`domains=None`）同样不是
+  独立资产，锁的是同一函数里 `elif change:` 的旧协议回退分支（`perception_change_json:` 文案）——
+  `v1_reachout_context`（board 非空）和 `v1_reachout_context_empty`（全空）都不会走到这条分支，
+  漏了会让这段文案长期不被 golden 覆盖（2026-08-20 review 补）。
 - V1 没有 V2 那种"稳定 system 层 vs 逐回合 runtime_data 层"的显式分层——一次 native
   reach-out 就是一个字符串，`_native_reachout_perception_context` 只是其中一段。列进
   「内核」是因为**内容**是感知判断说明书，不代表 V1 也有对应的"role 挂载点"概念。
-- 本文档只覆盖上面五个 fixture 键覆盖到的资产；`_message_for_proactive_job` 里其余
-  的部分（`wake_metadata`、`_reply_protocol_block`、`_local_time_anchor` 等）属于
-  V1 的投递/协议层，不在本次感知内核提取范围内，未列入表格。
+- 本文档覆盖 fixture 里全部 7 个键对应的资产（4 段常量文本 + 1 个 dict 资产 + 同一函数的
+  3 种分支输出）；`_message_for_proactive_job` 里其余的部分（`wake_metadata`、
+  `_reply_protocol_block`、`_local_time_anchor` 等）属于 V1 的投递/协议层，不在本次感知
+  内核提取范围内，未列入表格。

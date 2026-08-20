@@ -1,7 +1,19 @@
 """把基线上的感知相关 prompt 文本导出成 golden fixture。
 
 在 origin/test 的 checkout 上跑一次，产出的 JSON 就是「行为逐字节不变」的判据。
-V2 的三段是模块级常量，直接取；V1 那段是函数，用固定输入调一次。
+V2 的三段是模块级常量，直接取；V1 的三段是函数，用固定输入调一次；
+`v2_tool_schema_perception` 是 `capabilities.tool_schema.DESCRIPTIONS` 里
+感知信号读取工具（perception_snapshot/perception_recent_apps/perception_trend/
+perception_history）的 {tool_name: description} 子集快照——同样直接从这份
+origin/test checkout 里 import，与其余条目走同一条 provenance，不依赖
+"当前分支这个文件是否被改过"这类会漂移的前提。
+
+（2026-08-20 复核记录：曾有过"当前分支 tool_schema.py 未改动，working tree
+内容等于 origin/test 基线"的假设——实测不成立：分支落后 origin/test 126 个
+提交，其中两个改过 tool_schema.py 的其它工具描述（identity_dimensions_set/
+history_search/MEMORY_ORGANIZE_TOOL/MCP_TOOL_SEARCH_TOOL），只是恰好都不在
+感知工具那四条里。为避免这条 provenance 假设以后失效，改为始终从 origin/test
+的 checkout 直接 import，不依赖当前分支的工作区文件。）
 """
 from __future__ import annotations
 
@@ -16,6 +28,7 @@ sys.path.insert(0, str(TOOLS))
 
 from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import worker as v2_worker
+from capabilities import tool_schema as v2_tool_schema
 
 import chat_resident_consumer as consumer
 
@@ -23,16 +36,35 @@ _V1_PRESENCE = {"place_label": "office", "motion_state": "walking"}
 _V1_CHANGE = [{"signal": "health_sleep", "field": "asleep_minutes", "direction": "down"}]
 _V1_DOMAINS = {"location": {"label": "office"}, "media": {"new_artist": True}}
 
+# The perception signal-reading cluster in capabilities.tool_schema.DESCRIPTIONS
+# (Task 5 will move these). Snapshotted as a {name: description} dict rather
+# than one concatenated blob so a later reader can tell which tool's text
+# changed, and so Task 5 can move them one at a time against this same fixture.
+_PERCEPTION_TOOL_NAMES = (
+    "perception_snapshot",
+    "perception_recent_apps",
+    "perception_trend",
+    "perception_history",
+)
+
 
 def main() -> None:
     out = {
         "v2_wake_system": v2_worker._WAKE_SYSTEM_PROMPT,
         "v2_scheduled_wake_system": v2_worker._SCHEDULED_WAKE_SYSTEM_PROMPT,
         "v2_runtime_perception_policy": v2_context._RUNTIME_PERCEPTION_POLICY,
+        "v2_tool_schema_perception": {
+            name: v2_tool_schema.DESCRIPTIONS[name] for name in _PERCEPTION_TOOL_NAMES
+        },
         "v1_reachout_context": consumer._native_reachout_perception_context(
             _V1_PRESENCE, _V1_CHANGE, _V1_DOMAINS
         ),
         "v1_reachout_context_empty": consumer._native_reachout_perception_context({}, [], None),
+        # Exercises the `elif change:` back-compat branch (domains falsy,
+        # change non-empty) — the only branch the first two inputs never hit.
+        "v1_reachout_context_change_only": consumer._native_reachout_perception_context(
+            _V1_PRESENCE, _V1_CHANGE, None
+        ),
     }
     dest = pathlib.Path(sys.argv[1])
     dest.parent.mkdir(parents=True, exist_ok=True)

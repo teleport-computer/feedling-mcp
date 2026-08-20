@@ -69,3 +69,28 @@ def test_v1_reachout_context_empty_unchanged():
 
     assert consumer._native_reachout_perception_context({}, [], None) == \
         _baseline()["v1_reachout_context_empty"]
+
+
+def test_v1_reachout_context_change_only_unchanged():
+    """Exercises the `elif change:` back-compat branch (domains falsy, change
+    non-empty) — neither of the two tests above ever reaches it: one has
+    domains truthy, the other has both change and domains empty."""
+    import chat_resident_consumer as consumer
+
+    got = consumer._native_reachout_perception_context(
+        {"place_label": "office", "motion_state": "walking"},
+        [{"signal": "health_sleep", "field": "asleep_minutes", "direction": "down"}],
+        None,
+    )
+    assert got == _baseline()["v1_reachout_context_change_only"]
+
+
+def test_v2_tool_schema_perception_descriptions_unchanged():
+    """Task 5 will move these out of capabilities.tool_schema.DESCRIPTIONS into
+    the kernel package; pin the current text of each one individually so a
+    later diff can tell exactly which tool's wording moved/changed."""
+    from capabilities import tool_schema
+
+    baseline = _baseline()["v2_tool_schema_perception"]
+    for name, expected in baseline.items():
+        assert tool_schema.DESCRIPTIONS[name] == expected

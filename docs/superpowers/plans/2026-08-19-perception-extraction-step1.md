@@ -66,7 +66,14 @@
 - Consumes: 无（第一个任务）
 - Produces: fixture 文件 `tests/fixtures/perception_kernel/prompt_baseline.json`，键为
   `v2_wake_system` / `v2_scheduled_wake_system` / `v2_runtime_perception_policy` /
-  `v1_reachout_context` / `tool_schema_perception`；后续每一批都比对它。
+  `v2_tool_schema_perception`（dict，`{tool_name: description}`，覆盖
+  `perception_snapshot`/`perception_recent_apps`/`perception_trend`/`perception_history`
+  四个感知信号读取工具，供 Task 5 逐个搬时比对）/ `v1_reachout_context` /
+  `v1_reachout_context_empty` / `v1_reachout_context_change_only`（分别覆盖
+  `_native_reachout_perception_context` 的 board 分支、全空分支、`elif change:`
+  回退分支）；后续每一批都比对它。
+  （2026-08-20 review 修正：之前这里写的 `tool_schema_perception` 与 Step 2
+  实际导出脚本的产出键不一致，已按脚本的真实产出改写。）
 
 - [ ] **Step 1: 建一个基线 worktree**
 
