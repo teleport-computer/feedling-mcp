@@ -233,5 +233,6 @@ def delete(store, entry_id_raw) -> tuple[dict, int]:
     entry_id = str(entry_id_raw or "").strip()
     if not entry_id:
         return {"error": "id required"}, 400
-    store.delete_world_book(entry_id)
+    if not store.delete_world_book(entry_id):
+        return {"error": "world book entry not found"}, 404
     return {"ok": True}, 200

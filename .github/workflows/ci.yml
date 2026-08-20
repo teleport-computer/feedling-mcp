@@ -741,6 +741,7 @@ jobs:
             tests/test_chat_activity_projection.py \
             tests/test_capabilities_tool_schema.py \
             tests/test_debug_trace.py \
+            tests/test_db_health_timeouts.py \
             tests/test_access_mode_runtime_sync_unit.py \
             tests/test_pytest_coverage_ratchet.py \
             tests/test_mcp_client.py \

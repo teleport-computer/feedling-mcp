@@ -36,6 +36,16 @@ change must not be interpreted as an API guarantee.
   **This does not add address-level egress filtering:** an `https` `base_url`
   pointing at a private or link-local address is accepted exactly as before.
 
+- **Persistence failures no longer look like successful memory, trace, or World
+  Book operations.** A Memory Garden index request returns `503` when its
+  database read fails instead of returning an empty garden; changing the debug
+  trace switch returns an error unless the stored setting can be read back; and
+  deleting a World Book entry returns `404` when the entry does not exist and a
+  server error when storage is unavailable, instead of always returning
+  `{\"ok\": true}`. Internal writes that only record cleanup or delivery
+  bookkeeping remain explicitly best-effort and do not rewrite an already-real
+  delivery outcome.
+
 - **An image-generation provider may now answer with a link, and the server
   retrieves it.** Some providers return `data[].url` from the image endpoint
   instead of inline bytes — measured on a relay that does this only for the 2K

@@ -63,7 +63,10 @@ def _post_enclave_for(runtime_token):
 # readside (auth only; forwards api key + runtime token to the enclave)
 # --------------------------------------------------------------------------- #
 
-@router.post("/v1/memory/index")
+@router.post(
+    "/v1/memory/index",
+    responses={503: {"description": "Memory storage or readside unavailable"}},
+)
 async def memory_index(request: Request, auth: AuthResult = Depends(require_auth)):
     payload = (await asgi_http.read_json_silent(request)) or {}
     runtime_token = auth_core.extract_runtime_token(request.headers)
