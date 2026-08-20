@@ -2268,3 +2268,47 @@ def test_https_private_addresses_are_still_accepted_this_is_not_an_ssrf_fix():
     for base_url in ["https://10.0.0.5/v1", "https://169.254.169.254/latest"]:
         _, _, out = pc.validate_config("openai_compatible", "gpt-4", base_url)
         assert out == base_url.rstrip("/")
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        # The bracket is never closed. urlsplit raises on every supported
+        # interpreter, so this is the version-independent form of the bug.
+        "http://[::1/v1",
+        "https://[::1/v1",
+    ],
+)
+def test_malformed_authority_is_a_provider_error_not_a_valueerror(base_url):
+    """A mistyped base_url must fail like every other bad value: 400, not 500.
+
+    Both callers of validate_config catch only ProviderError, so a ValueError
+    escaping this function is an unhandled exception on a user-input path. The
+    prefix check this replaced never parsed the URL, so it could not raise —
+    the parsing rewrite is what introduced the possibility.
+    """
+    with pytest.raises(pc.ProviderError):
+        pc.validate_config("openai_compatible", "gpt-4", base_url)
+
+    # The catalog path shares the validator and must not diverge again.
+    with pytest.raises(pc.ProviderError):
+        pc.validate_catalog_target("openai_compatible", base_url)
+
+
+def test_bracketed_non_address_never_escapes_as_a_valueerror():
+    """A bracketed host that is not an address is interpreter-dependent.
+
+    On 3.11+ urlsplit rejects it outright; on 3.9 urlsplit accepts it and
+    `.hostname` returns the raw text. Either way the caller must see a
+    ProviderError or a normal accept — never a ValueError. Asserting the
+    *classification* rather than accept-vs-reject keeps this honest about a
+    difference we do not control, instead of pinning whichever answer the
+    machine running the tests happens to give.
+    """
+    for base_url in ("https://[gg::1]/v1", "http://[not-an-address]/v1"):
+        try:
+            pc.validate_config("openai_compatible", "gpt-4", base_url)
+        except pc.ProviderError:
+            pass
+        except ValueError as exc:  # pragma: no cover - the regression itself
+            raise AssertionError(f"ValueError escaped for {base_url!r}: {exc}") from exc
