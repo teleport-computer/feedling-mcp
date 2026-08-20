@@ -5141,7 +5141,8 @@
             }
           }
         },
-        "x-feedling-contract-level": "compatibility"
+        "x-feedling-contract-level": "compatibility",
+        "description": "Create a model route. A base_url with an explicit port accepts only integer ports from 1 through 65535."
       }
     },
     "/v1/model_api/routes/{route_id}": {
@@ -5418,7 +5419,7 @@
           }
         },
         "x-feedling-contract-level": "compatibility",
-        "description": "Create or update the active hosted model route. context_window_tokens is treated as route metadata: a value below Runtime V2's deployment-tunable trust floor (32,768 by default) falls through to the audited-family or unaudited-route default rather than becoming the prompt budget. The resolved value is returned and persisted."
+        "description": "Create or update the active hosted model route. context_window_tokens is treated as route metadata: a value below Runtime V2's deployment-tunable trust floor (32,768 by default) falls through to the audited-family or unaudited-route default rather than becoming the prompt budget. The resolved value is returned and persisted. A base_url with an explicit port accepts only integer ports from 1 through 65535."
       }
     },
     "/v1/model_api/test": {
@@ -8876,7 +8877,7 @@
           },
           "base_url": {
             "type": "string",
-            "description": "Override base URL. Required for `openai_compatible`; must be `https://` or local `http://127.0.0.1`."
+            "description": "Override base URL. Required for `openai_compatible`; must be `https://` or local `http://127.0.0.1`. An explicit port must be an integer from 1 through 65535."
           },
           "api_key": {
             "type": "string",
@@ -10072,7 +10073,8 @@
           },
           "base_url": {
             "type": "string",
-            "format": "uri"
+            "format": "uri",
+            "description": "An explicit port must be an integer from 1 through 65535."
           },
           "context_window_tokens": {
             "type": "integer",
@@ -10166,7 +10168,8 @@
           },
           "base_url": {
             "type": "string",
-            "format": "uri"
+            "format": "uri",
+            "description": "An explicit port must be an integer from 1 through 65535."
           },
           "context_window_tokens": {
             "type": "integer",

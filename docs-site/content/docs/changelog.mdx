@@ -10,6 +10,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Model provider base URLs now reject invalid TCP ports before any outbound
+  request.** Saving, testing, or listing models for a route with a non-numeric,
+  zero, or out-of-range explicit port now returns the existing client-input
+  error path instead of accepting a URL that would fail later in the HTTP
+  client. Explicit ports from `1` through `65535` remain valid.
+
 - **Managed deployments reuse healthy persisted ingress certificates without
   blocking public traffic on an unnecessary ACME renewal.** A recreated ingress
   verifies that every stored certificate is valid for at least seven days and

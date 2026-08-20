@@ -3987,6 +3987,18 @@ def _validate_egress_url(base_url: str) -> None:
     scheme = parts.scheme.lower()
     if scheme not in ("https", "http"):
         raise ProviderError("base_url must be https:// or local http://127.0.0.1")
+    try:
+        port = parts.port
+    except ValueError as exc:
+        # SplitResult.port raises for both non-numeric and out-of-range values.
+        # Translate it at this boundary: setup/test callers catch ProviderError,
+        # while a raw ValueError would turn user input into an internal 500.
+        raise ProviderError(
+            "base_url port must be an integer between 1 and 65535"
+        ) from exc
+    if port is not None and not (1 <= port <= 65535):
+        # Port zero parses successfully, so it needs an explicit range check.
+        raise ProviderError("base_url port must be an integer between 1 and 65535")
     # Forbid userinfo: "http://127.0.0.1@evil.example" hides the real host after
     # the '@'. Reject on any credential component or a stray '@' in netloc.
     if parts.username or parts.password or "@" in (parts.netloc or ""):

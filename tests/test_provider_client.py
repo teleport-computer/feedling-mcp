@@ -2193,6 +2193,20 @@ FORGED_LOOPBACK_URLS = [
     "https://api.example.com@evil.example/v1",
 ]
 
+INVALID_PORT_BASE_URLS = [
+    # Accessing SplitResult.port raises ValueError for both out-of-range and
+    # non-numeric ports. The provider boundary must translate that into the
+    # same ProviderError callers already surface as a user-readable 400.
+    "https://example.com:99999/v1",
+    "https://example.com:abc/v1",
+    "http://127.0.0.1:99999/v1",
+    "http://localhost:abc/v1",
+    # Port zero parses as an int, so it needs an explicit range check rather
+    # than relying on SplitResult.port to reject it.
+    "https://example.com:0/v1",
+    "http://127.0.0.1:0/v1",
+]
+
 
 @pytest.mark.parametrize("base_url", FORGED_LOOPBACK_URLS)
 def test_validate_config_rejects_hosts_disguised_as_loopback(base_url):
@@ -2236,11 +2250,34 @@ def test_validate_config_rejects_non_https_remote_targets(base_url):
         pc.validate_config("openai_compatible", "gpt-4", base_url)
 
 
+@pytest.mark.parametrize("base_url", INVALID_PORT_BASE_URLS)
+def test_invalid_ports_are_provider_errors_on_both_validation_paths(base_url):
+    """Invalid ports are rejected consistently without leaking ValueError."""
+    with pytest.raises(pc.ProviderError, match="port"):
+        pc.validate_config("openai_compatible", "gpt-4", base_url)
+
+    with pytest.raises(pc.ProviderError, match="port"):
+        pc.validate_catalog_target("openai_compatible", base_url)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    ["https://example.com:65535/v1", "http://127.0.0.1:65535/v1"],
+)
+def test_maximum_valid_port_is_still_accepted(base_url):
+    _, _, config_url = pc.validate_config("openai_compatible", "gpt-4", base_url)
+    _, catalog_url = pc.validate_catalog_target("openai_compatible", base_url)
+    assert config_url == catalog_url == base_url
+
+
 def test_validate_config_and_catalog_path_now_agree():
     """The two validators disagreeing is why the forgery survived: it was fixed
     on the catalog path and left in place here. Pin them together so a future
     change to one cannot silently re-open the gap in the other."""
-    for base_url in FORGED_LOOPBACK_URLS + ["http://localhost:11434/v1", "http://127.0.0.1:8080/v1"]:
+    for base_url in FORGED_LOOPBACK_URLS + INVALID_PORT_BASE_URLS + [
+        "http://localhost:11434/v1",
+        "http://127.0.0.1:8080/v1",
+    ]:
         def _save_path():
             pc.validate_config("openai_compatible", "gpt-4", base_url)
 
