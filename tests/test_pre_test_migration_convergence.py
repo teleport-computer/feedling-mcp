@@ -61,7 +61,10 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0029_plaintext_shadow_merge"]
+    assert script.get_heads() == [
+        "0029_plaintext_shadow_merge",
+        "0030_voice_call_sessions_primary",
+    ]
     assert set(
         script.get_revision("0029_plaintext_shadow_merge").down_revision
     ) == {
@@ -86,6 +89,10 @@ def test_tee_chain_carries_test_runtime_schema():
     )
     assert (
         script.get_revision("0026_chat_daily_rollup").down_revision
+        == "0025_lane_rollup_voice"
+    )
+    assert (
+        script.get_revision("0030_voice_call_sessions_primary").down_revision
         == "0025_lane_rollup_voice"
     )
     assert (
@@ -166,4 +173,8 @@ def test_tee_migrations_reuse_the_rds_contract_sql():
     assert (
         tee.get_revision("0028_trace_write_stats_health").module._UP
         == rds.get_revision("0096_trace_write_stats_health").module._UP
+    )
+    assert (
+        tee.get_revision("0030_voice_call_sessions_primary").module._UP
+        == rds.get_revision("0081_voice_call_sessions").module._UP
     )

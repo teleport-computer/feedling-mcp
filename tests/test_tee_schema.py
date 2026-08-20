@@ -493,3 +493,55 @@ def test_tee_primary_shared_runtime_indexes_match_runtime_schema():
         if rds[table] - tee[table]
     }
     assert missing == {}
+
+
+def test_tee_voice_call_sessions_match_the_primary_lifecycle_contract():
+    """Dropping any voice fence column or constraint breaks TEE-primary calls."""
+    with psycopg.connect(os.environ["TEE_DATABASE_URL"]) as conn:
+        columns = {
+            name: (data_type, nullable, default)
+            for name, data_type, nullable, default in conn.execute(
+                "SELECT column_name,data_type,is_nullable,column_default "
+                "FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name='voice_call_sessions' "
+                "ORDER BY ordinal_position"
+            ).fetchall()
+        }
+        constraints = conn.execute(
+            "SELECT contype,pg_get_constraintdef(oid,true) "
+            "FROM pg_constraint "
+            "WHERE conrelid='voice_call_sessions'::regclass "
+            "ORDER BY contype,conname"
+        ).fetchall()
+        index_sql = conn.execute(
+            "SELECT pg_get_indexdef(indexrelid) FROM pg_index "
+            "WHERE indrelid='voice_call_sessions'::regclass AND NOT indisprimary"
+        ).fetchall()
+
+    assert columns == {
+        "user_id": ("text", "NO", None),
+        "call_id": ("text", "NO", None),
+        "status": ("text", "NO", "'active'::text"),
+        "cancel_reason": ("text", "NO", "''::text"),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+        "ended_at": ("timestamp with time zone", "YES", None),
+    }
+    assert any(
+        kind == "p" and definition == "PRIMARY KEY (user_id, call_id)"
+        for kind, definition in constraints
+    )
+    assert any(
+        kind == "f"
+        and definition
+        == "FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE"
+        for kind, definition in constraints
+    )
+    assert any(
+        kind == "c"
+        and "status = ANY" in definition
+        and "'finalized'::text" in definition
+        for kind, definition in constraints
+    )
+    assert len(index_sql) == 1
+    assert "ix_voice_call_sessions_status" in index_sql[0][0]
+    assert "(user_id, status)" in index_sql[0][0]

@@ -13,23 +13,24 @@ branch_labels = None
 depends_on = None
 
 
+_UP = """
+CREATE TABLE IF NOT EXISTS voice_call_sessions (
+  user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+  call_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active'
+    CHECK (status IN ('active', 'finalizing', 'cancelled', 'finalized')),
+  cancel_reason TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  ended_at TIMESTAMPTZ,
+  PRIMARY KEY (user_id, call_id)
+);
+CREATE INDEX IF NOT EXISTS ix_voice_call_sessions_status
+  ON voice_call_sessions (user_id, status);
+"""
+
+
 def upgrade() -> None:
-    op.execute(
-        """
-        CREATE TABLE IF NOT EXISTS voice_call_sessions (
-          user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-          call_id TEXT NOT NULL,
-          status TEXT NOT NULL DEFAULT 'active'
-            CHECK (status IN ('active', 'finalizing', 'cancelled', 'finalized')),
-          cancel_reason TEXT NOT NULL DEFAULT '',
-          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-          ended_at TIMESTAMPTZ,
-          PRIMARY KEY (user_id, call_id)
-        );
-        CREATE INDEX IF NOT EXISTS ix_voice_call_sessions_status
-          ON voice_call_sessions (user_id, status);
-        """
-    )
+    op.execute(_UP)
 
 
 def downgrade() -> None:
