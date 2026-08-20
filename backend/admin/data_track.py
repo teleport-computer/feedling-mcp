@@ -3713,6 +3713,10 @@ def _runtime_user_report(*, within_hours: int = 24) -> dict:
     return {"window_hours": within_hours, "users": []}
 
 
+def _runtime_watchdog_recoveries(*, within_hours: int = 24) -> dict[str, int]:
+    return {}
+
+
 # Injected by the assembly layer (asgi_app.py); the real implementation is
 # model_api_runtime.v2.jobs_store.usage_report_snapshot.  The stub keeps Admin
 # importable in isolation without reversing the admin -> Runtime V2 dependency.
@@ -4054,12 +4058,64 @@ def _render_stuck_block(stuck: dict | None) -> str:
     return head + "".join(body) + "</section>"
 
 
+def _render_watchdog_recovery_events(
+    counts: dict[str, int] | None,
+    *,
+    within_hours: int,
+) -> str:
+    scope = (
+        "分子 = 所选窗口内 recover_killed_job 已完成状态转移，并在同一事务追加的 "
+        "slot_watchdog_timeout 事件；requeued/terminal 取事件记录的真实 recovery，"
+        "不按 lane 名猜。"
+    )
+    history = (
+        "历史不可回填，准确性从事件表上线时刻起算；上线初期读数偏低不等于此前未发生。"
+    )
+    if counts is None:
+        return (
+            "<div class='note-box'><b>Watchdog recovery 事件数据不可用。</b>"
+            f"{html.escape(scope)} {html.escape(history)}</div>"
+        )
+
+    by_lane: dict[str, dict[str, int]] = {}
+    for raw_key, raw_count in counts.items():
+        lane, separator, recovery = str(raw_key).rpartition(":")
+        if not separator or not lane or recovery not in {"requeued", "terminal"}:
+            continue
+        bucket = by_lane.setdefault(lane, {"requeued": 0, "terminal": 0})
+        bucket[recovery] += max(0, int(raw_count or 0))
+
+    rows = []
+    for lane in sorted(by_lane):
+        bucket = by_lane[lane]
+        escaped_lane = html.escape(lane)
+        rows.append(
+            f"<tr data-watchdog-lane='{html.escape(lane, quote=True)}'>"
+            f"<td><b>{escaped_lane}</b></td>"
+            f"<td class='watchdog-requeued'>{bucket['requeued']}</td>"
+            f"<td class='watchdog-terminal'>{bucket['terminal']}</td>"
+            "</tr>"
+        )
+    body = "".join(rows) or (
+        "<tr><td colspan='3' class='muted'>窗口内新事件账本无 recovery 记录；"
+        "这不代表事件表上线前为零。</td></tr>"
+    )
+    return (
+        f"<div class='muted'>近 {int(within_hours)} 小时。{html.escape(scope)} "
+        f"<b>{html.escape(history)}</b></div>"
+        "<div class='table-wrap'><table><thead><tr><th>Lane</th>"
+        "<th>杀掉并重投</th><th>杀掉后终结</th></tr></thead>"
+        f"<tbody>{body}</tbody></table></div>"
+    )
+
+
 def _render_runtime_health_page(
     payload: dict,
     tokens: dict | None = None,
     delivery: dict | None = None,
     user_report: dict | None = None,
     stuck: dict | None = None,
+    watchdog_recoveries: dict[str, int] | None = None,
 ) -> str:
     """Runtime V2 全 lane 运行时健康值班台（?view=runtime）。
 
@@ -4067,9 +4123,9 @@ def _render_runtime_health_page(
     （日报送达率，按天）。heartbeat lane 两页都出现但口径不同，故本页该行给出
     指向日报页的链接。
 
-    ``tokens`` / ``delivery`` / ``user_report`` 都可能是 None（各自独立的失败域，
-    见 admin_core）：取不到时对应区块显「暂不可用」，不得把 None 渲染成 0——0
-    是"确认过是零"。
+    ``tokens`` / ``delivery`` / ``user_report`` / ``watchdog_recoveries`` 都可能
+    是 None（各自独立的失败域，见 admin_core）：取不到时对应区块显「暂不可用」，
+    不得把 None 渲染成 0——0 是"确认过是零"。
     """
     service_level, service_reasons = _runtime_service_level(payload, delivery)
     if delivery is None and service_level == "ok":
@@ -4184,6 +4240,10 @@ def _render_runtime_health_page(
             _fmt_duration_sec(pool_age),
         ),
     ])
+    watchdog_section = _render_watchdog_recovery_events(
+        watchdog_recoveries,
+        within_hours=window_hours,
+    )
 
     # 交付区块：唯一能看出「job 判成功但产物没到用户」的地方。取不到时明说取不到，
     # 不拿 0 顶替——这个区块显示 0 的含义是"队列是空的、一切送达了"，与"数据取不到"
@@ -4451,6 +4511,8 @@ def _render_runtime_health_page(
   {empty_note}
   <h2>Worker 池</h2>
   <section class="metrics">{pool_metrics}</section>
+  <h2>Watchdog 精确恢复</h2>
+  {watchdog_section}
   <h2>端到端交付</h2>
   <div class="muted">job 判 completed 只证明回合跑完了，不证明产物到达用户。
   这里是副作用与失败回包的投递积压——<b>积压条数不参与总体档位，只有"堵了多久"参与</b>

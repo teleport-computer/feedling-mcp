@@ -136,6 +136,12 @@ REGISTRY: dict[str, Entry] = {
         "同一坏通道写失败态，而由 last_success_at 自然过期。每 writer 单行原地更新，"
         "热镜像并由 reconciler 按 writer_id 扶正",
     ),
+    "v2_job_recovery_events": Entry(
+        MIRROR,
+        "watchdog exact recovery 的低频明文不可变事件（RDS 0097/TEE 0030）；"
+        "主库与 agent_jobs 状态转移同事务追加，提交后热镜像，漏镜像由 reconciler "
+        "按 job_id+job_attempt_count 扶正；滚动窗口不能由 agent_jobs 当前态反推",
+    ),
 
     # ---------------------------------------------------------------- #
     # CIPHERTEXT —— 装信封的表，经 enclave 解密成明文写进 TEE。
@@ -350,6 +356,7 @@ _PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "chat_rollup_watermark": ("scope",),
     "trace_write_stats": ("day", "writer_id", "subsystem", "event_type", "lane"),
     "trace_write_stats_health": ("writer_id",),
+    "v2_job_recovery_events": ("job_id", "job_attempt_count"),
     "chat_messages": ("user_id", "msg_id"),
     "memory_moments": ("user_id", "moment_id"),
     "world_book_entries": ("user_id", "entry_id"),
