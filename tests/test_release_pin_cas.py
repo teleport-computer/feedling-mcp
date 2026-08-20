@@ -57,6 +57,10 @@ def _make_release_repo(tmp_path: Path) -> ReleaseRepo:
         "services:\n"
         "  backend:\n"
         "    image: ghcr.io/old-owner/feedling:deadbee\n"
+        "    environment:\n"
+        "      PLAINTEXT_SHADOW_DATABASE_URL: \"${PLAINTEXT_SHADOW_DATABASE_URL:-}\"\n"
+        "      FEEDLING_PLAINTEXT_SHADOW_ENABLED: \"${FEEDLING_PLAINTEXT_SHADOW_ENABLED:-0}\"\n"
+        "      FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY: \"${FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY:-}\"\n"
         "  cpu-recorder:\n"
         "    image: ghcr.io/old-owner/feedling:deadbee\n"
         "  cpu-socket-proxy:\n"
@@ -66,6 +70,8 @@ def _make_release_repo(tmp_path: Path) -> ReleaseRepo:
         "services:\n"
         "  serve-worker:\n"
         "    image: ghcr.io/old-owner/feedling-agent-runner:cafe123\n"
+        "    environment:\n"
+        "      FEEDLING_PLAINTEXT_SHADOW_ENABLED: \"0\"\n"
     )
     _git(checkout, "add", MAIN_COMPOSE, RUNNER_COMPOSE)
     _git(checkout, "commit", "-m", "trigger release")

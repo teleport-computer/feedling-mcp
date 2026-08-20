@@ -676,6 +676,16 @@ def test_cold_start_copies_new_ciphertext_tables_without_a_prior_cursor_row(back
         ).fetchone()[0]
         c.execute("INSERT INTO v2_trajectory_streams (job_id, user_id) VALUES (%s,%s)",
                   (job_id, uid))
+    # Primary-capable TEE schema enforces the review -> agent_jobs FK.  The real
+    # migration workflow snapshots parent runtime tables before the encrypted
+    # incremental lanes; mirror that prerequisite while keeping every lane's
+    # replication cursor genuinely cold.
+    with psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as c:
+        c.execute(
+            "INSERT INTO agent_jobs (id, user_id, lane, status) "
+            "VALUES (%s,%s,'chat','pending') ON CONFLICT (id) DO NOTHING",
+            (job_id, uid),
+        )
 
     seed_sql = {
         "chat_message_archive": (

@@ -120,7 +120,7 @@ def test_zero_roster_runtime_token_covers_image_key_and_provider_call(
     monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "https://fake-enclave")
     monkeypatch.setattr(httpx, "get", _get)
     monkeypatch.setattr(
-        vision_observer.core_enclave,
+        vision_observer.core_envelope.enclave,
         "_decrypt_envelope_via_enclave",
         _decrypt,
     )

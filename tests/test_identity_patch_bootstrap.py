@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import json
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -86,6 +87,38 @@ def _plain_identity() -> dict:
             {"name": "Context retention", "value": 88, "description": "y"},
         ],
     }
+
+
+def test_identity_action_reads_plaintext_card_without_enclave(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_plain")
+    monkeypatch.setattr(
+        identity_actions_mod.identity_service,
+        "_load_identity",
+        lambda _store: {
+            "v": 1,
+            "body": json.dumps(_plain_identity()),
+            "owner_user_id": "usr_plain",
+            "visibility": "shared",
+        },
+    )
+    monkeypatch.setattr(
+        identity_actions_mod.identity_service,
+        "_live_days_with_user",
+        lambda *_args, **_kwargs: 3,
+    )
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext identity must not call enclave")
+        ),
+    )
+
+    identity, error = identity_actions_mod._identity_plain_for_action(store, None)
+
+    assert error == ""
+    assert identity["agent_name"] == "bro"
+    assert identity["days_with_user"] == 3
 
 
 def test_profile_patch_bootstraps_card_when_none_exists(client, monkeypatch):

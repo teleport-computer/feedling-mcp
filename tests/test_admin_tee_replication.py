@@ -12,10 +12,13 @@ test_tee_reconciler.py / test_tee_replicator_worker.py / test_tee_verify.py.
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 import time
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
@@ -53,6 +56,17 @@ def test_non_dry_run_replicate_without_confirm_is_400(client, monkeypatch):
         "/v1/admin/tee-replication/run",
         headers=_admin_headers(),
         json={"action": "replicate", "table": "chat_messages", "dry_run": False},
+    )
+    assert res.status_code == 400
+    assert res.get_json() == {"error": "confirm_required"}
+
+
+def test_non_dry_run_reflow_without_confirm_is_400(client, monkeypatch):
+    _set_admin_token(monkeypatch)
+    res = client.post(
+        "/v1/admin/tee-replication/run",
+        headers=_admin_headers(),
+        json={"action": "reflow", "table": "chat_messages", "dry_run": False},
     )
     assert res.status_code == 400
     assert res.get_json() == {"error": "confirm_required"}
@@ -310,6 +324,34 @@ def test_run_verify_tee_database_unconfigured_is_503(client, monkeypatch):
     assert res.get_json() == {"error": "tee_database_unconfigured"}
 
 
+def test_new_plaintext_shadow_target_satisfies_database_configuration(monkeypatch):
+    from admin import tee_replication
+
+    monkeypatch.delenv("TEE_DATABASE_URL", raising=False)
+    monkeypatch.setenv("FEEDLING_PLAINTEXT_SHADOW_ENABLED", "1")
+    monkeypatch.setenv(
+        "PLAINTEXT_SHADOW_DATABASE_URL", "postgresql://shadow.invalid/plaintext"
+    )
+
+    tee_replication._require_tee_configured()
+
+
+def test_plaintext_shadow_status_is_admin_gated_and_redacted(client, monkeypatch):
+    monkeypatch.setenv("FEEDLING_PLAINTEXT_SHADOW_ENABLED", "0")
+    _set_admin_token(monkeypatch)
+    response = client.get("/v1/admin/plaintext-shadow/status")
+    assert response.status_code == 401
+
+    response = client.get(
+        "/v1/admin/plaintext-shadow/status", headers=_admin_headers()
+    )
+    assert response.status_code == 200
+    rendered = json.dumps(response.get_json())
+    assert "postgresql://" not in rendered
+    assert "body_ct" not in rendered
+    assert response.get_json()["enabled"] is False
+
+
 def test_dry_run_reconcile_plan_still_works_without_tee_database(client, monkeypatch):
     # The plan-only short-circuit never touches the TEE pool, so it must NOT 503
     # even with TEE_DATABASE_URL unset.
@@ -372,6 +414,123 @@ def test_replicate_unknown_table_is_400(client, monkeypatch):
     )
     assert res.status_code == 400
     assert res.get_json() == {"error": "unknown_table"}
+
+
+def test_reflow_passes_exact_stale_preview_to_recovery_boundary(client, monkeypatch):
+    _set_admin_token(monkeypatch)
+    captured = {}
+
+    def _stub(table, *, qps=2.0, dry_run=True, expected_stale=None):
+        captured.update(
+            table=table, qps=qps, dry_run=dry_run, expected_stale=expected_stale
+        )
+        return {"scanned": 21, "would_copy": 21, "stale": 15001}
+
+    monkeypatch.setattr("tee_replicator.reflow.reflow_table", _stub)
+    res = client.post(
+        "/v1/admin/tee-replication/run",
+        headers=_admin_headers(),
+        json={
+            "action": "reflow",
+            "table": "voice_transcripts",
+            "dry_run": True,
+            "qps": 20.0,
+            "expected_stale": 15001,
+        },
+    )
+    assert res.status_code == 200
+    assert captured == {
+        "table": "voice_transcripts",
+        "qps": 20.0,
+        "dry_run": True,
+        "expected_stale": 15001,
+    }
+    assert res.get_json()["action"] == "reflow"
+
+
+def test_reflow_requires_a_known_table_and_non_negative_expected_stale(client, monkeypatch):
+    _set_admin_token(monkeypatch)
+    for payload in (
+        {"action": "reflow", "dry_run": True},
+        {"action": "reflow", "table": "not-a-table", "dry_run": True},
+        {
+            "action": "reflow",
+            "table": "chat_messages",
+            "dry_run": True,
+            "expected_stale": -1,
+        },
+    ):
+        res = client.post(
+            "/v1/admin/tee-replication/run", headers=_admin_headers(), json=payload
+        )
+        assert res.status_code == 400
+
+
+def test_reflow_rejects_table_without_typed_recovery_contract(client, monkeypatch):
+    _set_admin_token(monkeypatch)
+    res = client.post(
+        "/v1/admin/tee-replication/run",
+        headers=_admin_headers(),
+        json={"action": "reflow", "table": "v2_trajectory_events", "dry_run": True},
+    )
+    assert res.status_code == 400
+    assert res.get_json() == {"error": "unsupported_reflow_table"}
+
+
+def test_reflow_rejects_invalid_qps_before_dispatch(client, monkeypatch):
+    _set_admin_token(monkeypatch)
+    for qps in (True, "20", -1):
+        res = client.post(
+            "/v1/admin/tee-replication/run",
+            headers=_admin_headers(),
+            json={
+                "action": "reflow",
+                "table": "voice_transcripts",
+                "dry_run": True,
+                "qps": qps,
+            },
+        )
+        assert res.status_code == 400
+        assert res.get_json() == {"error": "invalid_qps"}
+    from admin import tee_replication as admin_tee_replication
+
+    for qps in (float("nan"), float("inf")):
+        with pytest.raises(admin_tee_replication.BadRequest) as exc:
+            admin_tee_replication.run_action(
+                action="reflow",
+                table="voice_transcripts",
+                dry_run=True,
+                qps=qps,
+            )
+        assert exc.value.error == "invalid_qps"
+
+
+def test_prune_dispatches_exact_stale_guard(client, monkeypatch):
+    _set_admin_token(monkeypatch)
+    captured = {}
+
+    def _stub(table, *, dry_run=False, expected_stale=None):
+        captured.update(table=table, dry_run=dry_run, expected_stale=expected_stale)
+        return {"table": table, "stale": 15001, "deleted": 0, "error": None, "refused": None}
+
+    monkeypatch.setattr("tee_shadow.ciphertext_prune.prune_table", _stub)
+    res = client.post(
+        "/v1/admin/tee-replication/run",
+        headers=_admin_headers(),
+        json={
+            "action": "prune",
+            "table": "v2_trajectory_events",
+            "dry_run": True,
+            "expected_stale": 15001,
+        },
+    )
+    assert res.status_code == 200
+    assert captured == {
+        "table": "v2_trajectory_events",
+        "dry_run": True,
+        "expected_stale": 15001,
+    }
+    assert res.get_json()["ok"] is True
 
 
 def test_unknown_action_is_400(client, monkeypatch):

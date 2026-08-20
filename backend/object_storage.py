@@ -347,6 +347,38 @@ def put_chat_body(
     allocate a private key for this attempt. The DB then uses compare-and-swap
     promotion, so a losing upload can be deleted without risking the winner.
     """
+    try:
+        raw = base64.b64decode(body_ct_b64, validate=True)
+    except Exception as exc:
+        raise ValueError("chat_body_invalid_base64") from exc
+    return put_chat_body_bytes(
+        user_id,
+        msg_id,
+        raw,
+        content_type,
+        upload_version=upload_version,
+        storage_generation=storage_generation,
+    )
+
+
+def put_chat_body_bytes(
+    user_id: str,
+    msg_id: str,
+    raw: bytes,
+    content_type: str = "file",
+    *,
+    upload_version: str | None = None,
+    storage_generation: int | None = None,
+) -> str:
+    """Upload raw chat-body bytes under a newly derived key.
+
+    The caller supplies bytes, never an arbitrary destination key.  This keeps
+    ownership and versioned-key construction inside this module and makes the
+    helper safe for plaintext object migration without enabling in-place
+    overwrite of the currently authoritative object.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("raw must be bytes")
     key = chat_body_key(
         user_id,
         msg_id,
@@ -354,7 +386,6 @@ def put_chat_body(
         upload_version=upload_version,
         storage_generation=storage_generation,
     )
-    raw = base64.b64decode(body_ct_b64)
     _client().put_object(
         Bucket=_chat_files_bucket(),
         Key=key,
@@ -429,19 +460,35 @@ def get_chat_body(key: str, user_id: str) -> str | None:
 
     Returns None if the key isn't this user's, the object is missing, or the fetch
     fails (the caller then surfaces an absent body rather than crashing the read)."""
+    raw = get_chat_body_bytes(key, user_id)
+    if raw is None:
+        return None
+    return base64.b64encode(raw).decode("ascii")
+
+
+def get_chat_body_bytes(key: str, user_id: str) -> bytes | None:
+    """Fetch raw bytes for an owned chat-body key.
+
+    Returning raw bytes lets callers interpret the object according to the
+    pointer's explicit format marker.  Ownership rejection, missing objects and
+    transient fetch failures retain the legacy ``None`` behavior.
+    """
     if not chat_key_owned_by(key, user_id):
         if key:
-            log.error("[r2] get_chat_body refused foreign key %s for user %s", key, user_id)
+            log.error(
+                "[r2] get_chat_body_bytes refused foreign key %s for user %s",
+                key,
+                user_id,
+            )
         return None
     try:
         resp = _client().get_object(Bucket=_chat_files_bucket(), Key=key)
     except Exception as e:  # noqa: BLE001
         if _is_not_found(e):
             return None
-        log.error("[r2] get_chat_body(%s) failed: %s", key, e)
+        log.error("[r2] get_chat_body_bytes(%s) failed: %s", key, e)
         return None
-    raw = resp["Body"].read()
-    return base64.b64encode(raw).decode("ascii")
+    return resp["Body"].read()
 
 
 def delete_chat_body(key: str, user_id: str) -> bool:

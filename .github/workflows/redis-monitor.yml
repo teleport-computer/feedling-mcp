@@ -1,15 +1,18 @@
+# DEPRECATED 2026-08-20：三套 Redis CVM 已暂停且仍为零业务流量。
+# 触发器已禁用，避免对已停止的 pre/prod 实例产生预期内告警；实现保留供审计。
+#
 # .github/workflows/redis-monitor.yml — 盯 prod + pre 的 Redis 健康。
 #
 # 【无离线备份，刻意为之】Redis 在本架构里是纯临时层（缓存/队列/锁，全部可从
 # Postgres 重建，PG 是权威源），故不做离线备份、没有「R2 快照新鲜度」这一维。
 # 本 workflow 只盯两件事：持久化写状态（AOF/RDB 落盘没报错）+ 内存水位
 # （noeviction 下打满 = 写入报错）。test 数据可弃，不监控（与 pg-monitor.yml 同理）。
-name: Redis monitor
+name: Deprecated — Redis monitor
 on:
-  schedule: [{ cron: '*/30 * * * *' }]
   workflow_dispatch: {}
 jobs:
   check:
+    if: ${{ false }} # DEPRECATED：CVM 已停止，避免产生预期内告警
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

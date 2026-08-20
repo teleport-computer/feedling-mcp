@@ -16,7 +16,7 @@ import json
 import os
 
 from enclave import config, envelope
-from memory_garden import card_fields  # noqa: E402
+from memory import card_shape  # noqa: E402
 from memory_garden.scoring.selector import select_memory_index_items  # noqa: E402
 
 
@@ -24,12 +24,17 @@ def memory_readside_for_model_api_enabled() -> bool:
     return config.env_flag_enabled("MEMORY_READSIDE_FOR_MODEL_API")
 
 
-def memory_readside_model_api_limit() -> int:
-    raw = os.environ.get("MEMORY_READSIDE_MODEL_API_LIMIT", "50")
+def memory_readside_model_api_limit(default: int = 50) -> int:
+    """自动注入的候选池大小。
+
+    2026-08-18：默认值由调用方给。两条 runtime 统一挑法之后，chat 入口传 200
+    （resident 一直在用的值）—— 池子大小是运维旋钮，不该随统一被写死。
+    """
+    raw = os.environ.get("MEMORY_READSIDE_MODEL_API_LIMIT", "")
     try:
-        value = int(str(raw or "50").strip())
+        value = int(str(raw).strip()) if str(raw).strip() else int(default)
     except (TypeError, ValueError):
-        value = 50
+        value = int(default)
     return max(1, min(value, 200))
 
 
@@ -79,14 +84,14 @@ def context_moment_to_index_item(moment: dict) -> dict:
     # 摘要**只能**来自可公开字段（card_fields 保证 content 不在其列）——
     # 它会进 selector 的 skipped/selected trace，而 context_trace=1 时整个
     # trace 会返回客户端。用正文兜底会让被拒掉的卡从 trace 漏出正文。
-    summary = memory_readside_text(card_fields.summary_of(moment), 500)
+    summary = memory_readside_text(card_shape.summary_of(moment), 500)
     bucket_refs = [item for item in (linked, memory_readside_text(moment.get("type"), 40)) if item]
     return {
         "id": memory_readside_text(moment.get("id"), 120),
         "summary": summary,
         # 私有搜索语料：只在 enclave 内参与匹配，任何出口都必须剥掉。
         # 沿用 build_memory_search_item 已有的字段名与既定语义，不新造一套。
-        "_search_content": card_fields.private_text(moment),
+        "_search_content": card_shape.private_text(moment),
         "bucket_refs": bucket_refs,
         "status": "active",
         "salience": "medium",
@@ -370,12 +375,16 @@ def decrypt_readside_items(
         if not isinstance(moment, dict):
             continue
         memory_id = str(moment.get("id") or "")
-        if moment.get("visibility") == "local_only" or not moment.get("K_enclave"):
+        if moment.get("visibility") == "local_only" or (
+            not moment.get("K_enclave")
+            and moment.get("body") is None
+            and moment.get("body_b64") is None
+        ):
             if memory_id:
                 unavailable_ids.append(memory_id)
             continue
         try:
-            plaintext = envelope.decrypt_envelope(moment, authorized_user_id, content_sk)
+            plaintext = envelope.read_envelope(moment, authorized_user_id, content_sk)
             inner = json.loads(plaintext.decode("utf-8"))
             if not isinstance(inner, dict):
                 raise ValueError("memory plaintext is not an object")
@@ -396,7 +405,7 @@ def moments_to_cards(moments: list, authorized_user_id: str, content_sk) -> list
         if m.get("visibility") == "local_only":
             continue  # enclave doesn't have K_enclave for these
         try:
-            plaintext = envelope.decrypt_envelope(m, authorized_user_id, content_sk)
+            plaintext = envelope.read_envelope(m, authorized_user_id, content_sk)
             inner = json.loads(plaintext.decode("utf-8"))
         except (envelope.DecryptFailure, json.JSONDecodeError):
             continue

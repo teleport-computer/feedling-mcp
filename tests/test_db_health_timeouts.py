@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import ast
 import sys
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db
+
+
+_BACKEND = Path(__file__).parent.parent / "backend"
 
 
 class _Context:
@@ -96,3 +102,95 @@ def test_runner_heartbeat_default_path_preserves_pool_defaults(monkeypatch):
     assert pool.connection_calls == [{}]
     assert conn.transactions == 0
     assert all("set_config" not in sql for sql, _params in conn.calls)
+
+
+def test_set_blob_propagates_primary_write_failure(monkeypatch):
+    def fail_pool():
+        raise RuntimeError("primary unavailable")
+
+    monkeypatch.setattr(db, "get_pool", fail_pool)
+
+    with pytest.raises(RuntimeError, match="primary unavailable"):
+        db.set_blob("usr_contract", "identity", {"v": 1})
+
+
+def test_set_blob_best_effort_is_explicit_and_reports_failure(monkeypatch, caplog):
+    def fail_pool():
+        raise RuntimeError("primary unavailable")
+
+    monkeypatch.setattr(db, "get_pool", fail_pool)
+
+    assert db.set_blob_best_effort("usr_contract", "push_state", {"v": 1}) is False
+    assert "set_blob_best_effort(usr_contract,push_state) failed" in caplog.text
+
+
+def test_memory_load_strict_propagates_while_legacy_loader_is_explicitly_fail_soft(
+    monkeypatch, caplog,
+):
+    monkeypatch.setattr(db, "_memory_mutation_context", lambda _user_id: None)
+
+    def fail_pool():
+        raise RuntimeError("memory database unavailable")
+
+    monkeypatch.setattr(db, "get_pool", fail_pool)
+
+    with pytest.raises(RuntimeError, match="memory database unavailable"):
+        db.memory_load_strict("usr_memory_contract")
+    assert db.memory_load("usr_memory_contract") == []
+    assert "memory_load(usr_memory_contract) failed" in caplog.text
+
+
+def _db_blob_call_sites(method: str) -> set[tuple[str, str]]:
+    sites: set[tuple[str, str]] = set()
+    for path in _BACKEND.rglob("*.py"):
+        if path.name == "db.py":
+            continue
+        stack: list[str] = []
+
+        class Visitor(ast.NodeVisitor):
+            def visit_FunctionDef(self, node):  # noqa: N802 - ast visitor API
+                stack.append(node.name)
+                self.generic_visit(node)
+                stack.pop()
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_Call(self, node):  # noqa: N802 - ast visitor API
+                func = node.func
+                if (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == method
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "db"
+                ):
+                    sites.add((str(path.relative_to(_BACKEND)), ".".join(stack)))
+                self.generic_visit(node)
+
+        Visitor().visit(ast.parse(path.read_text()))
+    return sites
+
+
+def test_blob_write_callers_keep_strict_and_best_effort_contracts_explicit():
+    assert _db_blob_call_sites("set_blob_best_effort") == {
+        ("core/store.py", "_persist_frames_meta"),
+        ("core/store.py", "_save_tokens_best_effort"),
+        ("core/store.py", "record_successful_push"),
+        ("core/store.py", "_save_live_activity_state"),
+        ("hosted/turn.py", "_state_pending_items"),
+    }
+    assert _db_blob_call_sites("set_blob") == {
+        ("bootstrap/bootstrap_core.py", "bootstrap_payload"),
+        ("core/store.py", "_save_tokens"),
+        ("debug_trace.py", "set_enabled"),
+        ("genesis/service.py", "write_genesis_checkpoint"),
+        ("genesis/service.py", "write_genesis_state"),
+        ("genesis/service.py", "write_persona_artifact"),
+        ("genesis/service.py", "write_voice_artifact"),
+        ("hosted/history_import.py", "_save_history_job"),
+        ("hosted/mcp_core.py", "_save"),
+        ("identity/service.py", "_save_identity"),
+        ("memory/memory_core.py", "migration_state_post"),
+        ("proactive/capture_scheduler.py", "save_capture_state"),
+        ("proactive/dream_scheduler.py", "save_dream_state"),
+        ("proactive/store_v2.py", "save"),
+    }

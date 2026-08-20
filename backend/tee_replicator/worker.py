@@ -21,13 +21,15 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 import os
 
 import db
 import psycopg
+from plaintext_shadow import config as plaintext_shadow_config
+from plaintext_shadow.config import TargetPolicy
 from psycopg.types.json import Jsonb
 from tee_shadow import mirror
 
@@ -131,18 +133,16 @@ class _Table:
     requeue_delete_tee_sql: str | None = None  # drop the TEE row when RDS row is gone
     requeue_by_user_only: bool = False          # identity: key on user_id alone
     # prune lane（删除传播的兜底对账，见 tee_shadow/ciphertext_prune.py）。两条
-    # SELECT 必须返回**同构**的主键元组，且元组顺序与 requeue_delete_tee_sql 的
-    # 参数顺序逐位对齐——prune 就是把差集里的元组原样喂给那条 DELETE。
+    # SELECT 必须返回**同构**的主键元组，且元组顺序与
+    # tee_shadow.ciphertext_prune._PRUNE_DELETE_SQL 的参数逐位对齐。
     #
     # 为什么两侧要分别给一条而不是共用：表名和辖区在两侧不一定相同。
     # frame_envelopes（RDS）在 TEE 侧叫 frames；identity 是伪表，两侧都要
     # `WHERE kind='identity'` 的辖区限定，否则会把 user_blobs 的其它 kind
     # （归 MIRROR lane 的 reconciler 管）卷进来当孤儿删掉。
     #
-    # 留空 = 本表不参与 prune。纯 append-only、连 requeue_delete_tee_sql 都没有的
-    # 表（chat_message_archive / v2_trajectory_events /
-    # v2_conversation_summary_segments）就该留空：它们没有删除语义，prune 无从
-    # 判断"消失"是删除还是尚未复制。
+    # 留空 = 本表不参与 prune。没有安全删除契约的表（chat_message_archive /
+    # v2_conversation_summary_segments）就该留空。
     prune_rds_keys_sql: str | None = None
     prune_tee_keys_sql: str | None = None
     # 冷启动（tee_replication_cursors 里还没有本表的行）时喂给 select_sql 的参数
@@ -154,9 +154,17 @@ class _Table:
     # try/except 会把这个错误吞掉计入退避，每个 tick 静默重复失败，见
     # 2026-07-28 审查记录）。
     cursor_zero: tuple | None = None
+    # Dirty-key replay always re-reads the authoritative current row.  These
+    # contracts are separate from the legacy requeue lane because the durable
+    # key is the real source PK (for example model_api_credentials carries only
+    # `id`, while its old requeue row also carried user_id).
+    key_fetch_sql: str | None = None
+    key_delete_sql: str | None = None
+    key_params: Callable[[dict], tuple] | None = None
 
 
 _SEQ_KEY = "_replicator_seq"  # smuggled through the plaintext doc dict, see below
+_STORAGE_GENERATION_KEY = "_replicator_storage_generation"
 
 
 def _chat_unpack(r: tuple) -> tuple:
@@ -177,20 +185,33 @@ def _chat_unpack(r: tuple) -> tuple:
     返回、transform 照常失败 → freeze → 下个 pass 重试，与其余瞬时错误同策略。
     unpack 同时服务 run_table 游标环和 _consume_requeue，两条路径一并覆盖。
     """
-    uid, msg_id, ts, doc, seq = r
-    if db._is_chat_file_pointer(doc):
+    uid, msg_id, ts, doc, seq, storage_generation = r
+    if (
+        db._is_chat_file_pointer(doc)
+        and db._chat_body_object_format(doc) == "sealed_v1"
+    ):
         doc = db.hydrate_chat_file_body(uid, doc)
-    return (uid, msg_id, ts, {**doc, _SEQ_KEY: seq})
+    return (
+        uid,
+        msg_id,
+        ts,
+        {
+            **doc,
+            _SEQ_KEY: seq,
+            _STORAGE_GENERATION_KEY: storage_generation,
+        },
+    )
 
 
 def _chat_upsert_args(uid: str, iid: str, sort, doc: dict) -> tuple:
     seq = doc.pop(_SEQ_KEY)
-    return (uid, seq, iid, sort, Jsonb(doc))
+    storage_generation = doc.pop(_STORAGE_GENERATION_KEY)
+    return (uid, seq, iid, sort, Jsonb(doc), storage_generation)
 
 
 _TABLES: dict[str, _Table] = {
     "chat_messages": _Table(
-        select_sql=("SELECT user_id, msg_id, ts, doc, seq FROM chat_messages "
+        select_sql=("SELECT user_id, msg_id, ts, doc, seq, storage_generation FROM chat_messages "
                     "WHERE (ts, msg_id) > (%s, %s) ORDER BY ts, msg_id LIMIT %s"),
         cursor_kind="numeric",
         transform=transforms.plaintext_chat_doc,
@@ -206,12 +227,16 @@ _TABLES: dict[str, _Table] = {
         # row was already inserted with the correct seq the first time
         # (upserts are idempotent replays of the same watermark range), so
         # the existing seq is already right and simply needs to survive.
-        upsert_sql=("INSERT INTO chat_messages (user_id, seq, msg_id, ts, doc) "
-                    "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s) "
-                    "ON CONFLICT (user_id, msg_id) DO UPDATE SET ts=EXCLUDED.ts, doc=EXCLUDED.doc"),
+        upsert_sql=("INSERT INTO chat_messages "
+                    "(user_id, seq, msg_id, ts, doc, storage_generation) "
+                    "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (user_id, msg_id) DO UPDATE SET "
+                    "ts=EXCLUDED.ts, doc=EXCLUDED.doc, "
+                    "storage_generation=EXCLUDED.storage_generation"),
         unpack=_chat_unpack,
         upsert_args=_chat_upsert_args,
-        requeue_fetch_sql=("SELECT user_id, msg_id, ts, doc, seq FROM chat_messages "
+        requeue_fetch_sql=("SELECT user_id, msg_id, ts, doc, seq, storage_generation "
+                           "FROM chat_messages "
                            "WHERE user_id = %s AND msg_id = %s"),
         requeue_delete_tee_sql="DELETE FROM chat_messages WHERE user_id = %s AND msg_id = %s",
         prune_rds_keys_sql="SELECT user_id, msg_id FROM chat_messages",
@@ -286,12 +311,14 @@ def _make_decrypt(user_id: str) -> Callable[[dict, str], bytes]:
     Runtime V2 下没有 per-user api_key，只能用 runtime token
     （scope=envelope_decrypt，见 supervisor.py 的 mint_token 用法）。
     """
-    from core import enclave as core_enclave
+    from core import envelope as core_envelope
 
     token = _mint_runtime_token(user_id)
 
     def decrypt(envelope: dict, purpose: str) -> bytes:
-        return core_enclave._decrypt_envelope_via_enclave(
+        # 形状路由：明文行直读、不白跑一趟 enclave。cutover 后 TEE 主库里
+        # 密文/明文行的共存形态仍由 Task 2.4 定，这里只是不再假设行一定是信封。
+        return core_envelope.read_envelope_body(
             envelope, None, purpose=purpose, runtime_token=token)
 
     return decrypt
@@ -342,6 +369,43 @@ def _get_reencrypt(user_id: str, *, fresh: bool = False) -> Callable[[dict, str]
     return fn
 
 
+# 判据是**用户意图**而不是行形状。设计初稿写的是「按行形状搬运」，实现时发现有
+# 洞：现在 PLAINTEXT_WRITES_ACCEPTED 是 False、effective 恒 "on"，所有行都是信封，
+# 按形状搬运会让影子库立刻整体变密文、明文排查通道当场失效。那是过渡期回归，不是
+# 终态。平台放开明文后意图与形状自然一致，本分流退化成「按行形状搬运」。
+_CARRY_VERBATIM_TTL_SEC = 60.0
+_carry_verbatim_cache: dict[str, tuple[float, bool]] = {}
+
+
+def _carries_verbatim(
+    user_id: str,
+    target_policy: TargetPolicy | None = None,
+) -> bool:
+    """该用户的行是否原样搬运（= 显式选了加密档）。
+
+    fail-safe 方向与写侧一致：**查不到用户就不解密**。搬运的失败方向是「多留了
+    密文」，事后重放可修；解密的失败方向是「明文泄漏」，不可逆。
+
+    带 TTL 缓存：``_get_user_content_encryption`` 是 O(用户数) 的全表扫描，按行
+    调用会拖垮长跑 pass；但不能永久缓存，否则用户切档后要等进程重启才生效。
+    """
+    if target_policy is not None and target_policy.mode == "plaintext_all":
+        return False
+
+    now = time.time()
+    hit = _carry_verbatim_cache.get(user_id)
+    if hit is not None and now - hit[0] <= _CARRY_VERBATIM_TTL_SEC:
+        return hit[1]
+
+    from accounts import registry  # 延迟导入：复制层不该在模块期拉起 accounts
+
+    # 三态：`"on"` 加密档 → 搬运；`"off"` 明文档 → 解密；`None` 查不到用户 →
+    # fail-safe 搬运。所以「不等于 off」正是判据。
+    verbatim = registry._get_user_content_encryption(user_id) != "off"
+    _carry_verbatim_cache[user_id] = (now, verbatim)
+    return verbatim
+
+
 def _get_decrypt(user_id: str, *, fresh: bool = False) -> Callable[[dict, str], bytes]:
     """TTL 感知的 per-user decrypt 缓存。
 
@@ -380,12 +444,33 @@ def _is_permanent_decrypt_failure(exc: Exception) -> bool:
     return "enclave_http_403" in msg and "decrypt_failed" in msg
 
 
-def _transform_with_retry(cfg: _Table, doc: dict, user_id: str) -> dict:
+def _transform_with_retry(
+    cfg: _Table,
+    doc: dict,
+    user_id: str,
+    target_policy: TargetPolicy | None = None,
+) -> dict:
     """PendingDeviceMigration 是确定性的，立即上抛不重试；其余（网络/enclave）重试。
 
     auth 形状的失败（401/token 过期）在重试前强制重铸 token——同一枚 stale token
     重试多少次都是白试。
     """
+    if _carries_verbatim(user_id, target_policy):
+        # 加密档：整行原样搬运，复制层不解密（Task 2.4）。
+        return transforms.carry_verbatim(doc)
+    main_is_plaintext = (
+        isinstance(doc.get("body"), str)
+        or (
+            bool(doc.get("body_key"))
+            and doc.get("body_object_format") == "plaintext_v1"
+        )
+    )
+    if main_is_plaintext and not transforms.needs_decrypt(doc):
+        # 明文档的终态行已经是 transform 的目标形状。旁路必须放在
+        # _get_decrypt 之前，否则即使 transform 本身不调用 decrypt，复制层仍会
+        # 无意义地铸 token/准备 enclave，并在 enclave 故障时连坐明文用户。
+        return cfg.transform(doc, None)
+
     decrypt = _get_decrypt(user_id)
     last: Exception | None = None
     for _ in range(_RETRIES + 1):
@@ -427,10 +512,36 @@ def _reencrypt_with_retry(user_id: str, envelope: dict) -> dict:
 
 
 def _frames_row_writer(user_id: str, frame_id: str, sort_val, doc: dict,
-                       dry_run: bool):
+                       dry_run: bool, target_policy: TargetPolicy | None = None):
     """_TABLES["frame_envelopes"].row_writer：委托 frames.replicate，注入带重试的
-    reencrypt 回调。返回 frames upsert_sql 的 9 元参数，或 dry_run 下 None。"""
+    回调。legacy target 返回 R2 ciphertext pointer；plaintext_all target 返回
+    inline body_plaintext。两者均返回 frames upsert_sql 的 10 元参数，dry_run 为 None。"""
     from tee_replicator import frames
+
+    if target_policy is not None and target_policy.mode == "plaintext_all":
+        def decrypt(envelope: dict) -> bytes:
+            fn = _get_decrypt(user_id)
+            last: Exception | None = None
+            for _ in range(_RETRIES + 1):
+                try:
+                    return fn(envelope, purpose="plaintext_shadow_frame")
+                except Exception as exc:  # noqa: BLE001
+                    if _is_permanent_decrypt_failure(exc):
+                        raise transforms.PermanentDecryptFailure(str(exc)) from exc
+                    last = exc
+                    if _is_auth_error(exc):
+                        fn = _get_decrypt(user_id, fresh=True)
+            assert last is not None
+            raise last
+
+        return frames.replicate_plaintext(
+            user_id,
+            frame_id,
+            float(sort_val or 0.0),
+            doc,
+            decrypt,
+            dry_run=dry_run,
+        )
 
     def reencrypt(envelope: dict, key_version: str) -> dict:
         return _reencrypt_with_retry(user_id, envelope)
@@ -442,7 +553,7 @@ def _frames_row_writer(user_id: str, frame_id: str, sort_val, doc: dict,
 # frames：R2/inline 双形态 → 存储层重加密 → TEE frames 指针行（spec §4 / D4）。
 # 排序键 (ts, frame_id) 同 chat（numeric 游标）；unpack 把整行三形态字段打包进
 # "doc" 交给 row_writer。row_writer 委托 tee_replicator.frames.replicate，故这里
-# 无需 transform/upsert_args。upsert_sql 的 9 列与 frames.replicate 返回元组对齐，
+# 无需 transform/upsert_args。upsert_sql 的 10 列与 frames writer 返回元组对齐，
 # TEE 写 + 游标推进仍在 run_table 的单事务里（本体密文已先落 R2，只写指针）。
 #
 # requeue_delete_tee_sql：frame_envelopes 没有 requeue_fetch_sql（/v1/content/swap
@@ -461,18 +572,19 @@ _TABLES["frame_envelopes"] = _Table(
     cursor_kind="numeric",
     upsert_sql=(
         "INSERT INTO frames (user_id, frame_id, ts, meta, body_storage_key, "
-        "body_storage_key_version, body_mime, body_sha256, body_size_bytes) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "body_storage_key_version, body_mime, body_sha256, body_size_bytes, "
+        "body_plaintext) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
         "ON CONFLICT (user_id, frame_id) DO UPDATE SET ts=EXCLUDED.ts, meta=EXCLUDED.meta, "
         "body_storage_key=EXCLUDED.body_storage_key, "
         "body_storage_key_version=EXCLUDED.body_storage_key_version, "
         "body_mime=EXCLUDED.body_mime, body_sha256=EXCLUDED.body_sha256, "
-        "body_size_bytes=EXCLUDED.body_size_bytes"),
+        "body_size_bytes=EXCLUDED.body_size_bytes, "
+        "body_plaintext=EXCLUDED.body_plaintext"),
     unpack=lambda r: (r[0], r[1], r[2], {"doc": r[3], "env_meta": r[4], "body_key": r[5]}),
     row_writer=_frames_row_writer,
     requeue_delete_tee_sql="DELETE FROM frames WHERE user_id = %s AND frame_id = %s",
     # ⚠️ 两侧表名不同：RDS 是 frame_envelopes，TEE 侧叫 frames。
-    # 遗留风险与上面 requeue_delete_tee_sql 那段注释同源：prune 删掉 TEE 明文指针
+    # 遗留风险与上面 requeue_delete_tee_sql 那段注释同源：prune 的独立删除契约删掉 TEE 明文指针
     # 行时，不清理该行 body_storage_key 指向的 frames-tee R2 对象，会留下孤儿对象。
     # 与 requeue lane 的既有行为一致（那条 DELETE 同样不碰 R2），不在本次修复范围。
     prune_rds_keys_sql="SELECT user_id, frame_id FROM frame_envelopes",
@@ -543,7 +655,10 @@ def _chat_archive_unpack(r: tuple) -> tuple:
     """
     (uid, source_seq, msg_id, ts, doc, storage_generation, clear_generation,
      cleared_at) = r
-    if db._is_chat_file_pointer(doc):
+    if (
+        db._is_chat_file_pointer(doc)
+        and db._chat_body_object_format(doc) == "sealed_v1"
+    ):
         doc = db.hydrate_chat_file_body(uid, doc)
     item_id = str(source_seq)
     sort_val = _iso(cleared_at) or ""
@@ -577,10 +692,15 @@ _TABLES["chat_message_archive"] = _Table(
                 "cleared_at=EXCLUDED.cleared_at"),
     unpack=_chat_archive_unpack,
     upsert_args=_chat_archive_upsert_args,
-    # 归档表只有一条 INSERT 写路径（db.py 清空历史时），没有任何 UPDATE——一旦
-    # 归档即不可变，不需要 requeue（同 chat_message_archive 自身没有原地改写）。
-    requeue_fetch_sql=None,
-    requeue_delete_tee_sql=None,
+    # 常规产品路径仍是 append-only；R2 plaintext pointer backfill 会在 RDS 事务内
+    # delete+insert 同一 source_seq（保留 cleared_at），因此普通游标不会再看见它。
+    # 迁移完成后用 requeue lane 取回当前行，保证 TEE pointer 同步切换。
+    requeue_fetch_sql=("SELECT user_id, source_seq, msg_id, ts, doc, "
+                       "storage_generation, clear_generation, cleared_at "
+                       "FROM chat_message_archive "
+                       "WHERE user_id = %s AND source_seq = %s"),
+    requeue_delete_tee_sql=("DELETE FROM chat_message_archive "
+                            "WHERE user_id = %s AND source_seq = %s"),
     # 冷启动：cleared_at 是 TIMESTAMPTZ，"-infinity" 是合法字面量；source_seq 是
     # BIGINT（WHERE 里没有 ::text 转型），空串不是合法 bigint，必须给数字串。
     cursor_zero=("-infinity", "0"),
@@ -676,6 +796,10 @@ _TABLES["v2_trajectory_events"] = _Table(
     # 原地改写路径，不需要 requeue。
     requeue_fetch_sql=None,
     requeue_delete_tee_sql=None,
+    # 实际运行中 agent_jobs 清理会让 RDS 轨迹事件消失；TEE 表刻意没有跨表 FK，
+    # 因此不能再把它视作永不删除。全量 reflow/prune 用真实复合 PK 收敛孤儿行。
+    prune_rds_keys_sql="SELECT job_id, event_index FROM v2_trajectory_events",
+    prune_tee_keys_sql="SELECT job_id, event_index FROM v2_trajectory_events",
     # 冷启动：created_at 是 TIMESTAMPTZ，"-infinity" 合法；第二列在 SQL 里已经
     # ::text 转型成字符串拼接，空串本身就是合法 TEXT 且排在任何非空拼接结果之前。
     cursor_zero=("-infinity", ""),
@@ -692,12 +816,13 @@ _TABLES["voice_transcripts"] = _Table(
         doc, decrypt, purpose=f"tee_replicate:voice_transcripts:{doc.get('id', '')}"),
     upsert_sql=("INSERT INTO voice_transcripts "
                 "(user_id, call_id, chat_message_id, turn_count, duration_sec, "
-                "char_count, created_at, doc) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+                "char_count, created_at, transcript_envelope) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
                 "ON CONFLICT (user_id, call_id) DO UPDATE SET "
                 "chat_message_id=EXCLUDED.chat_message_id, "
                 "turn_count=EXCLUDED.turn_count, duration_sec=EXCLUDED.duration_sec, "
                 "char_count=EXCLUDED.char_count, created_at=EXCLUDED.created_at, "
-                "doc=EXCLUDED.doc"),
+                "transcript_envelope=EXCLUDED.transcript_envelope"),
     unpack=_voice_transcripts_unpack,
     upsert_args=_voice_transcripts_upsert_args,
     # 归档行只在挂断时写一次、此后永不改写（全仓无 "UPDATE voice_transcripts"），
@@ -1061,14 +1186,141 @@ _TABLES["v2_workspace_entries"] = _Table(
 )
 
 
-def _produce_write(cfg: _Table, user_id: str, item_id: str, sort_val, doc: dict,
-                   dry_run: bool):
+def _key_values(*columns: str) -> Callable[[dict], tuple]:
+    def values(key: dict) -> tuple:
+        missing = [column for column in columns if column not in key]
+        if missing:
+            raise ValueError(f"dirty key missing columns: {','.join(missing)}")
+        return tuple(key[column] for column in columns)
+
+    return values
+
+
+# Current-row keyed replay contracts.  The SELECT projection must match each
+# table's existing `unpack` function exactly; tests require every ciphertext
+# config (including the identity pseudo-table) to have a complete contract.
+_KEY_CONTRACTS: dict[str, tuple[str, str, Callable[[dict], tuple]]] = {
+    "chat_messages": (
+        "SELECT user_id, msg_id, ts, doc, seq, storage_generation FROM chat_messages "
+        "WHERE user_id=%s AND msg_id=%s",
+        "DELETE FROM chat_messages WHERE user_id=%s AND msg_id=%s",
+        _key_values("user_id", "msg_id"),
+    ),
+    "memory_moments": (
+        "SELECT user_id, moment_id, occurred_at, doc FROM memory_moments "
+        "WHERE user_id=%s AND moment_id=%s",
+        "DELETE FROM memory_moments WHERE user_id=%s AND moment_id=%s",
+        _key_values("user_id", "moment_id"),
+    ),
+    "world_book_entries": (
+        "SELECT user_id, entry_id, updated_at, doc FROM world_book_entries "
+        "WHERE user_id=%s AND entry_id=%s",
+        "DELETE FROM world_book_entries WHERE user_id=%s AND entry_id=%s",
+        _key_values("user_id", "entry_id"),
+    ),
+    "identity": (
+        "SELECT user_id, doc FROM user_blobs WHERE kind='identity' AND user_id=%s",
+        "DELETE FROM user_blobs WHERE user_id=%s AND kind='identity'",
+        _key_values("user_id"),
+    ),
+    "frame_envelopes": (
+        "SELECT user_id, frame_id, ts, doc, env_meta, body_key FROM frame_envelopes "
+        "WHERE user_id=%s AND frame_id=%s",
+        "DELETE FROM frames WHERE user_id=%s AND frame_id=%s",
+        _key_values("user_id", "frame_id"),
+    ),
+    "chat_message_archive": (
+        "SELECT user_id, source_seq, msg_id, ts, doc, storage_generation, "
+        "clear_generation, cleared_at FROM chat_message_archive "
+        "WHERE user_id=%s AND source_seq=%s",
+        "DELETE FROM chat_message_archive WHERE user_id=%s AND source_seq=%s",
+        _key_values("user_id", "source_seq"),
+    ),
+    "v2_trajectory_events": (
+        "SELECT user_id, job_id, event_index, event_kind, idempotency_key, "
+        "payload_bytes, truncated, created_at, payload_envelope "
+        "FROM v2_trajectory_events WHERE job_id=%s AND event_index=%s",
+        "DELETE FROM v2_trajectory_events WHERE job_id=%s AND event_index=%s",
+        _key_values("job_id", "event_index"),
+    ),
+    "voice_transcripts": (
+        "SELECT user_id, call_id, chat_message_id, turn_count, duration_sec, "
+        "char_count, created_at, transcript_envelope FROM voice_transcripts "
+        "WHERE user_id=%s AND call_id=%s",
+        "DELETE FROM voice_transcripts WHERE user_id=%s AND call_id=%s",
+        _key_values("user_id", "call_id"),
+    ),
+    "model_api_credentials": (
+        "SELECT id, user_id, provider, label, base_url, api_key_envelope, "
+        "api_key_hint, supports_responses, created_at, updated_at "
+        "FROM model_api_credentials WHERE id=%s",
+        "DELETE FROM model_api_credentials WHERE id=%s",
+        _key_values("id"),
+    ),
+    "v2_conversation_summary": (
+        "SELECT user_id, summary_envelope, watermark_ts, version, updated_at, "
+        "watermark_seq, materialized_segment_ids FROM v2_conversation_summary "
+        "WHERE user_id=%s",
+        "DELETE FROM v2_conversation_summary WHERE user_id=%s",
+        _key_values("user_id"),
+    ),
+    "v2_conversation_summary_segments": (
+        "SELECT segment_id, user_id, format_version, coverage_kind, level, "
+        "start_seq, end_seq, source_message_count, legacy_opaque_through_seq, "
+        "child_segment_ids, summary_envelope, created_at "
+        "FROM v2_conversation_summary_segments WHERE segment_id=%s",
+        "DELETE FROM v2_conversation_summary_segments WHERE segment_id=%s",
+        _key_values("segment_id"),
+    ),
+    "v2_trajectory_reviews": (
+        "SELECT user_id, source_job_id, status, attempt_count, claimed_by_job_id, "
+        "review_envelope, last_error, created_at, started_at, finished_at "
+        "FROM v2_trajectory_reviews WHERE source_job_id=%s",
+        "DELETE FROM v2_trajectory_reviews WHERE source_job_id=%s",
+        _key_values("source_job_id"),
+    ),
+    "v2_workspace_entries": (
+        "SELECT user_id, path, kind, content_envelope, mime_type, source_ref, "
+        "revision, created_at, updated_at FROM v2_workspace_entries "
+        "WHERE user_id=%s AND path=%s",
+        "DELETE FROM v2_workspace_entries WHERE user_id=%s AND path=%s",
+        _key_values("user_id", "path"),
+    ),
+}
+
+if set(_KEY_CONTRACTS) != set(_TABLES):
+    raise RuntimeError(
+        "plaintext shadow keyed replay contracts do not cover every ciphertext table"
+    )
+
+_TABLES = {
+    name: replace(
+        cfg,
+        key_fetch_sql=_KEY_CONTRACTS[name][0],
+        key_delete_sql=_KEY_CONTRACTS[name][1],
+        key_params=_KEY_CONTRACTS[name][2],
+    )
+    for name, cfg in _TABLES.items()
+}
+
+
+def _produce_write(
+    cfg: _Table,
+    user_id: str,
+    item_id: str,
+    sort_val,
+    doc: dict,
+    dry_run: bool,
+    target_policy: TargetPolicy | None = None,
+):
     """一行 → TEE upsert 参数元组（或 None=已计数但不写，frames dry_run 用）。
     抛 PendingDeviceMigration / 其余异常的语义与 decrypt 路径一致，供 run_table
     的 freeze/pending 共用。"""
     if cfg.row_writer is not None:
-        return cfg.row_writer(user_id, item_id, sort_val, doc, dry_run)
-    pt_doc = _transform_with_retry(cfg, doc, user_id)
+        return cfg.row_writer(
+            user_id, item_id, sort_val, doc, dry_run, target_policy
+        )
+    pt_doc = _transform_with_retry(cfg, doc, user_id, target_policy)
     return cfg.upsert_args(user_id, item_id, sort_val, pt_doc)
 
 
@@ -1105,8 +1357,18 @@ def _decode_cursor(cfg: _Table, wm_ts: float, wm_id: str) -> tuple:
     return (sort_val, item_id)
 
 
-def _read_cursor(table: str) -> tuple[float, str]:
-    with mirror.get_tee_pool().connection() as c:
+def _target_pool(target_policy: TargetPolicy | None = None):
+    """Keep the legacy pool seam when the new plaintext target is disabled."""
+    if target_policy is None:
+        return mirror.get_tee_pool()
+    return mirror.get_target_pool(target_policy)
+
+
+def _read_cursor(
+    table: str,
+    target_policy: TargetPolicy | None = None,
+) -> tuple[float, str]:
+    with _target_pool(target_policy).connection() as c:
         row = c.execute(
             "SELECT watermark_ts, watermark_id FROM tee_replication_cursors "
             "WHERE table_name = %s", (table,)).fetchone()
@@ -1128,7 +1390,11 @@ def _log_row_error(table: str, user_id: str, item_id: str, exc: Exception) -> No
         log.warning("[tee-replicate] failed to log row error for %s/%s: %s", table, item_id, e)
 
 
-def _consume_requeue(cfg: _Table, table: str) -> tuple[int, int, int, int]:
+def _consume_requeue(
+    cfg: _Table,
+    table: str,
+    target_policy: TargetPolicy | None = None,
+) -> tuple[int, int, int, int]:
     """Drain the requeue lane before the cursor loop (non-dry-run only).
 
     requeue rows (``reason LIKE 'requeue%'``) mark same-PK in-place rewrites
@@ -1154,7 +1420,7 @@ def _consume_requeue(cfg: _Table, table: str) -> tuple[int, int, int, int]:
     """
     if cfg.requeue_fetch_sql is None:
         return (0, 0, 0, 0)
-    with mirror.get_tee_pool().connection() as dst:
+    with _target_pool(target_policy).connection() as dst:
         pend = dst.execute(_REQUEUE_SELECT, (table, "requeue%")).fetchall()
     if not pend:
         return (0, 0, 0, 0)
@@ -1164,7 +1430,7 @@ def _consume_requeue(cfg: _Table, table: str) -> tuple[int, int, int, int]:
         for user_id, item_id in pend:
             key = (user_id,) if cfg.requeue_by_user_only else (user_id, item_id)
             rds_row = src.execute(cfg.requeue_fetch_sql, key).fetchone()
-            with mirror.get_tee_pool().connection() as dst:
+            with _target_pool(target_policy).connection() as dst:
                 if rds_row is None:
                     with dst.transaction():
                         dst.execute(cfg.requeue_delete_tee_sql, key)
@@ -1172,7 +1438,9 @@ def _consume_requeue(cfg: _Table, table: str) -> tuple[int, int, int, int]:
                     continue
                 uid, iid, sort_val, doc = cfg.unpack(rds_row)
                 try:
-                    args = _produce_write(cfg, uid, iid, sort_val, doc, False)
+                    args = _produce_write(
+                        cfg, uid, iid, sort_val, doc, False, target_policy
+                    )
                 except transforms.PendingDeviceMigration as e:
                     # The row is now local_only/no-K_enclave — terminal. Any
                     # plaintext left over in TEE from a prior (pre-rewrite)
@@ -1226,6 +1494,22 @@ def _consume_requeue(cfg: _Table, table: str) -> tuple[int, int, int, int]:
 _SEQ_TABLES: dict[str, str] = {"chat_messages": "seq"}
 
 
+def finalize_identity_sequence(
+    table: str,
+    target_policy: TargetPolicy | None = None,
+) -> None:
+    """Fast-forward a carried identity sequence after a successful full pass."""
+    seq_col = _SEQ_TABLES.get(table)
+    if not seq_col:
+        return
+    with _target_pool(target_policy).connection() as dst:
+        dst.execute(
+            f"SELECT setval(pg_get_serial_sequence(%s, %s), "
+            f"GREATEST((SELECT COALESCE(MAX({seq_col}), 1) FROM {table}), 1))",
+            (table, seq_col),
+        )
+
+
 def _write_pending_and_cursor(dst, cfg, table, pend_rows, adv_ts, adv_id) -> None:
     """把 PendingDeviceMigration 标记 + 游标推进写进当前(调用方开的)事务。
 
@@ -1257,7 +1541,15 @@ def _conn_lost(dst, exc: Exception) -> bool:
     return isinstance(exc, psycopg.OperationalError)
 
 
-def _flush_batch(cfg, table, writes, pend_rows, adv_ts, adv_id) -> int:
+def _flush_batch(
+    cfg,
+    table,
+    writes,
+    pend_rows,
+    adv_ts,
+    adv_id,
+    target_policy: TargetPolicy | None = None,
+) -> int:
     """整批写 upsert + pending 标记 + 游标推进,返回本批跳过的毒行数。
 
     两类失败分开处理(2026-07-14 test 根因:direct-TLS 连接经 Phala 网关掉线,
@@ -1271,7 +1563,7 @@ def _flush_batch(cfg, table, writes, pend_rows, adv_ts, adv_id) -> int:
     attempts = _batch_conn_retries()
     for attempt in range(1, attempts + 1):
         try:
-            with mirror.get_tee_pool().connection() as dst:
+            with _target_pool(target_policy).connection() as dst:
                 try:
                     with dst.transaction():
                         for args in writes:
@@ -1305,8 +1597,76 @@ def _flush_batch(cfg, table, writes, pend_rows, adv_ts, adv_id) -> int:
     return 0
 
 
-def run_table(table: str, *, qps: float = 2.0, dry_run: bool = False,
-              limit: int | None = None) -> dict:
+def run_keys(
+    table: str,
+    keys: list[dict],
+    *,
+    target_policy: TargetPolicy | None = None,
+) -> dict:
+    """Re-read and apply current authoritative rows for durable dirty keys.
+
+    The event operation is deliberately ignored.  If a delete was followed by
+    a reinsertion, the current row is upserted; if an update was followed by a
+    delete, the target row is deleted.  Replaying the same key is idempotent.
+    """
+    cfg = _TABLES[table]
+    if cfg.key_fetch_sql is None or cfg.key_delete_sql is None or cfg.key_params is None:
+        raise RuntimeError(f"keyed replay is not configured for {table}")
+    if target_policy is None:
+        target_policy = plaintext_shadow_config.load_target()
+
+    applied = deleted = pending = 0
+    with db.get_pool().connection() as src, _target_pool(
+        target_policy
+    ).connection() as dst:
+        for dirty_key in keys:
+            params = cfg.key_params(dirty_key)
+            source_row = src.execute(cfg.key_fetch_sql, params).fetchone()
+            if source_row is None:
+                with dst.transaction():
+                    dst.execute(cfg.key_delete_sql, params)
+                deleted += 1
+                continue
+
+            user_id, item_id, sort_val, doc = cfg.unpack(source_row)
+            try:
+                args = _produce_write(
+                    cfg,
+                    user_id,
+                    item_id,
+                    sort_val,
+                    doc,
+                    False,
+                    target_policy,
+                )
+            except transforms.PendingDeviceMigration:
+                # local_only/no-K_enclave rows must have no plaintext target.
+                with dst.transaction():
+                    dst.execute(cfg.key_delete_sql, params)
+                pending += 1
+                continue
+
+            with dst.transaction():
+                if args is not None:
+                    dst.execute(cfg.upsert_sql, args)
+            applied += 1
+
+    return {
+        "table": table,
+        "applied": applied,
+        "deleted": deleted,
+        "pending": pending,
+    }
+
+
+def run_table(
+    table: str,
+    *,
+    qps: float = 2.0,
+    dry_run: bool = False,
+    limit: int | None = None,
+    target_policy: TargetPolicy | None = None,
+) -> dict:
     """把 RDS ``table`` 的密文增量解密复制进 TEE 明文库。
 
     失败语义（brief）：
@@ -1320,14 +1680,18 @@ def run_table(table: str, *, qps: float = 2.0, dry_run: bool = False,
       - dry_run：零 TEE 写入（含游标），report 给出 would_copy 计数。
       - 幂等：ON CONFLICT upsert，同水位重放不重不丢。
     """
+    if target_policy is None:
+        target_policy = plaintext_shadow_config.load_target()
     cfg = _TABLES[table]
-    wm_ts, wm_id = _read_cursor(table)
+    wm_ts, wm_id = _read_cursor(table, target_policy)
     copied = pending = errors = skipped = quarantined = 0
     # Requeue lane first (non-dry-run): drain same-PK in-place rewrites the
     # append-only cursor can't see. Independent of the cursor — its failures
     # never freeze it.
     if not dry_run:
-        rq_copied, rq_pending, rq_errors, rq_quarantined = _consume_requeue(cfg, table)
+        rq_copied, rq_pending, rq_errors, rq_quarantined = _consume_requeue(
+            cfg, table, target_policy
+        )
         copied += rq_copied
         pending += rq_pending
         errors += rq_errors
@@ -1352,7 +1716,15 @@ def run_table(table: str, *, qps: float = 2.0, dry_run: bool = False,
             for row in rows:
                 user_id, item_id, sort_val, doc = cfg.unpack(row)
                 try:
-                    args = _produce_write(cfg, user_id, item_id, sort_val, doc, dry_run)
+                    args = _produce_write(
+                        cfg,
+                        user_id,
+                        item_id,
+                        sort_val,
+                        doc,
+                        dry_run,
+                        target_policy,
+                    )
                 except transforms.PendingDeviceMigration as e:
                     pend_rows.append((user_id, item_id, _pdm_reason(e)))
                     pending += 1
@@ -1383,7 +1755,15 @@ def run_table(table: str, *, qps: float = 2.0, dry_run: bool = False,
                 # 整批写 + pending + 游标推进单事务(见 _flush_batch)。两类失败分开:
                 # 连接断 → 换连接重试整批;活连接批失败(毒行) → 逐行 savepoint 跳过,
                 # 让毒行不拖垮整表。返回本批跳过的毒行数。
-                skipped += _flush_batch(cfg, table, writes, pend_rows, adv_ts, adv_id)
+                skipped += _flush_batch(
+                    cfg,
+                    table,
+                    writes,
+                    pend_rows,
+                    adv_ts,
+                    adv_id,
+                    target_policy,
+                )
 
             wm_ts, wm_id = adv_ts, adv_id
             if remaining is not None:
@@ -1397,18 +1777,8 @@ def run_table(table: str, *, qps: float = 2.0, dry_run: bool = False,
                 break
 
     if not dry_run:
-        seq_col = _SEQ_TABLES.get(table)
-        if seq_col:
-            # See _SEQ_TABLES above: fast-forward the TEE identity sequence past
-            # the highest carried-over seq so a post-cutover direct INSERT on
-            # TEE can't collide with an already-replicated high value.
-            # GREATEST(...,1) guards an empty table (COALESCE(MAX,1) also
-            # guards NULL) — same shape as reconciler.reconcile_table's setval.
-            with mirror.get_tee_pool().connection() as dst:
-                dst.execute(
-                    f"SELECT setval(pg_get_serial_sequence(%s, %s), "
-                    f"GREATEST((SELECT COALESCE(MAX({seq_col}), 1) FROM {table}), 1))",
-                    (table, seq_col))
+        # See _SEQ_TABLES above: keep future TEE-primary inserts collision-free.
+        finalize_identity_sequence(table, target_policy)
 
     report = {"table": table, "copied": copied, "pending": pending, "errors": errors,
               "skipped": skipped, "quarantined": quarantined,

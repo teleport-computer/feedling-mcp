@@ -169,14 +169,15 @@ def classify_item_v2(item: Mapping[str, Any]) -> IOSSignalContractV2:
     if key in ENCRYPTED_SIGNAL_KEYS_V2:
         envelope = item.get("envelope")
         if isinstance(envelope, Mapping):
+            encrypted = bool(envelope.get("body_ct"))
             raw_changed = item.get("changed")
             if not isinstance(raw_changed, bool):
                 return IOSSignalContractV2(
                     key=key,
                     status="invalid_changed_flag",
                     wake_policy="error",
-                    encrypted=True,
-                    requires_decrypt=True,
+                    encrypted=encrypted,
+                    requires_decrypt=encrypted,
                     envelope_id=str(envelope.get("id") or ""),
                 )
             return IOSSignalContractV2(
@@ -184,8 +185,8 @@ def classify_item_v2(item: Mapping[str, Any]) -> IOSSignalContractV2:
                 status="changed" if raw_changed else "unchanged",
                 wake_policy=WAKE_POLICY_BY_IOS_KEY_V2[key],
                 differ_inputs=DIFFER_INPUTS_BY_IOS_KEY_V2[key],
-                encrypted=True,
-                requires_decrypt=True,
+                encrypted=encrypted,
+                requires_decrypt=encrypted,
                 changed=raw_changed,
                 envelope_id=str(envelope.get("id") or ""),
             )

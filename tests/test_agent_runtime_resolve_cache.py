@@ -44,7 +44,7 @@ def test_envelope_fetch_is_cached_within_ttl(monkeypatch):
     fetches = []
     monkeypatch.setenv("AGENT_ENVELOPE_REFETCH_SEC", "300")
     monkeypatch.setattr(supervisor_mod, "_fetch_key_envelope",
-                        lambda api_url, runtime_token="": (fetches.append(runtime_token) or {"ct": "c1"}))
+                        lambda api_url, runtime_token="": (fetches.append(runtime_token) or {"body_ct": "c1"}))
     decrypts = []
     monkeypatch.setattr(supervisor_mod, "_decrypt_provider_key",
                         lambda enclave_url, envelope=None, runtime_token="": (decrypts.append(1) or "sk-1"))
@@ -70,7 +70,7 @@ def test_envelope_fetch_is_cached_within_ttl(monkeypatch):
 def test_envelope_transient_fetch_failure_keeps_last_good(monkeypatch):
     # After TTL, a refetch that returns None (backend blip) must NOT drop the
     # cached key — a healthy consumer should not be respawned keyless.
-    state = {"env": {"ct": "c1"}}
+    state = {"env": {"body_ct": "c1"}}
     monkeypatch.setenv("AGENT_ENVELOPE_REFETCH_SEC", "100")
     monkeypatch.setattr(supervisor_mod, "_fetch_key_envelope",
                         lambda api_url, runtime_token="": state["env"])
@@ -101,7 +101,7 @@ def test_resolution_fans_out_across_users(monkeypatch):
         _time.sleep(0.05)
         with lock:
             active["now"] -= 1
-        return {"ct": runtime_token}
+        return {"body_ct": runtime_token}
 
     monkeypatch.setenv("AGENT_RESOLVE_CONCURRENCY", "4")
     monkeypatch.setattr(supervisor_mod, "_fetch_key_envelope", slow_fetch)
@@ -118,7 +118,7 @@ def test_one_user_failure_does_not_abort_the_pass(monkeypatch):
     def fetch(api_url, runtime_token=""):
         if runtime_token == "tok-bad":
             raise RuntimeError("enclave blip for one user")
-        return {"ct": runtime_token}
+        return {"body_ct": runtime_token}
 
     monkeypatch.setattr(supervisor_mod, "_fetch_key_envelope", fetch)
     monkeypatch.setattr(supervisor_mod, "_decrypt_provider_key",

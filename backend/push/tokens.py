@@ -84,7 +84,9 @@ def _update_token_lifecycle(
         break
 
     if changed:
-        store._save_tokens()
+        # APNs has already answered. Persistence is lifecycle bookkeeping and
+        # must not turn a real delivery/failure response into a different one.
+        store._save_tokens_best_effort()
 
 
 def _mark_expired_token(store: UserStore, entry: dict, reason: str):

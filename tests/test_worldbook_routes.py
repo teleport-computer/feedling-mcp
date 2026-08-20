@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import sys
 from pathlib import Path
 
@@ -188,3 +189,45 @@ def test_worldbook_match_calls_enclave_with_stored_envelopes(client, monkeypatch
     body = res.get_json()
     assert body["block"] == "<world_book>\nhello\n</world_book>"
     assert body["matched_names"] == ["Match"]
+
+
+def test_plaintext_worldbook_upsert_and_match_never_call_enclave(client, monkeypatch):
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(
+        worldbook_core.core_envelope,
+        "resolve_content_encryption",
+        lambda _user_id: "off",
+    )
+    monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "http://enclave.test")
+    monkeypatch.setattr(
+        worldbook_core.worldbook_readside_core,
+        "post_enclave_worldbook_match",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext world book must not call enclave")
+        ),
+    )
+    inner = {
+        "id": "wb-plain",
+        "name": "Plain",
+        "keywords": ["needle"],
+        "content": "local context",
+        "enabled": True,
+    }
+    env = {
+        "id": "wb-plain",
+        "body": json.dumps(inner),
+        "owner_user_id": user_id,
+        "visibility": "shared",
+    }
+
+    assert client.post(
+        "/v1/worldbook/upsert", json=env, headers=_headers(api_key)).status_code == 200
+    response = client.post(
+        "/v1/worldbook/match",
+        json={"message": "needle"},
+        headers=_headers(api_key),
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["matched_names"] == ["Plain"]
+    assert "local context" in response.get_json()["block"]

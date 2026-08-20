@@ -1,14 +1,16 @@
-"""Frame storage and decrypt plumbing (v1 envelopes only)."""
+"""Frame storage and shape-aware read plumbing."""
 
+import json
 import os
-import re
 import time
 import uuid
 
 import httpx
 
 import db
+from core import envelope as core_envelope
 from core import store as core_store
+from core.frame_ids import is_supported_frame_id
 from core.reqctx import request
 from core.store import UserStore
 
@@ -59,8 +61,12 @@ def _save_frame(store: UserStore, payload: dict):
     `encrypted=True` so the UI + enclave path can find it.
     """
     env = payload.get("envelope")
-    if not (isinstance(env, dict) and env.get("v") and env.get("body_ct")):
-        print(f"[ingest:{store.user_id}] rejecting frame without v1 envelope")
+    error = core_envelope.validate_uploaded_chat_envelope(
+        env, user_id=store.user_id, content_type="image",
+        max_binary_bytes=12 * 1024 * 1024,
+    )
+    if error is not None:
+        print(f"[ingest:{store.user_id}] rejecting frame: {error.get('error')}")
         return
     _save_frame_envelope(store, payload, env)
 
@@ -73,16 +79,19 @@ def _save_frame_envelope(store: UserStore, payload: dict, env: dict):
     """
     item_id = env.get("id") or uuid.uuid4().hex
     ts = payload.get("ts") or time.time()
-    db.frame_upsert(store.user_id, item_id, ts, env)
+    if db.frame_upsert(store.user_id, item_id, ts, env) is False:
+        return
 
+    encrypted = bool(env.get("body_ct"))
+    inner = _read_plaintext_frame(env) if not encrypted else None
     meta = {
         "filename": f"{item_id}.env.json",
         "ts": ts,
-        "app": None,         # unknown — inside ciphertext
-        "ocr_text": "",      # unknown — inside ciphertext
-        "w": payload.get("w", 0),
-        "h": payload.get("h", 0),
-        "encrypted": True,
+        "app": (inner or {}).get("app"),
+        "ocr_text": str((inner or {}).get("ocr_text") or "")[:1200],
+        "w": (inner or {}).get("w") or payload.get("w", 0),
+        "h": (inner or {}).get("h") or payload.get("h", 0),
+        "encrypted": encrypted,
         "id": item_id,
         "v": env.get("v", 1),
         "owner_user_id": env.get("owner_user_id"),
@@ -95,8 +104,21 @@ def _save_frame_envelope(store: UserStore, payload: dict, env: dict):
             db.frame_delete(store.user_id, removed.get("id") or removed["filename"].split(".")[0])
         store._persist_frames_meta()  # also broadcasts the "frames" wake cross-worker
 
-    body_len = len(env.get("body_ct") or "")
-    print(f"[ingest:{store.user_id}] saved v1 frame id={item_id} body_ct_len={body_len}")
+    body_field = "body_ct" if encrypted else "body_b64"
+    body_len = len(env.get(body_field) or "")
+    print(f"[ingest:{store.user_id}] saved frame id={item_id} shape={body_field} body_len={body_len}")
+
+
+def _read_plaintext_frame(env: dict) -> dict | None:
+    """Decode a plaintext-binary frame wire body without involving the enclave."""
+    if not isinstance(env, dict) or env.get("body_b64") is None:
+        return None
+    try:
+        inner = json.loads(core_envelope.read_envelope_body(
+            env, None, purpose="screen_frame_plaintext_read").decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return inner if isinstance(inner, dict) else None
 
 
 def _recent_frame_meta(store: UserStore, now: float, window_sec: float) -> list[dict]:
@@ -154,6 +176,19 @@ def _decrypt_frame_metadata_for_gate(
         return {"frame_id": "", "error": "missing_frame_id"}
     if not _frame_exists(store, fid):
         return {"frame_id": fid, "error": "frame_not_found"}
+    env = db.frame_get(store.user_id, fid)
+    inner = _read_plaintext_frame(env or {})
+    if inner is not None:
+        result = {
+            "frame_id": fid, "id": fid, "ts": inner.get("ts"),
+            "app": inner.get("app") or "unknown",
+            "ocr_text": str(inner.get("ocr_text") or "")[:1200],
+            "w": inner.get("w"), "h": inner.get("h"),
+            "image_mime": inner.get("image_mime") or "image/jpeg",
+        }
+        if include_image and inner.get("image"):
+            result["image_b64"] = str(inner.get("image") or "")
+        return result
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave_url:
         return {"frame_id": fid, "error": "enclave_unavailable"}
@@ -242,7 +277,7 @@ def _ocr_summary(frames: list[dict]) -> str:
 
 def _load_envelope(store, frame_id: str) -> dict | None:
     """Load a frame's stored v1 envelope doc by id, or None if absent/invalid."""
-    if not re.match(r"^[a-f0-9]{16,64}$", frame_id):
+    if not is_supported_frame_id(frame_id):
         return None
     env = db.frame_get(store.user_id, frame_id)
     return env if isinstance(env, dict) else None
@@ -250,6 +285,6 @@ def _load_envelope(store, frame_id: str) -> dict | None:
 
 def _frame_exists(store, frame_id: str) -> bool:
     """Existence guard for the proxy endpoints (no heavy body_ct fetch)."""
-    if not re.match(r"^[a-f0-9]{16,64}$", frame_id):
+    if not is_supported_frame_id(frame_id):
         return False
     return db.frame_exists(store.user_id, frame_id)

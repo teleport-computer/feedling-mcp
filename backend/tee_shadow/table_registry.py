@@ -13,7 +13,7 @@ scheduler、verify、snapshot 三处消费，必须能在任何上下文里安�
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 # 热路径双写：写主库的同时经 tee_shadow.mirror.execute 尽力而为地写 TEE。
 # 适用于低频写的明文运维表。
@@ -23,12 +23,14 @@ MIRROR = "MIRROR"
 # 解密、写 TEE 明文行。适用于装信封的表。
 CIPHERTEXT = "CIPHERTEXT"
 
-# 整表快照刷：TRUNCATE + COPY 原子替换（tee_shadow.snapshot）。适用于数据量
+# 整表快照刷：临时表 COPY + 主键精确合并（tee_shadow.snapshot）。适用于数据量
 # 小、但有 UPDATE/DELETE 的明文表——全量替换天然处理可变行，不需要 requeue
 # 补偿和 prune。
 SNAPSHOT = "SNAPSHOT"
 
-# 不同步。理由必填且必须具体（守卫会拒绝"暂不需要"这类含糊理由）。
+# 不做 RDS → TEE 数据复制。理由必填且必须具体（守卫会拒绝"暂不需要"这类
+# 含糊理由）。部分 TEE-primary 本地表仍会由 TEE 迁移链创建，并在切主后由应用
+# 本地写入；这类条目必须显式 required_in_tee=True。
 SKIP = "SKIP"
 
 # PG 原生逻辑复制。**预留，尚未实现**：需要把 RDS 的 rds.logical_replication
@@ -47,6 +49,28 @@ class Entry:
     # True = 这张表不由 alembic 迁移链创建（人工 SQL 建的，如一次性备份表）。
     # 守卫据此放行"注册表里有、迁移链里没有"的条目；不标就当成表名打错。
     manual: bool = False
+    # Plaintext-shadow dirty-key capture records these identifiers only.  They
+    # are asserted against pg_catalog so a schema change cannot silently make
+    # replay address the wrong row.
+    key_columns: tuple[str, ...] = ()
+    # Most targets keep the source name.  frame_envelopes is transformed into
+    # the historical `frames` plaintext shape.
+    destination_table: str | None = None
+    # None means capture the real primary key.  An empty tuple means a table-
+    # level dirty marker: required when the primary key itself is a secret.
+    capture_key_columns: tuple[str, ...] | None = None
+    # None = 按 lane 推导（非 SKIP 必需、SKIP 不必需）。SKIP lane 上的
+    # TEE-primary 本地 staging/观测表必须显式 True，避免复制策略被误当成 DDL 豁免。
+    required_in_tee: bool | None = None
+
+    @property
+    def tee_required(self) -> bool:
+        # A replicated lane cannot opt out: its destination table is part of
+        # the replication contract.  The override exists only to pull a
+        # primary-local SKIP table into the TEE schema guard.
+        if self.lane != SKIP:
+            return True
+        return self.required_in_tee is True
 
 
 REGISTRY: dict[str, Entry] = {
@@ -65,17 +89,64 @@ REGISTRY: dict[str, Entry] = {
     "perception_daily": Entry(MIRROR, "感知日聚合，明文；reconciler.TABLES 已覆盖"),
     "copytext_strings": Entry(MIRROR, "文案表，明文；reconciler.TABLES 已覆盖"),
     "copytext_meta": Entry(MIRROR, "文案版本哨兵单行表；reconciler.TABLES 已覆盖"),
-    "genesis_import_jobs": Entry(MIRROR, "入住导入作业元数据，明文；reconciler.TABLES 已覆盖"),
+    "genesis_import_jobs": Entry(
+        MIRROR,
+        "入住导入作业元数据，明文；worker_claimed_* 已纳入 reconciler；"
+        "resident_* 四列当前既不热路径双写也不扶正（T150 待设计决定）",
+    ),
     "genesis_import_outputs": Entry(MIRROR, "入住导入产物，明文；reconciler.TABLES 已覆盖"),
     "notify_relay_configs": Entry(MIRROR, "自部署推送中继配置；alembic_tee 0002 已建表"),
     "notify_relay_logs": Entry(MIRROR, "推送中继日志；id 是 IDENTITY 列"),
+    "lane_daily_rollup": Entry(
+        MIRROR,
+        "按用户×道×北京日的 job 结果冻结格子（0091/tee 0023），单例调度器日批写、"
+        "写后不变、永久增长——正因永久增长不能走 SNAPSHOT（20 万行 MAX_ROWS 硬阀，"
+        "超限后仅该表复制失败并停止更新、其余表继续，codex2 2026-08-18 审出）。语句幂等"
+        "（ON CONFLICT DO NOTHING），冻结点以 execute_many 按日整组镜像；"
+        "期 2 接 user_logs 源后格子是环形缓冲滚掉明细后的唯一存留，必须双写",
+    ),
+    "lane_rollup_watermark": Entry(
+        MIRROR,
+        "格子覆盖水位（每 route 一行，through_day 原地 UPDATE），与当日格子同组"
+        "镜像——TEE 侧水位若滞后，cutover 后会把「已冻结」误读成「记录史之前」",
+    ),
+    "chat_daily_rollup": Entry(
+        MIRROR,
+        "按用户×北京日的聊天冻结格子（0094/tee 0026），救 data-track 用（现算全史"
+        "在 prod 实测 99-115s、被 gunicorn 120s 打死）。与 lane 格子同理永久增长，"
+        "不能走 SNAPSHOT。⚠️ 内容是「那天发生过多少」而非「当前 live 还剩多少」"
+        "（Seven 2026-08-19 定），源含 chat_messages + chat_message_archive，"
+        "所以清空历史不会让数字掉下去；ON CONFLICT DO NOTHING，按日整组镜像",
+    ),
+    "chat_rollup_watermark": Entry(
+        MIRROR,
+        "聊天格子覆盖水位（单行 scope='chat'），与当日格子同组镜像；独立于 "
+        "lane_rollup_watermark——两个源丢历史的方式不同，共用一行会把更悲观的"
+        "下界强加给两边",
+    ),
+    "trace_write_stats": Entry(
+        MIRROR,
+        "T138 块0的永久日速率尺子（RDS 0095/TEE 0027）；test primary 必须直接写"
+        "TEE，RDS-primary 期间则以每进程启动实例的单调绝对值幂等热镜像。行按日永久"
+        "增长，不能进 20 万行硬阀的 SNAPSHOT；reconciler 按复合主键扶正漏镜像",
+    ),
+    "trace_write_stats_health": Entry(
+        MIRROR,
+        "T138 尺子每个进程 writer 的成功心跳（RDS 0096/TEE 0028）；失败时不依赖"
+        "同一坏通道写失败态，而由 last_success_at 自然过期。每 writer 单行原地更新，"
+        "热镜像并由 reconciler 按 writer_id 扶正",
+    ),
 
     # ---------------------------------------------------------------- #
     # CIPHERTEXT —— 装信封的表，经 enclave 解密成明文写进 TEE。
     # ---------------------------------------------------------------- #
     "chat_messages": Entry(CIPHERTEXT, "对话正文信封 doc；worker._TABLES 已覆盖"),
     "memory_moments": Entry(CIPHERTEXT, "记忆信封 doc；worker._TABLES 已覆盖"),
-    "world_book_entries": Entry(CIPHERTEXT, "世界书信封 doc；worker._TABLES 已覆盖"),
+    "world_book_entries": Entry(
+        CIPHERTEXT,
+        "世界书信封 doc；worker._TABLES 已覆盖。T149 反向约束债：TEE 0004 多出 "
+        "user_id→users CASCADE，违反源库 parity；实库孤儿预检后应删 TEE FK",
+    ),
     "frame_envelopes": Entry(
         CIPHERTEXT,
         "帧信封；TEE 侧对应物是形状不同的 frames（R2 存储层指针），由 worker "
@@ -89,8 +160,9 @@ REGISTRY: dict[str, Entry] = {
     ),
     "v2_trajectory_events": Entry(
         CIPHERTEXT,
-        "V2 轨迹事件 payload_envelope；表级 CHECK ck_v2_trajectory_envelope 强制 "
-        "K_enclave + visibility='shared'，故服务端可解",
+        "V2 轨迹事件 payload_envelope；RDS 0072 的现行 CHECK 同时允许密文信封与 "
+        "TEE worker 产出的四键明文 body。T149 约束债：TEE 缺 5 条 CHECK；复合跨表 "
+        "FK 则由 0004 §2 有意省略并靠 worker reflow/prune 收敛，TEE-primary 后须复评",
     ),
     "model_api_credentials": Entry(
         CIPHERTEXT,
@@ -110,7 +182,11 @@ REGISTRY: dict[str, Entry] = {
     # 已实测确认这批表的 jsonb 列（payload_json / result_json / detail_json /
     # state_json / actions_json / v2_effect_outbox.payload）装的是明文，不含信封。
     # ---------------------------------------------------------------- #
-    "agent_action_queue": Entry(SNAPSHOT, "动作队列，行状态流转（UPDATE 密集），明文 payload_json"),
+    "agent_action_queue": Entry(
+        SNAPSHOT,
+        "动作队列，行状态流转（UPDATE 密集），明文 payload_json。T149/B：job_id 跨表 "
+        "FK 由 TEE 0004 §2 为独立刷新顺序有意省略；TEE-primary 后须复评",
+    ),
     "agent_jobs": Entry(SNAPSHOT, "agent 作业表，status 流转，明文"),
     "agent_runtime_instances": Entry(
         SNAPSHOT,
@@ -134,61 +210,82 @@ REGISTRY: dict[str, Entry] = {
         "V1 工具活动时间线的固定标识、状态与展示安全 detail_json；持久用户回合元数据，"
         "有追加与级联删除，整表快照天然收敛",
     ),
-    "chat_r2_cleanup": Entry(SNAPSHOT, "R2 清理队列，行会被删，明文"),
-    "chat_r2_lifecycle": Entry(SNAPSHOT, "R2 生命周期状态，UPDATE 密集，明文"),
-    "dau_daily_snapshot": Entry(SNAPSHOT, "DAU 日快照，每日批量写，明文"),
+    "chat_r2_cleanup": Entry(
+        SNAPSHOT, "R2 清理队列，行会被删，明文；T149/A：TEE 0004 派生漏 2 条 RDS CHECK"),
+    "chat_r2_lifecycle": Entry(
+        SNAPSHOT, "R2 生命周期状态，UPDATE 密集，明文；T149/A：TEE 0004 派生漏 2 条 RDS CHECK"),
+    "dau_daily_snapshot": Entry(
+        SNAPSHOT, "DAU 日快照，每日批量写，明文；T149/A：TEE 0004 派生漏 day CHECK"),
     "model_api_routes": Entry(SNAPSHOT, "BYOK 路由配置（不含凭证，凭证在 model_api_credentials），明文"),
     "perception_signal_state_v2": Entry(
         SNAPSHOT,
         "V2 感知去重基线，频繁原地 UPDATE；只含 HMAC 指纹、事件标识与时间戳，明文整表收敛",
     ),
     "provider_health": Entry(SNAPSHOT, "provider 健康状态，UPDATE 密集，明文"),
-    "retention_cohort_snapshot": Entry(SNAPSHOT, "留存 cohort 快照，批量写，明文"),
+    "retention_cohort_snapshot": Entry(
+        SNAPSHOT, "留存 cohort 快照，批量写，明文；T149/A：TEE 0004 派生漏 2 条 RDS CHECK"),
     "runtime_state": Entry(SNAPSHOT, "runtime 状态 state_json，UPDATE 密集，明文"),
-    "user_growth_daily_snapshot": Entry(SNAPSHOT, "增长日快照，批量写，明文"),
+    "user_growth_daily_snapshot": Entry(
+        SNAPSHOT, "增长日快照，批量写，明文；T149/A：TEE 0004 派生漏 day CHECK"),
     "v2_capture_batches": Entry(SNAPSHOT, "V2 捕获批次 actions_json，status 流转，明文"),
     "v2_chat_tail_anchor": Entry(
         SNAPSHOT,
         "V2 对话尾锚点 anchor_seq，per-user 单行 UPDATE 密集（GREATEST 单调 upsert），明文整数"),
-    "v2_effect_outbox": Entry(SNAPSHOT, "V2 效果 outbox，投递后删行，明文 payload（实测非信封）"),
-    "v2_effect_sink_applied": Entry(SNAPSHOT, "V2 效果幂等标记，明文"),
+    "v2_effect_outbox": Entry(
+        SNAPSHOT,
+        "V2 效果 outbox，投递后更新状态而非删行（仅账号清空时删除），明文 payload（实测非信封）",
+    ),
+    "v2_effect_sink_applied": Entry(
+        SNAPSHOT,
+        "V2 效果幂等标记，明文；T149/A：TEE 0004 派生漏 claim_state CHECK",
+    ),
     "v2_mcp_mutation_attempts": Entry(SNAPSHOT, "V2 MCP 变更尝试记录，明文"),
-    "v2_runtime_control": Entry(SNAPSHOT, "V2 运行时总控单行表，明文"),
+    "v2_runtime_control": Entry(
+        SNAPSHOT, "V2 运行时总控单行表，明文；T149/A：TEE 0004 派生漏 id=1 CHECK"),
     "v2_runtime_state": Entry(SNAPSHOT, "V2 per-user 运行时 fence，UPDATE 密集，明文"),
     "v2_sandbox_usage_events": Entry(SNAPSHOT, "V2 sandbox 用量事件，明文"),
-    "v2_terminal_failure_outbox": Entry(SNAPSHOT, "V2 终态失败 outbox，投递后删行，明文"),
+    "v2_terminal_failure_outbox": Entry(
+        SNAPSHOT,
+        "V2 终态失败 outbox，投递后更新状态而非删行（仅账号清空时删除），明文",
+    ),
     "v2_trajectory_access_audit": Entry(SNAPSHOT, "V2 轨迹访问审计（审计元数据本身是明文）"),
     "v2_trajectory_streams": Entry(SNAPSHOT, "V2 轨迹流游标，UPDATE 密集，明文"),
     "v2_turn_metrics": Entry(SNAPSHOT, "V2 回合指标，明文"),
-    "v2_user_allowlist": Entry(SNAPSHOT, "V2 灰度名单，UPDATE 密集，明文"),
+    "v2_usage_daily_dimensions": Entry(
+        SNAPSHOT,
+        "Admin 用量页从 v2_turn_metrics 派生的按日维度投影；TEE 扶正后由同库 worker 继续维护",
+    ),
+    "v2_usage_daily_users": Entry(
+        SNAPSHOT,
+        "Admin 用量页从 v2_turn_metrics 派生的按日用户投影；TEE 扶正后保留报表连续性",
+    ),
+    "v2_usage_rollup_watermarks": Entry(
+        SNAPSHOT,
+        "Admin 用量 rollup 的 bootstrap/cursor/error 控制面；必须与扶正后的派生表同库推进",
+    ),
+    "v2_user_allowlist": Entry(
+        SNAPSHOT, "V2 灰度名单，UPDATE 密集，明文；T149/A：TEE 0004 派生漏 desired CHECK"),
     "v2_wake_schedule": Entry(SNAPSHOT, "V2 唤醒排程，UPDATE 密集，明文"),
-    "v2_worker_heartbeats": Entry(SNAPSHOT, "V2 worker 心跳，UPDATE 密集，明文"),
+    "v2_worker_heartbeats": Entry(
+        SNAPSHOT, "V2 worker 心跳，UPDATE 密集，明文；T149/A：TEE 0004 派生漏 capacity CHECK"),
 
     # ---------------------------------------------------------------- #
-    # SKIP —— 永远不进 TEE。理由必须具体。
+    # SKIP —— 不做 RDS → TEE 数据复制。理由必须具体。
     # ---------------------------------------------------------------- #
     "alembic_version": Entry(
         SKIP, "RDS 迁移链自己的版本表；TEE 有独立的 alembic_tee_version，两条链互不感知"),
     "genesis_import_chunks": Entry(
-        SKIP, "入住导入的 staging 数据，冻结窗口内处理完即弃，非用户资产（上游 plan 已决定不复制）"),
-    "v2_usage_daily_dimensions": Entry(
         SKIP,
-        "Admin 用量页从 v2_turn_metrics 可重建的按日维度投影；复制会在 TEE 重复派生数据，"
-        "当前业务 RDS 是这份报表的唯一服务存储",
-    ),
-    "v2_usage_daily_users": Entry(
-        SKIP,
-        "Admin 用量页从 v2_turn_metrics 可重建的按日用户投影；已知用户行在 RDS 通过 FK 随销号级联，"
-        "无需在 TEE 保存第二份派生副本",
+        "入住导入的 staging 数据，冻结窗口内处理完即弃，非用户资产；不搬 RDS 历史，"
+        "TEE-primary 后由当前主库本地产生",
+        required_in_tee=True,
     ),
     "v2_wake_shadow_decisions": Entry(
         SKIP,
         "主动唤醒 A′ 影子观测；只含本地日期/时分、lane、放行与 APNs 告警投递布尔，"
-        "独立保留 90 天且不依赖 agent_jobs 生命周期，RDS Admin 报表是唯一消费者",
-    ),
-    "v2_usage_rollup_watermarks": Entry(
-        SKIP,
-        "Admin 用量 rollup 的 bootstrap/cursor/error 控制面；不含用户内容，必须跟 RDS 派生表同库推进",
+        "独立保留 90 天且不依赖 agent_jobs 生命周期；不搬 RDS 历史，TEE-primary 后"
+        "由当前主库本地产生",
+        required_in_tee=True,
     ),
     "tee_sync_runs": Entry(
         SKIP, "TEE 同步自身的控制面/指标表，必须住在 RDS——复制到被它监控的库里没有意义"),
@@ -200,20 +297,21 @@ REGISTRY: dict[str, Entry] = {
         "memory_moments 同型。切读 TEE 后用户仍要能回看通话记录，所以必须复制",
     ),
     "voice_call_sessions": Entry(
-        SKIP,
-        "语音通话取消/finalize 的 RDS 并发控制面；只保存 call id、状态与结束原因，"
-        "回复落库 fence 必须和 RDS chat 写事务共库加锁，复制到 TEE 既不能参与互斥"
-        "也不是持久用户资产",
+        SNAPSHOT,
+        "语音取消/finalize 的当前主库并发控制面；RDS-primary 时整表快照保证切换前"
+        "状态与 tombstone 收敛，TEE-primary 后与 chat 写事务共库",
     ),
     "voice_turn_results": Entry(
         SKIP,
         "voice SSE 的 900 秒 AES-GCM 临时交接缓冲；非标准 content envelope，过期即删，"
-        "不是持久用户资产，复制只会制造不可消费的陈旧密文",
+        "不是持久用户资产，不搬 RDS 历史；TEE-primary 后由当前主库本地产生",
+        required_in_tee=True,
     ),
     "voice_turn_streams": Entry(
         SKIP,
         "voice SSE 增量的 900 秒 AES-GCM 临时流状态；非标准 content envelope，持续覆写"
-        "且过期即删，复制只会制造不可消费的陈旧密文",
+        "且过期即删，不搬 RDS 历史；TEE-primary 后由当前主库本地产生",
+        required_in_tee=True,
     ),
     "bak_20260710_usr450_blobs": Entry(
         SKIP, "2026-07-10 单用户事故的一次性人工备份表，非生产数据", manual=True),
@@ -228,6 +326,103 @@ REGISTRY: dict[str, Entry] = {
 }
 
 
+# Authoritative primary-key inventory for content-free change capture.  Keep
+# this static: deriving it at runtime would make a compromised/mis-migrated
+# database define what the replication code is allowed to address.  The test
+# suite compares every value with a freshly migrated PostgreSQL catalog.
+_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    "server_config": ("key",),
+    "global_blobs": ("key",),
+    "users": ("user_id",),
+    "user_blobs": ("user_id", "kind"),
+    "user_logs": ("user_id", "stream", "seq"),
+    "perception_items": ("user_id", "kind", "item_id"),
+    "perception_daily": ("user_id", "date", "signal"),
+    "copytext_strings": ("key", "lang"),
+    "copytext_meta": ("id",),
+    "genesis_import_jobs": ("user_id", "job_id"),
+    "genesis_import_outputs": ("user_id", "job_id", "output_type"),
+    "notify_relay_configs": ("auth_token",),
+    "notify_relay_logs": ("id",),
+    "lane_daily_rollup": ("user_id", "day", "route", "lane", "enqueue_source"),
+    "lane_rollup_watermark": ("route",),
+    "chat_daily_rollup": ("user_id", "day"),
+    "chat_rollup_watermark": ("scope",),
+    "trace_write_stats": ("day", "writer_id", "subsystem", "event_type", "lane"),
+    "trace_write_stats_health": ("writer_id",),
+    "chat_messages": ("user_id", "msg_id"),
+    "memory_moments": ("user_id", "moment_id"),
+    "world_book_entries": ("user_id", "entry_id"),
+    "frame_envelopes": ("user_id", "frame_id"),
+    "chat_message_archive": ("user_id", "source_seq"),
+    "v2_trajectory_events": ("job_id", "event_index"),
+    "model_api_credentials": ("id",),
+    "v2_conversation_summary": ("user_id",),
+    "v2_conversation_summary_segments": ("segment_id",),
+    "v2_trajectory_reviews": ("source_job_id",),
+    "v2_workspace_entries": ("user_id", "path"),
+    "agent_action_queue": ("id",),
+    "agent_jobs": ("id",),
+    "agent_runtime_instances": ("user_id",),
+    "agent_runtime_supervisor_heartbeats": ("owner",),
+    "agent_status_events": ("id",),
+    "chat_turn_activity_events": ("id",),
+    "chat_r2_cleanup": ("body_key",),
+    "chat_r2_lifecycle": ("user_id",),
+    "dau_daily_snapshot": ("day",),
+    "model_api_routes": ("id",),
+    "perception_signal_state_v2": ("user_id", "signal"),
+    "provider_health": ("user_id",),
+    "retention_cohort_snapshot": ("cohort_week", "period_index"),
+    "runtime_state": ("user_id",),
+    "user_growth_daily_snapshot": ("day",),
+    "v2_capture_batches": ("id",),
+    "v2_chat_tail_anchor": ("user_id",),
+    "v2_effect_outbox": ("effect_id",),
+    "v2_effect_sink_applied": ("effect_id",),
+    "v2_mcp_mutation_attempts": ("job_id", "call_key"),
+    "v2_runtime_control": ("id",),
+    "v2_runtime_state": ("user_id",),
+    "v2_sandbox_usage_events": ("id",),
+    "v2_terminal_failure_outbox": ("job_id",),
+    "v2_trajectory_access_audit": ("id",),
+    "v2_trajectory_streams": ("job_id",),
+    "v2_turn_metrics": ("id",),
+    "v2_usage_daily_dimensions": ("id",),
+    "v2_usage_daily_users": ("id",),
+    "v2_usage_rollup_watermarks": ("rollup_name",),
+    "v2_user_allowlist": ("user_id",),
+    "v2_wake_schedule": ("user_id",),
+    "v2_worker_heartbeats": ("worker_id",),
+    "voice_call_sessions": ("user_id", "call_id"),
+    "voice_transcripts": ("user_id", "call_id"),
+}
+
+_capture_tables = {
+    name for name, entry in REGISTRY.items() if entry.lane not in (SKIP, LOGICAL)
+}
+if set(_PRIMARY_KEYS) != _capture_tables:
+    missing = sorted(_capture_tables - set(_PRIMARY_KEYS))
+    extra = sorted(set(_PRIMARY_KEYS) - _capture_tables)
+    raise RuntimeError(
+        f"plaintext shadow key registry mismatch: missing={missing} extra={extra}"
+    )
+
+REGISTRY = {
+    name: replace(
+        entry,
+        key_columns=_PRIMARY_KEYS.get(name, ()),
+        destination_table="frames" if name == "frame_envelopes" else name,
+        capture_key_columns=(
+            ()
+            if name in {"notify_relay_configs", "chat_r2_cleanup"}
+            else _PRIMARY_KEYS.get(name, ())
+        ),
+    )
+    for name, entry in REGISTRY.items()
+}
+
+
 def tables_in_lane(lane: str) -> tuple[str, ...]:
     """某条 lane 下的表名，按字典序。"""
     return tuple(sorted(t for t, e in REGISTRY.items() if e.lane == lane))
@@ -236,6 +431,11 @@ def tables_in_lane(lane: str) -> tuple[str, ...]:
 def synced_tables() -> tuple[str, ...]:
     """所有会进 TEE 的表（即非 SKIP），按字典序。"""
     return tuple(sorted(t for t, e in REGISTRY.items() if e.lane != SKIP))
+
+
+def tee_required_tables() -> tuple[str, ...]:
+    """TEE-primary schema 必须具备的表，包含同步表与本地产生的 SKIP 表。"""
+    return tuple(sorted(t for t, entry in REGISTRY.items() if entry.tee_required))
 
 
 # worker._TABLES 里那些**不是 RDS 表名**的 key。

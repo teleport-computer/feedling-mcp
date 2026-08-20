@@ -151,7 +151,7 @@ def _send_hosted(c, text: str) -> tuple[float, str]:
 
 def _decrypt(c, message: dict, *, action: str) -> str:
     try:
-        text = c.decrypt_reply(message)
+        text = c.read_reply_strict(message)
     except Exception as exc:
         raise _ProbeIssue(
             "SECURITY_FAIL",

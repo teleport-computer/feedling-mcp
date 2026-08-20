@@ -3,6 +3,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))  # noq
 
 import httpx  # noqa: E402
 from capabilities import chat as cap_chat  # noqa: E402
+import types  # noqa: E402
 
 
 class _Resp:
@@ -80,3 +81,30 @@ def test_image_read_without_any_credential_keeps_forbidden_error(monkeypatch):
     assert result.ok is False
     assert result.error["code"] == "capability_forbidden"
     assert seen["headers"] == {}
+
+
+def test_image_read_plaintext_binary_never_calls_enclave(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_plain")
+    monkeypatch.setattr(
+        cap_chat.db,
+        "chat_get_strict",
+        lambda *_args: {
+            "id": "img-plain",
+            "content_type": "image",
+            "body_b64": "AAAA",
+            "image_mime": "image/png",
+            "owner_user_id": "usr_plain",
+        },
+    )
+    monkeypatch.setattr(
+        cap_chat.httpx,
+        "get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext image must not call enclave")
+        ),
+    )
+
+    result = cap_chat.image_read(store, params={"id": "img-plain"})
+
+    assert result.ok is True
+    assert result.data["image_b64"] == "AAAA"

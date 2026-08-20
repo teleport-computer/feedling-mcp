@@ -8,6 +8,7 @@ enqueue_job/upsert_wake_schedule/due_heartbeat_users，断言 deps 的四个 cal
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -26,7 +27,10 @@ def test_enqueue_heartbeat_enqueues_on_the_heartbeat_lane(monkeypatch):
     deps = serve_worker._build_scheduler_deps()
     deps.enqueue_heartbeat("u1")
 
-    assert calls == [("u1", "heartbeat", {})]
+    assert len(calls) == 1
+    uid, lane, kwargs = calls[0]
+    assert (uid, lane) == ("u1", "heartbeat")
+    assert re.fullmatch(r"[0-9a-f]{32}", kwargs["trace_id"])
 
 
 def test_advance_heartbeat_upserts_next_heartbeat_at(monkeypatch):

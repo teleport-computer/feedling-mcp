@@ -191,6 +191,101 @@ def test_post_reply_passes_through_other_409(monkeypatch):
     assert result.get("error") == "bootstrap_incomplete"
 
 
+def test_post_reply_retries_explicitly_retryable_bootstrap_and_succeeds(monkeypatch):
+    responses = [
+        _FakeResp(409, {
+            "error": "bootstrap_incomplete",
+            "stage": "needs_resident_consumer",
+            "retryable": True,
+        }),
+        _FakeResp(409, {
+            "error": "bootstrap_incomplete",
+            "stage": "needs_resident_consumer",
+            "retryable": True,
+        }),
+        _FakeResp(200, {"id": "reply-after-retry"}),
+    ]
+    posts: list = []
+    sleeps: list[float] = []
+    monkeypatch.setattr(crc, "CHAT_RESPONSE_MAX_RETRIES", 3)
+    monkeypatch.setattr(crc, "CHAT_RESPONSE_RETRY_BASE_SEC", 0.5)
+    monkeypatch.setattr(crc, "CHAT_RESPONSE_RETRY_MAX_ELAPSED_SEC", 10.0)
+    monkeypatch.setattr(crc.time, "sleep", sleeps.append)
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        posts.append(json)
+        return responses.pop(0)
+
+    monkeypatch.setattr(crc._HTTP, "post", fake_post)
+    result = crc.post_reply("你好")
+    assert result == {"id": "reply-after-retry"}
+    assert len(posts) == 3
+    assert sleeps == [0.5, 1.0]
+
+
+def test_post_reply_retryable_bootstrap_has_hard_attempt_bound(monkeypatch):
+    posts: list = []
+    sleeps: list[float] = []
+    monkeypatch.setattr(crc, "CHAT_RESPONSE_MAX_RETRIES", 3)
+    monkeypatch.setattr(crc, "CHAT_RESPONSE_RETRY_BASE_SEC", 0.25)
+    monkeypatch.setattr(crc, "CHAT_RESPONSE_RETRY_MAX_ELAPSED_SEC", 10.0)
+    monkeypatch.setattr(crc.time, "sleep", sleeps.append)
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        posts.append(json)
+        return _FakeResp(409, {
+            "error": "bootstrap_incomplete",
+            "stage": "needs_resident_consumer",
+            "retryable": True,
+        })
+
+    monkeypatch.setattr(crc._HTTP, "post", fake_post)
+    result = crc.post_reply("你好")
+    assert result["error"] == "bootstrap_incomplete"
+    assert len(posts) == 4, "initial request plus exactly three retries"
+    assert sleeps == [0.25, 0.5, 1.0]
+
+
+def test_post_reply_retry_budget_can_disable_retry_wait(monkeypatch):
+    posts: list = []
+    sleeps: list[float] = []
+    monkeypatch.setattr(crc, "CHAT_RESPONSE_MAX_RETRIES", 3)
+    monkeypatch.setattr(crc, "CHAT_RESPONSE_RETRY_BASE_SEC", 0.25)
+    monkeypatch.setattr(crc, "CHAT_RESPONSE_RETRY_MAX_ELAPSED_SEC", 0.0)
+    monkeypatch.setattr(crc.time, "sleep", sleeps.append)
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        posts.append(json)
+        return _FakeResp(409, {
+            "error": "bootstrap_incomplete",
+            "stage": "needs_resident_consumer",
+            "retryable": True,
+        })
+
+    monkeypatch.setattr(crc._HTTP, "post", fake_post)
+    result = crc.post_reply("你好")
+    assert result["error"] == "bootstrap_incomplete"
+    assert len(posts) == 1
+    assert sleeps == []
+
+
+def test_post_reply_retryable_false_remains_single_terminal_attempt(monkeypatch):
+    posts: list = []
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        posts.append(json)
+        return _FakeResp(409, {
+            "error": "bootstrap_incomplete",
+            "stage": "needs_live_connection",
+            "retryable": False,
+        })
+
+    monkeypatch.setattr(crc._HTTP, "post", fake_post)
+    result = crc.post_reply("你好")
+    assert len(posts) == 1
+    assert result["retryable"] is False
+
+
 def test_reply_envelope_is_labeled_with_seal_key_fpr(monkeypatch):
     """build_envelope's label rides on the consumer reply wire shape."""
     posts: list = []

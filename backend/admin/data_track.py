@@ -2198,8 +2198,13 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         lane="chat",
         within_days=int(filters.get("days") or 30),
     )
+    # 聊天数字的覆盖范围。顶层一份，**不进每个用户行**：那份返回按 user_id 键控，
+    # 加非 uid 的键会让调用方拿到一个假用户；每行各存一份既冗余，又会让人以为
+    # 覆盖是 per-user 的。complete=False 时页面必须显示缺口——一个数字旁边没有
+    # 它的覆盖范围就会被当成全量，这正是 Seven 定 A 时要避免的那种误读。
     summary = {
         "generated_at": datetime.now().isoformat(),
+        "chat_coverage": db.chat_rollup_coverage(),
         "users_total": len(rows),
         "activated_total": activated,
         "human_active_1d": human_active_1d,
@@ -2453,6 +2458,35 @@ _LANGUAGE_FOLLOW_PUBLIC_ENUMS = {
     "lane": frozenset({"chat", "wake"}),
 }
 
+_PROMPT_FRONTIER_TRACE_TYPES = frozenset({
+    "v2.prompt_frontier.budget",
+    "v2.prompt_frontier.exhausted",
+})
+_PROMPT_FRONTIER_METADATA_TRACE_TYPE = "v2.prompt_frontier.metadata_rejected"
+_PROMPT_FRONTIER_PUBLIC_ENUMS = {
+    "limit_source": frozenset({
+        "provider_metadata", "caller", "audited_family",
+        "unaudited_default", "deployment_override",
+    }),
+    "lane": frozenset({
+        "chat", "heartbeat", "scheduled", "manual_wake", "screen_watch",
+    }),
+    "resolved_source": frozenset({
+        "caller", "audited_family", "unaudited_default", "deployment_override",
+    }),
+    "provider": frozenset({
+        "openai", "openrouter", "anthropic", "bedrock", "gemini",
+        "deepseek", "openai_compatible",
+    }),
+}
+_PROMPT_FRONTIER_PUBLIC_REQUIRED_COMPONENTS = frozenset({
+    "message_context", "tool_transcript", "required_tool_schemas",
+})
+_PROMPT_FRONTIER_PUBLIC_BYTE_COMPONENTS = frozenset({
+    "tools", "system", "summary", "tail", "worldbook", "runtime_data",
+    "screen", "tool_transcript",
+})
+
 
 def _debug_event_public_json(ev: dict) -> dict:
     raw_detail = ev.get("detail") or {}
@@ -2480,6 +2514,97 @@ def _debug_event_public_json(ev: dict) -> dict:
         for key, allowed_values in _LANGUAGE_FOLLOW_PUBLIC_ENUMS.items():
             value = raw_detail.get(key)
             if isinstance(value, str) and value in allowed_values:
+                public_detail[key] = value
+    if (
+        ev.get("type") == _PROMPT_FRONTIER_METADATA_TRACE_TYPE
+        and isinstance(raw_detail, dict)
+    ):
+        expected_keys = {
+            "reported_tokens", "floor_tokens", "resolved_tokens",
+            "resolved_source", "provider",
+        }
+        counts = tuple(
+            raw_detail.get(key)
+            for key in ("reported_tokens", "floor_tokens", "resolved_tokens")
+        )
+        valid = (
+            set(raw_detail) == expected_keys
+            and all(type(value) is int and value > 0 for value in counts)
+            and counts[0] < counts[1]
+            and raw_detail.get("provider")
+            in _PROMPT_FRONTIER_PUBLIC_ENUMS["provider"]
+            and raw_detail.get("resolved_source")
+            in _PROMPT_FRONTIER_PUBLIC_ENUMS["resolved_source"]
+        )
+        # Exact-shape projection: an extra model/free-text key invalidates the
+        # whole detail instead of inheriting the generic model/provider allowlist.
+        public_detail = dict(raw_detail) if valid else {}
+    if (
+        ev.get("type") in _PROMPT_FRONTIER_TRACE_TYPES
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        # Prompt-budget traces expose only producer-validated closed enums and
+        # integer counts.  Any extra key or string leaves the generic redaction
+        # intact, so a future producer cannot turn ``components`` into a prompt
+        # plaintext side channel by adding (for example) a ``content`` field.
+        for key, allowed_values in _PROMPT_FRONTIER_PUBLIC_ENUMS.items():
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed_values:
+                public_detail[key] = value
+        required = raw_detail.get("required_components")
+        if (
+            isinstance(required, list)
+            and all(
+                isinstance(value, str)
+                and value in _PROMPT_FRONTIER_PUBLIC_REQUIRED_COMPONENTS
+                for value in required
+            )
+        ):
+            public_detail["required_components"] = list(required)
+        components = raw_detail.get("components")
+        if (
+            isinstance(components, list)
+            and all(
+                isinstance(item, dict)
+                and set(item) == {"name", "bytes"}
+                and isinstance(item.get("name"), str)
+                and item["name"] in _PROMPT_FRONTIER_PUBLIC_BYTE_COMPONENTS
+                and type(item.get("bytes")) is int
+                and item["bytes"] >= 0
+                for item in components
+            )
+        ):
+            public_detail["components"] = [dict(item) for item in components]
+    if (
+        ev.get("type") == "mcp.roundtrip.provider"
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        # The tool loop owns these finite producer vocabularies. Import lazily
+        # to preserve admin module startup while avoiding a copied allowlist
+        # that could drift open or silently redact newly added producer values.
+        from model_api_runtime.v2 import tool_loop as v2_tool_loop
+        from model_api_runtime.v2 import worker as v2_worker
+
+        public_enums = {
+            "terminal_text_round_reason": (
+                v2_tool_loop._PROVIDER_TERMINAL_TEXT_ROUND_REASONS
+            ),
+            "force_text_fallback_reason": (
+                v2_tool_loop._PROVIDER_FORCE_TEXT_FALLBACK_REASONS
+            ),
+        }
+        for key, allowed_values in public_enums.items():
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed_values:
+                public_detail[key] = value
+        for key in ("lane", "wake_kind"):
+            value = raw_detail.get(key)
+            if (
+                isinstance(value, str)
+                and v2_worker._normalize_provider_trace_lane(value) == value
+            ):
                 public_detail[key] = value
     return {
         "ts": ev.get("ts"),
@@ -3861,11 +3986,80 @@ _HOME_WIDGET_CSS = """
 _HOME_PAGE_CSS = _RUNTIME_PAGE_CSS + _HOME_WIDGET_CSS
 
 
+def _render_chat_coverage_note(coverage: dict | None) -> str:
+    """Chat 数字的覆盖范围 —— **必须肉眼可见**（Seven 2026-08-19 定 A）。
+
+    这些数字来自每日冻结的格子，含义是「那天发生过多少」而非「当前还剩多少」，
+    所以列名是「累计发生」。冻结器落后时数字会偏低：A 口径要求**照常给数、但把
+    缺口写出来**，而不是让偏低的数冒充全量。一个数字旁边没有它的覆盖范围，就会
+    被当成全量——这正是这行字存在的唯一理由，不是装饰。
+    """
+    if not coverage:
+        return ("<div class='muted section-intro'>Chat 覆盖范围暂不可用"
+                "（读取失败）—— 下方聊天数字可能不完整。</div>")
+    through = str(coverage.get("through_day") or "")
+    expected = str(coverage.get("expected_through_day") or "")
+    backfill = str(coverage.get("backfill_from") or "")
+    if not through:
+        return ("<div class='muted section-intro'>⚠️ Chat 日格子<b>尚未冻结任何一天</b>，"
+                f"下方「累计发生」只含今天的实时数据（应覆盖到 {html.escape(expected)}）。"
+                "历史数字缺失，不是「这些用户没说过话」。</div>")
+    if not coverage.get("complete"):
+        return ("<div class='muted section-intro'>⚠️ Chat 冻结落后："
+                f"已覆盖 {html.escape(backfill)} … {html.escape(through)}，"
+                f"应到 {html.escape(expected)}。"
+                "下方「累计发生」<b>偏低</b>，缺的是这段区间。</div>")
+    return ("<div class='muted section-intro'>Chat「累计发生」= 那天发生过多少"
+            "（清空历史不会让它下降），非当前剩余条数。覆盖 "
+            f"{html.escape(backfill)} … {html.escape(through)}。</div>")
+
+
+def _render_stuck_block(stuck: dict | None) -> str:
+    """卡住的非终态尝试 —— 与失败率并排（Seven 2026-08-18 定 A）。
+
+    失败率只统计已终结的尝试，永久卡在 pending/claimed/realizing 的 job 因此
+    从失败率里彻底消失。这个区块是它唯一的出口，所以刻意放在 lane 表旁边而不是
+    次级页面。``stuck`` 为 None（独立失败域取不到）时显「暂不可用」而不是 0 ——
+    0 意味着「确认过是零」，与本页其余部分同一姿态。
+    """
+    if stuck is None:
+        return ("<section class='card'><h3>卡住的尝试</h3>"
+                "<p class='muted'>暂不可用</p></section>")
+    rows = stuck.get("rows") or []
+    total = int(stuck.get("total") or 0)
+    hours = stuck.get("stuck_after_hours")
+    head = (f"<section class='card'><h3>卡住的尝试 · {total}</h3>"
+            f"<p class='muted'>非终态尝试不计入失败率的分子或分母，只在这里出现；"
+            f"resident 判据为超过 {hours} 小时未终结，model_api 判据为已过其自身"
+            f" deadline。</p>")
+    if not rows:
+        return head + "<p class='muted'>窗口内没有卡住的尝试。</p></section>"
+    body = ["<table><thead><tr><th>用户</th><th>路线</th><th>道</th>"
+            "<th>数量</th><th>最早</th><th>定位</th></tr></thead><tbody>"]
+    for r in rows[:50]:
+        ids = r.get("job_ids") or r.get("job_seqs") or []
+        body.append(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>"
+            "<td>{}</td></tr>".format(
+                html.escape(str(r.get("user_id") or "")),
+                html.escape(str(r.get("route") or "")),
+                html.escape(str(r.get("lane") or "")),
+                int(r.get("count") or 0),
+                html.escape(str(r.get("oldest_at") or "—")),
+                html.escape(",".join(str(x) for x in ids[:5])) or "—",
+            ))
+    body.append("</tbody></table>")
+    if len(rows) > 50:
+        body.append(f"<p class='muted'>另有 {len(rows) - 50} 组未列出。</p>")
+    return head + "".join(body) + "</section>"
+
+
 def _render_runtime_health_page(
     payload: dict,
     tokens: dict | None = None,
     delivery: dict | None = None,
     user_report: dict | None = None,
+    stuck: dict | None = None,
 ) -> str:
     """Runtime V2 全 lane 运行时健康值班台（?view=runtime）。
 
@@ -4269,6 +4463,7 @@ def _render_runtime_health_page(
     <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>原始失败</th><th>过期</th><th>系统故障<br><span class='muted'>含过期</span></th><th>控制切流</th><th>安全抑制</th><th>终态未成功率</th><th>系统故障率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>开口回合/回合<br><span class='muted'>仅 screen_watch</span></th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
     <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='17' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
   </table></div>
+  {_render_stuck_block(stuck)}
   {_render_runtime_user_report(user_report)}
   <h2>未成功原因 Top</h2>
   <div class="table-wrap"><table>
@@ -6851,10 +7046,11 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
 	    <button type="submit">打开用户详情</button>
 	  </form>
 	  <div class="toolbar"><input id="q" placeholder="筛选 UID、route、runtime state、stage"></div>
+	  {_render_chat_coverage_note(summary.get("chat_coverage"))}
 	  <div class="sortbar">{sort_controls}</div>
 	  {pager}
 	  <div class="table-wrap"><table id="users">
-    <thead><tr><th>User</th><th>Onboarding route</th><th>实际 Runtime</th><th>连接</th><th>Onboarding</th><th>Steps</th><th>Chat</th><th>Memory</th><th>Proactive 心跳/屏幕(fail)</th><th>Last activity</th></tr></thead>
+    <thead><tr><th>User</th><th>Onboarding route</th><th>实际 Runtime</th><th>连接</th><th>Onboarding</th><th>Steps</th><th>Chat 累计发生</th><th>Memory</th><th>Proactive 心跳/屏幕(fail)</th><th>Last activity</th></tr></thead>
     <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='10' class='muted'>No users yet.</td></tr>"}</tbody>
   </table></div>
 </main>
@@ -8080,6 +8276,8 @@ def _debug_time(ts) -> str:
 _DEBUG_STEP_LABELS = {
     "route.decided": ("🧭", "路由决策"),
     "context.build": ("📎", "组装上下文"),
+    "memory.inject": ("🧠", "自动注入记忆"),
+    "memory.dream.tick": ("🌙", "做梦判定"),
     "agent.model.call.start": ("🧠", "调用模型 · 开始"),
     "agent.model.call.done": ("🧠", "调用模型 · 完成"),
     "agent.tool.call": ("🔧", "调用工具"),

@@ -47,7 +47,7 @@ def decrypt_client(monkeypatch):
     yield client, forwarded
 
 
-_ENV = {"v": 1, "id": "x", "owner_user_id": "usr_from_whoami", "ct": "Zm9v"}
+_ENV = {"v": 1, "id": "x", "owner_user_id": "usr_from_whoami", "body_ct": "Zm9v"}
 
 
 def test_decrypt_forwards_runtime_token_to_whoami(decrypt_client):

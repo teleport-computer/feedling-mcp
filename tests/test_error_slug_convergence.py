@@ -10,8 +10,8 @@ Covers the 6 core-function error sites converged by this task:
 
 None of these six functions go through the api_error() helper (Task 1) — they
 keep returning framework-neutral ``(dict, status)`` tuples. The actions batch
-preserves its HTTP-200 aggregate response while exposing the validation status
-and stable error slug on the failed item.
+preserves independent item results while promoting an all-failed batch to HTTP
+400 with the first stable error slug at the top level.
 
 Run:  python -m pytest tests/test_error_slug_convergence.py -q
 """
@@ -203,6 +203,8 @@ def test_memory_actions_add_anchor_required_is_slug(backend_env):
     body = res.get_json()
     assert body["error"] == "anchor_required"           # top-level, slug
     assert body["status"] == "failed"
+    assert body["error"] == "anchor_required"
+    assert body["detail"] == {"mem_type": "insight"}
     result0 = body["results"][0]
     assert result0["http_status"] == 400
     assert result0["error"] == "anchor_required"

@@ -11,6 +11,7 @@ stands in for boto3 (reuses test_frame_r2).
 """
 
 import base64
+import hashlib
 import sys
 import threading
 import time
@@ -22,6 +23,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
 import object_storage  # noqa: E402
+from accounts import registry  # noqa: E402
 from chat import service as chat_service  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
 
@@ -69,6 +71,26 @@ def _file_doc(uid: str, mid: str, body: bytes = b"PK\x03\x04docx-bytes") -> dict
     }
 
 
+def _plaintext_file_doc(
+    uid: str,
+    mid: str,
+    body: bytes = b"PK\x03\x04plaintext-docx",
+) -> dict:
+    return {
+        "id": mid,
+        "role": "user",
+        "ts": 1.0,
+        "source": "model_api",
+        "content_type": "file",
+        "file_name": "报告.docx",
+        "file_mime": "application/octet-stream",
+        "body_b64": base64.b64encode(body).decode("ascii"),
+        "body_size_bytes": len(body),
+        "visibility": "shared",
+        "owner_user_id": uid,
+    }
+
+
 def _raw_doc(uid: str, mid: str) -> dict | None:
     with db.get_pool().connection() as conn:
         row = conn.execute(
@@ -85,6 +107,16 @@ def _archived_doc(uid: str, mid: str) -> dict | None:
             (uid, mid),
         ).fetchone()
     return row[0] if row else None
+
+
+def _archived_row(uid: str, mid: str) -> tuple | None:
+    with db.get_pool().connection() as conn:
+        return conn.execute(
+            "SELECT source_seq,storage_generation,doc,ts,clear_generation,"
+            "cleared_at FROM chat_message_archive "
+            "WHERE user_id=%s AND msg_id=%s ORDER BY source_seq DESC LIMIT 1",
+            (uid, mid),
+        ).fetchone()
 
 
 def _body_key(uid: str, mid: str) -> str:
@@ -172,6 +204,30 @@ def test_offload_stores_pointer_and_chat_load_is_lazy(backend_env, monkeypatch):
     # chat_load is LAZY: returns the pointer, does NOT reconstitute.
     loaded = {m["id"]: m for m in db.chat_load(uid)}
     assert loaded[mid].get("body_key") and loaded[mid].get("body_ct") is None
+
+
+def test_new_plaintext_file_write_offloads_to_verified_plaintext_pointer(
+    backend_env, monkeypatch,
+):
+    client = _FakeS3()
+    _enable_r2(monkeypatch, client)
+    uid = _uid()
+    seed_user(uid)
+    mid = uuid.uuid4().hex
+    body = b"\x00new-plaintext-file\xff"
+
+    db.chat_append(uid, mid, 1.0, _plaintext_file_doc(uid, mid, body), 100)
+
+    raw = _raw_doc(uid, mid)
+    key = str(raw["body_key"])
+    _assert_versioned_key(key, uid, mid, "file")
+    assert raw["body_object_format"] == "plaintext_v1"
+    assert raw["body_size_bytes"] == len(body)
+    assert raw["body_sha256"] == hashlib.sha256(body).hexdigest()
+    assert "body_b64" not in raw and "body_ct" not in raw
+    assert client.store[(_BUCKET, key)] == body
+    hydrated = db.hydrate_chat_file_body(uid, raw)
+    assert base64.b64decode(hydrated["body_b64"], validate=True) == body
 
 
 def test_idempotent_retry_offloads_winner_only_once(backend_env, monkeypatch):
@@ -323,6 +379,329 @@ def test_hydrate_helper_reconstitutes(backend_env, monkeypatch):
     full = db.hydrate_chat_file_body(uid, pointer)
     assert base64.b64decode(full["body_ct"]) == body
     assert "body_key" not in full
+
+
+def test_raw_chat_body_helpers_preserve_bytes_and_legacy_wrapper(
+    backend_env, monkeypatch,
+):
+    client = _FakeS3()
+    _enable_r2(monkeypatch, client)
+    uid = _uid()
+    raw = b"\x00\xffplaintext-file"
+    key = object_storage.put_chat_body_bytes(
+        uid,
+        "msg-raw",
+        raw,
+        "file",
+        upload_version="version",
+        storage_generation=7,
+    )
+
+    assert key == f"chatfiles/{uid}/g7/msg-raw/version"
+    assert object_storage.get_chat_body_bytes(key, uid) == raw
+    assert base64.b64decode(object_storage.get_chat_body(key, uid)) == raw
+
+
+def test_legacy_put_chat_body_rejects_noncanonical_base64(
+    backend_env, monkeypatch,
+):
+    client = _FakeS3()
+    _enable_r2(monkeypatch, client)
+
+    with pytest.raises(ValueError, match="chat_body_invalid_base64"):
+        object_storage.put_chat_body(
+            _uid(),
+            "msg-invalid",
+            "not base64!",
+            upload_version="version",
+            storage_generation=1,
+        )
+    assert client.store == {}
+
+
+def test_plaintext_pointer_hydrates_to_verified_body_b64(
+    backend_env, monkeypatch,
+):
+    client = _FakeS3()
+    _enable_r2(monkeypatch, client)
+    uid = _uid()
+    raw = b"\x00plaintext-image\xff"
+    key = object_storage.put_chat_body_bytes(
+        uid,
+        "msg-plain",
+        raw,
+        "image",
+        upload_version="version",
+        storage_generation=2,
+    )
+    pointer = {
+        "id": "msg-plain",
+        "content_type": "image",
+        "owner_user_id": uid,
+        "visibility": "shared",
+        "body_key": key,
+        "body_object_format": "plaintext_v1",
+        "body_size_bytes": len(raw),
+        "body_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+    full = db.hydrate_chat_file_body(uid, pointer)
+
+    assert base64.b64decode(full["body_b64"], validate=True) == raw
+    assert full["body_size_bytes"] == len(raw)
+    assert not ({"body_key", "body_object_format", "body_sha256"} & set(full))
+    assert "body_ct" not in full
+
+
+@pytest.mark.parametrize("mutation", ["size", "hash", "unknown_format"])
+def test_plaintext_pointer_fails_closed_on_bad_metadata(
+    backend_env, monkeypatch, mutation,
+):
+    client = _CountingS3()
+    _enable_r2(monkeypatch, client)
+    uid = _uid()
+    raw = b"verified"
+    key = object_storage.put_chat_body_bytes(
+        uid,
+        "msg-bad",
+        raw,
+        upload_version="version",
+        storage_generation=1,
+    )
+    pointer = {
+        "body_key": key,
+        "body_object_format": "plaintext_v1",
+        "body_size_bytes": len(raw),
+        "body_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    if mutation == "size":
+        pointer["body_size_bytes"] += 1
+    elif mutation == "hash":
+        pointer["body_sha256"] = "0" * 64
+    else:
+        pointer["body_object_format"] = "future_v2"
+
+    with pytest.raises(ValueError):
+        db.hydrate_chat_file_body(uid, pointer)
+    if mutation == "unknown_format":
+        assert client.gets == [], "未知 marker 必须在 GET 前拒绝"
+
+
+def test_history_plaintext_pointer_omits_without_leaking_internal_fields(
+    backend_env, monkeypatch,
+):
+    client = _CountingS3()
+    _enable_r2(monkeypatch, client)
+    uid = _uid()
+    raw = b"x" * 300_000
+    key = object_storage.put_chat_body_bytes(
+        uid,
+        "msg-large-plain",
+        raw,
+        upload_version="version",
+        storage_generation=1,
+    )
+    pointer = {
+        "id": "msg-large-plain",
+        "content_type": "file",
+        "owner_user_id": uid,
+        "visibility": "shared",
+        "body_key": key,
+        "body_object_format": "plaintext_v1",
+        "body_size_bytes": len(raw),
+        "body_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+    item = chat_service._chat_history_item(pointer, include_image_body=False)
+
+    assert item["body_omitted"] is True
+    assert item["body_omitted_reason"] == "large_body"
+    assert item["body_size_bytes"] == len(raw)
+    assert not ({"body_key", "body_object_format", "body_sha256"} & set(item))
+    assert client.gets == []
+
+
+def test_live_pointer_plaintext_migration_is_atomic_and_preserves_metadata(
+    backend_env, monkeypatch,
+):
+    uid = _uid()
+    seed_user(uid)
+    registry._set_user_content_encryption(uid, "off")
+    mid = uuid.uuid4().hex
+    plaintext = b"\x00new-plaintext-file"
+
+    class _MetadataRaceS3(_FakeS3):
+        def put_object(self, Bucket, Key, Body, **kw):
+            if Body == plaintext:
+                db.chat_update_metadata(
+                    uid,
+                    mid,
+                    {"reply_status": "replied", "reply_message_id": "reply-1"},
+                )
+            return super().put_object(Bucket, Key, Body, **kw)
+
+    client = _MetadataRaceS3()
+    _enable_r2(monkeypatch, client)
+    db.chat_append(uid, mid, 1.0, _file_doc(uid, mid, b"old-ciphertext"), 100)
+    before = _raw_doc(uid, mid)
+    old_key = str(before["body_key"])
+
+    promoted = db.migrate_chat_r2_pointer_to_plaintext(
+        uid,
+        table="live",
+        item_id=mid,
+        old_body_key=old_key,
+        storage_generation=_storage_generation(uid),
+        plaintext=plaintext,
+        content_type="file",
+    )
+
+    assert promoted is True
+    after = _raw_doc(uid, mid)
+    assert after["body_object_format"] == "plaintext_v1"
+    assert after["body_size_bytes"] == len(plaintext)
+    assert after["body_sha256"] == hashlib.sha256(plaintext).hexdigest()
+    assert after["body_key"] != old_key
+    assert after["reply_status"] == "replied"
+    assert after["reply_message_id"] == "reply-1"
+    assert not (
+        {
+            "body_ct",
+            "body_b64",
+            "body_ct_len",
+            "nonce",
+            "K_user",
+            "K_enclave",
+            "enclave_pk_fpr",
+            "content_pk_fpr",
+        }
+        & set(after)
+    )
+    assert base64.b64decode(
+        db.hydrate_chat_file_body(uid, after)["body_b64"],
+        validate=True,
+    ) == plaintext
+    assert old_key in _cleanup_keys(uid)
+    assert after["body_key"] not in _cleanup_keys(uid)
+
+
+def test_archive_pointer_plaintext_migration_preserves_immutable_columns(
+    backend_env, monkeypatch,
+):
+    client = _FakeS3()
+    _enable_r2(monkeypatch, client)
+    uid = _uid()
+    seed_user(uid)
+    registry._set_user_content_encryption(uid, "off")
+    mid = uuid.uuid4().hex
+    plaintext = b"archived-plaintext"
+    db.chat_append(uid, mid, 1.25, _file_doc(uid, mid, b"old-archive-ct"), 100)
+    assert db.chat_clear(uid) == 1
+    before = _archived_row(uid, mid)
+    assert before is not None
+    source_seq, generation, before_doc, ts, clear_generation, cleared_at = before
+    old_key = str(before_doc["body_key"])
+
+    promoted = db.migrate_chat_r2_pointer_to_plaintext(
+        uid,
+        table="archive",
+        item_id=source_seq,
+        old_body_key=old_key,
+        storage_generation=generation,
+        plaintext=plaintext,
+        content_type="file",
+    )
+
+    assert promoted is True
+    after = _archived_row(uid, mid)
+    assert after is not None
+    assert after[0] == source_seq
+    assert after[1] == generation
+    assert after[3] == ts
+    assert after[4] == clear_generation
+    assert after[5] == cleared_at
+    after_doc = after[2]
+    assert after_doc["body_object_format"] == "plaintext_v1"
+    assert after_doc["body_key"] != old_key
+    assert base64.b64decode(
+        db.hydrate_chat_file_body(uid, after_doc)["body_b64"],
+        validate=True,
+    ) == plaintext
+    assert old_key in _cleanup_keys(uid)
+
+
+def test_plaintext_pointer_migration_refuses_non_explicit_off_tier(
+    backend_env, monkeypatch,
+):
+    client = _FakeS3()
+    _enable_r2(monkeypatch, client)
+    uid = _uid()
+    seed_user(uid)
+    registry._set_user_content_encryption(uid, "on")
+    mid = uuid.uuid4().hex
+    db.chat_append(uid, mid, 1.0, _file_doc(uid, mid), 100)
+    before = _raw_doc(uid, mid)
+
+    promoted = db.migrate_chat_r2_pointer_to_plaintext(
+        uid,
+        table="live",
+        item_id=mid,
+        old_body_key=str(before["body_key"]),
+        storage_generation=_storage_generation(uid),
+        plaintext=b"must-not-upload",
+        content_type="file",
+    )
+
+    assert promoted is False
+    assert _raw_doc(uid, mid) == before
+    assert b"must-not-upload" not in client.store.values()
+
+
+@pytest.mark.parametrize("race", ["delete", "switch_to_encrypted"])
+def test_plaintext_migration_cas_loss_leaves_new_object_for_durable_cleanup(
+    backend_env, monkeypatch, race,
+):
+    uid = _uid()
+    seed_user(uid)
+    registry._set_user_content_encryption(uid, "off")
+    mid = uuid.uuid4().hex
+    plaintext = b"late-new-plaintext"
+
+    class _RaceS3(_FakeS3):
+        def put_object(self, Bucket, Key, Body, **kw):
+            if Body == plaintext:
+                if race == "delete":
+                    assert db.chat_delete(uid, mid) is True
+                else:
+                    assert registry._set_user_content_encryption(uid, "on")
+            return super().put_object(Bucket, Key, Body, **kw)
+
+    client = _RaceS3()
+    _enable_r2(monkeypatch, client)
+    db.chat_append(uid, mid, 1.0, _file_doc(uid, mid, b"old-ciphertext"), 100)
+    before = _raw_doc(uid, mid)
+    old_key = str(before["body_key"])
+
+    promoted = db.migrate_chat_r2_pointer_to_plaintext(
+        uid,
+        table="live",
+        item_id=mid,
+        old_body_key=old_key,
+        storage_generation=_storage_generation(uid),
+        plaintext=plaintext,
+        content_type="file",
+    )
+
+    assert promoted is False
+    assert any(value == plaintext for value in client.store.values())
+    _drain_r2(uid)
+    assert all(value != plaintext for value in client.store.values())
+    if race == "delete":
+        assert _raw_doc(uid, mid) is None
+        assert client.store == {}
+    else:
+        assert _raw_doc(uid, mid) == before
+        assert client.store == {(_BUCKET, old_key): b"old-ciphertext"}
 
 
 def test_history_item_hydrates_when_body_included(backend_env, monkeypatch):

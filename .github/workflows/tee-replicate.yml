@@ -3,7 +3,7 @@
 # 复制/收敛本身在 CVM enclave 内跑（backend/admin/tee_replication.py 同步执行
 # tee_shadow.reconciler / tee_replicator.worker / tee_shadow.verify）；本
 # workflow 只手动 dispatch，curl 打 admin 端点当遥控器，绝不在 CI runner 里跑
-# 复制逻辑。默认 dry_run=true；非 dry_run 的 reconcile/replicate 服务端强制
+# 复制逻辑。默认 dry_run=true；非 dry_run 的写操作服务端强制
 # confirm 字面等于 MIGRATE（400 confirm_required）——这里只透传，不做客户端
 # typo-guard（拼错直接被服务端拒绝，等价效果）。
 name: TEE replicate
@@ -19,19 +19,25 @@ on:
         options: [test]
         required: true
       action:
-        description: reconcile=全表收敛 / replicate=游标增量复制 / verify=只读抽样核对
+        description: reconcile/replicate/reflow/prune/verify
         type: choice
-        options: [reconcile, replicate, verify]
+        options: [reconcile, replicate, reflow, prune, verify]
         required: true
       table:
-        description: 表名（replicate 必填；reconcile 留空=全表；verify 忽略）
+        description: 表名（replicate/reflow/prune 必填；reconcile 留空=全表）
+        required: false
+      qps:
+        description: reflow 限速；0=不限速，留空=服务端默认 2
+        required: false
+      expected_stale:
+        description: 大规模 prune 的精确 dry-run stale 数；实时不一致即拒绝
         required: false
       dry_run:
         description: 演练（不落写）——关掉需要下面 confirm 填字面 MIGRATE
         type: boolean
         default: true
       confirm:
-        description: 非 dry_run 的 reconcile/replicate 必须填字面 MIGRATE（服务端校验）
+        description: 非 dry_run 的写操作必须填字面 MIGRATE（服务端校验）
         required: false
 
 permissions:
@@ -44,6 +50,7 @@ jobs:
     # pg-deploy-*/应用部署的 concurrency 组分离，纯粹防止两次复制/收敛并发。
     concurrency: tee-replication
     steps:
+      - uses: actions/checkout@v4
       - name: Trigger admin tee-replication endpoint
         env:
           BASE_URL: ${{ secrets.TEST_ADMIN_BASE_URL }}
@@ -52,13 +59,10 @@ jobs:
           TABLE_IN: ${{ inputs.table }}
           DRY_RUN_IN: ${{ inputs.dry_run }}
           CONFIRM_IN: ${{ inputs.confirm }}
+          QPS_IN: ${{ inputs.qps }}
+          EXPECTED_STALE_IN: ${{ inputs.expected_stale }}
         run: |
-          table_json=$([ -n "$TABLE_IN" ] && printf '%s' "$TABLE_IN" | jq -R . || echo null)
-          confirm_json=$([ -n "$CONFIRM_IN" ] && printf '%s' "$CONFIRM_IN" | jq -R . || echo null)
-          dry_run_json=$(printf '%s' "$DRY_RUN_IN" | tr '[:upper:]' '[:lower:]')
-          body=$(jq -n --arg action "$ACTION" --argjson table "$table_json" \
-            --argjson dry_run "$dry_run_json" --argjson confirm "$confirm_json" \
-            '{action: $action, table: $table, dry_run: $dry_run, confirm: $confirm}')
+          body=$(python scripts/tee/replication_workflow_guard.py build)
           echo "request body: $body"
           # 不用 curl -f：非 2xx 也要把响应体（{"error": ...}）打给操作者看，
           # 再用 HTTP 状态码决定 job 成败。
@@ -69,4 +73,4 @@ jobs:
             -d "$body")
           echo "HTTP $HTTP_CODE"
           jq . resp.json || cat resp.json
-          test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300
+          python scripts/tee/replication_workflow_guard.py check "$HTTP_CODE" resp.json

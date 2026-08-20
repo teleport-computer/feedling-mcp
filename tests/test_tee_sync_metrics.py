@@ -153,6 +153,50 @@ def test_sync_tick_records_whole_table_replicate_failure(backend_env, monkeypatc
 # db.last_tee_reconcile_age_sec — 调度器跨 worker 恢复 last_reconcile 的读侧。
 # --------------------------------------------------------------------------- #
 
+def test_sync_tick_surfaces_verify_decrypt_failures(backend_env, monkeypatch):
+    """verify 报出的「解不开」行数必须单独可观测。
+
+    毒行卡死修掉之后 verify 不再整趟崩了,但坏行会安静地混进 mismatches 里,
+    和普通的「内容不一致」长得一样。两者的处置完全不同:内容不一致是复制逻辑
+    问题,解不开是 enclave/信封出了事(2026-07-28 prod 那条 missing body_ct),
+    是要立刻处理的信号。所以要单独计数,否则修好 verify 只是把一种静默换成
+    另一种。
+    """
+    from admin import tee_replication as tr
+    from admin import tee_sync_scheduler as sched
+
+    def fake_run_action(*, action, table=None, dry_run=True, confirm=None, **kw):
+        if action == "reconcile":
+            return {"tables": [{"table": "users", "copied": 0, "pruned": 0,
+                                "skipped": 0, "rds_rows": 1, "tee_rows": 1}]}
+        if action == "replicate":
+            return {"copied": 0, "pending": 0, "errors": 0, "skipped": 0}
+        return {"ok": False,
+                "mismatches": [
+                    {"table": "chat_messages", "user_id": "u1", "item_id": "bad1",
+                     "field": "<decrypt-failed>", "error": "enclave_http_403"},
+                    {"table": "chat_messages", "user_id": "u1", "item_id": "bad2",
+                     "field": "<decrypt-failed>", "error": "enclave_http_403"},
+                    {"table": "chat_messages", "user_id": "u1", "item_id": "diff1",
+                     "field": "body"},
+                ],
+                "tables": {"chat_messages": {"rows_ok": True, "user_diffs": {},
+                                             "requeue_backlog": 0}}}
+
+    monkeypatch.setattr(tr, "run_action", fake_run_action)
+
+    before_ids = {r["id"] for r in db.recent_tee_sync_runs(limit=500)}
+    sched._sync_tick(do_reconcile=True)
+    new_rows = [r for r in db.recent_tee_sync_runs(limit=500)
+                if r["id"] not in before_ids]
+    assert len(new_rows) == 1
+    verify_report = new_rows[0]["report"]["verify"]
+
+    # 3 条 mismatch 里有 2 条是解不开 —— 必须分开报,不能只给一个总数。
+    assert verify_report["mismatches"] == 3
+    assert verify_report["decrypt_failures"] == 2
+
+
 def test_last_reconcile_age_none_without_mark(backend_env):
     with db.get_pool().connection() as c:
         c.execute("DELETE FROM tee_reconcile_state")

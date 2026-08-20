@@ -96,6 +96,22 @@ db.chat_coverage_bounds_after_seq(user_id, after_seq, *, limit, through_seq)
 
 ### 2.2 存储
 
+> **2026-07-31 与 content-encryption v6 合并后的修正（后者优先）**
+>
+> 本节原写于「内容恒加密」基线，把 profile 两字段写死为 shared envelope。v6 已把
+> 内容加密改成每用户偏好，因此 profile 不能成为新增的强制加密孤岛：
+>
+> - `memory/user.envelope` 这个容器名为兼容保留，但其内部按 effective preference
+>   存 `body_ct`（加密档）或 `body`（明文档）；
+> - 构建统一走 `core_envelope._build_shared_envelope_for_store`，不得直接调用
+>   `build_envelope`；
+> - turn 读取按字段形状路由，明文字段不铸 runtime token、不进 enclave；
+> - CAS、两个字段全有或全无、chars 校验和 metadata 上限全部不变；
+> - TEE shadow 保留与 RDS 相同的用户选择形状，不再承诺「只镜密文」。
+>
+> 下面提到「信封必须自己建」「只存密文」的原文保留为历史设计背景，实现以此修正
+> 为准。
+
 **单个 blob,`kind="v2_agent_profile"`**,两字段同一个 CAS(不会错位;turn 路径一次读)。
 
 ```jsonc

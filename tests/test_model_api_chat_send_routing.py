@@ -80,7 +80,13 @@ def _fake_envelope_builder():
     """每次调用返回一个假的 envelope，不需要真实 enclave。"""
     counter = {"n": 0}
 
-    def _build(store, plaintext: bytes, *, item_id: str | None = None):
+    def _build(
+        store,
+        plaintext: bytes,
+        *,
+        item_id: str | None = None,
+        content_kind: str = "text",
+    ):
         counter["n"] += 1
         return {
             "v": 1,

@@ -95,6 +95,103 @@ def test_consumer_agent_runtime_requires_fresh_official_poll(monkeypatch):
     }
 
 
+def test_current_response_from_prior_poller_is_live_past_poll_window(monkeypatch):
+    state = {
+        "official": True,
+        "consumer_name": "feedling-chat-resident",
+        "consumer_id": "resident-vps:1",
+        "last_poll_epoch": 100.0,
+        "poll_consumers": {
+            "resident-vps:1": {
+                "consumer_id": "resident-vps:1",
+                "consumer_name": "feedling-chat-resident",
+                "last_poll_epoch": 100.0,
+            },
+        },
+    }
+    store = _Store()
+    monkeypatch.setattr(consumer, "_load_consumer_state", lambda _store: dict(state))
+    response_info = {
+        "official": True,
+        "consumer_name": "feedling-chat-resident",
+        "consumer_id": "resident-vps:1",
+    }
+
+    for age in (179.0, 181.0):
+        validation = consumer._consumer_validation_state(
+            store,
+            now_epoch=100.0 + age,
+            response_info=response_info,
+        )
+        assert validation["passing"] is True
+        assert validation["age_sec"] == 0
+        assert validation["last_activity_type"] == "response"
+
+
+def test_current_response_cannot_mint_liveness_without_matching_poll(monkeypatch):
+    state = {
+        "official": True,
+        "consumer_name": "feedling-chat-resident",
+        "consumer_id": "resident-vps:1",
+        "last_poll_epoch": 100.0,
+        "poll_consumers": {
+            "resident-vps:1": {"last_poll_epoch": 100.0},
+        },
+    }
+    store = _Store()
+    monkeypatch.setattr(consumer, "_load_consumer_state", lambda _store: dict(state))
+
+    foreign = consumer._consumer_validation_state(
+        store,
+        now_epoch=100.0 + consumer._CONSUMER_RECENT_SEC + 1,
+        response_info={
+            "official": True,
+            "consumer_name": "feedling-chat-resident",
+            "consumer_id": "never-polled",
+        },
+    )
+    no_poll = consumer._consumer_validation_state(
+        store,
+        now_epoch=100.0 + consumer._CONSUMER_RECENT_SEC + 1,
+        response_info={
+            "official": False,
+            "consumer_name": "other",
+            "consumer_id": "resident-vps:1",
+        },
+    )
+    assert foreign["passing"] is False
+    assert no_poll["passing"] is False
+
+
+def test_official_response_does_not_reuse_nonofficial_poll_identity(monkeypatch):
+    state = {
+        "official": False,
+        "consumer_name": "other-consumer",
+        "consumer_id": "shared-id",
+        "last_poll_epoch": 100.0,
+        "poll_consumers": {
+            "shared-id": {
+                "consumer_id": "shared-id",
+                "consumer_name": "other-consumer",
+                "last_poll_epoch": 100.0,
+            },
+        },
+    }
+    store = _Store()
+    monkeypatch.setattr(consumer, "_load_consumer_state", lambda _store: dict(state))
+
+    validation = consumer._consumer_validation_state(
+        store,
+        now_epoch=100.0 + consumer._CONSUMER_RECENT_SEC + 1,
+        response_info={
+            "official": True,
+            "consumer_name": "feedling-chat-resident",
+            "consumer_id": "shared-id",
+        },
+    )
+    assert validation["passing"] is False
+
+
 def test_fresh_ok_decrypt_health_passes_independently_of_poll_freshness(monkeypatch):
     validation = _validation(
         monkeypatch,

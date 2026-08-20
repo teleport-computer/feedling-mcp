@@ -180,7 +180,7 @@ def test_models_route_compatible_no_catalog_is_200(client, monkeypatch):
 def test_models_route_credential_decrypt_success(client, monkeypatch):
     monkeypatch.setattr(db, "model_api_credential_get",
         lambda uid, cid: {"provider": "openai", "base_url": "",
-                          "api_key_envelope": {"ciphertext": "x"}})
+                          "api_key_envelope": {"body_ct": "x"}})
     monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave",
         lambda *a, **k: b"sk-decrypted")
     seen: dict = {}
@@ -205,7 +205,7 @@ def test_models_route_credential_overrides_payload_provider_and_base_url(client,
     monkeypatch.setattr(db, "model_api_credential_get",
         lambda uid, cid: {"provider": "anthropic",
                           "base_url": "https://cred.example.com/v1",
-                          "api_key_envelope": {"ciphertext": "x"}})
+                          "api_key_envelope": {"body_ct": "x"}})
     monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave",
         lambda *a, **k: b"sk-ant")
     seen: dict = {}
@@ -238,7 +238,7 @@ def test_models_route_credential_not_found_is_404(client, monkeypatch):
 def test_models_route_credential_decrypt_failure_is_400(client, monkeypatch):
     monkeypatch.setattr(db, "model_api_credential_get",
         lambda uid, cid: {"provider": "openai", "base_url": "",
-                          "api_key_envelope": {"ciphertext": "x"}})
+                          "api_key_envelope": {"body_ct": "x"}})
 
     def boom(*a, **k):
         raise RuntimeError("enclave rejected envelope")

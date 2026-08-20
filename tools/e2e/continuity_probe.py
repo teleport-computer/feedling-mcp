@@ -112,7 +112,7 @@ def _multi_turn(c: E2EClient, p: Probe):
 
     # HARD decrypt continuity
     try:
-        dec = c.decrypt_reply(reply)
+        dec = c.read_reply_strict(reply)
         p.add("decrypt_continuity_HARD", PASS if dec.strip() else PRODUCT_FAIL,
               f"len={len(dec)}" if dec.strip() else "empty plaintext")
     except Exception as e:  # noqa: BLE001

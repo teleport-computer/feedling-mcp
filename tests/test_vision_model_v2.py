@@ -510,8 +510,15 @@ def test_failed_new_vision_route_is_cleaned_up_inside_configure(monkeypatch):
     )
     monkeypatch.setattr(
         setup_core.db,
+        "model_api_route_delete",
+        lambda uid, route_id: deleted.append(("route", uid, route_id)) or True,
+    )
+    monkeypatch.setattr(
+        setup_core.db,
         "model_api_credential_delete",
-        lambda uid, credential_id: deleted.append((uid, credential_id)) or True,
+        lambda uid, credential_id: deleted.append(
+            ("credential", uid, credential_id)
+        ) or True,
     )
 
     body, status = setup_core.vision_route_configure.__wrapped__(
@@ -521,7 +528,55 @@ def test_failed_new_vision_route_is_cleaned_up_inside_configure(monkeypatch):
     )
 
     assert (body, status) == ({"error": "vision_model_test_failed"}, 400)
-    assert deleted == [("u1", "new-credential")]
+    # 路线和凭据都要显式回收:tee schema 没有 credential→route 级联,只删凭据
+    # 会留下 JOIN 不出来的僵尸路线。
+    assert deleted == [
+        ("route", "u1", "new-route"),
+        ("credential", "u1", "new-credential"),
+    ]
+
+
+def test_failed_vision_configure_with_reused_credential_keeps_credential(monkeypatch):
+    deleted = []
+    monkeypatch.setattr(setup_core, "_vision_routing_available", lambda _store: True)
+    monkeypatch.setattr(setup_core.db, "model_api_routes_list", lambda _uid: [])
+    monkeypatch.setattr(
+        setup_core.model_api_route_create,
+        "__wrapped__",
+        lambda _store, _payload, **_kwargs: ({
+            "route": {"id": "new-route", "credential_id": "shared-credential"}
+        }, 200),
+    )
+    monkeypatch.setattr(
+        setup_core.vision_config_set,
+        "__wrapped__",
+        lambda _store, _payload, **_kwargs: (
+            {"error": "vision_model_test_failed"},
+            400,
+        ),
+    )
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_route_delete",
+        lambda uid, route_id: deleted.append(("route", uid, route_id)) or True,
+    )
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_credential_delete",
+        lambda uid, credential_id: deleted.append(
+            ("credential", uid, credential_id)
+        ) or True,
+    )
+
+    body, status = setup_core.vision_route_configure.__wrapped__(
+        _store(),
+        {"credential_id": "shared-credential", "model": "gpt-4.1-mini"},
+        caller_api_key="caller",
+    )
+
+    assert (body, status) == ({"error": "vision_model_test_failed"}, 400)
+    # 复用的凭据别的路线可能还在引用,只删本请求新建的路线。
+    assert deleted == [("route", "u1", "new-route")]
 
 
 def test_follow_main_can_clear_dedicated_route_before_resident_update(monkeypatch):

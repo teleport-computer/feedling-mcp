@@ -71,7 +71,7 @@ async def v1_identity_get(request: Request):
 
     def _work():
         try:
-            plaintext = envelope.decrypt_envelope(identity, user_id, content_sk)
+            plaintext = envelope.read_envelope(identity, user_id, content_sk)
             inner = json.loads(plaintext.decode("utf-8"))
 
             # days_with_user is computed live from the server-side anchor.

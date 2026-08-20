@@ -205,6 +205,27 @@ def test_existing_identity_preferred_name_is_read_from_encrypted_card(monkeypatc
     assert hi._existing_import_user_name(store, "key") == "Seven"
 
 
+def test_existing_identity_preferred_name_reads_plaintext_without_enclave(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_existing_plain_name")
+    monkeypatch.setattr(
+        hi.identity_service,
+        "_load_identity",
+        lambda _store: {
+            "body": '{"agent_name":"IO","user_preferred_name":"Seven"}',
+            "owner_user_id": "usr_existing_plain_name",
+        },
+    )
+    monkeypatch.setattr(
+        hi.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext identity must not call enclave")
+        ),
+    )
+
+    assert hi._existing_import_user_name(store, "key") == "Seven"
+
+
 def test_rendered_user_candidate_replaces_system_label_with_known_name():
     candidates = hi._coerce_import_candidates(
         {"candidates": [{

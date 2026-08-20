@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 from dataclasses import asdict
 
-from core import enclave as core_enclave
 from core import envelope as core_envelope
 from workspace.backends import (
     WORKING_MEMORY_PATH,
@@ -47,7 +46,7 @@ class SharedEnvelopeCodec:
             raise RuntimeError("workspace envelope id mismatch")
         if str(envelope.get("owner_user_id") or "") != str(self.store.user_id):
             raise RuntimeError("workspace envelope owner mismatch")
-        return core_enclave._decrypt_envelope_via_enclave(
+        return core_envelope.read_envelope_body(
             envelope,
             None,
             purpose="v2_workspace_read",

@@ -208,6 +208,28 @@ def test_recent_wraps_json_body(monkeypatch):
     assert r.ok is True and r.data == {"frames": [], "total": 0}
 
 
+def test_frame_decrypt_reports_store_unavailable_instead_of_not_found(monkeypatch):
+    store = types.SimpleNamespace(user_id="u1")
+    monkeypatch.setattr(
+        screen_read_core.db,
+        "frame_get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            screen_read_core.db.FrameReadUnavailable("r2 unavailable")
+        ),
+    )
+
+    result = screen_read_core.frame_decrypt(
+        store,
+        "ab" * 16,
+        include_image="true",
+        api_key="key",
+        runtime_token=None,
+    )
+
+    assert result.status == 503
+    assert result.json_body == {"error": "frame_store_unavailable"}
+
+
 def test_read_resolves_latest_then_decrypts(monkeypatch):
     monkeypatch.setattr(screen_read_core, "latest_frame",
                         lambda store: ScreenResult(status=200, json_body={"id": "f1"}))

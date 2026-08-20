@@ -799,6 +799,77 @@ def _set_user_timezone(user_id: str, tz: str | None) -> bool:
     return False
 
 
+_CONTENT_ENCRYPTION_VALUES = ("on", "off")
+
+
+def _get_user_content_encryption(user_id: str) -> str | None:
+    """Return the user's content_encryption preference as a THREE-state value:
+
+      - ``"on"``  — user opted into encryption.
+      - ``"off"`` — user exists and has not opted in (v6 default: plaintext).
+      - ``None``  — **the user record was not found**.
+
+    The third state is deliberately distinct from ``"off"``: a caller on the
+    write path must treat "unknown user" as **fail-safe → encrypt**, never as
+    plaintext. Collapsing the two would make every registry miss (new-user
+    race, registry not yet loaded, pure-unit-test user) silently downgrade a
+    write to plaintext — see the plan's Task 2.2 note and
+    tests/test_v2_encrypted_effect_payload.py's ``u_effect_real_crypto``, which
+    is exactly such a user.
+
+    (Note this differs from _get_user_timezone's two-state contract on purpose:
+    an unknown timezone is harmless, an unknown encryption preference is not.)
+    """
+    with _users_lock:
+        for u in _users:
+            if u.get("user_id") == user_id:
+                value = str(u.get("content_encryption") or "").strip().lower()
+                return value if value in _CONTENT_ENCRYPTION_VALUES else "off"
+    return None
+
+
+def _set_user_content_encryption(user_id: str, value: str | None) -> bool:
+    """Set (or clear, when value is falsy) the user's content_encryption
+    preference. Only "on"/"off" are accepted — an unrecognized value is rejected
+    rather than stored, so downstream format routing never sees a third state.
+    Returns True when the record was found and updated, False when the user is
+    unknown or the value is non-empty and invalid."""
+    normalized = str(value or "").strip().lower()
+    if normalized and normalized not in _CONTENT_ENCRYPTION_VALUES:
+        return False
+    with _users_lock:
+        for u in _users:
+            if u.get("user_id") == user_id:
+                # Unchanged value is a pure no-op — persist_user is a users-row
+                # upsert + TEE mirror + a cross-worker broadcast that makes EVERY
+                # worker reload the whole registry (see _set_user_timezone).
+                if normalized == str(u.get("content_encryption") or "").strip().lower():
+                    return True
+                if normalized:
+                    u["content_encryption"] = normalized
+                else:
+                    u.pop("content_encryption", None)
+                persist_user(u)
+                return True
+    return False
+
+
+def effective_content_encryption(user_id: str) -> str:
+    """客户端**写侧**必须遵守的内容形状："on" | "off"。
+
+    与 ``_get_user_content_encryption``（用户意图）的区别：意图可以随时是
+    "off"，但服务端在 Task 2.2 前仍拒收明文写入，此时生效值恒为 "on"。
+    两者分开下发，iOS 与后端的发版顺序才互不依赖。
+
+    fail-safe：查不到用户 / 服务端未开闸 → "on"（加密）。
+    """
+    from core import envelope as core_envelope  # 延迟导入：避免装配期循环
+
+    if not core_envelope.PLAINTEXT_WRITES_ACCEPTED:
+        return "on"
+    return "off" if _get_user_content_encryption(user_id) == "off" else "on"
+
+
 def _find_user_entry_locked(user_id: str) -> dict | None:
     for user_entry in _users:
         if user_entry.get("user_id") == user_id:

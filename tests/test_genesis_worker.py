@@ -11,7 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import provider_client  # noqa: E402
-from genesis import prompts, service, worker  # noqa: E402
+from genesis import persona_backfill, prompts, service, worker  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -134,6 +134,52 @@ def test_source_family_accepts_import_suffix_aliases():
     assert worker._source_family("user_profile_import") == "user_profile"
     assert worker._source_family("memory_summary_import") == "memory_summary"
     assert worker._source_family("chat_export") == "history"
+
+
+def test_plaintext_persona_blob_reads_without_enclave():
+    assert worker._decrypt_blob_text(
+        "http://enclave",
+        "runtime-token",
+        {"content_envelope": {"body": "You are Kai.", "owner_user_id": "usr_1"}},
+        purpose="genesis_persona",
+    ) == "You are Kai."
+
+
+def test_plaintext_persona_backfill_stages_local_body(monkeypatch):
+    from core import envelope as core_envelope
+    import db
+
+    store = types.SimpleNamespace(user_id="usr_plain")
+    captured = {}
+    monkeypatch.setattr(db, "genesis_list_jobs", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda *_args, **_kwargs: ({
+            "body": "Name: Mira\nVoice / tone: warm",
+            "owner_user_id": "usr_plain",
+            "visibility": "shared",
+        }, ""),
+    )
+    def create_import_job(_store, payload):
+        captured["job"] = payload
+        return {"job_id": "job_plain"}, 201
+
+    monkeypatch.setattr(service, "create_import_job", create_import_job)
+    monkeypatch.setattr(
+        service,
+        "put_chunk",
+        lambda _store, _job_id, **kwargs: captured.setdefault("chunk", kwargs),
+    )
+    monkeypatch.setattr(service, "finalize_upload", lambda *_args: None)
+
+    persona_backfill.run_persona_backfill(
+        store,
+        {"agent_name": "Mira", "tone_style": "warm"},
+    )
+
+    assert captured["chunk"]["encrypted_body"] == b"Name: Mira\nVoice / tone: warm"
+    assert captured["job"]["total_bytes"] == len(captured["chunk"]["encrypted_body"])
 
 
 def test_plaintext_key_prefix_does_not_replace_persisted_job_id(monkeypatch):

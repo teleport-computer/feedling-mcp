@@ -107,7 +107,12 @@ def run_persona_backfill(store, identity_plain: dict | None) -> dict | None:
     envelope, err = core_envelope._build_shared_envelope_for_store(store, material.encode("utf-8"))
     if envelope is None:
         raise RuntimeError(err or "persona_backfill_envelope_failed")
-    encrypted_body = base64.b64decode(envelope["body_ct"])
+    shape = core_envelope.classify_envelope_shape(envelope)
+    if shape == "sealed":
+        encrypted_body = base64.b64decode(envelope["body_ct"])
+    else:
+        encrypted_body = core_envelope.read_plaintext_envelope_body(
+            envelope, owner_user_id=store.user_id)
 
     job, _code = genesis_service.create_import_job(store, {
         "source_kind": _SOURCE_KIND,

@@ -605,6 +605,61 @@ def test_run_history_search_time_only_skips_leaf_hints(monkeypatch):
     assert out["complete"] is True
 
 
+def test_run_history_search_plaintext_never_posts_enclave(monkeypatch):
+    _patch_store(monkeypatch, leaves=[])
+    plaintext = _text_row(100)
+    plaintext.pop("body_ct")
+    plaintext.pop("nonce")
+    plaintext.pop("K_enclave")
+    plaintext["body"] = "the local needle"
+    monkeypatch.setattr(
+        history_readside.jobs_store,
+        "chat_history_rows_by_seqs",
+        lambda _uid, _seqs: [plaintext],
+    )
+
+    out = history_readside.run_history_search(
+        "usr_a",
+        cursor_hmac_key=_KEY,
+        query="needle",
+        limit=1,
+        post_enclave=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext history must not post to enclave")
+        ),
+    )
+
+    assert [match["message_id"] for match in out["matches"]] == ["m100"]
+
+
+def test_run_history_search_mixed_posts_only_sealed_projection(monkeypatch):
+    _patch_store(monkeypatch, leaves=[])
+    plaintext = _text_row(100)
+    for key in ("body_ct", "nonce", "K_enclave"):
+        plaintext.pop(key)
+    plaintext["body"] = "local miss"
+    sealed = _text_row(99)
+    monkeypatch.setattr(
+        history_readside.jobs_store,
+        "chat_history_rows_by_seqs",
+        lambda _uid, _seqs: [plaintext, sealed],
+    )
+    posted = []
+
+    def post(op, payload):
+        assert op == "scan"
+        posted.extend(payload["rows"])
+        return {
+            "hits": [], "checked_count": 1, "unavailable_count": 0,
+            "last_checked_seq": 99, "stopped": "exhausted", "truncated": False,
+        }
+
+    history_readside.run_history_search(
+        "usr_a", cursor_hmac_key=_KEY, query="needle", post_enclave=post)
+
+    assert posted and {row["id"] for row in posted} == {"m99"}
+    assert all("body" not in row and "body_b64" not in row for row in posted)
+
+
 def test_run_history_search_requires_query_or_range(monkeypatch):
     _patch_store(monkeypatch)
     with pytest.raises(history_search.HistorySearchInputError):
@@ -1034,6 +1089,40 @@ def test_run_history_fetch_not_found_and_structure(monkeypatch):
     assert out["omitted_before"] == 0 and out["omitted_after"] == 0
     assert out["after"][0]["content"] == "newer body"
     assert out["unavailable_count"] == 0
+
+
+def test_run_history_fetch_plaintext_window_never_posts_enclave(monkeypatch):
+    def plain(seq, role="user"):
+        row = _text_row(seq, role=role)
+        for key in ("body_ct", "nonce", "K_enclave"):
+            row.pop(key)
+        row["body"] = f"plain {seq}"
+        return row
+
+    monkeypatch.setattr(
+        history_readside.jobs_store,
+        "chat_history_anchor_row",
+        lambda _uid, _mid: plain(5),
+    )
+    monkeypatch.setattr(
+        history_readside.jobs_store,
+        "chat_history_neighbor_rows",
+        lambda *_args, **_kwargs: (
+            [plain(4, "openclaw")], [plain(6)], {"before": 1, "after": 1}
+        ),
+    )
+
+    out = history_readside.run_history_fetch(
+        "usr_a",
+        message_id="m5",
+        post_enclave=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext history must not post to enclave")
+        ),
+    )
+
+    assert out["anchor"]["content"] == "plain 5"
+    assert out["before"][0]["content"] == "plain 4"
+    assert out["after"][0]["content"] == "plain 6"
 
 
 def _patch_fetch_store(monkeypatch, *, anchor_seq=50,

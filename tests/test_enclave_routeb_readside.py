@@ -166,13 +166,16 @@ def test_routeb_flag_false_keeps_legacy_context_selection(enclave_history_client
     assert body["context_memory_trace"]["mode"] == "model_api"
 
 
-def test_routeb_flag_true_uses_readside_selection(enclave_history_client, monkeypatch):
+def test_model_api_now_uses_the_same_selection_as_resident(enclave_history_client, monkeypatch):
+    """2026-08-18 统一：两条 runtime 走**同一套**挑卡，开关不再影响挑法。
+
+    hx 拍板「v2 的挑卡参考 v1 的，就是挑桶那种」，目标是用户切 runtime 无感。
+
+    此前这条测试断言的是反面 ——「开关为真时不许走老 selector」。那个分叉
+    经查并非有意设计：2026-06-21 换管道时顺手丢掉了打底逻辑，当次设计文档
+    对「转折/最近/打底」一个字未提，代码注释也没有取舍记录。
+    """
     monkeypatch.setenv("MEMORY_READSIDE_FOR_MODEL_API", "true")
-    monkeypatch.setattr(
-        chat_route,
-        "select_context_memories_with_trace",
-        lambda *_args, **_kwargs: pytest.fail("legacy selector should not run when readside flag is true"),
-    )
 
     res = enclave_history_client.get(
         "/v1/chat/history?context_mode=model_api&context_trace=1",
@@ -181,9 +184,10 @@ def test_routeb_flag_true_uses_readside_selection(enclave_history_client, monkey
 
     assert res.status_code == 200
     body = res.get_json()
-    assert [item["id"] for item in body["context_memories"]] == ["mem_cat"]
-    assert body["context_memory_trace"]["mode"] == "model_api_readside_v1"
-    assert body["context_memory_trace"]["readside_enabled"] is True
+    # 开关仍为真，但挑法已统一 —— trace 不再是 readside 那套的形状
+    assert body["context_memory_trace"].get("mode") != "model_api_readside_v1", (
+        "model_api 仍在走 readside 挑法 —— 统一没生效"
+    )
 
 
 def test_routeb_readside_uses_configurable_memory_limit(enclave_history_client, monkeypatch):
@@ -211,10 +215,13 @@ def test_routeb_readside_uses_configurable_memory_limit(enclave_history_client, 
     assert captured_limits[-1] == 200
 
     monkeypatch.setenv("MEMORY_READSIDE_FOR_MODEL_API", "true")
+    # 2026-08-18 统一之后默认值从 50 提到 200（resident 一直在用的值）——
+    # 挑法一样但候选池 50 vs 200 的话，「切 runtime 无感」仍不成立：
+    # 卡多的用户在小池子里会漏掉旧卡。旋钮本身保留，只是默认值变了。
     monkeypatch.delenv("MEMORY_READSIDE_MODEL_API_LIMIT", raising=False)
     enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1",
                               headers={"X-API-Key": "key_routeb"})
-    assert captured_limits[-1] == 50
+    assert captured_limits[-1] == 200
 
     monkeypatch.setenv("MEMORY_READSIDE_MODEL_API_LIMIT", "80")
     enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1",

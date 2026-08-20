@@ -104,7 +104,7 @@ def main() -> None:
 
         row = injected[0]
         # a. decryptable with the user's own key (hard assertion, no fallback)
-        text = c.decrypt_reply(row)
+        text = c.read_reply_strict(row)
         step("a2-user-key-decrypt", bool(text.strip()), f"len={len(text)}")
         step("a3-content-is-maintenance",
              "维护" in text or "resident" in text, text[:60].replace("\n", " "))

@@ -681,7 +681,8 @@ def test_reconciler_registration():
 def test_reconciler_converges_after_missed_displacement_delete(app):
     """换机顶替 + 镜像漏删 DELETE 的自愈（Codex review P2）：TEE 里陈旧行仍占着
     同一 device_token 时，reconcile 的 copy 阶段不得撞约束，prune 后两侧收敛。
-    前提是 TEE 侧 configs 有意不带 device_token UNIQUE（alembic_tee 0002）。"""
+    TEE 进入 primary-capable 状态后也带 device_token UNIQUE，因此 reconciler
+    必须在同一事务内先清掉旧 binding，再写入 RDS 的当前 binding。"""
     from tee_shadow import reconciler
 
     new_token = _enroll(app)["auth_token"]  # RDS 存活行（dual-write 未开，TEE 没有）

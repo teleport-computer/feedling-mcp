@@ -156,7 +156,7 @@ async def v1_memory_list(request: Request):
                 decrypted.append(base)
                 continue
             try:
-                plaintext = envelope.decrypt_envelope(m, user_id, content_sk)
+                plaintext = envelope.read_envelope(m, user_id, content_sk)
                 inner = json.loads(plaintext.decode("utf-8"))
                 base.update({
                     "title": inner.get("title"),

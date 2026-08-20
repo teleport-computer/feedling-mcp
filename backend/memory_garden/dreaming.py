@@ -29,7 +29,13 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-#: 做梦自己产出的卡带这个来源标记，不计入触发水位线。
+#: 整理产物的来源标记。内核只需要认出**这一个**语义：
+#: 「这张卡是不是上次整理产出的」——用来防止整理产物自己喂自己
+#: （整理完立刻又满足「攒够了」，无限循环）。
+#:
+#: 取值是 io 的历史约定，留作默认值；别的宿主用别的名字时，
+#: 把自己的值传给 `seed_cards(..., consolidated_source=...)` 即可 ——
+#: 内核不需要知道宿主还有哪些别的来源（那 17 个已于 2026-08-17 搬回 io）。
 DREAM_SOURCE = "memory_dream"
 
 #: 参与签名的字段。只用不可变或极少变的字段 —— 签名要能代表「花园的形状」，
@@ -66,14 +72,16 @@ class DreamVerdict:
     new_cards: int
 
 
-def seed_cards(all_cards: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+def seed_cards(all_cards: Sequence[Mapping[str, Any]], *,
+               consolidated_source: str | None = None) -> list[Mapping[str, Any]]:
     """筛出计入水位线的卡：**排除做梦自己产出的**。
 
     注意入参是「全部卡」而不是「可用卡」—— 被做梦退休掉的旧种子卡仍要算数，
     否则水位线会因为一次整理而回退，下次又触发。
     """
+    marker = str(consolidated_source or DREAM_SOURCE)
     return sorted(
-        (c for c in all_cards if str(c.get("source") or "").strip() != DREAM_SOURCE),
+        (c for c in all_cards if str(c.get("source") or "").strip() != marker),
         key=lambda c: str(c.get("id") or ""),
     )
 
@@ -91,13 +99,14 @@ def dream_snapshot(
     *,
     available_cards: Sequence[Mapping[str, Any]],
     all_cards: Sequence[Mapping[str, Any]],
+    consolidated_source: str | None = None,
 ) -> DreamSnapshot:
     """从两份已过滤的卡列表算出快照。
 
     ``available_cards`` —— 当前可用的卡（宿主已按可见性/归属过滤）。
     ``all_cards``       —— 含已被取代的全部卡，用来算只增不减的水位线。
     """
-    seeds = seed_cards(all_cards)
+    seeds = seed_cards(all_cards, consolidated_source=consolidated_source)
     return DreamSnapshot(
         card_count=len(available_cards),
         seed_card_count=len(seeds),

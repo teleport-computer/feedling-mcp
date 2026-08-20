@@ -14,6 +14,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from asgi_test_client import make_client  # noqa: E402
 from core import store as core_store  # noqa: E402
+from core import envelope as core_envelope  # noqa: E402
 from chat import chat_core  # noqa: E402
 
 
@@ -54,6 +55,65 @@ def test_write_message_accepts_file(store):
     assert m["content_type"] == "file"
     assert m["file_name"] == "plan.md"
     assert m["file_mime"] == "text/markdown"
+
+
+def test_write_message_accepts_binary_plaintext_file_when_effective_off(
+    store, monkeypatch,
+):
+    raw = b"\x00plaintext-file\xff"
+    monkeypatch.setattr(
+        core_envelope,
+        "resolve_content_encryption",
+        lambda _uid: "off",
+    )
+    payload = {
+        "envelope": {
+            "v": 1,
+            "id": "env-plain-file",
+            "body_b64": _b64(raw),
+            "body_size_bytes": len(raw),
+            "visibility": "shared",
+            "owner_user_id": store.user_id,
+        },
+        "content_type": "file",
+        "file_name": "plain.bin",
+        "file_mime": "application/octet-stream",
+    }
+
+    body, status = chat_core.write_message(store, payload)
+
+    assert status == 200, body
+    message = next(
+        x for x in store.chat_messages if x["id"] == "env-plain-file"
+    )
+    assert message["body_b64"] == _b64(raw)
+    assert message["body_size_bytes"] == len(raw)
+    assert "body_ct" not in message and "K_enclave" not in message
+
+
+def test_write_message_rejects_binary_plaintext_file_when_effective_on(
+    store, monkeypatch,
+):
+    monkeypatch.setattr(
+        core_envelope,
+        "resolve_content_encryption",
+        lambda _uid: "on",
+    )
+    body, status = chat_core.write_message(
+        store,
+        {
+            "envelope": {
+                "id": "env-rejected-plain-file",
+                "body_b64": _b64(b"plaintext"),
+                "visibility": "shared",
+                "owner_user_id": store.user_id,
+            },
+            "content_type": "file",
+        },
+    )
+
+    assert status == 400
+    assert body["error"] == "plaintext_envelope_not_enabled_for_this_account"
 
 
 def test_write_message_rejects_unknown_content_type(store):

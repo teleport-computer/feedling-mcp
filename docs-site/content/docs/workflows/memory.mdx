@@ -590,7 +590,8 @@ X-API-Key: YOUR_FEEDLING_API_KEY
       "owner_user_id": "usr_0123456789abcdef"
     }
   ],
-  "total": 1
+  "total": 73,
+  "next_cursor": "eyJoIjp0cnVlLCJpIjoibW9tXzdmMjBkMzlhZjMyMSIsInQiOiIyMDI2LTA3LTEzVDEyOjMwOjAwKzAwOjAwIiwidiI6MX0"
 }
 ```
 
@@ -598,9 +599,12 @@ X-API-Key: YOUR_FEEDLING_API_KEY
 comparison, so equivalent `Z`, offset, and legacy naive datetime strings sort
 consistently. Date-only values are interpreted at UTC midnight. Invalid card
 timestamps sort after valid timestamps and are excluded when a valid `since`
-filter is active. Results are newest first, `limit` is capped at 200, and
-`total` is the number matching the filters before the page slice. This endpoint
-does not expose a universal cursor token; see
+filter is active. Results are newest first with memory ID as a stable tie-break.
+The default `limit` is 50 and the server caps a page at 500. `total` is the
+number matching the filters before any cursor or page slice, so it stays
+constant while paging. Pass each opaque `next_cursor` back as `cursor` until the
+response returns `next_cursor: null`. Existing clients may continue to omit the
+cursor and receive the same first-page filtering and ordering behavior. See the
 [pagination rules](/docs/reliability#pagination).
 
 ## Retype an existing card

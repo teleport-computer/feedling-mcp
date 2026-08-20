@@ -682,6 +682,22 @@ def test_photo_one_step_store(env):
     assert any(c == "photos" for c, _ in wakes)               # legacy dormant fallback fired
 
 
+def test_photo_storage_failure_is_retryable_and_never_confirmed(env, monkeypatch):
+    fake, wakes = env
+    monkeypatch.setattr(fake, "put_photo_envelope", lambda *_args, **_kwargs: False)
+
+    out, code = service.photo_evaluate(
+        UID,
+        {"scene_hint": "landscape"},
+        {"id": "p_failed", "body_ct": "cipher"},
+    )
+
+    assert code == 503
+    assert out == {"error": "photo_storage_unavailable"}
+    assert service.photos_recent(UID)[0]["photos"] == []
+    assert wakes == []
+
+
 def test_photo_v2_burst_dedup_collapses_rapid_captures(env, monkeypatch):
     """V2 photo path reapplies the 30s burst/cluster dedup: rapid captures must
     collapse to a single wake (regression — the v2 differ keys on a unique

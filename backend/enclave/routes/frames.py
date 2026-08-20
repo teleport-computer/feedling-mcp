@@ -15,7 +15,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 
 import anyio.to_thread
 import httpx
@@ -24,15 +23,13 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 import provider_client
+from core.frame_ids import is_supported_frame_id
 from enclave import auth, backend_client, config, envelope, state, visual
 from enclave.routes._errors import backend_call_or_error, content_sk_or_503
 from enclave.routes._json import json_response_offthread
 
 router = APIRouter()
 log = logging.getLogger("feedling.enclave.screen_frames")
-
-_FRAME_ID_RE = re.compile(r"^[a-f0-9]{16,64}$")
-
 
 def _conditional_image_response(request: Request, image_bytes: bytes,
                                  image_mime: str, frame_id: str):
@@ -110,7 +107,7 @@ async def v1_frame_decrypt(frame_id: str, request: Request):
         return JSONResponse(
             {"error": "not_ready", "detail": state._state["error"]}, status_code=503)
 
-    if not _FRAME_ID_RE.match(frame_id or ""):
+    if not is_supported_frame_id(frame_id):
         return JSONResponse({"error": "bad frame id"}, status_code=400)
 
     ctx = auth.extract_auth(request)
@@ -182,7 +179,7 @@ async def v1_frame_caption(frame_id: str, request: Request):
         return JSONResponse(
             {"error": "not_ready", "detail": state._state["error"]}, status_code=503)
 
-    if not _FRAME_ID_RE.match(frame_id or ""):
+    if not is_supported_frame_id(frame_id):
         return JSONResponse({"error": "bad frame id"}, status_code=400)
 
     # Read live so tests / rotated secrets take effect without a restart.
@@ -280,7 +277,7 @@ async def v1_frame_image(frame_id: str, request: Request):
         return JSONResponse(
             {"error": "not_ready", "detail": state._state["error"]}, status_code=503)
 
-    if not _FRAME_ID_RE.match(frame_id or ""):
+    if not is_supported_frame_id(frame_id):
         return JSONResponse({"error": "bad frame id"}, status_code=400)
 
     ctx = auth.extract_auth(request)

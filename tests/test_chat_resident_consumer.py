@@ -642,6 +642,112 @@ def test_post_reply_uses_cached_whoami_keys_when_refresh_fails(monkeypatch):
     assert captured["json"]["envelope"]["visibility"] == "shared"
 
 
+def test_post_reply_uses_plaintext_envelopes_when_effective_off(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"id": "m_plain", "ts": 3.0}
+
+    def _post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        return _Resp()
+
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {
+            "user_id": "usr_plain",
+            "user_pk": b"p" * 32,
+            "enclave_pk": b"e" * 32,
+            "content_encryption_effective": "off",
+        },
+    )
+    monkeypatch.setattr(
+        crc,
+        "_build_envelope",
+        lambda **kw: pytest.fail("plaintext-tier reply must not call build_envelope"),
+    )
+    monkeypatch.setattr(crc._HTTP, "post", _post)
+
+    body = crc.post_reply(
+        "plain reply",
+        thinking_summary="plain thought",
+        file_followups=[
+            crc.StagedChatFile(
+                source_path="/tmp/report.txt",
+                name="report.txt",
+                mime_type="text/plain",
+                data=b"plain file",
+            )
+        ],
+    )
+
+    assert body["id"] == "m_plain"
+    payload = captured["json"]
+    assert payload["envelope"] == {
+        "body": "plain reply",
+        "owner_user_id": "usr_plain",
+        "visibility": "shared",
+    }
+    assert payload["thinking_envelope"] == {
+        "body": "plain thought",
+        "owner_user_id": "usr_plain",
+        "visibility": "shared",
+    }
+    file_envelope = payload["file_followups"][0]["envelope"]
+    assert base64.b64decode(file_envelope["body_b64"], validate=True) == b"plain file"
+    assert file_envelope["body_size_bytes"] == len(b"plain file")
+    assert file_envelope["owner_user_id"] == "usr_plain"
+    assert file_envelope["visibility"] == "shared"
+    assert all(
+        key not in payload["envelope"]
+        for key in ("body_ct", "nonce", "K_user", "K_enclave")
+    )
+
+
+def test_post_reply_unknown_effective_value_fails_safe_to_encryption(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"id": "m_safe", "ts": 4.0}
+
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {
+            "user_id": "usr_safe",
+            "user_pk": b"p" * 32,
+            "enclave_pk": b"e" * 32,
+            "content_encryption_effective": "unexpected",
+        },
+    )
+    monkeypatch.setattr(crc, "_build_envelope", lambda **kw: {"body_ct": "sealed"})
+
+    def _post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        return _Resp()
+
+    monkeypatch.setattr(crc._HTTP, "post", _post)
+    assert crc.post_reply("safe reply")["id"] == "m_safe"
+    assert captured["json"]["envelope"] == {"body_ct": "sealed"}
+
+
 def test_post_reply_skips_when_whoami_refresh_fails_without_cache(monkeypatch):
     posted = []
 
@@ -1023,6 +1129,46 @@ def test_fetch_from_enclave_gives_up_after_max_attempts(monkeypatch):
 
     assert result is None
     assert mock_client.get.call_count == crc.ENCLAVE_FETCH_MAX_ATTEMPTS
+
+
+def test_plaintext_history_uses_backend_without_bulk_enclave(monkeypatch):
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"messages": [{
+                "id": "m-plain",
+                "ts": 2.0,
+                "role": "user",
+                "content_type": "text",
+                "body": "hello local",
+                "owner_user_id": "usr_plain",
+            }]}
+
+    monkeypatch.setattr(crc._HTTP, "get", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr(
+        crc,
+        "_fetch_from_enclave",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext history must not use bulk enclave")
+        ),
+    )
+
+    result = crc.get_decrypted_history(since=1.0, limit=20)
+
+    assert result[0]["content"] == "hello local"
+
+
+def test_resident_plaintext_envelope_helpers_never_call_enclave(monkeypatch):
+    monkeypatch.setattr(
+        crc,
+        "_ENCLAVE_CLIENT",
+        object(),
+    )
+
+    assert crc._decrypt_envelope({"body": "mcp local"}) == b"mcp local"
+    assert crc._decrypt_sealed_material({"body": "genesis local"}) == b"genesis local"
 
 
 def test_image_message_passes_image_context_to_agent(monkeypatch, tmp_path):
@@ -3851,34 +3997,37 @@ def test_migrate_job_fails_when_legacy_batch_response_missing(monkeypatch):
     assert all(row[2] != "migrate_no_legacy" for row in statuses)
 
 
-def test_capture_identity_context_prefers_enclave_plaintext_and_filters_ciphertext(monkeypatch):
+def test_capture_identity_context_decodes_plaintext_without_enclave(monkeypatch):
     calls = []
 
     def _get_json(path, **kwargs):
         calls.append((path, kwargs.get("base_url")))
+        if kwargs.get("base_url"):
+            raise AssertionError("plaintext identity must not call enclave")
         return {
             "identity": {
-                "agent_name": "IO",
-                "user_preferred_name": "Seven",
-                "self_introduction": "陪 Seven 一起生活。",
-                "dimensions": [{"key": "tone", "value": "direct"}],
-                "body_ct": "ciphertext-must-not-enter-prompt",
-                "K_user": "wrapped-key-must-not-enter-prompt",
+                "body": json.dumps({
+                    "agent_name": "IO",
+                    "user_preferred_name": "Seven",
+                    "self_introduction": "陪 Seven 一起生活。",
+                    "dimensions": [{"key": "tone", "value": "direct"}],
+                }),
+                "owner_user_id": "usr_plain",
+                "visibility": "shared",
             }
         }
 
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "http://enclave.local")
     monkeypatch.setattr(crc, "_capture_get_json", _get_json)
+    monkeypatch.setitem(crc._whoami_cache, "user_id", "usr_plain")
 
     identity, ai_name, user_name, identity_text = crc._capture_identity_context()
 
-    assert calls == [("/v1/identity/get", "http://enclave.local")]
+    assert calls == [("/v1/identity/get", None)]
     assert ai_name == "IO"
     assert user_name == "Seven"
     assert identity["self_introduction"] == "陪 Seven 一起生活。"
-    assert "body_ct" not in identity_text
-    assert "K_user" not in identity_text
-    assert "ciphertext-must-not-enter-prompt" not in identity_text
+    assert "body" not in identity_text
 
 
 def test_capture_job_add_card_writes_envelope_without_chat_or_delivery(monkeypatch):
@@ -8541,6 +8690,46 @@ def test_load_whoami_caches_archive_language(monkeypatch):
 
     assert crc._load_whoami() is True
     assert crc._whoami_cache["archive_language"] == "en"
+
+
+def test_load_whoami_caches_content_encryption_effective(monkeypatch):
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "user_id": "usr_plain",
+                "public_key": base64.b64encode(b"p" * 32).decode(),
+                "enclave_content_public_key_hex": (b"e" * 32).hex(),
+                "content_encryption_effective": "off",
+            }
+
+    monkeypatch.setattr(crc, "_whoami_cache", {})
+    monkeypatch.setattr(crc._HTTP, "get", lambda *a, **kw: _Resp())
+
+    assert crc._load_whoami() is True
+    assert crc._whoami_cache["content_encryption_effective"] == "off"
+
+
+def test_load_whoami_unknown_content_encryption_effective_defaults_on(monkeypatch):
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "user_id": "usr_safe",
+                "public_key": base64.b64encode(b"p" * 32).decode(),
+                "enclave_content_public_key_hex": (b"e" * 32).hex(),
+                "content_encryption_effective": "future-value",
+            }
+
+    monkeypatch.setattr(crc, "_whoami_cache", {})
+    monkeypatch.setattr(crc._HTTP, "get", lambda *a, **kw: _Resp())
+
+    assert crc._load_whoami() is True
+    assert crc._whoami_cache["content_encryption_effective"] == "on"
 
 
 def test_load_whoami_defaults_archive_language_to_empty_when_absent(monkeypatch):

@@ -62,3 +62,27 @@ def test_resident_account_still_blocked_by_resident_consumer_gate(monkeypatch):
     body, status = gated
     assert status == 409
     assert body["stage"] == "needs_resident_consumer"
+    assert body["retryable"] is True
+
+
+def test_non_liveness_bootstrap_stages_are_not_retryable(monkeypatch):
+    passing = {
+        **_NOT_PASSING,
+        "passing": True,
+        "official": True,
+        "decrypt_health": {"status": "ok", "required": ""},
+    }
+    monkeypatch.setattr(boot_gates, "_bootstrap_state", lambda store: dict(_MAIN_LOOP_STATE))
+    monkeypatch.setattr(accounts_onboarding, "_load_onboarding_route", lambda store: "resident")
+    monkeypatch.setattr(chat_consumer, "_consumer_validation_state", lambda *args, **kwargs: dict(passing))
+    monkeypatch.setattr(
+        chat_consumer,
+        "_decrypt_health_enforcement_state",
+        lambda *args, **kwargs: {"blocks_chat": False},
+    )
+    monkeypatch.setattr(boot_gates, "_chat_loop_verified_by_server", lambda store: False)
+
+    body, status = boot_gates._gate_bootstrap_for_chat(_Store())
+    assert status == 409
+    assert body["stage"] == "needs_live_connection"
+    assert body["retryable"] is False

@@ -32,10 +32,10 @@ import logging
 from psycopg.types.json import Jsonb
 
 import db
-from core import enclave as core_enclave
 from core import envelope as core_envelope
 from identity import identity_core
 from identity import user_naming
+from memory_garden.policies import RESTRAINT_RULE_QUOTE as _RESTRAINT_QUOTE
 
 log = logging.getLogger("feedling.voice.transcript_store")
 
@@ -103,7 +103,7 @@ def capture_window_header(*, turn_count=None, user_name: str = "",
 
     做两件事:
     1. 说清谁是谁(转写两侧都是真名,不带第一人称);
-    2. 换尺子。capture 提示词里那句「宁少勿多、只留一到两件」是为闲聊窗口写的,
+    2. 换尺子。capture 提示词里那句「少而精、只留一到两件」是为闲聊窗口写的,
        对一通电话是错的量纲 —— 实测 12 件明确值得记的事只留下 2 件
        (2026-08-07 探针)。不改提示词本身(那会影响所有 capture),只在这里把
        「这段是什么」讲明白。
@@ -118,7 +118,8 @@ def capture_window_header(*, turn_count=None, user_name: str = "",
         "以下是一通完整电话的逐字记录，不是一段闲聊。\n"
         "电话的信息密度远高于日常对话：这个人会在一通里一口气讲很多件彼此独立的事"
         "——承诺与计划、家人、身体、工作进展、习惯的改变、在意的传统。\n"
-        "**上面那条「宁少勿多、只留一到两件」是为闲聊窗口写的，不适用于这里。**"
+        f"**上面那条「{_RESTRAINT_QUOTE}」（少而精、只留一到两件）是为闲聊窗口写的，"
+        "不适用于这里。**"
         "请把这通电话当成一份清单逐件过：这个人明确讲出来的每一件事，只要三个月后"
         "还可能重要、或这个人会希望你记得，就各自成卡。同一件事的多个侧面仍然合成"
         "一张厚卡，但不同的事**不要**为了凑数量少而合并。"
@@ -288,7 +289,7 @@ def load_plaintext(user_id: str, call_id: str, *, runtime_token: str = "",
     row = get_envelope(user_id, call_id)
     if not row or not isinstance(row.get("transcript"), dict):
         raise RuntimeError("voice_transcript_not_found")
-    plaintext = core_enclave._decrypt_envelope_via_enclave(
+    plaintext = core_envelope.read_envelope_body(
         row["transcript"],
         api_key,
         purpose="voice_transcript_read",

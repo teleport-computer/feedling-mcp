@@ -79,7 +79,7 @@ def _fake_envelope(monkeypatch):
     from core import envelope as core_envelope
     monkeypatch.setattr(
         core_envelope, "_build_shared_envelope_for_store",
-        lambda store, raw, item_id=None: ({"v": 1, "id": item_id, "ct": raw.hex()}, ""),
+        lambda store, raw, item_id=None: ({"v": 1, "id": item_id, "body_ct": raw.hex()}, ""),
     )
 
 

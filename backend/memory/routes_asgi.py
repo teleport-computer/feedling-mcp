@@ -63,7 +63,10 @@ def _post_enclave_for(runtime_token):
 # readside (auth only; forwards api key + runtime token to the enclave)
 # --------------------------------------------------------------------------- #
 
-@router.post("/v1/memory/index")
+@router.post(
+    "/v1/memory/index",
+    responses={503: {"description": "Memory storage or readside unavailable"}},
+)
 async def memory_index(request: Request, auth: AuthResult = Depends(require_auth)):
     payload = (await asgi_http.read_json_silent(request)) or {}
     runtime_token = auth_core.extract_runtime_token(request.headers)
@@ -164,7 +167,10 @@ async def memory_list(request: Request, auth: AuthResult = Depends(require_auth)
     body, status = await threadpool.run_db(
         memory_core.list_moments,
         auth.store,
-        limit_raw=request.query_params.get("limit", 50),
+        limit_raw=request.query_params.get(
+            "limit", memory_core.MEMORY_LIST_DEFAULT_LIMIT
+        ),
+        cursor=request.query_params.get("cursor", ""),
         since=request.query_params.get("since", ""),
         include_archived_raw=request.query_params.get("include_archived"),
     )

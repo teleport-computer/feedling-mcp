@@ -1,9 +1,9 @@
 # Fable 5 在 Runtime V1 的 Claude Code 模型适配问题与修复方案
 
-**日期**：2026-08-07  
-**测试用户**：`usr_6491814d52abdf99`（test）  
-**涉及运行时**：Runtime V1 resident、Claude Code CLI  
-**涉及供应商**：Anthropic 直连  
+**日期**：2026-08-07
+**测试用户**：`usr_6491814d52abdf99`（test）
+**涉及运行时**：Runtime V1 resident、Claude Code CLI
+**涉及供应商**：Anthropic 直连
 **报告状态**：Claude Code 已回滚至 2.1.195；Claude 家族内 fallback 允许，跨家族错配仍 fail-closed
 
 > **2026-08-08 后续决策**：Claude Code/Anthropic 调用链可能把所请求的
@@ -499,19 +499,19 @@ Opus 4.8 → Fable 5 → Opus 5 → Sonnet 4.6 → Opus 4.8
 
 ## 12. 建议拆分的开发任务
 
-1. **P0：Claude 显式模型选择**  
+1. **P0：Claude 显式模型选择**
    route model 进入默认 CLI `--model`，补 command/env 单元测试。
 
-2. **P0：实际模型一致性安全门**  
+2. **P0：实际模型一致性安全门**
    提取结构化 actual model，新增 `model_mismatch` 错误分类和用户提示。
 
-3. **P0：resident session provenance**  
+3. **P0：resident session provenance**
    provider/model/base URL fingerprint 进入 entry signature。
 
-4. **P1：credential/config route-version invalidation**  
+4. **P1：credential/config route-version invalidation**
    消除 provider 快速切换后的旧 key 窗口。
 
-5. **验证与灰度**  
+5. **验证与灰度**
    运行 Anthropic Claude 模型矩阵并保存脱敏证据。
 
 ---

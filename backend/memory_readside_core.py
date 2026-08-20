@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 import httpx
 
+from core import envelope as core_envelope
+from enclave import readside as enclave_readside
 from memory import service as memory_service
 from memory_garden import timestamps as memory_timestamps
 
@@ -92,7 +95,11 @@ def memory_available(
         return False
     if moment.get("visibility") == "local_only":
         return False
-    if not moment.get("K_enclave"):
+    if (
+        not moment.get("K_enclave")
+        and moment.get("body") is None
+        and moment.get("body_b64") is None
+    ):
         return False
     status = _status(moment)
     if status == "superseded" and not include_superseded:
@@ -242,6 +249,96 @@ def post_enclave_readside(
     return response
 
 
+def _partition_memory_candidates(
+    candidates: list[dict],
+    owner_user_id: str,
+) -> tuple[list[dict], list[dict], list[str]]:
+    plaintext: list[dict] = []
+    sealed: list[dict] = []
+    invalid_ids: list[str] = []
+    for candidate in candidates:
+        shape = core_envelope.classify_envelope_shape(candidate)
+        if shape in ("plaintext_text", "plaintext_binary"):
+            plaintext.append(candidate)
+        elif shape == "sealed":
+            projection = dict(candidate)
+            projection.pop("body", None)
+            projection.pop("body_b64", None)
+            sealed.append(projection)
+        else:
+            memory_id = str(candidate.get("id") or "")
+            if memory_id:
+                invalid_ids.append(memory_id)
+    return plaintext, sealed, invalid_ids
+
+
+def _local_memory_items(
+    candidates: list[dict],
+    owner_user_id: str,
+    *,
+    item_builder,
+) -> tuple[list[dict], list[str]]:
+    items: list[dict] = []
+    unavailable_ids: list[str] = []
+    for candidate in candidates:
+        memory_id = str(candidate.get("id") or "")
+        try:
+            raw = core_envelope.read_plaintext_envelope_body(
+                candidate, owner_user_id=owner_user_id)
+            inner = json.loads(raw.decode("utf-8"))
+            if not isinstance(inner, dict):
+                raise ValueError("memory plaintext is not an object")
+            items.append(item_builder(candidate, inner))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            if memory_id:
+                unavailable_ids.append(memory_id)
+    return items, unavailable_ids
+
+
+def _ordered_items(items: list[dict], candidates: list[dict], limit: int) -> list[dict]:
+    rank = {str(row.get("id") or ""): index for index, row in enumerate(candidates)}
+    return sorted(
+        (item for item in items if str(item.get("id") or "") in rank),
+        key=lambda item: rank[str(item.get("id") or "")],
+    )[:limit]
+
+
+def _memory_index_partition(
+    api_key: str | None,
+    candidates: list[dict],
+    owner_user_id: str,
+    payload: dict,
+    *,
+    post,
+) -> list[dict]:
+    plaintext, sealed, _invalid_ids = _partition_memory_candidates(
+        candidates, owner_user_id)
+    builder = (
+        enclave_readside.build_memory_search_item
+        if str(payload.get("query") or "").strip()
+        else enclave_readside.build_memory_index_item
+    )
+    local_items, _local_unavailable = _local_memory_items(
+        plaintext, owner_user_id, item_builder=builder)
+    local_items = enclave_readside.memory_index_filter_items(local_items, payload)
+    if not bool(payload.get("include_sensitive", False)):
+        local_items = [item for item in local_items if not item.get("is_sensitive")]
+
+    sealed_items: list[dict] = []
+    if sealed:
+        response = post(
+            api_key,
+            sealed,
+            operation="index",
+            payload=payload,
+        )
+        sealed_items = response.get("items") if isinstance(response.get("items"), list) else []
+    items = _ordered_items(local_items + sealed_items, candidates, int(payload["limit"]))
+    for item in items:
+        item.pop("_search_content", None)
+    return items
+
+
 def memory_index_core(
     store,
     api_key: str | None,
@@ -288,22 +385,22 @@ def memory_index_core(
             remaining = limit - len(items)
             if remaining <= 0:
                 break
-            response = post(
+            page = candidates[offset:offset + page_size]
+            items.extend(_memory_index_partition(
                 api_key,
-                candidates[offset:offset + page_size],
-                operation="index",
-                payload={**payload_base, "limit": remaining},
-            )
-            page_items = response.get("items") if isinstance(response.get("items"), list) else []
-            items.extend(page_items[:remaining])
+                page,
+                store.user_id,
+                {**payload_base, "limit": remaining},
+                post=post,
+            ))
     else:
-        response = post(
+        items = _memory_index_partition(
             api_key,
             candidates,
-            operation="index",
-            payload=payload_base,
+            store.user_id,
+            payload_base,
+            post=post,
         )
-        items = response.get("items") if isinstance(response.get("items"), list) else []
     return {
         "items": items,
         "limit": limit,
@@ -350,17 +447,32 @@ def memory_fetch_core(
             unavailable_ids.append(memory_id)
             continue
         candidates.append(moment)
-    response = (post_enclave or post_enclave_readside)(
-        api_key,
-        candidates,
-        operation="fetch",
-        payload={"ids": [m.get("id") for m in candidates], "limit": limit},
+    plaintext, sealed, invalid_ids = _partition_memory_candidates(
+        candidates, store.user_id)
+    local_items, local_unavailable = _local_memory_items(
+        plaintext,
+        store.user_id,
+        item_builder=enclave_readside.build_memory_fetch_item,
     )
+    local_items = [item for item in local_items if not item.get("is_sensitive")]
+    response = {"items": [], "unavailable_ids": []}
+    if sealed:
+        response = (post_enclave or post_enclave_readside)(
+            api_key,
+            sealed,
+            operation="fetch",
+            payload={"ids": [m.get("id") for m in sealed], "limit": limit},
+        )
     enclave_unavailable = response.get("unavailable_ids") if isinstance(response.get("unavailable_ids"), list) else []
+    unavailable_ids.extend(invalid_ids)
+    unavailable_ids.extend(local_unavailable)
     unavailable_ids.extend(str(mid) for mid in enclave_unavailable if isinstance(mid, str))
+    response_items = (
+        response.get("items") if isinstance(response.get("items"), list) else []
+    )
     items_by_id = {
         item.get("id"): item
-        for item in (response.get("items") if isinstance(response.get("items"), list) else [])
+        for item in local_items + response_items
         if isinstance(item, dict)
     }
     referenced_ids = {str(mid) for mid in items_by_id.keys() if str(mid or "").strip()}

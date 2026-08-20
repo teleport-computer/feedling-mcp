@@ -125,16 +125,13 @@ def index_item_to_relevance_memory(item: dict) -> dict:
     summary = _text(item.get("summary"), 500)
     return {
         "id": _text(item.get("id"), 120),
-        "title": summary,
-        "description": summary,
-        "linked_dimension": buckets,
-        "context": buckets,
-        # Do not synthesize her_quote from index. The index should remain a
-        # no-raw-quote surface.
-        "her_quote": "",
-        # 私有搜索语料走 canonical 的 content 位 —— 于是 card_fields.text_for_match
-        # 会把它追加进 haystack，正文里的关键词才搜得到（本批要修的核心）。
-        # 这个 dict 只在 enclave 内用于打分，用完即弃，不会被序列化。
+        # 内核形状：summary / content / bucket（2026-08-17 边界整理，
+        # 此前这里合成的是 io 的老形状 title/description/linked_dimension）。
+        "summary": summary,
+        "bucket": buckets,
+        # 私有搜索语料放进 content 位 —— 正文里的关键词才搜得到。
+        # 索引本身仍是「无原话」的表面：这个 dict 只在 enclave 内用于打分，
+        # 用完即弃，不会被序列化。
         "content": _text(item.get("_search_content"), 5000),
         "occurred_at": _text(item.get("occurred_at"), 80),
         "created_at": _text(item.get("created_at"), 80),

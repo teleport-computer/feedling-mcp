@@ -52,6 +52,71 @@ def _moment(
     return moment
 
 
+def _plaintext_moment(mid: str, summary: str, *, content: str = "") -> dict:
+    moment = _moment(mid, k_enclave=False)
+    moment.pop("body_ct", None)
+    moment.pop("nonce", None)
+    moment.pop("K_user", None)
+    moment["body"] = __import__("json").dumps({
+        "summary": summary,
+        "content": content or summary,
+        "bucket": "未分类",
+        "threads": [],
+    }, ensure_ascii=False)
+    return moment
+
+
+def test_plaintext_memory_index_never_posts_enclave(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_core")
+    monkeypatch.setattr(
+        readside_core.memory_service,
+        "_load_moments",
+        lambda _store: [_plaintext_moment("m1", "needle summary")],
+    )
+
+    result = readside_core.memory_index_core(
+        store,
+        None,
+        {"query": "needle"},
+        post_enclave=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext memory must not post to enclave")
+        ),
+    )
+
+    assert [item["id"] for item in result["items"]] == ["m1"]
+
+
+def test_mixed_memory_fetch_posts_only_ciphertext(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_core")
+    plaintext = _plaintext_moment("p", "plain")
+    ciphertext = _moment("c")
+    monkeypatch.setattr(
+        readside_core.memory_service,
+        "_load_moments",
+        lambda _store: [plaintext, ciphertext],
+    )
+    monkeypatch.setattr(readside_core.memory_service, "_save_moments", lambda *_args: None)
+    seen = []
+
+    def post(_api_key, candidates, *, operation, payload=None):
+        seen.extend(candidates)
+        return {
+            "items": [{"id": "c", "summary": "cipher"}],
+            "unavailable_ids": [],
+        }
+
+    result = readside_core.memory_fetch_core(
+        store,
+        "key",
+        {"ids": ["p", "c"]},
+        post_enclave=post,
+    )
+
+    assert [row["id"] for row in seen] == ["c"]
+    assert all("body" not in row and "body_b64" not in row for row in seen)
+    assert [item["id"] for item in result["items"]] == ["p", "c"]
+
+
 def test_index_core_prefilters_sorts_caps_and_reports_card_count(monkeypatch):
     store = types.SimpleNamespace(user_id="usr_core")
     moments = [

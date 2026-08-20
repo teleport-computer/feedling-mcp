@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+from core import net_safety  # noqa: E402
 from hosted import mcp_client, mcp_probe  # noqa: E402
 
 from _ca_helpers import self_signed_ca_pem  # noqa: E402
@@ -381,10 +382,12 @@ def test_whole_operation_deadline_stops_infinite_slow_drip(monkeypatch):
 
 
 def test_dns_submission_capacity_fails_closed_without_default_executor():
+    # The bounded pool lives in core.net_safety now: every backend-originated
+    # resolution of an externally supplied hostname shares one budget.
     acquired = 0
     try:
-        for _ in range(mcp_probe._DNS_MAX_PENDING):
-            assert mcp_probe._DNS_SUBMISSION_SLOTS.acquire(blocking=False)
+        for _ in range(net_safety._DNS_MAX_PENDING):
+            assert net_safety._DNS_SUBMISSION_SLOTS.acquire(blocking=False)
             acquired += 1
         with pytest.raises(mcp_probe.ProbeError) as exc:
             asyncio.run(mcp_client.list_tools(URL, {}))
@@ -392,7 +395,26 @@ def test_dns_submission_capacity_fails_closed_without_default_executor():
         assert exc.value.detail == "resolver capacity exhausted"
     finally:
         for _ in range(acquired):
-            mcp_probe._DNS_SUBMISSION_SLOTS.release()
+            net_safety._DNS_SUBMISSION_SLOTS.release()
+
+
+def test_dns_submit_failure_keeps_the_probe_error_contract(monkeypatch):
+    """A resolver that cannot accept work at all is still a DNS failure to the
+    caller — not a raw executor exception leaking through the shared pool."""
+    class _Broken:
+        def submit(self, *args, **kwargs):
+            raise RuntimeError("executor shut down")
+
+    monkeypatch.setattr(net_safety, "_DNS_EXECUTOR", _Broken())
+    before = net_safety._DNS_SUBMISSION_SLOTS._value
+
+    with pytest.raises(mcp_probe.ProbeError) as exc:
+        asyncio.run(mcp_client.list_tools(URL, {}))
+
+    assert exc.value.kind == "dns"
+    assert exc.value.detail == "DNS resolver unavailable"
+    # The slot taken for the rejected submission must come back.
+    assert net_safety._DNS_SUBMISSION_SLOTS._value == before
 
 
 def test_one_shot_sse_is_bounded_then_parsed(monkeypatch):

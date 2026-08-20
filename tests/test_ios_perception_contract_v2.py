@@ -91,6 +91,18 @@ def test_ios_full_report_fixture_classifies_current_payload_shape():
     assert signals["unsupported"].status == "ignored"
 
 
+def test_plaintext_sensitive_envelope_does_not_require_enclave_decrypt():
+    signal = classify_item_v2({
+        "key": "weather",
+        "envelope": {"id": "weather-plain", "body": '{"values":{"condition":"rain"}}',
+                     "owner_user_id": "u1", "visibility": "shared"},
+        "changed": True,
+    })
+    assert signal.status == "changed"
+    assert signal.encrypted is False
+    assert signal.requires_decrypt is False
+
+
 def test_ios_unchanged_encrypted_signals_do_not_imply_wake():
     payload = _load("ios_report_unchanged.json")
     signals = _by_key(classify_report_v2(payload))

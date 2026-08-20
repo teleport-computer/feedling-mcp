@@ -237,6 +237,7 @@ services:
       # compose synthesis / build never aborts on an unset var; the backend
       # still fails fast at startup (db.py) if it ends up empty at runtime.
       DATABASE_URL: "${DATABASE_URL:-}"
+      FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
       # TEE 明文影子库（feedling-io-db-prod，独立 pg CVM）。best-effort 双写：
       # db.py 写主库后镜像到这里，tee_shadow.mirror 永不 raise、失败只计数，绝不
       # 拖垮主路径。两个都为空 = 双写 OFF（mirror.enabled() 需 FEEDLING_TEE_DUAL_WRITE=1
@@ -249,6 +250,11 @@ services:
       # 部署确认健康，再挑低峰翻开（改 PROD_FEEDLING_TEE_DUAL_WRITE + 重部署）。
       TEE_DATABASE_URL: "${TEE_DATABASE_URL:-}"
       FEEDLING_TEE_DUAL_WRITE: "${FEEDLING_TEE_DUAL_WRITE:-}"
+      # TEE-primary → independent decrypted shadow.  The app-role DSN is an
+      # encrypted deploy input; the literal gate defaults off for Gate 1.
+      PLAINTEXT_SHADOW_DATABASE_URL: "${PLAINTEXT_SHADOW_DATABASE_URL:-}"
+      FEEDLING_PLAINTEXT_SHADOW_ENABLED: "${FEEDLING_PLAINTEXT_SHADOW_ENABLED:-0}"
+      FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY: "${FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY:-}"
       # Cloudflare R2 (S3-compatible) offload for the heavy frame ciphertext
       # (backend/object_storage.py). Injected via `phala deploy -e R2_*=...`
       # (encrypted env channel). Empty default = feature OFF (body_ct stays
@@ -323,6 +329,7 @@ services:
       # (the setup path resolves/validates the same limit). See the serve-worker
       # block for the rationale. ${VAR:-} form → tunable without a new compose_hash.
       FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS: "${FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS:-131072}"
+      FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS: "${FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS:-32768}"
       # Genesis v2 (foreground-fast onboarding): greet on 3-5 core + identity
       # baseline, push the heavy reduce (the old ~37% failure surface) to the
       # background. Validated on test; flip to "false" to revert to the v1
@@ -404,6 +411,14 @@ services:
       FEEDLING_API_URL: "http://backend:5001"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
       DATABASE_URL: "${DATABASE_URL:-}"
+      FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
+      # Only the backend owns the elected decrypted-shadow drain.
+      FEEDLING_PLAINTEXT_SHADOW_ENABLED: "0"
+      # frame_get resolves R2-backed photo pointers in this process.
+      R2_ENDPOINT: "${R2_ENDPOINT:-}"
+      R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"
+      R2_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY:-}"
+      R2_FRAMES_BUCKET: "${R2_FRAMES_BUCKET:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       FEEDLING_V2_MAX_WORKERS: "4"
       FEEDLING_V2_FLEET_IDENTITY_REQUIRED: "1"
@@ -425,6 +440,7 @@ services:
       # call). ${VAR:-} form: tunable later via encrypted env WITHOUT a new
       # compose_hash; "0" restores strict fail-closed.
       FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS: "${FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS:-131072}"
+      FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS: "${FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS:-32768}"
       # web_fetch article extraction (trafilatura, runs in this serve-worker).
       # Default ON — a rollback lever, not a feature gate. Set to "0" to fall back
       # to the plain tag-strip; takes effect on the next serve-worker restart.

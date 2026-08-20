@@ -407,13 +407,12 @@ def _deploy_workflow() -> dict:
     return yaml.safe_load(REDIS_DEPLOY_WF.read_text())
 
 
-def test_deploy_workflow_is_manual_only_and_covers_three_environments():
+def test_deploy_workflow_is_disabled_while_redis_is_deprecated():
     wf = _deploy_workflow()
     # PyYAML 把裸 `on:` 解析成布尔 True 而不是字符串 "on"。
     triggers = wf[True] if True in wf else wf["on"]
-    assert set(triggers) == {"workflow_dispatch"}, "绝不并入 merge 自动部署"
-    options = triggers["workflow_dispatch"]["inputs"]["environment"]["options"]
-    assert options == ["test", "pre", "prod"]
+    assert set(triggers) == {"workflow_dispatch"}, "退役 workflow 不得自动触发"
+    assert wf["jobs"]["deploy"]["if"] == "${{ false }}", "退役期间 job 必须固定跳过"
 
 
 def test_deploy_workflow_maps_each_environment_to_the_right_phala_account():
@@ -564,14 +563,11 @@ def test_deploy_workflow_validates_environment_input_before_anything_else():
 REDIS_MONITOR_WF = ROOT / ".github" / "workflows" / "redis-monitor.yml"
 
 
-def test_monitor_runs_on_a_schedule_and_covers_prod_and_pre():
+def test_monitor_is_disabled_while_redis_cvms_are_stopped():
     wf = yaml.safe_load(REDIS_MONITOR_WF.read_text())
     triggers = wf[True] if True in wf else wf["on"]
-    assert "schedule" in triggers
-    assert triggers["schedule"][0]["cron"] == "*/30 * * * *"
-    # 监控矩阵覆盖 prod + pre，不覆盖 test（test 数据可弃，与 pg-monitor.yml 同理）。
-    envs = {row["env_name"] for row in wf["jobs"]["check"]["strategy"]["matrix"]["include"]}
-    assert envs == {"prod", "pre"}
+    assert set(triggers) == {"workflow_dispatch"}, "已停止的 CVM 不得再定时监控"
+    assert wf["jobs"]["check"]["if"] == "${{ false }}", "手工触发也必须固定跳过"
 
 
 def test_monitor_has_no_offsite_backup_freshness_check():

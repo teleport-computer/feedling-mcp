@@ -384,8 +384,12 @@ def test_preferences_set_language_and_timezone_parity(user):
     f_status, f_body = _flask_post("/v1/users/preferences", payload, h)
     a_status, a_body = _asgi_post("/v1/users/preferences", payload, h)
     assert f_status == a_status == 200
+    # content_encryption 是 v6 新增的一等偏好（Phase 2 Task 2.1）。响应体加字段是
+    # 加性契约变更，两侧实现仍然逐字一致——parity 断言的是 f == a，此处只是把
+    # 硬编码的期望值补齐。未设置时下发 "off"（v6 默认明文）。
     assert a_body == f_body == {
-        "status": "updated", "archive_language": "zh-Hans", "timezone": "Asia/Shanghai"}
+        "status": "updated", "archive_language": "zh-Hans", "timezone": "Asia/Shanghai",
+        "content_encryption": "off"}
 
 
 def test_preferences_empty_body_parity(user):
@@ -393,7 +397,11 @@ def test_preferences_empty_body_parity(user):
     h = {"X-API-Key": api_key}
     f = _flask_post("/v1/users/preferences", {}, h)
     a = _asgi_post("/v1/users/preferences", {}, h)
-    assert f == a == (400, {"error": "provide archive_language and/or timezone (string or null)"})
+    # 文案随 v6 新增的 content_encryption 一起扩了（Phase 2 Task 2.1）。这是给人看的
+    # 提示、不是机器契约；两侧实现仍逐字一致。
+    assert f == a == (400, {
+        "error": "provide archive_language, timezone, and/or content_encryption "
+                 "(string or null)"})
 
 
 def test_preferences_bad_timezone_parity(user):

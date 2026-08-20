@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+from core import envelope as core_envelope  # noqa: E402
 from perception import ingress_v2, service  # noqa: E402
 from perception.differ_v2 import PerceptionDifferV2  # noqa: E402
 from perception.signal_state_v2 import SignalObservationDecision  # noqa: E402
@@ -349,11 +350,11 @@ def test_weather_health_and_focus_ingress_are_pull_only_after_decrypt(monkeypatc
         "u_weather_health",
         [
             {"key": "focus", "data": json.dumps({"authorization_status": "authorized", "focused": True})},
-            {"key": "audio_route", "envelope": {"id": "env_audio"}, "changed": True},
-            {"key": "weather", "envelope": {"id": "env_weather"}, "changed": True},
-            {"key": "health_sleep", "envelope": {"id": "env_sleep"}, "changed": True},
-            {"key": "health_workout", "envelope": {"id": "env_workout"}, "changed": True},
-            {"key": "health_vitals", "envelope": {"id": "env_vitals"}, "changed": True},
+            {"key": "audio_route", "envelope": {"id": "env_audio", "body_ct": "Y3Q="}, "changed": True},
+            {"key": "weather", "envelope": {"id": "env_weather", "body_ct": "Y3Q="}, "changed": True},
+            {"key": "health_sleep", "envelope": {"id": "env_sleep", "body_ct": "Y3Q="}, "changed": True},
+            {"key": "health_workout", "envelope": {"id": "env_workout", "body_ct": "Y3Q="}, "changed": True},
+            {"key": "health_vitals", "envelope": {"id": "env_vitals", "body_ct": "Y3Q="}, "changed": True},
         ],
         client_ts=200.0,
         api_key="api-key",
@@ -382,6 +383,30 @@ def test_weather_health_and_focus_ingress_are_pull_only_after_decrypt(monkeypatc
     assert service.pull_snapshot("u_weather_health", now=200.0)["in_focus"] is True
     assert service.pull_snapshot("u_weather_health", now=200.0)["output_type"] == "bluetooth"
     assert emitted == []
+
+
+def test_plaintext_sensitive_signal_reads_without_decrypt_credential(monkeypatch):
+    fake = _Store()
+    monkeypatch.setattr(service, "store", fake)
+    monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
+    monkeypatch.setattr(core_envelope, "PLAINTEXT_WRITES_ACCEPTED", True)
+    monkeypatch.setattr(core_envelope, "resolve_content_encryption", lambda uid: "off")
+    body = json.dumps({"values": {"condition": "clear", "temperature": 21.5},
+                       "message": "local plaintext"})
+
+    results = service.ingest_snapshot_v2(
+        "u_plain_perception",
+        [{"key": "weather", "envelope": {
+            "id": "weather-plain", "owner_user_id": "u_plain_perception",
+            "visibility": "shared", "body": body,
+        }, "changed": True}],
+        client_ts=200.0,
+    )
+
+    assert results["weather"] == "accepted"
+    state = fake.get_state("u_plain_perception")
+    assert state["condition"]["v"] == "clear"
+    assert state["temperature"]["v"] == 21.5
 
 
 def test_encrypted_body_output_key_values_are_unwrapped_before_storage(monkeypatch):
@@ -438,9 +463,9 @@ def test_encrypted_body_output_key_values_are_unwrapped_before_storage(monkeypat
     results = service.ingest_snapshot_v2(
         "u_output_key_values",
         [
-            {"key": "motion_state", "envelope": {"id": "env_motion"}, "changed": True},
-            {"key": "calendar_next_event", "envelope": {"id": "env_calendar"}, "changed": True},
-            {"key": "playback", "envelope": {"id": "env_playback"}, "changed": True},
+            {"key": "motion_state", "envelope": {"id": "env_motion", "body_ct": "Y3Q="}, "changed": True},
+            {"key": "calendar_next_event", "envelope": {"id": "env_calendar", "body_ct": "Y3Q="}, "changed": True},
+            {"key": "playback", "envelope": {"id": "env_playback", "body_ct": "Y3Q="}, "changed": True},
         ],
         client_ts=250.0,
         api_key="api-key",
@@ -502,7 +527,7 @@ def test_calendar_encrypted_body_missing_next_event_clears_old_next_event(monkey
 
     results = service.ingest_snapshot_v2(
         "u_calendar_clear",
-        [{"key": "calendar_next_event", "envelope": {"id": "calendar_no_next"}, "changed": True}],
+        [{"key": "calendar_next_event", "envelope": {"id": "calendar_no_next", "body_ct": "Y3Q="}, "changed": True}],
         client_ts=300.0,
         api_key="api-key",
         decrypt_envelope=decrypt,
@@ -554,7 +579,7 @@ def test_location_signal_decrypt_feeds_wifi_anchor_differ_once(monkeypatch):
 
     first = service.ingest_snapshot_v2(
         user_id,
-        [{"key": "location_signal", "envelope": {"id": "loc_home_1"}, "changed": False}],
+        [{"key": "location_signal", "envelope": {"id": "loc_home_1", "body_ct": "Y3Q="}, "changed": False}],
         client_ts=300.0,
         api_key="api-key",
         decrypt_envelope=decrypt,
@@ -566,7 +591,7 @@ def test_location_signal_decrypt_feeds_wifi_anchor_differ_once(monkeypatch):
     )
     repeat = service.ingest_snapshot_v2(
         user_id,
-        [{"key": "location_signal", "envelope": {"id": "loc_home_2"}, "changed": True}],
+        [{"key": "location_signal", "envelope": {"id": "loc_home_2", "body_ct": "Y3Q="}, "changed": True}],
         client_ts=310.0,
         api_key="api-key",
         decrypt_envelope=decrypt,
@@ -578,7 +603,7 @@ def test_location_signal_decrypt_feeds_wifi_anchor_differ_once(monkeypatch):
     )
     moved = service.ingest_snapshot_v2(
         user_id,
-        [{"key": "location_signal", "envelope": {"id": "loc_work"}, "changed": True}],
+        [{"key": "location_signal", "envelope": {"id": "loc_work", "body_ct": "Y3Q="}, "changed": True}],
         client_ts=320.0,
         api_key="api-key",
         decrypt_envelope=decrypt,
@@ -664,7 +689,7 @@ def test_snapshot_v2_records_an_audit_event_when_a_signal_fails_to_decrypt(monke
 
     results = service.ingest_snapshot_v2(
         "u_decrypt_failure",
-        [{"key": "location_signal", "envelope": {"id": "loc_1"}, "changed": True}],
+        [{"key": "location_signal", "envelope": {"id": "loc_1", "body_ct": "Y3Q="}, "changed": True}],
         client_ts=500.0,
         api_key="api-key",
         decrypt_envelope=boom,
@@ -705,14 +730,14 @@ def test_location_signal_null_or_unchanged_anchor_does_not_wake(monkeypatch):
 
     service.ingest_snapshot_v2(
         "u_wifi_anchor_noop",
-        [{"key": "location_signal", "envelope": {"id": "loc_null"}, "changed": True}],
+        [{"key": "location_signal", "envelope": {"id": "loc_null", "body_ct": "Y3Q="}, "changed": True}],
         client_ts=300.0,
         api_key="api-key",
         decrypt_envelope=decrypt,
     )
     service.ingest_snapshot_v2(
         "u_wifi_anchor_unchanged",
-        [{"key": "location_signal", "envelope": {"id": "loc_unchanged"}, "changed": False}],
+        [{"key": "location_signal", "envelope": {"id": "loc_unchanged", "body_ct": "Y3Q="}, "changed": False}],
         client_ts=300.0,
         api_key="api-key",
         decrypt_envelope=decrypt,
@@ -999,7 +1024,7 @@ def test_report_decrypts_context_snapshot_even_for_resident_chat_users(monkeypat
         user_store,
         {
             "context_snapshot": [
-                {"key": "audio_route", "envelope": {"id": "env_a1"}, "changed": True},
+                {"key": "audio_route", "envelope": {"id": "env_a1", "body_ct": "Y3Q="}, "changed": True},
             ],
             "client_ts": 100.0,
         },

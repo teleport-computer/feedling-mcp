@@ -1,10 +1,12 @@
 ---
 title: Feedling API
-description: Build clients and agent integrations on Feedling's encrypted, user-scoped API.
+description: Build clients and agent integrations on Feedling's user-scoped API.
 ---
 
-Feedling exposes a versioned HTTP API for accounts, encrypted chat, model routing,
-agent memory, identity, perception, and proactive experiences.
+Feedling exposes a versioned HTTP API for accounts, chat, model routing, agent
+memory, identity, perception, and proactive experiences. Protected bodies are
+stored encrypted or as plaintext according to a per-user preference; see
+[architecture](/docs/architecture) for the trust boundary that follows from it.
 
 <Cards>
   <Card title="Getting started" description="Make your first authenticated request." href="/docs/getting-started" />

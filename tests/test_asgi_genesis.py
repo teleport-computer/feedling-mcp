@@ -578,6 +578,9 @@ def test_plaintext_update_identity_without_identity_enqueues_202_parity(user, mo
         headers=_headers(api_key),
         json_body=payload,
     )
+    # Flask and ASGI are alternate adapters, not two concurrent requests in
+    # this parity test. Clear the first adapter's active job before exercising
+    # the second; a real duplicate while processing correctly returns 409.
     _reset_genesis(uid)
     a = _asgi("POST", "/v1/genesis/imports/plaintext", headers=_headers(api_key), json_body=payload)
 

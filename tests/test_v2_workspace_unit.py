@@ -270,6 +270,40 @@ def test_workspace_prompt_jit_injects_complete_genesis_persona(monkeypatch):
     ]
 
 
+def test_workspace_prompt_prefers_current_plaintext_identity_view(monkeypatch):
+    monkeypatch.setattr(
+        serve_worker.cap_identity,
+        "get",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            ok=True,
+            data={"identity": {
+                "decrypt_status": "ok",
+                "agent_name": "pre c",
+                "user_preferred_name": "Seven",
+            }},
+        ),
+    )
+    monkeypatch.setattr(
+        serve_worker,
+        "_load_genesis_persona",
+        lambda *_args, **_kwargs: pytest.fail("identity card must suppress persona"),
+    )
+    monkeypatch.setattr(
+        serve_worker,
+        "production_workspace_backend",
+        lambda *_args, **_kwargs: InMemoryWorkspaceBackend(),
+    )
+
+    rendered = serve_worker._load_workspace_prompt(
+        SimpleNamespace(user_id="u-plaintext"), runtime_token="rt"
+    )
+
+    identity = rendered["identity_card_or_persona"]
+    assert "agent_name: \"pre c\"" in identity
+    assert "user_preferred_name: \"Seven\"" in identity
+    assert rendered["trusted_system_blocks"] == ()
+
+
 def test_workspace_prompt_without_genesis_persona_keeps_existing_shape(monkeypatch):
     monkeypatch.setattr(serve_worker.db, "get_blob", lambda *_args: None)
     monkeypatch.setattr(

@@ -15,6 +15,7 @@ import asyncio
 import base64
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -28,6 +29,7 @@ import worldbook_match
 from admin import data_track as admin_data_track
 from provider_types import ToolCall, ToolExchange
 from capabilities import registry as cap_registry
+from capabilities import tool_schema as cap_tool_schema
 from core import envelope as core_envelope
 from core import self_thinking
 from core import store as core_store
@@ -39,6 +41,7 @@ from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import language_follow
 from model_api_runtime.v2 import profile_store
 from model_api_runtime.v2 import serve_worker
+from model_api_runtime.v2 import tool_loop
 from model_api_runtime.v2 import worker
 
 pytestmark = pytest.mark.skipif(
@@ -3085,6 +3088,211 @@ def _job_status_row(job_id):
     return row
 
 
+def test_reply_tool_bubble_can_atomically_close_chat_without_second_message(
+    monkeypatch,
+):
+    uid = "u_toolloop_promote_intermediate"
+    conftest.seed_user(uid)
+    _reset(uid)
+    generation = db.get_runtime_generation(uid)
+    input_seq, job_id = db.chat_append_and_enqueue(
+        uid,
+        "promotion-parent",
+        10.0,
+        _user_doc("promotion-parent", "answer this"),
+        5000,
+        "chat",
+        expected_generation=generation,
+    )
+    job = jobs_store.claim_next_job("w-promote-intermediate")
+    assert job is not None and job["id"] == job_id
+    _stub_envelope_build(monkeypatch)
+
+    def read_after_seq(_user_id: str, after_seq: int):
+        return [
+            {
+                "id": row["id"],
+                "seq": int(row["seq"]),
+                "ts": float(row.get("ts") or 0),
+                "role": row.get("role"),
+                "content": row.get("test_plaintext") or "",
+            }
+            for row in db.chat_messages_after_seq(uid, after_seq, limit=None)
+            if row.get("role") == "user"
+        ]
+
+    calls = _script_provider(
+        monkeypatch,
+        [
+            _tool_round(_tc("r1", "reply", text="complete answer")),
+            {
+                "reply": "",
+                "reasoning": "no additional visible body",
+                "stop_reason": "end_turn",
+                "tool_calls": [],
+                "usage": {"completion_tokens": 3930},
+            },
+            {
+                "reply": "",
+                "reasoning": "still complete",
+                "stop_reason": "end_turn",
+                "tool_calls": [],
+                "usage": {"completion_tokens": 2},
+            },
+        ],
+    )
+    deps = worker.TurnDeps(
+        web_tools_enabled=lambda _uid: True,
+        read_messages=lambda _uid: read_after_seq(uid, 0),
+        read_messages_after_seq=read_after_seq,
+        read_tail_after_seq=lambda _uid, after_seq, limit, **kwargs: read_after_seq(
+            uid, after_seq
+        ),
+        read_summary_with_seq=lambda _uid: ("", 0.0, 0, 0),
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert len(calls) == 3  # the existing semantic-empty recovery still ran once
+    bubbles = _bubbles(uid)
+    assert len(bubbles) == 1
+    assert bubbles[0]["body_ct"] == "complete answer"
+    assert _job_status_row(job_id) == ("completed", None)
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == input_seq
+    parent = db.chat_doc_for_seq(uid, input_seq)
+    assert parent["reply_status"] == "replied"
+    assert parent["reply_message_id"] == bubbles[0]["id"]
+
+    with db.get_pool().connection() as conn:
+        effects = conn.execute(
+            "SELECT effect_id,effect_type,status,payload "
+            "FROM v2_effect_outbox WHERE user_id=%s AND job_id=%s "
+            "ORDER BY enqueue_seq",
+            (uid, job_id),
+        ).fetchall()
+    assert [(row[1], row[2]) for row in effects] == [
+        (v2_effect_outbox.INTERMEDIATE_REPLY_EFFECT_TYPE, "applied"),
+        (v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE, "applied"),
+    ]
+    source_effect_id = str(effects[0][0])
+    final_payload = effects[1][3]
+    replay_id = v2_effect_outbox.enqueue_reply_promotion(
+        intermediate_effect_id=source_effect_id,
+        job_id=job_id,
+        user_id=uid,
+        expected_generation=generation,
+        payload=final_payload,
+    )
+    assert replay_id == str(effects[1][0])
+    assert serve_worker._apply_pending_effects_for_user(uid) == {
+        "applied": 0,
+        "discarded": 0,
+    }
+    assert len(_bubbles(uid)) == 1
+
+
+def test_removing_reply_promotion_regresses_to_two_chat_messages(monkeypatch):
+    """Mutation guard: the old empty-reply failure adds a terminal error bubble."""
+    uid = "u_toolloop_promote_intermediate_mutation"
+    conftest.seed_user(uid)
+    _reset(uid)
+    generation = db.get_runtime_generation(uid)
+    _input_seq, job_id = db.chat_append_and_enqueue(
+        uid,
+        "promotion-mutation-parent",
+        10.0,
+        _user_doc("promotion-mutation-parent", "answer this"),
+        5000,
+        "chat",
+        expected_generation=generation,
+    )
+    job = jobs_store.claim_next_job("w-promote-intermediate-mutation")
+    assert job is not None and job["id"] == job_id
+    _stub_envelope_build(monkeypatch)
+
+    def read_after_seq(_user_id: str, after_seq: int):
+        return [
+            {
+                "id": row["id"],
+                "seq": int(row["seq"]),
+                "ts": float(row.get("ts") or 0),
+                "role": row.get("role"),
+                "content": row.get("test_plaintext") or "",
+            }
+            for row in db.chat_messages_after_seq(uid, after_seq, limit=None)
+            if row.get("role") == "user"
+        ]
+
+    _script_provider(
+        monkeypatch,
+        [
+            _tool_round(_tc("r1", "reply", text="complete answer")),
+            {
+                "reply": "",
+                "reasoning": "no additional visible body",
+                "stop_reason": "end_turn",
+                "tool_calls": [],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "reasoning": "still complete",
+                "stop_reason": "end_turn",
+                "tool_calls": [],
+                "usage": {},
+            },
+        ],
+    )
+    real_loop = worker.v2_tool_loop.run_tool_loop
+
+    async def run_without_promotion(**kwargs):
+        kwargs["on_promote_last_intermediate"] = None
+        return await real_loop(**kwargs)
+
+    monkeypatch.setattr(
+        worker.v2_tool_loop,
+        "run_tool_loop",
+        run_without_promotion,
+    )
+    deps = worker.TurnDeps(
+        web_tools_enabled=lambda _uid: True,
+        read_messages=lambda _uid: read_after_seq(uid, 0),
+        read_messages_after_seq=read_after_seq,
+        read_tail_after_seq=lambda _uid, after_seq, limit, **kwargs: read_after_seq(
+            uid, after_seq
+        ),
+        read_summary_with_seq=lambda _uid: ("", 0.0, 0, 0),
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "failed"
+    assert len(_bubbles(uid)) == 2
+
+
 def test_intermediate_reply_then_terminal_text_and_exactly_once_replay(monkeypatch):
     """Two-round script: round 0 the model calls `reply` (intermediate bubble)
     ALONGSIDE a `web_search` read tool call; round 1 the model stops with plain
@@ -3562,3 +3770,68 @@ def test_half_open_halt_gives_the_still_working_tool_a_collateral_error(monkeypa
     contents = _tool_result_contents(calls[1])
     assert "error: web_tool_halted" in contents           # search: really halted
     assert "error: batch_cancelled_web_halted" in contents  # fetch: collateral
+
+
+def test_child_subagent_tool_schemas_are_protected_from_folding(monkeypatch):
+    """子 agent 的 7 件工具全部标为「不可折叠」。
+
+    为什么必须是保护、而不是折叠+恢复:子 agent 的整个工具面只有 7 件,其中
+    只有 `memory_search` 是常驻;而 `mcp_tool_search` **不在**
+    `_SUBAGENT_ALLOWED_TOOLS` 里 —— 一旦被折成空参数表,它没有任何取回口,
+    表现是「看着工具名填不出参数」,在系统里和「模型自己不想调」无法区分。
+
+    ⚠️ 这条是**结构性**断言,不是端到端复现。我没能构造出真正让子轮折叠的
+    用例:7 份说明书合计约 1k token,要触发折叠需要模型写出 20k token 级别的
+    task prompt。所以这里钉住的是契约本身(保护集 == 全部 7 件)与它的三个
+    前提(工具面是这 7 件、只有一件常驻、没有 mcp_tool_search);任何一条被
+    改动,这个保护的必要性就变了,应当重新判断而不是照旧。
+    """
+    from model_api_runtime.v2 import tool_surface as v2_tool_surface
+
+    allowed = set(worker._SUBAGENT_ALLOWED_TOOLS)
+    assert len(allowed) == 7
+    # 前提一:没有恢复口。
+    assert cap_tool_schema.MCP_TOOL_SEARCH_TOOL not in allowed
+    # 前提二:只有一件是常驻工具,其余 6 件都在可折叠面上。
+    assert allowed & set(v2_tool_surface.RESIDENT_TOOL_NAMES) == {"memory_search"}
+
+    uid = "u_child_protected"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-child-protect")
+    _patch_real_write(monkeypatch)
+
+    seen_child_kwargs = []
+    real_run_tool_loop = worker.v2_tool_loop.run_tool_loop
+
+    async def _spy(**kwargs):
+        if kwargs.get("allow_reply_tool") is False:
+            seen_child_kwargs.append(kwargs)
+        return await real_run_tool_loop(**kwargs)
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", _spy)
+
+    responses = iter([
+        _tool_round(_tc("task-1", "task", prompt="Check the workspace.")),
+        _text_round("child evidence"),
+        _text_round("parent answer"),
+    ])
+
+    async def provider(config, messages, *, tools=None, **_kwargs):
+        return next(responses)
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    deps = _deps(messages=[
+        {"id": "m1", "ts": 10.0, "role": "user", "content": "check it"},
+    ])
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert len(seen_child_kwargs) == 1
+    protect = seen_child_kwargs[0].get("refresh_protected_extra_tool_names")
+    assert callable(protect), "child loop must declare a protected-name source"
+    assert set(protect()) == allowed

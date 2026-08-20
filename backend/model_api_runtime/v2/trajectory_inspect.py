@@ -106,7 +106,7 @@ def _validate_request(
 
 
 def _production_deps() -> InspectDeps:
-    from core import enclave as core_enclave
+    from core import envelope as core_envelope
     from core import runtime_token
     from model_api_runtime.v2 import jobs_store
 
@@ -127,7 +127,7 @@ def _production_deps() -> InspectDeps:
     def decrypt(user_id: str, envelope: dict, token: str) -> bytes:
         if str(envelope.get("owner_user_id") or "") != user_id:
             raise TrajectoryInspectError("trajectory_owner_mismatch")
-        return core_enclave._decrypt_envelope_via_enclave(
+        return core_envelope.read_envelope_body(
             envelope,
             None,
             purpose="runtime_v2_trajectory_break_glass",

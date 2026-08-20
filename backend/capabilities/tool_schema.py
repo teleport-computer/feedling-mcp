@@ -25,7 +25,7 @@ from identity import card_policy
 # Card-writing rules live with the memory package (single source of truth shared
 # with the V1 guidance block); only the op names above are V2-specific.
 from memory_garden.prompts import buckets as prompts_v1
-from memory_garden.types import MAX_MEMORY_SUPERSEDE_TARGETS
+from memory.source_policy import MAX_MEMORY_SUPERSEDE_TARGETS
 from perception.agent_fields import (
     AGENT_PERCEPTION_SIGNALS,
     AGENT_SIGNAL_FIELDS,
@@ -46,6 +46,7 @@ _EXCLUDED = frozenset({"chat_image_read", "chat_file_read", "perception_glance"}
 _STR = {"type": "string"}
 _INT = {"type": "integer"}
 _BOOL = {"type": "boolean"}
+_TRUE_BOOL = {"type": "boolean", "enum": [True], "default": True}
 _NO_ARGS: dict = {"type": "object", "properties": {}}
 
 _IDENTITY_DIMENSION = {
@@ -320,7 +321,7 @@ PARAMS: dict[str, dict] = {
     # params.get("include_image") (bool).
     "photo_read": {
         "type": "object",
-        "properties": {"photo_id": _STR, "include_image": _BOOL},
+        "properties": {"photo_id": _STR, "include_image": _TRUE_BOOL},
         "required": ["photo_id"],
     },
 
@@ -508,8 +509,12 @@ DESCRIPTIONS: dict[str, str] = {
                        "add, or delete, use identity_dimensions_set instead."),
     "identity_dimensions_set": (
         "Replace the persona's COMPLETE dimensions list without changing identity/profile "
-        "text fields. Use only for an explicit user-requested rewrite; call identity_get "
-        "first, then provide every dimension that should remain. Each item has a 'name', "
+        "text fields. Use only for an explicit user-requested rewrite. If the user "
+        "supplies the complete replacement list, or asks to delete all dimensions, "
+        "call this tool directly. Call identity_get first only when the request "
+        "depends on preserving or modifying unspecified existing dimensions whose "
+        "current values are not already in context. Always provide every dimension "
+        "that should remain. Each item has a 'name', "
         f"a numeric 'value' from {card_policy._VALUE_MIN} to {card_policy._VALUE_MAX}, "
         "and optional 'description' content. Renaming edits 'name'; an empty list deletes "
         f"all dimensions; at most {card_policy.MAX_DIMENSIONS} are allowed. A non-empty "
@@ -577,8 +582,9 @@ DESCRIPTIONS: dict[str, str] = {
     "history_search": (
         "Search the user's raw chat history (original message text from ANY "
         "time period, beyond what is visible in context) by substring query "
-        "and/or RFC3339 time range. Use it when memory tools miss and the "
-        "user asks about the original wording of an earlier conversation. "
+        "and/or RFC3339 time range. Use this directly for original wording "
+        "or conversation evidence; use the memory tools for remembered facts "
+        "or summaries. "
         "First call: give 'query' and/or 'start'/'end' (start inclusive, end "
         "exclusive, RFC3339 with explicit UTC offset; convert relative times "
         "like 'last month' yourself). 'limit' 1-5, default 3. Results are in "
@@ -670,11 +676,13 @@ DESCRIPTIONS: dict[str, str] = {
                     "returns an untrusted visual_observation instead of a local image_file "
                     "path."),
     "photo_recent": ("Use when the user's request depends on their photos; do not call for "
-                     "unrelated conversation. List recent photos, optionally capped by limit."),
+                     "unrelated conversation. List recent photo metadata, optionally capped "
+                     "by limit. This does not show you the actual image; call photo_read for "
+                     "a photo whose visual content you need."),
     "photo_read": ("Use when the user's request depends on a specific photo; do not call "
-                   "for unrelated conversation. Read a specific photo by id. Set "
-                   "include_image=true only when metadata "
-                   "is insufficient; Runtime V2 inspects the decrypted pixels through its "
+                   "for unrelated conversation. Read and visually inspect a specific photo "
+                   "by id. Pixels are included by default; photo_recent is the metadata-only "
+                   "tool. Runtime V2 inspects the decrypted pixels through its "
                    "native vision observer and returns an untrusted visual_observation "
                    "instead of a local image_file path."),
     "web_search": "Search the live public web for current information such as news, weather, prices, or recent events, or anything past your training data that you are not sure is current. Prefer this over guessing or telling the user you cannot access the internet.",
@@ -711,8 +719,9 @@ DESCRIPTIONS: dict[str, str] = {
     REPLY_TOOL: (
         "Send an immediate reply bubble to the user with the given text during a "
         "long-running task when timely progress feedback is useful. This bubble is "
-        "not the final reply, does not need and must not include <think>, and must "
-        "not replace the final reply."
+        "sent without <think>. If it already says everything you need to say, end "
+        "the turn with no additional visible text and do not repeat it. Continue "
+        "to a final visible answer only when you still have new content for the user."
     ),
     STAY_SILENT_TOOL: (
         "Choose not to send a proactive message on this wake. Give one short, "
@@ -752,6 +761,9 @@ DESCRIPTIONS: dict[str, str] = {
     ),
     MEMORY_ORGANIZE_TOOL: (
         "Queue a full Dream reorganization of the user's existing memory garden. "
+        "For an explicit whole-garden or bulk request to organize, consolidate, "
+        "or clean up memories, call this tool directly; do not browse with "
+        "memory_index first. "
         "Dream already runs automatically at night; call this only when the user "
         "explicitly asks you to organize, consolidate, or clean up their memories. "
         "Do not call it proactively or for ordinary single-card edits (use memory_write "
@@ -759,10 +771,10 @@ DESCRIPTIONS: dict[str, str] = {
         "turn merge cards directly."
     ),
     MCP_TOOL_SEARCH_TOOL: (
-        "Load complete argument schemas for user-connected MCP tools whose names "
-        "and short descriptions are already visible. Provide either a search query "
-        "or exact qualified tool names. After this returns, call a resolved tool in "
-        "a later round using its newly available parameters."
+        "Non-resident platform tools and connected MCP tools may show shortened "
+        "schemas under context pressure. Search them by capability query or exact "
+        "tool name to load complete argument schemas. After this returns, call a "
+        "resolved tool in a later round using its newly available parameters."
     ),
 }
 

@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import db
 from core import config
+from core import envelope as core_envelope
 from core import wake_bus
 
 MAX_FRAMES = 200
@@ -236,20 +237,34 @@ class UserStore:
             print(f"[{self.user_id}/frames] rebuild failed: {e}")
             self.frames_meta = []
 
-    def _persist_frames_meta(self):
-        db.set_blob(self.user_id, "frames_meta", self.frames_meta)
-        self._broadcast_store_change("frames")
+    def _persist_frames_meta(self) -> bool:
+        # This blob is a rebuildable index over the canonical frame rows. Frame
+        # ingest happens on a detached background thread, so an index-write
+        # failure cannot be reported as a request failure. Keep that contract
+        # explicitly best-effort and never wake other workers for a write that
+        # did not commit; their next reload can rebuild from frame_envelopes.
+        saved = db.set_blob_best_effort(
+            self.user_id, "frames_meta", self.frames_meta)
+        if saved:
+            self._broadcast_store_change("frames")
+        return saved
 
     # ------- tokens -------
     def _load_tokens(self):
         data = db.get_blob(self.user_id, "tokens")
         self.tokens = data if isinstance(data, list) else []
         self.tokens[:] = [_normalize_token_entry(t) for t in self.tokens]
-        self._save_tokens()
+        self._save_tokens_best_effort()
 
     def _save_tokens(self):
         db.set_blob(self.user_id, "tokens", self.tokens)
         self._broadcast_store_change("blob")
+
+    def _save_tokens_best_effort(self) -> bool:
+        saved = db.set_blob_best_effort(self.user_id, "tokens", self.tokens)
+        if saved:
+            self._broadcast_store_change("blob")
+        return saved
 
     # ------- push cooldown -------
     def _load_push_state(self):
@@ -268,8 +283,10 @@ class UserStore:
         with self.push_lock:
             self.last_push_epoch = time.time()
             self.last_push_mono = time.monotonic()
-        db.set_blob(self.user_id, "push_state", {"last_push_epoch": self.last_push_epoch})
-        self._broadcast_store_change("blob")  # other workers' push cooldown must see this
+        saved = db.set_blob_best_effort(
+            self.user_id, "push_state", {"last_push_epoch": self.last_push_epoch})
+        if saved:
+            self._broadcast_store_change("blob")  # other workers' push cooldown must see this
 
     def cooldown_remaining_seconds(self) -> float:
         with self.push_lock:
@@ -291,8 +308,11 @@ class UserStore:
             print(f"[{self.user_id}/live-activity] load failed: {e}")
 
     def _save_live_activity_state(self):
-        db.set_blob(self.user_id, "live_activity_state", self.live_activity_state)
-        self._broadcast_store_change("blob")
+        saved = db.set_blob_best_effort(
+            self.user_id, "live_activity_state", self.live_activity_state)
+        if saved:
+            self._broadcast_store_change("blob")
+        return saved
 
     def should_suppress_live_activity(self, message: str, top_app: str) -> tuple[bool, str]:
         normalized_message = " ".join((message or "").strip().split())
@@ -425,16 +445,17 @@ class UserStore:
             "ts": time.time(),
             "source": source,
             "v": envelope.get("v", 1),
-            "body_ct": envelope["body_ct"],
-            "nonce": envelope["nonce"],
-            "K_user": envelope["K_user"],
-            "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
+            # 这两个指纹保持「键恒在、缺省空串」的既有行为：老客户端不传，而
+            # rewrap 的跳过逻辑直接从落库行上读它们。下面的 splice 只在信封真
+            # 带了值时覆盖。
+            "enclave_pk_fpr": "",
             # Seal-time label of the user pk K_user was wrapped to; rewrap's
             # skip logic reads it off the stored row (empty for old clients).
-            "content_pk_fpr": envelope.get("content_pk_fpr", ""),
-            "visibility": envelope.get("visibility", "shared"),
-            "owner_user_id": envelope.get("owner_user_id", self.user_id),
+            "content_pk_fpr": "",
             "content_type": ct,
+            # 形状无关：信封行取 body_ct/nonce/K_user/…，明文行取 body。
+            **core_envelope.envelope_storage_fields(
+                envelope, default_owner_user_id=self.user_id),
         }
         # Synthetic verify pings are not real user content and are removed
         # after /v1/chat/verify_loop completes. They still need plaintext
@@ -518,6 +539,9 @@ class UserStore:
                 "caption_K_enclave",
                 "caption_enclave_pk_fpr",
                 "caption_content_pk_fpr",
+                # 明文形状的子信封正文（v6）。漏登记会被静默丢掉——正文凭空
+                # 消失且不报错，见 tests/test_envelope_storage_fields.py。
+                "caption_body",
                 "caption_visibility",
                 "caption_owner_user_id",
                 "thinking_v",
@@ -528,6 +552,7 @@ class UserStore:
                 "thinking_K_enclave",
                 "thinking_enclave_pk_fpr",
                 "thinking_content_pk_fpr",
+                "thinking_body",
                 "thinking_visibility",
                 "thinking_owner_user_id",
                 "thinking_kind",
@@ -658,16 +683,17 @@ class UserStore:
             "ts": time.time(),
             "source": source,
             "v": envelope.get("v", 1),
-            "body_ct": envelope["body_ct"],
-            "nonce": envelope["nonce"],
-            "K_user": envelope["K_user"],
-            "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
+            # 这两个指纹保持「键恒在、缺省空串」的既有行为：老客户端不传，而
+            # rewrap 的跳过逻辑直接从落库行上读它们。下面的 splice 只在信封真
+            # 带了值时覆盖。
+            "enclave_pk_fpr": "",
             # Seal-time label of the user pk K_user was wrapped to; rewrap's
             # skip logic reads it off the stored row (empty for old clients).
-            "content_pk_fpr": envelope.get("content_pk_fpr", ""),
-            "visibility": envelope.get("visibility", "shared"),
-            "owner_user_id": envelope.get("owner_user_id", self.user_id),
+            "content_pk_fpr": "",
             "content_type": ct,
+            # 形状无关：信封行取 body_ct/nonce/K_user/…，明文行取 body。
+            **core_envelope.envelope_storage_fields(
+                envelope, default_owner_user_id=self.user_id),
         }
         # Synthetic verify pings are not real user content and are removed
         # after /v1/chat/verify_loop completes. They still need plaintext
@@ -741,6 +767,9 @@ class UserStore:
                 "caption_K_enclave",
                 "caption_enclave_pk_fpr",
                 "caption_content_pk_fpr",
+                # 明文形状的子信封正文（v6）。漏登记会被静默丢掉——正文凭空
+                # 消失且不报错，见 tests/test_envelope_storage_fields.py。
+                "caption_body",
                 "caption_visibility",
                 "caption_owner_user_id",
                 "thinking_v",
@@ -751,6 +780,7 @@ class UserStore:
                 "thinking_K_enclave",
                 "thinking_enclave_pk_fpr",
                 "thinking_content_pk_fpr",
+                "thinking_body",
                 "thinking_visibility",
                 "thinking_owner_user_id",
                 "thinking_kind",
@@ -1137,13 +1167,13 @@ class UserStore:
         if not entry_id:
             return False
         with self.world_books_lock:
+            removed_db = db.world_book_delete_strict(self.user_id, entry_id)
             before = len(self.world_books)
             self.world_books[:] = [
                 item for item in self.world_books
                 if str(item.get("id") or "") != entry_id
             ]
             removed_local = len(self.world_books) != before
-            removed_db = db.world_book_delete(self.user_id, entry_id)
         return removed_local or removed_db
 
     def update_chat_message_metadata(self, msg_id: str, fields: dict) -> dict | None:

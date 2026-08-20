@@ -13,6 +13,8 @@ dict）+ 一个记录调用的 enqueue_write_effect 驱动，纯 asyncio，无 D
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import sys
 import threading
 from pathlib import Path
@@ -21,6 +23,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from capabilities import registry as cap_registry  # noqa: E402
+from perception import perception_read_core  # noqa: E402
+from screen import screen_read_core  # noqa: E402
+from screen.screen_read_core import ScreenResult  # noqa: E402
 from model_api_runtime.v2 import executor as v2_executor  # noqa: E402
 from provider_types import ToolCall, ToolResult  # noqa: E402
 
@@ -148,9 +153,21 @@ def test_photo_read_with_image_invokes_observer_and_hides_base64(monkeypatch):
     assert enqueued == []
 
 
-def test_photo_read_without_include_image_never_invokes_observer(monkeypatch):
-    async def _observe_photo(*_args):
-        raise AssertionError("observer must remain pull-on-demand")
+def test_photo_read_without_include_image_defaults_to_visual_observation(monkeypatch):
+    requested = []
+    observed = []
+
+    def _run_capability(_action, _store, *, params, **_kwargs):
+        requested.append(params)
+        return _FakeResult(True, {
+            "photo_id": "p1",
+            "image_media_type": "image/jpeg",
+            "image_b64": "cGl4ZWxz",
+        })
+
+    async def _observe_photo(mime, image_b64):
+        observed.append((mime, image_b64))
+        return "a blue notebook on a desk"
 
     results, enqueued = _run(
         [ToolCall(
@@ -159,13 +176,60 @@ def test_photo_read_without_include_image_never_invokes_observer(monkeypatch):
             args={"photo_id": "p1"},
         )],
         turn_authorization=False,
-        run_capability=lambda *_a, **_k: _FakeResult(True, {"photo_id": "p1"}),
+        run_capability=_run_capability,
         observe_photo=_observe_photo,
         monkeypatch=monkeypatch,
     )
 
-    assert "p1" in results[0].content
+    assert requested == [{"photo_id": "p1", "include_image": True}]
+    assert observed == [("image/jpeg", "cGl4ZWxz")]
+    assert "a blue notebook on a desk" in results[0].content
+    assert "cGl4ZWxz" not in results[0].content
     assert enqueued == []
+
+
+def test_photo_read_default_extracts_enclave_json_pixels_before_observation(monkeypatch):
+    pixels = b"\xff\xd8actual-photo\xff\xd9"
+    image_b64 = base64.b64encode(pixels).decode("ascii")
+    monkeypatch.setattr(
+        perception_read_core,
+        "photo_content",
+        lambda _store, _photo_id: ({"photo_id": "p1", "frame_id": "f1"}, 200),
+    )
+    monkeypatch.setattr(
+        screen_read_core,
+        "frame_decrypt",
+        lambda *_args, **_kwargs: ScreenResult(
+            status=200,
+            raw_body=json.dumps({
+                "image_b64": image_b64,
+                "image_mime": "image/jpeg",
+            }).encode("utf-8"),
+            media_type="application/json",
+        ),
+    )
+    observed = []
+
+    async def _observe_photo(mime, encoded):
+        observed.append((mime, encoded))
+        return "the photo shows an actual handwritten checklist"
+
+    real_run_capability = cap_registry.run_capability
+    results, _ = _run(
+        [ToolCall(
+            id="photo-json",
+            name="photo_read",
+            args={"photo_id": "p1"},
+        )],
+        turn_authorization=False,
+        run_capability=real_run_capability,
+        observe_photo=_observe_photo,
+        monkeypatch=monkeypatch,
+    )
+
+    assert observed == [("image/jpeg", image_b64)]
+    assert "actual handwritten checklist" in results[0].content
+    assert image_b64 not in results[0].content
 
 
 def test_screen_read_with_image_uses_native_observer_and_hides_pixels(monkeypatch):

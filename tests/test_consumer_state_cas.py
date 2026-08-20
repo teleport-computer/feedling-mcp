@@ -134,3 +134,5 @@ def test_poll_history_keeps_hosted_and_resident_identities(backend_env, monkeypa
     assert state["poll_consumers"]["resident-vps:123"]["responder"] == "resident"
     assert state["poll_consumers"][f"agent-runner:{user_id}"]["last_poll_epoch"] == 100.0
     assert state["poll_consumers"]["resident-vps:123"]["last_poll_epoch"] == 101.0
+    assert state["last_activity_epoch"] == 101.0
+    assert state["last_activity_type"] == "poll"

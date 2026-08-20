@@ -237,6 +237,9 @@ CREATE TABLE IF NOT EXISTS memory_moments (
 );
 CREATE INDEX IF NOT EXISTS memory_user_occ_idx ON memory_moments (user_id, occurred_at);
 
+-- T149 reverse parity debt: this user FK exists only on TEE, contrary to the
+-- later source-parity rule.  Remove it after a live orphan-count preflight;
+-- do not "fix" the difference by making RDS stricter.
 CREATE TABLE IF NOT EXISTS world_book_entries (
     user_id    TEXT NOT NULL,
     entry_id   TEXT NOT NULL,

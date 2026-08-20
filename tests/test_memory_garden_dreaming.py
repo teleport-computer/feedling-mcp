@@ -233,3 +233,36 @@ def test_idempotency_key_matches_legacy_algorithm(last_sig, sig, seed_count, tur
         {"signature": sig, "seed_card_count": seed_count, "turn_count": turn_count},
     )
     assert mine == theirs
+
+
+# --------------------------------------------------------------------------- #
+# 换个宿主：整理产物的标记不叫 memory_dream 也要管用
+# （2026-08-17 边界整理：内核不再写死 io 的来源名）
+# --------------------------------------------------------------------------- #
+
+
+def test_a_different_host_can_name_its_consolidation_marker():
+    """别的宿主把整理产物叫 `merged`，水位线同样要排除它。
+
+    不能排除的话，整理产物会把自己算成「新增」→ 整理完立刻又满足触发条件
+    → 无限循环。这正是 seed_cards 存在的唯一理由。
+    """
+    cards = [
+        {"id": "a", "source": "slack_import"},
+        {"id": "b", "source": "merged"},
+        {"id": "c", "source": "manual"},
+    ]
+    kept = [c["id"] for c in seed_cards(cards, consolidated_source="merged")]
+    assert kept == ["a", "c"], "宿主自定义的整理标记没被排除"
+
+
+def test_default_marker_still_matches_io_history():
+    """不传就还是 io 那套 —— 存量行为逐字不变。"""
+    cards = [{"id": "a", "source": "memory_capture"}, {"id": "b", "source": "memory_dream"}]
+    assert [c["id"] for c in seed_cards(cards)] == ["a"]
+
+
+def test_snapshot_threads_the_marker_through():
+    cards = [{"id": "a", "source": "manual"}, {"id": "b", "source": "merged"}]
+    snap = dream_snapshot(available_cards=cards, all_cards=cards, consolidated_source="merged")
+    assert snap.seed_card_count == 1, "快照没把宿主的标记透传给 seed_cards"

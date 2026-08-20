@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -17,9 +18,11 @@ import conftest
 import db
 import provider_client
 from capabilities import registry as cap_registry
+from capabilities import tool_schema as cap_tool_schema
 from provider_types import ToolResult, ToolSpec
 from core import store as core_store
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import tool_loop
 from model_api_runtime.v2 import worker
 
 pytestmark = pytest.mark.skipif(
@@ -33,6 +36,11 @@ _MCP_SPEC = ToolSpec(name="mcp__test__ping", description="ping the test server",
 _MCP_SPEC_TWO = ToolSpec(
     name="mcp__test__status",
     description="read test server status",
+    parameters={"type": "object", "properties": {}},
+)
+_MCP_WRITE_SPEC = ToolSpec(
+    name="mcp__test__write",
+    description="mutate test server state",
     parameters={"type": "object", "properties": {}},
 )
 
@@ -192,12 +200,14 @@ def _make_load_turn_mcp(turn, seen=None):
         api_key=None,
         runtime_token="",
         enclave_sem=None,
+        lane="chat",
     ):
         if seen is not None:
             seen.append({
                 "user_id": store.user_id,
                 "runtime_token": runtime_token,
                 "enclave_sem": enclave_sem,
+                "lane": lane,
             })
         return turn
     return _fake_load
@@ -236,6 +246,8 @@ def test_chat_turn_offers_and_dispatches_configured_mcp_tool(monkeypatch):
     assert seen_load and seen_load[0]["user_id"] == uid
     assert seen_load[0]["runtime_token"] == "rt-turn"
     assert seen_load[0]["enclave_sem"] is enclave_sem
+    # 观测连线:chat 也必须显式传，否则只是撞上装配层默认值。
+    assert seen_load[0]["lane"] == "chat"
     # the MCP tool was offered to the provider in round 1
     assert any(s.name == "mcp__test__ping" for s in calls[0]["tools"])
     # the mcp__ call was routed to the MCP dispatcher (not the platform executor)
@@ -292,6 +304,63 @@ def test_chat_tool_search_injects_full_schema_before_mcp_dispatch(monkeypatch):
     assert first[_MCP_SPEC.name].parameters["properties"] == {}
     assert second[_MCP_SPEC.name] == _MCP_SPEC
     assert dispatched == [(_MCP_SPEC.name, {})]
+
+
+def test_chat_pressure_folded_platform_schema_is_searchable_and_protected(
+    monkeypatch,
+):
+    uid = "u_platform_tool_search"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    # One unrelated oversized manual forces the pressure form. workspace_read
+    # is then folded too, searched explicitly, and must return full next round.
+    monkeypatch.setitem(
+        cap_tool_schema.DESCRIPTIONS,
+        "identity_get",
+        "oversized optional manual " * 6_000,
+    )
+    monkeypatch.setattr(tool_loop, "_CATALOG", None)
+    pressure_config = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-sonnet-4-test",
+        api_key="sk-user-byok",
+        base_url="",
+        context_window_tokens=40_000,
+    )
+    calls = _script_provider(monkeypatch, [
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "find",
+                "name": "mcp_tool_search",
+                "args": {"names": ["workspace_read"]},
+            }],
+            "usage": {},
+        },
+        {"reply": "schema loaded", "tool_calls": [], "usage": {}},
+    ])
+    deps = _deps([
+        {"id": "m1", "ts": 10.0, "role": "user", "content": "read my file"}
+    ])
+
+    assert asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=pressure_config,
+        api_key=None,
+        runtime_token="rt-turn",
+    )) == "completed"
+
+    first = {spec.name: spec for spec in calls[0]["tools"]}
+    second = {spec.name: spec for spec in calls[1]["tools"]}
+    assert "mcp_tool_search" in first
+    assert first["workspace_read"].parameters["properties"] == {}
+    assert second["workspace_read"].parameters["required"] == ["path"]
+    assert second["identity_get"].parameters["properties"] == {}
 
 
 def test_chat_turn_keeps_mcp_usable_after_its_own_remote_result(
@@ -526,7 +595,8 @@ def test_provider_roundtrip_trace_distinguishes_empty_response_recovery(monkeypa
     uid = "u_provider_roundtrip_empty_recovery"
     conftest.seed_user(uid)
     _reset(uid)
-    jobs_store.enqueue_job(uid, "chat")
+    turn_trace_id = "trace-roundtrip-empty-recovery"
+    jobs_store.enqueue_job(uid, "chat", trace_id=turn_trace_id)
     job = jobs_store.claim_next_job("w")
     _patch_real_write(monkeypatch)
 
@@ -561,6 +631,21 @@ def test_provider_roundtrip_trace_distinguishes_empty_response_recovery(monkeypa
     assert roundtrip["detail"]["terminal_text_round_reason"] == "none"
     assert roundtrip["detail"]["force_text_fallback_reason"] == "none"
     assert roundtrip["detail"]["empty_response_recovery_used"] is True
+    joinable = [
+        trace
+        for trace in traces
+        if trace["type"] in {
+            "provider.empty_response",
+            "mcp.roundtrip.provider",
+            "mcp.surface.provider",
+        }
+    ]
+    assert {trace["type"] for trace in joinable} == {
+        "provider.empty_response",
+        "mcp.roundtrip.provider",
+        "mcp.surface.provider",
+    }
+    assert {trace["trace_id"] for trace in joinable} == {turn_trace_id}
 
 
 def test_mcp_turn_usage_records_offered_but_zero_calls(monkeypatch):
@@ -941,3 +1026,172 @@ def test_no_instructions_means_no_section_at_all(monkeypatch):
         for m in calls[0]["messages"] if m.get("role") == "system"
     )
     assert "MCP 服务器说明" not in system_text
+
+
+def test_chat_refuses_folded_platform_call_before_dispatch(monkeypatch):
+    """折叠态下直接调平台工具 → 运行时拒绝,不落 executor。
+
+    worker 里那句注释说这是「durable mutation marker 或远端请求之前」的一道
+    独立闸。2026-08-20 之前**全仓库没有一条测试提到过它**:把
+    `requires_resolution` 改成恒 False,所有既有 MCP 用例照绿。
+    唤醒侧的同一条在 tests/test_v2_wake_mcp.py。
+    """
+    uid = "u_chat_folded_refused"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    monkeypatch.setitem(
+        cap_tool_schema.DESCRIPTIONS,
+        "identity_get",
+        "oversized optional manual " * 6_000,
+    )
+    monkeypatch.setattr(tool_loop, "_CATALOG", None)
+    pressure_config = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-sonnet-4-test",
+        api_key="sk-user-byok",
+        base_url="",
+        context_window_tokens=40_000,
+    )
+
+    dispatched = []
+    real_dispatch = worker.v2_executor.dispatch_tool_calls
+
+    async def _spy_dispatch(calls, **kwargs):
+        dispatched.extend(str(tc.name) for tc in calls)
+        return await real_dispatch(calls, **kwargs)
+
+    monkeypatch.setattr(
+        worker.v2_executor, "dispatch_tool_calls", _spy_dispatch
+    )
+
+    calls = _script_provider(monkeypatch, [
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "guess",
+                "name": "workspace_read",
+                "args": {"path": "notes.md"},
+            }],
+            "usage": {},
+        },
+        {"reply": "我先查工具说明", "tool_calls": [], "usage": {}},
+    ])
+    deps = _deps([
+        {"id": "m1", "ts": 10.0, "role": "user", "content": "read my file"}
+    ])
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=pressure_config,
+        api_key=None,
+        runtime_token="rt-turn",
+    ))
+
+    assert status == "completed"
+    assert "workspace_read" not in dispatched
+    texts = []
+    for message in calls[1]["messages"]:
+        for result in getattr(message, "results", ()) or ():
+            texts.append(str(getattr(result, "content", "") or ""))
+    assert texts, "no tool results reached the second round at all"
+    assert any(
+        "tool schema is not loaded" in text
+        and cap_tool_schema.MCP_TOOL_SEARCH_TOOL in text
+        for text in texts
+    )
+
+
+def _run_chat_screen_with_mcp(monkeypatch, uid, *, with_frames: bool):
+    """Drive the production chat screen-frame source into the real tool loop."""
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("screen-mcp-chat-test")
+    _patch_real_write(monkeypatch)
+    monkeypatch.setattr(worker, "_report_turn_progress", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        worker,
+        "_screen_share_grounding",
+        lambda _uid: {"active": True, "latest_frame_age_sec": 1},
+    )
+    frames = [{"id": "f1", "ts": time.time()}] if with_frames else []
+    monkeypatch.setattr(worker.db, "frame_list_meta", lambda _uid: frames)
+    monkeypatch.setattr(
+        worker.db,
+        "model_api_active_route_vision_verdict",
+        lambda _uid: {"supported": True},
+    )
+
+    calls = _script_provider(monkeypatch, [{
+        "reply": "看到了。",
+        "tool_calls": [],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }])
+    turn = _FakeMcpTurn(
+        [_MCP_SPEC, _MCP_WRITE_SPEC],
+        [],
+        read_only_names={_MCP_SPEC.name},
+    )
+    deps = _deps(
+        [{"id": "m1", "ts": 10.0, "role": "user", "content": "你能看到吗？"}],
+        load_mcp_turn=_make_load_turn_mcp(turn),
+    )
+    deps.read_screen_frames = lambda _uid, _frame_ids: {
+        "frames": {
+            "f1": {
+                "image_b64": "AAAA",
+                "image_mime": "image/jpeg",
+                "ocr_text": "untrusted screen text",
+                "app": "Notes",
+                "ts": time.time(),
+            }
+        },
+        "cache_hits": 0,
+        "cache_misses": 1,
+    }
+
+    assert asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    )) == "completed"
+    carried_pixels = any(
+        message.get(worker.v2_screen_chat.MESSAGE_TAG) is True
+        for message in calls[0]["messages"]
+    )
+    offered = {spec.name for spec in calls[0]["tools"]}
+    return offered, carried_pixels
+
+
+def test_chat_live_pixels_keep_read_mcp_but_drop_write_web_and_task(monkeypatch):
+    """Production chat call-site derives the screen policy bit from pixels."""
+    control, control_pixels = _run_chat_screen_with_mcp(
+        monkeypatch,
+        "u_chat_screen_mcp_control",
+        with_frames=False,
+    )
+    assert not control_pixels
+    assert {
+        "web_search",
+        "web_fetch",
+        cap_tool_schema.TASK_TOOL,
+        _MCP_SPEC.name,
+        _MCP_WRITE_SPEC.name,
+    } <= control
+
+    offered, carried_pixels = _run_chat_screen_with_mcp(
+        monkeypatch,
+        "u_chat_screen_mcp_pixels",
+        with_frames=True,
+    )
+    assert carried_pixels, "target round must actually carry screen pixels"
+    assert {"web_search", "web_fetch", cap_tool_schema.TASK_TOOL}.isdisjoint(offered)
+    assert _MCP_SPEC.name in offered, "read-only user MCP survives the pixel fence"
+    assert _MCP_WRITE_SPEC.name not in offered, "screen pixels must fence MCP writes"

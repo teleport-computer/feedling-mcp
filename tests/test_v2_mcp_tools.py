@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from hosted import mcp_tools  # noqa: E402
 from hosted import mcp_client  # noqa: E402
 import provider_client  # noqa: E402
-from provider_types import ToolCall  # noqa: E402
+from provider_types import ToolCall, ToolSpec  # noqa: E402
 
 STORE = types.SimpleNamespace(user_id="usr_test")
 
@@ -173,7 +173,44 @@ def test_tool_search_query_only_matches_folded_tools(monkeypatch):
     assert "mcp__resident__lookup" not in turn.collapsed_names
 
 
-def test_tool_search_keeps_resolved_catalog_within_char_budget(monkeypatch):
+def test_pressure_folded_mcp_is_searchable_and_resolved_schema_is_protected():
+    name = "mcp__calendar__events"
+    full = ToolSpec(
+        name=name,
+        description="List calendar events",
+        parameters={
+            "type": "object",
+            "properties": {"date": {"type": "string"}},
+            "required": ["date"],
+        },
+    )
+    turn = mcp_tools.McpTurn(
+        [full],
+        {name: None},
+        full_specs={name: full},
+    )
+
+    turn.set_pressure_tool_surface({"pressure_collapsed_names": [name]})
+
+    assert turn.collapsed_names == set()
+    assert turn.requires_resolution(name)
+    assert turn.recovery_needed()
+    assert turn.pressure_collapsed_tool_specs()[name] == (
+        mcp_tools._collapsed_spec(full)
+    )
+
+    result = turn.resolve_tool_schemas({"query": "calendar events"})
+
+    assert result["resolved"] == [name]
+    assert turn.current_tool_specs() == [full]
+    assert turn.protected_tool_names() == {name}
+    assert not turn.requires_resolution(name)
+    assert not turn.recovery_needed()
+    turn.set_pressure_tool_surface({"pressure_collapsed_names": [name]})
+    assert turn.pressure_collapsed_names == set()
+
+
+def test_tool_search_can_resolve_beyond_initial_manual_char_budget(monkeypatch):
     async def fake_list(url, headers, *, ca_pem=None, transport=None,
                         mcp_transport=None, instructions_out=None):
         return [
@@ -201,39 +238,13 @@ def test_tool_search_keeps_resolved_catalog_within_char_budget(monkeypatch):
     turn = asyncio.run(
         mcp_tools.load_turn_mcp(STORE, api_key="k", runtime_token="rt"))
     names = [spec.name for spec in turn.tool_specs]
-    collapsed_total = sum(
-        mcp_tools._serialized_chars({
-            "name": spec.name,
-            "description": spec.description,
-            "parameters": spec.parameters,
-        })
-        for spec in turn.tool_specs
-    )
-    first = turn.full_specs[names[0]]
-    folded_first = turn.tool_specs[0]
-    first_delta = (
-        mcp_tools._serialized_chars({
-            "name": first.name,
-            "description": first.description,
-            "parameters": first.parameters,
-        })
-        - mcp_tools._serialized_chars({
-            "name": folded_first.name,
-            "description": folded_first.description,
-            "parameters": folded_first.parameters,
-        })
-    )
-    monkeypatch.setattr(
-        mcp_tools,
-        "MAX_MCP_TOOL_CATALOG_CHARS",
-        collapsed_total + first_delta,
-    )
+    monkeypatch.setattr(mcp_tools, "MAX_MCP_TOOL_CATALOG_CHARS", 1)
 
     result = turn.resolve_tool_schemas({"names": names})
 
-    assert result["resolved"] == [names[0]]
-    assert result["schema_budget_exceeded"] == [names[1]]
-    assert turn.requires_resolution(names[1])
+    assert result["resolved"] == names
+    assert result["schema_budget_exceeded"] == []
+    assert all(not turn.requires_resolution(name) for name in names)
 
 
 def test_catalog_permutations_produce_identical_provider_tool_bytes(monkeypatch):
@@ -504,7 +515,7 @@ def test_read_only_hint_is_preserved_as_metadata_but_grants_no_privilege(
     }
 
 
-def test_catalog_count_and_schema_budgets_fail_closed(monkeypatch):
+def test_catalog_count_cap_folds_manuals_without_dropping_tool_names(monkeypatch):
     async def fake_list(url, headers, *, ca_pem=None, transport=None, mcp_transport=None,
                          instructions_out=None):
         tools = [
@@ -540,8 +551,55 @@ def test_catalog_count_and_schema_budgets_fail_closed(monkeypatch):
     turn = asyncio.run(
         mcp_tools.load_turn_mcp(STORE, api_key="k", runtime_token="rt"))
 
-    assert len(turn.tool_specs) == mcp_tools.MAX_MCP_TOOLS_PER_TURN
+    assert len(turn.tool_specs) == mcp_tools.MAX_MCP_TOOLS_PER_TURN + 10
     assert "mcp__bounded__oversized" not in turn.routes
+    assert len(turn.collapsed_names) == 10
+    assert set(turn.routes) == set(turn.full_specs) == {
+        spec.name for spec in turn.tool_specs
+    }
+    folded_name = sorted(turn.collapsed_names)[0]
+    result = turn.resolve_tool_schemas({"names": [folded_name]})
+    assert result["resolved"] == [folded_name]
+    assert not turn.requires_resolution(folded_name)
+
+
+def test_valid_schema_over_manual_cap_stays_registered_and_searchable(monkeypatch):
+    async def fake_list(url, headers, *, ca_pem=None, transport=None,
+                        mcp_transport=None, instructions_out=None):
+        return [{
+            "name": "huge_manual",
+            "description": "large but valid",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "x" * (
+                            mcp_tools.MAX_MCP_TOOL_SCHEMA_CHARS + 100
+                        ),
+                    },
+                },
+            },
+        }]
+
+    _patch(
+        monkeypatch,
+        servers=_servers("bounded"),
+        decrypt=lambda env, api_key, runtime_token: {
+            "url": "https://bounded.example.com", "headers": {}},
+        list_tools=fake_list,
+    )
+    turn = asyncio.run(
+        mcp_tools.load_turn_mcp(STORE, api_key="k", runtime_token="rt"))
+    name = "mcp__bounded__huge_manual"
+
+    assert [spec.name for spec in turn.tool_specs] == [name]
+    assert name in turn.routes and name in turn.full_specs
+    assert name in turn.collapsed_names
+    assert turn.summary["schema_cap_collapsed"] == 1
+    result = turn.resolve_tool_schemas({"names": [name]})
+    assert result["resolved"] == [name]
+    assert turn.current_tool_specs()[0] == turn.full_specs[name]
 
 
 def test_tool_and_parameter_descriptions_both_pass_through(monkeypatch):
@@ -1246,16 +1304,22 @@ def test_small_server_is_not_starved_by_a_large_one(monkeypatch):
             if spec.name.startswith(f"mcp__{name}__"):
                 kept[name] += 1
                 break
-    assert len(turn.tool_specs) == mcp_tools.MAX_MCP_TOOLS_PER_TURN
-    assert all(kept[name] > 0 for name in sizes), kept
-    # A server offering fewer tools than its fair share loses nothing at all.
+    assert len(turn.tool_specs) == sum(sizes.values())
+    assert kept == sizes
+    # A server offering fewer tools than its fair share keeps full manuals.
     assert kept["tavily"] == sizes["tavily"], kept
-    # Only the big servers get trimmed.
-    assert kept["luckin-coffee"] < sizes["luckin-coffee"]
+    assert not any(
+        name.startswith("mcp__tavily__") for name in turn.collapsed_names
+    )
+    # Only manuals from the big servers need folding; their names remain.
+    assert any(
+        name.startswith("mcp__luckin-coffee__")
+        for name in turn.collapsed_names
+    )
 
 
-def test_char_cap_skips_the_overflowing_tool_and_keeps_allocating(monkeypatch):
-    """A char-cap overflow must reject one candidate, not end allocation.
+def test_char_cap_folds_the_overflowing_manual_and_keeps_allocating(monkeypatch):
+    """A char-cap overflow must fold one manual, not remove its tool name.
 
     The two caps are not symmetric: hitting the count cap means nothing more
     can fit, but hitting the char cap only means THIS candidate does not — a
@@ -1306,11 +1370,14 @@ def test_char_cap_skips_the_overflowing_tool_and_keeps_allocating(monkeypatch):
     big_kept = sum(1 for n in names if n.startswith("mcp__big__"))
     small_kept = sum(1 for n in names if n.startswith("mcp__small__"))
 
-    # The fat server must actually have overflowed, or this proves nothing.
-    assert big_kept < 30, (big_kept, small_kept)
+    assert big_kept == 30
+    assert any(name.startswith("mcp__big__") for name in turn.collapsed_names)
     # Every small tool survives — the ones allocated in rounds AFTER the first
     # overflow are exactly what a `break` implementation would have lost.
     assert small_kept == small_count, (big_kept, small_kept)
+    assert not any(
+        name.startswith("mcp__small__") for name in turn.collapsed_names
+    )
 
 
 # ── V2 的工具面必须可观测(2026-08-10)──────────────────────────────────

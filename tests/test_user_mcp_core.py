@@ -34,7 +34,7 @@ def _fake_envelope(monkeypatch):
     from core import envelope as core_envelope
     monkeypatch.setattr(
         core_envelope, "_build_shared_envelope_for_store",
-        lambda store, raw, item_id=None: ({"v": 1, "id": item_id, "ct": raw.hex()}, ""),
+        lambda store, raw, item_id=None: ({"v": 1, "id": item_id, "body_ct": raw.hex()}, ""),
     )
     # No SSRF/DNS stub needed anymore: upsert_server no longer does a
     # network-facing pre-check (Task 2 removed the blocked_url_kind call —
@@ -260,7 +260,7 @@ def test_patch_read_only_approvals_preserves_encrypted_connection_config(
         core_enclave,
         "_decrypt_envelope_via_enclave",
         lambda envelope, api_key, *, purpose, runtime_token="": bytes.fromhex(
-            envelope["ct"]
+            envelope["body_ct"]
         ),
     )
     mcp_core.upsert_server(store, {
@@ -283,7 +283,7 @@ def test_patch_read_only_approvals_preserves_encrypted_connection_config(
     assert body["enabled"] is True
     after = mcp_core.envelopes_payload(store)[0]["servers"][0]["config_envelope"]
     assert after != before
-    secret = json.loads(bytes.fromhex(after["ct"]))
+    secret = json.loads(bytes.fromhex(after["body_ct"]))
     assert secret["url"] == "https://mcp.example.com/rpc"
     assert secret["headers"] == {"Authorization": "Bearer secret"}
     assert "BEGIN CERTIFICATE" in secret["ca_pem"]
@@ -332,7 +332,7 @@ def test_patch_empty_read_only_approvals_revokes_existing_map(
         core_enclave,
         "_decrypt_envelope_via_enclave",
         lambda envelope, api_key, *, purpose, runtime_token="": bytes.fromhex(
-            envelope["ct"]
+            envelope["body_ct"]
         ),
     )
     mcp_core.upsert_server(store, {
@@ -351,7 +351,7 @@ def test_patch_empty_read_only_approvals_revokes_existing_map(
 
     assert status == 200
     envelope = mcp_core.envelopes_payload(store)[0]["servers"][0]["config_envelope"]
-    secret = json.loads(bytes.fromhex(envelope["ct"]))
+    secret = json.loads(bytes.fromhex(envelope["body_ct"]))
     assert "read_only_tool_fingerprints" not in secret
 
 
@@ -426,7 +426,7 @@ def test_probe_detected_transport_persisted(store, monkeypatch):
     from core import enclave as core_enclave
     monkeypatch.setattr(
         core_enclave, "_decrypt_envelope_via_enclave",
-        lambda env, key, purpose=None: bytes.fromhex(env["ct"]))
+        lambda env, key, purpose=None: bytes.fromhex(env["body_ct"]))
     from hosted import mcp_probe
     monkeypatch.setattr(
         mcp_probe, "probe",
@@ -452,7 +452,7 @@ def test_probe_persist_does_not_clobber_concurrent_write(store, monkeypatch):
     from core import enclave as core_enclave
     monkeypatch.setattr(
         core_enclave, "_decrypt_envelope_via_enclave",
-        lambda env, key, purpose=None: bytes.fromhex(env["ct"]))
+        lambda env, key, purpose=None: bytes.fromhex(env["body_ct"]))
 
     # The probe stub simulates a concurrent client landing a NEW server (and so
     # rewriting the blob) while this probe is "in flight", then reports sse.
@@ -496,7 +496,7 @@ def test_probe_persist_metadata_only_uses_cas(store, monkeypatch):
     from core import enclave as core_enclave
     monkeypatch.setattr(
         core_enclave, "_decrypt_envelope_via_enclave",
-        lambda env, key, purpose=None: bytes.fromhex(env["ct"]))
+        lambda env, key, purpose=None: bytes.fromhex(env["body_ct"]))
     from hosted import mcp_probe
     # hint is http (/mcp path) and detected is http → metadata-only stamp path.
     monkeypatch.setattr(
@@ -606,7 +606,7 @@ def test_legacy_record_without_has_ca_key_defaults_false(store):
         "id": "srv_legacy1",
         "name": "legacy",
         "enabled": True,
-        "config_envelope": {"v": 1, "id": "x", "ct": "00"},
+        "config_envelope": {"v": 1, "id": "x", "body_ct": "00"},
         "url_hint": "mcp.example.com",
         "header_names": [],
         # deliberately no "has_ca" key — pre-existing-field shape.

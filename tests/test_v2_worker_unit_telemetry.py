@@ -12,9 +12,26 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from core import self_thinking  # noqa: E402
+from model_api_runtime.v2 import tool_loop  # noqa: E402
 from model_api_runtime.v2 import worker  # noqa: E402
 from model_api_runtime.v2 import language_follow  # noqa: E402
+from model_api_runtime.v2 import prompt_frontier  # noqa: E402
 from model_api_runtime.v2 import summary_frontier  # noqa: E402
+
+
+def test_thinking_extra_preserves_plaintext_body():
+    extra = worker._thinking_extra({
+        "envelope": {
+            "id": "thinking-plain",
+            "body": "private reasoning",
+            "owner_user_id": "usr_plain",
+            "visibility": "shared",
+        },
+        "metadata": {"thinking_kind": "reasoning"},
+    })
+
+    assert extra["thinking_body"] == "private reasoning"
+    assert "thinking_body_ct" not in extra
 
 
 @pytest.mark.parametrize(
@@ -203,6 +220,319 @@ def test_language_follow_has_dedicated_admin_timeline_label():
     }) == ("🌐", "语言跟随")
 
 
+def test_prompt_frontier_trace_reaches_final_sink_with_closed_content_free_shape():
+    from admin import data_track
+
+    sentinel = "PRIVATE_PROMPT_BODY_must_never_reach_trace"
+    traces = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append({
+        "user_id": user_id,
+        "type": event_type,
+        **fields,
+    })
+    limit = prompt_frontier.ModelPromptLimit(
+        provider="test",
+        model="budget-test",
+        context_window_tokens=2_048,
+        source="caller",
+    )
+    plan = prompt_frontier.plan_provider_round(
+        model_limit=limit,
+        messages=[{"role": "system", "content": "x" * 750}],
+        tools=None,
+        output_reserve_tokens=512,
+        safety_margin_tokens=512,
+        message_component_bytes=(
+            prompt_frontier.PromptByteComponent("system", 750),
+        ),
+    )
+    sink = worker._ledger_tapped_sink(
+        None,
+        deps=deps,
+        user_id="u_budget_trace",
+        lane="chat",
+    )
+    asyncio.run(sink("provider_request", {
+        "prompt_frontier": plan,
+        "messages": [{"role": "user", "content": sentinel}],
+    }))
+
+    budget_trace = traces[-1]
+    assert budget_trace["type"] == "v2.prompt_frontier.budget"
+    assert budget_trace["status"] == "warning"
+    assert budget_trace["detail"] == {
+        "context_window_tokens": 2_048,
+        "input_budget_tokens": 1_024,
+        "required_tokens": plan.estimated_input_tokens,
+        "estimated_input_tokens": plan.estimated_input_tokens,
+        "overflow_tokens": 0,
+        "output_reserve_tokens": 512,
+        "safety_margin_tokens": 512,
+        "utf8_bytes_per_token": 1.0,
+        "limit_source": "caller",
+        "lane": "chat",
+        "required_components": ["message_context"],
+        "components": [{"name": "system", "bytes": 750}],
+    }
+    assert sentinel not in repr(budget_trace)
+
+    with pytest.raises(prompt_frontier.PromptFrontierExhausted) as caught:
+        prompt_frontier.plan_provider_round(
+            model_limit=limit,
+            messages=[{"role": "system", "content": sentinel * 40}],
+            tools=None,
+            output_reserve_tokens=512,
+            safety_margin_tokens=512,
+            message_component_bytes=(
+                prompt_frontier.PromptByteComponent("system", 1_700),
+            ),
+        )
+    callback = worker._prompt_frontier_exhaustion_trace_callback(
+        deps, "u_budget_trace", "heartbeat"
+    )
+    asyncio.run(callback(caught.value))
+
+    exhausted = traces[-1]
+    assert exhausted["type"] == "v2.prompt_frontier.exhausted"
+    assert exhausted["status"] == "warning"
+    assert exhausted["detail"]["overflow_tokens"] == (
+        exhausted["detail"]["required_tokens"] - 1_024
+    )
+    assert exhausted["detail"]["limit_source"] == "caller"
+    assert exhausted["detail"]["lane"] == "heartbeat"
+    assert exhausted["detail"]["components"] == [
+        {"name": "system", "bytes": 1_700},
+    ]
+    assert sentinel not in repr(exhausted)
+    assert data_track._debug_event_public_json(exhausted)["detail"] == (
+        exhausted["detail"]
+    )
+
+
+def test_rejected_provider_metadata_warning_reaches_final_sink_without_model(
+    monkeypatch,
+):
+    from admin import data_track
+
+    model_sentinel = "[PRIVATE GROUP]gemini-3.1-flash-lite"
+    traces = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append({
+        "user_id": user_id,
+        "type": event_type,
+        **fields,
+    })
+    monkeypatch.setenv(prompt_frontier._UNAUDITED_DEFAULT_ENV, "131072")
+    limit = prompt_frontier.resolve_model_limit(
+        "openai_compatible",
+        model_sentinel,
+        base_url="https://relay.example/v1",
+        provider_context_window_tokens=16_384,
+    )
+    plan = prompt_frontier.plan_provider_round(
+        model_limit=limit,
+        messages=[{"role": "system", "content": "fixed"}],
+        tools=None,
+        output_reserve_tokens=512,
+        safety_margin_tokens=512,
+    )
+    sink = worker._ledger_tapped_sink(
+        None,
+        deps=deps,
+        user_id="u_metadata_rejected",
+        lane="heartbeat",
+    )
+    asyncio.run(sink("provider_request", {"prompt_frontier": plan}))
+
+    assert traces[0]["type"] == "v2.prompt_frontier.budget"
+    warning = traces[1]
+    assert warning["type"] == "v2.prompt_frontier.metadata_rejected"
+    assert warning["status"] == "warning"
+    assert warning["detail"] == {
+        "reported_tokens": 16_384,
+        "floor_tokens": (
+            prompt_frontier.DEFAULT_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS
+        ),
+        "resolved_tokens": 131_072,
+        "resolved_source": "unaudited_default",
+        "provider": "openai_compatible",
+    }
+    assert set(warning["detail"]) == {
+        "reported_tokens",
+        "floor_tokens",
+        "resolved_tokens",
+        "resolved_source",
+        "provider",
+    }
+    assert "model" not in warning["detail"]
+    assert model_sentinel not in repr(warning)
+    assert data_track._debug_event_public_json(warning)["detail"] == warning["detail"]
+
+    forged = {**warning, "detail": {**warning["detail"], "model": model_sentinel}}
+    assert data_track._debug_event_public_json(forged)["detail"] == {}
+
+    traces.clear()
+    accepted = prompt_frontier.resolve_model_limit(
+        "openai_compatible",
+        model_sentinel,
+        base_url="https://relay.example/v1",
+        provider_context_window_tokens=131_072,
+    )
+    accepted_plan = prompt_frontier.plan_provider_round(
+        model_limit=accepted,
+        messages=[{"role": "system", "content": "fixed"}],
+        tools=None,
+        output_reserve_tokens=512,
+        safety_margin_tokens=512,
+    )
+    asyncio.run(sink("provider_request", {"prompt_frontier": accepted_plan}))
+    assert [item["type"] for item in traces] == ["v2.prompt_frontier.budget"]
+
+
+def test_invalid_metadata_warning_cannot_suppress_budget_trace():
+    traces = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append({
+        "type": event_type,
+        **fields,
+    })
+    limit = prompt_frontier.ModelPromptLimit(
+        provider="PRIVATE_PROVIDER_TEXT",
+        model="",
+        context_window_tokens=65_536,
+        source="unaudited_default",
+        rejected_provider_metadata_tokens=16_384,
+        provider_metadata_floor_tokens=32_768,
+    )
+    plan = prompt_frontier.plan_provider_round(
+        model_limit=limit,
+        messages=[{"role": "system", "content": "fixed"}],
+        tools=None,
+        output_reserve_tokens=512,
+        safety_margin_tokens=512,
+    )
+
+    worker._emit_prompt_frontier_trace(
+        deps,
+        "u_metadata_guard",
+        plan,
+        lane="chat",
+    )
+
+    assert [item["type"] for item in traces] == ["v2.prompt_frontier.budget"]
+
+
+def test_prompt_frontier_trace_rejects_component_plaintext_before_emit():
+    sentinel = "PRIVATE_COMPONENT_TEXT"
+    traces = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append({
+        "user_id": user_id,
+        "type": event_type,
+        **fields,
+    })
+    error = prompt_frontier.PromptFrontierExhausted(
+        required_tokens=2_000,
+        input_budget_tokens=1_000,
+        context_window_tokens=2_000,
+        required_components=("message_context",),
+        limit_source="caller",
+        output_reserve_tokens=500,
+        safety_margin_tokens=500,
+        utf8_bytes_per_token=1.0,
+        component_bytes=(
+            prompt_frontier.PromptByteComponent("system", 2_000),
+        ),
+    )
+    error.component_bytes = ({
+        "name": "system",
+        "bytes": 2_000,
+        "content": sentinel,
+    },)
+
+    worker._emit_prompt_frontier_trace(
+        deps,
+        "u_budget_guard",
+        error,
+        lane="chat",
+    )
+
+    assert traces == []
+
+
+def test_prompt_frontier_trace_rejects_plaintext_component_name_before_emit():
+    traces = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append({
+        "user_id": user_id,
+        "type": event_type,
+        **fields,
+    })
+    error = prompt_frontier.PromptFrontierExhausted(
+        required_tokens=2_000,
+        input_budget_tokens=1_000,
+        context_window_tokens=2_000,
+        required_components=("message_context",),
+        limit_source="caller",
+        output_reserve_tokens=500,
+        safety_margin_tokens=500,
+        utf8_bytes_per_token=1.0,
+        component_bytes=(
+            prompt_frontier.PromptByteComponent("system", 2_000),
+        ),
+    )
+    error.component_bytes = ({
+        "name": "她说她今天很累",
+        "bytes": 2_000,
+    },)
+
+    worker._emit_prompt_frontier_trace(
+        deps,
+        "u_budget_guard",
+        error,
+        lane="chat",
+    )
+
+    assert traces == []
+
+
+def test_prompt_frontier_message_breakdown_uses_only_semantic_closed_names():
+    messages = [
+        {"role": "system", "content": "private system"},
+        {
+            "role": "user",
+            "content": worker.context._SUMMARY_HEADER + "private summary",
+        },
+        {
+            "role": "user",
+            "content": (
+                worker.context.WORLD_BOOK_CONTEXT_HEADER + "\nprivate world"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                worker.context.RUNTIME_CONTEXT_HEADER + "\nprivate runtime"
+            ),
+        },
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "private screen"}],
+            worker.v2_screen_chat.MESSAGE_TAG: True,
+        },
+        {"role": "user", "content": "private tail"},
+    ]
+
+    breakdown = worker._prompt_frontier_message_component_bytes(messages)
+
+    assert [item.name for item in breakdown] == [
+        "system", "summary", "tail", "worldbook", "runtime_data", "screen",
+    ]
+    assert all(type(item.bytes) is int and item.bytes > 0 for item in breakdown)
+    assert "private" not in repr(breakdown)
+
+
 @pytest.mark.parametrize(
     ("self_on", "self_text", "failed", "provider_text", "expected"),
     [
@@ -329,7 +659,7 @@ def test_empty_provider_response_trace_is_content_free_and_admin_readable():
     deps = _minimal_deps()
     deps.emit_debug_trace = _emit
     callback = worker._empty_provider_response_debug_callback(
-        deps, "u_trace", "chat"
+        deps, "u_trace", "chat", "trace-empty-response"
     )
     assert callback is not None
     asyncio.run(callback({
@@ -342,6 +672,7 @@ def test_empty_provider_response_trace_is_content_free_and_admin_readable():
     }))
 
     assert captured["type"] == "provider.empty_response"
+    assert captured["trace_id"] == "trace-empty-response"
     assert captured["detail"] == {
         "stop_reason": "content_filter",
         "has_visible_text": False,
@@ -359,6 +690,7 @@ def test_empty_provider_response_trace_is_content_free_and_admin_readable():
         "lane",
     }
     public = data_track._debug_event_public_json(captured)
+    assert public["trace_id"] == "trace-empty-response"
     assert public["detail"] == captured["detail"]
     assert "MUST NEVER REACH DEBUG TRACE" not in str(captured)
 
@@ -380,6 +712,131 @@ def test_empty_provider_response_has_dedicated_admin_timeline_label():
         "type": "provider.empty_response",
         "subsystem": "agent",
     }) == ("🕳️", "空回复诊断")
+
+
+def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
+    from admin import data_track
+
+    assert "force_text_fallback" in (
+        tool_loop._PROVIDER_TERMINAL_TEXT_ROUND_REASONS
+    )
+    assert "tool_schema_rejected" in (
+        tool_loop._PROVIDER_FORCE_TEXT_FALLBACK_REASONS
+    )
+    captured = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: captured.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+    trace = worker._provider_tool_surface_callback(
+        deps, "u_roundtrip_trace", "chat", "trace-roundtrip"
+    )
+    assert trace is not None
+    asyncio.run(trace({
+        "round": 2,
+        "candidate_tool_count": 4,
+        "sent_tool_count": 0,
+        "dropped_tool_count": 4,
+        "mcp_candidate_tool_count": 2,
+        "mcp_sent_tool_count": 0,
+        "mcp_dropped_tool_count": 2,
+        "reason": "tool_schema_rejected",
+        "terminal_text_round": True,
+        "terminal_text_round_reason": "force_text_fallback",
+        "force_text_fallback_reason": "tool_schema_rejected",
+        "empty_response_recovery": False,
+    }))
+    asyncio.run(trace.emit_summary())
+
+    roundtrip = next(
+        event for event in captured if event["type"] == "mcp.roundtrip.provider"
+    )
+    assert roundtrip["trace_id"] == "trace-roundtrip"
+    public = data_track._debug_event_public_json(roundtrip)
+    assert public["detail"]["lane"] == "chat"
+    assert public["detail"]["terminal_text_round_reason"] == (
+        "force_text_fallback"
+    )
+    assert public["detail"]["force_text_fallback_reason"] == (
+        "tool_schema_rejected"
+    )
+
+    surface = next(
+        event for event in captured if event["type"] == "mcp.surface.provider"
+    )
+    assert surface["trace_id"] == "trace-roundtrip"
+    surface_public = data_track._debug_event_public_json(surface)["detail"]
+    assert surface_public["lane"].startswith("<redacted string")
+    assert surface_public["terminal_text_round_reason"].startswith(
+        "<redacted string"
+    )
+
+
+def test_provider_roundtrip_trace_normalizes_unknowns_and_admin_redacts_forgery():
+    from admin import data_track
+
+    private_lane = "private lane from caller"
+    private_terminal = "private terminal reason"
+    private_fallback = "private fallback reason"
+    captured = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: captured.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+    trace = worker._provider_tool_surface_callback(
+        deps, "u_roundtrip_unknown", private_lane
+    )
+    assert trace is not None
+    asyncio.run(trace({
+        "round": 1,
+        "candidate_tool_count": 0,
+        "sent_tool_count": 0,
+        "dropped_tool_count": 0,
+        "mcp_candidate_tool_count": 0,
+        "mcp_sent_tool_count": 0,
+        "mcp_dropped_tool_count": 0,
+        "reason": "none",
+        "terminal_text_round": True,
+        "terminal_text_round_reason": private_terminal,
+        "force_text_fallback_reason": private_fallback,
+        "empty_response_recovery": False,
+    }))
+    asyncio.run(trace.emit_summary())
+
+    roundtrip = next(
+        event for event in captured if event["type"] == "mcp.roundtrip.provider"
+    )
+    assert roundtrip["detail"]["lane"] == "other"
+    assert roundtrip["detail"]["wake_kind"] == "other"
+    assert roundtrip["detail"]["terminal_text_round_reason"] == "other"
+    assert roundtrip["detail"]["force_text_fallback_reason"] == "other"
+    assert private_lane not in str(roundtrip)
+    assert private_terminal not in str(roundtrip)
+    assert private_fallback not in str(roundtrip)
+    normalized_public = data_track._debug_event_public_json(roundtrip)["detail"]
+    assert normalized_public["lane"] == "other"
+    assert normalized_public["wake_kind"] == "other"
+    assert normalized_public["terminal_text_round_reason"] == "other"
+    assert normalized_public["force_text_fallback_reason"] == "other"
+
+    forged = {
+        **roundtrip,
+        "detail": {
+            **roundtrip["detail"],
+            "lane": private_lane,
+            "wake_kind": private_lane,
+            "terminal_text_round_reason": private_terminal,
+            "force_text_fallback_reason": private_fallback,
+        },
+    }
+    forged_public = data_track._debug_event_public_json(forged)["detail"]
+    for key in (
+        "lane",
+        "wake_kind",
+        "terminal_text_round_reason",
+        "force_text_fallback_reason",
+    ):
+        assert forged_public[key].startswith("<redacted string")
 
 
 def test_combined_memory_worldbook_message_keeps_truncation_trace_visible():

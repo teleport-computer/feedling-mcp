@@ -728,7 +728,17 @@ def _decrypt_provider_key(enclave_url: str, api_key: str = "", envelope: dict | 
                           *, runtime_token: str = "") -> str:
     """JIT-decrypt a provider-key envelope via the enclave (purpose reuses the
     model_api config scheme). Plaintext is handed to the child via env. Auth is
-    the api_key, or a runtime token (Stage D zero-roster) when provided."""
+    the api_key, or a runtime token (Stage D zero-roster) when provided.
+
+    明文行（TEE 主库形态）本地直读：cutover 后 ``model_api_credentials`` 的
+    ``api_key_envelope`` 是 ``{body,…}``、没有 ``body_ct``，发给 enclave 只会拿回
+    ``decrypt_failed: envelope missing body_ct``，再被下面的 except 吞成空串——
+    空 key 一路带到 provider 就变成 401，根因彻底看不见。判据与
+    ``core.envelope.decrypt_provider_key_envelope`` 一致（``body_ct`` 优先）。"""
+    if isinstance(envelope, dict) and not envelope.get("body_ct"):
+        body = envelope.get("body")
+        if isinstance(body, str):
+            return body
     try:
         resp = _ENCLAVE_HTTP.post(f"{enclave_url.rstrip('/')}/v1/envelope/decrypt",
                                   headers=_auth_headers(api_key=api_key, runtime_token=runtime_token),
@@ -760,14 +770,47 @@ def _needs_introduction_identity(identity: dict | None) -> bool:
 
 
 def _fetch_identity_plain_for_intro(entry: dict, *, api_url: str, enclave_url: str) -> tuple[dict | None, str]:
-    if not str(enclave_url or "").strip():
-        return None, "enclave_url_missing"
     headers = _auth_headers(
         api_key=str(entry.get("api_key") or ""),
         runtime_token=str(entry.get("runtime_token") or ""),
     )
     if not headers:
         return None, "auth_missing"
+    try:
+        from core import envelope as core_envelope
+        from identity import card_view
+
+        resp = httpx.get(
+            f"{api_url.rstrip('/')}/v1/identity/get",
+            headers=headers,
+            timeout=10,
+        )
+        if resp.status_code == 404:
+            return None, "identity_not_found"
+        resp.raise_for_status()
+        body = resp.json()
+        stored = body.get("identity") if isinstance(body, dict) else None
+        if not isinstance(stored, dict):
+            return None, "identity_not_initialized"
+        shape = core_envelope.classify_envelope_shape(stored)
+        if shape in ("plaintext_text", "plaintext_binary"):
+            raw = core_envelope.read_plaintext_envelope_body(
+                stored,
+                owner_user_id=str(entry.get("user_id") or ""),
+            )
+            inner = json.loads(raw.decode("utf-8"))
+            if not isinstance(inner, dict):
+                raise ValueError("identity plaintext is not an object")
+            return card_view.plaintext_view(
+                card_view.envelope_base(stored),
+                inner,
+                stored,
+                days_with_user=int(stored.get("days_with_user") or 0),
+            ), ""
+    except Exception as e:  # noqa: BLE001
+        return None, f"identity_fetch_failed:{type(e).__name__}"
+    if not str(enclave_url or "").strip():
+        return None, "enclave_url_missing"
     try:
         resp = _ENCLAVE_HTTP.get(
             f"{enclave_url.rstrip('/')}/v1/identity/get",
@@ -821,7 +864,10 @@ def _enqueue_introduction_job_if_needed(
     # introduced do we record the marker and skip — a transient decrypt failure
     # must not be mistaken for "already introduced" (it would suppress a real
     # intro forever).
-    identity, reason = _fetch_identity_plain_for_intro(entry, api_url=api_url, enclave_url=enclave_url)
+    identity_entry = dict(entry)
+    identity_entry.setdefault("user_id", user_id)
+    identity, reason = _fetch_identity_plain_for_intro(
+        identity_entry, api_url=api_url, enclave_url=enclave_url)
     if isinstance(identity, dict):
         status = str(identity.get("decrypt_status") or "").strip()
         decrypt_ok = (not status) or status == "ok"

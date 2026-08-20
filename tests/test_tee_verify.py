@@ -18,6 +18,7 @@ part of the effective cleanup set even though it never appears in
 ``_RDS_TABLES``/verify's scope.
 """
 import os
+import hashlib
 import re
 import sys
 import uuid
@@ -29,6 +30,7 @@ from psycopg.types.json import Jsonb
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
+import object_storage  # noqa: E402
 from tee_replicator import transforms  # noqa: E402
 from tee_shadow import mirror, verify  # noqa: E402
 from tee_shadow import table_registry as reg  # noqa: E402
@@ -281,6 +283,37 @@ def test_consistent_dbs_report_ok_with_zero_mismatches(backend_env):
     assert report["tables"]["chat_messages"]["tee_rows"] == 1
 
 
+def test_plaintext_pointer_integrity_helper_checks_object_without_exposing_bytes(
+    monkeypatch,
+):
+    uid = "usr_integrity"
+    raw = b"\x00private-file\xff"
+    key = f"chatfiles/{uid}/g1/msg/version"
+    doc = {
+        "body_key": key,
+        "body_object_format": "plaintext_v1",
+        "body_size_bytes": len(raw),
+        "body_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    monkeypatch.setattr(
+        object_storage,
+        "get_chat_body_bytes",
+        lambda fetched_key, fetched_uid: (
+            raw if (fetched_key, fetched_uid) == (key, uid) else None
+        ),
+    )
+
+    assert verify._plaintext_pointer_integrity_error(uid, doc) is None
+    assert verify._plaintext_pointer_integrity_error(
+        uid,
+        {**doc, "body_size_bytes": len(raw) + 1},
+    ) == "body_size_mismatch"
+    assert verify._plaintext_pointer_integrity_error(
+        uid,
+        {**doc, "body_sha256": "0" * 64},
+    ) == "body_sha256_mismatch"
+
+
 def test_mutated_tee_row_is_pinpointed_as_mismatch(backend_env):
     uid = f"usr_{uuid.uuid4().hex[:8]}"
     _seed(uid)
@@ -449,6 +482,47 @@ def test_pending_race_window_local_only_row_silently_skipped_in_sample(backend_e
     assert [m for m in report["mismatches"] if m["item_id"] == "loc2"] == []
 
 
+def test_undecryptable_row_is_reported_not_fatal(backend_env, monkeypatch):
+    """一条解不开的密文行必须被记成 mismatch，而不能炸掉整趟 verify。
+
+    prod 2026-07-28 实测：某条 envelope 让 enclave 返回
+    ``enclave_http_403:{"error":"decrypt_failed: envelope missing body_ct"}``。
+    该异常不在抽样循环的 catch 列表里（当时只 catch PendingDeviceMigration）
+    → 冒泡冲垮整趟 verify → 再被 tee_sync_scheduler 的兜底 except 静默吞掉
+    → 24h 内 ``verify_ran`` 恒 false，unconverged_tables / requeue_backlog
+    全线失去量测能力，而外部只看得到一条 warning 日志。
+
+    与 replicate 侧 2026-07-15 已修的毒行是同一模式：一条坏行做队头阻塞。
+    修复语义：坏行计入 mismatch 并继续，**不得**当成「两库一致」而跳过——
+    那会用虚假的全绿换来更危险的静默。
+    """
+    uid = f"usr_{uuid.uuid4().hex[:8]}"
+    _seed(uid)
+    # 一条正常行（两侧一致）+ 一条解密必失败的毒行。两侧都放行，避免行数缺口
+    # 掩盖了「内容抽样阶段」的行为——本测试断言的正是抽样阶段不能夭折。
+    good_rds = _insert_rds_chat(uid, "good1", 10.0, "AAA")
+    _insert_tee_chat(uid, "good1", 10.0,
+                     transforms.plaintext_chat_doc(good_rds, _stub_decrypt))
+    _insert_rds_chat(uid, "poison1", 11.0, "POISON")
+    _insert_tee_chat(uid, "poison1", 11.0, {"body": "whatever", "ts": 11.0})
+
+    def _poison_decrypt(envelope, purpose):
+        if envelope.get("body_ct") == "POISON":
+            raise RuntimeError(
+                'enclave_http_403:{"error":"decrypt_failed: envelope missing body_ct"}')
+        return _stub_decrypt(envelope, purpose)
+
+    monkeypatch.setattr(verify, "_make_decrypt", lambda _uid: _poison_decrypt)
+
+    # 修复前：这一行直接抛 RuntimeError，整趟 verify 夭折。
+    report = verify.run(sample_rate=1.0)
+
+    bad = [m for m in report["mismatches"] if m["item_id"] == "poison1"]
+    assert bad, "解不开的行必须被记成 mismatch，而不是让整趟 verify 崩掉"
+    assert bad[0]["field"] == "<decrypt-failed>"
+    assert report["ok"] is False
+    # 毒行之外的对账照常完成 —— 证明 verify 没有半途夭折。
+    assert report["tables"]["chat_messages"]["rds_rows"] == 2
 def test_verify_covers_every_synced_table():
     """verify 范围必须随注册表扩展——否则新增表会产生'全绿假象'：
     verify_ok=true 但那些表压根没被核对过。这是上游 plan 的 Phase 1 出口 gate。"""
@@ -480,10 +554,17 @@ def _insert_rds_voice_transcript(uid: str, call_id: str) -> None:
 
 
 def _insert_tee_voice_transcript(uid: str, call_id: str) -> None:
+    envelope = {
+        "id": call_id,
+        "owner_user_id": uid,
+        "visibility": "shared",
+        "body": "hello",
+    }
     with psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as conn:
         conn.execute(
-            "INSERT INTO voice_transcripts (user_id, call_id, doc) VALUES (%s,%s,%s)",
-            (uid, call_id, Jsonb({"transcript": "hello"})),
+            "INSERT INTO voice_transcripts "
+            "(user_id, call_id, transcript_envelope) VALUES (%s,%s,%s)",
+            (uid, call_id, Jsonb(envelope)),
         )
 
 
@@ -673,3 +754,61 @@ def test_migration_seeded_singletons_constant_is_complete():
         f"{sorted(seeded - set(_MIGRATION_SEEDED_SINGLETONS))}\n"
         f"常量里有但扫描没发现（该表可能已改名/该 migration 已删，需要人工确认）："
         f"{sorted(set(_MIGRATION_SEEDED_SINGLETONS) - seeded)}")
+
+
+# 本守卫上线时就已存在的缺口。**只减不增**：新表/新列一律不许进这里，
+# 加进来就等于把「静默写默认值」重新合法化。
+#
+# genesis_import_jobs 的认领/租约列。上报后 Supervisor 拍板 T150，处置分两半：
+#
+#   · worker_claimed_by / worker_claimed_at —— **已由 T150(PR #291, 816109f5)
+#     补进 reconciler.TABLES 并合入 test，因此从本白名单移除**。留着的话白名单
+#     会静默吞掉那次修复：守卫照样绿，而扶正仍把它们写成默认值。
+#   · resident_* 四列 —— 设计意图待定（认领状态属运行时本地，跨库复制可能反而
+#     造出两个认领者），T150 明确不碰，保留。
+#
+# 本表**只减不增**：新表/新列一律不许进来，加进来就等于把「静默写默认值」重新
+# 合法化。这次收窄是它上线后的第一次减项。
+_PREEXISTING_COLUMN_GAPS = {
+    "genesis_import_jobs": {
+        "resident_attempts", "resident_claimed_at", "resident_consumer_id",
+        "resident_heartbeat_at",
+    },
+}
+
+
+def test_reconciler_columns_cover_the_whole_table():
+    """对账列表必须覆盖被对账表的**全部**列。
+
+    漏一列不会报错,后果却是静默的:扶正通道按列表 SELECT/INSERT,漏掉的列在
+    TEE 侧取默认值。test 的 primary 已经是 TEE,所以「被读的那一份」会悄悄少
+    掉那几列的真实值 —— 例如 0093 加的说话四列若不补进列表,面板上就是「谁都
+    没说过话」,而且两侧行数一致、verify 也不会喊。
+
+    这条守卫从 schema 反推,而不是再抄一份列名清单:抄的那份同样会漂。
+    """
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+    import db  # noqa: E402
+    from tee_shadow import reconciler  # noqa: E402
+
+    with db.get_pool().connection() as conn:
+        for table, (_pk, columns) in reconciler.TABLES.items():
+            actual = {
+                str(r[0]) for r in conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema='public' AND table_name=%s", (table,),
+                ).fetchall()
+            }
+            if not actual:
+                continue  # 该表不在本地 schema（例如仅 TEE 链建的表）
+            listed = {c.strip() for c in columns.split(",") if c.strip()}
+            missing = sorted(actual - listed - _PREEXISTING_COLUMN_GAPS.get(table, set()))
+            assert not missing, (
+                f"{table}: 这些列存在于 schema 但不在 reconciler 列表里，"
+                f"扶正会把它们写成默认值：{missing}"
+            )
+            unknown = sorted(listed - actual)
+            assert not unknown, f"{table}: 列表里有 schema 上不存在的列：{unknown}"

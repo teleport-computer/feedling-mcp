@@ -77,6 +77,23 @@ _DELETE_BATCH = 500
 
 _RETRY_BACKOFF_SEC = 1.0
 
+# Prune deletion is a distinct typed contract from the requeue/terminal lane.
+# In particular trajectory pending uses item_id="job:event", while pruning uses
+# the real composite key (job_id,event_index); sharing one SQL slot is unsafe.
+_PRUNE_DELETE_SQL = {
+    "chat_messages": "DELETE FROM chat_messages WHERE user_id = %s AND msg_id = %s",
+    "memory_moments": "DELETE FROM memory_moments WHERE user_id = %s AND moment_id = %s",
+    "world_book_entries": "DELETE FROM world_book_entries WHERE user_id = %s AND entry_id = %s",
+    "identity": "DELETE FROM user_blobs WHERE user_id = %s AND kind = 'identity'",
+    "frame_envelopes": "DELETE FROM frames WHERE user_id = %s AND frame_id = %s",
+    "v2_trajectory_events": "DELETE FROM v2_trajectory_events WHERE job_id = %s AND event_index = %s",
+    "voice_transcripts": "DELETE FROM voice_transcripts WHERE user_id = %s AND call_id = %s",
+    "model_api_credentials": "DELETE FROM model_api_credentials WHERE user_id = %s AND id = %s",
+    "v2_conversation_summary": "DELETE FROM v2_conversation_summary WHERE user_id = %s",
+    "v2_trajectory_reviews": "DELETE FROM v2_trajectory_reviews WHERE user_id = %s AND source_job_id = %s",
+    "v2_workspace_entries": "DELETE FROM v2_workspace_entries WHERE user_id = %s AND path = %s",
+}
+
 
 def _conn_retries() -> int:
     try:
@@ -126,7 +143,7 @@ def prunable_tables() -> tuple[str, ...]:
     return tuple(sorted(
         t for t, cfg in tee_worker._TABLES.items()
         if cfg.prune_rds_keys_sql and cfg.prune_tee_keys_sql
-        and cfg.requeue_delete_tee_sql
+        and t in _PRUNE_DELETE_SQL
     ))
 
 
@@ -142,7 +159,12 @@ def unprunable_tables() -> tuple[str, ...]:
     return tuple(sorted(t for t in tee_worker._TABLES if t not in covered))
 
 
-def prune_table(table: str, *, dry_run: bool = False) -> dict:
+def prune_table(
+    table: str,
+    *,
+    dry_run: bool = False,
+    expected_stale: int | None = None,
+) -> dict:
     """对一张表做两侧主键差集，删掉 TEE 侧的残留行。绝不抛——失败落在返回值里。"""
     from tee_replicator import worker as tee_worker
 
@@ -154,8 +176,8 @@ def prune_table(table: str, *, dry_run: bool = False) -> dict:
     if cfg is None:
         rep["error"] = f"{table} 不在 replicator 的表配置里"
         return rep
-    if not (cfg.prune_rds_keys_sql and cfg.prune_tee_keys_sql
-            and cfg.requeue_delete_tee_sql):
+    delete_sql = _PRUNE_DELETE_SQL.get(table)
+    if not (cfg.prune_rds_keys_sql and cfg.prune_tee_keys_sql and delete_sql):
         rep["error"] = f"{table} 没有配 prune（缺 keys SQL 或 DELETE）"
         return rep
 
@@ -186,10 +208,11 @@ def prune_table(table: str, *, dry_run: bool = False) -> dict:
 
     # 安全阈值：宁可让残留多留一天等人来看，也不要自动做一次大规模不可逆删除。
     guard = max(_MIN_ABS_GUARD, int(len(tee_keys) * _MAX_FRACTION))
-    if len(stale) > guard:
+    exact_override = expected_stale is not None and expected_stale == len(stale)
+    if len(stale) > guard and not exact_override:
         rep["refused"] = (
             f"残留 {len(stale)} 行超过阈值 {guard}（TEE {len(tee_keys)} 行）——"
-            f"整表放弃，不删任何一行。先人工确认 RDS 侧读数是否正常")
+            f"整表放弃，不删任何一行。先 dry-run 确认后用精确 expected_stale 重试")
         log.error("[tee-prune] %s: %s", table, rep["refused"])
         return rep
 
@@ -200,7 +223,7 @@ def prune_table(table: str, *, dry_run: bool = False) -> dict:
 
     def _delete_batch(conn, batch):
         with conn.transaction(), conn.cursor() as cur:
-            cur.executemany(cfg.requeue_delete_tee_sql, batch)
+            cur.executemany(delete_sql, batch)
 
     try:
         # 每批各自取连接：一批之间的间隔足以让网关掐断长期持有的那条

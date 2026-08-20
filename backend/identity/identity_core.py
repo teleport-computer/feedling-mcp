@@ -111,13 +111,16 @@ def init_identity(store, payload: dict) -> tuple[dict, int]:
             # public-key material, not a malformed request -> 409, not 400.
             return {"error": build_err or "identity_envelope_failed"}, 409
         envelope = built
-    required = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
+    required, shape_err = core_envelope.upload_shape_gate(
+        envelope, user_id=store.user_id)
+    if shape_err is not None:
+        return shape_err, 400
     missing = [f for f in required if not envelope.get(f)]
     if missing:
         return {"error": f"envelope missing fields: {missing}"}, 400
     if envelope["visibility"] not in ("shared", "local_only"):
         return {"error": "envelope.visibility must be 'shared' or 'local_only'"}, 400
-    if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
+    if core_envelope.requires_enclave_key(envelope):
         return {"error": "envelope with visibility=shared requires K_enclave"}, 400
     # Defense-in-depth: refuse envelopes whose claimed owner_user_id doesn't
     # match the authenticated caller. The enclave's AEAD AAD check would also
@@ -162,12 +165,8 @@ def init_identity(store, payload: dict) -> tuple[dict, int]:
     identity = {
         "v": 1,
         "id": envelope.get("id") or uuid.uuid4().hex,
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
-        "visibility": envelope["visibility"],
-        "owner_user_id": envelope["owner_user_id"],
+        "enclave_pk_fpr": "",
+        **core_envelope.envelope_storage_fields(envelope),
         "created_at": now,
         "updated_at": now,
         "replaced_at": now,
@@ -201,13 +200,16 @@ def replace_identity(store, payload: dict) -> tuple[dict, int]:
     if envelope is None:
         return {"error": "envelope required for replace; use /v1/identity/init for plaintext"}, 400
 
-    required = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
+    required, shape_err = core_envelope.upload_shape_gate(
+        envelope, user_id=store.user_id)
+    if shape_err is not None:
+        return shape_err, 400
     missing = [f for f in required if not envelope.get(f)]
     if missing:
         return {"error": f"envelope missing fields: {missing}"}, 400
     if envelope["visibility"] not in ("shared", "local_only"):
         return {"error": "envelope.visibility must be 'shared' or 'local_only'"}, 400
-    if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
+    if core_envelope.requires_enclave_key(envelope):
         return {"error": "envelope with visibility=shared requires K_enclave"}, 400
     # Defense-in-depth: same owner check identity_init now does. See comment
     # there for why.
@@ -239,12 +241,8 @@ def replace_identity(store, payload: dict) -> tuple[dict, int]:
     identity = {
         "v": 1,
         "id": envelope.get("id") or (existing.get("id") if existing else uuid.uuid4().hex),
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
-        "visibility": envelope["visibility"],
-        "owner_user_id": envelope["owner_user_id"],
+        "enclave_pk_fpr": "",
+        **core_envelope.envelope_storage_fields(envelope),
         "created_at": created_at,
         "updated_at": now,
         "replaced_at": now,

@@ -70,6 +70,7 @@ from capabilities import registry as cap_registry
 from capabilities import result_budget as cap_result_budget
 from capabilities import tool_schema as cap_tool_schema
 from chat.reply_language import (
+    infer_garden_language,
     infer_reply_language_policy,
     reply_language_system_line,
 )
@@ -118,6 +119,7 @@ from model_api_runtime.v2 import subagents as v2_subagents
 from model_api_runtime.v2 import summary_frontier as v2_summary_frontier
 from model_api_runtime.v2 import tail_anchor as v2_tail_anchor
 from model_api_runtime.v2 import tool_loop as v2_tool_loop
+from model_api_runtime.v2 import tool_surface as v2_tool_surface
 from model_api_runtime.v2 import trajectory as v2_trajectory
 
 # 纯 prompt/parse 模块（无 I/O、不碰 DB/enclave）——依赖方向允许 worker 直接 import
@@ -472,6 +474,17 @@ PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN = _positive_float_env(
 PROMPT_IMAGE_RESERVE_TOKENS = _positive_int_env(
     "FEEDLING_V2_PROMPT_IMAGE_RESERVE_TOKENS", "8192"
 )
+try:
+    TOOL_SCHEMA_COLLAPSE_POLICY = v2_tool_surface.normalize_collapse_policy(
+        os.environ.get(
+            "FEEDLING_V2_TOOL_SCHEMA_COLLAPSE_POLICY",
+            v2_tool_surface.DEFAULT_COLLAPSE_POLICY,
+        )
+    )
+except ValueError as exc:
+    raise RuntimeError(
+        "FEEDLING_V2_TOOL_SCHEMA_COLLAPSE_POLICY is invalid"
+    ) from exc
 if any(
     context_window <= PROMPT_OUTPUT_RESERVE_TOKENS + PROMPT_SAFETY_MARGIN_TOKENS
     for context_window in PROMPT_CONTEXT_WINDOW_OVERRIDES.values()
@@ -533,6 +546,10 @@ if not math.isfinite(MCP_TURN_WALL_BUDGET_SEC) or MCP_TURN_WALL_BUDGET_SEC <= 0:
     raise RuntimeError(
         "FEEDLING_V2_MCP_TURN_WALL_BUDGET_SEC must be positive and finite"
     )
+# How many folded manuals one `mcp_tool_search` call may unfold. Bounded because
+# every resolved schema goes back into the next request's prompt: an unbounded
+# search would simply undo the folding that created the headroom.
+_SCHEMA_SEARCH_MAX_RESULTS = 8
 # History tools' cumulative per-chat-turn budget (spec §5): raw rows OR wall
 # seconds, whichever exhausts first,累计跨 provider round（两工具合计）。
 # Exhaustion is not a turn failure — later history calls get a short error
@@ -1500,8 +1517,12 @@ class TurnDeps:
 
 
 class _EmptyMcpTurn:
-    """The no-MCP turn: offered when `TurnDeps.load_mcp_turn` is unwired (wake
-    lane, legacy callers, tests). No tools, handles nothing."""
+    """The no-MCP turn: offered when `TurnDeps.load_mcp_turn` is unwired
+    (legacy callers, tests) or the user has zero enabled servers. No tools,
+    handles nothing.
+
+    Since T154 "wake lane" is no longer on that list — the wake lanes load a
+    real turn like chat does."""
 
     tool_specs: tuple = ()
 
@@ -1841,6 +1862,159 @@ def _mcp_mutating_names_for_turn(mcp_turn) -> frozenset[str]:
     return offered & mutating
 
 
+class _SchemaRecovery:
+    """One turn's folded-schema recovery contract, shared by chat and wake.
+
+    The prompt frontier may fold any non-resident tool down to a bounded
+    description with an empty parameter schema.  A lane that offers folded tools
+    without this object has no way back: the model sees a name it cannot call
+    correctly and the runtime has no resolver to hand the manual back.  Chat
+    owned this since T143; the wake lanes folded with ``recovery_name=''`` and
+    therefore never matched the recovery branch at all.
+
+    Both tool domains are covered here on purpose.  Platform schemas live in
+    ``SchemaRecoveryState``; user-MCP schemas stay inside the loader's turn
+    object (it owns the remote catalog and its own budget), and this class only
+    federates the two behind one contract so no lane can wire up half of it.
+    """
+
+    def __init__(self, mcp_turn, *, current_offered_mcp_tool_specs) -> None:
+        self._mcp_turn = mcp_turn
+        self._current_specs = current_offered_mcp_tool_specs
+        self.platform = v2_tool_surface.SchemaRecoveryState({
+            spec.name: spec for spec in cap_tool_schema.build_tool_specs()
+        })
+        self.pressure_extra_specs = getattr(
+            mcp_turn, "pressure_collapsed_tool_specs", None
+        )
+        if not callable(self.pressure_extra_specs):
+            self.pressure_extra_specs = None
+        self._record_mcp_surface = getattr(
+            mcp_turn, "set_pressure_tool_surface", None
+        )
+        self._mcp_protected = getattr(mcp_turn, "protected_tool_names", None)
+        self._mcp_recovery_needed = getattr(mcp_turn, "recovery_needed", None)
+
+    def _requires_mcp_resolution(self, name: str) -> bool:
+        predicate = getattr(self._mcp_turn, "requires_resolution", None)
+        return callable(predicate) and bool(predicate(name))
+
+    def _offered_mcp_names(self) -> tuple[str, ...]:
+        return tuple(
+            str(spec.name)
+            for spec in self._current_specs()
+            if str(getattr(spec, "name", "") or "")
+        )
+
+    def requires_resolution(self, name: str) -> bool:
+        """True when this call must be refused until its manual is loaded."""
+        return name in self.platform.discoverable_specs() or (
+            self._requires_mcp_resolution(name)
+        )
+
+    def record_surface(self, decision: dict | None) -> None:
+        detail = decision if isinstance(decision, dict) else {}
+        self.platform.set_pressure_collapsed(
+            detail.get("pressure_collapsed_names", ())
+        )
+        if callable(self._record_mcp_surface):
+            self._record_mcp_surface(detail)
+
+    def protected_names(self) -> set[str]:
+        protected = self.platform.protected_names()
+        if callable(self._mcp_protected):
+            protected.update(self._mcp_protected() or ())
+        else:
+            # Legacy duck-typed turn: a collapsed name that no longer requires
+            # resolution has already been resolved, so it must stay unfolded.
+            protected.update(
+                name
+                for name in (getattr(self._mcp_turn, "collapsed_names", ()) or ())
+                if not self._requires_mcp_resolution(name)
+            )
+        return protected
+
+    def recovery_needed(self) -> bool:
+        if self.platform.recovery_needed():
+            return True
+        if callable(self._mcp_recovery_needed):
+            return bool(self._mcp_recovery_needed())
+        return any(
+            self._requires_mcp_resolution(name)
+            for name in self._offered_mcp_names()
+        )
+
+    def resolve(self, args: dict | None) -> dict:
+        """`mcp_tool_search` body: hand back the full manuals that were folded."""
+        mcp_candidates = {
+            spec.name: spec
+            for spec in self._current_specs()
+            if self._requires_mcp_resolution(spec.name)
+        }
+        candidates = {
+            **self.platform.discoverable_specs(),
+            **mcp_candidates,
+        }
+        selection = v2_tool_surface.select_schema_names(
+            args,
+            candidates,
+            max_results=_SCHEMA_SEARCH_MAX_RESULTS,
+        )
+        if selection.get("error"):
+            return {"error": selection["error"], "tools": []}
+        selected = list(selection.get("selected") or [])
+        platform_resolved = self.platform.resolve([
+            name for name in selected if name in self.platform.full_specs
+        ])
+        tools_by_name: dict[str, Any] = {
+            name: self.platform.full_specs[name] for name in platform_resolved
+        }
+        mcp_selected = [name for name in selected if name in mcp_candidates]
+        mcp_result = {"resolved": [], "not_found": [], "tools": []}
+        resolve_mcp = getattr(self._mcp_turn, "resolve_tool_schemas", None)
+        if mcp_selected and callable(resolve_mcp):
+            mcp_result = resolve_mcp({"names": mcp_selected})
+            for item in mcp_result.get("tools") or []:
+                if isinstance(item, dict) and item.get("name"):
+                    tools_by_name[str(item["name"])] = item
+        resolved_set = set(platform_resolved) | set(
+            mcp_result.get("resolved") or []
+        )
+
+        def _public_tool(name: str) -> dict | None:
+            item = tools_by_name.get(name)
+            if isinstance(item, dict):
+                return item
+            if item is None:
+                return None
+            return {
+                "name": item.name,
+                "description": item.description,
+                "parameters": item.parameters,
+            }
+
+        return {
+            "resolved": [name for name in selected if name in resolved_set],
+            "not_found": list(selection.get("not_found") or [])
+            + list(mcp_result.get("not_found") or []),
+            "schema_budget_exceeded": list(
+                mcp_result.get("schema_budget_exceeded") or []
+            ),
+            "tools": [
+                public
+                for name in selected
+                if (public := _public_tool(name)) is not None
+            ],
+        }
+
+    def unresolved_call_error(self, tool_name: str) -> str:
+        return (
+            "error: tool schema is not loaded; call "
+            f'{cap_tool_schema.MCP_TOOL_SEARCH_TOOL} with '
+            f'names=["{tool_name}"] first'
+        )
+
+
 def _mcp_turn_usage_detail(
     offered_names: Iterable[str], called_names: Iterable[str]
 ) -> dict[str, Any]:
@@ -1868,11 +2042,15 @@ class _ProviderRoundtripTrace:
     deps: TurnDeps
     user_id: str
     lane: str
+    trace_id: str = ""
     provider_roundtrips: int = 0
     terminal_text_round_reached: bool = False
     terminal_text_round_reason: str = "none"
     force_text_fallback_reason: str = "none"
     empty_response_recovery_used: bool = False
+
+    def __post_init__(self) -> None:
+        self.lane = _normalize_provider_trace_lane(self.lane)
 
     async def __call__(self, detail: dict[str, Any]) -> None:
         try:
@@ -1884,11 +2062,13 @@ class _ProviderRoundtripTrace:
             pass
         if detail.get("terminal_text_round") is True:
             self.terminal_text_round_reached = True
-            self.terminal_text_round_reason = str(
-                detail.get("terminal_text_round_reason") or "none"
+            self.terminal_text_round_reason = _normalize_provider_trace_reason(
+                detail.get("terminal_text_round_reason"),
+                v2_tool_loop._PROVIDER_TERMINAL_TEXT_ROUND_REASONS,
             )
-        fallback_reason = str(
-            detail.get("force_text_fallback_reason") or "none"
+        fallback_reason = _normalize_provider_trace_reason(
+            detail.get("force_text_fallback_reason"),
+            v2_tool_loop._PROVIDER_FORCE_TEXT_FALLBACK_REASONS,
         )
         if fallback_reason != "none":
             self.force_text_fallback_reason = fallback_reason
@@ -1902,6 +2082,7 @@ class _ProviderRoundtripTrace:
             self.deps.emit_debug_trace,
             self.user_id,
             "mcp.surface.provider",
+            trace_id=self.trace_id,
             status=(
                 "warning"
                 if trace_detail["dropped_tool_count"]
@@ -1935,6 +2116,7 @@ class _ProviderRoundtripTrace:
                 self.deps.emit_debug_trace,
                 self.user_id,
                 "mcp.roundtrip.provider",
+                trace_id=self.trace_id,
                 status=(
                     "warning"
                     if self.terminal_text_round_reason == "max_calls"
@@ -1962,24 +2144,38 @@ def _provider_tool_surface_callback(
     deps: TurnDeps,
     user_id: str,
     lane: str,
+    trace_id: str = "",
 ):
     """Build a best-effort content-free trace sink for one runtime lane."""
 
     if deps.emit_debug_trace is None:
         return None
-    return _ProviderRoundtripTrace(deps, user_id, lane)
+    return _ProviderRoundtripTrace(deps, user_id, lane, str(trace_id or ""))
+
+
+def _normalize_provider_trace_lane(lane: object) -> str:
+    raw_lane = str(lane or "").strip()
+    return raw_lane if raw_lane == "chat" or raw_lane in _WAKE_LANES else "other"
+
+
+def _normalize_provider_trace_reason(
+    reason: object, allowed_values: frozenset[str]
+) -> str:
+    raw_reason = str(reason or "none").strip()
+    return raw_reason if raw_reason in allowed_values else "other"
 
 
 def _empty_provider_response_debug_callback(
     deps: TurnDeps,
     user_id: str,
     lane: str,
+    trace_id: str = "",
 ):
     """Build a content-free admin trace sink for provider-empty responses."""
     if deps.emit_debug_trace is None:
         return None
 
-    safe_lane = lane if lane == "chat" or lane in _WAKE_LANES else "other"
+    safe_lane = _normalize_provider_trace_lane(lane)
 
     async def _emit(response_shape: dict[str, Any]) -> None:
         raw_stop_reason = str(response_shape.get("stop_reason") or "")
@@ -2008,6 +2204,7 @@ def _empty_provider_response_debug_callback(
                 deps.emit_debug_trace,
                 user_id,
                 "provider.empty_response",
+                trace_id=str(trace_id or ""),
                 status="warning",
                 summary="V2 provider 返回空回复",
                 explain=(
@@ -2032,6 +2229,317 @@ _CONTEXT_TRUNCATION_COUNT_KEYS = (
     "profile_cards_truncated",
     "worldbook_truncated",
 )
+
+_PROMPT_FRONTIER_TRACE_EVENTS = frozenset({
+    "v2.prompt_frontier.budget",
+    "v2.prompt_frontier.exhausted",
+    "v2.prompt_frontier.metadata_rejected",
+})
+_PROMPT_FRONTIER_TRACE_LANES = frozenset({"chat", *_WAKE_LANES})
+_PROMPT_FRONTIER_LIMIT_SOURCES = frozenset({
+    "provider_metadata",
+    "caller",
+    "audited_family",
+    "unaudited_default",
+    "deployment_override",
+})
+_PROMPT_FRONTIER_REQUIRED_COMPONENTS = frozenset({
+    "message_context",
+    "tool_transcript",
+    "required_tool_schemas",
+})
+_PROMPT_FRONTIER_WARNING_RATIO = 0.70
+_PROMPT_FRONTIER_TRACE_PROVIDERS = frozenset({
+    "openai",
+    "openrouter",
+    "anthropic",
+    "bedrock",
+    "gemini",
+    "deepseek",
+    "openai_compatible",
+})
+
+
+def _prompt_frontier_message_component_bytes(
+    messages: Iterable[Any],
+) -> tuple[v2_prompt_frontier.PromptByteComponent, ...]:
+    """Project exact assembled messages to closed, content-free byte families."""
+
+    totals: dict[str, int] = {}
+    for message in messages:
+        if isinstance(message, ToolExchange):
+            name = "tool_transcript"
+        elif not isinstance(message, dict):
+            name = "tail"
+        else:
+            role = str(message.get("role") or "")
+            content = message.get("content")
+            text = content if isinstance(content, str) else ""
+            if role == "system":
+                name = "system"
+            elif message.get(v2_screen_chat.MESSAGE_TAG) is True:
+                name = "screen"
+            elif text.startswith(context.WORLD_BOOK_CONTEXT_HEADER + "\n"):
+                name = "worldbook"
+            elif text.startswith(context._SUMMARY_HEADER):
+                name = "summary"
+            elif any(
+                text.startswith(prefix)
+                for prefix in (
+                    context.RUNTIME_CONTEXT_HEADER + "\n",
+                    context.TEMPORAL_CONTEXT_HEADER + "\n",
+                    context.COVERAGE_HOLE_HEADER + "\n",
+                    context.PROACTIVE_TURN_BOUNDARY,
+                )
+            ):
+                name = "runtime_data"
+            else:
+                name = "tail"
+        totals[name] = totals.get(name, 0) + (
+            v2_prompt_frontier.prompt_structure_utf8_bytes(message)
+        )
+    return tuple(
+        v2_prompt_frontier.PromptByteComponent(name=name, bytes=byte_count)
+        for name in (
+            "system",
+            "summary",
+            "tail",
+            "worldbook",
+            "runtime_data",
+            "screen",
+            "tool_transcript",
+        )
+        if (byte_count := totals.get(name, 0)) > 0
+    )
+
+
+def _validated_prompt_frontier_trace_components(
+    components: Iterable[Any],
+) -> list[dict[str, Any]]:
+    """Allow only closed names and integer byte counts into plaintext trace."""
+
+    normalized = v2_prompt_frontier.normalize_prompt_byte_components(
+        tuple(components)
+    )
+    return [
+        {"name": item.name, "bytes": item.bytes}
+        for item in normalized
+    ]
+
+
+def _prompt_frontier_trace_detail(
+    observation: Any,
+    *,
+    lane: str,
+) -> tuple[str, str, dict[str, Any]]:
+    """Build one same-shape success/exhaustion observation with no prompt text."""
+
+    safe_lane = str(lane or "")
+    if safe_lane not in _PROMPT_FRONTIER_TRACE_LANES:
+        raise ValueError("prompt frontier trace lane is not in the closed set")
+    if isinstance(observation, v2_prompt_frontier.PromptFrontierPlan):
+        budget = observation.budget
+        required_tokens = sum(
+            item.estimated_tokens
+            for item in observation.decisions
+            if item.required
+        )
+        estimated_input_tokens = int(observation.estimated_input_tokens)
+        context_window_tokens = int(budget.context_window_tokens)
+        input_budget_tokens = int(budget.input_budget_tokens)
+        output_reserve_tokens = int(budget.output_reserve_tokens)
+        safety_margin_tokens = int(budget.safety_margin_tokens)
+        limit_source = str(observation.model_limit.source)
+        required_components = [
+            item.name for item in observation.decisions if item.required
+        ]
+        event_type = "v2.prompt_frontier.budget"
+        utilization = (
+            estimated_input_tokens / input_budget_tokens
+            if input_budget_tokens > 0
+            else 1.0
+        )
+        status = (
+            "warning"
+            if utilization >= _PROMPT_FRONTIER_WARNING_RATIO
+            else "ok"
+        )
+        utf8_bytes_per_token = float(observation.utf8_bytes_per_token)
+    elif isinstance(observation, v2_prompt_frontier.PromptFrontierExhausted):
+        required_tokens = int(observation.required_tokens)
+        estimated_input_tokens = required_tokens
+        context_window_tokens = int(observation.context_window_tokens)
+        input_budget_tokens = int(observation.input_budget_tokens)
+        output_reserve_tokens = observation.output_reserve_tokens
+        safety_margin_tokens = observation.safety_margin_tokens
+        if output_reserve_tokens is None or safety_margin_tokens is None:
+            raise ValueError("prompt frontier exhaustion lacks budget partitions")
+        output_reserve_tokens = int(output_reserve_tokens)
+        safety_margin_tokens = int(safety_margin_tokens)
+        limit_source = str(observation.limit_source)
+        required_components = list(observation.required_components)
+        event_type = "v2.prompt_frontier.exhausted"
+        status = "warning"
+        if observation.utf8_bytes_per_token is None:
+            raise ValueError("prompt frontier exhaustion lacks estimator ratio")
+        utf8_bytes_per_token = float(observation.utf8_bytes_per_token)
+    else:
+        raise ValueError("unsupported prompt frontier observation")
+    if event_type not in _PROMPT_FRONTIER_TRACE_EVENTS:
+        raise ValueError("prompt frontier trace event is not in the closed set")
+    if limit_source not in _PROMPT_FRONTIER_LIMIT_SOURCES:
+        raise ValueError("prompt frontier limit source is not in the closed set")
+    if any(
+        str(name) not in _PROMPT_FRONTIER_REQUIRED_COMPONENTS
+        for name in required_components
+    ):
+        raise ValueError("required prompt component is not in the closed set")
+    if not math.isfinite(utf8_bytes_per_token) or utf8_bytes_per_token <= 0:
+        raise ValueError("prompt frontier estimator ratio is invalid")
+    detail = {
+        "context_window_tokens": context_window_tokens,
+        "input_budget_tokens": input_budget_tokens,
+        "required_tokens": required_tokens,
+        "estimated_input_tokens": estimated_input_tokens,
+        "overflow_tokens": max(0, required_tokens - input_budget_tokens),
+        "output_reserve_tokens": output_reserve_tokens,
+        "safety_margin_tokens": safety_margin_tokens,
+        "utf8_bytes_per_token": utf8_bytes_per_token,
+        "limit_source": limit_source,
+        "lane": safe_lane,
+        "required_components": required_components,
+        "components": _validated_prompt_frontier_trace_components(
+            observation.component_bytes
+        ),
+    }
+    return event_type, status, detail
+
+
+def _prompt_frontier_metadata_rejection_detail(
+    observation: Any,
+) -> dict[str, Any] | None:
+    """Project a rejected metadata limit to one closed, content-free shape."""
+
+    if isinstance(observation, v2_prompt_frontier.PromptFrontierPlan):
+        model_limit = observation.model_limit
+        provider = model_limit.provider
+        reported_tokens = model_limit.rejected_provider_metadata_tokens
+        floor_tokens = model_limit.provider_metadata_floor_tokens
+        resolved_tokens = model_limit.context_window_tokens
+        resolved_source = model_limit.source
+    elif isinstance(observation, v2_prompt_frontier.PromptFrontierExhausted):
+        provider = observation.provider
+        reported_tokens = observation.rejected_provider_metadata_tokens
+        floor_tokens = observation.provider_metadata_floor_tokens
+        resolved_tokens = observation.context_window_tokens
+        resolved_source = observation.limit_source
+    else:
+        raise ValueError("unsupported prompt frontier observation")
+    if reported_tokens is None and floor_tokens is None:
+        return None
+    numeric_values = (reported_tokens, floor_tokens, resolved_tokens)
+    if any(type(value) is not int or value <= 0 for value in numeric_values):
+        raise ValueError("prompt frontier metadata rejection counts are invalid")
+    if reported_tokens >= floor_tokens:
+        raise ValueError("prompt frontier metadata rejection is below no floor")
+    if provider not in _PROMPT_FRONTIER_TRACE_PROVIDERS:
+        raise ValueError("prompt frontier provider is not in the closed set")
+    if (
+        resolved_source not in _PROMPT_FRONTIER_LIMIT_SOURCES
+        or resolved_source == "provider_metadata"
+    ):
+        raise ValueError("prompt frontier resolved source is invalid")
+    detail = {
+        "reported_tokens": reported_tokens,
+        "floor_tokens": floor_tokens,
+        "resolved_tokens": resolved_tokens,
+        "resolved_source": resolved_source,
+        "provider": provider,
+    }
+    if set(detail) != {
+        "reported_tokens",
+        "floor_tokens",
+        "resolved_tokens",
+        "resolved_source",
+        "provider",
+    }:
+        raise ValueError("prompt frontier metadata rejection shape is invalid")
+    return detail
+
+
+def _emit_prompt_frontier_trace(
+    deps: TurnDeps,
+    user_id: str,
+    observation: Any,
+    *,
+    lane: str,
+) -> None:
+    """Best-effort final debug-trace boundary for one prompt budget decision."""
+
+    if deps.emit_debug_trace is None:
+        return
+    try:
+        event_type, status, detail = _prompt_frontier_trace_detail(
+            observation,
+            lane=lane,
+        )
+        deps.emit_debug_trace(
+            user_id,
+            event_type,
+            status=status,
+            summary="V2 prompt 预算观测",
+            explain=(
+                "仅记录闭集组件名、字节/预算计数、lane 与 limit source；"
+                "不记录 prompt、工具 schema、回复或用户正文。"
+            ),
+            detail=detail,
+        )
+    except Exception as exc:  # noqa: BLE001 — observability cannot fail a turn
+        log.warning(
+            "[v2.prompt_frontier_trace] emit failed user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
+    try:
+        rejection_detail = _prompt_frontier_metadata_rejection_detail(observation)
+        if rejection_detail is not None:
+            deps.emit_debug_trace(
+                user_id,
+                "v2.prompt_frontier.metadata_rejected",
+                status="warning",
+                summary="V2 provider 元数据窗口过小",
+                explain=(
+                    "仅记录闭集 provider/source 与窗口计数；"
+                    "不记录模型名、prompt、回复或用户正文。"
+                ),
+                detail=rejection_detail,
+            )
+    except Exception as exc:  # noqa: BLE001 — observability cannot fail a turn
+        log.warning(
+            "[v2.prompt_frontier_metadata_trace] emit failed user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
+
+
+def _prompt_frontier_exhaustion_trace_callback(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+):
+    if deps.emit_debug_trace is None:
+        return None
+
+    async def _emit(observation: Any) -> None:
+        await asyncio.to_thread(
+            _emit_prompt_frontier_trace,
+            deps,
+            user_id,
+            observation,
+            lane=lane,
+        )
+
+    return _emit
 
 
 def _emit_context_truncation_trace(
@@ -3018,6 +3526,7 @@ def _ledger_tapped_sink(
     *,
     deps: TurnDeps | None = None,
     user_id: str = "",
+    lane: str = "chat",
 ):
     """`recorder.record` plus the plaintext ledger mirror, for tool_loop.
 
@@ -3034,6 +3543,13 @@ def _ledger_tapped_sink(
             await recorder.record(event_kind, payload)
             await _mirror_provider_attempt(recorder, event_kind, payload)
         if event_kind == "provider_request" and deps is not None:
+            await asyncio.to_thread(
+                _emit_prompt_frontier_trace,
+                deps,
+                user_id,
+                payload.get("prompt_frontier"),
+                lane=lane,
+            )
             await asyncio.to_thread(
                 _emit_context_truncation_trace,
                 deps,
@@ -4147,6 +4663,13 @@ def _make_build_messages_fn(
             utf8_bytes_per_token: float,
             image_reserve_tokens: int,
             required_tool_names=(),
+            protected_tool_names=(),
+            collapsed_tool_specs=None,
+            recovery_tool_name: str = "",
+            recovery_tool_active: bool = False,
+            tool_schema_collapse_policy: str = (
+                v2_tool_surface.DEFAULT_COLLAPSE_POLICY
+            ),
             system_suffix: str = "",
         ) -> tuple[list, Any, dict]:
             rendered_transcript: list = []
@@ -4180,10 +4703,20 @@ def _make_build_messages_fn(
                     messages=messages,
                     tools=tools,
                     required_tool_names=required_tool_names,
+                    protected_tool_names=protected_tool_names,
+                    collapsed_tool_specs=collapsed_tool_specs,
+                    recovery_tool_name=recovery_tool_name,
+                    recovery_tool_active=recovery_tool_active,
+                    tool_schema_collapse_policy=(
+                        tool_schema_collapse_policy
+                    ),
                     output_reserve_tokens=output_reserve_tokens,
                     safety_margin_tokens=safety_margin_tokens,
                     utf8_bytes_per_token=utf8_bytes_per_token,
                     image_reserve_tokens=image_reserve_tokens,
+                    message_component_bytes=(
+                        _prompt_frontier_message_component_bytes(messages)
+                    ),
                 )
                 return messages, plan
 
@@ -4578,6 +5111,14 @@ def _make_task_batch_dispatcher(
                     exc,
                 ),
                 disabled_tool_names=child_disabled_tools,
+                # 子 agent 的整个工具面只有 7 件,其中只有 memory_search 是常驻。
+                # 压力折叠会把另外 6 件折成空参数表,而子 agent **没有恢复口**:
+                # mcp_tool_search 不在 _SUBAGENT_ALLOWED_TOOLS 里,折掉就再也
+                # 拿不回来。与其让它看着名字填不出参数,不如全部保护 —— 真放不下
+                # 时 PromptFrontierExhausted 是一次可见的失败,好过静默失能。
+                refresh_protected_extra_tool_names=(
+                    lambda: set(_SUBAGENT_ALLOWED_TOOLS)
+                ),
                 allow_reply_tool=False,
                 outbound_blocking_read_tool_names=(_PRIVATE_READ_TOOLS),
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
@@ -5307,7 +5848,7 @@ class WorkspaceFileReply:
 
 @dataclass(frozen=True)
 class GeneratedImageReply:
-    """One validated provider image ready for encrypted chat publication."""
+    """One validated provider image ready for native Chat publication."""
 
     name: str
     mime_type: str
@@ -5702,18 +6243,10 @@ def _thinking_extra(thinking: dict | None) -> dict:
     env = thinking.get("envelope")
     if not isinstance(env, dict):
         return {}
-    extra = {
-        "thinking_v": str(env.get("v", 1)),
-        "thinking_id": str(env.get("id") or ""),
-        "thinking_body_ct": str(env.get("body_ct") or ""),
-        "thinking_nonce": str(env.get("nonce") or ""),
-        "thinking_K_user": str(env.get("K_user") or ""),
-        "thinking_visibility": str(env.get("visibility") or "shared"),
-        "thinking_owner_user_id": str(env.get("owner_user_id") or ""),
-        "thinking_enclave_pk_fpr": str(env.get("enclave_pk_fpr") or ""),
-    }
-    if env.get("K_enclave"):
-        extra["thinking_K_enclave"] = str(env.get("K_enclave") or "")
+    try:
+        extra = core_envelope.envelope_prefixed_fields(env, "thinking")
+    except ValueError:
+        return {}
     extra = {k: v for k, v in extra.items() if str(v).strip()}
     meta = thinking.get("metadata") or {}
     for key in ("thinking_kind", "thinking_source", "thinking_model"):
@@ -5867,12 +6400,13 @@ def _build_encrypted_image_reply_effect_payload(
     *,
     effect_id: str,
 ) -> dict:
-    """Seal one normalized image into a deterministic Chat image message."""
+    """Wrap one normalized image into a deterministic Chat image message."""
     item_id = hashlib.sha256(effect_id.encode("utf-8")).hexdigest()[:32]
     envelope, error = core_envelope._build_shared_envelope_for_store(
         store,
         bytes(image_reply.data),
         item_id=item_id,
+        content_kind="binary",
     )
     if envelope is None:
         raise RuntimeError(error or "image reply envelope build failed")
@@ -7017,6 +7551,7 @@ async def _run_wake(
     tm: "TurnMetrics | None" = None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
     attempt_count: int = 0,
+    trace_id: str = "",
 ) -> str:
     """wake-lane（heartbeat/scheduled/manual_wake/screen_watch）turn：让伴侣主动开口，而不是
     回答用户刚发的消息（用户根本没发消息——这就是唤醒的定义）。同 `_run_compaction` 一样自成
@@ -7053,10 +7588,18 @@ async def _run_wake(
     shadow_decision_allowed: bool | None = None
     stay_silent_reason: str | None = None
     language_user_rows: list[dict] = []
+    # Same content-free MCP usage counters chat keeps, declared before the try so
+    # the finally can emit `mcp.turn.usage` for wake lanes too. Without a wake
+    # copy of this trace, "did the heartbeat actually get the MCP surface?" is
+    # only answerable by reading code.
+    mcp_offered_names: tuple[str, ...] = ()
+    mcp_called_names: list[str] = []
+    mcp_turn_outcome = "failed"
     provider_roundtrip_trace = _provider_tool_surface_callback(
         deps,
         user_id,
         lane,
+        trace_id,
     )
     try:
         store = core_store.get_store(user_id)
@@ -7635,6 +8178,11 @@ async def _run_wake(
                     ordinal=prepared.ordinal,
                     expected_generation=gen,
                     payload=encrypted_payload,
+                    # 唤醒道的重投安全谓词判的就是「这个 job 写过没有」。
+                    # 裸 INSERT 不锁 source job,恢复路径可能在「已续租、
+                    # 尚未插入」的窗口里判定 pristine 并整轮重投。带 owner
+                    # 栅栏后,写入与 job 行锁在同一事务里线性化。
+                    claimed_by=claimed_by,
                 )
                 if enqueued_id != prepared.effect_id:
                     raise RuntimeError("tool effect id derivation mismatch")
@@ -7672,6 +8220,9 @@ async def _run_wake(
                     ordinal=prepared.ordinal,
                     expected_generation=gen,
                     payload=encrypted_payload,
+                    # 同上:批量工作区写也必须与 job 行锁线性化,否则谓词
+                    # 仍有 TOCTOU 窗口。
+                    claimed_by=claimed_by,
                 )
                 if enqueued_id != prepared.effect_id:
                     raise RuntimeError(
@@ -7705,6 +8256,99 @@ async def _run_wake(
             if tm is not None:
                 tm.add_call(usage)
 
+        # ------------------------------------------------------------------
+        # 唤醒道的用户 MCP 工具面,以及被折叠 schema 的恢复通道。
+        #
+        # 这两件必须一起接。prompt frontier 在上下文压力下会把非常驻工具折成
+        # 「只剩一句描述、参数表为空」的发现态;chat 自 T143 起有 mcp_tool_search
+        # 把说明书要回来,唤醒道**一样会折,却既没有 recovery state 也把
+        # mcp_tool_search 关着** —— 折掉的工具在这一轮里再也拿不回参数。
+        # 该洞在接 MCP 之前就存在(平台工具同样被折),接了 MCP 只是把它放大。
+        #
+        # api_key 在唤醒道恒为 None:没有用户在场。runtime_token 是这条道唯一的
+        # 解密凭据,`core.envelope.read_envelope_body` 已经支持它。
+        # ------------------------------------------------------------------
+        mcp_turn = _EMPTY_MCP_TURN
+        if deps.load_mcp_turn is not None:
+            mcp_turn = await deps.load_mcp_turn(
+                store,
+                api_key=None,
+                runtime_token=token,
+                enclave_sem=enclave_sem,
+                # 纯观测:让 mcp.surface.resolved 报真实 lane。不传的话装配层
+                # 默认写 chat,四条 wake lane 会在 admin 里全部伪装成聊天轮。
+                lane=lane,
+            )
+        mcp_instructions_block = _render_mcp_instructions(mcp_turn)
+        if mcp_instructions_block:
+            trusted_system_blocks = (*trusted_system_blocks, mcp_instructions_block)
+        mcp_mutating_names = _mcp_mutating_names_for_turn(mcp_turn)
+
+        def _current_offered_mcp_tool_specs() -> tuple:
+            # 不做 chat 的写工具扣留:`mutation_recovery_barrier` 只保护
+            # lane='chat',唤醒道没有那个屏障可言;而这一批的口径是读写都给。
+            refresh = getattr(mcp_turn, "current_tool_specs", None)
+            specs = refresh() if callable(refresh) else mcp_turn.tool_specs
+            return tuple(specs)
+
+        offered_mcp_tool_specs = _current_offered_mcp_tool_specs()
+        mcp_offered_names = tuple(
+            str(spec.name) for spec in offered_mcp_tool_specs if str(spec.name)
+        )
+        schema_recovery = _SchemaRecovery(
+            mcp_turn,
+            current_offered_mcp_tool_specs=_current_offered_mcp_tool_specs,
+        )
+        mcp_wall_budget = _McpTurnWallBudget(MCP_TURN_WALL_BUDGET_SEC)
+
+        # 这次远端写基于哪个**用户输入**边界。早绑,不用 cursor_box:
+        # `cursor_box["seq"]` 由 wake_snapshot_seq 初始化,那是 all-role 快照,
+        # 而这个字段的契约是 user input frontier —— 若最新一行是 assistant,
+        # 它会造出一个 reply cursor 永远覆盖不到的假 frontier(codex 复核指出)。
+        # 唤醒能执行本身已证明 wake_reply_cursor_seq 之后没有未答的 user 行:
+        # 新的用户消息会抢占本 job,写栅栏随即失败。
+        # legacy(非 seq-native)路径没有 seq 语义,记 0。
+        mutation_input_frontier_seq = (
+            int(wake_reply_cursor_seq) if seq_native else 0
+        )
+
+        async def _mcp_mutation_started(tc) -> None:
+            # 意图先落库再发请求。它同时是重投安全谓词读的那张表 ——
+            # 一个已经发过远端写的唤醒 job 不允许整轮重放。
+            started = await asyncio.to_thread(
+                jobs_store.start_mcp_mutation_attempt,
+                job_id,
+                user_id=user_id,
+                claimed_by=claimed_by,
+                call_id=str(tc.id),
+                tool_name=str(tc.name),
+                input_frontier_seq=mutation_input_frontier_seq,
+            )
+            if not started:
+                raise RuntimeError("MCP mutation intent was not durably recorded")
+            effect_evidence_by_call[str(tc.id)] = {
+                "domain": "mcp",
+                "call_id": str(tc.id),
+                "tool_name": str(tc.name),
+                "status": "started",
+            }
+
+        async def _mcp_mutation_finished(tc, outcome: str) -> None:
+            evidence = effect_evidence_by_call.setdefault(
+                str(tc.id),
+                {"domain": "mcp", "call_id": str(tc.id)},
+            )
+            evidence["status"] = "uncertain"
+            finished = await asyncio.to_thread(
+                jobs_store.finish_mcp_mutation_attempt,
+                job_id,
+                call_id=str(tc.id),
+                outcome=str(outcome),
+            )
+            if not finished:
+                raise RuntimeError("MCP mutation outcome was not durably recorded")
+            evidence["status"] = str(outcome)
+
         # The wake lane follows the SAME user switch as chat. The proactive
         # companion could already reach the network before this feature existed
         # (pre offered these tools here with no gate at all), so closing it
@@ -7728,10 +8372,11 @@ async def _run_wake(
         # proactive companion never has a user-asked-a-question moment to
         # answer, so it must never be offered here — unconditionally, not
         # gated by the kill switch (that gate is chat-lane's Task 6 concern).
+        # `mcp_tool_search` 不在这里 —— 它是折叠 schema 的唯一取回口。禁掉它
+        # 等于让唤醒道在压力下永久丢失工具参数(T154 之前正是如此)。
         wake_disabled_tool_names = wake_disabled_web_tool_names | {
             cap_tool_schema.PROVIDER_USAGE_TOOL,
             cap_tool_schema.MEMORY_ORGANIZE_TOOL,
-            cap_tool_schema.MCP_TOOL_SEARCH_TOOL,
             # History tools are chat-lane only (spec §6 offer gate): the
             # proactive companion must never browse raw history on its own.
             # Withheld unconditionally — not tied to the kill switch — and the
@@ -7771,6 +8416,16 @@ async def _run_wake(
             await _fence_wake_effect("tool dispatch")
 
             async def _dispatch_platform_one(tc) -> ToolResult:
+                if tc.name == cap_tool_schema.MCP_TOOL_SEARCH_TOOL:
+                    return ToolResult(
+                        call_id=tc.id,
+                        content=json.dumps(
+                            schema_recovery.resolve(tc.args),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    )
                 if tc.name == cap_tool_schema.MEMORY_ORGANIZE_TOOL:
                     return await _dispatch_memory_organize_tool(user_id, tc)
                 try:
@@ -7954,10 +8609,44 @@ async def _run_wake(
                     for tc, result in zip(calls, results)
                 ]
 
-            return await _dispatch_mixed_tool_calls(
-                tool_calls,
-                mcp_turn=_EMPTY_MCP_TURN,
-                mutating_mcp_names=frozenset(),
+            wake_tool_event = _make_tool_trajectory_callback(
+                trajectory_recorder,
+                effect_evidence_by_call,
+            )
+            # Folding is the provider-facing control; this runtime gate
+            # independently refuses every unresolved call before a durable
+            # mutation marker or remote request. Same contract as chat — a
+            # folded tool the model guessed at must not reach the network.
+            unresolved_by_id = {
+                str(tc.id): ToolResult(
+                    call_id=tc.id,
+                    content=schema_recovery.unresolved_call_error(tc.name),
+                )
+                for tc in tool_calls
+                if schema_recovery.requires_resolution(tc.name)
+            }
+            dispatchable_calls = [
+                tc for tc in tool_calls if str(tc.id) not in unresolved_by_id
+            ]
+            # `_make_tool_trajectory_callback` returns None when no recorder is
+            # wired (tests/legacy), so the refusal path must stay callable
+            # without one — the gate is a safety gate, not telemetry.
+            for tc in tool_calls if wake_tool_event is not None else ():
+                blocked = unresolved_by_id.get(str(tc.id))
+                if blocked is None:
+                    continue
+                await wake_tool_event(
+                    tc, "tool_call_started", {"phase": "mcp_schema_required"}
+                )
+                await wake_tool_event(
+                    tc,
+                    "tool_call_result",
+                    {"phase": "mcp_schema_required", "result": blocked},
+                )
+            dispatched = await _dispatch_mixed_tool_calls(
+                dispatchable_calls,
+                mcp_turn=mcp_turn,
+                mutating_mcp_names=mcp_mutating_names,
                 dispatch_platform_one=_dispatch_platform_one,
                 before_mcp_mutation=_before_write,
                 dispatch_workspace_batch=_dispatch_workspace_batch,
@@ -7966,21 +8655,29 @@ async def _run_wake(
                 dispatch_task_batch=dispatch_task_batch,
                 prepare_platform_mutation=effect_reservations.prepare,
                 prepare_workspace_batch=effect_reservations.prepare_batch,
+                mcp_mutation_started=_mcp_mutation_started,
+                mcp_mutation_finished=_mcp_mutation_finished,
+                mcp_wall_budget=mcp_wall_budget,
                 on_progress=_report_turn_progress,
-                on_tool_event=_make_tool_trajectory_callback(
-                    trajectory_recorder,
-                    effect_evidence_by_call,
-                ),
+                on_tool_event=wake_tool_event,
+                mcp_called_names=mcp_called_names,
             )
+            dispatched_by_id = {str(r.call_id): r for r in dispatched}
+            return [
+                unresolved_by_id.get(str(tc.id)) or dispatched_by_id[str(tc.id)]
+                for tc in tool_calls
+            ]
 
         thinking_trace_emitted = False
         language_trace_emitted = False
         wake_self_thinking_failed = False
+        last_promotable_reply_text = ""
 
         async def _on_reply(text: str, *, final: bool, reasoning: str = "") -> None:
             nonlocal thinking_trace_emitted, language_trace_emitted
             nonlocal shadow_decision_allowed
             nonlocal wake_self_thinking_failed
+            nonlocal last_promotable_reply_text
             text = str(text or "").strip()
             wake_self_thinking_failed = False
             # Self-authored thinking (same mechanism as the chat lane): peel a leading
@@ -8343,6 +9040,8 @@ async def _run_wake(
                         log.warning(
                             "[v2.worker] wake reply push slot build failed user=%s: %s",
                             user_id, e)
+                    if not final:
+                        last_promotable_reply_text = text
                 if status == "applied":
                     if tm is not None:
                         tm.record_visible_reply()
@@ -8480,6 +9179,170 @@ async def _run_wake(
             )
             return rows
 
+        async def _on_promote_last_wake_intermediate() -> bool:
+            """Close a scheduled wake through its last durable reply bubble."""
+            nonlocal thinking_trace_emitted, language_trace_emitted
+            nonlocal shadow_decision_allowed
+
+            if not seq_native or lane != "scheduled":
+                return False
+            await _fence_wake_effect("reply promotion")
+            receipt = await asyncio.to_thread(
+                v2_effect_outbox.last_promotable_intermediate_reply,
+                user_id=user_id,
+                job_id=job_id,
+            )
+            if receipt is None:
+                return False
+
+            source_effect_id = str(receipt["effect_id"])
+            payload = dict(receipt["payload"])
+            payload.pop(v2_effect_outbox.REPLY_SOURCE_FENCE_KEY, None)
+            consumed_seq = (
+                int(cursor_box["seq"])
+                if int(cursor_box["seq"]) > int(wake_start_seq)
+                else None
+            )
+            if consumed_seq is not None:
+                effect_type = v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE
+                payload["reply_through_seq"] = consumed_seq
+                payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
+                    "claimed_by": claimed_by,
+                    "input_generation": int(wake_observed_generation),
+                    "through_seq": consumed_seq,
+                }
+            else:
+                effect_type = v2_effect_outbox.TERMINAL_REPLY_EFFECT_TYPE
+                payload.pop("reply_through_seq", None)
+                payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
+                    "claimed_by": claimed_by,
+                    "input_generation": int(wake_observed_generation),
+                    "observed_user_seq": int(cursor_box["seq"]),
+                }
+            payload[
+                v2_effect_outbox.PROMOTED_INTERMEDIATE_EFFECT_ID_KEY
+            ] = source_effect_id
+            if scheduled_activity_events:
+                payload.update(
+                    _activity_extra(
+                        scheduled_activity_events,
+                        turn_id=f"scheduled:{job_id}",
+                        job_id=int(job_id),
+                    )
+                )
+
+            delivery_started_ns = time.monotonic_ns()
+            effect_id = await asyncio.to_thread(
+                v2_effect_outbox.enqueue_reply_promotion,
+                intermediate_effect_id=source_effect_id,
+                job_id=job_id,
+                user_id=user_id,
+                expected_generation=gen,
+                payload=payload,
+                effect_type=effect_type,
+                claimed_by=claimed_by,
+            )
+            if deps.apply_pending_effects is not None:
+                await asyncio.to_thread(deps.apply_pending_effects, user_id)
+            disposition = await asyncio.to_thread(
+                v2_effect_outbox.get_effect_disposition,
+                effect_id,
+                user_id=user_id,
+                job_id=job_id,
+                effect_type=effect_type,
+            )
+            status = "missing" if disposition is None else disposition["status"]
+            last_error = "" if disposition is None else disposition["last_error"]
+            await _record_trajectory(
+                trajectory_recorder,
+                "reply_effect_disposition",
+                {
+                    "effect_id": effect_id,
+                    "effect_type": effect_type,
+                    "final": True,
+                    "promoted_intermediate": True,
+                    "status": status,
+                    "last_error": last_error,
+                    "duration_ms": round(
+                        max(0, time.monotonic_ns() - delivery_started_ns)
+                        / 1_000_000.0,
+                        3,
+                    ),
+                },
+                best_effort=True,
+            )
+            if status == "applied":
+                source_status = await asyncio.to_thread(
+                    jobs_store.get_job_status,
+                    job_id,
+                    user_id=user_id,
+                    claimed_by=claimed_by,
+                )
+                if source_status != "completed":
+                    raise RuntimeError(
+                        "promoted wake reply applied without completing source job"
+                    )
+                shadow_decision_allowed = True
+                if not thinking_trace_emitted:
+                    thinking_trace_emitted = True
+                    await _emit_thinking_surfaced_trace(
+                        deps.emit_debug_trace,
+                        user_id,
+                        provider_config,
+                        lane="wake",
+                        branch="none",
+                        chars=0,
+                    )
+                if not language_trace_emitted:
+                    language_trace_emitted = True
+                    await _emit_reply_language_follow_trace(
+                        deps.emit_debug_trace,
+                        user_id,
+                        user_rows=language_user_rows,
+                        visible_reply=last_promotable_reply_text,
+                        lane="wake",
+                    )
+                return True
+            if (
+                status == "discarded"
+                and last_error == v2_effect_outbox.WAKE_REPLY_CHAT_COLLISION
+            ):
+                return True
+            if (
+                status == "discarded"
+                and last_error == v2_effect_outbox.FINAL_REPLY_INPUT_ADVANCED
+            ):
+                raise v2_tool_loop.FinalReplySuperseded()
+            if (
+                status == "discarded"
+                and last_error
+                == v2_effect_outbox.FINAL_REPLY_SOURCE_JOB_INACTIVE
+            ):
+                raise LostJobLease(
+                    "wake source job became inactive before reply promotion"
+                )
+            if (
+                status == "discarded"
+                and last_error == v2_effect_outbox.FINAL_REPLY_INVALID_FENCE
+            ):
+                raise RuntimeError("invalid promoted wake reply fence")
+            if status == "discarded" and last_error in {
+                v2_effect_outbox.EFFECT_RUNTIME_STATE_CHANGED,
+                v2_effect_outbox.EFFECT_RUNTIME_GENERATION_CHANGED,
+            }:
+                code = (
+                    "runtime_mode_changed"
+                    if last_error == v2_effect_outbox.EFFECT_RUNTIME_STATE_CHANGED
+                    else "runtime_generation_changed"
+                )
+                await _fail_runtime_fence(
+                    code,
+                    "runtime ownership changed before wake reply promotion",
+                )
+            raise RuntimeError(
+                "promoted wake reply effect not durably applied: " + status
+            )
+
         # ── 世界书:主动开口的四条道也要认得这个世界（Seven 2026-08-10）
         #
         # 之前只有 chat 道注入，于是同一个伴侣在聊天里说「影月初三」、心跳主动
@@ -8588,7 +9451,14 @@ async def _run_wake(
                     build_messages,
                     provider_config=provider_config,
                 )
-            except v2_prompt_frontier.PromptFrontierExhausted:
+            except v2_prompt_frontier.PromptFrontierExhausted as exc:
+                await asyncio.to_thread(
+                    _emit_prompt_frontier_trace,
+                    deps,
+                    user_id,
+                    exc,
+                    lane=lane,
+                )
                 if tm is not None:
                     tm.record_prompt_frontier_exhaustion()
                 if wake_snapshot_seq <= watermark_seq:
@@ -8634,7 +9504,14 @@ async def _run_wake(
                         build_messages,
                         provider_config=provider_config,
                     )
-                except v2_prompt_frontier.PromptFrontierExhausted:
+                except v2_prompt_frontier.PromptFrontierExhausted as exc:
+                    await asyncio.to_thread(
+                        _emit_prompt_frontier_trace,
+                        deps,
+                        user_id,
+                        exc,
+                        lane=lane,
+                    )
                     if tm is not None:
                         tm.record_prompt_frontier_exhaustion()
                     raise
@@ -8662,10 +9539,30 @@ async def _run_wake(
                 build_messages=build_messages,
                 suppress_native_reasoning=_st_wake_loop.enabled(),
                 disabled_tool_names=wake_disabled_tool_names,
+                extra_tool_specs=offered_mcp_tool_specs,
+                refresh_extra_tool_specs=_current_offered_mcp_tool_specs,
+                refresh_pressure_collapsed_extra_tool_specs=(
+                    schema_recovery.pressure_extra_specs
+                ),
+                refresh_protected_extra_tool_names=(
+                    schema_recovery.protected_names
+                ),
+                extra_tool_recovery_name=cap_tool_schema.MCP_TOOL_SEARCH_TOOL,
+                extra_tool_recovery_active=schema_recovery.recovery_needed,
+                on_extra_tool_surface_plan=schema_recovery.record_surface,
+                extra_mutating_tool_names=mcp_mutating_names,
+                # 只有在 recovery 接齐之后才允许把策略交给唤醒:折叠而没有取回口
+                # 正是 T154 之前的那个洞,顺序反了会把洞做成默认行为。
+                tool_schema_collapse_policy=TOOL_SCHEMA_COLLAPSE_POLICY,
                 on_stay_silent=(_on_stay_silent if lane != "scheduled" else None),
                 memory_delete_allowed=False,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,
+                on_promote_last_intermediate=(
+                    _on_promote_last_wake_intermediate
+                    if lane == "scheduled"
+                    else None
+                ),
                 fold_new_messages=fold_new_messages,
                 add_usage=_add_usage,
                 max_calls=_TURN_MAX_LLM_CALLS,
@@ -8690,8 +9587,13 @@ async def _run_wake(
                 # 打开它拿到的是 tool_loop 已有的整条恢复链，而不是直接判死：
                 # 先追加 _EMPTY_RESPONSE_CORRECTION 重试一轮（多数抽风到此为止），
                 # 仍空才 ProviderEmptyReply → wake_failed:empty_reply。失败不会
-                # 重放定时器（mark_fired 在入队时就落，不等 job 成功），只会 arm
-                # 60s 起、1h 封顶的 proactive 退避，用户下次说话即清。
+                # 重放定时器（mark_fired 在入队时就落，不等 job 成功）。
+                #
+                # ⚠️ 失败之后走哪条路按 lane 分，别照抄 heartbeat 的直觉：
+                # `_FAIL_BACKOFF_WAKE_LANES` 只含 heartbeat，所以「60s 起、1h 封顶
+                # 的 proactive 退避」**不适用于 scheduled**。scheduled 走
+                # `_SCHEDULED_FAILURE_RETRY_DELAYS_SEC` 的有限重投，退完仍失败就落
+                # 用户可见的终态失败 outbox —— 到点交付不允许无声消失。
                 require_reply=(lane == "scheduled"),
                 empty_response_correction=(
                     _SCHEDULED_WAKE_EMPTY_RESPONSE_CORRECTION
@@ -8705,7 +9607,9 @@ async def _run_wake(
                 ),
                 on_provider_tool_surface=provider_roundtrip_trace,
                 on_empty_provider_response=(
-                    _empty_provider_response_debug_callback(deps, user_id, lane)
+                    _empty_provider_response_debug_callback(
+                        deps, user_id, lane, trace_id
+                    )
                 ),
                 fold_before_first=deps.read_messages_after_seq is not None,
                 on_progress=_report_turn_progress,
@@ -8713,6 +9617,7 @@ async def _run_wake(
                     trajectory_recorder,
                     deps=deps,
                     user_id=user_id,
+                    lane=lane,
                 ),
                 outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
@@ -8730,7 +9635,7 @@ async def _run_wake(
                 prompt_estimator_utf8_bytes_per_token=(
                     PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
                 ),
-                initial_outbound_tools_blocked=(screen_frame_message is not None),
+                initial_screen_pixels_blocked=(screen_frame_message is not None),
                 tagged_image_message_key=v2_screen_chat.MESSAGE_TAG,
                 on_tagged_images_rejected=(
                     _on_wake_screen_images_rejected
@@ -8744,7 +9649,13 @@ async def _run_wake(
                     if tm is not None
                     else None
                 ),
+                on_prompt_frontier_exhausted_detail=(
+                    _prompt_frontier_exhaustion_trace_callback(
+                        deps, user_id, lane
+                    )
+                ),
             )
+            mcp_turn_outcome = "completed"
             if shadow_decision_allowed is None:
                 # A successful weak-wake turn with no applied reply is the
                 # model's suppress/sleep outcome.  This assignment is after the
@@ -8932,6 +9843,33 @@ async def _run_wake(
     finally:
         if provider_roundtrip_trace is not None:
             await provider_roundtrip_trace.emit_summary()
+        if mcp_offered_names and deps.emit_debug_trace is not None:
+            # 与 chat 同名同形的事件,detail.lane 区分。没有它就只能靠读代码回答
+            # 「这次心跳到底拿没拿到 MCP 工具面」。
+            detail = _mcp_turn_usage_detail(mcp_offered_names, mcp_called_names)
+            try:
+                await asyncio.to_thread(
+                    deps.emit_debug_trace,
+                    user_id,
+                    "mcp.turn.usage",
+                    status="ok" if mcp_turn_outcome == "completed" else "error",
+                    summary=(
+                        f"MCP 本轮解析 {detail['offered_tool_count']} 个工具，"
+                        f"调用 {detail['call_count']} 次"
+                    ),
+                    explain=(
+                        "解析数是 prompt 预算前的回合工具面，不证明 provider 实收；"
+                        "实际下发见 mcp.surface.provider。仅记录数量和调用次数，"
+                        "不记录参数、返回值或用户内容。"
+                    ),
+                    detail={"lane": lane, "outcome": mcp_turn_outcome, **detail},
+                )
+            except Exception as exc:  # noqa: BLE001 -- telemetry is best-effort
+                log.warning(
+                    "[v2.mcp] wake turn usage trace failed user=%s code=%s",
+                    user_id,
+                    type(exc).__name__.lower(),
+                )
         decided_at = time.time()
         apns_alert_sent = False
         if push_slot is not None and deps.send_reply_push is not None:
@@ -9881,6 +10819,12 @@ async def _run_extraction(
             items, reason = [], None
         else:
             if lane == "capture":
+                # 花园的分类语言。已有桶优先 —— 一个花园只用一种语言的桶，
+                # 不因为这轮对话换了语言就长出并存的第二套。
+                # 与 V1 consumer 走同一个 helper，两条 runtime 不许各判各的。
+                capture_locale = infer_garden_language(
+                    None, existing_buckets=str(ctx.get("buckets") or "")
+                )
                 prompt = build_capture_prompt(
                     ai_name=ctx.get("ai_name", ""),
                     user_name=ctx.get("user_name", ""),
@@ -9889,6 +10833,7 @@ async def _run_extraction(
                     identity=ctx.get("identity", ""),
                     window=window,
                     cards=ctx.get("cards", ""),
+                    locale=capture_locale,
                 )
         if lane == "capture" and prompt_tail:
             await _ensure_capture_not_halted("provider_authorization")
@@ -10706,7 +11651,12 @@ async def process_job(
     mcp_called_names: list[str] = []
     mcp_turn_outcome = "failed"
     provider_roundtrip_trace = (
-        _provider_tool_surface_callback(deps, user_id, lane)
+        _provider_tool_surface_callback(
+            deps,
+            user_id,
+            lane,
+            str(job.get("trace_id") or ""),
+        )
         if lane == "chat"
         else None
     )
@@ -10841,6 +11791,7 @@ async def process_job(
                 tm,
                 trajectory_recorder,
                 attempt_count=int(job.get("attempt_count") or 0),
+                trace_id=str(job.get("trace_id") or ""),
             )
         if lane in _EXTRACTION_LANES:
             # 自成一体的记忆抽取路径（capture/dream，Task 3）：build prompt → BYOK 抽取 →
@@ -11426,8 +12377,9 @@ async def process_job(
                 raise RuntimeError("MCP mutation outcome was not durably recorded")
             evidence["status"] = str(outcome)
 
-        # User-MCP tool surface for THIS turn (chat lane only, mirroring the
-        # resident which gives claude `--mcp-config` on the chat lane only). The
+        # User-MCP tool surface for THIS turn. Chat and the four wake lanes both
+        # load one since T154 (before that this was chat-only, mirroring the
+        # resident's `--mcp-config`; the proactive companion had no外部 tools). The
         # loader lives in hosted (needs mcp_core/enclave) and is injected as
         # `deps.load_mcp_turn`; unwired (tests/legacy) → the empty turn. Loads the
         # user's enabled servers, decrypts them, and fetches each server's tools
@@ -11440,6 +12392,7 @@ async def process_job(
                 api_key=api_key,
                 runtime_token=runtime_token,
                 enclave_sem=enclave_sem,
+                lane=lane,
             )
         # 服务器自己写的使用说明进系统提示(MCP spec 的 initialize.result.
         # instructions)。走 trusted_system_blocks 这条现成通道,和 skills 同一个
@@ -11461,6 +12414,13 @@ async def process_job(
             )
 
         offered_mcp_tool_specs = _current_offered_mcp_tool_specs()
+        # Both tool domains' folded-schema recovery, federated behind one
+        # object so chat and the wake lanes cannot wire up different halves of
+        # it (they did: wake had none of it until T154).
+        schema_recovery = _SchemaRecovery(
+            mcp_turn,
+            current_offered_mcp_tool_specs=_current_offered_mcp_tool_specs,
+        )
         mcp_offered_names = tuple(
             str(spec.name) for spec in offered_mcp_tool_specs if str(spec.name)
         )
@@ -11519,12 +12479,10 @@ async def process_job(
             if history_tools_offered
             else frozenset(cap_history.HISTORY_TOOL_NAMES)
         )
-        disabled_mcp_search_tool_names = (
-            frozenset()
-            if set(getattr(mcp_turn, "collapsed_names", ()) or ())
-            & {spec.name for spec in offered_mcp_tool_specs}
-            else frozenset({cap_tool_schema.MCP_TOOL_SEARCH_TOOL})
-        )
+        # The search schema remains latent in full-fit plans. It must stay in
+        # the planner's candidate catalog even without MCP, because prompt
+        # pressure can fold non-resident platform manuals too.
+        disabled_mcp_search_tool_names = frozenset()
         disabled_tool_names_for_turn = (
             frozenset(disabled_mutation_tool_names)
             | disabled_web_tool_names
@@ -11673,16 +12631,10 @@ async def process_job(
                 # worker-level gate as MCP reads. Executor still owns validation,
                 # provenance, encrypted outbox writes, and terminal write failures.
                 if tc.name == cap_tool_schema.MCP_TOOL_SEARCH_TOOL:
-                    resolve = getattr(mcp_turn, "resolve_tool_schemas", None)
-                    if not callable(resolve):
-                        return ToolResult(
-                            call_id=tc.id,
-                            content="error: no folded MCP tools are available",
-                        )
                     return ToolResult(
                         call_id=tc.id,
                         content=json.dumps(
-                            resolve(tc.args),
+                            schema_recovery.resolve(tc.args),
                             ensure_ascii=False,
                             sort_keys=True,
                             separators=(",", ":"),
@@ -11867,23 +12819,18 @@ async def process_job(
                     for tc, result in zip(calls, results)
                 ]
 
-            # Schema omission is the provider-facing control; this runtime gate
-            # independently refuses unresolved MCP calls before any durable
+            # Folding is the provider-facing control; this runtime gate
+            # independently refuses every unresolved call before a durable
             # mutation marker or remote request.
             blocked_by_id: dict[str, ToolResult] = {}
             dispatchable_calls = list(tool_calls)
             unresolved_by_id = {
                 str(tc.id): ToolResult(
                     call_id=tc.id,
-                    content=(
-                        "error: mcp tool schema is not loaded; call "
-                        f'{cap_tool_schema.MCP_TOOL_SEARCH_TOOL} with '
-                        f'names=["{tc.name}"] first'
-                    ),
+                    content=schema_recovery.unresolved_call_error(tc.name),
                 )
                 for tc in dispatchable_calls
-                if callable(getattr(mcp_turn, "requires_resolution", None))
-                and mcp_turn.requires_resolution(tc.name)
+                if schema_recovery.requires_resolution(tc.name)
             }
             if unresolved_by_id:
                 blocked_by_id.update(unresolved_by_id)
@@ -12004,6 +12951,7 @@ async def process_job(
         final_job_completed_atomically = False
         pending_file_replies: list[WorkspaceFileReply] = []
         pending_file_keys: set[tuple[str, int]] = set()
+        last_promotable_reply_text = ""
 
         async def _on_file_requirement_changed() -> None:
             pending_file_replies.clear()
@@ -12044,6 +12992,7 @@ async def process_job(
             nonlocal language_correction_attempted
             nonlocal language_correction_pending, language_correction_outcome
             nonlocal thinking_language_correction_pending
+            nonlocal last_promotable_reply_text
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
             raw_reply_text = "" if file_reply is not None else str(text or "").strip()
             text = raw_reply_text
@@ -12596,6 +13545,8 @@ async def process_job(
                                 "text": spoken_reply,
                             }
                 if status == "applied" and not final:
+                    if file_reply is None and not image_replies:
+                        last_promotable_reply_text = str(text or "").strip()
                     return
                 if status == "applied":
                     source_status = await asyncio.to_thread(
@@ -12716,6 +13667,183 @@ async def process_job(
                     correction_attempted=language_correction_attempted,
                     correction_outcome=language_correction_outcome,
                 )
+
+        async def _on_promote_last_intermediate() -> bool:
+            """Close this chat turn through its last durable reply-tool bubble."""
+            nonlocal final_job_completed_atomically
+            nonlocal thinking_trace_emitted, language_trace_emitted
+            nonlocal voice_reply_slot
+
+            if not seq_native or pending_file_replies:
+                return False
+            await _ensure_runtime_mode()
+            await _renew_lease()
+            receipt = await asyncio.to_thread(
+                v2_effect_outbox.last_promotable_intermediate_reply,
+                user_id=user_id,
+                job_id=job_id,
+            )
+            if receipt is None:
+                return False
+
+            source_effect_id = str(receipt["effect_id"])
+            payload = dict(receipt["payload"])
+            payload.pop(v2_effect_outbox.REPLY_SOURCE_FENCE_KEY, None)
+            payload["reply_through_seq"] = int(cursor_box["seq"])
+            payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
+                "claimed_by": claimed_by,
+                "input_generation": int(observed_generation),
+                "through_seq": int(cursor_box["seq"]),
+            }
+            if ordered_chat_replies:
+                payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY][
+                    "preserve_queued_input"
+                ] = True
+            payload[
+                v2_effect_outbox.PROMOTED_INTERMEDIATE_EFFECT_ID_KEY
+            ] = source_effect_id
+            if reply_parent_message_id:
+                payload["reply_to_message_id"] = reply_parent_message_id
+            if voice_call_context:
+                payload.update(voice_call_context)
+            try:
+                status_rows = await asyncio.to_thread(
+                    jobs_store.status_events_for_job, user_id, int(job_id)
+                )
+                payload.update(
+                    _activity_extra(
+                        core_chat_activity.project_tool_events(status_rows),
+                        turn_id=str(job.get("trace_id") or ""),
+                        job_id=int(job_id),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - reply stays authoritative
+                log.warning(
+                    "[v2.activity] promoted final projection failed "
+                    "user=%s job=%s code=%s",
+                    user_id,
+                    job_id,
+                    type(exc).__name__.lower(),
+                )
+
+            delivery_started_ns = time.monotonic_ns()
+            effect_id = await asyncio.to_thread(
+                v2_effect_outbox.enqueue_reply_promotion,
+                intermediate_effect_id=source_effect_id,
+                job_id=job_id,
+                user_id=user_id,
+                expected_generation=gen,
+                payload=payload,
+            )
+            if deps.apply_pending_effects is not None:
+                await asyncio.to_thread(deps.apply_pending_effects, user_id)
+            disposition = await asyncio.to_thread(
+                v2_effect_outbox.get_effect_disposition,
+                effect_id,
+                user_id=user_id,
+                job_id=job_id,
+                effect_type=v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE,
+            )
+            status = "missing" if disposition is None else disposition["status"]
+            last_error = "" if disposition is None else disposition["last_error"]
+            await _record_trajectory(
+                trajectory_recorder,
+                "reply_effect_disposition",
+                {
+                    "effect_id": effect_id,
+                    "effect_type": v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE,
+                    "final": True,
+                    "promoted_intermediate": True,
+                    "status": status,
+                    "last_error": last_error,
+                    "duration_ms": round(
+                        max(0, time.monotonic_ns() - delivery_started_ns)
+                        / 1_000_000.0,
+                        3,
+                    ),
+                },
+                best_effort=True,
+            )
+            if status == "applied":
+                source_status = await asyncio.to_thread(
+                    jobs_store.get_job_status,
+                    job_id,
+                    user_id=user_id,
+                    claimed_by=claimed_by,
+                )
+                if source_status != "completed":
+                    raise RuntimeError(
+                        "promoted final reply applied without completing source job"
+                    )
+                if not thinking_trace_emitted:
+                    thinking_trace_emitted = True
+                    await _emit_thinking_surfaced_trace(
+                        deps.emit_debug_trace,
+                        user_id,
+                        provider_config,
+                        lane="chat",
+                        branch="none",
+                        chars=0,
+                    )
+                if not language_trace_emitted:
+                    language_trace_emitted = True
+                    await _emit_reply_language_follow_trace(
+                        deps.emit_debug_trace,
+                        user_id,
+                        user_rows=language_user_rows,
+                        visible_reply=last_promotable_reply_text,
+                        lane="chat",
+                        correction_attempted=False,
+                        correction_outcome="skipped",
+                    )
+                if last_promotable_reply_text:
+                    voice_context = await asyncio.to_thread(
+                        _voice_context_for_seq,
+                        user_id,
+                        cursor_box["seq"],
+                    )
+                    if voice_context is not None:
+                        voice_reply_slot = {
+                            **voice_context,
+                            "message_id": str(payload["envelope"]["id"]),
+                            "text": last_promotable_reply_text,
+                        }
+                final_job_completed_atomically = True
+                return True
+            if (
+                status == "discarded"
+                and last_error == v2_effect_outbox.FINAL_REPLY_INPUT_ADVANCED
+            ):
+                raise v2_tool_loop.FinalReplySuperseded()
+            if (
+                status == "discarded"
+                and last_error == v2_effect_outbox.FINAL_REPLY_INVALID_FENCE
+            ):
+                raise RuntimeError("invalid promoted final reply fence")
+            if (
+                status == "discarded"
+                and last_error == v2_effect_outbox.FINAL_REPLY_SOURCE_JOB_INACTIVE
+            ):
+                raise LostJobLease(
+                    "source job became inactive before reply promotion"
+                )
+            if status == "discarded" and last_error in {
+                v2_effect_outbox.EFFECT_RUNTIME_STATE_CHANGED,
+                v2_effect_outbox.EFFECT_RUNTIME_GENERATION_CHANGED,
+            }:
+                code = (
+                    "runtime_mode_changed"
+                    if last_error
+                    == v2_effect_outbox.EFFECT_RUNTIME_STATE_CHANGED
+                    else "runtime_generation_changed"
+                )
+                await _fail_runtime_fence(
+                    code,
+                    "runtime ownership changed before reply promotion",
+                )
+            raise RuntimeError(
+                "promoted final reply effect not durably applied: " + status
+            )
 
         # `seq` is exclusively the consumed user|human frontier. The base prompt's
         # all-role snapshot bound is passed separately to the fold closure so an
@@ -12957,7 +14085,14 @@ async def process_job(
                     build_messages,
                     provider_config=provider_config,
                 )
-            except v2_prompt_frontier.PromptFrontierExhausted:
+            except v2_prompt_frontier.PromptFrontierExhausted as exc:
+                await asyncio.to_thread(
+                    _emit_prompt_frontier_trace,
+                    deps,
+                    user_id,
+                    exc,
+                    lane=lane,
+                )
                 tm.record_prompt_frontier_exhaustion()
                 pending_seqs = [
                     int(row["seq"])
@@ -13018,7 +14153,14 @@ async def process_job(
                         build_messages,
                         provider_config=provider_config,
                     )
-                except v2_prompt_frontier.PromptFrontierExhausted:
+                except v2_prompt_frontier.PromptFrontierExhausted as exc:
+                    await asyncio.to_thread(
+                        _emit_prompt_frontier_trace,
+                        deps,
+                        user_id,
+                        exc,
+                        lane=lane,
+                    )
                     tm.record_prompt_frontier_exhaustion()
                     raise
 
@@ -13049,6 +14191,7 @@ async def process_job(
             build_messages=build_messages,
             dispatch_tools=_dispatch_tools,
             on_reply=_on_reply,
+            on_promote_last_intermediate=_on_promote_last_intermediate,
             on_file_reply=(
                 _on_file_reply if deps.load_workspace_file is not None else None
             ),
@@ -13078,7 +14221,12 @@ async def process_job(
             ),
             on_provider_tool_surface=provider_roundtrip_trace,
             on_empty_provider_response=(
-                _empty_provider_response_debug_callback(deps, user_id, lane)
+                _empty_provider_response_debug_callback(
+                    deps,
+                    user_id,
+                    lane,
+                    str(job.get("trace_id") or ""),
+                )
             ),
             fold_before_first=seq_native and not ordered_chat_replies,
             on_progress=_report_turn_progress,
@@ -13086,14 +14234,28 @@ async def process_job(
                 trajectory_recorder,
                 deps=deps,
                 user_id=user_id,
+                lane=lane,
             ),
             extra_tool_specs=offered_mcp_tool_specs,
             refresh_extra_tool_specs=_current_offered_mcp_tool_specs,
+            refresh_pressure_collapsed_extra_tool_specs=(
+                schema_recovery.pressure_extra_specs
+            ),
+            refresh_protected_extra_tool_names=(
+                schema_recovery.protected_names
+            ),
+            extra_tool_recovery_name=cap_tool_schema.MCP_TOOL_SEARCH_TOOL,
+            extra_tool_recovery_active=(
+                schema_recovery.recovery_needed
+            ),
+            on_extra_tool_surface_plan=(
+                schema_recovery.record_surface
+            ),
             extra_mutating_tool_names=mcp_mutating_names,
             disabled_tool_names=disabled_tool_names_for_turn,
             outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
             outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
-            initial_outbound_tools_blocked=(screen_frame_message is not None),
+            initial_screen_pixels_blocked=(screen_frame_message is not None),
             tagged_image_message_key=v2_screen_chat.MESSAGE_TAG,
             on_tagged_images_rejected=_on_screen_images_rejected,
             max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
@@ -13111,9 +14273,15 @@ async def process_job(
                 PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
             ),
             prompt_image_reserve_tokens=PROMPT_IMAGE_RESERVE_TOKENS,
+            tool_schema_collapse_policy=TOOL_SCHEMA_COLLAPSE_POLICY,
             on_tail_window=_tail_window_callback(tm),
             on_prompt_frontier_exhaustion=(
                 tm.record_prompt_frontier_exhaustion
+            ),
+            on_prompt_frontier_exhausted_detail=(
+                _prompt_frontier_exhaustion_trace_callback(
+                    deps, user_id, lane
+                )
             ),
         )
         if pushed_screen_frame_ids:

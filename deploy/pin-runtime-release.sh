@@ -23,6 +23,20 @@ for path in "$main_compose" "$runner_compose"; do
   fi
 done
 
+# Release-unit topology contract: only the main backend may receive the
+# decrypted-shadow credential; every runner compose must pin its local gate to
+# literal 0 and rely on primary-side dirty-key triggers.
+if ! grep -q 'PLAINTEXT_SHADOW_DATABASE_URL:' "$main_compose" \
+  || ! grep -q 'FEEDLING_PLAINTEXT_SHADOW_ENABLED:' "$main_compose" \
+  || ! grep -q 'FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY:' "$main_compose"; then
+  echo "::error::$main_compose is missing plaintext-shadow Gate 2 inputs"
+  exit 1
+fi
+if ! grep -Eq 'FEEDLING_PLAINTEXT_SHADOW_ENABLED:[[:space:]]*"0"' "$runner_compose"; then
+  echo "::error::$runner_compose must keep the plaintext-shadow drain disabled"
+  exit 1
+fi
+
 git fetch origin "$branch"
 remote_sha=$(git rev-parse "origin/$branch")
 if [ "$remote_sha" != "$trigger_sha" ]; then

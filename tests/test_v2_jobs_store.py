@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db
+from psycopg.rows import dict_row
 from core import envelope as core_envelope
 from core import store as core_store
 from core import wake_bus
@@ -2458,6 +2459,96 @@ def _job_row(job_id: int):
         ).fetchone()
 
 
+def test_watchdog_recovery_expires_scheduled_once_requeue_budget_is_spent():
+    """The exact watchdog path must honor the same bounded retry budget."""
+
+    job_id = _stuck_scheduled("u_js_sched_watchdog_budget")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET attempt_count=%s WHERE id=%s",
+            (jobs_store.SCHEDULED_LEASE_REQUEUE_MAX_ATTEMPTS, job_id),
+        )
+
+    recovered = jobs_store.recover_killed_job(
+        job_id=job_id,
+        claimed_by="w",
+        reason="slot_watchdog_timeout",
+    )
+
+    assert recovered is not None and recovered["recovery"] == "terminal"
+    status, attempts, last_error = _job_row(job_id)
+    assert status == "expired"
+    assert attempts == jobs_store.SCHEDULED_LEASE_REQUEUE_MAX_ATTEMPTS + 1
+    assert last_error == "slot_watchdog_timeout"
+
+
+@pytest.mark.parametrize("outcome", [None, "known"])
+def test_watchdog_recovery_does_not_requeue_scheduled_with_mcp_attempt(outcome):
+    """Any MCP attempt makes replay unsafe, regardless of recorded outcome."""
+
+    uid = f"u_js_sched_watchdog_mcp_{outcome or 'unknown'}"
+    job_id = _stuck_scheduled(uid)
+    jobs_store.start_mcp_mutation_attempt(
+        job_id,
+        user_id=uid,
+        claimed_by="w",
+        call_id=f"watchdog-{outcome or 'unknown'}",
+        tool_name="mcp__calendar__create",
+        input_frontier_seq=0,
+    )
+    if outcome is not None:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE v2_mcp_mutation_attempts SET outcome=%s, "
+                "resolved_at=clock_timestamp() WHERE job_id=%s",
+                (outcome, job_id),
+            )
+
+    recovered = jobs_store.recover_killed_job(
+        job_id=job_id,
+        claimed_by="w",
+        reason="slot_watchdog_timeout",
+    )
+
+    assert recovered is not None and recovered["recovery"] == "terminal"
+    status, _attempts, last_error = _job_row(job_id)
+    assert status == "expired"
+    assert last_error == (
+        "mcp_mutation_outcome_unknown" if outcome is None
+        else "slot_watchdog_timeout"
+    )
+
+
+@pytest.mark.parametrize("effect_type", sorted(jobs_store.DURABLE_TOOL_EFFECT_TYPES))
+def test_watchdog_recovery_does_not_requeue_scheduled_with_durable_effect(
+    effect_type,
+):
+    """A durable platform write makes exact scheduled replay unsafe."""
+
+    from model_api_runtime.v2 import effect_outbox
+
+    uid = f"u_js_sched_watchdog_effect_{effect_type[:10]}"
+    job_id = _stuck_scheduled(uid)
+    effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type=effect_type,
+        ordinal=0,
+        expected_generation=1,
+        payload={"ciphertext": "shell"},
+        input_frontier_seq=0,
+    )
+
+    recovered = jobs_store.recover_killed_job(
+        job_id=job_id,
+        claimed_by="w",
+        reason="slot_watchdog_timeout",
+    )
+
+    assert recovered is not None and recovered["recovery"] == "terminal"
+    assert _job_row(job_id)[0] == "expired"
+
+
 def test_reap_requeues_stuck_scheduled_instead_of_expiring():
     """租约超时 = worker 死了、活儿没干 → 退回 pending 重投,不是丢掉。"""
     import time
@@ -2697,3 +2788,479 @@ def test_durable_effect_closed_set_matches_worker():
     assert jobs_store.DURABLE_TOOL_EFFECT_TYPES == frozenset(
         v2_worker.ENCRYPTED_TOOL_EFFECT_TYPES.values()
     )
+
+
+# ---------------------------------------------------------------------------
+# T154 第2步:弱唤醒道与前台抢占的重投安全
+# ---------------------------------------------------------------------------
+
+def _stuck_wake(uid: str, lane: str) -> int:
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    jobs_store.claim_next_job("w")
+    jobs_store.mark_running(job_id, claimed_by="w")
+    return job_id
+
+
+def _record_durable_platform_effect(job_id: int, uid: str) -> None:
+    """一条已落地的持久平台写(memory 卡)，谓词必须看得见。
+
+    走生产入口而不是裸 INSERT：裸 INSERT 会把列名写死，schema 一变就静默
+    失配，而这里「写没写过」正是被测的那件事。
+    """
+    from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
+
+    v2_effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type="memory_encrypted_v1",
+        ordinal=0,
+        expected_generation=0,
+        payload={"ct": "x"},
+        input_frontier_seq=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "lane", ["heartbeat", "manual_wake", "screen_watch"]
+)
+def test_watchdog_does_not_requeue_weak_wake_after_a_durable_write(lane):
+    """弱唤醒道写过东西之后不许整轮重投 —— 重投会把那次写再做一遍。
+
+    这三条道用的是**共享的** `_enqueue_write_effect`(memory / identity /
+    schedule / workspace 都走它)，接上 MCP 之后还能发远端写。而 chat 那条
+    mutation recovery barrier 硬过滤 `lane='chat'`，覆盖不到它们。
+    T154 之前它们落在一个既无谓词也无重投预算的 else 分支里。
+    """
+    uid = f"u_js_weak_wake_write_{lane}"
+    job_id = _stuck_wake(uid, lane)
+    _record_durable_platform_effect(job_id, uid)
+
+    recovered = jobs_store.recover_killed_job(
+        job_id=job_id, claimed_by="w", reason="slot_watchdog_timeout",
+    )
+
+    assert recovered is not None
+    assert recovered["recovery"] == "terminal"
+    status, _attempts, last_error = _job_row(job_id)
+    assert status == "expired"
+    assert last_error == "wake_replay_unsafe"
+    # 弱唤醒失败对用户永远静默(2026-08-10 Seven 定案):终结但不排
+    # 用户可见失败 outbox。scheduled 才有交付义务。
+    with db.get_pool().connection() as conn:
+        visible = conn.execute(
+            "SELECT count(*) FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+    assert visible[0] == 0
+
+
+@pytest.mark.parametrize(
+    "lane", ["heartbeat", "manual_wake", "screen_watch"]
+)
+def test_watchdog_still_requeues_a_pristine_weak_wake(lane):
+    """阴性对照:没写过东西的那一轮仍然照常重投。
+
+    没有这一条，上面那条可能只是「弱唤醒从此一律终结」——那会把一个可恢复
+    的场景变成永久丢失。
+    """
+    uid = f"u_js_weak_wake_pristine_{lane}"
+    job_id = _stuck_wake(uid, lane)
+
+    recovered = jobs_store.recover_killed_job(
+        job_id=job_id, claimed_by="w", reason="slot_watchdog_timeout",
+    )
+
+    assert recovered is not None
+    assert recovered["recovery"] == "requeued"
+    status, _attempts, _last_error = _job_row(job_id)
+    assert status == "pending"
+
+
+@pytest.mark.parametrize("outcome", [None, "known"])
+def test_watchdog_does_not_requeue_weak_wake_with_mcp_attempt(outcome):
+    """远端写同理，且**不看 outcome** —— 一次已成功的远端写正是最不该重做的。
+
+    NULL outcome(worker 死在请求途中)在终结时记成 unknown:留 NULL 会让
+    后续判定把它当成「没发生过」。
+    """
+    uid = f"u_js_weak_wake_mcp_{outcome or 'null'}"
+    job_id = _stuck_wake(uid, "heartbeat")
+    jobs_store.start_mcp_mutation_attempt(
+        job_id,
+        user_id=uid,
+        claimed_by="w",
+        call_id=f"weak-wake-{outcome or 'null'}",
+        tool_name="mcp__town__post",
+        input_frontier_seq=0,
+    )
+    if outcome is not None:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE v2_mcp_mutation_attempts SET outcome=%s, "
+                "resolved_at=clock_timestamp() WHERE job_id=%s",
+                (outcome, job_id),
+            )
+
+    recovered = jobs_store.recover_killed_job(
+        job_id=job_id, claimed_by="w", reason="slot_watchdog_timeout",
+    )
+
+    assert recovered is not None and recovered["recovery"] == "terminal"
+    status, _attempts, last_error = _job_row(job_id)
+    assert status == "expired"
+    assert last_error == (
+        "mcp_mutation_outcome_unknown" if outcome is None
+        else "wake_replay_unsafe"
+    )
+    # NULL outcome 在终结时被记成 unknown → 仍然「有歧义」。
+    # 已 known 的那条不该被改写成 unknown（它是确定发生过的事实）。
+    assert jobs_store.has_ambiguous_mcp_mutation(job_id=job_id) is (
+        outcome is None
+    )
+
+
+@pytest.mark.parametrize("lane", ["dream", "profile", "capture", "maintenance"])
+def test_watchdog_still_requeues_the_deliberately_unguarded_lanes(lane):
+    """这几条**刻意**不加谓词，各自理由不同 —— 这条用例是那个决定的记录。
+
+    ⚠️ 尤其 `dream`:它直写 `memory_core.actions`(那个模块里 `effect_outbox`
+    出现 0 次)，**这条谓词结构上看不见它的写**。把谓词套上去只会让它显示成
+    「已受保护」而实际不受保护 —— 比不套更坏，因为它会让人停止担心。
+    dream 的真实修法另立 T157。
+
+    其余三条:capture 靠 prepare/commit 批次状态机(已提交无法二次提交)，
+    profile 是 latest-wins 覆盖写，maintenance 是确定性摘要 + 版本校验。
+    """
+    uid = f"u_js_unguarded_{lane}"
+    job_id = _stuck_wake(uid, lane)
+    _record_durable_platform_effect(job_id, uid)
+
+    recovered = jobs_store.recover_killed_job(
+        job_id=job_id, claimed_by="w", reason="slot_watchdog_timeout",
+    )
+
+    assert recovered is not None
+    assert recovered["recovery"] == "requeued"
+
+
+def test_foreground_chat_preempt_terminalizes_a_scheduled_job_that_wrote():
+    """前台抢占这条路此前**没有**重投谓词，而租约回收器和 watchdog 都有。
+
+    同一条 lane 在三条恢复路径上语义不一致，等于那两处的保护可以被第三条
+    绕过 —— 用户随便发一句话就能触发。
+    """
+    uid = "u_js_preempt_sched_wrote"
+    job_id = _stuck_wake(uid, "scheduled")
+    _record_durable_platform_effect(job_id, uid)
+
+    with db.get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                preempted = jobs_store.preempt_active_for_chat_on_cursor(
+                    cur, user_id=uid
+                )
+
+    assert [p.lane for p in preempted] == ["scheduled"]
+    assert preempted[0].recovery == "terminal"
+    status, _attempts, last_error = _job_row(job_id)
+    # `expired` 而不是 `superseded`:重放不安全是终态失败,不是被新版本替代 ——
+    # 而且 failure review 的 INSERT 只认 failed/expired。
+    assert status == "expired"
+    assert last_error == "foreground_chat_preempted"
+
+
+def test_foreground_chat_preempt_still_requeues_a_pristine_scheduled_job():
+    """阴性对照:没写过东西的定时任务仍然保留 job 身份、回到 pending。"""
+    uid = "u_js_preempt_sched_pristine"
+    job_id = _stuck_wake(uid, "scheduled")
+
+    with db.get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                preempted = jobs_store.preempt_active_for_chat_on_cursor(
+                    cur, user_id=uid
+                )
+
+    assert [p.recovery for p in preempted] == ["requeued"]
+    status, _attempts, _last_error = _job_row(job_id)
+    assert status == "pending"
+
+
+def test_foreground_chat_preempt_still_requeues_capture_that_wrote():
+    """capture 保留自己的语义:它靠批次状态机，不靠这条谓词。"""
+    uid = "u_js_preempt_capture_wrote"
+    job_id = _stuck_wake(uid, "capture")
+    _record_durable_platform_effect(job_id, uid)
+
+    with db.get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                preempted = jobs_store.preempt_active_for_chat_on_cursor(
+                    cur, user_id=uid
+                )
+
+    assert [p.recovery for p in preempted] == ["requeued"]
+    status, _attempts, _last_error = _job_row(job_id)
+    assert status == "pending"
+
+
+def _pending_reviews(job_id: int):
+    with db.get_pool().connection() as conn:
+        return [
+            row[0] for row in conn.execute(
+                "SELECT status FROM v2_trajectory_reviews WHERE source_job_id=%s",
+                (job_id,),
+            ).fetchall()
+        ]
+
+
+def _terminal_outbox(job_id: int):
+    with db.get_pool().connection() as conn:
+        return conn.execute(
+            "SELECT error_code FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+
+
+def _preempt(uid: str):
+    with db.get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                return jobs_store.preempt_active_for_chat_on_cursor(
+                    cur, user_id=uid
+                )
+
+
+def test_preempt_unsafe_scheduled_keeps_its_delivery_obligation():
+    """被抢占终结的定时任务仍要落用户可见失败 —— 它有交付义务。
+
+    ⚠️ 这三件必须在调用方那个事务里当场做完:行一旦 superseded，独立 reaper
+    的扫描条件再也扫不到它，留给它等于永远不做。
+    """
+    uid = "u_js_preempt_sched_visible"
+    job_id = _stuck_wake(uid, "scheduled")
+    _record_durable_platform_effect(job_id, uid)
+
+    preempted = _preempt(uid)
+
+    assert [p.recovery for p in preempted] == ["terminal"]
+    assert _terminal_outbox(job_id) == ("foreground_chat_preempted",)
+    # ⚠️ 只断失败 outbox 是不够的:`_queue_failure_review_on_cursor` 的 INSERT
+    # 只接受 `status IN ('failed','expired')`,行写成 superseded 时它会**静默
+    # 返回 False** —— 调用在、复核没排上,而上面那条断言照样绿。
+    # 必须直接断复核行本身。
+    status, _attempts, _err = _job_row(job_id)
+    assert status == "expired"
+    assert _pending_reviews(job_id) == ["pending"]
+
+
+def test_preempt_unsafe_scheduled_closes_out_a_dangling_mcp_attempt():
+    """worker 死在远端请求途中 → NULL outcome 记成 unknown，标签也要说明白。
+
+    留 NULL 会让后续判定把它当成「没发生过」。
+    """
+    uid = "u_js_preempt_sched_mcp"
+    job_id = _stuck_wake(uid, "scheduled")
+    jobs_store.start_mcp_mutation_attempt(
+        job_id,
+        user_id=uid,
+        claimed_by="w",
+        call_id="preempt-dangling",
+        tool_name="mcp__town__post",
+        input_frontier_seq=0,
+    )
+
+    preempted = _preempt(uid)
+
+    assert [p.recovery for p in preempted] == ["terminal"]
+    assert _terminal_outbox(job_id) == ("mcp_mutation_outcome_unknown",)
+    # ⚠️ 不能只断言 has_ambiguous:它对 NULL 和 'unknown' 都返回 True,
+    # 所以「没收口」和「收口成 unknown」在它眼里一样 —— 恒真断言。
+    # 必须直接读那一列。
+    with db.get_pool().connection() as conn:
+        outcomes = [
+            row[0] for row in conn.execute(
+                "SELECT outcome FROM v2_mcp_mutation_attempts WHERE job_id=%s",
+                (job_id,),
+            ).fetchall()
+        ]
+    assert outcomes == ["unknown"]
+    assert jobs_store.has_ambiguous_mcp_mutation(job_id=job_id) is True
+    assert _pending_reviews(job_id) == ["pending"]
+
+
+@pytest.mark.parametrize("lane", ["scheduled", "capture"])
+def test_preempt_pristine_job_creates_no_failure_obligation(lane):
+    """阴性对照:干净的让位不是失败，不该排用户可见 outbox。
+
+    没有这条，上面两条可能只是「抢占一律报失败」—— 那会把每一次正常让位
+    都变成用户看得见的错误。
+    """
+    uid = f"u_js_preempt_pristine_{lane}"
+    job_id = _stuck_wake(uid, lane)
+
+    preempted = _preempt(uid)
+
+    assert [p.recovery for p in preempted] == ["requeued"]
+    assert _terminal_outbox(job_id) is None
+    assert _pending_reviews(job_id) == []
+
+
+def test_effect_enqueue_fence_refuses_a_stale_job_owner():
+    """平台写必须与 job 行锁线性化 —— 否则重投谓词有 TOCTOU 窗口。
+
+    竞态形状(codex 复核指出):worker 续租成功 → 恢复路径锁住 job、查到
+    「还没有 effect」于是重投 → 旧 worker 这才把 effect 插进去 → 同一个 job
+    重跑，副作用做两遍。`start_mcp_mutation_attempt` 早就用 job 行锁堵住了
+    远端写的同一个窗口，平台写此前没有。
+    """
+    from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
+
+    uid = "u_js_effect_fence"
+    job_id = _stuck_wake(uid, "heartbeat")
+
+    # 正常持有者:写得进去。
+    eid = v2_effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type="memory_encrypted_v1",
+        ordinal=0,
+        expected_generation=0,
+        payload={"ct": "x"},
+        input_frontier_seq=0,
+        claimed_by="w",
+    )
+    assert eid
+
+    # 同一条 effect 重放:幂等，不算被拒。
+    assert v2_effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type="memory_encrypted_v1",
+        ordinal=0,
+        expected_generation=0,
+        payload={"ct": "x"},
+        input_frontier_seq=0,
+        claimed_by="w",
+    ) == eid
+
+    # 换了持有者之后,旧 owner 再也写不进去 —— 且是抛错,不是静默 no-op:
+    # 静默会让模型以为写成功了。
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET claimed_by='someone-else' WHERE id=%s",
+            (job_id,),
+        )
+    with pytest.raises(RuntimeError):
+        v2_effect_outbox.enqueue_effect(
+            job_id=job_id,
+            user_id=uid,
+            effect_type="memory_encrypted_v1",
+            ordinal=1,
+            expected_generation=0,
+            payload={"ct": "y"},
+            input_frontier_seq=0,
+            claimed_by="w",
+        )
+
+
+def test_effect_enqueue_fence_refuses_after_the_job_is_terminalized():
+    """被抢占终结之后,旧 worker 的在途写必须写不进去。
+
+    这正是重投安全谓词依赖的那条不变量:恢复路径提交之后，源 job 不再
+    running，因此不可能再冒出新的持久写把「已判定 pristine」变成假的。
+    """
+    from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
+
+    uid = "u_js_effect_fence_after_preempt"
+    job_id = _stuck_wake(uid, "heartbeat")
+
+    preempted = _preempt(uid)
+    assert [p.recovery for p in preempted] == ["terminal"]
+
+    with pytest.raises(RuntimeError):
+        v2_effect_outbox.enqueue_effect(
+            job_id=job_id,
+            user_id=uid,
+            effect_type="memory_encrypted_v1",
+            ordinal=0,
+            expected_generation=0,
+            payload={"ct": "x"},
+            input_frontier_seq=0,
+            claimed_by="w",
+        )
+
+
+def test_effect_enqueue_without_fence_stays_unfenced():
+    """不传 claimed_by 的调用保持原语义 —— 本批不改 chat 的行为。
+
+    chat 由 `get_chat_mutation_recovery_barrier` 保护，走的是另一条不变量。
+    """
+    from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
+
+    uid = "u_js_effect_unfenced"
+    job_id = _stuck_wake(uid, "heartbeat")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET claimed_by='someone-else' WHERE id=%s",
+            (job_id,),
+        )
+    assert v2_effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type="memory_encrypted_v1",
+        ordinal=0,
+        expected_generation=0,
+        payload={"ct": "x"},
+        input_frontier_seq=0,
+    )
+
+
+def test_unsafe_heartbeat_terminal_strands_its_perception_context_on_purpose():
+    """不安全的心跳终结之后**刻意不建后继**承接未消费的感知上下文。
+
+    看起来像漏交付，所以必须写成一条用例，否则后人很容易把它当普通 bug
+    「修」回去 —— 那会重新打开重复写。
+
+    转移不安全的原因不是「弱唤醒可丢」，是 **watchdog 杀进程时没有持久化的
+    `consumed_context_seq`**：无法区分哪些 context 已经进过 prompt、甚至已经
+    因果地产生了那条 durable/远端写。交给后继 = 同一份感知输入再驱动一次写。
+    晚到且确实未消费的行可能安全，但当前 schema 证明不了；证不了就按已消费
+    处理。想无损转移，得先把「写动作所见的 context 水位」持久化，那是另一件事。
+    """
+    from perception import store as perception_store
+
+    uid = "u_js_weak_wake_context_stranded"
+    job_id = _stuck_wake(uid, "heartbeat")
+    perception_store.append_v2_wake_context(
+        uid, job_id, {"kind": "app_focus"}, ts=1_700_000_000.0
+    )
+    assert perception_store.read_v2_wake_context(uid, job_id)
+    _record_durable_platform_effect(job_id, uid)
+
+    recovered = jobs_store.recover_killed_job(
+        job_id=job_id, claimed_by="w", reason="slot_watchdog_timeout",
+    )
+    assert recovered is not None and recovered["recovery"] == "terminal"
+
+    # 1) 没有**唤醒道**后继 —— 这条道安静地停下，不把感知事件搬到新 job 上
+    #    重跑。(failure review 自己的 runner job 是另一回事：它只读轨迹做
+    #    后台复盘，不重跑模型、不产生副作用。)
+    with db.get_pool().connection() as conn:
+        jobs = conn.execute(
+            "SELECT id,lane,status FROM agent_jobs WHERE user_id=%s ORDER BY id",
+            (uid,),
+        ).fetchall()
+    wake_jobs = [
+        (jid, status) for jid, lane, status in jobs
+        if lane in {"heartbeat", "manual_wake", "screen_watch", "scheduled"}
+    ]
+    assert wake_jobs == [(job_id, "expired")]
+
+    # 2) context 行仍绑在这个已终结的 job 上，只供审计/后续 trim
+    assert perception_store.read_v2_wake_context(uid, job_id)
+
+    # 3) 后台复盘由 failure review 承担，不靠转移 context
+    assert _pending_reviews(job_id) == ["pending"]

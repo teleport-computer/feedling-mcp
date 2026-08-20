@@ -27,6 +27,7 @@ def test_prompt_renders_with_context_and_escaped_json():
         buckets="工作, 关系", threads="加班, 吵架",
         identity="伴侣三个月", window="[user] 今天开了一天会",
         cards="- [mom_123] （桶：工作）长期加班",
+        locale="zh-Hans",
     )
     assert "小柒" in p and "Seven" in p
     assert "今天开了一天会" in p
@@ -34,18 +35,19 @@ def test_prompt_renders_with_context_and_escaped_json():
     assert '"cards": []' in p
     assert '"action": "add | merge | supersede | noop"' in p
     assert "[mom_123]" in p
-    assert "只能从这里复制确切 target_id" in p
-    assert "你们刚聊了一段" in p
-    assert "【你们的关系】" in p
-    assert "这个人的原话值得留" in p
+    assert "may only copy an exact target_id from here" in p
+    assert "have just finished a stretch of conversation" in p
+    assert "[Your relationship]" in p
+    assert "this person's own words worth keeping" in p
 
 
 def test_prompt_falls_back_to_neutral_defaults():
     p = build_capture_prompt(
         ai_name="", user_name="", buckets="", threads="", identity="", window="",
+        locale="zh-Hans",
     )
-    assert "（暂无）" in p and "（空）" in p
-    assert p.startswith("你是 我——这个人 的伴侣。")
+    assert "(none)" in p and "（空）" in p
+    assert p.startswith("You are 这个人, 这个人's companion.")
 
 
 def test_prompt_naming_rule_uses_known_name():
@@ -55,12 +57,13 @@ def test_prompt_naming_rule_uses_known_name():
     p = build_capture_prompt(
         ai_name="小柒", user_name="Seven",
         buckets="", threads="", identity="", window="",
+        locale="zh-Hans",
     )
     assert "提到 Seven 就用「Seven」" in p
-    assert '永远不要用"用户"/"user"' in p
+    assert 'Never use system labels like 「用户」/"user"' in p
     # TA is an instruction/transcript marker only — outputs must not use it.
-    assert "不要用「TA」指代本人" in p
-    assert "这些卡会由这个人亲眼看到" in p
+    assert "never use the placeholder 「TA」 for them" in p
+    assert "This person will read these cards with their own eyes" in p
 
 
 def test_prompt_naming_rule_without_name_uses_relationship_referent():
@@ -75,6 +78,7 @@ def test_prompt_naming_rule_without_name_uses_relationship_referent():
     """
     p = build_capture_prompt(
         ai_name="", user_name="", buckets="", threads="", identity="", window="",
+        locale="zh-Hans",
     )
     assert "优先省略主语" in p
     # 线索够就用 他/她,「对方」只兜最后一档。
@@ -83,8 +87,8 @@ def test_prompt_naming_rule_without_name_uses_relationship_referent():
     assert "猜测性别" not in p
     # 仍然禁的三样,一样都不能松。
     assert "第二人称「你」" in p
-    assert '永远不要用"用户"/"user"' in p
-    assert "不要用「TA」指代本人" in p
+    assert 'Never use system labels like 「用户」/"user"' in p
+    assert "never use the placeholder 「TA」 for them" in p
 
 
 def test_capture_prompt_marks_对方_as_a_placeholder_label_not_a_referent():
@@ -93,9 +97,10 @@ def test_capture_prompt_marks_对方_as_a_placeholder_label_not_a_referent():
     p = build_capture_prompt(
         ai_name="", user_name="", buckets="", threads="", identity="",
         window="- 对方: 老公我到家了",
+        locale="zh-Hans",
     )
-    assert "那只是标签" in p
-    assert "卡里怎么称呼，按上面那条规则判断" in p
+    assert "that is only a label" in p
+    assert "how you address them inside a card follows the rule above" in p
 
 
 def test_reserved_placeholder_names_are_treated_as_unknown():
@@ -109,6 +114,7 @@ def test_reserved_placeholder_names_are_treated_as_unknown():
         p = build_capture_prompt(
             ai_name="", user_name=reserved,
             buckets="", threads="", identity="", window="",
+            locale="zh-Hans",
         )
         assert "优先省略主语" in p, repr(reserved)
         assert "就用「用户」" not in p and "就用「user」" not in p, repr(reserved)
@@ -250,12 +256,19 @@ def test_capture_prompt_carries_canonical_buckets():
     p = build_capture_prompt(
         ai_name="io", user_name="hx", buckets="（暂无）", threads="（暂无）",
         identity="x", window="y",
+        locale="zh-Hans",
     )
-    # zh + en presented as SEPARATE lists (not 工作/Work pairs) so the model writes one
-    # single-language word, not the "健康/Health" pair verbatim (real bug e2e caught).
-    assert _COMMON_BUCKETS_ZH in p and _COMMON_BUCKETS_EN in p
-    assert "宠物" in p and "Pets" in p          # both languages available, single-word
-    assert "别写成「健康/Health」" in p          # explicit anti-mixing example
+    # 2026-08-20 起**只发一套**桶，按花园的语言取。
+    #
+    # 旧行为是把中英两套都塞进去、叮嘱模型「只准挑一边」——实测约 1/3 的中文记忆
+    # 被贴上英文公共桶，才需要 normalize_bucket_language 常态纠错。给模型一个它
+    # 不该做的选择题，它就会做错；宿主本来就知道这个花园是什么语言。
+    assert _COMMON_BUCKETS_ZH in p, "中文花园该发的那套桶不见了"
+    assert _COMMON_BUCKETS_EN not in p, "另一套桶又被塞回来了 —— 模型会挑错"
+    # "Pets" 仍会出现一次 —— 在防斜杠双语串的例子 no 「宠物/Pets」 里，那是要保留的。
+    assert "宠物" in p
+    assert p.count("Pets") == 1, "英文桶清单又被塞回来了"
+    assert "no 「健康/Health」" in p            # 防斜杠双语串的例子仍在
     assert COMMON_BUCKETS_V1 and all(zh.strip() and en.strip() for zh, en in COMMON_BUCKETS_V1)
     # companion-tuned set (hx): 14 buckets incl. the relationship/emotion/boundary ones
     assert len(COMMON_BUCKETS_V1) == 14

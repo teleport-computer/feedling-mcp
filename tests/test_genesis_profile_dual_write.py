@@ -53,6 +53,7 @@ def test_genesis_profile_uses_v2_prompt_and_bounces_required_empty_once():
     )
 
     assert len(llm.calls) == 2
+    assert llm.calls[0]["response_format"] == {"type": "json_object"}
     first_messages = llm.calls[0]["messages"]
     assert first_messages == worker.v2_profile.build_profile_prompt(
         "- id=m1 | summary=养狗 | content=狗叫蛋子\n"

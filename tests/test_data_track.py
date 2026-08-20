@@ -1215,6 +1215,7 @@ def test_detail_runtime_reports_the_prompt_budget_turns_are_planned_against(clie
     inherited default can never read as something the user chose.
     """
     from admin import data_track as data_track
+    from model_api_runtime.v2 import prompt_frontier
     from conftest import configure_model_api_route
 
     supplied = 24576
@@ -1229,8 +1230,14 @@ def test_detail_runtime_reports_the_prompt_budget_turns_are_planned_against(clie
         user_entry, include_detail=True)["runtime"]
 
     assert runtime["context_window_configured"] == supplied
-    assert runtime["context_window_tokens"] == supplied
-    assert runtime["context_window_source"] == "provider_metadata"
+    # Route storage has no provenance bit. A configured value below the metadata
+    # trust floor is intentionally visible as configured but not used as the
+    # runtime budget; the warning trace makes this accepted tradeoff observable.
+    assert supplied < prompt_frontier.provider_metadata_context_window_floor()
+    assert runtime["context_window_tokens"] == (
+        prompt_frontier.unaudited_default_context_window()
+    )
+    assert runtime["context_window_source"] == "unaudited_default"
 
 
 def test_detail_runtime_marks_an_inherited_window_as_not_user_chosen(client):
