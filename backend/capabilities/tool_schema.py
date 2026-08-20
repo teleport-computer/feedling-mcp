@@ -32,6 +32,7 @@ from perception.agent_fields import (
     AGENT_SIGNAL_FIELDS,
     FAST_AGENT_PERCEPTION_SIGNALS,
 )
+from perception_kernel import prompts as perception_prompts
 
 STAY_SILENT_TOOL = "stay_silent"
 FILE_REPLY_TOOL = "send_file"
@@ -653,22 +654,21 @@ DESCRIPTIONS: dict[str, str] = {
                             "If signals is omitted, ONLY the fast defaults are returned: "
                             + _PERCEPTION_DEFAULTS + ". Health and activity signals are "
                             "never included by default; request them explicitly by name. "
-                            "The app field is only the latest open/close event observed "
-                            "within 15 minutes; never claim it is the app currently in use. "
+                            + perception_prompts.PERCEPTION_TOOL_NOTES["perception_snapshot"]
+                            + " "
                             "Use perception_recent_apps for an activity trajectory."),
     "perception_recent_apps": (_PERCEPTION_USAGE_GATE
                                + "Read the merged app open/close trajectory, newest first, "
                                "with event, minutes_ago, and category. Use hours to bound "
                                "the time window and check minutes_ago before saying 'just "
-                               "now'. apps=[] means no data; disabled=true means access is "
-                               "off, not that no apps were used."),
+                               "now'. "
+                               + perception_prompts.PERCEPTION_TOOL_NOTES["perception_recent_apps"]),
     "perception_trend": (_PERCEPTION_USAGE_GATE
                          + "Read a numeric-field trend over recent days for one named signal "
                          "from " + _PERCEPTION_DOMAINS + ". Snapshot defaults do not apply: "
                          "always name the signal, and name the field when the signal has "
                          "multiple numeric fields. "
-                         "Interpret the rolling baseline as the usual level and delta as "
-                         "the current change from that baseline; do not conflate them."),
+                         + perception_prompts.PERCEPTION_TOOL_NOTES["perception_trend"]),
     "perception_history": (_PERCEPTION_USAGE_GATE
                            + "Read raw daily historical values over recent days for one named "
                            "signal from " + _PERCEPTION_DOMAINS + ". Snapshot defaults do "
