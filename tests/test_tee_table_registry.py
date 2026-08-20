@@ -92,8 +92,43 @@ def test_perception_signal_state_uses_snapshot_lane():
     assert entry.lane == reg.SNAPSHOT
 
 
+def test_tee_required_tables_include_synced_and_primary_local_tables():
+    """A local-only SKIP lane must not exempt a TEE-primary runtime table."""
+    required = set(reg.tee_required_tables())
+    assert set(reg.synced_tables()) <= required
+    assert {
+        "genesis_import_chunks",
+        "v2_wake_shadow_decisions",
+        "voice_turn_results",
+        "voice_turn_streams",
+        "voice_call_sessions",
+    } <= required
+    assert {
+        "alembic_version",
+        "tee_sync_runs",
+        "tee_reconcile_state",
+        "tee_reconcile_cursors",
+        "bak_20260710_usr450_blobs",
+    }.isdisjoint(required)
+
+
+def test_synced_lane_cannot_opt_out_of_tee_schema():
+    """A mistaken override must not recreate the synced-without-DDL failure."""
+    entry = reg.Entry(
+        reg.SNAPSHOT,
+        "test contract",
+        required_in_tee=False,
+    )
+    assert entry.tee_required is True
+
+
+def test_voice_call_sessions_use_snapshot_lane():
+    """The source lifecycle state must converge before primary promotion."""
+    assert reg.REGISTRY["voice_call_sessions"].lane == reg.SNAPSHOT
+
+
 def test_skip_entries_must_justify():
-    """SKIP 是"这张表永远不进 TEE"的承诺，理由必须具体（不是"暂不需要"）。"""
+    """SKIP 是“不做跨库复制”的承诺，理由必须具体（不是“暂不需要”）。"""
     vague = {"暂不需要", "不需要", "TODO", "待定", "以后再说"}
     lazy = sorted(t for t in reg.tables_in_lane(reg.SKIP)
                   if reg.REGISTRY[t].reason.strip() in vague)
@@ -107,18 +142,18 @@ def test_skip_entries_must_justify():
 TEE_TABLE_ALIAS = {"frame_envelopes": "frames"}
 
 
-def test_tee_schema_covers_every_synced_table():
-    """DDL 也要被守卫覆盖：非 SKIP lane 的表必须在 TEE 库里真实存在。
+def test_tee_schema_covers_every_required_table():
+    """DDL 守卫同时覆盖同步表和 TEE-primary 本地表。
 
     这一条专治 0002 那类事故——revision 写了、合并了，但从未在实库执行。
     conftest 的 TEE 测试库是 alembic_tee.upgrade_head() 的产物，所以这里等价于
     断言"迁移链真的建了这些表"。
     """
     tee_actual = _tables_in("TEE_DATABASE_URL")
-    want = {TEE_TABLE_ALIAS.get(t, t) for t in reg.synced_tables()}
+    want = {TEE_TABLE_ALIAS.get(t, t) for t in reg.tee_required_tables()}
     missing = sorted(want - tee_actual)
     assert not missing, (
-        f"这些表登记了非 SKIP lane，但 alembic_tee 没建（共 {len(missing)} 张）：\n  "
+        f"这些 TEE-primary 必需表未由 alembic_tee 创建（共 {len(missing)} 张）：\n  "
         + "\n  ".join(missing)
     )
 
