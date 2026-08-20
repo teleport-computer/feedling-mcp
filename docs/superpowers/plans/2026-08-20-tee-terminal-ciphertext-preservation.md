@@ -368,9 +368,10 @@ from the checkout's `ScriptDirectory.get_heads()`.
 - [ ] **Step 5: Implement CLI and JSON aggregate output**
 
 Use `argparse` flags `--apply`, `--revert`, `--confirm`, `--expected-count`, and
-`--expected-plan-sha256`. Connect from `DATABASE_URL`, `TEE_DATABASE_URL`, and
-`TEE_MIGRATION_DATABASE_URL`; set the source transaction read-only; compare
-database fingerprints and TEE heads before dispatch. Print one JSON report
+`--expected-plan-sha256`. Dry-run connects only from `DATABASE_URL` and the
+read-only/app `TEE_DATABASE_URL`; apply and revert additionally require
+`TEE_MIGRATION_DATABASE_URL`. Set the source transaction read-only and compare
+the applicable database fingerprints plus TEE heads before dispatch. Print one JSON report
 containing mode, counts by table/reason class, blockers, plan digest, and
 database fingerprints only.
 

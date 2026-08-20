@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import re
+from contextlib import ExitStack
 
 import psycopg
 
@@ -87,21 +88,23 @@ def run(
     )
     source_url = _required_env("DATABASE_URL")
     app_url = _required_env("TEE_DATABASE_URL")
-    owner_url = _required_env("TEE_MIGRATION_DATABASE_URL")
 
-    with (
-        psycopg.connect(source_url, autocommit=True) as source,
-        psycopg.connect(app_url, autocommit=True) as app,
-        psycopg.connect(owner_url, autocommit=True) as owner,
-    ):
+    with ExitStack() as stack:
+        source = stack.enter_context(psycopg.connect(source_url, autocommit=True))
+        app = stack.enter_context(psycopg.connect(app_url, autocommit=True))
+        owner = None
+        if mode != "dry-run":
+            owner_url = _required_env("TEE_MIGRATION_DATABASE_URL")
+            owner = stack.enter_context(
+                psycopg.connect(owner_url, autocommit=True)
+            )
         source_fingerprint = _fingerprint(source)
         app_fingerprint = _fingerprint(app)
-        owner_fingerprint = _fingerprint(owner)
         if source_fingerprint == app_fingerprint:
             raise RuntimeError(
                 "DATABASE_URL and TEE_DATABASE_URL resolve to the same database"
             )
-        if owner_fingerprint != app_fingerprint:
+        if owner is not None and _fingerprint(owner) != app_fingerprint:
             raise RuntimeError(
                 "TEE_MIGRATION_DATABASE_URL does not resolve to TEE_DATABASE_URL"
             )
@@ -132,6 +135,7 @@ def run(
 
         assert expected_count is not None
         assert expected_plan_sha256 is not None
+        assert owner is not None
         if mode == "apply":
             operation = preservation.apply_plan(
                 source,
