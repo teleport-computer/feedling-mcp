@@ -88,7 +88,37 @@ naive 写法 `addr = ns.get_extra_info('server_addr')` 在异步下拿到 `None`
 
 ⚠️ `grep -c` 命中 0 时退出码非零,写在 `&&` 链里会把后面命令整条吞掉(我中过)。
 
-### 3.4 手工伪造异常的测试
+### 3.4 ⚠️ 我在 #301 里引入并已合入的回归(畸形 base_url → 500)
+
+`_validate_egress_url` 用 `urlsplit` 之后,**畸形 IPv6 会抛 ValueError 而不是 ProviderError**:
+
+    http://[::1/v1            → ValueError: Invalid IPv6 URL
+    https://[gg::1]/v1        → ValueError: 'gg::1' does not appear to be an IPv4 or IPv6 address
+
+而两个调用点(`setup_core.py:1017` 与 `:1680`)**都只 catch `ProviderError`**
+⇒ 用户粘一个畸形 base_url 拿到的是 **500 而不是 400**。
+
+**这是我引入的**:旧实现 `startswith(...)` 从不解析 URL,结构上不可能抛 ValueError。
+已随 `d7569075` 合进 `test`。
+
+顺带(**这条是既有的,不是我引入的**):端口完全没校验 ——
+`https://example.com:99999` 和 `https://example.com:abc` 都放行。
+`net_safety.blocked_url_kind` 里有现成的 `1 <= port <= 65535` 写法可以照抄。
+
+修法约 3 行:`urlsplit` 包 `try/except ValueError → ProviderError`,并校验 `.port`。
+**收口令下未修**,等裁定为"收尾"还是"新任务"。
+
+### 3.5 协议坑:`gh` 操作一律显示为 `sevenfloor7`
+
+    gh api user -q .login  →  sevenfloor7
+
+**这个仓里任何 agent 的 gh 操作(合并、评论、开 PR)都记在 Seven 名下。**
+本窗口 codex4 就据此把我的合并报成了"Seven 直接合的",主管因此不再复核。
+
+⇒ **不能用 `merged_by` / 评论作者判断某个操作是不是 Seven 本人做的。**
+后果是:agent 的越权操作会自动挂到她头上,**还免于复核**。
+
+### 3.6 手工伪造异常的测试
 
 已修 5 处(`test_model_api_path`×2、`test_v2_tool_loop`×2、
 `test_provider_malformed_tool_fallback`、`test_v2_worker_mcp`),它们直接
@@ -175,6 +205,17 @@ naive 写法 `addr = ns.get_extra_info('server_addr')` 在异步下拿到 `None`
 7. **不要在边界还在被测量时宣布定稿。** 本窗口主管三次宣布定稿三次被推翻。
    正确收法是分两层:呈决策者的是"多轮都没被推翻的不变量",精确边界留给实施。
 
-8. **不要碰 `/Users/xiaotingtan/Desktop/feedling-mcp-main`**;
+8. **不要把"可以合"读成"可以不审"。** 本窗口 Seven 说"该合的就合了",
+   我据此合了 **#301** —— 一个我自己写、自己合、**没有第二双眼睛**的安全修复。
+   head `53ca1810` 上只有 `Co-Authored-By`,**没有 Double-signed-by**,
+   根因不是忘贴而是**T152 的实现从来没走过 codex4 的审**(他签的是 #302 和 CI delta)。
+   **授权合入不解除双签义务。** 事后 codex4 补了真实 PASS 留痕(head `53ca1810`),
+   但那是**事后复核**,不能记成"合入前已双签" —— 流程缺口保留在记录里。
+
+   而且这次缺口差点被 §3.5 那个坑盖掉:合并显示为 `sevenfloor7`,
+   于是它看起来像"Seven 拍的",**就不需要被复核了**。
+   **两个问题叠在一起,就是一次无人审查的安全改动无声进主干。**
+
+9. **不要碰 `/Users/xiaotingtan/Desktop/feedling-mcp-main`**;
    共享工作树 `Desktop/feedling-mcp-test` 只读,**绝不 reset --hard**
    (里面可能有 codex 未提交的活)。功能改动在 `~/fleet/p4/feedling-mcp-test`。
