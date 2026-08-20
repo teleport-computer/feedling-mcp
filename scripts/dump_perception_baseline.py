@@ -15,10 +15,22 @@ history_search/MEMORY_ORGANIZE_TOOL/MCP_TOOL_SEARCH_TOOL），只是恰好都不
 感知工具那四条里。为避免这条 provenance 假设以后再失效，改为始终从
 origin/test 的 checkout 直接 import，不依赖当前分支的工作区文件——这份
 `prompt_baseline.json` 已按此方式核对过，与基线文本逐字节一致。）
+
+（2026-08-20 补充：四格验收矩阵。新增条目走**真实入口**而不是裸常量——
+`v2_wake_prompt_*` 五个经 `worker._wake_system_prompt_for_lane`（V2 wake 系统
+prompt 按 lane 的真实选择器），`v2_build_turn_messages_system` 经
+`context.build_turn_messages`（V2 runtime context 的真实拼装函数）。V1
+hosted/self-hosted/agent-mode 三格不需要新增基线条目——
+`_native_reachout_perception_context` 全文不读 `_HOSTED`/`AGENT_MODE`，
+在 origin/test 与本分支都成立（git diff 核对过），所以那三格直接对比
+已有的 `v1_reachout_context*` 三个基线值，由测试端用 subprocess 分别以
+`_HOSTED=True/False`×`AGENT_MODE=cli/http` 四种真实模块导入态调用同一
+入口来证明"确实不受影响"，而不是静态断言。）
 """
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import sys
 
@@ -32,6 +44,12 @@ from model_api_runtime.v2 import worker as v2_worker
 from capabilities import tool_schema as v2_tool_schema
 
 import chat_resident_consumer as consumer
+
+# Force the self-thinking suffix ON for the wake-prompt matrix capture so the
+# fixture doesn't depend on the ambient env of whichever machine runs this
+# script. core/self_thinking.py reads this env var at call time (not import
+# time), and it is untouched by the perception-kernel refactor.
+os.environ["FEEDLING_V2_SELF_THINKING"] = "1"
 
 _V1_PRESENCE = {"place_label": "office", "motion_state": "walking"}
 _V1_CHANGE = [{"signal": "health_sleep", "field": "asleep_minutes", "direction": "down"}]
@@ -66,6 +84,45 @@ def main() -> None:
         "v1_reachout_context_change_only": consumer._native_reachout_perception_context(
             _V1_PRESENCE, _V1_CHANGE, None
         ),
+        # --- Task-matrix cell 1 (V2 hosted worker): wake system prompt AS
+        # ACTUALLY SELECTED per lane, via the real selector
+        # `worker._wake_system_prompt_for_lane`. `_wake_builder` (the real
+        # call site inside `_run_wake`) picks the base prompt per lane BEFORE
+        # calling the selector:
+        #   screen_watch          -> _SCREEN_WATCH_SYSTEM_PROMPT
+        #   scheduled + due notes -> _SCHEDULED_WAKE_SYSTEM_PROMPT
+        #   everything else       -> _WAKE_SYSTEM_PROMPT
+        # so this captures both that base-prompt selection AND the selector's
+        # own lane-conditional suffix assembly (self-thinking instruction +
+        # optional screen_watch/non-scheduled suffixes).
+        "v2_screen_watch_system": v2_worker._SCREEN_WATCH_SYSTEM_PROMPT,
+        "v2_wake_prompt_heartbeat": v2_worker._wake_system_prompt_for_lane(
+            "heartbeat", v2_worker._WAKE_SYSTEM_PROMPT
+        ),
+        "v2_wake_prompt_manual_wake": v2_worker._wake_system_prompt_for_lane(
+            "manual_wake", v2_worker._WAKE_SYSTEM_PROMPT
+        ),
+        "v2_wake_prompt_screen_watch": v2_worker._wake_system_prompt_for_lane(
+            "screen_watch", v2_worker._SCREEN_WATCH_SYSTEM_PROMPT
+        ),
+        # scheduled lane with no due reminder notes: `_run_wake` never swaps in
+        # `_SCHEDULED_WAKE_SYSTEM_PROMPT`, so the base stays `_WAKE_SYSTEM_PROMPT`.
+        "v2_wake_prompt_scheduled_no_notes": v2_worker._wake_system_prompt_for_lane(
+            "scheduled", v2_worker._WAKE_SYSTEM_PROMPT
+        ),
+        # scheduled lane WITH due reminder notes (the replacement variant).
+        "v2_wake_prompt_scheduled_with_notes": v2_worker._wake_system_prompt_for_lane(
+            "scheduled", v2_worker._SCHEDULED_WAKE_SYSTEM_PROMPT
+        ),
+        # --- Task-matrix cell 1 (V2 runtime context policy assembly): the
+        # REAL assembly entry point `context.build_turn_messages`, not the
+        # bare `_RUNTIME_PERCEPTION_POLICY` constant. With every optional arg
+        # left at its default, messages[0] (system role) is exactly
+        # `system_prompt.strip() + "\n\n" + _RUNTIME_CONTEXT_POLICY` — the
+        # composed block that actually ships the perception policy text.
+        "v2_build_turn_messages_system": v2_context.build_turn_messages(
+            system_prompt="SENTINEL_SYSTEM_PROMPT", summary="", tail=[]
+        )[0]["content"],
     }
     dest = pathlib.Path(sys.argv[1])
     dest.parent.mkdir(parents=True, exist_ok=True)
