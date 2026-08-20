@@ -2296,15 +2296,130 @@ def test_validate_config_and_catalog_path_now_agree():
         assert save_ok == catalog_ok, f"paths disagree on {base_url!r}"
 
 
-def test_https_private_addresses_are_still_accepted_this_is_not_an_ssrf_fix():
-    """Guards the SCOPE of this change, not a behaviour we want.
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://10.0.0.5/v1",
+        "https://169.254.169.254/latest",
+        "https://127.0.0.1/v1",
+        "https://[::1]/v1",
+        "https://[fe80::1]/v1",
+        "https://192.0.2.1/v1",
+        "https://224.0.0.1/v1",
+    ],
+)
+def test_https_non_public_literals_are_blocked_on_both_validation_paths(base_url):
+    with pytest.raises(pc.ProviderError, match="public"):
+        pc.validate_config("openai_compatible", "gpt-4", base_url)
+    with pytest.raises(pc.ProviderError, match="public"):
+        pc.validate_catalog_target("openai_compatible", base_url)
 
-    Address-level egress policy does not exist on this path. If someone later
-    adds it, this test SHOULD fail — that failure is the signal to update the
-    changelog and the docs claim, not to weaken the new check."""
-    for base_url in ["https://10.0.0.5/v1", "https://169.254.169.254/latest"]:
+
+@pytest.mark.parametrize(
+    "resolved_ips",
+    [
+        ["10.0.0.5"],
+        ["8.8.8.8", "169.254.169.254"],
+        ["ff02::1"],
+    ],
+)
+def test_https_hostname_is_blocked_if_any_dns_answer_is_not_public(
+    monkeypatch, resolved_ips
+):
+    monkeypatch.setattr(pc, "_resolve_provider_base_url_ips", lambda _host: resolved_ips)
+
+    with pytest.raises(pc.ProviderError, match="public"):
+        pc.validate_config("openai_compatible", "gpt-4", "https://relay.example/v1")
+    with pytest.raises(pc.ProviderError, match="public"):
+        pc.validate_catalog_target("openai_compatible", "https://relay.example/v1")
+
+
+@pytest.mark.parametrize(
+    "resolved", [[], ["not-an-address"], OSError("dns unavailable")]
+)
+def test_https_dns_failure_is_a_provider_error_on_both_validation_paths(
+    monkeypatch, resolved
+):
+    def _resolve(_host):
+        if isinstance(resolved, BaseException):
+            raise resolved
+        return resolved
+
+    monkeypatch.setattr(pc, "_resolve_provider_base_url_ips", _resolve)
+
+    with pytest.raises(pc.ProviderError, match="resolve"):
+        pc.validate_config("openai_compatible", "gpt-4", "https://relay.example/v1")
+    with pytest.raises(pc.ProviderError, match="resolve"):
+        pc.validate_catalog_target("openai_compatible", "https://relay.example/v1")
+
+
+def test_https_dns_is_checked_on_every_explicit_validation_without_a_cache(monkeypatch):
+    resolved_hosts = []
+
+    def _resolve(host):
+        resolved_hosts.append(host)
+        return ["8.8.8.8"]
+
+    monkeypatch.setattr(pc, "_resolve_provider_base_url_ips", _resolve)
+
+    pc.validate_config("openai_compatible", "gpt-4", "https://relay.example/v1")
+    pc.validate_config("openai_compatible", "gpt-4", "https://relay.example/v1")
+
+    assert resolved_hosts == ["relay.example", "relay.example"]
+
+
+def test_provider_dns_resolver_has_no_process_cache(monkeypatch):
+    resolved_hosts = []
+
+    def _resolve(host):
+        resolved_hosts.append(host)
+        return ["8.8.8.8"]
+
+    monkeypatch.setattr(pc.net_safety, "resolve_ips", _resolve)
+
+    pc._resolve_provider_base_url_ips("relay.example")
+    pc._resolve_provider_base_url_ips("relay.example")
+
+    assert resolved_hosts == ["relay.example", "relay.example"]
+
+
+def test_private_base_url_escape_is_exact_and_does_not_expand_cleartext(monkeypatch):
+    private_url = "https://10.0.0.5/v1"
+    monkeypatch.setenv("FEEDLING_PROVIDER_ALLOW_PRIVATE_BASE_URLS", "true")
+    with pytest.raises(pc.ProviderError, match="public"):
+        pc.validate_config("openai_compatible", "gpt-4", private_url)
+
+    monkeypatch.setenv("FEEDLING_PROVIDER_ALLOW_PRIVATE_BASE_URLS", "1")
+    _, _, out = pc.validate_config("openai_compatible", "gpt-4", private_url)
+    assert out == private_url
+    _, catalog_url = pc.validate_catalog_target("openai_compatible", private_url)
+    assert catalog_url == private_url
+
+    monkeypatch.setattr(
+        pc,
+        "_resolve_provider_base_url_ips",
+        lambda _host: (_ for _ in ()).throw(AssertionError("escape must skip DNS")),
+    )
+    _, _, hostname_url = pc.validate_config(
+        "openai_compatible", "gpt-4", "https://lan-model.example/v1"
+    )
+    assert hostname_url == "https://lan-model.example/v1"
+
+    with pytest.raises(pc.ProviderError, match="local http"):
+        pc.validate_config(
+            "openai_compatible", "gpt-4", "http://192.168.1.50:11434/v1"
+        )
+
+
+def test_cleartext_loopback_allowlist_still_skips_dns(monkeypatch):
+    def _unexpected_dns(_host):
+        raise AssertionError("cleartext loopback must not enter the HTTPS DNS policy")
+
+    monkeypatch.setattr(pc, "_resolve_provider_base_url_ips", _unexpected_dns)
+
+    for base_url in ["http://127.0.0.1:8080/v1", "http://localhost:11434/v1"]:
         _, _, out = pc.validate_config("openai_compatible", "gpt-4", base_url)
-        assert out == base_url.rstrip("/")
+        assert out == base_url
 
 
 @pytest.mark.parametrize(

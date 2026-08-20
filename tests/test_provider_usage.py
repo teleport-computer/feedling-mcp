@@ -196,6 +196,21 @@ def test_relay_blocked_private_url(monkeypatch):
     assert fake.requests == []  # 一个请求都不许发
 
 
+def test_general_private_base_url_escape_also_applies_to_usage_probe(monkeypatch):
+    monkeypatch.delenv("FEEDLING_PROVIDER_USAGE_ALLOW_PRIVATE", raising=False)
+    monkeypatch.setenv("FEEDLING_PROVIDER_ALLOW_PRIVATE_BASE_URLS", "true")
+    assert pu.allow_private() is False
+
+    monkeypatch.setenv("FEEDLING_PROVIDER_ALLOW_PRIVATE_BASE_URLS", "1")
+    assert pu.allow_private() is True
+
+
+def test_legacy_usage_only_private_escape_remains_compatible(monkeypatch):
+    monkeypatch.delenv("FEEDLING_PROVIDER_ALLOW_PRIVATE_BASE_URLS", raising=False)
+    monkeypatch.setenv("FEEDLING_PROVIDER_USAGE_ALLOW_PRIVATE", "1")
+    assert pu.allow_private() is True
+
+
 def test_timeout_maps_to_slug(monkeypatch):
     import httpx as _httpx
     fake = FakeAsyncClient({"/user/balance": _httpx.TimeoutException("t")})

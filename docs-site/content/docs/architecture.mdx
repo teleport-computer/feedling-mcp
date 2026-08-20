@@ -72,6 +72,20 @@ protects persisted content and the storage path; it does not hide the prompt
 from the model selected to process it. When visible push text is enabled, that
 notification text also passes through the external push provider.
 
+Managed provider routes resolve every explicit HTTPS base URL on each
+validation, including the validation immediately before runtime calls, and
+reject the route when any answer is not publicly reachable. This reuses the
+same private, loopback, link-local, reserved, and multicast classification as
+other server-side egress guards. It deliberately pays a synchronous DNS lookup
+per call and keeps no process cache, reducing the rebinding window compared with
+save-time-only validation. It does not pin the HTTP connection to the checked
+address, so infrastructure egress policy remains the final control if DNS
+changes between validation and connection. Exact cleartext loopback URLs remain
+available for local development. A self-hosted operator can explicitly disable
+the HTTPS address filter for a LAN provider, as documented in
+[Self-hosting](/docs/self-hosting); managed deployments leave that escape hatch
+unset.
+
 Managed Phala deployments place the CPU recorder inside the measured main-CVM
 boundary. The recorder does not mount the Docker socket. A separate privileged
 socket proxy holds that mount and regex-allowlists only the two Docker GET path

@@ -8,6 +8,7 @@ import http.cookiejar as _cookiejar
 import json
 import logging
 import math
+import os
 import random
 import re
 import threading
@@ -20,6 +21,7 @@ import httpx
 
 import generated_image
 import safe_url_fetch
+from core import net_safety
 from generated_image import (
     MAX_GENERATED_IMAGE_SOURCE_BYTES,
     MAX_GENERATED_IMAGES_PER_REPLY,
@@ -388,11 +390,9 @@ def validate_config(
     # already used it; the bug survived because the two paths disagreed. Sharing
     # one parser is the point — a third dialect would leave the same seam.
     #
-    # SCOPE: this fixes how the cleartext-loopback allowlist is parsed and matched.
-    # It is NOT an SSRF fix. https targets are still accepted without any address
-    # check at all, so https://10.0.0.5/v1 and https://169.254.169.254/latest pass
-    # today and still pass after this change. That gap is a separate, larger piece
-    # of work waiting on a product ruling about private-network and proxy support.
+    # HTTPS targets also pass the shared address-level egress policy below. The
+    # self-host escape hatch is deployment-wide and explicit; the ordinary
+    # hosted default remains fail closed for private or unresolvable addresses.
     if base_url:
         _validate_egress_url(base_url)
     if not base_url:
@@ -3948,11 +3948,26 @@ def validate_catalog_target(provider: str, base_url: str = "") -> tuple[str, str
 # both the model-catalog path and the save/test path validate through here, and
 # tying the name to one of them is how they drifted apart before.
 _CLEARTEXT_ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
+_ALLOW_PRIVATE_BASE_URLS_ENV = "FEEDLING_PROVIDER_ALLOW_PRIVATE_BASE_URLS"
+
+
+def private_provider_base_urls_allowed() -> bool:
+    """Return the deployment-level self-host escape hatch, exact-value only."""
+    return os.environ.get(_ALLOW_PRIVATE_BASE_URLS_ENV, "0").strip() == "1"
+
+
+def _resolve_provider_base_url_ips(host: str) -> list[str]:
+    """Named seam for deterministic tests; production uses shared net safety."""
+    return net_safety.resolve_ips(host)
 
 
 def _validate_egress_url(base_url: str) -> None:
-    """Reject any egress target that isn't ``https://`` or an EXACT loopback
-    ``http://`` host — parsed with ``urlsplit``, never ``startswith``.
+    """Reject unsafe provider egress targets before save, catalog, or use.
+
+    Cleartext is limited to an EXACT loopback ``http://`` host, parsed with
+    ``urlsplit`` rather than ``startswith``. HTTPS names and literals must
+    resolve only to publicly reachable addresses unless a self-host operator
+    explicitly enables ``FEEDLING_PROVIDER_ALLOW_PRIVATE_BASE_URLS=1``.
 
     A ``startswith("http://127.0.0.1")`` prefix check is forgeable: both
     ``http://127.0.0.1.evil.example`` (real host ``evil.example``) and
@@ -3961,17 +3976,23 @@ def _validate_egress_url(base_url: str) -> None:
     plaintext to the attacker. urlsplit resolves the true ``hostname`` and lets
     us forbid userinfo outright.
 
-    What this does and does not decide, stated plainly because the name is
-    broader than the check:
+    What this does and does not decide:
 
     * it decides **which cleartext http targets are allowed** — only the exact
       hosts above, so ``127.0.0.1.evil.example``, ``127.0.0.1@evil.example``,
       a trailing-dot ``127.0.0.1.``, ``127.0.0.2`` and ``[::1]`` are all refused;
     * it rejects userinfo on **every** scheme, https included, because
       credentials in a URL are both a leak and a way to disguise the real host;
-    * it does **not** look at addresses for https targets. ``https://10.0.0.5``
-      and ``https://169.254.169.254`` pass. Address-level egress policy does not
-      exist on this path yet; nothing here should be read as providing it.
+    * HTTPS address classification delegates to ``core.net_safety`` so private,
+      loopback, link-local, multicast, reserved, mixed-answer, empty-answer and
+      unresolvable targets share the existing outbound policy;
+    * explicit base URLs are resolved on every validation with no process cache.
+      Runtime call sites validate before each provider request, trading one
+      synchronous DNS lookup per call for a shorter DNS-rebinding window. The
+      HTTP client still resolves independently: IP pinning and peer verification
+      remain an infrastructure/follow-up boundary, not a claim made here;
+    * the self-host escape bypasses only HTTPS address classification. It does
+      not widen the exact cleartext-loopback allowlist or relax URL structure.
     """
     try:
         parts = urlsplit(base_url)
@@ -4015,6 +4036,20 @@ def _validate_egress_url(base_url: str) -> None:
             raise ProviderError("base_url must be https:// or local http://127.0.0.1") from exc
         if host not in _CLEARTEXT_ALLOWED_HOSTS:
             raise ProviderError("base_url must be https:// or local http://127.0.0.1")
+        return
+
+    if private_provider_base_urls_allowed():
+        return
+
+    blocked_kind = net_safety.blocked_url_kind(
+        base_url,
+        resolve=_resolve_provider_base_url_ips,
+        allowed_schemes=("https",),
+    )
+    if blocked_kind == "dns":
+        raise ProviderError("base_url host could not be resolved")
+    if blocked_kind is not None:
+        raise ProviderError("base_url must resolve only to publicly reachable addresses")
 
 
 def _catalog_request(provider: str, api_key: str, base_url: str,
