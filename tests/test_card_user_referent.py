@@ -204,7 +204,8 @@ def test_all_three_write_paths_carry_the_naming_rule():
     from memory.dream_prompt_v1 import build_dream_prompt
 
     capture = build_capture_prompt(ai_name="小柒", user_name="", buckets="",
-                                   threads="", identity="", window="- 对方: hi")
+                                   threads="", identity="", window="- 对方: hi",
+                                   locale="zh-Hans")
     dream = build_dream_prompt(ai_name="小柒", user_name="", cards="", recent_conversations="")
     for prompt, who in ((capture, "capture"), (dream, "dream")):
         assert "「用户」" in prompt or '"用户"' in prompt, who   # 明令禁用
