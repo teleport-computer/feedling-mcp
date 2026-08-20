@@ -262,7 +262,7 @@ def test_chat_tool_search_injects_full_schema_before_mcp_dispatch(monkeypatch):
     uid = "u_mcp_tool_search"
     conftest.seed_user(uid)
     _reset(uid)
-    jobs_store.enqueue_job(uid, "chat")
+    jobs_store.enqueue_job(uid, "chat", trace_id="trace-schema-chat")
     job = jobs_store.claim_next_job("w")
     _patch_real_write(monkeypatch)
 
@@ -293,6 +293,11 @@ def test_chat_tool_search_injects_full_schema_before_mcp_dispatch(monkeypatch):
         [{"id": "m1", "ts": 10.0, "role": "user", "content": "ping it"}],
         load_mcp_turn=_make_load_turn_mcp(turn),
     )
+    schema_events = []
+    deps.emit_schema_surface_trace = (
+        lambda user_id, event_type, **kwargs:
+        schema_events.append((user_id, event_type, kwargs))
+    )
 
     status = asyncio.run(worker.process_job(
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt-turn"))
@@ -304,6 +309,25 @@ def test_chat_tool_search_injects_full_schema_before_mcp_dispatch(monkeypatch):
     assert first[_MCP_SPEC.name].parameters["properties"] == {}
     assert second[_MCP_SPEC.name] == _MCP_SPEC
     assert dispatched == [(_MCP_SPEC.name, {})]
+    assert [event[1] for event in schema_events] == [
+        "mcp.surface.schema_folded",
+        "mcp.surface.schema_recovered",
+    ], "the provider plans three rounds; unchanged fold sets must not duplicate"
+    folded = schema_events[0][2]
+    recovered = schema_events[1][2]
+    assert folded["collapsed_names"] == (_MCP_SPEC.name,)
+    assert folded["resolved_names"] == ()
+    assert folded["protected_names"] == ()
+    assert recovered["collapsed_names"] == ()
+    assert recovered["resolved_names"] == (_MCP_SPEC.name,)
+    assert recovered["protected_names"] == (_MCP_SPEC.name,)
+    assert {event[2]["lane"] for event in schema_events} == {"chat"}
+    assert {event[2]["trace_id"] for event in schema_events} == {
+        "trace-schema-chat"
+    }
+    assert {event[2]["job_id"] for event in schema_events} == {
+        str(job["id"])
+    }
 
 
 def test_chat_pressure_folded_platform_schema_is_searchable_and_protected(

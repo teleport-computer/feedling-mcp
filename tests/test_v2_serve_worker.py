@@ -617,6 +617,51 @@ def test_v2_debug_trace_user_seam_resolves_store_and_preserves_duration(monkeypa
     ]
 
 
+@pytest.mark.parametrize(
+    "event_type",
+    ["mcp.surface.schema_folded", "mcp.surface.schema_recovered"],
+)
+def test_schema_surface_trace_bounds_all_name_sets_and_threads_ids(
+    monkeypatch, event_type,
+):
+    captured = []
+    monkeypatch.setattr(
+        serve_worker,
+        "_emit_v2_debug_trace_for_user",
+        lambda user_id, kind, **kwargs: captured.append(
+            (user_id, kind, kwargs)
+        ),
+    )
+    names = [
+        f"mcp__server__tool_{index:02d}"
+        for index in range(debug_trace._DETAIL_MAX_LIST + 7)
+    ]
+
+    serve_worker._emit_schema_surface_trace_for_user(
+        "usr_schema",
+        event_type,
+        lane="heartbeat",
+        trace_id="trace-schema",
+        job_id="job-42",
+        collapsed_names=reversed(names),
+        resolved_names=names,
+        protected_names=names,
+    )
+
+    assert len(captured) == 1
+    user_id, kind, kwargs = captured[0]
+    assert (user_id, kind) == ("usr_schema", event_type)
+    assert kwargs["trace_id"] == "trace-schema"
+    assert kwargs["job_id"] == "job-42"
+    detail = kwargs["detail"]
+    assert detail["driver"] == "v2"
+    assert detail["lane"] == "heartbeat"
+    for key in ("collapsed_names", "resolved_names", "protected_names"):
+        assert detail[key] == names[:debug_trace._DETAIL_MAX_LIST]
+        assert detail[f"{key}_truncated"] is True
+        assert detail[f"{key}_total"] == len(names)
+
+
 def test_v2_debug_trace_payload_preserves_turn_trace_id(monkeypatch):
     from diagnostics import diagnostics_core
 

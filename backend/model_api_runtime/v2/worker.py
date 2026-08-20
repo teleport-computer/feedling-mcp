@@ -1514,6 +1514,10 @@ class TurnDeps:
     # dependency-clean and tests may inject a collector. Observability is always
     # best-effort and must never affect tool execution.
     emit_debug_trace: Callable[..., None] | None = None
+    # Assembly-owned name-level folded-schema observer. The worker supplies
+    # complete raw sets; serve_worker applies debug_trace.bounded_names before
+    # persistence so the trace sanitizer cannot silently clip them.
+    emit_schema_surface_trace: Callable[..., None] | None = None
 
 
 class _EmptyMcpTurn:
@@ -1878,9 +1882,17 @@ class _SchemaRecovery:
     federates the two behind one contract so no lane can wire up half of it.
     """
 
-    def __init__(self, mcp_turn, *, current_offered_mcp_tool_specs) -> None:
+    def __init__(
+        self,
+        mcp_turn,
+        *,
+        current_offered_mcp_tool_specs,
+        observe_surface=None,
+    ) -> None:
         self._mcp_turn = mcp_turn
         self._current_specs = current_offered_mcp_tool_specs
+        self._observe_surface = observe_surface
+        self._last_collapsed_names: frozenset[str] = frozenset()
         self.platform = v2_tool_surface.SchemaRecoveryState({
             spec.name: spec for spec in cap_tool_schema.build_tool_specs()
         })
@@ -1912,13 +1924,74 @@ class _SchemaRecovery:
             self._requires_mcp_resolution(name)
         )
 
-    def record_surface(self, decision: dict | None) -> None:
+    def _surface_name_sets(self) -> dict[str, tuple[str, ...]]:
+        protected = {
+            str(name) for name in self.protected_names() if str(name)
+        }
+        collapsed = {
+            str(name)
+            for name in self.platform.pressure_collapsed_names
+            if str(name)
+        }
+        for attr in ("collapsed_names", "pressure_collapsed_names"):
+            collapsed.update(
+                str(name)
+                for name in (getattr(self._mcp_turn, attr, ()) or ())
+                if str(name)
+            )
+        collapsed.difference_update(protected)
+        # Today every resolved schema is protected from being folded again.
+        # Keep both lists: they answer different operational questions and the
+        # two contracts may diverge later.
+        resolved = set(protected)
+        return {
+            "collapsed_names": tuple(sorted(collapsed)),
+            "resolved_names": tuple(sorted(resolved)),
+            "protected_names": tuple(sorted(protected)),
+        }
+
+    async def _observe(self, event_type: str) -> None:
+        if self._observe_surface is None:
+            return
+        try:
+            observed = self._observe_surface(
+                event_type,
+                self._surface_name_sets(),
+            )
+            if inspect.isawaitable(observed):
+                await observed
+        except Exception as exc:  # noqa: BLE001 -- telemetry is best-effort
+            log.warning(
+                "[v2.mcp] schema surface trace failed code=%s",
+                type(exc).__name__.lower(),
+            )
+
+    async def record_surface(self, decision: dict | None) -> None:
         detail = decision if isinstance(decision, dict) else {}
         self.platform.set_pressure_collapsed(
             detail.get("pressure_collapsed_names", ())
         )
         if callable(self._record_mcp_surface):
             self._record_mcp_surface(detail)
+        current = self._surface_name_sets()
+        collapsed = frozenset(current["collapsed_names"])
+        if collapsed == self._last_collapsed_names:
+            return
+        self._last_collapsed_names = collapsed
+        await self._observe("mcp.surface.schema_folded")
+
+    async def record_recovery(self, result: dict | None) -> None:
+        """Observe one successful search and absorb its fold-set transition."""
+        detail = result if isinstance(result, dict) else {}
+        if not list(detail.get("resolved") or []):
+            return
+        # The recovery event carries the post-search fold set. Advancing the
+        # signature prevents the next provider round from emitting a redundant
+        # empty/partial schema_folded event for this same transition.
+        self._last_collapsed_names = frozenset(
+            self._surface_name_sets()["collapsed_names"]
+        )
+        await self._observe("mcp.surface.schema_recovered")
 
     def protected_names(self) -> set[str]:
         protected = self.platform.protected_names()
@@ -2151,6 +2224,42 @@ def _provider_tool_surface_callback(
     if deps.emit_debug_trace is None:
         return None
     return _ProviderRoundtripTrace(deps, user_id, lane, str(trace_id or ""))
+
+
+def _schema_surface_trace_callback(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+    *,
+    trace_id: str = "",
+    job_id: Any = "",
+):
+    """Bridge complete raw name sets to assembly-owned bounded trace output."""
+
+    if deps.emit_schema_surface_trace is None:
+        return None
+
+    async def _emit(event_type: str, names: dict[str, tuple[str, ...]]) -> None:
+        try:
+            await asyncio.to_thread(
+                deps.emit_schema_surface_trace,
+                user_id,
+                event_type,
+                lane=_normalize_provider_trace_lane(lane),
+                trace_id=str(trace_id or ""),
+                job_id=str(job_id or ""),
+                collapsed_names=names.get("collapsed_names", ()),
+                resolved_names=names.get("resolved_names", ()),
+                protected_names=names.get("protected_names", ()),
+            )
+        except Exception as exc:  # noqa: BLE001 -- telemetry is best-effort
+            log.warning(
+                "[v2.mcp] schema surface trace bridge failed user=%s code=%s",
+                user_id,
+                type(exc).__name__.lower(),
+            )
+
+    return _emit
 
 
 def _normalize_provider_trace_lane(lane: object) -> str:
@@ -8298,6 +8407,13 @@ async def _run_wake(
         schema_recovery = _SchemaRecovery(
             mcp_turn,
             current_offered_mcp_tool_specs=_current_offered_mcp_tool_specs,
+            observe_surface=_schema_surface_trace_callback(
+                deps,
+                user_id,
+                lane,
+                trace_id=trace_id,
+                job_id=job_id,
+            ),
         )
         mcp_wall_budget = _McpTurnWallBudget(MCP_TURN_WALL_BUDGET_SEC)
 
@@ -8417,10 +8533,12 @@ async def _run_wake(
 
             async def _dispatch_platform_one(tc) -> ToolResult:
                 if tc.name == cap_tool_schema.MCP_TOOL_SEARCH_TOOL:
+                    recovered = schema_recovery.resolve(tc.args)
+                    await schema_recovery.record_recovery(recovered)
                     return ToolResult(
                         call_id=tc.id,
                         content=json.dumps(
-                            schema_recovery.resolve(tc.args),
+                            recovered,
                             ensure_ascii=False,
                             sort_keys=True,
                             separators=(",", ":"),
@@ -12420,6 +12538,13 @@ async def process_job(
         schema_recovery = _SchemaRecovery(
             mcp_turn,
             current_offered_mcp_tool_specs=_current_offered_mcp_tool_specs,
+            observe_surface=_schema_surface_trace_callback(
+                deps,
+                user_id,
+                lane,
+                trace_id=str(job.get("trace_id") or ""),
+                job_id=job_id,
+            ),
         )
         mcp_offered_names = tuple(
             str(spec.name) for spec in offered_mcp_tool_specs if str(spec.name)
@@ -12631,10 +12756,12 @@ async def process_job(
                 # worker-level gate as MCP reads. Executor still owns validation,
                 # provenance, encrypted outbox writes, and terminal write failures.
                 if tc.name == cap_tool_schema.MCP_TOOL_SEARCH_TOOL:
+                    recovered = schema_recovery.resolve(tc.args)
+                    await schema_recovery.record_recovery(recovered)
                     return ToolResult(
                         call_id=tc.id,
                         content=json.dumps(
-                            schema_recovery.resolve(tc.args),
+                            recovered,
                             ensure_ascii=False,
                             sort_keys=True,
                             separators=(",", ":"),

@@ -4721,6 +4721,54 @@ def _emit_v2_debug_trace_for_user(user_id: str, event_type: str, **kwargs) -> No
     _emit_v2_debug_trace(core_store.get_store(user_id), event_type, **kwargs)
 
 
+def _emit_schema_surface_trace_for_user(
+    user_id: str,
+    event_type: str,
+    *,
+    lane: str,
+    trace_id: str,
+    job_id: str,
+    collapsed_names,
+    resolved_names,
+    protected_names,
+) -> None:
+    """Persist one schema transition with honest name-list completeness."""
+    import debug_trace
+
+    if event_type not in {
+        "mcp.surface.schema_folded",
+        "mcp.surface.schema_recovered",
+    }:
+        return
+    detail = {"driver": "v2", "lane": str(lane or "other")}
+    for key, names in (
+        ("collapsed_names", collapsed_names),
+        ("resolved_names", resolved_names),
+        ("protected_names", protected_names),
+    ):
+        detail.update(debug_trace.bounded_names(key, sorted(set(names or ()))))
+    folded_total = int(detail["collapsed_names_total"])
+    recovered_total = int(detail["resolved_names_total"])
+    is_folded = event_type == "mcp.surface.schema_folded"
+    _emit_v2_debug_trace_for_user(
+        user_id,
+        event_type,
+        status=("warning" if is_folded and folded_total else "ok"),
+        trace_id=str(trace_id or ""),
+        job_id=str(job_id or ""),
+        summary=(
+            f"Provider 工具面折叠 {folded_total} 个 schema"
+            if is_folded
+            else f"本回合累计恢复 {recovered_total} 个 schema"
+        ),
+        explain=(
+            "仅记录折叠、已恢复和受保护工具的名称集合及完整性标记;"
+            "不记录 schema、工具参数、返回值或用户内容。"
+        ),
+        detail=detail,
+    )
+
+
 def build_production_deps() -> v2_worker.TurnDeps:
     return v2_worker.TurnDeps(
         read_messages=_read_messages,
@@ -4786,6 +4834,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         seal_trajectory_payload=_seal_trajectory_payload,
         open_trajectory_payload=_open_trajectory_payload,
         emit_debug_trace=_emit_v2_debug_trace_for_user,
+        emit_schema_surface_trace=_emit_schema_surface_trace_for_user,
         send_reply_push=(
             _send_reply_push
             if os.environ.get("FEEDLING_V2_PUSH_ENABLED", "1").strip() != "0"
