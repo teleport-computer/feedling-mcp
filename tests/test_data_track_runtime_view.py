@@ -98,6 +98,23 @@ def _payload(lanes=None, **pool_overrides) -> dict:
     }
 
 
+def _trajectory_review_snapshot(**overrides) -> dict:
+    snapshot = {
+        "generated_at": 1_800_000_000.0,
+        "heartbeat_within_sec": 30,
+        "runner_config": {
+            "current_enabled": True,
+            "observed_runners": 2,
+            "enabled_runners": 2,
+            "disabled_runners": 0,
+            "consistent": True,
+        },
+        "status_counts": {"pending": 7, "running": 2, "completed": 11},
+    }
+    snapshot.update(overrides)
+    return snapshot
+
+
 def test_runtime_health_level_green_on_healthy_fleet():
     level, reasons = _dt._runtime_health_level(_payload())
     assert level == "ok"
@@ -610,6 +627,63 @@ def test_render_runtime_health_page_explains_exact_watchdog_event_scope(
     assert "上线初期读数偏低不等于此前未发生" in html_out
 
 
+def test_runtime_page_renders_runner_switch_and_current_review_snapshot(
+    bound_request,
+):
+    html_out = _dt._render_runtime_health_page(
+        _payload(),
+        trajectory_reviews=_trajectory_review_snapshot(),
+    )
+
+    assert "data-trajectory-review-enabled='true'" in html_out
+    assert "Runner 读取到的 trajectory_review 开关" in html_out
+    assert "不是 admin 进程的 env" in html_out
+    assert "分进程或分容器" in html_out
+    assert (
+        "data-review-status='pending'><div class='metric-value'>7</div>"
+        in html_out
+    )
+    assert (
+        "data-review-status='running'><div class='metric-value'>2</div>"
+        in html_out
+    )
+    assert "当前快照，不是历史累计" in html_out
+
+
+def test_runtime_page_does_not_guess_missing_or_conflicting_runner_config(
+    bound_request,
+):
+    missing = _trajectory_review_snapshot(
+        runner_config={
+            "current_enabled": None,
+            "observed_runners": 0,
+            "enabled_runners": 0,
+            "disabled_runners": 0,
+            "consistent": False,
+        }
+    )
+    mixed = _trajectory_review_snapshot(
+        runner_config={
+            "current_enabled": None,
+            "observed_runners": 2,
+            "enabled_runners": 1,
+            "disabled_runners": 1,
+            "consistent": False,
+        }
+    )
+
+    missing_html = _dt._render_runtime_health_page(
+        _payload(), trajectory_reviews=missing
+    )
+    mixed_html = _dt._render_runtime_health_page(
+        _payload(), trajectory_reviews=mixed
+    )
+    assert "data-trajectory-review-enabled='unknown'" in missing_html
+    assert "未知（无新格式新鲜心跳）" in missing_html
+    assert "data-trajectory-review-enabled='mixed'" in mixed_html
+    assert "runner 间不一致" in mixed_html
+
+
 def test_runtime_view_renders_and_highlights_nav(client, monkeypatch):
     monkeypatch.setattr(_dt, "_runtime_health_summary", _fake_summary)
     page = client.get(
@@ -687,6 +761,16 @@ def test_runtime_watchdog_recoveries_is_wired_to_jobs_store():
     assert (
         _dt._runtime_watchdog_recoveries
         is jobs_store.recent_watchdog_recovery_counts
+    )
+
+
+def test_runtime_trajectory_reviews_is_wired_to_jobs_store():
+    import asgi_app  # noqa: F401
+    from model_api_runtime.v2 import jobs_store
+
+    assert (
+        _dt._runtime_trajectory_reviews
+        is jobs_store.trajectory_review_observability_snapshot
     )
 
 
@@ -1487,11 +1571,16 @@ def test_runtime_view_passes_same_window_to_user_report(monkeypatch):
         seen["watchdog"] = kwargs["within_hours"]
         return {}
 
+    def _trajectory_reviews():
+        seen["trajectory_reviews"] = "current_snapshot"
+        return _trajectory_review_snapshot()
+
     monkeypatch.setattr(_dt, "_runtime_health_summary", _health)
     monkeypatch.setattr(_dt, "_runtime_token_by_lane", _tokens_for_window)
     monkeypatch.setattr(_dt, "_runtime_delivery_health", _delivery_for_window)
     monkeypatch.setattr(_dt, "_runtime_user_report", _users)
     monkeypatch.setattr(_dt, "_runtime_watchdog_recoveries", _watchdog)
+    monkeypatch.setattr(_dt, "_runtime_trajectory_reviews", _trajectory_reviews)
 
     body = _admin_core.page_html("view=runtime&hours=168")
 
@@ -1501,8 +1590,10 @@ def test_runtime_view_passes_same_window_to_user_report(monkeypatch):
         "delivery": 168,
         "users": 168,
         "watchdog": 168,
+        "trajectory_reviews": "current_snapshot",
     }
     assert "用户交付可靠性" in body
+    assert "data-trajectory-review-enabled='true'" in body
 
 
 @pytest.mark.skipif(

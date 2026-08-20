@@ -196,6 +196,15 @@ SCHEDULED_LEASE_REQUEUE_MAX_ATTEMPTS = _positive_int_env(
     "FEEDLING_V2_SCHEDULED_REQUEUE_MAX_ATTEMPTS", "3"
 )
 
+# 通用 watchdog 恢复最多重投三次，避免确定性卡死无限占 worker 槽并重复
+# 调 provider。这个预算只限制「最多烧几轮」：dream 如果在卡死前已经直写了
+# 一部分 memory cards，预算内的整轮重放仍可能再次铸造新 id。彻底避免重复写
+# 需要冻结日志，而那项方案不属于本改动。
+GENERAL_LEASE_REQUEUE_MAX_ATTEMPTS = _positive_int_env(
+    "FEEDLING_V2_GENERAL_REQUEUE_MAX_ATTEMPTS", "3"
+)
+GENERAL_WATCHDOG_REQUEUE_EXHAUSTED = "watchdog_requeue_exhausted"
+
 # Shared by the periodic lease reaper and the eager watchdog recovery path.
 # Keeping the SQL predicate single-sourced prevents either recovery mechanism
 # from silently widening scheduled whole-turn replay in the future.
@@ -2149,21 +2158,48 @@ def recover_killed_job(
                     # 持久化进 attempt/effect —— 那是另一件事,不能在这里猜。
                     # 后台复盘由上面那条 failure review 承担。
                 else:
-                    recovery = "requeued"
                     cur.execute(
                         "UPDATE agent_jobs SET status='pending',created_at=now(), "
                         "last_error=%s,attempt_count=attempt_count+1,"
                         "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
                         "finished_at=NULL,lease_expires_at=NULL,deadline_at=NULL "
                         "WHERE id=%s AND claimed_by=%s "
-                        "AND status IN ('claimed','running')",
-                        (str(reason)[:500], int(job_id), str(claimed_by)),
+                        "AND status IN ('claimed','running') "
+                        "AND (lane=%s OR attempt_count<%s)",
+                        (
+                            str(reason)[:500],
+                            int(job_id),
+                            str(claimed_by),
+                            _TRAJECTORY_REVIEW_LANE,
+                            int(GENERAL_LEASE_REQUEUE_MAX_ATTEMPTS),
+                        ),
                     )
-                    if cur.rowcount != 1:
-                        return None
-                    recovered_reviews = _recover_review_runner_on_cursor(
-                        cur, int(job_id)
-                    )
+                    if cur.rowcount == 1:
+                        recovery = "requeued"
+                        recovered_reviews = _recover_review_runner_on_cursor(
+                            cur, int(job_id)
+                        )
+                    else:
+                        recovery = "terminal"
+                        cur.execute(
+                            "UPDATE agent_jobs SET status='expired',finished_at=now(), "
+                            "last_error=%s,attempt_count=attempt_count+1,"
+                            "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
+                            "lease_expires_at=NULL,deadline_at=NULL "
+                            "WHERE id=%s AND claimed_by=%s "
+                            "AND status IN ('claimed','running')",
+                            (
+                                GENERAL_WATCHDOG_REQUEUE_EXHAUSTED,
+                                int(job_id),
+                                str(claimed_by),
+                            ),
+                        )
+                        if cur.rowcount != 1:
+                            return None
+                        recovered_reviews = _recover_review_runner_on_cursor(
+                            cur, int(job_id)
+                        )
+                        _queue_failure_review_on_cursor(cur, int(job_id))
                 result = {
                     "job_id": int(job_id),
                     "user_id": str(row["user_id"]),
@@ -4797,6 +4833,76 @@ def recent_worker_heartbeat_count(*, within_sec: int = 300) -> int:
             return int(cur.fetchone()[0])
 
 
+def trajectory_review_observability_snapshot(
+    *, heartbeat_within_sec: int = 30
+) -> dict:
+    """Current review backlog plus the value reported by live runner processes.
+
+    Admin may run in a different process or container, so consulting this
+    module's environment from the admin request would report the wrong process.
+    The switch value below comes only from fresh foreground runner heartbeats;
+    missing or conflicting observations deliberately produce ``None``.
+    """
+    safe_window = max(1, min(int(heartbeat_within_sec), 3600))
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+                )
+                cur.execute(
+                    "SELECT runtime_state #>> "
+                    "  '{configuration,trajectory_review_enabled}' AS enabled,"
+                    "  count(*)::int AS n "
+                    "FROM v2_worker_heartbeats "
+                    "WHERE kind='turn' AND pool='foreground' "
+                    "  AND beat_at > now() - make_interval(secs => %s) "
+                    "  AND runtime_state #>> "
+                    "    '{configuration,trajectory_review_enabled}' "
+                    "    IN ('true','false') "
+                    "GROUP BY enabled",
+                    (safe_window,),
+                )
+                config_rows = cur.fetchall()
+                cur.execute(
+                    "SELECT status,count(*)::int AS n "
+                    "FROM v2_trajectory_reviews GROUP BY status"
+                )
+                status_rows = cur.fetchall()
+                cur.execute("SELECT EXTRACT(EPOCH FROM clock_timestamp()) AS ts")
+                generated_at = float(cur.fetchone()["ts"])
+
+    enabled_runners = sum(
+        int(row["n"] or 0) for row in config_rows if row["enabled"] == "true"
+    )
+    disabled_runners = sum(
+        int(row["n"] or 0) for row in config_rows if row["enabled"] == "false"
+    )
+    observed_runners = enabled_runners + disabled_runners
+    if observed_runners and enabled_runners == observed_runners:
+        current_enabled: bool | None = True
+    elif observed_runners and disabled_runners == observed_runners:
+        current_enabled = False
+    else:
+        current_enabled = None
+    status_counts = {"pending": 0, "running": 0}
+    status_counts.update(
+        {str(row["status"] or "unknown"): int(row["n"] or 0) for row in status_rows}
+    )
+    return {
+        "generated_at": generated_at,
+        "heartbeat_within_sec": safe_window,
+        "runner_config": {
+            "current_enabled": current_enabled,
+            "observed_runners": observed_runners,
+            "enabled_runners": enabled_runners,
+            "disabled_runners": disabled_runners,
+            "consistent": bool(observed_runners and current_enabled is not None),
+        },
+        "status_counts": status_counts,
+    }
+
+
 def _job_pool_case_sql() -> str:
     return (
         "CASE WHEN lane IN ('chat','manual_wake') THEN 'foreground' "
@@ -5283,6 +5389,45 @@ def recent_chat_failures_for_user(
                 "job_id": int(row["id"]),
                 "status": str(row["status"] or ""),
                 "reason": _truncated_failure_reason(row["last_error"]),
+                "attempt_count": int(row["attempt_count"] or 0),
+                "created_at": _iso_or_empty(row["created_at"]),
+                "finished_at": _iso_or_empty(row["finished_at"]),
+            }
+            for row in rows[:safe_limit]
+        ],
+    }
+
+
+def recent_jobs_for_user(
+    user_id: str,
+    *,
+    within_hours: int = 72,
+    limit: int = 50,
+) -> dict:
+    """Content-free recent Runtime V2 tasks for one admin user view."""
+    safe_hours = max(1, min(int(within_hours), 24 * 30))
+    safe_limit = max(1, min(int(limit), 200))
+    uid = str(user_id or "").strip()
+    if not uid:
+        return {"window_hours": safe_hours, "jobs": [], "has_more": False}
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id,lane,status,attempt_count,created_at,finished_at "
+                "FROM agent_jobs WHERE user_id=%s "
+                "  AND created_at >= now() - make_interval(hours => %s) "
+                "ORDER BY created_at DESC,id DESC LIMIT %s",
+                (uid, safe_hours, safe_limit + 1),
+            )
+            rows = cur.fetchall()
+    return {
+        "window_hours": safe_hours,
+        "has_more": len(rows) > safe_limit,
+        "jobs": [
+            {
+                "job_id": int(row["id"]),
+                "lane": str(row["lane"] or ""),
+                "status": str(row["status"] or ""),
                 "attempt_count": int(row["attempt_count"] or 0),
                 "created_at": _iso_or_empty(row["created_at"]),
                 "finished_at": _iso_or_empty(row["finished_at"]),
