@@ -277,7 +277,6 @@ tests/test_v2_summary_frontier_unit.py
 tests/test_v2_summary_store.py
 tests/test_v2_tail_anchor_store.py
 tests/test_v2_tail_anchor_unit.py
-tests/test_v2_trajectory_db.py
 tests/test_v2_trajectory_inspect_unit.py
 tests/test_v2_trajectory_unit.py
 tests/test_v2_turn_failure_supersede.py

@@ -769,6 +769,7 @@ jobs:
             tests/test_lane_rollup.py \
             tests/test_data_track_snapshot_golden.py \
             tests/test_v2_jobs_store.py \
+            tests/test_v2_trajectory_db.py \
             tests/test_v2_enclave_broker.py \
             tests/test_v2_job_lease_fencing.py \
             tests/test_v2_pool_config.py \
