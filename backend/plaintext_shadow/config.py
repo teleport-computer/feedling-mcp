@@ -42,6 +42,15 @@ def load_target() -> TargetPolicy | None:
     return TargetPolicy(dsn=dsn)
 
 
+def require_target() -> TargetPolicy:
+    """Return the enabled target or fail with a credential-free message."""
+    target = load_target()
+    if target is None:
+        raise RuntimeError("plaintext shadow is disabled")
+    validate_startup()
+    return target
+
+
 def _database_identity(dsn: str) -> tuple[str, str, str]:
     try:
         parsed = conninfo_to_dict(dsn)
@@ -79,4 +88,3 @@ def validate_startup() -> None:
         raise RuntimeError(
             "DATABASE_URL and PLAINTEXT_SHADOW_DATABASE_URL must identify different PostgreSQL databases"
         )
-

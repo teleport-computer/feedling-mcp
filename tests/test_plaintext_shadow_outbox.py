@@ -215,3 +215,20 @@ def test_snapshot_table_is_applied_once_per_claimed_batch(primary_pool, monkeypa
     assert report.claimed == 2
     assert calls == ["agent_jobs"]
     assert _row(primary_pool) is None
+
+
+def test_pending_device_migration_is_retained_and_quarantined(
+    primary_pool, monkeypatch
+):
+    _seed(primary_pool)
+    monkeypatch.setattr(
+        outbox, "apply_key", lambda _row, **_kwargs: {"pending": 1}
+    )
+
+    report = outbox.drain_once(limit=1)
+    row = _row(primary_pool)
+
+    assert report.pending == 1
+    assert report.quarantined == 1
+    assert row[5] == "pending_device_migration"
+    assert row[6] is not None

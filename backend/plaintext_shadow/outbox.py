@@ -96,6 +96,18 @@ def _fail(row: DirtyKey) -> bool:
     return bool(quarantine and result.rowcount == 1)
 
 
+def _quarantine(row: DirtyKey, slug: str) -> bool:
+    """Keep a terminal, content-free gap visible until an operator repairs it."""
+    with db.get_pool().connection() as conn:
+        result = conn.execute(
+            "UPDATE plaintext_shadow_dirty_keys SET attempts=attempts + 1, "
+            "last_error_slug=%s, quarantined_at=now() "
+            "WHERE table_name=%s AND key_json=%s AND generation=%s",
+            (slug, row.table_name, Jsonb(row.key_json), row.generation),
+        )
+    return result.rowcount == 1
+
+
 def apply_key(row: DirtyKey, *, target_policy=None) -> dict:
     """Apply current authoritative state; the captured operation is advisory."""
     entry = table_registry.REGISTRY.get(row.table_name)
@@ -146,6 +158,10 @@ def drain_once(*, limit: int = 500) -> DrainReport:
             else:
                 result = apply_key(row, target_policy=target_policy)
             _fold(report, result)
+            if int((result or {}).get("pending", 0) or 0):
+                if _quarantine(row, "pending_device_migration"):
+                    report.quarantined += 1
+                continue
             _ack(row)
         except Exception:  # noqa: BLE001 - persist only a fixed, content-free slug
             if _fail(row):

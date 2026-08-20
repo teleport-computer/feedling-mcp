@@ -323,6 +323,18 @@ def test_run_verify_tee_database_unconfigured_is_503(client, monkeypatch):
     assert res.get_json() == {"error": "tee_database_unconfigured"}
 
 
+def test_new_plaintext_shadow_target_satisfies_database_configuration(monkeypatch):
+    from admin import tee_replication
+
+    monkeypatch.delenv("TEE_DATABASE_URL", raising=False)
+    monkeypatch.setenv("FEEDLING_PLAINTEXT_SHADOW_ENABLED", "1")
+    monkeypatch.setenv(
+        "PLAINTEXT_SHADOW_DATABASE_URL", "postgresql://shadow.invalid/plaintext"
+    )
+
+    tee_replication._require_tee_configured()
+
+
 def test_dry_run_reconcile_plan_still_works_without_tee_database(client, monkeypatch):
     # The plan-only short-circuit never touches the TEE pool, so it must NOT 503
     # even with TEE_DATABASE_URL unset.
