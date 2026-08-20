@@ -1151,6 +1151,9 @@ git commit -m "refactor(perception-kernel): 叫醒判据进内核，DB 与 metri
 - [ ] `docs/PERCEPTION_PROMPT_ASSETS.zh.md` 与实际接线一致（清单里每一条都能指到内核里的常量）
 - [ ] 照 `CLAUDE.md` 更新 `FEATURE_LOG.md` 的「主动感知提取」一节 + 跑 `ops/refresh-branch-board.sh`
 - [ ] 按 `docs/testing/TESTING.md` §2 决策矩阵补齐该跑的项，满足 §7 的 DoD
+- [ ] **四格验收矩阵各跑一遍**（Codex plan review 指出 V1 不能只算一格）：
+      V2 云上 / hosted resident / 自托管 VPS resident（`_HOSTED` 两侧行为不同）/
+      各自实际支持的 agent mode。每格冻结自己的配置，不能只比内核默认值
 - [ ] 发一轮 `codex-review --type code_review`（碰了共享文件 `chat_resident_consumer.py`，必发）
 
 ## 本批**不做**（留给第二、三步）
