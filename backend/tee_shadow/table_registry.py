@@ -394,6 +394,7 @@ _PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "v2_user_allowlist": ("user_id",),
     "v2_wake_schedule": ("user_id",),
     "v2_worker_heartbeats": ("worker_id",),
+    "voice_call_sessions": ("user_id", "call_id"),
     "voice_transcripts": ("user_id", "call_id"),
 }
 

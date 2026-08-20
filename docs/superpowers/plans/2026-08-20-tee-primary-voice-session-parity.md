@@ -569,6 +569,8 @@ Expected: 无 whitespace/error；worktree 仅有计划内提交。
 
 **Files:**
 - Create on TEST integration branch: `backend/alembic_tee/versions/0031_merge_voice_primary.py`
+- Modify on TEST integration branch: `backend/admin/plaintext_shadow.py`
+- Modify on TEST integration branch: `backend/tee_shadow/table_registry.py`
 - Modify on TEST integration branch: `tests/test_pre_runtime_preflight.py`
 - Modify on TEST integration branch: `tests/test_pre_test_migration_convergence.py`
 - Modify on TEST integration branch: any test-only head pin assertion that names `0029_plaintext_shadow_merge`
@@ -577,13 +579,13 @@ Expected: 无 whitespace/error；worktree 仅有计划内提交。
 - Consumes: 已合入 PRE 的共享 `0030_voice_call_sessions_primary` commit，以及 TEST 当前 TEE head。
 - Produces: TEST 单 head `0031_merge_voice_primary`，同时包含原 `0029` ancestry 与共享 voice DDL branch。
 
-- [ ] **Step 1: 从最新 `origin/test` 建隔离 integration worktree并同步共享 commits**
+- [x] **Step 1: 从最新 `origin/test` 建隔离 integration worktree并同步共享 commits**
 
 先 `git fetch origin test pre`，确认 TEST 当前单 head。如果仍为 `0029_plaintext_shadow_merge`，
 将 Tasks 1–5 的 commits cherry-pick/merge 到 TEST integration branch；若 head 已前进，把下列 merge
 revision 的第一个父节点替换为实测单 head，并同步测试预期。
 
-- [ ] **Step 2: 先把 TEST head 测试改成 merge revision 并确认失败**
+- [x] **Step 2: 先把 TEST head 测试改成 merge revision 并确认失败**
 
 ```python
 assert script.get_heads() == ["0031_merge_voice_primary"]
@@ -602,7 +604,7 @@ PYTHONPATH=backend .venv-test/bin/python -m pytest -p no:cacheprovider \
 
 Expected: FAIL because merge revision 尚不存在。
 
-- [ ] **Step 3: 创建 TEST merge revision**
+- [x] **Step 3: 创建 TEST merge revision**
 
 ```python
 revision = "0031_merge_voice_primary"
@@ -626,6 +628,7 @@ WHERE key = 'phase4_primary_prepared'
 
 
 def upgrade() -> None:
+    op.execute("TRUNCATE TABLE plaintext_shadow_restore_evidence")
     op.execute(_UPDATE_PREPARED_HEAD)
 
 
@@ -635,9 +638,12 @@ def downgrade() -> None:
     )
 ```
 
-merge revision 不重复执行建表 SQL；Alembic 会沿未执行的 `0030` 分支执行共享 DDL。
+merge revision 不重复执行建表 SQL；Alembic 会沿未执行的 `0030` 分支执行共享 DDL。由于
+schema 已从 `0029` 改变，merge revision 清空绑定旧 head 的 restore evidence；同时把
+plaintext-shadow 的合法 head pin 更新到 `0031`，并为新增 SNAPSHOT 表声明
+`(user_id, call_id)` capture key。
 
-- [ ] **Step 4: 验证从现有 TEST head 升级**
+- [x] **Step 4: 验证从现有 TEST head 升级**
 
 创建隔离数据库，先只 upgrade 到 `0029_plaintext_shadow_merge`，断言缺表；再 upgrade 到 head，
 断言 `voice_call_sessions` 存在且 `alembic_tee_version` 只有
