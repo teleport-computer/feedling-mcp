@@ -1087,7 +1087,8 @@ def test_heartbeat_stay_silent_completes_with_auditable_reason(monkeypatch):
     uid = "u_wake_stay_silent"
     conftest.seed_user(uid)
     _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    trace_id = "trace-silent-by-choice"
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat", trace_id=trace_id)
     claimed_by = _claim(job_id)
     calls = _script_provider(monkeypatch, [{
         "reply": "",
@@ -1099,14 +1100,29 @@ def test_heartbeat_stay_silent_completes_with_auditable_reason(monkeypatch):
         "usage": {"prompt_tokens": 1, "completion_tokens": 1},
     }])
 
+    writes = []
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda *_args, **_kwargs: writes.append(True),
+    )
+    traces = []
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
     status = asyncio.run(worker._run_wake(
         job_id,
         uid,
         "heartbeat",
-        _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]),
+        deps,
         _BYOK,
         asyncio.Semaphore(4),
         claimed_by,
+        trace_id=trace_id,
     ))
 
     assert status == "completed"
@@ -1119,6 +1135,26 @@ def test_heartbeat_stay_silent_completes_with_auditable_reason(monkeypatch):
             (job_id,),
         ).fetchone()
     assert row == ("completed", "sleep", "48 秒前刚主动联系过")
+    assert writes == []
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM chat_messages WHERE user_id=%s", (uid,)
+        ).fetchone()[0] == 0
+    silence = [
+        trace for trace in traces if trace["type"] == "reply.silent_by_choice"
+    ]
+    assert len(silence) == 1
+    assert silence[0]["trace_id"] == trace_id
+    assert silence[0]["job_id"] == str(job_id)
+    assert silence[0]["status"] == "warning"
+    assert silence[0]["outcome_class"] == "safety_suppression"
+    assert silence[0]["detail"] == {
+        "lane": "heartbeat",
+        "cause": "suppressed",
+    }
+    assert "48 秒前刚主动联系过" not in json.dumps(
+        silence, ensure_ascii=False
+    )
 
 
 def test_scheduled_thinking_only_remains_a_must_deliver_failure(monkeypatch):
@@ -2651,6 +2687,74 @@ def _empty_round(*, stop_reason="end_turn"):
     round_ = _text_round("")
     round_["stop_reason"] = stop_reason
     return round_
+
+
+def test_weak_wake_semantic_empty_has_distinct_trace_and_no_message(monkeypatch):
+    uid = "u_wake_semantic_empty_trace"
+    conftest.seed_user(uid)
+    _reset(uid)
+    trace_id = "trace-silent-empty-response"
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat", trace_id=trace_id)
+    claimed_by = _claim(job_id)
+    private_reasoning = "Q6_PRIVATE_REASONING_MUST_NOT_REACH_TRACE"
+    response = _empty_round(stop_reason="end_turn")
+    response["reasoning"] = private_reasoning
+    _script_provider(monkeypatch, [response])
+    writes = []
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda *_args, **_kwargs: writes.append(True),
+    )
+    traces = []
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "heartbeat",
+        deps,
+        _BYOK,
+        asyncio.Semaphore(4),
+        claimed_by,
+        trace_id=trace_id,
+    ))
+
+    assert status == "completed"
+    assert _job_status(job_id) == ("completed", None)
+    assert writes == []
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM chat_messages WHERE user_id=%s", (uid,)
+        ).fetchone()[0] == 0
+    silence = [
+        trace
+        for trace in traces
+        if trace["type"] == "reply.silent_empty_response"
+    ]
+    assert len(silence) == 1
+    assert silence[0]["trace_id"] == trace_id
+    assert silence[0]["job_id"] == str(job_id)
+    assert silence[0]["status"] == "warning"
+    assert silence[0]["outcome_class"] == "operational_failure"
+    assert silence[0]["detail"] == {
+        "lane": "heartbeat",
+        "cause": "empty_response",
+        "stop_reason": "end_turn",
+        "has_visible_text": False,
+        "reasoning_present": True,
+        "tool_call_count": 0,
+        "completion_tokens": 1,
+    }
+    assert private_reasoning not in json.dumps(silence, ensure_ascii=False)
+    assert not [
+        trace for trace in traces if trace["type"] == "reply.silent_by_choice"
+    ]
 
 
 def _seen_lane_policy(monkeypatch):

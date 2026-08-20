@@ -2431,6 +2431,10 @@ _EMPTY_RESPONSE_PUBLIC_ENUMS = {
         "other",
     }),
 }
+_SILENT_REPLY_PUBLIC_ENUMS = {
+    "lane": _EMPTY_RESPONSE_PUBLIC_ENUMS["lane"],
+    "cause": frozenset({"suppressed", "empty_response"}),
+}
 
 _LANGUAGE_FOLLOW_PUBLIC_ENUMS = {
     "user_script": frozenset({
@@ -2494,6 +2498,22 @@ def _debug_event_public_json(ev: dict) -> dict:
             value = raw_detail.get(key)
             if isinstance(value, str) and value in allowed_values:
                 public_detail[key] = value
+    if (
+        ev.get("type") in {
+            "reply.silent_by_choice", "reply.silent_empty_response"
+        }
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        for key, allowed_values in _SILENT_REPLY_PUBLIC_ENUMS.items():
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed_values:
+                public_detail[key] = value
+        if ev.get("type") == "reply.silent_empty_response":
+            for key, allowed_values in _EMPTY_RESPONSE_PUBLIC_ENUMS.items():
+                value = raw_detail.get(key)
+                if isinstance(value, str) and value in allowed_values:
+                    public_detail[key] = value
     if (
         ev.get("type") == "reply.language_follow"
         and isinstance(raw_detail, dict)
@@ -8434,6 +8454,8 @@ _DEBUG_STEP_LABELS = {
     "thinking.surfaced": ("💭", "思考展示 · 分支"),
     "reply.language_follow": ("🌐", "语言跟随"),
     "provider.empty_response": ("🕳️", "空回复诊断"),
+    "reply.silent_by_choice": ("🤫", "主动静默 · 模型选择"),
+    "reply.silent_empty_response": ("🕳️", "主动静默 · 空响应"),
     "mcp.surface.resolved": ("🧩", "MCP 工具面"),
     "mcp.surface.provider": ("🧩", "MCP Provider 实收工具面"),
     "mcp.roundtrip.provider": ("🔁", "Provider 本轮往返"),

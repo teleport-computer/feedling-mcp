@@ -2275,6 +2275,33 @@ def _normalize_provider_trace_reason(
     return raw_reason if raw_reason in allowed_values else "other"
 
 
+def _empty_response_trace_detail(
+    response_shape: dict[str, Any], lane: str
+) -> dict[str, Any]:
+    """Normalize provider-empty metadata once for every trace consumer."""
+    raw_stop_reason = str(response_shape.get("stop_reason") or "")
+    stop_reason = (
+        raw_stop_reason
+        if raw_stop_reason in v2_tool_loop._CONTENT_FREE_STOP_REASONS
+        else ("other" if raw_stop_reason else "")
+    )
+    completion_tokens = response_shape.get("completion_tokens")
+    return {
+        "stop_reason": stop_reason,
+        "has_visible_text": bool(response_shape.get("has_visible_text")),
+        "reasoning_present": bool(response_shape.get("reasoning_present")),
+        "tool_call_count": max(
+            0, int(response_shape.get("tool_call_count") or 0)
+        ),
+        "completion_tokens": (
+            max(0, int(completion_tokens))
+            if isinstance(completion_tokens, (int, float))
+            else None
+        ),
+        "lane": _normalize_provider_trace_lane(lane),
+    }
+
+
 def _empty_provider_response_debug_callback(
     deps: TurnDeps,
     user_id: str,
@@ -2288,27 +2315,7 @@ def _empty_provider_response_debug_callback(
     safe_lane = _normalize_provider_trace_lane(lane)
 
     async def _emit(response_shape: dict[str, Any]) -> None:
-        raw_stop_reason = str(response_shape.get("stop_reason") or "")
-        stop_reason = (
-            raw_stop_reason
-            if raw_stop_reason in v2_tool_loop._CONTENT_FREE_STOP_REASONS
-            else ("other" if raw_stop_reason else "")
-        )
-        completion_tokens = response_shape.get("completion_tokens")
-        detail = {
-            "stop_reason": stop_reason,
-            "has_visible_text": bool(response_shape.get("has_visible_text")),
-            "reasoning_present": bool(response_shape.get("reasoning_present")),
-            "tool_call_count": max(
-                0, int(response_shape.get("tool_call_count") or 0)
-            ),
-            "completion_tokens": (
-                max(0, int(completion_tokens))
-                if isinstance(completion_tokens, (int, float))
-                else None
-            ),
-            "lane": safe_lane,
-        }
+        detail = _empty_response_trace_detail(response_shape, safe_lane)
         try:
             await asyncio.to_thread(
                 deps.emit_debug_trace,
@@ -2330,6 +2337,81 @@ def _empty_provider_response_debug_callback(
                 safe_lane,
                 type(exc).__name__.lower(),
             )
+
+    return _emit
+
+
+async def _emit_silent_reply_trace(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+    *,
+    event_type: str,
+    cause: str,
+    outcome_code: str,
+    trace_id: str = "",
+    job_id: object = "",
+    response_shape: dict[str, Any] | None = None,
+) -> None:
+    """Emit one content-free weak-wake silence attribution event."""
+    if deps.emit_debug_trace is None:
+        return
+    safe_lane = _normalize_provider_trace_lane(lane)
+    detail: dict[str, Any] = {"lane": safe_lane, "cause": cause}
+    if response_shape is not None:
+        detail.update(_empty_response_trace_detail(response_shape, safe_lane))
+    try:
+        await asyncio.to_thread(
+            deps.emit_debug_trace,
+            user_id,
+            event_type,
+            trace_id=str(trace_id or ""),
+            job_id=str(job_id or ""),
+            status="warning",
+            outcome_class=jobs_store.terminal_outcome_class(outcome_code),
+            summary=(
+                "V2 主动回合明确选择静默"
+                if event_type == "reply.silent_by_choice"
+                else "V2 主动回合收到语义空响应"
+            ),
+            explain=(
+                "仅记录静默归因、lane 与关联 id；不记录模型给出的静默理由、"
+                "回复、reasoning、prompt 或错误正文。"
+            ),
+            detail=detail,
+        )
+    except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a turn
+        log.warning(
+            "[v2.silent_reply] trace failed user=%s lane=%s code=%s",
+            user_id,
+            safe_lane,
+            type(exc).__name__.lower(),
+        )
+
+
+def _silent_empty_response_debug_callback(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+    trace_id: str = "",
+    job_id: object = "",
+):
+    """Build the weak-wake semantic-empty attribution callback."""
+    if deps.emit_debug_trace is None:
+        return None
+
+    async def _emit(response_shape: dict[str, Any]) -> None:
+        await _emit_silent_reply_trace(
+            deps,
+            user_id,
+            lane,
+            event_type="reply.silent_empty_response",
+            cause="empty_response",
+            outcome_code="wake_failed:empty_reply",
+            trace_id=trace_id,
+            job_id=job_id,
+            response_shape=response_shape,
+        )
 
     return _emit
 
@@ -9651,6 +9733,16 @@ async def _run_wake(
             nonlocal stay_silent_reason, shadow_decision_allowed
             stay_silent_reason = str(reason or "").strip()[:500]
             shadow_decision_allowed = False
+            await _emit_silent_reply_trace(
+                deps,
+                user_id,
+                lane,
+                event_type="reply.silent_by_choice",
+                cause="suppressed",
+                outcome_code=jobs_store.SILENT_BY_CHOICE_OUTCOME_CODE,
+                trace_id=trace_id,
+                job_id=job_id,
+            )
 
         try:
             await v2_tool_loop.run_tool_loop(
@@ -9728,6 +9820,10 @@ async def _run_wake(
                 on_empty_provider_response=(
                     _empty_provider_response_debug_callback(
                         deps, user_id, lane, trace_id
+                    )
+                    if lane == "scheduled"
+                    else _silent_empty_response_debug_callback(
+                        deps, user_id, lane, trace_id, job_id
                     )
                 ),
                 fold_before_first=deps.read_messages_after_seq is not None,

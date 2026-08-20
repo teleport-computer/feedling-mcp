@@ -321,7 +321,9 @@ CONTROL_OUTCOME_CODES = frozenset({
     "scheduled_disabled",
     "manual_wake_disabled",
 })
+SILENT_BY_CHOICE_OUTCOME_CODE = "wake_failed:explicit_silence_suppressed"
 SAFETY_SUPPRESSION_CODES = frozenset({
+    SILENT_BY_CHOICE_OUTCOME_CODE,
     "wake_failed:degenerate_reply_suppressed",
     "wake_failed:protocol_fragment_suppressed",
     "wake_failed:malformed_self_thinking_suppressed",
