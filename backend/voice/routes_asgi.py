@@ -31,6 +31,7 @@ from hosted import config_store as hosted_config_store
 from notices import catalog as notices_catalog
 from voice import results
 from voice.message_filter import is_meaningful_voice_message
+import debug_trace
 
 router = APIRouter()
 log = logging.getLogger("feedling.voice.gateway")
@@ -56,6 +57,59 @@ _VOICE_BUFFER_TEXT = "... "
 # ⚠️ 更正的长期做法是 ElevenLabs 的 Skip Turn 系统工具(语义上就是"这轮不说话"),
 # 需要改 agent 配置 + 返回工具调用,不在本批。
 _VOICE_SILENT_TURN_TEXT = _VOICE_BUFFER_TEXT
+
+
+def _trace_voice_gateway_event(
+    store,
+    event_type: str,
+    *,
+    trace_id: str,
+    call_id: str,
+    logical_turn_id: str,
+    status: str,
+    runtime: str = "",
+    exit: str = "",
+    error_code: str = "",
+    runtime_status: int | None = None,
+    gateway_http_status: int | None = None,
+    stage: str = "",
+    reply_source: str = "",
+    skip_turn_available: bool | None = None,
+    dur_ms: float | None = None,
+) -> None:
+    """Emit content-free gateway facts without assigning an outcome class."""
+    detail = {
+        "call_id": str(call_id or "")[:96],
+        "logical_turn_id": str(logical_turn_id or "")[:40],
+    }
+    if runtime:
+        detail["runtime"] = str(runtime)[:16]
+    if exit:
+        detail["exit"] = str(exit)[:40]
+    if error_code:
+        detail["error_code"] = str(error_code)[:80]
+    if isinstance(runtime_status, int):
+        detail["runtime_status"] = runtime_status
+    if isinstance(gateway_http_status, int):
+        detail["gateway_http_status"] = gateway_http_status
+    if stage:
+        detail["stage"] = str(stage)[:40]
+    if reply_source:
+        detail["reply_source"] = str(reply_source)[:40]
+    if skip_turn_available is not None:
+        detail["skip_turn_available"] = bool(skip_turn_available)
+    debug_trace.trace_event(
+        store,
+        subsystem="voice",
+        type=event_type,
+        actor="voice_gateway",
+        status=status,
+        summary=event_type,
+        detail=detail,
+        trace_id=trace_id,
+        turn_id=trace_id,
+        dur_ms=dur_ms,
+    )
 
 
 def _gateway_url(request: Request) -> str | None:
@@ -293,14 +347,24 @@ def _final_suffix(streamed: str, final_text: str) -> str:
     return ""
 
 
-def _failed_turn_text(user_id: str, message_id: str) -> str | None:
-    """Return the normal chat failure copy once this voice turn has settled."""
+def _failed_turn_result(user_id: str, message_id: str) -> dict | None:
+    """Return content plus its stable code once this voice turn has failed."""
     import db
 
     row = db.chat_get_strict(user_id, message_id)
     if not isinstance(row, dict) or str(row.get("reply_status") or "") != "failed":
         return None
-    return notices_catalog.user_text_for(str(row.get("reply_failure_code") or "unknown"))
+    raw_error_code = str(row.get("reply_failure_code") or "unknown")
+    return {
+        "text": notices_catalog.user_text_for(raw_error_code),
+        "error_code": raw_error_code[:80],
+    }
+
+
+def _failed_turn_text(user_id: str, message_id: str) -> str | None:
+    """Compatibility view used by narrow callers/tests that need only copy."""
+    result = _failed_turn_result(user_id, message_id)
+    return str(result.get("text") or "") if result is not None else None
 
 
 def _resident_voice_send_core(
@@ -884,6 +948,16 @@ async def voice_chat_completions(request: Request):
     from core import store as core_store
 
     store = await threadpool.run_db(core_store.get_store, user_id)
+    _trace_voice_gateway_event(
+        store,
+        "voice.gateway.turn.started",
+        trace_id=turn_id,
+        call_id=call_id,
+        logical_turn_id=logical_turn_id,
+        status="started",
+        skip_turn_available=skip_turn_available,
+    )
+    runtime_kind = "unknown"
     try:
         resident_runtime = await threadpool.run_db(
             _is_resident_voice_runtime, store
@@ -896,6 +970,16 @@ async def voice_chat_completions(request: Request):
         )
         body, status = {"error": "runtime_control_unavailable"}, 503
     else:
+        runtime_kind = "resident" if resident_runtime else "v2"
+        _trace_voice_gateway_event(
+            store,
+            "voice.gateway.runtime.selected",
+            trace_id=turn_id,
+            call_id=call_id,
+            logical_turn_id=logical_turn_id,
+            status="ok",
+            runtime=runtime_kind,
+        )
         if resident_runtime:
             body, status = await threadpool.run_db(
                 _resident_voice_send_core,
@@ -927,6 +1011,19 @@ async def voice_chat_completions(request: Request):
             status,
             code[:80],
         )
+        _trace_voice_gateway_event(
+            store,
+            "voice.gateway.turn.runtime_rejected",
+            trace_id=turn_id,
+            call_id=call_id,
+            logical_turn_id=logical_turn_id,
+            status="error",
+            runtime=runtime_kind,
+            exit="runtime_rejected",
+            error_code=code,
+            runtime_status=status,
+            gateway_http_status=200,
+        )
         # Authentication and malformed ElevenLabs requests still fail as HTTP.
         # Once a valid user transcript reached IO, however, returning JSON 4xx/5xx
         # makes ElevenLabs tear down the whole call as custom_llm_error. Keep the
@@ -934,6 +1031,18 @@ async def voice_chat_completions(request: Request):
         return _streaming_text_response(request_id, _voice_error_text(body))
     message_id = str((body.get("user_message") or {}).get("id") or "").strip()
     if not message_id:
+        _trace_voice_gateway_event(
+            store,
+            "voice.gateway.turn.not_accepted",
+            trace_id=turn_id,
+            call_id=call_id,
+            logical_turn_id=logical_turn_id,
+            status="error",
+            runtime=runtime_kind,
+            exit="message_id_missing",
+            error_code="voice_turn_not_accepted",
+            gateway_http_status=502,
+        )
         return JSONResponse({"error": "voice_turn_not_accepted"}, status_code=502)
     log.info(
         "[voice.gateway] turn accepted user=%s runtime=%s",
@@ -957,6 +1066,8 @@ async def voice_chat_completions(request: Request):
         next_lifecycle_check = time.monotonic()
         next_revision_check = time.monotonic()
         reply = None
+        reply_source = ""
+        reply_error_code = ""
         while time.monotonic() < deadline:
             now = time.monotonic()
             if now >= next_lifecycle_check:
@@ -977,6 +1088,18 @@ async def voice_chat_completions(request: Request):
                     parent_message_id=message_id,
                 )
                 if not current:
+                    _trace_voice_gateway_event(
+                        store,
+                        "voice.gateway.turn.superseded",
+                        trace_id=turn_id,
+                        call_id=call_id,
+                        logical_turn_id=logical_turn_id,
+                        status="cancelled",
+                        runtime=runtime_kind,
+                        exit="superseded",
+                        stage="revision_check",
+                        skip_turn_available=skip_turn_available,
+                    )
                     if skip_turn_available:
                         for chunk in _skip_turn_chunks(
                             request_id,
@@ -1013,6 +1136,18 @@ async def voice_chat_completions(request: Request):
                     parent_message_id=message_id,
                 )
                 if not current:
+                    _trace_voice_gateway_event(
+                        store,
+                        "voice.gateway.turn.superseded",
+                        trace_id=turn_id,
+                        call_id=call_id,
+                        logical_turn_id=logical_turn_id,
+                        status="cancelled",
+                        runtime=runtime_kind,
+                        exit="superseded",
+                        stage="before_content",
+                        skip_turn_available=skip_turn_available,
+                    )
                     if skip_turn_available:
                         for chunk in _skip_turn_chunks(
                             request_id,
@@ -1058,6 +1193,7 @@ async def voice_chat_completions(request: Request):
                     "message_id": "",
                     "text": streamed_by_segment.get(latest_segment, ""),
                 }
+                reply_source = "stream_final"
                 break
             reply = await threadpool.run_db(
                 results.load_reply,
@@ -1066,14 +1202,22 @@ async def voice_chat_completions(request: Request):
                 turn_id=turn_id,
             )
             if reply is not None:
+                reply_source = "stored_reply"
                 break
-            failure_text = await threadpool.run_db(
-                _failed_turn_text,
+            failure_result = await threadpool.run_db(
+                _failed_turn_result,
                 user_id,
                 message_id,
             )
-            if failure_text:
-                reply = {"message_id": "", "text": failure_text}
+            if failure_result and failure_result.get("text"):
+                reply = {
+                    "message_id": "",
+                    "text": str(failure_result.get("text") or ""),
+                }
+                reply_source = "failure_copy"
+                reply_error_code = str(
+                    failure_result.get("error_code") or "unknown"
+                )[:80]
                 break
             now = time.monotonic()
             if first_real_content_at is None and now >= next_keepalive:
@@ -1096,6 +1240,31 @@ async def voice_chat_completions(request: Request):
                 "message_id": "",
                 "text": notices_catalog.user_text_for("turn_timeout"),
             }
+            _trace_voice_gateway_event(
+                store,
+                "voice.gateway.turn.timed_out",
+                trace_id=turn_id,
+                call_id=call_id,
+                logical_turn_id=logical_turn_id,
+                status="error",
+                runtime=runtime_kind,
+                exit="deadline_timeout",
+                error_code="turn_timeout",
+                gateway_http_status=200,
+                dur_ms=(time.monotonic() - started_at) * 1000,
+            )
+        if reply_source:
+            _trace_voice_gateway_event(
+                store,
+                "voice.gateway.reply.received",
+                trace_id=turn_id,
+                call_id=call_id,
+                logical_turn_id=logical_turn_id,
+                status="error" if reply_source == "failure_copy" else "ok",
+                runtime=runtime_kind,
+                error_code=reply_error_code,
+                reply_source=reply_source,
+            )
         if lifecycle_status not in {"finalizing", "cancelled", "finalized"}:
             current = await threadpool.run_db(
                 results.is_current_voice_turn,
@@ -1103,6 +1272,18 @@ async def voice_chat_completions(request: Request):
                 parent_message_id=message_id,
             )
             if not current:
+                _trace_voice_gateway_event(
+                    store,
+                    "voice.gateway.turn.superseded",
+                    trace_id=turn_id,
+                    call_id=call_id,
+                    logical_turn_id=logical_turn_id,
+                    status="cancelled",
+                    runtime=runtime_kind,
+                    exit="superseded",
+                    stage="before_final",
+                    skip_turn_available=skip_turn_available,
+                )
                 if skip_turn_available:
                     for chunk in _skip_turn_chunks(
                         request_id,
