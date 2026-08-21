@@ -834,6 +834,7 @@ jobs:
             tests/test_tee_carry_verbatim.py \
             tests/test_uploaded_envelope_gate.py \
             tests/test_write_side_format_routing.py \
+            tests/test_admin_debug_turn_view.py \
             tests/test_data_track_debug.py \
             -v
 

@@ -2310,6 +2310,49 @@ def _debug_trace_detect_stall(events: list[dict]) -> bool:
     return bool(open_stems)
 
 
+# `str.isdigit()` 会接受全角 １２３、上标 ²、以及 200 位的数字 —— DB 的 id 是
+# ASCII 有界整数,直接钉死形状。
+_JOB_ID_RE = re.compile(r"[0-9]{1,20}")
+
+
+def _finite_ms(value):
+    """**非有限 或 负数**一律归一成 None,在数据边界,不在渲染边界。
+
+    ⚠️ 我说过一句「挡在渲染层就所有出口一次覆盖」——**那句是错的**,
+    今天第三次把「我希望它是这样」说成「它是这样」。
+    `_debug_ms` 只挡 HTML;`/v1/admin/data-track/debug` 这个 JSON 端点
+    直接带原始值出去,而 Starlette 对 NaN/±Inf **抛 ValueError ⇒ 整个端点 500**。
+    ⇒ 渲染层是**最后一条**出口,不是唯一一条。归一化必须放在数据产出的地方。
+    """
+    try:
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        # ⚠️ `OverflowError` 是**第三种**:`float(10**400)` 抛的既不是 TypeError
+        # 也不是 ValueError。只抓两种,一个超大整数就能把端点打 500。
+        return None
+    # ⚠️ `>= 0` 这半边是**第二轮才补上的**,而它漏掉的方式与非有限值**完全同形**:
+    # 渲染层 `_debug_ms` 一直查着 `value < 0`,所以 HTML 看不见负数,
+    # **而 JSON 端点照样公开 `dur_ms=-5.0`,并把总耗时拉成负数。**
+    # ⇒ 同一个不对称第二次咬我:**人眼出口是好的、机器出口是坏的,所以自查发现不了。**
+    # 判据两半必须都写在数据边界,不能一半在这、一半在渲染层。
+    return out if (math.isfinite(out) and out >= 0) else None
+
+
+def _known_job_lanes() -> frozenset:
+    """后台任务的 lane 闭集,**从产生方读**,不在管理端抄一份。"""
+    global _KNOWN_JOB_LANES_CACHE
+    if _KNOWN_JOB_LANES_CACHE is None:
+        try:
+            from model_api_runtime.v2 import jobs_store as _js
+            _KNOWN_JOB_LANES_CACHE = frozenset(_js.LANES)
+        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
+            _KNOWN_JOB_LANES_CACHE = frozenset()
+    return _KNOWN_JOB_LANES_CACHE
+
+
+_KNOWN_JOB_LANES_CACHE = None
+
+
 def _debug_trace_group_turns(events: list[dict]) -> list[dict]:
     buckets: dict[tuple[str, str], list[dict]] = {}
     for ev in events:
@@ -2323,17 +2366,115 @@ def _debug_trace_group_turns(events: list[dict]) -> list[dict]:
         any_error = any(str(e.get("status") or "") in {"error", "failed"} for e in ordered)
         any_blocked = any(str(e.get("status") or "") == "blocked" for e in ordered)
         terminal = "stalled" if stalled else ("error" if any_error else ("blocked" if any_blocked else "ok"))
+        # ⚠️ **每个值都有限,不代表和有限。** 两个 1e308 相加就是 inf,
+        # 而我上一轮的守卫只看单个值 —— 端点照样 500。
+        # ⇒ **聚合结果本身也要过同一道判据**:守住每个输入 ≠ 守住输出。
         total = 0.0
         for ev in ordered:
-            try:
-                total += float(ev.get("dur_ms") or 0)
-            except (TypeError, ValueError):
-                continue
+            one = _finite_ms(ev.get("dur_ms"))
+            if one is not None:
+                total += one
+        # ⚠️ 这里**上一版写的是 `or 0.0`** —— 那是把「不可表示」改写成
+        # 「总耗时 0.0」,**一个精确的假值**。两个 1e308 的真实总时长是未知,不是零。
+        # 而我在同一个 PR 里刚因为「排队 0ms」被打回过同一个病 ——
+        # **修好一处,又在另一处复现。** 保留 None:算不出来就说算不出来。
+        total = _finite_ms(total)
         title = (
             next((str(e.get("explain") or "") for e in ordered if str(e.get("explain") or "")), "")
             or next((str(e.get("summary") or "") for e in ordered if str(e.get("summary") or "")), "")
             or trace_id
         )
+        # Route/job identity, read off the events rather than re-derived: the
+        # writer already decided which lane and job this turn belongs to, and a
+        # second derivation here could disagree with the one that produced the
+        # failure-rate panels.
+        # 抬头是**第三条**输出通路 —— 它既不过 `_debug_redact_value` 也不过
+        # public projection。第一版我一边在信里问搭档「有没有别的出口绕过去」,
+        # 一边自己新开了一个:实跑 lane=alice / job_id=secret_token /
+        # outcome_class=patient_12345 三项全显示。
+        # ⇒ 这里只接受**闭集成员**;job_id 只接受纯数字;其余一律不显示。
+        lane = next(
+            (
+                str(e.get("lane") or "")
+                for e in ordered
+                if str(e.get("lane") or "") in _known_job_lanes()
+            ),
+            "",
+        ) or next(
+            (
+                str((e.get("detail") or {}).get("lane") or "")
+                for e in ordered
+                if isinstance(e.get("detail"), dict)
+                and str((e.get("detail") or {}).get("lane") or "") in _known_job_lanes()
+            ),
+            "",
+        )
+        job_id = next(
+            (
+                str(e.get("job_id") or "")
+                for e in ordered
+                if _JOB_ID_RE.fullmatch(str(e.get("job_id") or ""))
+            ),
+            "",
+        )
+        # `outcome_class` has no success member: it is only meaningful on an
+        # event whose own status is not ok (T189). Reading it off an ok event
+        # would surface the *default* -- on 2026-08-21 that was 111 of 132 live
+        # rows carrying `operational_failure` while nothing had failed.
+        outcome_class = next(
+            (
+                str(e.get("outcome_class") or "")
+                for e in ordered
+                if str(e.get("status") or "ok") not in {"ok", "started"}
+                and str(e.get("outcome_class") or "") in db.TRACE_OUTCOME_CLASSES
+            ),
+            "",
+        )
+        # Queue wait vs execution, kept apart on purpose. `dur_ms` on the
+        # terminal event measures execution only; it rides on the terminal half
+        # of an enqueue->terminal pair, which invites reading it as "time since
+        # enqueue". Showing one merged number hands that misreading to whoever
+        # reads the page next.
+        enqueued_ts = next(
+            (float(e.get("ts") or 0) for e in ordered
+             if str(e.get("type") or "").endswith(".enqueued")),
+            None,
+        )
+        terminal_ev = next(
+            (e for e in reversed(ordered)
+             if str(e.get("type") or "").endswith(".terminal")),
+            None,
+        )
+        queue_wait_ms = None
+        exec_ms = None
+        if terminal_ev is not None:
+            try:
+                exec_ms = float(terminal_ev.get("dur_ms") or 0) or None
+            except (TypeError, ValueError):
+                exec_ms = None
+            # ⚠️ 不可判定就留 None,**绝不夹到 0**。
+            # 第一版用 `max(0.0, ...)`,于是时钟回拨、终态缺失、跨度小于执行时长
+            # 三种情况**全部显示成「排队 0ms」** —— 把「我不知道」伪装成一个
+            # 精确的事实。我在请审信里写过「宁可显示未知也不要显示错的秒数」,
+            # 而实现正好相反,是 codex2 实跑三例查出来的。
+            #
+            # ⚠️ 还有一层夹紧检不出来的:enqueue 与 terminal 由 web / worker
+            # **两个进程**各自用 `time.time()` 写,**正向时钟偏移无法识别**。
+            # 所以这个数只在明显自洽时才显示;要真正可信的排队时长,
+            # 应改用同一个 DB 时钟下的 job created/claimed(另开单)。
+            # ⚠️ 上一版只验了 span_ms 有限,**没验 exec_ms** ⇒ NaN/±Inf 会直接
+            # 渲染成「执行 nanms」「执行 infms」。不可判定要**两端都验**。
+            if exec_ms is not None and not (math.isfinite(exec_ms) and exec_ms >= 0):
+                exec_ms = None
+            if enqueued_ts is not None and exec_ms is not None:
+                terminal_ts = float(terminal_ev.get("ts") or 0)
+                span_ms = (terminal_ts - enqueued_ts) * 1000.0
+                if (
+                    math.isfinite(span_ms)
+                    and terminal_ts > enqueued_ts
+                    and span_ms >= exec_ms
+                ):
+                    queue_wait_ms = round(span_ms - exec_ms, 1)
         turns.append({
             "user_id": user_id,
             "trace_id": trace_id,
@@ -2341,9 +2482,14 @@ def _debug_trace_group_turns(events: list[dict]) -> list[dict]:
             "title": title,
             "first_ts": ordered[0].get("ts") if ordered else 0,
             "last_ts": ordered[-1].get("ts") if ordered else 0,
-            "total_dur_ms": round(total, 1),
+            "total_dur_ms": round(total, 1) if total is not None else None,
             "terminal_status": terminal,
             "is_stalled": stalled,
+            "lane": lane,
+            "job_id": job_id,
+            "outcome_class": outcome_class,
+            "queue_wait_ms": queue_wait_ms,
+            "exec_ms": round(exec_ms, 1) if exec_ms is not None else None,
         })
     turns.sort(key=lambda t: float(t.get("last_ts") or 0), reverse=True)
     return turns
@@ -2490,9 +2636,171 @@ _PROMPT_FRONTIER_PUBLIC_BYTE_COMPONENTS = frozenset({
 })
 
 
+# --- 2026-08-21 批事件的公开字段(T219) ------------------------------------- #
+#
+# 照 `_EMPTY_RESPONSE_PUBLIC_ENUMS` 那一族的既有做法:**按事件类型放行,不是按键名
+# 全局放行**。默认仍然是「detail 里的字符串一律遮住」,每个事件显式声明自己哪几个
+# 键、哪几个取值可以出。
+#
+# ⚠️ 我第一版做成了全局的形状检查(只看字符串长得像不像错误码),被
+# `test_provider_roundtrip_trace_closed_enums_are_admin_readable` 挡了下来 ——
+# 那条用例同时断言「`lane` 在某个事件上看得见」和「`lane` 在 `mcp.surface.*` 上必须
+# 仍被遮住」。**一个全局规则会把这个刻意的 fail-closed 默认在整页掀翻。**
+# 那条断言是对的,不该为了让我的改动变绿去改它。
+#
+# 取值集合一律**从产生方的模块读**,不在这里抄一份:抄一份就会在别人改常量时
+# 静默失配,而失配的表现是「字段忽然消失」,没有人会因此收到告警。
+_TRACE_PUBLIC_SHAPE = object()   # 取值空间开放,退而用形状判定(见下)
+
+# ⚠️ 这一格改过两次,两次都错在**同一个方向:想从字符串本身推断它的来源**。
+#
+#   第一版  字符形状(小写/下划线/最多一个冒号)
+#           搭档当场构造反例:`alice` / `secret_token` / `patient_12345` 全部通过。
+#   第二版  前缀白名单 + startswith
+#           **两个方向同时错**,搭档各给了实例:
+#             泄漏侧  `turn_failed:secret_token`  前缀匹配 ⇒ 原样公开
+#             隐藏侧  `scheduled_wake` / `voice_turn_not_accepted` / `empty_reply`
+#                     全是真实生产码 ⇒ 反而被判 False
+#           我在请审信里写过「后半段来自我们自己的封闭词表」——
+#           **那是假话:`startswith` 根本不检查后半段。** 我把「我希望它是这样」
+#           写成了「它是这样」。
+#
+# ⇒ 结论:**形状和前缀都证明不了来源,只有产生者能证明。**
+# 现在只认**产生方模块显式导出的集合成员**,不做任何字符串推断。
+# 代价是 `wake_failed:providererror` 这类**拼装码暂时仍被遮住** ——
+# 它的后半段来自 `type(exc).__name__.lower()`(worker.py:1163),产生方目前
+# 没有导出完整词表。**这是已知缺口,不是遗漏**:与其用一条推断规则假装覆盖它,
+# 不如让它显式地留在遮蔽里,并单开一单让产生方导出(见台账)。
+
+
+def _known_failure_codes() -> frozenset:
+    """产生方**显式导出**的失败码集合,从模块读,管理端不抄也不推断。"""
+    global _KNOWN_FAILURE_CODES_CACHE
+    if _KNOWN_FAILURE_CODES_CACHE is None:
+        codes: set[str] = set()
+        try:
+            from model_api_runtime.v2 import jobs_store as _js
+            codes |= set(_js.CONTROL_OUTCOME_CODES)
+            codes |= set(_js.SAFETY_SUPPRESSION_CODES)
+            codes |= set(_js.TIMEOUT_OUTCOME_CODES)
+        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
+            pass
+        _KNOWN_FAILURE_CODES_CACHE = frozenset(codes)
+    return _KNOWN_FAILURE_CODES_CACHE
+
+
+_KNOWN_FAILURE_CODES_CACHE = None
+
+
+# ⚠️ 这里**曾经**是我在管理端手抄的一份表,而注释还写着「从产生方读」——
+# **注释描述的是我的意图,不是代码的行为。今天第二次犯同一个毛病。**
+# 后果不只是抄漏(`provider_timeout` / `provider_empty_reply` 都判 False),
+# 还让我据此宣布了一个**根本不存在的「视觉缺口」**:
+# `vision_model_unavailable` 一直就在权威导出里。
+#
+# `notices/catalog.py` 的 `ERROR_CLASSES`(50 个)就是那份权威表 ——
+# 它同时是客户端文案的 slug 来源,**改它等于改对外契约**,所以它必然被维护。
+def _known_error_classes() -> frozenset:
+    global _KNOWN_ERROR_CLASSES_CACHE
+    if _KNOWN_ERROR_CLASSES_CACHE is None:
+        try:
+            from notices import catalog as _catalog
+            _KNOWN_ERROR_CLASSES_CACHE = frozenset(_catalog.ERROR_CLASSES)
+        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
+            _KNOWN_ERROR_CLASSES_CACHE = frozenset()
+    return _KNOWN_ERROR_CLASSES_CACHE
+
+
+_KNOWN_ERROR_CLASSES_CACHE = None
+
+
+def _is_registered_failure_code(value: str) -> bool:
+    return value in _known_failure_codes() or value in _known_error_classes()
+
+
+def _trace_public_fields() -> dict:
+    """事件类型 -> {键: 允许取值集合 或 _TRACE_PUBLIC_SHAPE}。
+
+    惰性构建:`jobs_store` 在 `data_track` 之下,模块级导入会把管理端接进运行时
+    的导入链(仓内既有做法同此,见 `_v2_wake_activity_detail`)。
+    """
+    global _TRACE_PUBLIC_FIELDS_CACHE
+    if _TRACE_PUBLIC_FIELDS_CACHE is not None:
+        return _TRACE_PUBLIC_FIELDS_CACHE
+    try:
+        from model_api_runtime.v2 import jobs_store as _js
+        lanes = frozenset(_js.LANES)
+    except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
+        lanes = frozenset()
+    outcomes = frozenset(db.TRACE_OUTCOME_CLASSES)
+    job_outcomes = frozenset({"completed", "failed", "rescheduled", "superseded"})
+    voice_stage = frozenset({
+        "revision_check", "before_content", "before_final", "deadline",
+        "runtime", "gateway",
+    })
+    runtime_kind = frozenset({"resident", "v2", "unknown"})
+    table = {
+        "agent.job.enqueued": {
+            "lane": lanes, "enqueue_source": lanes,
+            # ⚠️ `reason` 曾被声明成公开字段,但它的真实产生值
+            # (scheduled_wake / manual_tick / dream_refresh …)**一个都不在**
+            # 任何权威导出里 ⇒ 声明了却一个典型值都看不见,
+            # **那是比不声明更坏的状态**:读的人会以为这个字段没值。
+            # 删掉假声明,归入 T220(让产生方导出 reason 词表)。
+        },
+        "agent.job.terminal": {
+            "lane": lanes, "outcome": job_outcomes,
+            "outcome_class": outcomes, "error_code": _TRACE_PUBLIC_SHAPE,
+        },
+        "vision.provider.called": {},
+        "vision.provider.completed": {"error_class": _TRACE_PUBLIC_SHAPE},
+        "agent.image.generate.failed": {
+            "error_code": _TRACE_PUBLIC_SHAPE, "classified": _TRACE_PUBLIC_SHAPE,
+        },
+    }
+    for etype in (
+        "voice.gateway.turn.started", "voice.gateway.turn.runtime_rejected",
+        "voice.gateway.turn.timed_out", "voice.gateway.turn.not_accepted",
+        "voice.gateway.turn.superseded", "voice.gateway.reply.received",
+        "voice.gateway.runtime.selected",
+    ):
+        table[etype] = {
+            "stage": voice_stage, "runtime": runtime_kind,
+            "error_code": _TRACE_PUBLIC_SHAPE,
+        }
+    _TRACE_PUBLIC_FIELDS_CACHE = table
+    return table
+
+
+_TRACE_PUBLIC_FIELDS_CACHE = None
+
+
+def _expose_declared_trace_fields(ev: dict, raw_detail, public_detail) -> None:
+    """把该事件显式声明过的字段放回明文。
+
+    两层收口:键必须被这个事件声明过,**且**值必须落在声明的集合里(或通过形状)。
+    任何未声明的键、任何形状不符的值,一律维持既有的遮蔽。
+    """
+    if not isinstance(raw_detail, dict) or not isinstance(public_detail, dict):
+        return
+    allowed = _trace_public_fields().get(str(ev.get("type") or ""))
+    if not allowed:
+        return
+    for key, spec in allowed.items():
+        value = raw_detail.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        if spec is _TRACE_PUBLIC_SHAPE:
+            if _is_registered_failure_code(value):
+                public_detail[key] = value
+        elif value in spec:
+            public_detail[key] = value
+
+
 def _debug_event_public_json(ev: dict) -> dict:
     raw_detail = ev.get("detail") or {}
     public_detail = _debug_redact_value(raw_detail)
+    _expose_declared_trace_fields(ev, raw_detail, public_detail)
     if (
         ev.get("type") == "provider.empty_response"
         and isinstance(raw_detail, dict)
@@ -2658,7 +2966,9 @@ def _debug_event_public_json(ev: dict) -> dict:
         "subsystem": ev.get("subsystem"),
         "type": ev.get("type"),
         "status": ev.get("status"),
-        "dur_ms": ev.get("dur_ms"),
+        # JSON 端点直接吐这个 dict —— 非有限值会让 Starlette 抛 ValueError,
+        # 整个 /v1/admin/data-track/debug 变 500。归一化必须在这里,不是在渲染层。
+        "dur_ms": _finite_ms(ev.get("dur_ms")),
         "summary": ev.get("summary"),
         "explain": ev.get("explain"),
         "detail": public_detail,
@@ -2732,6 +3042,20 @@ def _data_track_debug_payload() -> dict:
         since_epoch=since_epoch,
         limit=scan_limit,
     )
+    # ⭐ 归一化放在**事件刚进来的这一刻**,而不是任何一个出口。
+    #
+    # 我为这一格改过三次,每次都以为"这次覆盖全了":
+    #   ① 只在算排队/执行时挡      -> 「总耗时」累加漏了
+    #   ② 挪到渲染层 `_debug_ms`   -> 我说「所有出口一次覆盖」,**那句是错的**:
+    #                                JSON 端点绕过渲染层,Starlette 对 NaN/±Inf 抛
+    #                                ValueError ⇒ 整个端点 500,而页面看起来一切正常
+    #   ③ 加在事件投影的构造点      -> `events` 与 `turns[].rows` 带的是**原始事件**,仍漏
+    #
+    # ⇒ 教训不是"再往下挪一层",是:**只要归一化放在出口,就得数清楚有几个出口 ——
+    # 而我三次都数错了。放在入口就不用数。**
+    for _ev in all_events_raw:
+        if isinstance(_ev, dict) and "dur_ms" in _ev:
+            _ev["dur_ms"] = _finite_ms(_ev.get("dur_ms"))
     event_user_ids = {
         str(event.get("user_id") or "")
         for event in all_events_raw
@@ -8463,9 +8787,18 @@ def _debug_json(obj) -> str:
 
 
 def _debug_ms(ms) -> str:
+    """毫秒渲染。**非有限值一律不渲染。**
+
+    我原本只在算排队/执行时挡 NaN/±Inf,而我自己的整页断言当场咬到:
+    「总耗时」是**另一条累加路径**(`total += float(dur_ms or 0)`),NaN 会一路
+    传到抬头渲染成「nanms」。
+    ⇒ 挡在**格式化这一层**,所有出口一次覆盖 —— 挡在算的那一层只能覆盖我想到的那些。
+    """
     try:
         value = float(ms or 0)
     except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(value) or value < 0:
         return ""
     return f"{value:.0f}ms" if value else ""
 
@@ -8492,6 +8825,26 @@ _DEBUG_STEP_LABELS = {
     "context.build": ("📎", "组装上下文"),
     "memory.inject": ("🧠", "自动注入记忆"),
     "memory.dream.tick": ("🌙", "做梦判定"),
+    # 2026-08-21 批。没有这些条目时,它们全部退化成通用的「• 某某」,
+    # 查案的人在页面上分不出「上游拒绝」和「被新回合取代」——而那正是
+    # 这一批事件被记录下来的全部理由。
+    "agent.job.enqueued": ("📥", "后台任务 · 入队"),
+    "agent.job.terminal": ("📤", "后台任务 · 结束"),
+    "vision.provider.called": ("👁", "视觉模型 · 开始调用"),
+    "vision.provider.completed": ("👁", "视觉模型 · 调用结束"),
+    "agent.image.generate.start": ("🎨", "生图 · 开始"),
+    "agent.image.generate.done": ("🎨", "生图 · 成功"),
+    "agent.image.generate.failed": ("🎨", "生图 · 失败"),
+    # 语音四个失败出口在页面上本来长得一模一样。标签里必须写出
+    # 「仍返回 200」——那是这条道最反直觉、最容易被当成成功的地方:
+    # 返回 4xx 会让 ElevenLabs 拆掉整通电话,所以失败是「说出来」的。
+    "voice.gateway.turn.started": ("📞", "语音 · 回合开始"),
+    "voice.gateway.runtime.selected": ("📞", "语音 · 选定运行时"),
+    "voice.gateway.reply.received": ("📞", "语音 · 拿到回复"),
+    "voice.gateway.turn.runtime_rejected": ("📞", "语音 · 上游拒绝(仍返回 200)"),
+    "voice.gateway.turn.timed_out": ("📞", "语音 · 等超时(仍返回 200)"),
+    "voice.gateway.turn.not_accepted": ("📞", "语音 · 未受理(502)"),
+    "voice.gateway.turn.superseded": ("📞", "语音 · 被新回合取代(静默结束)"),
     "agent.model.call.start": ("🧠", "调用模型 · 开始"),
     "agent.model.call.done": ("🧠", "调用模型 · 完成"),
     "agent.model.call.error": ("🧠", "调用模型 · 失败"),
@@ -8541,6 +8894,59 @@ def _debug_friendly_step(ev: dict) -> tuple[str, str]:
     tail = typ.split(".")[-1] if typ else ""
     label = f"{base} · {tail}" if base and tail else (base or tail or "事件")
     return (icon, label)
+
+
+_OUTCOME_CLASS_LABELS = {
+    "operational_failure": "运行故障",
+    "timeout": "超时",
+    "control": "闸拦截",
+    "safety_suppression": "安全抑制",
+}
+
+
+def _render_turn_identity(turn: dict) -> str:
+    """回合抬头的身份与耗时。
+
+    **`outcome_class` 只在这一回合真的没成功时才出现。** 它没有「成功」这一档,
+    ok 事件带的是默认值 —— 2026-08-21 实弹里 132 行有 111 行是 ok 却带着
+    `operational_failure`。无条件渲染会让页面凭空多出一批看起来在报错的行,
+    而**页面上「看起来像失败」和「真的失败」的代价是不一样的**:前者会让人
+    去追一个不存在的故障。
+
+    **排队与执行分开写,不合并成一个总数。** 终态事件上的 `dur_ms` 只含执行时长,
+    可它偏偏挂在 enqueue->terminal 这一对的终态那半边,极易被读成「从入队到结束」。
+    给一个合并数字等于把这个误读留给下一个人 —— 这正是 T197 在失败率上踩过的同一个坑:
+    **一个值脱离它的前提被展示。**
+    """
+    bits: list[str] = []
+    lane = str(turn.get("lane") or "")
+    if lane:
+        bits.append(f"<span class='muted'>道 {html.escape(lane)}</span>")
+    job_id = str(turn.get("job_id") or "")
+    if job_id:
+        bits.append(f"<span class='muted mono'>job {html.escape(job_id)}</span>")
+    outcome = str(turn.get("outcome_class") or "")
+    if outcome and str(turn.get("terminal_status") or "ok") != "ok":
+        label = _OUTCOME_CLASS_LABELS.get(outcome, outcome)
+        bits.append(f"<span class='pill bad'>{html.escape(label)}</span>")
+    queue_ms = turn.get("queue_wait_ms")
+    exec_ms = turn.get("exec_ms")
+    # 「排队」这两个字只在**算得出来**时才出现。
+    # 我自己的整页断言咬到了这一处:上一版只要执行时长存在就渲染「排队 …」,
+    # 于是时钟回拨那种算不出来的情形,页面上还是写着「排队」两个字 ——
+    # **把「我不知道」渲染成一个看起来有值的字段。**
+    if queue_ms is not None and exec_ms is not None:
+        bits.append(
+            "<span class='muted'>排队 "
+            f"{html.escape(_debug_ms(queue_ms))} · 执行 "
+            f"{html.escape(_debug_ms(exec_ms))}</span>"
+        )
+    elif exec_ms is not None:
+        bits.append(
+            f"<span class='muted'>执行 {html.escape(_debug_ms(exec_ms))}"
+            "<span class='muted'>(排队时长不可判定)</span></span>"
+        )
+    return "".join(bits)
 
 
 def _render_data_track_debug_page(payload: dict) -> str:
@@ -8622,7 +9028,15 @@ def _render_data_track_debug_page(payload: dict) -> str:
 
     def event_detail_block(ev: dict) -> str:
         revealed = bool(reveal_key and reveal_key == _debug_event_key(ev))
-        detail = _debug_json(ev.get("detail") if revealed else _debug_redact_value(ev.get("detail") or {}))
+        # 走 **同一套** public projection,而不是直接调脱敏。
+        # 第一版我只改了 `_debug_event_public_json`(JSON 端点用的那条),
+        # 页面上肉眼看的这条仍直连 `_debug_redact_value` ⇒ **页面一个字都没变**,
+        # 而我的单测全绿,因为**我测的是函数不是页面**。codex2 实跑整页才发现。
+        # 这正是 T130 那条:单测绿 = 代码对,证不了页面看得见。
+        detail = _debug_json(
+            ev.get("detail") if revealed
+            else _debug_event_public_json(ev).get("detail") or {}
+        )
         excerpt = _debug_json(ev.get("content_excerpt") if revealed else _debug_content_summary(ev.get("content_excerpt") or {}))
         if not detail and not excerpt and not revealed:
             return ""
@@ -8705,7 +9119,8 @@ def _render_data_track_debug_page(payload: dict) -> str:
             f"<h3><span>{mark}</span> <span>{html.escape(str(turn.get('title') or ''))}</span>"
             f"<span class='pill {status_cls}'>{html.escape(status)}</span>"
             f"<span class='muted mono'>{html.escape(str(turn.get('user_id') or ''))} · {html.escape(str(turn.get('trace_id') or ''))}</span>"
-            f"<span class='muted'>{html.escape(_debug_ms(turn.get('total_dur_ms')))}</span></h3>"
+            f"<span class='muted'>{html.escape(_debug_ms(turn.get('total_dur_ms')))}</span>"
+            f"{_render_turn_identity(turn)}</h3>"
             f"{''.join(rows_html)}{stalled_note}"
             "</section>"
         )
