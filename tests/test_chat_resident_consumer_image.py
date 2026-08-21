@@ -389,7 +389,7 @@ def test_pi_vision_rejection_rotates_session_before_showing_model_guidance(
     monkeypatch.setattr(
         crc, "_foreground_agent_message", lambda text, current_ts: text
     )
-    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text: "")
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text, **_kwargs: "")
     monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
     monkeypatch.setattr(
         crc,
@@ -456,7 +456,7 @@ def test_pi_text_only_turn_recovers_from_session_with_rejected_image(
         lambda: resident_chat_v2_profile,
     )
     monkeypatch.setattr(crc, "_prepend_io_cli_capability_catalog", lambda text: text)
-    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text: "")
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text, **_kwargs: "")
     monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
     monkeypatch.setattr(
         crc, "_vision_observation", lambda *_args: "A blue chart is visible."

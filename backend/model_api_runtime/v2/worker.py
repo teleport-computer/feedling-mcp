@@ -3882,6 +3882,8 @@ def _ledger_tapped_sink(
     deps: TurnDeps | None = None,
     user_id: str = "",
     lane: str = "chat",
+    trace_id: str = "",
+    job_id: str = "",
 ):
     """`recorder.record` plus the plaintext ledger mirror, for tool_loop.
 
@@ -3893,7 +3895,10 @@ def _ledger_tapped_sink(
     if recorder is None and (deps is None or deps.emit_debug_trace is None):
         return None
 
+    worldbook_context_reported = False
+
     async def _record(event_kind: str, payload: dict) -> None:
+        nonlocal worldbook_context_reported
         if recorder is not None:
             await recorder.record(event_kind, payload)
             await _mirror_provider_attempt(recorder, event_kind, payload)
@@ -3911,8 +3916,78 @@ def _ledger_tapped_sink(
                 user_id,
                 payload,
             )
+            if not worldbook_context_reported:
+                observation = _worldbook_context_observation(payload)
+                if observation is not None:
+                    worldbook_context_reported = True
+                    try:
+                        await asyncio.to_thread(
+                            deps.emit_debug_trace,
+                            user_id,
+                            "worldbook.context.applied",
+                            status=(
+                                "warning"
+                                if observation["truncated"]
+                                else "ok"
+                            ),
+                            summary="",
+                            explain="",
+                            trace_id=str(trace_id or ""),
+                            turn_id=str(trace_id or ""),
+                            job_id=str(job_id or ""),
+                            detail={
+                                "runtime": "hosted_v2",
+                                "lane": str(lane or "chat"),
+                                **observation,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001 — trace is best-effort
+                        log.warning(
+                            "[v2.worldbook] context trace failed user=%s code=%s",
+                            user_id,
+                            type(exc).__name__.lower(),
+                        )
 
     return _record
+
+
+def _worldbook_context_observation(provider_request: dict) -> dict | None:
+    """Describe only a World Book block that reached a provider request.
+
+    Wake lanes carry eager context as an application-data string. Foreground
+    Chat carries a pull result inside a native ``ToolExchange``. Inspecting the
+    trusted in-memory shape here avoids copying any content into plaintext
+    telemetry; only the carrier length and truncation bit leave this function.
+    """
+    for message in provider_request.get("messages") or ():
+        if isinstance(message, dict):
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            header = context.WORLD_BOOK_CONTEXT_HEADER + "\n"
+            if not content.startswith(header):
+                continue
+            return {
+                "source": "eager_context",
+                "carrier_chars": len(content),
+                "truncated": context.WORLD_BOOK_TRUNCATION_MARKER in content,
+            }
+        if not isinstance(message, ToolExchange):
+            continue
+        result_by_id = {str(result.call_id): result for result in message.results}
+        for call in message.calls:
+            if str(call.name or "") != "worldbook_match":
+                continue
+            result = result_by_id.get(str(call.id))
+            content = str(getattr(result, "content", "") or "")
+            if "<world_book>" not in content:
+                continue
+            return {
+                "source": "tool_result",
+                "carrier_chars": len(content),
+                "truncated": "...[truncated]" in content,
+            }
+    return None
 
 
 def _make_tool_trajectory_callback(
@@ -8806,6 +8881,11 @@ async def _run_wake(
                         before_write=_before_write,
                         observe_photo=observe_photo,
                         read_parallelism=1,
+                        trace_context={
+                            "trace_id": str(trace_id or ""),
+                            "job_id": str(job_id),
+                            "lane": lane,
+                        },
                     )
                 finally:
                     effect_reservations.mark_ready(tc)
@@ -8895,6 +8975,11 @@ async def _run_wake(
                         before_write=_before_write,
                         observe_photo=observe_photo,
                         read_parallelism=1,
+                        trace_context={
+                            "trace_id": str(trace_id or ""),
+                            "job_id": str(job_id),
+                            "lane": lane,
+                        },
                     )
                 finally:
                     effect_reservations.mark_batch_ready(calls)
@@ -9745,6 +9830,11 @@ async def _run_wake(
                         user_id,
                         wake_match_messages,
                         runtime_token=token,
+                        trace_context={
+                            "trace_id": str(trace_id or ""),
+                            "job_id": str(job_id),
+                            "lane": lane,
+                        },
                     )
                 if isinstance(wb, dict):
                     worldbook_context = str(wb.get("block") or "").strip()
@@ -10001,6 +10091,8 @@ async def _run_wake(
                     deps=deps,
                     user_id=user_id,
                     lane=lane,
+                    trace_id=str(trace_id or ""),
+                    job_id=str(job_id),
                 ),
                 outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
@@ -12992,6 +13084,11 @@ async def process_job(
                                 # and only while the switch resolved ON for
                                 # this turn.
                                 history_tools_allowed=history_tools_offered,
+                                trace_context={
+                                    "trace_id": str(job.get("trace_id") or ""),
+                                    "job_id": str(job_id),
+                                    "lane": lane,
+                                },
                             )
                         scanned_rows = _history_rows_charged(result, lease)
                     finally:
@@ -13034,6 +13131,11 @@ async def process_job(
                         before_write=_before_write,
                         observe_photo=observe_photo,
                         read_parallelism=1,
+                        trace_context={
+                            "trace_id": str(job.get("trace_id") or ""),
+                            "job_id": str(job_id),
+                            "lane": lane,
+                        },
                     )
                 finally:
                     effect_reservations.mark_ready(tc)
@@ -13116,6 +13218,11 @@ async def process_job(
                         before_write=_before_write,
                         observe_photo=observe_photo,
                         read_parallelism=1,
+                        trace_context={
+                            "trace_id": str(job.get("trace_id") or ""),
+                            "job_id": str(job_id),
+                            "lane": lane,
+                        },
                     )
                 finally:
                     effect_reservations.mark_batch_ready(calls)
@@ -14604,6 +14711,8 @@ async def process_job(
                 deps=deps,
                 user_id=user_id,
                 lane=lane,
+                trace_id=str(job.get("trace_id") or ""),
+                job_id=str(job_id),
             ),
             extra_tool_specs=offered_mcp_tool_specs,
             refresh_extra_tool_specs=_current_offered_mcp_tool_specs,

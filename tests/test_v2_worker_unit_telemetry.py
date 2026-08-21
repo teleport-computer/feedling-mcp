@@ -18,6 +18,7 @@ from model_api_runtime.v2 import worker  # noqa: E402
 from model_api_runtime.v2 import language_follow  # noqa: E402
 from model_api_runtime.v2 import prompt_frontier  # noqa: E402
 from model_api_runtime.v2 import summary_frontier  # noqa: E402
+from provider_types import ToolCall, ToolExchange, ToolResult  # noqa: E402
 
 
 def test_thinking_extra_preserves_plaintext_body():
@@ -982,6 +983,87 @@ def test_combined_memory_worldbook_message_keeps_truncation_trace_visible():
             }
         },
     }
+
+
+def test_worldbook_context_applied_trace_is_content_free_and_emitted_once():
+    from admin import data_track
+
+    traces = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append({
+        "user_id": user_id,
+        "type": event_type,
+        **fields,
+    })
+    private_context = "private setting body that must not enter telemetry"
+    provider_request = {"messages": [{
+        "role": "user",
+        "content": (
+            worker.context.WORLD_BOOK_CONTEXT_HEADER
+            + "\n<world_book>"
+            + private_context
+            + "</world_book>"
+        ),
+    }]}
+    sink = worker._ledger_tapped_sink(
+        None,
+        deps=deps,
+        user_id="u-worldbook-applied",
+        lane="scheduled",
+        trace_id="trace-worldbook",
+        job_id="job-worldbook",
+    )
+
+    asyncio.run(sink("provider_request", provider_request))
+    asyncio.run(sink("provider_request", provider_request))
+
+    events = [
+        event for event in traces
+        if event["type"] == "worldbook.context.applied"
+    ]
+    assert len(events) == 1
+    event = events[0]
+    assert set(event) == {
+        "user_id", "type", "status", "summary", "explain", "trace_id",
+        "turn_id", "job_id", "detail",
+    }
+    assert set(event["detail"]) == {
+        "runtime", "lane", "source", "carrier_chars", "truncated",
+    }
+    assert event["trace_id"] == "trace-worldbook"
+    assert event["job_id"] == "job-worldbook"
+    assert event["detail"] == {
+        "runtime": "hosted_v2",
+        "lane": "scheduled",
+        "source": "eager_context",
+        "carrier_chars": len(provider_request["messages"][0]["content"]),
+        "truncated": False,
+    }
+    assert private_context not in repr(event)
+    assert data_track._debug_event_public_json(event)["detail"] == event["detail"]
+
+
+def test_worldbook_tool_result_observation_contains_shape_only():
+    private_context = "private tool result body"
+    request = {"messages": [ToolExchange(
+        calls=(ToolCall(id="call-wb", name="worldbook_match", args={}),),
+        results=(ToolResult(
+            call_id="call-wb",
+            content=f"<world_book>{private_context}</world_book>",
+        ),),
+    )]}
+
+    observation = worker._worldbook_context_observation(request)
+
+    assert set(observation) == {"source", "carrier_chars", "truncated"}
+    assert observation == {
+        "source": "tool_result",
+        "carrier_chars": len(
+            f"<world_book>{private_context}</world_book>"
+        ),
+        "truncated": False,
+    }
+    assert private_context not in repr(observation)
 
 
 def test_post_fold_checkpoint_exhaustion_is_content_free_degradation(monkeypatch):

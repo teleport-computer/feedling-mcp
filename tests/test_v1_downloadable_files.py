@@ -561,7 +561,7 @@ def _patch_v1_foreground_file_turn(monkeypatch):
     )
     monkeypatch.setattr(resident, "_consume_reply_parse_failed", lambda: False)
     monkeypatch.setattr(resident, "_note_agent_turn_success", lambda: None)
-    monkeypatch.setattr(resident, "_worldbook_context_for_foreground", lambda _text: "")
+    monkeypatch.setattr(resident, "_worldbook_context_for_foreground", lambda _text, **_kwargs: "")
     resident._seen_ids.clear()
     resident._seen_ids_order.clear()
 

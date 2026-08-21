@@ -23,14 +23,23 @@ from model_api_runtime.v2 import provenance as _prov
 from provider_types import ToolResult
 from workspace.backends import WorkspaceError, model_writable_path
 
-async def _run_one(store, step, *, api_key, runtime_token, enclave_sem) -> tuple[str, dict]:
+async def _run_one(
+    store, step, *, api_key, runtime_token, enclave_sem, trace_context=None,
+) -> tuple[str, dict]:
     """Run one synchronous capability behind the shared enclave gate."""
     t = str(step.get("type") or "")
     params = step.get("payload") or {}
     async with enclave_sem:
+        kwargs = {
+            "api_key": api_key,
+            "runtime_token": runtime_token,
+            "params": params,
+        }
+        if trace_context is not None:
+            kwargs["trace_context"] = trace_context
         result = await asyncio.to_thread(
             cap_registry.run_capability, t, store,
-            api_key=api_key, runtime_token=runtime_token, params=params,
+            **kwargs,
         )
     data = result.to_dict()
     return t, data
@@ -141,6 +150,9 @@ async def dispatch_tool_calls(
     # so with the switch OFF, or for any non-history tool, the gate branch
     # below never changes behavior.
     history_tools_allowed: bool = False,
+    # Content-free correlation metadata from the trusted worker, never from
+    # provider tool arguments. Only World Book consumes it today.
+    trace_context: dict | None = None,
 ) -> list[ToolResult]:
     """Dispatch provider tool_calls (spec C3). READ_ACTIONS run inline-parallel (their content
     feeds back to the model); WRITE_ACTIONS pass the provenance write_gate then are ENQUEUED as
@@ -202,6 +214,7 @@ async def dispatch_tool_calls(
             _t, data = await _run_one(
                 store, step, api_key=api_key, runtime_token=runtime_token,
                 enclave_sem=enclave_sem,
+                trace_context=trace_context,
             )
             if (
                 tc.name in {"photo_read", "screen_read"}

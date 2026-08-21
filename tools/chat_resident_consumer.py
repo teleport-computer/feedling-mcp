@@ -1786,6 +1786,7 @@ def _refresh_debug_trace_enabled() -> None:
 def _emit_debug_trace(subsystem: str, type: str, *, status: str = "ok",
                       summary: str = "", explain: str = "", detail: dict | None = None,
                       content_excerpt: dict | None = None, trace_id: str = "",
+                      job_id: str = "",
                       dur_ms: float | None = None) -> None:
     """Fire-and-forget flow-trace emit. Offloads all network I/O (both the
     cache-refresh GET and the event POST) to a daemon thread and returns
@@ -1800,7 +1801,8 @@ def _emit_debug_trace(subsystem: str, type: str, *, status: str = "ok",
             "subsystem": subsystem, "type": type, "status": status,
             "summary": summary, "explain": explain, "detail": detail or {},
             "content_excerpt": content_excerpt or {}, "trace_id": trace_id,
-            "turn_id": trace_id, "actor": "vps_resident", "dur_ms": dur_ms,
+            "turn_id": trace_id, "job_id": job_id,
+            "actor": "vps_resident", "dur_ms": dur_ms,
         }}
 
         def _dispatch() -> None:
@@ -3923,7 +3925,7 @@ def _screen_context_for_message(content: str) -> tuple[str, list[dict[str, str]]
     return "\n".join(context_parts), payloads, paths
 
 
-def _worldbook_context_for_foreground(content: str) -> str:
+def _worldbook_context_for_foreground(content: str, *, trace_id: str = "") -> str:
     if FOREGROUND_WORLDBOOK_CONTEXT_MODE not in {
         "1", "true", "on", "auto", "always", "eager",
     }:
@@ -3934,7 +3936,14 @@ def _worldbook_context_for_foreground(content: str) -> str:
     try:
         resp = _HTTP.post(
             f"{FEEDLING_API_URL}/v1/worldbook/match",
-            headers=_HEADERS,
+            headers={
+                **_HEADERS,
+                **(
+                    {"X-Feedling-Trace-Id": str(trace_id)}
+                    if trace_id
+                    else {}
+                ),
+            },
             json={"message": text},
             timeout=20,
         )
@@ -3986,9 +3995,17 @@ def _worldbook_context_for_wake(job: dict) -> str:
         if note:
             messages = [{"role": "user", "content": note}]
     try:
+        trace_id = str(job.get("trace_id") or job.get("job_id") or "")
         resp = _HTTP.post(
             f"{FEEDLING_API_URL}/v1/worldbook/match",
-            headers=_HEADERS,
+            headers={
+                **_HEADERS,
+                **(
+                    {"X-Feedling-Trace-Id": trace_id}
+                    if trace_id
+                    else {}
+                ),
+            },
             json={"messages": messages},
             timeout=20,
         )
@@ -14707,6 +14724,33 @@ def _message_for_proactive_job(
         block = _worldbook_match.format_context_block(_worldbook_context_for_wake(job))
         if not block:
             return message
+        _wb_trace_id = str(job.get("trace_id") or job.get("job_id") or "")
+        _emit_debug_trace(
+            "worldbook",
+            "worldbook.context.applied",
+            status=(
+                "warning"
+                if _worldbook_match.TRUNCATION_MARKER in block
+                else "ok"
+            ),
+            trace_id=_wb_trace_id,
+            job_id=str(job.get("job_id") or job.get("wake_id") or ""),
+            summary="",
+            explain="",
+            detail={
+                "runtime": "resident_v1",
+                "lane": (
+                    "screen_watch"
+                    if _is_screen_watch_job(job)
+                    else "scheduled"
+                    if _is_scheduled_wake_job(job)
+                    else "heartbeat"
+                ),
+                "source": "eager_context",
+                "carrier_chars": len(block),
+                "truncated": _worldbook_match.TRUNCATION_MARKER in block,
+            },
+        )
         return f"{block}\n\n{message}"
 
     if _is_screen_watch_job(job):
@@ -17731,8 +17775,29 @@ def _process_messages(messages: list) -> float:
         # ——enclave 只 cap 单条(20k),多条 alwaysOn 合并后可以远超一轮该占的份额,
         # V2 的 builder 会截断而 resident 直接全塞(codex 复验 2026-08-10 指出)。
         worldbook_text = _worldbook_match.format_context_block(
-            _worldbook_context_for_foreground(content))
+            _worldbook_context_for_foreground(content, trace_id=trace_id))
         if worldbook_text:
+            _emit_debug_trace(
+                "worldbook",
+                "worldbook.context.applied",
+                status=(
+                    "warning"
+                    if _worldbook_match.TRUNCATION_MARKER in worldbook_text
+                    else "ok"
+                ),
+                trace_id=trace_id,
+                summary="",
+                explain="",
+                detail={
+                    "runtime": "resident_v1",
+                    "lane": "chat",
+                    "source": "eager_context",
+                    "carrier_chars": len(worldbook_text),
+                    "truncated": (
+                        _worldbook_match.TRUNCATION_MARKER in worldbook_text
+                    ),
+                },
+            )
             content = f"{worldbook_text}\n\n{content}"
 
         # Inject any memory the user explicitly referenced for this turn

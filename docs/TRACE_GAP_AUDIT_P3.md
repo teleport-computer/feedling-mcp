@@ -31,8 +31,8 @@ V2 不是“没有 trace”：`worker.py` + `serve_worker.py` 当前可发 16 �
 9. `[genesis/plaintext.py:_append_plaintext_onboarding_greeting] [问候发布] [零探针] [答不了导入成功但 greeting 是否真正 append；异常被吞成空串] [genesis.greeting.publish.completed；job_id,source,published,error_class,message_id]`
 10. `[genesis/genesis_core.py:resident_pending/resident_complete] [本地蒸馏网络边界] [零探针且 complete 会假成功] [答不了 claim 是否缺 material、complete 是否真正写终态后才删 chunks] [genesis.resident.claim.completed / genesis.resident.complete.completed；job_id,outcome,claimed_count,missing_material_count,completion_written,chunks_deleted,memory_action_count,identity_output,trace_id]`
 11. `[genesis/persona_backfill.py route] [最终响应] [零探针] [答不了 no_signal、enqueued、failed 三种用户结果] [genesis.persona_backfill.completed；outcome,job_id,error_class,trace_id]`
-12. `[worldbook/worldbook_core.py:match] [匹配/注入最终出口] [半探针：只有 block 非空才发 worldbook_injected，且无实弹验过] [答不了空 block 是合法无匹配，还是 rejected/unavailable/corrupt] [worldbook.match.completed；candidate_count,matched_count,rejected_count,unavailable_count,block_chars,outcome,trace_id]`
-13. `[worldbook/worldbook_core.py:delete] [写入最终出口] [零探针且会假成功] [答不了 entry 是否实际删除；bool 被忽略仍回 ok=true] [worldbook.entry.write.completed；action,entry_id,outcome,trace_id]`
+12. ✅ T216 已补：`worldbook.match.completed` 区分 `no_entries/no_match/matched/partial/unavailable` 并带 content-free counts/trace_id；`worldbook.context.applied` 在 resident V1 eager prompt 装配点与 hosted V2 最终 provider request 边界确认应用。V1 pull 工具最终应用仍沿用通用 `agent.tool.call`。
+13. `[worldbook/worldbook_core.py:delete] [写入最终出口] [假成功已修：不存在回 404、存储错误回 500；仍零探针] [答不了删除请求是否到达最终出口] [worldbook.entry.write.completed；action,outcome,trace_id（不得记录用户自建 entry id）]`
 14. `[hosted/vision_observer.py:observe] [观察最终出口] [半探针：provider/image 失败与调用有事件但无实弹验过；早期 400/404/409 零探针] [答不了一次图片观察从 message 到 route 到最终 observation 的完整结果] [vision.observation.completed；trace_id,message_id,route_id,outcome,error_class,retryable,observation_chars,dur_ms]`
 15. `[hosted/setup_core.py:model_api setup/test_provider_key] [文本模型零样本测试出口] [零探针] [答不了用户配置测试是否调用、成功、失败及耗时] [model_api.route_test.completed；test_kind=text,route_id,outcome,error_class,status_code,dur_ms,trace_id]`
 16. `[hosted/setup_core.py:_run_setup_main_vision_test] [异步视觉测试出口] [半探针：只在 catalog/probe 不一致时有事件；正常、普通失败、stale 丢弃零探针] [答不了异步 probe 是否真正执行和最终采用] [model_api.setup_vision_probe.completed；route_id,outcome,error_class,dur_ms,trace_id]`
@@ -84,7 +84,7 @@ V2 不是“没有 trace”：`worker.py` + `serve_worker.py` 当前可发 16 �
 | genesis/plaintext.py:_append_plaintext_onboarding_greeting | stdout/空串 | greeting append 失败，主 job 仍继续 |
 | genesis/plaintext.py:_run_plaintext_genesis_v2 | job failed 状态但随后 done trace | 真失败从 trace 终态视图消失 |
 | genesis/genesis_core.py:resident_complete | 可能只剩 200 done | completion 未写却继续删 chunks |
-| worldbook_core.py:match/delete | 空 match 无事件；delete 恒 ok | unavailable/rejected/no-op 与成功混同 |
+| worldbook_core.py:match/delete | T216 已补 match 分型；delete 假成功已修但仍无事件 | delete 到达情况仍不可见 |
 | vision_observer.py:observe | 400/404/409 响应 | invalid request/message missing/route mismatch 无 trace |
 | setup_core.py:_run_setup_main_vision_test | stdout 或什么都没有 | stale/inactive/普通失败/thread 启动问题无最终事件 |
 | identity/service.py:_load_identity/_save_identity | stdout/log/审计可能仍成功 | 读失败变 None，写失败被 set_blob 吞掉 |
