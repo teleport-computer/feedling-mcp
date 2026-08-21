@@ -9,12 +9,30 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from accounts import onboarding as accounts_onboarding
-from hosted import setup_core, vision_routing
 from chat import consumer as chat_consumer
+from hosted import setup_core, vision_observer, vision_routing
 
 
 def _store(user_id="u1"):
     return SimpleNamespace(user_id=user_id)
+
+
+def test_catalog_vision_remap_keeps_internal_upstream_detail():
+    original = vision_observer.VisionObserverError(
+        "vision_model_not_found",
+        status_code=404,
+        upstream_detail="UPSTREAM_MODEL_LOOKUP_DETAIL",
+    )
+
+    remapped = setup_core._classify_catalog_route_vision_error(
+        original,
+        catalog_model_found=True,
+    )
+
+    assert remapped.error_code == "vision_model_incompatible"
+    assert remapped.status_code == 404
+    assert remapped.upstream_detail == "UPSTREAM_MODEL_LOOKUP_DETAIL"
+    assert "UPSTREAM_MODEL_LOOKUP_DETAIL" not in remapped.detail
 
 
 def _run_pixel_probe(monkeypatch, reply):

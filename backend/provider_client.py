@@ -36,9 +36,19 @@ log = logging.getLogger(__name__)
 
 
 class ProviderError(Exception):
-    def __init__(self, message: str, *, status_code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        response_detail: str = "",
+    ):
         super().__init__(message)
         self.status_code = status_code
+        # Internal diagnostic carrier. Callers choose explicitly whether the
+        # bounded fragment may enter an operator-only sink; tenant-visible
+        # response/trace surfaces must not serialize this attribute.
+        self.response_detail = str(response_detail or "")[:240]
 
 
 # --- Genesis v2 Step 1: shared retry wrapper + failure classification ---------
@@ -500,6 +510,7 @@ def _raise_for_provider_status(resp: httpx.Response) -> None:
     raise ProviderError(
         f"provider_http_{resp.status_code}{suffix}",
         status_code=resp.status_code,
+        response_detail=detail,
     )
 
 

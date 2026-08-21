@@ -1069,11 +1069,17 @@ class DedicatedVisionUnavailable(RuntimeError):
         error_code: str = "vision_model_failed",
         model: str = "",
         provider: str = "",
+        status_code: int | None = None,
+        upstream_detail: str = "",
     ):
         super().__init__(message)
         self.error_code = error_code
         self.model = str(model or "")[:96]
         self.provider = str(provider or "")[:80]
+        self.status_code = status_code if isinstance(status_code, int) else None
+        # Internal-only carrier. Never add this value to terminal status events,
+        # trajectories, debug traces, or user-facing exception messages.
+        self.upstream_detail = str(upstream_detail or "")[:240]
 
 
 class ImageGenerationUnavailable(RuntimeError):
@@ -11640,6 +11646,10 @@ def _inject_tail_images(
                 error_code=safe_code,
                 model=str(getattr(exc, "model", "") or ""),
                 provider=str(getattr(exc, "provider", "") or ""),
+                status_code=getattr(exc, "status_code", None),
+                upstream_detail=str(
+                    getattr(exc, "upstream_detail", "") or ""
+                ),
             ) from exc
         if any(
             not str(observations.get(item["message_id"]) or "").strip()
@@ -14805,6 +14815,12 @@ async def process_job(
                     error_code=vision_code,
                     model=str(getattr(provider_config, "model", "") or ""),
                     provider=str(getattr(provider_config, "provider", "") or ""),
+                    status_code=getattr(e, "status_code", None),
+                    upstream_detail=str(
+                        getattr(e, "upstream_detail", "")
+                        or getattr(e, "response_detail", "")
+                        or ""
+                    ),
                 )
         message = _safe_failure_code("turn_failed", failure_exc)
         await _record_trajectory(
@@ -14817,7 +14833,13 @@ async def process_job(
             },
             best_effort=True,
         )
-        log.warning("[v2.worker] job %s failed code=%s", job_id, message)
+        log.warning(
+            "[v2.worker] job %s failed code=%s status=%s upstream_detail=%r",
+            job_id,
+            message,
+            getattr(failure_exc, "status_code", None),
+            str(getattr(failure_exc, "upstream_detail", "") or "")[:240],
+        )
         owned = await asyncio.to_thread(
             jobs_store.mark_failed,
             job_id,

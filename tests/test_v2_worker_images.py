@@ -172,6 +172,8 @@ def test_dedicated_observer_failure_keeps_safe_reason_code():
 
     class ObserverFailure(RuntimeError):
         error_code = "vision_model_auth_invalid"
+        status_code = 401
+        upstream_detail = "UPSTREAM_SECRET_NOT_TENANT_VISIBLE"
 
     with pytest.raises(worker.DedicatedVisionUnavailable) as caught:
         worker._inject_tail_images(
@@ -185,9 +187,12 @@ def test_dedicated_observer_failure_keeps_safe_reason_code():
         )
 
     assert caught.value.error_code == "vision_model_auth_invalid"
+    assert caught.value.status_code == 401
+    assert caught.value.upstream_detail == "UPSTREAM_SECRET_NOT_TENANT_VISIBLE"
     assert worker._safe_failure_code("turn_failed", caught.value) == (
         "turn_failed:vision_model_auth_invalid"
     )
+    assert "UPSTREAM_SECRET_NOT_TENANT_VISIBLE" not in str(caught.value)
 
 
 def test_historical_dedicated_image_is_not_observed_or_resent():
