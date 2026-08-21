@@ -890,7 +890,7 @@ def test_budget_pressure_keeps_complete_directory_and_folds_only_non_resident():
 
 def test_pressure_keeps_explicitly_resolved_schema_full():
     messages = [{"role": "user", "content": "use the resolved tool"}]
-    floor = ToolSpec("reply", "reply", {"type": "object"})
+    floor = ToolSpec("memory_search", "search memory", {"type": "object"})
     resolved = ToolSpec(
         "mcp__calendar__events",
         "calendar events " * 20,
@@ -937,7 +937,11 @@ def test_required_resident_floor_exhaustion_fails_loud_without_trimming():
     resident_tools = [
         ToolSpec(
             name,
-            ("oversized resident manual " * 1_000 if name == "reply" else name),
+            (
+                "oversized resident manual " * 1_000
+                if name == "memory_search"
+                else name
+            ),
             {"type": "object"},
         )
         for name in sorted(frontier._CORE_TOOL_FLOOR_NAMES)
@@ -984,7 +988,7 @@ def test_pressure_folded_platform_schema_search_becomes_protected():
 
 def test_under_pressure_policy_keeps_full_fit_and_leaves_search_latent():
     tools = [
-        ToolSpec("reply", "reply", {"type": "object"}),
+        ToolSpec("direct_answer", "answer directly", {"type": "object"}),
         ToolSpec(
             "workspace_read",
             "read a file",
@@ -1010,12 +1014,12 @@ def test_under_pressure_policy_keeps_full_fit_and_leaves_search_latent():
         safety_margin_tokens=128,
     )
 
-    assert plan.included_tool_names == ("reply", "workspace_read")
+    assert plan.included_tool_names == ("direct_answer", "workspace_read")
     assert plan.pressure_collapsed_tool_names == ()
     assert not plan.schema_recovery_needed
 
 
-def test_runtime_v2_catalog_has_five_resident_and_thirty_two_foldable_tools():
+def test_runtime_v2_catalog_has_four_resident_and_thirty_two_foldable_tools():
     specs = tool_schema.build_tool_specs()
     resident = [
         spec for spec in specs
@@ -1026,7 +1030,7 @@ def test_runtime_v2_catalog_has_five_resident_and_thirty_two_foldable_tools():
         if spec.name not in frontier._CORE_TOOL_FLOOR_NAMES
     ]
 
-    assert len(resident) == 5
+    assert len(resident) == 4
     assert len(foldable) == 32
     assert all(
         len(tool_surface.collapsed_tool_spec(spec).description)
@@ -1378,8 +1382,8 @@ def test_fourteen_mcp_catalog_pressure_reaches_provider_with_memory_floor(
         "memory_fetch",
         "memory_write",
         "memory_organize",
-        "reply",
     }.issubset(sent_names)
+    assert "reply" not in sent_names
     assert {tool.name for tool in mcp_tools}.issubset(sent_names)
     assert "large_read" in sent_names
     sent_by_name = {spec.name: spec for spec in calls[0][1]}

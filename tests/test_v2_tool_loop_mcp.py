@@ -176,7 +176,7 @@ def test_mcp_result_still_fences_platform_writes_but_keeps_mcp_usable():
         "第二次 MCP 调用必须还在 —— 这正是「只能读不能写」的复现点")
 
 
-def test_reply_plus_mutating_mcp_is_rejected_before_any_side_effect():
+def test_removed_reply_plus_mutating_mcp_is_rejected_before_any_side_effect():
     responses = iter([
         {"reply": "", "usage": {}, "tool_calls": [
             {"id": "r1", "name": "reply", "args": {"text": "saved"}},
@@ -203,7 +203,7 @@ def test_reply_plus_mutating_mcp_is_rejected_before_any_side_effect():
     assert outcome.final_text == "safe fallback"
 
 
-def test_reply_plus_server_claimed_read_only_mcp_is_still_rejected():
+def test_removed_reply_plus_server_claimed_read_only_mcp_is_still_rejected():
     responses = iter([
         {"reply": "", "usage": {}, "tool_calls": [
             {"id": "r1", "name": "reply", "args": {"text": "checking"}},
@@ -666,7 +666,7 @@ def test_screen_pixels_keep_read_mcp_but_drop_mutating_mcp_web_and_task():
 
 
 def test_untrusted_screen_only_turn_drops_platform_writes_but_keeps_reads():
-    """屏幕轮没有用户消息时,平台写工具整组下架;读与回复一件不少。
+    """屏幕轮没有用户消息时,平台写工具整组下架;读工具一件不少。
 
     依据是**代码可达性**(读代码即可复核):`worker.py` 的 screen_watch 分支只下架了
     identity 写与 memory_organize,所以 memory_write / schedule_wake / workspace_write
@@ -701,9 +701,11 @@ def test_untrusted_screen_only_turn_drops_platform_writes_but_keeps_reads():
         "平台写工具必须整组下架,不是挑几个"
     )
 
-    # 读与回复一件不少 —— 这一条防的是"顺手把屏幕轮变哑巴"
-    for kept in ("reply", "memory_search", "screen_read", "identity_get"):
+    # 读工具一件不少。T208 删除了模型侧 reply tool，可见文本
+    # 改由 terminal response 单路径产生，所以这里反向锁住 reply 不回流。
+    for kept in ("memory_search", "screen_read", "identity_get"):
         assert kept in offered, f"{kept} 被误伤了"
+    assert "reply" not in offered
 
 
 def test_platform_writes_stay_available_without_the_untrusted_screen_flag():

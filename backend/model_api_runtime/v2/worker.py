@@ -1009,7 +1009,7 @@ _THINKING_ONLY_NO_REPLY_REASON = "thinking_only_no_reply"
 
 
 def _torn_protocol_evidence(text: str, reasoning: str, *, lane: str) -> str:
-    """Classify a V2 reply-tool / free-text reply for a torn protocol leak, then
+    """Classify a V2 visible reply for a torn protocol leak, then
     apply the lane policy. Returns the evidence enum when it should be suppressed,
     or "" to deliver. `lane` here is the detector policy ("proactive"/"foreground"),
     not the wake lane."""
@@ -5437,7 +5437,7 @@ def _make_task_batch_dispatcher(
                 reasoning: str = "",
             ) -> None:
                 if not final:
-                    raise RuntimeError("subagent reply tool is disabled")
+                    raise RuntimeError("subagent intermediate replies are disabled")
 
             async def _no_fold() -> list[dict]:
                 return []
@@ -5474,7 +5474,6 @@ def _make_task_batch_dispatcher(
                 refresh_protected_extra_tool_names=(
                     lambda: set(_SUBAGENT_ALLOWED_TOOLS)
                 ),
-                allow_reply_tool=False,
                 outbound_blocking_read_tool_names=(_PRIVATE_READ_TOOLS),
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
                 max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
@@ -9035,13 +9034,45 @@ async def _run_wake(
         thinking_trace_emitted = False
         language_trace_emitted = False
         wake_self_thinking_failed = False
-        last_promotable_reply_text = ""
+
+        async def _suppress_empty_visible_reply(
+            *, final: bool, fragment: str, stage: str
+        ) -> None:
+            """Fail closed without turning weak-wake silence into an incident."""
+            nonlocal stay_silent_reason, shadow_decision_allowed
+            log.warning(
+                "[v2.worker] wake empty visible reply suppressed user=%s "
+                "job=%s lane=%s final=%s stage=%s fragment=%r",
+                user_id,
+                job_id,
+                lane,
+                final,
+                stage,
+                fragment[:20],
+            )
+            if not final:
+                return
+            # Scheduled reminders retain their must-deliver contract.  All
+            # other proactive lanes may safely sleep without publishing text.
+            if lane == "scheduled":
+                raise TurnError("degenerate_reply_suppressed")
+            stay_silent_reason = jobs_store.EMPTY_VISIBLE_REPLY_SUPPRESSED_REASON
+            shadow_decision_allowed = False
+            await _emit_silent_reply_trace(
+                deps,
+                user_id,
+                lane,
+                event_type="reply.empty_visible_suppressed",
+                cause="suppressed",
+                outcome_code=jobs_store.EMPTY_VISIBLE_REPLY_SUPPRESSED_REASON,
+                trace_id=trace_id,
+                job_id=job_id,
+            )
 
         async def _on_reply(text: str, *, final: bool, reasoning: str = "") -> None:
             nonlocal thinking_trace_emitted, language_trace_emitted
             nonlocal shadow_decision_allowed
             nonlocal wake_self_thinking_failed
-            nonlocal last_promotable_reply_text
             text = str(text or "").strip()
             wake_self_thinking_failed = False
             # Self-authored thinking (same mechanism as the chat lane): peel a leading
@@ -9088,17 +9119,11 @@ async def _run_wake(
                         raise TurnError(_MALFORMED_SELF_THINKING_REASON)
                     return
             if text and _is_degenerate_reply(text):
-                log.warning(
-                    "[v2.worker] wake degenerate reply suppressed user=%s "
-                    "job=%s lane=%s final=%s fragment=%r",
-                    user_id,
-                    job_id,
-                    lane,
-                    final,
-                    text[:20],
+                await _suppress_empty_visible_reply(
+                    final=final,
+                    fragment=text,
+                    stage="pre_sanitize",
                 )
-                if final:
-                    raise TurnError("degenerate_reply_suppressed")
                 return
             # Torn protocol-JSON leak (stream-cut relay split the envelope across
             # reasoning/content). Proactive policy suppresses any leak — silence
@@ -9159,14 +9184,16 @@ async def _run_wake(
                                 type(exc).__name__.lower(),
                             )
                     if _is_degenerate_reply(text):
-                        if final:
-                            raise TurnError("degenerate_reply_suppressed")
+                        await _suppress_empty_visible_reply(
+                            final=final,
+                            fragment=text,
+                            stage="post_sanitize",
+                        )
                         return
             if not text:
-                # Silence is a legitimate wake outcome — both mid-loop (an empty
-                # `reply{}` call) and terminal ("weak wake sleeps"): unlike the chat
-                # lane, an empty terminal text is NOT a failure here, so this is a
-                # plain no-op, never a raise.
+                # Silence is a legitimate terminal wake outcome ("weak wake
+                # sleeps"): unlike the chat lane, an empty terminal text is NOT
+                # a failure here, so this is a plain no-op, never a raise.
                 return
             delivery_started_ns = time.monotonic_ns()
             # The provider call may have taken minutes. Re-check ownership at
@@ -9404,8 +9431,6 @@ async def _run_wake(
                         log.warning(
                             "[v2.worker] wake reply push slot build failed user=%s: %s",
                             user_id, e)
-                    if not final:
-                        last_promotable_reply_text = text
                 if status == "applied":
                     if tm is not None:
                         tm.record_visible_reply()
@@ -9542,170 +9567,6 @@ async def _run_wake(
                 {**row, "role": "user"} for row in rows
             )
             return rows
-
-        async def _on_promote_last_wake_intermediate() -> bool:
-            """Close a scheduled wake through its last durable reply bubble."""
-            nonlocal thinking_trace_emitted, language_trace_emitted
-            nonlocal shadow_decision_allowed
-
-            if not seq_native or lane != "scheduled":
-                return False
-            await _fence_wake_effect("reply promotion")
-            receipt = await asyncio.to_thread(
-                v2_effect_outbox.last_promotable_intermediate_reply,
-                user_id=user_id,
-                job_id=job_id,
-            )
-            if receipt is None:
-                return False
-
-            source_effect_id = str(receipt["effect_id"])
-            payload = dict(receipt["payload"])
-            payload.pop(v2_effect_outbox.REPLY_SOURCE_FENCE_KEY, None)
-            consumed_seq = (
-                int(cursor_box["seq"])
-                if int(cursor_box["seq"]) > int(wake_start_seq)
-                else None
-            )
-            if consumed_seq is not None:
-                effect_type = v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE
-                payload["reply_through_seq"] = consumed_seq
-                payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
-                    "claimed_by": claimed_by,
-                    "input_generation": int(wake_observed_generation),
-                    "through_seq": consumed_seq,
-                }
-            else:
-                effect_type = v2_effect_outbox.TERMINAL_REPLY_EFFECT_TYPE
-                payload.pop("reply_through_seq", None)
-                payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
-                    "claimed_by": claimed_by,
-                    "input_generation": int(wake_observed_generation),
-                    "observed_user_seq": int(cursor_box["seq"]),
-                }
-            payload[
-                v2_effect_outbox.PROMOTED_INTERMEDIATE_EFFECT_ID_KEY
-            ] = source_effect_id
-            if scheduled_activity_events:
-                payload.update(
-                    _activity_extra(
-                        scheduled_activity_events,
-                        turn_id=f"scheduled:{job_id}",
-                        job_id=int(job_id),
-                    )
-                )
-
-            delivery_started_ns = time.monotonic_ns()
-            effect_id = await asyncio.to_thread(
-                v2_effect_outbox.enqueue_reply_promotion,
-                intermediate_effect_id=source_effect_id,
-                job_id=job_id,
-                user_id=user_id,
-                expected_generation=gen,
-                payload=payload,
-                effect_type=effect_type,
-                claimed_by=claimed_by,
-            )
-            if deps.apply_pending_effects is not None:
-                await asyncio.to_thread(deps.apply_pending_effects, user_id)
-            disposition = await asyncio.to_thread(
-                v2_effect_outbox.get_effect_disposition,
-                effect_id,
-                user_id=user_id,
-                job_id=job_id,
-                effect_type=effect_type,
-            )
-            status = "missing" if disposition is None else disposition["status"]
-            last_error = "" if disposition is None else disposition["last_error"]
-            await _record_trajectory(
-                trajectory_recorder,
-                "reply_effect_disposition",
-                {
-                    "effect_id": effect_id,
-                    "effect_type": effect_type,
-                    "final": True,
-                    "promoted_intermediate": True,
-                    "status": status,
-                    "last_error": last_error,
-                    "duration_ms": round(
-                        max(0, time.monotonic_ns() - delivery_started_ns)
-                        / 1_000_000.0,
-                        3,
-                    ),
-                },
-                best_effort=True,
-            )
-            if status == "applied":
-                source_status = await asyncio.to_thread(
-                    jobs_store.get_job_status,
-                    job_id,
-                    user_id=user_id,
-                    claimed_by=claimed_by,
-                )
-                if source_status != "completed":
-                    raise RuntimeError(
-                        "promoted wake reply applied without completing source job"
-                    )
-                shadow_decision_allowed = True
-                if not thinking_trace_emitted:
-                    thinking_trace_emitted = True
-                    await _emit_thinking_surfaced_trace(
-                        deps.emit_debug_trace,
-                        user_id,
-                        provider_config,
-                        lane="wake",
-                        branch="none",
-                        chars=0,
-                    )
-                if not language_trace_emitted:
-                    language_trace_emitted = True
-                    await _emit_reply_language_follow_trace(
-                        deps.emit_debug_trace,
-                        user_id,
-                        user_rows=language_user_rows,
-                        visible_reply=last_promotable_reply_text,
-                        lane="wake",
-                    )
-                return True
-            if (
-                status == "discarded"
-                and last_error == v2_effect_outbox.WAKE_REPLY_CHAT_COLLISION
-            ):
-                return True
-            if (
-                status == "discarded"
-                and last_error == v2_effect_outbox.FINAL_REPLY_INPUT_ADVANCED
-            ):
-                raise v2_tool_loop.FinalReplySuperseded()
-            if (
-                status == "discarded"
-                and last_error
-                == v2_effect_outbox.FINAL_REPLY_SOURCE_JOB_INACTIVE
-            ):
-                raise LostJobLease(
-                    "wake source job became inactive before reply promotion"
-                )
-            if (
-                status == "discarded"
-                and last_error == v2_effect_outbox.FINAL_REPLY_INVALID_FENCE
-            ):
-                raise RuntimeError("invalid promoted wake reply fence")
-            if status == "discarded" and last_error in {
-                v2_effect_outbox.EFFECT_RUNTIME_STATE_CHANGED,
-                v2_effect_outbox.EFFECT_RUNTIME_GENERATION_CHANGED,
-            }:
-                code = (
-                    "runtime_mode_changed"
-                    if last_error == v2_effect_outbox.EFFECT_RUNTIME_STATE_CHANGED
-                    else "runtime_generation_changed"
-                )
-                await _fail_runtime_fence(
-                    code,
-                    "runtime ownership changed before wake reply promotion",
-                )
-            raise RuntimeError(
-                "promoted wake reply effect not durably applied: " + status
-            )
 
         # ── 世界书:主动开口的四条道也要认得这个世界（Seven 2026-08-10）
         #
@@ -9932,11 +9793,6 @@ async def _run_wake(
                 memory_delete_allowed=False,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,
-                on_promote_last_intermediate=(
-                    _on_promote_last_wake_intermediate
-                    if lane == "scheduled"
-                    else None
-                ),
                 fold_new_messages=fold_new_messages,
                 add_usage=_add_usage,
                 max_calls=_TURN_MAX_LLM_CALLS,
@@ -13328,8 +13184,6 @@ async def process_job(
         final_job_completed_atomically = False
         pending_file_replies: list[WorkspaceFileReply] = []
         pending_file_keys: set[tuple[str, int]] = set()
-        last_promotable_reply_text = ""
-
         async def _on_file_requirement_changed() -> None:
             pending_file_replies.clear()
             pending_file_keys.clear()
@@ -13369,7 +13223,6 @@ async def process_job(
             nonlocal language_correction_attempted
             nonlocal language_correction_pending, language_correction_outcome
             nonlocal thinking_language_correction_pending
-            nonlocal last_promotable_reply_text
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
             raw_reply_text = "" if file_reply is not None else str(text or "").strip()
             text = raw_reply_text
@@ -13529,7 +13382,7 @@ async def process_job(
                 # owns the attributed failure bubble.
                 raise TurnError("empty_reply")
             if not text and file_reply is None and not image_replies:
-                return  # empty intermediate reply{} call: no bubble, not an error
+                return  # empty non-text delivery: no bubble, not an error
             if file_reply is None:
                 text, removed_internal_reference = sanitize_downloadable_reply(
                     text,
@@ -13663,8 +13516,7 @@ async def process_job(
                     # are only non-sensitive routing metadata. The outbox
                     # validates them while holding the source job lock across
                     # sink dispatch.
-                    # Intermediate reply-tool bubbles deliberately carry no
-                    # fence and remain immediately visible mid-turn.
+                    # Final text replies carry the input frontier fence.
                     payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
                         "claimed_by": claimed_by,
                         "input_generation": int(observed_generation),
@@ -13922,8 +13774,6 @@ async def process_job(
                                 "text": spoken_reply,
                             }
                 if status == "applied" and not final:
-                    if file_reply is None and not image_replies:
-                        last_promotable_reply_text = str(text or "").strip()
                     return
                 if status == "applied":
                     source_status = await asyncio.to_thread(
@@ -14044,183 +13894,6 @@ async def process_job(
                     correction_attempted=language_correction_attempted,
                     correction_outcome=language_correction_outcome,
                 )
-
-        async def _on_promote_last_intermediate() -> bool:
-            """Close this chat turn through its last durable reply-tool bubble."""
-            nonlocal final_job_completed_atomically
-            nonlocal thinking_trace_emitted, language_trace_emitted
-            nonlocal voice_reply_slot
-
-            if not seq_native or pending_file_replies:
-                return False
-            await _ensure_runtime_mode()
-            await _renew_lease()
-            receipt = await asyncio.to_thread(
-                v2_effect_outbox.last_promotable_intermediate_reply,
-                user_id=user_id,
-                job_id=job_id,
-            )
-            if receipt is None:
-                return False
-
-            source_effect_id = str(receipt["effect_id"])
-            payload = dict(receipt["payload"])
-            payload.pop(v2_effect_outbox.REPLY_SOURCE_FENCE_KEY, None)
-            payload["reply_through_seq"] = int(cursor_box["seq"])
-            payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
-                "claimed_by": claimed_by,
-                "input_generation": int(observed_generation),
-                "through_seq": int(cursor_box["seq"]),
-            }
-            if ordered_chat_replies:
-                payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY][
-                    "preserve_queued_input"
-                ] = True
-            payload[
-                v2_effect_outbox.PROMOTED_INTERMEDIATE_EFFECT_ID_KEY
-            ] = source_effect_id
-            if reply_parent_message_id:
-                payload["reply_to_message_id"] = reply_parent_message_id
-            if voice_call_context:
-                payload.update(voice_call_context)
-            try:
-                status_rows = await asyncio.to_thread(
-                    jobs_store.status_events_for_job, user_id, int(job_id)
-                )
-                payload.update(
-                    _activity_extra(
-                        core_chat_activity.project_tool_events(status_rows),
-                        turn_id=str(job.get("trace_id") or ""),
-                        job_id=int(job_id),
-                    )
-                )
-            except Exception as exc:  # noqa: BLE001 - reply stays authoritative
-                log.warning(
-                    "[v2.activity] promoted final projection failed "
-                    "user=%s job=%s code=%s",
-                    user_id,
-                    job_id,
-                    type(exc).__name__.lower(),
-                )
-
-            delivery_started_ns = time.monotonic_ns()
-            effect_id = await asyncio.to_thread(
-                v2_effect_outbox.enqueue_reply_promotion,
-                intermediate_effect_id=source_effect_id,
-                job_id=job_id,
-                user_id=user_id,
-                expected_generation=gen,
-                payload=payload,
-            )
-            if deps.apply_pending_effects is not None:
-                await asyncio.to_thread(deps.apply_pending_effects, user_id)
-            disposition = await asyncio.to_thread(
-                v2_effect_outbox.get_effect_disposition,
-                effect_id,
-                user_id=user_id,
-                job_id=job_id,
-                effect_type=v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE,
-            )
-            status = "missing" if disposition is None else disposition["status"]
-            last_error = "" if disposition is None else disposition["last_error"]
-            await _record_trajectory(
-                trajectory_recorder,
-                "reply_effect_disposition",
-                {
-                    "effect_id": effect_id,
-                    "effect_type": v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE,
-                    "final": True,
-                    "promoted_intermediate": True,
-                    "status": status,
-                    "last_error": last_error,
-                    "duration_ms": round(
-                        max(0, time.monotonic_ns() - delivery_started_ns)
-                        / 1_000_000.0,
-                        3,
-                    ),
-                },
-                best_effort=True,
-            )
-            if status == "applied":
-                source_status = await asyncio.to_thread(
-                    jobs_store.get_job_status,
-                    job_id,
-                    user_id=user_id,
-                    claimed_by=claimed_by,
-                )
-                if source_status != "completed":
-                    raise RuntimeError(
-                        "promoted final reply applied without completing source job"
-                    )
-                if not thinking_trace_emitted:
-                    thinking_trace_emitted = True
-                    await _emit_thinking_surfaced_trace(
-                        deps.emit_debug_trace,
-                        user_id,
-                        provider_config,
-                        lane="chat",
-                        branch="none",
-                        chars=0,
-                    )
-                if not language_trace_emitted:
-                    language_trace_emitted = True
-                    await _emit_reply_language_follow_trace(
-                        deps.emit_debug_trace,
-                        user_id,
-                        user_rows=language_user_rows,
-                        visible_reply=last_promotable_reply_text,
-                        lane="chat",
-                        correction_attempted=False,
-                        correction_outcome="skipped",
-                    )
-                if last_promotable_reply_text:
-                    voice_context = await asyncio.to_thread(
-                        _voice_context_for_seq,
-                        user_id,
-                        cursor_box["seq"],
-                    )
-                    if voice_context is not None:
-                        voice_reply_slot = {
-                            **voice_context,
-                            "message_id": str(payload["envelope"]["id"]),
-                            "text": last_promotable_reply_text,
-                        }
-                final_job_completed_atomically = True
-                return True
-            if (
-                status == "discarded"
-                and last_error == v2_effect_outbox.FINAL_REPLY_INPUT_ADVANCED
-            ):
-                raise v2_tool_loop.FinalReplySuperseded()
-            if (
-                status == "discarded"
-                and last_error == v2_effect_outbox.FINAL_REPLY_INVALID_FENCE
-            ):
-                raise RuntimeError("invalid promoted final reply fence")
-            if (
-                status == "discarded"
-                and last_error == v2_effect_outbox.FINAL_REPLY_SOURCE_JOB_INACTIVE
-            ):
-                raise LostJobLease(
-                    "source job became inactive before reply promotion"
-                )
-            if status == "discarded" and last_error in {
-                v2_effect_outbox.EFFECT_RUNTIME_STATE_CHANGED,
-                v2_effect_outbox.EFFECT_RUNTIME_GENERATION_CHANGED,
-            }:
-                code = (
-                    "runtime_mode_changed"
-                    if last_error
-                    == v2_effect_outbox.EFFECT_RUNTIME_STATE_CHANGED
-                    else "runtime_generation_changed"
-                )
-                await _fail_runtime_fence(
-                    code,
-                    "runtime ownership changed before reply promotion",
-                )
-            raise RuntimeError(
-                "promoted final reply effect not durably applied: " + status
-            )
 
         # `seq` is exclusively the consumed user|human frontier. The base prompt's
         # all-role snapshot bound is passed separately to the fold closure so an
@@ -14555,7 +14228,6 @@ async def process_job(
             build_messages=build_messages,
             dispatch_tools=_dispatch_tools,
             on_reply=_on_reply,
-            on_promote_last_intermediate=_on_promote_last_intermediate,
             on_file_reply=(
                 _on_file_reply if deps.load_workspace_file is not None else None
             ),

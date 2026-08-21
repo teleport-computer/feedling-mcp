@@ -408,7 +408,7 @@ def test_web_search_result_cannot_redirect_model_to_fresh_fetch_url(monkeypatch)
     assert outcome.final_text == "safe fallback"
 
 
-def test_reply_and_durable_write_same_batch_fail_closed(monkeypatch):
+def test_removed_reply_tool_and_durable_write_same_batch_fail_closed(monkeypatch):
     provider_tools = []
     responses = iter([
         {
@@ -430,7 +430,7 @@ def test_reply_and_durable_write_same_batch_fail_closed(monkeypatch):
         return next(responses)
 
     async def _dispatch(_calls):
-        raise AssertionError("mixed reply+write batch must not dispatch")
+        raise AssertionError("removed reply + write batch must not dispatch")
 
     replies = []
 

@@ -1,10 +1,11 @@
 """Tool-schema catalog (Plan C, Task 3 / C1).
 
-Derives one `ToolSpec` per model-facing capability in `capabilities.registry.CAPABILITIES`
-(everything except the internal-only `chat_image_read`, `chat_file_read`, and
-`perception_glance`, which have no model-facing schema) plus the runtime-native `task`, `reply`, and
-`provider_usage` tools.  The unified tool loop handles these specially instead
-of dispatching them through the capability executor. `provider_usage` is
+Derives one `ToolSpec` per model-facing capability in
+`capabilities.registry.CAPABILITIES` (everything except the internal-only
+`chat_image_read`, `chat_file_read`, and `perception_glance`, which have no
+model-facing schema) plus the runtime-native `task` and `provider_usage` tools.
+The unified tool loop handles these specially instead of dispatching them
+through the capability executor. `provider_usage` is
 chat-lane only — it is deliberately absent from `worker._SUBAGENT_ALLOWED_TOOLS`
 (so subagents never see it) and is always withheld from the wake/screen_watch/
 manual_wake lane (see `worker._run_wake`); see Task 5's brief for why it is not
@@ -32,7 +33,6 @@ from perception.agent_fields import (
     FAST_AGENT_PERCEPTION_SIGNALS,
 )
 
-REPLY_TOOL = "reply"
 STAY_SILENT_TOOL = "stay_silent"
 FILE_REPLY_TOOL = "send_file"
 IMAGE_REPLY_TOOL = "generate_image"
@@ -412,12 +412,6 @@ PARAMS: dict[str, dict] = {
         "required": ["prompt"],
     },
 
-    # -- synthetic reply tool --
-    REPLY_TOOL: {
-        "type": "object",
-        "properties": {"text": _STR},
-        "required": ["text"],
-    },
     STAY_SILENT_TOOL: {
         "type": "object",
         "properties": {"reason": _STR},
@@ -739,13 +733,6 @@ DESCRIPTIONS: dict[str, str] = {
     TASK_TOOL: ("Run a bounded isolated subagent on one focused task. The child can "
                 "read workspace/artifact, memory, and web data but cannot reply to "
                 "the user, mutate state, call MCP, or spawn another task."),
-    REPLY_TOOL: (
-        "Send an immediate reply bubble to the user with the given text during a "
-        "long-running task when timely progress feedback is useful. This bubble is "
-        "sent without <think>. If it already says everything you need to say, end "
-        "the turn with no additional visible text and do not repeat it. Continue "
-        "to a final visible answer only when you still have new content for the user."
-    ),
     STAY_SILENT_TOOL: (
         "Choose not to send a proactive message on this wake. Give one short, "
         "specific reason based on the current attention facts. This is a successful, "
@@ -1034,10 +1021,15 @@ def build_tool_specs() -> list[ToolSpec]:
     for name in registry.CAPABILITIES:
         if name in _EXCLUDED:
             continue
-        specs.append(ToolSpec(name=name, description=DESCRIPTIONS[name], parameters=PARAMS[name]))
+        specs.append(
+            ToolSpec(
+                name=name,
+                description=DESCRIPTIONS[name],
+                parameters=PARAMS[name],
+            )
+        )
     for name in (
         TASK_TOOL,
-        REPLY_TOOL,
         STAY_SILENT_TOOL,
         FILE_REPLY_TOOL,
         IMAGE_REPLY_TOOL,

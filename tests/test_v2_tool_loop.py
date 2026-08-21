@@ -459,7 +459,8 @@ def test_foreground_screen_context_does_not_remove_write_surface(monkeypatch):
         name for name in cap_registry.WRITE_ACTIONS if name.startswith("identity_")
     }
     assert identity_writes <= offered
-    assert {"memory_write", "schedule_wake", cap_tool_schema.REPLY_TOOL} <= offered
+    assert {"memory_write", "schedule_wake"} <= offered
+    assert "reply" not in offered
 
 
 def test_provider_image_is_a_terminal_reply_without_synthetic_text(monkeypatch):
@@ -671,15 +672,8 @@ def test_foreground_semantic_empty_response_gets_one_correction(monkeypatch):
     )
 
 
-def test_reply_bubble_promotes_only_after_empty_recovery_is_exhausted(monkeypatch):
+def test_repeated_semantic_empty_fails_after_one_correction(monkeypatch):
     provider = _ScriptedProvider([
-        {
-            "reply": "",
-            "tool_calls": [
-                {"id": "r1", "name": "reply", "args": {"text": "complete answer"}}
-            ],
-            "usage": {},
-        },
         {
             "reply": "",
             "reasoning": "private work with no visible answer",
@@ -697,56 +691,6 @@ def test_reply_bubble_promotes_only_after_empty_recovery_is_exhausted(monkeypatc
     ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     on_reply = _RecordingReply()
-    promotion_calls = []
-
-    async def promote():
-        promotion_calls.append(len(provider.calls))
-        return True
-
-    outcome = asyncio.run(tool_loop.run_tool_loop(
-        provider_config=_TEST_PROVIDER_CONFIG,
-        build_messages=_AdaptiveBuildMessages(),
-        dispatch_tools=_RecordingDispatch(),
-        on_reply=on_reply,
-        on_promote_last_intermediate=promote,
-        fold_new_messages=_RecordingFold([]),
-        add_usage=_noop_add_usage,
-        max_calls=5,
-    ))
-
-    assert len(provider.calls) == 3
-    assert promotion_calls == [3]
-    assert "without visible text" in provider.calls[2]["messages"][0]["content"]
-    assert on_reply.calls == [("complete answer", False)]
-    assert outcome.final_text == ""
-    assert outcome.stop_reason == "intermediate_promoted"
-    assert outcome.replied_intermediate is True
-
-
-def test_first_empty_at_call_budget_never_promotes_reply_bubble(monkeypatch):
-    provider = _ScriptedProvider([
-        {
-            "reply": "",
-            "tool_calls": [
-                {"id": "r1", "name": "reply", "args": {"text": "one moment"}}
-            ],
-            "usage": {},
-        },
-        {
-            "reply": "",
-            "reasoning": "provider produced no visible answer",
-            "stop_reason": "end_turn",
-            "tool_calls": [],
-            "usage": {"completion_tokens": 3930},
-        },
-    ])
-    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
-    on_reply = _RecordingReply()
-    promotion_calls = []
-
-    async def promote():
-        promotion_calls.append(True)
-        return True
 
     with pytest.raises(tool_loop.ProviderEmptyReply, match="empty_reply"):
         asyncio.run(tool_loop.run_tool_loop(
@@ -754,68 +698,15 @@ def test_first_empty_at_call_budget_never_promotes_reply_bubble(monkeypatch):
             build_messages=_AdaptiveBuildMessages(),
             dispatch_tools=_RecordingDispatch(),
             on_reply=on_reply,
-            on_promote_last_intermediate=promote,
             fold_new_messages=_RecordingFold([]),
             add_usage=_noop_add_usage,
-            max_calls=2,
+            max_calls=5,
         ))
 
     assert len(provider.calls) == 2
     assert provider.calls[1]["tools"] is not None
-    assert provider.calls[1]["tool_choice"] == "none"
-    assert on_reply.calls == [("one moment", False)]
-    assert promotion_calls == []
-
-
-def test_empty_recovery_can_still_publish_new_final_after_reply_bubble(monkeypatch):
-    provider = _ScriptedProvider([
-        {
-            "reply": "",
-            "tool_calls": [
-                {"id": "r1", "name": "reply", "args": {"text": "one moment"}}
-            ],
-            "usage": {},
-        },
-        {
-            "reply": "",
-            "reasoning": "provider produced no body",
-            "stop_reason": "end_turn",
-            "tool_calls": [],
-            "usage": {},
-        },
-        {
-            "reply": "different final answer",
-            "stop_reason": "end_turn",
-            "tool_calls": [],
-            "usage": {},
-        },
-    ])
-    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
-    on_reply = _RecordingReply()
-    promotion_calls = []
-
-    async def promote():
-        promotion_calls.append(True)
-        return True
-
-    outcome = asyncio.run(tool_loop.run_tool_loop(
-        provider_config=_TEST_PROVIDER_CONFIG,
-        build_messages=_AdaptiveBuildMessages(),
-        dispatch_tools=_RecordingDispatch(),
-        on_reply=on_reply,
-        on_promote_last_intermediate=promote,
-        fold_new_messages=_RecordingFold([]),
-        add_usage=_noop_add_usage,
-        max_calls=5,
-    ))
-
-    assert promotion_calls == []
-    assert on_reply.calls == [
-        ("one moment", False),
-        ("different final answer", True),
-    ]
-    assert outcome.final_text == "different final answer"
-    assert outcome.stop_reason == "final_text"
+    assert "without visible text" in provider.calls[1]["messages"][0]["content"]
+    assert on_reply.calls == []
 
 
 def test_serialized_upstream_response_envelope_gets_one_correction(monkeypatch):
@@ -1379,7 +1270,7 @@ def test_superseded_final_at_budget_returns_clean_handoff_outcome(monkeypatch):
     assert outcome.replied_intermediate is False
 
 
-def test_child_loop_can_remove_reply_from_the_offered_catalog(monkeypatch):
+def test_reply_is_absent_from_every_loop_catalog(monkeypatch):
     provider = _ScriptedProvider([
         {"reply": "child result", "tool_calls": [], "usage": {}},
     ])
@@ -1393,7 +1284,6 @@ def test_child_loop_can_remove_reply_from_the_offered_catalog(monkeypatch):
         fold_new_messages=_RecordingFold([]),
         add_usage=_noop_add_usage,
         max_calls=2,
-        allow_reply_tool=False,
     ))
 
     offered = {spec.name for spec in provider.calls[0]["tools"]}
@@ -1441,14 +1331,14 @@ def test_task_result_is_external_and_removes_later_writes_and_recursion(
     assert outcome.final_text == "done"
 
 
-def test_intermediate_reply_remains_visible_when_later_final_is_superseded(
+def test_tool_round_has_no_visible_bubble_when_later_final_is_superseded(
     monkeypatch,
 ):
     provider = _ScriptedProvider([
         {
             "reply": "",
             "tool_calls": [
-                {"id": "r1", "name": "reply", "args": {"text": "I am checking"}}
+                {"id": "r1", "name": "memory_search", "args": {"query": "B"}}
             ],
             "usage": {},
         },
@@ -1475,11 +1365,8 @@ def test_intermediate_reply_remains_visible_when_later_final_is_superseded(
         max_calls=4,
     ))
 
-    assert visible == [
-        ("I am checking", False),
-        ("fresh final with B", True),
-    ]
-    assert outcome.replied_intermediate is True
+    assert visible == [("fresh final with B", True)]
+    assert outcome.replied_intermediate is False
     assert outcome.final_text == "fresh final with B"
 
 
@@ -1518,42 +1405,6 @@ def test_preamble_text_with_tool_calls_is_not_a_bubble(monkeypatch):
     assert len(dispatch.calls) == 1
     assert [tc.name for tc in dispatch.calls[0]] == ["memory_search"]
     assert outcome.final_text == "final answer"
-    assert outcome.rounds == 2
-
-
-def test_reply_special_tool_is_immediate_and_continues(monkeypatch):
-    """reply{text} tool_call -> on_reply(text, final=False) fires immediately and the
-    loop continues to a later terminal round."""
-    provider = _ScriptedProvider([
-        {
-            "reply": "",
-            "tool_calls": [{"id": "1", "name": "reply", "args": {"text": "我看看哈"}}],
-            "usage": {},
-        },
-        {"reply": "done", "tool_calls": [], "usage": {}},
-    ])
-    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
-
-    on_reply = _RecordingReply()
-    dispatch = _RecordingDispatch()
-    build_messages = _RecordingBuildMessages()
-    fold = _RecordingFold([])
-
-    outcome = asyncio.run(tool_loop.run_tool_loop(
-        provider_config=_TEST_PROVIDER_CONFIG,
-        build_messages=build_messages,
-        dispatch_tools=dispatch,
-        on_reply=on_reply,
-        fold_new_messages=fold,
-        add_usage=_noop_add_usage,
-        max_calls=5,
-    ))
-
-    assert on_reply.calls == [("我看看哈", False), ("done", True)]
-    # the reply tool_call is handled specially, not routed through dispatch_tools.
-    assert dispatch.calls == []
-    assert outcome.replied_intermediate is True
-    assert outcome.final_text == "done"
     assert outcome.rounds == 2
 
 
@@ -2407,39 +2258,6 @@ def test_native_tool_exchange_keeps_calls_results_and_midturn_user_order(monkeyp
     assert [c.id for c in exchange.calls] == ["c1"]
     assert [(r.call_id, r.content) for r in exchange.results] == [("c1", "found x")]
     assert build_messages.calls[1][1] == new_msg
-
-
-def test_reply_tool_also_gets_call_id_matched_result(monkeypatch):
-    provider = _ScriptedProvider([
-        {
-            "reply": "",
-            "tool_calls": [{"id": "r1", "name": "reply", "args": {"text": "one sec"}}],
-            "usage": {},
-        },
-        {"reply": "done", "tool_calls": [], "usage": {}},
-    ])
-    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
-    build_messages = _RecordingBuildMessages()
-    activity = []
-
-    async def on_tool_event(tc, kind, payload):
-        activity.append((tc.id, tc.name, kind, payload.get("result")))
-
-    asyncio.run(tool_loop.run_tool_loop(
-        provider_config=_TEST_PROVIDER_CONFIG, build_messages=build_messages,
-        dispatch_tools=_RecordingDispatch(), on_reply=_RecordingReply(),
-        fold_new_messages=_RecordingFold([[]]), add_usage=_noop_add_usage,
-        max_calls=5, on_tool_event=on_tool_event,
-    ))
-
-    exchange = build_messages.calls[1][0]
-    assert [r.call_id for r in exchange.results] == ["r1"]
-    assert exchange.results[0].content.startswith("ok:")
-    assert [(call_id, name, kind) for call_id, name, kind, _ in activity] == [
-        ("r1", "reply", "tool_call_started"),
-        ("r1", "reply", "tool_call_result"),
-    ]
-    assert activity[-1][3].content == "ok: reply delivered"
 
 
 def test_malformed_args_gets_one_tools_disabled_fallback_without_dispatch(monkeypatch):
