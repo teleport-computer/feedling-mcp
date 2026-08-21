@@ -28,10 +28,14 @@ _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 class _Contract:
     source_fetch_sql: str
     destination_fetch_sql: str
+    audit_fetch_sql: str
     insert_sql: str
     delete_sql: str
     json_indices: tuple[int, ...]
     by_user_only: bool = False
+    # Frame audits deliberately compare compact, database-local transport
+    # fingerprints.  The persisted SHA-256 marker remains the plan authority.
+    audit_uses_marker_digest: bool = False
 
     def args(self, user_id: str, item_id: str) -> tuple[str, ...]:
         return (user_id,) if self.by_user_only else (user_id, item_id)
@@ -49,6 +53,9 @@ CONTRACTS: dict[str, _Contract] = {
         "FROM chat_messages WHERE user_id=%s AND msg_id=%s",
         "SELECT user_id,msg_id,ts,doc,seq,storage_generation "
         "FROM chat_messages WHERE user_id=%s AND msg_id=%s",
+        "SELECT user_id,msg_id,ts,doc,seq,storage_generation "
+        "FROM chat_messages WHERE (user_id,msg_id) IN "
+        "(SELECT * FROM unnest(%s::text[],%s::text[]))",
         "INSERT INTO chat_messages "
         "(user_id,msg_id,ts,doc,seq,storage_generation) "
         "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s,%s)",
@@ -60,6 +67,9 @@ CONTRACTS: dict[str, _Contract] = {
         "WHERE user_id=%s AND moment_id=%s",
         "SELECT user_id,moment_id,occurred_at,doc FROM memory_moments "
         "WHERE user_id=%s AND moment_id=%s",
+        "SELECT user_id,moment_id,occurred_at,doc FROM memory_moments "
+        "WHERE (user_id,moment_id) IN "
+        "(SELECT * FROM unnest(%s::text[],%s::text[]))",
         "INSERT INTO memory_moments (user_id,moment_id,occurred_at,doc) "
         "VALUES (%s,%s,%s,%s)",
         "DELETE FROM memory_moments WHERE user_id=%s AND moment_id=%s",
@@ -70,6 +80,8 @@ CONTRACTS: dict[str, _Contract] = {
         "WHERE user_id=%s AND kind='identity'",
         "SELECT user_id,kind,doc FROM user_blobs "
         "WHERE user_id=%s AND kind='identity'",
+        "SELECT user_id,kind,doc FROM user_blobs "
+        "WHERE kind='identity' AND user_id = ANY(%s::text[])",
         "INSERT INTO user_blobs (user_id,kind,doc) VALUES (%s,%s,%s)",
         "DELETE FROM user_blobs WHERE user_id=%s AND kind='identity'",
         (2,),
@@ -80,11 +92,16 @@ CONTRACTS: dict[str, _Contract] = {
         "FROM frame_envelopes WHERE user_id=%s AND frame_id=%s",
         "SELECT user_id,frame_id,ts,doc,env_meta,body_key "
         "FROM frame_envelopes WHERE user_id=%s AND frame_id=%s",
+        "SELECT user_id,frame_id,ts,md5(doc::text),octet_length(doc::text),"
+        "md5(env_meta::text),octet_length(env_meta::text),body_key "
+        "FROM frame_envelopes WHERE (user_id,frame_id) IN "
+        "(SELECT * FROM unnest(%s::text[],%s::text[]))",
         "INSERT INTO frame_envelopes "
         "(user_id,frame_id,ts,doc,env_meta,body_key) "
         "VALUES (%s,%s,%s,%s,%s,%s)",
         "DELETE FROM frame_envelopes WHERE user_id=%s AND frame_id=%s",
         (3, 4),
+        audit_uses_marker_digest=True,
     ),
 }
 
@@ -358,6 +375,38 @@ def build_revert_plan(source, destination) -> PreservationPlan:
     return _finish_plan(rows, counts, blocker_counts)
 
 
+def _fetch_keyed_rows(
+    connection,
+    query: str,
+    keys: Sequence[tuple[str, str]],
+    *,
+    by_user_only: bool = False,
+) -> dict[tuple[str, str], tuple]:
+    """Fetch one table's keyed projections in a single gateway round trip."""
+    fetched: dict[tuple[str, str], tuple] = {}
+    if not keys:
+        return fetched
+    user_ids = [user_id for user_id, _item_id in keys]
+    args = (
+        (user_ids,)
+        if by_user_only
+        else (user_ids, [item_id for _user_id, item_id in keys])
+    )
+    rows = [tuple(row) for row in connection.execute(query, args).fetchall()]
+    if by_user_only:
+        # Historical identity markers have used both the user id and the blob
+        # kind as item_id.  The row itself is keyed only by user_id, so retain
+        # each exact requested marker key instead of inventing one from kind.
+        by_user = {str(row[0]): row for row in rows}
+        for user_id, item_id in keys:
+            if user_id in by_user:
+                fetched[(user_id, item_id)] = by_user[user_id]
+        return fetched
+    for row_tuple in rows:
+        fetched[(str(row_tuple[0]), str(row_tuple[1]))] = row_tuple
+    return fetched
+
+
 def audit_preserved(
     source,
     destination,
@@ -368,6 +417,8 @@ def audit_preserved(
     counts: Counter[str] = Counter()
     mismatch_counts: Counter[tuple[str, str]] = Counter()
     valid_keys: set[tuple[str, str, str]] = set()
+    candidates: list[tuple[PreservedPending, str, str, _Contract]] = []
+    keys_by_table: dict[str, list[tuple[str, str]]] = {}
 
     for marker in sorted(
         markers, key=lambda row: (row.table, row.user_id, row.item_id)
@@ -381,29 +432,57 @@ def audit_preserved(
         if contract is None:
             mismatch_counts[("unknown_table", marker.table)] += 1
             continue
-        args = contract.args(marker.user_id, marker.item_id)
-        source_row = source.execute(contract.source_fetch_sql, args).fetchone()
+        candidates.append((marker, marker_digest, original_reason, contract))
+        keys_by_table.setdefault(marker.table, []).append(
+            (marker.user_id, marker.item_id)
+        )
+
+    source_rows: dict[str, dict[tuple[str, str], tuple]] = {}
+    destination_rows: dict[str, dict[tuple[str, str], tuple]] = {}
+    for table, keys in sorted(keys_by_table.items()):
+        contract = CONTRACTS[table]
+        source_rows[table] = _fetch_keyed_rows(
+            source,
+            contract.audit_fetch_sql,
+            keys,
+            by_user_only=contract.by_user_only,
+        )
+        destination_rows[table] = _fetch_keyed_rows(
+            destination,
+            contract.audit_fetch_sql,
+            keys,
+            by_user_only=contract.by_user_only,
+        )
+
+    frame_keys = keys_by_table.get("frame_envelopes", [])
+    duplicate_frames = _fetch_keyed_rows(
+        destination,
+        "SELECT user_id,frame_id FROM frames WHERE (user_id,frame_id) IN "
+        "(SELECT * FROM unnest(%s::text[],%s::text[]))",
+        frame_keys,
+    )
+
+    for marker, marker_digest, original_reason, contract in candidates:
+        key = (marker.user_id, marker.item_id)
+        source_row = source_rows[marker.table].get(key)
         if source_row is None:
             mismatch_counts[("missing_source", marker.table)] += 1
             continue
-        source_tuple = tuple(source_row)
-        row_sha256 = canonical_row_sha256(marker.table, source_tuple)
-        if marker_digest != row_sha256:
-            mismatch_counts[("marker_digest_mismatch", marker.table)] += 1
-            continue
-        destination_row = destination.execute(
-            contract.destination_fetch_sql, args
-        ).fetchone()
+        if contract.audit_uses_marker_digest:
+            row_sha256 = marker_digest
+        else:
+            row_sha256 = canonical_row_sha256(marker.table, source_row)
+            if marker_digest != row_sha256:
+                mismatch_counts[("marker_digest_mismatch", marker.table)] += 1
+                continue
+        destination_row = destination_rows[marker.table].get(key)
         if destination_row is None:
             mismatch_counts[("missing_preserved_destination", marker.table)] += 1
             continue
-        if tuple(destination_row) != source_tuple:
+        if destination_row != source_row:
             mismatch_counts[("destination_conflict", marker.table)] += 1
             continue
-        if marker.table == "frame_envelopes" and destination.execute(
-            "SELECT 1 FROM frames WHERE user_id=%s AND frame_id=%s",
-            (marker.user_id, marker.item_id),
-        ).fetchone() is not None:
+        if marker.table == "frame_envelopes" and key in duplicate_frames:
             mismatch_counts[("duplicate_frame_representation", marker.table)] += 1
             continue
         valid_rows.append(
@@ -413,7 +492,7 @@ def audit_preserved(
                 item_id=marker.item_id,
                 original_reason=original_reason,
                 current_reason=marker.reason,
-                source_row=source_tuple,
+                source_row=source_row,
                 row_sha256=row_sha256,
                 destination_state="exact",
             )

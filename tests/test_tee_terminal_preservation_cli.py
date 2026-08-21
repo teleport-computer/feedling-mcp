@@ -18,6 +18,99 @@ def _empty_plan() -> preservation.PreservationPlan:
     )
 
 
+def test_audit_preserved_groups_contract_reads_by_table_for_gateway():
+    """Large frames use one compact checksum query per database."""
+    rows = {
+        ("usr_gateway", f"frame-{index:03d}"): (
+            "usr_gateway",
+            f"frame-{index:03d}",
+            float(index),
+            {"body_ct": "cipher" * 1000, "index": index},
+            {"nonce": f"nonce-{index}"},
+            None,
+        )
+        for index in range(120)
+    }
+    audit_rows = {
+        key: (row[0], row[1], row[2], f"doc-{index}", len(str(row[3])),
+              f"meta-{index}", len(str(row[4])), row[5])
+        for index, (key, row) in enumerate(rows.items())
+    }
+    markers = [
+        preservation.PreservedPending(
+            user_id=user_id,
+            table="frame_envelopes",
+            item_id=item_id,
+            reason=preservation.encode_preserved_reason(
+                preservation.canonical_row_sha256("frame_envelopes", row),
+                "decrypt_failed:historical",
+            ),
+        )
+        for (user_id, item_id), row in rows.items()
+    ]
+
+    class Cursor:
+        def __init__(self, fetched):
+            self._fetched = fetched
+
+        def fetchall(self):
+            return self._fetched
+
+    class BatchOnlyConnection:
+        def __init__(self):
+            self.batch_sizes: list[int] = []
+
+        def execute(self, query, args):
+            if "FROM frames " in query:
+                return Cursor([])
+            assert "unnest" in query, "audit issued a point read"
+            assert "md5(doc::text)" in query
+            assert "octet_length(doc::text)" in query
+            user_ids, item_ids = args
+            assert len(user_ids) == len(item_ids)
+            self.batch_sizes.append(len(user_ids))
+            return Cursor(
+                [audit_rows[key] for key in zip(user_ids, item_ids) if key in rows]
+            )
+
+    source = BatchOnlyConnection()
+    destination = BatchOnlyConnection()
+
+    audit = preservation.audit_preserved(source, destination, markers)
+
+    assert audit.preserved == 120
+    assert audit.counts == {"frame_envelopes": 120}
+    assert audit.mismatches == ()
+    assert source.batch_sizes == [120]
+    assert destination.batch_sizes == [120]
+
+
+def test_identity_batch_lookup_preserves_historical_marker_item_ids():
+    """Identity markers are compatible with both item-id conventions."""
+
+    class Cursor:
+        def fetchall(self):
+            return [("usr_identity", "identity", {"body_ct": "cipher"})]
+
+    class Connection:
+        def execute(self, query, args):
+            assert args == (["usr_identity", "usr_identity"],)
+            return Cursor()
+
+    row = ("usr_identity", "identity", {"body_ct": "cipher"})
+    fetched = preservation._fetch_keyed_rows(
+        Connection(),
+        preservation.CONTRACTS["identity"].audit_fetch_sql,
+        [("usr_identity", "usr_identity"), ("usr_identity", "identity")],
+        by_user_only=True,
+    )
+
+    assert fetched == {
+        ("usr_identity", "usr_identity"): row,
+        ("usr_identity", "identity"): row,
+    }
+
+
 def test_apply_ignores_source_read_only_cleanup_eof_after_destination_commit(
     monkeypatch,
 ):

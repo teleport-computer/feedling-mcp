@@ -183,6 +183,14 @@ device only when its `K_user` is still valid. Preservation does not synthesize a
 working `K_enclave` and therefore does not make previously undecryptable content
 readable to hosted agents.
 
+The Phase 4 re-audit does not transfer large inline frame ciphertext back
+through the database gateway. For `frame_envelopes` only, each database computes
+an ephemeral MD5 plus UTF-8 text length for the large JSON columns and the
+operator compares those transport checksums with the remaining scalar columns.
+This MD5 is not encryption, authentication, or an ownership proof and is never
+stored; the already-reviewed SHA-256 preservation marker remains the ownership
+and plan-digest authority.
+
 Before the first TEE-primary write, the exact operation can be reversed with the
 same reviewed count and digest:
 
