@@ -489,6 +489,17 @@ def test_memory_search_shares_the_index_filters_it_already_consumes():
     ) is None
 
 
+def test_worldbook_match_is_pull_only_and_requires_query():
+    spec = next(
+        item for item in tool_schema.build_tool_specs()
+        if item.name == "worldbook_match"
+    )
+
+    assert spec.parameters["required"] == ["query"]
+    assert set(spec.parameters["properties"]) == {"query"}
+    assert "Do not call it for ordinary conversation" in spec.description
+
+
 def test_identity_patch_description_names_the_irregular_replace_key():
     """描述教模型 `replace_<field>`,list 字段列的是 "signature"(单数),
     模型自然推出 `replace_signature` —— 而实现唯一认的是 `replace_signatures`(复数)。

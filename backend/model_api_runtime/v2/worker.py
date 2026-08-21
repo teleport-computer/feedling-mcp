@@ -726,6 +726,7 @@ _SUBAGENT_ALLOWED_TOOLS = frozenset(
         "memory_index",
         "memory_search",
         "memory_fetch",
+        "worldbook_match",
         "web_search",
         "web_fetch",
     }
@@ -5303,8 +5304,8 @@ def _make_task_batch_dispatcher(
                     exc,
                 ),
                 disabled_tool_names=child_disabled_tools,
-                # 子 agent 的整个工具面只有 7 件,其中只有 memory_search 是常驻。
-                # 压力折叠会把另外 6 件折成空参数表,而子 agent **没有恢复口**:
+                # 子 agent 的整个工具面只有 8 件,其中只有 memory_search 是常驻。
+                # 压力折叠会把另外 7 件折成空参数表,而子 agent **没有恢复口**:
                 # mcp_tool_search 不在 _SUBAGENT_ALLOWED_TOOLS 里,折掉就再也
                 # 拿不回来。与其让它看着名字填不出参数,不如全部保护 —— 真放不下
                 # 时 PromptFrontierExhausted 是一次可见的失败,好过静默失能。
@@ -12421,35 +12422,11 @@ async def process_job(
         else:
             summary, tail = "", []
 
+        # Foreground World Book reads are model-visible and pull-only through
+        # worldbook_match. This avoids decrypting and injecting unrelated lore
+        # on every API-key chat/voice turn. The wake lane intentionally keeps
+        # its eager empty-message read above so alwaysOn entries still apply.
         worldbook_context = ""
-        if lane == "chat" and deps.read_worldbook_context is not None:
-            worldbook_match_messages = [
-                {
-                    "role": "user",
-                    "content": context.text_of(row.get("content")),
-                }
-                for row in coalesced
-                if context.text_of(row.get("content")).strip()
-            ]
-            if worldbook_match_messages:
-                try:
-                    async with enclave_sem:
-                        worldbook_result = await asyncio.to_thread(
-                            deps.read_worldbook_context,
-                            user_id,
-                            worldbook_match_messages,
-                            runtime_token=runtime_token,
-                        )
-                    if isinstance(worldbook_result, dict):
-                        worldbook_context = str(
-                            worldbook_result.get("block") or ""
-                        ).strip()
-                except Exception as exc:  # noqa: BLE001 — V1 parity: best effort
-                    log.warning(
-                        "[v2.worldbook] match unavailable user=%s code=%s",
-                        user_id,
-                        type(exc).__name__.lower(),
-                    )
 
         temporal_snapshot = await _capture_turn_temporal_snapshot(
             user_id=user_id,

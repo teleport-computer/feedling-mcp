@@ -28,7 +28,7 @@ def _model_limit(context_window_tokens: int = 2_048) -> frontier.ModelPromptLimi
 
 
 _REAL_TOOL_COUNT = 69
-_REAL_TOOL_CATALOG_BYTES = 34_800
+_REAL_TOOL_CATALOG_BYTES = 35_118
 
 
 def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
@@ -36,7 +36,7 @@ def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
 
     The fixture is derived from the real platform catalog rather than copying a
     toy schema list. ASCII description padding makes the combined canonical
-    payload exactly 34,800 bytes while keeping 69 independently named tools.
+    payload exactly 35,118 bytes while keeping 69 independently named tools.
     The 2026-08-17 increase records the real `stay_silent` wake schema: it adds
     341 bytes by itself and 267 bytes net when replacing one synthetic MCP tool
     in this fixed-count mixed catalog.
@@ -48,6 +48,8 @@ def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
     memory tools, memory_organize now makes the direct bulk-action route
     explicit, and identity_dimensions_set makes its identity_get step
     conditional instead of unconditional. It records catalog size only.
+    The 2026-08-21 increase to 35,118 records the pull-only worldbook_match
+    schema while preserving the captured MCP description padding.
     """
     platform = list(tool_schema.build_tool_specs())
     mcp_count = _REAL_TOOL_COUNT - len(platform)
@@ -1003,7 +1005,7 @@ def test_under_pressure_policy_keeps_full_fit_and_leaves_search_latent():
     assert not plan.schema_recovery_needed
 
 
-def test_runtime_v2_catalog_has_five_resident_and_thirty_one_foldable_tools():
+def test_runtime_v2_catalog_has_five_resident_and_thirty_two_foldable_tools():
     specs = tool_schema.build_tool_specs()
     resident = [
         spec for spec in specs
@@ -1015,7 +1017,7 @@ def test_runtime_v2_catalog_has_five_resident_and_thirty_one_foldable_tools():
     ]
 
     assert len(resident) == 5
-    assert len(foldable) == 31
+    assert len(foldable) == 32
     assert all(
         len(tool_surface.collapsed_tool_spec(spec).description)
         <= tool_surface.MAX_COLLAPSED_DESCRIPTION_CHARS

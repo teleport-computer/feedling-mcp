@@ -28,6 +28,8 @@ HTTP mode:
   AGENT_HTTP_TOKEN      Bearer token (optional)
   AGENT_HTTP_PROTOCOL   "simple" (POST {"message"}) or "openai" for Hermes
   AGENT_HTTP_FIELD      JSON response field containing the reply (default: "response")
+  AGENT_HTTP_CANCEL_URL Optional endpoint for cancelling an obsolete voice
+                        request. Receives {"request_id": "..."}.
 
 CLI mode:
   AGENT_CLI_CMD         Full command template; {message} is replaced with the
@@ -82,14 +84,21 @@ Optional:
                         Default true. Agent failures post a visible, bounded
                         failure reply instead of silently dropping the turn.
   FALLBACK_REPLY        Optional user-visible fallback text
-  AGENT_SESSION_MAX_TURNS / AGENT_SESSION_MAX_BYTES
+  AGENT_SESSION_MAX_TURNS / AGENT_SESSION_MAX_BYTES /
+  AGENT_SESSION_MAX_INPUT_TOKENS
                         Bound resident-owned CLI/HTTP sessions. When either
                         limit is reached, the next turn starts a fresh session.
+  FEEDLING_MINIMAL_RUNTIME_PROFILE
+                        "auto" (default), "on", or "off". Removes optional
+                        CLI catalogs that are not part of the IO voice runtime.
+  FEEDLING_CODEX_APP_SERVER_STREAM
+                        "auto" (default), "on", or "off". For Codex voice
+                        turns, use App Server deltas when the configured command
+                        can be translated without changing user model/reasoning
+                        settings; otherwise keep the existing exec path.
   IMAGE_TEMP_DIR        Where decrypted chat images are written for CLI agents
-  SCREEN_CONTEXT_MODE   "on_mention" (default), "always", or "off". When active,
-                        recent screen-sharing context is attached to screen
-                        questions so the agent does not need to run curl/MCP
-                        commands from its own sandbox.
+  SCREEN_CONTEXT_MODE   "tool" (default), "auto"/"always", or "off". In tool
+                        mode the model uses screen-recent/screen-read on demand.
   POLL_TIMEOUT          Long-poll timeout in seconds (default: 30)
   FEEDLING_RESIDENT_BUSY_POLL_INTERVAL_SEC
                         Claim-free liveness poll cadence while a foreground
@@ -304,6 +313,10 @@ AGENT_HTTP_SESSION_HEADER = os.environ.get(
 AGENT_HTTP_SESSION_KEY_HEADER = os.environ.get(
     "AGENT_HTTP_SESSION_KEY_HEADER", "X-Hermes-Session-Key"
 )
+AGENT_HTTP_CANCEL_URL = os.environ.get("AGENT_HTTP_CANCEL_URL", "").strip()
+AGENT_HTTP_REQUEST_ID_HEADER = os.environ.get(
+    "AGENT_HTTP_REQUEST_ID_HEADER", "X-Feedling-Request-Id"
+).strip()
 
 AGENT_CLI_CMD = os.environ.get("AGENT_CLI_CMD", "")
 # Per-turn subprocess cap for the CLI agent. Default 300s: the managed
@@ -496,24 +509,45 @@ AGENT_SESSION_FILE_TEMPLATE = os.environ.get(
 )
 AGENT_SESSION_MAX_TURNS = int(os.environ.get("AGENT_SESSION_MAX_TURNS", "40"))
 AGENT_SESSION_MAX_BYTES = int(os.environ.get("AGENT_SESSION_MAX_BYTES", "250000"))
+# Provider-reported input is an exact signal for the model's effective context.
+# Local Codex voice measurements reached ~18K tokens on the cold turn and ~34K
+# on the first resume, so waiting for the older 64K content-window guard allowed
+# a third increasingly expensive turn. Rotate after ~32K instead: one resume is
+# still available for prompt-cache/session continuity, while the following turn
+# re-grounds from the bounded canonical bridge. Completed replies are never
+# truncated.
+AGENT_SESSION_MAX_INPUT_TOKENS = int(
+    os.environ.get("AGENT_SESSION_MAX_INPUT_TOKENS", "32768")
+)
 AGENT_SESSION_ROTATE_PREFIX = os.environ.get("AGENT_SESSION_ROTATE_PREFIX", "feedling-io")
+CODEX_SESSION_RESUME = _env_bool("FEEDLING_CODEX_SESSION_RESUME", True)
+MINIMAL_RUNTIME_PROFILE = os.environ.get(
+    "FEEDLING_MINIMAL_RUNTIME_PROFILE", "auto"
+).strip().lower()
+CODEX_APP_SERVER_STREAM = os.environ.get(
+    "FEEDLING_CODEX_APP_SERVER_STREAM", "auto"
+).strip().lower()
+VOICE_STREAM_FINAL_ATTEMPTS = max(
+    1, int(os.environ.get("FEEDLING_VOICE_STREAM_FINAL_ATTEMPTS", "3"))
+)
 HERMES_SESSION_REASONING_MAX_BYTES = int(os.environ.get("HERMES_SESSION_REASONING_MAX_BYTES", "2000000"))
 CODEX_SESSION_REASONING_MAX_BYTES = int(os.environ.get("CODEX_SESSION_REASONING_MAX_BYTES", "8000000"))
 IMAGE_TEMP_DIR = Path(os.environ.get(
     "IMAGE_TEMP_DIR",
     f"/tmp/feedling_chat_images_{CHECKPOINT_API_KEY_FINGERPRINT}"))
-SCREEN_CONTEXT_MODE = os.environ.get("SCREEN_CONTEXT_MODE", "on_mention").strip().lower()
+SCREEN_CONTEXT_MODE = os.environ.get("SCREEN_CONTEXT_MODE", "tool").strip().lower()
 SCREEN_CONTEXT_MAX_AGE_SEC = 90
 SCREEN_CONTEXT_INCLUDE_IMAGE = _env_bool("SCREEN_CONTEXT_INCLUDE_IMAGE", True)
+FOREGROUND_WORLDBOOK_CONTEXT_MODE = os.environ.get(
+    "FEEDLING_FOREGROUND_WORLDBOOK_CONTEXT", "tool"
+).strip().lower()
 SCREEN_VISION_TEST_STATUS = os.environ.get(
     "FEEDLING_AGENT_VISION_TEST_STATUS", "untested"
 ).strip().lower()
-# Foreground chat continuity. codex has no --resume and the HOSTED claude command
-# carries no durable session, so those runs otherwise forget everything after the
-# first turn. When active we prepend a short recent-chat transcript to each
-# foreground turn so continuity does not depend on the agent's own session.
-#   auto (default) — inject for codex always, and for claude only when HOSTED
-#                    (in-CVM run, no durable session store). A self-hosted
+# Foreground chat continuity. Resume-capable runtimes get one canonical Enclave
+# bridge per session; stateless Codex and hosted Claude get it on every turn.
+#   auto (default) — inject once for Codex with `exec resume`, always for older
+#                    Codex, and for Claude only when HOSTED. A self-hosted
 #                    resident's local claude has a reliable --resume and keeps
 #                    its persistent session instead — injecting there replaced
 #                    the session with a cold start per turn (7f3ff266 fallout;
@@ -524,10 +558,10 @@ SCREEN_VISION_TEST_STATUS = os.environ.get(
 FOREGROUND_CHAT_CONTEXT_MODE = os.environ.get(
     "FEEDLING_FOREGROUND_CHAT_CONTEXT", "auto"
 ).strip().lower()
-# 50 messages ≈ 25 full rounds; this default sits exactly at the clamp in
-# _recent_chat_context_for_foreground — raise both together or the extra is
-# silently dropped.
-FOREGROUND_CHAT_CONTEXT_LIMIT = int(os.environ.get("FEEDLING_FOREGROUND_CHAT_CONTEXT_LIMIT", "50"))
+# Eight meaningful rows bridge a cold/rebuilt runtime without replaying a large
+# archive. Canonical history stays in the Enclave, and voice archives remain
+# available through voice-transcript-* tools.
+FOREGROUND_CHAT_CONTEXT_LIMIT = int(os.environ.get("FEEDLING_FOREGROUND_CHAT_CONTEXT_LIMIT", "8"))
 FOREGROUND_CHAT_CONTEXT_HEADER = os.environ.get(
     "FEEDLING_FOREGROUND_CHAT_CONTEXT_HEADER",
     # 反开机仪式护栏:注入路径下每轮都是新模型会话,自带"唤醒仪式"的 persona
@@ -643,6 +677,13 @@ except (TypeError, ValueError):
 # Retry transient failures in-cycle with a short bounded backoff instead.
 ENCLAVE_FETCH_MAX_ATTEMPTS = max(1, int(os.environ.get("FEEDLING_ENCLAVE_FETCH_ATTEMPTS", "3")))
 ENCLAVE_FETCH_BACKOFF_SEC = float(os.environ.get("FEEDLING_ENCLAVE_FETCH_BACKOFF_SEC", "0.5"))
+ENCLAVE_CONNECT_TIMEOUT_SEC = max(
+    0.1, float(os.environ.get("FEEDLING_ENCLAVE_CONNECT_TIMEOUT_SEC", "5"))
+)
+ENCLAVE_READ_TIMEOUT_SEC = max(
+    ENCLAVE_CONNECT_TIMEOUT_SEC,
+    float(os.environ.get("FEEDLING_ENCLAVE_READ_TIMEOUT_SEC", "20")),
+)
 _RETRYABLE_ENCLAVE_STATUS = frozenset({429, 502, 503, 504})
 WHOAMI_STARTUP_RETRIES = int(os.environ.get("WHOAMI_STARTUP_RETRIES", "8"))
 WHOAMI_STARTUP_RETRY_DELAY_SEC = float(
@@ -2168,9 +2209,19 @@ def _maybe_self_update(poll_result: Any) -> None:
         _run_self_update(target)
 
 
-# Separate HTTP client for the enclave (self-signed TLS, verify=False).
+# Healthy Test TLS handshakes measured around 1.3s; broken handshakes otherwise
+# consumed the old 20s all-phase timeout. Keep the successful read budget intact.
+def _enclave_http_timeout() -> httpx.Timeout:
+    return httpx.Timeout(
+        ENCLAVE_READ_TIMEOUT_SEC,
+        connect=ENCLAVE_CONNECT_TIMEOUT_SEC,
+    )
+
+
 _ENCLAVE_CLIENT: httpx.Client | None = (
-    httpx.Client(timeout=20, verify=False) if FEEDLING_ENCLAVE_URL else None
+    httpx.Client(timeout=_enclave_http_timeout(), verify=False)
+    if FEEDLING_ENCLAVE_URL
+    else None
 )
 
 # Pooled client for everything that is NOT the enclave — the backend API and the
@@ -2208,7 +2259,9 @@ def _client_for(root: str) -> httpx.Client:
     global _ENCLAVE_CLIENT
     if FEEDLING_ENCLAVE_URL and root.rstrip("/") == FEEDLING_ENCLAVE_URL.rstrip("/"):
         if _ENCLAVE_CLIENT is None:
-            _ENCLAVE_CLIENT = httpx.Client(timeout=20, verify=False)
+            _ENCLAVE_CLIENT = httpx.Client(
+                timeout=_enclave_http_timeout(), verify=False
+            )
         return _ENCLAVE_CLIENT
     return _HTTP
 
@@ -3641,14 +3694,12 @@ def _message_for_agent(content: str, image_paths: list[str] | None = None) -> st
 def _should_attach_screen_context(_content: str = "") -> bool:
     """Whether live screen frames may be attached to a V1 chat turn.
 
-    ``auto`` used to inspect message wording.  A live share is now the only
-    content-independent trigger; freshness is checked immediately afterwards.
-    Explicitly disabled deployments remain disabled.
+    The default ``tool`` mode performs no automatic network/decrypt work; the
+    model can use screen-recent/screen-read when screen context matters. Legacy
+    eager modes remain as an operator rollback.
     """
     mode = SCREEN_CONTEXT_MODE
-    if mode in {"0", "false", "off", "none", "disabled"}:
-        return False
-    return True
+    return mode in {"1", "true", "on", "auto", "always", "on_mention"}
 
 
 def _fetch_screen_json(path: str) -> dict | None:
@@ -3873,6 +3924,10 @@ def _screen_context_for_message(content: str) -> tuple[str, list[dict[str, str]]
 
 
 def _worldbook_context_for_foreground(content: str) -> str:
+    if FOREGROUND_WORLDBOOK_CONTEXT_MODE not in {
+        "1", "true", "on", "auto", "always", "eager",
+    }:
+        return ""
     text = str(content or "").strip()
     if not text:
         return ""
@@ -5692,6 +5747,22 @@ def _pi_message_text(message: Any) -> str:
     return "\n\n".join(texts)
 
 
+def _visible_stream_text(text: str) -> str:
+    """Project cumulative model text to speech-safe visible text."""
+    raw = str(text or "")
+    head = raw.lstrip()
+    lowered = re.sub(r"\s+", "", head[:24].lower())
+    thinking_openers = ("<think>", "<thinking>", "<reasoning>", "<thought>")
+    if lowered.startswith("<") and any(
+        opener.startswith(lowered) for opener in thinking_openers
+    ):
+        return ""
+    if head.startswith(("{", "[", "```json", "```JSON")):
+        return ""
+    visible, _thinking = _split_tagged_thinking(raw)
+    return visible
+
+
 class _PiStreamObserver:
     """Project Pi's cumulative JSONL snapshots into monotonic answer segments."""
 
@@ -5715,11 +5786,14 @@ class _PiStreamObserver:
             return
         if event_type not in {"message_update", "message_end"}:
             return
-        text = _pi_message_text(message)
-        if not text:
+        raw_text = _pi_message_text(message)
+        if not raw_text:
             return
         if self._segment < 0:
             self._segment = 0
+        text = _visible_stream_text(raw_text)
+        if not text:
+            return
         previous = self._seen.get(self._segment, "")
         if text == previous:
             return
@@ -5731,13 +5805,144 @@ class _PiStreamObserver:
         self._publish(self._segment, text, event_type == "message_end")
 
 
+class _ClaudeStreamObserver:
+    """Project Claude stream-json visible text deltas into answer segments."""
+
+    def __init__(self, publish: Callable[[int, str, bool], None]):
+        self._publish = publish
+        self._segment = -1
+        self._raw: dict[int, str] = {}
+        self._visible: dict[int, str] = {}
+
+    def feed(self, line: str) -> None:
+        try:
+            outer = json.loads(line)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(outer, dict) or outer.get("type") != "stream_event":
+            return
+        event = outer.get("event")
+        if not isinstance(event, dict):
+            return
+        event_type = str(event.get("type") or "")
+        if event_type == "message_start":
+            self._segment = min(31, self._segment + 1)
+            return
+        if event_type != "content_block_delta":
+            return
+        delta = event.get("delta")
+        if not isinstance(delta, dict) or delta.get("type") != "text_delta":
+            return
+        piece = delta.get("text")
+        if not isinstance(piece, str) or not piece:
+            return
+        if self._segment < 0:
+            self._segment = 0
+        raw = self._raw.get(self._segment, "") + piece
+        self._raw[self._segment] = raw
+        visible = _visible_stream_text(raw)
+        previous = self._visible.get(self._segment, "")
+        if not visible or visible == previous:
+            return
+        if previous and not visible.startswith(previous):
+            return
+        self._visible[self._segment] = visible
+        self._publish(self._segment, visible, False)
+
+
+class _CodexStreamObserver:
+    """Use Codex JSON events when the installed CLI exposes visible deltas."""
+
+    def __init__(self, publish: Callable[[int, str, bool], None]):
+        self._publish = publish
+        self._segment = -1
+        self._raw = ""
+        self._visible = ""
+
+    def _start(self) -> None:
+        self._segment = min(31, self._segment + 1)
+        self._raw = ""
+        self._visible = ""
+
+    def _snapshot(self, raw: str, *, final: bool) -> None:
+        if self._segment < 0:
+            self._start()
+        # Buffer transport text even while it is not speech-visible. A tagged
+        # thinking opener commonly arrives split as "<th" + "ink>...". If the
+        # hidden first piece is discarded here, the next piece looks like plain
+        # visible text ("ink>...") and leaks reasoning; the completed full item
+        # then appears non-prefix and starts a second, duplicate speech segment.
+        self._raw = raw
+        visible = _visible_stream_text(raw)
+        if not visible or visible == self._visible:
+            return
+        if self._visible and not visible.startswith(self._visible):
+            return
+        self._visible = visible
+        self._publish(self._segment, visible, final)
+
+    def feed(self, line: str) -> None:
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(event, dict):
+            return
+        event_type = str(event.get("type") or "")
+        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        item_type = str(item.get("type") or "")
+
+        if event_type == "item.started" and item_type == "agent_message":
+            self._start()
+            return
+        if event_type in {"agent_message_delta", "item.agent_message.delta"}:
+            piece = event.get("delta")
+            if isinstance(piece, str) and piece:
+                self._snapshot(self._raw + piece, final=False)
+            return
+        if event_type in {"item.updated", "item.completed"} and item_type == "agent_message":
+            text = item.get("text")
+            if isinstance(text, str) and text:
+                if (
+                    event_type == "item.completed"
+                    and self._raw
+                    and not text.startswith(self._raw)
+                ):
+                    self._start()
+                self._snapshot(text, final=event_type == "item.completed")
+            return
+        if event_type == "agent_message":
+            text = event.get("message")
+            if not isinstance(text, str):
+                text = event.get("text")
+            if isinstance(text, str) and text:
+                self._start()
+                self._snapshot(text, final=True)
+
+
+def _runtime_stream_observer(
+    cmd: list[str],
+    publish: Callable[[int, str, bool], None] | None,
+) -> Any | None:
+    if publish is None:
+        return None
+    if _is_pi_cmd(cmd):
+        return _PiStreamObserver(publish)
+    if _is_claude_code_cmd(cmd):
+        return _ClaudeStreamObserver(publish)
+    if _is_codex_cmd(cmd):
+        return _CodexStreamObserver(publish)
+    return None
+
+
 def _run_cli_subprocess(
     cmd: list[str],
     run_kwargs: dict,
     *,
     stdout_line: Callable[[str], None] | None = None,
+    cancellation: "_VoiceTurnCancellation | None" = None,
 ) -> subprocess.CompletedProcess:
-    if stdout_line is None:
+    if stdout_line is None and cancellation is None:
         return subprocess.run(cmd, **run_kwargs)
 
     kwargs = dict(run_kwargs)
@@ -5784,7 +5989,33 @@ def _run_cli_subprocess(
         finally:
             process.stdin.close()
     try:
-        returncode = process.wait(timeout=timeout)
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        while True:
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            if remaining == 0.0:
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            try:
+                returncode = process.wait(
+                    timeout=0.1 if remaining is None else min(0.1, remaining)
+                )
+                break
+            except subprocess.TimeoutExpired:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+    except VoiceTurnSuperseded:
+        process.terminate()
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        stdout_thread.join(timeout=1.0)
+        stderr_thread.join(timeout=1.0)
+        raise
     except subprocess.TimeoutExpired as exc:
         process.kill()
         process.wait()
@@ -6501,6 +6732,222 @@ def _agent_http_headers() -> dict[str, str]:
     return headers
 
 
+class VoiceTurnSuperseded(RuntimeError):
+    """The voice turn being processed is no longer the active user turn."""
+
+
+class _LocalTurnCancellation:
+    """Cancellation signal for bounded non-user agent probes."""
+
+    def __init__(self):
+        self.cancelled = threading.Event()
+        self._callbacks_lock = threading.Lock()
+        self._callbacks: list[Callable[[], None]] = []
+
+    def add_cancel_callback(self, callback: Callable[[], None]) -> None:
+        call_now = False
+        with self._callbacks_lock:
+            if self.cancelled.is_set():
+                call_now = True
+            else:
+                self._callbacks.append(callback)
+        if call_now:
+            callback()
+
+    def cancel(self) -> None:
+        if self.cancelled.is_set():
+            return
+        self.cancelled.set()
+        with self._callbacks_lock:
+            callbacks = list(self._callbacks)
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception as exc:
+                log.debug("local agent cancellation callback failed: %s", exc)
+
+    def raise_if_cancelled(self) -> None:
+        if self.cancelled.is_set():
+            raise VoiceTurnSuperseded("agent turn cancelled")
+
+
+class _VoiceTurnCancellation:
+    """Watch for a newer user turn in the same voice call.
+
+    This covers both an updated ASR revision and a real barge-in whose logical
+    turn ID differs. The watcher uses the claim-free poll surface, so it never
+    leases the newer turn from the main resident loop.
+    """
+
+    def __init__(self, message: dict[str, Any]):
+        self.message_id = str(
+            message.get("id") or message.get("message_id") or ""
+        ).strip()
+        self.call_id = str(message.get("voice_call_id") or "").strip()
+        self.logical_turn_id = str(
+            message.get("voice_logical_turn_id") or ""
+        ).strip()
+        self.message_ts = float(
+            message.get("ts", message.get("timestamp", 0)) or 0
+        )
+        self.superseding_message_id = ""
+        self.superseding_logical_turn_id = ""
+        self.cancellation_reason = ""
+        self.cancelled = threading.Event()
+        self._stop = threading.Event()
+        self._callbacks_lock = threading.Lock()
+        self._callbacks: list[Callable[[], None]] = []
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._watch,
+            daemon=True,
+            name="voice-revision-watcher",
+        )
+        self._thread.start()
+
+    def add_cancel_callback(self, callback: Callable[[], None]) -> None:
+        call_now = False
+        with self._callbacks_lock:
+            if self.cancelled.is_set():
+                call_now = True
+            else:
+                self._callbacks.append(callback)
+        if call_now:
+            try:
+                callback()
+            except Exception as exc:
+                log.debug("late voice cancellation callback failed: %s", exc)
+
+    def _cancel(
+        self,
+        superseding_message_id: str,
+        *,
+        logical_turn_id: str = "",
+    ) -> None:
+        if self.cancelled.is_set():
+            return
+        self.superseding_message_id = superseding_message_id
+        self.superseding_logical_turn_id = logical_turn_id
+        self.cancellation_reason = (
+            "asr_revision"
+            if logical_turn_id == self.logical_turn_id
+            else "barge_in"
+        )
+        self.cancelled.set()
+        with self._callbacks_lock:
+            callbacks = list(self._callbacks)
+        log.info(
+            "[voice-cancel] superseded reason=%s parent=%s replacement=%s "
+            "call=%s logical=%s next_logical=%s",
+            self.cancellation_reason,
+            self.message_id[:12],
+            superseding_message_id[:12],
+            self.call_id[:12],
+            self.logical_turn_id[:24],
+            logical_turn_id[:24],
+        )
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception as exc:
+                log.debug("voice cancellation callback failed: %s", exc)
+
+    def _watch(self) -> None:
+        since = self.message_ts
+        while not self._stop.is_set() and not self.cancelled.is_set():
+            try:
+                body = poll_chat(since, timeout=1, claim=False)
+                messages = body.get("messages") if isinstance(body, dict) else []
+                max_seen = since
+                for candidate in messages or []:
+                    if not isinstance(candidate, dict):
+                        continue
+                    candidate_ts = float(
+                        candidate.get("ts", candidate.get("timestamp", 0)) or 0
+                    )
+                    max_seen = max(max_seen, candidate_ts)
+                    if candidate_ts <= self.message_ts:
+                        continue
+                    candidate_id = str(
+                        candidate.get("id") or candidate.get("message_id") or ""
+                    ).strip()
+                    if not candidate_id or candidate_id == self.message_id:
+                        continue
+                    if str(candidate.get("role") or "") != "user":
+                        continue
+                    if str(candidate.get("voice_turn_status") or "current").strip() == "superseded":
+                        continue
+                    if str(candidate.get("voice_call_id") or "").strip() != self.call_id:
+                        continue
+                    logical_turn_id = str(
+                        candidate.get("voice_logical_turn_id")
+                        or candidate.get("voice_turn_id")
+                        or ""
+                    ).strip()
+                    self._cancel(
+                        candidate_id,
+                        logical_turn_id=logical_turn_id,
+                    )
+                    return
+                since = max_seen
+            except Exception as exc:
+                # Best effort: the server-side reply fence remains authoritative.
+                log.debug("voice turn watcher poll failed: %s", exc)
+            self._stop.wait(0.05)
+
+    def raise_if_cancelled(self) -> None:
+        if self.cancelled.is_set():
+            raise VoiceTurnSuperseded(
+                "voice turn superseded"
+                + (
+                    f" by {self.superseding_message_id}"
+                    if self.superseding_message_id
+                    else ""
+                )
+            )
+
+    def close(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=0.25)
+
+
+def _voice_turn_cancellation(message: dict[str, Any]) -> _VoiceTurnCancellation | None:
+    if str(message.get("voice_turn_status") or "current").strip() == "superseded":
+        return None
+    guard = _VoiceTurnCancellation(message)
+    if not guard.message_id or not guard.call_id or not guard.logical_turn_id:
+        return None
+    return guard
+
+
+def _cancel_http_agent_request(request_id: str) -> None:
+    if not AGENT_HTTP_CANCEL_URL or not request_id:
+        return
+    try:
+        response = _HTTP.post(
+            AGENT_HTTP_CANCEL_URL,
+            json={"request_id": request_id},
+            headers=_agent_http_headers(),
+            timeout=3.0,
+        )
+        if response.status_code >= 400:
+            log.warning(
+                "voice runtime cancellation rejected status=%d",
+                response.status_code,
+            )
+    except Exception as exc:
+        log.warning(
+            "voice runtime cancellation unavailable type=%s",
+            type(exc).__name__,
+        )
+
+
 def _agent_session_key() -> str:
     if AGENT_HTTP_SESSION_KEY.strip():
         return AGENT_HTTP_SESSION_KEY.strip()
@@ -6587,26 +7034,311 @@ def _bare_cards_json(body: Any) -> str:
     return ""
 
 
+class _HTTPRuntimeStream:
+    """Consume the resident's runtime-neutral NDJSON/SSE reply protocol."""
+
+    def __init__(self, publish: Callable[[int, str, bool], None]):
+        self._publish = publish
+        self._segment = 0
+        self._texts: dict[int, str] = {}
+        self.result: Any = None
+
+    def feed(self, raw_line: str | bytes) -> None:
+        if isinstance(raw_line, bytes):
+            line = raw_line.decode("utf-8", errors="replace").strip()
+        else:
+            line = str(raw_line or "").strip()
+        if not line or line.startswith(":"):
+            return
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        if not line or line == "[DONE]":
+            return
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(event, dict):
+            return
+
+        event_type = str(event.get("type") or "").strip().lower()
+        if event_type in {"message_start", "segment_start"}:
+            requested = event.get("segment")
+            if isinstance(requested, int) and 0 <= requested <= 31:
+                self._segment = requested
+            elif self._texts.get(self._segment):
+                self._segment = min(31, self._segment + 1)
+            return
+
+        if event_type in {"text_delta", "agent_message_delta"}:
+            delta = event.get("delta")
+            if not isinstance(delta, str) or not delta:
+                return
+            text = self._texts.get(self._segment, "") + delta
+            self._texts[self._segment] = text
+            self._publish(self._segment, text, False)
+            return
+
+        if event_type in {"text_snapshot", "message_update"}:
+            text = event.get("text")
+            if not isinstance(text, str) or not text:
+                return
+            previous = self._texts.get(self._segment, "")
+            if previous and not text.startswith(previous):
+                return
+            self._texts[self._segment] = text
+            self._publish(self._segment, text, False)
+            return
+
+        if event_type in {"result", "response", "message_end"}:
+            body = event.get("body")
+            if body is None:
+                body = {
+                    key: value
+                    for key, value in event.items()
+                    if key not in {"type", "final"}
+                }
+            self.result = body
+
+    def finish(self) -> Any:
+        if self.result is not None:
+            return self.result
+        if not self._texts:
+            raise ValueError("streaming HTTP runtime produced no result")
+        latest = max(self._texts)
+        return {"response": self._texts[latest]}
+
+
+class _OpenAIHTTPRuntimeStream:
+    """Aggregate OpenAI-compatible SSE without speaking reasoning or tools."""
+
+    def __init__(self, publish: Callable[[int, str, bool], None]):
+        self._publish = publish
+        self._content = ""
+        self._visible = ""
+        self._reasoning = ""
+        self._tool_calls: dict[int, dict[str, Any]] = {}
+        self._finish_reason: str | None = None
+        self._model = ""
+        self._response_id = ""
+        self._usage: Any = None
+
+    def feed(self, raw_line: str | bytes) -> None:
+        if isinstance(raw_line, bytes):
+            line = raw_line.decode("utf-8", errors="replace").strip()
+        else:
+            line = str(raw_line or "").strip()
+        if not line or line.startswith(":"):
+            return
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        if not line or line == "[DONE]":
+            return
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(event, dict):
+            return
+        self._model = str(event.get("model") or self._model)
+        self._response_id = str(event.get("id") or self._response_id)
+        if event.get("usage") is not None:
+            self._usage = event.get("usage")
+        choices = event.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            return
+        finish_reason = choice.get("finish_reason")
+        if finish_reason is not None:
+            self._finish_reason = str(finish_reason)
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            return
+
+        reasoning = delta.get("reasoning_content")
+        if isinstance(reasoning, str):
+            self._reasoning += reasoning
+        content = delta.get("content")
+        piece = _content_blocks_to_text(content)
+        if piece:
+            self._content += piece
+            visible = _visible_stream_text(self._content)
+            if visible and visible != self._visible:
+                if not self._visible or visible.startswith(self._visible):
+                    self._visible = visible
+                    self._publish(0, visible, False)
+
+        tool_calls = delta.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for fallback_index, tool_delta in enumerate(tool_calls):
+                if not isinstance(tool_delta, dict):
+                    continue
+                index = tool_delta.get("index")
+                if not isinstance(index, int) or index < 0:
+                    index = fallback_index
+                call = self._tool_calls.setdefault(
+                    index,
+                    {"id": "", "type": "function", "function": {
+                        "name": "", "arguments": ""}},
+                )
+                if isinstance(tool_delta.get("id"), str):
+                    call["id"] += tool_delta["id"]
+                if isinstance(tool_delta.get("type"), str):
+                    call["type"] = tool_delta["type"]
+                function = tool_delta.get("function")
+                if isinstance(function, dict):
+                    if isinstance(function.get("name"), str):
+                        call["function"]["name"] += function["name"]
+                    if isinstance(function.get("arguments"), str):
+                        call["function"]["arguments"] += function["arguments"]
+
+    def finish(self) -> dict[str, Any]:
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": self._content or None,
+        }
+        if self._reasoning:
+            message["reasoning_content"] = self._reasoning
+        if self._tool_calls:
+            message["tool_calls"] = [
+                self._tool_calls[index] for index in sorted(self._tool_calls)
+            ]
+        body: dict[str, Any] = {
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": self._finish_reason,
+            }],
+        }
+        if self._response_id:
+            body["id"] = self._response_id
+        if self._model:
+            body["model"] = self._model
+        if self._usage is not None:
+            body["usage"] = self._usage
+        return body
+
+
+def _streaming_http_body(
+    response: Any,
+    publish: Callable[[int, str, bool], None],
+    cancellation: _VoiceTurnCancellation | None = None,
+) -> Any:
+    stream = _HTTPRuntimeStream(publish)
+    for line in response.iter_lines():
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        stream.feed(line)
+    if cancellation is not None:
+        cancellation.raise_if_cancelled()
+    return stream.finish()
+
+
+def _streaming_openai_body(
+    response: Any,
+    publish: Callable[[int, str, bool], None],
+    cancellation: _VoiceTurnCancellation | None = None,
+) -> dict[str, Any]:
+    stream = _OpenAIHTTPRuntimeStream(publish)
+    for line in response.iter_lines():
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        stream.feed(line)
+    if cancellation is not None:
+        cancellation.raise_if_cancelled()
+    return stream.finish()
+
+
+def _http_streaming_post(
+    url: str,
+    *,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    timeout: float,
+) -> httpx.Response:
+    request = _HTTP.build_request(
+        "POST",
+        url,
+        json=payload,
+        headers=headers,
+        timeout=timeout,
+    )
+    return _HTTP.send(request, stream=True)
+
+
 def _call_agent_http_simple(
     message: str,
     images: list[dict[str, str]] | None = None,
     raw_text: bool = False,
     *,
     isolated_session: bool = False,
+    stream_update: Callable[[int, str, bool], None] | None = None,
+    request_id: str = "",
+    cancellation: _VoiceTurnCancellation | None = None,
 ) -> Any:
     headers = _agent_http_headers()
+    if request_id and AGENT_HTTP_REQUEST_ID_HEADER:
+        headers[AGENT_HTTP_REQUEST_ID_HEADER] = request_id
     payload = {"message": message}
     if images:
         payload["images"] = images
-    resp = _HTTP.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=60)
-    resp.raise_for_status()
-    if not isolated_session:
-        _remember_http_session(
-            resp,
-            sent_bytes=len(message.encode("utf-8")),
-            received_bytes=_response_text_len(resp),
+    if stream_update is not None:
+        payload["stream"] = True
+        payload["stream_format"] = "ndjson"
+        headers["Accept"] = (
+            "application/x-ndjson, text/event-stream, application/json"
         )
-    body = resp.json()
+    resp = (
+        _http_streaming_post(
+            AGENT_HTTP_URL,
+            payload=payload,
+            headers=headers,
+            timeout=60,
+        )
+        if stream_update is not None
+        else _HTTP.post(
+            AGENT_HTTP_URL,
+            json=payload,
+            headers=headers,
+            timeout=60,
+        )
+    )
+    if cancellation is not None:
+        cancellation.add_cancel_callback(resp.close)
+        cancellation.raise_if_cancelled()
+    try:
+        try:
+            resp.raise_for_status()
+            content_type = str(resp.headers.get("Content-Type") or "").lower()
+            is_stream = stream_update is not None and (
+                "application/x-ndjson" in content_type
+                or "application/ndjson" in content_type
+                or "text/event-stream" in content_type
+            )
+            if stream_update is not None and not is_stream:
+                resp.read()
+            body = (
+                _streaming_http_body(resp, stream_update, cancellation)
+                if is_stream and stream_update is not None
+                else resp.json()
+            )
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
+            if not isolated_session:
+                _remember_http_session(
+                    resp,
+                    sent_bytes=len(message.encode("utf-8")),
+                    received_bytes=_response_text_len(resp),
+                )
+        except Exception:
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
+            raise
+    finally:
+        if stream_update is not None:
+            resp.close()
     if raw_text:
         text = _raw_assistant_text(body)
         if text.strip():
@@ -6647,8 +7379,13 @@ def _call_agent_http_openai(
     raw_text: bool = False,
     *,
     isolated_session: bool = False,
+    stream_update: Callable[[int, str, bool], None] | None = None,
+    request_id: str = "",
+    cancellation: _VoiceTurnCancellation | None = None,
 ) -> Any:
     headers = _agent_http_headers()
+    if request_id and AGENT_HTTP_REQUEST_ID_HEADER:
+        headers[AGENT_HTTP_REQUEST_ID_HEADER] = request_id
     sid = "" if isolated_session else _load_agent_session_id()
     if sid:
         headers[AGENT_HTTP_SESSION_HEADER] = sid
@@ -6668,17 +7405,72 @@ def _call_agent_http_openai(
     payload = {
         "model": AGENT_HTTP_MODEL,
         "messages": [{"role": "user", "content": content}],
-        "stream": False,
+        "stream": stream_update is not None,
     }
-    resp = _HTTP.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=120)
-    resp.raise_for_status()
-    if not isolated_session:
-        _remember_http_session(
-            resp,
-            sent_bytes=len(str(content).encode("utf-8")),
-            received_bytes=_response_text_len(resp),
+    if stream_update is not None:
+        headers["Accept"] = "text/event-stream, application/x-ndjson, application/json"
+        resp = _http_streaming_post(
+            AGENT_HTTP_URL,
+            payload=payload,
+            headers=headers,
+            timeout=120,
         )
-    body = resp.json()
+    else:
+        resp = _HTTP.post(
+            AGENT_HTTP_URL, json=payload, headers=headers, timeout=120
+        )
+    if cancellation is not None:
+        cancellation.add_cancel_callback(resp.close)
+        cancellation.raise_if_cancelled()
+    try:
+        try:
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError:
+                if stream_update is None or resp.status_code not in {
+                    400, 404, 405, 415, 422, 501,
+                }:
+                    raise
+                resp.close()
+                payload["stream"] = False
+                headers.pop("Accept", None)
+                resp = _HTTP.post(
+                    AGENT_HTTP_URL, json=payload, headers=headers, timeout=120
+                )
+                if cancellation is not None:
+                    cancellation.add_cancel_callback(resp.close)
+                    cancellation.raise_if_cancelled()
+                resp.raise_for_status()
+                body = resp.json()
+            else:
+                content_type = str(resp.headers.get("Content-Type") or "").lower()
+                is_stream = stream_update is not None and (
+                    "text/event-stream" in content_type
+                    or "application/x-ndjson" in content_type
+                    or "application/ndjson" in content_type
+                )
+                if stream_update is not None and not is_stream:
+                    resp.read()
+                body = (
+                    _streaming_openai_body(resp, stream_update, cancellation)
+                    if is_stream and stream_update is not None
+                    else resp.json()
+                )
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
+            if not isolated_session:
+                _remember_http_session(
+                    resp,
+                    sent_bytes=len(str(content).encode("utf-8")),
+                    received_bytes=_response_text_len(resp),
+                )
+        except Exception:
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
+            raise
+    finally:
+        if stream_update is not None:
+            resp.close()
     if not isinstance(body, dict):
         raise ValueError(f"unexpected OpenAI response type: {type(body)}")
     if raw_text:
@@ -6717,6 +7509,9 @@ def call_agent_http(
     raw_text: bool = False,
     *,
     isolated_session: bool = False,
+    stream_update: Callable[[int, str, bool], None] | None = None,
+    request_id: str = "",
+    cancellation: _VoiceTurnCancellation | None = None,
 ) -> Any:
     if not AGENT_HTTP_URL:
         raise ValueError("AGENT_HTTP_URL is not set for http mode")
@@ -6724,11 +7519,17 @@ def call_agent_http(
         return _call_agent_http_openai(
             message, images=images, raw_text=raw_text,
             isolated_session=isolated_session,
+            stream_update=stream_update,
+            request_id=request_id,
+            cancellation=cancellation,
         )
     if AGENT_HTTP_PROTOCOL in {"simple", "generic", "json"}:
         return _call_agent_http_simple(
             message, images=images, raw_text=raw_text,
             isolated_session=isolated_session,
+            stream_update=stream_update,
+            request_id=request_id,
+            cancellation=cancellation,
         )
     raise ValueError(f"unknown AGENT_HTTP_PROTOCOL: {AGENT_HTTP_PROTOCOL!r}")
 
@@ -6824,6 +7625,7 @@ def _empty_agent_session_meta(session_id: str = "") -> dict[str, Any]:
         "session_id": session_id,
         "turns": 0,
         "bytes": 0,
+        "peak_input_tokens": 0,
         "bridged": False,
         "created_at": time.time() if session_id else 0.0,
         "updated_at": time.time() if session_id else 0.0,
@@ -6858,7 +7660,7 @@ def _coerce_agent_session_meta(raw: Any) -> dict[str, Any]:
 
     sid = str(raw.get("session_id") or raw.get("sessionId") or raw.get("session") or "").strip()
     meta = _empty_agent_session_meta(sid)
-    for key in ("turns", "bytes"):
+    for key in ("turns", "bytes", "peak_input_tokens"):
         try:
             meta[key] = max(0, int(raw.get(key) or 0))
         except (TypeError, ValueError):
@@ -6886,6 +7688,12 @@ def _agent_session_meta_exceeds_bounds(meta: dict[str, Any]) -> bool:
     if AGENT_SESSION_MAX_TURNS > 0 and int(meta.get("turns") or 0) >= AGENT_SESSION_MAX_TURNS:
         return True
     if AGENT_SESSION_MAX_BYTES > 0 and int(meta.get("bytes") or 0) >= AGENT_SESSION_MAX_BYTES:
+        return True
+    if (
+        AGENT_SESSION_MAX_INPUT_TOKENS > 0
+        and int(meta.get("peak_input_tokens") or 0)
+        >= AGENT_SESSION_MAX_INPUT_TOKENS
+    ):
         return True
     return False
 
@@ -6964,7 +7772,10 @@ def _load_agent_session_meta(*, check_bounds: bool = True) -> dict[str, Any]:
                 meta = _empty_agent_session_meta()
 
     if check_bounds and _agent_session_meta_exceeds_bounds(meta):
-        reason = f"turns={meta.get('turns')} bytes={meta.get('bytes')}"
+        reason = (
+            f"turns={meta.get('turns')} bytes={meta.get('bytes')} "
+            f"peak_input_tokens={meta.get('peak_input_tokens')}"
+        )
         _clear_agent_session_id(reason)
         return _empty_agent_session_meta()
 
@@ -7015,7 +7826,13 @@ def _save_agent_session_id(sid: str) -> None:
         log.warning("failed to persist agent session id: %s", e)
 
 
-def _record_agent_session_turn(sid: str, *, sent_bytes: int = 0, received_bytes: int = 0) -> None:
+def _record_agent_session_turn(
+    sid: str,
+    *,
+    sent_bytes: int = 0,
+    received_bytes: int = 0,
+    input_tokens: int | None = None,
+) -> None:
     sid = (sid or "").strip()
     if not sid:
         return
@@ -7025,6 +7842,13 @@ def _record_agent_session_turn(sid: str, *, sent_bytes: int = 0, received_bytes:
     meta["agent_entry_signature"] = _agent_entry_signature()
     meta["turns"] = int(meta.get("turns") or 0) + 1
     meta["bytes"] = int(meta.get("bytes") or 0) + max(0, int(sent_bytes or 0)) + max(0, int(received_bytes or 0))
+    try:
+        observed_input_tokens = max(0, int(input_tokens or 0))
+    except (TypeError, ValueError):
+        observed_input_tokens = 0
+    meta["peak_input_tokens"] = max(
+        int(meta.get("peak_input_tokens") or 0), observed_input_tokens
+    )
     meta["updated_at"] = time.time()
 
     user_id = _agent_session_user_id()
@@ -7212,6 +8036,682 @@ def _is_codex_cmd(cmd: list[str]) -> bool:
     return bool(cmd) and Path(cmd[0]).name == "codex"
 
 
+_codex_resume_support_cache: dict[str, bool] = {}
+_codex_feature_names_cache: dict[str, frozenset[str]] = {}
+_cli_help_text_cache: dict[str, str] = {}
+
+# IO supplies its own relationship prompt and model-visible tools. These
+# optional Codex product surfaces add a large generic catalog to every request
+# but are not part of voice. Shell/unified_exec/view_image and user MCP stay on.
+_CODEX_MINIMAL_DISABLED_FEATURES = (
+    "apps",
+    "browser_use",
+    "computer_use",
+    "goals",
+    "image_generation",
+    "in_app_browser",
+    "memories",
+    "multi_agent",
+    "plugins",
+    "recommended_plugins",
+    "skill_mcp_dependency_install",
+    "skill_search",
+    "workspace_dependencies",
+)
+
+
+def _minimal_runtime_profile_enabled() -> bool:
+    return MINIMAL_RUNTIME_PROFILE not in {
+        "0", "false", "off", "no", "none", "disabled"
+    }
+
+
+def _codex_feature_names(executable: str) -> frozenset[str]:
+    key = str(executable or "")
+    if key in _codex_feature_names_cache:
+        return _codex_feature_names_cache[key]
+    try:
+        probe = subprocess.run(
+            [key, "features", "list"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
+        names = frozenset(
+            line.split(None, 1)[0]
+            for line in (probe.stdout or "").splitlines()
+            if line.strip() and probe.returncode == 0
+        )
+    except Exception:
+        names = frozenset()
+    _codex_feature_names_cache[key] = names
+    return names
+
+
+def _cli_help_text(executable: str) -> str:
+    key = str(executable or "")
+    if key in _cli_help_text_cache:
+        return _cli_help_text_cache[key]
+    try:
+        probe = subprocess.run(
+            [key, "--help"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
+        help_text = (probe.stdout or "") + "\n" + (probe.stderr or "")
+        if probe.returncode != 0:
+            help_text = ""
+    except Exception:
+        help_text = ""
+    _cli_help_text_cache[key] = help_text
+    return help_text
+
+
+def _inject_minimal_runtime_profile(cmd: list[str]) -> list[str]:
+    """Apply only driver-advertised, semantics-safe voice runtime flags."""
+    if not _minimal_runtime_profile_enabled() or not cmd:
+        return cmd
+    # _resolve_cli_executable normally makes this absolute. Requiring a concrete
+    # path avoids probing an opaque shell alias or wrapper with guessed flags.
+    if not Path(cmd[0]).is_absolute():
+        return cmd
+    if _is_codex_cmd(cmd):
+        supported = _codex_feature_names(cmd[0])
+        existing = {
+            cmd[index + 1]
+            for index, token in enumerate(cmd[:-1])
+            if token == "--disable"
+        }
+        flags = [
+            part
+            for name in _CODEX_MINIMAL_DISABLED_FEATURES
+            if name in supported and name not in existing
+            for part in ("--disable", name)
+        ]
+        return [cmd[0], *flags, *cmd[1:]]
+    help_text = _cli_help_text(cmd[0])
+    if _is_pi_cmd(cmd):
+        safe_flags = ("--no-skills", "--no-prompt-templates", "--no-themes")
+    elif _is_claude_code_cmd(cmd):
+        safe_flags = ("--disable-slash-commands",)
+    else:
+        safe_flags = ()
+    inject = [flag for flag in safe_flags if flag in help_text and flag not in cmd]
+    return [cmd[0], *inject, *cmd[1:]]
+
+
+def _codex_resume_supported(executable: str) -> bool:
+    """Whether this installed Codex exposes ``exec resume``."""
+    if not CODEX_SESSION_RESUME:
+        return False
+    key = str(executable or "codex")
+    if key in _codex_resume_support_cache:
+        return _codex_resume_support_cache[key]
+    try:
+        probe = subprocess.run(
+            [key, "exec", "resume", "--help"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+        supported = probe.returncode == 0
+    except Exception:
+        supported = False
+    _codex_resume_support_cache[key] = supported
+    if not supported:
+        log.warning(
+            "codex exec resume unavailable; keeping stateless transcript fallback"
+        )
+    return supported
+
+
+def _codex_resume_available_for_cmd(cmd: list[str]) -> bool:
+    if not _is_codex_cmd(cmd):
+        return False
+    try:
+        resolved = _resolve_cli_executable(cmd)
+    except Exception:
+        return False
+    return _codex_resume_supported(resolved[0])
+
+
+def _codex_resume_command(cmd: list[str], session_id: str) -> list[str]:
+    """Convert ``codex exec`` argv to ``codex exec resume`` argv."""
+    try:
+        exec_index = cmd.index("exec")
+    except ValueError:
+        return cmd
+
+    # These creation-only flags are not accepted by ``exec resume``. Their
+    # effective values are already part of the session being resumed.
+    drop_with_value = {
+        "-s", "--sandbox", "-p", "--profile", "--local-provider",
+        "-C", "--cd", "--add-dir", "--color",
+    }
+    drop_switches = {"--oss", "--approve-for-me"}
+    tail = cmd[exec_index + 1 :]
+    filtered: list[str] = []
+    index = 0
+    while index < len(tail):
+        token = tail[index]
+        name = token.split("=", 1)[0]
+        if name in drop_switches:
+            index += 1
+            continue
+        if name in drop_with_value:
+            index += 1 if "=" in token else 2
+            continue
+        filtered.append(token)
+        index += 1
+    return [
+        *cmd[:exec_index],
+        "exec",
+        "resume",
+        *filtered,
+        session_id,
+        "-",
+    ]
+
+
+@dataclass(frozen=True)
+class _CodexAppServerPlan:
+    launch_cmd: list[str]
+    thread_method: str
+    thread_params: dict[str, Any]
+    turn_input: list[dict[str, Any]]
+
+
+class _CodexAppServerUnavailable(RuntimeError):
+    """App Server could not safely complete before speech-visible output."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        visible_output: bool = False,
+        turn_started: bool = False,
+    ):
+        super().__init__(message)
+        self.visible_output = visible_output
+        self.turn_started = turn_started
+
+
+def _codex_app_server_stream_enabled() -> bool:
+    return CODEX_APP_SERVER_STREAM not in {
+        "0", "false", "off", "no", "none", "disabled"
+    }
+
+
+def _codex_app_server_plan(
+    cmd: list[str],
+    *,
+    message: str,
+    image_paths: list[str] | None,
+    cwd: str | None,
+    session_id: str,
+    isolated_session: bool,
+) -> _CodexAppServerPlan | None:
+    """Translate ``codex exec`` without guessing at user runtime settings.
+
+    App Server inherits the user's normal config. Explicit model/config flags are
+    preserved; reasoning effort is never supplied at ``turn/start``. If an exec
+    option has no exact App Server equivalent, return ``None`` and keep the
+    established ``codex exec`` path.
+    """
+    if not _codex_app_server_stream_enabled() or not _is_codex_cmd(cmd):
+        return None
+    try:
+        exec_index = cmd.index("exec")
+    except ValueError:
+        return None
+
+    prefix = cmd[1:exec_index]
+    tail = cmd[exec_index + 1 :]
+    resuming = bool(tail and tail[0] == "resume")
+    if resuming:
+        tail = tail[1:]
+    args = [*prefix, *tail]
+
+    launch_options: list[str] = []
+    thread_params: dict[str, Any] = {}
+    explicit_images: list[str] = []
+    unsupported = {
+        "-p", "--profile", "--oss", "--local-provider", "--add-dir",
+        "--ignore-user-config", "--ignore-rules", "--output-schema",
+        "--dangerously-bypass-hook-trust",
+    }
+    carry_with_value = {"-c", "--config", "--enable", "--disable"}
+    ignore_with_value = {"-o", "--output-last-message", "--color"}
+
+    index = 0
+    while index < len(args):
+        token = args[index]
+        name, equals, inline_value = token.partition("=")
+        if name in unsupported:
+            return None
+        if name in carry_with_value:
+            if equals:
+                launch_options.append(token)
+                index += 1
+                continue
+            if index + 1 >= len(args):
+                return None
+            launch_options.extend((token, args[index + 1]))
+            index += 2
+            continue
+        if name == "--strict-config":
+            launch_options.append(token)
+            index += 1
+            continue
+        if name in {"-m", "--model", "-s", "--sandbox", "-C", "--cd"}:
+            if equals:
+                value = inline_value
+                index += 1
+            elif index + 1 < len(args):
+                value = args[index + 1]
+                index += 2
+            else:
+                return None
+            if name in {"-m", "--model"}:
+                thread_params["model"] = value
+            elif name in {"-s", "--sandbox"}:
+                thread_params["sandbox"] = value
+            else:
+                thread_params["cwd"] = value
+            continue
+        if name in {"-i", "--image"}:
+            if equals:
+                explicit_images.append(inline_value)
+                index += 1
+            elif index + 1 < len(args):
+                explicit_images.append(args[index + 1])
+                index += 2
+            else:
+                return None
+            continue
+        if name in ignore_with_value:
+            index += 1 if equals else 2
+            if index > len(args):
+                return None
+            continue
+        if token == "--dangerously-bypass-approvals-and-sandbox":
+            thread_params["approvalPolicy"] = "never"
+            thread_params["sandbox"] = "danger-full-access"
+            index += 1
+            continue
+        if token == "--approve-for-me":
+            thread_params["approvalsReviewer"] = "auto_review"
+            thread_params["sandbox"] = "workspace-write"
+            index += 1
+            continue
+        if token == "--ephemeral":
+            thread_params["ephemeral"] = True
+            index += 1
+            continue
+        if token in {"--json", "--skip-git-repo-check", "-"}:
+            index += 1
+            continue
+        if resuming and session_id and token == session_id:
+            index += 1
+            continue
+        # A positional or unknown option may encode user intent. Do not guess.
+        return None
+
+    effective_cwd = str(thread_params.get("cwd") or cwd or "").strip()
+    if effective_cwd:
+        thread_params["cwd"] = effective_cwd
+    if isolated_session:
+        thread_params["ephemeral"] = True
+    elif session_id:
+        thread_params["threadId"] = session_id
+
+    inputs: list[dict[str, Any]] = [{"type": "text", "text": message}]
+    for path in image_paths or explicit_images:
+        inputs.append({"type": "localImage", "path": path})
+
+    return _CodexAppServerPlan(
+        launch_cmd=[cmd[0], *launch_options, "app-server", "--stdio"],
+        thread_method=(
+            "thread/resume" if session_id and not isolated_session else "thread/start"
+        ),
+        thread_params=thread_params,
+        turn_input=inputs,
+    )
+
+
+def _codex_app_server_item_text(item: Any) -> tuple[str, str]:
+    if not isinstance(item, dict):
+        return "", ""
+    item_type = str(item.get("type") or "")
+    if item_type == "agentMessage":
+        return str(item.get("text") or ""), ""
+    if item_type == "reasoning":
+        summaries = item.get("summary") or []
+        if isinstance(summaries, list):
+            return "", "\n\n".join(
+                str(value).strip() for value in summaries if str(value).strip()
+            )
+    return "", ""
+
+
+def _run_codex_app_server_turn(
+    plan: _CodexAppServerPlan,
+    run_kwargs: dict[str, Any],
+    *,
+    stdout_line: Callable[[str], None] | None,
+    cancellation: "_VoiceTurnCancellation | None",
+) -> subprocess.CompletedProcess:
+    """Run one App Server turn and expose speech-safe agent-message deltas."""
+    started_at = time.monotonic()
+    kwargs = {
+        key: value for key, value in run_kwargs.items()
+        if key not in {"capture_output", "input", "timeout"}
+    }
+    timeout = run_kwargs.get("timeout")
+    process = subprocess.Popen(
+        plan.launch_cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=1,
+        **kwargs,
+    )
+    incoming: queue.Queue[tuple[str, str | None]] = queue.Queue()
+    stderr_parts: list[str] = []
+
+    def _drain(name: str, stream) -> None:
+        if stream is None:
+            incoming.put((name, None))
+            return
+        for line in iter(stream.readline, ""):
+            incoming.put((name, line))
+        stream.close()
+        incoming.put((name, None))
+
+    stdout_thread = threading.Thread(
+        target=_drain, args=("stdout", process.stdout), daemon=True,
+        name="feedling-codex-app-server-stdout",
+    )
+    stderr_thread = threading.Thread(
+        target=_drain, args=("stderr", process.stderr), daemon=True,
+        name="feedling-codex-app-server-stderr",
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    request_id = 0
+    responses: dict[int, dict[str, Any]] = {}
+    pending_notifications: list[dict[str, Any]] = []
+    synthetic: list[str] = []
+    message_text: dict[str, str] = {}
+    completed_items: set[str] = set()
+    visible_output = False
+    turn_dispatched = False
+    active_thread_id = ""
+    active_turn_id = ""
+
+    def _send(payload: dict[str, Any]) -> None:
+        if process.stdin is None:
+            raise _CodexAppServerUnavailable(
+                "Codex App Server stdin closed", visible_output=visible_output
+            )
+        process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        process.stdin.flush()
+
+    def _emit(event: dict[str, Any]) -> None:
+        line = json.dumps(event, ensure_ascii=False) + "\n"
+        synthetic.append(line)
+        if stdout_line is not None:
+            stdout_line(line)
+
+    def _next_object() -> dict[str, Any]:
+        while True:
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(plan.launch_cmd, timeout)
+            try:
+                source, line = incoming.get(timeout=0.1)
+            except queue.Empty:
+                if process.poll() is not None:
+                    raise _CodexAppServerUnavailable(
+                        f"Codex App Server exited {process.returncode}",
+                        visible_output=visible_output,
+                    )
+                continue
+            if line is None:
+                if source == "stdout" and process.poll() is not None:
+                    raise _CodexAppServerUnavailable(
+                        f"Codex App Server exited {process.returncode}",
+                        visible_output=visible_output,
+                    )
+                continue
+            if source == "stderr":
+                stderr_parts.append(line)
+                continue
+            try:
+                obj = json.loads(line)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(obj, dict):
+                return obj
+
+    def _handle_notification(obj: dict[str, Any]) -> bool:
+        nonlocal visible_output, active_thread_id, active_turn_id
+        method = str(obj.get("method") or "")
+        params = obj.get("params") if isinstance(obj.get("params"), dict) else {}
+        if method == "turn/started":
+            turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+            active_thread_id = str(params.get("threadId") or active_thread_id)
+            active_turn_id = str(turn.get("id") or active_turn_id)
+            return False
+        if method == "item/agentMessage/delta":
+            item_id = str(params.get("itemId") or "agent-message")
+            delta = str(params.get("delta") or "")
+            if not delta:
+                return False
+            if item_id not in message_text:
+                message_text[item_id] = ""
+                _emit({"type": "item.started", "item": {
+                    "id": item_id, "type": "agent_message"
+                }})
+            message_text[item_id] += delta
+            was_visible = visible_output
+            visible_output = visible_output or bool(
+                _visible_stream_text(message_text[item_id])
+            )
+            if visible_output and not was_visible:
+                log.info(
+                    "[voice.stream] codex first visible delta ms=%d",
+                    int((time.monotonic() - started_at) * 1000),
+                )
+            _emit({"type": "agent_message_delta", "delta": delta})
+            return False
+        if method == "item/completed":
+            item = params.get("item")
+            text, reasoning = _codex_app_server_item_text(item)
+            item_id = str(item.get("id") or "") if isinstance(item, dict) else ""
+            if text:
+                if item_id:
+                    message_text[item_id] = text
+                    completed_items.add(item_id)
+                visible_output = visible_output or bool(_visible_stream_text(text))
+                _emit({"type": "item.completed", "item": {
+                    "id": item_id, "type": "agent_message", "text": text
+                }})
+            elif reasoning:
+                _emit({"type": "item.completed", "item": {
+                    "id": item_id, "type": "reasoning", "text": reasoning
+                }})
+            return False
+        if method == "thread/tokenUsage/updated":
+            token_usage = params.get("tokenUsage")
+            last = token_usage.get("last") if isinstance(token_usage, dict) else {}
+            if isinstance(last, dict):
+                _emit({"type": "turn.usage", "usage": {
+                    "input_tokens": int(last.get("inputTokens") or 0),
+                    "output_tokens": int(last.get("outputTokens") or 0),
+                }})
+            return False
+        if method == "turn/completed":
+            turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+            active_thread_id = str(params.get("threadId") or active_thread_id)
+            active_turn_id = str(turn.get("id") or active_turn_id)
+            for item in turn.get("items") or []:
+                text, reasoning = _codex_app_server_item_text(item)
+                item_id = str(item.get("id") or "") if isinstance(item, dict) else ""
+                if text and item_id not in completed_items:
+                    visible_output = visible_output or bool(_visible_stream_text(text))
+                    _emit({"type": "item.completed", "item": {
+                        "id": item_id, "type": "agent_message", "text": text
+                    }})
+                elif reasoning:
+                    _emit({"type": "item.completed", "item": {
+                        "id": item_id, "type": "reasoning", "text": reasoning
+                    }})
+            status = str(turn.get("status") or "")
+            if status not in {"completed", ""}:
+                error = turn.get("error")
+                raise _CodexAppServerUnavailable(
+                    f"Codex App Server turn {status}: {error}",
+                    visible_output=visible_output,
+                )
+            _emit({"type": "turn.completed", "turn_id": active_turn_id})
+            return True
+        if method == "error":
+            raise _CodexAppServerUnavailable(
+                f"Codex App Server error: {params}",
+                visible_output=visible_output,
+            )
+        return False
+
+    def _wait_response(wanted_id: int) -> dict[str, Any]:
+        while wanted_id not in responses:
+            obj = _next_object()
+            obj_id = obj.get("id")
+            if isinstance(obj_id, int):
+                # Server-to-client requests are not safe to answer implicitly.
+                if "method" in obj:
+                    raise _CodexAppServerUnavailable(
+                        f"Codex App Server requested interaction: {obj.get('method')}",
+                        visible_output=visible_output,
+                    )
+                responses[obj_id] = obj
+            else:
+                pending_notifications.append(obj)
+        response = responses.pop(wanted_id)
+        if response.get("error") is not None:
+            raise _CodexAppServerUnavailable(
+                f"Codex App Server RPC failed: {response.get('error')}",
+                visible_output=visible_output,
+            )
+        result = response.get("result")
+        return result if isinstance(result, dict) else {}
+
+    def _request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        nonlocal request_id
+        request_id += 1
+        _send({"id": request_id, "method": method, "params": params})
+        return _wait_response(request_id)
+
+    try:
+        _request("initialize", {
+            "clientInfo": {"name": "feedling-voice", "version": "1"}
+        })
+        _send({"method": "initialized"})
+        thread_result = _request(plan.thread_method, plan.thread_params)
+        thread = (
+            thread_result.get("thread")
+            if isinstance(thread_result.get("thread"), dict)
+            else {}
+        )
+        active_thread_id = str(thread.get("id") or plan.thread_params.get("threadId") or "")
+        if not active_thread_id:
+            raise _CodexAppServerUnavailable("Codex App Server returned no thread id")
+        log.info(
+            "[voice.stream] codex app-server model=%s reasoning_effort=%s "
+            "turn_effort_override=false",
+            str(thread_result.get("model") or "(config default)"),
+            str(thread_result.get("reasoningEffort") or "(config default)"),
+        )
+        _emit({"type": "thread.started", "thread_id": active_thread_id})
+
+        turn_dispatched = True
+        turn_result = _request("turn/start", {
+            "threadId": active_thread_id,
+            "input": plan.turn_input,
+            # Deliberately no model/effort override: thread/start must keep the
+            # user's configured model and reasoning strength.
+        })
+        turn = (
+            turn_result.get("turn")
+            if isinstance(turn_result.get("turn"), dict)
+            else {}
+        )
+        active_turn_id = str(turn.get("id") or active_turn_id)
+
+        completed = False
+        queued = list(pending_notifications)
+        pending_notifications.clear()
+        while not completed:
+            obj = queued.pop(0) if queued else _next_object()
+            if isinstance(obj.get("id"), int) and "method" in obj:
+                raise _CodexAppServerUnavailable(
+                    f"Codex App Server requested interaction: {obj.get('method')}",
+                    visible_output=visible_output,
+                )
+            completed = _handle_notification(obj)
+    except _CodexAppServerUnavailable as exc:
+        exc.turn_started = exc.turn_started or turn_dispatched
+        raise
+    except VoiceTurnSuperseded:
+        if active_thread_id and active_turn_id:
+            try:
+                request_id += 1
+                _send({
+                    "id": request_id,
+                    "method": "turn/interrupt",
+                    "params": {
+                        "threadId": active_thread_id,
+                        "turnId": active_turn_id,
+                    },
+                })
+            except Exception:
+                pass
+        raise
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        stdout_thread.join(timeout=1.0)
+        stderr_thread.join(timeout=1.0)
+
+    log.info(
+        "[voice.stream] codex app-server completed ms=%d visible=%s",
+        int((time.monotonic() - started_at) * 1000),
+        visible_output,
+    )
+    return subprocess.CompletedProcess(
+        plan.launch_cmd,
+        0,
+        stdout="".join(synthetic),
+        stderr="".join(stderr_parts),
+    )
+
+
 def _is_pi_cmd(cmd: list[str]) -> bool:
     return bool(cmd) and Path(cmd[0]).name == "pi"
 
@@ -7304,7 +8804,8 @@ def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
     """Whether foreground turns get a resident-injected recent-chat transcript.
 
     Gated so we don't double up context for agents that already carry it:
-    codex (no --resume) injects every turn in ``auto``. claude injects only when
+    resume-capable codex and pi inject once per session. Older codex versions
+    keep the stateless every-turn fallback. claude injects only when
     HOSTED (in-CVM, no durable session store — its scrape + --resume continuity
     is unreliable there); a self-hosted resident's local claude has a reliable
     --resume, so it keeps its persistent session and never injects in ``auto``
@@ -7328,7 +8829,9 @@ def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
         return True
     cmd = cmd if cmd is not None else _cli_cmd_tokens()
     if _is_codex_cmd(cmd):
-        return True
+        if not _codex_resume_available_for_cmd(cmd):
+            return True
+        return not _agent_session_is_bridged()
     if _is_claude_code_cmd(cmd):
         if _has_cli_resume(cmd) or _has_claude_session_id(cmd):
             return False
@@ -8071,7 +9574,16 @@ def _prepare_cli_command(
         # ——而他们恰恰是最容易漏测的那一批(PR#174 就是这么漏的)。
         cmd = _inject_claude_user_mcp(cmd, lane)
 
-    return _resolve_cli_executable(cmd), stdin_msg
+    cmd = _resolve_cli_executable(cmd)
+    cmd = _inject_minimal_runtime_profile(cmd)
+    if (
+        sid
+        and session_id_override is None
+        and _is_codex_cmd(cmd)
+        and _codex_resume_supported(cmd[0])
+    ):
+        cmd = _codex_resume_command(cmd, sid)
+    return cmd, stdin_msg
 
 
 def _codex_turn_metrics(raw: str) -> dict:
@@ -8378,6 +9890,12 @@ _CLAUDE_MISSING_SESSION_RE = re.compile(
     r"no conversation found|session.{0,24}not found|not found.{0,24}session",
     re.I,
 )
+_CODEX_MISSING_SESSION_RE = re.compile(
+    r"session.{0,32}(?:not found|does not exist)|"
+    r"(?:not found|missing).{0,32}(?:session|thread|rollout)|"
+    r"no.{0,16}(?:session|thread|rollout).{0,16}found",
+    re.I,
+)
 
 
 def call_agent_cli(
@@ -8390,6 +9908,7 @@ def call_agent_cli(
     stream_update: Callable[[int, str, bool], None] | None = None,
     isolated_session: bool = False,
     outbound_fence: bool = False,
+    cancellation: _VoiceTurnCancellation | None = None,
 ) -> Any:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
@@ -8424,6 +9943,12 @@ def call_agent_cli(
     if isolated_sid is not None:
         prepare_kwargs["session_id_override"] = isolated_sid
     cmd, stdin_msg = _prepare_cli_command(message, **prepare_kwargs)
+    if stream_update is not None and _is_claude_code_cmd(cmd):
+        cmd = _set_cli_option_value(cmd, "--output-format", "stream-json")
+        if "--include-partial-messages" not in cmd:
+            cmd.append("--include-partial-messages")
+        if "--verbose" not in cmd:
+            cmd.append("--verbose")
     # Self-authored thinking does NOT strip the driver's native reasoning flags: the
     # model keeps thinking natively (answer quality unchanged), and we additionally
     # ask it to open its reply with a <think> block (see the prompt injection on the
@@ -8488,17 +10013,61 @@ def call_agent_cli(
     normalized_attempt_trigger = (
         attempt_trigger if attempt_trigger in _PROVIDER_ATTEMPT_TRIGGERS else "first"
     )
-    pi_stream = (
-        _PiStreamObserver(stream_update)
-        if stream_update is not None and _is_pi_cmd(cmd)
+    runtime_stream = _runtime_stream_observer(cmd, stream_update)
+    run_extra = {"cancellation": cancellation} if cancellation is not None else {}
+    app_server_plan = (
+        _codex_app_server_plan(
+            cmd,
+            message=message,
+            image_paths=image_paths,
+            cwd=_cli_cwd,
+            session_id="" if isolated_session else _load_agent_session_id(),
+            isolated_session=isolated_session,
+        )
+        if stream_update is not None and _is_codex_cmd(cmd)
         else None
     )
     try:
-        result = _run_cli_subprocess(
-            cmd,
-            _run_kwargs,
-            stdout_line=pi_stream.feed if pi_stream is not None else None,
-        )
+        if app_server_plan is not None:
+            try:
+                result = _run_codex_app_server_turn(
+                    app_server_plan,
+                    _run_kwargs,
+                    stdout_line=(
+                        runtime_stream.feed if runtime_stream is not None else None
+                    ),
+                    cancellation=cancellation,
+                )
+            except _CodexAppServerUnavailable as exc:
+                # Only initialization/thread setup failures can safely fall back.
+                # Once turn/start was sent, replaying through exec would charge
+                # and potentially speak the same user turn twice.
+                if exc.turn_started or exc.visible_output:
+                    raise RuntimeError(str(exc)) from exc
+                log.warning(
+                    "Codex App Server unavailable before turn start; keeping "
+                    "codex exec path: %s",
+                    exc,
+                )
+                result = _run_cli_subprocess(
+                    cmd,
+                    _run_kwargs,
+                    stdout_line=(
+                        runtime_stream.feed if runtime_stream is not None else None
+                    ),
+                    **run_extra,
+                )
+        else:
+            result = _run_cli_subprocess(
+                cmd,
+                _run_kwargs,
+                stdout_line=runtime_stream.feed if runtime_stream is not None else None,
+                **run_extra,
+            )
+    except VoiceTurnSuperseded:
+        if not isolated_session and _load_agent_session_id():
+            _clear_agent_session_id("voice interruption invalidated in-flight session")
+        raise
     except subprocess.TimeoutExpired as exc:
         if ledger_enabled:
             def _timeout_text(value: Any) -> str:
@@ -8634,54 +10203,82 @@ def call_agent_cli(
         # pi events carry no session_id field to scrape, and stream scraping could
         # latch a wrong value from tool output — trust the command.
         observed_sid = command_sid or _extract_session_id(raw_transport)
+    elif _is_codex_cmd(cmd):
+        observed_sid = _codex_thread_id_from_stream(result.stdout or "")
     else:
         observed_sid = _extract_session_id(raw_transport) or command_sid
-    if observed_sid and not isolated_session:
+    if (
+        observed_sid
+        and not isolated_session
+        and (result.returncode == 0 or not _is_codex_cmd(cmd))
+    ):
         _save_agent_session_id(observed_sid)
         _record_agent_session_turn(
             observed_sid,
             sent_bytes=len((message or "").encode("utf-8")),
             received_bytes=_turn_content_bytes(cmd, result.stdout or "", result.stderr or ""),
+            input_tokens=_m.get("input_tokens"),
         )
+        _bind_pending_catalog_to_session(observed_sid)
 
     if result.returncode != 0:
-        # Self-heal a stale claude --resume ONCE per turn: when the local claude
-        # session store lost the sid we resumed into (missing-session signature
-        # + the failing --resume value is OUR stored sid), clear the sid and
-        # retry the same turn fresh — otherwise every turn from here on fails on
-        # the same dead --resume. Strictly scoped: claude only, signature only,
-        # own-sid only (an operator-pinned foreign --resume is their config, not
-        # ours to rotate), single retry (the retry command carries no --resume,
-        # so this branch cannot re-enter).
-        _resume_sid = _cli_flag_value(cmd, "--resume") or _cli_flag_value(cmd, "-r")
-        if (
-            _is_claude_code_cmd(cmd)
-            and _resume_sid
-            and not isolated_session
-            and _resume_sid == _load_agent_session_id()
-            and _CLAUDE_MISSING_SESSION_RE.search(raw_transport)
-        ):
+        # A locally persisted upstream session can disappear after cache cleanup
+        # or a CLI upgrade. Heal one missing-session failure, then stay bounded.
+        _stored_sid = "" if isolated_session else _load_agent_session_id()
+        _claude_resume_sid = (
+            _cli_flag_value(cmd, "--resume") or _cli_flag_value(cmd, "-r")
+        )
+        _codex_resume_attempt = (
+            _is_codex_cmd(cmd)
+            and "exec" in cmd
+            and cmd.index("exec") + 1 < len(cmd)
+            and cmd[cmd.index("exec") + 1] == "resume"
+            and bool(_stored_sid)
+            and _stored_sid in cmd
+        )
+        _resume_driver = (
+            "claude"
+            if _is_claude_code_cmd(cmd) and _claude_resume_sid == _stored_sid
+            else ("codex" if _codex_resume_attempt else "")
+        )
+        _missing_session = (
+            bool(_CLAUDE_MISSING_SESSION_RE.search(raw_transport))
+            if _resume_driver == "claude"
+            else bool(_CODEX_MISSING_SESSION_RE.search(raw_transport))
+            if _resume_driver == "codex"
+            else False
+        )
+        if _resume_driver and _stored_sid and _missing_session:
             _clear_agent_session_id(
-                f"claude --resume session missing upstream: "
+                f"{_resume_driver} resume session missing upstream: "
                 f"{_cli_error_detail(result.stdout or '', result.stderr or '')[:160]}"
             )
             log.warning(
-                "stale claude --resume sid=%s: local session store no longer has it; "
-                "retrying this turn once with a fresh session", _resume_sid,
+                "stale %s resume sid=%s: local session store no longer has it; "
+                "retrying this turn once with a fresh session",
+                _resume_driver,
+                _stored_sid,
             )
             _emit_debug_trace(
                 "agent", "agent.session.stale_resume_retry", trace_id=trace_id,
                 summary="stale --resume cleared; single fresh-session retry",
-                explain="claude 本地会话丢失(--resume 指向不存在的会话)——已清除并用新会话重试本轮",
+                explain=f"{_resume_driver} 本地会话丢失——已清除并用新会话重试本轮",
             )
-            cmd, stdin_msg = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
+            _retry_prepare: dict[str, Any] = {
+                "image_paths": image_paths,
+                "lane": lane,
+            }
+            if outbound_fence:
+                _retry_prepare["outbound_fence"] = True
+            cmd, stdin_msg = _prepare_cli_command(message, **_retry_prepare)
             command_sid = _cli_flag_value(cmd, "--session-id")
             if stdin_msg is not None:
                 _run_kwargs["input"] = stdin_msg
             result = _run_cli_subprocess(
                 cmd,
                 _run_kwargs,
-                stdout_line=pi_stream.feed if pi_stream is not None else None,
+                stdout_line=runtime_stream.feed if runtime_stream is not None else None,
+                **run_extra,
             )
             if ledger_enabled:
                 _queue_provider_attempt_ledger(_provider_attempt_rows_for_result(
@@ -8707,21 +10304,25 @@ def call_agent_cli(
             _trace_user_mcp_registered(
                 result.stdout or "", cmd, trace_id=trace_id, lane=lane,
                 attempt="stale_resume_retry")
-            # Persist the fresh session so the NEXT turn resumes it — but ONLY
-            # from a SUCCESSFUL retry: claude's failure result JSON can still
-            # carry a session_id, and saving that would re-persist a sid for a
-            # failed session right after we cleared the stale one — the next
-            # turn would --resume straight back into a dead session.
+            # Persist only a successful fresh session. Failure envelopes can
+            # carry ids that must not resurrect the stale session.
             if result.returncode == 0:
-                _validate_claude_actual_model(result.stdout or "")
-                observed_sid = _extract_session_id(raw_transport) or command_sid
+                if _is_claude_code_cmd(cmd):
+                    _validate_claude_actual_model(result.stdout or "")
+                observed_sid = (
+                    _codex_thread_id_from_stream(result.stdout or "")
+                    if _is_codex_cmd(cmd)
+                    else (_extract_session_id(raw_transport) or command_sid)
+                )
                 if observed_sid:
                     _save_agent_session_id(observed_sid)
                     _record_agent_session_turn(
                         observed_sid,
                         sent_bytes=len((message or "").encode("utf-8")),
                         received_bytes=_turn_content_bytes(cmd, result.stdout or "", result.stderr or ""),
+                        input_tokens=_cli_turn_metrics(cmd, result, 0).get("input_tokens"),
                     )
+                    _bind_pending_catalog_to_session(observed_sid)
     if result.returncode != 0:
         raise RuntimeError(
             f"cli agent exited {result.returncode}: "
@@ -8754,7 +10355,7 @@ def call_agent_cli(
             result = _run_cli_subprocess(
                 cmd,
                 _run_kwargs,
-                stdout_line=pi_stream.feed if pi_stream is not None else None,
+                stdout_line=runtime_stream.feed if runtime_stream is not None else None,
             )
             if ledger_enabled:
                 _queue_provider_attempt_ledger(_provider_attempt_rows_for_result(
@@ -8774,6 +10375,7 @@ def call_agent_cli(
                     observed_sid,
                     sent_bytes=len((message or "").encode("utf-8")),
                     received_bytes=_turn_content_bytes(cmd, result.stdout or "", result.stderr or ""),
+                    input_tokens=_cli_turn_metrics(cmd, result, 0).get("input_tokens"),
                 )
             # The retry runs AFTER the function's original returncode gate — re-check
             # it here so a crashed retry can never be returned as success just
@@ -8836,6 +10438,12 @@ def call_agent_cli(
                 _codex_thread_id_from_stream(result.stdout)
             )
         if codex_reply:
+            if (
+                observed_sid
+                and not isolated_session
+                and _message_has_injected_history(message)
+            ):
+                _mark_agent_session_bridged(observed_sid)
             # Background memory lanes (raw_text) parse the model's literal output
             # with their own extractors — hand them the bare reply untouched. Only
             # foreground chat folds reasoning into the thinking disclosure.
@@ -9177,6 +10785,7 @@ def call_agent(
     stream_update: Callable[[int, str, bool], None] | None = None,
     isolated_session: bool = False,
     outbound_fence: bool = False,
+    cancellation: _VoiceTurnCancellation | None = None,
 ) -> Any:
     # `_turn_reply_parse_failed` is a per-turn signal: reset it at entry so a
     # prior turn's failure (or a suppressed leak below) never bleeds into this
@@ -9196,6 +10805,12 @@ def call_agent(
             }
             if isolated_session:
                 http_kwargs["isolated_session"] = True
+            if stream_update is not None:
+                http_kwargs["stream_update"] = stream_update
+            if trace_id and stream_update is not None:
+                http_kwargs["request_id"] = trace_id
+            if cancellation is not None:
+                http_kwargs["cancellation"] = cancellation
             return call_agent_http(message, **http_kwargs)
         if AGENT_MODE == "cli":
             cli_kwargs: dict[str, Any] = {
@@ -9206,6 +10821,8 @@ def call_agent(
                 "attempt_trigger": attempt_trigger,
                 "stream_update": stream_update,
             }
+            if cancellation is not None:
+                cli_kwargs["cancellation"] = cancellation
             if outbound_fence:
                 cli_kwargs["outbound_fence"] = True
             if isolated_session:
@@ -9214,6 +10831,8 @@ def call_agent(
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
     raw = _call_with_resident_busy_poll(_invoke, lane=lane)
+    if cancellation is not None:
+        cancellation.raise_if_cancelled()
 
     if raw_text:
         # Background memory lanes (capture/dream) parse JSON from the model's
@@ -9356,6 +10975,7 @@ _IO_CLI_PATH = str(_REPO / "tools" / "io_cli.py")
 # is expected to be transient (e.g. io_cli.py mid-write during a deploy), so
 # the very next turn gets another attempt instead of going dark forever.
 _io_cli_catalog_cache: str | None = None
+_io_cli_voice_catalog_cache: str | None = None
 
 # The agent session id (see _load_agent_session_id) this process already
 # CONFIRMED-injected the catalog for, on a resume-capable driver
@@ -9589,7 +11209,11 @@ def _prepend_user_mcp_wait_hint(content: str, *, lane: str) -> str:
     return _USER_MCP_WAIT_HINT.format(names=", ".join(names)) + content
 
 
-def _prepend_io_cli_capability_catalog(content: str) -> str:
+def _prepend_io_cli_capability_catalog(
+    content: str,
+    *,
+    compact: bool = False,
+) -> str:
     """Prepend the live io_cli command catalog (io_cli_catalog.build_catalog,
     T6) to a foreground CLI turn, so a self-hosted resident's model always
     sees the io_cli surface actually shipped in THIS checkout — never a stale
@@ -9612,12 +11236,8 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
     never cached, so injection is silently skipped THIS turn only and retried
     next turn.
 
-    Once-per-session vs every-turn: codex has no ``--resume``, so every turn
-    starts context-blind and gets the catalog every turn. claude/pi/hermes
-    resume natively, so re-injecting every turn would just bloat every prompt
-    with a block the model already has in its resumed session — inject once
-    per agent session id (see ``_io_cli_catalog_injected_session_id`` above);
-    a session id change (rotation, a brand-new session) re-injects once.
+    Resume-capable CLI drivers receive the catalog once per session. Older
+    codex versions keep the stateless every-turn fallback.
 
     Pending -> commit (Codex review I10): for a resume-capable driver this
     only marks the session id PENDING (``_io_cli_catalog_pending_session_id``)
@@ -9626,14 +11246,16 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
     pending_injection()`` on failure, so a turn whose subprocess/HTTP call
     fails before the model ever saw the prompt does not permanently skip the
     catalog for the rest of that session."""
-    global _io_cli_catalog_cache, _io_cli_catalog_pending_session_id
+    global _io_cli_catalog_cache, _io_cli_voice_catalog_cache
+    global _io_cli_catalog_pending_session_id
+    global _web_advertised_session_id, _web_off_notice_session_id
     if _HOSTED or AGENT_MODE != "cli":
         return content
 
-    is_codex = _is_codex_cmd(_cli_cmd_tokens())
-    sid = None
-    if not is_codex:
-        sid = _load_agent_session_id()
+    cli_tokens = _cli_cmd_tokens()
+    is_codex = _is_codex_cmd(cli_tokens)
+    resume_capable = not is_codex or _codex_resume_available_for_cmd(cli_tokens)
+    sid = _load_agent_session_id() if resume_capable else None
 
     # Web policy (batch 5) is applied on TOP of the cached full catalog, per turn,
     # so it tracks a mid-session toggle even for a resume-capable driver whose
@@ -9641,12 +11263,12 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
     # one-line "web is off now" correction below.
     web_notice = _web_off_notice_for_turn(sid)
 
-    if not is_codex and sid == _io_cli_catalog_injected_session_id:
+    if resume_capable and sid == _io_cli_catalog_injected_session_id:
         # Catalog already confirmed-injected for this session; only a web-off
         # correction (if any) still needs to reach the model this turn.
         return f"{web_notice}\n\n{content}" if web_notice else content
 
-    catalog = _io_cli_catalog_cache
+    catalog = _io_cli_voice_catalog_cache if compact else _io_cli_catalog_cache
     if catalog is None:
         # The real entrypoint runs as `python tools/chat_resident_consumer.py`
         # with tools/ auto-added to sys.path[0], so this bare sibling import
@@ -9661,7 +11283,11 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
             sys.path.insert(0, _tools_dir)
         import io_cli_catalog  # noqa: PLC0415 — sibling on tools/ path
 
-        catalog = io_cli_catalog.build_catalog(_IO_CLI_PATH, python=sys.executable)
+        catalog = io_cli_catalog.build_catalog(
+            _IO_CLI_PATH,
+            python=sys.executable,
+            compact=compact,
+        )
         if catalog is None:
             # Build failed this turn (subprocess error, --help format drift,
             # io_cli.py mid-deploy write) — skip the full catalog, retry next
@@ -9676,10 +11302,19 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
             notice = f"{web_notice}\n\n" if web_notice else ""
             return (
                 f"{notice}{io_cli_catalog.D3_SOURCING_RULE}\n"
-                f"{_memory_read_prompt_block()}\n"
-                f"{_outbound_file_prompt_block()}\n\n{content}"
+                + (
+                    "Memory requests: memory-index first, then memory-fetch only "
+                    "with real items[].id values. Requested files/images: stage "
+                    "them with send-file/send-image and claim success only after ok.\n\n"
+                    if compact
+                    else f"{_memory_read_prompt_block()}\n{_outbound_file_prompt_block()}\n\n"
+                )
+                + content
             )
-        _io_cli_catalog_cache = catalog
+        if compact:
+            _io_cli_voice_catalog_cache = catalog
+        else:
+            _io_cli_catalog_cache = catalog
 
     # Our web-search / web-fetch is CLOUD-ONLY. This whole path is VPS /
     # self-hosted only (the ``_HOSTED`` early-return above), so the web verbs are
@@ -9690,12 +11325,20 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
     # stays empty too (nothing was ever promised to retract).
     catalog_for_turn = _strip_web_verbs_from_catalog(catalog)
 
-    if not is_codex:
+    if resume_capable:
         # NOT committed yet — see _commit_io_cli_catalog_injection /
         # _discard_io_cli_catalog_pending_injection docstrings above.
         _io_cli_catalog_pending_session_id = sid
 
     notice = f"{web_notice}\n\n" if web_notice else ""
+    if compact:
+        essentials = (
+            "Memory requests: memory-index first, then memory-fetch only with "
+            "real items[].id values. Requested files/images: create them under "
+            f"{OUTBOUND_FILE_DIR}, stage with send-file/send-image, and claim "
+            "success only after ok."
+        )
+        return f"{notice}{catalog_for_turn}\n{essentials}\n\n{content}"
     return (
         f"{notice}{catalog_for_turn}\n{_memory_read_prompt_block()}\n"
         f"{_outbound_file_prompt_block()}\n\n{content}"
@@ -9715,6 +11358,14 @@ def _commit_io_cli_catalog_injection() -> None:
     if _io_cli_catalog_pending_session_id is not None:
         _io_cli_catalog_injected_session_id = _io_cli_catalog_pending_session_id
         _io_cli_catalog_pending_session_id = None
+
+
+def _bind_pending_catalog_to_session(session_id: str) -> None:
+    """Bind a first-turn catalog injection to the session created by that turn."""
+    global _io_cli_catalog_pending_session_id
+    sid = str(session_id or "").strip()
+    if sid and _io_cli_catalog_pending_session_id == "":
+        _io_cli_catalog_pending_session_id = sid
 
 
 def _discard_io_cli_catalog_pending_injection() -> None:
@@ -9747,7 +11398,11 @@ def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = No
         return ""
     if not history:
         return ""
-    messages = _clean_messages_for_proactive_context(history)
+    messages = [
+        message
+        for message in _clean_messages_for_proactive_context(history)
+        if str(message.get("source") or "") != VOICE_TRANSCRIPT_SOURCE
+    ]
     if before_ts > 0:
         messages = [m for m in messages if _message_ts_for_context(m) < before_ts]
     selected = messages[-limit:]
@@ -11765,85 +13420,177 @@ def execute_scheduled_wake_actions(actions: list[dict], job: dict) -> dict:
 
 
 class _VoiceDeltaPublisher:
-    """Throttle Pi snapshots before handing them to the encrypted voice stream."""
+    """Common VPS delta contract and non-blocking backend publisher.
+
+    Every CLI/HTTP adapter reports ``(segment, cumulative_text, final)``. Text
+    must grow monotonically within a segment; final marks the last stable
+    snapshot. This publisher validates that contract, coalesces intermediate
+    snapshots, and converts it to the one encrypted voice handoff endpoint.
+    """
 
     def __init__(self, parent_message_id: str):
         self.parent_message_id = parent_message_id
+        self._latest: dict[int, str] = {}
         self._published: dict[int, str] = {}
+        self._pending: set[int] = set()
+        self._started_at = time.monotonic()
         self._last_post_at = 0.0
         self._warned = False
+        self._closing = False
+        self._aborted = False
+        self._final_sent = False
+        self._condition = threading.Condition()
+        self._done = threading.Event()
+        threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="voice-delta-publisher",
+        ).start()
 
     def __call__(self, segment: int, text: str, final: bool) -> None:
-        previous = self._published.get(segment, "")
-        if previous and not text.startswith(previous):
+        if not isinstance(segment, int) or not 0 <= segment <= 31:
             return
-        if text == previous:
-            return
-        now = time.monotonic()
-        appended = text[len(previous) :] if text.startswith(previous) else text
-        sentence_boundary = bool(re.search(r"[。！？!?，,；;：:\n]$", text))
-        if not final:
-            if not previous and len(text.strip()) < 2:
+        with self._condition:
+            if self._closing:
                 return
-            if (
-                now - self._last_post_at < 0.18
-                and len(appended) < 8
-                and not sentence_boundary
-            ):
+            previous = self._latest.get(segment, "")
+            if previous and not text.startswith(previous):
                 return
-        try:
-            response = _HTTP.post(
-                f"{FEEDLING_API_URL}/v1/internal/voice/delta",
-                json={
-                    "parent_message_id": self.parent_message_id,
-                    "segment": segment,
-                    "text": text,
-                    "final": False,
-                },
-                headers=_HEADERS,
-                timeout=3.0,
-            )
-            if response.status_code >= 400:
-                raise RuntimeError(f"status={response.status_code}")
-        except Exception as exc:
-            if not self._warned:
-                log.warning(
-                    "voice stream handoff unavailable parent=%s type=%s",
-                    self.parent_message_id[:12],
-                    type(exc).__name__,
+            if text == previous:
+                return
+            if not previous and len(text.strip()) < 2 and not final:
+                return
+            self._latest[segment] = text
+            self._pending.add(segment)
+            self._condition.notify()
+
+    def _post(self, segment: int, text: str, *, final: bool) -> bool:
+        attempts = VOICE_STREAM_FINAL_ATTEMPTS if final else 1
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                response = _HTTP.post(
+                    f"{FEEDLING_API_URL}/v1/internal/voice/delta",
+                    json={
+                        "parent_message_id": self.parent_message_id,
+                        "segment": segment,
+                        "text": text,
+                        "final": final,
+                    },
+                    headers=_HEADERS,
+                    timeout=3.0,
                 )
-                self._warned = True
-            return
-        self._published[segment] = text
-        self._last_post_at = now
+                if response.status_code >= 400:
+                    raise RuntimeError(f"status={response.status_code}")
+                return True
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 < attempts:
+                    time.sleep(0.2 * (2 ** attempt))
+        if not self._warned:
+            log.warning(
+                "voice stream %s unavailable parent=%s attempts=%d type=%s",
+                "completion" if final else "handoff",
+                self.parent_message_id[:12],
+                attempts,
+                type(last_error).__name__ if last_error else "unknown",
+            )
+            self._warned = True
+        return False
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while not self._pending and not self._closing:
+                    self._condition.wait()
+                if self._closing and not self._latest:
+                    self._done.set()
+                    return
+
+                final = False
+                if self._pending:
+                    segment = min(self._pending)
+                    text = self._latest[segment]
+                    if not self._closing:
+                        first = not self._published
+                        sentence_boundary = bool(
+                            re.search(r"[。！？!?，,；;：:\n]$", text)
+                        )
+                        delay = max(
+                            0.0,
+                            0.18 - (time.monotonic() - self._last_post_at),
+                        )
+                        if not first and not sentence_boundary and delay > 0:
+                            self._condition.wait(timeout=delay)
+                            continue
+                    final = (
+                        self._closing
+                        and segment == max(self._latest)
+                        and not any(other > segment for other in self._pending)
+                    )
+                    self._pending.discard(segment)
+                else:
+                    if self._final_sent:
+                        self._done.set()
+                        return
+                    segment = max(self._latest)
+                    text = self._latest[segment]
+                    final = True
+
+            first_publish = not self._published
+            posted = self._post(segment, text, final=final)
+            now = time.monotonic()
+            with self._condition:
+                if posted:
+                    self._published[segment] = text
+                    self._last_post_at = now
+                if final:
+                    self._final_sent = True
+                    self._done.set()
+
+            if posted and first_publish:
+                log.info(
+                    "[voice-stream] first_delta parent=%s elapsed_ms=%d chars=%d",
+                    self.parent_message_id[:12],
+                    int((now - self._started_at) * 1000),
+                    len(text),
+                )
+            if final:
+                if posted:
+                    log.info(
+                        "[voice-stream] complete parent=%s elapsed_ms=%d "
+                        "segment=%d chars=%d",
+                        self.parent_message_id[:12],
+                        int((now - self._started_at) * 1000),
+                        segment,
+                        len(text),
+                    )
+                return
 
     def complete(self) -> None:
-        if not self._published:
-            return
-        segment = max(self._published)
-        text = self._published[segment]
-        try:
-            response = _HTTP.post(
-                f"{FEEDLING_API_URL}/v1/internal/voice/delta",
-                json={
-                    "parent_message_id": self.parent_message_id,
-                    "segment": segment,
-                    "text": text,
-                    "final": True,
-                },
-                headers=_HEADERS,
-                timeout=3.0,
+        with self._condition:
+            if self._aborted:
+                return
+            self._closing = True
+            self._condition.notify()
+            if not self._latest:
+                return
+        if not self._done.wait(timeout=6.0):
+            log.info(
+                "[voice-stream] completion pending parent=%s elapsed_ms=%d",
+                self.parent_message_id[:12],
+                int((time.monotonic() - self._started_at) * 1000),
             )
-            if response.status_code >= 400:
-                raise RuntimeError(f"status={response.status_code}")
-        except Exception as exc:
-            if not self._warned:
-                log.warning(
-                    "voice stream completion unavailable parent=%s type=%s",
-                    self.parent_message_id[:12],
-                    type(exc).__name__,
-                )
-                self._warned = True
+
+    def abort(self) -> None:
+        """Drop pending snapshots for a voice turn that is no longer current."""
+        with self._condition:
+            self._aborted = True
+            self._closing = True
+            self._pending.clear()
+            self._latest.clear()
+            self._condition.notify_all()
+        self._done.wait(timeout=0.25)
 
 
 def _voice_delta_publisher(message: dict) -> _VoiceDeltaPublisher | None:
@@ -12179,6 +13926,8 @@ def _handle_post_reply_response(resp) -> dict:
             body = resp.json()
         except Exception:
             body = {}
+        if body.get("error") == "voice_turn_superseded":
+            return body
         if body.get("error") == "bootstrap_incomplete":
             if body.get("retryable") is True:
                 log.error(
@@ -15672,6 +17421,18 @@ def _process_messages(messages: list) -> float:
             latest = max(latest, ts)
             continue
 
+        # A newer ASR revision can supersede this row while the resident is
+        # waiting for the enclave decrypt view. Do not start a model process for
+        # work the reply fence already guarantees can never be published.
+        if str(msg.get("voice_turn_status") or "").strip() == "superseded":
+            log.info(
+                "obsolete voice turn skipped before model parent=%s replacement=%s",
+                str(msg.get("id") or msg.get("message_id") or "")[:12],
+                str(msg.get("voice_superseded_by") or "")[:12],
+            )
+            latest = max(latest, ts)
+            continue
+
         # Idempotency — skip messages already processed in this session.
         key = _msg_key(msg)
         if not _mark_seen(key):
@@ -15722,10 +17483,22 @@ def _process_messages(messages: list) -> float:
             # and mint the sticky live-loop green (codex3 backend strict matcher).
             _ping_id = str(msg.get("id") or msg.get("message_id") or "").strip()
             probe: dict[str, Any] = {}
+            probe_cancellation = _LocalTurnCancellation()
 
             def _run_verify_probe() -> None:
                 try:
-                    probe["result"] = call_agent(VERIFY_PROBE_MESSAGE)
+                    # Verification proves the adapter/parser works, but it is
+                    # not part of the user's relationship conversation. Keep it
+                    # in a throwaway native session so the first real voice turn
+                    # does not inherit ~one full Codex prompt of synthetic
+                    # history (or race a slow probe still finishing in the
+                    # background after the bounded fallback fires).
+                    probe["result"] = call_agent(
+                        VERIFY_PROBE_MESSAGE,
+                        lane="background",
+                        isolated_session=True,
+                        cancellation=probe_cancellation,
+                    )
                     # Probe has its own success semantics and never posts a
                     # user-visible notice; discard the marker so it can't leak
                     # into the next foreground/proactive turn (see
@@ -15746,6 +17519,12 @@ def _process_messages(messages: list) -> float:
                 # the GC window — otherwise the (real or canned) ack leaks as a
                 # stray visible message. suppress_push already kills the APNs push.
                 if probe_thread.is_alive():
+                    # The canned ack ends the verification wait, but the model
+                    # process must end too. Leaving it running competes with the
+                    # first real voice turn for CPU/network and, for paid APIs,
+                    # keeps spending tokens on an answer nobody will use.
+                    probe_cancellation.cancel()
+                    probe_thread.join(timeout=1.5)
                     log.warning("verify ping — agent slow (>%ss); canned ack fallback so verify still passes", VERIFY_PROBE_TIMEOUT_SEC)
                     post_reply(VERIFY_PING_REPLY, source="verify_ping", suppress_push=True, reply_to_message_id=_ping_id)
                 elif "result" in probe:
@@ -15889,6 +17668,36 @@ def _process_messages(messages: list) -> float:
 
         trace_id = str(msg.get("id") or msg.get("message_id") or "").strip()
         voice_stream_update = _voice_delta_publisher(msg)
+        voice_cancellation = _voice_turn_cancellation(msg)
+        voice_cancellation_started = False
+        voice_runtime_stopped = False
+
+        def _start_voice_cancellation() -> None:
+            nonlocal voice_cancellation_started
+            if voice_cancellation is None or voice_cancellation_started:
+                return
+            if voice_stream_update is not None:
+                voice_cancellation.add_cancel_callback(voice_stream_update.abort)
+            if AGENT_MODE == "http" and AGENT_HTTP_CANCEL_URL:
+                voice_cancellation.add_cancel_callback(
+                    lambda: _cancel_http_agent_request(trace_id)
+                )
+            voice_cancellation.start()
+            voice_cancellation_started = True
+
+        def _stop_voice_runtime(*, abort_stream: bool) -> None:
+            nonlocal voice_runtime_stopped
+            if voice_runtime_stopped:
+                return
+            voice_runtime_stopped = True
+            if voice_cancellation is not None:
+                voice_cancellation.close()
+            if voice_stream_update is not None:
+                if abort_stream:
+                    voice_stream_update.abort()
+                else:
+                    voice_stream_update.complete()
+
         attempt_trigger = str(msg.get("_provider_attempt_trigger") or "first")
         if attempt_trigger not in _PROVIDER_ATTEMPT_TRIGGERS:
             attempt_trigger = "first"
@@ -15979,7 +17788,10 @@ def _process_messages(messages: list) -> float:
         # turn for codex. Must run BEFORE _foreground_agent_message below so the
         # transcript header it prepends stays topmost (see that function's
         # docstring and _message_has_injected_history).
-        content = _prepend_io_cli_capability_catalog(content)
+        if voice_stream_update is not None:
+            content = _prepend_io_cli_capability_catalog(content, compact=True)
+        else:
+            content = _prepend_io_cli_capability_catalog(content)
         # claude does NOT wait for the user-MCP handshake, and we spawn a fresh
         # process per turn — so tell the model about WaitForMcpServers rather
         # than let it truthfully report a capability it cannot see. No-op for
@@ -16036,12 +17848,19 @@ def _process_messages(messages: list) -> float:
         pending_failure_is_parse_only = False
 
         def _dispatch_foreground_agent(turn_content: str) -> Any:
+            _start_voice_cancellation()
             fence_kwargs = {"outbound_fence": True} if screen_pixel_turn else {}
+            cancellation_kwargs = (
+                {"cancellation": voice_cancellation}
+                if voice_cancellation is not None
+                else {}
+            )
             if use_resident_chat_v2_profile:
                 return call_agent(
                     _resident_foreground_chat_message_v2(turn_content),
                     trace_id=trace_id, lane="chat",
                     stream_update=voice_stream_update,
+                    **cancellation_kwargs,
                     **fence_kwargs,
                     **attempt_kwargs)
             if image_payloads or image_paths:
@@ -16052,6 +17871,7 @@ def _process_messages(messages: list) -> float:
                     trace_id=trace_id,
                     lane="chat",
                     stream_update=voice_stream_update,
+                    **cancellation_kwargs,
                     **fence_kwargs,
                     **attempt_kwargs,
                 )
@@ -16060,6 +17880,7 @@ def _process_messages(messages: list) -> float:
                 trace_id=trace_id,
                 lane="chat",
                 stream_update=voice_stream_update,
+                **cancellation_kwargs,
                 **fence_kwargs,
                 **attempt_kwargs,
             )
@@ -16158,7 +17979,19 @@ def _process_messages(messages: list) -> float:
                         content = _foreground_agent_message(content, current_ts=ts)
                         content += suffix
                         agent_result = _dispatch_foreground_agent(content)
+        except VoiceTurnSuperseded:
+            _discard_io_cli_catalog_pending_injection()
+            if outbound_file_turn_active:
+                _finish_outbound_attachment_turn(trace_id)
+            _stop_voice_runtime(abort_stream=True)
+            log.info(
+                "obsolete voice turn stopped before reply parent=%s",
+                trace_id[:12],
+            )
+            latest = max(latest, ts)
+            continue
         except Exception as e:
+            _stop_voice_runtime(abort_stream=True)
             log.error("agent call failed; posting user-visible fallback: %s", e)
             if content_type == "image" and not isinstance(e, VisionObserverFailure):
                 e = VisionObserverFailure(
@@ -16203,6 +18036,19 @@ def _process_messages(messages: list) -> float:
             # success.
             if not vision_observer_failed:
                 _commit_io_cli_catalog_injection()
+            if (
+                voice_cancellation is not None
+                and voice_cancellation.cancelled.is_set()
+            ):
+                if outbound_file_turn_active:
+                    _finish_outbound_attachment_turn(trace_id)
+                _stop_voice_runtime(abort_stream=True)
+                log.info(
+                    "obsolete voice turn dropped after model return parent=%s",
+                    trace_id[:12],
+                )
+                latest = max(latest, ts)
+                continue
             if voice_stream_update is not None:
                 voice_stream_update.complete()
             if (
@@ -16549,8 +18395,21 @@ def _process_messages(messages: list) -> float:
                         "degenerate-only turn and fallback disabled by env; "
                         "this user turn will not get a visible reply"
                     )
+                    _stop_voice_runtime(abort_stream=True)
                     latest = max(latest, ts)
                     continue
+
+        if voice_cancellation is not None and voice_cancellation.cancelled.is_set():
+            if outbound_file_turn_active:
+                _finish_outbound_attachment_turn(trace_id)
+            _stop_voice_runtime(abort_stream=True)
+            log.info(
+                "obsolete voice turn dropped before response parent=%s",
+                trace_id[:12],
+            )
+            latest = max(latest, ts)
+            continue
+        _stop_voice_runtime(abort_stream=False)
 
         reply_to_message_id = str(msg.get("id") or msg.get("message_id") or "").strip()
         posted_any = False

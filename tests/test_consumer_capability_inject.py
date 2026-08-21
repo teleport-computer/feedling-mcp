@@ -88,10 +88,13 @@ def _reset_capability_catalog_state(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_MODE", "cli")
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", "claude -p {message}")
     crc._io_cli_catalog_cache = None
+    crc._io_cli_voice_catalog_cache = None
     crc._io_cli_catalog_injected_session_id = None
     crc._io_cli_catalog_pending_session_id = None
+    crc._codex_resume_support_cache.clear()
     yield
     crc._io_cli_catalog_cache = None
+    crc._io_cli_voice_catalog_cache = None
     crc._io_cli_catalog_injected_session_id = None
     crc._io_cli_catalog_pending_session_id = None
     # The one test in this file that exercises the real _process_messages
@@ -106,8 +109,8 @@ def _reset_capability_catalog_state(monkeypatch):
 def _mock_build_catalog(monkeypatch, *, return_value=None, side_effect=None):
     calls = []
 
-    def _fake(io_cli_path, python=sys.executable):
-        calls.append((io_cli_path, python))
+    def _fake(io_cli_path, python=sys.executable, *, compact=False):
+        calls.append((io_cli_path, python, compact))
         if side_effect is not None:
             return side_effect(len(calls))
         return return_value
@@ -252,11 +255,12 @@ def test_cli_mode_session_change_reinjects(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# codex (no --resume) — every turn, session id irrelevant
+# codex — native resume when available, stateless fallback otherwise
 # ---------------------------------------------------------------------------
 
-def test_codex_injects_every_turn(monkeypatch):
+def test_old_codex_without_resume_injects_every_turn(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec {message}")
+    monkeypatch.setattr(crc, "_codex_resume_available_for_cmd", lambda cmd: False)
 
     def _boom():
         raise AssertionError("_load_agent_session_id must not be consulted for codex")
@@ -275,6 +279,22 @@ def test_codex_injects_every_turn(monkeypatch):
     # codex never touches the pending/committed session trackers at all.
     assert crc._io_cli_catalog_pending_session_id is None
     assert crc._io_cli_catalog_injected_session_id is None
+
+
+def test_resume_capable_codex_injects_catalog_once_per_session(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec {message}")
+    monkeypatch.setattr(crc, "_codex_resume_available_for_cmd", lambda cmd: True)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "codex-thread-1")
+    calls = _mock_build_catalog(monkeypatch, return_value="CATALOG_TEXT")
+
+    first = crc._prepend_io_cli_capability_catalog("turn 1")
+    crc._commit_io_cli_catalog_injection()
+    second = crc._prepend_io_cli_capability_catalog("turn 2")
+
+    assert first == _with_download_delivery_prompt("CATALOG_TEXT", "turn 1")
+    assert second == "turn 2"
+    assert len(calls) == 1
+    assert crc._io_cli_catalog_injected_session_id == "codex-thread-1"
 
 
 # ---------------------------------------------------------------------------

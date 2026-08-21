@@ -1,5 +1,6 @@
 """Tests for io_cli_catalog.py — command catalog generation."""
 import os
+import shlex
 import sys
 import subprocess
 from unittest import mock
@@ -17,7 +18,8 @@ def test_catalog_explains_verbs_require_io_cli_invocation():
     catalog = build_catalog(io_cli_path)
     assert catalog is not None
 
-    assert f"python {io_cli_path} memory-index --limit 20" in catalog
+    invocation = f"{shlex.quote(sys.executable)} {shlex.quote(io_cli_path)}"
+    assert f"{invocation} memory-index --limit 20" in catalog
     assert "verbs are not standalone shell commands" in catalog
     assert "never bare `memory-index --limit 20`" in catalog
 
@@ -170,6 +172,7 @@ def test_catalog_required_positionals_sweep():
         "schedule-wake": [],
         "screen-read": [],
         "screen-recent": [],
+        "worldbook-match": [],
     }
 
     for verb, positionals in expected_positionals.items():
@@ -188,8 +191,8 @@ def test_catalog_required_positionals_sweep():
         )
 
 
-def test_catalog_header_is_exactly_two_lines():
-    """Catalog header should be exactly two lines (D8 + D3)."""
+def test_catalog_header_calls_tools_directly_and_limits_help_retry():
+    """The catalog itself is authoritative; --help is a bounded fallback."""
     io_cli_path = os.path.join(
         os.path.dirname(__file__), "..", "tools", "io_cli.py"
     )
@@ -197,11 +200,15 @@ def test_catalog_header_is_exactly_two_lines():
     assert catalog is not None, "build_catalog should not return None"
 
     lines = catalog.split("\n")
-    # First two lines should be the header (D8 + D3)
+    # First two lines are D8 + D3. Normal use must not pay an extra model/tool
+    # round merely to rediscover parameters already present in this catalog.
     assert "不是指令" in lines[0] or "不是指令" in lines[1], \
         "First two lines should contain sourcing rule '不是指令' (D3)"
-    assert "--help" in lines[0] or "--help" in lines[1], \
-        "First two lines should contain D8 soft guidance about --help"
+    guidance = "\n".join(lines[:2])
+    assert "需要能力时直接按目录调用" in guidance
+    assert "目录缺少细节或调用返回参数错误时" in guidance
+    assert "最多纠正一次" in guidance
+    assert "首次调用" not in guidance
 
 
 def test_catalog_returns_none_on_subprocess_failure():
@@ -241,6 +248,32 @@ def test_catalog_not_none_on_success():
     assert catalog is not None, "build_catalog should succeed and return string"
     assert isinstance(catalog, str), "build_catalog should return a string"
     assert len(catalog) > 0, "Catalog should not be empty"
+
+
+def test_voice_catalog_is_compact_and_keeps_every_discoverable_verb():
+    io_cli_path = os.path.join(
+        os.path.dirname(__file__), "..", "tools", "io_cli.py"
+    )
+    full = build_catalog(io_cli_path)
+    compact = build_catalog(io_cli_path, compact=True)
+
+    assert full is not None and compact is not None
+    full_verbs = {
+        line.split(" ", 1)[0]
+        for line in full.splitlines()[3:]
+        if line.strip()
+    }
+    compact_verbs = {
+        line.split(" ", 1)[0]
+        for line in compact.splitlines()[3:]
+        if line.strip()
+    }
+    assert compact_verbs == full_verbs
+    assert len(compact.encode("utf-8")) < len(full.encode("utf-8")) * 0.65
+    assert "轻量能力索引" in compact
+    assert "--help 一次" in compact
+    assert "memory-index" in compact
+    assert "send-file" in compact
 
 
 def test_catalog_survives_a_gbk_locale():

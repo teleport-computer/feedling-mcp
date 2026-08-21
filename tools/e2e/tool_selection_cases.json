@@ -276,6 +276,18 @@
       "utterance": "你还记得我妈妈的名字吗"
     },
     {
+      "id": "worldbook_match_1",
+      "family": "worldbook",
+      "expect": "worldbook_match",
+      "utterance": "查一下我的世界书，Luna 在 Moon Court 是什么身份？"
+    },
+    {
+      "id": "worldbook_match_2",
+      "family": "worldbook",
+      "expect": "worldbook_match",
+      "utterance": "按我设定集里的规则，银月仪式要满足什么条件？"
+    },
+    {
       "id": "mem_index_1",
       "family": "memory",
       "expect": "memory_index",

@@ -198,6 +198,15 @@ PARAMS: dict[str, dict] = {
         },
         "required": ["query"],
     },
+    # -- worldbook.py (backed by worldbook/worldbook_core.py) --
+    # Match only the current subject requested by the model. Proactive alwaysOn
+    # entries remain on the dedicated wake path and are not exposed through an
+    # empty-query tool call.
+    "worldbook_match": {
+        "type": "object",
+        "properties": {"query": _STR},
+        "required": ["query"],
+    },
     # -- history.py (backed by model_api_runtime/v2/history_readside.py) --
     # history.search(store, ...): params query/start/end/cursor/limit, all
     # optional at the schema level — "query 与 (start|end) 至少给一个 / 续页只传
@@ -568,6 +577,12 @@ DESCRIPTIONS: dict[str, str] = {
                       "earlier answered memory workflow unless the current message "
                       "explicitly asks. For a "
                       "user-requested bulk rewrite or cleanup, call memory_organize."),
+    "worldbook_match": (
+        "Match the current subject against the user's World Book and return only "
+        "the relevant entries. Use it when the answer depends on user-defined lore, "
+        "characters, places, rules, or terminology. Do not call it for ordinary "
+        "conversation, and do not repeat the same query in one turn."
+    ),
     "voice_transcript_list": (
         "List this user's archived voice calls, newest first: call_id, when it "
         "happened, how long it ran, how many turns. Metadata only — no words "
