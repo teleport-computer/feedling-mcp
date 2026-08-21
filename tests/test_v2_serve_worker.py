@@ -639,6 +639,25 @@ def test_job_enqueue_trace_uses_trace_id_as_turn_id(monkeypatch):
     assert captured[0][2]["turn_id"] == "trace-enqueue-123"
 
 
+def test_job_enqueue_trace_emits_only_exported_reasons(monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        serve_worker,
+        "_emit_v2_debug_trace_for_user",
+        lambda user_id, event_type, **kwargs: captured.append(kwargs),
+    )
+
+    serve_worker._emit_job_enqueued_trace(
+        "usr_enqueue", "scheduled", reason="scheduled_wake", trace_id="t1"
+    )
+    serve_worker._emit_job_enqueued_trace(
+        "usr_enqueue", "scheduled", reason="secret_token", trace_id="t2"
+    )
+
+    assert captured[0]["detail"]["reason"] == "scheduled_wake"
+    assert "reason" not in captured[1]["detail"]
+
+
 @pytest.mark.parametrize(
     "event_type",
     ["mcp.surface.schema_folded", "mcp.surface.schema_recovered"],

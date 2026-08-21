@@ -2650,7 +2650,7 @@ _PROMPT_FRONTIER_PUBLIC_BYTE_COMPONENTS = frozenset({
 #
 # 取值集合一律**从产生方的模块读**,不在这里抄一份:抄一份就会在别人改常量时
 # 静默失配,而失配的表现是「字段忽然消失」,没有人会因此收到告警。
-_TRACE_PUBLIC_SHAPE = object()   # 取值空间开放,退而用形状判定(见下)
+_TRACE_PUBLIC_FAILURE_CODE = object()  # 值必须命中产生方显式导出
 
 # ⚠️ 这一格改过两次,两次都错在**同一个方向:想从字符串本身推断它的来源**。
 #
@@ -2667,10 +2667,8 @@ _TRACE_PUBLIC_SHAPE = object()   # 取值空间开放,退而用形状判定(见�
 #
 # ⇒ 结论:**形状和前缀都证明不了来源,只有产生者能证明。**
 # 现在只认**产生方模块显式导出的集合成员**,不做任何字符串推断。
-# 代价是 `wake_failed:providererror` 这类**拼装码暂时仍被遮住** ——
-# 它的后半段来自 `type(exc).__name__.lower()`(worker.py:1163),产生方目前
-# 没有导出完整词表。**这是已知缺口,不是遗漏**:与其用一条推断规则假装覆盖它,
-# 不如让它显式地留在遮蔽里,并单开一单让产生方导出(见台账)。
+# T220 已让 V2 worker、jobs_store 与 voice gateway 各自导出并在写入边界归一化；
+# `wake_failed:providererror` 等真实码因此可见,未知后缀仍保持遮蔽。
 
 
 def _known_failure_codes() -> frozenset:
@@ -2681,8 +2679,19 @@ def _known_failure_codes() -> frozenset:
         try:
             from model_api_runtime.v2 import jobs_store as _js
             codes |= set(_js.CONTROL_OUTCOME_CODES)
+            codes |= set(_js.JOB_FAILURE_CODES)
             codes |= set(_js.SAFETY_SUPPRESSION_CODES)
             codes |= set(_js.TIMEOUT_OUTCOME_CODES)
+        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
+            pass
+        try:
+            from model_api_runtime.v2 import worker as _worker
+            codes |= set(_worker.PUBLIC_FAILURE_CODES)
+        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
+            pass
+        try:
+            from voice import error_codes as _voice_error_codes
+            codes |= set(_voice_error_codes.VOICE_GATEWAY_ERROR_CODES)
         except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
             pass
         _KNOWN_FAILURE_CODES_CACHE = frozenset(codes)
@@ -2730,8 +2739,10 @@ def _trace_public_fields() -> dict:
     try:
         from model_api_runtime.v2 import jobs_store as _js
         lanes = frozenset(_js.LANES)
+        enqueue_reasons = frozenset(_js.ENQUEUE_REASON_CODES)
     except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
         lanes = frozenset()
+        enqueue_reasons = frozenset()
     outcomes = frozenset(db.TRACE_OUTCOME_CLASSES)
     job_outcomes = frozenset({"completed", "failed", "rescheduled", "superseded"})
     voice_stage = frozenset({
@@ -2742,20 +2753,20 @@ def _trace_public_fields() -> dict:
     table = {
         "agent.job.enqueued": {
             "lane": lanes, "enqueue_source": lanes,
-            # ⚠️ `reason` 曾被声明成公开字段,但它的真实产生值
-            # (scheduled_wake / manual_tick / dream_refresh …)**一个都不在**
-            # 任何权威导出里 ⇒ 声明了却一个典型值都看不见,
-            # **那是比不声明更坏的状态**:读的人会以为这个字段没值。
-            # 删掉假声明,归入 T220(让产生方导出 reason 词表)。
+            "reason": enqueue_reasons,
         },
         "agent.job.terminal": {
             "lane": lanes, "outcome": job_outcomes,
-            "outcome_class": outcomes, "error_code": _TRACE_PUBLIC_SHAPE,
+            "outcome_class": outcomes,
+            "error_code": _TRACE_PUBLIC_FAILURE_CODE,
         },
         "vision.provider.called": {},
-        "vision.provider.completed": {"error_class": _TRACE_PUBLIC_SHAPE},
+        "vision.provider.completed": {
+            "error_class": _TRACE_PUBLIC_FAILURE_CODE,
+        },
         "agent.image.generate.failed": {
-            "error_code": _TRACE_PUBLIC_SHAPE, "classified": _TRACE_PUBLIC_SHAPE,
+            "error_code": _TRACE_PUBLIC_FAILURE_CODE,
+            "classified": _TRACE_PUBLIC_FAILURE_CODE,
         },
     }
     for etype in (
@@ -2766,7 +2777,7 @@ def _trace_public_fields() -> dict:
     ):
         table[etype] = {
             "stage": voice_stage, "runtime": runtime_kind,
-            "error_code": _TRACE_PUBLIC_SHAPE,
+            "error_code": _TRACE_PUBLIC_FAILURE_CODE,
         }
     _TRACE_PUBLIC_FIELDS_CACHE = table
     return table
@@ -2778,8 +2789,8 @@ _TRACE_PUBLIC_FIELDS_CACHE = None
 def _expose_declared_trace_fields(ev: dict, raw_detail, public_detail) -> None:
     """把该事件显式声明过的字段放回明文。
 
-    两层收口:键必须被这个事件声明过,**且**值必须落在声明的集合里(或通过形状)。
-    任何未声明的键、任何形状不符的值,一律维持既有的遮蔽。
+    两层收口:键必须被这个事件声明过,**且**值必须落在产生方集合里。
+    任何未声明的键、任何未登记的值,一律维持既有的遮蔽。
     """
     if not isinstance(raw_detail, dict) or not isinstance(public_detail, dict):
         return
@@ -2790,7 +2801,7 @@ def _expose_declared_trace_fields(ev: dict, raw_detail, public_detail) -> None:
         value = raw_detail.get(key)
         if not isinstance(value, str) or not value:
             continue
-        if spec is _TRACE_PUBLIC_SHAPE:
+        if spec is _TRACE_PUBLIC_FAILURE_CODE:
             if _is_registered_failure_code(value):
                 public_detail[key] = value
         elif value in spec:
@@ -2955,9 +2966,7 @@ def _debug_event_public_json(ev: dict) -> dict:
         if provider_error_class in {"transient", "provider_config", "unknown"}:
             public_detail["provider_error_class"] = provider_error_class
         error_class = raw_detail.get("error_class")
-        if isinstance(error_class, str) and re.fullmatch(
-            r"[A-Za-z0-9_.-]{1,80}", error_class
-        ):
+        if isinstance(error_class, str) and error_class in _known_error_classes():
             public_detail["error_class"] = error_class
     return {
         "ts": ev.get("ts"),
@@ -3752,16 +3761,8 @@ _RUNTIME_HEALTH_PENDING_BAD_SEC = 180
 # 跑出稳态分布后再收紧，收紧前不要把它当灵敏的告警用。
 _RUNTIME_DELIVERY_AGE_WARN_SEC = 3600
 _RUNTIME_DELIVERY_AGE_BAD_SEC = 21600
-_RUNTIME_FAILURE_CODE_MAX = 64
-# 按形状放行，不按枚举前缀放行。agent_jobs.last_error 的真实写入点远不止
-# turn_failed:/queue_timeout/lease_timeout 三种（wake_failed:*、
-# extraction_failed:*、compaction_failed:*、mcp_mutation_outcome_unknown、
-# runtime_expired 都是 mark_failed/mark_expired 落库的合法码），枚举前缀白名单
-# 会把 chat 之外每条 lane 的失败原因塌成 other。所有已知写入点产出的码都是
-# "scope:kind" 或裸 "snake_case"，且只含小写字母/数字/下划线——照此收紧，而不
-# 是照 jobs_store._TERMINAL_ERROR_CODE_RE（那个更宽松的 `:`/`-` 全字符集是给
-# outbox 用的，admin 层不 import model_api_runtime，故在此单独定义）。
-_RUNTIME_FAILURE_CODE_RE = re.compile(r"^[a-z0-9_]+(:[a-z0-9_]+)?$")
+_RUNTIME_FAILURE_CODE_MAX = 120
+# 与单回合 trace 共用产生方导出，不在日报投影里另造一套形状/前缀规则。
 _RUNTIME_ERROR_CLASS_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 RUNTIME_OUTCOME_CLASS_LABELS = {
     "operational_failure": "执行故障",
@@ -3786,14 +3787,9 @@ def _runtime_operational_rate(lane: dict):
 
 
 def _runtime_failure_code(raw) -> str:
-    """失败码白名单化：只放行已知形状（scope:kind 或裸 snake_case），其余归入
-    other。
-
-    形状校验而非前缀校验：`turn_failed:` 前缀曾经无条件放行 + 截断，哪怕冒号
-    后是含空格/中文的自由文本也会被截断显示——这是本函数要堵住的口子。
-    """
+    """只放行产生方显式导出的失败码；未知值统一归入 ``other``。"""
     code = str(raw or "").strip()
-    if not code or not _RUNTIME_FAILURE_CODE_RE.fullmatch(code):
+    if not code or not _is_registered_failure_code(code):
         return "other"
     return code[:_RUNTIME_FAILURE_CODE_MAX]
 
