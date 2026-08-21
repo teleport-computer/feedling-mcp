@@ -27,6 +27,7 @@ IMAGE_GENERATION_RESULT_CODES = frozenset({
     "image_generation_unavailable",
     "image_generation_invalid_output",
     "image_generation_invalid_prompt",
+    "image_generation_internal_error",
     "image_generation_failed",
 })
 MEMORY_CATEGORY_KEYS = frozenset({

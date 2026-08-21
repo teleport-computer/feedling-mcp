@@ -528,6 +528,9 @@ def test_image_generation_result_code_is_allowlisted():
     assert chat_activity.image_generation_result_code(
         "image_generation_model_required"
     ) == "image_generation_model_required"
+    assert chat_activity.image_generation_result_code(
+        "image_generation_internal_error"
+    ) == "image_generation_internal_error"
     assert chat_activity.image_generation_result_code("private_customer_record") == ""
 
 

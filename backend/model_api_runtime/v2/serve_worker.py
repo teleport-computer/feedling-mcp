@@ -51,7 +51,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -2538,18 +2538,9 @@ async def _generate_image_for_chat(
         explain="开始生成图片（记录用的是哪条路由，不含提示词）。",
         detail=dict(_image_route_detail),
     )
-    try:
-        result = await provider_client.generate_image_async(config, prompt)
-        media = ProviderResponse.from_result(result).media
-        if not media:
-            raise provider_client.ProviderError("image_generation_invalid_output")
-        _emit_v2_debug_trace(
-            _image_store, "agent.image.generate.done", status="ok",
-            summary="image generation done",
-            explain="图片生成成功。",
-            detail={**_image_route_detail, "media_count": len(media)},
-        )
-    except Exception as exc:  # noqa: BLE001 - stable capability surface
+
+    async def raise_provider_failure(exc: BaseException) -> NoReturn:
+        """Classify and persist only failures raised by the provider seam."""
         classified = provider_client.classify_provider_error(exc)
         raw_status_code = getattr(exc, "status_code", None)
         status_code = (
@@ -2640,6 +2631,23 @@ async def _generate_image_for_chat(
             status_code=status_code,
             upstream_detail=upstream_detail,
         ) from exc
+
+    try:
+        result = await provider_client.generate_image_async(config, prompt)
+    except Exception as exc:  # noqa: BLE001 - this try contains only provider I/O
+        await raise_provider_failure(exc)
+
+    media = ProviderResponse.from_result(result).media
+    if not media:
+        await raise_provider_failure(
+            provider_client.ProviderError("image_generation_invalid_output")
+        )
+    _emit_v2_debug_trace(
+        _image_store, "agent.image.generate.done", status="ok",
+        summary="image generation done",
+        explain="图片生成成功。",
+        detail={**_image_route_detail, "media_count": len(media)},
+    )
 
     target = route
     if target is None:
