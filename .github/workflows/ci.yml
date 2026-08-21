@@ -805,6 +805,8 @@ jobs:
             tests/test_v2_mutation_recovery.py \
             tests/test_v2_reconcile.py \
             tests/test_v2_tool_loop.py \
+            tests/test_t208_reply_tool_removal.py \
+            tests/test_t210_wake_sentinel_suppression.py \
             tests/test_v2_turn_budget_defaults.py \
             tests/test_v2_tool_loop_mcp.py \
             tests/test_v2_worker_mcp.py \
@@ -832,6 +834,7 @@ jobs:
             tests/test_tee_carry_verbatim.py \
             tests/test_uploaded_envelope_gate.py \
             tests/test_write_side_format_routing.py \
+            tests/test_admin_debug_turn_view.py \
             tests/test_data_track_debug.py \
             -v
 

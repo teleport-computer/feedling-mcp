@@ -74,6 +74,7 @@ ERROR_CLASSES = frozenset({
     "image_generation_unavailable",
     "image_generation_invalid_output",
     "image_generation_invalid_prompt",
+    "image_generation_internal_error",
     "image_generation_failed",
 })
 
@@ -180,6 +181,8 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "provider_transient", "生图模型没有返回有效图片，请重试或更换模型。"),
     "image_generation_invalid_prompt": (
         "system", "这次生图请求没有正确送达，我们会尽快排查。"),
+    "image_generation_internal_error": (
+        "system", "图片生成后的系统处理出了问题，我们会尽快排查。"),
     "image_generation_failed": (
         "provider_transient", "图片生成失败，请重试；如果仍失败，请更换模型。"),
 }

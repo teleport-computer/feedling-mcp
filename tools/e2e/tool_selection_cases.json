@@ -5,7 +5,7 @@
     "这正是要测的:perception_trend 的用例里,另外三个 perception 就坐在旁边。",
     "",
     "excluded_tools 里的工具结构上无法用单轮用户话触发,硬编用例只会制造噪声:",
-    "  reply / stay_silent / mcp_tool_search  —— 协议与元工具,不由用户请求触发",
+    "  stay_silent / mcp_tool_search          —— 协议与元工具,不由用户请求触发",
     "  identity_nudge                         —— 描述明写是模型自己推断的微调",
     "  memory_fetch / history_fetch           —— 必须先由 index/search 给出 id",
     "native_image_cases 单列当前消息原生图片：生产会直接注入 image block，不应调用图库工具。",
@@ -13,7 +13,6 @@
     "它们的正确性由别处保证。mcp_tool_search 的恢复协议仍由生产 tool_loop 测试覆盖。"
   ],
   "excluded_tools": {
-    "reply": "protocol tool, not user-triggered",
     "stay_silent": "wake-lane only; filtered out of the evaluated chat catalog entirely",
     "mcp_tool_search": "recovery protocol requires a multi-round executor; covered elsewhere, NOT by this evaluator",
     "identity_nudge": "model-inferred adjustment, not a user request",

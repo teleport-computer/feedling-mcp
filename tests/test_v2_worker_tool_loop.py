@@ -568,10 +568,7 @@ def test_language_follow_emits_once_for_terminal_visible_body_after_thinking(
     )
     private_thinking = "这是绝对不能参与回复文字系统分类的私密中文思考内容"
     _script_provider(monkeypatch, [
-        _tool_round(
-            _tc("r1", "reply", text="我先查一下"),
-            _tc("s1", "web_search", query="x"),
-        ),
+        _tool_round(_tc("s1", "web_search", query="x")),
         _text_round(
             f"<think>{private_thinking}</think>"
             "This is the final visible English response"
@@ -598,7 +595,6 @@ def test_language_follow_emits_once_for_terminal_visible_body_after_thinking(
 
     assert status == "completed", _job_status_row(job["id"])
     assert [row["body_ct"] for row in _bubbles(uid)] == [
-        "我先查一下",
         "This is the final visible English response",
     ]
     language_traces = [
@@ -1118,8 +1114,13 @@ def test_chat_thinking_only_keeps_existing_required_reply_fallback(monkeypatch):
     assert _job_status_row(job_id)[0] == "completed"
 
 
-def test_degenerate_terminal_reply_becomes_attributed_fallback(monkeypatch):
-    uid = "u_toolloop_degenerate_fallback"
+@pytest.mark.parametrize("provider_text", ["。", "</s>"])
+def test_degenerate_terminal_reply_becomes_attributed_fallback(
+    monkeypatch, provider_text
+):
+    uid = "u_toolloop_degenerate_fallback_" + (
+        "sentinel" if provider_text == "</s>" else "punctuation"
+    )
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
@@ -1133,7 +1134,7 @@ def test_degenerate_terminal_reply_becomes_attributed_fallback(monkeypatch):
         return real_write(store, text, extra=extra)
 
     monkeypatch.setattr(worker, "_write_encrypted_reply", _capture_write)
-    _script_provider(monkeypatch, [_text_round("。")])
+    _script_provider(monkeypatch, [_text_round(provider_text)])
     deps = _deps(
         messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "晚安呀"}]
     )
@@ -1155,8 +1156,8 @@ def test_degenerate_terminal_reply_becomes_attributed_fallback(monkeypatch):
     assert _job_status_row(job_id)[0] == "completed"
 
 
-def test_degenerate_intermediate_is_dropped_before_real_final_reply(monkeypatch):
-    uid = "u_toolloop_degenerate_intermediate"
+def test_degenerate_tool_preamble_is_not_a_bubble(monkeypatch):
+    uid = "u_toolloop_degenerate_preamble"
     conftest.seed_user(uid)
     _reset(uid)
     jobs_store.enqueue_job(uid, "chat")
@@ -1170,10 +1171,11 @@ def test_degenerate_intermediate_is_dropped_before_real_final_reply(monkeypatch)
     _script_provider(
         monkeypatch,
         [
-            _tool_round(
-                _tc("r1", "reply", text="."),
-                _tc("s1", "web_search", query="x"),
-            ),
+            {
+                "reply": ".",
+                "tool_calls": [_tc("s1", "web_search", query="x")],
+                "usage": {},
+            },
             _text_round("在的，怎么了"),
         ],
     )
@@ -1367,95 +1369,6 @@ def test_foreground_wrapped_reply_payload_is_not_lost(monkeypatch):
 
     assert status == "completed"
     assert [bubble["body_ct"] for bubble in _bubbles(uid)] == ["真正的回复内容"]
-
-
-def test_chat_intermediate_reply_tool_tail_with_reasoning_suppressed(monkeypatch):
-    """Codex code-review #1: an intermediate `reply` tool call carrying a torn
-    tail, with the head in the round's reasoning, must not produce a leaked
-    bubble. The reasoning is now passed to the intermediate sink so the chat lane
-    sees STRONG evidence; the following real terminal reply still lands."""
-    uid = "u_toolloop_torn_intermediate"
-    conftest.seed_user(uid)
-    _reset(uid)
-    jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w-torn-mid")
-    monkeypatch.setattr(
-        cap_registry,
-        "run_capability",
-        lambda action_type, store, **kwargs: _FakeCapResult({"snippet": "r"}),
-    )
-    # The round carries reasoning (the torn head), which the worker surfaces via
-    # the envelope path — stub it (as the reasoning-surfacing test does) so the
-    # sealed bodies are readable and no unwired-assembly error masks the check.
-    _stub_envelope_build(monkeypatch)
-    # Same structure as test_degenerate_intermediate_is_dropped_before_real_final_
-    # reply: a real tool call (web_search) rides alongside the suppressed reply so
-    # the loop continues to the terminal reply, isolating the suppression itself.
-    _script_provider(
-        monkeypatch,
-        [
-            {
-                "reply": "",
-                "tool_calls": [
-                    _tc("r1", "reply", text=_TORN_TAIL),
-                    _tc("s1", "web_search", query="x"),
-                ],
-                "reasoning": _TORN_HEAD,
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
-            },
-            _text_round("在的，怎么了"),
-        ],
-    )
-    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "在吗"}])
-
-    status = asyncio.run(
-        worker.process_job(job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt")
-    )
-
-    assert status == "completed"
-    bubbles = [b["body_ct"] for b in _bubbles(uid)]
-    # THE invariant: the torn tail never reaches a bubble; the real terminal does.
-    assert _TORN_TAIL not in bubbles
-    assert bubbles == ["在的，怎么了"]
-
-
-def test_chat_intermediate_reply_tool_upstream_envelope_is_suppressed(monkeypatch):
-    """The final-effect guard also covers a relay wrapper inside reply(text=...)."""
-    uid = "u_toolloop_upstream_envelope_intermediate"
-    conftest.seed_user(uid)
-    _reset(uid)
-    jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w-upstream-envelope-mid")
-    monkeypatch.setattr(
-        cap_registry,
-        "run_capability",
-        lambda action_type, store, **kwargs: _FakeCapResult({"snippet": "r"}),
-    )
-    _patch_real_write(monkeypatch)
-    _script_provider(
-        monkeypatch,
-        [
-            _tool_round(
-                _tc("r1", "reply", text=_UPSTREAM_RESPONSE_ENVELOPE),
-                _tc("s1", "web_search", query="x"),
-            ),
-            _text_round("在的，怎么了"),
-        ],
-    )
-    deps = _deps(
-        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "在吗"}]
-    )
-
-    status = asyncio.run(
-        worker.process_job(
-            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
-        )
-    )
-
-    assert status == "completed"
-    bubbles = [bubble["body_ct"] for bubble in _bubbles(uid)]
-    assert _UPSTREAM_RESPONSE_ENVELOPE not in bubbles
-    assert bubbles == ["在的，怎么了"]
 
 
 def test_torn_protocol_evidence_lane_policy():
@@ -2362,14 +2275,13 @@ def test_ordered_chat_replies_settle_each_user_message_separately(monkeypatch):
     assert reply_payload["reply_to_message_id"] == "A"
 
 
-def test_new_turn_after_intermediate_failure_starts_after_failure_cursor(
+def test_new_turn_after_tool_failure_starts_after_failure_cursor(
     monkeypatch,
 ):
     """An assistant-only prompt snapshot advance cannot poison the final fence.
 
-    The first worker publishes an intermediate reply, then crashes. The retry's
-    all-role tail includes that bubble after the newest user row, while the
-    compound final reply must still fence and advance only through the user seq.
+    The first worker completes a tool round, then crashes. The compound final
+    reply on a later user turn must fence and advance only through the user seq.
     """
     uid = "u_toolloop_intermediate_crash_retry_cursor"
     conftest.seed_user(uid)
@@ -2491,9 +2403,9 @@ def test_new_turn_after_intermediate_failure_starts_after_failure_cursor(
             first_attempt_calls += 1
             if first_attempt_calls == 1:
                 return _tool_round(
-                    _tc("checking", "reply", text="I am still checking."),
+                    _tc("checking", "memory_search", query="investigate"),
                 )
-            raise RuntimeError("injected worker crash after intermediate reply")
+            raise RuntimeError("injected worker crash after tool round")
         retry_messages.append(list(messages))
         return _text_round("final answer after retry")
 
@@ -2549,7 +2461,7 @@ def test_new_turn_after_intermediate_failure_starts_after_failure_cursor(
 
     assert retry_status == "completed"
     assert len(retry_messages) == 1
-    assert "I am still checking." in str(retry_messages[0])
+    assert "I am still checking." not in str(retry_messages[0])
     assert "please try once more" in str(retry_messages[0])
     assert v2_cursor.load_seq(core_store.get_store(uid)) == new_user_seq
     assert _job_status_row(retry_job_id) == ("completed", None)
@@ -3070,290 +2982,6 @@ def _job_status_row(job_id):
     return row
 
 
-def test_reply_tool_bubble_can_atomically_close_chat_without_second_message(
-    monkeypatch,
-):
-    uid = "u_toolloop_promote_intermediate"
-    conftest.seed_user(uid)
-    _reset(uid)
-    generation = db.get_runtime_generation(uid)
-    input_seq, job_id = db.chat_append_and_enqueue(
-        uid,
-        "promotion-parent",
-        10.0,
-        _user_doc("promotion-parent", "answer this"),
-        5000,
-        "chat",
-        expected_generation=generation,
-    )
-    job = jobs_store.claim_next_job("w-promote-intermediate")
-    assert job is not None and job["id"] == job_id
-    _stub_envelope_build(monkeypatch)
-
-    def read_after_seq(_user_id: str, after_seq: int):
-        return [
-            {
-                "id": row["id"],
-                "seq": int(row["seq"]),
-                "ts": float(row.get("ts") or 0),
-                "role": row.get("role"),
-                "content": row.get("test_plaintext") or "",
-            }
-            for row in db.chat_messages_after_seq(uid, after_seq, limit=None)
-            if row.get("role") == "user"
-        ]
-
-    calls = _script_provider(
-        monkeypatch,
-        [
-            _tool_round(_tc("r1", "reply", text="complete answer")),
-            {
-                "reply": "",
-                "reasoning": "no additional visible body",
-                "stop_reason": "end_turn",
-                "tool_calls": [],
-                "usage": {"completion_tokens": 3930},
-            },
-            {
-                "reply": "",
-                "reasoning": "still complete",
-                "stop_reason": "end_turn",
-                "tool_calls": [],
-                "usage": {"completion_tokens": 2},
-            },
-        ],
-    )
-    deps = worker.TurnDeps(
-        web_tools_enabled=lambda _uid: True,
-        read_messages=lambda _uid: read_after_seq(uid, 0),
-        read_messages_after_seq=read_after_seq,
-        read_tail_after_seq=lambda _uid, after_seq, limit, **kwargs: read_after_seq(
-            uid, after_seq
-        ),
-        read_summary_with_seq=lambda _uid: ("", 0.0, 0, 0),
-        resolve_provider=lambda _uid: (_BYOK, {}),
-        mint_enclave_token=lambda _uid: "rt",
-        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
-    )
-
-    status = asyncio.run(
-        worker.process_job(
-            job,
-            deps,
-            provider_config=_BYOK,
-            api_key=None,
-            runtime_token="rt",
-        )
-    )
-
-    assert status == "completed"
-    assert len(calls) == 3  # the existing semantic-empty recovery still ran once
-    bubbles = _bubbles(uid)
-    assert len(bubbles) == 1
-    assert bubbles[0]["body_ct"] == "complete answer"
-    assert _job_status_row(job_id) == ("completed", None)
-    assert v2_cursor.load_seq(core_store.get_store(uid)) == input_seq
-    parent = db.chat_doc_for_seq(uid, input_seq)
-    assert parent["reply_status"] == "replied"
-    assert parent["reply_message_id"] == bubbles[0]["id"]
-
-    with db.get_pool().connection() as conn:
-        effects = conn.execute(
-            "SELECT effect_id,effect_type,status,payload "
-            "FROM v2_effect_outbox WHERE user_id=%s AND job_id=%s "
-            "ORDER BY enqueue_seq",
-            (uid, job_id),
-        ).fetchall()
-    assert [(row[1], row[2]) for row in effects] == [
-        (v2_effect_outbox.INTERMEDIATE_REPLY_EFFECT_TYPE, "applied"),
-        (v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE, "applied"),
-    ]
-    source_effect_id = str(effects[0][0])
-    final_payload = effects[1][3]
-    replay_id = v2_effect_outbox.enqueue_reply_promotion(
-        intermediate_effect_id=source_effect_id,
-        job_id=job_id,
-        user_id=uid,
-        expected_generation=generation,
-        payload=final_payload,
-    )
-    assert replay_id == str(effects[1][0])
-    assert serve_worker._apply_pending_effects_for_user(uid) == {
-        "applied": 0,
-        "discarded": 0,
-    }
-    assert len(_bubbles(uid)) == 1
-
-
-def test_removing_reply_promotion_regresses_to_two_chat_messages(monkeypatch):
-    """Mutation guard: the old empty-reply failure adds a terminal error bubble."""
-    uid = "u_toolloop_promote_intermediate_mutation"
-    conftest.seed_user(uid)
-    _reset(uid)
-    generation = db.get_runtime_generation(uid)
-    _input_seq, job_id = db.chat_append_and_enqueue(
-        uid,
-        "promotion-mutation-parent",
-        10.0,
-        _user_doc("promotion-mutation-parent", "answer this"),
-        5000,
-        "chat",
-        expected_generation=generation,
-    )
-    job = jobs_store.claim_next_job("w-promote-intermediate-mutation")
-    assert job is not None and job["id"] == job_id
-    _stub_envelope_build(monkeypatch)
-
-    def read_after_seq(_user_id: str, after_seq: int):
-        return [
-            {
-                "id": row["id"],
-                "seq": int(row["seq"]),
-                "ts": float(row.get("ts") or 0),
-                "role": row.get("role"),
-                "content": row.get("test_plaintext") or "",
-            }
-            for row in db.chat_messages_after_seq(uid, after_seq, limit=None)
-            if row.get("role") == "user"
-        ]
-
-    _script_provider(
-        monkeypatch,
-        [
-            _tool_round(_tc("r1", "reply", text="complete answer")),
-            {
-                "reply": "",
-                "reasoning": "no additional visible body",
-                "stop_reason": "end_turn",
-                "tool_calls": [],
-                "usage": {},
-            },
-            {
-                "reply": "",
-                "reasoning": "still complete",
-                "stop_reason": "end_turn",
-                "tool_calls": [],
-                "usage": {},
-            },
-        ],
-    )
-    real_loop = worker.v2_tool_loop.run_tool_loop
-
-    async def run_without_promotion(**kwargs):
-        kwargs["on_promote_last_intermediate"] = None
-        return await real_loop(**kwargs)
-
-    monkeypatch.setattr(
-        worker.v2_tool_loop,
-        "run_tool_loop",
-        run_without_promotion,
-    )
-    deps = worker.TurnDeps(
-        web_tools_enabled=lambda _uid: True,
-        read_messages=lambda _uid: read_after_seq(uid, 0),
-        read_messages_after_seq=read_after_seq,
-        read_tail_after_seq=lambda _uid, after_seq, limit, **kwargs: read_after_seq(
-            uid, after_seq
-        ),
-        read_summary_with_seq=lambda _uid: ("", 0.0, 0, 0),
-        resolve_provider=lambda _uid: (_BYOK, {}),
-        mint_enclave_token=lambda _uid: "rt",
-        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
-    )
-
-    status = asyncio.run(
-        worker.process_job(
-            job,
-            deps,
-            provider_config=_BYOK,
-            api_key=None,
-            runtime_token="rt",
-        )
-    )
-
-    assert status == "failed"
-    assert len(_bubbles(uid)) == 2
-
-
-def test_intermediate_reply_then_terminal_text_and_exactly_once_replay(monkeypatch):
-    """Two-round script: round 0 the model calls `reply` (intermediate bubble)
-    ALONGSIDE a `web_search` read tool call; round 1 the model stops with plain
-    terminal text. Both bubbles land via the PR A effect outbox, the
-    intermediate one visible BEFORE the terminal one (C6: drained immediately,
-    not batched to end-of-turn). Then a re-drive that re-enqueues the SAME
-    effect_id (job_id + effect_type + ordinal are what `effect_id.derive`
-    hashes — a retry of the same turn reproduces it exactly) must NOT produce a
-    duplicate bubble (PR A's ON CONFLICT DO NOTHING + pending-only drain)."""
-    uid = "u_toolloop_tworound"
-    conftest.seed_user(uid)
-    _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w")
-
-    monkeypatch.setattr(
-        cap_registry,
-        "run_capability",
-        lambda action_type, store, **k: _FakeCapResult({"snippet": "search result"}),
-    )
-    _patch_real_write(monkeypatch)
-    calls = _script_provider(
-        monkeypatch,
-        [
-            _tool_round(
-                _tc("r1", "reply", text="intermediate"),
-                _tc("s1", "web_search", query="x"),
-            ),
-            _text_round("final answer"),
-        ],
-    )
-    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
-
-    status = asyncio.run(
-        worker.process_job(
-            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
-        )
-    )
-
-    assert status == "completed"
-    assert len(calls) == 2
-    # Round 1 carries the native assistant call and call-id-matched observation.
-    exchanges = [m for m in calls[1]["messages"] if isinstance(m, ToolExchange)]
-    assert len(exchanges) == 1
-    assert "search result" in " ".join(r.content for r in exchanges[0].results)
-
-    bubbles = _bubbles(uid)
-    assert len(bubbles) == 2
-    # `_bubbles` reflects chat_messages' `seq` (identity-column) order, i.e. real
-    # write order: the intermediate bubble must land before the terminal one.
-    assert [b["body_ct"] for b in bubbles] == ["intermediate", "final answer"]
-
-    # Exactly-once replay: reconstruct the FIRST reply effect's deterministic id
-    # (ordinal 0 -- the intermediate `reply` tool call was the turn's first
-    # enqueue_effect call) and re-drive enqueue+drain exactly as a retried turn
-    # would.
-    gen = db.get_runtime_generation(uid)
-    eid = v2_effect_id.derive(job_id=job_id, effect_type="reply", ordinal=0)
-    replay_id = v2_effect_outbox.enqueue_effect(
-        job_id=job_id,
-        user_id=uid,
-        effect_type="reply",
-        ordinal=0,
-        expected_generation=gen,
-        payload={"text": "intermediate"},
-    )
-    assert (
-        replay_id == eid
-    )  # same deterministic id -> ON CONFLICT DO NOTHING, no new row
-    result = _apply_effects(uid)
-    assert result == {
-        "applied": 0,
-        "discarded": 0,
-    }  # already applied -> not in the pending set
-
-    bubbles_after = _bubbles(uid)
-    assert len(bubbles_after) == 2  # NO duplicate bubble
-
-
 # ------------------------------------------------------------------
 # PR C final review, BUG #2 (minor, no-filler): if the unified loop returns a
 # LoopOutcome with NO reply produced (final_text empty AND replied_intermediate
@@ -3788,7 +3416,7 @@ def test_child_subagent_tool_schemas_are_protected_from_folding(monkeypatch):
     real_run_tool_loop = worker.v2_tool_loop.run_tool_loop
 
     async def _spy(**kwargs):
-        if kwargs.get("allow_reply_tool") is False:
+        if kwargs.get("max_calls") == worker._SUBAGENT_MAX_LLM_CALLS:
             seen_child_kwargs.append(kwargs)
         return await real_run_tool_loop(**kwargs)
 

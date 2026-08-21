@@ -41,6 +41,7 @@ import provider_client
 import provider_attempt_ledger
 from hosted import agent_runtime_cutover
 from hosted import config_store as hosted_config_store
+from hosted import image_generator
 from hosted import new_user_v2_cohort
 from hosted import turn as hosted_turn
 from hosted import vision_routing
@@ -971,14 +972,8 @@ def _test_route_image_generation_or_error(
         context_window_tokens=route.get("context_window_tokens"),
         reasoning_effort=str(route.get("reasoning_effort") or ""),
     )
-    try:
-        result = provider_client.generate_image(
-            config,
-            "A simple blue circle centered on a plain white background.",
-        )
-        if not isinstance(result.get("media"), list) or not result["media"]:
-            raise provider_client.ProviderError("image_generation_invalid_output")
-    except Exception as exc:  # noqa: BLE001 - stable setup error contract
+
+    def provider_failure(exc: BaseException):
         code = _image_generation_error_code(exc, dedicated=True)
         status = (
             "unsupported"
@@ -993,6 +988,20 @@ def _test_route_image_generation_or_error(
         ):
             return {"error": "model_api_route_write_failed"}, 500
         return {"error": code, "retryable": status != "unsupported"}, 400
+
+    try:
+        result = provider_client.generate_image(
+            config,
+            "A simple blue circle centered on a plain white background.",
+        )
+    except Exception as exc:  # noqa: BLE001 - this try contains only provider I/O
+        return provider_failure(exc)
+
+    images = image_generator.normalize_provider_media(result)
+    if not images:
+        return provider_failure(
+            provider_client.ProviderError("image_generation_invalid_output")
+        )
 
     if not db.model_api_route_mark_image_generation_test(
         store.user_id,
