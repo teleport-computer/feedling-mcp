@@ -748,6 +748,20 @@ user selected and authenticated, rather than outbound destinations discovered
 by the model. This is an intentional trust-boundary difference, not a known
 resident isolation gap.
 
+Hosted Runtime V2 draws a second, separate line for unattended screen turns.
+The two questions are distinct: the pixel fence above asks whether what the
+turn saw may be *sent outward*, while this one asks whether what the turn saw
+may *instruct it to act*. A proactive screen-watch turn carries no user
+message, so text that happened to appear on the shared screen is the turn's
+only instruction source. From 2026-08-21 such a turn is offered no platform
+mutation tools at all — no memory write, no schedule or cancel wake, no
+workspace write or delete, on top of the identity writes already withheld.
+The prompt does label that content as untrusted application data rather than
+instructions, but a label constrains intent, not the model's choice, so the
+boundary is enforced on the tool surface instead. Reads, screen inspection and
+replying stay available, and a foreground Chat turn that carries pixels keeps
+its full write surface because the user's own message is present in it.
+
 The resident exception does not relax platform web egress. Screen turns still
 set `FEEDLING_OUTBOUND_FENCE=1`, and `io_cli` refuses platform `web_search` and
 `web_fetch` before making an HTTP request. An image-rejection retry stays behind
