@@ -712,6 +712,7 @@ jobs:
             tests/test_worldbook_readside_core.py \
             tests/test_worldbook_routes.py \
             tests/test_worldbook_store.py \
+            tests/test_worldbook_trace.py \
             -v
 
       - name: Run Hosted Runtime V2 safety and prompt-cache suites

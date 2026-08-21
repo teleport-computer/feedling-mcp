@@ -2635,6 +2635,31 @@ _PROMPT_FRONTIER_PUBLIC_BYTE_COMPONENTS = frozenset({
     "screen", "tool_transcript",
 })
 
+_WORLDBOOK_TRACE_TYPES = frozenset({
+    "worldbook.entry.write.completed",
+    "worldbook.match.completed",
+    "worldbook.context.applied",
+})
+_WORLDBOOK_PUBLIC_ENUMS = {
+    "operation": frozenset({"upsert", "match"}),
+    "outcome": frozenset({
+        "stored", "rejected", "failed", "no_entries", "matched",
+        "no_match", "partial", "unavailable",
+    }),
+    "reason": frozenset({
+        "", "committed", "request_invalid", "envelope_invalid",
+        "content_too_long", "worldbook_validate_failed",
+        "worldbook_validate_unavailable", "validation_failed",
+        "storage_error", "readside_unavailable",
+    }),
+    "lane": frozenset({
+        "api", "chat", "heartbeat", "scheduled", "manual_wake",
+        "screen_watch",
+    }),
+    "runtime": frozenset({"resident_v1", "hosted_v2"}),
+    "source": frozenset({"eager_context", "tool_result"}),
+}
+
 
 # --- 2026-08-21 批事件的公开字段(T219) ------------------------------------- #
 #
@@ -2812,6 +2837,18 @@ def _debug_event_public_json(ev: dict) -> dict:
     raw_detail = ev.get("detail") or {}
     public_detail = _debug_redact_value(raw_detail)
     _expose_declared_trace_fields(ev, raw_detail, public_detail)
+    if (
+        ev.get("type") in _WORLDBOOK_TRACE_TYPES
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        # World Book diagnostics expose only producer-normalized enums plus
+        # generic numeric/boolean counters. Entry ids, names, keywords, query
+        # text, and matched content stay behind the default string redactor.
+        for key, allowed_values in _WORLDBOOK_PUBLIC_ENUMS.items():
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed_values:
+                public_detail[key] = value
     if (
         ev.get("type") == "provider.empty_response"
         and isinstance(raw_detail, dict)

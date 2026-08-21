@@ -156,9 +156,11 @@ change must not be interpreted as an API guarantee.
 - **Persistence failures no longer look like successful memory, trace, or World
   Book operations.** A Memory Garden index request returns `503` when its
   database read fails instead of returning an empty garden; changing the debug
-  trace switch returns an error unless the stored setting can be read back; and
-  deleting a World Book entry returns `404` when the entry does not exist and a
-  server error when storage is unavailable, instead of always returning
+  trace switch returns an error unless the stored setting can be read back;
+  saving a World Book entry returns a server error unless the database accepted
+  the write; and deleting a World Book entry returns `404` when the entry does
+  not exist and a server error when storage is unavailable, instead of always
+  returning
   `{\"ok\": true}`. Internal writes that only record cleanup or delivery
   bookkeeping remain explicitly best-effort and do not rewrite an already-real
   delivery outcome.

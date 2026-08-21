@@ -51,7 +51,7 @@
 | 1c | Dream | 🔴 | 全链仅 1 个调用点,模型调用与落库全黑 |
 | 1d | 心跳 | 🟡 | 入队↔终态已通(§3),打模型那一段 2026-08-22 已补(§9) |
 | 1e | 事件唤醒 | 🟡 | 同 1d,共用同一条路径 |
-| **1f** | **世界书** | **🔴** | **全链仅 1 个调用点** |
+| **1f** | **世界书** | **🟡** | 写入、匹配结果、实际进 provider 已分段；V1 pull 工具最终应用仍复用通用工具 trace |
 | 2a | 视觉模型调用 | 🟡 | provider 往返已有(T203),回复生成仍走 chat |
 | 2b | 生图模型调用 | 🟡 | provider 往返已有(T204) |
 | **2c** | **语音通话** | **🔴** | **整条零调用点,且失败被伪装成 HTTP 200** |
@@ -113,16 +113,19 @@ heartbeat 46/46 两端共享同一 id、零孤儿;但 capture 19 + profile 1 **�
 | 文件摄入 / 建卡 | 🟡(`genesis.plaintext.*` 11 个事件名、`genesis.worker.*` 13 个) |
 | 索引 | 🔴 |
 
-## §6 世界书 ⚠️ 第一版整条缺席
+## §6 世界书（T216 已补主链分段）
 
 | 阶段 | 状态 | 坐标 |
 |---|---|---|
-| 写入 / 更新 | 🟡 | `worldbook/worldbook_core.py:216` —— **全链唯一一个调用点** |
-| 匹配命中 | 🔴 | — |
-| 注入提示词 | 🔴 | — |
+| 写入 / 更新 | 🟢 | `worldbook.entry.write.completed`：`stored/rejected/failed`，数据库拒绝写入时 API 返回 500 且不改本地缓存 |
+| 匹配结果 | 🟢 | `worldbook.match.completed`：区分 `no_entries/no_match/matched/partial/unavailable`，只带候选/命中/拒绝/不可用/字符计数 |
+| 注入提示词 | 🟡 | `worldbook.context.applied`：resident V1 eager 在 prompt 装配点记录，hosted V2 eager/tool-result 在最终 provider request 边界记录；V1 pull 工具沿用 `agent.tool.call` + 后端 match 事件 |
 
 **为什么要紧**:usr_99c3eca0 曾报「世界书存不进去」,随后又报「存进去了但命中不了」。
-**这是两条完全不同的排查路径**,而现在的记录分不出来。
+**这是两条完全不同的排查路径**。T216 后先看 write event 是否 `stored`，再看
+match event 是 `no_entries`、`no_match` 还是 `unavailable`；命中后再看 applied event
+是否出现。事件不记录 entry id/name、关键词、查询或世界书正文，后台只公开闭集枚举、
+布尔值和计数。
 
 ## §7 视觉
 

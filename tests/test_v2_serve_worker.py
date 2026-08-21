@@ -2211,6 +2211,40 @@ def test_worldbook_reader_forwards_current_turn_and_runtime_token(monkeypatch):
     )
 
 
+def test_worldbook_reader_forwards_trusted_trace_context(monkeypatch):
+    observed = {}
+    monkeypatch.setattr(
+        serve_worker.core_store, "get_store", lambda uid: f"store:{uid}"
+    )
+
+    def match(store, payload, **kwargs):
+        observed.update(store=store, payload=payload, **kwargs)
+        return {"block": ""}, 200
+
+    monkeypatch.setattr(serve_worker.worldbook_core, "match", match)
+    serve_worker._read_worldbook_context(
+        "u-worldbook",
+        [],
+        runtime_token="runtime-secret",
+        trace_context={
+            "trace_id": "trace-wb",
+            "job_id": "job-wb",
+            "lane": "scheduled",
+        },
+    )
+
+    assert observed == {
+        "store": "store:u-worldbook",
+        "payload": {"messages": []},
+        "api_key": None,
+        "runtime_token": "runtime-secret",
+        "trace_id": "trace-wb",
+        "job_id": "job-wb",
+        "lane": "scheduled",
+        "actor": "host_agent_runtime",
+    }
+
+
 def _catalog_traces(monkeypatch, store, *, fingerprint, specs, emit_fails=False):
     """驱动 _load_mcp_turn_observed,收集它发出的 trace。"""
     traces = []

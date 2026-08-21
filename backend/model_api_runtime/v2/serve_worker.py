@@ -4551,6 +4551,7 @@ def _read_worldbook_context(
     messages: list[dict],
     *,
     runtime_token: str,
+    trace_context: dict | None = None,
 ) -> dict:
     """Match this foreground turn against the user's encrypted World Book."""
     body, status = worldbook_core.match(
@@ -4558,6 +4559,16 @@ def _read_worldbook_context(
         {"messages": list(messages or [])},
         api_key=None,
         runtime_token=str(runtime_token or ""),
+        **(
+            {
+                "trace_id": str(trace_context.get("trace_id") or ""),
+                "job_id": str(trace_context.get("job_id") or ""),
+                "lane": str(trace_context.get("lane") or ""),
+                "actor": "host_agent_runtime",
+            }
+            if isinstance(trace_context, dict)
+            else {}
+        ),
     )
     if status != 200:
         raise RuntimeError("worldbook_match_failed")

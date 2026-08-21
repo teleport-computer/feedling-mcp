@@ -212,6 +212,7 @@
 | `worldbook_validate_unavailable` | 503 | system | enclave 校验回环不可达 | |
 | `content_too_long` | 400 | — | 超字数上限（detail.max_chars） | |
 | `worldbook_validate_failed` | 400 | — | | |
+| `worldbook_write_failed` | 500 | system | 世界书条目未能持久化；不会写入进程内缓存 | |
 | `worldbook_match_unavailable` | 503 | system | | |
 
 ## 蒸馏 / 导入（genesis）
