@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from unittest.mock import Mock
 
 import pytest
@@ -150,6 +150,12 @@ def test_cli_rejects_database_fingerprint_mismatch(
         same_source=same_source,
         owner_mismatch=owner_mismatch,
     )
+    if owner_mismatch:
+        # Owner discovery is intentionally delayed until the read-only plan is
+        # complete so the mutation connection cannot age out behind the plan.
+        monkeypatch.setattr(
+            preservation, "build_plan", Mock(return_value=_empty_plan())
+        )
 
     kwargs = dict(
         apply=owner_mismatch,
@@ -200,6 +206,59 @@ def test_cli_dispatches_guarded_apply_to_owner_connection(monkeypatch):
         expected_count=0,
         expected_plan_sha256="a" * 64,
     )
+
+
+def test_cli_opens_owner_only_after_read_only_plan_is_built(monkeypatch):
+    source, app, owner = Mock(name="source"), Mock(name="app"), Mock(name="owner")
+    connections = {
+        "postgresql://source": source,
+        "postgresql://tee-app": app,
+        "postgresql://tee-owner": owner,
+    }
+    events: list[str] = []
+
+    @contextmanager
+    def connect(url, **_kwargs):
+        events.append(f"connect:{url}")
+        yield connections[url]
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://source")
+    monkeypatch.setenv("TEE_DATABASE_URL", "postgresql://tee-app")
+    monkeypatch.setenv("TEE_MIGRATION_DATABASE_URL", "postgresql://tee-owner")
+    monkeypatch.setattr(cli.psycopg, "connect", connect)
+    monkeypatch.setattr(
+        cli,
+        "_fingerprint",
+        lambda conn: ("source", "10.0.0.1", 5432)
+        if conn is source
+        else ("tee", "10.0.0.2", 5432),
+    )
+    monkeypatch.setattr(cli, "_expected_tee_heads", lambda: {"0025_head"})
+    monkeypatch.setattr(cli, "_actual_tee_heads", lambda _conn: {"0025_head"})
+
+    plan = _empty_plan()
+
+    def build_plan(_source, _app):
+        assert "connect:postgresql://tee-owner" not in events
+        events.append("plan-built")
+        return plan
+
+    monkeypatch.setattr(preservation, "build_plan", build_plan)
+    monkeypatch.setattr(
+        preservation,
+        "apply_plan",
+        Mock(return_value={"ok": True, "preserved": 0}),
+    )
+
+    cli.run(
+        apply=True,
+        revert=False,
+        confirm="PRESERVE-TERMINAL-CIPHERTEXT",
+        expected_count=0,
+        expected_plan_sha256="a" * 64,
+    )
+
+    assert events.index("plan-built") < events.index("connect:postgresql://tee-owner")
 
 
 def test_cli_dispatches_guarded_revert_to_owner_connection(monkeypatch):

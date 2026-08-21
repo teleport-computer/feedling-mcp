@@ -92,21 +92,11 @@ def run(
     with ExitStack() as stack:
         source = stack.enter_context(psycopg.connect(source_url, autocommit=True))
         app = stack.enter_context(psycopg.connect(app_url, autocommit=True))
-        owner = None
-        if mode != "dry-run":
-            owner_url = _required_env("TEE_MIGRATION_DATABASE_URL")
-            owner = stack.enter_context(
-                psycopg.connect(owner_url, autocommit=True)
-            )
         source_fingerprint = _fingerprint(source)
         app_fingerprint = _fingerprint(app)
         if source_fingerprint == app_fingerprint:
             raise RuntimeError(
                 "DATABASE_URL and TEE_DATABASE_URL resolve to the same database"
-            )
-        if owner is not None and _fingerprint(owner) != app_fingerprint:
-            raise RuntimeError(
-                "TEE_MIGRATION_DATABASE_URL does not resolve to TEE_DATABASE_URL"
             )
         expected_heads = _expected_tee_heads()
         actual_heads = _actual_tee_heads(app)
@@ -135,7 +125,17 @@ def run(
 
         assert expected_count is not None
         assert expected_plan_sha256 is not None
-        assert owner is not None
+        # Build the potentially slow read-only plan before opening the owner
+        # connection.  The Phala DB gateway can retire an otherwise idle TLS
+        # connection while hundreds of terminal rows are inspected; opening it
+        # here gives apply_plan a fresh connection for its guarded live-plan
+        # rebuild and atomic write transaction.
+        owner_url = _required_env("TEE_MIGRATION_DATABASE_URL")
+        owner = stack.enter_context(psycopg.connect(owner_url, autocommit=True))
+        if _fingerprint(owner) != app_fingerprint:
+            raise RuntimeError(
+                "TEE_MIGRATION_DATABASE_URL does not resolve to TEE_DATABASE_URL"
+            )
         if mode == "apply":
             operation = preservation.apply_plan(
                 source,
