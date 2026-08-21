@@ -1,4 +1,13 @@
-"""Proactive/perception V2 runtime spine.
+"""T227 (audited 2026-08-22): the spine is not production-driven.
+
+No production code constructs ``RuntimeSpineV2`` or ``TurnRunnerV2``; current
+wake turns execute through ``model_api_runtime/v2/worker.py`` / ``tool_loop.py``.
+This does **not** make the whole module dead.  ``WakeEventV2`` and other data
+contracts remain imported by live scheduled-wake/store code and perception
+ingress.  Treat the runtime spine as un-driven, but preserve the exported types
+until those consumers migrate.  See T160 and T227.
+
+Proactive/perception V2 runtime spine.
 
 The production routes still write legacy proactive jobs today. This module
 defines the new center of gravity: wake events enter a per-user inbox, are

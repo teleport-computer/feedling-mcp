@@ -1,4 +1,21 @@
-"""Agent protocol helpers for Proactive/Perception Runtime V2.
+"""T227 (audited 2026-08-22): not wired into production delivery.
+
+This long-standing model-facing Proactive/Perception V2 spine is not the active
+wake path; it was not disconnected by the T208 reply-tool removal.  Live
+scheduled-wake/store code reuses ``WakeEventV2`` from ``proactive/runtime_v2.py``,
+but scheduled delivery is handed directly to ``model_api_runtime/v2/jobs_store``
+and runs through ``model_api_runtime/v2/worker.py`` / ``tool_loop.py``.  No
+production assembly instantiates the island's runtime runner or tool executor.
+The two subsystems both use the name "V2": current ``model_api_runtime/v2`` has
+no call to this protocol, despite the easy-to-misread name overlap.
+
+Consequently, the fail-closed promise on
+``sanitize_visible_message_text_v2`` applies only inside this un-driven island;
+it does **not** protect the current proactive outlet.  That outlet uses
+``core/tool_markup_leak.py`` from ``model_api_runtime/v2/worker.py`` for markup
+stripping and T210 sentinel/degenerate suppression.  See T160, T210, and T227.
+
+Agent protocol helpers for Proactive/Perception Runtime V2.
 
 This module is intentionally pure. It parses the model-facing V2 turn protocol
 and builds the context payload without reaching into perception services.
