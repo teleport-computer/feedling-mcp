@@ -322,6 +322,7 @@ CONTROL_OUTCOME_CODES = frozenset({
     "manual_wake_disabled",
 })
 SILENT_BY_CHOICE_OUTCOME_CODE = "wake_failed:explicit_silence_suppressed"
+EMPTY_VISIBLE_REPLY_SUPPRESSED_REASON = "empty_visible_reply_suppressed"
 SAFETY_SUPPRESSION_CODES = frozenset({
     SILENT_BY_CHOICE_OUTCOME_CODE,
     "wake_failed:degenerate_reply_suppressed",
@@ -5943,7 +5944,8 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 "WITH recent AS ("
-                "  SELECT lane,status,last_error FROM agent_jobs "
+                "  SELECT lane,status,last_error,wake_result,wake_result_reason "
+                "  FROM agent_jobs "
                 "  WHERE status IN ('completed','failed','expired','superseded') "
                 "    AND finished_at >= now() - make_interval(hours => %s)"
                 ") SELECT lane,"
@@ -5955,8 +5957,11 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
                 "    AND last_error='queue_timeout')::int AS queue_expired,"
                 "  COUNT(*) FILTER (WHERE status='expired' "
                 "    AND last_error='lease_timeout')::int AS lease_expired "
+                ", COUNT(*) FILTER (WHERE status='completed' "
+                "    AND wake_result='sleep' AND wake_result_reason=%s)::int "
+                "    AS empty_reply_suppressions "
                 "FROM recent GROUP BY lane",
-                (safe_hours,),
+                (safe_hours, EMPTY_VISIBLE_REPLY_SUPPRESSED_REASON),
             )
             outcome_rows = cur.fetchall()
 
@@ -6104,6 +6109,9 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
             "operational_failures": operational_failures,
             "control_outcomes": control_outcomes,
             "safety_suppressions": safety_suppressions,
+            "empty_reply_suppressions": int(
+                (outcome or {}).get("empty_reply_suppressions") or 0
+            ),
             "failure_rate": (
                 float(failed + expired) / float(resolved) if resolved else None
             ),
@@ -6194,6 +6202,34 @@ def recent_chat_reliability(
                 (safe_hours,),
             )
             outcome = cur.fetchone() or {}
+
+            # T208 regression gauges use existing content-free signals only:
+            # reply_planned trajectory event kinds and the terminal empty-reply
+            # code.  Count logical trajectory events rather than physical rows;
+            # an oversized encrypted event may be split into several chunks.
+            cur.execute(
+                "WITH settled AS ("
+                " SELECT id,last_error FROM agent_jobs WHERE lane='chat' "
+                " AND status IN ('completed','failed','expired') "
+                " AND created_at >= now() - make_interval(hours => %s)"
+                "), planned AS ("
+                " SELECT event.job_id,"
+                "  count(DISTINCT regexp_replace(event.idempotency_key,"
+                "   '_p[0-9a-f]{6}_[0-9a-f]{8}$',''))::int AS reply_count "
+                " FROM v2_trajectory_events event JOIN settled "
+                "   ON settled.id=event.job_id "
+                " WHERE event.event_kind='reply_planned' GROUP BY event.job_id"
+                ") SELECT count(*)::int AS settled_turns,"
+                " count(*) FILTER (WHERE coalesce(planned.reply_count,0)>=2)::int "
+                "   AS multi_reply_turns,"
+                " count(*) FILTER (WHERE coalesce(planned.reply_count,0)>=1)::int "
+                "   AS reply_planned_observed_turns,"
+                " count(*) FILTER (WHERE settled.last_error="
+                "   'turn_failed:empty_reply')::int AS empty_reply_failures "
+                "FROM settled LEFT JOIN planned ON planned.job_id=settled.id",
+                (safe_hours,),
+            )
+            reply_quality = cur.fetchone() or {}
 
             cur.execute(
                 "WITH chat AS ("
@@ -6412,6 +6448,9 @@ def recent_chat_reliability(
     admitted = as_int(outcome, "admitted")
     settled = completed + failed + expired
     applied = as_int(effects, "final_applied_jobs")
+    multi_reply_turns = as_int(reply_quality, "multi_reply_turns")
+    empty_reply_failures = as_int(reply_quality, "empty_reply_failures")
+    reply_quality_settled = as_int(reply_quality, "settled_turns")
     return {
         "window_hours": safe_hours,
         "outcomes": {
@@ -6437,6 +6476,22 @@ def recent_chat_reliability(
                 "fallback_reply_pending", "error_status_delivered",
                 "runtime_error_delivered",
             )
+        },
+        "reply_quality": {
+            "settled_turns": reply_quality_settled,
+            "reply_planned_observed_turns": as_int(
+                reply_quality, "reply_planned_observed_turns"
+            ),
+            "multi_reply_turns": multi_reply_turns,
+            "multi_reply_turn_rate": (
+                float(multi_reply_turns) / float(reply_quality_settled)
+                if reply_quality_settled else None
+            ),
+            "empty_reply_failures": empty_reply_failures,
+            "empty_reply_failure_rate": (
+                float(empty_reply_failures) / float(reply_quality_settled)
+                if reply_quality_settled else None
+            ),
         },
         "settled_jobs": settled,
         "terminal_completion_rate": (

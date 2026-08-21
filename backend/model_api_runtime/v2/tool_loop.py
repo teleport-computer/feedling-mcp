@@ -467,9 +467,7 @@ class FinalReplySuperseded(RuntimeError):
 
     ``on_reply`` raises this only after the candidate reply effect has been
     terminally discarded without reaching its sink.  It is therefore safe for
-    the loop to fold the newly arrived input and ask the provider again.  An
-    intermediate ``reply{}`` bubble never uses this signal: those bubbles are
-    intentionally immediate and remain visible while the turn continues.
+    the loop to fold the newly arrived input and ask the provider again.
     """
 
 
@@ -544,7 +542,6 @@ async def run_tool_loop(
     build_messages,
     dispatch_tools,
     on_reply,
-    on_promote_last_intermediate=None,
     fold_new_messages,
     add_usage,
     max_calls: int,
@@ -570,7 +567,6 @@ async def run_tool_loop(
     # Execution authorization is independently enforced by the caller's
     # dispatch_tools closure; this parameter controls only the provider surface.
     memory_delete_allowed: bool = False,
-    allow_reply_tool: bool = True,
     on_stay_silent=None,
     include_reasoning: bool = False,
     # Self-authored thinking: when True, NEVER request provider-native reasoning —
@@ -655,12 +651,6 @@ async def run_tool_loop(
     publishing, then either publish the accepted rewrite or return
     :class:`FinalReplyCorrectionRejected`.  The loop gives that request exactly one
     text-only provider call and otherwise republishes the original fail-open.
-
-    Foreground Chat may also provide ``on_promote_last_intermediate``.  It is
-    consulted only after the existing one-shot semantic-empty recovery has
-    already been consumed.  A true result means the caller atomically closed
-    the turn through a previously published reply bubble; false preserves the
-    ordinary empty-reply failure.
 
     ``on_file_reply`` is an optional async chat-lane callback. When absent, the
     ``send_file`` tool is removed from the offered catalog. Production resolves
@@ -827,14 +817,6 @@ async def run_tool_loop(
     # content does not remove later user-MCP calls; platform web/task fences and
     # the unknown-mutation idempotency gate still apply below.
     disabled_names = {str(name) for name in (disabled_tool_names or ()) if str(name)}
-    # ``reply`` is part of the parent loop protocol rather than a side-effect
-    # capability. Recovery callers may remove every mutation schema, but must
-    # always leave the model a way to produce an intermediate bubble. Isolated
-    # child loops explicitly disable it and return only terminal plain text.
-    if allow_reply_tool:
-        disabled_names.discard(tool_schema.REPLY_TOOL)
-    else:
-        disabled_names.add(tool_schema.REPLY_TOOL)
     if on_stay_silent is None:
         disabled_names.add(tool_schema.STAY_SILENT_TOOL)
     else:
@@ -1829,11 +1811,6 @@ async def run_tool_loop(
                 and not empty_response_recovery_used
                 and attempts < max_calls - 1
             )
-            can_attempt_promotion = bool(
-                on_promote_last_intermediate is not None
-                and empty_response_recovery_used
-                and not upstream_response_envelope
-            )
             await _trajectory(
                 "empty_provider_response",
                 {
@@ -1847,11 +1824,7 @@ async def run_tool_loop(
                     "action": (
                         "semantic_correction"
                         if can_correct
-                        else (
-                            "promote_intermediate_or_fail"
-                            if can_attempt_promotion
-                            else "fail_provider_empty_reply"
-                        )
+                        else "fail_provider_empty_reply"
                     ),
                 },
             )
@@ -1871,31 +1844,6 @@ async def run_tool_loop(
                 seen_reasoning_fragments.clear()
                 _progress("empty_response_retry_boundary")
                 continue
-            if can_attempt_promotion:
-                try:
-                    promoted = await on_promote_last_intermediate()
-                except FinalReplySuperseded:
-                    reasoning_fragments.clear()
-                    seen_reasoning_fragments.clear()
-                    _progress("final_reply_superseded")
-                    await _trajectory(
-                        "final_reply_superseded",
-                        {"round": attempts, "source": "intermediate_promotion"},
-                    )
-                    if attempts < max_calls:
-                        continue
-                    return LoopOutcome(
-                        "", attempts, "input_advanced", replied_intermediate
-                    )
-                if promoted:
-                    replied_intermediate = True
-                    await _trajectory(
-                        "intermediate_reply_promoted",
-                        {"round": attempts},
-                    )
-                    return LoopOutcome(
-                        "", attempts, "intermediate_promoted", True
-                    )
             exc = ProviderEmptyReply("empty_reply")
             if on_provider_failure is not None:
                 try:
@@ -2204,7 +2152,6 @@ async def run_tool_loop(
         ]
         mixed_reply_write = any(
             tc.name in {
-                tool_schema.REPLY_TOOL,
                 tool_schema.FILE_REPLY_TOOL,
                 tool_schema.IMAGE_REPLY_TOOL,
                 tool_schema.STAY_SILENT_TOOL,
@@ -2234,10 +2181,10 @@ async def run_tool_loop(
             # duplicate durable writes on the corrected round. Missing/duplicate
             # ids also cannot form a provider-native result exchange. Make exactly
             # one tools-disabled fallback from the original prompt instead.
-            # A reply plus either a platform or MCP mutation is rejected for the
-            # same reason: the bubble cannot truthfully claim success before the
-            # later sink commits. The model may mutate in one round and reply only
-            # after observing its result in the next.
+            # An outbound delivery plus either a platform or MCP mutation is
+            # rejected for the same reason: the bubble cannot truthfully claim
+            # success before the later sink commits. The model may mutate in one
+            # round and reply only after observing its result in the next.
             if attempts >= max_calls:
                 break
             await _trajectory(
@@ -2260,12 +2207,10 @@ async def run_tool_loop(
         tool_calls_used += len(pr.tool_calls)
 
         # text accompanying tool_calls = preamble/thinking, NOT a bubble.
-        reply_calls = [tc for tc in pr.tool_calls if tc.name == tool_schema.REPLY_TOOL]
         file_reply_calls = [
             tc for tc in pr.tool_calls if tc.name == tool_schema.FILE_REPLY_TOOL
         ]
         loop_reply_tools = {
-            tool_schema.REPLY_TOOL,
             tool_schema.FILE_REPLY_TOOL,
             tool_schema.IMAGE_REPLY_TOOL,
             tool_schema.STAY_SILENT_TOOL,
@@ -2301,46 +2246,6 @@ async def run_tool_loop(
             await _tool_event(
                 tc, "tool_call_result", {"result": repeated_result}
             )
-        for tc in reply_calls:
-            reply_text = str(tc.args.get("text") or "")
-            await _tool_event(tc, "tool_call_started", {})
-            await _trajectory(
-                "reply_planned",
-                {
-                    "round": attempts,
-                    "final": False,
-                    "call_id": tc.id,
-                    "text": reply_text,
-                },
-            )
-            # Pass this round's reasoning so the sink can detect a cross-channel
-            # torn-protocol leak on the intermediate reply too (Codex code-review
-            # #1): without it a chat-lane tail is only ever weak evidence and
-            # would be delivered. NOTE: the delivery-confirmation contract below
-            # still marks a non-empty reply as delivered even when the sink
-            # suppresses it — a pre-existing gap (degenerate replies hit it too);
-            # tightening on_reply to report published/suppressed is a separate,
-            # wider change left for review.
-            try:
-                await on_reply(
-                    reply_text, final=False, reasoning=str(pr.raw.get("reasoning") or "")
-                )  # immediate intermediate bubble
-            except Exception as exc:
-                await _tool_event(
-                    tc, "tool_call_error", {"error": type(exc).__name__}
-                )
-                raise
-            if reply_text.strip():
-                replied_intermediate = True
-                content = "ok: reply delivered"
-            else:
-                content = "ok: empty reply ignored"
-            reply_result = ToolResult(call_id=tc.id, content=content)
-            reply_results[tc.id] = reply_result
-            await _tool_event(
-                tc, "tool_call_result", {"result": reply_result}
-            )
-
         for tc in stay_silent_calls:
             reason = str(tc.args.get("reason") or "").strip()
             await _tool_event(tc, "tool_call_started", {})
@@ -2511,8 +2416,8 @@ async def run_tool_loop(
         ):
             mutation_outcome_unknown = True
 
-        # This is the provider-neutral trust boundary: platform, MCP, reply, and
-        # any future injected dispatcher all receive identical prompt budgets.
+        # This is the provider-neutral trust boundary: platform, MCP, and any
+        # future injected dispatcher all receive identical prompt budgets.
         # Normalize before deriving the web-fetch allowlist so a URL the model did
         # not actually receive can never become fetch-authorized.
         ordered_results = _normalize_tool_results(

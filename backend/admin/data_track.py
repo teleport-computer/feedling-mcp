@@ -4315,6 +4315,7 @@ def _render_runtime_health_page(
                 "operational_failures": None,
                 "control_outcomes": None,
                 "safety_suppressions": None,
+                "empty_reply_suppressions": None,
                 "failure_rate": None,
                 "operational_failure_rate": None,
                 "p50_ok_ms": None,
@@ -4532,6 +4533,7 @@ def _render_runtime_health_page(
             f"<td>{_fmt_count(lane.get('operational_failures'))}</td>"
             f"<td class='muted'>{_fmt_count(lane.get('control_outcomes'))}</td>"
             f"<td class='muted'>{_fmt_count(lane.get('safety_suppressions'))}</td>"
+            f"<td>{_fmt_count(lane.get('empty_reply_suppressions'))}</td>"
             + raw_rate_cell
             + operational_rate_cell
             + _ms_cell(lane.get("p50_ok_ms"))
@@ -4664,8 +4666,8 @@ def _render_runtime_health_page(
   {delivery_section}
   <h2>各 lane 健康</h2>
   <div class="table-wrap"><table>
-    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>原始失败</th><th>过期</th><th>系统故障<br><span class='muted'>含过期</span></th><th>控制切流</th><th>安全抑制</th><th>终态未成功率</th><th>系统故障率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>开口回合/回合<br><span class='muted'>仅 screen_watch</span></th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
-    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='17' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
+    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>原始失败</th><th>过期</th><th>系统故障<br><span class='muted'>含过期</span></th><th>控制切流</th><th>安全抑制</th><th>空内容主动抑制</th><th>终态未成功率</th><th>系统故障率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>开口回合/回合<br><span class='muted'>仅 screen_watch</span></th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
+    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='18' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
   </table></div>
   {_render_stuck_block(stuck)}
   {_render_runtime_user_report(user_report)}
@@ -4786,6 +4788,7 @@ def _ops_chat_level(report: dict | None) -> tuple[str, list[str]]:
         return "unknown", ["聊天统计暂不可用"]
     outcomes = report.get("outcomes") or {}
     delivery = report.get("reply_delivery") or {}
+    reply_quality = report.get("reply_quality") or {}
     settled = int(report.get("settled_jobs") or 0)
     failed = int(outcomes.get("failed") or 0) + int(outcomes.get("expired") or 0)
     reasons: list[str] = []
@@ -4809,6 +4812,10 @@ def _ops_chat_level(report: dict | None) -> tuple[str, list[str]]:
     if reconciliation:
         level = "bad"
         reasons.append(f"{reconciliation} 个 final reply 需要人工 reconcile")
+    multi_reply_turns = int(reply_quality.get("multi_reply_turns") or 0)
+    if multi_reply_turns:
+        level = "bad"
+        reasons.append(f"{multi_reply_turns} 个回合计划了至少 2 条可见回复")
     if not reasons:
         reasons.append("服务端交付可观测；客户端接收 ACK 尚未采集")
     return level, reasons
@@ -5172,6 +5179,7 @@ def _render_chat_reliability_page(report: dict | None, *, within_hours: int) -> 
     outcomes = report.get("outcomes") or {}
     delivery = report.get("reply_delivery") or {}
     failure_delivery = report.get("failure_delivery") or {}
+    reply_quality = report.get("reply_quality") or {}
     failure_rows = "".join(
         "<tr>"
         f"<td><code>{html.escape(str(row.get('code') or 'runtime_failed'))}</code></td>"
@@ -5218,8 +5226,10 @@ def _render_chat_reliability_page(report: dict | None, *, within_hours: int) -> 
       {_render_metric('Completed 无 applied', _fmt_count(delivery.get('completed_without_final_applied')))}
       {_render_metric('失败 fallback 已投递', _fmt_count(failure_delivery.get('fallback_reply_delivered')))}
       {_render_metric('失败 fallback 待投递', _fmt_count(failure_delivery.get('fallback_reply_pending')))}
+      {_render_metric('≥2 条可见回复的回合', f"{_fmt_count(reply_quality.get('multi_reply_turns'))} / {_fmt_ratio(reply_quality.get('multi_reply_turn_rate'))}")}
+      {_render_metric('Empty reply 失败', f"{_fmt_count(reply_quality.get('empty_reply_failures'))} / {_fmt_ratio(reply_quality.get('empty_reply_failure_rate'))}")}
     </section>
-    <div class="note-box"><b>两条率不能混：</b>“Admitted → final reply 服务端 applied”以窗口内全部 chat agent_jobs 为同一 cohort，回答进入 Runtime 的 turn 有多少已经落地最终回复；“终态完成率”只在 completed / failed / expired 终态中计算 completed。最终回复只认明确 final effect，或带 <code>reply_through_seq</code> 的 legacy reply；普通中间 reply 不计。服务端 applied 比“模型 API 200”更接近用户结果，但仍<b>不等于设备收到或用户已读</b>；客户端 delivery ACK 当前不可用，因此页面不会给“用户真的收到”绿灯。同一用户在单飞回合中追加的多条消息会折入一个 job，所以 admitted 是 turns，不是原始消息条数。</div>
+    <div class="note-box"><b>这些率不能混：</b>“Admitted → final reply 服务端 applied”以窗口内全部 chat agent_jobs 为同一 cohort，回答进入 Runtime 的 turn 有多少已经落地最终回复；“终态完成率”只在 completed / failed / expired 终态中计算 completed。两个回归指标也以已结算回合为分母：“≥2 条可见回复”按既有 trajectory <code>reply_planned</code> 事件计数，是服务端计划证据而非客户端 ACK；“Empty reply”按既有 <code>turn_failed:empty_reply</code> 终态码计数。最终回复只认明确 final effect，或带 <code>reply_through_seq</code> 的 legacy reply。服务端 applied 比“模型 API 200”更接近用户结果，但仍<b>不等于设备收到或用户已读</b>；客户端 delivery ACK 当前不可用，因此页面不会给“用户真的收到”绿灯。同一用户在单飞回合中追加的多条消息会折入一个 job，所以 admitted 是 turns，不是原始消息条数。</div>
     <h2>失败原因 Top</h2><div class="table-wrap"><table><thead><tr><th>失败码</th><th>次数</th></tr></thead><tbody>{failure_rows or "<tr><td colspan='2' class='muted'>窗口内无失败。</td></tr>"}</tbody></table></div>
     <h2>最近 chat jobs</h2><div class="table-wrap"><table><thead><tr><th>User</th><th>Job</th><th>Job 状态</th><th>Final effect</th><th>Provider / Model</th><th>Calls / retries</th><th>失败码</th><th>创建 UTC</th></tr></thead><tbody>{''.join(recent_rows) if recent_rows else "<tr><td colspan='8' class='muted'>窗口内无 chat。</td></tr>"}</tbody></table></div>
     """

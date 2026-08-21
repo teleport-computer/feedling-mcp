@@ -74,6 +74,7 @@ def _lane(**overrides) -> dict:
         "superseded": 0,
         "queue_expired": 0,
         "lease_expired": 0,
+        "empty_reply_suppressions": 0,
         "failure_rate": 0.0,
         "p50_ok_ms": 18_500,
         "p95_ok_ms": 38_100,
@@ -446,6 +447,24 @@ def test_render_runtime_health_page_shows_conclusion_and_lanes(bound_request):
     assert "chat" in html_out
     assert "heartbeat" in html_out
     assert "Worker 池" in html_out
+
+
+def test_render_runtime_health_page_shows_empty_proactive_suppression_metric(
+    bound_request,
+):
+    html_out = _dt._render_runtime_health_page(
+        _payload([
+            _lane(
+                lane="heartbeat",
+                sampled_jobs=7,
+                completed=7,
+                empty_reply_suppressions=3,
+            )
+        ])
+    )
+
+    assert "空内容主动抑制" in html_out
+    assert "<td>3</td>" in html_out
 
 
 def test_render_runtime_health_page_warns_service_when_delivery_is_missing(

@@ -14,7 +14,7 @@ from provider_types import ToolSpec
 def test_catalog_covers_capabilities_plus_synthetic_tools_minus_internal_actions():
     specs = tool_schema.build_tool_specs()
     names = {s.name for s in specs}
-    assert "reply" in names
+    assert "reply" not in names
     assert "task" in names
     assert "chat_image_read" not in names   # BUG-1 mitigation
     assert "chat_file_read" not in names    # internal-only, never offered to the model
@@ -24,27 +24,6 @@ def test_catalog_covers_capabilities_plus_synthetic_tools_minus_internal_actions
             continue
         assert cap in names, f"missing tool: {cap}"
     assert all(isinstance(s, ToolSpec) for s in specs)
-
-
-def test_reply_tool_schema_shape():
-    reply = next(s for s in tool_schema.build_tool_specs() if s.name == "reply")
-    assert reply.parameters["required"] == ["text"]
-    assert reply.parameters["properties"]["text"]["type"] == "string"
-
-
-def test_t140_reply_description_allows_complete_bubble_to_end_turn():
-    description = next(
-        spec.description for spec in tool_schema.build_tool_specs()
-        if spec.name == "reply"
-    )
-
-    assert "long-running task" in description
-    assert "immediate reply bubble" in description
-    assert "without <think>" in description
-    assert "end the turn with no additional visible text" in description
-    assert "do not repeat it" in description
-    assert "only when you still have new content" in description
-    assert "must not replace the final reply" not in description
 
 
 def test_t101_perception_and_screen_gates_reach_final_tool_descriptions():

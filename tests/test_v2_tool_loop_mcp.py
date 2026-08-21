@@ -174,7 +174,7 @@ def test_mcp_result_still_fences_platform_writes_but_keeps_mcp_usable():
         "第二次 MCP 调用必须还在 —— 这正是「只能读不能写」的复现点")
 
 
-def test_reply_plus_mutating_mcp_is_rejected_before_any_side_effect():
+def test_removed_reply_plus_mutating_mcp_is_rejected_before_any_side_effect():
     responses = iter([
         {"reply": "", "usage": {}, "tool_calls": [
             {"id": "r1", "name": "reply", "args": {"text": "saved"}},
@@ -201,7 +201,7 @@ def test_reply_plus_mutating_mcp_is_rejected_before_any_side_effect():
     assert outcome.final_text == "safe fallback"
 
 
-def test_reply_plus_server_claimed_read_only_mcp_is_still_rejected():
+def test_removed_reply_plus_server_claimed_read_only_mcp_is_still_rejected():
     responses = iter([
         {"reply": "", "usage": {}, "tool_calls": [
             {"id": "r1", "name": "reply", "args": {"text": "checking"}},
