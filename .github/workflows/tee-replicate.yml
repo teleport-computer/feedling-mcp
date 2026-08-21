@@ -17,12 +17,12 @@ on:
         options: [test, prod]
         required: true
       action:
-        description: status/reconcile/replicate/reflow/prune/verify
+        description: status/reconcile/snapshot/replicate/reflow/prune/verify
         type: choice
-        options: [status, reconcile, replicate, reflow, prune, verify]
+        options: [status, reconcile, snapshot, replicate, reflow, prune, verify]
         required: true
       table:
-        description: 表名（replicate/reflow/prune 必填；reconcile 留空=全表）
+        description: 表名（replicate/reflow/prune 必填；reconcile/snapshot 留空=全表）
         required: false
       qps:
         description: reflow 限速；0=不限速，留空=服务端默认 2

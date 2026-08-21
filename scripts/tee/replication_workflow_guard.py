@@ -68,6 +68,16 @@ def check(http_code: str, response_path: str) -> int:
     if not _dry_run() and os.environ.get("ACTION") in ("reflow", "prune"):
         if body.get("ok") is not True or body.get("failures") != 0:
             return 1
+    if not _dry_run() and os.environ.get("ACTION") == "snapshot":
+        failures = body.get("failures")
+        if failures is None:
+            tables = body.get("tables")
+            if not isinstance(tables, list) or not tables:
+                return 1
+            if any(not isinstance(table, dict) or table.get("ok") is not True for table in tables):
+                return 1
+        elif failures != 0:
+            return 1
     return 0
 
 
