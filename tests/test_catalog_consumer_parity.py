@@ -50,6 +50,11 @@ def test_every_catalog_blame_is_valid():
         assert catalog.blame_for(ec) in core.VALID_BLAME
 
 
+def test_every_registered_error_class_has_explicit_catalog_entry():
+    missing = set(catalog.ERROR_CLASSES) - set(catalog._CATALOG)
+    assert not missing, f"error_class 缺显式 catalog 话术: {sorted(missing)}"
+
+
 def test_vision_model_required_catalog_guidance_is_bilingual():
     assert catalog.user_text_for(
         "vision_model_required", language="zh-Hans"

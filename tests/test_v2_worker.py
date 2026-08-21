@@ -167,6 +167,44 @@ def test_image_generation_wrapper_keeps_internal_http_diagnostics(status_code):
     assert upstream_detail not in str(failure)
 
 
+def test_image_generation_dependency_bug_is_system_owned():
+    async def broken_dependency(*_args, **_kwargs):
+        raise TypeError("internal provider-response adapter drift")
+
+    with pytest.raises(worker.ImageGenerationInternalError) as raised:
+        asyncio.run(
+            worker._call_image_generation_dependency(
+                broken_dependency,
+                user_id="usr_image_internal",
+                prompt="a small red robot",
+                provider_config=_BYOK,
+                api_key=None,
+                runtime_token="runtime-token",
+            )
+        )
+
+    failure = raised.value
+    assert failure.error_code == "image_generation_internal_error"
+    assert failure.provider == _BYOK.provider
+    assert failure.model == _BYOK.model
+    assert isinstance(failure.__cause__, TypeError)
+    assert "adapter drift" not in str(failure)
+
+
+def test_image_generation_internal_error_reaches_system_classification():
+    failure = worker.ImageGenerationInternalError(
+        model="gpt-image-test",
+        provider="openai",
+    )
+
+    assert worker._turn_failure_error_class(failure) == (
+        "image_generation_internal_error"
+    )
+    assert worker._safe_failure_code("turn_failed", failure) == (
+        "turn_failed:image_generation_internal_error"
+    )
+
+
 class _FakeCapResult:
     def __init__(self, data=None, ok=True):
         self._data = data or {}

@@ -1111,6 +1111,18 @@ class ImageGenerationUnavailable(RuntimeError):
         self.upstream_detail = str(upstream_detail or "")[:240]
 
 
+class ImageGenerationInternalError(ImageGenerationUnavailable):
+    """Feedling failed after the provider seam; the saved route is not blamed."""
+
+    def __init__(self, *, model: str = "", provider: str = ""):
+        super().__init__(
+            "internal image generation processing failed",
+            error_code="image_generation_internal_error",
+            model=model,
+            provider=provider,
+        )
+
+
 def _safe_failure_code(scope: str, exc: BaseException) -> str:
     """Stable plaintext error code that never embeds exception messages."""
     if isinstance(exc, WorkspacePromptUnavailable):
@@ -1297,6 +1309,47 @@ def _image_generation_unavailable_from_exception(
             or ""
         ),
     )
+
+
+def _image_generation_internal_error(
+    provider_config: Any,
+) -> ImageGenerationInternalError:
+    return ImageGenerationInternalError(
+        model=str(getattr(provider_config, "model", "") or ""),
+        provider=str(getattr(provider_config, "provider", "") or ""),
+    )
+
+
+async def _call_image_generation_dependency(
+    generate_image: Callable[..., Any],
+    *,
+    user_id: str,
+    prompt: str,
+    provider_config: Any,
+    api_key: str | None,
+    runtime_token: str,
+) -> Any:
+    """Keep assembly/processing failures system-owned at the tool boundary."""
+    try:
+        return await generate_image(
+            user_id,
+            prompt,
+            main_provider_config=provider_config,
+            api_key=api_key,
+            runtime_token=runtime_token,
+        )
+    except ImageGenerationUnavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001 - dependency seam bugs stay system-owned
+        log.exception(
+            "[v2.image] internal generation handling failed user=%s "
+            "provider=%s model=%s error=%s",
+            str(user_id)[:8],
+            str(getattr(provider_config, "provider", "") or "")[:80],
+            str(getattr(provider_config, "model", "") or "")[:96],
+            type(exc).__name__,
+        )
+        raise _image_generation_internal_error(provider_config) from exc
 
 
 def _required_file_missing_fallback(messages: list[dict]) -> str:
@@ -13939,21 +13992,14 @@ async def process_job(
                     model=str(getattr(provider_config, "model", "") or ""),
                     provider=str(getattr(provider_config, "provider", "") or ""),
                 )
-            try:
-                generated = await deps.generate_image(
-                    user_id,
-                    prompt,
-                    main_provider_config=provider_config,
-                    api_key=api_key,
-                    runtime_token=runtime_token,
-                )
-            except ImageGenerationUnavailable:
-                raise
-            except Exception as exc:  # noqa: BLE001 - stable chat failure below
-                raise _image_generation_unavailable_from_exception(
-                    exc,
-                    provider_config,
-                ) from exc
+            generated = await _call_image_generation_dependency(
+                deps.generate_image,
+                user_id=user_id,
+                prompt=prompt,
+                provider_config=provider_config,
+                api_key=api_key,
+                runtime_token=runtime_token,
+            )
             media = tuple(generated or ())
             if not media or any(not isinstance(item, ProviderMedia) for item in media):
                 raise ImageGenerationUnavailable(

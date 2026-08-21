@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import base64
+import io
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
@@ -11,6 +16,12 @@ from hosted import image_generator, setup_core  # noqa: E402
 
 def _store(user_id: str = "image-user"):
     return SimpleNamespace(user_id=user_id)
+
+
+def _valid_png_base64() -> str:
+    out = io.BytesIO()
+    Image.new("RGB", (2, 2), (30, 90, 180)).save(out, format="PNG")
+    return base64.b64encode(out.getvalue()).decode("ascii")
 
 
 def _route(**overrides):
@@ -283,6 +294,118 @@ def test_resident_generate_uses_only_the_pinned_image_route(monkeypatch):
     assert marked == [{"status": "ok"}]
 
 
+def _wire_resident_generation_route(monkeypatch, *, generated, marked):
+    monkeypatch.setattr(
+        image_generator.db,
+        "model_api_image_generation_route",
+        lambda _uid: _route(),
+    )
+    monkeypatch.setattr(
+        image_generator.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: b"provider-key",
+    )
+    monkeypatch.setattr(
+        image_generator.provider_client,
+        "generate_image_async",
+        generated,
+    )
+    monkeypatch.setattr(
+        image_generator.db,
+        "model_api_route_mark_image_generation_test",
+        lambda _uid, _rid, **kwargs: marked.append(kwargs) or True,
+    )
+
+
+def test_resident_provider_seam_bare_exception_still_updates_route_health(monkeypatch):
+    """The narrow try is structural; provider adapters may leak raw exceptions."""
+    marked = []
+
+    async def provider_failure(*_args, **_kwargs):
+        raise TypeError("provider adapter response parser failed")
+
+    _wire_resident_generation_route(
+        monkeypatch,
+        generated=provider_failure,
+        marked=marked,
+    )
+
+    body, status = image_generator.generate_with_pinned_route(
+        _store(),
+        {"prompt": "draw a red robot"},
+        caller_api_key="caller-key",
+    )
+
+    assert status == 400
+    assert body["error"] == "image_generation_failed"
+    assert marked == [{"status": "failed", "error": "image_generation_failed"}]
+
+
+def test_resident_local_decrypt_bug_does_not_poison_route_health(monkeypatch):
+    marked = []
+    monkeypatch.setattr(
+        image_generator.db,
+        "model_api_image_generation_route",
+        lambda _uid: _route(),
+    )
+    monkeypatch.setattr(
+        image_generator.core_envelope,
+        "decrypt_provider_key_envelope",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            TypeError("internal decrypt helper signature drift")
+        ),
+    )
+    monkeypatch.setattr(
+        image_generator.db,
+        "model_api_route_mark_image_generation_test",
+        lambda _uid, _rid, **kwargs: marked.append(kwargs) or True,
+    )
+
+    with pytest.raises(TypeError, match="internal decrypt helper signature drift"):
+        image_generator.generate_with_pinned_route(
+            _store(),
+            {"prompt": "draw a red robot"},
+            caller_api_key="caller-key",
+        )
+
+    assert marked == [], "local credential bugs are not provider route evidence"
+
+
+def test_resident_normalization_bug_does_not_poison_route_health(monkeypatch):
+    marked = []
+
+    async def generated(*_args, **_kwargs):
+        return {
+            "media": [{
+                "mime_type": "image/png",
+                "data_base64": "aW1hZ2U=",
+                "name": "robot.png",
+            }]
+        }
+
+    _wire_resident_generation_route(
+        monkeypatch,
+        generated=generated,
+        marked=marked,
+    )
+    monkeypatch.setattr(
+        image_generator.generated_image,
+        "normalize_generated_image",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            TypeError("internal normalizer signature drift")
+        ),
+    )
+
+    with pytest.raises(TypeError, match="internal normalizer signature drift"):
+        image_generator.generate_with_pinned_route(
+            _store(),
+            {"prompt": "draw a red robot"},
+            caller_api_key="caller-key",
+        )
+
+    assert marked == [], "our processing bug must leave the saved route status unchanged"
+
+
 def test_select_dedicated_tests_before_changing_route(monkeypatch):
     route = _route(image_generation_test_status="untested")
     events = []
@@ -364,7 +487,7 @@ def test_route_probe_marks_real_generated_media_ready(monkeypatch):
             "media": [
                 {
                     "mime_type": "image/png",
-                    "data_base64": "aW1hZ2U=",
+                    "data_base64": _valid_png_base64(),
                 }
             ]
         }
@@ -388,6 +511,50 @@ def test_route_probe_marks_real_generated_media_ready(monkeypatch):
 
     assert error is None
     assert marked == [{"status": "ok"}]
+
+
+def test_route_probe_normalization_bug_preserves_existing_status(monkeypatch):
+    marked = []
+    monkeypatch.setattr(
+        setup_core.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: b"provider-key",
+    )
+
+    async def generated(*_args, **_kwargs):
+        return {
+            "media": [{
+                "mime_type": "image/png",
+                "data_base64": "aW1hZ2U=",
+            }]
+        }
+
+    monkeypatch.setattr(
+        setup_core.provider_client,
+        "generate_image_async",
+        generated,
+    )
+    monkeypatch.setattr(
+        setup_core.image_generator,
+        "normalize_provider_media",
+        lambda _result: (_ for _ in ()).throw(
+            TypeError("internal normalizer signature drift")
+        ),
+    )
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_route_mark_image_generation_test",
+        lambda _uid, _rid, **kwargs: marked.append(kwargs) or True,
+    )
+
+    with pytest.raises(TypeError, match="internal normalizer signature drift"):
+        setup_core._test_route_image_generation_or_error(
+            _store(),
+            _route(image_generation_test_status="ok"),
+            "caller-key",
+        )
+
+    assert marked == [], "the probe must neither fail nor re-approve the route"
 
 
 def test_route_probe_maps_text_only_model_to_configuration_error(monkeypatch):

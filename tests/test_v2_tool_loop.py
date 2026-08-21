@@ -2834,6 +2834,55 @@ def test_image_generation_failure_is_handed_back_instead_of_killing_the_turn(mon
     )
 
 
+def test_internal_image_processing_failure_is_handed_back_for_companion_reply(
+    monkeypatch,
+):
+    provider = _ScriptedProvider([
+        {"reply": "", "tool_calls": [{"id": "c1", "name": "generate_image",
+                                      "args": {"prompt": "a cat"}}], "usage": {}},
+        {"reply": "图片处理出了问题，我先不假装它生成成功。", "tool_calls": [],
+         "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    published = []
+    tool_events = []
+
+    class _InternalImageProcessingError(RuntimeError):
+        error_code = "image_generation_internal_error"
+
+    async def on_image_reply(_args):
+        raise _InternalImageProcessingError("private internal signature drift")
+
+    async def on_reply(text, *, final, reasoning="", media=()):
+        published.append((text, final, tuple(media)))
+
+    async def on_tool_event(call, event_kind, payload):
+        tool_events.append((call.name, event_kind, payload))
+
+    asyncio.run(
+        tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=on_reply,
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            on_image_reply=on_image_reply,
+            on_tool_event=on_tool_event,
+            max_calls=3,
+        )
+    )
+
+    assert published == [
+        ("图片处理出了问题，我先不假装它生成成功。", True, ()),
+    ]
+    image_result = tool_events[-1][2]["result"]
+    assert image_result.metadata == {
+        "image_generation_result_code": "image_generation_internal_error"
+    }
+    assert "private internal signature drift" not in image_result.content
+
+
 def test_unbacked_image_claim_is_bounced_once_then_let_through(monkeypatch):
     """说了没做要纠正,但**只纠正一次**;再撒谎照原样发出,不拿 runtime 跟模型较劲。"""
     provider = _ScriptedProvider([
