@@ -10019,6 +10019,10 @@ async def _run_wake(
                     PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
                 ),
                 initial_screen_pixels_blocked=(screen_frame_message is not None),
+                # T107:唤醒轮没有用户消息 —— 屏幕上那段字是这一轮唯一的
+                # 指令来源,所以它同时开启**注入面**的封锁(禁平台写)。
+                # 前台 `process_job` 那个调用点**故意不传这个** —— 那里有用户消息。
+                initial_untrusted_screen_only=(screen_frame_message is not None),
                 tagged_image_message_key=v2_screen_chat.MESSAGE_TAG,
                 on_tagged_images_rejected=(
                     _on_wake_screen_images_rejected
