@@ -13869,6 +13869,144 @@ def chat_delete(user_id: str, msg_id: str) -> bool:
     return True
 
 
+def chat_delete_uncovered_many(user_id: str, targets) -> dict:
+    """Delete exact chat rows only while they remain outside summary coverage.
+
+    Voice hangup cleanup snapshots its candidate ids before entering this
+    helper.  A compaction leaf may commit after that snapshot, so the coverage
+    watermark and the DELETE must share one *exclusive* per-user chat fence.
+    The two possible orders are then both safe: cleanup wins and compaction's
+    write witness no longer sees the rows, or compaction wins and cleanup
+    re-reads the advanced watermark and retains them.
+
+    ``targets`` carries the candidate ``(msg_id, seq)`` snapshot. Keeping the
+    seq lets the shadow mirror self-heal a target that another cleanup deleted
+    from primary after discovery, without ever mirror-deleting a row that the
+    now-current summary watermark covers.
+
+    Returns ``deleted`` / ``retained_covered`` / ``remaining`` counts. A
+    successful atomic batch has ``remaining == 0`` by construction; a database
+    failure is fail-closed as ``remaining == len(targets)`` so the voice
+    finalize route cannot report cleanup after an unknown outcome.
+
+    Do not call this helper from a transaction that already holds the same
+    user's shared chat fence on another connection: the exclusive acquisition
+    would correctly wait for that outer transaction while the caller waits for
+    this helper, creating a self-deadlock. Current voice route callers enter
+    only after their lifecycle transactions have committed.
+    """
+    normalized_targets: dict[str, int] = {}
+    for raw in targets or ():
+        try:
+            raw_id, raw_seq = raw
+            msg_id = str(raw_id or "").strip()
+            seq = int(raw_seq)
+        except (TypeError, ValueError):
+            continue
+        if msg_id and seq > 0:
+            normalized_targets[msg_id] = seq
+    if not normalized_targets:
+        return {"deleted": 0, "retained_covered": 0, "remaining": 0}
+    normalized_ids = tuple(normalized_targets)
+
+    deletable_ids: tuple[str, ...] = ()
+    mirror_ids: tuple[str, ...] = ()
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    # Global order matches chat_clear/account deletion: the
+                    # broad chat fence always precedes the R2 lifecycle lock.
+                    _lock_chat_user_fence_on_cursor(
+                        cur, str(user_id), exclusive=True,
+                    )
+                    _lock_chat_r2_lifecycle_on_cursor(cur, str(user_id))
+                    cur.execute(
+                        "SELECT COALESCE(watermark_seq,0),watermark_ts "
+                        "FROM v2_conversation_summary WHERE user_id=%s",
+                        (str(user_id),),
+                    )
+                    head = cur.fetchone()
+                    covered = int(head[0] or 0) if head is not None else 0
+                    watermark_ts = head[1] if head is not None else None
+                    if watermark_ts:
+                        cur.execute(
+                            "SELECT COALESCE(MAX(seq),0) FROM chat_messages "
+                            "WHERE user_id=%s AND ts<=%s",
+                            (str(user_id), float(watermark_ts)),
+                        )
+                        covered = max(covered, int(cur.fetchone()[0] or 0))
+
+                    # Inclusive is deliberate: the row exactly at the summary
+                    # watermark is already frozen coverage and must be kept.
+                    # Cleanup rounds in the conservative DELETE direction,
+                    # opposite to readers that under-approximate an ambiguous
+                    # legacy timestamp boundary.
+
+                    cur.execute(
+                        "SELECT msg_id,seq FROM chat_messages "
+                        "WHERE user_id=%s AND msg_id=ANY(%s)",
+                        (str(user_id), list(normalized_ids)),
+                    )
+                    current = {
+                        str(row[0]): int(row[1] or 0)
+                        for row in cur.fetchall()
+                    }
+                    retained_covered = sum(
+                        1 for seq in current.values() if seq <= covered
+                    )
+                    deletable_ids = tuple(
+                        msg_id for msg_id, seq in current.items() if seq > covered
+                    )
+                    # A target may already be absent from primary because a
+                    # competing cleanup won after candidate discovery. Its
+                    # immutable snapshot seq still lets the best-effort shadow
+                    # DELETE repair an earlier missed mirror. For present rows,
+                    # the authoritative current seq wins (they are equal under
+                    # the chat table contract).
+                    mirror_ids = tuple(
+                        msg_id
+                        for msg_id, snapshot_seq in normalized_targets.items()
+                        if current.get(msg_id, snapshot_seq) > covered
+                    )
+                    deleted = 0
+                    if deletable_ids:
+                        cur.execute(
+                            "DELETE FROM chat_messages WHERE user_id=%s "
+                            "AND msg_id=ANY(%s) RETURNING msg_id",
+                            (str(user_id), list(deletable_ids)),
+                        )
+                        deleted = len(cur.fetchall())
+    except Exception as e:
+        log.error("[db] chat_delete_uncovered_many(%s) failed: %s", user_id, e)
+        return {
+            "deleted": 0,
+            "retained_covered": 0,
+            "remaining": len(normalized_targets),
+        }
+
+    if mirror_ids:
+        # Mirror the exact post-fence decision, not all candidates: covered
+        # primary rows must remain present on the plaintext side as well.
+        from tee_shadow import mirror
+        mirror.execute_many([
+            (
+                "DELETE FROM chat_messages WHERE user_id=%s AND msg_id=ANY(%s)",
+                (str(user_id), list(mirror_ids)),
+            ),
+            (
+                "DELETE FROM tee_pending_device_migration WHERE user_id=%s "
+                "AND table_name='chat_messages' AND item_id=ANY(%s)",
+                (str(user_id), list(mirror_ids)),
+            ),
+        ])
+    return {
+        "deleted": deleted,
+        "retained_covered": retained_covered,
+        "remaining": 0,
+    }
+
+
 def chat_clear(user_id: str) -> int | None:
     """Atomically retire one user's complete *live* chat context.
 
