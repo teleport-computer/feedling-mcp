@@ -361,7 +361,9 @@ def test_new_user_send_after_crashed_mutation_runs_one_text_only_recovery_turn(
             assert names.isdisjoint(cap_registry.WRITE_ACTIONS)
             assert _MCP_MUTATION.name not in names
             assert _MCP_READ.name in names
-            assert "reply" in names
+            # T208 removes the model-facing reply tool even in the constrained
+            # recovery catalog. The one visible text is the terminal response.
+            assert "reply" not in names
             assert cap_tool_schema.FILE_REPLY_TOOL not in names
             # Simulate a broken relay inventing a call for the omitted schema.
             # The loop rejects it before dispatch; the worker also has an

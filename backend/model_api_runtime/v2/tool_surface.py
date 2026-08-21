@@ -24,7 +24,6 @@ COLLAPSE_POLICIES = frozenset(
 # the prompt frontier whenever they are present in the lane's actual catalog.
 RESIDENT_TOOL_NAMES = frozenset(
     {
-        "reply",
         "mcp_tool_search",
         "memory_search",
         "memory_write",
