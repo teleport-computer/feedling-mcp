@@ -20,7 +20,7 @@ def _text(html_str: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# 1. 脱敏:按形状放行,不按键名放行
+# 1. 脱敏:按产生方闭集放行,不按键名/形状放行
 # --------------------------------------------------------------------------- #
 
 def _public(etype: str, detail: dict) -> dict:
@@ -68,7 +68,7 @@ def test_a_declared_key_still_rejects_values_outside_its_set():
 
 
 def test_anything_a_person_said_is_still_redacted():
-    """开放取值的键走形状判定 —— 所以同一个键塞进人话也照样遮住。
+    """公开键仍只接受产生方闭集；同一个键塞进人话照样遮住。
 
     这条是可读性那条的另一半。**没有它,把整套放行删掉也会全绿。**
     """
@@ -324,28 +324,91 @@ def test_undecidable_queue_wait_is_not_rendered_as_zero(monkeypatch):
     assert "排队时长不可判定" in visible
 
 
-def test_composed_codes_stay_hidden_until_the_producer_exports_them():
-    """⚠️ 已知缺口,**故意写成断言**,免得它变成"大家以为修好了"。
+def test_v2_composed_failure_codes_come_from_the_worker_export():
+    """正向遍历产生方导出；管理端抄表或漏接新增值都会直接变红。"""
+    from model_api_runtime.v2 import worker
 
-    `wake_failed:providererror` 的后半段来自 `type(exc).__name__.lower()`
-    (worker.py:1163),产生方没有导出完整词表 ⇒ 管理端**无法证明它的来源**,
-    只能维持遮蔽。
+    assert "wake_failed:providererror" in worker.PUBLIC_FAILURE_CODES
+    for code in sorted(worker.PUBLIC_FAILURE_CODES):
+        assert _public("agent.job.terminal", {"error_code": code})["error_code"] == code
 
-    我改过两次都错在同一个方向:**想从字符串本身推断来源**
-    (先是字符形状,后是前缀 + startswith)。两次都被搭档用反例打回。
-    ⇒ **与其用一条推断规则假装覆盖它,不如让它显式地留在遮蔽里。**
-    产生方导出词表后,这条断言要一起改掉(见台账收尾单)。
-    """
-    assert _public("agent.job.terminal", {
-        "error_code": "wake_failed:providererror",
-    })["error_code"].startswith("<redacted")
-    # ⚠️ 我原本在这里断言「视觉那组码也是缺口」—— **那是错的,而且是我造出来的**:
-    # `vision_model_unavailable` 一直就在 `notices.catalog.ERROR_CLASSES` 里,
-    # 是我没找到权威导出、自己在管理端抄了一份表,才把它抄漏成「缺口」。
-    # 现在它可见,断言反过来。
-    assert _public("vision.provider.completed", {
-        "error_class": "vision_model_unavailable",
-    })["error_class"] == "vision_model_unavailable"
+
+def test_admin_failure_allowlist_tracks_a_producer_export_mutation(monkeypatch):
+    """突变守卫：若 admin 偷抄当前表，产生方新增值时这条会红。"""
+    from model_api_runtime.v2 import worker
+
+    probe = "runtime_failed:producer_export_probe"
+    monkeypatch.setattr(
+        worker,
+        "PUBLIC_FAILURE_CODES",
+        worker.PUBLIC_FAILURE_CODES | {probe},
+    )
+    monkeypatch.setattr(data_track, "_KNOWN_FAILURE_CODES_CACHE", None)
+    try:
+        assert _public("agent.job.terminal", {"error_code": probe})["error_code"] == probe
+    finally:
+        data_track._KNOWN_FAILURE_CODES_CACHE = None
+
+
+def test_composed_failure_prefix_does_not_authorize_an_unknown_suffix():
+    """泄漏侧独立断言：合法前缀不能替任意后半段证明来源。"""
+    hidden = _public("agent.job.terminal", {
+        "error_code": "turn_failed:secret_token",
+    })["error_code"]
+    assert hidden.startswith("<redacted")
+
+
+def test_enqueue_reasons_come_from_the_jobs_store_export():
+    from model_api_runtime.v2 import jobs_store
+
+    assert {"scheduled_wake", "manual_tick"} <= jobs_store.ENQUEUE_REASON_CODES
+    for reason in sorted(jobs_store.ENQUEUE_REASON_CODES):
+        assert _public("agent.job.enqueued", {"reason": reason})["reason"] == reason
+    assert _public("agent.job.enqueued", {
+        "reason": "patient_12345",
+    })["reason"].startswith("<redacted")
+
+
+def test_admin_enqueue_allowlist_tracks_a_producer_export_mutation(monkeypatch):
+    from model_api_runtime.v2 import jobs_store
+
+    probe = "producer_enqueue_probe"
+    monkeypatch.setattr(
+        jobs_store,
+        "ENQUEUE_REASON_CODES",
+        jobs_store.ENQUEUE_REASON_CODES | {probe},
+    )
+    monkeypatch.setattr(data_track, "_TRACE_PUBLIC_FIELDS_CACHE", None)
+    try:
+        assert _public("agent.job.enqueued", {"reason": probe})["reason"] == probe
+    finally:
+        data_track._TRACE_PUBLIC_FIELDS_CACHE = None
+
+
+def test_voice_codes_cover_both_runtime_paths_from_the_producer_export():
+    from voice import error_codes
+
+    assert {
+        "voice_turn_not_accepted",
+        "runtime_control_unavailable",
+    } <= error_codes.VOICE_GATEWAY_ERROR_CODES
+    for code in sorted(error_codes.VOICE_GATEWAY_ERROR_CODES):
+        assert _public("voice.gateway.turn.runtime_rejected", {
+            "error_code": code,
+        })["error_code"] == code
+
+
+def test_v1_model_error_classes_use_the_resident_catalog_contract():
+    """V1 resident classifications are catalog-parity tested separately."""
+    from notices import catalog
+
+    for code in sorted(catalog.ERROR_CLASSES):
+        assert _public("agent.model.call.error", {
+            "error_class": code,
+        })["error_class"] == code
+    assert _public("agent.model.call.error", {
+        "error_class": "SecretTokenError",
+    })["error_class"].startswith("<redacted")
 
 
 def test_error_classes_come_from_the_notices_catalog(monkeypatch):

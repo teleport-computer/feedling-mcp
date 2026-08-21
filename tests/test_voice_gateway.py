@@ -25,8 +25,19 @@ from enclave.routes import chat as enclave_chat
 from hosted import chat_send_core
 from voice import results
 from voice import routes_asgi
+from voice import error_codes as voice_error_codes
 from voice import cleanup as voice_cleanup
 from voice.message_filter import is_meaningful_voice_message
+
+
+def test_voice_trace_error_codes_are_closed_at_the_producer_boundary():
+    assert voice_error_codes.public_voice_error_code(
+        "runtime_control_unavailable"
+    ) == "runtime_control_unavailable"
+    assert voice_error_codes.public_voice_error_code(
+        "voice_turn_not_accepted"
+    ) == "voice_turn_not_accepted"
+    assert voice_error_codes.public_voice_error_code("secret_token") == "unknown"
 
 
 def _voice_gateway_payload(*, skip_turn=False):
