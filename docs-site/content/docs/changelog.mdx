@@ -10,6 +10,19 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Image-generation route health now reflects provider failures, not server
+  processing bugs.** A provider call can still mark its saved route failed or
+  unsupported, but failures while decrypting local configuration, interpreting
+  the normalized media shape, decoding base64, or validating raster output no
+  longer poison that persistent route status. Unexpected media-processing bugs
+  in direct generation and setup reach the standard request-ID-backed internal
+  error path, while existing explicit configuration errors keep their current
+  responses. Runtime V2 reports a system-owned image-processing failure to the
+  turn so the assistant can still answer instead of blaming the user's model.
+  The setup probe now runs the same media normalization as real generation,
+  closing the gap where a route test could pass but every real image failed
+  afterward.
+
 - **Hosted proactive replies now suppress leaked provider end sentinels instead
   of displaying them as messages.** A narrow whole-message check recognizes
   common relay tokens such as `</s>`, `<|endoftext|>`, and `<|im_end|>` while
