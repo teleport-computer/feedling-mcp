@@ -1092,11 +1092,17 @@ class ImageGenerationUnavailable(RuntimeError):
         error_code: str = "image_generation_failed",
         model: str = "",
         provider: str = "",
+        status_code: int | None = None,
+        upstream_detail: str = "",
     ):
         super().__init__(message)
         self.error_code = str(error_code or "image_generation_failed")[:64]
         self.model = str(model or "")[:96]
         self.provider = str(provider or "")[:80]
+        self.status_code = status_code if isinstance(status_code, int) else None
+        # Internal-only carrier. Tenant-visible status events, trajectories,
+        # debug traces, and exception messages must never serialize this value.
+        self.upstream_detail = str(upstream_detail or "")[:240]
 
 
 def _safe_failure_code(scope: str, exc: BaseException) -> str:
@@ -1255,6 +1261,36 @@ def _turn_failure_error_class(exc: BaseException) -> str:
     if provider_client.classify_provider_error(exc) == "transient":
         return "upstream_unavailable"
     return "unknown"
+
+
+def _image_generation_unavailable_from_exception(
+    exc: BaseException,
+    provider_config: Any,
+) -> ImageGenerationUnavailable:
+    """Preserve diagnostics while keeping the existing stable error mapping."""
+    classified = _turn_failure_error_class(exc)
+    code = {
+        "auth_invalid": "image_generation_auth_invalid",
+        "quota_insufficient": "image_generation_quota_insufficient",
+        "model_not_found": "image_generation_model_not_found",
+        "provider_incompatible": "image_generation_model_required",
+        "rate_limited": "image_generation_rate_limited",
+        "upstream_unavailable": "image_generation_unavailable",
+        "turn_timeout": "image_generation_unavailable",
+        "reply_parse_failed": "image_generation_invalid_output",
+    }.get(classified, "image_generation_failed")
+    return ImageGenerationUnavailable(
+        "image generation failed",
+        error_code=code,
+        model=str(getattr(provider_config, "model", "") or ""),
+        provider=str(getattr(provider_config, "provider", "") or ""),
+        status_code=getattr(exc, "status_code", None),
+        upstream_detail=str(
+            getattr(exc, "upstream_detail", "")
+            or getattr(exc, "response_detail", "")
+            or ""
+        ),
+    )
 
 
 def _required_file_missing_fallback(messages: list[dict]) -> str:
@@ -14112,22 +14148,9 @@ async def process_job(
             except ImageGenerationUnavailable:
                 raise
             except Exception as exc:  # noqa: BLE001 - stable chat failure below
-                classified = _turn_failure_error_class(exc)
-                code = {
-                    "auth_invalid": "image_generation_auth_invalid",
-                    "quota_insufficient": "image_generation_quota_insufficient",
-                    "model_not_found": "image_generation_model_not_found",
-                    "provider_incompatible": "image_generation_model_required",
-                    "rate_limited": "image_generation_rate_limited",
-                    "upstream_unavailable": "image_generation_unavailable",
-                    "turn_timeout": "image_generation_unavailable",
-                    "reply_parse_failed": "image_generation_invalid_output",
-                }.get(classified, "image_generation_failed")
-                raise ImageGenerationUnavailable(
-                    "image generation failed",
-                    error_code=code,
-                    model=str(getattr(provider_config, "model", "") or ""),
-                    provider=str(getattr(provider_config, "provider", "") or ""),
+                raise _image_generation_unavailable_from_exception(
+                    exc,
+                    provider_config,
                 ) from exc
             media = tuple(generated or ())
             if not media or any(not isinstance(item, ProviderMedia) for item in media):
