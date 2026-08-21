@@ -94,7 +94,11 @@ def test_phase4_prepare_copies_frame_bridge_and_aligns_sequences(monkeypatch):
                 "VALUES (%s, 'chat', 'completed') RETURNING id",
                 (uid,),
             ).fetchone()[0]
-            for suffix, status in (("applied", "applied"), ("discarded", "discarded")):
+            for suffix, status in (
+                ("applied", "applied"),
+                ("applied-results", "applied_with_results"),
+                ("discarded", "discarded"),
+            ):
                 source.execute(
                     "INSERT INTO v2_effect_outbox "
                     "(effect_id, user_id, job_id, effect_type, "
