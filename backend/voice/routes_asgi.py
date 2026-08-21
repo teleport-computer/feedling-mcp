@@ -30,6 +30,7 @@ from hosted import chat_send_core
 from hosted import config_store as hosted_config_store
 from notices import catalog as notices_catalog
 from voice import results
+from voice import error_codes as voice_error_codes
 from voice.message_filter import is_meaningful_voice_message
 import debug_trace
 
@@ -87,7 +88,7 @@ def _trace_voice_gateway_event(
     if exit:
         detail["exit"] = str(exit)[:40]
     if error_code:
-        detail["error_code"] = str(error_code)[:80]
+        detail["error_code"] = voice_error_codes.public_voice_error_code(error_code)
     if isinstance(runtime_status, int):
         detail["runtime_status"] = runtime_status
     if isinstance(gateway_http_status, int):

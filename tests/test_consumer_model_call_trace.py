@@ -190,6 +190,8 @@ def test_call_agent_cli_emits_error_on_nonzero_rc(monkeypatch):
     assert types_seen == ["agent.model.call.start", "agent.model.call.error"]
     assert calls[1]["status"] == "error"
     assert calls[1]["trace_id"] == "trace-err"
+    assert calls[1]["detail"]["error_class"] == "unknown"
+    assert calls[1]["detail"]["error_class"] in crc.CONSUMER_ERROR_CLASSES
 
 
 def test_call_agent_cli_emits_error_on_timeout_and_reraises(monkeypatch):
@@ -213,6 +215,8 @@ def test_call_agent_cli_emits_error_on_timeout_and_reraises(monkeypatch):
     assert error_event["status"] == "error"
     assert error_event["trace_id"] == "trace-timeout"
     assert "超时" in error_event["explain"]
+    assert error_event["detail"]["error_class"] == "turn_timeout"
+    assert error_event["detail"]["error_class"] in crc.CONSUMER_ERROR_CLASSES
 
 
 def test_call_agent_threads_trace_id_to_cli(monkeypatch):

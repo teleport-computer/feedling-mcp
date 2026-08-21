@@ -5107,13 +5107,17 @@ def _emit_job_enqueued_trace(user_id: str, lane: str, *, reason: str, trace_id: 
     real indexed columns by insert_trace_events_strict, so putting them in
     detail is what populates them.
     """
+    detail = {"lane": lane, "enqueue_source": lane}
+    public_reason = jobs_store.public_enqueue_reason(reason)
+    if public_reason:
+        detail["reason"] = public_reason
     _emit_v2_debug_trace_for_user(
         user_id,
         "agent.job.enqueued",
         status="ok",
         trace_id=trace_id,
         turn_id=trace_id,
-        detail={"lane": lane, "reason": reason, "enqueue_source": lane},
+        detail=detail,
     )
 
 

@@ -1045,6 +1045,67 @@ class WorkspacePromptUnavailable(RuntimeError):
 _COVERAGE_INCOMPLETE = "prompt_coverage_incomplete"
 
 
+# Public observability is allowed to expose only codes this producer can mint.
+# Keep the scope and kind vocabularies closed here rather than asking an admin
+# reader to infer provenance from a string shape or prefix.  ``runtime_failed``
+# is the fail-closed bucket for a future caller that forgets to register its
+# scope; it preserves a useful, content-free signal without opening the set.
+PUBLIC_FAILURE_SCOPES = frozenset({
+    "capture_recovery_failed",
+    "compaction_failed",
+    "extraction_failed",
+    "extraction_gate_failed",
+    "runtime_failed",
+    "slot_recovery_failed",
+    "trajectory_review_failed",
+    "turn_failed",
+    "turn_setup_failed",
+    "wake_failed",
+})
+
+_GENERIC_FAILURE_KINDS = frozenset({
+    # Exception class names historically persisted by this producer. Unknown
+    # classes now collapse to ``error`` instead of expanding the public vocab.
+    "capturehalted",
+    "connectionerror",
+    "exception",
+    "keyerror",
+    "lostjoblease",
+    "oserror",
+    "providererror",
+    "runtimeerror",
+    "runtimemodechanged",
+    "timeouterror",
+    "typeerror",
+    "valueerror",
+})
+_TURN_FAILURE_KINDS = frozenset({
+    "degenerate_reply_suppressed",
+    "empty_reply",
+    "malformed_self_thinking_suppressed",
+    "no_user_messages",
+    "prompt_coverage_incomplete",
+    "prompt_coverage_incomplete:catchup_unwired",
+    "protocol_fragment_suppressed",
+    "responder_error",
+    "thinking_only_no_reply",
+    "tool_budget_exhausted",
+})
+_FRONTIER_FAILURE_KINDS = frozenset({
+    v2_prompt_frontier.PromptContextLimitUnconfigured.code,
+    v2_prompt_frontier.PromptFrontierExhausted.code,
+    v2_summary_frontier.SummaryFrontierIntegrityError.code,
+    v2_summary_frontier.SummaryFrontierExhausted.code,
+})
+_SAFE_FAILURE_KINDS = frozenset(
+    {"error", "workspace_prompt_unavailable"}
+    | set(notices_catalog.ERROR_CLASSES)
+    | set(_GENERIC_FAILURE_KINDS)
+    | set(_TURN_FAILURE_KINDS)
+    | set(_FRONTIER_FAILURE_KINDS)
+)
+
+
 def _coverage_incomplete_reason(reject_code: str = "") -> str:
     """Attach a content-free compaction reject code to the coverage error.
 
@@ -1128,7 +1189,8 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
     if isinstance(exc, WorkspacePromptUnavailable):
         kind = "workspace_prompt_unavailable"
     elif isinstance(exc, (DedicatedVisionUnavailable, ImageGenerationUnavailable)):
-        kind = exc.error_code
+        candidate = str(exc.error_code or "")
+        kind = candidate if candidate in notices_catalog.ERROR_CLASSES else "error"
     elif isinstance(exc, v2_tool_loop.ProviderEmptyReply):
         kind = "empty_reply"
     elif isinstance(exc, TurnError):
@@ -1153,7 +1215,7 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
             # the other eleven TurnError sites without decrypting a trajectory.
             # The suffix, when present, is the content-free compaction reject
             # code that stalled the watermark.
-            kind = raw
+            kind = raw if raw in _TURN_FAILURE_KINDS else _COVERAGE_INCOMPLETE
         else:
             # Keep the established persisted code stable across the internal
             # responder-module removal; dashboards and clients may group by it.
@@ -1170,10 +1232,13 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
         # Frontier errors expose explicit, content-free protocol codes. Preserve
         # those codes instead of leaking Python class-name formatting into the
         # persisted status/error surface.
-        kind = exc.code
+        candidate = str(exc.code or "")
+        kind = candidate if candidate in _FRONTIER_FAILURE_KINDS else "error"
     else:
-        kind = type(exc).__name__.lower() or "error"
-    return f"{scope}:{kind}"[:120]
+        candidate = type(exc).__name__.lower()
+        kind = candidate if candidate in _GENERIC_FAILURE_KINDS else "error"
+    normalized_scope = scope if scope in PUBLIC_FAILURE_SCOPES else "runtime_failed"
+    return f"{normalized_scope}:{kind}"
 
 
 _EXTRACTION_FAILURE_REASONS = frozenset(
@@ -1198,6 +1263,33 @@ _EXTRACTION_FAILURE_REASONS = frozenset(
         "not_an_object",
         "output_truncated",
         "semantic_validation_failed_after_retry",
+    }
+)
+
+_EXTRACTION_FAILURE_KINDS = frozenset(
+    set(_EXTRACTION_FAILURE_REASONS)
+    | set(v2_extraction.PUBLIC_PROVIDER_FAILURE_CODES)
+    | {
+        "invalid_card_content",
+        "invalid_card_content_after_retry",
+        "json_decode_error",
+        "memory_write_rejected",
+    }
+)
+
+# Exact, producer-owned vocabulary consumed by admin/debug projections. This is
+# deliberately generated from the normalization inputs above, so adding a new
+# safe kind without extending the export makes producer tests fail rather than
+# silently hiding the value or inviting a copied admin allowlist.
+PUBLIC_FAILURE_CODES = frozenset(
+    {
+        f"{scope}:{kind}"
+        for scope in PUBLIC_FAILURE_SCOPES
+        for kind in _SAFE_FAILURE_KINDS
+    }
+    | {
+        f"extraction_failed:{kind}"
+        for kind in _EXTRACTION_FAILURE_KINDS
     }
 )
 

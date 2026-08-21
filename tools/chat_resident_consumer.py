@@ -10118,7 +10118,8 @@ def call_agent_cli(
         _emit_debug_trace("agent", "agent.model.call.error", status="error", trace_id=trace_id,
                           dur_ms=(time.monotonic() - _turn_t0) * 1000,
                           summary="cli turn timeout",
-                          explain=f"模型调用超时（{AGENT_TURN_TIMEOUT_SEC}s 上限，FEEDLING_AGENT_TURN_TIMEOUT_SEC 可调）— 卡在模型这一步")
+                          explain=f"模型调用超时（{AGENT_TURN_TIMEOUT_SEC}s 上限，FEEDLING_AGENT_TURN_TIMEOUT_SEC 可调）— 卡在模型这一步",
+                          detail={"error_class": "turn_timeout"})
         log.warning(
             "[turn-timing] driver=%s rc=timeout wall_ms=%d (hit %ds subprocess cap)",
             "pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude"),
@@ -10170,6 +10171,13 @@ def call_agent_cli(
         # `item.completed` and never match), so surface the same string here.
         _excerpt = {"error_detail": _cli_error_detail(result.stdout or "", result.stderr or ""),
                     **_excerpt}
+    _trace_error_class = ""
+    if result.returncode != 0:
+        _trace_failure = RuntimeError(
+            f"cli agent exited {result.returncode}: "
+            f"{_cli_error_detail(result.stdout or '', result.stderr or '')}"
+        )
+        _trace_error_class = classify_agent_error(_trace_failure).error_class
     _emit_debug_trace(
         "agent", "agent.model.call.done" if result.returncode == 0 else "agent.model.call.error",
         status="ok" if result.returncode == 0 else "error", trace_id=trace_id, dur_ms=_wall_ms,
@@ -10180,6 +10188,7 @@ def call_agent_cli(
         detail={
             **{k: _m[k] for k in ("driver", "rc", "agent_ms", "api_ms", "num_turns",
                                   "steps", "input_tokens", "output_tokens")},
+            "error_class": _trace_error_class,
             "thinking_present": bool(_trace_turn.thinking_summary),
             "thinking_source": _trace_turn.thinking_source or "",
             "thinking_len": len(_trace_turn.thinking_summary or ""),

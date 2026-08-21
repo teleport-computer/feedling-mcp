@@ -334,6 +334,78 @@ TIMEOUT_OUTCOME_CODES = frozenset({
     "lease_timeout",
     "runtime_expired",
 })
+JOB_FAILURE_CODES = frozenset({
+    "foreground_chat_preempted",
+    "mcp_mutation_outcome_unknown",
+    "review_runner_failed",
+    "runtime_failed",
+    "runtime_state_not_v2",
+    "scheduled_lease_timeout_requeued",
+    "slot_watchdog_timeout",
+    "stale_runtime_generation",
+    "wake_replay_unsafe",
+    GENERAL_WATCHDOG_REQUEUE_EXHAUSTED,
+})
+
+# Closed vocabulary for the public enqueue trace. ``agent_jobs.reason`` remains
+# an internal persistence field and can carry migration/private coordination
+# values; the trace producer emits a reason only when it is registered here.
+# Admin consumes this export directly and therefore never has to infer that a
+# snake_case-looking string came from us.
+ENQUEUE_REASON_CODES = frozenset({
+    # Foreground/recovery producers (chat itself is intentionally not traced by
+    # the generic enqueue hook, but keeping the complete queue vocabulary here
+    # prevents a second allowlist when that policy changes).
+    "chat_send",
+    "legacy_final_regeneration",
+    "mutation_recovery",
+    "ordered_followup",
+    "reconcile",
+    "runtime_cutover_recovery",
+    # Scheduled/manual/background lane producers.
+    "backlog_scan",
+    "cas_lost_retry",
+    "compaction",
+    "compaction_catchup",
+    "dream_refresh",
+    "force_dream",
+    "manual_tick",
+    "nightly_dream",
+    "operator_profile_backfill",
+    "post_turn_refresh",
+    "provider_config_changed",
+    "runtime_v2_cutover",
+    "scheduled_wake",
+    "screen_watch",
+    "slot_watchdog_timeout",
+    "user_requested",
+    # Capture and perception producers. Perception payload strings are
+    # normalized at this queue/trace boundary; an unregistered future trigger
+    # remains persisted internally but is omitted from the public trace.
+    "app_background",
+    "arrived_at_anchor",
+    "background_result",
+    "broadcast_closed",
+    "broadcast_opened",
+    "explicit_close",
+    "good_night",
+    "manual_force",
+    "perception_event",
+    "photo_added",
+    "quiet_timeout",
+    "quiet_window_migrate",
+    "scene_change",
+    "screen_lock",
+    "session_end",
+    "turn_backstop",
+    "unlock_after_absence",
+})
+
+
+def public_enqueue_reason(reason: object) -> str:
+    """Return a producer-registered public reason, or an empty redaction cue."""
+    candidate = str(reason or "").strip()
+    return candidate if candidate in ENQUEUE_REASON_CODES else ""
 
 
 # Wired by the assembly layer, never imported here: jobs_store sits below

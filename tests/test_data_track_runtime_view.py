@@ -326,34 +326,29 @@ def test_runtime_failure_code_buckets_unknown_free_text():
     assert _dt._runtime_failure_code(None) == "other"
 
 
-def test_runtime_failure_code_truncates_long_valid_code():
-    # 新语义：形状合法（scope:kind，只含 [a-z0-9_]）的码无论多长都放行、截断到 64。
+def test_runtime_failure_code_rejects_unregistered_shaped_code():
+    # 字符形状证明不了来源；长得像码的任意串仍必须落 other。
     long_code = "wake_failed:" + ("x" * 200)
-    result = _dt._runtime_failure_code(long_code)
-    assert result == long_code[:64]
-    assert len(result) == 64
+    assert _dt._runtime_failure_code(long_code) == "other"
 
 
 def test_runtime_failure_code_rejects_free_text_after_known_prefix():
-    # 这是被移除的行为：旧实现只要 startswith("turn_failed:") 就无条件放行 +
-    # 截断，哪怕冒号后是含空格/中文的自由文本（"turn_failed: 我的身份证号是
-    # 1234" 这种）。新实现按形状校验，冒号后必须仍是 [a-z0-9_]+，自由文本一律
-    # 落 other。
+    # 旧实现只要前缀/形状匹配就可能放行；现在只认产生方精确成员。
     leaked = "turn_failed:" + ("我的身份证号是 1234 " * 20)
     assert _dt._runtime_failure_code(leaked) == "other"
 
 
 def test_runtime_failure_code_covers_non_chat_lane_shapes():
-    # I-2: 白名单曾经只放行 turn_failed:/queue_timeout/lease_timeout 三种形状，
-    # 其余全部写入点（wake_failed:*/extraction_failed:*/compaction_failed:*/
-    # mcp_mutation_outcome_unknown/runtime_expired）塌成 other。heartbeat lane
-    # 的失败码正是 wake_failed:*，本页专门给 heartbeat 加了日报口径链接，不能
-    # 让它的失败原因永远只显示 other。
+    # I-2: 这些非 chat 真实写入点都必须出现在产生方导出里，不能塌成 other。
     assert _dt._runtime_failure_code("wake_failed:timeouterror") == "wake_failed:timeouterror"
     assert _dt._runtime_failure_code("extraction_failed:valueerror") == "extraction_failed:valueerror"
     assert _dt._runtime_failure_code("compaction_failed:keyerror") == "compaction_failed:keyerror"
     assert _dt._runtime_failure_code("mcp_mutation_outcome_unknown") == "mcp_mutation_outcome_unknown"
     assert _dt._runtime_failure_code("runtime_expired") == "runtime_expired"
+
+
+def test_runtime_failure_code_rejects_forged_known_prefix():
+    assert _dt._runtime_failure_code("turn_failed:secret_token") == "other"
 
 
 def test_runtime_failure_code_rejects_malformed_shapes():

@@ -50,6 +50,42 @@ def test_wake_safety_suppressions_keep_distinct_stable_codes(reason):
     assert worker._turn_failure_error_class(exc) == "reply_parse_failed"
 
 
+def test_safe_failure_codes_are_members_of_the_producer_export():
+    samples = (
+        ("wake_failed", RuntimeError("private detail")),
+        ("wake_failed", TimeoutError("private detail")),
+        ("turn_failed", tool_loop.ProviderEmptyReply("private detail")),
+        ("compaction_failed", KeyError("private detail")),
+        ("extraction_failed", ValueError("private detail")),
+    )
+    for scope, exc in samples:
+        code = worker._safe_failure_code(scope, exc)
+        assert code in worker.PUBLIC_FAILURE_CODES
+        assert "private" not in code
+
+
+def test_unknown_exception_class_and_scope_collapse_to_registered_buckets():
+    class SecretToken(RuntimeError):
+        pass
+
+    assert worker._safe_failure_code("wake_failed", SecretToken("private")) == (
+        "wake_failed:error"
+    )
+    assert worker._safe_failure_code("secret_scope", SecretToken("private")) == (
+        "runtime_failed:error"
+    )
+    assert "turn_failed:secret_token" not in worker.PUBLIC_FAILURE_CODES
+
+
+def test_extraction_specific_codes_are_in_the_public_export():
+    for code in (
+        "extraction_failed:auth_invalid",
+        "extraction_failed:invalid_card_content",
+        "extraction_failed:memory_write_rejected",
+    ):
+        assert code in worker.PUBLIC_FAILURE_CODES
+
+
 def test_provider_attempt_ledger_inherits_job_lane_when_event_omits_it(monkeypatch):
     captured = {}
 
