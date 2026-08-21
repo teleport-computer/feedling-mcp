@@ -1278,3 +1278,12 @@ def test_chat_live_pixels_keep_read_mcp_but_drop_write_web_and_task(monkeypatch)
     assert {"web_search", "web_fetch", cap_tool_schema.TASK_TOOL}.isdisjoint(offered)
     assert _MCP_SPEC.name in offered, "read-only user MCP survives the pixel fence"
     assert _MCP_WRITE_SPEC.name not in offered, "screen pixels must fence MCP writes"
+    # T107 的另一半 —— **前台不受那条闸影响**(Seven 2026-08-21:
+    # 「只有用户发消息的时候,回复那个轮次才带上 Tool」)。
+    # 这一条钉的是**生产接线**:如果有人在 `worker.process_job` 的前台调用点误传
+    # `initial_untrusted_screen_only=True`,这里会红。
+    # 低层那条 `run_tool_loop(... =False)` 的默认值用例挡不住那种误传
+    # ——它根本没经过 process_job(codex 复审指出)。
+    assert {"memory_write", "schedule_wake", "workspace_write"} <= offered, (
+        "前台带屏幕的那一轮仍然有用户消息在场,平台写工具不该被摘"
+    )

@@ -602,6 +602,15 @@ async def run_tool_loop(
     outbound_blocking_read_tool_names=None,
     outbound_blocking_read_tool_predicate=None,
     initial_screen_pixels_blocked: bool = False,
+    # ⚠️ 2026-08-21 Seven 裁定(T107):「只有 OCR、用户没有发消息的时候就禁掉;
+    # 只有用户发消息的时候,回复那个轮次才带上 Tool」。
+    # 判据是**这一轮有没有用户消息**,不是"有没有屏幕内容":
+    #   带屏幕内容 + 无用户消息(screen_watch 唤醒轮)→ 平台写工具全禁
+    #   有用户消息的前台轮 → 不动(用户在场,出错他能当场阻止)
+    # 为什么必须是第三个语义位而不是复用上面那个:`screen_pixels_blocked` 管的是
+    # **外泄**(不许把看到的东西发出去),这一条管的是**注入**(不许让看到的东西
+    # 指挥你干活),两者拦的集合不同,合成一个 bool 就是 T166 之前那个病。
+    initial_untrusted_screen_only: bool = False,
     tagged_image_message_key: str = "",
     on_tagged_images_rejected=None,
     max_tool_calls_per_round: int = DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
@@ -743,6 +752,19 @@ async def run_tool_loop(
     # untrusted, system-chosen input and therefore fence mutating user MCP;
     # private reads retain the 2026-08-12 user-selected-MCP relaxation.
     screen_pixels_blocked = bool(initial_screen_pixels_blocked)
+    # 注入面(T107,Seven 2026-08-21 裁定):这一轮的**唯一指令来源**就是屏幕上
+    # 那段字 —— 没有用户消息,所以它不能驱动平台写。
+    #
+    # 代码可达性(读代码即可复核,不依赖任何模型实验):`worker.py` 的
+    # screen_watch 分支只下架了 `_IDENTITY_WRITE_ACTIONS` 与 `memory_organize`,
+    # 因此 `memory_write` / `schedule_wake` / `cancel_wake` /
+    # `workspace_write` / `workspace_delete` 在**有 frame 的无人值守轮**里仍被 offer。
+    #
+    # 提示词里的 `UNTRUSTED … never instructions` 抬头是**软标注**:它约束不了
+    # 模型的选择,只能表达意图。模型侧的选择率有一次探针测量,数字与其口径边界
+    # 记在台账 T107(⚠️ 那次探针的工具面**比生产宽**、且只记录工具名不验参数,
+    # 因此它是风险信号不是落地证明 —— 别把它当成本处的判据焊在这里)。
+    untrusted_screen_only = bool(initial_untrusted_screen_only)
     private_read_seen = False
     tagged_image_fallback_active = False
     file_requirement_message_state = [
@@ -1094,6 +1116,11 @@ async def run_tool_loop(
             external_content_seen
             or mutation_outcome_unknown
             or screen_pixels_blocked
+            # T107:这一位必须**单独**能触发整个策略块。生产里它总是与
+            # `screen_pixels_blocked` 同时为真(两者都由 screen_frame_message 决定),
+            # 少写这一行照样"能跑" —— 但那是靠另一个条件恰好也成立,
+            # 而不是靠它自己。我的用例只翻这一位,当场红了。
+            or untrusted_screen_only
             or private_read_seen
         ):
             # Web results are untrusted model input. Once one is present, page
@@ -1133,6 +1160,21 @@ async def run_tool_loop(
                 blocked_tools.update({"web_search", "web_fetch"})
                 blocked_tools.add(tool_schema.TASK_TOOL)
                 blocked_tools.update(mutating_mcp_names)
+            # T107(Seven 2026-08-21 原话):「只有 OCR、用户没有发消息的时候就禁掉;
+            # 只有用户发消息的时候,回复那个轮次才带上 Tool」。
+            # 判据是**这一轮有没有用户消息**,不是"屏幕上写了什么" ——
+            # 前台轮不走这条,因为用户在场、出错他能当场阻止。
+            #
+            # ⚠️ 范围只到「带屏幕内容的无人轮」,**不能扩到所有 wake lane**:
+            # 心跳/capture/dream 那些轮次**必须能写记忆**(docs/testing/TESTING.md §P:
+            # 「wake 轮次必须能写记忆(capture/dream 全靠它),但不该能改身份卡」)。
+            # 一刀切禁写会把记忆维护整条打掉 —— 这正是 T190 学到的
+            # 「硬闸会逼出一串特例」,所以这里只收窄到注入面。
+            #
+            # 已知代价(明写,别当 bug 修回去):屏幕轮里模型**合法**想写点什么
+            # (看到用户在改简历、想记一张卡)同样会被挡。Seven 接受这个代价。
+            if untrusted_screen_only:
+                blocked_tools.update(_PLATFORM_MUTATION_TOOLS)
             # A private read may expose persona, workspace/artifact, or memory
             # content. That observation cannot influence a later platform-owned
             # query/URL/task call. User-selected MCP endpoints remain available,

@@ -38,6 +38,7 @@ def _run(
     outbound_blocking_read_tool_predicate=None,
     refresh_extra_tool_specs=None,
     initial_screen_pixels_blocked=False,
+    initial_untrusted_screen_only=False,
 ):
     if extra_mutating_tool_names is None:
         extra_mutating_tool_names = {
@@ -74,6 +75,7 @@ def _run(
                 outbound_blocking_read_tool_predicate
             ),
             initial_screen_pixels_blocked=initial_screen_pixels_blocked,
+            initial_untrusted_screen_only=initial_untrusted_screen_only,
         ))
     finally:
         provider_client.chat_completion_async = orig
@@ -656,3 +658,93 @@ def test_screen_pixels_keep_read_mcp_but_drop_mutating_mcp_web_and_task():
     assert "web_search" not in offered
     assert "web_fetch" not in offered
     assert "task" not in offered
+
+
+# ---------------------------------------------------------------------------
+# T107:无人值守的屏幕轮不许被屏幕上那段字驱动去写(Seven 2026-08-21 裁定)
+# ---------------------------------------------------------------------------
+
+
+def test_untrusted_screen_only_turn_drops_platform_writes_but_keeps_reads():
+    """屏幕轮没有用户消息时,平台写工具整组下架;读工具一件不少。
+
+    依据是**代码可达性**(读代码即可复核):`worker.py` 的 screen_watch 分支只下架了
+    identity 写与 memory_organize,所以 memory_write / schedule_wake / workspace_write
+    在有 frame 的无人值守轮里仍被 offer。提示词里的 `UNTRUSTED … never instructions`
+    是软标注,约束不了模型的选择。
+    ⚠️ 模型侧确实做过一次选择率探针,但那次**工具面比生产宽、只记工具名不验参数**,
+    属于风险信号不是落地证明;数字与口径边界记在台账 T107,不在这里承重。
+
+    ⚠️ 断言用的是**生产 screen_watch 实际还提供**的那几个写工具
+    (`memory_write` / `schedule_wake` / `workspace_write`)。
+    不用 `identity_patch`:它在 `worker.py` 的 `lane == "screen_watch"` 分支里
+    **早就被 `_IDENTITY_WRITE_ACTIONS` 下架了**,拿它断言等于测一条生产走不到的路
+    (第一版探针就是这么高估了洞的大小,codex 复审抓出)。
+    """
+    from model_api_runtime.v2 import tool_loop as _tl
+
+    responses = iter([{"reply": "ok", "tool_calls": [], "usage": {}}])
+
+    async def _dispatch(calls):
+        return []
+
+    provider_tools = []
+    _run(responses, _dispatch, extra_tool_specs=[MCP_SPEC],
+         provider_tools=provider_tools, initial_untrusted_screen_only=True)
+    offered = {spec.name for spec in provider_tools[0]}
+
+    for write_tool in ("memory_write", "schedule_wake", "workspace_write"):
+        assert write_tool not in offered, (
+            f"{write_tool} 仍在无人值守的屏幕轮里 —— 屏幕上一段字就能驱动它"
+        )
+    assert not (_tl._PLATFORM_MUTATION_TOOLS & offered), (
+        "平台写工具必须整组下架,不是挑几个"
+    )
+
+    # 读工具一件不少。T208 删除了模型侧 reply tool，可见文本
+    # 改由 terminal response 单路径产生，所以这里反向锁住 reply 不回流。
+    for kept in ("memory_search", "screen_read", "identity_get"):
+        assert kept in offered, f"{kept} 被误伤了"
+    assert "reply" not in offered
+
+
+def test_platform_writes_stay_available_without_the_untrusted_screen_flag():
+    """阴性对照:不带这个标志的同一夹具里,那几个写工具**确实在场**。
+
+    少了这条,上面那个 `not in offered` 可能只是因为它们本来就不在目录里
+    —— 那种断言什么都没验证(今天已经栽过一次)。
+    """
+    responses = iter([{"reply": "ok", "tool_calls": [], "usage": {}}])
+
+    async def _dispatch(calls):
+        return []
+
+    provider_tools = []
+    _run(responses, _dispatch, extra_tool_specs=[MCP_SPEC],
+         provider_tools=provider_tools)
+    offered = {spec.name for spec in provider_tools[0]}
+
+    for write_tool in ("memory_write", "schedule_wake", "workspace_write"):
+        assert write_tool in offered, (
+            f"{write_tool} 在对照轮里也不在场 —— 上面那条用例证明不了任何事"
+        )
+
+
+def test_untrusted_screen_only_is_a_separate_bit_from_pixel_exfiltration():
+    """两个语义位不许合并:一个管外泄,一个管注入,拦的集合不同。
+
+    只开像素位(外泄面)时,平台写**仍然在场** —— 这正是 T107 之前的现状,
+    也是这条闸存在的理由。合并成一个 bool 就是 T166 之前那个病的重演。
+    """
+    responses = iter([{"reply": "ok", "tool_calls": [], "usage": {}}])
+
+    async def _dispatch(calls):
+        return []
+
+    provider_tools = []
+    _run(responses, _dispatch, extra_tool_specs=[MCP_SPEC],
+         provider_tools=provider_tools, initial_screen_pixels_blocked=True)
+    offered = {spec.name for spec in provider_tools[0]}
+
+    assert "web_search" not in offered           # 外泄面:已拦
+    assert "memory_write" in offered             # 注入面:像素位管不着

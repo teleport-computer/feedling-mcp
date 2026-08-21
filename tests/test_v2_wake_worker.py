@@ -2995,11 +2995,21 @@ def test_screen_watch_prefetch_injects_bounded_ocr_app_and_pixels(monkeypatch):
         name for name in cap_registry.WRITE_ACTIONS if name.startswith("identity_")
     }
     assert identity_writes.isdisjoint(offered)
-    assert {
-        "memory_write",
-        "schedule_wake",
-        "screen_read",
-    } <= offered
+    # ⚠️ 2026-08-21(T107)**这段断言被反向了,是裁定不是把红的改绿**。
+    # 改前锁的是「屏幕轮里 memory_write / schedule_wake 仍在场」——那正是被利用的面。
+    # Seven 原话:「只有 OCR、用户没有发消息的时候就禁掉;只有用户发消息的时候,
+    # 回复那个轮次才带上 Tool」。
+    # 依据是代码可达性:screen_watch 分支只下架 identity 写与 memory_organize,
+    # memory_write / schedule_wake 在有 frame 的无人值守轮里仍被 offer,而这一轮
+    # 的唯一指令来源就是屏幕上那段字。提示词抬头是软标注,约束不了模型的选择。
+    # (模型侧选择率探针的数字与口径边界见台账 T107;那次工具面比生产宽、
+    #  只记工具名不验参数,不在这里承重。)
+    assert {"memory_write", "schedule_wake"}.isdisjoint(offered), (
+        "无人值守的屏幕轮不许再提供平台写工具(T107)"
+    )
+    # 读屏能力仍保留；T208 删除了所有 lane 的模型侧 reply tool，
+    # 可见文本改由 terminal response 单路径产生。
+    assert "screen_read" in offered
     assert "reply" not in offered
 
 
