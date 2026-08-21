@@ -469,6 +469,7 @@ def _classify_catalog_route_vision_error(
         status_code=stable.status_code,
         retryable=False,
         detail="The provider lists this model but cannot use it for visual input.",
+        upstream_detail=stable.upstream_detail,
     )
 
 

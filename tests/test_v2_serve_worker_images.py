@@ -1,5 +1,7 @@
+import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -275,3 +277,126 @@ def test_dedicated_observer_fails_when_pinned_route_was_deleted(monkeypatch):
             "u1",
             [{"message_id": "m1", "route_id": "route-123"}],
         )
+
+
+@pytest.mark.parametrize("status_code", [408, 500])
+def test_direct_vision_failure_traces_safe_status_and_logs_internal_detail(
+    monkeypatch, caplog, status_code
+):
+    upstream_detail = f"UPSTREAM_{status_code}_SECRET_NOT_TENANT_VISIBLE"
+    events = []
+    config = SimpleNamespace(provider="openai", model="vision/model")
+    try:
+        serve_worker.provider_client._raise_for_provider_status(
+            serve_worker.httpx.Response(status_code, text=upstream_detail)
+        )
+    except serve_worker.provider_client.ProviderError as provider_failure:
+        failure = serve_worker.vision_observer.classify_vision_error(
+            provider_failure
+        )
+    else:
+        raise AssertionError("expected injected provider failure")
+
+    monkeypatch.setattr(
+        serve_worker,
+        "_read_images",
+        lambda _user_id, _ids: {
+            "m1": {"image_mime": "image/png", "image_b64": "AAAA"}
+        },
+    )
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "rt")
+    monkeypatch.setattr(
+        serve_worker.vision_observer,
+        "load_provider_config",
+        lambda *_args, **_kwargs: config,
+    )
+    monkeypatch.setattr(
+        serve_worker.vision_observer,
+        "observe_image",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+    monkeypatch.setattr(
+        serve_worker,
+        "_emit_v2_debug_trace_for_user",
+        lambda user_id, event_type, **kwargs: events.append(
+            {"user_id": user_id, "type": event_type, **kwargs}
+        ),
+    )
+
+    with caplog.at_level("WARNING", logger=serve_worker.log.name):
+        with pytest.raises(
+            serve_worker.vision_observer.VisionObserverError,
+            match="vision_model_unavailable",
+        ):
+            serve_worker._read_vision_observations(
+                "u1",
+                [{"message_id": "m1", "route_id": "route-123"}],
+            )
+
+    assert [event["type"] for event in events] == [
+        "vision.provider.called",
+        "vision.provider.completed",
+    ]
+    assert events[0]["status"] == "started"
+    assert events[1]["status"] == "error"
+    assert events[1]["detail"] == {
+        "provider": "openai",
+        "model": "vision/model",
+        "error_class": "vision_model_unavailable",
+        "status_code": status_code,
+        "retryable": True,
+    }
+    # /v1/debug/trace is tenant-authenticated, so response fragments must never
+    # enter its detail/content. Operators get the bounded fragment from logs.
+    assert upstream_detail not in json.dumps(events)
+    assert upstream_detail in caplog.text
+
+
+def test_direct_vision_internal_error_is_not_misclassified_as_provider_failure(
+    monkeypatch,
+):
+    events = []
+    internal_failure = TypeError("internal observer programming error")
+    config = SimpleNamespace(provider="openai", model="vision/model")
+    monkeypatch.setattr(
+        serve_worker,
+        "_read_images",
+        lambda _user_id, _ids: {
+            "m1": {"image_mime": "image/png", "image_b64": "AAAA"}
+        },
+    )
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "rt")
+    monkeypatch.setattr(
+        serve_worker.vision_observer,
+        "load_provider_config",
+        lambda *_args, **_kwargs: config,
+    )
+    monkeypatch.setattr(
+        serve_worker.vision_observer,
+        "observe_image",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(internal_failure),
+    )
+    monkeypatch.setattr(
+        serve_worker.vision_observer,
+        "classify_vision_error",
+        lambda _exc: pytest.fail(
+            "an internal exception must not be reclassified as a provider failure"
+        ),
+    )
+    monkeypatch.setattr(
+        serve_worker,
+        "_emit_v2_debug_trace_for_user",
+        lambda user_id, event_type, **kwargs: events.append(
+            {"user_id": user_id, "type": event_type, **kwargs}
+        ),
+    )
+
+    with pytest.raises(TypeError) as caught:
+        serve_worker._read_vision_observations(
+            "u1",
+            [{"message_id": "m1", "route_id": "route-123"}],
+        )
+
+    assert caught.value is internal_failure
+    assert [event["type"] for event in events] == ["vision.provider.called"]
+    assert "vision_model_failed" not in json.dumps(events)

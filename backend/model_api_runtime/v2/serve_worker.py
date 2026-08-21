@@ -2241,18 +2241,77 @@ def _read_vision_observations(
             configs[route_id] = config
 
         mime = str(image.get("image_mime") or "image/jpeg")
+        provider = str(config.provider or "")[:80]
+        model = str(config.model or "")[:96]
+        started_at = time.monotonic()
+
+        def emit_provider_trace(event_type: str, **kwargs) -> None:
+            try:
+                _emit_v2_debug_trace_for_user(
+                    user_id,
+                    event_type,
+                    trace_id=message_id,
+                    turn_id=message_id,
+                    **kwargs,
+                )
+            except Exception as trace_exc:  # noqa: BLE001 — diagnostics are best effort
+                log.warning(
+                    "[v2.vision] provider trace failed user=%s message=%s error=%s",
+                    str(user_id)[:8],
+                    message_id[:8],
+                    type(trace_exc).__name__,
+                )
+
+        emit_provider_trace(
+            "vision.provider.called",
+            status="started",
+            summary="provider_call",
+            detail={"provider": provider, "model": model},
+        )
         try:
             observations[message_id] = vision_observer.observe_image(
                 config,
                 image_mime=mime,
                 image_b64=image_b64,
             )
-        except vision_observer.VisionObserverError as exc:
+        except vision_observer.VisionObserverError as failure:
             # Fixed route metadata, never inferred from model prose. The worker
             # can carry it to the terminal activity/fallback projection.
-            exc.model = str(config.model or "")[:96]
-            exc.provider = str(config.provider or "")[:80]
+            failure.model = model
+            failure.provider = provider
+            emit_provider_trace(
+                "vision.provider.completed",
+                status="error",
+                summary=failure.error_code,
+                detail={
+                    "provider": provider,
+                    "model": model,
+                    "error_class": failure.error_code,
+                    "status_code": failure.status_code,
+                    "retryable": failure.retryable,
+                },
+                dur_ms=(time.monotonic() - started_at) * 1000,
+            )
+            log.warning(
+                "[v2.vision] provider call failed user=%s message=%s route=%s "
+                "provider=%s model=%s class=%s status=%s upstream_detail=%r",
+                str(user_id)[:8],
+                message_id[:8],
+                route_id[:8],
+                provider,
+                model,
+                failure.error_code,
+                failure.status_code,
+                failure.upstream_detail,
+            )
             raise
+        emit_provider_trace(
+            "vision.provider.completed",
+            status="ok",
+            summary="provider_call_complete",
+            detail={"provider": provider, "model": model},
+            dur_ms=(time.monotonic() - started_at) * 1000,
+        )
     return observations
 
 
