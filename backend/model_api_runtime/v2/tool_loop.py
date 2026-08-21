@@ -8,6 +8,7 @@ import inspect
 import json
 import posixpath
 import re
+import time
 from provider_types import ProviderResponse, ToolExchange, ToolResult
 from capabilities import registry as cap_registry
 from capabilities import result_budget
@@ -549,6 +550,7 @@ async def run_tool_loop(
     max_calls: int,
     before_provider_call=None,
     on_provider_tool_surface=None,
+    on_provider_call_event=None,
     on_empty_provider_response=None,
     on_provider_success=None,
     on_provider_failure=None,
@@ -884,6 +886,46 @@ async def run_tool_loop(
         # a pre-action append failure therefore prevents the action from running.
         if on_trajectory_event is not None:
             await on_trajectory_event(event_kind, payload)
+
+    async def _provider_call_event(event_kind: str, detail: dict) -> None:
+        # Cheap, content-free provider telemetry is best-effort. The assembly
+        # owns persistence and bounding; this dependency-clean loop supplies
+        # only closed metadata from the exact call boundary.
+        if on_provider_call_event is None:
+            return
+        try:
+            emitted = on_provider_call_event(event_kind, detail)
+            if inspect.isawaitable(emitted):
+                await emitted
+        except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
+            pass
+
+    def _provider_error_facts(exc: BaseException) -> dict[str, object]:
+        """Derive closed failure metadata without trusting exception text."""
+        status_code = getattr(exc, "status_code", None)
+        try:
+            timed_out = provider_client.is_timeout_error(exc)
+        except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
+            timed_out = False
+        try:
+            error_family = provider_client.classify_provider_error(exc)
+        except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
+            error_family = "unknown"
+        return {
+            "finish_reason": (
+                "timeout"
+                if timed_out
+                else (
+                    "http_error"
+                    if isinstance(status_code, int)
+                    and not isinstance(status_code, bool)
+                    else "provider_error"
+                )
+            ),
+            "status_code": status_code,
+            "error_class": type(exc).__name__,
+            "provider_error_class": error_family,
+        }
 
     async def _record_required_file_missing(round_number: int) -> None:
         nonlocal required_file_missing_recorded
@@ -1357,6 +1399,15 @@ async def run_tool_loop(
         )
         attempts += 1
         _progress("provider_start")
+        await _provider_call_event(
+            "start",
+            {
+                "round": attempts,
+                "provider": provider_name,
+                "model": str(getattr(provider_config, "model", "") or ""),
+            },
+        )
+        provider_call_started_at = time.monotonic()
         provider_error: BaseException | None = None
         try:
             # V2 owns the lane-specific empty-response policy. Let the provider
@@ -1501,6 +1552,20 @@ async def run_tool_loop(
                 provider_error = exc
         if provider_error is not None:
             exc = provider_error
+            await _provider_call_event(
+                "error",
+                {
+                    "round": attempts,
+                    "provider": provider_name,
+                    "model": str(
+                        getattr(provider_config, "model", "") or ""
+                    ),
+                    **_provider_error_facts(exc),
+                    "dur_ms": (
+                        time.monotonic() - provider_call_started_at
+                    ) * 1000,
+                },
+            )
             attempt_trace = provider_client.runtime_provider_attempt_trace(exc)
             await _trajectory(
                 "provider_error",
@@ -1610,6 +1675,23 @@ async def run_tool_loop(
                 _progress("provider_retry_boundary")
                 continue
             raise provider_error
+        raw_finish_reason = str(result.get("stop_reason") or "").strip().lower()
+        await _provider_call_event(
+            "done",
+            {
+                "round": attempts,
+                "provider": provider_name,
+                "model": str(getattr(provider_config, "model", "") or ""),
+                "finish_reason": (
+                    raw_finish_reason
+                    if raw_finish_reason in _CONTENT_FREE_STOP_REASONS
+                    else ("other" if raw_finish_reason else "unspecified")
+                ),
+                "dur_ms": (
+                    time.monotonic() - provider_call_started_at
+                ) * 1000,
+            },
+        )
         _progress("provider_complete")
         add_usage(result.get("usage"))
         upstream_response_envelope = protocol_leak.is_upstream_response_envelope(

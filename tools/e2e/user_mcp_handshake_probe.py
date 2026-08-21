@@ -189,11 +189,10 @@ def observation_complete(
         return False
     if min_mcp_calls > 0 and "mcp.turn.usage" not in types:
         return False
-    # V2 emits no `agent.model.call.done` at all — its runtime receipt rides on
-    # the surface event's own `driver` field. Requiring the V1 receipt here made
-    # every V2 run wait out the timeout and then report "no observation", which
-    # is the third time this probe demanded a V1-only signal on the V2 path.
-    return runtime != "resident" or "agent.model.call.done" in types
+    # Both runtimes now emit the same model-call completion receipt. The V2
+    # producer deliberately reuses this event name because the admin timeline
+    # and this deploy probe already consume it.
+    return "agent.model.call.done" in types
 
 
 def build_probe_prompt(server_name: str, min_mcp_calls: int = 0) -> str:
@@ -228,9 +227,9 @@ def classify(events: list[dict], *, runtime: str, expect: str,
     driver = ""
     for e in events:
         etype = str(e.get("type") or "")
-        # V1 reports the runtime on the CLI turn receipt; V2 has no such event
-        # and stamps `driver` into its surface trace instead. Read both, or the
-        # V2 path can never confirm what it measured.
+        # V1 reports the runtime on the CLI turn receipt. V2 emits the same
+        # receipt with provider/model/lane facts and retains its runtime marker
+        # on the surface event. Read both to attribute old and new deployments.
         if etype in ("agent.model.call.done", "mcp.surface.resolved"):
             driver = str((e.get("detail") or {}).get("driver") or "") or driver
     kinds = sorted({str(e.get("type") or "") for e in events

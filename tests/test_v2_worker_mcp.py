@@ -499,7 +499,8 @@ def test_provider_roundtrip_trace_records_cap_closure_without_user_content(monke
     sentinel = "PRIVATE_USER_SENTINEL_9ce12"
     conftest.seed_user(uid)
     _reset(uid)
-    jobs_store.enqueue_job(uid, "chat")
+    turn_trace_id = "trace-provider-roundtrip-cap"
+    jobs_store.enqueue_job(uid, "chat", trace_id=turn_trace_id)
     job = jobs_store.claim_next_job("w")
     _patch_real_write(monkeypatch)
 
@@ -512,6 +513,7 @@ def test_provider_roundtrip_trace_records_cap_closure_without_user_content(monke
     responses = [
         {
             "reply": "",
+            "stop_reason": "tool_calls",
             "tool_calls": [{
                 "id": f"mcp-{round_number}",
                 "name": _MCP_SPEC.name,
@@ -521,7 +523,12 @@ def test_provider_roundtrip_trace_records_cap_closure_without_user_content(monke
         }
         for round_number in range(1, worker._TURN_MAX_LLM_CALLS)
     ]
-    responses.append({"reply": "done", "tool_calls": [], "usage": {}})
+    responses.append({
+        "reply": "done",
+        "stop_reason": "end_turn",
+        "tool_calls": [],
+        "usage": {},
+    })
     calls = _script_provider(monkeypatch, responses)
     traces = []
     deps = _deps(
@@ -550,7 +557,39 @@ def test_provider_roundtrip_trace_records_cap_closure_without_user_content(monke
         "terminal_text_round_reason": "max_calls",
         "force_text_fallback_reason": "none",
         "empty_response_recovery_used": False,
+        "model_call_event_cap": 32,
+        "model_call_events_observed": 30,
+        "model_call_events_emitted": 30,
+        "model_call_events_dropped": 0,
     }
+    model_events = [
+        trace
+        for trace in traces
+        if trace["type"].startswith("agent.model.call.")
+    ]
+    assert len(model_events) == 30
+    assert [event["type"] for event in model_events] == [
+        event_type
+        for _round in range(1, 16)
+        for event_type in (
+            "agent.model.call.start",
+            "agent.model.call.done",
+        )
+    ]
+    assert [event["detail"]["round"] for event in model_events[::2]] == list(
+        range(1, 16)
+    )
+    assert model_events[-1]["detail"]["finish_reason"] == "end_turn"
+    assert all(event["detail"]["provider"] == "anthropic" for event in model_events)
+    assert all(event["detail"]["driver"] == "v2" for event in model_events)
+    assert all(
+        event["detail"]["model"] == "claude-sonnet-4-test"
+        for event in model_events
+    )
+    assert all(event["detail"]["lane"] == "chat" for event in model_events)
+    assert all(event["trace_id"] == turn_trace_id for event in model_events)
+    assert all(event.get("dur_ms") is not None for event in model_events[1::2])
+    assert sentinel not in repr(model_events)
     assert sentinel not in repr(roundtrip)
     assert not {
         "content",
@@ -721,8 +760,14 @@ def test_mcp_turn_usage_marks_failed_turns(monkeypatch):
     job = jobs_store.claim_next_job("w")
     _patch_real_write(monkeypatch)
 
+    private_provider_body = "PRIVATE_PROVIDER_BODY_MUST_NOT_ENTER_TRACE"
+
     async def _provider_failure(*_args, **_kwargs):
-        raise RuntimeError("provider unavailable")
+        raise provider_client.ProviderError(
+            "provider_http_402",
+            status_code=402,
+            response_detail=private_provider_body,
+        )
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _provider_failure)
     traces = []
@@ -742,6 +787,20 @@ def test_mcp_turn_usage_marks_failed_turns(monkeypatch):
     assert usage["detail"]["outcome"] == "failed"
     assert usage["detail"]["offered_tool_count"] == 1
     assert usage["detail"]["call_count"] == 0
+    model_events = [
+        trace
+        for trace in traces
+        if trace["type"].startswith("agent.model.call.")
+    ]
+    assert [event["type"] for event in model_events] == [
+        "agent.model.call.start",
+        "agent.model.call.error",
+    ]
+    assert model_events[-1]["status"] == "error"
+    assert model_events[-1]["detail"]["finish_reason"] == "http_error"
+    assert model_events[-1]["detail"]["status_code"] == 402
+    assert model_events[-1]["detail"]["error_class"] == "ProviderError"
+    assert private_provider_body not in repr(model_events)
 
 
 def test_chat_identity_get_result_fences_outbound_but_keeps_local_edits(

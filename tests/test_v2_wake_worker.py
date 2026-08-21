@@ -3071,8 +3071,26 @@ def test_wake_provider_tool_surface_trace_carries_wake_kind(monkeypatch):
         "terminal_text_round_reason": "none",
         "force_text_fallback_reason": "none",
         "empty_response_recovery_used": False,
+        "model_call_event_cap": 32,
+        "model_call_events_observed": 2,
+        "model_call_events_emitted": 2,
+        "model_call_events_dropped": 0,
         "wake_kind": "scheduled",
     }
+    model_events = [
+        trace
+        for trace in traces
+        if trace["type"].startswith("agent.model.call.")
+    ]
+    assert [event["type"] for event in model_events] == [
+        "agent.model.call.start",
+        "agent.model.call.done",
+    ]
+    assert all(event["detail"]["lane"] == "scheduled" for event in model_events)
+    assert all(
+        event["detail"]["wake_kind"] == "scheduled"
+        for event in model_events
+    )
 
 
 def test_scheduled_wake_empty_reply_fails_instead_of_completing_silently(monkeypatch):
