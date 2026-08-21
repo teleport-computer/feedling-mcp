@@ -11,6 +11,7 @@ import logging
 import os
 import secrets
 import time
+import unicodedata
 import uuid
 from urllib.parse import urlparse
 
@@ -189,6 +190,70 @@ def _sse_chunk(request_id: str, *, content: str = "", role: str = "", finish=Non
     return "data: " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n\n"
 
 
+def _supports_skip_turn(payload: dict) -> bool:
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        return False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        name = (
+            function.get("name")
+            if isinstance(function, dict)
+            else tool.get("name")
+        )
+        if str(name or "").strip() == "skip_turn":
+            return True
+    return False
+
+
+def _sse_skip_turn_chunk(request_id: str, reason: str) -> str:
+    call_id = "call_" + hashlib.sha256(
+        f"{request_id}:skip_turn".encode("utf-8")
+    ).hexdigest()[:24]
+    payload = {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": "io-current",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "skip_turn",
+                        "arguments": json.dumps(
+                            {"reason": reason},
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    },
+                }]
+            },
+            "finish_reason": None,
+        }],
+    }
+    return "data: " + json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":")
+    ) + "\n\n"
+
+
+def _skip_turn_chunks(request_id: str, reason: str, *, include_role: bool) -> list[str]:
+    chunks = []
+    if include_role:
+        chunks.append(_sse_chunk(request_id, role="assistant"))
+    chunks.extend([
+        _sse_skip_turn_chunk(request_id, reason),
+        _sse_chunk(request_id, finish="tool_calls"),
+        "data: [DONE]\n\n",
+    ])
+    return chunks
+
+
 def _incremental_suffix(previous: str, current: str) -> str:
     """Return only newly appended model text; never replay a rewritten prefix."""
     if not previous:
@@ -201,16 +266,31 @@ def _incremental_suffix(previous: str, current: str) -> str:
 def _final_suffix(streamed: str, final_text: str) -> str:
     if not streamed:
         return final_text
-    if final_text.startswith(streamed):
-        return final_text[len(streamed) :]
-    if streamed.startswith(final_text):
-        return ""
+
+    def speech_units(text: str) -> list[tuple[str, int]]:
+        return [
+            (char.casefold(), index + 1)
+            for index, char in enumerate(text)
+            if not char.isspace()
+            and not unicodedata.category(char).startswith("P")
+        ]
+
+    streamed_units = speech_units(streamed)
+    final_units = speech_units(final_text)
+    if not streamed_units:
+        return final_text
     common = 0
-    for left, right in zip(streamed, final_text):
-        if left != right:
+    for left, right in zip(streamed_units, final_units):
+        if left[0] != right[0]:
             break
         common += 1
-    return final_text[common:]
+    if common == len(final_units):
+        return ""
+    if common == len(streamed_units):
+        return final_text[final_units[common - 1][1] :]
+    # Spoken audio cannot be retracted. A rewritten final answer remains the
+    # canonical chat record, but replaying it would speak the turn twice.
+    return ""
 
 
 def _failed_turn_text(user_id: str, message_id: str) -> str | None:
@@ -321,6 +401,19 @@ def _streaming_text_response(request_id: str, text: str) -> StreamingResponse:
             await asyncio.sleep(0)
         yield _sse_chunk(request_id, finish="stop")
         yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _streaming_skip_turn_response(request_id: str, reason: str) -> StreamingResponse:
+    async def stream():
+        for chunk in _skip_turn_chunks(request_id, reason, include_role=True):
+            yield chunk
+            await asyncio.sleep(0)
 
     return StreamingResponse(
         stream(),
@@ -763,12 +856,17 @@ async def voice_chat_completions(request: Request):
     request_id = "chatcmpl-" + hashlib.sha256(
         f"{call_id}:{turn_id}".encode("utf-8")
     ).hexdigest()[:24]
+    skip_turn_available = _supports_skip_turn(payload)
     if not is_meaningful_voice_message(message):
         log.info(
             "[voice.gateway] turn ignored user=%s reason=non_speech",
             user_id[:12],
         )
-        return _streaming_text_response(request_id, _VOICE_SILENT_TURN_TEXT)
+        return (
+            _streaming_skip_turn_response(request_id, "non_speech_input")
+            if skip_turn_available
+            else _streaming_text_response(request_id, _VOICE_SILENT_TURN_TEXT)
+        )
 
     import db as _db
 
@@ -777,7 +875,11 @@ async def voice_chat_completions(request: Request):
         "cancelled",
         "finalized",
     }:
-        return _streaming_text_response(request_id, _VOICE_SILENT_TURN_TEXT)
+        return (
+            _streaming_skip_turn_response(request_id, "call_ending")
+            if skip_turn_available
+            else _streaming_text_response(request_id, _VOICE_SILENT_TURN_TEXT)
+        )
 
     from core import store as core_store
 
@@ -849,6 +951,7 @@ async def voice_chat_completions(request: Request):
         deadline = time.monotonic() + 115.0
         streamed_by_segment: dict[int, str] = {}
         first_real_content_at: float | None = None
+        delivered_text_chars = 0
         buffer_count = 1
         next_keepalive = time.monotonic() + 3.5
         next_lifecycle_check = time.monotonic()
@@ -874,8 +977,16 @@ async def voice_chat_completions(request: Request):
                     parent_message_id=message_id,
                 )
                 if not current:
-                    yield _sse_chunk(request_id, finish="stop")
-                    yield "data: [DONE]\n\n"
+                    if skip_turn_available:
+                        for chunk in _skip_turn_chunks(
+                            request_id,
+                            "superseded_voice_revision",
+                            include_role=False,
+                        ):
+                            yield chunk
+                    else:
+                        yield _sse_chunk(request_id, finish="stop")
+                        yield "data: [DONE]\n\n"
                     log.info(
                         "[voice.gateway] stream superseded user=%s",
                         user_id[:12],
@@ -902,8 +1013,16 @@ async def voice_chat_completions(request: Request):
                     parent_message_id=message_id,
                 )
                 if not current:
-                    yield _sse_chunk(request_id, finish="stop")
-                    yield "data: [DONE]\n\n"
+                    if skip_turn_available:
+                        for chunk in _skip_turn_chunks(
+                            request_id,
+                            "superseded_voice_revision",
+                            include_role=False,
+                        ):
+                            yield chunk
+                    else:
+                        yield _sse_chunk(request_id, finish="stop")
+                        yield "data: [DONE]\n\n"
                     log.info(
                         "[voice.gateway] stream superseded before content user=%s",
                         user_id[:12],
@@ -925,6 +1044,7 @@ async def voice_chat_completions(request: Request):
                             buffer_count,
                         )
                     yield _sse_chunk(request_id, content=suffix)
+                    delivered_text_chars += len(suffix)
                 if text.startswith(previous):
                     streamed_by_segment[segment] = text
             completed_segments = [
@@ -983,8 +1103,16 @@ async def voice_chat_completions(request: Request):
                 parent_message_id=message_id,
             )
             if not current:
-                yield _sse_chunk(request_id, finish="stop")
-                yield "data: [DONE]\n\n"
+                if skip_turn_available:
+                    for chunk in _skip_turn_chunks(
+                        request_id,
+                        "superseded_voice_revision",
+                        include_role=False,
+                    ):
+                        yield chunk
+                else:
+                    yield _sse_chunk(request_id, finish="stop")
+                    yield "data: [DONE]\n\n"
                 log.info(
                     "[voice.gateway] stream superseded before final user=%s",
                     user_id[:12],
@@ -995,16 +1123,30 @@ async def voice_chat_completions(request: Request):
         streamed_final = streamed_by_segment.get(latest_segment, "")
         remaining = _final_suffix(streamed_final, text)
         for offset in range(0, len(remaining), 18):
-            yield _sse_chunk(request_id, content=remaining[offset : offset + 18])
+            chunk = remaining[offset : offset + 18]
+            if first_real_content_at is None and chunk:
+                first_real_content_at = time.monotonic()
+                log.info(
+                    "[voice.gateway] first content user=%s ttft_ms=%d "
+                    "buffers=%d source=final",
+                    user_id[:12],
+                    int((first_real_content_at - started_at) * 1000),
+                    buffer_count,
+                )
+            yield _sse_chunk(request_id, content=chunk)
+            delivered_text_chars += len(chunk)
             await asyncio.sleep(0)
         yield _sse_chunk(request_id, finish="stop")
         yield "data: [DONE]\n\n"
         log.info(
-            "[voice.gateway] stream complete user=%s dur_ms=%d buffers=%d real=%s",
+            "[voice.gateway] stream complete user=%s dur_ms=%d buffers=%d "
+            "text_chars=%d segments=%d delta=%s",
             user_id[:12],
             int((time.monotonic() - started_at) * 1000),
             buffer_count,
-            first_real_content_at is not None,
+            delivered_text_chars,
+            len(streamed_by_segment),
+            bool(streamed_by_segment),
         )
 
     return StreamingResponse(

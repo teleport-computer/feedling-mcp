@@ -211,11 +211,50 @@ def test_sse_chunk_is_openai_compatible():
     assert payload["choices"][0]["delta"] == {"content": "你好"}
 
 
+def test_skip_turn_detection_uses_elevenlabs_function_definition():
+    assert routes_asgi._supports_skip_turn({
+        "tools": [{
+            "type": "function",
+            "function": {"name": "skip_turn", "parameters": {}},
+        }]
+    }) is True
+    assert routes_asgi._supports_skip_turn({"tools": []}) is False
+
+
+def test_skip_turn_response_is_an_openai_tool_completion():
+    response = routes_asgi._streaming_skip_turn_response(
+        "chatcmpl-test", "superseded_voice_revision"
+    )
+
+    async def collect() -> str:
+        chunks = [chunk async for chunk in response.body_iterator]
+        return "".join(chunks)
+
+    body = asyncio.run(collect())
+    payloads = [
+        json.loads(line[6:])
+        for line in body.splitlines()
+        if line.startswith("data: ") and line.strip() != "data: [DONE]"
+    ]
+    tool_call = payloads[1]["choices"][0]["delta"]["tool_calls"][0]
+    assert tool_call["function"]["name"] == "skip_turn"
+    assert json.loads(tool_call["function"]["arguments"]) == {
+        "reason": "superseded_voice_revision"
+    }
+    assert payloads[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    assert body.count("data: [DONE]") == 1
+
+
 def test_incremental_and_final_suffixes_do_not_replay_streamed_text():
     assert routes_asgi._incremental_suffix("你好", "你好呀") == "呀"
     assert routes_asgi._incremental_suffix("你好", "您好") == ""
     assert routes_asgi._final_suffix("你好", "你好呀") == "呀"
     assert routes_asgi._final_suffix("你好呀", "你好") == ""
+    assert routes_asgi._final_suffix(
+        "我觉得会呀。今天别急",
+        "我觉得会呀。\n\n今天别急着安排满",
+    ) == "着安排满"
+    assert routes_asgi._final_suffix("已经说出的答案", "完全改写的最终答案") == ""
 
 
 @pytest.mark.parametrize(

@@ -25,7 +25,6 @@ import pytest
 import conftest
 import db
 import provider_client
-import worldbook_match
 from admin import data_track as admin_data_track
 from provider_types import ToolCall, ToolExchange
 from capabilities import registry as cap_registry
@@ -815,7 +814,7 @@ def test_chat_tool_surface_keeps_memory_delete(monkeypatch):
     assert chat_ops == ["add", "update", "delete"]
 
 
-def test_chat_worldbook_matches_current_turn_without_rewriting_user_text(
+def test_chat_worldbook_is_pull_only_and_available_as_native_tool(
     monkeypatch,
 ):
     monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
@@ -826,19 +825,25 @@ def test_chat_worldbook_matches_current_turn_without_rewriting_user_text(
     job = jobs_store.claim_next_job("w-worldbook")
     _patch_real_write(monkeypatch)
 
-    calls = _script_provider(monkeypatch, [_text_round("The queen remembers you.")])
-    observed: dict = {}
+    calls = _script_provider(monkeypatch, [
+        _tool_round(_tc("wb-1", "worldbook_match", query="Luna")),
+        _text_round("The queen remembers you."),
+    ])
+    eager_reads = []
+    capability_calls = []
 
-    def read_worldbook(user_id, messages, *, runtime_token):
-        observed.update({
-            "user_id": user_id,
-            "messages": messages,
-            "runtime_token": runtime_token,
-        })
-        return {
+    def read_worldbook(*args, **kwargs):
+        eager_reads.append((args, kwargs))
+        raise AssertionError("foreground world book must be pull-only")
+
+    def run_capability(action_type, store, **kwargs):
+        capability_calls.append((action_type, kwargs))
+        return _FakeCapResult({
             "block": "<world_book>\nLuna is queen of the Moon Court.\n</world_book>",
             "matched_names": ["Moon Court"],
-        }
+        })
+
+    monkeypatch.setattr(cap_registry, "run_capability", run_capability)
 
     turn_messages = [{
         "id": "m-worldbook",
@@ -865,23 +870,22 @@ def test_chat_worldbook_matches_current_turn_without_rewriting_user_text(
     )
 
     assert status == "completed"
-    assert observed == {
-        "user_id": uid,
-        "messages": [{"role": "user", "content": "Tell me about Luna"}],
-        "runtime_token": "rt",
-    }
+    assert eager_reads == []
+    assert capability_calls[0][0] == "worldbook_match"
+    assert capability_calls[0][1]["params"] == {"query": "Luna"}
+    assert any(tool.name == "worldbook_match" for tool in calls[0]["tools"])
+    assert any(
+        "Luna is queen of the Moon Court." in content
+        for content in _tool_result_contents(calls[1])
+    )
     provider_messages = calls[0]["messages"]
-    worldbook_messages = [
-        message
-        for message in provider_messages
-        if isinstance(message, dict)
+    assert not any(
+        isinstance(message, dict)
         and str(message.get("content") or "").startswith(
             v2_context.WORLD_BOOK_CONTEXT_HEADER + "\n"
         )
-    ]
-    assert len(worldbook_messages) == 1
-    assert worldbook_messages[0]["role"] == "user"
-    assert "Luna is queen of the Moon Court." in worldbook_messages[0]["content"]
+        for message in provider_messages
+    )
     assert [
         message
         for message in provider_messages
@@ -895,9 +899,7 @@ def test_chat_worldbook_matches_current_turn_without_rewriting_user_text(
     )
 
 
-def test_worldbook_truncation_reaches_provider_and_data_track_without_content(
-    monkeypatch,
-):
+def test_worldbook_pull_result_is_bounded_before_next_provider_call(monkeypatch):
     monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
     uid = "u_toolloop_worldbook_truncation"
     conftest.seed_user(uid)
@@ -907,14 +909,19 @@ def test_worldbook_truncation_reaches_provider_and_data_track_without_content(
     _patch_real_write(monkeypatch)
 
     rare_secret = "T047_WORLDBOOK_SECRET_MUST_NOT_REACH_ADMIN"
-    raw_worldbook = (
-        "<world_book>\n"
-        + ("W" * worldbook_match.CONTEXT_CHAR_CAP)
-        + rare_secret
-        + "\n</world_book>"
+    raw_worldbook = "<world_book>\n" + ("W" * 4_000) + rare_secret + "\n</world_book>"
+    calls = _script_provider(monkeypatch, [
+        _tool_round(_tc("wb-large", "worldbook_match", query="setting")),
+        _text_round("bounded"),
+    ])
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: _FakeCapResult({
+            "block": raw_worldbook,
+            "matched_names": ["large setting"],
+        }),
     )
-    calls = _script_provider(monkeypatch, [_text_round("bounded")])
-    traces = []
     turn_messages = [{
         "id": "m-worldbook-truncated",
         "ts": 10.0,
@@ -924,12 +931,8 @@ def test_worldbook_truncation_reaches_provider_and_data_track_without_content(
     deps = _deps(messages=turn_messages)
     deps.read_summary = lambda _uid: ("", 0.0, 0)
     deps.read_tail = lambda _uid, _after_ts, _limit: list(turn_messages)
-    deps.read_worldbook_context = lambda *_args, **_kwargs: {
-        "block": raw_worldbook,
-        "matched_names": [],
-    }
-    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
-        {"user_id": user_id, "type": event_type, **fields}
+    deps.read_worldbook_context = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("foreground world book must be pull-only")
     )
 
     status = asyncio.run(
@@ -943,30 +946,9 @@ def test_worldbook_truncation_reaches_provider_and_data_track_without_content(
     )
 
     assert status == "completed"
-    provider_payload = json.dumps(calls[0]["messages"], ensure_ascii=False)
-    assert worldbook_match.TRUNCATION_MARKER.strip() in provider_payload
-    truncation = next(
-        trace for trace in traces if trace["type"] == "context.truncation"
-    )
-    assert truncation == {
-        "user_id": uid,
-        "type": "context.truncation",
-        "status": "warning",
-        "summary": "",
-        "explain": "",
-        "detail": {
-            "counts": {
-                "profile_cards_truncated": 0,
-                "worldbook_truncated": 1,
-            }
-        },
-    }
-    raw_admin_material = json.dumps(
-        admin_data_track._debug_event_public_json(truncation),
-        ensure_ascii=False,
-    )
+    provider_payload = "\n".join(_tool_result_contents(calls[1]))
+    assert "...[truncated]" in provider_payload
     assert rare_secret not in provider_payload
-    assert rare_secret not in raw_admin_material
 
 
 def test_empty_provider_response_reaches_debug_trace_without_content(monkeypatch):
@@ -3773,26 +3755,26 @@ def test_half_open_halt_gives_the_still_working_tool_a_collateral_error(monkeypa
 
 
 def test_child_subagent_tool_schemas_are_protected_from_folding(monkeypatch):
-    """子 agent 的 7 件工具全部标为「不可折叠」。
+    """子 agent 的 8 件工具全部标为「不可折叠」。
 
-    为什么必须是保护、而不是折叠+恢复:子 agent 的整个工具面只有 7 件,其中
+    为什么必须是保护、而不是折叠+恢复:子 agent 的整个工具面只有 8 件,其中
     只有 `memory_search` 是常驻;而 `mcp_tool_search` **不在**
     `_SUBAGENT_ALLOWED_TOOLS` 里 —— 一旦被折成空参数表,它没有任何取回口,
     表现是「看着工具名填不出参数」,在系统里和「模型自己不想调」无法区分。
 
     ⚠️ 这条是**结构性**断言,不是端到端复现。我没能构造出真正让子轮折叠的
-    用例:7 份说明书合计约 1k token,要触发折叠需要模型写出 20k token 级别的
-    task prompt。所以这里钉住的是契约本身(保护集 == 全部 7 件)与它的三个
-    前提(工具面是这 7 件、只有一件常驻、没有 mcp_tool_search);任何一条被
+    用例:8 份说明书合计约 1k token,要触发折叠需要模型写出 20k token 级别的
+    task prompt。所以这里钉住的是契约本身(保护集 == 全部 8 件)与它的三个
+    前提(工具面是这 8 件、只有一件常驻、没有 mcp_tool_search);任何一条被
     改动,这个保护的必要性就变了,应当重新判断而不是照旧。
     """
     from model_api_runtime.v2 import tool_surface as v2_tool_surface
 
     allowed = set(worker._SUBAGENT_ALLOWED_TOOLS)
-    assert len(allowed) == 7
+    assert len(allowed) == 8
     # 前提一:没有恢复口。
     assert cap_tool_schema.MCP_TOOL_SEARCH_TOOL not in allowed
-    # 前提二:只有一件是常驻工具,其余 6 件都在可折叠面上。
+    # 前提二:只有一件是常驻工具,其余 7 件都在可折叠面上。
     assert allowed & set(v2_tool_surface.RESIDENT_TOOL_NAMES) == {"memory_search"}
 
     uid = "u_child_protected"
