@@ -35,7 +35,7 @@ async def _run_one(
             "runtime_token": runtime_token,
             "params": params,
         }
-        if trace_context is not None:
+        if t == "worldbook_match" and trace_context is not None:
             kwargs["trace_context"] = trace_context
         result = await asyncio.to_thread(
             cap_registry.run_capability, t, store,
