@@ -1863,8 +1863,10 @@ def _runtime_repo_files() -> set[str]:
             rel = Path(f).resolve().relative_to(_REPO)
         except ValueError:
             continue  # stdlib / site-packages / outside the repo
+        if {"site-packages", "dist-packages"} & set(rel.parts):
+            continue  # third-party packages from an in-repo virtualenv
         if rel.suffix == ".py":
-            files.add(str(rel))
+            files.add(rel.as_posix())
     files.update(
         {
             "tools/io_cli.py",
