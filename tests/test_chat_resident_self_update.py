@@ -12,6 +12,7 @@ Run with: pytest tests/test_chat_resident_self_update.py -v
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -134,6 +135,50 @@ def test_runtime_files_excludes_stdlib_and_site_packages():
         assert not f.startswith("/"), f
         assert ".." not in f.split("/"), f
         assert "site-packages" not in f, f
+
+
+def test_runtime_files_excludes_site_packages_inside_repo(monkeypatch):
+    dependency = SimpleNamespace(
+        __file__=str(
+            crc._REPO
+            / ".venv"
+            / "lib"
+            / "python3.12"
+            / "site-packages"
+            / "dependency.py"
+        )
+    )
+    monkeypatch.setitem(sys.modules, "in_repo_venv_dependency", dependency)
+
+    files = crc._runtime_repo_files()
+
+    assert ".venv/lib/python3.12/site-packages/dependency.py" not in files
+
+
+def test_runtime_files_normalizes_repo_paths_for_git_diff(monkeypatch):
+    class WindowsRelativePath:
+        suffix = ".py"
+        parts = ("backend", "dependency.py")
+
+        def __str__(self):
+            return r"backend\dependency.py"
+
+        def as_posix(self):
+            return "backend/dependency.py"
+
+    class WindowsModulePath:
+        def resolve(self):
+            return self
+
+        def relative_to(self, _repo):
+            return WindowsRelativePath()
+
+    monkeypatch.setattr(crc, "Path", lambda _path: WindowsModulePath())
+
+    files = crc._runtime_repo_files()
+
+    assert "backend/dependency.py" in files
+    assert r"backend\dependency.py" not in files
 
 
 # ---------------------------------------------------------------------------
