@@ -597,9 +597,17 @@ DESCRIPTIONS: dict[str, str] = {
     "history_search": (
         "Search the user's raw chat history (original message text from ANY "
         "time period, beyond what is visible in context) by substring query "
-        "and/or RFC3339 time range. Use this directly for original wording "
-        "or conversation evidence; use the memory tools for remembered facts "
-        "or summaries. "
+        "and/or RFC3339 time range. "
+        # 2026-08-21 Seven 口径:memory_search 是默认路径(约 95% 的「以前的事」
+        # 它就够了),history_search 是**升级路径**,不是平行选项。两者串行,
+        # 不许同批一起调 —— 实测同批双调占了这两道题非命中的 26/40 与 20/40。
+        "memory_search is the normal path for anything the user remembers; this "
+        "tool is the escalation, not a parallel option. Reach for it when the "
+        "user names a specific past exchange or asks what was actually said "
+        "word-for-word, or after memory_search came back empty or too vague to "
+        "answer with. Do not call it in the same batch as memory_search: run "
+        "memory_search first and escalate only after seeing that its result is "
+        "missing or not specific enough. "
         "First call: give 'query' and/or 'start'/'end' (start inclusive, end "
         "exclusive, RFC3339 with explicit UTC offset; convert relative times "
         "like 'last month' yourself). 'limit' 1-5, default 3. Results are in "

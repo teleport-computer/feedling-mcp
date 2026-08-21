@@ -112,6 +112,36 @@ def test_history_search_description_carries_three_state_semantics():
     assert "not_found_or_not_visible" in fetch_desc
 
 
+def test_history_search_description_states_the_escalation_relationship():
+    """`memory_search` 是默认路径,`history_search` 是**升级**而非平行选项,且两者串行。
+
+    这三句是产品口径(Seven 2026-08-21:「用户聊到以前的事情时最常用的还是
+    memory search……这两个并不是平行关系,95% 的情况 memory search 都能搞定,
+    history search 只是留作备选」),不是措辞偏好。
+
+    为什么必须单独一条:
+    - 2026-08-19 那次改动把「memory tools miss 才用」删掉、换成「Use this directly」,
+      **等于把升级关系改成了平行关系**;实测代价是 hist_search_1 掉到 **0/40**
+      (模型照着"直接用"直接用了),两道题的同批双调率到 65-85%。
+    - `tests/test_v2_prompt_frontier.py` 的 35_229 **不是这条的守卫**:那个 fixture 会
+      自动调整 synthetic MCP padding,把描述退回旧语义后它照样是 35_229 照样绿
+      (codex 2026-08-21 复审指出)。账本记的是大小,不是语义。
+    """
+    desc = tool_schema.DESCRIPTIONS["history_search"]
+
+    # ① 默认路径是谁
+    assert "memory_search is the normal path" in desc
+    # ② 自己是升级、不是平行选项
+    assert "escalation" in desc and "not a parallel option" in desc
+    # ③ 串行:不许同批一起调
+    assert "Do not call it in the same batch as memory_search" in desc
+    assert "memory_search first" in desc
+
+    # 阴性对照:2026-08-19 那句把关系改平的措辞不许回来。
+    # 只断"新句子在"挡不住"新旧并存"——那种写法模型仍然会读到"直接用"。
+    assert "Use this directly" not in desc
+
+
 def test_history_tools_private_read_and_subagent_exclusion():
     assert "history_search" in worker._PRIVATE_READ_TOOLS
     assert "history_fetch" in worker._PRIVATE_READ_TOOLS

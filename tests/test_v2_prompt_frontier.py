@@ -28,7 +28,7 @@ def _model_limit(context_window_tokens: int = 2_048) -> frontier.ModelPromptLimi
 
 
 _REAL_TOOL_COUNT = 69
-_REAL_TOOL_CATALOG_BYTES = 35_118
+_REAL_TOOL_CATALOG_BYTES = 35_229
 
 
 def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
@@ -50,6 +50,16 @@ def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
     conditional instead of unconditional. It records catalog size only.
     The 2026-08-21 increase to 35,118 records the pull-only worldbook_match
     schema while preserving the captured MCP description padding.
+    The 2026-08-21 increase to 35,229 (+111 bytes) records the history_search
+    escalation contract: memory_search is stated as the default path, and the
+    tool is told never to be called in the same batch as memory_search (Seven
+    2026-08-21). It records catalog size only.
+    ⚠️ 为什么是抬记录值而不是把描述写短:那段措辞是**被实测过的**
+    (40 轮 × 60 用例:hist_search_1 0%→75%、hist_search_2 35%→67.5%,
+    同批多调 19.6%→9.6%,无关 54 题 90.3%→90.7% 无误伤)。改一个字就是换了
+    一个变量,那组数字就不再描述线上跑的东西。111 字节 = 目录的 0.32%,
+    而这个常量本来就是**记录实际大小的账本**(上面四条历史增记就是先例),
+    不是预算上限。
     """
     platform = list(tool_schema.build_tool_specs())
     mcp_count = _REAL_TOOL_COUNT - len(platform)
