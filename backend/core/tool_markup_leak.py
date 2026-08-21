@@ -34,6 +34,8 @@ _CODE_FENCE = "```"
 # Provider-native end-of-turn sentinels sometimes leak into ``content`` instead
 # of being consumed by the relay.  Match only a small, explicit, whole-message
 # family: this must never grow into a generic angle-bracket/HTML sanitizer.
+# Unbarred tags such as ``<end_of_turn>`` are safe here only because the sole
+# consumer uses ``fullmatch`` below, not because generic tags are acceptable.
 MODEL_SENTINEL_TOKENS = (
     "</s>",
     "<|endoftext|>",
@@ -41,6 +43,7 @@ MODEL_SENTINEL_TOKENS = (
     "<|eot_id|>",
     "<|end_of_text|>",
     "<|end_of_turn|>",
+    "<end_of_turn>",
 )
 _MODEL_SENTINEL_ONLY_RE = re.compile(
     r"(?:"
