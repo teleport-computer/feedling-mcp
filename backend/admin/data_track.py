@@ -2434,6 +2434,15 @@ _SILENT_REPLY_PUBLIC_ENUMS = {
     "cause": frozenset({"suppressed", "empty_response"}),
 }
 
+_MODEL_CALL_TRACE_TYPES = frozenset({
+    "agent.model.call.start",
+    "agent.model.call.done",
+    "agent.model.call.error",
+})
+_MODEL_CALL_FINISH_REASONS = _EMPTY_RESPONSE_PUBLIC_ENUMS["stop_reason"] | {
+    "unspecified", "timeout", "http_error", "provider_error",
+}
+
 _LANGUAGE_FOLLOW_PUBLIC_ENUMS = {
     "user_script": frozenset({
         "han", "latin", "kana", "hangul", "cyrillic", "other", "mixed",
@@ -2615,6 +2624,33 @@ def _debug_event_public_json(ev: dict) -> dict:
                 and v2_worker._normalize_provider_trace_lane(value) == value
             ):
                 public_detail[key] = value
+    if (
+        ev.get("type") in _MODEL_CALL_TRACE_TYPES
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        from model_api_runtime.v2 import worker as v2_worker
+
+        if raw_detail.get("driver") == "v2":
+            public_detail["driver"] = "v2"
+        for key in ("lane", "wake_kind"):
+            value = raw_detail.get(key)
+            if (
+                isinstance(value, str)
+                and v2_worker._normalize_provider_trace_lane(value) == value
+            ):
+                public_detail[key] = value
+        finish_reason = raw_detail.get("finish_reason")
+        if finish_reason in _MODEL_CALL_FINISH_REASONS:
+            public_detail["finish_reason"] = finish_reason
+        provider_error_class = raw_detail.get("provider_error_class")
+        if provider_error_class in {"transient", "provider_config", "unknown"}:
+            public_detail["provider_error_class"] = provider_error_class
+        error_class = raw_detail.get("error_class")
+        if isinstance(error_class, str) and re.fullmatch(
+            r"[A-Za-z0-9_.-]{1,80}", error_class
+        ):
+            public_detail["error_class"] = error_class
     return {
         "ts": ev.get("ts"),
         "user_id": ev.get("user_id"),
@@ -8448,6 +8484,7 @@ _DEBUG_STEP_LABELS = {
     "memory.dream.tick": ("🌙", "做梦判定"),
     "agent.model.call.start": ("🧠", "调用模型 · 开始"),
     "agent.model.call.done": ("🧠", "调用模型 · 完成"),
+    "agent.model.call.error": ("🧠", "调用模型 · 失败"),
     "agent.tool.call": ("🔧", "调用工具"),
     "thinking.surfaced": ("💭", "思考展示 · 分支"),
     "reply.language_follow": ("🌐", "语言跟随"),

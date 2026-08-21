@@ -182,6 +182,32 @@ def test_empty_tool_calls_is_final_reply_no_dispatch(monkeypatch):
     assert progress == ["round_boundary", "provider_start", "provider_complete"]
 
 
+def test_provider_call_trace_failure_does_not_change_the_reply(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "hello", "stop_reason": "end_turn", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    on_reply = _RecordingReply()
+
+    async def broken_trace(_event_kind, _detail):
+        raise RuntimeError("telemetry unavailable")
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=on_reply,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=1,
+        on_provider_call_event=broken_trace,
+    ))
+
+    assert outcome.final_text == "hello"
+    assert outcome.stop_reason == "final_text"
+    assert on_reply.calls == [("hello", True)]
+
+
 def test_new_input_cancels_old_final_reply_correction_before_retry(monkeypatch):
     provider = _ScriptedProvider([
         {"reply": "old candidate", "tool_calls": [], "usage": {}},

@@ -882,6 +882,69 @@ def test_provider_roundtrip_trace_normalizes_unknowns_and_admin_redacts_forgery(
         assert forged_public[key].startswith("<redacted string")
 
 
+def test_provider_model_call_trace_cap_keeps_head_and_latest_round():
+    from admin import data_track
+
+    captured = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: captured.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+    trace = worker._provider_tool_surface_callback(
+        deps, "u_model_call_cap", "chat", "trace-model-call-cap"
+    )
+    assert trace is not None
+
+    async def record() -> None:
+        for round_number in range(1, 19):
+            await trace.record_model_call("start", {
+                "round": round_number,
+                "provider": "anthropic",
+                "model": "claude-test",
+                "prompt": "PRIVATE PROMPT MUST NOT ENTER TRACE",
+            })
+            await trace.record_model_call("done", {
+                "round": round_number,
+                "provider": "anthropic",
+                "model": "claude-test",
+                "finish_reason": "end_turn",
+                "reply": "PRIVATE REPLY MUST NOT ENTER TRACE",
+                "dur_ms": float(round_number),
+            })
+        await trace.emit_summary()
+
+    asyncio.run(record())
+
+    model_events = [
+        event
+        for event in captured
+        if event["type"].startswith("agent.model.call.")
+    ]
+    assert len(model_events) == worker._MODEL_CALL_TRACE_EVENT_CAP == 32
+    assert [event["detail"]["round"] for event in model_events[:30:2]] == list(
+        range(1, 16)
+    )
+    assert [event["detail"]["round"] for event in model_events[-2:]] == [18, 18]
+    summary = next(
+        event for event in captured if event["type"] == "mcp.roundtrip.provider"
+    )
+    assert summary["detail"]["model_call_event_cap"] == 32
+    assert summary["detail"]["model_call_events_observed"] == 36
+    assert summary["detail"]["model_call_events_emitted"] == 32
+    assert summary["detail"]["model_call_events_dropped"] == 4
+    public = data_track._debug_event_public_json(model_events[-1])
+    assert public["detail"]["lane"] == "chat"
+    assert public["detail"]["driver"] == "v2"
+    assert public["detail"]["finish_reason"] == "end_turn"
+    assert data_track._debug_friendly_step({
+        "type": "agent.model.call.error",
+        "subsystem": "agent",
+    }) == ("🧠", "调用模型 · 失败")
+    serialized = repr(captured)
+    assert "PRIVATE PROMPT" not in serialized
+    assert "PRIVATE REPLY" not in serialized
+
+
 def test_combined_memory_worldbook_message_keeps_truncation_trace_visible():
     captured = {}
 

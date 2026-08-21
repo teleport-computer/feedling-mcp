@@ -700,6 +700,12 @@ _FILE_TURN_MAX_LLM_CALLS = int(
     os.environ.get("FEEDLING_V2_FILE_TURN_MAX_LLM_CALLS", "10")
 )
 _SUBAGENT_MAX_LLM_CALLS = _positive_int_env("FEEDLING_V2_SUBAGENT_MAX_LLM_CALLS", "4")
+# Two facts (start + done/error) for each of the normal 15 provider rounds, plus
+# one reserved pair for the latest round if an env override raises max_calls.
+# The cap is intentionally fixed: a bad rollout must not multiply pressure on
+# debug_trace's shared queue. Overflow retains rounds 1..15 and the latest pair.
+_MODEL_CALL_TRACE_EVENT_CAP = 32
+_MODEL_CALL_TRACE_HEAD_ROUNDS = (_MODEL_CALL_TRACE_EVENT_CAP // 2) - 1
 _SUBAGENT_MAX_TOTAL_LLM_CALLS = _positive_int_env(
     "FEEDLING_V2_SUBAGENT_MAX_TOTAL_LLM_CALLS", "12"
 )
@@ -2165,6 +2171,10 @@ class _ProviderRoundtripTrace:
     terminal_text_round_reason: str = "none"
     force_text_fallback_reason: str = "none"
     empty_response_recovery_used: bool = False
+    model_call_events_observed: int = 0
+    model_call_events_emitted: int = 0
+    _model_call_tail_start: dict[str, Any] | None = None
+    _model_call_tail_terminal: tuple[str, dict[str, Any]] | None = None
 
     def __post_init__(self) -> None:
         self.lane = _normalize_provider_trace_lane(self.lane)
@@ -2216,7 +2226,109 @@ class _ProviderRoundtripTrace:
             detail=trace_detail,
         )
 
+    def _safe_model_call_detail(self, detail: dict[str, Any]) -> dict[str, Any]:
+        try:
+            round_number = max(1, int(detail.get("round") or 1))
+        except (TypeError, ValueError, OverflowError):
+            round_number = 1
+        safe = {
+            "driver": "v2",
+            "provider": str(detail.get("provider") or "unknown")[:48],
+            "model": str(detail.get("model") or "unknown")[:96],
+            "lane": self.lane,
+            "round": round_number,
+        }
+        if self.lane != "chat":
+            safe["wake_kind"] = self.lane
+        finish_reason = str(detail.get("finish_reason") or "")
+        if finish_reason in (
+            v2_tool_loop._CONTENT_FREE_STOP_REASONS
+            | {"unspecified", "timeout", "http_error", "provider_error"}
+        ):
+            safe["finish_reason"] = finish_reason
+        error_class = re.sub(
+            r"[^A-Za-z0-9_.-]", "", str(detail.get("error_class") or "")
+        )[:80]
+        if error_class:
+            safe["error_class"] = error_class
+        provider_error_class = str(detail.get("provider_error_class") or "")
+        if provider_error_class in {"transient", "provider_config", "unknown"}:
+            safe["provider_error_class"] = provider_error_class
+        status_code = detail.get("status_code")
+        if (
+            isinstance(status_code, int)
+            and not isinstance(status_code, bool)
+            and 100 <= status_code <= 599
+        ):
+            safe["status_code"] = status_code
+        dur_ms = detail.get("dur_ms")
+        if isinstance(dur_ms, (int, float)) and not isinstance(dur_ms, bool):
+            safe["dur_ms"] = max(0.0, float(dur_ms))
+        return safe
+
+    async def _emit_model_call_event(
+        self, event_kind: str, detail: dict[str, Any]
+    ) -> None:
+        safe = dict(detail)
+        dur_ms = safe.pop("dur_ms", None)
+        try:
+            await asyncio.to_thread(
+                self.deps.emit_debug_trace,
+                self.user_id,
+                f"agent.model.call.{event_kind}",
+                trace_id=self.trace_id,
+                status=(
+                    "started"
+                    if event_kind == "start"
+                    else ("error" if event_kind == "error" else "ok")
+                ),
+                summary=(
+                    f"V2 provider round {safe['round']} {event_kind}"
+                ),
+                explain=(
+                    "记录 V2 provider 逻辑轮次、路由、耗时与闭集结束原因;"
+                    "不记录 prompt、回复、工具参数、工具结果或上游错误正文。"
+                ),
+                detail=safe,
+                dur_ms=dur_ms,
+            )
+            self.model_call_events_emitted += 1
+        except Exception as exc:  # noqa: BLE001 -- telemetry is best-effort
+            log.warning(
+                "[v2.model_call] trace failed user=%s code=%s",
+                self.user_id,
+                type(exc).__name__.lower(),
+            )
+
+    async def record_model_call(
+        self, event_kind: str, detail: dict[str, Any]
+    ) -> None:
+        """Keep all normal rounds; on overflow retain the head and latest pair."""
+        if event_kind not in {"start", "done", "error"}:
+            return
+        safe = self._safe_model_call_detail(detail)
+        self.model_call_events_observed += 1
+        if safe["round"] <= _MODEL_CALL_TRACE_HEAD_ROUNDS:
+            await self._emit_model_call_event(event_kind, safe)
+            return
+        if event_kind == "start":
+            self._model_call_tail_start = safe
+        else:
+            self._model_call_tail_terminal = (event_kind, safe)
+
+    async def _flush_model_call_tail(self) -> None:
+        if self._model_call_tail_start is not None:
+            await self._emit_model_call_event(
+                "start", self._model_call_tail_start
+            )
+            self._model_call_tail_start = None
+        if self._model_call_tail_terminal is not None:
+            event_kind, detail = self._model_call_tail_terminal
+            await self._emit_model_call_event(event_kind, detail)
+            self._model_call_tail_terminal = None
+
     async def emit_summary(self) -> None:
+        await self._flush_model_call_tail()
         detail = {
             "lane": self.lane,
             "provider_roundtrips": self.provider_roundtrips,
@@ -2225,6 +2337,14 @@ class _ProviderRoundtripTrace:
             "terminal_text_round_reason": self.terminal_text_round_reason,
             "force_text_fallback_reason": self.force_text_fallback_reason,
             "empty_response_recovery_used": self.empty_response_recovery_used,
+            "model_call_event_cap": _MODEL_CALL_TRACE_EVENT_CAP,
+            "model_call_events_observed": self.model_call_events_observed,
+            "model_call_events_emitted": self.model_call_events_emitted,
+            "model_call_events_dropped": max(
+                0,
+                self.model_call_events_observed
+                - self.model_call_events_emitted,
+            ),
         }
         if self.lane != "chat":
             detail["wake_kind"] = self.lane
@@ -9860,6 +9980,11 @@ async def _run_wake(
                     exc,
                 ),
                 on_provider_tool_surface=provider_roundtrip_trace,
+                on_provider_call_event=(
+                    provider_roundtrip_trace.record_model_call
+                    if provider_roundtrip_trace is not None
+                    else None
+                ),
                 on_empty_provider_response=(
                     _empty_provider_response_debug_callback(
                         deps, user_id, lane, trace_id
@@ -14455,6 +14580,11 @@ async def process_job(
                 exc,
             ),
             on_provider_tool_surface=provider_roundtrip_trace,
+            on_provider_call_event=(
+                provider_roundtrip_trace.record_model_call
+                if provider_roundtrip_trace is not None
+                else None
+            ),
             on_empty_provider_response=(
                 _empty_provider_response_debug_callback(
                     deps,
