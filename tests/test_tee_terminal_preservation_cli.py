@@ -6,6 +6,7 @@ from contextlib import contextmanager, nullcontext
 from unittest.mock import Mock
 
 import pytest
+import psycopg
 
 from admin import tee_terminal_preservation as cli
 from tee_replicator import terminal_preservation as preservation
@@ -15,6 +16,43 @@ def _empty_plan() -> preservation.PreservationPlan:
     return preservation.PreservationPlan(
         rows=(), sha256="a" * 64, counts={}, blockers=()
     )
+
+
+def test_apply_ignores_source_read_only_cleanup_eof_after_destination_commit(
+    monkeypatch,
+):
+    """A dead source socket after the TEE commit must not report false failure."""
+    events: list[str] = []
+
+    class Source:
+        @contextmanager
+        def transaction(self):
+            yield
+            events.append("source-cleanup")
+            raise psycopg.OperationalError("SSL EOF")
+
+        def execute(self, _sql):
+            return None
+
+    class Destination:
+        @contextmanager
+        def transaction(self):
+            yield
+            events.append("destination-committed")
+
+    plan = _empty_plan()
+    monkeypatch.setattr(preservation, "build_plan", lambda *_args: plan)
+
+    report = preservation.apply_plan(
+        Source(),
+        Destination(),
+        plan,
+        expected_count=0,
+        expected_plan_sha256="a" * 64,
+    )
+
+    assert report["ok"] is True
+    assert events == ["destination-committed", "source-cleanup"]
 
 
 def _wire_connections(

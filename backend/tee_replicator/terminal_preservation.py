@@ -16,6 +16,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Sequence
 
+from psycopg import OperationalError
 from psycopg.types.json import Jsonb
 
 
@@ -455,53 +456,64 @@ def apply_plan(
         expected_count=expected_count,
         expected_plan_sha256=expected_plan_sha256,
     )
-    with source.transaction():
-        source.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-        live_plan = build_plan(source, destination)
-        _assert_approved(
-            live_plan,
-            expected_count=expected_count,
-            expected_plan_sha256=expected_plan_sha256,
-        )
-        inserted = exact = marked = 0
-        with destination.transaction():
-            for row in live_plan.rows:
-                contract = CONTRACTS[row.table]
-                if row.destination_state == "absent":
-                    destination.execute(
-                        contract.insert_sql, contract.insert_args(row.source_row)
+    result = None
+    try:
+        with source.transaction():
+            source.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            live_plan = build_plan(source, destination)
+            _assert_approved(
+                live_plan,
+                expected_count=expected_count,
+                expected_plan_sha256=expected_plan_sha256,
+            )
+            inserted = exact = marked = 0
+            with destination.transaction():
+                for row in live_plan.rows:
+                    contract = CONTRACTS[row.table]
+                    if row.destination_state == "absent":
+                        destination.execute(
+                            contract.insert_sql, contract.insert_args(row.source_row)
+                        )
+                        inserted += 1
+                    else:
+                        exact += 1
+                    marker = encode_preserved_reason(
+                        row.row_sha256, row.original_reason
                     )
-                    inserted += 1
-                else:
-                    exact += 1
-                marker = encode_preserved_reason(
-                    row.row_sha256, row.original_reason
-                )
-                if row.current_reason == marker:
-                    marked += 1
-                else:
-                    changed = destination.execute(
-                        "UPDATE tee_pending_device_migration SET reason=%s,marked_at=now() "
-                        "WHERE user_id=%s AND table_name=%s AND item_id=%s AND reason=%s",
-                        (
-                            marker,
-                            row.user_id,
-                            row.table,
-                            row.item_id,
-                            row.current_reason,
-                        ),
-                    ).rowcount
-                    if changed != 1:
-                        raise PreservationRefused("preservation_marker_changed")
-                    marked += changed
-    return {
-        "ok": True,
-        "preserved": marked,
-        "inserted": inserted,
-        "already_exact": exact,
-        "counts": live_plan.counts,
-        "plan_sha256": live_plan.sha256,
-    }
+                    if row.current_reason == marker:
+                        marked += 1
+                    else:
+                        changed = destination.execute(
+                            "UPDATE tee_pending_device_migration SET reason=%s,marked_at=now() "
+                            "WHERE user_id=%s AND table_name=%s AND item_id=%s AND reason=%s",
+                            (
+                                marker,
+                                row.user_id,
+                                row.table,
+                                row.item_id,
+                                row.current_reason,
+                            ),
+                        ).rowcount
+                        if changed != 1:
+                            raise PreservationRefused("preservation_marker_changed")
+                        marked += changed
+            result = {
+                "ok": True,
+                "preserved": marked,
+                "inserted": inserted,
+                "already_exact": exact,
+                "counts": live_plan.counts,
+                "plan_sha256": live_plan.sha256,
+            }
+    except OperationalError:
+        # The source transaction is read-only.  Once the destination context
+        # has exited and ``result`` exists, TEE has committed atomically; a
+        # later EOF while committing/cleaning up the source snapshot cannot
+        # invalidate that destination commit and must not report false failure.
+        if result is None:
+            raise
+    assert result is not None
+    return result
 
 
 def revert_plan(
