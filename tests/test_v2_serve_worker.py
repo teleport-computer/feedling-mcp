@@ -617,6 +617,28 @@ def test_v2_debug_trace_user_seam_resolves_store_and_preserves_duration(monkeypa
     ]
 
 
+def test_job_enqueue_trace_uses_trace_id_as_turn_id(monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        serve_worker,
+        "_emit_v2_debug_trace_for_user",
+        lambda user_id, event_type, **kwargs: captured.append(
+            (user_id, event_type, kwargs)
+        ),
+    )
+
+    serve_worker._emit_job_enqueued_trace(
+        "usr_enqueue",
+        "capture",
+        reason="quiet_window",
+        trace_id="trace-enqueue-123",
+    )
+
+    assert captured[0][0:2] == ("usr_enqueue", "agent.job.enqueued")
+    assert captured[0][2]["trace_id"] == "trace-enqueue-123"
+    assert captured[0][2]["turn_id"] == "trace-enqueue-123"
+
+
 @pytest.mark.parametrize(
     "event_type",
     ["mcp.surface.schema_folded", "mcp.surface.schema_recovered"],
@@ -681,10 +703,12 @@ def test_v2_debug_trace_payload_preserves_turn_trace_id(monkeypatch):
         explain="content-free",
         detail={"lane": "chat"},
         trace_id="trace-current-turn",
+        turn_id="turn-current-turn",
     )
 
     assert captured[0][0] is store
     assert captured[0][1]["event"]["trace_id"] == "trace-current-turn"
+    assert captured[0][1]["event"]["turn_id"] == "turn-current-turn"
 
 
 def test_context_truncation_reaches_final_debug_event_without_upstream_content(

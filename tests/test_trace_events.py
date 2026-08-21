@@ -28,6 +28,7 @@ from admin import trace_events_monitor as monitor  # noqa: E402
 from admin import trace_events_partitions as partitions  # noqa: E402
 from core import leader as core_leader  # noqa: E402
 from core.reqctx import bind  # noqa: E402
+from model_api_runtime.v2 import jobs_store  # noqa: E402
 
 
 _ZONE = ZoneInfo("Asia/Shanghai")
@@ -177,13 +178,17 @@ def test_terminal_trace_reuses_the_job_trace_id(
         "trace_id": "trace-abc-123",
     }
     deps = types.SimpleNamespace(emit_debug_trace=_emit)
-    _asyncio.run(worker._emit_job_terminal_trace(deps, job, outcome))
+    _asyncio.run(worker._emit_job_terminal_trace(
+        deps, job, outcome, dur_ms=12.5,
+    ))
 
     assert len(captured) == 1
     user_id, event_type, kwargs = captured[0]
     assert event_type == "agent.job.terminal"
     assert kwargs["trace_id"] == job["trace_id"]      # the load-bearing one
+    assert kwargs["turn_id"] == job["trace_id"]
     assert kwargs["job_id"] == "4242"
+    assert kwargs["dur_ms"] == 12.5
     assert kwargs["status"] == expect_status
     assert kwargs["detail"]["lane"] == lane
     if expect_class is None:
@@ -192,6 +197,30 @@ def test_terminal_trace_reuses_the_job_trace_id(
         assert "outcome_class" not in kwargs
     else:
         assert kwargs["outcome_class"] == expect_class
+
+
+def test_run_turn_measures_terminal_duration(monkeypatch):
+    """The wrapper owns whole-turn elapsed time for every return path."""
+    import asyncio as _asyncio
+    from model_api_runtime.v2 import worker
+
+    ticks = iter((1_000_000_000, 1_012_500_000))
+    captured = []
+
+    async def _completed(_job, _deps, *, enclave_sem=None):
+        return "completed"
+
+    async def _terminal(_deps, _job, _outcome, *, dur_ms):
+        captured.append(dur_ms)
+
+    monkeypatch.setattr(worker.time, "monotonic_ns", lambda: next(ticks))
+    monkeypatch.setattr(worker, "_run_turn_body", _completed)
+    monkeypatch.setattr(worker, "_emit_job_terminal_trace", _terminal)
+
+    assert _asyncio.run(worker._run_turn(
+        {"id": 1, "user_id": "u", "lane": "heartbeat"}, object(),
+    )) == "completed"
+    assert captured == [12.5]
 
 
 def test_drained_turn_does_not_emit_an_invented_failure(monkeypatch):
@@ -208,7 +237,7 @@ def test_drained_turn_does_not_emit_an_invented_failure(monkeypatch):
     captured = []
     monkeypatch.setattr(
         worker, "_emit_job_terminal_trace",
-        lambda deps, job, outcome: captured.append(outcome) or _noop(),
+        lambda deps, job, outcome, *, dur_ms: captured.append(outcome) or _noop(),
     )
 
     async def _noop():
@@ -243,7 +272,11 @@ def test_body_failure_without_a_terminal_row_emits_nothing(durable_status, monke
     deps = types.SimpleNamespace(
         emit_debug_trace=lambda uid, et, **kw: captured.append(kw))
     _asyncio.run(worker._emit_job_terminal_trace(
-        deps, {"id": 5, "user_id": "u", "lane": "heartbeat", "trace_id": "t"}, "failed"))
+        deps,
+        {"id": 5, "user_id": "u", "lane": "heartbeat", "trace_id": "t"},
+        "failed",
+        dur_ms=1.0,
+    ))
     assert captured == []
 
 
@@ -276,6 +309,114 @@ def test_enqueue_rollback_leaves_no_job_and_fires_no_hook(tee_primary, monkeypat
                 "SELECT count(*) FROM agent_jobs WHERE user_id=%s", (uid,)
             ).fetchone()[0]
         assert left == 0                        # ...and the insert really rolled back
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM agent_jobs WHERE user_id=%s", (uid,))
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
+@pytest.mark.parametrize("lane", sorted(jobs_store.LANES - {"chat"}))
+def test_non_chat_enqueue_mints_joinable_trace_id_when_producer_omits_it(
+    tee_primary, monkeypatch, lane,
+):
+    """Every real background enqueue must have one id shared by row and hook."""
+    uid = _uid()
+    db.upsert_user({"user_id": uid, "created_at": datetime.now(_ZONE).isoformat()})
+    calls = []
+    monkeypatch.setattr(
+        jobs_store,
+        "on_job_enqueued",
+        lambda user_id, event_lane, **kwargs: calls.append(
+            (user_id, event_lane, kwargs)
+        ),
+    )
+    try:
+        job_id, coalesced = jobs_store.enqueue_job(
+            uid, lane, reason=f"{lane}_due", trace_id=None,
+        )
+        assert coalesced is False
+        with db.get_pool().connection() as conn:
+            row_trace_id = conn.execute(
+                "SELECT trace_id FROM agent_jobs WHERE id=%s AND user_id=%s",
+                (job_id, uid),
+            ).fetchone()[0]
+
+        assert isinstance(row_trace_id, str) and row_trace_id
+        assert calls == [(
+            uid,
+            lane,
+            {"reason": f"{lane}_due", "trace_id": row_trace_id},
+        )]
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM agent_jobs WHERE user_id=%s", (uid,))
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
+def test_non_chat_enqueue_preserves_semantic_producer_trace_id(
+    tee_primary, monkeypatch,
+):
+    """A wake/message id supplied by a producer must never be replaced."""
+    from model_api_runtime.v2 import jobs_store
+
+    uid = _uid()
+    db.upsert_user({"user_id": uid, "created_at": datetime.now(_ZONE).isoformat()})
+    calls = []
+    monkeypatch.setattr(
+        jobs_store,
+        "on_job_enqueued",
+        lambda _uid, _lane, **kwargs: calls.append(kwargs),
+    )
+    try:
+        job_id, coalesced = jobs_store.enqueue_job(
+            uid,
+            "scheduled",
+            reason="scheduled_wake",
+            trace_id="wake-semantic-123",
+        )
+        assert coalesced is False
+        with db.get_pool().connection() as conn:
+            row_trace_id = conn.execute(
+                "SELECT trace_id FROM agent_jobs WHERE id=%s AND user_id=%s",
+                (job_id, uid),
+            ).fetchone()[0]
+        assert row_trace_id == "wake-semantic-123"
+        assert calls == [{
+            "reason": "scheduled_wake",
+            "trace_id": "wake-semantic-123",
+        }]
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM agent_jobs WHERE user_id=%s", (uid,))
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
+def test_chat_enqueue_does_not_invent_a_nonsemantic_turn_id(
+    tee_primary, monkeypatch,
+):
+    """Chat correlation must remain a real message id, never a random token."""
+    from model_api_runtime.v2 import jobs_store
+
+    uid = _uid()
+    db.upsert_user({"user_id": uid, "created_at": datetime.now(_ZONE).isoformat()})
+    calls = []
+    monkeypatch.setattr(
+        jobs_store,
+        "on_job_enqueued",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    try:
+        job_id, coalesced = jobs_store.enqueue_job(
+            uid, "chat", reason="ordered_followup", trace_id=None,
+        )
+        assert coalesced is False
+        with db.get_pool().connection() as conn:
+            row_trace_id = conn.execute(
+                "SELECT trace_id FROM agent_jobs WHERE id=%s AND user_id=%s",
+                (job_id, uid),
+            ).fetchone()[0]
+        assert row_trace_id is None
+        assert calls == []
     finally:
         with db.get_pool().connection() as conn:
             conn.execute("DELETE FROM agent_jobs WHERE user_id=%s", (uid,))
@@ -320,7 +461,9 @@ def test_terminal_attribution_reads_the_durable_row_not_the_claim_snapshot(monke
         emit_debug_trace=lambda uid, et, **kw: captured.append(kw))
     stale = {"id": 9, "user_id": "u", "lane": "heartbeat", "trace_id": "t",
              "last_error": "previous_attempt_boom"}
-    _asyncio.run(worker._emit_job_terminal_trace(deps, stale, "failed"))
+    _asyncio.run(worker._emit_job_terminal_trace(
+        deps, stale, "failed", dur_ms=1.0,
+    ))
 
     assert captured[0]["detail"]["error_code"] == "turns_halted"
     assert captured[0]["outcome_class"] == "control"   # not operational_failure
@@ -333,7 +476,11 @@ def test_terminal_trace_skips_chat_and_survives_a_broken_sink():
     seen = []
     deps = types.SimpleNamespace(emit_debug_trace=lambda *a, **k: seen.append(a))
     _asyncio.run(worker._emit_job_terminal_trace(
-        deps, {"id": 1, "user_id": "u", "lane": "chat", "trace_id": "t"}, "failed"))
+        deps,
+        {"id": 1, "user_id": "u", "lane": "chat", "trace_id": "t"},
+        "failed",
+        dur_ms=1.0,
+    ))
     assert seen == []  # chat is traced on its own send path
 
     def _boom(*a, **k):
@@ -342,7 +489,10 @@ def test_terminal_trace_skips_chat_and_survives_a_broken_sink():
     # A turn must not fail because its observability failed.
     _asyncio.run(worker._emit_job_terminal_trace(
         types.SimpleNamespace(emit_debug_trace=_boom),
-        {"id": 2, "user_id": "u", "lane": "heartbeat", "trace_id": "t"}, "failed"))
+        {"id": 2, "user_id": "u", "lane": "heartbeat", "trace_id": "t"},
+        "failed",
+        dur_ms=1.0,
+    ))
 
 
 def test_enqueue_hook_fires_after_commit_and_skips_chat():
@@ -412,6 +562,20 @@ def test_detail_list_caps_cannot_drift_past_the_silent_ceiling():
     assert safe["collapsed_names_total"] == len(names)
     # A caller asking for more than the ceiling is clamped, not silently obeyed.
     assert len(debug_trace.bounded_names("k", names, cap=999)["k"]) <= debug_trace._DETAIL_MAX_LIST
+
+
+def test_safe_detail_preserves_json_null_instead_of_inventing_none_string():
+    safe = debug_trace._safe_detail({
+        "reason": None,
+        "nested": {"reason": None},
+        "items": [None, "real"],
+    })
+
+    assert safe == {
+        "reason": None,
+        "nested": {"reason": None},
+        "items": [None, "real"],
+    }
 
 
 def test_emit_payload_forwards_job_id_and_outcome_class(tee_primary, monkeypatch):

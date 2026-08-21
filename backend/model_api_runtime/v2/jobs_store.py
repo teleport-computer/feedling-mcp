@@ -341,6 +341,22 @@ TIMEOUT_OUTCOME_CODES = frozenset({
 on_job_enqueued = None
 
 
+def _trace_id_for_enqueue(lane: str, trace_id: object | None) -> str | None:
+    """Give every background job a join key without rewriting producer ids.
+
+    Chat trace ids are message/turn ids, not arbitrary correlation tokens.  A
+    few recovery/follow-up chat producers intentionally have no single source
+    message, so inventing an id there would lie to the activity projection.
+    Every other lane may safely use a generated correlation id when its
+    producer has none.  Keeping this decision at the queue boundary prevents a
+    newly added background producer from silently creating unjoinable traces.
+    """
+    if lane == "chat":
+        return None if trace_id is None else str(trace_id)
+    supplied = str(trace_id or "").strip()
+    return supplied or uuid.uuid4().hex
+
+
 def _notify_job_enqueued(
     user_id: str,
     lane: str,
@@ -1001,6 +1017,7 @@ def enqueue_job(
     """
     if lane not in LANES:
         raise ValueError(f"unknown lane: {lane!r}")
+    trace_id = _trace_id_for_enqueue(lane, trace_id)
     if priority is None:
         priority = LANE_PRIORITY.get(lane, 0)
 
@@ -1102,6 +1119,7 @@ def enqueue_job_with_context_log(
         raise ValueError(f"unknown lane: {lane!r}")
     if not str(context_stream).strip():
         raise ValueError("context_stream is required")
+    trace_id = _trace_id_for_enqueue(lane, trace_id)
     if priority is None:
         priority = LANE_PRIORITY.get(lane, 0)
 

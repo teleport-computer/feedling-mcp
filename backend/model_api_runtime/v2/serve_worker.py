@@ -4696,7 +4696,7 @@ async def _load_mcp_turn_observed(store, *, lane: str = "chat", **kwargs):
 def _emit_v2_debug_trace(store, event_type: str, *, status: str,
                          detail: dict, summary: str = "", explain: str = "",
                          dur_ms: float | None = None,
-                         trace_id: str = "", job_id: str = "",
+                         trace_id: str = "", turn_id: str = "", job_id: str = "",
                          outcome_class: str = "") -> None:
     from diagnostics import diagnostics_core
 
@@ -4709,6 +4709,8 @@ def _emit_v2_debug_trace(store, event_type: str, *, status: str,
         event["dur_ms"] = dur_ms
     # Added only when supplied, so the ~40 existing call sites keep emitting a
     # byte-identical payload.
+    if turn_id:
+        event["turn_id"] = str(turn_id)
     if job_id:
         event["job_id"] = str(job_id)
     if outcome_class:
@@ -5009,6 +5011,7 @@ def _emit_job_enqueued_trace(user_id: str, lane: str, *, reason: str, trace_id: 
         "agent.job.enqueued",
         status="ok",
         trace_id=trace_id,
+        turn_id=trace_id,
         detail={"lane": lane, "reason": reason, "enqueue_source": lane},
     )
 
