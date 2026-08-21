@@ -14935,17 +14935,26 @@ async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
 
     The signature is deliberately unchanged: many tests patch this seam.
     """
+    # Execution only; queue-inclusive elapsed time is terminal.ts - enqueued.ts.
+    started_ns = time.monotonic_ns()
     outcome = await _run_turn_body(job, deps, enclave_sem=enclave_sem)
     # Deliberately NOT a finally: a finally also runs for CancelledError and for
     # any unhandled BaseException, and would then emit outcome="failed" for a
     # turn that was merely drained -- inventing a failure that never happened.
     # Every terminal path inside the body returns an outcome, so returning is
     # the honest signal that a terminal state was reached.
-    await _emit_job_terminal_trace(deps, job, outcome)
+    dur_ms = max(0.0, (time.monotonic_ns() - started_ns) / 1_000_000)
+    await _emit_job_terminal_trace(deps, job, outcome, dur_ms=dur_ms)
     return outcome
 
 
-async def _emit_job_terminal_trace(deps: TurnDeps, job: dict, outcome: str) -> None:
+async def _emit_job_terminal_trace(
+    deps: TurnDeps,
+    job: dict,
+    outcome: str,
+    *,
+    dur_ms: float,
+) -> None:
     """Record the terminal half of the enqueue->terminal pair.
 
     Carries the job's own ``trace_id`` rather than minting one: a fresh id
@@ -14996,7 +15005,9 @@ async def _emit_job_terminal_trace(deps: TurnDeps, job: dict, outcome: str) -> N
         kwargs = {
             "status": status,
             "trace_id": str(job.get("trace_id") or ""),
+            "turn_id": str(job.get("trace_id") or ""),
             "job_id": str(job.get("id") or ""),
+            "dur_ms": max(0.0, float(dur_ms)),
             "detail": {"lane": lane, "outcome": outcome, "error_code": error_code},
         }
         # outcome_class has no success member, so it is only meaningful on an
