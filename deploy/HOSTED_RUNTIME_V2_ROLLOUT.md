@@ -1,10 +1,13 @@
 # Hosted Runtime V2 — Deployment and Recovery Runbook
 
-> **Current source of truth — 2026-07-20.** Hosted model-API execution is
-> Runtime V2-only in local, test, pre, and production manifests. There is no
-> hosted resident rollback, per-user runtime selector, supervisor service, or
-> empty resident roster to preserve. The independent user-operated
-> `feedling-chat-resident` path is separate and is not a hosted fallback.
+> **⚠️ Superseded 2026-07-21/22 by dual-runtime coexistence.** This runbook is
+> the historical 2026-07-20 V2-only deployment/recovery record, not the current
+> managed-runtime source of truth. Production, test, and pre now set
+> `FEEDLING_HOSTED_RUNTIME_POLICY="dual"`; per-user ownership can select the
+> restored hosted resident path or Runtime V2. Use the dual-runtime section in
+> [`DEPLOYMENTS.md`](DEPLOYMENTS.md) and the actual environment compose value
+> for current topology. The independent user-operated `feedling-chat-resident`
+> path remains separate from hosted execution.
 
 ## Topology
 
@@ -32,9 +35,11 @@ Authoritative manifests:
 - local: `deploy/docker-compose.yaml` plus
   `deploy/docker-compose.agent-runner.yaml`.
 
-Every backend manifest sets `FEEDLING_HOSTED_RUNTIME_POLICY: "v2_only"`
-literally. Any other policy value fails startup. Every runner manifest exposes
-exactly one service named `serve-worker`.
+In the historical V2-only snapshot documented here, backend manifests set
+`FEEDLING_HOSTED_RUNTIME_POLICY: "v2_only"`. That is no longer true of the
+production, test, or pre manifests: each now sets the policy to `"dual"` in its
+main backend and pooled worker. Treat the compose file's actual value as the
+deployment fact; do not use this historical runbook to infer current policy.
 
 ## Required configuration
 
@@ -94,6 +99,13 @@ Clear erase prepared content, and Capture failures never create a chat-visible
 error. Ordinary Memory retype operations also load and mutate their target only
 inside the shared cross-process Garden fence, so they cannot restore a stale
 pre-Capture ciphertext or supersede state.
+
+> ⚠️ **Historical V2-only cleanup instructions; do not apply to the current
+> `dual` topology.** Current prod/test/pre V1 runner manifests still pass
+> `FEEDLING_HOST_ALL`, `AGENT_RUNTIME_USERS`, and
+> `AGENT_RUNTIME_AUTODISCOVER`, and `supervisor.py` consumes them. Do not remove
+> or forbid those controls based on this section. The compose file's actual
+> value is the deployment fact; this historical text does not override it.
 
 Do not set `FEEDLING_HOST_ALL`, `AGENT_RUNTIME_USERS`,
 `AGENT_RUNTIME_AUTODISCOVER`, `AGENT_RUNTIME_MAX_CHILDREN`, or a
@@ -238,6 +250,14 @@ instead of leaving a message permanently in `processing`.
 
 ## Recovery — no resident rollback
 
+> ⚠️ **Historical 2026-07-20 V2-only recovery procedure.** Current
+> prod/test/pre are `dual`: `resident_cli` is a valid per-user ownership state,
+> and production has a dedicated agent-runner CVM running `supervisor.py`. The
+> "deliberately unavailable" statement below is no longer true; do not use this
+> section to classify or shut down current components. Follow the current
+> dual-runtime topology in [`DEPLOYMENTS.md`](DEPLOYMENTS.md) and the actual
+> compose values.
+
 Do not try to recover a hosted incident by selecting `resident_cli` or starting
 an old supervisor image. Those paths are deliberately unavailable.
 
@@ -261,6 +281,14 @@ accounts deliberately configured for that separate product route. It cannot
 claim hosted V2 accounts and is not part of this incident procedure.
 
 ## Release checklist
+
+> ⚠️ **Historical checklist; do not execute against the current `dual`
+> topology.** Its `v2_only`, `only serve-worker`, and `no hosted resident
+> supervisor` checks conflict with current prod/test/pre compose. Forcing
+> `v2_only` would fail closed with HTTP 503 for every hosted user whose fence is
+> `resident_cli`; shutting down the supervisor would remove a current production
+> deployment unit. Validate releases against current compose and
+> [`DEPLOYMENTS.md`](DEPLOYMENTS.md) instead.
 
 - [ ] Backend manifests render literal `v2_only`.
 - [ ] Runner manifests render only `serve-worker` with no volumes.
