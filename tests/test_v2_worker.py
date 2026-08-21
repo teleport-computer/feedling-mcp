@@ -147,6 +147,26 @@ def test_v2_turn_failure_classification_uses_shared_notice_vocabulary(exc, expec
     assert worker._turn_failure_error_class(exc) == expected
 
 
+@pytest.mark.parametrize("status_code", [408, 500])
+def test_image_generation_wrapper_keeps_internal_http_diagnostics(status_code):
+    upstream_detail = f"IMAGE_WORKER_UPSTREAM_{status_code}_SECRET"
+    try:
+        provider_client._raise_for_provider_status(
+            provider_client.httpx.Response(status_code, text=upstream_detail)
+        )
+    except provider_client.ProviderError as exc:
+        failure = worker._image_generation_unavailable_from_exception(
+            exc,
+            _BYOK,
+        )
+    else:
+        raise AssertionError("expected injected provider failure")
+
+    assert failure.status_code == status_code
+    assert failure.upstream_detail == upstream_detail
+    assert upstream_detail not in str(failure)
+
+
 class _FakeCapResult:
     def __init__(self, data=None, ok=True):
         self._data = data or {}

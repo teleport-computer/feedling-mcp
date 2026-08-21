@@ -2551,6 +2551,15 @@ async def _generate_image_for_chat(
         )
     except Exception as exc:  # noqa: BLE001 - stable capability surface
         classified = provider_client.classify_provider_error(exc)
+        raw_status_code = getattr(exc, "status_code", None)
+        status_code = (
+            raw_status_code if isinstance(raw_status_code, int) else None
+        )
+        upstream_detail = str(
+            getattr(exc, "upstream_detail", "")
+            or getattr(exc, "response_detail", "")
+            or ""
+        )[:240]
         incompatible = classified in {"provider_config", "provider_incompatible"} or (
             str(exc).strip().lower()
             in {"image_generation_model_unsupported", "image_generation_invalid_output"}
@@ -2591,7 +2600,19 @@ async def _generate_image_for_chat(
                 "error_code": code,
                 "classified": classified,
                 "incompatible": incompatible,
+                "status_code": status_code,
             },
+        )
+        log.warning(
+            "[v2.image] generation failed user=%s provider=%s model=%s "
+            "error=%s code=%s status=%s upstream_detail=%r",
+            str(user_id)[:8],
+            _image_route_detail["provider"],
+            _image_route_detail["model"],
+            type(exc).__name__,
+            code,
+            status_code,
+            upstream_detail,
         )
         if isinstance(route, dict) and route.get("id"):
             await asyncio.to_thread(
@@ -2616,6 +2637,8 @@ async def _generate_image_for_chat(
             error_code=code,
             model=str(getattr(config, "model", "") or ""),
             provider=str(getattr(config, "provider", "") or ""),
+            status_code=status_code,
+            upstream_detail=upstream_detail,
         ) from exc
 
     target = route

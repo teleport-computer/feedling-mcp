@@ -2947,6 +2947,8 @@ def test_image_generation_failure_is_handed_back_instead_of_killing_the_turn(mon
 
     class _ConfiguredRouteMissing(RuntimeError):
         error_code = "image_generation_model_required"
+        status_code = 500
+        upstream_detail = "IMAGE_UPSTREAM_SECRET_NOT_MODEL_VISIBLE"
 
     async def on_image_reply(args):
         raise _ConfiguredRouteMissing("image route missing")
@@ -2982,6 +2984,10 @@ def test_image_generation_failure_is_handed_back_instead_of_killing_the_turn(mon
     assert image_result.metadata == {
         "image_generation_result_code": "image_generation_model_required"
     }
+    assert "IMAGE_UPSTREAM_SECRET_NOT_MODEL_VISIBLE" not in image_result.content
+    assert "IMAGE_UPSTREAM_SECRET_NOT_MODEL_VISIBLE" not in json.dumps(
+        image_result.metadata
+    )
 
 
 def test_unbacked_image_claim_is_bounced_once_then_let_through(monkeypatch):
