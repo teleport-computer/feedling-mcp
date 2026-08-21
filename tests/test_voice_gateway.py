@@ -20,12 +20,116 @@ sys.path.insert(0, str(ROOT / "backend"))
 from core import voice_token
 from core import store as core_store
 import db
+import debug_trace
 from enclave.routes import chat as enclave_chat
 from hosted import chat_send_core
 from voice import results
 from voice import routes_asgi
 from voice import cleanup as voice_cleanup
 from voice.message_filter import is_meaningful_voice_message
+
+
+def _voice_gateway_payload(*, skip_turn=False):
+    payload = {
+        "elevenlabs_extra_body": {
+            "io_voice_token": "signed-token",
+            "io_call_id": "call-1",
+        },
+        "messages": [{
+            "role": "user",
+            "content": "PRIVATE SPOKEN WORDS MUST NOT ENTER TRACE",
+        }],
+    }
+    if skip_turn:
+        payload["tools"] = [{
+            "type": "function",
+            "function": {"name": "skip_turn", "parameters": {}},
+        }]
+    return payload
+
+
+def _install_voice_gateway_turn(
+    monkeypatch,
+    *,
+    send_body,
+    send_status,
+    runtime="v2",
+    current=True,
+    reply=None,
+    snapshots=None,
+):
+    events = []
+
+    async def read_payload(_request):
+        return _voice_gateway_payload(skip_turn=True)
+
+    async def run_db(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(routes_asgi.asgi_http, "read_json_silent", read_payload)
+    monkeypatch.setattr(routes_asgi.threadpool, "run_db", run_db)
+    monkeypatch.setattr(routes_asgi.results, "secret", lambda: b"voice-secret")
+    monkeypatch.setattr(
+        routes_asgi.voice_token,
+        "verify",
+        lambda _secret, _token: {"call_id": "call-1", "user_id": "user-1"},
+    )
+    monkeypatch.setattr(db, "voice_call_status", lambda *_args: "active")
+    monkeypatch.setattr(
+        core_store,
+        "get_store",
+        lambda user_id: SimpleNamespace(user_id=user_id),
+    )
+    monkeypatch.setattr(
+        routes_asgi,
+        "_is_resident_voice_runtime",
+        lambda _store: runtime == "resident",
+    )
+    monkeypatch.setattr(
+        routes_asgi.results,
+        "mint_enclave_token",
+        lambda _user_id: "runtime-token",
+    )
+    monkeypatch.setattr(
+        routes_asgi,
+        "_resident_voice_send_core",
+        lambda *_args, **_kwargs: (send_body, send_status),
+    )
+    monkeypatch.setattr(
+        routes_asgi.chat_send_core,
+        "model_api_chat_send_core",
+        lambda *_args, **_kwargs: (send_body, send_status),
+    )
+    monkeypatch.setattr(
+        routes_asgi.results,
+        "is_current_voice_turn",
+        lambda *_args, **_kwargs: current() if callable(current) else current,
+    )
+    monkeypatch.setattr(
+        routes_asgi.results,
+        "load_stream_texts",
+        lambda *_args, **_kwargs: list(snapshots or []),
+    )
+    monkeypatch.setattr(
+        routes_asgi.results,
+        "load_reply",
+        lambda *_args, **_kwargs: reply,
+    )
+    monkeypatch.setattr(routes_asgi, "_failed_turn_result", lambda *_args: None)
+    monkeypatch.setattr(
+        debug_trace,
+        "trace_event",
+        lambda _store, **kwargs: events.append(kwargs),
+    )
+    return events
+
+
+def _collect_streaming_response(response) -> str:
+    async def collect() -> str:
+        chunks = [chunk async for chunk in response.body_iterator]
+        return "".join(chunks)
+
+    return asyncio.run(collect())
 
 
 def test_internal_voice_delta_requires_voice_reply_scope():
@@ -611,6 +715,232 @@ def test_gateway_does_not_persist_or_run_non_speech_turn(monkeypatch):
     # 它必须仍是协议合法的(带正文),否则 ElevenLabs 会拆掉整通电话 ——
     # 见 test_ignored_voice_turn_still_returns_a_protocol_valid_completion。
     assert '"content"' in body
+
+
+def test_voice_gateway_traces_runtime_rejection_without_changing_http_200(
+    monkeypatch,
+):
+    private_error_text = "PRIVATE RUNTIME ERROR MUST NOT ENTER TRACE"
+    events = _install_voice_gateway_turn(
+        monkeypatch,
+        send_body={"error": "rate_limited", "detail": private_error_text},
+        send_status=429,
+        runtime="v2",
+    )
+
+    response = asyncio.run(
+        routes_asgi.voice_chat_completions(SimpleNamespace())
+    )
+    streamed = _collect_streaming_response(response)
+
+    assert response.status_code == 200
+    assert "data: [DONE]" in streamed
+    assert [event["type"] for event in events] == [
+        "voice.gateway.turn.started",
+        "voice.gateway.runtime.selected",
+        "voice.gateway.turn.runtime_rejected",
+    ]
+    terminal = events[-1]
+    assert terminal["status"] == "error"
+    assert terminal["detail"]["exit"] == "runtime_rejected"
+    assert terminal["detail"]["runtime"] == "v2"
+    assert terminal["detail"]["error_code"] == "rate_limited"
+    assert terminal["detail"]["runtime_status"] == 429
+    assert terminal["detail"]["gateway_http_status"] == 200
+    serialized = json.dumps(events)
+    assert "PRIVATE SPOKEN WORDS" not in serialized
+    assert private_error_text not in serialized
+
+
+def test_voice_gateway_traces_missing_message_id_as_real_http_502(monkeypatch):
+    events = _install_voice_gateway_turn(
+        monkeypatch,
+        send_body={},
+        send_status=202,
+        runtime="resident",
+    )
+
+    response = asyncio.run(
+        routes_asgi.voice_chat_completions(SimpleNamespace())
+    )
+
+    assert response.status_code == 502
+    assert [event["type"] for event in events][-1] == (
+        "voice.gateway.turn.not_accepted"
+    )
+    terminal = events[-1]
+    assert terminal["status"] == "error"
+    assert terminal["detail"]["exit"] == "message_id_missing"
+    assert terminal["detail"]["runtime"] == "resident"
+    assert terminal["detail"]["error_code"] == "voice_turn_not_accepted"
+    assert terminal["detail"]["gateway_http_status"] == 502
+    assert "PRIVATE SPOKEN WORDS" not in json.dumps(events)
+
+
+def test_voice_gateway_traces_deadline_timeout_with_duration(monkeypatch):
+    events = _install_voice_gateway_turn(
+        monkeypatch,
+        send_body={"user_message": {"id": "message-1"}},
+        send_status=202,
+        runtime="v2",
+    )
+    monotonic_values = iter([10.0, 10.0, 126.0])
+    monkeypatch.setattr(
+        routes_asgi,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: next(monotonic_values, 126.0),
+            time=lambda: 1_700_000_000.0,
+        ),
+    )
+
+    response = asyncio.run(
+        routes_asgi.voice_chat_completions(SimpleNamespace())
+    )
+    streamed = _collect_streaming_response(response)
+
+    assert response.status_code == 200
+    assert routes_asgi.notices_catalog.user_text_for("turn_timeout") in streamed
+    timed_out = [
+        event
+        for event in events
+        if event["type"] == "voice.gateway.turn.timed_out"
+    ]
+    assert len(timed_out) == 1
+    assert timed_out[0]["status"] == "error"
+    assert timed_out[0]["detail"]["exit"] == "deadline_timeout"
+    assert timed_out[0]["detail"]["error_code"] == "turn_timeout"
+    assert timed_out[0]["dur_ms"] == 116_000.0
+    assert "PRIVATE SPOKEN WORDS" not in json.dumps(events)
+
+
+@pytest.mark.parametrize(
+    ("expected_stage", "current_values", "snapshots", "reply"),
+    [
+        ("revision_check", [False], [], None),
+        (
+            "before_content",
+            [True, False],
+            [{"segment": 0, "text": "PRIVATE STREAM TEXT", "is_final": False}],
+            None,
+        ),
+        (
+            "before_final",
+            [True, False],
+            [],
+            {"message_id": "reply-1", "text": "PRIVATE FINAL REPLY"},
+        ),
+    ],
+)
+def test_voice_gateway_traces_superseded_skip_turn(
+    monkeypatch, expected_stage, current_values, snapshots, reply
+):
+    current_iter = iter(current_values)
+    current = lambda: next(current_iter, current_values[-1])
+    events = _install_voice_gateway_turn(
+        monkeypatch,
+        send_body={"user_message": {"id": "message-1"}},
+        send_status=202,
+        runtime="v2",
+        current=current,
+        snapshots=snapshots,
+        reply=reply,
+    )
+
+    response = asyncio.run(
+        routes_asgi.voice_chat_completions(SimpleNamespace())
+    )
+    streamed = _collect_streaming_response(response)
+
+    superseded = [
+        event
+        for event in events
+        if event["type"] == "voice.gateway.turn.superseded"
+    ]
+    assert len(superseded) == 1
+    assert superseded[0]["status"] == "cancelled"
+    assert superseded[0]["detail"]["exit"] == "superseded"
+    assert superseded[0]["detail"]["stage"] == expected_stage
+    assert superseded[0]["detail"]["skip_turn_available"] is True
+    assert "skip_turn" in streamed
+    serialized = json.dumps(events)
+    assert "PRIVATE SPOKEN WORDS" not in serialized
+    assert "PRIVATE STREAM TEXT" not in serialized
+    assert "PRIVATE FINAL REPLY" not in serialized
+
+
+def test_voice_gateway_traces_reply_source_without_reply_body(monkeypatch):
+    private_reply = "PRIVATE MODEL REPLY MUST NOT ENTER TRACE"
+    events = _install_voice_gateway_turn(
+        monkeypatch,
+        send_body={"user_message": {"id": "message-1"}},
+        send_status=202,
+        runtime="v2",
+        reply={"message_id": "reply-1", "text": private_reply},
+    )
+
+    response = asyncio.run(
+        routes_asgi.voice_chat_completions(SimpleNamespace())
+    )
+    streamed = _collect_streaming_response(response)
+
+    replies = [
+        event
+        for event in events
+        if event["type"] == "voice.gateway.reply.received"
+    ]
+    assert len(replies) == 1
+    assert replies[0]["status"] == "ok"
+    assert replies[0]["detail"]["reply_source"] == "stored_reply"
+    spoken = "".join(
+        (json.loads(line[6:])["choices"][0]["delta"] or {}).get("content")
+        or ""
+        for line in streamed.splitlines()
+        if line.startswith("data: ") and line.strip() != "data: [DONE]"
+    )
+    assert private_reply in spoken
+    serialized = json.dumps(events)
+    assert private_reply not in serialized
+    assert "PRIVATE SPOKEN WORDS" not in serialized
+    trace_ids = {event["trace_id"] for event in events}
+    assert len(trace_ids) == 1
+    assert next(iter(trace_ids)).startswith("1.")
+
+
+def test_voice_gateway_marks_spoken_failure_copy_as_failure_fact(monkeypatch):
+    private_failure_copy = "PRIVATE FAILURE COPY MUST NOT ENTER TRACE"
+    events = _install_voice_gateway_turn(
+        monkeypatch,
+        send_body={"user_message": {"id": "message-1"}},
+        send_status=202,
+        runtime="v2",
+    )
+    monkeypatch.setattr(
+        routes_asgi,
+        "_failed_turn_result",
+        lambda *_args: {
+            "text": private_failure_copy,
+            "error_code": "upstream_unavailable",
+        },
+    )
+
+    response = asyncio.run(
+        routes_asgi.voice_chat_completions(SimpleNamespace())
+    )
+    _collect_streaming_response(response)
+
+    failures = [
+        event
+        for event in events
+        if event["type"] == "voice.gateway.reply.received"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["status"] == "error"
+    assert failures[0]["detail"]["reply_source"] == "failure_copy"
+    assert failures[0]["detail"]["error_code"] == "upstream_unavailable"
+    serialized = json.dumps(events)
+    assert private_failure_copy not in serialized
+    assert "PRIVATE SPOKEN WORDS" not in serialized
 
 
 class _Result:
