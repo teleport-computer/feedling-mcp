@@ -181,7 +181,6 @@ def test_blob_write_callers_keep_strict_and_best_effort_contracts_explicit():
     assert _db_blob_call_sites("set_blob") == {
         ("bootstrap/bootstrap_core.py", "bootstrap_payload"),
         ("core/store.py", "_save_tokens"),
-        ("debug_trace.py", "set_enabled"),
         ("genesis/service.py", "write_genesis_checkpoint"),
         ("genesis/service.py", "write_genesis_state"),
         ("genesis/service.py", "write_persona_artifact"),

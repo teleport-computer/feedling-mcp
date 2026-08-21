@@ -10,6 +10,44 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Independent resident screen turns now retain user-configured MCP tools in
+  both foreground Chat and proactive lanes.** Under an explicit 2026-08-21
+  trust-boundary decision, resident/CLI turns receiving pixels keep both
+  read-only and mutating user MCP because those servers are infrastructure the
+  user selected and authenticated, not destinations discovered by the model.
+  Ordinary resident proactive wakes now receive the user's MCP configuration as
+  well, matching foreground lane-aware configuration instead of starting with
+  no user MCP surface.
+  Platform web egress remains blocked through `FEEDLING_OUTBOUND_FENCE` and
+  `io_cli`. Hosted Runtime V2 intentionally remains stricter: pixel turns keep
+  approved read-only MCP but remove mutating MCP, web, and `task`. Resident
+  proactive turns may now include the same bounded self-authored `<think>` block
+  as foreground Chat; it is permitted, not required, by the shared
+  `FEEDLING_V2_SELF_THINKING` kill switch rather than a lane-specific setting.
+
+- **Model provider HTTPS base URLs now fail closed when they resolve inward.**
+  Saving, testing, listing models, and runtime provider calls reject an explicit
+  HTTPS `base_url` when any DNS answer is private, loopback, link-local,
+  reserved, multicast, invalid, empty, or unresolvable. The exact
+  `http://127.0.0.1` and `http://localhost` development allowlist is unchanged.
+  Explicit URLs are resolved on every validation without a process cache; this
+  adds a synchronous DNS lookup to runtime calls but avoids the larger
+  rebinding window created by checking only when a route is saved. The HTTP
+  client still performs its own resolution, so deployment-level egress controls
+  remain the final defense against a DNS change between validation and connect.
+  A self-hosted operator whose HTTPS model server is intentionally on a LAN can
+  set `FEEDLING_PROVIDER_ALLOW_PRIVATE_BASE_URLS=1`; this disables the address
+  filter for provider calls and usage probes but does not broaden the cleartext
+  allowlist. Self-hosted deployments are not observable by the project, so we
+  cannot measure who needs this exception or detect when a future change breaks
+  their configuration; operators must test it at their exact deployed commit.
+
+- **Model provider base URLs now reject invalid TCP ports before any outbound
+  request.** Saving, testing, or listing models for a route with a non-numeric,
+  zero, or out-of-range explicit port now returns the existing client-input
+  error path instead of accepting a URL that would fail later in the HTTP
+  client. Explicit ports from `1` through `65535` remain valid.
+
 - **Managed deployments reuse healthy persisted ingress certificates without
   blocking public traffic on an unnecessary ACME renewal.** A recreated ingress
   verifies that every stored certificate is valid for at least seven days and
@@ -26,6 +64,19 @@ change must not be interpreted as an API guarantee.
   not repair an unusable enclave wrap or grant the service new plaintext access.
   Promotion now distinguishes fully audited preservation from unresolved,
   malformed, or requeued work, which remains blocking.
+
+- **Managed debug traces use append-only, 30-day TEE storage.** Each event is a
+  row in a Beijing-day PostgreSQL partition instead of a rewrite of a bounded
+  per-user JSON blob. A default partition keeps a late maintenance run from
+  dropping writes and is independently reported as degraded; owner-only
+  maintenance repairs that partition and removes expired days. Trace fields and
+  bounded content excerpts are plaintext operational data within the managed
+  TEE boundary. Recent traces intentionally survive account deletion and remain
+  available to an authorized administrator by exact uid until retention or an
+  explicit trace clear removes them.
+  Trace outcomes reuse the Runtime job dashboard's failure, timeout, control,
+  and safety-suppression classification so per-event diagnosis and aggregate
+  operational failure rates use the same vocabulary.
 
 - **Managed TEE-primary promotion now verifies the voice-call lifecycle on the
   database that will receive Chat writes.** The TEE schema carries the same
@@ -65,9 +116,8 @@ change must not be interpreted as an API guarantee.
   (`https://user:pw@host/v1`) are now rejected on every scheme. And
   `http://localhost:<port>` is now accepted where previously only
   `http://127.0.0.1` was — the model-catalog endpoint already accepted it, and
-  the save path now uses that same check rather than a second, weaker one.
-  **This does not add address-level egress filtering:** an `https` `base_url`
-  pointing at a private or link-local address is accepted exactly as before.
+  the save path now uses that same check rather than a second, weaker one. The
+  HTTPS address policy described above is applied after this structural check.
 
 - **Persistence failures no longer look like successful memory, trace, or World
   Book operations.** A Memory Garden index request returns `503` when its

@@ -694,6 +694,8 @@ jobs:
             tests/test_tee_sync_metrics.py \
             tests/test_tee_sync_scheduler.py \
             tests/test_tee_verify.py \
+            tests/test_trace_events.py \
+            tests/test_trace_events_cleanup.py \
             tests/test_user_mcp_ca_fetch.py \
             tests/test_user_mcp_ca_fetch_leaf.py \
             tests/test_user_mcp_materialize.py \
@@ -767,10 +769,12 @@ jobs:
             tests/test_admin_proactive_observability.py \
             tests/test_wake_support_indexes_migration.py \
             tests/test_v2_first_chat_activation_backfill.py \
+            tests/test_pre_runtime_preflight.py \
             tests/test_pre_test_migration_convergence.py \
             tests/test_v2_jobs_migration.py \
             tests/test_lane_rollup.py \
             tests/test_data_track_snapshot_golden.py \
+            tests/test_v2_general_watchdog_budget.py \
             tests/test_v2_jobs_store.py \
             tests/test_v2_trajectory_db.py \
             tests/test_v2_enclave_broker.py \

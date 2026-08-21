@@ -115,6 +115,14 @@ def _start_lane_rollup_leader() -> None:
     core_leader.run_singleton("lane-rollup", lane_rollup_scheduler.start)
 
 
+def _start_trace_events_monitor_leader() -> None:
+    """Detect a stuck DEFAULT/horizon/capacity issue on one TEE worker."""
+    from admin import trace_events_monitor
+    from core import leader as core_leader
+
+    core_leader.run_singleton("trace-events-monitor", trace_events_monitor.start)
+
+
 @asynccontextmanager
 async def lifespan(app):
     # Validate the topology even when this worker does not own background jobs.
@@ -201,6 +209,12 @@ async def lifespan(app):
         _start_dau_snapshot_leader()
         _start_runtime_reconciler_leader()
         _start_lane_rollup_leader()
+        # trace_events is TEE-only.  RDS rollback processes have no such table
+        # and must not produce a false missing-table alarm.
+        import db
+
+        if db.database_schema() == "tee":
+            _start_trace_events_monitor_leader()
         # (6b) TEE 影子库自动同步单例 — 仅在双写已接时选举（env 决定，接=重部署）。
         from admin import plaintext_shadow_scheduler
         from tee_shadow import mirror as _tee_mirror

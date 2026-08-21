@@ -1,4 +1,7 @@
-"""Executable contract for Proactive/Perception V2 tools.
+"""T160: not wired into production assembly; the production memory/tool surface is
+``capabilities/registry`` -> ``model_api_runtime/v2``.
+
+Executable contract for Proactive/Perception V2 tools.
 
 PR3 keeps this layer independent from hosted/resident cutover. Callers can
 inject output adapters for side-effecting actions while the shared catalog,

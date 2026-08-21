@@ -54,8 +54,8 @@ def test_plaintext_shadow_control_revision_is_head() -> None:
         os.environ["TEE_DATABASE_URL"],
         "SELECT version_num FROM alembic_tee_version",
     )
-    assert rows == [("0031_merge_voice_primary",)]
-    assert plaintext_shadow._SCHEMA_HEAD == "0031_merge_voice_primary"
+    assert rows == [("0033_trace_events",)]
+    assert plaintext_shadow._SCHEMA_HEAD == "0033_trace_events"
 
 
 def test_dirty_key_control_plane_contains_no_content_columns() -> None:

@@ -226,20 +226,14 @@ def test_the_scope_closes_even_when_the_body_raises(recorded):
 
 
 # --------------------------------------------------------------------------- #
-# 环深 —— 48 小时的保留期需要装得下 48 小时
+# Append-only read depth — storage retention is time-based, not event-count based
 # --------------------------------------------------------------------------- #
 
-def test_the_ring_is_deep_enough_to_outlive_a_single_turn():
-    """环深必须远大于单个回合的事件量,否则 TTL 写多久都没意义。"""
-    assert debug_trace._MAX_EVENTS >= 2000, (
-        f"环深 {debug_trace._MAX_EVENTS} 条,一个活跃用户装不下 48 小时"
-    )
-    assert debug_trace._MAX_EVENTS_VERBOSE >= 1000
-    assert debug_trace._TTL_SEC == 48 * 3600, "保留期不再是 48 小时"
+def test_trace_read_limit_can_inspect_a_large_turn_without_defining_retention():
+    assert debug_trace._READ_LIMIT_MAX >= 2500
 
 
-def test_the_admin_panel_can_read_the_whole_ring_out():
-    """环里存了 2500 条,面板最多只能选 500 的话等于读不到。"""
+def test_the_admin_panel_can_request_a_large_trace_page():
     import inspect
 
     from admin import data_track

@@ -1075,6 +1075,50 @@ def test_empty_response_trajectory_records_only_content_free_shape(monkeypatch):
     }
 
 
+def test_weak_wake_empty_diagnostic_failure_cannot_change_turn_outcome(monkeypatch):
+    response = {
+        "reply": "",
+        "reasoning": "private but semantically empty",
+        "stop_reason": "end_turn",
+        "tool_calls": [],
+        "usage": {"completion_tokens": 3},
+    }
+
+    def run(callback):
+        provider = _ScriptedProvider([dict(response)])
+        monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+        on_reply = _RecordingReply()
+        events = []
+
+        async def record(event_kind, payload):
+            events.append((event_kind, payload))
+
+        outcome = asyncio.run(tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=on_reply,
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            max_calls=2,
+            require_reply=False,
+            on_empty_provider_response=callback,
+            on_trajectory_event=record,
+        ))
+        return outcome, on_reply.calls, events
+
+    async def unavailable(_response_shape):
+        raise RuntimeError("diagnostics unavailable")
+
+    without_diagnostics = run(None)
+    failing_diagnostics = run(unavailable)
+
+    assert failing_diagnostics == without_diagnostics
+    assert failing_diagnostics[0].final_text == ""
+    assert failing_diagnostics[0].stop_reason == "final_text"
+    assert failing_diagnostics[1] == [("", True)]
+
+
 def test_usable_provider_success_survives_response_trajectory_failure(monkeypatch):
     provider = _ScriptedProvider([
         {"reply": "usable", "tool_calls": [], "usage": {}},

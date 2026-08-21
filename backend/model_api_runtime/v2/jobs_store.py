@@ -196,6 +196,15 @@ SCHEDULED_LEASE_REQUEUE_MAX_ATTEMPTS = _positive_int_env(
     "FEEDLING_V2_SCHEDULED_REQUEUE_MAX_ATTEMPTS", "3"
 )
 
+# 通用 watchdog 恢复最多重投三次，避免确定性卡死无限占 worker 槽并重复
+# 调 provider。这个预算只限制「最多烧几轮」：dream 如果在卡死前已经直写了
+# 一部分 memory cards，预算内的整轮重放仍可能再次铸造新 id。彻底避免重复写
+# 需要冻结日志，而那项方案不属于本改动。
+GENERAL_LEASE_REQUEUE_MAX_ATTEMPTS = _positive_int_env(
+    "FEEDLING_V2_GENERAL_REQUEUE_MAX_ATTEMPTS", "3"
+)
+GENERAL_WATCHDOG_REQUEUE_EXHAUSTED = "watchdog_requeue_exhausted"
+
 # Shared by the periodic lease reaper and the eager watchdog recovery path.
 # Keeping the SQL predicate single-sourced prevents either recovery mechanism
 # from silently widening scheduled whole-turn replay in the future.
@@ -295,6 +304,99 @@ def _terminal_error_class(error: object, error_class: object = "") -> str:
     if code.endswith(":empty_reply"):
         return "provider_empty_reply"
     return "unknown"
+
+
+# Keep this list content-free and deliberately narrow: an unknown code stays
+# operational until somebody classifies it explicitly.  These are visible
+# outcomes but are not interchangeable with a provider/worker/runtime failure on
+# an operations dashboard.
+CONTROL_OUTCOME_CODES = frozenset({
+    "runtime_mode_changed",
+    "turns_halted",
+    "capture_disabled",
+    "dream_disabled",
+    "profile_disabled",
+    "maintenance_disabled",
+    "heartbeat_disabled",
+    "scheduled_disabled",
+    "manual_wake_disabled",
+})
+SILENT_BY_CHOICE_OUTCOME_CODE = "wake_failed:explicit_silence_suppressed"
+SAFETY_SUPPRESSION_CODES = frozenset({
+    SILENT_BY_CHOICE_OUTCOME_CODE,
+    "wake_failed:degenerate_reply_suppressed",
+    "wake_failed:protocol_fragment_suppressed",
+    "wake_failed:malformed_self_thinking_suppressed",
+})
+TIMEOUT_OUTCOME_CODES = frozenset({
+    "queue_timeout",
+    "lease_timeout",
+    "runtime_expired",
+})
+
+
+# Wired by the assembly layer, never imported here: jobs_store sits below
+# debug_trace and must not reach upward for it.  Left None in contexts that do
+# not wire it (tests, tools), where enqueue must still work.
+on_job_enqueued = None
+
+
+def _notify_job_enqueued(
+    user_id: str,
+    lane: str,
+    *,
+    reason: str,
+    trace_id: str,
+    result: tuple | None = None,
+) -> None:
+    """Fire the enqueue hook once the write is durable, for real inserts only.
+
+    ``coalesce_or_insert_on_cursor`` returns ``(job_id, coalesced)``.  A
+    coalesced call coalesces new input into an *existing* row and keeps that
+    row's original trace_id, so emitting here would (a) call something
+    "enqueued" that enqueued nothing and (b) publish this call's trace_id while
+    the terminal event later carries the row's older one -- breaking the very
+    id-equality join this pair exists to provide.
+
+    Deliberately skips ``chat``: already traced on its own send path, and by far
+    the highest-volume producer.
+
+    An enqueue must never fail because its trace failed, so everything is
+    swallowed -- this sits next to a database transaction and is the one new
+    call site that could otherwise take a write down with it.
+    """
+    if on_job_enqueued is None or lane == "chat":
+        return
+    if result is not None and len(result) > 1 and result[1]:
+        return  # coalesced into an existing job: not an enqueue
+    try:
+        on_job_enqueued(user_id, lane, reason=reason, trace_id=trace_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("[jobs_store] enqueue trace hook failed: %s", exc)
+
+
+def terminal_outcome_class(error_code: str) -> str:
+    """Map a terminal error code to the shared four-value outcome taxonomy.
+
+    This lived inside the operations-dashboard query as two local frozensets, so
+    the dashboard was the only thing that could tell a deliberate control
+    outcome from a real failure.  Trace rows carry the same taxonomy now, and if
+    the two derived it independently they could disagree about the very same
+    job -- one screen calling a suppression a failure while the other did not.
+    One function, both readers.
+
+    ``outcome_class`` has no success member: it is only meaningful when the
+    event being classified is itself a failure.  Callers must not stamp it on a
+    ``status="ok"`` event.
+    """
+    code = str(error_code or "")
+    if code in CONTROL_OUTCOME_CODES:
+        return "control"
+    if code in SAFETY_SUPPRESSION_CODES:
+        return "safety_suppression"
+    if code in TIMEOUT_OUTCOME_CODES:
+        return "timeout"
+    return "operational_failure"
 
 
 def _pool():
@@ -902,6 +1004,11 @@ def enqueue_job(
     if priority is None:
         priority = LANE_PRIORITY.get(lane, 0)
 
+    # The result is captured and returned *after* the transaction closes so the
+    # enqueue hook below cannot observe a write that later rolls back: a trace
+    # row claiming a job exists, for a job that does not, is worse than no row.
+    result = None
+    committed = False
     for _ in range(3):
         try:
             with _pool().connection() as conn:
@@ -922,7 +1029,7 @@ def enqueue_job(
                                 effective_generation = int(
                                     control["runtime_generation"]
                                 )
-                        return coalesce_or_insert_on_cursor(
+                        result = coalesce_or_insert_on_cursor(
                             cur,
                             user_id,
                             lane,
@@ -932,8 +1039,13 @@ def enqueue_job(
                             deadline_at=deadline_at,
                             expected_generation=effective_generation,
                         )
+            committed = True
+            break
         except psycopg.errors.UniqueViolation:
             continue  # 并发 racer 抢先建了 active job；重读并 coalesce
+    if committed:
+        _notify_job_enqueued(user_id, lane, reason=reason, trace_id=trace_id, result=result)
+        return result
     # A very busy terminal/enqueue race can exhaust the optimistic retries.
     # The fallback must still record that new input arrived; merely returning
     # the row id would let finalization miss the follow-up generation.
@@ -953,7 +1065,7 @@ def enqueue_job(
                         and str(control["hosted_runtime_state"]) == "v2"
                     ):
                         effective_generation = int(control["runtime_generation"])
-                return coalesce_or_insert_on_cursor(
+                result = coalesce_or_insert_on_cursor(
                     cur,
                     user_id,
                     lane,
@@ -963,6 +1075,8 @@ def enqueue_job(
                     deadline_at=deadline_at,
                     expected_generation=effective_generation,
                 )
+    _notify_job_enqueued(user_id, lane, reason=reason, trace_id=trace_id, result=result)
+    return result
 
 
 def enqueue_job_with_context_log(
@@ -1041,6 +1155,14 @@ def enqueue_job_with_context_log(
         raise RuntimeError("could not atomically enqueue job context")
 
     job_id, coalesced, seq, payload = inserted
+    # Fired here, before the mirror write: the authoritative job is already
+    # durable at this point, and a mirror failure must not be able to swallow
+    # the enqueue event for a job that really exists.  The hook is fail-open, so
+    # putting it first cannot harm the mirror either.
+    _notify_job_enqueued(
+        user_id, lane, reason=reason or "", trace_id=trace_id or "",
+        result=(job_id, coalesced),
+    )
     from tee_shadow import mirror
 
     mirror.execute(
@@ -1938,6 +2060,52 @@ def mark_expired(job_id, error: str = "runtime_expired") -> None:
                 user_id, "v2_trajectory_reviews", source_job_id, "requeue")
 
 
+def _record_job_recovery_event_on_cursor(
+    cur,
+    *,
+    job_id: int,
+    lane: str,
+    recovery: str,
+    reason: str,
+) -> dict[str, object]:
+    """Append the recovery fact inside the job transition transaction."""
+    cur.execute(
+        "INSERT INTO v2_job_recovery_events "
+        "(job_id,job_attempt_count,lane,recovery,reason) "
+        "SELECT id,attempt_count,%s,%s,%s FROM agent_jobs WHERE id=%s "
+        "RETURNING job_id,job_attempt_count,lane,recovery,reason,created_at",
+        (
+            str(lane),
+            str(recovery),
+            str(reason)[:500],
+            int(job_id),
+        ),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise RuntimeError("recovered job missing while recording recovery event")
+    return dict(row)
+
+
+def _mirror_job_recovery_event(event: dict[str, object]) -> None:
+    """Best-effort RDS-shadow copy; the primary insert already committed."""
+    from tee_shadow import mirror
+
+    mirror.execute(
+        "INSERT INTO v2_job_recovery_events "
+        "(job_id,job_attempt_count,lane,recovery,reason,created_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+        (
+            int(event["job_id"]),
+            int(event["job_attempt_count"]),
+            str(event["lane"]),
+            str(event["recovery"]),
+            str(event["reason"]),
+            event["created_at"],
+        ),
+    )
+
+
 def recover_killed_job(
     *,
     job_id: int,
@@ -1947,6 +2115,7 @@ def recover_killed_job(
     """Recover exactly one claim still owned by a killed slot generation."""
     recovered_reviews: list[tuple[str, str]] = []
     result: dict[str, object] | None = None
+    recovery_event: dict[str, object] | None = None
     with _pool().connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
@@ -2102,27 +2271,63 @@ def recover_killed_job(
                     # 持久化进 attempt/effect —— 那是另一件事,不能在这里猜。
                     # 后台复盘由上面那条 failure review 承担。
                 else:
-                    recovery = "requeued"
                     cur.execute(
                         "UPDATE agent_jobs SET status='pending',created_at=now(), "
                         "last_error=%s,attempt_count=attempt_count+1,"
                         "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
                         "finished_at=NULL,lease_expires_at=NULL,deadline_at=NULL "
                         "WHERE id=%s AND claimed_by=%s "
-                        "AND status IN ('claimed','running')",
-                        (str(reason)[:500], int(job_id), str(claimed_by)),
+                        "AND status IN ('claimed','running') "
+                        "AND (lane=%s OR attempt_count<%s)",
+                        (
+                            str(reason)[:500],
+                            int(job_id),
+                            str(claimed_by),
+                            _TRAJECTORY_REVIEW_LANE,
+                            int(GENERAL_LEASE_REQUEUE_MAX_ATTEMPTS),
+                        ),
                     )
-                    if cur.rowcount != 1:
-                        return None
-                    recovered_reviews = _recover_review_runner_on_cursor(
-                        cur, int(job_id)
-                    )
+                    if cur.rowcount == 1:
+                        recovery = "requeued"
+                        recovered_reviews = _recover_review_runner_on_cursor(
+                            cur, int(job_id)
+                        )
+                    else:
+                        recovery = "terminal"
+                        cur.execute(
+                            "UPDATE agent_jobs SET status='expired',finished_at=now(), "
+                            "last_error=%s,attempt_count=attempt_count+1,"
+                            "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
+                            "lease_expires_at=NULL,deadline_at=NULL "
+                            "WHERE id=%s AND claimed_by=%s "
+                            "AND status IN ('claimed','running')",
+                            (
+                                GENERAL_WATCHDOG_REQUEUE_EXHAUSTED,
+                                int(job_id),
+                                str(claimed_by),
+                            ),
+                        )
+                        if cur.rowcount != 1:
+                            return None
+                        recovered_reviews = _recover_review_runner_on_cursor(
+                            cur, int(job_id)
+                        )
+                        _queue_failure_review_on_cursor(cur, int(job_id))
                 result = {
                     "job_id": int(job_id),
                     "user_id": str(row["user_id"]),
                     "lane": lane,
                     "recovery": recovery,
                 }
+                recovery_event = _record_job_recovery_event_on_cursor(
+                    cur,
+                    job_id=int(job_id),
+                    lane=lane,
+                    recovery=recovery,
+                    reason=str(reason),
+                )
+    if recovery_event is not None:
+        _mirror_job_recovery_event(recovery_event)
     if recovered_reviews:
         from tee_shadow import mirror
 
@@ -4283,6 +4488,26 @@ def get_chat_mutation_recovery_barrier(
     }
 
 
+def get_terminal_snapshot(job_id, *, user_id: str) -> dict | None:
+    """Read the durable terminal state of one job.
+
+    Terminal attribution must come from the row, not from the claim snapshot
+    the worker is holding: ``mark_failed``/``reschedule`` write the database and
+    never write back into that dict, so a caller reading the snapshot gets an
+    empty code for a fresh job and the PREVIOUS attempt's error for a retried
+    one -- blaming this failure on the wrong cause.
+    """
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT status, last_error FROM agent_jobs "
+                "WHERE id=%s AND user_id=%s",
+                (job_id, str(user_id)),
+            )
+            row = cur.fetchone()
+    return dict(row) if row else None
+
+
 def get_job_status(
     job_id,
     *,
@@ -4741,6 +4966,76 @@ def recent_worker_heartbeat_count(*, within_sec: int = 300) -> int:
             return int(cur.fetchone()[0])
 
 
+def trajectory_review_observability_snapshot(
+    *, heartbeat_within_sec: int = 30
+) -> dict:
+    """Current review backlog plus the value reported by live runner processes.
+
+    Admin may run in a different process or container, so consulting this
+    module's environment from the admin request would report the wrong process.
+    The switch value below comes only from fresh foreground runner heartbeats;
+    missing or conflicting observations deliberately produce ``None``.
+    """
+    safe_window = max(1, min(int(heartbeat_within_sec), 3600))
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+                )
+                cur.execute(
+                    "SELECT runtime_state #>> "
+                    "  '{configuration,trajectory_review_enabled}' AS enabled,"
+                    "  count(*)::int AS n "
+                    "FROM v2_worker_heartbeats "
+                    "WHERE kind='turn' AND pool='foreground' "
+                    "  AND beat_at > now() - make_interval(secs => %s) "
+                    "  AND runtime_state #>> "
+                    "    '{configuration,trajectory_review_enabled}' "
+                    "    IN ('true','false') "
+                    "GROUP BY enabled",
+                    (safe_window,),
+                )
+                config_rows = cur.fetchall()
+                cur.execute(
+                    "SELECT status,count(*)::int AS n "
+                    "FROM v2_trajectory_reviews GROUP BY status"
+                )
+                status_rows = cur.fetchall()
+                cur.execute("SELECT EXTRACT(EPOCH FROM clock_timestamp()) AS ts")
+                generated_at = float(cur.fetchone()["ts"])
+
+    enabled_runners = sum(
+        int(row["n"] or 0) for row in config_rows if row["enabled"] == "true"
+    )
+    disabled_runners = sum(
+        int(row["n"] or 0) for row in config_rows if row["enabled"] == "false"
+    )
+    observed_runners = enabled_runners + disabled_runners
+    if observed_runners and enabled_runners == observed_runners:
+        current_enabled: bool | None = True
+    elif observed_runners and disabled_runners == observed_runners:
+        current_enabled = False
+    else:
+        current_enabled = None
+    status_counts = {"pending": 0, "running": 0}
+    status_counts.update(
+        {str(row["status"] or "unknown"): int(row["n"] or 0) for row in status_rows}
+    )
+    return {
+        "generated_at": generated_at,
+        "heartbeat_within_sec": safe_window,
+        "runner_config": {
+            "current_enabled": current_enabled,
+            "observed_runners": observed_runners,
+            "enabled_runners": enabled_runners,
+            "disabled_runners": disabled_runners,
+            "consistent": bool(observed_runners and current_enabled is not None),
+        },
+        "status_counts": status_counts,
+    }
+
+
 def _job_pool_case_sql() -> str:
     return (
         "CASE WHEN lane IN ('chat','manual_wake') THEN 'foreground' "
@@ -4847,15 +5142,15 @@ def recent_watchdog_recovery_counts(*, within_hours: int = 24) -> dict[str, int]
     safe_hours = max(1, min(int(within_hours), 24 * 30))
     with _pool().connection() as conn:
         rows = conn.execute(
-            "SELECT lane, count(*) FROM agent_jobs "
-            "WHERE last_error='slot_watchdog_timeout' "
-            "AND COALESCE(finished_at,created_at) > "
-            "now()-make_interval(hours => %s) GROUP BY lane ORDER BY lane",
+            "SELECT lane,recovery,count(*) FROM v2_job_recovery_events "
+            "WHERE reason='slot_watchdog_timeout' AND created_at > "
+            "now()-make_interval(hours => %s) "
+            "GROUP BY lane,recovery ORDER BY lane,recovery",
             (safe_hours,),
         ).fetchall()
     return {
-        f"{str(lane)}:{'terminal' if str(lane) == 'chat' else 'requeued'}": int(count)
-        for lane, count in rows
+        f"{str(lane)}:{str(recovery)}": int(count)
+        for lane, recovery, count in rows
     }
 
 
@@ -5236,6 +5531,45 @@ def recent_chat_failures_for_user(
     }
 
 
+def recent_jobs_for_user(
+    user_id: str,
+    *,
+    within_hours: int = 72,
+    limit: int = 50,
+) -> dict:
+    """Content-free recent Runtime V2 tasks for one admin user view."""
+    safe_hours = max(1, min(int(within_hours), 24 * 30))
+    safe_limit = max(1, min(int(limit), 200))
+    uid = str(user_id or "").strip()
+    if not uid:
+        return {"window_hours": safe_hours, "jobs": [], "has_more": False}
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id,lane,status,attempt_count,created_at,finished_at "
+                "FROM agent_jobs WHERE user_id=%s "
+                "  AND created_at >= now() - make_interval(hours => %s) "
+                "ORDER BY created_at DESC,id DESC LIMIT %s",
+                (uid, safe_hours, safe_limit + 1),
+            )
+            rows = cur.fetchall()
+    return {
+        "window_hours": safe_hours,
+        "has_more": len(rows) > safe_limit,
+        "jobs": [
+            {
+                "job_id": int(row["id"]),
+                "lane": str(row["lane"] or ""),
+                "status": str(row["status"] or ""),
+                "attempt_count": int(row["attempt_count"] or 0),
+                "created_at": _iso_or_empty(row["created_at"]),
+                "finished_at": _iso_or_empty(row["finished_at"]),
+            }
+            for row in rows[:safe_limit]
+        ],
+    }
+
+
 WAKE_LANES_FOR_SUPPORT = ("heartbeat", "scheduled", "manual_wake", "screen_watch")
 
 
@@ -5585,23 +5919,8 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
     # interchangeable with a provider/worker/runtime failure on an operations
     # dashboard.  Keep this list content-free and deliberately narrow: an unknown
     # code stays operational until somebody classifies it explicitly.
-    control_outcome_codes = frozenset({
-        "runtime_mode_changed",
-        "turns_halted",
-        "capture_disabled",
-        "dream_disabled",
-        "profile_disabled",
-        "maintenance_disabled",
-        "heartbeat_disabled",
-        "scheduled_disabled",
-        "manual_wake_disabled",
-    })
-    safety_suppression_codes = frozenset({
-        "wake_failed:degenerate_reply_suppressed",
-        "wake_failed:protocol_fragment_suppressed",
-        "wake_failed:malformed_self_thinking_suppressed",
-    })
-
+    # Classification now lives at module level (``terminal_outcome_class``) so
+    # the trace layer and this dashboard cannot drift apart.
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -5703,14 +6022,7 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
     failures_by_lane: dict[str, list[dict]] = {}
     for row in failure_rows:
         code = str(row["last_error"] or "")
-        if code in control_outcome_codes:
-            outcome_class = "control"
-        elif code in safety_suppression_codes:
-            outcome_class = "safety_suppression"
-        elif code in {"queue_timeout", "lease_timeout", "runtime_expired"}:
-            outcome_class = "timeout"
-        else:
-            outcome_class = "operational_failure"
+        outcome_class = terminal_outcome_class(code)
         failures_by_lane.setdefault(str(row["lane"] or ""), []).append({
             "code": code,
             "error_class": str(row.get("error_class") or ""),

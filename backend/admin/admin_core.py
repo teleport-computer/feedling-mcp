@@ -507,6 +507,27 @@ def _build_page_html(query_string: str) -> str:
                 logging.exception("runtime user report failed (health still served)")
                 user_report = None
             try:
+                watchdog_recoveries = _timed(
+                    "runtime_watchdog_recoveries",
+                    data_track._runtime_watchdog_recoveries,
+                    within_hours=hours,
+                )
+            except Exception:
+                logging.exception(
+                    "runtime watchdog recoveries failed (health still served)"
+                )
+                watchdog_recoveries = None
+            try:
+                trajectory_reviews = _timed(
+                    "runtime_trajectory_reviews",
+                    data_track._runtime_trajectory_reviews,
+                )
+            except Exception:
+                logging.exception(
+                    "runtime trajectory review snapshot failed (health still served)"
+                )
+                trajectory_reviews = None
+            try:
                 # stuck：非终态尝试不进失败率（Seven 2026-08-18 定 A），所以必须
                 # 与失败率并排出现在同一页 —— 否则它就是下一个「用户完全看不见」。
                 stuck = _timed(
@@ -517,7 +538,13 @@ def _build_page_html(query_string: str) -> str:
                 logging.exception("runtime stuck failed (health still served)")
                 stuck = None
             return data_track._render_runtime_health_page(
-                payload, tokens, delivery, user_report, stuck
+                payload,
+                tokens,
+                delivery,
+                user_report,
+                stuck,
+                watchdog_recoveries,
+                trajectory_reviews,
             )
         if view == "events":
             event = (request.args.get("event") or "").strip()

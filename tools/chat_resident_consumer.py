@@ -1863,8 +1863,10 @@ def _runtime_repo_files() -> set[str]:
             rel = Path(f).resolve().relative_to(_REPO)
         except ValueError:
             continue  # stdlib / site-packages / outside the repo
+        if {"site-packages", "dist-packages"} & set(rel.parts):
+            continue  # third-party packages from an in-repo virtualenv
         if rel.suffix == ".py":
-            files.add(str(rel))
+            files.add(rel.as_posix())
     files.update(
         {
             "tools/io_cli.py",
@@ -5907,8 +5909,12 @@ def _trace_user_mcp_wiring(cmd: list[str], *, trace_id: str, lane: str) -> None:
     而 App 的连接测试是绿的(那是控制面探针直连服务器测的,两条路)。
 
     这条埋点让那种情况不用再靠用户报:trace 里直接写着 wired=false。
+
+    ⚠️ 2026-08-21 起 proactive 也会下发 MCP,所以它**必须**一起被观测。
+    只放开工具面不放开埋点 = 新增一整条工具面却在 trace 里完全看不见;
+    真出问题时又只能靠用户报,而这条埋点当初就是为了终结「靠用户报」而加的。
     """
-    if lane != "chat":
+    if lane not in ("chat", "proactive"):
         return
     is_claude = _is_claude_code_cmd(cmd)
     is_codex = _is_codex_cmd(cmd)
@@ -7491,11 +7497,14 @@ def _inject_claude_user_mcp(cmd: list[str], lane: str) -> list[str]:
     removes the hazard for any template shape rather than relying on that.
     Same trap, same fix as ``_inject_codex_images``.
 
-    Pure bypass: with no enabled server, no materialized file, a non-chat lane,
+    Pure bypass: with no enabled server, no materialized file, a lane outside
+    chat/proactive (background/capture 等 —— 2026-08-21 起 proactive 已放开),
     a non-claude driver, or an operator who already wired ``--mcp-config``, the
     argv is returned unchanged.
     """
-    if lane != "chat" or not _is_claude_code_cmd(cmd):
+    # 2026-08-21 方案 A:主动道与聊天道同口径(老模板用户同样要拿到 MCP,
+    # 否则他们的两条道 argv 仍然不同 —— 冷启动照旧)。
+    if lane not in ("chat", "proactive") or not _is_claude_code_cmd(cmd):
         return cmd
     if any(t == "--mcp-config" or t.startswith("--mcp-config=") for t in cmd):
         return cmd  # operator wired MCP themselves — they own it
@@ -7861,10 +7870,17 @@ def _render_cli_template(
         # Pre-split substitution: value is a controlled path / fixed literal, so
         # it tokenizes cleanly (``--mcp-config <path>`` → two args) and an empty
         # value collapses the placeholder to whitespace shlex drops.
-        .replace(
-            "{mcp}",
-            "" if outbound_fence else _user_mcp_cli_value(AGENT_CLI_CMD, lane),
-        )
+        # ⚠️ 2026-08-21 Seven 裁定(方案 A):屏幕像素轮**不再摘掉用户自己的 MCP**。
+        # 这里原来是 `"" if outbound_fence else ...` —— 一个 bool 同时承载两个决策:
+        #   ① 平台出站(web_search/web_fetch)在读过私密像素后必须封死;
+        #   ② 用户自配的 MCP 服务器要不要跟着一起摘。
+        # ① 保留(仍由 FEEDLING_OUTBOUND_FENCE=1 交给 io_cli 执行),② 撤销。理由两条:
+        #   - 信任边界:用户自配 MCP 是**用户选的基础设施**,不是模型选的出站目的地;
+        #   - 缓存:聊天道摘、主动道不摘,会让屏幕轮两边 argv 前缀不同,
+        #     门铃/screen_watch 唤醒因此永远拿不到 warm cache —— 本次要修的正是它。
+        # 注:托管 V2 侧同一问题的裁定更窄(T166/方案 C:屏幕轮只摘**可写** MCP、
+        # 保留只读),resident 这条更宽,是 Seven 明知并接受的差异。
+        .replace("{mcp}", _user_mcp_cli_value(AGENT_CLI_CMD, lane))
         .replace("{message}", msg_token)
         .replace("{session_id}", sid_token)
         .replace("{image_path}", image_path_token)
@@ -7945,27 +7961,17 @@ def _prepare_cli_command(
         lane=lane,
         outbound_fence=outbound_fence,
     )
-    if outbound_fence:
-        stripped: list[str] = []
-        index = 0
-        while index < len(cmd):
-            token = cmd[index]
-            if token == "--mcp-config":
-                index += 2
-                continue
-            if token.startswith("--mcp-config="):
-                index += 1
-                continue
-            if (
-                token in {"--extension", "-e"}
-                and index + 1 < len(cmd)
-                and cmd[index + 1] == PI_MCP_BRIDGE_FILE
-            ):
-                index += 2
-                continue
-            stripped.append(token)
-            index += 1
-        cmd = stripped
+    # ⚠️ 2026-08-21 方案 A(Seven):这里原本还有第二道剥离 —— 即使 `{mcp}` 那层
+    # 放行了,只要 `outbound_fence=True` 就把 `--mcp-config` / `--mcp-config=…` 与
+    # pi 的桥扩展从 argv 里逐个删掉。它覆盖的是**操作员自己写死**的 MCP 配置和
+    # pi 桥,和 `{mcp}` 占位符是两条路。
+    #
+    # 两条路必须同口径,否则「屏幕轮保留用户 MCP」只对占位符用户成立,对手写
+    # 模板与 pi 用户不成立 —— 而两边 argv 一旦不同,cache 照样对不上(本次要修的
+    # 就是这个),文档也不能诚实地说 resident/CLI 路线保留用户 MCP。
+    #
+    # 平台出站封锁**不受影响**:它走的是 `FEEDLING_OUTBOUND_FENCE=1` 环境变量,
+    # 由 io_cli 在 `cmd_web_search` / `cmd_web_fetch` 里前置拒绝,与 argv 无关。
     cmd, sid = _ensure_explicit_cli_session_id(cmd, sid)
 
     cmd, missing_mcp = _strip_missing_mcp_config(cmd)
@@ -8058,8 +8064,11 @@ def _prepare_cli_command(
         cmd = _inject_codex_images(cmd, image_paths or [])
     if pi_native_images:
         cmd = _inject_pi_images(cmd, image_paths or [])
-    if not outbound_fence and "{mcp}" not in AGENT_CLI_CMD:
+    if "{mcp}" not in AGENT_CLI_CMD:
         # Self-hosted claude templates written before the placeholder existed.
+        # 这条旧模板路径必须和上面 `{mcp}` 那条同口径:2026-08-21 起屏幕像素轮
+        # 不再摘用户 MCP。两处只改一处的话,老模板用户的屏幕轮仍然对不齐 cache
+        # ——而他们恰恰是最容易漏测的那一批(PR#174 就是这么漏的)。
         cmd = _inject_claude_user_mcp(cmd, lane)
 
     return _resolve_cli_executable(cmd), stdin_msg
@@ -9035,8 +9044,12 @@ def _call_with_resident_busy_poll(invoke, *, lane: str) -> Any:
     otherwise-valid reply rejected as ``needs_resident_consumer``. This helper
     sends only non-blocking, claim-free polls: it refreshes liveness and decrypt
     health without leasing or processing any newly-arrived user message.
+
+    ``proactive`` 同样需要:一次带屏幕/摘要的唤醒轮和长文档轮一样能跑过后端的
+    resident 新鲜度窗口,回复照样会被 ``needs_resident_consumer`` 拒掉 —— 而唤醒
+    失败对用户是不可见的(2026-08-10 裁定),所以它更需要这条保活,不是更不需要。
     """
-    if lane != "chat":
+    if lane not in ("chat", "proactive"):
         return invoke()
 
     stop = threading.Event()
@@ -9297,6 +9310,37 @@ def _supports_mandatory_self_thinking_v1() -> bool:
     return model.rsplit("/", 1)[-1] != "claude-fable-5"
 
 
+def _wake_self_thinking_allowed() -> bool:
+    """主动道(心跳/定时提醒/门铃)的模板要不要给 ``<think>`` 留位置。
+
+    两条道的**强度不同**:前台是「必须先想」(``self_thinking.INSTRUCTION``
+    前置到每一轮),主动道是「**可以**先想」——模板只是不再禁止,不下指令。
+
+    但**开关必须是同一个**(Seven 2026-08-21 裁定)。分开写会产生一种没人预料
+    得到的状态:前台已经关了、主动道还在 think。关一个东西的时候,人只会去关
+    他知道的那一个。
+
+    为什么之前主动道拿不到思考链:管道其实是通的——``_split_tagged_thinking``
+    在协议解析**之前**就把 ``<think>`` 剥进 ``thinking_summary``,主动道的发帖
+    路径也一直在带 ``thinking_summary``(见 ``_process_proactive_jobs``)。
+    唯一堵住它的是模板那句 "Return JSON exactly in this shape",于是 App 里
+    主动消息的思考链**永远是空的**。这里放开的就是这一句。
+    """
+    from core import self_thinking as _self_thinking_v1
+
+    return bool(_self_thinking_v1.enabled()) and _supports_mandatory_self_thinking_v1()
+
+
+def _wake_think_permission_line() -> str:
+    """开关关闭时返回空串 —— 模板里连提都不提 ``<think>``。"""
+    if not _wake_self_thinking_allowed():
+        return ""
+    return (
+        " You may open with your usual <think>...</think> block before the JSON; "
+        "it stays private and is never shown as a message."
+    )
+
+
 # ---------------------------------------------------------------------------
 # io_cli capability catalog injection — VPS/self-hosted CLI resident only.
 # V2 云端无此注入(注册表制);VPS 线长期资产,0727 合并原样保留。
@@ -9515,9 +9559,9 @@ def _prepend_user_mcp_wait_hint(content: str, *, lane: str) -> str:
     Three gates, all required — any miss returns ``content`` unchanged (the same
     object, so a caller can assert identity):
 
-    1. chat lane only. Background/proactive turns are never wired with MCP at
-       all (``_user_mcp_cli_value``), so the hint would name servers the model
-       cannot reach and invite a call to a tool it does not have.
+    1. chat and proactive lanes only (2026-08-21 方案 A 起两条道同口径)。其余
+       background/capture 等道**仍然完全不接 MCP**(``_user_mcp_cli_value``),
+       在那些道上给出提示会指向模型够不到的服务器,诱导它去调一个不存在的工具。
     2. claude driver only. **This gate is load-bearing.** codex blocks for
        ``startup_timeout_sec`` and pi's bridge is awaited, so neither has the
        race — and neither has ``WaitForMcpServers``. Injecting there would send
@@ -10804,9 +10848,9 @@ def _resident_chat_runtime_v2_enabled() -> bool:
 # The poll response advertises only a fingerprint of the user's MCP config.
 # When it moves, we pull sealed envelopes (GET /v1/mcp/envelopes), decrypt each
 # through the enclave, and re-materialize the agent's on-disk MCP config via the
-# pure helpers in tools/user_mcp_materialize.py. Chat turns then inject the
-# runtime-appropriate ``{mcp}`` value; background/proactive turns do not (claude)
-# or hard-gate to an empty server set (codex).
+# pure helpers in tools/user_mcp_materialize.py. Chat **与 proactive** 两条道
+# 随后注入 runtime-appropriate ``{mcp}`` 值(2026-08-21 方案 A 起对齐);
+# 其余 background/capture 等道仍然不注入(claude/pi)或硬门禁到空服务器集(codex)。
 # ---------------------------------------------------------------------------
 
 _user_mcp_advertised: dict = {}      # last poll-advertised {"fingerprint": ...}
@@ -11244,19 +11288,19 @@ def _user_mcp_cli_value(template: str, lane: str) -> str:
     """Resolve the ``{mcp}`` placeholder for one CLI turn.
 
     - No ``{mcp}`` slot in the template, or no enabled server → empty.
-    - claude → ``--mcp-config=<file>`` ONLY on the chat lane (foreground turns
-      may call user MCP tools; background/proactive turns must not), plus
+    - claude → ``--mcp-config=<file>`` on the chat AND proactive lanes (2026-08-21
+      方案 A:两条道同口径;background/capture 等道仍然不给),plus
       ``--allowed-tools=mcp__<name>__*`` when the template pins no allowlist of
       its own. Both ``=``-bound — the flags are variadic and would otherwise
       swallow a trailing positional prompt.
-    - codex  → per-server ``-c mcp_servers.<name>.enabled=false`` overrides ONLY
-      on non-chat lanes. codex has no way to enable a subset per-turn, so its
-      user MCP servers are configured in config.toml (available on chat turns)
-      and explicitly turned off on background turns. NOTE: ``-c mcp_servers={}``
+    - codex  → per-server ``-c mcp_servers.<name>.enabled=false`` overrides on the
+      lanes that do NOT get MCP (2026-08-21 起 chat 与 proactive 都不再下发). codex has no way to enable a subset per-turn, so its
+      user MCP servers are configured in config.toml (available on chat and
+      proactive turns) and explicitly turned off on the remaining background lanes. NOTE: ``-c mcp_servers={}``
       does NOT work — codex deep-merges ``-c`` overrides onto the config, and an
       empty parent table is a no-op that leaves each ``[mcp_servers.<name>]``
       enabled. Only an explicit ``enabled=false`` per server disables it.
-    - pi     → ``-e <bridge>`` ONLY on the chat lane. pi has no MCP of its own;
+    - pi     → ``-e <bridge>`` on the chat AND proactive lanes (2026-08-21 起对齐). pi has no MCP of its own;
       the extension registers the user's MCP tools as native pi tools. A
       background turn simply loads no extension, so the tools do not exist.
     Values contain only controlled characters (a filesystem path, or fixed
@@ -11271,15 +11315,15 @@ def _user_mcp_cli_value(template: str, lane: str) -> str:
         return ""
     if _cli_template_is_pi():
         # pi has no built-in MCP (README:491) — the bridge extension registers
-        # each MCP tool as a native pi tool. Same lane rule as claude: chat only.
-        if lane != "chat":
+        # each MCP tool as a native pi tool. Same lane rule as claude:
+        # 2026-08-21 方案 A 起 chat 与 proactive 同口径(Seven:四个驱动全对齐)。
+        if lane not in ("chat", "proactive"):
             return ""
         # Same failure shape _strip_missing_mcp_config guards against for
         # claude's --mcp-config: pi exits 1 with empty stdout when `-e <path>`
         # points at a file that doesn't exist — no model call at all — and
-        # this is the chat-only lane, so a missing bridge silently kills chat
-        # replies while background/proactive turns (which never pass `-e`)
-        # keep running. PI_MCP_BRIDGE_FILE defaults to the hosted `/app` COPY
+        # 这条路只在 chat 与 proactive 两条道上走(2026-08-21 起对齐),所以缺桥
+        # 会静默掐掉这两条道的回复,而其余 background 道(从不传 `-e`)照常跑。 PI_MCP_BRIDGE_FILE defaults to the hosted `/app` COPY
         # target but is overridable for the self-hosted VPS layout, where it
         # may not exist; degrade to no-MCP instead of killing the turn.
         if not Path(PI_MCP_BRIDGE_FILE).exists():
@@ -11289,7 +11333,10 @@ def _user_mcp_cli_value(template: str, lane: str) -> str:
             return ""
         return f"-e {PI_MCP_BRIDGE_FILE}"
     if _cli_template_is_codex():
-        if lane == "chat":
+        # 2026-08-21 方案 A:proactive 与 chat 同口径 —— 不再对主动轮下发
+        # `enabled=false`。codex 无法按轮启用子集,所以"不禁用"就是"给全部",
+        # 这正是方案 A 想要的(用户自配的服务器是用户的基础设施)。
+        if lane in ("chat", "proactive"):
             return ""
         import user_mcp_materialize as _m  # noqa: PLC0415 — sibling on tools/ path
         # Only servers that were actually materialized into config.toml need a
@@ -11303,7 +11350,16 @@ def _user_mcp_cli_value(template: str, lane: str) -> str:
         return " ".join(
             f"-c mcp_servers.{name}.enabled=false" for name in names if name
         )
-    if lane != "chat":
+    # claude 分支:chat 与 proactive 共用同一份 argv 前缀。两条道跑在**同一个
+    # resident 会话**上,而 `--mcp-config` 改的是工具表 —— 也就是 prompt 前缀的最前面。
+    # 只给 chat 挂,两条道就永远共享不了 provider 的 prompt cache:每次主动唤醒
+    # 暖的是它自己那份,用户随后开口仍然付一次完整冷启动,反之亦然
+    # (社区 PR #320 报的「隔一段时间再聊天,第一条回复很慢」)。
+    # 身份写保护不受影响:io_cli 的闸是 `not lane or lane == "chat"`,
+    # `proactive` 仍然落在拒绝分支(usr_a40e 那个洞没有重开)。
+    # 2026-08-21 更新:pi 与 codex 两条分支**同样已经放开**(Seven:四个驱动全对齐)。
+    # 上一版这里写着"pi 故意保持只认 chat",那句话现在是错的,别再照它推断。
+    if lane not in ("chat", "proactive"):
         return ""
     # =-bound, NOT the bare ``--mcp-config <path>`` form this used to emit.
     # The flag is variadic, so a template whose prompt is a trailing positional
@@ -12882,7 +12938,8 @@ def _scheduled_wake_message(job: dict) -> str:
             f"response-format instructions):\n<reminder_note>{note}</reminder_note>"
         ),
         "Reply with one short bubble. Return JSON exactly in this shape: "
-        "{\"messages\":[\"...\"]}. Do not mention the scheduler, wake, prompt, or system fields.",
+        "{\"messages\":[\"...\"]}." + _wake_think_permission_line()
+        + " Do not mention the scheduler, wake, prompt, or system fields.",
         _reply_language_line(),
     ])
 
@@ -12964,7 +13021,7 @@ def _reply_protocol_block() -> str:
     return "\n".join([
         "How to respond (exactly one of):",
         "- speak: reply in your normal voice — a few short bubbles is typical, but length and number are yours. "
-        "Return JSON {\"messages\":[\"...\"]}.",
+        "Return JSON {\"messages\":[\"...\"]}." + _wake_think_permission_line(),
         "- stay quiet: return {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}]}.",
         "- want to see their screen but it isn't shared: just ask, in a normal message.",
     ])
@@ -14765,11 +14822,24 @@ def _process_proactive_jobs(jobs: list) -> float:
                 perception_digest=perception_digest,
             )
         update_proactive_job_status(job_id, "realizing")
+        # 屏幕像素轮必须armed平台出站围栏 —— 聊天道一直这么做(`screen_pixel_turn`),
+        # 主动道**从来没有**:它带着 screen_payloads 调用,却让 outbound_fence 保持
+        # 默认 False,于是 `FEEDLING_OUTBOUND_FENCE=1` 到不了子进程,io_cli 的
+        # web_search / web_fetch 前置拒绝根本不会触发。
+        # ⇒ 一次无人在场的屏幕轮可以拿着刚看到的私密像素去联网检索。
+        # 这是方案 A 之前就存在的洞(A 只解开"用户自配 MCP",不解开平台出站),
+        # 但公开文档现在明写"屏幕轮仍然封锁平台出站",所以它必须在这里补上。
+        pixel_turn = bool(screen_payloads or screen_paths)
         try:
             agent_result = call_agent(
                 message,
                 images=screen_payloads,
                 image_paths=screen_paths,
+                # 不传 lane 会默认 "background",于是这一轮拿不到 MCP、argv 前缀
+                # 与聊天道不同,两条道永远共享不了 provider 的 prompt cache。
+                # 身份写保护不受影响:io_cli 的闸只放行 chat/未设,proactive 仍被拒。
+                lane="proactive",
+                **({"outbound_fence": True} if pixel_turn else {}),
             )
         except Exception as e:
             if _is_provider_payment_error(e):
@@ -15036,6 +15106,55 @@ def _process_proactive_jobs(jobs: list) -> float:
                     "request_broadcast": request_broadcast,
                 },
             )
+
+        # 「想了但没说」在唤醒道是**合法沉默**,不是失败。
+        #
+        # 2026-08-21 起主动道的模板允许开头写 `<think>...</think>`(与前台共用
+        # kill switch),于是"整轮只有思考、没有 messages 也没有 actions"这条路径
+        # **从冷路变成了热路**。而下面的收尾是 `if not posted_any: failed
+        # empty_agent_reply` —— 它会把一次合法的沉默记成失败,污染唤醒失败率,
+        # 并且用户永远看不到(唤醒失败对前端不可见,2026-08-10 裁定)。
+        # 托管 V2 早就把这条语义修好了(`2f187175 accept thinking-only wake
+        # silence`),resident 侧一直没有对应实现 —— 放开 think 的同时必须补上。
+        #
+        # 只认**自己解析出来的** thinking(`thinking_self_authored`):模型原生
+        # reasoning 字段任何一轮都可能有,拿它当"这轮有效"会把真正的空回复也
+        # 洗成沉默。
+        # `memory_identity_actions` 也必须为空:一次只写记忆不说话的唤醒是**另一件事**
+        # (capture/dream 靠它),把它标成 thinking_only_silence 会掩盖真实的写动作。
+        #
+        # ⚠️ **有交付义务的两类唤醒不在此列**(codex 第二轮复审抓出):
+        #   - 定时提醒:用户明确要求过的提醒必须送达。让它以 `completed` 收场
+        #     等于**把一次没送达的提醒报成成功** —— 用户什么都没收到,而指标是绿的。
+        #   - 首次介绍(introduction):那一轮的问候是它存在的理由。
+        # 这两类保持走既有的 `empty_agent_reply` 失败路径。合法沉默只属于
+        # 环境心跳/手动/屏幕这些**没有承诺产出**的唤醒。
+        #
+        # 同族前车之鉴:`_run_wake` 曾对**所有** wake lane 传 `require_reply=False`,
+        # 把已上线的空回复恢复整条关掉,定时提醒被静默吞掉(修复 519ec0b8)。
+        # 一条为"某些道"写的放行规则,套到有交付义务的道上就是这个后果。
+        if (
+            not replies
+            and not proactive_actions
+            and not memory_identity_actions
+            and not is_introduction
+            and not _is_scheduled_wake_job(job)
+            and getattr(turn, "thinking_self_authored", False)
+            and str(getattr(turn, "thinking_summary", "") or "").strip()
+        ):
+            update_proactive_job_status(
+                job_id,
+                "completed",
+                "thinking_only_silence",
+                extra={
+                    "agent_action": "sleep",
+                    "agent_action_status": "thinking_only_silence",
+                    "agent_actions": status_actions,
+                    "wake_result": "sleep",
+                },
+            )
+            log.info("proactive wake thought without speaking id=%s", job_id)
+            continue
 
         sleep_action = _first_proactive_action(proactive_actions, {"sleep"})
         if sleep_action and not replies:

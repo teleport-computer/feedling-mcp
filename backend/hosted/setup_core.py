@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+import time
 import uuid
 from functools import wraps
 
@@ -37,6 +38,7 @@ from core.store import UserStore
 from accounts import onboarding as accounts_onboarding
 from memory import service as memory_service
 import provider_client
+import provider_attempt_ledger
 from hosted import agent_runtime_cutover
 from hosted import config_store as hosted_config_store
 from hosted import new_user_v2_cohort
@@ -50,6 +52,168 @@ _TEST_PATCHABLE_MODULES = (core_enclave,)
 _REASONING_EFFORT_OFF = {"off", "none", "no", "false", "0", "disabled"}
 _REASONING_EFFORT_LEVELS = {"low", "medium", "high"}
 _VISION_TEST_LOCKS = tuple(threading.Lock() for _ in range(32))
+_MODEL_API_PROBE_TRIGGER = "model_api_probe"
+
+
+def _model_api_probe_trace_id() -> str:
+    return f"model_api_probe:{uuid.uuid4().hex}"
+
+
+def _model_api_probe_usage(result) -> dict[str, int | None]:
+    usage = result.get("usage") if isinstance(result, dict) else None
+    usage = usage if isinstance(usage, dict) else {}
+
+    def _count(*names: str) -> int | None:
+        for name in names:
+            value = usage.get(name)
+            if value is None:
+                continue
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        return None
+
+    return {
+        "input_tokens": _count("prompt_tokens", "input_tokens"),
+        "output_tokens": _count("completion_tokens", "output_tokens"),
+        "total_tokens": _count("total_tokens"),
+    }
+
+
+def _model_api_probe_error(exc: BaseException) -> tuple[str, str]:
+    error_class = str(
+        getattr(exc, "feedling_error_class", "")
+        or provider_client.classify_provider_error(exc)
+        or "unknown"
+    )[:64]
+    # The ledger is always-on and append-only. A regex can validate an open-set
+    # upstream string's *shape*, never its provenance or confidentiality: a
+    # token fragment can be alphanumeric too. Preserve only our exact sentinel;
+    # every other outcome comes from the closed provider classifier.
+    raw = str(exc or "").strip()
+    outcome = "invalid_output" if raw == "invalid_output" else error_class
+    return outcome, error_class
+
+
+def _emit_model_api_probe_trace(
+    store,
+    *,
+    probe_trace_id: str,
+    operation: str,
+    provider: str,
+    model: str,
+    phase: str,
+    status: str = "ok",
+    outcome_class: str = debug_trace.TRACE_OUTCOME_DEFAULT,
+    usage: dict | None = None,
+    error_class: str = "",
+    dur_ms: float | None = None,
+) -> None:
+    event_type = {
+        "started": "model_api.provider_probe.started",
+        "finished": "model_api.provider_probe.finished",
+        "runtime_fenced": "model_api.provider_probe.runtime_fenced",
+    }[phase]
+    detail = {
+        "operation": operation,
+        "phase": phase,
+        "provider": provider,
+        "model": model,
+    }
+    if usage:
+        detail["usage"] = dict(usage)
+    if error_class:
+        detail["error_class"] = error_class
+    debug_trace.trace_event(
+        store,
+        subsystem="model_api",
+        type=event_type,
+        actor="backend",
+        status=status,
+        outcome_class=outcome_class,
+        summary=f"provider_probe_{phase}",
+        trace_id=probe_trace_id,
+        detail=detail,
+        dur_ms=dur_ms,
+    )
+
+
+def _test_provider_key_observed(
+    store,
+    config: provider_client.ProviderConfig,
+    *,
+    operation: str,
+    probe_trace_id: str | None = None,
+) -> dict:
+    """Run one paid provider probe with gated trace plus an always-on ledger row."""
+    trace_id = probe_trace_id or _model_api_probe_trace_id()
+    started = time.monotonic()
+    _emit_model_api_probe_trace(
+        store,
+        probe_trace_id=trace_id,
+        operation=operation,
+        provider=config.provider,
+        model=config.model,
+        phase="started",
+    )
+    try:
+        result = provider_client.test_provider_key(config)
+    except provider_client.ProviderError as exc:
+        outcome, error_class = _model_api_probe_error(exc)
+        provider_attempt_ledger.record_runtime_attempt(
+            store.user_id,
+            parent_key=trace_id,
+            trigger=_MODEL_API_PROBE_TRIGGER,
+            outcome=outcome,
+            provider=config.provider,
+            model=config.model,
+            lane=operation,
+            runtime="hosted_setup",
+            error_class=error_class,
+        )
+        _emit_model_api_probe_trace(
+            store,
+            probe_trace_id=trace_id,
+            operation=operation,
+            provider=config.provider,
+            model=config.model,
+            phase="finished",
+            status="error",
+            outcome_class="operational_failure",
+            error_class=error_class,
+            dur_ms=(time.monotonic() - started) * 1000.0,
+        )
+        raise
+
+    usage = _model_api_probe_usage(result)
+    provider_attempt_ledger.record_runtime_attempt(
+        store.user_id,
+        parent_key=trace_id,
+        trigger=_MODEL_API_PROBE_TRIGGER,
+        outcome="ok",
+        provider=config.provider,
+        model=config.model,
+        lane=operation,
+        runtime="hosted_setup",
+        input_tokens=usage["input_tokens"],
+        output_tokens=usage["output_tokens"],
+        total_tokens=usage["total_tokens"],
+        provider_request_id=(
+            str(result.get("raw_id") or "") if isinstance(result, dict) else ""
+        ),
+    )
+    _emit_model_api_probe_trace(
+        store,
+        probe_trace_id=trace_id,
+        operation=operation,
+        provider=config.provider,
+        model=config.model,
+        phase="finished",
+        usage=usage,
+        dur_ms=(time.monotonic() - started) * 1000.0,
+    )
+    return result
 
 
 def _prompt_frontier_runtime_numbers() -> tuple[dict[str, int], int, int]:
@@ -1057,14 +1221,16 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
         return envelope, api_key_hint      # (error_body, status)
 
     try:
-        provider_client.test_provider_key(
+        _test_provider_key_observed(
+            store,
             provider_client.ProviderConfig(
                 provider,
                 model,
                 provider_key,
                 base_url,
                 context_window_tokens=context_window_tokens,
-            )
+            ),
+            operation="setup",
         )
     except provider_client.ProviderError as e:
         # Log enough to triage a user-reported "key won't validate" without ever
@@ -1659,7 +1825,13 @@ def _provider_test_failed_body(exc: BaseException) -> dict:
             "status_code": getattr(exc, "status_code", None)}
 
 
-def _test_active_route(store, route: dict, api_key: str | None) -> tuple[dict, int] | None:
+def _test_active_route(
+    store,
+    route: dict,
+    api_key: str | None,
+    *,
+    probe_trace_id: str,
+) -> tuple[dict, int] | None:
     """Decrypt the active route's envelope via the enclave and test the provider key,
     writing the ok/failed result back to the route row. Returns ``None`` on success
     or ``(error_body, status)`` on failure.
@@ -1696,14 +1868,17 @@ def _test_active_route(store, route: dict, api_key: str | None) -> tuple[dict, i
         )
         return frontier_error
     try:
-        provider_client.test_provider_key(
+        _test_provider_key_observed(
+            store,
             provider_client.ProviderConfig(
                 provider,
                 model,
                 provider_key,
                 base_url,
                 context_window_tokens=context_window_tokens,
-            )
+            ),
+            operation="test",
+            probe_trace_id=probe_trace_id,
         )
     except provider_client.ProviderError as e:
         # Not checked on purpose: the response below is already an accurate 400
@@ -1730,7 +1905,13 @@ def model_api_test(store, *, api_key: str | None) -> tuple[dict, int]:
     route = hosted_config_store.load_active_route(store)
     if not route:
         return {"error": "model_api_not_configured"}, 404
-    err = _test_active_route(store, route, api_key)
+    probe_trace_id = _model_api_probe_trace_id()
+    err = _test_active_route(
+        store,
+        route,
+        api_key,
+        probe_trace_id=probe_trace_id,
+    )
     if err is not None:
         # The active route is no longer proven runnable. Fence the current V2
         # generation before returning the provider error so pending work cannot
@@ -1739,6 +1920,16 @@ def model_api_test(store, *, api_key: str | None) -> tuple[dict, int]:
             hosted_config_store.prepare_model_api_delete(store)
         except Exception:
             return {"error": "model_api_runtime_disable_failed"}, 500
+        _emit_model_api_probe_trace(
+            store,
+            probe_trace_id=probe_trace_id,
+            operation="test",
+            provider=str(route.get("provider") or ""),
+            model=str(route.get("model") or ""),
+            phase="runtime_fenced",
+            status="warning",
+            outcome_class="control",
+        )
         return err
     policy_error = _apply_runtime_policy_or_error(store)
     if policy_error is not None:

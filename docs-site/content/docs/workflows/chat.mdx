@@ -74,6 +74,15 @@ ownership are recorded. If that ownership transition cannot complete, setup
 fails closed with a retryable error rather than silently falling back to the
 resident path.
 
+An explicit provider HTTPS base URL must resolve only to publicly reachable
+addresses. Feedling repeats that uncached DNS classification before runtime
+provider calls as well as during setup and model listing; a private, loopback,
+link-local, reserved, multicast, empty, or unresolvable answer is rejected.
+Exact `http://127.0.0.1` and `http://localhost` URLs remain available for local
+development. Self-host operators who intentionally use an HTTPS LAN model
+server must opt into the deployment-level exception described in
+[Self-hosting](/docs/self-hosting).
+
 ### Time grounding
 
 Hosted Runtime V2 freezes one user-local temporal snapshot for the whole turn
