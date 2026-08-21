@@ -343,13 +343,27 @@ def test_test_preflight_rejects_noncanonical_database_schema_selector():
 
 def test_prod_deploys_forward_one_database_schema_selector_to_every_database_client():
     source = WORKFLOW.read_text()
+    validator = _job(
+        source, "validate-prod-runner-topology", "detect-cvm-changes-pre"
+    )
     main = _job(source, "deploy-cvm", "deploy-test-cvm")
     runner = _job(source, "deploy-prod-runner-cvm", "notify-lark-prod-deploy")
 
-    selector = "${{ vars.PROD_FEEDLING_DATABASE_SCHEMA || 'rds' }}"
+    assert "${{ vars.PROD_FEEDLING_DATABASE_SCHEMA || 'rds' }}" in validator
+    assert (
+        "database_schema: ${{ steps.prod_release_config.outputs.database_schema }}"
+        in validator
+    )
+    assert (
+        "FEEDLING_DATABASE_SCHEMA: ${{ needs.validate-prod-runner-topology."
+        "outputs.database_schema }}"
+    ) in main
+    assert (
+        "FEEDLING_DATABASE_SCHEMA:      ${{ needs.deploy-cvm.outputs."
+        "database_schema }}"
+    ) in runner
     for deploy in (main, runner):
         assert "FEEDLING_DATABASE_SCHEMA:" in deploy
-        assert selector in deploy
         assert '-e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA"' in deploy
 
 
@@ -383,7 +397,7 @@ def test_prod_preflight_blocks_unready_tee_primary_before_mutating_any_cvm():
     )
 
     for required in (
-        "PROD_FEEDLING_DATABASE_SCHEMA == 'tee'",
+        "steps.prod_release_config.outputs.database_schema == 'tee'",
         "PROD_TEE_MIGRATION_DSN",
         "PROD_TEE_PG_CA_PEM",
         "APP_DATABASE_URL",

@@ -304,6 +304,8 @@ services:
       # encrypted deploy input; the literal gate defaults off for Gate 1.
       PLAINTEXT_SHADOW_DATABASE_URL: "${PLAINTEXT_SHADOW_DATABASE_URL:-}"
       FEEDLING_PLAINTEXT_SHADOW_ENABLED: "${FEEDLING_PLAINTEXT_SHADOW_ENABLED:-0}"
+      # PROD is fail-closed. CI admits 1 only together with TEE-primary wiring.
+      FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "${FEEDLING_PLAINTEXT_WRITES_ACCEPTED:-0}"
       FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY: "${FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY:-}"
       # Cloudflare R2 (S3-compatible) offload for the heavy frame ciphertext
       # (backend/object_storage.py). Injected via `phala deploy -e R2_*=...`
@@ -464,6 +466,8 @@ services:
       FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
       # Only the backend owns the elected decrypted-shadow drain.
       FEEDLING_PLAINTEXT_SHADOW_ENABLED: "0"
+      # Must match the backend; CI admits 1 only with TEE-primary wiring.
+      FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "${FEEDLING_PLAINTEXT_WRITES_ACCEPTED:-0}"
       # frame_get resolves R2-backed photo pointers in this process.
       R2_ENDPOINT: "${R2_ENDPOINT:-}"
       R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"

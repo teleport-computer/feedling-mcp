@@ -53,8 +53,12 @@ and attachment plaintext binary uses strict `body_b64`; large objects may use a
    ciphertext using the guarded procedure below, run strict verification, then
    perform Phase 4 and switch both units to TEE.
 7. Open `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` only after compatible clients and
-   regression evidence exist, one environment at a time. This per-user write
-   gate is independent from the all-plaintext shadow described below.
+   regression evidence exist, one environment at a time. Production uses the
+   fail-closed `PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED` repository variable;
+   CI accepts `1` only when `PROD_FEEDLING_DATABASE_SCHEMA=tee` and forwards the
+   same value to the API, in-CVM worker, and every independent runner. This
+   per-user write gate is independent from the all-plaintext shadow described
+   below.
 
 ## Post-promotion plaintext shadow
 
@@ -211,10 +215,13 @@ audited preserved ciphertext. Only the former blocks promotion; the preserved
 count and aggregate digest are embedded in the prepared marker.
 
 Before traffic resumes, point main and runner at the same TEE app DSN, set
-`FEEDLING_DATABASE_SCHEMA=tee`, and remove `TEE_DATABASE_URL`/dual-write. Startup
-must assert the TEE head and marker without DDL. After the first TEE-primary
-write, frozen RDS is not a lossless rollback target; reverse-reconcile or restore
-TEE changes before switching a DSN back.
+`FEEDLING_DATABASE_SCHEMA=tee`, and remove `TEE_DATABASE_URL`/dual-write. To open
+the plaintext tier in the same maintenance window, also set
+`PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1`; CI rejects that value with the RDS
+schema selector, and all production write processes receive the same gate.
+Startup must assert the TEE head and marker without DDL. After the first
+TEE-primary write, frozen RDS is not a lossless rollback target;
+reverse-reconcile or restore TEE changes before switching a DSN back.
 
 ## Shape inventory
 

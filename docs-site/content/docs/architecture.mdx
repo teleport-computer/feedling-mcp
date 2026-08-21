@@ -531,8 +531,11 @@ envelopes. Treat an absent, empty, or unrecognized value as `on`.
 
 The deployment gate is closed by default and opens only when
 `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` is set. The test and pre-production
-environments enable it; production remains closed. Even in an enabled
-deployment, an unknown user remains fail-safe encrypted.
+environments enable it. Production exposes a separate fail-closed release
+variable, forwards one value to the API and every worker/runner, and rejects an
+open gate unless the database schema selector is `tee`. Even in an enabled
+deployment, an explicit encrypted-tier account or an unknown user remains
+fail-safe encrypted; existing ciphertext is not rewritten by the gate.
 
 Two boundaries hold in both tiers:
 
