@@ -316,6 +316,175 @@ def test_rows_folded_by_compaction_are_retained_not_deleted():
     assert db.chat_get_strict(uid, late) is None        # unfolded row deleted
 
 
+def test_uncovered_batch_mirrors_deletes_and_repairs_absent_primary_row(
+    monkeypatch,
+):
+    """Mirror only safe uncovered ids, including an already-absent target.
+
+    The absent row models a competing cleanup whose best-effort mirror was
+    missed. The candidate seq snapshot retains the old ``chat_delete``
+    self-heal property without allowing the covered row onto the shadow DELETE.
+    Removing the helper's mirror block leaves ``mirrored`` empty and fails.
+    """
+    from tee_shadow import mirror
+
+    uid = _seed_user()
+    call_id = "vcall_" + uuid.uuid4().hex[:10]
+    covered_id = _append(uid, {
+        "role": "user", "source": "model_api",
+        "voice_call_id": call_id, "voice_turn_id": "covered",
+    })
+    absent_id = _append(uid, {
+        "role": "user", "source": "model_api",
+        "voice_call_id": call_id, "voice_turn_id": "absent",
+    })
+    current_id = _append(uid, {
+        "role": "user", "source": "model_api",
+        "voice_call_id": call_id, "voice_turn_id": "current",
+    })
+    targets = summary.call_message_rows(uid, call_id)
+    seq_by_id = dict(targets)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_conversation_summary (user_id,watermark_seq) "
+            "VALUES (%s,%s)",
+            (uid, seq_by_id[covered_id]),
+        )
+        # Simulate another cleanup winning primary deletion but missing its
+        # best-effort shadow mirror before this snapshot-bearing retry runs.
+        conn.execute(
+            "DELETE FROM chat_messages WHERE user_id=%s AND msg_id=%s",
+            (uid, absent_id),
+        )
+
+    mirrored = []
+    monkeypatch.setattr(
+        mirror, "execute_many", lambda statements: mirrored.append(statements)
+    )
+    result = db.chat_delete_uncovered_many(uid, targets)
+
+    assert result == {"deleted": 1, "retained_covered": 1, "remaining": 0}
+    assert db.chat_get_strict(uid, covered_id) is not None
+    assert db.chat_get_strict(uid, absent_id) is None
+    assert db.chat_get_strict(uid, current_id) is None
+    assert len(mirrored) == 1
+    assert len(mirrored[0]) == 2
+    for _sql, params in mirrored[0]:
+        assert params[0] == uid
+        assert set(params[1]) == {absent_id, current_id}
+        assert covered_id not in params[1]
+
+
+def test_voice_cleanup_serializes_coverage_check_with_compaction_leaf(
+    monkeypatch,
+):
+    """A leaf committing after candidate discovery must protect its rows.
+
+    The compactor holds the ordinary shared chat-user fence while it commits
+    the immutable leaf. Voice cleanup must wait on the exclusive form, then
+    re-read the advanced watermark before deleting anything. Removing that
+    exclusive fence makes the cleanup future finish early and this test fail;
+    reading coverage before the fence makes the final retained count fail.
+    """
+    from model_api_runtime.v2 import jobs_store
+    from model_api_runtime.v2 import serve_worker
+
+    uid = _seed_user()
+    call_id = "vcall_" + uuid.uuid4().hex[:10]
+    first = _append(uid, {
+        "role": "user", "source": "model_api",
+        "voice_call_id": call_id, "voice_turn_id": "t1",
+    })
+    second = _append(uid, {
+        "role": "openclaw", "source": "model_api",
+        "voice_call_id": call_id, "voice_turn_id": "t1",
+    })
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT msg_id,seq FROM chat_messages WHERE user_id=%s "
+            "AND msg_id=ANY(%s) ORDER BY seq",
+            (uid, [first, second]),
+        ).fetchall()
+    start_seq, end_seq = int(rows[0][1]), int(rows[-1][1])
+
+    helper_entered = threading.Event()
+    real_delete = db.chat_delete_uncovered_many
+
+    def observed_delete(user_id, msg_ids):
+        helper_entered.set()
+        return real_delete(user_id, msg_ids)
+
+    monkeypatch.setattr(db, "chat_delete_uncovered_many", observed_delete)
+
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        with db.get_pool().connection() as compaction_conn:
+            with compaction_conn.transaction():
+                with compaction_conn.cursor() as cur:
+                    db._lock_chat_user_fence_on_cursor(cur, uid)
+                    cleanup_future = pool.submit(
+                        summary.delete_call_messages, uid, call_id
+                    )
+                    assert helper_entered.wait(timeout=2)
+
+                    # Prove cleanup reached the guard and is waiting behind
+                    # this shared compaction transaction, rather than relying
+                    # on thread timing alone.
+                    deadline = time.monotonic() + 2
+                    waiting = 0
+                    while time.monotonic() < deadline and not cleanup_future.done():
+                        waiting = int(cur.execute(
+                            "SELECT COUNT(*) FROM pg_locks "
+                            "WHERE locktype='advisory' "
+                            "AND mode='ExclusiveLock' AND NOT granted"
+                        ).fetchone()[0])
+                        if waiting:
+                            break
+                        time.sleep(0.01)
+                    assert waiting >= 1
+                    assert not cleanup_future.done()
+
+                    cur.execute(
+                        "INSERT INTO v2_conversation_summary_segments "
+                        "(user_id,format_version,coverage_kind,level,start_seq,"
+                        "end_seq,source_message_count,legacy_opaque_through_seq,"
+                        "child_segment_ids,summary_envelope) "
+                        "VALUES (%s,1,'exact',0,%s,%s,2,0,'{}'::BIGINT[],%s) "
+                        "RETURNING segment_id",
+                        (
+                            uid,
+                            start_seq,
+                            end_seq,
+                            db.Jsonb({"plaintext": "covered voice rows"}),
+                        ),
+                    )
+                    segment_id = int(cur.fetchone()[0])
+                    cur.execute(
+                        "INSERT INTO v2_conversation_summary "
+                        "(user_id,summary_envelope,watermark_ts,version,"
+                        "watermark_seq,materialized_segment_ids) "
+                        "VALUES (%s,%s,%s,1,%s,%s)",
+                        (
+                            uid,
+                            db.Jsonb({"plaintext": "covered voice rows"}),
+                            time.time(),
+                            end_seq,
+                            [segment_id],
+                        ),
+                    )
+        # The transaction commit releases the shared fence, so cleanup can now
+        # re-read the new head and make its delete/retain decision.
+        result = cleanup_future.result(timeout=2)
+    finally:
+        pool.shutdown(wait=True)
+    assert result == {"deleted": 0, "retained_covered": 2, "remaining": 0}
+    assert db.chat_get_strict(uid, first) is not None
+    assert db.chat_get_strict(uid, second) is not None
+    state = jobs_store.get_summary_frontier_state(uid)
+    assert state is not None
+    assert len(serve_worker._summary_metadata_frontier(state)) == 1
+
+
 # --------------------------------------------------------------------------- #
 # finalize route: archive -> bounded card -> cleanup -> capture nudge
 # --------------------------------------------------------------------------- #
