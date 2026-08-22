@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 
+import db
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
@@ -153,13 +154,13 @@ async def chat_message(request: Request, auth: AuthResult = Depends(require_auth
 
 
 def _allow_verify_reply_with_fresh_pending_check(store, payload: dict) -> bool:
-    """Check pending verify ping, reloading once before a negative decision.
+    """Check a pending verify ping with one exact durable negative-path read.
 
     In multi-worker deployments, verify_loop inserts a synthetic ping in one
     worker and the resident consumer may answer through another before
-    LISTEN/NOTIFY has evicted that second worker's cached store. The fast path
-    stays cache-only; the negative path reloads once so we do not reject a valid
-    verify reply based on stale chat_messages.
+    LISTEN/NOTIFY has refreshed that second worker's cached store. The fast path
+    stays cache-only; the negative path reads only the named ping so a valid
+    reply is not rejected and unrelated resident state is never reloaded.
     """
     source = str(payload.get("source") or "chat").strip() or "chat"
     reply_to_message_id = chat_core._reply_to_message_id(payload)
@@ -168,9 +169,14 @@ def _allow_verify_reply_with_fresh_pending_check(store, payload: dict) -> bool:
     if boot_gates._reply_is_for_pending_verify_ping(store, reply_to_message_id):
         return True
     # verify_loop is repeatable. A previous sticky green does not prove this
-    # worker has seen the new ping, so always reload once for an exact negative.
-    store.reload()
-    return boot_gates._reply_is_for_pending_verify_ping(store, reply_to_message_id)
+    # worker has seen the new ping, so always point-read this exact target.
+    ping = db.chat_get_strict(store.user_id, reply_to_message_id)
+    return bool(
+        isinstance(ping, dict)
+        and ping.get("role") == "user"
+        and ping.get("source") == "verify_ping"
+        and not str(ping.get("reply_message_id") or "").strip()
+    )
 
 
 @router.post("/v1/chat/response")

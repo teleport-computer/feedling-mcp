@@ -131,7 +131,11 @@ def test_verify_loop_requires_decrypt_health_before_minting_sticky_green(monkeyp
 
         def __init__(self):
             self.chat_lock = threading.RLock()
-            self.chat_messages: list[dict] = []
+            self.chat_messages: list[dict] = [
+                {"id": "ordinary1", "role": "openclaw", "source": "chat", "ts": 99.0}
+            ]
+            self.chat_waiters: list[threading.Event] = []
+            self.chat_waiters_lock = threading.Lock()
             self.acked = False
 
         def append_chat(self, role, source, envelope):
@@ -152,17 +156,19 @@ def test_verify_loop_requires_decrypt_health_before_minting_sticky_green(monkeyp
             return ""
 
         def reload(self):
-            # No-op double: verify_loop now reloads before each poll read (to
-            # see a cross-worker ack). This fake's fake sleep injects the ack
-            # straight into chat_messages, so there is nothing to re-read here.
-            return None
+            raise AssertionError("verify_loop must not reload the whole store")
 
     def run(status: str):
         store = Store()
         clock = {"now": 100.0}
         logged: list[str] = []
 
-        def sleep(_seconds):
+        wait_durations: list[float] = []
+
+        def wait_without_notify(_waiter, seconds):
+            # Simulate a lost NOTIFY: the ack becomes durable while the waiter
+            # times out, and the next bounded point read must discover it.
+            wait_durations.append(seconds)
             clock["now"] += 0.1
             if not store.acked:
                 store.chat_messages.append(
@@ -175,6 +181,18 @@ def test_verify_loop_requires_decrypt_health_before_minting_sticky_green(monkeyp
                     }
                 )
                 store.acked = True
+            return False
+
+        def verify_reply(_user_id, ping_id, ping_ts):
+            return next(
+                (
+                    row for row in store.chat_messages
+                    if chat_core._verify_reply_matches_ping(
+                        row, ping_id=ping_id, ping_ts=ping_ts
+                    )
+                ),
+                None,
+            )
 
         if status == "ok":
             health = chat_core.chat_consumer._decrypt_health_from_state(
@@ -194,7 +212,8 @@ def test_verify_loop_requires_decrypt_health_before_minting_sticky_green(monkeyp
             )
         resident = {"passing": True, "decrypt_health": health}
         monkeypatch.setattr(chat_core.time, "time", lambda: clock["now"])
-        monkeypatch.setattr(chat_core.time, "sleep", sleep)
+        monkeypatch.setattr(chat_core, "_wait_for_verify_wake", wait_without_notify)
+        monkeypatch.setattr(chat_core.db, "chat_verify_reply_strict", verify_reply)
         monkeypatch.setattr(
             chat_core.accounts_onboarding,
             "_load_onboarding_route",
@@ -213,6 +232,8 @@ def test_verify_loop_requires_decrypt_health_before_minting_sticky_green(monkeyp
         monkeypatch.setattr(chat_core, "_maybe_enqueue_resident_introduction", lambda _store: None)
         monkeypatch.setattr(chat_core.db, "chat_delete", lambda *_args: None)
         body, code = chat_core.verify_loop(store, {"timeout_sec": 2})
+        assert wait_durations and max(wait_durations) <= 2.0
+        assert [row["id"] for row in store.chat_messages] == ["ordinary1"]
         return body, code, logged
 
     healthy, code, logged = run("ok")
@@ -227,3 +248,119 @@ def test_verify_loop_requires_decrypt_health_before_minting_sticky_green(monkeyp
     assert unconfigured["passing"] is False
     assert unconfigured["reason"] == "decrypt_source_unconfigured"
     assert logged == []
+
+
+def test_two_concurrent_verify_loops_cleanup_only_their_own_exchange(monkeypatch):
+    class Store:
+        user_id = "usr_concurrent_verify"
+
+        def __init__(self):
+            self.chat_lock = threading.RLock()
+            self.chat_messages: list[dict] = []
+            self.chat_waiters: list[threading.Event] = []
+            self.chat_waiters_lock = threading.Lock()
+
+        def append_chat(self, role, source, envelope):
+            row = {**envelope, "role": role, "source": source, "ts": 100.0}
+            with self.chat_lock:
+                self.chat_messages.append(row)
+            return row
+
+        def notify_chat_waiters(self):
+            return None
+
+    store = Store()
+    both_queries = threading.Barrier(2)
+    deleted: list[tuple[str, str]] = []
+    deleted_lock = threading.Lock()
+
+    def exact_reply(_user_id, ping_id, _ping_ts):
+        both_queries.wait(timeout=2)
+        ack = {
+            "id": f"ack-{ping_id}",
+            "role": "openclaw",
+            "source": "verify_ping",
+            "reply_to_message_id": ping_id,
+            "ts": 100.1,
+        }
+        with store.chat_lock:
+            store.chat_messages.append(ack)
+        return ack
+
+    def delete(_user_id, message_id):
+        with deleted_lock:
+            deleted.append((threading.current_thread().name, message_id))
+        return True
+
+    from hosted import config_store as hosted_config_store
+
+    monkeypatch.setattr(hosted_config_store, "load_active_route", lambda _store: None)
+    monkeypatch.setattr(chat_core.db, "chat_verify_reply_strict", exact_reply)
+    monkeypatch.setattr(chat_core.db, "chat_delete", delete)
+    monkeypatch.setattr(
+        chat_core.accounts_onboarding, "_load_onboarding_route", lambda _store: "model_api"
+    )
+    monkeypatch.setattr(chat_core.boot_gates, "_log_bootstrap_event", lambda *_a, **_k: None)
+    monkeypatch.setattr(chat_core, "_maybe_enqueue_resident_introduction", lambda _store: None)
+
+    results: dict[str, tuple[dict, int]] = {}
+
+    def run():
+        results[threading.current_thread().name] = chat_core.verify_loop(
+            store, {"timeout_sec": 2}
+        )
+
+    threads = [threading.Thread(target=run, name=name) for name in ("verify-a", "verify-b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+
+    assert all(body["loop_alive"] and code == 200 for body, code in results.values())
+    by_thread = {
+        name: {message_id for owner, message_id in deleted if owner == name}
+        for name in results
+    }
+    assert all(len(ids) == 2 for ids in by_thread.values())
+    assert by_thread["verify-a"].isdisjoint(by_thread["verify-b"])
+    assert store.chat_messages == []
+    assert store.chat_waiters == []
+
+
+def test_verify_timeout_cleans_exact_ping_and_waiter(monkeypatch):
+    class Store:
+        user_id = "usr_verify_timeout"
+        chat_lock = threading.RLock()
+        chat_messages: list[dict] = []
+        chat_waiters: list[threading.Event] = []
+        chat_waiters_lock = threading.Lock()
+
+        def append_chat(self, role, source, envelope):
+            row = {**envelope, "role": role, "source": source, "ts": 100.0}
+            self.chat_messages.append(row)
+            return row
+
+        def notify_chat_waiters(self):
+            return None
+
+    store = Store()
+    deleted: list[str] = []
+    from hosted import config_store as hosted_config_store
+
+    monkeypatch.setattr(hosted_config_store, "load_active_route", lambda _store: None)
+    monkeypatch.setattr(chat_core.db, "chat_verify_reply_strict", lambda *_args: None)
+    monkeypatch.setattr(
+        chat_core.db, "chat_delete", lambda _user_id, message_id: deleted.append(message_id)
+    )
+    monkeypatch.setattr(
+        chat_core.accounts_onboarding, "_load_onboarding_route", lambda _store: "model_api"
+    )
+
+    body, code = chat_core.verify_loop(store, {"timeout_sec": 0})
+
+    assert code == 200
+    assert body["loop_alive"] is False
+    assert len(deleted) == 1
+    assert store.chat_messages == []
+    assert store.chat_waiters == []

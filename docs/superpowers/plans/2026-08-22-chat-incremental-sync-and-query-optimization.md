@@ -222,6 +222,7 @@ git commit -m "feat(chat): dispatch versioned targeted wake events"
 **Files:**
 - Modify: `backend/chat/chat_core.py`
 - Modify: `backend/chat/routes_asgi.py`
+- Modify: `backend/core/store.py`
 - Modify: `tests/test_verify_loop_cross_worker.py`
 - Modify: `tests/test_chat_response_verify_reload.py`
 - Modify: `tests/test_verify_loop_gc_dangling_pointer.py`
@@ -231,22 +232,22 @@ git commit -m "feat(chat): dispatch versioned targeted wake events"
 - Consumes `db.chat_verify_reply_strict` and `db.chat_get_strict`.
 - Preserves response schema and maximum timeout.
 
-- [ ] **Step 1: Add RED tests**
+- [x] **Step 1: Add RED tests**
 
 Assert no `store.reload()`, cross-worker wake success, lost-NOTIFY two-second fallback, two concurrent verifies with isolated cleanup, timeout cleanup, and protection of ordinary replies.
 
-- [ ] **Step 2: Run the verify slice and confirm RED**
+- [x] **Step 2: Run the verify slice and confirm RED**
 
 ```bash
 FEEDLING_TEST_PG='postgresql://postgres:test@127.0.0.1:55432/postgres' \
   .venv-test/bin/python -m pytest tests/test_verify_loop_cross_worker.py tests/test_chat_response_verify_reload.py tests/test_verify_loop_gc_dangling_pointer.py tests/test_bootstrap_status_verify_ping.py -q
 ```
 
-- [ ] **Step 3: Implement event-first verification**
+- [x] **Step 3: Implement event-first verification**
 
 Register waiter after ping commit, recheck to close the registration race, then wait in at-most-two-second intervals and point-read. Cleanup exact ping/reply IDs in `finally`. Replace negative response-admission reload with exact ping lookup.
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 ```bash
 git add backend/chat/chat_core.py backend/chat/routes_asgi.py tests/test_verify_loop_cross_worker.py tests/test_chat_response_verify_reload.py tests/test_verify_loop_gc_dangling_pointer.py tests/test_bootstrap_status_verify_ping.py

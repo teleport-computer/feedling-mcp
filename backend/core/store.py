@@ -504,6 +504,27 @@ class UserStore:
                 self, rows, version=version
             )
 
+    def remove_committed_chat_ids(self, message_ids: list[str]) -> None:
+        """Remove exact already-deleted rows from the local hot cache."""
+        removed = {
+            str(message_id) for message_id in message_ids if str(message_id)
+        }
+        if not removed:
+            return
+        with self.chat_lock:
+            self._ensure_chat_cache_state_locked()
+            if not any(
+                message_id in self._chat_messages_by_id
+                for message_id in removed
+            ):
+                return
+            remaining = [
+                row
+                for row in self.chat_messages
+                if str(row.get("id") or "") not in removed
+            ]
+            self._replace_chat_rows_locked(remaining, version=self.chat_version)
+
     def reload_chat_hot_strict(self) -> list[dict]:
         """Replace only chat state from one version-consistent hot snapshot."""
         limit = min(
