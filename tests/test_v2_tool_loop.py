@@ -1408,18 +1408,24 @@ def test_preamble_text_with_tool_calls_is_not_a_bubble(monkeypatch):
     assert outcome.rounds == 2
 
 
-def test_budget_bound_last_call_keeps_history_schema_and_forbids_tools(monkeypatch):
-    """If every round returns a tool_call, the loop's LAST provider call
-    keeps the schema referenced by native history but sets tool_choice=none, so
-    strict providers can validate the transcript without extending the loop."""
+def test_configured_budget_stops_tool_only_loop_and_requests_complete_reply(
+    monkeypatch,
+):
+    """A model that only calls tools gets one fresh, explicit answer request.
+
+    The stall threshold is independent from the hard ``max_calls`` ceiling. Its
+    next attempt keeps schemas required by native history, forbids tool execution,
+    and asks the model to use existing information. The user receives that complete
+    model reply rather than the worker's generic failure fallback.
+    """
     provider = _ScriptedProvider([
         {
-            "reply": "looking 1",
+            "reply": "",
             "tool_calls": [{"id": "1", "name": "memory_search", "args": {"query": "a"}}],
             "usage": {},
         },
         {
-            "reply": "looking 2",
+            "reply": "",
             "tool_calls": [{"id": "2", "name": "memory_search", "args": {"query": "b"}}],
             "usage": {},
         },
@@ -1445,7 +1451,8 @@ def test_budget_bound_last_call_keeps_history_schema_and_forbids_tools(monkeypat
         on_reply=on_reply,
         fold_new_messages=fold,
         add_usage=_noop_add_usage,
-        max_calls=3,
+        max_calls=15,
+        max_consecutive_tool_only_rounds=2,
     ))
 
     assert len(provider.calls) == 3
@@ -1453,6 +1460,10 @@ def test_budget_bound_last_call_keeps_history_schema_and_forbids_tools(monkeypat
     assert provider.calls[1]["tools"] is not None
     assert {spec.name for spec in provider.calls[2]["tools"]} == {"memory_search"}
     assert provider.calls[2]["tool_choice"] == "none"
+    terminal_system = provider.calls[2]["messages"][0]
+    assert terminal_system["role"] == "system"
+    assert "Using only the information already available" in terminal_system["content"]
+    assert "write one complete, self-contained reply" in terminal_system["content"]
     assert any(
         isinstance(message, ToolExchange)
         and message.calls[0].name == "memory_search"
@@ -2284,6 +2295,56 @@ def test_malformed_args_gets_one_tools_disabled_fallback_without_dispatch(monkey
     assert [call["tools"] is None for call in provider.calls] == [False, True]
     assert reply.calls == [("I could not use tools, but here is the answer.", True)]
     assert outcome.rounds == 2
+
+
+def test_tools_disabled_fallback_is_not_retried_when_model_calls_tools_again(
+    monkeypatch,
+):
+    """A broken terminal response cannot consume the remaining provider budget."""
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "bad-1",
+                "name": "web_search",
+                "args": {},
+                "args_raw": "{",
+                "args_ok": False,
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "half-finished preamble",
+            "tool_calls": [{
+                "id": "bad-2",
+                "name": "web_search",
+                "args": {"query": "x"},
+            }],
+            "usage": {},
+        },
+        {"reply": "must not be requested", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    reply = _RecordingReply()
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=reply,
+        fold_new_messages=_RecordingFold([[]]),
+        add_usage=_noop_add_usage,
+        max_calls=15,
+    ))
+
+    assert len(provider.calls) == 2
+    assert provider.calls[1]["tools"] is None
+    assert "write one complete, self-contained reply" in (
+        provider.calls[1]["messages"][0]["content"]
+    )
+    assert reply.calls == []
+    assert outcome.rounds == 2
+    assert outcome.stop_reason == "budget_exhausted"
 
 
 def test_malformed_reasoning_turn_disables_reasoning_for_text_fallback(monkeypatch):

@@ -444,6 +444,9 @@ MAX_TOOL_CALLS_PER_ROUND = _positive_int_env(
     "FEEDLING_V2_MAX_TOOL_CALLS_PER_ROUND", "8"
 )
 MAX_TOOL_CALLS_PER_TURN = _positive_int_env("FEEDLING_V2_MAX_TOOL_CALLS_PER_TURN", "24")
+MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS = _positive_int_env(
+    "FEEDLING_V2_MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS", "3"
+)
 TOOL_RESULT_CHAR_CAP = _positive_int_env("FEEDLING_V2_TOOL_RESULT_CHAR_CAP", "2000")
 TOOL_BATCH_RESULT_CHAR_CAP = _positive_int_env(
     "FEEDLING_V2_TOOL_BATCH_RESULT_CHAR_CAP", "8000"
@@ -5697,6 +5700,9 @@ def _make_task_batch_dispatcher(
                 ),
                 outbound_blocking_read_tool_names=(_PRIVATE_READ_TOOLS),
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
+                max_consecutive_tool_only_rounds=(
+                    MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS
+                ),
                 max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
                 max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
                 tool_result_char_cap=TOOL_RESULT_CHAR_CAP,
@@ -10105,6 +10111,9 @@ async def _run_wake(
                 ),
                 outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
+                max_consecutive_tool_only_rounds=(
+                    MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS
+                ),
                 max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
                 max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
                 tool_result_char_cap=TOOL_RESULT_CHAR_CAP,
@@ -14809,6 +14818,9 @@ async def process_job(
             initial_screen_pixels_blocked=(screen_frame_message is not None),
             tagged_image_message_key=v2_screen_chat.MESSAGE_TAG,
             on_tagged_images_rejected=_on_screen_images_rejected,
+            max_consecutive_tool_only_rounds=(
+                MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS
+            ),
             max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
             max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
             tool_result_char_cap=TOOL_RESULT_CHAR_CAP,

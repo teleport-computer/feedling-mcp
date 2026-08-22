@@ -2051,11 +2051,11 @@ def test_chat_turn_always_replies_even_when_model_only_calls_tools(monkeypatch):
     """BUG-4 structural successor (Task 7): in the old json_planner pipeline, a
     plan that never asked for `final_response` could silently swallow the turn
     (fixed back then by forcing `wants_reply=True` for the chat lane). In the
-    unified tool loop this can no longer happen BY CONSTRUCTION:
-    `tool_loop.run_tool_loop`'s last round keeps referenced schemas but sets
-    `tool_choice=none`, so a model that just keeps calling tools every round
-    still gets forced to a real reply at the `_TURN_MAX_LLM_CALLS`
-    budget — never a placeholder, never a silent swallow."""
+    unified tool loop this can no longer happen BY CONSTRUCTION. After the
+    independently configured consecutive tool-only threshold, the next round
+    keeps referenced schemas but sets `tool_choice=none`, so the model is forced
+    to a real reply before the hard `_TURN_MAX_LLM_CALLS` budget — never a
+    placeholder, never a silent swallow."""
     uid = "u_w_loop_bug4"
     conftest.seed_user(uid)
     _reset(uid)
@@ -2063,8 +2063,8 @@ def test_chat_turn_always_replies_even_when_model_only_calls_tools(monkeypatch):
     job = jobs_store.claim_next_job("w")
 
     monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
-    n = worker._TURN_MAX_LLM_CALLS
-    script = [_tool_round(_tc(f"c{i}", "memory_index")) for i in range(n - 1)]
+    n = worker.MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS
+    script = [_tool_round(_tc(f"c{i}", "memory_index")) for i in range(n)]
     script.append(_text_round("MODEL REPLY"))
     calls = _script_provider(monkeypatch, script)
 
@@ -2077,10 +2077,11 @@ def test_chat_turn_always_replies_even_when_model_only_calls_tools(monkeypatch):
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
-    assert len(calls) == n            # ran to the budget, no early silent stop
+    assert len(calls) == n + 1
+    assert len(calls) < worker._TURN_MAX_LLM_CALLS
     assert {spec.name for spec in calls[-1]["tools"]} == {"memory_index"}
     assert calls[-1]["tool_choice"] == "none"
-    assert written.get("text") == "MODEL REPLY"       # forced reply at the cap — no silent swallow
+    assert written.get("text") == "MODEL REPLY"  # early forced reply, no swallow
 
 
 def test_second_round_receives_first_round_native_tool_exchange(monkeypatch):
