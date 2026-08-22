@@ -3,6 +3,7 @@
 import asyncio
 import json
 import sys
+import time
 import types
 from contextlib import contextmanager
 from pathlib import Path
@@ -20,6 +21,19 @@ from model_api_runtime.v2 import (
     worker,
 )
 import debug_trace
+
+
+@pytest.fixture(autouse=True)
+def _guard_process_sleep(monkeypatch):
+    """No test in this module may mutate the process-global sleep function.
+
+    Depending on ``monkeypatch`` is intentional: this fixture's teardown runs
+    before monkeypatch restores changes, so an unsafe patch through a module's
+    shared stdlib ``time`` object cannot repair itself before the assertion.
+    """
+    process_sleep = time.sleep
+    yield
+    assert time.sleep is process_sleep
 
 
 def _fake_serve_from_script(script, calls):
@@ -44,7 +58,12 @@ def test_run_forever_relaunches_crashes_then_exits_on_clean_return(monkeypatch):
         _fake_serve_from_script(
             [RuntimeError("boom1"), RuntimeError("boom2"), None], calls),
     )
-    monkeypatch.setattr(serve_worker.time, "sleep", sleeps.append)
+    # Replace this module's reference instead of mutating ``time.sleep`` on the
+    # process-global stdlib module. Background wake-bus threads also use that
+    # object and can otherwise append unrelated sleeps to this test's list.
+    monkeypatch.setattr(
+        serve_worker, "time", SimpleNamespace(sleep=sleeps.append)
+    )
 
     serve_worker._run_forever("w-test", 1.0)
 
@@ -59,7 +78,9 @@ def test_run_forever_clean_return_does_not_relaunch(monkeypatch):
     calls, sleeps = [], []
     monkeypatch.setattr(
         serve_worker, "_serve", _fake_serve_from_script([None], calls))
-    monkeypatch.setattr(serve_worker.time, "sleep", sleeps.append)
+    monkeypatch.setattr(
+        serve_worker, "time", SimpleNamespace(sleep=sleeps.append)
+    )
 
     serve_worker._run_forever("w-test", 1.0)
 
@@ -347,7 +368,9 @@ def test_run_forever_backoff_is_bounded(monkeypatch):
     script = [RuntimeError(f"boom{i}") for i in range(8)] + [None]
     monkeypatch.setattr(
         serve_worker, "_serve", _fake_serve_from_script(script, calls))
-    monkeypatch.setattr(serve_worker.time, "sleep", sleeps.append)
+    monkeypatch.setattr(
+        serve_worker, "time", SimpleNamespace(sleep=sleeps.append)
+    )
 
     serve_worker._run_forever("w-test", 1.0)
 
