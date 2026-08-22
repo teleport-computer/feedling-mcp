@@ -169,11 +169,11 @@ from memory.capture_prompt_v1 import (
     sanitize_user_name,
 )
 from identity.user_naming import transcript_speaker_label
-from memory_garden import dream_trace as memory_dream_trace
-from memory_garden.text import card_guard
-from memory_garden.guards import dream_gates as memory_dream_gates
-from memory_garden.prompts.buckets import normalize_bucket_language
-from memory_garden.text.card_text import (
+from memgarden import dream_trace as memory_dream_trace
+from memgarden.text import card_guard
+from memgarden.guards import dream_gates as memory_dream_gates
+from memgarden.prompts.buckets import normalize_bucket_language
+from memgarden.text.card_text import (
     count_user_token_residuals,
     is_retryable_parse_error,
 )
@@ -182,7 +182,7 @@ from memory.dream_prompt_v1 import (
     build_dream_retry_prompt,
     parse_dream_consolidations,
 )
-from memory_garden.prompts.migrate import build_migrate_prompt, parse_migrated_cards
+from memgarden.prompts.migrate import build_migrate_prompt, parse_migrated_cards
 from chat.reply_language import (
     format_time_anchor,
     infer_garden_language,
@@ -2531,7 +2531,7 @@ def _unmark_seen(keys) -> None:
 def _emit_injection_trace(log: dict | None) -> None:
     """把 enclave 带回来的注入记录落成一条 debug trace。
 
-    记录本身已经是内容无关的（见 memory_garden/observability.py）；
+    记录本身已经是内容无关的（见 memgarden/observability.py）；
     这里只负责转发，不再加工 —— 加工会让「什么算内容」这件事散成两处。
     失败一律吞掉：可观测性绝不能拖垮聊天。
     """
@@ -15492,7 +15492,7 @@ def _memory_agent_parse_with_bounce(
     _note_agent_turn_success()
     parsed = parse(reply_text, strict=True)
     err = parsed[-1]
-    # 谓词与 V2 的 ParseRetry.should_retry 是同一个(memory_garden.text.card_text)。两条 lane
+    # 谓词与 V2 的 ParseRetry.should_retry 是同一个(memgarden.text.card_text)。两条 lane
     # 必须共用一份判据,否则同一个模型在托管和自建上会得到不同的重问行为 ——
     # json_decode_error 以前不在重问范围,注释说它「各有自己的退避路径」,实测那条
     # 路是空的:usr_450ee421e16a3b5a 连续 6 次失败,reask_count 全是 0。

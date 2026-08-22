@@ -744,7 +744,7 @@ def test_admin_data_track_sorts_before_pagination(client):
 
 # --- 2026-07 data-track redo: genesis-aware stage + activation funnel ---------
 # Regression guards for the fix that stopped counting genesis (bucket-based)
-# users as stuck at memory_garden. Pure-function tests on _data_track_fast_validation.
+# users as stuck at memgarden. Pure-function tests on _data_track_fast_validation.
 from admin import data_track as _dt  # noqa: E402
 
 
@@ -1257,7 +1257,7 @@ def test_admin_data_track_app_usage_dau_is_shanghai_day(client, monkeypatch):
     assert au["dau_today"] == 1  # only the Shanghai-today session, not the day-boundary one
 
 
-def test_fast_validation_no_memories_still_blocks_memory_garden():
+def test_fast_validation_no_memories_still_blocks_memgarden():
     v = _dt._data_track_fast_validation(
         route="model_api",
         chat={},

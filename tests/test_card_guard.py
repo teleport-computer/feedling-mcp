@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
-from memory_garden.text.card_guard import (  # noqa: E402
+from memgarden.text.card_guard import (  # noqa: E402
     bucket_pollution_reason as _kernel_bucket_pollution_reason,
     default_bucket_for_text,
     field_pollution_reason as _kernel_field_pollution_reason,

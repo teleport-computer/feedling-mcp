@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 import db
 import debug_trace
 import memory_readside_core
-from memory_garden import dreaming as mg_dreaming
+from memgarden import dreaming as mg_dreaming
 from memory import service as memory_service
 from proactive import capture_jobs
 
@@ -160,7 +160,7 @@ def _live_user_turn_count(store) -> int:
 def _dream_snapshot(store) -> dict[str, Any]:
     """取花园形状。**「什么算种子卡」「签名怎么算」已搬进内核** —— 那是 Garden
     内部结构的知识；这里只负责取数（查库、按归属和可见性过滤）与拼上 io 侧的
-    对话轮数。见 memory_garden/dreaming.py 的模块说明。
+    对话轮数。见 memgarden/dreaming.py 的模块说明。
     """
     all_moments = [
         dict(moment)

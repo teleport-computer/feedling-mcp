@@ -23,13 +23,13 @@ import pathlib
 import pytest
 
 from memory.capture_prompt_v1 import build_capture_prompt as build_via_shell
-from memory_garden.policies import CURATED_ARCHIVE, HISTORY_IMPORT
-from memory_garden.prompts.capture import build_capture_prompt as build_via_kernel
+from memgarden.policies import CURATED_ARCHIVE, HISTORY_IMPORT
+from memgarden.prompts.capture import build_capture_prompt as build_via_kernel
 
 _FIXTURE = (
     pathlib.Path(__file__).resolve().parent
     / "fixtures"
-    / "memory_garden"
+    / "memgarden"
     / "capture_prompt_baseline.json"
 )
 
@@ -115,7 +115,7 @@ def test_prompt_is_byte_identical_to_baseline(case_name):
 @pytest.mark.parametrize("case_name", sorted(CASES))
 def test_language_block_comes_from_the_shared_rule(case_name):
     """语言段来自共用规则，且**目标语言是被指定的、不是让模型猜的**。"""
-    from memory_garden.policies import language_rule
+    from memgarden.policies import language_rule
 
     locale = CASES[case_name]["locale"]
     actual = build_via_shell(**CASES[case_name])
@@ -136,7 +136,7 @@ def test_only_one_bucket_language_is_offered(case_name):
     才需要 ``normalize_bucket_language`` 常态纠错。给模型一个它不该做的选择题，
     它就会做错。
     """
-    from memory_garden.prompts.buckets import BUCKET_SETS
+    from memgarden.prompts.buckets import BUCKET_SETS
 
     locale = CASES[case_name]["locale"]
     actual = build_via_shell(**CASES[case_name])
@@ -190,7 +190,7 @@ def test_kernel_default_and_fallbacks_match_baseline_typical(policy_name):
     """内核层：默认档与「没传」的回落产出同一份文本（除语言段外与基线一致）。
 
     注意未知名不在这里 —— 它现在会抛 UnknownPolicyError，见
-    test_memory_garden_policies.py::test_unknown_policy_name_raises。
+    test_memgarden_policies.py::test_unknown_policy_name_raises。
     """
     from identity.user_naming import _naming_rule, sanitize_user_name
 

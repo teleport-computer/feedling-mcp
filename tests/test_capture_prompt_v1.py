@@ -15,7 +15,7 @@ from memory.capture_prompt_v1 import (  # noqa: E402
     capture_semantic_retry_reasons,
     parse_capture_cards,
 )
-from memory_garden.text.card_text import extract_json_block  # noqa: E402
+from memgarden.text.card_text import extract_json_block  # noqa: E402
 from agent_protocol_core import self_thinking  # noqa: E402
 
 _FENCE = "`" * 3
@@ -252,7 +252,7 @@ def test_capture_semantic_retry_requires_the_complete_batch():
 # instead of each card minting a fresh near-synonym (工作/职业/事业) or scattering.
 
 def test_capture_prompt_carries_canonical_buckets():
-    from memory_garden.prompts.buckets import COMMON_BUCKETS_V1, _COMMON_BUCKETS_ZH, _COMMON_BUCKETS_EN
+    from memgarden.prompts.buckets import COMMON_BUCKETS_V1, _COMMON_BUCKETS_ZH, _COMMON_BUCKETS_EN
     p = build_capture_prompt(
         ai_name="io", user_name="hx", buckets="（暂无）", threads="（暂无）",
         identity="x", window="y",
@@ -278,8 +278,8 @@ def test_capture_prompt_carries_canonical_buckets():
 
 
 def test_migrate_and_genesis_share_the_same_canonical_buckets():
-    from memory_garden.prompts.buckets import _COMMON_BUCKETS_ZH
-    from memory_garden.prompts.migrate import build_migrate_prompt
+    from memgarden.prompts.buckets import _COMMON_BUCKETS_ZH
+    from memgarden.prompts.migrate import build_migrate_prompt
     from genesis.prompts import FACT_WRITE_PROMPT
     mig = build_migrate_prompt(ai_name="io", user_name="hx", old_cards="c", vocab="（暂无）")
     assert _COMMON_BUCKETS_ZH in mig
@@ -289,7 +289,7 @@ def test_migrate_and_genesis_share_the_same_canonical_buckets():
 
 
 def test_migrate_prompt_unknown_person_does_not_leak_ta_marker():
-    from memory_garden.prompts.migrate import build_migrate_prompt
+    from memgarden.prompts.migrate import build_migrate_prompt
 
     prompt = build_migrate_prompt(
         ai_name="", user_name="TA", old_cards="", vocab=""

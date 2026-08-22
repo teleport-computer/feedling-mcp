@@ -1,4 +1,4 @@
-"""已搬至 ``memory_garden.prompts.capture`` —— 此处保留 re-export 与旧签名。
+"""已搬至 ``memgarden.prompts.capture`` —— 此处保留 re-export 与旧签名。
 
 内核不 import ``identity``（那是宿主的身份体系），所以称呼规则的装配留在这层壳里，
 现有调用方（V1 consumer、V2 worker、genesis）无需改动。
@@ -8,8 +8,8 @@
 """
 from identity.user_naming import _naming_rule, sanitize_user_name  # noqa: F401
 
-from memory_garden.prompts.capture import *  # noqa: F401,F403
-from memory_garden.prompts import capture as _kernel
+from memgarden.prompts.capture import *  # noqa: F401,F403
+from memgarden.prompts import capture as _kernel
 
 
 def build_capture_prompt(

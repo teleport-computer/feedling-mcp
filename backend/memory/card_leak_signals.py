@@ -1,6 +1,6 @@
 """io 自己的「模型输出残片长什么样」—— 喂给内核的识别器。
 
-内核（``memory_garden.text.card_guard``）只管**判据强弱怎么权衡**：强证据直接判脏、
+内核（``memgarden.text.card_guard``）只管**判据强弱怎么权衡**：强证据直接判脏、
 硬字段要两个弱证据、软字段一个就够。**具体指纹是宿主的**，因为它们照着 io 的协议、
 provider 和工具调用格式调，换个宿主既拦不住该拦的、又会误伤正常文本。
 
@@ -24,7 +24,7 @@ from __future__ import annotations
 import re
 
 from agent_protocol_core import protocol_leak
-from memory_garden.text.leak_signals import GENERIC_SIGNALS, LeakSignals, combine
+from memgarden.text.leak_signals import GENERIC_SIGNALS, LeakSignals, combine
 
 # harmony 特殊 token（强）：``<|channel|>`` / ``<|message|>`` / ``<|start|>`` 等。
 _HARMONY_SPECIAL_RE = re.compile(r"<\|(?:channel|message|start|end|constrain|return)\|>")

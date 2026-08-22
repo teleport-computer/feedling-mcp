@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from memory_garden.storage import (
+from memgarden.storage import (
     CORRECTNESS_CRITICAL,
     FULL_CAPABILITIES,
     ApplyResult,

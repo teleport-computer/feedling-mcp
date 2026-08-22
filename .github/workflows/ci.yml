@@ -439,13 +439,13 @@ jobs:
             tests/test_route_b_card_shape_recall.py \
             tests/test_route_b_sensitive_gate.py \
             tests/test_memory_injection_observability.py \
-            tests/test_memory_garden_purity.py \
-            tests/test_memory_garden_policies.py \
-            tests/test_memory_garden_capture_golden.py \
-            tests/test_memory_garden_dream_migrate_golden.py \
-            tests/test_memory_garden_prompt_params.py \
-            tests/test_memory_garden_storage_port.py \
-            tests/test_memory_garden_dreaming.py \
+            tests/test_memgarden_purity.py \
+            tests/test_memgarden_policies.py \
+            tests/test_memgarden_capture_golden.py \
+            tests/test_memgarden_dream_migrate_golden.py \
+            tests/test_memgarden_prompt_params.py \
+            tests/test_memgarden_storage_port.py \
+            tests/test_memgarden_dreaming.py \
             -v
 
       - name: Guard top-level pytest discovery coverage

@@ -1,10 +1,10 @@
 """Dream / migrate prompt 的基线快照 —— 守「文本改动必须被看见」。
 
 背景:2026-08-16 的内核提取(``ec660613``)把 capture / dream / migrate 三份 prompt
-都搬进了 ``memory_garden/prompts/``。**只有 capture 配了逐字节 golden**
-(``test_memory_garden_capture_golden.py``),dream 与 migrate 没有 ——
+都搬进了 ``memgarden/prompts/``。**只有 capture 配了逐字节 golden**
+(``test_memgarden_capture_golden.py``),dream 与 migrate 没有 ——
 实测把 ``_DREAM_PROMPT_TEMPLATE`` 里的「更干净」改成「更简洁」,
-全套 memory_garden 测试 132 passed,**一条都不红**。
+全套 memgarden 测试 132 passed,**一条都不红**。
 
 这不是"文本不许改"。像 ``ac291a4f fix(prompts): stop using TA for the person``
 那样声明清楚、更新基线、双签,是完全正当的路径。这里守的是
@@ -17,7 +17,7 @@
 比对的入口刻意选**运行时真正调用的那个**:
 - dream → ``memory.dream_prompt_v1.build_dream_prompt``(适配层壳,内部装配称呼规则;
   Runtime V2 与 resident consumer 都调它)
-- migrate → ``memory_garden.prompts.migrate.build_migrate_prompt``
+- migrate → ``memgarden.prompts.migrate.build_migrate_prompt``
   (**只有 resident consumer 在用**,V2 侧无调用方;老壳
   ``memory/migrate_prompt_v1.py`` 已在 ``5e50e79e`` 删除)
 
@@ -32,12 +32,12 @@ import pathlib
 import pytest
 
 from memory.dream_prompt_v1 import build_dream_prompt as build_dream_via_shell
-from memory_garden.prompts.migrate import build_migrate_prompt
+from memgarden.prompts.migrate import build_migrate_prompt
 
 _FIXTURE = (
     pathlib.Path(__file__).resolve().parent
     / "fixtures"
-    / "memory_garden"
+    / "memgarden"
     / "dream_migrate_prompt_baseline.json"
 )
 
@@ -125,7 +125,7 @@ def test_dream_shell_is_an_adapter_not_a_second_template() -> None:
     模板里的 ``user_name`` 取 **sanitize 后**的值。两者不同源。
     """
     from identity.user_naming import _naming_rule, sanitize_user_name
-    from memory_garden.prompts import dream as kernel
+    from memgarden.prompts import dream as kernel
 
     # 刻意用带前后空格的名字:sanitize 与否会产生不同结果,
     # 抄错一边就会被这条抓住。

@@ -12,7 +12,7 @@ import pathlib
 
 import pytest
 
-from memory_garden.policies import (
+from memgarden.policies import (
     CURATED_ARCHIVE,
     DEFAULT_POLICY,
     POLICIES,
@@ -105,7 +105,7 @@ def test_policies_are_immutable():
 
 def test_language_rule_is_shared_text_with_only_the_basis_swapped():
     """措辞/举例/标点全共用，只有「依据」不同 —— 那是必要差异，不是不一致。"""
-    from memory_garden.policies import language_rule
+    from memgarden.policies import language_rule
 
     chat = language_rule("conversation_capture")
     imported = language_rule("history_import")
@@ -129,7 +129,7 @@ def test_language_rule_is_conditional_not_unconditional():
     后半句无条件生效会加剧「英文用户拿到中文卡」。
     （codex review 2026-08-14 指出。）
     """
-    from memory_garden.policies import language_rule
+    from memgarden.policies import language_rule
 
     text = language_rule("conversation_capture")
     assert "mostly Chinese, write Chinese" in text
@@ -149,7 +149,7 @@ def test_mixed_language_material_unifies_the_taxonomy_language():
     桶/线索是分类键，裂开等于同一类记忆被拆成两堆；而
     ``normalize_bucket_language`` 按每张卡自己的文字归一化，兜不住跨卡分裂。
     """
-    from memory_garden.policies import language_rule
+    from memgarden.policies import language_rule
 
     for policy in ("conversation_capture", "history_import", "curated_archive"):
         text = language_rule(policy)
@@ -173,7 +173,7 @@ def test_language_rule_rejects_unknown_policy_like_get_policy_does():
     """
     import pytest as _pytest
 
-    from memory_garden.policies import UnknownPolicyError, language_rule
+    from memgarden.policies import UnknownPolicyError, language_rule
 
     with _pytest.raises(UnknownPolicyError):
         language_rule("nonexistent")
@@ -190,7 +190,7 @@ def test_language_rule_is_wired_into_both_sides():
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[1] / "backend"
-    capture_src = (root / "memory_garden" / "prompts" / "capture.py").read_text(encoding="utf-8")
+    capture_src = (root / "memgarden" / "prompts" / "capture.py").read_text(encoding="utf-8")
     genesis_src = (root / "genesis" / "prompts.py").read_text(encoding="utf-8")
 
     assert "{language_rule}" in capture_src, "capture 模板没有语言占位符"
@@ -205,7 +205,7 @@ def test_language_rule_is_wired_into_both_sides():
 
 def test_language_basis_reads_as_a_relationship_not_a_placeholder():
     """对话语言以双方关系表达，不再用内部占位词指用户。"""
-    from memory_garden.policies import language_rule
+    from memgarden.policies import language_rule
 
     assert "the language of your conversation" in language_rule("conversation_capture")
     assert "the language of the source material" in language_rule("history_import")
@@ -222,7 +222,7 @@ def test_genesis_keep_all_comes_from_policies_not_its_own_copy():
     这条一旦红，说明有人在 genesis 那边又写回了一份字面量。
     """
     from genesis import prompts as gp
-    from memory_garden.policies import KEEP_ALL_MAP_SUFFIX, KEEP_ALL_WRITE_SUFFIX
+    from memgarden.policies import KEEP_ALL_MAP_SUFFIX, KEEP_ALL_WRITE_SUFFIX
 
     assert gp.FACT_MAP_KEEP_ALL_SUFFIX == "\n\n" + KEEP_ALL_MAP_SUFFIX
     assert gp.FACT_WRITE_KEEP_ALL_SUFFIX == "\n\n" + KEEP_ALL_WRITE_SUFFIX
@@ -236,7 +236,7 @@ def test_history_import_is_also_single_source_now():
     又不移动任何文本。
     """
     from genesis import prompts as gp
-    from memory_garden.policies import (
+    from memgarden.policies import (
         HISTORY_IMPORT_FILTER_RUBRIC,
         HISTORY_IMPORT_OPENING_RUBRIC,
     )
@@ -279,7 +279,7 @@ def test_genesis_prompt_is_byte_identical_to_golden(name):
 
 def test_keep_all_text_keeps_genesis_original_punctuation():
     """逐字保留意味着连半角标点都不许「顺手改成全角」—— 那也是改 prompt。"""
-    from memory_garden.policies import KEEP_ALL_MAP_SUFFIX
+    from memgarden.policies import KEEP_ALL_MAP_SUFFIX
 
     assert "不是聊天记录:" in KEEP_ALL_MAP_SUFFIX, "半角冒号被改掉了"
     assert "宁多勿漏。" in KEEP_ALL_MAP_SUFFIX
@@ -315,7 +315,7 @@ def test_max_cards_is_actually_enforced_not_just_declared():
     codex review 2026-08-14 实测：此前传 3 张卡返回 3 张，max_cards 声明了
     却没有任何调用方消费 —— 三个档位只是「描述数据」，不是可执行策略。
     """
-    from memory_garden.prompts.capture import parse_capture_cards
+    from memgarden.prompts.capture import parse_capture_cards
 
     cards, err = parse_capture_cards(_cards_json(3))
     assert cards == []
@@ -324,7 +324,7 @@ def test_max_cards_is_actually_enforced_not_just_declared():
 
 def test_over_limit_is_a_full_batch_retry_not_a_silent_truncation():
     """超限要打回重做整批，而不是静默截掉第三张 —— 截断会丢内容且无人知晓。"""
-    from memory_garden.prompts.capture import parse_capture_cards
+    from memgarden.prompts.capture import parse_capture_cards
 
     _, err = parse_capture_cards(_cards_json(3), strict=True)
     assert "too_many_cards" in err
@@ -334,7 +334,7 @@ def test_after_retry_keeps_the_first_n_instead_of_failing_the_whole_job():
     """重问后仍超：保留前 N 张。**不能**整批失败 ——
     那会推进 capture frontier 把这段对话永久丢掉（与内容闸同一教训）。
     """
-    from memory_garden.prompts.capture import parse_capture_cards
+    from memgarden.prompts.capture import parse_capture_cards
 
     cards, err = parse_capture_cards(_cards_json(3), strict=False)
     assert len(cards) == 2 and err is None
@@ -342,7 +342,7 @@ def test_after_retry_keeps_the_first_n_instead_of_failing_the_whole_job():
 
 def test_unlimited_policies_do_not_truncate():
     """用户整理的档案不限张数 —— 传 3 张就该留 3 张。"""
-    from memory_garden.prompts.capture import parse_capture_cards
+    from memgarden.prompts.capture import parse_capture_cards
 
     for name in ("curated_archive", "history_import"):
         cards, err = parse_capture_cards(_cards_json(3), policy=name)
@@ -351,7 +351,7 @@ def test_unlimited_policies_do_not_truncate():
 
 def test_within_limit_is_untouched():
     """没超限的批次行为完全不变（守住绝大多数正常路径）。"""
-    from memory_garden.prompts.capture import parse_capture_cards
+    from memgarden.prompts.capture import parse_capture_cards
 
     for n in (0, 1, 2):
         cards, err = parse_capture_cards(_cards_json(n))
@@ -373,7 +373,7 @@ def test_voice_call_header_quotes_a_phrase_that_is_actually_in_the_prompt():
 
     引用方现在用 RESTRAINT_RULE_QUOTE 常量，这条守住常量与 rubric 不脱节。
     """
-    from memory_garden.policies import RESTRAINT_RULE_QUOTE, get_policy
+    from memgarden.policies import RESTRAINT_RULE_QUOTE, get_policy
     from voice.transcript_store import capture_window_header
 
     rubric = get_policy("conversation_capture").selection_rubric

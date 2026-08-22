@@ -13,7 +13,7 @@ from __future__ import annotations
 
 
 def test_kernel_capture_prompt_takes_naming_rule_as_param():
-    from memory_garden.prompts.capture import build_capture_prompt
+    from memgarden.prompts.capture import build_capture_prompt
 
     text = build_capture_prompt(
         ai_name="io",
@@ -31,7 +31,7 @@ def test_kernel_capture_prompt_takes_naming_rule_as_param():
 
 
 def test_kernel_dream_prompt_takes_naming_rule_as_param():
-    from memory_garden.prompts.dream import build_dream_prompt
+    from memgarden.prompts.dream import build_dream_prompt
 
     text = build_dream_prompt(
         ai_name="io",
@@ -50,7 +50,7 @@ def test_kernel_prompts_do_not_import_identity():
     root = (
         pathlib.Path(__file__).resolve().parents[1]
         / "backend"
-        / "memory_garden"
+        / "memgarden"
         / "prompts"
     )
     offenders = [
@@ -59,7 +59,7 @@ def test_kernel_prompts_do_not_import_identity():
         if "identity" in p.read_text(encoding="utf-8").split("\n\n\n")[0]
         and "import" in p.read_text(encoding="utf-8").split("\n\n\n")[0]
     ]
-    # 更直接的判据交给 test_memory_garden_purity.py 的 AST 守卫；
+    # 更直接的判据交给 test_memgarden_purity.py 的 AST 守卫；
     # 这里只做一次可读性检查，确保 import 段没有 identity。
     src_heads = {
         p.name: "\n".join(p.read_text(encoding="utf-8").splitlines()[:40])

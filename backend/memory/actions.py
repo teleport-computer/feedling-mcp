@@ -14,11 +14,11 @@ from bootstrap import gates as boot_gates
 from core import envelope as core_envelope
 from core import util as core_util
 from identity import service as identity_service
-from memory_garden.text import card_guard
-from memory_garden.text import card_text
+from memgarden.text import card_guard
+from memgarden.text import card_text
 from memory import service as memory_service
-from memory_garden import timestamps as memory_timestamps
-from memory_garden.prompts.buckets import normalize_bucket_language
+from memgarden import timestamps as memory_timestamps
+from memgarden.prompts.buckets import normalize_bucket_language
 from memory.source_policy import (
     MAX_MEMORY_SUPERSEDE_TARGETS,
     MEMORY_CAPTURE_MODE_VALUES,

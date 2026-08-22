@@ -12,7 +12,7 @@
   加解密与 enclave · 身份装配 · 所有权校验 · gates · 审计 ·
   锁与事务 · 捞聊天记录 · 定时器 · 真正调模型
 
-硬指标：**本包不 import 任何 io 模块**，由 ``tests/test_memory_garden_purity.py``
+硬指标：**本包不 import 任何 io 模块**，由 ``tests/test_memgarden_purity.py``
 守卫。一旦这条破了，「内核可独立发布 / 记忆库可被替换」就都不成立。
 
 设计与边界见 ``docs/MEMORY_GARDEN_EXTRACTION_DESIGN.zh.md``。

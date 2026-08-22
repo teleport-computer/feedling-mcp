@@ -44,14 +44,13 @@ _COMMON_BUCKETS_ZH = "、".join(zh for zh, _en in COMMON_BUCKETS_V1)
 # with an English common bucket (~1/3 of the time — e.g. "Pets" for 用户十年前养过一只狗),
 # despite the guidance. Since the common buckets are a fixed zh<->en pair map, we can
 # map a wrong-language COMMON bucket back to the card's own language IN CODE — a backstop
-# that catches EVERY write path (genesis / capture / agent inline / io_cli all funnel
-# through _memory_inner_from_action) regardless of prompt drift, and is unit-testable
+# that catches EVERY write path regardless of prompt drift, and is unit-testable
 # without a real model. Custom buckets (妈妈 / the house) pass through unchanged.
 _BUCKET_EN_TO_ZH = {en: zh for zh, en in COMMON_BUCKETS_V1}
 _BUCKET_ZH_TO_EN = {zh: en for zh, en in COMMON_BUCKETS_V1}
 
 # Short forms the model actually emits instead of the canonical multi-word bucket.
-# Observed 2026-08-10 (usr_7001b1df80e2024d, V2): a Chinese card came back with the
+# Observed 2026-08-10 in production: a Chinese card came back with the
 # bucket "preferences" — not a key in the pair map above, so the backstop passed it
 # straight through and an English bucket landed in a Chinese garden. The exact-match
 # map only ever caught models that wrote "Preferences & boundaries" in full.

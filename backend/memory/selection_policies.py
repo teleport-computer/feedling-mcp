@@ -5,7 +5,7 @@
 换个产品就不成立 —— 所以组合放在这里。
 
 外部使用者接 Garden 时不会继承这套：他们自己组合，或者传一个完全
-自己实现的 SelectionPolicy（见 memory_garden/selection.py 的模块说明）。
+自己实现的 SelectionPolicy（见 memgarden/selection.py 的模块说明）。
 
 ## io 现在的两套
 
@@ -19,7 +19,7 @@
 """
 from __future__ import annotations
 
-from memory_garden.selection import Chain, RecentStage, RelevanceStage, RoleStage
+from memgarden.selection import Chain, RecentStage, RelevanceStage, RoleStage
 
 #: 转折卡与纠正卡的角色名。识别逻辑在 card_shape.roles_of()，内核只认这两个标签。
 ROLE_TURNING_POINT = "turning_point"

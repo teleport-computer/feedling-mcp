@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from memory_garden.dreaming import (
+from memgarden.dreaming import (
     DREAM_SOURCE,
     DreamLedger,
     DreamSnapshot,

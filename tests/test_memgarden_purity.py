@@ -1,4 +1,4 @@
-"""内核纯度守卫：``memory_garden`` 包不得 import 任何 io 模块。
+"""内核纯度守卫：``memgarden`` 包不得 import 任何 io 模块。
 
 这是《Memory Garden 内核提取》验收标准第 ② 条的自动化。一旦包里出现
 ``import db`` 或 ``import identity.user_naming``，「内核可独立发布 / 可被替换」
@@ -16,13 +16,13 @@ import sys
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _BACKEND_ROOT = _REPO_ROOT / "backend"
-_KERNEL_ROOT = _BACKEND_ROOT / "memory_garden"
+_KERNEL_ROOT = _BACKEND_ROOT / "memgarden"
 
 # 允许的非标准库依赖。
 #
 # ``core`` 是模型协议层的纯共享判据（思维链剥离、协议残片识别），
 # 与「记忆」无关 —— 聊天主链路、工具循环、主动唤醒都在用。把它单独成包是因为
-# 第一版把它塞进了 memory_garden，导致**普通聊天反向依赖记忆包**
+# 第一版把它塞进了 memgarden，导致**普通聊天反向依赖记忆包**
 # （codex review 2026-08-14 指出）。它自己同样不 import 任何 io 模块。
 _ALLOWED_THIRD_PARTY: frozenset[str] = frozenset({"agent_protocol_core"})
 
@@ -37,7 +37,7 @@ def _backend_top_level_names() -> frozenset[str]:
     """
     names: set[str] = set()
     # 这两个包本身就是「非 io」的纯包，不算在禁止集合里。
-    _NOT_IO = {"memory_garden", "agent_protocol_core"}
+    _NOT_IO = {"memgarden", "agent_protocol_core"}
     for entry in _BACKEND_ROOT.iterdir():
         if entry.name.startswith((".", "_")) or entry.name in _NOT_IO:
             continue
@@ -70,7 +70,7 @@ def _imported_roots(path: pathlib.Path) -> set[str]:
 
 def test_kernel_package_is_not_empty():
     files = _kernel_files()
-    assert files, f"memory_garden 包为空或不存在：{_KERNEL_ROOT}"
+    assert files, f"memgarden 包为空或不存在：{_KERNEL_ROOT}"
 
 
 def test_kernel_imports_no_io():
@@ -86,8 +86,8 @@ def test_kernel_imports_no_io():
         for root in sorted(_imported_roots(path)):
             if root in io_names:
                 offenders.append(f"{rel}: import {root}（io 模块）")
-            elif root == "memory_garden":
-                offenders.append(f"{rel}: import memory_garden（包内请用相对 import）")
+            elif root == "memgarden":
+                offenders.append(f"{rel}: import memgarden（包内请用相对 import）")
     assert not offenders, (
         "内核里出现了 io 依赖（包内引用请改成相对 import）:\n  "
         + "\n  ".join(offenders)
@@ -139,7 +139,7 @@ def test_kernel_modules_import_without_side_effects():
 # 包名与独立发布时一致，所以内核代码两边写法相同，不用维护 import 分叉。
 # 这个包整体就该是纯的，所以下面直接对整包断言，不再点名守文件。
 #
-# 2026-08-15：这两个模块曾被短暂放进 memory_garden，Codex 指出那会让
+# 2026-08-15：这两个模块曾被短暂放进 memgarden，Codex 指出那会让
 # **普通聊天反向依赖记忆包**；同期主线独立把它们放进了 core/。两边结论一致，
 # 按主线走。这里守的就是"放对了地方之后不许再漂回去"。
 _PROTOCOL_MODULES = ("self_thinking.py", "protocol_leak.py")
@@ -172,9 +172,9 @@ def test_protocol_core_imports_only_stdlib():
     )
 
 
-def test_protocol_core_does_not_depend_on_memory_garden():
-    """方向必须是单向的：memory_garden → core，不能反过来。"""
+def test_protocol_core_does_not_depend_on_memgarden():
+    """方向必须是单向的：memgarden → core，不能反过来。"""
     for path in _protocol_files():
-        assert "memory_garden" not in _imported_roots(path), (
-            f"{path.name} 反向依赖了 memory_garden"
+        assert "memgarden" not in _imported_roots(path), (
+            f"{path.name} 反向依赖了 memgarden"
         )

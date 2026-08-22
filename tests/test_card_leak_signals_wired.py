@@ -22,8 +22,8 @@ if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
 from memory.card_leak_signals import IO_LEAK_SIGNALS  # noqa: E402
-from memory_garden.text import card_guard, card_text  # noqa: E402
-from memory_garden.text.leak_signals import GENERIC_SIGNALS  # noqa: E402
+from memgarden.text import card_guard, card_text  # noqa: E402
+from memgarden.text.leak_signals import GENERIC_SIGNALS  # noqa: E402
 
 #: 2026-07-28 真实事故串的三个成分。整卡 JSON 合法、有实义字符，
 #: 所以 payload 级拒绝和占位符检测都拦不住 —— 只有字段级判据能抓。

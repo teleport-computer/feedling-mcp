@@ -279,7 +279,7 @@ def build_capture_prompt(
     leaking into the platform prompt.
     The io-side compat shell (``memory/capture_prompt_v1.py``) does that.
 
-    ``policy`` 决定用哪把「什么值得记」的尺子（见 ``memory_garden.policies``）。
+    ``policy`` 决定用哪把「什么值得记」的尺子（见 ``memgarden.policies``）。
     留空 = 日常聊天档，其 rubric 与本模板原先内联的那段逐字相同，
     所以默认调用的产出与重构前**字节一致**（golden fixture 守着这一点）。
 

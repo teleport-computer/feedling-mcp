@@ -1,4 +1,4 @@
-"""已搬至 ``memory_garden.prompts.dream`` —— 此处保留 re-export 与旧签名。
+"""已搬至 ``memgarden.prompts.dream`` —— 此处保留 re-export 与旧签名。
 
 同 ``capture_prompt_v1``：内核不 import ``identity``，称呼规则在这层装配。
 
@@ -7,8 +7,8 @@
 """
 from identity.user_naming import _naming_rule, sanitize_user_name  # noqa: F401
 
-from memory_garden.prompts.dream import *  # noqa: F401,F403
-from memory_garden.prompts import dream as _kernel
+from memgarden.prompts.dream import *  # noqa: F401,F403
+from memgarden.prompts import dream as _kernel
 
 
 def build_dream_prompt(

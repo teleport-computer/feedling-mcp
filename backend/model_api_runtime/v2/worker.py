@@ -84,8 +84,8 @@ from core import provider_usage
 from agent_protocol_core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
-from memory_garden import dream_trace as memory_dream_trace
-from memory_garden import timestamps as memory_timestamps
+from memgarden import dream_trace as memory_dream_trace
+from memgarden import timestamps as memory_timestamps
 from core.downloadable_reply import sanitize_downloadable_reply
 from perception.glance import (
     perception_glance_fingerprint,
@@ -134,15 +134,15 @@ from memory.capture_prompt_v1 import (
     parse_capture_cards,
 )
 from identity.user_naming import transcript_speaker_label
-from memory_garden.text.card_text import (
+from memgarden.text.card_text import (
     build_truncation_retry_prompt,
     card_text_rejection,
     count_user_token_residuals,
     is_retryable_parse_error,
     sanitize_card_labels,
 )
-from memory_garden.text import card_guard
-from memory_garden.guards import dream_gates as memory_dream_gates
+from memgarden.text import card_guard
+from memgarden.guards import dream_gates as memory_dream_gates
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
     build_dream_retry_prompt,

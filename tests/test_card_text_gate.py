@@ -19,7 +19,7 @@ from memory.capture_prompt_v1 import (  # noqa: E402
     build_capture_retry_prompt,
     parse_capture_cards,
 )
-from memory_garden.text.card_text import (  # noqa: E402
+from memgarden.text.card_text import (  # noqa: E402
     card_text_rejection as _kernel_card_text_rejection,
     format_error,
     is_card_format_error,
