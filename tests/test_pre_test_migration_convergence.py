@@ -26,7 +26,11 @@ def _database_url(base: str, database: str) -> str:
 
 def test_rds_pre_and_test_heads_converge():
     script = _scripts("alembic")
-    assert script.get_heads() == ["0097_v2_job_recovery_events"]
+    assert script.get_heads() == ["0098_chat_change_events"]
+    assert (
+        script.get_revision("0098_chat_change_events").down_revision
+        == "0097_v2_job_recovery_events"
+    )
     assert (
         script.get_revision("0097_v2_job_recovery_events").down_revision
         == "0096_trace_write_stats_health"

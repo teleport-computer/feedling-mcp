@@ -49,7 +49,7 @@
 
 - [ ] **Step 1: Write real-Postgres RED tests**
 
-Cover schema/trigger existence, one and multi-row INSERT, UPDATE, one-row DELETE, 65-row DELETE, two users in one statement, and rollback. Assert one version per user per statement, sorted unique IDs, `reset` above 64 IDs, and no row or notification after rollback.
+Cover schema/trigger existence, one and multi-row INSERT, UPDATE, one-row DELETE, 65-row DELETE, two users in one statement, transaction rollback, and deleting a parent `users` row. Assert one version per user per statement, sorted unique IDs, `reset` above 64 IDs, no row or notification after rollback, and no recreated change-control row during account-delete cascade.
 
 - [ ] **Step 2: Register the DB-backed test in CI and verify RED**
 
@@ -64,7 +64,7 @@ Expected: FAIL because revision 0098 and its schema do not exist.
 
 - [ ] **Step 3: Implement migration and triggers**
 
-Create separate AFTER STATEMENT INSERT, UPDATE, and DELETE triggers with transition tables. For each affected user, atomically increment state, insert `upsert`, `delete`, or `reset`, and call `pg_notify`. Events contain IDs only, never `doc`.
+Create separate AFTER STATEMENT INSERT, UPDATE, and DELETE triggers with transition tables. For each affected user whose `users` row still exists, atomically increment state, insert `upsert`, `delete`, or `reset`, and call `pg_notify`. Events contain IDs only, never `doc`; the existence guard prevents a parent-user cascade from recreating child control rows.
 
 - [ ] **Step 4: Create the poll index concurrently**
 

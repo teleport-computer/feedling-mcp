@@ -87,6 +87,8 @@ Install separate AFTER STATEMENT INSERT, UPDATE, and DELETE triggers using trans
 - use `reset` with an empty ID array for a larger mutation;
 - call transactional `pg_notify` with `{v:2,c:"chat",u:<user>,r:<version>}`.
 
+The trigger records changes only while the corresponding `users` row still exists. A `users` deletion already removes all cached business state and cascades through `chat_messages`; its internal cascade must not recreate change-control rows or fail its foreign-key checks.
+
 No `doc` or ciphertext is placed in the event table or notification. Trigger DDL is additive, and the tables are not part of the TEE replication registry.
 
 ## 6. Chat worker consistency model
