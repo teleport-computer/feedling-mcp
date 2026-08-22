@@ -46,6 +46,7 @@ import posixpath
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -1514,6 +1515,10 @@ class TurnDeps:
     # dependency-clean and tests may inject a collector. Observability is always
     # best-effort and must never affect tool execution.
     emit_debug_trace: Callable[..., None] | None = None
+    # Assembly-owned name-level folded-schema observer. The worker supplies
+    # complete raw sets; serve_worker applies debug_trace.bounded_names before
+    # persistence so the trace sanitizer cannot silently clip them.
+    emit_schema_surface_trace: Callable[..., None] | None = None
 
 
 class _EmptyMcpTurn:
@@ -1878,9 +1883,17 @@ class _SchemaRecovery:
     federates the two behind one contract so no lane can wire up half of it.
     """
 
-    def __init__(self, mcp_turn, *, current_offered_mcp_tool_specs) -> None:
+    def __init__(
+        self,
+        mcp_turn,
+        *,
+        current_offered_mcp_tool_specs,
+        observe_surface=None,
+    ) -> None:
         self._mcp_turn = mcp_turn
         self._current_specs = current_offered_mcp_tool_specs
+        self._observe_surface = observe_surface
+        self._last_collapsed_names: frozenset[str] = frozenset()
         self.platform = v2_tool_surface.SchemaRecoveryState({
             spec.name: spec for spec in cap_tool_schema.build_tool_specs()
         })
@@ -1912,13 +1925,74 @@ class _SchemaRecovery:
             self._requires_mcp_resolution(name)
         )
 
-    def record_surface(self, decision: dict | None) -> None:
+    def _surface_name_sets(self) -> dict[str, tuple[str, ...]]:
+        protected = {
+            str(name) for name in self.protected_names() if str(name)
+        }
+        collapsed = {
+            str(name)
+            for name in self.platform.pressure_collapsed_names
+            if str(name)
+        }
+        for attr in ("collapsed_names", "pressure_collapsed_names"):
+            collapsed.update(
+                str(name)
+                for name in (getattr(self._mcp_turn, attr, ()) or ())
+                if str(name)
+            )
+        collapsed.difference_update(protected)
+        # Today every resolved schema is protected from being folded again.
+        # Keep both lists: they answer different operational questions and the
+        # two contracts may diverge later.
+        resolved = set(protected)
+        return {
+            "collapsed_names": tuple(sorted(collapsed)),
+            "resolved_names": tuple(sorted(resolved)),
+            "protected_names": tuple(sorted(protected)),
+        }
+
+    async def _observe(self, event_type: str) -> None:
+        if self._observe_surface is None:
+            return
+        try:
+            observed = self._observe_surface(
+                event_type,
+                self._surface_name_sets(),
+            )
+            if inspect.isawaitable(observed):
+                await observed
+        except Exception as exc:  # noqa: BLE001 -- telemetry is best-effort
+            log.warning(
+                "[v2.mcp] schema surface trace failed code=%s",
+                type(exc).__name__.lower(),
+            )
+
+    async def record_surface(self, decision: dict | None) -> None:
         detail = decision if isinstance(decision, dict) else {}
         self.platform.set_pressure_collapsed(
             detail.get("pressure_collapsed_names", ())
         )
         if callable(self._record_mcp_surface):
             self._record_mcp_surface(detail)
+        current = self._surface_name_sets()
+        collapsed = frozenset(current["collapsed_names"])
+        if collapsed == self._last_collapsed_names:
+            return
+        self._last_collapsed_names = collapsed
+        await self._observe("mcp.surface.schema_folded")
+
+    async def record_recovery(self, result: dict | None) -> None:
+        """Observe one successful search and absorb its fold-set transition."""
+        detail = result if isinstance(result, dict) else {}
+        if not list(detail.get("resolved") or []):
+            return
+        # The recovery event carries the post-search fold set. Advancing the
+        # signature prevents the next provider round from emitting a redundant
+        # empty/partial schema_folded event for this same transition.
+        self._last_collapsed_names = frozenset(
+            self._surface_name_sets()["collapsed_names"]
+        )
+        await self._observe("mcp.surface.schema_recovered")
 
     def protected_names(self) -> set[str]:
         protected = self.platform.protected_names()
@@ -2153,6 +2227,42 @@ def _provider_tool_surface_callback(
     return _ProviderRoundtripTrace(deps, user_id, lane, str(trace_id or ""))
 
 
+def _schema_surface_trace_callback(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+    *,
+    trace_id: str = "",
+    job_id: Any = "",
+):
+    """Bridge complete raw name sets to assembly-owned bounded trace output."""
+
+    if deps.emit_schema_surface_trace is None:
+        return None
+
+    async def _emit(event_type: str, names: dict[str, tuple[str, ...]]) -> None:
+        try:
+            await asyncio.to_thread(
+                deps.emit_schema_surface_trace,
+                user_id,
+                event_type,
+                lane=_normalize_provider_trace_lane(lane),
+                trace_id=str(trace_id or ""),
+                job_id=str(job_id or ""),
+                collapsed_names=names.get("collapsed_names", ()),
+                resolved_names=names.get("resolved_names", ()),
+                protected_names=names.get("protected_names", ()),
+            )
+        except Exception as exc:  # noqa: BLE001 -- telemetry is best-effort
+            log.warning(
+                "[v2.mcp] schema surface trace bridge failed user=%s code=%s",
+                user_id,
+                type(exc).__name__.lower(),
+            )
+
+    return _emit
+
+
 def _normalize_provider_trace_lane(lane: object) -> str:
     raw_lane = str(lane or "").strip()
     return raw_lane if raw_lane == "chat" or raw_lane in _WAKE_LANES else "other"
@@ -2163,6 +2273,33 @@ def _normalize_provider_trace_reason(
 ) -> str:
     raw_reason = str(reason or "none").strip()
     return raw_reason if raw_reason in allowed_values else "other"
+
+
+def _empty_response_trace_detail(
+    response_shape: dict[str, Any], lane: str
+) -> dict[str, Any]:
+    """Normalize provider-empty metadata once for every trace consumer."""
+    raw_stop_reason = str(response_shape.get("stop_reason") or "")
+    stop_reason = (
+        raw_stop_reason
+        if raw_stop_reason in v2_tool_loop._CONTENT_FREE_STOP_REASONS
+        else ("other" if raw_stop_reason else "")
+    )
+    completion_tokens = response_shape.get("completion_tokens")
+    return {
+        "stop_reason": stop_reason,
+        "has_visible_text": bool(response_shape.get("has_visible_text")),
+        "reasoning_present": bool(response_shape.get("reasoning_present")),
+        "tool_call_count": max(
+            0, int(response_shape.get("tool_call_count") or 0)
+        ),
+        "completion_tokens": (
+            max(0, int(completion_tokens))
+            if isinstance(completion_tokens, (int, float))
+            else None
+        ),
+        "lane": _normalize_provider_trace_lane(lane),
+    }
 
 
 def _empty_provider_response_debug_callback(
@@ -2178,27 +2315,7 @@ def _empty_provider_response_debug_callback(
     safe_lane = _normalize_provider_trace_lane(lane)
 
     async def _emit(response_shape: dict[str, Any]) -> None:
-        raw_stop_reason = str(response_shape.get("stop_reason") or "")
-        stop_reason = (
-            raw_stop_reason
-            if raw_stop_reason in v2_tool_loop._CONTENT_FREE_STOP_REASONS
-            else ("other" if raw_stop_reason else "")
-        )
-        completion_tokens = response_shape.get("completion_tokens")
-        detail = {
-            "stop_reason": stop_reason,
-            "has_visible_text": bool(response_shape.get("has_visible_text")),
-            "reasoning_present": bool(response_shape.get("reasoning_present")),
-            "tool_call_count": max(
-                0, int(response_shape.get("tool_call_count") or 0)
-            ),
-            "completion_tokens": (
-                max(0, int(completion_tokens))
-                if isinstance(completion_tokens, (int, float))
-                else None
-            ),
-            "lane": safe_lane,
-        }
+        detail = _empty_response_trace_detail(response_shape, safe_lane)
         try:
             await asyncio.to_thread(
                 deps.emit_debug_trace,
@@ -2220,6 +2337,81 @@ def _empty_provider_response_debug_callback(
                 safe_lane,
                 type(exc).__name__.lower(),
             )
+
+    return _emit
+
+
+async def _emit_silent_reply_trace(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+    *,
+    event_type: str,
+    cause: str,
+    outcome_code: str,
+    trace_id: str = "",
+    job_id: object = "",
+    response_shape: dict[str, Any] | None = None,
+) -> None:
+    """Emit one content-free weak-wake silence attribution event."""
+    if deps.emit_debug_trace is None:
+        return
+    safe_lane = _normalize_provider_trace_lane(lane)
+    detail: dict[str, Any] = {"lane": safe_lane, "cause": cause}
+    if response_shape is not None:
+        detail.update(_empty_response_trace_detail(response_shape, safe_lane))
+    try:
+        await asyncio.to_thread(
+            deps.emit_debug_trace,
+            user_id,
+            event_type,
+            trace_id=str(trace_id or ""),
+            job_id=str(job_id or ""),
+            status="warning",
+            outcome_class=jobs_store.terminal_outcome_class(outcome_code),
+            summary=(
+                "V2 主动回合明确选择静默"
+                if event_type == "reply.silent_by_choice"
+                else "V2 主动回合收到语义空响应"
+            ),
+            explain=(
+                "仅记录静默归因、lane 与关联 id；不记录模型给出的静默理由、"
+                "回复、reasoning、prompt 或错误正文。"
+            ),
+            detail=detail,
+        )
+    except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a turn
+        log.warning(
+            "[v2.silent_reply] trace failed user=%s lane=%s code=%s",
+            user_id,
+            safe_lane,
+            type(exc).__name__.lower(),
+        )
+
+
+def _silent_empty_response_debug_callback(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+    trace_id: str = "",
+    job_id: object = "",
+):
+    """Build the weak-wake semantic-empty attribution callback."""
+    if deps.emit_debug_trace is None:
+        return None
+
+    async def _emit(response_shape: dict[str, Any]) -> None:
+        await _emit_silent_reply_trace(
+            deps,
+            user_id,
+            lane,
+            event_type="reply.silent_empty_response",
+            cause="empty_response",
+            outcome_code="wake_failed:empty_reply",
+            trace_id=trace_id,
+            job_id=job_id,
+            response_shape=response_shape,
+        )
 
     return _emit
 
@@ -6068,7 +6260,7 @@ async def _emit_thinking_surfaced_trace(
     safe_chars = max(0, int(chars))
     # ``model`` is user-configurable for compatible relays.  Match the existing
     # plaintext thinking metadata bound instead of letting an arbitrary string
-    # expand the server-visible trace ring.
+    # expand the server-visible trace payload.
     model = str(getattr(provider_config, "model", "") or "").strip()[:96]
     try:
         await asyncio.to_thread(
@@ -8298,6 +8490,13 @@ async def _run_wake(
         schema_recovery = _SchemaRecovery(
             mcp_turn,
             current_offered_mcp_tool_specs=_current_offered_mcp_tool_specs,
+            observe_surface=_schema_surface_trace_callback(
+                deps,
+                user_id,
+                lane,
+                trace_id=trace_id,
+                job_id=job_id,
+            ),
         )
         mcp_wall_budget = _McpTurnWallBudget(MCP_TURN_WALL_BUDGET_SEC)
 
@@ -8417,10 +8616,12 @@ async def _run_wake(
 
             async def _dispatch_platform_one(tc) -> ToolResult:
                 if tc.name == cap_tool_schema.MCP_TOOL_SEARCH_TOOL:
+                    recovered = schema_recovery.resolve(tc.args)
+                    await schema_recovery.record_recovery(recovered)
                     return ToolResult(
                         call_id=tc.id,
                         content=json.dumps(
-                            schema_recovery.resolve(tc.args),
+                            recovered,
                             ensure_ascii=False,
                             sort_keys=True,
                             separators=(",", ":"),
@@ -9532,6 +9733,16 @@ async def _run_wake(
             nonlocal stay_silent_reason, shadow_decision_allowed
             stay_silent_reason = str(reason or "").strip()[:500]
             shadow_decision_allowed = False
+            await _emit_silent_reply_trace(
+                deps,
+                user_id,
+                lane,
+                event_type="reply.silent_by_choice",
+                cause="suppressed",
+                outcome_code=jobs_store.SILENT_BY_CHOICE_OUTCOME_CODE,
+                trace_id=trace_id,
+                job_id=job_id,
+            )
 
         try:
             await v2_tool_loop.run_tool_loop(
@@ -9609,6 +9820,10 @@ async def _run_wake(
                 on_empty_provider_response=(
                     _empty_provider_response_debug_callback(
                         deps, user_id, lane, trace_id
+                    )
+                    if lane == "scheduled"
+                    else _silent_empty_response_debug_callback(
+                        deps, user_id, lane, trace_id, job_id
                     )
                 ),
                 fold_before_first=deps.read_messages_after_seq is not None,
@@ -11580,7 +11795,8 @@ async def _ensure_prompt_coverage_or_degrade(
         _report_turn_progress("prompt_catchup_degraded")
         try:
             await asyncio.to_thread(
-                jobs_store.enqueue_job, user_id, "maintenance", reason="compaction"
+                jobs_store.enqueue_job, user_id, "maintenance",
+                reason="compaction", trace_id=uuid.uuid4().hex,
             )
             await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
         except Exception as enqueue_exc:  # noqa: BLE001
@@ -12420,6 +12636,13 @@ async def process_job(
         schema_recovery = _SchemaRecovery(
             mcp_turn,
             current_offered_mcp_tool_specs=_current_offered_mcp_tool_specs,
+            observe_surface=_schema_surface_trace_callback(
+                deps,
+                user_id,
+                lane,
+                trace_id=str(job.get("trace_id") or ""),
+                job_id=job_id,
+            ),
         )
         mcp_offered_names = tuple(
             str(spec.name) for spec in offered_mcp_tool_specs if str(spec.name)
@@ -12631,10 +12854,12 @@ async def process_job(
                 # worker-level gate as MCP reads. Executor still owns validation,
                 # provenance, encrypted outbox writes, and terminal write failures.
                 if tc.name == cap_tool_schema.MCP_TOOL_SEARCH_TOOL:
+                    recovered = schema_recovery.resolve(tc.args)
+                    await schema_recovery.record_recovery(recovered)
                     return ToolResult(
                         call_id=tc.id,
                         content=json.dumps(
-                            schema_recovery.resolve(tc.args),
+                            recovered,
                             ensure_ascii=False,
                             sort_keys=True,
                             separators=(",", ":"),
@@ -14374,7 +14599,8 @@ async def process_job(
         if tail and context.needs_compaction(tail, budget=_TAIL_BUDGET):
             try:
                 await asyncio.to_thread(
-                    jobs_store.enqueue_job, user_id, "maintenance", reason="compaction"
+                    jobs_store.enqueue_job, user_id, "maintenance",
+                    reason="compaction", trace_id=uuid.uuid4().hex,
                 )
             except Exception as e:  # noqa: BLE001 — 压缩入队失败绝不能拖垮已经写成的这条回复
                 log.warning(
@@ -14722,6 +14948,94 @@ async def process_job(
 
 
 async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
+    """Thin wrapper whose only job is to record the terminal half of the pair.
+
+    ``_run_turn_body`` has several terminal exits -- provider_unavailable
+    returns early, the extraction gate terminalizes on its own, the outer
+    ``except`` returns, and wake can return "rescheduled" -- and only one of
+    them recorded anything.  Emitting at each site means every future early
+    return is one more silent hole, so the wrapper emits once for all of them.
+
+    The signature is deliberately unchanged: many tests patch this seam.
+    """
+    outcome = await _run_turn_body(job, deps, enclave_sem=enclave_sem)
+    # Deliberately NOT a finally: a finally also runs for CancelledError and for
+    # any unhandled BaseException, and would then emit outcome="failed" for a
+    # turn that was merely drained -- inventing a failure that never happened.
+    # Every terminal path inside the body returns an outcome, so returning is
+    # the honest signal that a terminal state was reached.
+    await _emit_job_terminal_trace(deps, job, outcome)
+    return outcome
+
+
+async def _emit_job_terminal_trace(deps: TurnDeps, job: dict, outcome: str) -> None:
+    """Record the terminal half of the enqueue->terminal pair.
+
+    Carries the job's own ``trace_id`` rather than minting one: a fresh id
+    yields two events that both exist and cannot be joined, which looks like
+    success while answering nothing.  ``chat`` is skipped -- it is traced on its
+    own send path and is the highest-volume lane.
+    """
+    emit = getattr(deps, "emit_debug_trace", None)
+    lane = str(job.get("lane") or "")
+    if emit is None or lane == "chat":
+        return
+    try:
+        # The claim snapshot is stale by construction: mark_failed/reschedule
+        # write the durable row, never this dict.  Reading the snapshot would
+        # give a new job an empty code and a retried job the PREVIOUS attempt's
+        # error -- attributing this failure to the wrong cause, which is exactly
+        # the misclassification the taxonomy exists to prevent.
+        # The body returning "failed" means *this worker* stopped, which is not
+        # the same as the job being terminal: on LostJobLease the winning
+        # lifecycle owns terminal visibility and the row may already be
+        # completed, and trajectory review returns "failed" when mark_running
+        # loses.  Emitting on the body's word alone would publish a failure for
+        # a job that succeeded.  The durable row is the precondition, not a
+        # decoration.
+        durable = None
+        try:
+            durable = await asyncio.to_thread(
+                jobs_store.get_terminal_snapshot,
+                job.get("id"),
+                user_id=str(job.get("user_id") or ""),
+            )
+        except Exception:  # noqa: BLE001 — cannot confirm terminality: stay quiet
+            return
+        if not isinstance(durable, dict):
+            return
+        durable_status = str(durable.get("status") or "")
+        expected = {
+            "completed": {"completed"},
+            "failed": {"failed", "expired"},
+            "rescheduled": {"pending"},
+            "superseded": {"superseded"},
+        }.get(outcome, set())
+        if durable_status not in expected:
+            return
+        error_code = str(durable.get("last_error") or "")
+        status = {"completed": "ok", "rescheduled": "warning",
+                  "superseded": "warning"}.get(outcome, "error")
+        kwargs = {
+            "status": status,
+            "trace_id": str(job.get("trace_id") or ""),
+            "job_id": str(job.get("id") or ""),
+            "detail": {"lane": lane, "outcome": outcome, "error_code": error_code},
+        }
+        # outcome_class has no success member, so it is only meaningful on an
+        # actual failure.  rescheduled/superseded are warnings, not failures --
+        # stamping them would assert a failure classification that is not true
+        # of them, which is the same conflation this taxonomy exists to prevent.
+        if status == "error":
+            kwargs["outcome_class"] = jobs_store.terminal_outcome_class(error_code)
+        await asyncio.to_thread(
+            emit, str(job.get("user_id") or ""), "agent.job.terminal", **kwargs
+        )
+    except Exception as exc:  # noqa: BLE001 — observability must not fail a turn
+        log.warning("[v2.worker] terminal trace emit failed: %s", exc)
+
+
+async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
     """把一个已 claim 的 job 交给 `process_job` 之前，先做一次性的 enclave-bound 解析：
     单次解密 BYOK provider key（single-decrypt-per-turn）+ 铸一个
     enclave-auth runtime_token。resolve_provider 失败（未配置/解密失败等）直接 mark_failed，

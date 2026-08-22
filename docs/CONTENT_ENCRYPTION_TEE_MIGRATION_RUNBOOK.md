@@ -43,18 +43,22 @@ and attachment plaintext binary uses strict `body_b64`; large objects may use a
    mixed rows, and publishes the effective shape to Broadcast.
 3. Provision environment-specific TEE PostgreSQL, owner/app roles, verify-full
    CA, backup prefix, and WAL-G encryption key.
-4. Run owner migrations to the release's `alembic_tee` head. It is
-   `0013_primary_runtime_contracts` at this revision; derive it from the actual
-   release rather than copying this value blindly.
+4. Run owner migrations to the exact release's `alembic_tee` head. Derive the
+   head from the checked-out release rather than copying a historical value.
 5. Replicate/reconcile until strict verification is green. Existing users whose
    v6 preference is absent or `off` transform to plaintext; explicit `on` users
    and unknown users carry verbatim. R2 plaintext backfill follows the same
    default/fail-safe rule.
-6. Perform Phase 4 under a write freeze, switch both units to TEE, then run the
-   two-account regression.
+6. Under the Phase 4 write freeze, preserve any explicitly terminal historical
+   ciphertext using the guarded procedure below, run strict verification, then
+   perform Phase 4 and switch both units to TEE.
 7. Open `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` only after compatible clients and
-   regression evidence exist, one environment at a time. This per-user write
-   gate is independent from the all-plaintext shadow described below.
+   regression evidence exist, one environment at a time. Production uses the
+   fail-closed `PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED` repository variable;
+   CI accepts `1` only when `PROD_FEEDLING_DATABASE_SCHEMA=tee` and forwards the
+   same value to the API, in-CVM worker, and every independent runner. This
+   per-user write gate is independent from the all-plaintext shadow described
+   below.
 
 ## Post-promotion plaintext shadow
 
@@ -77,6 +81,15 @@ restore drill has been recorded. The pooled worker and every independent runner
 must keep `FEEDLING_PLAINTEXT_SHADOW_ENABLED=0` and receive no shadow DSN; source
 database triggers capture their writes, and the elected main-backend scheduler
 is the sole drain owner.
+
+Every release that advances `alembic_tee` must apply that same release head to
+the decrypted-shadow target with `PLAINTEXT_SHADOW_MIGRATION_DATABASE_URL`
+before, or in the same maintenance window as, the TEE primary migration. This
+includes a TEE-primary-only table such as `trace_events`: the table is not added
+to shadow replication, but the exact-head gate still requires the target's
+schema version to advance. Migrating only the primary makes the elected drain
+stop deliberately on head mismatch; treat that stop as a failed deployment
+sequence, not as ordinary replication lag.
 
 The source control tables contain keys, generations, counters, timestamps, and
 fixed error slugs only. The drain claims dirty keys with short
@@ -123,8 +136,13 @@ unreachable.
 
 Stop API writes, main `serve-worker`, and the independent runner. Drain Genesis
 chunks/jobs, voice handoffs, agent jobs, the action queue, both V2 outboxes, and
-pending TEE device migrations. Confirm that the migrated destination has both
-the release head and the voice lifecycle fence:
+active requeue work. Take and verify a TEE backup before changing terminal
+rows. Migrate the TEE database to the exact release head before running the
+release-local preservation command; the command rejects a different head or
+database fingerprint.
+
+Before generating a preservation plan, confirm that the migrated destination
+has both the release head and the voice lifecycle fence:
 
 ```sql
 SELECT version_num FROM alembic_tee_version;
@@ -132,13 +150,65 @@ SELECT to_regclass('public.voice_call_sessions');
 ```
 
 The first query must return exactly the release's single TEE head and the second
-must return `voice_call_sessions`. Complete a TEST voice session
+must return `voice_call_sessions`. Any earlier preservation dry-run was bound to
+the previous head and is invalid after this migration; regenerate its count and
+SHA-256 from the exact release checkout. Complete a TEST voice session
 create/cancel/finalize smoke before entering the production write freeze.
 
-From the exact release being promoted:
+From the exact release being promoted, first obtain a read-only aggregate plan:
 
 ```bash
 cd backend
+PRESERVATION_PLAN="$(python -m admin.tee_terminal_preservation)"
+printf '%s\n' "$PRESERVATION_PLAN"
+PRESERVATION_COUNT="$(printf '%s' "$PRESERVATION_PLAN" | jq -er '.eligible')"
+PRESERVATION_SHA256="$(printf '%s' "$PRESERVATION_PLAN" | jq -er '.plan_sha256')"
+```
+
+Do not continue unless `blockers` is empty and the aggregate count matches the
+reviewed inventory. Apply only that exact count and digest:
+
+```bash
+python -m admin.tee_terminal_preservation \
+  --apply \
+  --confirm PRESERVE-TERMINAL-CIPHERTEXT \
+  --expected-count "$PRESERVATION_COUNT" \
+  --expected-plan-sha256 "$PRESERVATION_SHA256"
+python -m tee_shadow verify --sample-rate 1
+```
+
+The operation copies raw ciphertext rows; it never decrypts them and never
+changes `users.doc.content_encryption`. Preserved content remains readable by a
+device only when its `K_user` is still valid. Preservation does not synthesize a
+working `K_enclave` and therefore does not make previously undecryptable content
+readable to hosted agents.
+
+The Phase 4 re-audit does not transfer large inline frame ciphertext back
+through the database gateway. For `frame_envelopes` only, each database computes
+an ephemeral MD5 plus UTF-8 text length for the large JSON columns and the
+operator compares those transport checksums with the remaining scalar columns.
+This MD5 is not encryption, authentication, or an ownership proof and is never
+stored; the already-reviewed SHA-256 preservation marker remains the ownership
+and plan-digest authority.
+
+Before the first TEE-primary write, the exact operation can be reversed with the
+same reviewed count and digest:
+
+```bash
+python -m admin.tee_terminal_preservation \
+  --revert \
+  --confirm REVERT-PRESERVED-CIPHERTEXT \
+  --expected-count "$PRESERVATION_COUNT" \
+  --expected-plan-sha256 "$PRESERVATION_SHA256"
+```
+
+Revert fails after the Phase 4 prepared marker exists, or if any source,
+destination, or audit marker has changed. It deletes only rows whose ownership
+is proven by a valid preservation marker.
+
+After strict verification is green, run Phase 4:
+
+```bash
 python -m admin.phase4_cutover
 python -m admin.phase4_cutover --apply --confirm-writes-frozen
 ```
@@ -148,13 +218,18 @@ app role to execute a voice-session create/cancel/finalize smoke inside a
 forced-rollback transaction. Apply additionally requires the TEE owner DSN in
 `TEE_MIGRATION_DATABASE_URL`; it copies the frame bridge and Chat generation
 fences, aligns sequences, enables TEE contracts, and writes the head-bound
-prepared marker.
+prepared marker. The gate reports unresolved pending rows separately from fully
+audited preserved ciphertext. Only the former blocks promotion; the preserved
+count and aggregate digest are embedded in the prepared marker.
 
 Before traffic resumes, point main and runner at the same TEE app DSN, set
-`FEEDLING_DATABASE_SCHEMA=tee`, and remove `TEE_DATABASE_URL`/dual-write. Startup
-must assert the TEE head and marker without DDL. After the first TEE-primary
-write, frozen RDS is not a lossless rollback target; reverse-reconcile or restore
-TEE changes before switching a DSN back.
+`FEEDLING_DATABASE_SCHEMA=tee`, and remove `TEE_DATABASE_URL`/dual-write. To open
+the plaintext tier in the same maintenance window, also set
+`PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1`; CI rejects that value with the RDS
+schema selector, and all production write processes receive the same gate.
+Startup must assert the TEE head and marker without DDL. After the first
+TEE-primary write, frozen RDS is not a lossless rollback target;
+reverse-reconcile or restore TEE changes before switching a DSN back.
 
 ## Shape inventory
 

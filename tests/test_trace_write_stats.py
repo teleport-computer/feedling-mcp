@@ -264,11 +264,20 @@ def test_queue_full_is_the_only_known_drop_source(monkeypatch):
     assert debug_trace._take_dropped("usr_full") == 1
 
 
-def test_flush_exception_is_at_risk_and_restores_only_queue_marker(monkeypatch):
+def test_flush_exception_is_immediately_red_and_restores_only_queue_marker(
+    monkeypatch, caplog,
+):
     monkeypatch.setattr(debug_trace, "is_enabled", lambda _store: True)
     monkeypatch.setattr(debug_trace, "verbose_enabled", lambda _store: False)
     monkeypatch.setattr(debug_trace, "_dropped_by_uid", {"usr_risk": 2})
     monkeypatch.setattr(debug_trace, "_at_risk_by_uid", {})
+    with debug_trace._write_failure_lock:
+        debug_trace._write_failures_total = 0
+        debug_trace._write_consecutive_failures = 0
+        debug_trace._write_last_failure_at = 0.0
+        debug_trace._write_last_success_at = 0.0
+        debug_trace._write_last_error = ""
+        debug_trace._write_last_error_log_at = 0.0
     captured: list[tuple[list[dict], str]] = []
     monkeypatch.setattr(
         debug_trace,
@@ -277,11 +286,12 @@ def test_flush_exception_is_at_risk_and_restores_only_queue_marker(monkeypatch):
     )
     monkeypatch.setattr(
         debug_trace.db,
-        "append_blob_events_strict",
+        "insert_trace_events_strict",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("db down")),
     )
 
-    debug_trace._append_events("usr_risk", [_event()])
+    with caplog.at_level("ERROR", logger="feedling.debug_trace"):
+        debug_trace._append_events("usr_risk", [_event()])
 
     assert len(captured) == 1
     events, outcome = captured[0]
@@ -290,6 +300,8 @@ def test_flush_exception_is_at_risk_and_restores_only_queue_marker(monkeypatch):
     assert events[0]["type"] == "debug_trace.dropped"
     assert debug_trace._take_dropped("usr_risk") == 2
     assert debug_trace._take_at_risk_marker("usr_risk") == 2
+    assert debug_trace.trace_storage_health()["healthy"] is False
+    assert "trace_events insert failed" in caplog.text
 
 
 def test_next_success_emits_at_risk_marker_without_calling_it_a_drop(monkeypatch):
@@ -300,8 +312,8 @@ def test_next_success_emits_at_risk_marker_without_calling_it_a_drop(monkeypatch
     written: list[dict] = []
     monkeypatch.setattr(
         debug_trace.db,
-        "append_blob_events_strict",
-        lambda _uid, _kind, events, **_kwargs: written.extend(events),
+        "insert_trace_events_strict",
+        lambda _uid, events: written.extend(events),
     )
     monkeypatch.setattr(debug_trace, "_record_trace_stats", lambda *_args, **_kwargs: None)
 
@@ -388,12 +400,13 @@ def test_health_upsert_recovers_failure_history_and_graceful_stop(backend_env):
     _delete_health(writer)
 
 
-def test_real_ring_append_reaches_persistent_rate_counter(backend_env, monkeypatch):
+def test_successful_table_append_reaches_persistent_rate_counter(backend_env, monkeypatch):
     uid = "usr_trace_rate_plumbing"
     conftest.seed_user(uid)
     _reset_stats(monkeypatch, pid=5252)
     monkeypatch.setattr(debug_trace, "is_enabled", lambda _store: True)
     monkeypatch.setattr(debug_trace, "verbose_enabled", lambda _store: False)
+    monkeypatch.setattr(debug_trace.db, "insert_trace_events_strict", lambda _uid, events: len(events))
     event = _event(lane="wake")
 
     debug_trace._append_events(uid, [event])

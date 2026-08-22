@@ -58,15 +58,16 @@
 | 阶段 | 状态 | 坐标 |
 |---|---|---|
 | 触发事件 | 🟡 | `perception/service.py:762-844` 写 user_logs |
-| 入队 | 🔴 | `v2/jobs_store.py` enqueue 无 emit |
+| 入队（Q2） | 🟡 | `agent.job.enqueued`；与终态复用 job 自带 `trace_id` |
 | 唤醒上下文读取 | 🔴 | `v2/worker.py` |
 | provider 回合 | 🔴 | 见下方【已证实 1】 |
-| **空回复被吞** | 🔴 | **非 scheduled 道整段检测不执行** |
+| **空回复归因（Q6）** | 🟡 | `reply.silent_by_choice` / `reply.silent_empty_response`；只进后台、用户侧仍无消息 |
 | 回复发布(若有) | 🔴 | 唤醒道回复不发 trace |
 
-**哪里可能什么都不留就退出**:非 scheduled 道的空回复。这是本矩阵里
-**最贵的一格** —— 它让"模型选择不说"和"provider 返回空"不可区分。
-期3a 的 `silent_undeclared` 列是它的**计量**(盲区多大),不是它的修复。
+**哪里仍可能什么都不留就退出**:provider 回合本身仍无开始/结束事件。
+非 scheduled 道的空回复现在有两类 content-free 归因探针，但尚未在 test
+部署上跑实弹，所以只标黄；期3a 的 `silent_undeclared` 仍是盲区计量，
+不是该归因探针的实弹证明。
 
 ### 3. 记忆 capture
 
@@ -100,7 +101,7 @@
 | 阶段 | 状态 | 坐标 |
 |---|---|---|
 | 建路线 | 🔴 | `hosted/setup_core.py` |
-| 发起测试 | 🔴 | `setup_core.py:346` |
+| provider 探测（Q1：建路线 / 测试） | 🟡 | `model_api.provider_probe.started/finished/runtime_fenced` + always-on attempt ledger |
 | 视觉探测执行 | 🔴 | `setup_core.py:381` |
 | 目录声明与探测结果打架 | 🟡 | `setup_core.py:262`(**仅**此一处) |
 | 结果落库 | 🔴 | `setup_core.py:277` |
@@ -130,14 +131,13 @@ usr_450ee 的事件窗口与 ring 查询配方。
 
 | 阶段 | 状态 | 坐标 |
 |---|---|---|
-| schema 折叠 | 🔴 | `capabilities/tool_schema.py` |
-| tool search resolve | 🔴 | — |
+| schema 折叠 / tool search resolve（Q8） | 🟡 | `mcp.surface.schema_folded/recovered`，name 集合经 `bounded_names` 带截断标记 |
 | 工具派发 | 🔴 | — |
 | 变更落地 | 🔴 | — |
 
-**trace 需求 #6(codex/T143)**:需要 **name 级**事件 —— 某轮哪些 schema 被折叠、
-哪些被 search resolve、后续是否受保护。现有 provider tool surface 只有
-count/reason,答不了。等 T143 放行时给接线口径。
+**Q8 现状**:name 级 folded/recovered 事件及 collapsed/resolved/protected
+集合已经有调用点；每轮集合不变去重，search 恢复吸收本轮折叠变化。
+尚未在 test 部署上跑一轮真实 fold + search，故只标黄。
 
 ### 10. resident(V1)poll 环
 
@@ -202,9 +202,11 @@ count/reason,答不了。等 T143 放行时给接线口径。
 `provider_client.py:2185` 的 `if require_reply and not reply and not tool_calls
 and not media` 整条判断不成立,空回复静默走完、终态 ok、零条消息。
 
-### 【已证实 2】模型路线添加/测试路径近乎零 trace
-正常路径零事件;唯一一处是 `setup_core.py:262` 的目录/探测打架分支。
-种子清单写的"零 trace"精确说法应为"**正常路径零 trace,仅异常分支一处**"。
+### 【代码接线、待实弹】模型路线添加/测试路径
+正常路径现有 `model_api.provider_probe.started/finished`，失败回滚有
+`runtime_fenced`；真钱调用另写 always-on provider-attempt ledger，避免用户关闭
+debug trace 后证据消失。尚未在 test 部署上造成功、`invalid_output`、回滚三次，
+所以 Q1 仍是黄，不是绿。
 
 ### 【UNKNOWN,不入红格】broadcast_opened「源头三个配置关着 / 下游六处是孤儿」
 
@@ -230,7 +232,7 @@ and not media` 整条判断不成立,空回复静默走完、终态 ok、零条�
 ## 五、下一步
 
 1. 把黄格逐个实弹复验转绿 —— 判据是"人为制造缺失,格子会红",不是"读代码觉得对"
-2. 唤醒道空回复(trace 需求 #7)与 MCP name 级事件(需求 #6)按红格优先级排
+2. Q1/Q2/Q6/Q8 四格在 test 部署上逐条跑实弹；当前有调用点但均只标黄
 3. T138 append-only 表落地前,本矩阵所有结论都受 2500 条/48h 环的限制:
    **矩阵说"有探针"不等于"事发后查得到"**
 4. 覆盖边界(partial_before / 截断标记)随读数自报 —— 需求 #4,与 T138 读端点同一格

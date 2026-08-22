@@ -637,6 +637,25 @@ def _reset_enclave_http_client():
 
 
 @pytest.fixture(autouse=True)
+def _stable_provider_base_url_dns(monkeypatch):
+    """Keep provider tests independent of real, proxy, and synthetic DNS.
+
+    Production still calls ``core.net_safety.resolve_ips``. Focused provider
+    URL tests replace this seam with private, mixed, invalid, and failing
+    answers; every unrelated test gets one known-public address so its mocked
+    HTTP provider remains the only behavior under test.
+    """
+    import provider_client
+
+    monkeypatch.delenv("FEEDLING_PROVIDER_ALLOW_PRIVATE_BASE_URLS", raising=False)
+    monkeypatch.setattr(
+        provider_client.net_safety,
+        "resolve_ips",
+        lambda _host: ["8.8.8.8"],
+    )
+
+
+@pytest.fixture(autouse=True)
 def _reset_admin_page_cache():
     """Clear admin_core's 60s page-html TTL cache between tests.
 
@@ -706,6 +725,27 @@ def backend_env(tmp_path, monkeypatch):
     core_store._stores.clear()
     registry._save_users()
     yield
+
+
+@pytest.fixture()
+def tee_primary(monkeypatch):
+    """Run a focused endpoint test against the migrated TEE-primary schema.
+
+    Generic backend tests intentionally use the legacy-chain database so both
+    migration families stay covered. T184 trace_events exists only in TEE, so
+    real trace endpoint tests opt into the topology they run under in test/prod.
+    """
+    import db
+
+    original_url = os.environ["DATABASE_URL"]
+    original_schema = os.environ.get("FEEDLING_DATABASE_SCHEMA", "rds")
+    db.close_pool()
+    monkeypatch.setenv("DATABASE_URL", os.environ["TEE_DATABASE_URL"])
+    monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "tee")
+    yield
+    db.close_pool()
+    monkeypatch.setenv("DATABASE_URL", original_url)
+    monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", original_schema)
 
 
 @pytest.fixture()

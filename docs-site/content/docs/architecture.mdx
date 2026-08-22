@@ -72,6 +72,20 @@ protects persisted content and the storage path; it does not hide the prompt
 from the model selected to process it. When visible push text is enabled, that
 notification text also passes through the external push provider.
 
+Managed provider routes resolve every explicit HTTPS base URL on each
+validation, including the validation immediately before runtime calls, and
+reject the route when any answer is not publicly reachable. This reuses the
+same private, loopback, link-local, reserved, and multicast classification as
+other server-side egress guards. It deliberately pays a synchronous DNS lookup
+per call and keeps no process cache, reducing the rebinding window compared with
+save-time-only validation. It does not pin the HTTP connection to the checked
+address, so infrastructure egress policy remains the final control if DNS
+changes between validation and connection. Exact cleartext loopback URLs remain
+available for local development. A self-hosted operator can explicitly disable
+the HTTPS address filter for a LAN provider, as documented in
+[Self-hosting](/docs/self-hosting); managed deployments leave that escape hatch
+unset.
+
 Managed Phala deployments place the CPU recorder inside the measured main-CVM
 boundary. The recorder does not mount the Docker socket. A separate privileged
 socket proxy holds that mount and regex-allowlists only the two Docker GET path
@@ -399,14 +413,30 @@ encrypted and expires automatically.
 4. A `local_only` body remains client-readable but is unavailable to agent-side
    index and fetch operations.
 
-The bounded, operator-only debug trace distinguishes an executed memory search
-from an index overview. It records the returned-card count, requested limit, and
-a 12-hex SHA-256 prefix of the trimmed search query; it never records the query
+The operator-only debug trace distinguishes an executed memory search from an
+index overview. It records the returned-card count, requested limit, and a
+12-hex SHA-256 prefix of the trimmed search query; it never records the query
 text. Repeated Runtime V2 discovery calls that reuse an earlier result carry a
 separate content-free reuse flag. The fingerprint is operational metadata: it
 lets an authorized administrator compare whether two searches used the same
 trimmed query during the trace-retention window, but it is not ciphertext and
 must not be exposed through a public debug route.
+
+In the managed TEE-primary topology, each trace event is an append-only row in
+the authoritative TEE PostgreSQL database. Daily partitions use Beijing-day
+boundaries and retain 30 days. A default partition preserves events if rolling
+partition maintenance is late, but any row in that partition is a degraded
+state that the backend reports independently of the owner-only repair command.
+Trace summaries, explanations, bounded structured detail, and explicitly
+captured content excerpts are plaintext operational data inside the TEE trust
+boundary; they are not end-to-end encrypted user envelopes. The table has no
+foreign key to the account row: deleting an account intentionally leaves its
+recent trace queryable by exact uid for incident diagnosis until retention or
+an explicit operator trace clear removes it. Each event also carries the same
+outcome classification used by Runtime job reporting: operational failure,
+timeout, control flow, or safety suppression. Keeping that vocabulary shared
+prevents trace investigation and the operational failure-rate dashboard from
+assigning the same terminal outcome to different buckets.
 
 See the [Memory workflow](/docs/workflows/memory) for the complete envelope,
 selection, fetch, and action contracts.
@@ -501,8 +531,11 @@ envelopes. Treat an absent, empty, or unrecognized value as `on`.
 
 The deployment gate is closed by default and opens only when
 `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` is set. The test and pre-production
-environments enable it; production remains closed. Even in an enabled
-deployment, an unknown user remains fail-safe encrypted.
+environments enable it. Production exposes a separate fail-closed release
+variable, forwards one value to the API and every worker/runner, and rejects an
+open gate unless the database schema selector is `tee`. Even in an enabled
+deployment, an explicit encrypted-tier account or an unknown user remains
+fail-safe encrypted; existing ciphertext is not rewritten by the gate.
 
 Two boundaries hold in both tiers:
 
@@ -528,6 +561,17 @@ through the decrypt service, `body_b64` is strictly base64-decoded locally, and
 preference, and precedence is `body_ct`, then `body_b64`, then `body`. The
 [`/v1/content/swap`](/docs/workflows/memory) endpoint converts existing inline
 records between encrypted and plaintext shapes.
+
+During a managed TEE-database promotion, historical ciphertext that has reached
+an explicitly terminal decrypt state can be retained without pretending it was
+converted to plaintext. The migration copies the original raw row, records a
+versioned digest marker, and audits every preserved source/destination pair.
+This does not change the account's `content_encryption` preference, manufacture
+an enclave-readable key, or make the service able to open ciphertext it could
+not previously decrypt. A device can still read such a record only when its
+`K_user` remains valid. Promotion gates distinguish these fully audited rows
+from unresolved, malformed, or requeued work; only audited preservation is
+eligible for the migration waiver.
 
 This routing rule is also a service boundary, not only a decoding convenience.
 Normal backend and hosted-runtime workflows do not submit `body` or `body_b64`
@@ -694,13 +738,25 @@ Hosted Runtime V2 may contribute the bounded new-frame block unless the exact
 active route is explicitly marked image-unsupported. Untested and absent probe
 states are admitted optimistically; a confirmed rejection is learned by the
 screen-only text fallback. The official resident path still requires a setup
-probe `ok` signal. Screen content is evidence only and
-cannot supply requirements or instructions. A turn receiving screen pixels has
-web, mutating MCP, and `task` removed before its first provider call; read-only
-user MCP remains available. An image-rejection
-retry stays behind the same fence. After any other explicit text-bearing private
-read, web and `task` are removed for the remainder of the turn while
-user-configured MCP remains available, including mutations. Numeric
+probe `ok` signal. Screen content is evidence only and cannot supply
+requirements or instructions.
+
+Screen-pixel authorization intentionally differs by execution boundary. In
+Hosted Runtime V2, a turn receiving pixels has web, mutating MCP, and `task`
+removed before its first provider call; approved read-only user MCP remains
+available. On the independent resident/CLI path, an explicit 2026-08-21 policy
+keeps both read-only and mutating user MCP available in foreground Chat and
+proactive screen turns. Those servers are configuration and infrastructure the
+user selected and authenticated, rather than outbound destinations discovered
+by the model. This is an intentional trust-boundary difference, not a known
+resident isolation gap.
+
+The resident exception does not relax platform web egress. Screen turns still
+set `FEEDLING_OUTBOUND_FENCE=1`, and `io_cli` refuses platform `web_search` and
+`web_fetch` before making an HTTP request. An image-rejection retry stays behind
+the same path-specific fence. After any other explicit text-bearing private
+read, Hosted Runtime V2 removes web and `task` for the remainder of the turn
+while user-configured MCP remains available, including mutations. Numeric
 health snapshot/trend reads remain compatible with outbound work.
 
 ### Runtime V2 prompt caching
@@ -795,6 +851,13 @@ The custom-domain route has a deliberately disclosed plaintext hop between
 measured TDX CVM, not a public-network hop; its protection relies on that CVM
 boundary rather than a second TLS layer. Cloudflare manages DNS-01 records only
 and does not proxy this traffic.
+
+Ingress certificates persist on an encrypted application volume while the
+container root filesystem is replaceable. On restart, the managed compose
+reuses that material only after checking certificate lifetime and private-key
+matching; otherwise the upstream DNS-01 bootstrap runs normally. Successful
+reuse starts the proxy immediately and leaves renewal to the image's background
+renewal daemon.
 
 Clients using the custom domain must verify both the ingress certificate-evidence
 bundle and the enclave attestation bundle, in addition to ordinary WebPKI, before

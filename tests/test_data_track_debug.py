@@ -48,6 +48,29 @@ def _patch_blob_reads(monkeypatch, blobs: dict) -> None:
         },
     )
 
+    def query_events(
+        *, user_id="", trace_id_contains="", subsystem="", q="",
+        since_epoch=0, limit=50_000, offset=0, **_kwargs,
+    ):
+        events = [
+            dict(event)
+            for (uid, kind), doc in blobs.items()
+            if kind == "trace_events" and (not user_id or uid == user_id)
+            for event in doc.get("events", [])
+        ]
+        if trace_id_contains:
+            events = [e for e in events if trace_id_contains in str(e.get("trace_id") or "")]
+        if subsystem:
+            events = [e for e in events if e.get("subsystem") == subsystem]
+        if since_epoch:
+            events = [e for e in events if float(e.get("ts") or 0) >= since_epoch]
+        if q:
+            events = [e for e in events if q.lower() in data_track._debug_trace_search_text(e)]
+        events.sort(key=lambda e: float(e.get("ts") or 0), reverse=True)
+        return events[offset:offset + limit]
+
+    monkeypatch.setattr(data_track.db, "query_trace_events", query_events)
+
 
 def test_provider_tool_surface_has_explicit_admin_step_label():
     assert data_track._debug_friendly_step({
@@ -272,7 +295,7 @@ def test_debug_payload_groups_multi_user_trace_and_marks_stalled(monkeypatch):
     blobs = {
         ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
         ("user_b", "v1_flow_trace_enabled"): {"enabled": True},
-        ("user_a", "v1_flow_trace"): {
+        ("user_a", "trace_events"): {
             "events": [
                 _event(100, "user_a", "route.chat.message", trace_id="t-ok"),
                 _event(101, "user_a", "agent.model.call.start", trace_id="t-ok"),
@@ -287,7 +310,7 @@ def test_debug_payload_groups_multi_user_trace_and_marks_stalled(monkeypatch):
                 ),
             ]
         },
-        ("user_b", "v1_flow_trace"): {
+        ("user_b", "trace_events"): {
             "events": [
                 _event(200, "user_b", "route.chat.message", trace_id="t-stall"),
                 _event(
@@ -325,6 +348,7 @@ def test_debug_payload_groups_multi_user_trace_and_marks_stalled(monkeypatch):
         "turns_returned",
         "stalled_turns",
         "error_turns",
+        "scan_truncated",
     }
     assert payload["summary"]["users_with_events"] == 2
     assert payload["summary"]["events_total"] == 5
@@ -356,6 +380,7 @@ def test_debug_payload_treats_missing_trace_flag_as_enabled_by_default(monkeypat
             "user_id": "user_a",
             "principal_id": "p_a",
             "enabled": True,
+            "account_present": True,
             "events": 0,
             "last_ts": 0,
             "last_at": "",
@@ -375,7 +400,7 @@ def test_debug_payload_paginates_filtered_events(monkeypatch):
     ]
     blobs = {
         ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
-        ("user_a", "v1_flow_trace"): {"events": events},
+        ("user_a", "trace_events"): {"events": events},
     }
     _patch_blob_reads(monkeypatch, blobs)
 
@@ -403,7 +428,7 @@ def test_debug_page_renders_nav_filters_and_redacts_plaintext_by_default(monkeyp
 
     blobs = {
         ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
-        ("user_a", "v1_flow_trace"): {
+        ("user_a", "trace_events"): {
             "events": [
                 _event(
                     100,
@@ -441,7 +466,7 @@ def test_debug_page_renders_load_more_when_paginated(monkeypatch):
 
     blobs = {
         ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
-        ("user_a", "v1_flow_trace"): {
+        ("user_a", "trace_events"): {
             "events": [
                 _event(100 + idx, "user_a", "agent.reply", trace_id=f"t-{idx}")
                 for idx in range(3)
@@ -464,7 +489,7 @@ def test_debug_page_renders_numbered_pagination_controls(monkeypatch):
 
     blobs = {
         ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
-        ("user_a", "v1_flow_trace"): {
+        ("user_a", "trace_events"): {
             "events": [
                 _event(100 + idx, "user_a", "agent.reply", trace_id=f"t-{idx}")
                 for idx in range(25)
@@ -498,7 +523,7 @@ def test_debug_reveal_and_timeline_links_reset_pagination(monkeypatch):
     target = events[1]
     blobs = {
         ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
-        ("user_a", "v1_flow_trace"): {"events": events},
+        ("user_a", "trace_events"): {"events": events},
     }
     _patch_blob_reads(monkeypatch, blobs)
 
@@ -519,7 +544,7 @@ def test_debug_timeline_event_rows_have_event_anchors(monkeypatch):
     event = _event(100, "user_a", "agent.reply", trace_id="t-reply")
     blobs = {
         ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
-        ("user_a", "v1_flow_trace"): {"events": [event]},
+        ("user_a", "trace_events"): {"events": [event]},
     }
     _patch_blob_reads(monkeypatch, blobs)
 
@@ -543,7 +568,7 @@ def test_debug_page_reveals_plaintext_for_one_event(monkeypatch):
     )
     blobs = {
         ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
-        ("user_a", "v1_flow_trace"): {"events": [event]},
+        ("user_a", "trace_events"): {"events": [event]},
     }
     _patch_blob_reads(monkeypatch, blobs)
 
@@ -563,7 +588,7 @@ def test_debug_page_can_render_timeline_mode(monkeypatch):
 
     blobs = {
         ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
-        ("user_a", "v1_flow_trace"): {
+        ("user_a", "trace_events"): {
             "events": [
                 _event(100, "user_a", "route.chat.message", trace_id="t-reply"),
                 _event(101, "user_a", "agent.model.call.start", trace_id="t-reply"),

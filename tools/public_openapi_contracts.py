@@ -419,7 +419,9 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                 "type": "string",
                 "description": (
                     "Override base URL. Required for `openai_compatible`; must be "
-                    "`https://` or local `http://127.0.0.1`."
+                    "`https://` or local `http://127.0.0.1`. An explicit port "
+                    "must be an integer from 1 through 65535. By default every "
+                    "HTTPS DNS answer must be publicly reachable."
                 ),
             },
             "api_key": {
@@ -1181,7 +1183,14 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "api_key": {"type": "string", "minLength": 1, "writeOnly": True},
             "credential_id": {"type": "string", "format": "uuid"},
             "label": {"type": "string"},
-            "base_url": {"type": "string", "format": "uri"},
+            "base_url": {
+                "type": "string",
+                "format": "uri",
+                "description": (
+                    "An explicit port must be an integer from 1 through 65535. "
+                    "By default every HTTPS DNS answer must be publicly reachable."
+                ),
+            },
             "context_window_tokens": {"type": "integer", "minimum": 8192},
         },
         "oneOf": [
@@ -1214,7 +1223,14 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "api_key": {"type": "string", "minLength": 1, "writeOnly": True},
             "credential_id": {"type": "string", "format": "uuid"},
             "label": {"type": "string"},
-            "base_url": {"type": "string", "format": "uri"},
+            "base_url": {
+                "type": "string",
+                "format": "uri",
+                "description": (
+                    "An explicit port must be an integer from 1 through 65535. "
+                    "By default every HTTPS DNS answer must be publicly reachable."
+                ),
+            },
             "context_window_tokens": {"type": "integer", "minimum": 8192},
         },
         "oneOf": [
@@ -2386,7 +2402,15 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "is treated as route metadata: a value below Runtime V2's "
         "deployment-tunable trust floor (32,768 by default) falls through to "
         "the audited-family or unaudited-route default rather than becoming "
-        "the prompt budget. The resolved value is returned and persisted."
+        "the prompt budget. The resolved value is returned and persisted. "
+        "A base_url with an explicit port accepts only integer ports from 1 "
+        "through 65535. By default every HTTPS DNS answer must be publicly "
+        "reachable."
+    ),
+    ("post", "/v1/model_api/routes"): (
+        "Create a model route. A base_url with an explicit port accepts only "
+        "integer ports from 1 through 65535. By default every HTTPS DNS answer "
+        "must be publicly reachable."
     ),
     ("post", "/v1/model_api/models"): "列出某 provider 在该凭据下可见的模型清单（实时拉取，非 io 兼容性保证）。unsupported / partial 时客户端退回手填。",
     ("post", "/v1/model_api/runtime_error"): "Record or clear the resident runtime's latest provider error. provider_result=success refreshes provider health immediately; provider_result=failure applies error_class to the provider-health policy.",
@@ -2403,7 +2427,8 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "usage_total, usage_today, usage_month) actually populate depends on the provider/adapter: "
         "DeepSeek and OpenRouter are queried through their official APIs; an openai_compatible "
         "relay/中转站 is queried through its dashboard-style endpoints when reachable, and is "
-        "skipped with error=usage_blocked_url if it resolves to a private/loopback address. "
+        "skipped by default with error=usage_blocked_url if it resolves to a private/loopback "
+        "address; a self-host deployment can explicitly opt into its private-provider escape. "
         "Metrics the adapter cannot report are status=\"unsupported\", not omitted."
     ),
     ("get", "/v1/chat/history"): "Read encrypted chat history. Use oldest_seq as before_seq for lossless older paging and latest_seq as after_seq for lossless forward paging; timestamp watermarks remain for compatibility.",

@@ -20,7 +20,15 @@ def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
     cfg.set_main_option("script_location", str(ROOT / "backend" / "alembic_tee"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0031_merge_voice_primary"]
+    assert script.get_heads() == ["0033_trace_events"]
+    assert (
+        script.get_revision("0033_trace_events").down_revision
+        == "0032_v2_job_recovery_events"
+    )
+    assert (
+        script.get_revision("0032_v2_job_recovery_events").down_revision
+        == "0031_merge_voice_primary"
+    )
     assert set(
         script.get_revision("0031_merge_voice_primary").down_revision
     ) == {
@@ -335,14 +343,38 @@ def test_test_preflight_rejects_noncanonical_database_schema_selector():
 
 def test_prod_deploys_forward_one_database_schema_selector_to_every_database_client():
     source = WORKFLOW.read_text()
+    validator = _job(
+        source, "validate-prod-runner-topology", "detect-cvm-changes-pre"
+    )
     main = _job(source, "deploy-cvm", "deploy-test-cvm")
     runner = _job(source, "deploy-prod-runner-cvm", "notify-lark-prod-deploy")
 
-    selector = "${{ vars.PROD_FEEDLING_DATABASE_SCHEMA || 'rds' }}"
+    assert "${{ vars.PROD_FEEDLING_DATABASE_SCHEMA || 'rds' }}" in validator
+    assert (
+        "database_schema: ${{ steps.prod_release_config.outputs.database_schema }}"
+        in validator
+    )
+    assert (
+        "FEEDLING_DATABASE_SCHEMA: ${{ needs.validate-prod-runner-topology."
+        "outputs.database_schema }}"
+    ) in main
+    assert (
+        "FEEDLING_DATABASE_SCHEMA:      ${{ needs.deploy-cvm.outputs."
+        "database_schema }}"
+    ) in runner
     for deploy in (main, runner):
         assert "FEEDLING_DATABASE_SCHEMA:" in deploy
-        assert selector in deploy
         assert '-e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA"' in deploy
+
+
+def test_prod_runner_runs_after_main_deploy_even_when_optional_ancestor_skips():
+    source = WORKFLOW.read_text()
+    runner = _job(source, "deploy-prod-runner-cvm", "notify-lark-prod-deploy")
+    header = "\n".join(runner.splitlines()[:14])
+
+    assert "always()" in header
+    assert "needs.deploy-cvm.result == 'success'" in header
+    assert "needs.detect-cvm-changes.outputs.cvm == 'true'" in header
 
 
 def test_prod_compose_forwards_database_schema_to_every_database_client():
@@ -365,7 +397,7 @@ def test_prod_preflight_blocks_unready_tee_primary_before_mutating_any_cvm():
     )
 
     for required in (
-        "PROD_FEEDLING_DATABASE_SCHEMA == 'tee'",
+        "steps.prod_release_config.outputs.database_schema == 'tee'",
         "PROD_TEE_MIGRATION_DSN",
         "PROD_TEE_PG_CA_PEM",
         "APP_DATABASE_URL",

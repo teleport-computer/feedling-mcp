@@ -1,4 +1,8 @@
-"""Proactive debug dashboard: snapshot + HTML renderer + zh translation cache."""
+"""T160: not wired into production assembly; the production memory/tool surface is
+``capabilities/registry`` -> ``model_api_runtime/v2``.
+
+Proactive debug dashboard: snapshot + HTML renderer + zh translation cache.
+"""
 
 import html
 import json

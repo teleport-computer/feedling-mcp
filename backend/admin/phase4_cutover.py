@@ -33,6 +33,7 @@ from psycopg import sql
 from psycopg.types.json import Jsonb
 
 import db
+from tee_replicator import terminal_preservation
 
 
 _DRAIN_GATES = {
@@ -54,7 +55,7 @@ _DRAIN_GATES = {
     "agent_action_queue": "SELECT count(*) FROM agent_action_queue",
     "active_v2_effect_outbox": (
         "SELECT count(*) FROM v2_effect_outbox "
-        "WHERE status NOT IN ('applied','discarded')"
+        "WHERE status NOT IN ('applied','applied_with_results','discarded')"
     ),
     "active_v2_terminal_failure_outbox": (
         "SELECT count(*) FROM v2_terminal_failure_outbox "
@@ -167,6 +168,36 @@ def _voice_session_smoke(
         "ok": True,
         "cancel_winner": "cancelled",
         "finalize_winner": "finalized",
+    }
+
+
+def _pending_gate(
+    source: psycopg.Connection,
+    destination: psycopg.Connection,
+) -> dict[str, object]:
+    """Audit preservation markers and count every remaining pending row."""
+    rows = destination.execute(
+        "SELECT user_id,table_name,item_id,reason "
+        "FROM tee_pending_device_migration "
+        "ORDER BY table_name,user_id,item_id"
+    ).fetchall()
+    markers = [
+        terminal_preservation.PreservedPending(
+            user_id=str(user_id),
+            table=str(table),
+            item_id=str(item_id),
+            reason=str(reason or ""),
+        )
+        for user_id, table, item_id, reason in rows
+        if terminal_preservation.parse_preserved_reason(str(reason or ""))
+        is not None
+    ]
+    audit = terminal_preservation.audit_preserved(source, destination, markers)
+    return {
+        "tee_pending_device_migration_blocking": len(rows) - audit.preserved,
+        "tee_terminal_ciphertext_preserved": audit.preserved,
+        "preserved_plan_sha256": audit.sha256,
+        "preserved_mismatches": list(audit.mismatches),
     }
 
 
@@ -349,6 +380,10 @@ def _activate_primary_contract(owner: psycopg.Connection,
         "tee_heads": sorted(tee_heads),
         "frame_sha256": report["frame_bridge"]["sha256"],
         "chat_generation_sha256": report["chat_storage_generations"]["sha256"],
+        "tee_terminal_ciphertext_preserved": report[
+            "tee_terminal_ciphertext_preserved"
+        ],
+        "preserved_plan_sha256": report["preserved_plan_sha256"],
     }
     app.execute(
         "INSERT INTO server_config (key, value) VALUES (%s, %s) "
@@ -383,10 +418,9 @@ def run(*, apply: bool, writes_frozen: bool) -> dict[str, object]:
 
         voice_session_smoke = _voice_session_smoke(destination)
         drain = _drain_counts(source)
-        drain["tee_pending_device_migration"] = int(
-            destination.execute(
-                "SELECT count(*) FROM tee_pending_device_migration"
-            ).fetchone()[0]
+        pending_gate = _pending_gate(source, destination)
+        drain["tee_pending_device_migration_blocking"] = int(
+            pending_gate["tee_pending_device_migration_blocking"]
         )
         blockers = {name: count for name, count in drain.items() if count}
         result: dict[str, object] = {
@@ -398,6 +432,7 @@ def run(*, apply: bool, writes_frozen: bool) -> dict[str, object]:
             "voice_session_smoke": voice_session_smoke,
             "drain": drain,
             "blockers": blockers,
+            **pending_gate,
         }
         if blockers:
             return result

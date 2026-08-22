@@ -11,17 +11,32 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 _DATA_DIR = tempfile.mkdtemp(prefix="feedling-capture-trace-test-")
 os.environ.setdefault("FEEDLING_DATA_DIR", _DATA_DIR)
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import debug_trace  # noqa: E402
+import db  # noqa: E402
 from proactive import capture_jobs  # noqa: E402
 from proactive import capture_scheduler  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
 
 from conftest import seed_user  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _tee_primary(monkeypatch):
+    original_url = os.environ["DATABASE_URL"]
+    db.close_pool()
+    monkeypatch.setenv("DATABASE_URL", os.environ["TEE_DATABASE_URL"])
+    monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "tee")
+    yield
+    db.close_pool()
+    monkeypatch.setenv("DATABASE_URL", original_url)
+    monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "rds")
 
 
 def _store(tmp_path, monkeypatch, user_id: str):

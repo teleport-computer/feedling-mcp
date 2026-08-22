@@ -87,12 +87,58 @@ def test_record_attempts_rejects_invalid_trigger(monkeypatch):
     assert body == {"error": "invalid_trigger"}
 
 
+def test_record_runtime_attempt_accepts_hosted_model_api_probe(monkeypatch):
+    stored = []
+
+    def fake_append(user_id, stream, doc, *, number_field, ts, item_key):
+        stored.append((user_id, stream, item_key, dict(doc)))
+        return {**doc, number_field: 1}
+
+    monkeypatch.setattr(
+        provider_attempt_ledger.db,
+        "log_append_numbered",
+        fake_append,
+    )
+
+    assert provider_attempt_ledger.record_runtime_attempt(
+        "usr_setup",
+        parent_key="model_api_probe:abc",
+        trigger="model_api_probe",
+        outcome="ok",
+        provider="anthropic",
+        model="claude-sonnet-4-5",
+        lane="setup",
+        runtime="hosted_setup",
+        input_tokens=11,
+        output_tokens=3,
+        total_tokens=14,
+        provider_request_id="req_1",
+    ) is True
+
+    assert len(stored) == 1
+    user_id, stream, item_key, doc = stored[0]
+    assert (user_id, stream, item_key) == (
+        "usr_setup",
+        "provider_attempts",
+        "model_api_probe:abc",
+    )
+    assert doc["trigger"] == "model_api_probe"
+    assert doc["runtime"] == "hosted_setup"
+    assert doc["lane"] == "setup"
+    assert doc["usage"] == {
+        "input_tokens": 11,
+        "output_tokens": 3,
+        "total_tokens": 14,
+    }
+    assert doc["provider_request_id"] == "req_1"
+
+
 def test_diagnostics_payload_routes_ledger_without_trace_ring(monkeypatch):
     monkeypatch.setattr(
         diagnostics_core.debug_trace,
         "trace_event",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("provider attempts must not enter the trace ring")
+            AssertionError("provider attempts must not enter the debug trace store")
         ),
     )
     monkeypatch.setattr(

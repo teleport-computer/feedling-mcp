@@ -83,6 +83,15 @@ _LOG_KEYS = (
     "tee_probe_ms", "duration_ms",
 )
 
+# These SNAPSHOT children reference parents delivered by the independent
+# CIPHERTEXT lane.  The cheap full snapshot still runs before replicate to
+# avoid starvation under a large decrypt backlog; these two tables get one
+# final targeted pass after their parents have advanced.
+_POST_REPLICATE_SNAPSHOT_TABLES = (
+    "chat_turn_activity_events",
+    "model_api_routes",
+)
+
 # 复制延迟/追平信号 = 每 tick 的 ``replicate_copied``:游标持续吐行说明还在追赶,
 # 趋近 0 说明追平了(verify 的行数差再确认收敛)。刻意不用「now - watermark_ts」——
 # 游标表的 watermark_ts 是 DOUBLE 排序值、每表语义不同(chat=消息 ts、memory/
@@ -153,6 +162,12 @@ def _sync_tick(*, do_reconcile: bool) -> bool:
     # 重试，而不是傻等到一天后的日常周期。not do_reconcile 时视为 True（本 tick
     # 本就无需 reconcile，不制造重试压力）。
     reconcile_ok = not do_reconcile
+    snapshot_reports: dict[str, dict] = {}
+
+    def collect_snapshot_report(rep: dict) -> None:
+        for table_rep in rep.get("tables") or []:
+            if isinstance(table_rep, dict) and table_rep.get("table"):
+                snapshot_reports[table_rep["table"]] = table_rep
 
     # (1) reconcile 明文表在前 —— 回填/修复父表，子表才有 FK 父行。
     if do_reconcile:
@@ -185,16 +200,7 @@ def _sync_tick(*, do_reconcile: bool) -> bool:
     # （不被慢的密文复制饿死；snapshot 无 enclave 往返，是整个 tick 里最便宜的一段）。
     try:
         rep = tr.run_action(action="snapshot", dry_run=False, confirm="MIGRATE")
-        summary["snapshot_copied"] = rep.get("copied") or 0
-        summary["snapshot_failures"] = rep.get("failures") or 0
-        summary["report"]["snapshot"] = rep.get("tables") or []
-        if summary["snapshot_failures"]:
-            failed = [t.get("table") for t in (rep.get("tables") or [])
-                      if isinstance(t, dict) and not t.get("ok")]
-            log.warning("[tee-sync] snapshot 有 %d 张表失败: %s",
-                        summary["snapshot_failures"], failed)
-        else:
-            log.info("[tee-sync] snapshot done: copied=%s", summary["snapshot_copied"])
+        collect_snapshot_report(rep)
     except tr.AlreadyRunning:
         log.info("[tee-sync] 手动 run 持锁中 — 跳过本 tick 的 snapshot")
     except tr.Unconfigured:
@@ -241,6 +247,59 @@ def _sync_tick(*, do_reconcile: bool) -> bool:
             _table_backoff[table] = (fails, time.monotonic() + _backoff_delay(fails))
             log.warning("[tee-sync] replicate %s 失败(连败%d, 退避%.0fs): %s",
                         table, fails, _backoff_delay(fails), e)
+
+    # Cross-lane children are retried only after their ciphertext parents have
+    # advanced.  A successful retry replaces the pre-replicate failure in the
+    # tick report, so metrics describe the final state rather than a recovered
+    # transient ordering conflict.
+    for table in _POST_REPLICATE_SNAPSHOT_TABLES:
+        try:
+            rep = tr.run_action(
+                action="snapshot",
+                table=table,
+                dry_run=False,
+                confirm="MIGRATE",
+            )
+            collect_snapshot_report(rep)
+        except tr.AlreadyRunning:
+            log.info(
+                "[tee-sync] 手动 run 持锁中 — 跳过 post-replicate snapshot %s",
+                table,
+            )
+            break
+        except tr.Unconfigured:
+            return reconcile_ok
+        except Exception as e:  # noqa: BLE001 — 影子期铁律：绝不传染主路径
+            snapshot_reports[table] = {
+                "table": table,
+                "rows": 0,
+                "ok": False,
+                "error": str(e)[:300],
+            }
+
+    final_snapshot_reports = list(snapshot_reports.values())
+    summary["snapshot_copied"] = sum(
+        int(rep.get("rows") or 0)
+        for rep in final_snapshot_reports
+        if rep.get("ok")
+    )
+    summary["snapshot_failures"] = sum(
+        1 for rep in final_snapshot_reports if not rep.get("ok")
+    )
+    summary["report"]["snapshot"] = final_snapshot_reports
+    if summary["snapshot_failures"]:
+        failed = [
+            rep.get("table") for rep in final_snapshot_reports if not rep.get("ok")
+        ]
+        log.warning(
+            "[tee-sync] snapshot 有 %d 张表失败: %s",
+            summary["snapshot_failures"],
+            failed,
+        )
+    else:
+        log.info(
+            "[tee-sync] snapshot done: copied=%s", summary["snapshot_copied"]
+        )
 
     # (2.5) prune 密文表的残留行 —— 删除传播的兜底对账（tee_shadow/ciphertext_prune）。
     #

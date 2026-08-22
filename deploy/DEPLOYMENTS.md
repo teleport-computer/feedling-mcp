@@ -166,9 +166,10 @@ fail closed 为 `503 voice_gateway_not_configured`。
 2. **主 CVM**：原地部署新镜像（`backend` 双路由 + `serve-worker` 容器）。
    原地重部署不翻 KMS 钥（2026-07-05 实证：compose_hash 变但钥不翻）；仍需
    先走完 pre → test 全流程再碰 prod。
-3. **runner CVM：不动**。`deploy/docker-compose.phala.prod.runner.yaml`
-   本次仅做「文件追平现状」的一次性恢复提交，此后不再随主 CVM 部署改动
-   （除非未来任务显式改它）。
+3. **runner CVM：作为同一个 release unit 更新**。
+   `deploy/docker-compose.phala.prod.runner.yaml` 仍保持 V1 agent-runner
+   形态，但每次生产 CVM 变更都使用同一触发 commit 的镜像和数据库 selector；
+   optional Gate 2 被预期跳过时不能把 runner job 一并跳过。
 4. 部署完成瞬间：全员 fence 应为 `resident` → 行为与部署前完全一致
    （P3 验收点）；之后由 allowlist 逐步把个别账号切到 `v2`。
 
@@ -199,6 +200,12 @@ inside the measured TDX CVM → Docker-internal HTTP → `enclave-domain`; the f
 hop is plaintext, but remains inside that measured CVM rather than crossing a
 public network. Cloudflare manages DNS-01 records only and does not proxy this
 traffic.
+
+`dstack-ingress` 的证书目录是持久卷，但上游用来区分首次启动的
+`/.bootstrapped` 位于可替换的容器根文件系统。三套 managed compose 会先验证
+持久证书至少还有 7 天有效期且公钥与私钥匹配；全部通过才重建 marker、立即启动
+HAProxy，并继续使用镜像内的后台续期 daemon。证书缺失、临期或 key mismatch
+仍走完整 DNS-01 bootstrap，不能为了可用性绕过证书校验。
 
 Release clients using a custom domain must validate WebPKI, ingress certificate
 evidence, and enclave attestation as separate bundles before claiming security
@@ -237,6 +244,7 @@ certificate-chain 与 hostname 验证；不得改成 unverified context、`verif
 | WS ingest | `wss://9798850e096d770293c67305c6cfdceed68c1d28-9998.dstack-pha-prod9.phala.network/ingest` |
 | TLS model | `api.feedling.app` terminates at `dstack-ingress`; `/attestation` keeps its own dstack-KMS-derived TLS on `:5003` for iOS pinning. |
 | Database promotion wiring | The staged production workflow defaults `PROD_FEEDLING_DATABASE_SCHEMA` to `rds` and forwards the same selector to the backend, in-CVM `serve-worker`, and every independent runner. Selecting `tee` is fail-closed before any CVM mutation: CI requires the owner migration DSN and CA, proves the owner/app DSNs target the same database, requires the deployed `DATABASE_URL` role to be `app`, checks the exact `alembic_tee` head, and runs the Phase-4 startup contract. `PROD_TEE_DATABASE_URL` and `PROD_FEEDLING_TEE_DUAL_WRITE` must both be empty in primary mode. This row describes release wiring, not evidence that the live production database has already been promoted. |
+| Plaintext write gate | `PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED` defaults to `0`, accepts only `0` or `1`, and is forwarded identically to the backend, in-CVM `serve-worker`, and every independent runner. CI refuses `1` unless `PROD_FEEDLING_DATABASE_SCHEMA=tee`, preventing an unrelated RDS deployment from opening plaintext writes. With the gate open, known users whose preference is unset or `off` write plaintext; explicit `on` and unknown users remain encrypted, and historical ciphertext is not rewritten. |
 | Plaintext shadow Gate 2 | Source wiring supports `PROD_PLAINTEXT_SHADOW_DATABASE_URL` plus the literal `PROD_FEEDLING_PLAINTEXT_SHADOW_ENABLED` gate. This is separate from Gate 1 and is not evidence that the live target is enabled. When the gate is `1`, the protected `prod-plaintext-shadow-gate2` environment runs redacted `preflight` and strict `verify --require-green` against the already-running Gate-1 backend before deployment. The main backend alone receives the target DSN and owns the singleton drain; `serve-worker` and every independent runner force the gate to `0` and receive no target credential. The TEE database stays primary and the target is an all-plaintext projection, never a failover source. |
 | MCP pubkey pin | Retired in prod9 architecture: `mcp_tls_cert_pubkey_fingerprint_hex` is empty by design; content-layer envelopes sealed to `enclave_content_pk` are the privacy boundary. |
 | **Enclave content pk** | `2d642ec1f54719d8c6088e8cbaf394961cb804a533bd4d7366d48d1d543f5620` — **THE prod9 content-key baseline.** Verified against live `/attestation` 2026-07-03. Envelope `enclave_pk_fpr` = `sha256(pk)[:16]` = `50f9a01800d4a230de85507d25b86eb1`, a constant stamped on envelopes April→July → the enclave content key has **never changed**. ⚠️ Do NOT confuse with the retired prod5 value `f50c90f7…` (app `051a174f`) that still appears in the Phase A/B tables below — that is a different, dead CVM and is NOT this baseline. |
@@ -353,7 +361,9 @@ in test, pre, and production.
 The pre backend sets `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` to exercise PR #131's
 per-user plaintext tier. Test also opens the gate after its TEE-primary promotion;
 production remains closed by default. Unknown users and users whose effective
-preference is `on` still write encrypted envelopes.
+preference is `on` still write encrypted envelopes. Production can open the
+same per-user gate through `PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1`, but CI
+admits it only as part of a TEE-primary release unit.
 | Baseline | Set repo var `PRE_ENCLAVE_CONTENT_PK_BASELINE` from a manual `/attestation` read after the first healthy deploy (the attestation gate is inert until then). |
 
 部署后从仓库根目录验证 pre 自定义 enclave 域名的 live ingress evidence；

@@ -1528,7 +1528,7 @@ def _provider_attempts_detail(store: UserStore) -> dict:
         limit=_PROVIDER_ATTEMPT_DETAIL_LIMIT + 1,
     )
     return {
-        "coverage": "chat_turns_only",
+        "coverage": "provider_runtime_and_model_api_probes",
         "attempts": rows[-_PROVIDER_ATTEMPT_DETAIL_LIMIT:],
         "has_more": len(rows) > _PROVIDER_ATTEMPT_DETAIL_LIMIT,
     }
@@ -1537,15 +1537,22 @@ def _provider_attempts_detail(store: UserStore) -> dict:
 def _v2_chat_failures_detail(user_id: str) -> dict:
     """Why this user's V2 chat turns failed.
 
-    Complements ``provider_attempt_ledger``, which is V1-only
-    (``coverage: chat_turns_only`` is written by the runner, and the V2
-    package contains no ledger writes at all). Reading the two together is
-    the whole point: a V2 user's ledger goes silent at the moment of the
-    cutover, so silence there means "switched", not "no provider call".
+    Complements ``provider_attempt_ledger``. The ledger covers resident chat,
+    Runtime V2 provider calls, and hosted model-API setup/test probes; this view
+    adds the job-level terminal failure shape for V2 chat.
     """
     try:
         from model_api_runtime.v2 import jobs_store as _v2_jobs_store
         return _v2_jobs_store.recent_chat_failures_for_user(user_id)
+    except Exception as e:  # noqa: BLE001 — observability must never 500 the page
+        return {"error": f"{type(e).__name__}:{str(e)[:120]}"}
+
+
+def _v2_recent_jobs_detail(user_id: str) -> dict:
+    """Recent content-free agent_jobs rows for one user's support view."""
+    try:
+        from model_api_runtime.v2 import jobs_store as _v2_jobs_store
+        return _v2_jobs_store.recent_jobs_for_user(user_id)
     except Exception as e:  # noqa: BLE001 — observability must never 500 the page
         return {"error": f"{type(e).__name__}:{str(e)[:120]}"}
 
@@ -1863,6 +1870,7 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         row["notice_summaries"] = _notice_summaries(user_id)
         row["provider_attempt_ledger"] = _provider_attempts_detail(store)
         row["v2_chat_failures"] = _v2_chat_failures_detail(user_id)
+        row["v2_recent_jobs"] = _v2_recent_jobs_detail(user_id)
         row["v2_profile"] = _v2_profile_detail(user_id)
         row["memory_capture_validation"] = _memory_capture_validation_detail(store)
         _ps = store.load_proactive_settings()
@@ -2272,33 +2280,14 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     return payload
 
 
-def _debug_trace_events_from_blobs(
-    user_id: str,
-    enabled_raw,
-    raw,
-) -> tuple[bool, list[dict]]:
+def _debug_trace_enabled(enabled_raw) -> bool:
     if debug_trace._hard_disabled():
-        enabled = False
-    elif isinstance(enabled_raw, dict) and "enabled" in enabled_raw:
-        enabled = bool(enabled_raw.get("enabled"))
-    elif enabled_raw is None:
-        enabled = debug_trace._default_enabled()
-    else:
-        enabled = bool(enabled_raw)
-    raw = raw or {}
-    events = raw.get("events") if isinstance(raw, dict) and isinstance(raw.get("events"), list) else []
-    out = []
-    for e in events:
-        if not isinstance(e, dict):
-            continue
-        ev = dict(e)
-        ev["user_id"] = user_id
-        try:
-            ev["ts"] = float(ev.get("ts") or 0)
-        except (TypeError, ValueError):
-            ev["ts"] = 0.0
-        out.append(ev)
-    return enabled, out
+        return False
+    if isinstance(enabled_raw, dict) and "enabled" in enabled_raw:
+        return bool(enabled_raw.get("enabled"))
+    if enabled_raw is None:
+        return debug_trace._default_enabled()
+    return bool(enabled_raw)
 
 
 def _debug_trace_stem(event_type: str) -> str:
@@ -2440,6 +2429,10 @@ _EMPTY_RESPONSE_PUBLIC_ENUMS = {
         "other",
     }),
 }
+_SILENT_REPLY_PUBLIC_ENUMS = {
+    "lane": _EMPTY_RESPONSE_PUBLIC_ENUMS["lane"],
+    "cause": frozenset({"suppressed", "empty_response"}),
+}
 
 _LANGUAGE_FOLLOW_PUBLIC_ENUMS = {
     "user_script": frozenset({
@@ -2503,6 +2496,22 @@ def _debug_event_public_json(ev: dict) -> dict:
             value = raw_detail.get(key)
             if isinstance(value, str) and value in allowed_values:
                 public_detail[key] = value
+    if (
+        ev.get("type") in {
+            "reply.silent_by_choice", "reply.silent_empty_response"
+        }
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        for key, allowed_values in _SILENT_REPLY_PUBLIC_ENUMS.items():
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed_values:
+                public_detail[key] = value
+        if ev.get("type") == "reply.silent_empty_response":
+            for key, allowed_values in _EMPTY_RESPONSE_PUBLIC_ENUMS.items():
+                value = raw_detail.get(key)
+                if isinstance(value, str) and value in allowed_values:
+                    public_detail[key] = value
     if (
         ev.get("type") == "reply.language_follow"
         and isinstance(raw_detail, dict)
@@ -2622,7 +2631,7 @@ def _debug_event_public_json(ev: dict) -> dict:
 
 
 def _debug_filter_options(events: list[dict]) -> dict:
-    """Build stable filter choices from the current ring-buffer sample."""
+    """Build stable filter choices from the bounded table-query sample."""
     subsystems = sorted({str(e.get("subsystem") or "").strip() for e in events if str(e.get("subsystem") or "").strip()})
     statuses = sorted({str(e.get("status") or "").strip().lower() for e in events if str(e.get("status") or "").strip()})
     preferred_subsystems = ["route", "context", "agent", "memory", "genesis", "debug_trace"]
@@ -2665,49 +2674,61 @@ def _data_track_debug_payload() -> dict:
     since_epoch = float(filters.get("since_epoch") or 0)
 
     with registry._users_lock:
-        users = [dict(u) for u in registry._users if u.get("user_id")]
-    if user_filter:
-        users = [u for u in users if str(u.get("user_id") or "") == user_filter]
+        live_users = {
+            str(user.get("user_id") or ""): dict(user)
+            for user in registry._users
+            if user.get("user_id")
+            and (
+                not user_filter
+                or str(user.get("user_id") or "") == user_filter
+            )
+        }
 
-    user_ids = [str(user.get("user_id") or "") for user in users]
-    trace_blobs = db.get_blobs_for_users(
-        user_ids,
-        ["v1_flow_trace_enabled", "v1_flow_trace"],
+    # Direct table scan is bounded and filter-aware. Crucially, it begins from
+    # trace rows rather than the live account registry, so an exact deleted uid
+    # remains reachable for the 30-day incident window (T184 D7).
+    scan_limit = 50_000
+    all_events_raw = db.query_trace_events(
+        user_id=user_filter,
+        trace_id_contains=trace_filter,
+        subsystem=subsystem_filter,
+        q=q,
+        since_epoch=since_epoch,
+        limit=scan_limit,
     )
+    event_user_ids = {
+        str(event.get("user_id") or "")
+        for event in all_events_raw
+        if event.get("user_id")
+    }
+    user_ids = sorted(set(live_users) | event_user_ids)
+    trace_flags = db.get_blobs_for_users(user_ids, [debug_trace.DEBUG_TRACE_FLAG_BLOB])
 
-    all_events_raw: list[dict] = []
-    all_events: list[dict] = []
+    all_events = list(all_events_raw)
     user_rows: dict[str, dict] = {}
-    for user in users:
-        uid = str(user.get("user_id") or "")
-        enabled, events = _debug_trace_events_from_blobs(
-            uid,
-            trace_blobs.get((uid, "v1_flow_trace_enabled")),
-            trace_blobs.get((uid, "v1_flow_trace")),
+    for uid in user_ids:
+        user = live_users.get(uid) or {}
+        enabled = (
+            _debug_trace_enabled(
+                trace_flags.get((uid, debug_trace.DEBUG_TRACE_FLAG_BLOB))
+            )
+            if uid in live_users
+            else False
         )
-        all_events_raw.extend(events)
-        matching = []
-        for ev in events:
-            if since_epoch and float(ev.get("ts") or 0) < since_epoch:
-                continue
-            if subsystem_filter and str(ev.get("subsystem") or "") != subsystem_filter:
-                continue
-            if trace_filter and trace_filter not in str(ev.get("trace_id") or ""):
-                continue
-            if q and q not in _debug_trace_search_text(ev):
-                continue
-            matching.append(ev)
+        matching = [
+            event for event in all_events if str(event.get("user_id") or "") == uid
+        ]
         if matching or enabled:
             latest = max((float(e.get("ts") or 0) for e in matching), default=0)
             user_rows[uid] = {
                 "user_id": uid,
                 "principal_id": user.get("principal_id") or "",
                 "enabled": enabled,
+                "account_present": uid in live_users,
                 "events": len(matching),
                 "last_ts": latest,
                 "last_at": core_util._epoch_to_iso(latest),
             }
-        all_events.extend(matching)
 
     all_events = sorted(all_events, key=lambda e: float(e.get("ts") or 0), reverse=True)
     turns = _debug_trace_group_turns(all_events)
@@ -2752,7 +2773,7 @@ def _data_track_debug_payload() -> dict:
     return {
         "summary": {
             "generated_at": datetime.now().isoformat(),
-            "users_scanned": len(users),
+            "users_scanned": len(user_ids),
             "users_with_events": sum(1 for u in users_out if int(u.get("events") or 0) > 0),
             "events_total": len(all_events),
             "turns_total": len(turns),
@@ -2760,6 +2781,7 @@ def _data_track_debug_payload() -> dict:
             "turns_returned": len(turns_out),
             "stalled_turns": sum(1 for t in turns if t.get("terminal_status") == "stalled"),
             "error_turns": sum(1 for t in turns if t.get("terminal_status") == "error"),
+            "scan_truncated": len(all_events_raw) >= scan_limit,
         },
         "filters": {
             "since": filters.get("since", ""),
@@ -3381,6 +3403,14 @@ _RUNTIME_FAILURE_CODE_MAX = 64
 # outbox 用的，admin 层不 import model_api_runtime，故在此单独定义）。
 _RUNTIME_FAILURE_CODE_RE = re.compile(r"^[a-z0-9_]+(:[a-z0-9_]+)?$")
 _RUNTIME_ERROR_CLASS_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+RUNTIME_OUTCOME_CLASS_LABELS = {
+    "operational_failure": "执行故障",
+    "timeout": "超时 / 失活",
+    "control": "控制切流",
+    "safety_suppression": "安全抑制",
+}
+RUNTIME_OUTCOME_CLASSES = frozenset(RUNTIME_OUTCOME_CLASS_LABELS)
+RUNTIME_OUTCOME_DEFAULT = "operational_failure"
 
 
 def _runtime_operational_rate(lane: dict):
@@ -3711,6 +3741,27 @@ def _runtime_delivery_health(*, within_hours: int = 24) -> dict:
 # stub content-free so Admin can render safely before that binding is installed.
 def _runtime_user_report(*, within_hours: int = 24) -> dict:
     return {"window_hours": within_hours, "users": []}
+
+
+def _runtime_watchdog_recoveries(*, within_hours: int = 24) -> dict[str, int]:
+    return {}
+
+
+# Injected by the assembly layer (asgi_app.py); the real implementation is
+# model_api_runtime.v2.jobs_store.trajectory_review_observability_snapshot.
+def _runtime_trajectory_reviews() -> dict:
+    return {
+        "generated_at": 0.0,
+        "heartbeat_within_sec": 30,
+        "runner_config": {
+            "current_enabled": None,
+            "observed_runners": 0,
+            "enabled_runners": 0,
+            "disabled_runners": 0,
+            "consistent": False,
+        },
+        "status_counts": {"pending": 0, "running": 0},
+    }
 
 
 # Injected by the assembly layer (asgi_app.py); the real implementation is
@@ -4054,12 +4105,123 @@ def _render_stuck_block(stuck: dict | None) -> str:
     return head + "".join(body) + "</section>"
 
 
+def _render_watchdog_recovery_events(
+    counts: dict[str, int] | None,
+    *,
+    within_hours: int,
+) -> str:
+    scope = (
+        "分子 = 所选窗口内 recover_killed_job 已完成状态转移，并在同一事务追加的 "
+        "slot_watchdog_timeout 事件；requeued/terminal 取事件记录的真实 recovery，"
+        "不按 lane 名猜。"
+    )
+    history = (
+        "历史不可回填，准确性从事件表上线时刻起算；上线初期读数偏低不等于此前未发生。"
+    )
+    if counts is None:
+        return (
+            "<div class='note-box'><b>Watchdog recovery 事件数据不可用。</b>"
+            f"{html.escape(scope)} {html.escape(history)}</div>"
+        )
+
+    by_lane: dict[str, dict[str, int]] = {}
+    for raw_key, raw_count in counts.items():
+        lane, separator, recovery = str(raw_key).rpartition(":")
+        if not separator or not lane or recovery not in {"requeued", "terminal"}:
+            continue
+        bucket = by_lane.setdefault(lane, {"requeued": 0, "terminal": 0})
+        bucket[recovery] += max(0, int(raw_count or 0))
+
+    rows = []
+    for lane in sorted(by_lane):
+        bucket = by_lane[lane]
+        escaped_lane = html.escape(lane)
+        rows.append(
+            f"<tr data-watchdog-lane='{html.escape(lane, quote=True)}'>"
+            f"<td><b>{escaped_lane}</b></td>"
+            f"<td class='watchdog-requeued'>{bucket['requeued']}</td>"
+            f"<td class='watchdog-terminal'>{bucket['terminal']}</td>"
+            "</tr>"
+        )
+    body = "".join(rows) or (
+        "<tr><td colspan='3' class='muted'>窗口内新事件账本无 recovery 记录；"
+        "这不代表事件表上线前为零。</td></tr>"
+    )
+    return (
+        f"<div class='muted'>近 {int(within_hours)} 小时。{html.escape(scope)} "
+        f"<b>{html.escape(history)}</b></div>"
+        "<div class='table-wrap'><table><thead><tr><th>Lane</th>"
+        "<th>杀掉并重投</th><th>杀掉后终结</th></tr></thead>"
+        f"<tbody>{body}</tbody></table></div>"
+    )
+
+
+def _render_trajectory_review_observability(snapshot: dict | None) -> str:
+    if snapshot is None:
+        return (
+            "<div class='note-box'><b>Trajectory review 运行态暂不可用。</b>"
+            "页面不会用 admin 进程自己的环境变量冒充 runner 配置，也不会把未知显示成关闭。"
+            "</div>"
+        )
+    config = snapshot.get("runner_config") or {}
+    observed = int(config.get("observed_runners") or 0)
+    enabled_count = int(config.get("enabled_runners") or 0)
+    disabled_count = int(config.get("disabled_runners") or 0)
+    current = config.get("current_enabled")
+    if current is True:
+        switch_label = "开启"
+        switch_value = "true"
+        switch_cls = "ok"
+    elif current is False:
+        switch_label = "关闭"
+        switch_value = "false"
+        switch_cls = "muted"
+    elif observed:
+        switch_label = "runner 间不一致"
+        switch_value = "mixed"
+        switch_cls = "bad"
+    else:
+        switch_label = "未知（无新格式新鲜心跳）"
+        switch_value = "unknown"
+        switch_cls = "muted"
+
+    counts = snapshot.get("status_counts") or {}
+    pending = int(counts.get("pending") or 0)
+    running = int(counts.get("running") or 0)
+    heartbeat_window = int(snapshot.get("heartbeat_within_sec") or 30)
+    return (
+        "<div class='note-box trajectory-review-observability' "
+        f"data-trajectory-review-enabled='{switch_value}'>"
+        "<b>Runner 读取到的 trajectory_review 开关：</b> "
+        f"<span class='{switch_cls}'>{html.escape(switch_label)}</span>"
+        f"（近 {heartbeat_window} 秒 foreground runner 心跳：观察到 {observed}，"
+        f"开启 {enabled_count} / 关闭 {disabled_count}）。"
+        "该布尔由 runner 进程自身读取环境变量后写入心跳，<b>不是 admin 进程的 env</b>；"
+        "admin 与 runner 分进程或分容器时，这里仍只反映 runner 看到的值。"
+        "无心跳或多 runner 值冲突时页面不会猜。"
+        "</div>"
+        "<div class='muted'>Review 状态是数据库的<b>当前快照，不是历史累计</b>；"
+        "不随上方 hours 窗口切换。快照生成 "
+        f"{html.escape(_bj_iso(snapshot.get('generated_at')))}。</div>"
+        "<section class='metrics trajectory-review-status'>"
+        f"<div class='metric' data-review-status='pending'>"
+        f"<div class='metric-value'>{pending}</div>"
+        "<div class='metric-label'>Review pending（当前快照）</div></div>"
+        f"<div class='metric' data-review-status='running'>"
+        f"<div class='metric-value'>{running}</div>"
+        "<div class='metric-label'>Review running（当前快照）</div></div>"
+        + "</section>"
+    )
+
+
 def _render_runtime_health_page(
     payload: dict,
     tokens: dict | None = None,
     delivery: dict | None = None,
     user_report: dict | None = None,
     stuck: dict | None = None,
+    watchdog_recoveries: dict[str, int] | None = None,
+    trajectory_reviews: dict | None = None,
 ) -> str:
     """Runtime V2 全 lane 运行时健康值班台（?view=runtime）。
 
@@ -4067,9 +4229,10 @@ def _render_runtime_health_page(
     （日报送达率，按天）。heartbeat lane 两页都出现但口径不同，故本页该行给出
     指向日报页的链接。
 
-    ``tokens`` / ``delivery`` / ``user_report`` 都可能是 None（各自独立的失败域，
-    见 admin_core）：取不到时对应区块显「暂不可用」，不得把 None 渲染成 0——0
-    是"确认过是零"。
+    ``tokens`` / ``delivery`` / ``user_report`` / ``watchdog_recoveries`` /
+    ``trajectory_reviews`` 都可能
+    是 None（各自独立的失败域，见 admin_core）：取不到时对应区块显「暂不可用」，
+    不得把 None 渲染成 0——0 是"确认过是零"。
     """
     service_level, service_reasons = _runtime_service_level(payload, delivery)
     if delivery is None and service_level == "ok":
@@ -4184,6 +4347,13 @@ def _render_runtime_health_page(
             _fmt_duration_sec(pool_age),
         ),
     ])
+    watchdog_section = _render_watchdog_recovery_events(
+        watchdog_recoveries,
+        within_hours=window_hours,
+    )
+    trajectory_review_section = _render_trajectory_review_observability(
+        trajectory_reviews
+    )
 
     # 交付区块：唯一能看出「job 判成功但产物没到用户」的地方。取不到时明说取不到，
     # 不拿 0 顶替——这个区块显示 0 的含义是"队列是空的、一切送达了"，与"数据取不到"
@@ -4348,22 +4518,16 @@ def _render_runtime_health_page(
         merged: dict[tuple[str, str, str], int] = {}
         for item in lane.get("top_failures") or []:
             code = _runtime_failure_code(item.get("code"))
-            outcome_class = str(item.get("outcome_class") or "operational_failure")
-            if outcome_class not in {
-                "operational_failure", "timeout", "control", "safety_suppression"
-            }:
-                outcome_class = "operational_failure"
+            outcome_class = str(
+                item.get("outcome_class") or RUNTIME_OUTCOME_DEFAULT
+            )
+            if outcome_class not in RUNTIME_OUTCOME_CLASSES:
+                outcome_class = RUNTIME_OUTCOME_DEFAULT
             error_class = str(item.get("error_class") or "")
             if not _RUNTIME_ERROR_CLASS_RE.fullmatch(error_class):
                 error_class = ""
             key = (code, outcome_class, error_class)
             merged[key] = merged.get(key, 0) + int(item.get("count") or 0)
-        class_labels = {
-            "operational_failure": "执行故障",
-            "timeout": "超时 / 失活",
-            "control": "控制切流",
-            "safety_suppression": "安全抑制",
-        }
         for (code, outcome_class, error_class), count in sorted(
             merged.items(), key=lambda kv: kv[1], reverse=True
         ):
@@ -4374,7 +4538,7 @@ def _render_runtime_health_page(
             failure_rows.append(
                 "<tr>"
                 f"<td>{name}</td>"
-                f"<td>{class_labels[outcome_class]}</td>"
+                f"<td>{RUNTIME_OUTCOME_CLASS_LABELS[outcome_class]}</td>"
                 f"<td><code>{html.escape(code)}</code></td>"
                 f"<td>{error_class_html}</td>"
                 f"<td>{_fmt_count(count)}</td>"
@@ -4451,6 +4615,10 @@ def _render_runtime_health_page(
   {empty_note}
   <h2>Worker 池</h2>
   <section class="metrics">{pool_metrics}</section>
+  <h2>Trajectory review 运行态</h2>
+  {trajectory_review_section}
+  <h2>Watchdog 精确恢复</h2>
+  {watchdog_section}
   <h2>端到端交付</h2>
   <div class="muted">job 判 completed 只证明回合跑完了，不证明产物到达用户。
   这里是副作用与失败回包的投递积压——<b>积压条数不参与总体档位，只有"堵了多久"参与</b>
@@ -8284,6 +8452,8 @@ _DEBUG_STEP_LABELS = {
     "thinking.surfaced": ("💭", "思考展示 · 分支"),
     "reply.language_follow": ("🌐", "语言跟随"),
     "provider.empty_response": ("🕳️", "空回复诊断"),
+    "reply.silent_by_choice": ("🤫", "主动静默 · 模型选择"),
+    "reply.silent_empty_response": ("🕳️", "主动静默 · 空响应"),
     "mcp.surface.resolved": ("🧩", "MCP 工具面"),
     "mcp.surface.provider": ("🧩", "MCP Provider 实收工具面"),
     "mcp.roundtrip.provider": ("🔁", "Provider 本轮往返"),
@@ -8500,8 +8670,8 @@ def _render_data_track_debug_page(payload: dict) -> str:
         )
     limit_options = []
     current_limit = str(pagination.get("limit") or filters.get("limit") or 100)
-    # Ring depth is debug_trace._MAX_EVENTS (2500); stopping the picker at 500
-    # meant a full 48h trace could not be read out from the panel at all.
+    # Keep a large drill-down option; storage retention is time-based now, so
+    # this controls only one response rather than the amount retained.
     for value in ("50", "100", "200", "500", "1000", "2500"):
         selected = "selected" if current_limit == value else ""
         limit_options.append(f'<option value="{value}" {selected}>{value}</option>')
@@ -8634,7 +8804,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
 <body>
 <main>
   <h1>Feedling Debug Logs</h1>
-  <div class="muted">Admin-only beta debug view. Reads existing per-user v1_flow_trace ring buffers; no instrumentation writes here. Generated {html.escape(_bj_iso(summary["generated_at"]))}.</div>
+  <div class="muted">Admin-only debug view. Reads the append-only TEE trace table; no instrumentation writes here. Generated {html.escape(_bj_iso(summary["generated_at"]))}.</div>
   {_render_data_track_view_nav("debug")}
   <section class="metrics">{metrics}</section>
   <div class="modebar">
@@ -8643,7 +8813,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
       <a class="sort-button {'active' if mode == 'timeline' else ''}" href="{html.escape(mode_href('timeline'), quote=True)}">Timeline</a>
       <span class="muted">Flat 用来扫全局异常；Timeline 用来看一次聊天怎么走完。</span>
     </div>
-    <span class="muted">{hint('页面每 30 秒自动刷新。所有数据来自已有 v1_flow_trace ring buffer，不会写新埋点。')} auto refresh</span>
+    <span class="muted">{hint('页面每 30 秒自动刷新。所有数据来自 append-only trace_events 表，不会写新埋点。')} auto refresh</span>
   </div>
   <h2>Filter debug logs {hint('先按 user 或 status 收窄，再用 q 搜 prompt/reply/tokens/explain；点 trace 可进入单轮链路。')}</h2>
   <form class="toolbar" method="get" action="/admin/data-track">
@@ -8661,7 +8831,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
       <option value="blocked" {is_selected("status", "blocked")}>blocked</option>
       <option value="stalled" {is_selected("status", "stalled")}>stalled</option>
     </select></div>
-    <div class="field"><label>Since {hint('支持 ISO 时间或 epoch；空着就是 ring buffer 里全部。')}</label><input name="since" placeholder="2026-07-04T00:00:00" value="{input_value('since')}"></div>
+    <div class="field"><label>Since {hint('支持 ISO 时间或 epoch；空着就是当前 30 天保留窗口。')}</label><input name="since" placeholder="2026-07-04T00:00:00" value="{input_value('since')}"></div>
     <div class="field"><label>Search {hint('会搜 type/explain/detail/content_excerpt，能查明文 excerpt。')}</label><input name="q" placeholder="prompt / reply / token / error" value="{input_value('q')}"></div>
     <button type="submit">Search</button>
   </form>
@@ -9368,6 +9538,46 @@ def _render_invalid_data_track_user_page(raw_user_id: str) -> str:
 </section></main></body></html>"""
 
 
+def _render_user_recent_jobs(user: dict) -> str:
+    report = user.get("v2_recent_jobs")
+    if not isinstance(report, dict) or report.get("error"):
+        return (
+            "<section><h2 class='daily-heading'>Runtime V2 最近任务</h2>"
+            "<div class='daily-summary'>任务快照暂不可用；不会把未知显示成零。</div>"
+            "</section>"
+        )
+    jobs = report.get("jobs") or []
+    rows = []
+    for job in jobs:
+        rows.append(
+            "<tr>"
+            f"<td>{int(job.get('job_id') or 0)}</td>"
+            f"<td>{html.escape(str(job.get('lane') or ''))}</td>"
+            f"<td>{html.escape(str(job.get('status') or ''))}</td>"
+            f"<td class='job-attempt-count'>{int(job.get('attempt_count') or 0)}</td>"
+            f"<td>{html.escape(_bj_iso(job.get('created_at')) or '—')}</td>"
+            f"<td>{html.escape(_bj_iso(job.get('finished_at')) or '—')}</td>"
+            "</tr>"
+        )
+    body = "".join(rows) or (
+        "<tr><td colspan='6' class='muted'>近 "
+        f"{int(report.get('window_hours') or 0)} 小时没有 Runtime V2 任务。</td></tr>"
+    )
+    more = (
+        "<div class='muted'>结果已截断；还有更早任务未显示。</div>"
+        if report.get("has_more") else ""
+    )
+    return (
+        "<section><h2 class='daily-heading'>Runtime V2 最近任务</h2>"
+        "<div class='daily-summary'><b>attempt_count</b> 直接显示现有 "
+        "<code>agent_jobs.attempt_count</code>，不是另建或推算的计数。</div>"
+        "<div class='table-wrap'><table class='runtime-user-jobs'>"
+        "<thead><tr><th>Job</th><th>Lane</th><th>Status</th>"
+        "<th>attempt_count</th><th>创建</th><th>终结</th></tr></thead>"
+        f"<tbody>{body}</tbody></table></div>{more}</section>"
+    )
+
+
 def _render_user_detail_page(user: dict) -> str:
     qs = _data_track_qs()
     back = f"/admin/data-track?{qs}" if qs else "/admin/data-track"
@@ -9417,6 +9627,10 @@ def _render_user_detail_page(user: dict) -> str:
     .daily-track span {{ display:block; height:100%; min-width:0; background:var(--accent); border-radius:4px; }}
     .daily-track.daily-zero {{ background:#e7e2de; border:1px dashed #c9beb6; box-sizing:border-box; }}
     .daily-note {{ margin-top:7px; font-size:12px; }}
+    .table-wrap {{ max-width:100%; overflow-x:auto; }}
+    .runtime-user-jobs {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); margin:10px 0 18px; }}
+    .runtime-user-jobs th,.runtime-user-jobs td {{ padding:9px 10px; border-bottom:1px solid var(--line); text-align:left; white-space:nowrap; }}
+    .runtime-user-jobs th {{ color:var(--muted); font-size:12px; }}
     .responder-alert {{ margin:10px 0; padding:11px 13px; color:#8f1711; background:#fff0ee; border:2px solid #c62f25; border-radius:8px; }}
   </style>
 </head>
@@ -9441,6 +9655,7 @@ def _render_user_detail_page(user: dict) -> str:
   <div class="muted">Responder 判据：{html.escape(str(responder.get('criteria') or 'unavailable'))}</div>
   {_render_screen_frames(user)}
   {_render_user_daily_usage(user)}
+  {_render_user_recent_jobs(user)}
   {_render_perception_permissions(user)}
   {_render_perception_freshness(user)}
   <div class="muted" style="margin-top:14px">以下所有时间已转北京时间(UTC+8) · 原始存储为 UTC。</div>

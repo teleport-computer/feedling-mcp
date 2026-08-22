@@ -4528,7 +4528,14 @@ def _record_extraction_status(
 _LAST_MCP_CATALOG_FINGERPRINT: dict[str, str] = {}
 _MCP_CATALOG_FINGERPRINT_MAX_USERS = 4096
 _MCP_CATALOG_DESC_CHARS = 160
-_MCP_CATALOG_MAX_TOOLS = 60
+# Must not exceed debug_trace._DETAIL_MAX_LIST: _safe_detail caps every list at
+# that number and leaves no marker, so a larger cap here reported
+# catalog_truncated=False while entries had already been dropped underneath --
+# the field asserting completeness exactly when the record was incomplete.
+# Kept as a literal because debug_trace is imported lazily inside functions
+# here; test_detail_list_caps_cannot_drift_past_the_silent_ceiling pins the
+# relationship instead, so raising this without raising the ceiling goes red.
+_MCP_CATALOG_MAX_TOOLS = 20
 
 
 def _remember_mcp_catalog_fingerprint(user_id: str, fingerprint: str) -> None:
@@ -4687,9 +4694,10 @@ async def _load_mcp_turn_observed(store, *, lane: str = "chat", **kwargs):
 
 
 def _emit_v2_debug_trace(store, event_type: str, *, status: str,
-                         summary: str, explain: str, detail: dict,
+                         detail: dict, summary: str = "", explain: str = "",
                          dur_ms: float | None = None,
-                         trace_id: str = "") -> None:
+                         trace_id: str = "", job_id: str = "",
+                         outcome_class: str = "") -> None:
     from diagnostics import diagnostics_core
 
     event = {
@@ -4699,12 +4707,66 @@ def _emit_v2_debug_trace(store, event_type: str, *, status: str,
     }
     if dur_ms is not None:
         event["dur_ms"] = dur_ms
+    # Added only when supplied, so the ~40 existing call sites keep emitting a
+    # byte-identical payload.
+    if job_id:
+        event["job_id"] = str(job_id)
+    if outcome_class:
+        event["outcome_class"] = str(outcome_class)
     diagnostics_core.emit_trace_event_payload(store, {"event": event})
 
 
 def _emit_v2_debug_trace_for_user(user_id: str, event_type: str, **kwargs) -> None:
     """Assembly seam for the dependency-clean V2 worker."""
     _emit_v2_debug_trace(core_store.get_store(user_id), event_type, **kwargs)
+
+
+def _emit_schema_surface_trace_for_user(
+    user_id: str,
+    event_type: str,
+    *,
+    lane: str,
+    trace_id: str,
+    job_id: str,
+    collapsed_names,
+    resolved_names,
+    protected_names,
+) -> None:
+    """Persist one schema transition with honest name-list completeness."""
+    import debug_trace
+
+    if event_type not in {
+        "mcp.surface.schema_folded",
+        "mcp.surface.schema_recovered",
+    }:
+        return
+    detail = {"driver": "v2", "lane": str(lane or "other")}
+    for key, names in (
+        ("collapsed_names", collapsed_names),
+        ("resolved_names", resolved_names),
+        ("protected_names", protected_names),
+    ):
+        detail.update(debug_trace.bounded_names(key, sorted(set(names or ()))))
+    folded_total = int(detail["collapsed_names_total"])
+    recovered_total = int(detail["resolved_names_total"])
+    is_folded = event_type == "mcp.surface.schema_folded"
+    _emit_v2_debug_trace_for_user(
+        user_id,
+        event_type,
+        status=("warning" if is_folded and folded_total else "ok"),
+        trace_id=str(trace_id or ""),
+        job_id=str(job_id or ""),
+        summary=(
+            f"Provider 工具面折叠 {folded_total} 个 schema"
+            if is_folded
+            else f"本回合累计恢复 {recovered_total} 个 schema"
+        ),
+        explain=(
+            "仅记录折叠、已恢复和受保护工具的名称集合及完整性标记;"
+            "不记录 schema、工具参数、返回值或用户内容。"
+        ),
+        detail=detail,
+    )
 
 
 def build_production_deps() -> v2_worker.TurnDeps:
@@ -4772,6 +4834,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         seal_trajectory_payload=_seal_trajectory_payload,
         open_trajectory_payload=_open_trajectory_payload,
         emit_debug_trace=_emit_v2_debug_trace_for_user,
+        emit_schema_surface_trace=_emit_schema_surface_trace_for_user,
         send_reply_push=(
             _send_reply_push
             if os.environ.get("FEEDLING_V2_PUSH_ENABLED", "1").strip() != "0"
@@ -4929,7 +4992,25 @@ def wire_assembly() -> None:
     core_wake_bus.register_handler("users", _reload_accounts_registry)
     core_wake_bus.register_handler("v2_jobs", v2_worker.on_v2_job_notify)
     core_wake_bus.register_job_cancel_handler(_JOB_CANCEL_ROUTER.handle)
+    jobs_store.on_job_enqueued = _emit_job_enqueued_trace
     core_wake_bus.start_listener()
+
+
+def _emit_job_enqueued_trace(user_id: str, lane: str, *, reason: str, trace_id: str) -> None:
+    """Enqueue half of the enqueue->terminal pair.
+
+    Wired rather than imported: jobs_store sits below debug_trace and must not
+    reach upward.  ``detail.lane`` and ``detail.enqueue_source`` are promoted to
+    real indexed columns by insert_trace_events_strict, so putting them in
+    detail is what populates them.
+    """
+    _emit_v2_debug_trace_for_user(
+        user_id,
+        "agent.job.enqueued",
+        status="ok",
+        trace_id=trace_id,
+        detail={"lane": lane, "reason": reason, "enqueue_source": lane},
+    )
 
 
 def build_health_app():
@@ -5003,6 +5084,9 @@ def _heartbeat_slot_state(
     snapshot_fn = getattr(supervisor, "snapshot", None)
     snapshot = snapshot_fn() if callable(snapshot_fn) else None
     return {
+        "configuration": {
+            "trajectory_review_enabled": jobs_store.trajectory_review_enabled(),
+        },
         "slot": {
             "stage": "starting" if snapshot is None else snapshot.stage,
             "busy": bool(snapshot is not None and snapshot.active_job is not None),
@@ -5075,7 +5159,14 @@ async def _heartbeat_loop(
                 capacity=0,
                 kind="turn",
                 pool=pool,
-                runtime_state={"slot": {"stage": "stopping", "busy": False}},
+                runtime_state={
+                    "configuration": {
+                        "trajectory_review_enabled": (
+                            jobs_store.trajectory_review_enabled()
+                        ),
+                    },
+                    "slot": {"stage": "stopping", "busy": False},
+                },
             )
         except Exception as e:  # noqa: BLE001 — shutdown must remain bounded
             log.warning("[v2.serve_worker] clear worker capacity failed: %s", e)
@@ -5104,6 +5195,11 @@ async def _fleet_heartbeat_loop(
                     for key, snapshot in snapshots.items()
                 )
                 runtime_state = {
+                    "configuration": {
+                        "trajectory_review_enabled": (
+                            jobs_store.trajectory_review_enabled()
+                        ),
+                    },
                     "slots": {
                         "configured": configured,
                         "healthy": capacity,
@@ -5191,6 +5287,11 @@ async def _fleet_heartbeat_loop(
                 kind="turn",
                 capacity=0,
                 runtime_state={
+                    "configuration": {
+                        "trajectory_review_enabled": (
+                            jobs_store.trajectory_review_enabled()
+                        ),
+                    },
                     "slots": {
                         "configured": configured,
                         "healthy": 0,

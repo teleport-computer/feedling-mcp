@@ -208,8 +208,8 @@ def test_plaintext_write_gate_defaults_closed():
     assert core_envelope._plaintext_writes_accepted({key: " 1 "}) is True
 
 
-def test_pre_and_test_processes_share_the_plaintext_gate_and_prod_stays_closed():
-    """Every Pre/Test reply writer must agree with whoami; prod stays closed."""
+def test_all_release_units_share_the_plaintext_gate_and_prod_defaults_closed():
+    """Every reply writer agrees; PROD is configurable but fails closed."""
     from pathlib import Path
 
     import yaml
@@ -236,8 +236,59 @@ def test_pre_and_test_processes_share_the_plaintext_gate_and_prod_stays_closed()
         assert test_compose["services"][service]["environment"][key] == "1"
     test_runner_compose = yaml.safe_load(test_runner)
     assert test_runner_compose["x-agent-runner-env"][key] == "1"
-    assert key not in prod
-    assert key not in prod_runner
+    prod_compose = yaml.safe_load(prod)
+    for service in ("backend", "serve-worker"):
+        assert prod_compose["services"][service]["environment"][key] == (
+            "${FEEDLING_PLAINTEXT_WRITES_ACCEPTED:-0}"
+        )
+    prod_runner_compose = yaml.safe_load(prod_runner)
+    assert prod_runner_compose["services"]["agent-runner"]["environment"][key] == (
+        "${FEEDLING_PLAINTEXT_WRITES_ACCEPTED:-0}"
+    )
+
+    workflow = (root / ".github/workflows/ci.yml").read_text()
+    prod_main_job = workflow.split("\n  deploy-cvm:\n", 1)[1].split(
+        "\n  deploy-test-cvm:\n", 1
+    )[0]
+    prod_runner_job = workflow.split("\n  deploy-prod-runner-cvm:\n", 1)[1].split(
+        "\n  notify-lark-prod-deploy:\n", 1
+    )[0]
+    gate_env = (
+        "FEEDLING_PLAINTEXT_WRITES_ACCEPTED: ${{ "
+        "needs.validate-prod-runner-topology.outputs."
+        "plaintext_writes_accepted }}"
+    )
+    assert gate_env in prod_main_job
+    assert (
+        "FEEDLING_PLAINTEXT_WRITES_ACCEPTED: ${{ "
+        "needs.deploy-cvm.outputs.plaintext_writes_accepted }}"
+    ) in prod_runner_job
+    assert (
+        "plaintext_writes_accepted: ${{ "
+        "steps.prod_release_config.outputs.plaintext_writes_accepted }}"
+    ) in workflow
+    assert (
+        "plaintext_writes_accepted: ${{ "
+        "needs.validate-prod-runner-topology.outputs."
+        "plaintext_writes_accepted }}"
+    ) in prod_main_job
+    assert (
+        "FEEDLING_CANARY_EXPECT_PLAINTEXT: ${{ "
+        "needs.validate-prod-runner-topology.outputs."
+        "plaintext_writes_accepted }}"
+    ) in prod_main_job
+    assert (
+        "FEEDLING_DATABASE_SCHEMA:      ${{ "
+        "needs.deploy-cvm.outputs.database_schema }}"
+    ) in prod_runner_job
+    assert workflow.count(
+        '-e "FEEDLING_PLAINTEXT_WRITES_ACCEPTED=$FEEDLING_PLAINTEXT_WRITES_ACCEPTED"'
+    ) == 2
+    assert (
+        "PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED must be exactly 0 or 1"
+        in workflow
+    )
+    assert "PROD plaintext writes require FEEDLING_DATABASE_SCHEMA=tee" in workflow
 
 
 def test_test_main_deploy_canary_requires_plaintext_effective_state():

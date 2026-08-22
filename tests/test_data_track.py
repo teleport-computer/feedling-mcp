@@ -693,6 +693,41 @@ def test_admin_data_track_sorts_before_pagination(client):
 from admin import data_track as _dt  # noqa: E402
 
 
+def test_user_detail_page_displays_existing_agent_job_attempt_count(
+    client, monkeypatch
+):
+    user_id, _ = _register(client)
+    monkeypatch.setattr(
+        _dt,
+        "_v2_recent_jobs_detail",
+        lambda _uid: {
+            "window_hours": 72,
+            "has_more": False,
+            "jobs": [
+                {
+                    "job_id": 18801,
+                    "lane": "dream",
+                    "status": "expired",
+                    "attempt_count": 4,
+                    "created_at": "2026-08-21T00:00:00Z",
+                    "finished_at": "2026-08-21T00:05:00Z",
+                }
+            ],
+        },
+    )
+
+    page = client.get(
+        f"/admin/data-track/users/{user_id}", headers=_admin_headers()
+    )
+    body = page.get_data(as_text=True)
+
+    assert page.status_code == 200
+    assert "Runtime V2 最近任务" in body
+    assert "<th>attempt_count</th>" in body
+    assert "<td class='job-attempt-count'>4</td>" in body
+    assert "agent_jobs.attempt_count" in body
+
+
 def _genesis_model_api_memory():
     # Genesis writes by bucket, so the retired by_tab counters are all zero even
     # though the garden has cards. This is exactly the shape that used to break.
@@ -1680,7 +1715,7 @@ def test_provider_attempts_detail_is_bounded_and_reports_more(monkeypatch):
     detail = _dt._provider_attempts_detail(SimpleNamespace(user_id="usr_ledger"))
 
     assert calls == [("usr_ledger", "provider_attempts", 201)]
-    assert detail["coverage"] == "chat_turns_only"
+    assert detail["coverage"] == "provider_runtime_and_model_api_probes"
     assert detail["has_more"] is True
     assert len(detail["attempts"]) == 200
     assert detail["attempts"][0]["attempt_n"] == 2

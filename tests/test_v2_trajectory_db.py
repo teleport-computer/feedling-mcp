@@ -60,7 +60,8 @@ def clean_tables(monkeypatch):
     with db.get_pool().connection() as conn:
         conn.execute(
             "TRUNCATE v2_trajectory_reviews,v2_trajectory_events,"
-            "v2_trajectory_streams,agent_jobs,v2_runtime_state,users CASCADE"
+            "v2_trajectory_streams,v2_worker_heartbeats,agent_jobs,"
+            "v2_runtime_state,users CASCADE"
         )
     yield
 
@@ -73,6 +74,60 @@ def _source_job(user_id: str) -> tuple[int, dict]:
     assert job is not None and int(job["id"]) == job_id
     assert jobs_store.mark_running(job_id, claimed_by="worker-source")
     return job_id, job
+
+
+def test_trajectory_review_observability_reads_runner_heartbeat_and_current_rows():
+    pending_job, _ = _source_job("u_review_observe_pending")
+    running_job, _ = _source_job("u_review_observe_running")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM v2_worker_heartbeats WHERE worker_id LIKE 't188-runner-%'"
+        )
+        conn.execute(
+            "INSERT INTO v2_trajectory_reviews (source_job_id,user_id,status) "
+            "VALUES (%s,%s,'pending'),(%s,%s,'running')",
+            (
+                pending_job,
+                "u_review_observe_pending",
+                running_job,
+                "u_review_observe_running",
+            ),
+        )
+    jobs_store.record_worker_heartbeat(
+        "t188-runner-a",
+        pool="foreground",
+        kind="turn",
+        capacity=1,
+        runtime_state={
+            "configuration": {"trajectory_review_enabled": True}
+        },
+    )
+
+    snapshot = jobs_store.trajectory_review_observability_snapshot()
+
+    assert snapshot["runner_config"] == {
+        "current_enabled": True,
+        "observed_runners": 1,
+        "enabled_runners": 1,
+        "disabled_runners": 0,
+        "consistent": True,
+    }
+    assert snapshot["status_counts"]["pending"] == 1
+    assert snapshot["status_counts"]["running"] == 1
+
+
+def test_recent_jobs_for_user_exposes_the_existing_attempt_count():
+    job_id, _ = _source_job("u_recent_jobs_attempt_count")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET attempt_count=4 WHERE id=%s",
+            (job_id,),
+        )
+
+    report = jobs_store.recent_jobs_for_user("u_recent_jobs_attempt_count")
+
+    assert report["jobs"][0]["job_id"] == job_id
+    assert report["jobs"][0]["attempt_count"] == 4
 
 
 def test_encrypted_events_are_ordered_idempotent_and_immutable():

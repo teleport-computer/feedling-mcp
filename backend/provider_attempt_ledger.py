@@ -3,12 +3,11 @@
 The resident consumer reports metadata only. Provider prompts, responses,
 headers, credentials, and raw errors never enter this stream.
 
-Two writers share this one stream on purpose. V1's resident consumer POSTs its
-attempts (``record_attempts_payload``); Runtime V2 writes its own server-side
-(``record_runtime_attempt``). Keeping both in ``provider_attempts`` with the
-same field names is what makes "the same relay works under V1 and fails under
-V2" a single query instead of a break-glass trajectory decrypt — exactly the
-comparison that took a decrypt to answer for usr_90184… on 2026-07-27.
+Three writers share this one stream on purpose. V1's resident consumer POSTs its
+attempts (``record_attempts_payload``); Runtime V2 and hosted model-API probes
+write server-side (``record_runtime_attempt``). Keeping all three in
+``provider_attempts`` with the same field names makes provider billing attempts
+answerable even when gated debug trace is disabled.
 """
 
 from __future__ import annotations
@@ -23,9 +22,9 @@ import db
 
 STREAM = "provider_attempts"
 # "first"/"stream_cut_retry"/"redelivery" are the resident consumer's own
-# vocabulary. The v2_* values are written server-side by Runtime V2 and name
-# the lane whose provider call this was, so one stream can still be split by
-# runtime when reading.
+# vocabulary. The v2_* values are written server-side by Runtime V2; the
+# model_api_probe value is written by hosted setup/test endpoints. Runtime and
+# lane fields keep the shared stream attributable.
 VALID_TRIGGERS = frozenset(
     {
         "first",
@@ -33,6 +32,7 @@ VALID_TRIGGERS = frozenset(
         "redelivery",
         "v2_turn",
         "v2_catchup",
+        "model_api_probe",
     }
 )
 _SAFE_OUTCOME_RE = re.compile(r"[^a-z0-9_.-]+")
@@ -81,6 +81,7 @@ def _normalize_attempt(raw: Any) -> tuple[dict | None, str]:
         "usage": {
             "input_tokens": _usage_count(usage.get("input_tokens")),
             "output_tokens": _usage_count(usage.get("output_tokens")),
+            "total_tokens": _usage_count(usage.get("total_tokens")),
         },
         "outcome": outcome,
         "ts": ts,
@@ -133,17 +134,19 @@ def record_runtime_attempt(
     provider: str = "",
     model: str = "",
     lane: str = "",
+    runtime: str = "v2",
     input_tokens: Any = None,
     output_tokens: Any = None,
+    total_tokens: Any = None,
     error_class: str = "",
     provider_request_id: str = "",
     ts: float | None = None,
 ) -> bool:
-    """Append one Runtime V2 provider attempt. Never raises.
+    """Append one server-side provider attempt. Never raises.
 
     Same stream and same field names as the resident consumer's ledger, plus
-    ``provider``/``model``/``lane``/``error_class`` — V1 gets those from the
-    consumer's own config, V2 has to state them itself.
+    ``provider``/``model``/``lane``/``runtime``/``error_class`` — V1 gets those
+    from the consumer's own config, server-side callers state them explicitly.
 
     Telemetry must never be able to fail a turn that would otherwise succeed,
     so every failure here is swallowed and reported as ``False``.
@@ -167,12 +170,13 @@ def record_runtime_attempt(
             "usage": {
                 "input_tokens": _usage_count(input_tokens),
                 "output_tokens": _usage_count(output_tokens),
+                "total_tokens": _usage_count(total_tokens),
             },
             "outcome": safe_outcome,
             "ts": _timestamp(ts),
-            # V2-only additions. Absent on resident rows, which is itself a
-            # useful discriminator when reading the merged stream.
-            "runtime": "v2",
+            # Server-side additions. Absent on resident rows, which is itself
+            # a useful discriminator when reading the merged stream.
+            "runtime": _bounded_text(runtime, 32) or "v2",
             "lane": _bounded_text(lane, 32),
             "provider": _bounded_text(provider, 64),
             "model": _bounded_text(model, 128),

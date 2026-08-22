@@ -21,7 +21,7 @@ def _b64(raw: bytes) -> str:
 
 
 @pytest.fixture()
-def client(tmp_path, monkeypatch):
+def client(tmp_path, monkeypatch, tee_primary):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     debug_trace._flag_cache.clear()
     registry._users[:] = []
@@ -55,14 +55,18 @@ def _enable_trace(client, api_key: str) -> None:
 def test_enable_write_failure_must_not_claim_enabled(client, monkeypatch):
     user_id, api_key = _register(client)
 
-    real_set_blob = debug_trace.db.set_blob
+    real_patch_blob = debug_trace.db.patch_blob_strict
 
-    def silently_drop_only_trace_flag(uid, kind, doc):
+    def silently_drop_only_trace_flag(uid, kind, doc, **kwargs):
         if kind == debug_trace.DEBUG_TRACE_FLAG_BLOB:
             return None
-        return real_set_blob(uid, kind, doc)
+        return real_patch_blob(uid, kind, doc, **kwargs)
 
-    monkeypatch.setattr(debug_trace.db, "set_blob", silently_drop_only_trace_flag)
+    monkeypatch.setattr(
+        debug_trace.db,
+        "patch_blob_strict",
+        silently_drop_only_trace_flag,
+    )
     with pytest.raises(RuntimeError, match="^debug_trace_flag_write_not_visible$"):
         client.post(
             "/v1/debug/trace/enable",
@@ -98,7 +102,7 @@ def test_emit_event_records(client):
     assert any(e["type"] == "agent.model.call.done" for e in body["events"])
 
 
-def test_provider_attempt_payload_bypasses_debug_ring(client, monkeypatch):
+def test_provider_attempt_payload_bypasses_debug_trace_store(client, monkeypatch):
     user_id, api_key = _register(client)
     _enable_trace(client, api_key)
     recorded = []

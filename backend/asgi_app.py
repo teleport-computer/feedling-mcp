@@ -153,9 +153,35 @@ _admin_data_track._runtime_health_summary = _v2_jobs_store.recent_runtime_health
 _admin_data_track._runtime_token_by_lane = _v2_jobs_store.recent_token_usage_by_lane
 _admin_data_track._runtime_delivery_health = _v2_jobs_store.recent_delivery_health
 _admin_data_track._runtime_user_report = _v2_jobs_store.recent_runtime_user_delivery_report
+_admin_data_track._runtime_watchdog_recoveries = (
+    _v2_jobs_store.recent_watchdog_recovery_counts
+)
+_admin_data_track._runtime_trajectory_reviews = (
+    _v2_jobs_store.trajectory_review_observability_snapshot
+)
 _admin_data_track._usage_report = _v2_jobs_store.usage_report_snapshot
 _chat_core.publish_voice_reply = _voice_results.store_reply_for_parent
 # V1's only per-turn evidence about a user's MCP servers is the consumer's
 # `mcp.surface.registered` trace. Wired (not imported) because diagnostics sits
 # below hosted — see diagnostics_core.on_mcp_surface_registered.
 _diagnostics_core.on_mcp_surface_registered = _hosted_mcp_status.record_from_registered_trace
+
+
+def _emit_job_enqueued_trace(user_id: str, lane: str, *, reason: str, trace_id: str) -> None:
+    """Enqueue half of the wake enqueue->terminal pair for jobs enqueued by the
+    web process (manual_wake and friends). Wired, not imported: jobs_store sits
+    below debug_trace. The worker process wires the same hook in
+    serve_worker.wire_assembly, so both producers are covered."""
+    from core import store as _wire_core_store
+
+    _diagnostics_core.emit_trace_event_payload(
+        _wire_core_store.get_store(user_id),
+        {"event": {
+            "subsystem": "agent", "type": "agent.job.enqueued", "status": "ok",
+            "actor": "hosted_v2", "trace_id": str(trace_id or ""),
+            "detail": {"lane": lane, "reason": reason, "enqueue_source": lane},
+        }},
+    )
+
+
+_v2_jobs_store.on_job_enqueued = _emit_job_enqueued_trace

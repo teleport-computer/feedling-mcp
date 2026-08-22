@@ -114,6 +114,10 @@ TABLES: dict[str, tuple[tuple[str, ...], str]] = {
         "failures_total, max_consecutive_failures, dirty_rows, stopped_at, "
         "updated_at",
     ),
+    "v2_job_recovery_events": (
+        ("job_id", "job_attempt_count"),
+        "job_id, job_attempt_count, lane, recovery, reason, created_at",
+    ),
 }
 
 # 每表可选的辖区 WHERE 子句：不满足的行完全不归本 reconciler 管——既不 copy、

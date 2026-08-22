@@ -1,4 +1,7 @@
-"""Proactive/perception V2 tool catalog.
+"""T160: not wired into production assembly; the production memory/tool surface is
+``capabilities/registry`` -> ``model_api_runtime/v2``.
+
+Proactive/perception V2 tool catalog.
 
 This is the runtime-facing catalog, not an HTTP router. The first migration
 step is to make the new contract explicit: every turn sees the same tool names

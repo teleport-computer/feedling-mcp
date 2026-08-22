@@ -157,6 +157,7 @@ def _norm_html(text: str) -> str:
 
 def test_memory_truncation_real_action_is_queryable_through_admin_data_track(
     env,
+    tee_primary,
     monkeypatch,
 ):
     user_id, api_key = _register()

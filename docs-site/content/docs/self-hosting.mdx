@@ -40,6 +40,15 @@ operators with either form of storage access are plaintext recipients. Decide th
 tier deliberately for the deployment, not per user, when the host operator is not
 the data subject.
 
+A managed migration may preserve a historical ciphertext envelope verbatim
+when its enclave recipient can no longer decrypt it. That is a data-retention
+mechanism, not key recovery: it does not grant the host or enclave new plaintext
+access, and device readability still depends on a valid user recipient key.
+Migration tooling must keep this state distinct from unresolved replication and
+must not silently change an account's encryption preference. Self-hosted
+operators adopting an equivalent workflow should require exact source/target
+digests, an explicit write approval, and a tested pre-cutover rollback boundary.
+
 ### Managed enclave-domain access is a separate trust model
 
 The managed custom domain is available only when the endpoint is behind
@@ -153,6 +162,7 @@ these settings:
 | `FEEDLING_PLAINTEXT_SHADOW_ENABLED` | Defaults to `0` and accepts only literal `0` or `1`. Enable only on the elected main backend after the TEE primary, target schema, backup/restore evidence, full backfill, and strict verification are green. This gate is independent from `FEEDLING_PLAINTEXT_WRITES_ACCEPTED`: an explicit encrypted-tier account is still decrypted before entering the all-plaintext shadow. |
 | `FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY` | Managed Gate-2 trust anchor: base64 of a raw Ed25519 public key. The external infrastructure verification process signs a canonical JSON payload binding the live target identity, backup artifact and restore-verifier digests, declared capacity, live connection limit, HA result, schema head, and expiry. The primary retains the canonical payload and full signature so every preflight can verify them again; application and replication roles cannot directly modify evidence rows. |
 | `FEEDLING_HOSTED_RUNTIME_POLICY` | The code default and managed deployments are `dual` (V1 resident supervisor and Runtime V2 coexist behind a per-user fence). The reference self-hosting Compose file pins `v2_only`, a fail-closed override under which resident/per-user selectors are rejected. |
+| `FEEDLING_PROVIDER_ALLOW_PRIVATE_BASE_URLS` | Defaults to `0` and accepts only literal `1` as enabled. Set it only when this self-host intentionally uses an HTTPS provider base URL that resolves to a LAN, loopback, link-local, or other non-public address. It disables provider address filtering for model calls and usage probes; URL structure, credentials-in-URL rejection, and the exact `http://127.0.0.1` / `http://localhost` cleartext allowlist remain enforced. The older `FEEDLING_PROVIDER_USAGE_ALLOW_PRIVATE=1` remains a usage-probe-only compatibility switch. |
 | `FEEDLING_RUNTIME_TOKEN_SECRET` | Required by the current hosted topology. Generate a high-entropy secret, supply it to the backend and Runtime V2 workers through a secret manager, and never bake it into an image. |
 | `FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS` | Optional one-generation rotation bridge for durable Perception anchor fingerprints. Set it to the immediately previous runtime-token secret while rolling out a new `FEEDLING_RUNTIME_TOKEN_SECRET`; keep it until all workers use the new secret. It does not authorize runtime tokens. |
 | `FEEDLING_PERCEPTION_REBASELINE_UNKNOWN_KEYS` | Emergency/post-rotation convergence switch, default `0`. After every old backend worker is confirmed stopped, set it to `1` so the next fresh observation of any dormant old-key anchor replaces that row with a non-waking baseline under the current key. Never enable it during a mixed-version rollout. Monitor old key-ID row counts, then disable it after they reach zero. |
@@ -192,6 +202,14 @@ these settings:
 | `FEEDLING_DATA_DIR` | Non-database local material such as push keys and residual object files. Protect and back it up according to enabled features. |
 | Object-storage variables | Optional, and a one-way switch once used. When configured, heavy ciphertext—screen frames, and Chat image and file bodies—is stored as objects and the database row keeps only a pointer. Leaving them unset keeps every body inline in PostgreSQL. Turning them off, repointing them, or scoping the credential too narrowly **after** pointer rows exist makes those bodies unreadable: the row no longer carries the ciphertext. Treat the store as part of the primary data set, not as a cache. |
 | APNs variables | Optional and secret. Required only for Apple push/Live Activity. |
+
+The project cannot measure how many route ③ self-hosted users depend on a
+private provider URL, because their backend and logs never reach the managed
+service. It therefore also cannot detect when a later compatibility change
+breaks that configuration. Treat the private-base-URL switch as an explicit,
+locally tested trust decision rather than a zero-cost compatibility promise,
+and test provider setup, model listing, Chat, and usage at the exact commit you
+deploy.
 
 The resident reports the commit loaded by its running process in
 `X-Feedling-Consumer-Commit`. Do not infer that identity by reading the current
@@ -363,6 +381,10 @@ operator will respond to a leaked client credential.
 - Back up the database and object storage before applying a new image.
 - Review Alembic migrations for forward and rollback implications; do not assume
   every data migration is automatically reversible.
+- If the managed decrypted shadow is enabled, apply every new `alembic_tee`
+  head to that target before, or in the same maintenance window as, the TEE
+  primary. The exact-head gate deliberately stops replication on a mismatch,
+  even when a new primary-only table is not itself shadow-replicated.
 - Stage the exact image and configuration against a restored copy of production
   data with credentials disabled or replaced.
 - Keep the prior image and configuration, but do not roll application code back
@@ -382,7 +404,10 @@ operator will respond to a leaked client credential.
 - Do not expose admin/debug routes or internal ports through the public proxy.
 - Monitor authentication failures, `5xx`, database pool exhaustion, stale
   Runtime V2 per-pool heartbeats, slot restarts, Enclave waits, queue age, disk
-  use, and backup age.
+  use, backup age, and trace-partition health. Treat a non-empty
+  `trace_events_default` partition as degraded even when writes still succeed;
+  run partition maintenance with the database owner credential, never the
+  application role.
 - Keep unrelated tenant code and secrets out of a shared process runner.
 - Commission an isolation and abuse review before offering the deployment to
   untrusted public users.
