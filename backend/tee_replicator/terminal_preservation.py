@@ -309,6 +309,8 @@ def build_plan(source, destination) -> PreservationPlan:
 
 def build_revert_plan(source, destination) -> PreservationPlan:
     """Plan an exact pre-cutover revert of rows owned by preservation markers."""
+    import db
+
     pending = destination.execute(
         "SELECT user_id,table_name,item_id,reason "
         "FROM tee_pending_device_migration "
@@ -322,7 +324,13 @@ def build_revert_plan(source, destination) -> PreservationPlan:
     prepared = destination.execute(
         "SELECT 1 FROM server_config WHERE key='phase4_primary_prepared'"
     ).fetchone()
-    if prepared is not None:
+    primary_trigger = destination.execute(
+        "SELECT 1 FROM pg_trigger "
+        "WHERE NOT tgisinternal AND tgenabled = 'O' AND tgname = ANY(%s) "
+        "LIMIT 1",
+        (list(db._TEE_PRIMARY_TRIGGERS),),
+    ).fetchone()
+    if prepared is not None or primary_trigger is not None:
         blocker_counts[("phase4_already_prepared", "all")] += 1
 
     for raw_user_id, raw_table, raw_item_id, raw_reason in pending:

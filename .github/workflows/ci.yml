@@ -1449,7 +1449,7 @@ jobs:
       # the deployed main and runner CVMs both receive the app-role DATABASE_URL.
       # Fail before either CVM is mutated if the two credentials point at
       # different databases, the owner migration is behind, the app role is
-      # wrong, or the Phase-4 prepared marker/startup contract is missing.
+      # wrong, or the TEE migration-head/primary-trigger contract is incomplete.
       - name: Prepare PROD TEE schema preflight credentials
         if: ${{ steps.prod_release_config.outputs.database_schema == 'tee' }}
         env:
