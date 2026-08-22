@@ -712,6 +712,7 @@ jobs:
             tests/test_worldbook_readside_core.py \
             tests/test_worldbook_routes.py \
             tests/test_worldbook_store.py \
+            tests/test_worldbook_trace.py \
             -v
 
       - name: Run Hosted Runtime V2 safety and prompt-cache suites
@@ -721,6 +722,7 @@ jobs:
           python -m pytest \
             tests/test_ci_image_tag_width.py \
             tests/test_deploy_yaml_strict.py \
+            tests/test_release_pin_cas.py \
             tests/test_frame_r2_deploy_config.py \
             tests/test_admin_runtime_mode.py \
             tests/test_hosted_runtime_policy.py \

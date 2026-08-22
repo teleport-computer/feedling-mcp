@@ -38,6 +38,7 @@ def _without_tagged_image_messages(messages, tag_key: str) -> list:
 
 _CATALOG = None  # built lazily/once
 _SEARCH_RESULT_URL_RE = re.compile(r'"url"\s*:\s*("(?:\\.|[^"\\])*")')
+_WORKSPACE_REVISION_RE = re.compile(r"\brevision\s+(\d+)\b", re.IGNORECASE)
 
 # Provider output is untrusted even after its tool names/arguments validate.  These
 # defaults bound both fan-out and how much observation text one native exchange can
@@ -291,6 +292,19 @@ def _positive_limit(value, *, name: str) -> int:
     if parsed <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return parsed
+
+
+def _file_suffix_for_requirement(
+    path: str,
+    required_suffixes: frozenset[str],
+) -> str:
+    normalized = str(path or "").strip().casefold()
+    matches = [suffix for suffix in required_suffixes if normalized.endswith(suffix)]
+    if matches:
+        return max(matches, key=len)
+    if normalized.endswith(".io.html"):
+        return ".io.html"
+    return posixpath.splitext(normalized)[1]
 
 
 def _serialized_chars(value) -> int | None:
@@ -778,7 +792,8 @@ async def run_tool_loop(
             str(suffix).strip().casefold() for suffix in (value or ())
         )
         if any(
-            re.fullmatch(r"\.[a-z0-9]{1,16}", suffix) is None
+            re.fullmatch(r"\.[a-z0-9]{1,16}(?:\.[a-z0-9]{1,16})?", suffix)
+            is None
             for suffix in suffixes
         ):
             raise ValueError("required_file_suffixes contains an invalid suffix")
@@ -802,6 +817,10 @@ async def run_tool_loop(
     file_delivery_fallback_reasoning = ""
     file_delivery_recovery_needed = False
     workspace_write_applied = False
+    workspace_delivery_target: tuple[str, int] | None = None
+    compact_delivery_validation_exchange: ToolExchange | None = None
+    compact_delivery_mismatch_retry_used = False
+    compact_delivery_confirmation_needed = False
     # Names keep required schemas visible and completed discovery calls valid in
     # native history. Exact call keys independently decide whether dispatch would
     # repeat work; do not collapse these sets back into one name-only concept.
@@ -1042,6 +1061,11 @@ async def run_tool_loop(
                         required_file_missing_recorded = False
                         file_delivery_fallback_text = ""
                         file_delivery_fallback_reasoning = ""
+                        workspace_write_applied = False
+                        workspace_delivery_target = None
+                        compact_delivery_validation_exchange = None
+                        compact_delivery_mismatch_retry_used = False
+                        compact_delivery_confirmation_needed = False
                         if on_file_requirement_changed is not None:
                             await on_file_requirement_changed()
 
@@ -1069,6 +1093,7 @@ async def run_tool_loop(
         terminal_text_round = (
             force_text_fallback
             or final_reply_correction_request is not None
+            or compact_delivery_confirmation_needed
             or attempts == max_calls - 1
         )
         terminal_text_round_reason = "none"
@@ -1079,7 +1104,11 @@ async def run_tool_loop(
                 else (
                     "final_reply_correction"
                     if final_reply_correction_request is not None
-                    else "max_calls"
+                    else (
+                        "compact_delivery_confirmation"
+                        if compact_delivery_confirmation_needed
+                        else "max_calls"
+                    )
                 )
             )
         historical_tool_names = {
@@ -1094,6 +1123,7 @@ async def run_tool_loop(
         ).strip().lower()
         terminal_schema_guard = (
             terminal_text_round
+            and not compact_delivery_confirmation_needed
             and bool(historical_tool_names)
             and provider_name
             in {"anthropic", "openrouter", "openai_compatible", "deepseek"}
@@ -1211,6 +1241,23 @@ async def run_tool_loop(
         if (
             not terminal_text_round
             and tools is not None
+            and workspace_delivery_target is not None
+        ):
+            forced_delivery_tool = tool_schema.FILE_REPLY_TOOL
+            target_path, _ = workspace_delivery_target
+            exact_canvas_delivery = target_path.casefold().endswith(".io.html")
+            tools = [
+                spec for spec in tools
+                if spec.name == forced_delivery_tool
+                or (
+                    not exact_canvas_delivery
+                    and spec.name == extra_tool_recovery_name
+                )
+            ]
+            surface_reason = "file_delivery_forced"
+        elif (
+            not terminal_text_round
+            and tools is not None
             and file_delivery_required
             and not requirement_already_met
         ):
@@ -1221,12 +1268,11 @@ async def run_tool_loop(
                 or spec.name == extra_tool_recovery_name
             ]
             surface_reason = "file_delivery_forced"
-            if file_delivery_recovery_needed:
-                forced_delivery_tool = (
-                    tool_schema.FILE_REPLY_TOOL
-                    if workspace_write_applied
-                    else "workspace_write"
-                )
+            if workspace_write_applied:
+                forced_delivery_tool = tool_schema.FILE_REPLY_TOOL
+            elif file_delivery_recovery_needed:
+                forced_delivery_tool = "workspace_write"
+            if forced_delivery_tool:
                 tools = [
                     spec for spec in tools
                     if spec.name in {
@@ -1234,6 +1280,43 @@ async def run_tool_loop(
                         extra_tool_recovery_name,
                     }
                 ]
+        compact_delivery_phase = ""
+        if compact_delivery_confirmation_needed:
+            compact_delivery_phase = "confirm"
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "The work the user asked for was saved and delivered "
+                        "successfully. Finish this turn in your own voice with that "
+                        "fact available; the user can open the work now."
+                    ),
+                },
+                {"role": "user", "content": "Finish your response to me."},
+            ]
+        elif (
+            forced_delivery_tool == tool_schema.FILE_REPLY_TOOL
+            and workspace_delivery_target is not None
+        ):
+            compact_delivery_phase = "send_file"
+            target_path, target_revision = workspace_delivery_target
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "The work's source is already saved. Complete the delivery "
+                        "now by calling send_file once with this exact target: "
+                        + json.dumps(
+                            {"path": target_path, "revision": target_revision},
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    ),
+                },
+                {"role": "user", "content": "Complete the pending delivery now."},
+            ]
+            if compact_delivery_validation_exchange is not None:
+                messages.append(compact_delivery_validation_exchange)
         tail_window = None
         required_schema_names = (
             historical_tool_names
@@ -1276,7 +1359,17 @@ async def run_tool_loop(
                 recovery_active = False
         adaptive_planner = getattr(build_messages, "plan_provider_round", None)
         try:
-            if callable(adaptive_planner):
+            if compact_delivery_phase:
+                frontier_plan = prompt_frontier.plan_provider_round(
+                    model_limit=model_prompt_limit,
+                    messages=messages,
+                    tools=tools,
+                    output_reserve_tokens=prompt_output_reserve_tokens,
+                    safety_margin_tokens=prompt_safety_margin_tokens,
+                    utf8_bytes_per_token=prompt_estimator_utf8_bytes_per_token,
+                    image_reserve_tokens=prompt_image_reserve_tokens,
+                )
+            elif callable(adaptive_planner):
                 messages, frontier_plan, tail_window = adaptive_planner(
                     transcript=list(transcript),
                     tools=tools,
@@ -1417,6 +1510,7 @@ async def run_tool_loop(
                 "messages": messages,
                 "tools": tools,
                 "forced_tool": forced_delivery_tool,
+                "compact_delivery_phase": compact_delivery_phase,
                 "prompt_frontier": frontier_plan,
                 "tail_window": tail_window,
             },
@@ -1480,7 +1574,11 @@ async def run_tool_loop(
                 # JSON. Use the output budget already reserved by V2's prompt
                 # frontier; wake/child/screen lanes omit on_file_reply and keep
                 # their existing limits unchanged.
-                provider_kwargs["max_tokens"] = prompt_output_reserve_tokens
+                provider_kwargs["max_tokens"] = (
+                    min(prompt_output_reserve_tokens, 512)
+                    if compact_delivery_phase
+                    else prompt_output_reserve_tokens
+                )
             if on_provider_tool_surface is not None:
                 candidate_names = {
                     str(spec.name) for spec in surface_candidate_tools
@@ -2314,7 +2412,10 @@ async def run_tool_loop(
             # check as a defense for direct/internal callers.
             if on_file_reply is None:
                 raise RuntimeError("send_file callback is unavailable")
-            file_suffix = posixpath.splitext(workspace_path)[1].casefold()
+            file_suffix = _file_suffix_for_requirement(
+                workspace_path,
+                normalized_required_suffixes,
+            )
             if (
                 normalized_required_suffixes
                 and file_suffix not in normalized_required_suffixes
@@ -2331,6 +2432,45 @@ async def run_tool_loop(
                     tc, "tool_call_result", {"result": file_result}
                 )
                 continue
+            if (
+                workspace_delivery_target is not None
+                and (workspace_path, workspace_revision)
+                != workspace_delivery_target
+            ):
+                target_path, target_revision = workspace_delivery_target
+                file_result = ToolResult(
+                    call_id=tc.id,
+                    content=(
+                        "error: pending_delivery_target_mismatch; no file was "
+                        "delivered. Call send_file with exactly "
+                        + json.dumps(
+                            {"path": target_path, "revision": target_revision},
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    ),
+                )
+                reply_results[tc.id] = file_result
+                compact_delivery_validation_exchange = ToolExchange(
+                    calls=(tc,),
+                    results=(file_result,),
+                    assistant_text=pr.text,
+                    assistant_turn=pr.assistant_turn,
+                )
+                await _tool_event(
+                    tc, "tool_call_result", {"result": file_result}
+                )
+                if compact_delivery_mismatch_retry_used:
+                    force_text_fallback = True
+                    force_text_fallback_reason = "pending_delivery_target_mismatch"
+                    delivery_retry_instruction = (
+                        "The Canvas source was saved, but no file was delivered because "
+                        "send_file did not use the exact pending path and revision. Do "
+                        "not claim that the Canvas was delivered."
+                    )
+                else:
+                    compact_delivery_mismatch_retry_used = True
+                continue
             try:
                 await on_file_reply(workspace_path, workspace_revision)
             except Exception as exc:
@@ -2339,6 +2479,17 @@ async def run_tool_loop(
                 )
                 raise
             delivered_file_suffixes.add(file_suffix)
+            workspace_write_applied = False
+            workspace_delivery_target = None
+            compact_delivery_validation_exchange = None
+            compact_delivery_mismatch_retry_used = False
+            requirement_now_met = (
+                bool(delivered_file_suffixes)
+                if not normalized_required_suffixes
+                else normalized_required_suffixes.issubset(delivered_file_suffixes)
+            )
+            if requirement_now_met:
+                compact_delivery_confirmation_needed = True
             replied_intermediate = True
             file_result = ToolResult(
                 call_id=tc.id,
@@ -2491,12 +2642,29 @@ async def run_tool_loop(
             if discovery_call_key is not None:
                 completed_memory_discovery_tools.add(tc.name)
                 completed_memory_discovery_calls.add(discovery_call_key)
-        if any(
-            tc.name == "workspace_write"
-            and str(ordered_results_by_id[tc.id].content).strip().lower().startswith("ok")
-            for tc in dispatch_calls
-        ):
+        for tc in dispatch_calls:
+            if tc.name != "workspace_write":
+                continue
+            result = ordered_results_by_id[tc.id]
+            if not str(result.content).strip().lower().startswith("ok"):
+                continue
+            path = str(tc.args.get("path") or "").strip()
+            suffix = _file_suffix_for_requirement(path, normalized_required_suffixes)
+            model_chose_shared_work = path.casefold().endswith(".io.html")
+            matches_required_delivery = file_delivery_required and (
+                not normalized_required_suffixes
+                or suffix in normalized_required_suffixes
+            )
+            if not model_chose_shared_work and not matches_required_delivery:
+                continue
             workspace_write_applied = True
+            metadata = result.metadata or {}
+            revision = metadata.get("workspace_revision")
+            if type(revision) is not int or revision <= 0:
+                match = _WORKSPACE_REVISION_RE.search(str(result.content))
+                revision = int(match.group(1)) if match else None
+            if type(revision) is int and revision > 0:
+                workspace_delivery_target = (path, revision)
         if any(
             tc.name in provenance.EXTERNAL_READS or tc.name in mcp_names
             for tc in dispatch_calls

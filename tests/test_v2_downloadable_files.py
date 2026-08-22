@@ -64,6 +64,21 @@ def test_file_delivery_policy_is_semantic_and_hides_internal_paths():
     assert "real Word/PDF bytes" in description
 
 
+def test_canvas_policy_is_offline_semantic_and_hides_source():
+    prompt = v2_context.CHAT_SYSTEM_PROMPT
+    description = tool_schema.DESCRIPTIONS[tool_schema.FILE_REPLY_TOOL]
+
+    assert "你也可以主动选择制作 Canvas" in prompt
+    assert ".io.html" in prompt
+    assert "离线、自包含" in prompt
+    assert "用对方当前回复语言写简洁的 <title>" in prompt
+    assert "不要向对方展示内部源码或实现术语" in prompt
+    assert "presented by IO as an interactive" in description
+    assert "you have decided an experience belongs" in description
+    assert "everything the work needs inline so it opens offline" in description
+    assert "discuss its source only if they ask" in description
+
+
 def _run_loop(
     monkeypatch,
     responses,
@@ -78,6 +93,7 @@ def _run_loop(
     max_calls=3,
     trajectory_events=None,
     tool_events=None,
+    build_messages=None,
 ):
     calls = []
     replies = []
@@ -113,10 +129,13 @@ def _run_loop(
             tool_events.append((tc.id, tc.name, event_kind, payload))
 
     monkeypatch.setattr(provider_client, "chat_completion_async", fake_chat)
+    message_builder = build_messages or (
+        lambda transcript: [{"role": "user", "content": "turn"}]
+    )
     outcome = asyncio.run(
         tool_loop.run_tool_loop(
             provider_config=_PROVIDER,
-            build_messages=lambda transcript: [{"role": "user", "content": "turn"}],
+            build_messages=message_builder,
             dispatch_tools=dispatch_tools,
             on_reply=on_reply,
             on_file_reply=on_file_reply,
@@ -370,6 +389,295 @@ def test_required_file_suffixes_detects_clear_file_intent(text, expected):
     assert v2_context.required_file_suffixes(
         [{"role": "user", "content": text}]
     ) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "请和我做一个可交互的 Canvas，我们的记忆知识图谱，直接交给我。",
+        "Create an interactive knowledge graph work for me",
+        "请解释一下什么是可交互知识图谱",
+    ],
+)
+def test_shared_work_intent_is_not_preclassified_from_user_words(text):
+    assert v2_context.required_file_suffixes(
+        [{"role": "user", "content": text}]
+    ) is None
+
+
+def test_model_selected_shared_work_uses_compact_delivery_after_large_write(
+    monkeypatch,
+):
+    files = []
+    trajectory_events = []
+
+    async def on_file(path, revision):
+        files.append((path, revision))
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content=(
+                    "ok: workspace_write applied at revision 1; use the same "
+                    "path and revision 1 with send_file"
+                ),
+            )
+            for call in tool_calls
+        ]
+
+    def large_after_write(transcript):
+        has_write = any(
+            isinstance(item, ToolExchange)
+            and any(call.name == "workspace_write" for call in item.calls)
+            for item in transcript
+        )
+        return [
+            {
+                "role": "system",
+                "content": "x" * (40_000 if has_write else 100),
+            },
+            {"role": "user", "content": "make the Canvas"},
+            *transcript,
+        ]
+
+    outcome, calls, replies, messages_seen = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "w1",
+                        "name": "workspace_write",
+                        "args": {
+                            "path": "/workspace/记忆知识图谱.io.html",
+                            "content": "<!doctype html><title>记忆知识图谱</title>",
+                            "expected_revision": 0,
+                        },
+                    }
+                ],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "f1",
+                        "name": "send_file",
+                        "args": {
+                            "path": "/workspace/记忆知识图谱.io.html",
+                            "revision": 1,
+                        },
+                    }
+                ],
+                "usage": {},
+            },
+            {"reply": "Canvas 已经准备好了。", "tool_calls": [], "usage": {}},
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        max_calls=3,
+        trajectory_events=trajectory_events,
+        build_messages=large_after_write,
+    )
+
+    assert {"workspace_write", "send_file"}.issubset(calls[0])
+    assert calls[1:] == [("send_file",), ()]
+    assert files == [("/workspace/记忆知识图谱.io.html", 1)]
+    assert replies == [("Canvas 已经准备好了。", True)]
+    assert outcome.stop_reason == "final_text"
+    assert len(str(messages_seen[1])) < 2_000
+    assert "记忆知识图谱.io.html" in str(messages_seen[1])
+    assert len(str(messages_seen[2])) < 2_000
+    assert all(
+        kind != "required_file_missing" for kind, _payload in trajectory_events
+    )
+
+
+def test_ordinary_workspace_write_remains_a_draft_without_auto_delivery(monkeypatch):
+    files = []
+
+    async def on_file(path, revision):
+        files.append((path, revision))
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content="ok: workspace_write applied at revision 1",
+            )
+            for call in tool_calls
+        ]
+
+    outcome, calls, replies, _ = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "w1",
+                        "name": "workspace_write",
+                        "args": {
+                            "path": "/workspace/notes.md",
+                            "content": "# Notes",
+                            "expected_revision": 0,
+                        },
+                    }
+                ],
+                "usage": {},
+            },
+            {"reply": "我先把草稿保存好了。", "tool_calls": [], "usage": {}},
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        max_calls=2,
+    )
+
+    assert "workspace_write" in calls[0]
+    assert calls[1] == ("workspace_write",)
+    assert files == []
+    assert replies == [("我先把草稿保存好了。", True)]
+    assert outcome.stop_reason == "final_text"
+
+
+def test_pending_canvas_delivery_rejects_wrong_target_then_delivers_exact_one(
+    monkeypatch,
+):
+    files = []
+
+    async def on_file(path, revision):
+        files.append((path, revision))
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content="ok: workspace_write applied at revision 1",
+                metadata={"workspace_revision": 1},
+            )
+            for call in tool_calls
+        ]
+
+    outcome, calls, replies, _ = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "write",
+                    "name": "workspace_write",
+                    "args": {
+                        "path": "/workspace/panel.io.html",
+                        "content": "<title>面板</title><main>panel</main>",
+                        "expected_revision": 0,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "wrong-file",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/other.io.html",
+                        "revision": 9,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "exact-file",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/panel.io.html",
+                        "revision": 1,
+                    },
+                }],
+                "usage": {},
+            },
+            {"reply": "新版面板已发送。", "tool_calls": [], "usage": {}},
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        max_calls=5,
+    )
+
+    assert calls[1] == ("send_file",)
+    assert calls[2] == ("send_file",)
+    assert files == [("/workspace/panel.io.html", 1)]
+    assert replies == [("新版面板已发送。", True)]
+    assert outcome.stop_reason == "final_text"
+
+
+def test_io_html_satisfies_generic_html_delivery_requirement(monkeypatch):
+    files = []
+
+    async def on_file(path, revision):
+        files.append((path, revision))
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content="ok: workspace_write applied at revision 1",
+                metadata={"workspace_revision": 1},
+            )
+            for call in tool_calls
+        ]
+
+    outcome, calls, replies, _ = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "write-game",
+                    "name": "workspace_write",
+                    "args": {
+                        "path": "/workspace/接星星小游戏.io.html",
+                        "content": "<title>接星星小游戏</title>",
+                        "expected_revision": 0,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "send-game",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/接星星小游戏.io.html",
+                        "revision": 1,
+                    },
+                }],
+                "usage": {},
+            },
+            {"reply": "小游戏已经发给你了。", "tool_calls": [], "usage": {}},
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        required_file_suffixes=(".html",),
+        max_calls=4,
+    )
+
+    assert calls[1] == ("send_file",)
+    assert files == [("/workspace/接星星小游戏.io.html", 1)]
+    assert replies == [("小游戏已经发给你了。", True)]
+    assert outcome.stop_reason == "final_text"
+
+
+@pytest.mark.parametrize("required_suffix", [".pdf", ".docx", ".json"])
+def test_io_html_does_not_satisfy_non_html_requirement(required_suffix):
+    assert tool_loop._file_suffix_for_requirement(
+        "/workspace/game.io.html",
+        frozenset({required_suffix}),
+    ) == ".io.html"
 
 
 def test_required_file_suffixes_follow_latest_user_correction():
@@ -812,6 +1120,34 @@ def test_workspace_file_result_bounds_content_and_sanitizes_name():
         worker._workspace_file_reply_from_result(
             {"path": "/workspace/empty.md", "content": ""}
         )
+
+    shared_work = worker._workspace_file_reply_from_result(
+        {
+            "path": "/workspace/knowledge.io.html",
+            "content": "<!doctype html><title>Knowledge</title>",
+            "mime_type": "text/markdown",
+        }
+    )
+    assert shared_work.mime_type == "text/html"
+    with pytest.raises(ValueError):
+        worker._workspace_file_reply_from_result(
+            {
+                "path": "/workspace/too-large.io.html",
+                "content": "x" * (tool_schema.SHARED_WORK_MAX_BYTES + 1),
+            }
+        )
+
+
+def test_workspace_write_rejects_oversized_shared_work_source():
+    error = tool_schema.validate_tool_args(
+        "workspace_write",
+        {
+            "path": "/workspace/too-large.io.html",
+            "content": "x" * (tool_schema.SHARED_WORK_MAX_BYTES + 1),
+            "expected_revision": 0,
+        },
+    )
+    assert error == "Canvas source exceeds the 256 KB UTF-8 limit"
     with pytest.raises(ValueError):
         worker._workspace_file_reply_from_result(
             {

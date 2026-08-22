@@ -50,6 +50,38 @@ def test_worldbook_match_rejects_blank_query_without_read(monkeypatch):
     assert result.error["retryable"] is False
 
 
+def test_worldbook_match_forwards_trusted_trace_context(monkeypatch):
+    observed = {}
+
+    def match(store, payload, **kwargs):
+        observed.update(store=store, payload=payload, **kwargs)
+        return {"block": "", "matched_names": []}, 200
+
+    monkeypatch.setattr(cap_worldbook.worldbook_core, "match", match)
+    result = cap_worldbook.match(
+        "STORE",
+        params={"query": "Luna"},
+        trace_context={
+            "trace_id": "trace-wb",
+            "job_id": "job-wb",
+            "lane": "chat",
+            "ignored": "private provider value",
+        },
+    )
+
+    assert result.ok is True
+    assert observed == {
+        "store": "STORE",
+        "payload": {"message": "Luna"},
+        "api_key": None,
+        "runtime_token": None,
+        "trace_id": "trace-wb",
+        "job_id": "job-wb",
+        "lane": "chat",
+        "actor": "host_agent_runtime",
+    }
+
+
 def test_worldbook_match_surfaces_structured_backend_failure(monkeypatch):
     monkeypatch.setattr(
         cap_worldbook.worldbook_core,

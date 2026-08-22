@@ -3244,8 +3244,9 @@ def test_scheduled_wake_empty_reply_recovers_on_the_correction_retry(monkeypatch
 
 def _wake_deps_with_worldbook(seen, *, block="〈世界书〉墨白历,一年十四个月。", boom=False,
                               tail=None, **kw):
-    def _read(user_id, messages, *, runtime_token):
+    def _read(user_id, messages, *, runtime_token, trace_context=None):
         seen["messages"] = list(messages or [])
+        seen["trace_context"] = trace_context
         seen["n"] = seen.get("n", 0) + 1
         if boom:
             raise RuntimeError("worldbook_match_failed")

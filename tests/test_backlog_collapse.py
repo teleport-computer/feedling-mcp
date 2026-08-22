@@ -173,7 +173,7 @@ def _neutralize_pipeline(monkeypatch, agent_calls, replies):
     monkeypatch.setattr(c, "_clear_proactive_failure", lambda: None)
     monkeypatch.setattr(c, "_emit_debug_trace", lambda *a, **k: None)
     monkeypatch.setattr(c, "_screen_context_for_message", lambda content: ("", [], []))
-    monkeypatch.setattr(c, "_worldbook_context_for_foreground", lambda content: "")
+    monkeypatch.setattr(c, "_worldbook_context_for_foreground", lambda content, **_kwargs: "")
     monkeypatch.setattr(c, "_quoted_memory_context", lambda msg: "")
     monkeypatch.setattr(c, "_prepend_time_anchor_foreground", lambda content, ts: content)
     monkeypatch.setattr(c, "_foreground_agent_message", lambda content, current_ts=0: content)

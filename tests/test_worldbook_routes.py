@@ -84,6 +84,60 @@ def test_worldbook_upsert_list_delete_round_trips_ciphertext(client):
     assert client.get("/v1/worldbook/list", headers=_headers(api_key)).get_json() == {"envelopes": []}
 
 
+def test_worldbook_upsert_db_failure_is_500_and_not_visible_in_list(
+    client, monkeypatch,
+):
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(core_store.db, "world_book_upsert", lambda *_args: False)
+
+    response = client.post(
+        "/v1/worldbook/upsert",
+        json=_env(user_id, "not-saved"),
+        headers=_headers(api_key),
+    )
+
+    assert response.status_code == 500
+    assert response.get_json() == {"error": "worldbook_write_failed"}
+    assert client.get(
+        "/v1/worldbook/list", headers=_headers(api_key)
+    ).get_json() == {"envelopes": []}
+
+
+def test_worldbook_routes_forward_trace_header_to_write_and_match_events(
+    client, monkeypatch,
+):
+    user_id, api_key = _register(client)
+    events = []
+    monkeypatch.setattr(
+        worldbook_core.debug_trace,
+        "trace_event",
+        lambda _store, **event: events.append(event),
+    )
+    headers = {
+        **_headers(api_key),
+        "X-Feedling-Trace-Id": "trace-worldbook-route",
+    }
+
+    assert client.post(
+        "/v1/worldbook/match",
+        json={"message": "private query"},
+        headers=headers,
+    ).status_code == 200
+    assert client.post(
+        "/v1/worldbook/upsert",
+        json=_env(user_id, "route-entry"),
+        headers=headers,
+    ).status_code == 200
+
+    by_type = {event["type"]: event for event in events}
+    assert by_type["worldbook.entry.write.completed"]["trace_id"] == (
+        "trace-worldbook-route"
+    )
+    assert by_type["worldbook.match.completed"]["trace_id"] == (
+        "trace-worldbook-route"
+    )
+
+
 def test_worldbook_upsert_rejects_outer_id_mismatch(client):
     user_id, api_key = _register(client)
     res = client.post(

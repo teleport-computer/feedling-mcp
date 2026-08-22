@@ -2842,6 +2842,11 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
         "cards": "",
         "card_items": [],
     }
+    if full_cards:
+        # Internal-only, content-free signal consumed by the Dream worker.  An
+        # empty successful index and a failed/degraded read must not both look
+        # like "the model chose to do nothing" in diagnostics.
+        ctx["_diagnostic_cards_outcome"] = "unavailable"
     try:
         body, status = memory_core.buckets(store, None, post_enclave=_post)
         if status == 200:
@@ -2915,6 +2920,11 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
                     rendered_chars += added_chars
                 ctx["card_items"] = selected
                 ctx["cards"] = "\n".join(lines)
+                ctx["_diagnostic_cards_outcome"] = (
+                    "ready" if len(selected) == len(ids) else "truncated"
+                )
+            elif full_cards:
+                ctx["_diagnostic_cards_outcome"] = "empty"
             elif not full_cards:
                 lines = [_render_card_line(item) for item in index_items]
                 ctx["cards"] = "\n".join(line for line in lines if line)
@@ -3311,10 +3321,15 @@ def _reply_message_fields(payload: dict) -> tuple[str, dict]:
     ):
         raise RuntimeError("invalid reply file mime")
     byte_count = raw.get("file_byte_count")
+    maximum_file_bytes = (
+        cap_tool_schema.SHARED_WORK_MAX_BYTES
+        if name.casefold().endswith(".io.html")
+        else v2_worker._WORKSPACE_FILE_MAX_BYTES
+    )
     if (
         type(byte_count) is not int
         or byte_count <= 0
-        or byte_count > v2_worker._WORKSPACE_FILE_MAX_BYTES
+        or byte_count > maximum_file_bytes
     ):
         raise RuntimeError("invalid reply file size")
     return "file", {
@@ -4551,6 +4566,7 @@ def _read_worldbook_context(
     messages: list[dict],
     *,
     runtime_token: str,
+    trace_context: dict | None = None,
 ) -> dict:
     """Match this foreground turn against the user's encrypted World Book."""
     body, status = worldbook_core.match(
@@ -4558,6 +4574,16 @@ def _read_worldbook_context(
         {"messages": list(messages or [])},
         api_key=None,
         runtime_token=str(runtime_token or ""),
+        **(
+            {
+                "trace_id": str(trace_context.get("trace_id") or ""),
+                "job_id": str(trace_context.get("job_id") or ""),
+                "lane": str(trace_context.get("lane") or ""),
+                "actor": "host_agent_runtime",
+            }
+            if isinstance(trace_context, dict)
+            else {}
+        ),
     )
     if status != 200:
         raise RuntimeError("worldbook_match_failed")

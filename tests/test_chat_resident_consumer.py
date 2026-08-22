@@ -1224,7 +1224,7 @@ def test_screen_question_attaches_decrypted_screen_context(monkeypatch):
             ["/tmp/feedling_chat_images/screen.jpg"],
         ),
     )
-    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text: "")
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text, **_kwargs: "")
 
     with patch.object(crc, "call_agent", return_value="I can see it.") as mock_agent, \
          patch.object(crc, "post_reply") as mock_post:
@@ -1285,10 +1285,16 @@ def test_foreground_worldbook_eager_mode_remains_as_rollback(monkeypatch):
         "matched_names": ["历法"],
     }
     monkeypatch.setattr(crc, "FOREGROUND_WORLDBOOK_CONTEXT_MODE", "eager")
-    monkeypatch.setattr(crc._HTTP, "post", MagicMock(return_value=response))
+    post = MagicMock(return_value=response)
+    monkeypatch.setattr(crc._HTTP, "post", post)
 
-    assert crc._worldbook_context_for_foreground("今天是什么日子") == (
+    assert crc._worldbook_context_for_foreground(
+        "今天是什么日子", trace_id="trace-worldbook"
+    ) == (
         "<world_book>影月历</world_book>"
+    )
+    assert post.call_args.kwargs["headers"]["X-Feedling-Trace-Id"] == (
+        "trace-worldbook"
     )
 
 
@@ -1485,7 +1491,7 @@ def test_screen_frame_provider_rejection_retries_once_without_screen_pixels(
     )
     report = MagicMock(return_value=True)
     monkeypatch.setattr(crc, "_report_runtime_error", report)
-    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text: "")
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text, **_kwargs: "")
 
     with patch.object(
         crc,
@@ -3939,6 +3945,7 @@ def _install_dream_job_harness(monkeypatch, agent_reply):
         "envelope_plaintexts": [],
         "envelope_kwargs": [],
         "post_called": False,
+        "traces": [],
     }
 
     history = [
@@ -4011,6 +4018,13 @@ def _install_dream_job_harness(monkeypatch, agent_reply):
             "effects": [{"type": "memory_superseded"} for _action in actions],
         }
 
+    def _trace(subsystem, event_type, **kwargs):
+        captured["traces"].append({
+            "subsystem": subsystem,
+            "type": event_type,
+            **kwargs,
+        })
+
     monkeypatch.setattr(crc, "call_agent", _agent)
     monkeypatch.setattr(crc, "post_reply", _fail_post)
     monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
@@ -4037,6 +4051,7 @@ def _install_dream_job_harness(monkeypatch, agent_reply):
     monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
     monkeypatch.setattr(crc, "_build_envelope", _build_envelope)
     monkeypatch.setattr(crc, "execute_memory_actions", _memory_actions)
+    monkeypatch.setattr(crc, "_emit_debug_trace", _trace)
     return captured, job
 
 
@@ -4678,6 +4693,36 @@ def test_dream_job_merge_writes_multi_supersede_without_chat_or_delivery(monkeyp
     assert extra["dream_result"]["organized_count"] == 2
     assert extra["dream_result"]["merged_count"] == 1
     assert extra["questions"] == ["确认是否只是不喝牛奶？"]
+    assert [row["type"] for row in captured["traces"]] == [
+        "memory.dream.start",
+        "memory.dream.model.start",
+        "memory.dream.model.done",
+        "memory.dream.done",
+    ]
+    assert all(
+        row["trace_id"] == "dream_dispatch"
+        and row["job_id"] == "dream_dispatch"
+        for row in captured["traces"]
+    )
+    terminal = captured["traces"][-1]
+    assert terminal["status"] == "ok"
+    assert terminal["detail"] == {
+        "runtime": "resident_v1",
+        "lane": "dream",
+        "outcome": "applied",
+        "degraded_context": False,
+        "counts": {
+            "actions": 1,
+            "active_cards": 3,
+            "applied": 1,
+            "failed": 0,
+            "merged": 1,
+            "model_attempts": 1,
+            "organized": 2,
+            "proposals": 1,
+            "skipped": 0,
+        },
+    }
 
 
 def test_dream_job_thicken_and_supersede_are_memory_supersede_actions(monkeypatch):
@@ -4727,6 +4772,46 @@ def test_dream_job_thicken_and_supersede_are_memory_supersede_actions(monkeypatc
     assert extra["dream_result"]["cards_thickened"] == 1
 
 
+def test_dream_job_partial_write_is_a_warning_not_a_false_ok(monkeypatch):
+    reply = json.dumps({
+        "consolidations": [
+            {
+                "op": "thicken",
+                "card_ids": ["mem_a"],
+                "rationale": "同一偏好的补充",
+                "result": {"summary": "偏好摘要", "content": "偏好正文"},
+            },
+            {
+                "op": "supersede",
+                "card_ids": ["mem_c"],
+                "rationale": "同一习惯的更新",
+                "result": {"summary": "习惯摘要", "content": "习惯正文"},
+            },
+        ],
+        "questions_to_ask": [],
+    }, ensure_ascii=False)
+    captured, job = _install_dream_job_harness(monkeypatch, reply)
+
+    def _partial(actions):
+        captured["actions"].extend(actions)
+        return {
+            "results": [
+                {"status": "ok", "action": actions[0]["type"]},
+                {"status": "error", "error": "storage_error"},
+            ],
+        }
+
+    monkeypatch.setattr(crc, "execute_memory_actions", _partial)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+    terminal = captured["traces"][-1]
+    assert terminal["type"] == "memory.dream.done"
+    assert terminal["status"] == "warning"
+    assert terminal["detail"]["outcome"] == "partial"
+    assert terminal["detail"]["counts"]["applied"] == 1
+    assert terminal["detail"]["counts"]["failed"] == 1
+
+
 def test_dream_job_empty_consolidations_completes_noop_without_memory_write_or_chat(monkeypatch):
     captured, job = _install_dream_job_harness(
         monkeypatch,
@@ -4757,6 +4842,11 @@ def test_dream_job_bad_json_fails_without_crash_or_memory_write(monkeypatch):
     assert captured["post_called"] is False
     assert _dream_final_status(captured)[:3] == ("dream_dispatch", "failed", "no_json_object")
     assert _dream_final_status(captured)[3]["extra"]["noop_reason"] == "no_json_object"
+    assert [row["type"] for row in captured["traces"]][-2:] == [
+        "memory.dream.model.error",
+        "memory.dream.error",
+    ]
+    assert captured["traces"][-1]["detail"]["outcome"] == "parse_rejected"
 
 
 def test_process_proactive_v2_wake_routes_without_gate_judgment(monkeypatch):
@@ -12299,7 +12389,7 @@ class _FakeWorldbookHTTP:
         self.block, self.status, self.sent = block, status, []
 
     def post(self, url, headers=None, json=None, timeout=None):
-        self.sent.append({"url": url, "json": json})
+        self.sent.append({"url": url, "headers": headers, "json": json})
 
         class _R:
             status_code = self.status
@@ -12355,6 +12445,55 @@ def test_scheduled_wake_worldbook_matches_the_reminder_note(monkeypatch):
     sent_messages = fake.sent[0]["json"].get("messages") or []
     assert any("青岚学院" in str(m.get("content")) for m in sent_messages), sent_messages
     assert _worldbook_match.CONTEXT_HEADER in message and "墨白历" in message
+
+
+def test_wake_worldbook_context_applied_trace_is_content_free(monkeypatch):
+    fake = _FakeWorldbookHTTP(block="private world setting")
+    events = []
+    monkeypatch.setattr(crc, "_HTTP", fake)
+    monkeypatch.setattr(
+        crc,
+        "_emit_debug_trace",
+        lambda subsystem, event_type, **fields: events.append({
+            "subsystem": subsystem,
+            "type": event_type,
+            **fields,
+        }),
+    )
+    job = {
+        "schema_version": 2,
+        "job_id": "job-worldbook",
+        "trace_id": "trace-worldbook",
+        "trigger": "scheduled_wake",
+        "scheduled_note": "private reminder",
+    }
+
+    message = crc._message_for_proactive_job(job)
+
+    assert "private world setting" in message
+    assert fake.sent[0]["headers"]["X-Feedling-Trace-Id"] == "trace-worldbook"
+    event = next(
+        event for event in events
+        if event["type"] == "worldbook.context.applied"
+    )
+    assert set(event) == {
+        "subsystem", "type", "status", "trace_id", "job_id", "summary",
+        "explain", "detail",
+    }
+    assert set(event["detail"]) == {
+        "runtime", "lane", "source", "carrier_chars", "truncated",
+    }
+    assert event["trace_id"] == "trace-worldbook"
+    assert event["detail"] == {
+        "runtime": "resident_v1",
+        "lane": "scheduled",
+        "source": "eager_context",
+        "carrier_chars": len(
+            _worldbook_match.format_context_block("private world setting")
+        ),
+        "truncated": False,
+    }
+    assert "private world setting" not in repr(event)
 
 
 def test_wake_worldbook_failure_does_not_break_the_wake(monkeypatch):

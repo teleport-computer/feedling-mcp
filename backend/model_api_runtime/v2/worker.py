@@ -84,6 +84,7 @@ from core import provider_usage
 from core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
+from memory_garden import dream_trace as memory_dream_trace
 from memory_garden import timestamps as memory_timestamps
 from core.downloadable_reply import sanitize_downloadable_reply
 from perception.glance import (
@@ -4027,6 +4028,8 @@ def _ledger_tapped_sink(
     deps: TurnDeps | None = None,
     user_id: str = "",
     lane: str = "chat",
+    trace_id: str = "",
+    job_id: str = "",
 ):
     """`recorder.record` plus the plaintext ledger mirror, for tool_loop.
 
@@ -4038,7 +4041,10 @@ def _ledger_tapped_sink(
     if recorder is None and (deps is None or deps.emit_debug_trace is None):
         return None
 
+    worldbook_context_reported = False
+
     async def _record(event_kind: str, payload: dict) -> None:
+        nonlocal worldbook_context_reported
         if recorder is not None:
             await recorder.record(event_kind, payload)
             await _mirror_provider_attempt(recorder, event_kind, payload)
@@ -4056,8 +4062,78 @@ def _ledger_tapped_sink(
                 user_id,
                 payload,
             )
+            if not worldbook_context_reported:
+                observation = _worldbook_context_observation(payload)
+                if observation is not None:
+                    worldbook_context_reported = True
+                    try:
+                        await asyncio.to_thread(
+                            deps.emit_debug_trace,
+                            user_id,
+                            "worldbook.context.applied",
+                            status=(
+                                "warning"
+                                if observation["truncated"]
+                                else "ok"
+                            ),
+                            summary="",
+                            explain="",
+                            trace_id=str(trace_id or ""),
+                            turn_id=str(trace_id or ""),
+                            job_id=str(job_id or ""),
+                            detail={
+                                "runtime": "hosted_v2",
+                                "lane": str(lane or "chat"),
+                                **observation,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001 — trace is best-effort
+                        log.warning(
+                            "[v2.worldbook] context trace failed user=%s code=%s",
+                            user_id,
+                            type(exc).__name__.lower(),
+                        )
 
     return _record
+
+
+def _worldbook_context_observation(provider_request: dict) -> dict | None:
+    """Describe only a World Book block that reached a provider request.
+
+    Wake lanes carry eager context as an application-data string. Foreground
+    Chat carries a pull result inside a native ``ToolExchange``. Inspecting the
+    trusted in-memory shape here avoids copying any content into plaintext
+    telemetry; only the carrier length and truncation bit leave this function.
+    """
+    for message in provider_request.get("messages") or ():
+        if isinstance(message, dict):
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            header = context.WORLD_BOOK_CONTEXT_HEADER + "\n"
+            if not content.startswith(header):
+                continue
+            return {
+                "source": "eager_context",
+                "carrier_chars": len(content),
+                "truncated": context.WORLD_BOOK_TRUNCATION_MARKER in content,
+            }
+        if not isinstance(message, ToolExchange):
+            continue
+        result_by_id = {str(result.call_id): result for result in message.results}
+        for call in message.calls:
+            if str(call.name or "") != "worldbook_match":
+                continue
+            result = result_by_id.get(str(call.id))
+            content = str(getattr(result, "content", "") or "")
+            if "<world_book>" not in content:
+                continue
+            return {
+                "source": "tool_result",
+                "carrier_chars": len(content),
+                "truncated": "...[truncated]" in content,
+            }
+    return None
 
 
 def _make_tool_trajectory_callback(
@@ -6376,6 +6452,8 @@ def _safe_download_name(path: str) -> str:
 
 def _workspace_file_mime(name: str, declared: str = "") -> str:
     """Choose a safe MIME for generated workspace files sent without rendering."""
+    if str(name or "").casefold().endswith(".io.html"):
+        return "text/html"
     explicit = str(declared or "").strip().lower()
     if explicit.startswith("text/") or explicit in {
         "application/json",
@@ -6411,10 +6489,15 @@ def _workspace_file_reply_from_result(result: dict) -> WorkspaceFileReply:
     content = result.get("content")
     if not isinstance(content, str):
         raise ValueError("send_file requires UTF-8 workspace source content")
-    source_data = content.encode("utf-8")
-    if not source_data or len(source_data) > _WORKSPACE_FILE_MAX_BYTES:
-        raise ValueError("workspace file is empty or too large")
     name = _safe_download_name(path)
+    maximum_bytes = (
+        cap_tool_schema.SHARED_WORK_MAX_BYTES
+        if name.casefold().endswith(".io.html")
+        else _WORKSPACE_FILE_MAX_BYTES
+    )
+    source_data = content.encode("utf-8")
+    if not source_data or len(source_data) > maximum_bytes:
+        raise ValueError("workspace file is empty or too large")
     rendered = v2_document_render.render_download(name, content)
     if rendered is None:
         data = source_data
@@ -6423,7 +6506,7 @@ def _workspace_file_reply_from_result(result: dict) -> WorkspaceFileReply:
         )
     else:
         data, mime_type = rendered
-    if not data or len(data) > _WORKSPACE_FILE_MAX_BYTES:
+    if not data or len(data) > maximum_bytes:
         raise ValueError("rendered workspace file is empty or too large")
     return WorkspaceFileReply(
         path=path,
@@ -8950,6 +9033,11 @@ async def _run_wake(
                         before_write=_before_write,
                         observe_photo=observe_photo,
                         read_parallelism=1,
+                        trace_context={
+                            "trace_id": str(trace_id or ""),
+                            "job_id": str(job_id),
+                            "lane": lane,
+                        },
                     )
                 finally:
                     effect_reservations.mark_ready(tc)
@@ -9039,6 +9127,11 @@ async def _run_wake(
                         before_write=_before_write,
                         observe_photo=observe_photo,
                         read_parallelism=1,
+                        trace_context={
+                            "trace_id": str(trace_id or ""),
+                            "job_id": str(job_id),
+                            "lane": lane,
+                        },
                     )
                 finally:
                     effect_reservations.mark_batch_ready(calls)
@@ -9751,6 +9844,11 @@ async def _run_wake(
                         user_id,
                         wake_match_messages,
                         runtime_token=token,
+                        trace_context={
+                            "trace_id": str(trace_id or ""),
+                            "job_id": str(job_id),
+                            "lane": lane,
+                        },
                     )
                 if isinstance(wb, dict):
                     worldbook_context = str(wb.get("block") or "").strip()
@@ -10002,6 +10100,8 @@ async def _run_wake(
                     deps=deps,
                     user_id=user_id,
                     lane=lane,
+                    trace_id=str(trace_id or ""),
+                    job_id=str(job_id),
                 ),
                 outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
@@ -10846,6 +10946,85 @@ async def _run_profile(
         return "failed"
 
 
+async def _emit_v2_dream_lifecycle(
+    deps: TurnDeps,
+    user_id: str,
+    event_type: str,
+    *,
+    job_id: str,
+    trace_id: str,
+    status: str,
+    outcome: str,
+    started_at: float,
+    degraded_context: bool = False,
+    counts: dict | None = None,
+) -> None:
+    """Emit one content-free hosted Dream lifecycle observation."""
+    if deps.emit_debug_trace is None:
+        return
+    try:
+        await asyncio.to_thread(
+            deps.emit_debug_trace,
+            user_id,
+            event_type,
+            status=status,
+            summary="",
+            explain="",
+            trace_id=str(trace_id or job_id),
+            turn_id=str(trace_id or job_id),
+            job_id=str(job_id),
+            dur_ms=max(0.0, (time.monotonic() - started_at) * 1000.0),
+            detail=memory_dream_trace.detail(
+                runtime="hosted_v2",
+                outcome=outcome,
+                degraded_context=degraded_context,
+                counts=counts,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — observability must not fail Dream
+        log.warning(
+            "[v2.dream] lifecycle trace failed user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
+
+
+async def _emit_v2_dream_context_error(
+    deps: TurnDeps,
+    user_id: str,
+    *,
+    job_id: str,
+    trace_id: str,
+    component: str,
+    outcome: str,
+) -> None:
+    if deps.emit_debug_trace is None:
+        return
+    try:
+        await asyncio.to_thread(
+            deps.emit_debug_trace,
+            user_id,
+            memory_dream_trace.CONTEXT_TRACE_TYPE,
+            status="warning",
+            summary="",
+            explain="",
+            trace_id=str(trace_id or job_id),
+            turn_id=str(trace_id or job_id),
+            job_id=str(job_id),
+            detail=memory_dream_trace.context_detail(
+                runtime="hosted_v2",
+                component=component,
+                outcome=outcome,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — observability must not fail Dream
+        log.warning(
+            "[v2.dream] context trace failed user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
+
+
 async def _run_extraction(
     job_id,
     user_id: str,
@@ -10856,6 +11035,7 @@ async def _run_extraction(
     claimed_by: str | None = None,
     tm: "TurnMetrics | None" = None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
+    trace_id: str = "",
 ) -> str:
     """capture / dream：后台记忆抽取。自成一体的 try/except —— 绝不落进 process_job 那个
     chat-turn 的 except（那条会 emit 用户可见的 error status + record_terminal_error）。
@@ -10866,8 +11046,29 @@ async def _run_extraction(
     extraction_status_recorded = False
     extraction_failure_detail: dict[str, Any] = {}
     capture_window: dict[str, Any] = {}
+    dream_started = time.monotonic()
+    dream_counts: dict[str, int] = {}
+    dream_degraded_context = False
+    dream_stage = "context"
+    dream_terminal_outcome = "failed"
+    dream_model_attempts = 0
+    dream_context_reader_failed = False
+    dream_terminal_emitted = False
     # call_id -> 该通电话的全文明文。只在 capture lane 填充（见 enclave_sem 闸内）。
     voice_transcripts: dict[str, str] = {}
+
+    if lane == "dream":
+        await _emit_v2_dream_lifecycle(
+            deps,
+            user_id,
+            "memory.dream.start",
+            job_id=str(job_id),
+            trace_id=trace_id,
+            status="ok",
+            outcome="started",
+            started_at=dream_started,
+            counts=dream_counts,
+        )
 
     async def _ensure_capture_not_halted(stage: str) -> None:
         """Bypass the polling cache at disclosure and durable-write boundaries."""
@@ -11022,6 +11223,8 @@ async def _run_extraction(
                         await asyncio.to_thread(memory_context_reader, user_id) or {}
                     )
                 except Exception as e:  # noqa: BLE001 — 上下文取数失败 → 降级，不失败（spec §3.5）
+                    if lane == "dream":
+                        dream_context_reader_failed = True
                     log.warning(
                         "[v2.worker] memory context unavailable for %s: %s", user_id, e
                     )
@@ -11075,6 +11278,32 @@ async def _run_extraction(
                         raise RuntimeError(
                             f"capture_voice_transcript_unavailable:{call_id}"
                         ) from e
+        if lane == "dream":
+            card_items = ctx.get("card_items") if isinstance(ctx, dict) else None
+            dream_counts["active_cards"] = len(
+                card_items if isinstance(card_items, list) else []
+            )
+            cards_outcome = (
+                "unavailable"
+                if dream_context_reader_failed
+                else str(ctx.get("_diagnostic_cards_outcome") or "")
+                if isinstance(ctx, dict)
+                else "unavailable"
+            )
+            if not cards_outcome:
+                cards_outcome = (
+                    "ready" if dream_counts["active_cards"] else "empty"
+                )
+            if cards_outcome in {"unavailable", "truncated"}:
+                dream_degraded_context = True
+                await _emit_v2_dream_context_error(
+                    deps,
+                    user_id,
+                    job_id=str(job_id),
+                    trace_id=trace_id,
+                    component="cards",
+                    outcome=cards_outcome,
+                )
         if lane == "capture" and deps.read_capture_state is not None and tail:
             last = tail[-1]
             last_id = str(last.get("id") or "")
@@ -11199,6 +11428,21 @@ async def _run_extraction(
                 build_truncation_prompt=build_truncation_retry_prompt,
             )
 
+        async def _extraction_trajectory(kind: str, payload: dict) -> None:
+            nonlocal dream_model_attempts
+            if lane == "dream" and kind == "provider_request":
+                dream_model_attempts += 1
+            if trajectory_recorder is not None:
+                await trajectory_recorder.record(kind, payload)
+
+        extraction_trajectory_out = (
+            _extraction_trajectory
+            if lane == "dream"
+            else trajectory_recorder.record
+            if trajectory_recorder is not None
+            else None
+        )
+
         if lane == "capture" and not prompt_tail:
             # The raw batch may consist entirely of synthetic/internal/import
             # rows. Advance its exact seq frontier through an empty durable
@@ -11249,11 +11493,7 @@ async def _run_extraction(
                         f"extraction_provider_{stage}_{attempt}"
                     ),
                     usage_out=tm.add_call if tm is not None else None,
-                    trajectory_out=(
-                        trajectory_recorder.record
-                        if trajectory_recorder is not None
-                        else None
-                    ),
+                    trajectory_out=extraction_trajectory_out,
                 )
                 _report_turn_progress("extraction_provider_complete")
                 return result
@@ -11366,6 +11606,19 @@ async def _run_extraction(
                 await _ensure_capture_not_halted("legacy_provider_call")
                 items, reason = await _invoke_capture_provider()
         elif lane != "capture":
+            dream_stage = "model"
+            await _emit_v2_dream_lifecycle(
+                deps,
+                user_id,
+                "memory.dream.model.start",
+                job_id=str(job_id),
+                trace_id=trace_id,
+                status="ok",
+                outcome="started",
+                started_at=dream_started,
+                degraded_context=dream_degraded_context,
+                counts=dream_counts,
+            )
             _report_turn_progress("extraction_provider_start")
             items, reason = await _extract_with_provider_health(
                 user_id,
@@ -11379,24 +11632,64 @@ async def _run_extraction(
                     f"extraction_provider_{stage}_{attempt}"
                 ),
                 usage_out=tm.add_call if tm is not None else None,
-                trajectory_out=(
-                    trajectory_recorder.record
-                    if trajectory_recorder is not None
-                    else None
-                ),
+                trajectory_out=extraction_trajectory_out,
             )
             _report_turn_progress("extraction_provider_complete")
+            dream_counts["model_attempts"] = max(1, dream_model_attempts)
+            dream_counts["proposals"] = len(items or [])
         if reason:
+            if lane == "dream":
+                dream_terminal_outcome = memory_dream_trace.reason_outcome(reason)
+                await _emit_v2_dream_lifecycle(
+                    deps,
+                    user_id,
+                    "memory.dream.model.error",
+                    job_id=str(job_id),
+                    trace_id=trace_id,
+                    status="error",
+                    outcome=dream_terminal_outcome,
+                    started_at=dream_started,
+                    degraded_context=dream_degraded_context,
+                    counts=dream_counts,
+                )
             raise RuntimeError(reason)
+        if lane == "dream":
+            await _emit_v2_dream_lifecycle(
+                deps,
+                user_id,
+                "memory.dream.model.done",
+                job_id=str(job_id),
+                trace_id=trace_id,
+                status="ok",
+                outcome=("accepted" if items else "no_proposals"),
+                started_at=dream_started,
+                degraded_context=dream_degraded_context,
+                counts=dream_counts,
+            )
         # 2026-08-05 复盘拆掉了这里的逐提案语义审查(弱模型自审自查既误放也误杀,
         # 每条提案还多烧一次 BYOK 调用)。出口防线现在全部是确定性的:parse 层的
         # 内容闸+卡id泄漏闸、mapper 的结构判据、下方的爆炸半径保险丝。
         if not items and lane != "capture":
             await _complete_extraction(item_count=0)
+            await _emit_v2_dream_lifecycle(
+                deps,
+                user_id,
+                "memory.dream.done",
+                job_id=str(job_id),
+                trace_id=trace_id,
+                status=("warning" if dream_degraded_context else "ok"),
+                outcome="noop",
+                started_at=dream_started,
+                degraded_context=dream_degraded_context,
+                counts=dream_counts,
+            )
+            dream_terminal_emitted = True
             if tm is not None:
                 tm.flush(failed=False, status="ok")
             return "completed"
 
+        if lane == "dream":
+            dream_stage = "mapping"
         if deps.build_memory_envelope is None:
             raise RuntimeError("extraction_memory_writer_unavailable")
         if lane == "capture" and (
@@ -11409,6 +11702,8 @@ async def _run_extraction(
         ):
             raise RuntimeError("capture_commit_protocol_unavailable")
         if lane != "capture" and deps.apply_memory_actions is None:
+            if lane == "dream":
+                dream_stage = "write"
             raise RuntimeError("extraction_memory_writer_unavailable")
 
         occurred_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -11489,6 +11784,16 @@ async def _run_extraction(
                     )
                 )
             actions, _added, _superseded = to_actions(items, **action_kwargs)
+            if lane == "dream":
+                dream_counts.update({
+                    "actions": len(actions),
+                    "organized": _superseded,
+                    "merged": sum(
+                        1
+                        for action in actions
+                        if str(action.get("dream_op") or "") == "merge"
+                    ),
+                })
             for _known, _missing, _fb in source_time_degraded:
                 log.warning(
                     "[v2.dream] source occurred_at degraded user=%s job=%s "
@@ -11508,6 +11813,7 @@ async def _run_extraction(
                 if memory_dream_gates.blast_radius_exceeded(
                     _superseded, active_count
                 ):
+                    dream_terminal_outcome = "guard_rejected"
                     await _record_trajectory(
                         trajectory_recorder,
                         "dream_blast_radius_fuse",
@@ -11571,13 +11877,23 @@ async def _run_extraction(
                 tm.flush(failed=False, status="ok")
             return "completed"
 
+        if lane == "dream":
+            dream_stage = "write"
         write_result = await asyncio.to_thread(
             deps.apply_memory_actions, user_id, actions
         )
         applied_count, skipped_count, failed_count, first_error = (
             _memory_write_result_counts(actions, write_result)
         )
+        if lane == "dream":
+            dream_counts.update({
+                "applied": applied_count,
+                "skipped": skipped_count,
+                "failed": failed_count,
+            })
         if failed_count == len(actions) and actions:
+            if lane == "dream":
+                dream_terminal_outcome = "write_rejected"
             raise RuntimeError(
                 f"extraction_memory_write_rejected:{first_error}"
             )
@@ -11605,6 +11921,24 @@ async def _run_extraction(
                 skipped_count,
                 failed_count,
             )
+        if lane == "dream":
+            await _emit_v2_dream_lifecycle(
+                deps,
+                user_id,
+                "memory.dream.done",
+                job_id=str(job_id),
+                trace_id=trace_id,
+                status=(
+                    "warning"
+                    if failed_count or dream_degraded_context
+                    else "ok"
+                ),
+                outcome=("partial" if failed_count else "applied"),
+                started_at=dream_started,
+                degraded_context=dream_degraded_context,
+                counts=dream_counts,
+            )
+            dream_terminal_emitted = True
         if tm is not None:
             tm.flush(failed=False, status="ok")
         return "completed"
@@ -11649,6 +11983,26 @@ async def _run_extraction(
         return "failed"
     except Exception as e:  # noqa: BLE001 — 背景 job：静默 mark_failed，绝不 surface/写气泡
         code = _extraction_failure_code(e)
+        if lane == "dream" and not dream_terminal_emitted:
+            if dream_terminal_outcome == "failed":
+                dream_terminal_outcome = {
+                    "context": "context_unavailable",
+                    "mapping": "mapping_rejected",
+                    "write": "write_failed",
+                }.get(dream_stage, "failed")
+            await _emit_v2_dream_lifecycle(
+                deps,
+                user_id,
+                "memory.dream.error",
+                job_id=str(job_id),
+                trace_id=trace_id,
+                status="error",
+                outcome=dream_terminal_outcome,
+                started_at=dream_started,
+                degraded_context=dream_degraded_context,
+                counts=dream_counts,
+            )
+            dream_terminal_emitted = True
         if lane != "capture" and not extraction_status_recorded:
             try:
                 await _record_extraction_status("failed")
@@ -12231,6 +12585,7 @@ async def process_job(
                 claimed_by,
                 tm,
                 trajectory_recorder,
+                trace_id=str(job.get("trace_id") or ""),
             )
         if lane != "chat":
             # 真·未注册 lane 的兜底：maintenance/wake（heartbeat/scheduled/manual_wake）/
@@ -12993,6 +13348,11 @@ async def process_job(
                                 # and only while the switch resolved ON for
                                 # this turn.
                                 history_tools_allowed=history_tools_offered,
+                                trace_context={
+                                    "trace_id": str(job.get("trace_id") or ""),
+                                    "job_id": str(job_id),
+                                    "lane": lane,
+                                },
                             )
                         scanned_rows = _history_rows_charged(result, lease)
                     finally:
@@ -13035,6 +13395,11 @@ async def process_job(
                         before_write=_before_write,
                         observe_photo=observe_photo,
                         read_parallelism=1,
+                        trace_context={
+                            "trace_id": str(job.get("trace_id") or ""),
+                            "job_id": str(job_id),
+                            "lane": lane,
+                        },
                     )
                 finally:
                     effect_reservations.mark_ready(tc)
@@ -13117,6 +13482,11 @@ async def process_job(
                         before_write=_before_write,
                         observe_photo=observe_photo,
                         read_parallelism=1,
+                        trace_context={
+                            "trace_id": str(job.get("trace_id") or ""),
+                            "job_id": str(job_id),
+                            "lane": lane,
+                        },
                     )
                 finally:
                     effect_reservations.mark_batch_ready(calls)
@@ -14414,6 +14784,8 @@ async def process_job(
                 deps=deps,
                 user_id=user_id,
                 lane=lane,
+                trace_id=str(job.get("trace_id") or ""),
+                job_id=str(job_id),
             ),
             extra_tool_specs=offered_mcp_tool_specs,
             refresh_extra_tool_specs=_current_offered_mcp_tool_specs,
