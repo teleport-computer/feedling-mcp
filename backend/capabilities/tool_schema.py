@@ -35,6 +35,7 @@ from perception.agent_fields import (
 
 STAY_SILENT_TOOL = "stay_silent"
 FILE_REPLY_TOOL = "send_file"
+SHARED_WORK_MAX_BYTES = 256_000
 IMAGE_REPLY_TOOL = "generate_image"
 TASK_TOOL = "task"
 PROVIDER_USAGE_TOOL = "provider_usage"
@@ -727,7 +728,9 @@ DESCRIPTIONS: dict[str, str] = {
                         "send_file renders the binary document. Use expected_revision=0 "
                         "to create. Generated files must use /workspace/<filename>; "
                         "never write them under /artifacts or /skills because those "
-                        "namespaces are read-only."),
+                        "namespaces are read-only. A .io.html Canvas must be no "
+                        "larger than 256 KB of UTF-8 source; keep it compact and use "
+                        "CSS or SVG instead of embedding large base64 raster assets."),
     "workspace_delete": ("Delete an editable virtual file at its exact revision. "
                          "Artifacts and skills cannot be deleted by the model."),
     TASK_TOOL: ("Run a bounded isolated subagent on one focused task. The child can "
@@ -740,6 +743,11 @@ DESCRIPTIONS: dict[str, str] = {
     ),
     FILE_REPLY_TOOL: (
         "Deliver an existing /workspace source as a downloadable attachment. "
+        "A self-contained .io.html target is presented by IO as an interactive "
+        "Canvas. Choose it when you have decided an experience belongs in the "
+        "conversation. Put everything the work needs inline so it opens offline. "
+        "Let the user experience the work itself, and discuss its source only if "
+        "they ask. "
         "Plain-text formats are sent directly; .docx and .pdf targets are rendered "
         "into real Word/PDF bytes. Preserve any format the user explicitly requested: "
         "Word means .docx and PDF means .pdf, and never replace either with Markdown. "
@@ -989,6 +997,14 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
         revision = args.get("expected_revision")
         if type(revision) is not int or revision < 0:
             return "expected_revision must be a non-negative integer"
+    if name == "workspace_write":
+        path = str(args.get("path") or "").strip().casefold()
+        content = str(args.get("content") or "")
+        if (
+            path.endswith(".io.html")
+            and len(content.encode("utf-8")) > SHARED_WORK_MAX_BYTES
+        ):
+            return "Canvas source exceeds the 256 KB UTF-8 limit"
     if name == TASK_TOOL and not str(args.get("prompt") or "").strip():
         return "task requires a non-empty prompt"
     if name == FILE_REPLY_TOOL and not str(args.get("path") or "").strip():
