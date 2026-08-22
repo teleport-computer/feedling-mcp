@@ -67,7 +67,8 @@ The release has two explicit production gates:
 1. **Gate 1 — TEE primary.** Promote the current TEE PostgreSQL database to
    `DATABASE_URL`, set `FEEDLING_DATABASE_SCHEMA=tee` for every release unit,
    remove the legacy `TEE_DATABASE_URL` dual-write wiring, and verify encrypted
-   canaries, backups, the exact migration head, and the prepared marker.
+   canaries, backups, the exact migration head, and the enabled primary
+   triggers. The prepared marker remains audit metadata, not a startup gate.
 2. **Gate 2 — decrypted shadow.** Only after Gate 1 is healthy, provide an
    independent PostgreSQL 17 app DSN as `PLAINTEXT_SHADOW_DATABASE_URL` and set
    `FEEDLING_PLAINTEXT_SHADOW_ENABLED=1` on the main backend. The protected CI
@@ -227,7 +228,8 @@ Before traffic resumes, point main and runner at the same TEE app DSN, set
 the plaintext tier in the same maintenance window, also set
 `PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1`; CI rejects that value with the RDS
 schema selector, and all production write processes receive the same gate.
-Startup must assert the TEE head and marker without DDL. After the first
+Startup must assert the TEE head and primary triggers without DDL; it does not
+depend on the optional prepared-marker row. After the first
 TEE-primary write, frozen RDS is not a lossless rollback target;
 reverse-reconcile or restore TEE changes before switching a DSN back.
 

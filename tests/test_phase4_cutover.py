@@ -191,8 +191,17 @@ def test_phase4_prepare_copies_frame_bridge_and_aligns_sequences(monkeypatch):
             "chat_message_archive_immutable",
         }
 
-        # The same app role now passes startup's read-only head + prepared
-        # marker + trigger assertion; no RDS Alembic table is created.
+        # The marker is audit metadata, not a durable safety boundary. A later
+        # server_config reconciliation may remove it after the frozen prepare,
+        # while the migration head and primary triggers remain authoritative.
+        with psycopg.connect(destination_url, autocommit=True) as destination:
+            destination.execute(
+                "DELETE FROM server_config WHERE key = %s",
+                (db._TEE_PRIMARY_PREPARED_KEY,),
+            )
+
+        # The same app role passes startup's read-only head + trigger
+        # assertion without the optional marker; no RDS Alembic table is created.
         monkeypatch.setenv("DATABASE_URL", destination_url)
         monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "tee")
         db.init_schema()

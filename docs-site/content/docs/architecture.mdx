@@ -232,9 +232,10 @@ data route. Every backend and runner must switch `DATABASE_URL` and the explicit
 schema contract together. In the promoted mode, application startup performs a
 read-only assertion against `alembic_tee_version`; it never applies the legacy
 RDS migration chain with the application role. Startup also requires the
-head-bound frozen-prepare marker and enabled Chat lifecycle triggers, so a
-schema-only or partial cutover fails closed. The legacy RDS-to-TEE shadow
-dual-write and its reconciliation scheduler are disabled in this mode,
+enabled Chat lifecycle triggers, so a schema-only or partial cutover fails
+closed. The head-bound frozen-prepare marker remains optional audit metadata;
+startup does not depend on a mutable `server_config` row. The legacy RDS-to-TEE
+shadow dual-write and its reconciliation scheduler are disabled in this mode,
 including when stale legacy shadow variables remain present.
 
 Managed release units pass the same schema selector to the API, in-CVM worker,
