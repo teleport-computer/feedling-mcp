@@ -19709,17 +19709,17 @@ def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> s
         if _guard_on:
             _summary = str(card.get("summary") or "")
             _content = str(card.get("content") or "")
-            if card_guard.hard_field_pollution_reason(_summary) or card_guard.hard_field_pollution_reason(_content):
+            if card_guard.hard_field_pollution_reason(_summary, IO_LEAK_SIGNALS) or card_guard.hard_field_pollution_reason(_content, IO_LEAK_SIGNALS):
                 continue
             _bucket = str(card.get("bucket") or "").strip()
-            if _bucket and card_guard.bucket_pollution_reason(_bucket):
+            if _bucket and card_guard.bucket_pollution_reason(_bucket, IO_LEAK_SIGNALS):
                 card["bucket"] = card_guard.default_bucket_for_text(f"{_summary}\n{_content}")
             elif _bucket:
                 # Q3:干净桶按卡片语言归一(与 capture/dream/migrate/history 一致;此前漏了这条路)。
                 card["bucket"] = normalize_bucket_language(_bucket, f"{_summary}\n{_content}")
             _threads = card.get("threads")
             if isinstance(_threads, list):
-                card["threads"] = [t for t in _threads if not card_guard.field_pollution_reason(str(t or ""))]
+                card["threads"] = [t for t in _threads if not card_guard.field_pollution_reason(str(t or ""), IO_LEAK_SIGNALS)]
         # Long-term-memory distill (keep_all ← material_kind == "memory_summary") carries the
         # user's original per-card date through fact_write. Preserve it so decades of uploaded
         # memories don't all collapse onto today. Chat-history distill keeps the "now" stamp;

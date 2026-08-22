@@ -105,3 +105,48 @@ def test_normal_developer_memories_survive_the_hard_gate(clean):
     这三条各只命中一个弱证据，必须活下来 —— 用户里有开发者，这类内容是正常记忆。
     """
     assert card_guard.hard_field_pollution_reason(clean, IO_LEAK_SIGNALS) is None
+
+
+# --------------------------------------------------------------------------- #
+# 静态守卫：每一个调用点都必须带识别器
+# --------------------------------------------------------------------------- #
+
+
+def test_every_guard_call_site_passes_io_signals():
+    """内核那几个闸函数的 signals 有默认值，**漏传不会报错，只会静默失去防护**。
+
+    这条不是补充，是必需的：写这批时我用 grep 扫了一遍，自认为都接上了；
+    改用 AST 扫描才发现漏了 5 处，其中 4 处在 V1 consumer 的 pre-seal 路径上 ——
+    那条路当时跑的是通用集，io 自己的残片一个都拦不住，而且没有任何测试会红
+    （管道通、参数有默认、行为测试也覆盖不到那条具体分支）。
+
+    grep 抓不住的原因：调用可能跨行、可能是 `a.b.fn(...)` 形式、
+    `hard_field_pollution_reason` 还会被 `field_pollution_reason` 的模式误匹配。
+    只能按语法树逐个调用节点看。
+    """
+    import ast
+
+    GUARDS = {
+        "hard_field_pollution_reason", "field_pollution_reason",
+        "bucket_pollution_reason", "card_text_rejection",
+        "sanitize_card_labels", "parse_migrated_cards",
+    }
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    offenders = []
+    for path in list((repo / "backend").rglob("*.py")) + list((repo / "tools").rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = (fn.attr if isinstance(fn, ast.Attribute)
+                    else fn.id if isinstance(fn, ast.Name) else None)
+            if name in GUARDS and "IO_LEAK_SIGNALS" not in ast.unparse(node):
+                offenders.append(f"{path.relative_to(repo)}:{node.lineno} {name}")
+    assert not offenders, (
+        "这些调用点漏了 IO_LEAK_SIGNALS —— 会静默退回通用集，io 的残片拦不住：\n  "
+        + "\n  ".join(offenders)
+    )

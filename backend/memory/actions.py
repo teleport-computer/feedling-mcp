@@ -828,7 +828,7 @@ def _memory_supersede_action(
             # 查真正会存的 content(不是 description),污染常在 content 里。
             return {"status": "error", "error": "memory_card_polluted", "action": "memory.supersede"}, [], 400
 
-        if card_guard.bucket_pollution_reason(str(raw.get("bucket") or "")):
+        if card_guard.bucket_pollution_reason(str(raw.get("bucket") or ""), IO_LEAK_SIGNALS):
             # 脏桶视为「模型没给桶」→ 从 raw 剔除,让下面的合并继承旧卡的桶,而不是用残片覆盖。
             raw = {k: v for k, v in raw.items() if k != "bucket"}
         _raw_threads = raw.get("threads")
