@@ -9458,6 +9458,192 @@ def chat_load_recent_strict(user_id: str, limit: int) -> list[dict]:
     return [r[0] for r in rows]
 
 
+_CHAT_BOUNDED_READ_MAX = 256
+_CHAT_HOT_SNAPSHOT_MAX = 5000
+_CHAT_HOT_SNAPSHOT_SQL = (
+    "SELECT seq,msg_id,ts,doc FROM ("
+    "  SELECT seq,msg_id,ts,doc FROM chat_messages "
+    "  WHERE user_id=%s ORDER BY seq DESC LIMIT %s"
+    ") hot ORDER BY seq ASC"
+)
+_CHAT_POINT_READ_SQL = (
+    "SELECT seq,msg_id,ts,doc FROM chat_messages "
+    "WHERE user_id=%s AND msg_id=%s"
+)
+_CHAT_MANY_READ_SQL = (
+    "SELECT seq,msg_id,ts,doc FROM chat_messages "
+    "WHERE user_id=%s AND msg_id=ANY(%s) ORDER BY seq ASC"
+)
+_CHAT_POLL_CANDIDATES_SQL = (
+    "SELECT seq,msg_id,ts,doc FROM chat_messages "
+    "WHERE user_id=%s AND doc->>'role'='user' "
+    "AND COALESCE(doc->>'voice_turn_status','')<>'superseded' "
+    "AND COALESCE(doc->>'reply_status','')<>'replied' "
+    "AND COALESCE(doc->>'reply_message_id','')='' "
+    "AND (ts>%s OR ts>%s) "
+    "ORDER BY seq ASC LIMIT %s"
+)
+
+
+def _chat_bounded_read_limit(limit: int) -> int:
+    return min(_CHAT_BOUNDED_READ_MAX, max(1, int(limit)))
+
+
+def _chat_hot_snapshot_limit(limit: int) -> int:
+    return min(_CHAT_HOT_SNAPSHOT_MAX, max(1, int(limit)))
+
+
+def _chat_project_row(row) -> dict:
+    """Overlay authoritative relational identity/order on a chat JSON doc."""
+    seq, msg_id, ts, doc = row
+    return {
+        **dict(doc or {}),
+        "id": str(msg_id),
+        "ts": float(ts),
+        "seq": int(seq),
+    }
+
+
+def chat_load_hot_snapshot_strict(
+    user_id: str,
+    limit: int,
+) -> tuple[int, list[dict]]:
+    """Read one version-consistent newest chat window, oldest first."""
+    bounded = _chat_hot_snapshot_limit(limit)
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            conn.execute(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+            )
+            version_row = conn.execute(
+                "SELECT version FROM chat_change_state WHERE user_id=%s",
+                (user_id,),
+            ).fetchone()
+            rows = conn.execute(
+                _CHAT_HOT_SNAPSHOT_SQL,
+                (user_id, bounded),
+            ).fetchall()
+    version = int(version_row[0]) if version_row is not None else 0
+    if version < 0:
+        raise ValueError("chat change version must be >= 0")
+    return version, [_chat_project_row(row) for row in rows]
+
+
+def chat_change_version(user_id: str) -> int:
+    """Return the user's durable chat version, or zero before first change."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT version FROM chat_change_state WHERE user_id=%s",
+            (user_id,),
+        ).fetchone()
+    version = int(row[0]) if row is not None else 0
+    if version < 0:
+        raise ValueError("chat change version must be >= 0")
+    return version
+
+
+def chat_change_events_after(
+    user_id: str,
+    after_version: int,
+    limit: int,
+) -> list[dict]:
+    """Return a bounded contiguous candidate window ordered by version."""
+    cursor = int(after_version)
+    if cursor < 0:
+        raise ValueError("after_version must be >= 0")
+    bounded = _chat_bounded_read_limit(limit)
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT version,operation,message_ids FROM chat_change_events "
+            "WHERE user_id=%s AND version>%s ORDER BY version ASC LIMIT %s",
+            (user_id, cursor, bounded),
+        ).fetchall()
+    return [
+        {
+            "version": int(version),
+            "operation": str(operation),
+            "message_ids": [str(message_id) for message_id in message_ids],
+        }
+        for version, operation, message_ids in rows
+    ]
+
+
+def chat_get_many_strict(user_id: str, message_ids: list[str]) -> list[dict]:
+    """Point-read at most 256 unique message IDs, returned in seq order."""
+    ids = list(dict.fromkeys(
+        str(message_id).strip() for message_id in message_ids
+        if str(message_id).strip()
+    ))[:_CHAT_BOUNDED_READ_MAX]
+    if not ids:
+        return []
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            _CHAT_MANY_READ_SQL,
+            (user_id, ids),
+        ).fetchall()
+    return [_chat_project_row(row) for row in rows]
+
+
+def chat_verify_reply_strict(
+    user_id: str,
+    ping_id: str,
+    ping_ts: float,
+) -> dict | None:
+    """Point-read the exact hidden ack referenced by one verify ping."""
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            conn.execute(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+            )
+            ping_row = conn.execute(
+                _CHAT_POINT_READ_SQL,
+                (user_id, ping_id),
+            ).fetchone()
+            if ping_row is None:
+                return None
+            ping = _chat_project_row(ping_row)
+            if (
+                ping.get("role") != "user"
+                or ping.get("source") != "verify_ping"
+            ):
+                return None
+            reply_id = str(ping.get("reply_message_id") or "").strip()
+            if not reply_id:
+                return None
+            reply_row = conn.execute(
+                _CHAT_POINT_READ_SQL,
+                (user_id, reply_id),
+            ).fetchone()
+    if reply_row is None:
+        return None
+    reply = _chat_project_row(reply_row)
+    if reply.get("role") not in ("agent", "openclaw"):
+        return None
+    if reply.get("source") != "verify_ping":
+        return None
+    if str(reply.get("reply_to_message_id") or "") != str(ping_id):
+        return None
+    if float(reply["ts"]) <= float(ping_ts):
+        return None
+    return reply
+
+
+def chat_poll_candidates_strict(
+    user_id: str,
+    since: float,
+    redelivery_floor: float,
+    limit: int,
+) -> list[dict]:
+    """Read bounded unanswered user rows from the durable poll window."""
+    bounded = _chat_bounded_read_limit(limit)
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            _CHAT_POLL_CANDIDATES_SQL,
+            (user_id, float(since), float(redelivery_floor), bounded),
+        ).fetchall()
+    return [_chat_project_row(row) for row in rows]
+
+
 def chat_load_recent(user_id: str, limit: int) -> list[dict]:
     """Legacy best-effort wrapper around :func:`chat_load_recent_strict`."""
     try:

@@ -215,6 +215,128 @@ def test_chat_append_preserves_durable_order_and_recent_window_is_bounded():
     assert recent[0]["body_ct"] == "ct2"
 
 
+def test_chat_hot_snapshot_and_change_reads_are_bounded_and_authoritative():
+    uid = _uid()
+    seed_user(uid)
+    assert db.chat_load_hot_snapshot_strict(uid, 10) == (0, [])
+    assert db.chat_change_version(uid) == 0
+
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO chat_messages (user_id,msg_id,ts,doc) VALUES "
+            "(%s,'m1',10,%s),(%s,'m2',20,%s),(%s,'m3',30,%s)",
+            (
+                uid, db.Jsonb({"id": "stale-1", "ts": -1, "seq": -1}),
+                uid, db.Jsonb({"id": "stale-2", "ts": -2, "seq": -2}),
+                uid, db.Jsonb({"id": "stale-3", "ts": -3, "seq": -3}),
+            ),
+        )
+
+    version, rows = db.chat_load_hot_snapshot_strict(uid, 2)
+    assert version == 1
+    assert [(row["id"], row["ts"]) for row in rows] == [
+        ("m2", 20.0),
+        ("m3", 30.0),
+    ]
+    assert [row["seq"] for row in rows] == sorted(row["seq"] for row in rows)
+    assert db.chat_change_version(uid) == 1
+    assert db.chat_change_events_after(uid, 0, 10) == [
+        {"version": 1, "operation": "upsert", "message_ids": ["m1", "m2", "m3"]}
+    ]
+
+
+def test_bounded_chat_reads_are_empty_before_first_message():
+    uid = _uid()
+    seed_user(uid)
+    assert db.chat_load_hot_snapshot_strict(uid, 256) == (0, [])
+    assert db.chat_change_version(uid) == 0
+    assert db.chat_change_events_after(uid, 0, 256) == []
+    assert db.chat_get_many_strict(uid, ["missing"]) == []
+    assert db.chat_verify_reply_strict(uid, "missing", 0.0) is None
+    assert db.chat_poll_candidates_strict(uid, 0.0, 0.0, 256) == []
+
+
+def test_chat_change_events_and_point_reads_validate_and_cap_inputs():
+    uid = _uid()
+    seed_user(uid)
+    for i in range(3):
+        db.chat_append(
+            uid,
+            f"m{i}",
+            float(i),
+            {"id": "stale", "ts": -1, "seq": -1, "n": i},
+            max_messages=5000,
+        )
+
+    assert [event["version"] for event in db.chat_change_events_after(uid, 0, 2)] == [1, 2]
+    assert db.chat_change_events_after(uid, 3, 10) == []
+    with pytest.raises(ValueError):
+        db.chat_change_events_after(uid, -1, 10)
+
+    rows = db.chat_get_many_strict(uid, ["m2", "m0", "m2", "", "missing"])
+    assert [(row["id"], row["ts"], row["n"]) for row in rows] == [
+        ("m0", 0.0, 0),
+        ("m2", 2.0, 2),
+    ]
+    assert db.chat_get_many_strict(uid, []) == []
+    assert db.chat_get_many_strict(uid, [f"missing-{i}" for i in range(300)]) == []
+
+
+def test_chat_verify_reply_requires_exact_source_role_parent_and_time():
+    uid = _uid()
+    seed_user(uid)
+    db.chat_append(
+        uid,
+        "ping",
+        100.0,
+        {
+            "id": "ping",
+            "ts": 100.0,
+            "role": "user",
+            "source": "verify_ping",
+            "reply_message_id": "ack",
+        },
+        max_messages=5000,
+    )
+    db.chat_append(
+        uid,
+        "ack",
+        101.0,
+        {
+            "id": "stale-ack",
+            "ts": -1.0,
+            "role": "agent",
+            "source": "verify_ping",
+            "reply_to_message_id": "ping",
+        },
+        max_messages=5000,
+    )
+
+    reply = db.chat_verify_reply_strict(uid, "ping", 100.0)
+    assert reply is not None
+    assert (reply["id"], reply["ts"]) == ("ack", 101.0)
+
+    for fields in (
+        {"source": "chat"},
+        {"source": "verify_ping", "role": "assistant"},
+        {"role": "agent", "reply_to_message_id": "other"},
+    ):
+        db.chat_update_metadata(uid, "ack", fields)
+        assert db.chat_verify_reply_strict(uid, "ping", 100.0) is None
+    db.chat_update_metadata(
+        uid,
+        "ack",
+        {"source": "verify_ping", "role": "agent", "reply_to_message_id": "ping"},
+    )
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE chat_messages SET ts=99, doc=doc || '{\"ts\":999}'::jsonb "
+            "WHERE user_id=%s AND msg_id='ack'",
+            (uid,),
+        )
+    assert db.chat_verify_reply_strict(uid, "ping", 100.0) is None
+
+
 def _idempotent_chat_doc(msg_id: str, client_msg_id: str, ts: float) -> dict:
     return {
         "id": msg_id,
