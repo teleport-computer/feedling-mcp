@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
 import debug_trace  # noqa: E402
 from accounts import registry  # noqa: E402
+from admin import data_track  # noqa: E402
 from admin import routes_asgi as admin_asgi  # noqa: E402
 from admin import memory_metadata  # noqa: E402
 from asgi import middleware  # noqa: E402
@@ -364,9 +365,22 @@ def test_events_day_selector_shape_and_invalid_day(env, monkeypatch):
         return raw
 
     monkeypatch.setattr(db, "admin_events_overview", fake_overview)
+    frozen = {
+        "timezone": "Asia/Shanghai", "closed_through_day": "2035-05-05",
+        "windows": [],
+    }
+    import_overall = {
+        "calculated_at": "2035-05-06T00:00:00+00:00",
+        "coverage": "red", "reason": "test", "windows": [],
+    }
+    monkeypatch.setattr(db, "admin_event_path_rollup_windows", lambda **_kw: frozen)
+    monkeypatch.setattr(db, "admin_history_import_job_rolling_windows",
+                        lambda: import_overall)
     path = "/v1/admin/data-track/events?day=2035-05-06"
     expected = {
         "filters": {"day": "2035-05-06", "timezone": "Asia/Shanghai"},
+        "event_path_master": data_track._event_path_master_payload(frozen),
+        "history_import_overall": import_overall,
         **raw,
     }
     assert _flask_get_json(path, headers=_admin()) == (200, expected)

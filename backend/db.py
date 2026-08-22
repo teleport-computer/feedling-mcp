@@ -5923,6 +5923,296 @@ def admin_proactive_heartbeat_overspeed(*, since_epoch: float = 0.0, days: int =
         return {}
 
 
+_ADMIN_EVENT_READ_TIMEOUT_MS = 5000
+
+
+def _admin_event_read_failure(exc: Exception) -> tuple[str, str]:
+    """Map DB read failure to a user-actionable display state."""
+    if str(getattr(exc, "sqlstate", "") or "") == "57014":
+        return "timeout", "取数超时（记了，但这里读不出来）"
+    return "read_error", "取数失败（记了，但这里读不出来）"
+
+
+def admin_event_path_rollup_windows(*, through_day: str = "",
+                                    tz: str = "Asia/Shanghai") -> dict:
+    """Aggregate the immutable lane cells for the event×path master table.
+
+    Both windows end on the same last *closed* Beijing calendar day.  This
+    reader deliberately never mixes ``admin_lane_rollup``'s live tail into the
+    result: a partially observed day would make a low failure rate look better
+    than it is.  Watermarks are converted into an explicit per-window coverage
+    level so a true zero remains distinguishable from an unmeasured cell.
+
+    ``model_api`` here is Runtime V2's ``agent_jobs`` freezer.  It must not be
+    relabelled as a generic API-key bucket; APIKey-V1 has no equivalent frozen
+    source and is declared unavailable by the presentation layer.
+    """
+    zone = ZoneInfo(tz)
+    raw_end = str(through_day or "").strip()
+    if raw_end:
+        if not _VALID_DAY.match(raw_end):
+            raise ValueError(
+                f"admin_event_path_rollup_windows: bad day {raw_end!r}, "
+                "want YYYY-MM-DD"
+            )
+        try:
+            end_day = date.fromisoformat(raw_end)
+        except ValueError as exc:
+            raise ValueError(
+                f"admin_event_path_rollup_windows: bad day {raw_end!r}, "
+                "want YYYY-MM-DD"
+            ) from exc
+    else:
+        end_day = datetime.now(zone).date() - timedelta(days=1)
+
+    specs = (("24h", 1), ("7d", 7))
+    earliest = end_day - timedelta(days=6)
+    try:
+        with get_pool().connection(
+                timeout=_ADMIN_EVENT_READ_TIMEOUT_MS / 1000) as conn:
+            conn.execute(
+                "SELECT set_config('statement_timeout', %s, true)",
+                (f"{_ADMIN_EVENT_READ_TIMEOUT_MS}ms",),
+            )
+            rows = conn.execute(
+                """
+                WITH cells AS (
+                  SELECT day, route, lane, enqueue_source,
+                         coalesce(sum(completed), 0)::bigint AS completed,
+                         coalesce(sum(failed), 0)::bigint AS failed,
+                         coalesce(sum(expired), 0)::bigint AS expired,
+                         coalesce(sum(superseded), 0)::bigint AS superseded
+                  FROM lane_daily_rollup
+                  WHERE day >= %s AND day <= %s
+                    AND route IN ('resident', 'model_api')
+                  GROUP BY day, route, lane, enqueue_source
+                ), code_counts AS (
+                  SELECT r.day, r.route, r.lane, r.enqueue_source,
+                         code.key AS code,
+                         coalesce(sum(
+                           CASE WHEN code.value ~ '^[0-9]+$'
+                                THEN code.value::bigint ELSE 0 END
+                         ), 0)::bigint AS count
+                  FROM lane_daily_rollup r
+                  CROSS JOIN LATERAL jsonb_each_text(r.failure_codes) AS code
+                  WHERE r.day >= %s AND r.day <= %s
+                    AND r.route IN ('resident', 'model_api')
+                  GROUP BY r.day, r.route, r.lane, r.enqueue_source, code.key
+                ), codes AS (
+                  SELECT day, route, lane, enqueue_source,
+                         jsonb_object_agg(code, count) AS failure_codes
+                  FROM code_counts
+                  GROUP BY day, route, lane, enqueue_source
+                )
+                SELECT c.day, c.route, c.lane, c.enqueue_source,
+                       c.completed, c.failed, c.expired, c.superseded,
+                       coalesce(x.failure_codes, '{}'::jsonb)
+                FROM cells c
+                LEFT JOIN codes x USING (day, route, lane, enqueue_source)
+                ORDER BY c.day, c.route, c.lane, c.enqueue_source
+                """,
+                (earliest.isoformat(), end_day.isoformat(),
+                 earliest.isoformat(), end_day.isoformat()),
+            ).fetchall()
+            watermarks = {
+                str(row[0]): {
+                    "backfill_from": str(row[1]),
+                    "through_day": str(row[2]),
+                }
+                for row in conn.execute(
+                    "SELECT route, backfill_from, through_day "
+                    "FROM lane_rollup_watermark "
+                    "WHERE route IN ('resident', 'model_api')"
+                ).fetchall()
+            }
+    except Exception as exc:  # noqa: BLE001 - admin evidence degrades closed
+        level, message = _admin_event_read_failure(exc)
+        log.error("[db] admin_event_path_rollup_windows failed: %s", exc)
+        return {
+            "timezone": tz,
+            "closed_through_day": end_day.isoformat(),
+            "read_status": {"level": level, "message": message},
+            "windows": [
+                {
+                    "key": key,
+                    "start_day": (end_day - timedelta(days=days - 1)).isoformat(),
+                    "end_day": end_day.isoformat(),
+                    "day_count": days,
+                    "routes": {
+                        route: {
+                            "coverage": {
+                                "level": level, "message": message,
+                                "covered_days": 0, "required_days": days,
+                                "backfill_from": None, "through_day": None,
+                            },
+                            "lanes": {}, "lane_sources": {},
+                        }
+                        for route in ("resident", "model_api")
+                    },
+                }
+                for key, days in specs
+            ],
+        }
+
+    by_day: dict[tuple[str, str, str, str], dict] = {}
+    for row in rows:
+        by_day[(str(row[0]), str(row[1]), str(row[2]), str(row[3] or ""))] = {
+            "completed": int(row[4] or 0),
+            "failed": int(row[5] or 0),
+            "expired": int(row[6] or 0),
+            "superseded": int(row[7] or 0),
+            "failure_codes": {
+                str(code): int(count or 0)
+                for code, count in dict(row[8] or {}).items()
+            },
+        }
+
+    windows: list[dict] = []
+    for key, day_count in specs:
+        start_day = end_day - timedelta(days=day_count - 1)
+        routes: dict[str, dict] = {}
+        for route in ("resident", "model_api"):
+            wm = watermarks.get(route)
+            covered_days = 0
+            if wm:
+                covered_start = max(start_day,
+                                    date.fromisoformat(wm["backfill_from"]))
+                covered_end = min(end_day,
+                                  date.fromisoformat(wm["through_day"]))
+                if covered_end >= covered_start:
+                    covered_days = (covered_end - covered_start).days + 1
+            coverage_level = (
+                "green" if covered_days == day_count
+                else "yellow" if covered_days
+                else "red"
+            )
+
+            lanes: dict[str, dict] = {}
+            lane_sources: dict[str, dict[str, dict]] = {}
+            for (raw_day, raw_route, lane, enqueue_source), counts in by_day.items():
+                if raw_route != route or not start_day.isoformat() <= raw_day <= end_day.isoformat():
+                    continue
+                bucket = lanes.setdefault(
+                    lane,
+                    {"completed": 0, "failed": 0,
+                     "expired": 0, "superseded": 0,
+                     "failure_codes": {}},
+                )
+                for field in ("completed", "failed", "expired", "superseded"):
+                    bucket[field] += counts[field]
+                for code, count in counts["failure_codes"].items():
+                    bucket["failure_codes"][code] = (
+                        bucket["failure_codes"].get(code, 0) + count
+                    )
+                source_bucket = lane_sources.setdefault(lane, {}).setdefault(
+                    enqueue_source,
+                    {"completed": 0, "failed": 0,
+                     "expired": 0, "superseded": 0,
+                     "failure_codes": {}},
+                )
+                for field in ("completed", "failed", "expired", "superseded"):
+                    source_bucket[field] += counts[field]
+                for code, count in counts["failure_codes"].items():
+                    source_bucket["failure_codes"][code] = (
+                        source_bucket["failure_codes"].get(code, 0) + count
+                    )
+            routes[route] = {
+                "coverage": {
+                    "level": coverage_level,
+                    "covered_days": covered_days,
+                    "required_days": day_count,
+                    "backfill_from": wm["backfill_from"] if wm else None,
+                    "through_day": wm["through_day"] if wm else None,
+                },
+                "lanes": lanes,
+                "lane_sources": lane_sources,
+            }
+        windows.append({
+            "key": key,
+            "start_day": start_day.isoformat(),
+            "end_day": end_day.isoformat(),
+            "day_count": day_count,
+            "routes": routes,
+        })
+    return {
+        "timezone": tz,
+        "closed_through_day": end_day.isoformat(),
+        "windows": windows,
+    }
+
+
+def admin_history_import_job_rolling_windows() -> dict:
+    """Count every terminal history-import job in live rolling windows.
+
+    This is intentionally *not* the frozen path table above.  History import
+    blobs have no event-time access-mode snapshot and no physical daily
+    freezer.  The admin page therefore renders this result in a separate block
+    whose title and red coverage marker declare that lower evidence quality.
+
+    Every blob is one attempt and every attempt is counted.  Do not replace
+    this with the per-user ``DISTINCT ON`` query used by the user-detail page:
+    a failed attempt followed by a successful retry must remain two attempts.
+    """
+    calculated_at = datetime.now(timezone.utc)
+    oldest = calculated_at - timedelta(days=7)
+    terminal_expr = (
+        "CASE WHEN doc->>'status' = 'completed' THEN doc->>'completed_at' "
+        "WHEN doc->>'status' = 'failed' THEN doc->>'failed_at' END"
+    )
+    try:
+        with get_pool().connection(
+                timeout=_ADMIN_EVENT_READ_TIMEOUT_MS / 1000) as conn:
+            conn.execute(
+                "SELECT set_config('statement_timeout', %s, true)",
+                (f"{_ADMIN_EVENT_READ_TIMEOUT_MS}ms",),
+            )
+            rows = conn.execute(
+                f"""
+                SELECT doc->>'status', ({terminal_expr})::timestamptz
+                FROM user_blobs
+                WHERE kind LIKE 'history_import_job:%%'
+                  AND doc->>'status' IN ('completed', 'failed')
+                  AND ({terminal_expr}) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'
+                  AND ({terminal_expr})::timestamptz > %s
+                  AND ({terminal_expr})::timestamptz <= %s
+                """,
+                (oldest, calculated_at),
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001 - admin evidence degrades closed
+        level, message = _admin_event_read_failure(exc)
+        log.error("[db] admin_history_import_job_rolling_windows failed: %s", exc)
+        return {
+            "calculated_at": calculated_at.isoformat(),
+            "coverage": level,
+            "reason": f"{message}；无路径快照、未物理冻结；T247 补",
+            "windows": [],
+        }
+
+    windows = []
+    for key, days in (("rolling_1d", 1), ("rolling_7d", 7)):
+        start = calculated_at - timedelta(days=days)
+        selected = [(str(status), terminal_at) for status, terminal_at in rows
+                    if terminal_at is not None and terminal_at > start]
+        completed = sum(status == "completed" for status, _ in selected)
+        failed = sum(status == "failed" for status, _ in selected)
+        windows.append({
+            "key": key,
+            "label": f"过去 {days} 个滚动日",
+            "start_at": start.isoformat(),
+            "end_at": calculated_at.isoformat(),
+            "completed": completed,
+            "failed": failed,
+            "denominator": completed + failed,
+            "denominator_rule": "全部 terminal history import job（completed + failed）",
+        })
+    return {
+        "calculated_at": calculated_at.isoformat(),
+        "coverage": "red",
+        "reason": "无路径快照、未物理冻结；T247 补",
+        "windows": windows,
+    }
+
+
 def admin_v2_heartbeat_daily(*, since_epoch: float = 0.0, days: int = 30,
                              tz: str = "Asia/Shanghai") -> dict[str, dict]:
     """Runtime V2 心跳日聚合:{day: {jobs, completed, failed, expired}}。
@@ -6030,7 +6320,12 @@ def admin_events_overview(*, day: str = "", tz: str = "Asia/Shanghai") -> dict:
 
     def _run(key, sql):
         try:
-            with get_pool().connection() as conn:
+            with get_pool().connection(
+                    timeout=_ADMIN_EVENT_READ_TIMEOUT_MS / 1000) as conn:
+                conn.execute(
+                    "SELECT set_config('statement_timeout', %s, true)",
+                    (f"{_ADMIN_EVENT_READ_TIMEOUT_MS}ms",),
+                )
                 rows = conn.execute(sql).fetchall()
             return rows
         except Exception as e:  # noqa: BLE001

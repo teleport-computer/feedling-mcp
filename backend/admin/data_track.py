@@ -9506,6 +9506,268 @@ _EVENT_CATEGORIES = [
     ("other", "其他"),
 ]
 
+# T244's comparison table is intentionally independent from the older
+# VPS/API day drill below.  These are actions that can fail independently;
+# mappings exist only where the frozen source records that exact unit.  The
+# rollup's ``route`` is a runtime family, not an access mode: its V1 bucket
+# mixes Your Server users with hosted APIKey-V1 users.  A current access mode
+# join is not a lawful substitute for the missing event-time snapshot.
+_EVENT_MASTER_PATHS = (
+    ("resident", "resident"),
+    ("apikey_v1", "apikey_v1"),
+    ("apikey_v2", "apikey_v2"),
+)
+_EVENT_MASTER_ACTIONS = (
+    {"key": "onboarding_job", "label": "入驻蒸馏 · 整单",
+     "desc": "一次 history import job 的整体终态；身份卡/记忆/问候不是独立 attempt。"},
+    {"key": "onboarding_identity", "label": "入驻蒸馏 · 身份卡写入",
+     "desc": "当前 job 只保留最终汇总，无法把这一件 artifact 单独作为分母。"},
+    {"key": "onboarding_memory", "label": "入驻蒸馏 · 长期记忆写入",
+     "desc": "当前 job 只保留最终汇总，无法把这一件 artifact 单独作为分母。"},
+    {"key": "onboarding_history", "label": "入驻蒸馏 · 历史聊天落库",
+     "desc": "历史聊天当前仅作为蒸馏输入，不写入 chat_messages。", "na": True},
+    {"key": "onboarding_greeting", "label": "入驻蒸馏 · 首次问候写入",
+     "desc": "问候与整单共用一个终态，没有独立失败账本。"},
+    {"key": "redistill_identity", "label": "二次蒸馏 · 身份卡写入",
+     "desc": "终态会覆盖原 phase，当前不能定位到这一级。"},
+    {"key": "redistill_memory", "label": "二次蒸馏 · 长期记忆写入",
+     "desc": "终态会覆盖原 phase，当前不能定位到这一级。"},
+    {"key": "redistill_history", "label": "二次蒸馏 · 历史聊天落库",
+     "desc": "二次蒸馏不执行历史聊天落库。", "na": True},
+    {"key": "chat_job", "label": "正常聊天 · 整个回复任务",
+     "desc": "V2 以 chat job 终态计；resident 回复和 V1 没有同源冻结格。",
+     "runtime_metrics": {"runtime_v2": ("chat", None)}},
+    {"key": "model_call", "label": "正常聊天 · 单次模型调用",
+     "desc": "trace 有调用点不等于有可冻结的 attempt 分母。",
+     # Current source tree contains the V1 and T209 V2 callsites, but the
+     # coverage matrix has not promoted them beyond yellow live-fire status.
+     "runtime_probe": {"runtime_v1": "yellow", "runtime_v2": "yellow"}},
+    {"key": "capture", "label": "记忆整理 · Capture",
+     "desc": "一次 capture job 的终态。",
+     "runtime_metrics": {"runtime_v1": ("capture", None),
+                         "runtime_v2": ("capture", None)}},
+    {"key": "dream", "label": "记忆整理 · Dream",
+     "desc": "一次 dream job 的终态。",
+     "runtime_metrics": {"runtime_v1": ("dream", None),
+                         "runtime_v2": ("dream", None)}},
+    {"key": "migrate", "label": "记忆整理 · Migrate",
+     "desc": "resident 有独立 migrate 终态；V2 maintenance 不是同一动作。",
+     "runtime_metrics": {"runtime_v1": ("migrate", None)}},
+    {"key": "heartbeat", "label": "主动任务 · 时钟心跳",
+     "desc": "一次 heartbeat job 的终态；是否最终说话不是成功判据。",
+     "runtime_metrics": {"runtime_v1": ("heartbeat", None),
+                         "runtime_v2": ("heartbeat", "clock")}},
+    {"key": "event_wake", "label": "主动任务 · 事件唤醒",
+     "desc": "V2 可按 perception 来源分开；resident 的 trigger 混入定时来源。",
+     "runtime_metrics": {"runtime_v2": ("heartbeat", "perception")}},
+    {"key": "scheduled", "label": "主动任务 · 定时唤醒",
+     "desc": "V2 有独立 scheduled lane；resident 当前折进 trigger。",
+     "runtime_metrics": {"runtime_v2": ("scheduled", None)}},
+    {"key": "manual_wake", "label": "主动任务 · 手动唤醒",
+     "desc": "V2 有独立 manual_wake lane。",
+     "runtime_metrics": {"runtime_v2": ("manual_wake", None)}},
+    {"key": "screen", "label": "主动任务 · 屏幕观察",
+     "desc": "一次 screen/screen_watch job 的终态。",
+     "runtime_metrics": {"runtime_v1": ("screen", None),
+                         "runtime_v2": ("screen_watch", None)}},
+)
+
+
+def _event_path_master_payload(frozen: dict) -> dict:
+    """Build both the requested access-path table and a runtime-family aid.
+
+    Only Runtime V2 implies one access path (hosted API key).  Runtime V1 does
+    not: its frozen bucket mixes Your Server and hosted APIKey-V1 users, so the
+    two requested V1 access cells stay unavailable.  The raw V1 aggregate is
+    still useful and is exposed in a separate, differently shaped table where
+    nobody can mistake it for an access-path comparison.
+    """
+
+    def unavailable(*, coverage="red", detail=""):
+        return {
+            "state": "unavailable", "coverage": coverage,
+            "message": "当前记不到这一级", "detail": detail,
+        }
+
+    def metric_cell(raw_window: dict, runtime: str, mapping) -> dict:
+        source_route = "resident" if runtime == "runtime_v1" else "model_api"
+        route_data = (raw_window.get("routes") or {}).get(source_route, {})
+        coverage = route_data.get("coverage") or {}
+        level = str(coverage.get("level") or "red")
+        lane, enqueue_source = mapping
+        if enqueue_source is None:
+            counts = (route_data.get("lanes") or {}).get(lane, {})
+        else:
+            counts = (((route_data.get("lane_sources") or {}).get(lane) or {})
+                      .get(enqueue_source, {}))
+        if level in {"timeout", "read_error"}:
+            # The DB reader owns this wording together with the state.  Do not
+            # copy a fallback here: duplicated producer text can silently
+            # diverge while the fallback remains unreachable in normal data.
+            message = str(coverage["message"])
+            return {
+                "state": level, "coverage": level,
+                "message": message,
+                "detail": "下一步是修读取路径，不是补埋点",
+            }
+        if level != "green":
+            return {
+                "state": "coverage_gap", "coverage": level,
+                "message": "当前窗口不可计算",
+                "covered_days": int(coverage.get("covered_days") or 0),
+                "required_days": int(coverage.get("required_days") or 0),
+            }
+        completed = int(counts.get("completed") or 0)
+        failed = int(counts.get("failed") or 0)
+        expired = int(counts.get("expired") or 0)
+        superseded = int(counts.get("superseded") or 0)
+        failure_codes = {
+            str(code): int(count or 0)
+            for code, count in (counts.get("failure_codes") or {}).items()
+        }
+        if runtime == "runtime_v1":
+            # The V1 freezer deliberately reused one ``failed`` counter for
+            # status=failed AND status=skipped.  T197 classifies every skipped
+            # row as control, but ``failure_codes`` retained only its reason,
+            # not the status needed by _v1_proactive_outcome_class.  Subtracting
+            # only the V1 user-unavailable reasons would still turn unknown
+            # skipped controls into Feedling failures.  Do not print a rate
+            # that the frozen cell cannot reconstruct losslessly.
+            return unavailable(
+                detail=(
+                    "V1 冻结 failed 混合 failed 与 skipped，failure_codes 又不含原 status；"
+                    "按 T197 无法无损拆出 operational failure，不能叫失败率。"
+                    "这盖住托管 runtime 的多数用户：resident_cli 234 vs V2 32 "
+                    "（测于 2026-08-21/22；该端点现已超时，未复核）"
+                )
+            )
+
+        # V2 last_error has a producer-owned classifier.  T197 removes only
+        # explicit control and user-unavailable outcomes; unknown codes,
+        # expiries and timeouts remain Feedling operational failures.
+        from model_api_runtime.v2 import jobs_store as v2_jobs_store
+        control_outcomes = sum(
+            count for code, count in failure_codes.items()
+            if v2_jobs_store.terminal_outcome_class(code) == "control"
+        )
+        user_unavailable = sum(
+            count for code, count in failure_codes.items()
+            if v2_jobs_store.terminal_outcome_class(code) == "user_unavailable"
+        )
+        raw_non_success = failed + expired
+        failure = max(0, raw_non_success - control_outcomes - user_unavailable)
+        return {
+            "state": "metric", "coverage": "green",
+            "success": completed, "failure": failure,
+            "failed": failed, "expired": expired,
+            "superseded": superseded,
+            "raw_non_success": raw_non_success,
+            "control_outcomes": control_outcomes,
+            "user_unavailable": user_unavailable,
+            "denominator": completed + failure,
+            "denominator_rule": (
+                "completed + operational failure；control、明确用户侧不可用、"
+                "superseded 剔除；未知码/expired 仍算 operational failure"
+            ),
+        }
+
+    path_windows = []
+    runtime_windows = []
+    for raw_window in frozen.get("windows", []):
+        path_rows = []
+        runtime_rows = []
+        for action in _EVENT_MASTER_ACTIONS:
+            path_cells = {}
+            runtime_cells = {}
+            for path, _label in _EVENT_MASTER_PATHS:
+                if action.get("na"):
+                    path_cells[path] = {
+                        "state": "not_applicable", "coverage": "black",
+                        "message": "N/A（产品当前不执行）",
+                    }
+                    continue
+                # Only Runtime V2 identifies an access path by itself.
+                runtime_mapping = (action.get("runtime_metrics") or {}).get("runtime_v2")
+                runtime_probe = (action.get("runtime_probe") or {}).get("runtime_v2")
+                if path == "apikey_v2" and runtime_mapping:
+                    path_cells[path] = metric_cell(
+                        raw_window, "runtime_v2", runtime_mapping)
+                elif path == "apikey_v2" and runtime_probe:
+                    path_cells[path] = unavailable(
+                        coverage=runtime_probe,
+                        detail=(
+                            "有 V2 调用点，但尚无同源北京日冻结分母"
+                            if runtime_probe == "yellow"
+                            else "V2 在这一动作上零探针"
+                        ),
+                    )
+                elif path in {"resident", "apikey_v1"}:
+                    path_cells[path] = unavailable(
+                        detail=(
+                            "V1 冻结格混合 resident 与 APIKey-V1，"
+                            "没有事件发生时的 access_mode 快照"
+                        ),
+                    )
+                else:
+                    path_cells[path] = unavailable(
+                        detail="没有可用于该动作×路径的独立冻结探针")
+
+            for runtime in ("runtime_v1", "runtime_v2"):
+                if action.get("na"):
+                    runtime_cells[runtime] = {
+                        "state": "not_applicable", "coverage": "black",
+                        "message": "N/A（产品当前不执行）",
+                    }
+                    continue
+                mapping = (action.get("runtime_metrics") or {}).get(runtime)
+                probe_level = (action.get("runtime_probe") or {}).get(runtime)
+                if mapping:
+                    runtime_cells[runtime] = metric_cell(raw_window, runtime, mapping)
+                elif probe_level:
+                    runtime_cells[runtime] = unavailable(
+                        coverage=probe_level,
+                        detail=(
+                            "有调用点但尚无同源北京日冻结分母"
+                            if probe_level == "yellow"
+                            else "这一动作×runtime family 零探针"
+                        ),
+                    )
+                else:
+                    runtime_cells[runtime] = unavailable(
+                        detail="没有该动作×runtime family 的独立冻结探针")
+
+            base_row = {
+                "key": action["key"], "label": action["label"],
+                "description": action["desc"],
+            }
+            path_rows.append({**base_row, "cells": path_cells})
+            runtime_rows.append({**base_row, "cells": runtime_cells})
+        window_meta = {
+            "key": raw_window.get("key"),
+            "start_day": raw_window.get("start_day"),
+            "end_day": raw_window.get("end_day"),
+            "day_count": raw_window.get("day_count"),
+        }
+        path_windows.append({**window_meta, "rows": path_rows})
+        runtime_windows.append({**window_meta, "rows": runtime_rows})
+    return {
+        "timezone": frozen.get("timezone") or "Asia/Shanghai",
+        "closed_through_day": frozen.get("closed_through_day"),
+        "paths": [{"key": key, "label": label}
+                  for key, label in _EVENT_MASTER_PATHS],
+        "windows": path_windows,
+        "runtime_paths": [
+            {"key": "runtime_v1", "label": "V1 runtime（混合接入方式）"},
+            {"key": "runtime_v2", "label": "V2 runtime（APIKey）"},
+        ],
+        "runtime_windows": runtime_windows,
+        "access_gap": (
+            "V1 冻结格没有事件发生时的 access_mode；resident 与 APIKey-V1 "
+            "无法诚实拆开，不能用当前 access_mode 回填。"
+        ),
+        "self_deployed": "⬛ 结构性不可得，不在本表范围",
+    }
+
 # Plain-language: what each row actually is. Shown under every event label so the
 # page is self-explanatory (no tribal knowledge needed to read it).
 _EVENT_DESCRIPTIONS = {
@@ -9532,6 +9794,10 @@ def _data_track_events_payload() -> dict:
     raw_day = str(request.args.get("day") or "").strip()
     day = _validated_dau_day(raw_day) if raw_day else _events_today()
     raw = db.admin_events_overview(day=day)
+    frozen_master = _event_path_master_payload(
+        db.admin_event_path_rollup_windows(tz="Asia/Shanghai")
+    )
+    import_overall = db.admin_history_import_job_rolling_windows()
 
     def blank():
         return {"vps": _blank_evt_stat(), "api": _blank_evt_stat()}
@@ -9578,6 +9844,8 @@ def _data_track_events_payload() -> dict:
     return {
         "generated_at": datetime.now().isoformat(),
         "categories": [{"key": k, **cats[k]} for k, _ in _EVENT_CATEGORIES],
+        "event_path_master": frozen_master,
+        "history_import_overall": import_overall,
         "day": day,
         "note": "Onboarding 漏斗 + 回复延迟为下一阶段；本页先给 成功率/次数/中位耗时(job类)/兜底率，VPS·API 分列。按北京时区单日统计。",
     }
@@ -9637,6 +9905,161 @@ def _render_events_day_nav(day: str) -> str:
   </div>"""
 
 
+_EVENT_COVERAGE_MARK = {
+    "green": "🟢", "yellow": "🟡", "red": "🔴", "black": "⬛",
+    "timeout": "⏱️", "read_error": "⚠️",
+}
+
+
+def _render_event_master_cell(cell: dict, *, action: str, path: str,
+                              window: str) -> str:
+    level = str(cell.get("coverage") or "red")
+    mark = _EVENT_COVERAGE_MARK.get(level, "🔴")
+    scope = (f"动作={action} · 路径={path} · 窗口={window}")
+    state = str(cell.get("state") or "unavailable")
+    if state == "metric":
+        denominator = int(cell.get("denominator") or 0)
+        success = int(cell.get("success") or 0)
+        failure = int(cell.get("failure") or 0)
+        rule = str(cell.get("denominator_rule") or "")
+        if denominator:
+            success_rate = success / denominator * 100
+            failure_rate = failure / denominator * 100
+            headline = (
+                f"{mark} <b>{success_rate:.1f}% 成功</b> · "
+                f"<b>{failure_rate:.1f}% 失败</b>"
+            )
+        else:
+            headline = f"{mark} <b>0 次终态作业</b> · 成功/失败率 —"
+        controls = ""
+        if int(cell.get("superseded") or 0):
+            controls = f" · superseded {int(cell['superseded'])}（剔除）"
+        excluded = ""
+        if int(cell.get("user_unavailable") or 0):
+            excluded += (
+                f" · 用户侧不可用 {int(cell['user_unavailable'])}（剔除）"
+            )
+        if int(cell.get("control_outcomes") or 0):
+            excluded += f" · control {int(cell['control_outcomes'])}（剔除）"
+        detail = (
+            f"分母={denominator}（成功 {success} + 失败 {failure}；"
+            f"{rule}）{excluded}{controls}"
+        )
+        return (f"<td>{headline}<div class='evt-cell-scope'>"
+                f"{html.escape(scope)}<br>{html.escape(detail)}</div></td>")
+    if state == "coverage_gap":
+        covered = int(cell.get("covered_days") or 0)
+        required = int(cell.get("required_days") or 0)
+        message = str(cell.get("message") or "当前窗口不可计算")
+        detail = f"冻结覆盖 {covered}/{required} 个北京日；拒绝用残缺窗口算率"
+        return (f"<td>{mark} <b>{html.escape(message)}</b>"
+                f"<div class='evt-cell-scope'>{html.escape(scope)}<br>"
+                f"{html.escape(detail)}</div></td>")
+    message = str(cell.get("message") or "当前记不到这一级")
+    detail = str(cell.get("detail") or "")
+    return (f"<td>{mark} <b>{html.escape(message)}</b>"
+            f"<div class='evt-cell-scope'>{html.escape(scope)}"
+            f"{('<br>' + html.escape(detail)) if detail else ''}</div></td>")
+
+
+def _render_event_master_tables(master: dict) -> str:
+    def render_windows(*, windows, columns, title, note):
+        sections = []
+        for window in windows or []:
+            start = str(window.get("start_day") or "")
+            end = str(window.get("end_day") or "")
+            day_count = int(window.get("day_count") or 0)
+            window_label = (
+                f"最近 {day_count} 个已关闭北京日（{start} 至 {end}）"
+            )
+            heads = "".join(
+                f"<th>{html.escape(str(col.get('label') or col.get('key') or ''))}</th>"
+                for col in columns
+            )
+            rows = []
+            for row in window.get("rows") or []:
+                action = str(row.get("label") or "")
+                desc = str(row.get("description") or "")
+                cells = "".join(
+                    _render_event_master_cell(
+                        (row.get("cells") or {}).get(str(col.get("key")), {}),
+                        action=action,
+                        path=str(col.get("label") or col.get("key") or ""),
+                        window=window_label,
+                    )
+                    for col in columns
+                )
+                rows.append(
+                    f"<tr><td><b>{html.escape(action)}</b>"
+                    f"<div class='evt-desc'>{html.escape(desc)}</div></td>{cells}</tr>"
+                )
+            sections.append(
+                f"<h3>{html.escape(window_label)}</h3>"
+                f"<table class='evt-master'><thead><tr><th>可独立失败的动作</th>"
+                f"{heads}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
+            )
+        return (
+            f"<section class='evt-master-section'><h2>{html.escape(title)}</h2>"
+            f"<div class='note-box'>{html.escape(note)}</div>{''.join(sections)}</section>"
+        )
+
+    path_note = (
+        str(master.get("access_gap") or "") + " " +
+        str(master.get("self_deployed") or "") +
+        "。APIKey-V1 与 V2 的失败分母词表不同，不可把百分比直接当同一把尺。"
+    )
+    runtime_note = (
+        "这是 runtime family 辅助诊断，不是接入路径表。V1 runtime 同时包含 "
+        "resident 与托管 APIKey-V1；V2 runtime 对应 hosted APIKey-V2。"
+    )
+    return (
+        render_windows(
+            windows=master.get("windows"), columns=master.get("paths") or [],
+            title="事件 × 接入路径成功/失败率（北京日冻结）", note=path_note,
+        )
+        + render_windows(
+            windows=master.get("runtime_windows"),
+            columns=master.get("runtime_paths") or [],
+            title="Runtime family 辅助表（不可冒充接入路径）", note=runtime_note,
+        )
+    )
+
+
+def _render_history_import_overall(report: dict) -> str:
+    calculated_at = _bj_iso(report.get("calculated_at"))
+    level = str(report.get("coverage") or "red")
+    mark = _EVENT_COVERAGE_MARK.get(level, "🔴")
+    reason = str(report.get("reason") or
+                 "无路径快照、未物理冻结；T247 补")
+    rows = []
+    for window in report.get("windows") or []:
+        completed = int(window.get("completed") or 0)
+        failed = int(window.get("failed") or 0)
+        denominator = int(window.get("denominator") or 0)
+        if denominator:
+            success_rate = completed / denominator * 100
+            failure_rate = failed / denominator * 100
+            rates = f"{success_rate:.1f}% 成功 · {failure_rate:.1f}% 失败"
+        else:
+            rates = "0 次终态 job · 成功/失败率 —"
+        rows.append(
+            f"<tr><td>{html.escape(str(window.get('label') or '滚动窗口'))}</td>"
+            f"<td><b>{html.escape(rates)}</b><div class='evt-cell-scope'>"
+            f"分母={denominator} 个全部路径 terminal job（completed {completed} + "
+            f"failed {failed}）</div></td></tr>"
+        )
+    body = ("".join(rows) or
+            "<tr><td colspan='2' class='bad'>🔴 即时重算失败，当前不可用</td></tr>")
+    return f"""<section class='evt-master-section import-overall'>
+      <h2>全路径合计（滚动窗口 · 即时重算 · 未冻结）</h2>
+      <div class='note-box'><b>{mark} 覆盖：</b>{html.escape(reason)}。
+      计算时刻（北京）：<b>{html.escape(calculated_at)}</b>。这里的“全路径”仅含服务端可见的 resident/APIKey，
+      不含自部署；本块与三路径列不同构，禁止用于 V1/V2 比较。</div>
+      <table><thead><tr><th>滚动窗口</th><th>整单入驻蒸馏终态</th></tr></thead>
+      <tbody>{body}</tbody></table>
+    </section>"""
+
+
 def _render_events_page(payload: dict) -> str:
     cats = payload.get("categories", [])
 
@@ -9687,7 +10110,7 @@ def _render_events_page(payload: dict) -> str:
 <style>
   :root {{ color-scheme: light; --fg:#1b201d; --muted:#68706a; --line:#dddcd4; --bg:#f5f4ef; --card:#fcfbf8; --accent:#416b56; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }}
   body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
-  main {{ max-width:920px; margin:0 auto; padding:28px 24px 48px; }}
+  main {{ max-width:1380px; margin:0 auto; padding:28px 24px 48px; }}
   h1 {{ font-size:24px; margin:0 0 4px; }} h2 {{ font-size:15px; margin:24px 0 10px; }}
   .muted {{ color:var(--muted); }} .ok {{ color:var(--ok); }} .warn {{ color:var(--warn); }} .bad {{ color:var(--bad); }}
   .viewbar {{ display:flex; flex-wrap:wrap; gap:8px; margin:14px 0 18px; }}
@@ -9699,13 +10122,21 @@ def _render_events_page(payload: dict) -> str:
   th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; background:#f4ece5; }}
   tr:last-child td {{ border-bottom:0; }} b {{ font-size:15px; }}
   .evt-desc {{ font-size:12px; color:var(--muted); line-height:1.5; margin-top:3px; max-width:520px; font-weight:400; text-transform:none; letter-spacing:0; }}
+  .evt-cell-scope {{ font-size:11px; color:var(--muted); line-height:1.45; margin-top:5px; min-width:190px; }}
+  .evt-master-section {{ margin:28px 0 34px; }}
+  .evt-master-section h3 {{ font-size:14px; margin:18px 0 8px; }}
+  .evt-master {{ table-layout:fixed; }}
+  .evt-master th:first-child {{ width:19%; }}
   .note-box {{ background:#fff8ef; border:1px solid #e8d8be; border-radius:8px; padding:12px 14px; margin:14px 0; font-size:13px; line-height:1.65; color:#5a4d3c; }}
 {_NAV_GROUP_CSS}
 </style></head><body><main>
   <h1>事件健康度</h1>
-  <div class="muted">VPS=resident 自托管；API=model_api 托管。统计口径 = <b>{html.escape(str(payload.get('day') or ''))}</b> 当天（北京时间）。Generated {html.escape(_bj_iso(payload.get('generated_at')))}.</div>
+  <div class="muted">下方旧表按当前 onboarding route 折成 model_api / 非 model_api 两桶，仅供钻取。统计口径 = <b>{html.escape(str(payload.get('day') or ''))}</b> 当天（北京时间）。Generated {html.escape(_bj_iso(payload.get('generated_at')))}.</div>
   {_render_data_track_view_nav("events")}
   {_render_events_day_nav(str(payload.get('day') or ''))}
+  {_render_history_import_overall(payload.get('history_import_overall') or {})}
+  {_render_event_master_tables(payload.get('event_path_master') or {})}
+  <h2>旧版单日钻取（实时源，仅供定位）</h2>
   <div class="note-box">
     <b>每一格怎么读：</b>
     <b>成功率</b> = 完成 ÷（完成 + 失败）（回复类 = 真回复 ÷ 用户消息数，越高越健康）；

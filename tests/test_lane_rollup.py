@@ -771,6 +771,81 @@ def test_live_topup_declares_what_it_refuses_to_scan(clean_rollup):
     assert (today_bj - cutoff).days == db._LANE_ROLLUP_LIVE_MAX_DAYS - 1
 
 
+def test_event_path_windows_use_closed_days_and_declare_partial_coverage(
+        clean_rollup):
+    """24h/7d share one fixed Beijing endpoint; missing days are not zero."""
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO lane_daily_rollup
+              (user_id, day, route, lane, completed, failed, expired, superseded,
+               failure_codes)
+            VALUES
+              ('usr_event_master', '2030-06-01', 'resident', 'heartbeat', 3, 1, 0, 0,
+               '{"unknown":1}'::jsonb),
+              ('usr_event_master', '2030-06-07', 'resident', 'heartbeat', 5, 0, 0, 0,
+               '{}'::jsonb),
+              ('usr_event_master', '2030-06-07', 'model_api', 'chat', 6, 4, 0, 2,
+               '{"extraction_failed:quota_insufficient":1,
+                 "extraction_failed:upstream_unavailable":3}'::jsonb)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO lane_rollup_watermark (route, backfill_from, through_day)
+            VALUES
+              ('resident', '2030-06-01', '2030-06-07'),
+              ('model_api', '2030-06-06', '2030-06-07')
+            """
+        )
+
+    payload = db.admin_event_path_rollup_windows(through_day="2030-06-07")
+    windows = {row["key"]: row for row in payload["windows"]}
+
+    assert windows["24h"]["start_day"] == "2030-06-07"
+    assert windows["24h"]["end_day"] == "2030-06-07"
+    assert windows["7d"]["start_day"] == "2030-06-01"
+    assert windows["7d"]["end_day"] == "2030-06-07"
+    assert windows["24h"]["routes"]["model_api"]["coverage"]["level"] == "green"
+    assert windows["7d"]["routes"]["model_api"]["coverage"] == {
+        "level": "yellow",
+        "covered_days": 2,
+        "required_days": 7,
+        "backfill_from": "2030-06-06",
+        "through_day": "2030-06-07",
+    }
+    assert windows["7d"]["routes"]["resident"]["lanes"]["heartbeat"] == {
+        "completed": 8, "failed": 1, "expired": 0, "superseded": 0,
+        "failure_codes": {"unknown": 1},
+    }
+    assert windows["24h"]["routes"]["model_api"]["lanes"]["chat"] == {
+        "completed": 6, "failed": 4, "expired": 0, "superseded": 2,
+        "failure_codes": {
+            "extraction_failed:quota_insufficient": 1,
+            "extraction_failed:upstream_unavailable": 3,
+        },
+    }
+
+
+def test_event_path_windows_distinguish_covered_zero_from_no_source(clean_rollup):
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO lane_rollup_watermark (route, backfill_from, through_day) "
+            "VALUES ('resident', '2030-06-01', '2030-06-07')"
+        )
+
+    payload = db.admin_event_path_rollup_windows(through_day="2030-06-07")
+    one_day = next(row for row in payload["windows"] if row["key"] == "24h")
+    assert one_day["routes"]["resident"]["coverage"]["level"] == "green"
+    assert one_day["routes"]["resident"]["lanes"] == {}
+    assert one_day["routes"]["model_api"]["coverage"]["level"] == "red"
+
+
+def test_event_path_windows_reject_invalid_day(clean_rollup):
+    with pytest.raises(ValueError):
+        db.admin_event_path_rollup_windows(through_day="2030/06/07")
+
+
 def test_resident_rollup_agrees_with_the_events_page(clean_rollup):
     """Cross-check against the surface these numbers must not contradict.
 

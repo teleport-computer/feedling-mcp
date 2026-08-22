@@ -100,6 +100,10 @@ def events_payload(query_string: str) -> dict:
         )
         return {
             "filters": {"day": day, "timezone": "Asia/Shanghai"},
+            "event_path_master": data_track._event_path_master_payload(
+                db.admin_event_path_rollup_windows(tz="Asia/Shanghai")
+            ),
+            "history_import_overall": db.admin_history_import_job_rolling_windows(),
             **db.admin_events_overview(day=day, tz="Asia/Shanghai"),
         }
 
