@@ -24,7 +24,7 @@ _KERNEL_ROOT = _BACKEND_ROOT / "memory_garden"
 # 与「记忆」无关 —— 聊天主链路、工具循环、主动唤醒都在用。把它单独成包是因为
 # 第一版把它塞进了 memory_garden，导致**普通聊天反向依赖记忆包**
 # （codex review 2026-08-14 指出）。它自己同样不 import 任何 io 模块。
-_ALLOWED_THIRD_PARTY: frozenset[str] = frozenset({"core"})
+_ALLOWED_THIRD_PARTY: frozenset[str] = frozenset({"agent_protocol_core"})
 
 
 def _backend_top_level_names() -> frozenset[str]:
@@ -37,7 +37,7 @@ def _backend_top_level_names() -> frozenset[str]:
     """
     names: set[str] = set()
     # 这两个包本身就是「非 io」的纯包，不算在禁止集合里。
-    _NOT_IO = {"memory_garden", "core"}
+    _NOT_IO = {"memory_garden", "agent_protocol_core"}
     for entry in _BACKEND_ROOT.iterdir():
         if entry.name.startswith((".", "_")) or entry.name in _NOT_IO:
             continue
@@ -132,15 +132,18 @@ def test_kernel_modules_import_without_side_effects():
 # core 同样必须是纯的
 # --------------------------------------------------------------------------- #
 
-# 内核与聊天主链路**共用**的那两个协议模块。它们住在 io 的 `core/` 包里
-# （主线的既定落点），但 core 整体不是纯包，所以只能点名守这两个文件，
-# 不能对整个 core/ 断言纯度。
+# 内核与聊天主链路**共用**的那两个协议模块。
+#
+# 2026-08-22 从 `core/` 搬进独立的 `agent_protocol_core/`：`core/` 整体不是纯包
+# （信封、enclave、限流、store 都在里面），而这两个模块要跟内核一起发布出去。
+# 包名与独立发布时一致，所以内核代码两边写法相同，不用维护 import 分叉。
+# 这个包整体就该是纯的，所以下面直接对整包断言，不再点名守文件。
 #
 # 2026-08-15：这两个模块曾被短暂放进 memory_garden，Codex 指出那会让
 # **普通聊天反向依赖记忆包**；同期主线独立把它们放进了 core/。两边结论一致，
 # 按主线走。这里守的就是"放对了地方之后不许再漂回去"。
 _PROTOCOL_MODULES = ("self_thinking.py", "protocol_leak.py")
-_PROTOCOL_ROOT = _BACKEND_ROOT / "core"
+_PROTOCOL_ROOT = _BACKEND_ROOT / "agent_protocol_core"
 
 
 def _protocol_files() -> list[pathlib.Path]:

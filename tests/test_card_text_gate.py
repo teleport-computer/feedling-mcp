@@ -20,14 +20,23 @@ from memory.capture_prompt_v1 import (  # noqa: E402
     parse_capture_cards,
 )
 from memory_garden.text.card_text import (  # noqa: E402
-    card_text_rejection,
+    card_text_rejection as _kernel_card_text_rejection,
     format_error,
     is_card_format_error,
     is_retryable_parse_error,
     placeholder_reason,
-    sanitize_card_labels,
+    sanitize_card_labels as _kernel_sanitize_card_labels,
     substantive_len,
 )
+from functools import partial  # noqa: E402
+
+from memory.card_leak_signals import IO_LEAK_SIGNALS  # noqa: E402
+
+# 这个文件测的是 **io 的**闸，所以两个入口都绑上 io 自己的识别器。
+# 在 import 这层绑一次，而不是给 21 个调用点各加一个参数 —— 后者漏一处就是
+# 悄悄测了通用集，而通用集本来就拦不住 io 的残片，测了等于没测。
+card_text_rejection = partial(_kernel_card_text_rejection, signals=IO_LEAK_SIGNALS)
+sanitize_card_labels = partial(_kernel_sanitize_card_labels, signals=IO_LEAK_SIGNALS)
 from memory.dream_prompt_v1 import (  # noqa: E402
     build_dream_prompt,
     build_dream_retry_prompt,

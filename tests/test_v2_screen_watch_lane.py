@@ -36,7 +36,7 @@ import pytest
 import conftest
 import db
 import provider_client
-from core import self_thinking
+from agent_protocol_core import self_thinking
 from core import store as core_store
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store

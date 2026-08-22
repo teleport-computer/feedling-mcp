@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 from ..text import card_guard
+from ..text.leak_signals import GENERIC_SIGNALS, LeakSignals
 from ..text.card_text import extract_json_block, sanitize_card_labels
 from .buckets import COMMON_BUCKETS_GUIDANCE_V1
 
@@ -86,6 +87,7 @@ def parse_migrated_cards(
     raw: str,
     *,
     allowed_ids: set[str] | None = None,
+    signals: LeakSignals = GENERIC_SIGNALS,
 ) -> tuple[list[dict], list[str], str | None]:
     """Parse the migration agent reply.
 
@@ -138,14 +140,15 @@ def parse_migrated_cards(
         # 模型原始输出/协议残片:硬字段脏 → 跳过(计入 unmigrated,下轮重试);桶脏 → 清空
         # (走下游的空桶默认);threads 逐项滤脏。此路径提前封信封、绕过 actions 层,故在此接。
         if _guard_on and (
-            card_guard.field_pollution_reason(summary) or card_guard.field_pollution_reason(content)
+            card_guard.field_pollution_reason(summary, signals)
+            or card_guard.field_pollution_reason(content, signals)
         ):
             continue
         threads_raw = row.get("threads")
         threads = [str(t).strip()[:80] for t in threads_raw if str(t).strip()][:8] if isinstance(threads_raw, list) else []
         bucket, threads, label_reasons = sanitize_card_labels(
             bucket=str(row.get("bucket") or "").strip()[:80], threads=threads, guard=_guard_on,
-            lang_text=f"{summary}\n{content}",
+            lang_text=f"{summary}\n{content}", signals=signals,
         )
         if "bucket_protocol_leak" in label_reasons:
             # migrate 走 prebuilt-envelope upgrade、不过 _memory_inner_from_action,空桶不会被下游

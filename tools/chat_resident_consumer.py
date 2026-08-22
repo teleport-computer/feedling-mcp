@@ -154,7 +154,7 @@ import generated_image
 
 # Shared torn-protocol-JSON leak detector (backend/core, pure). backend/ is on
 # sys.path via the insert above, so it imports as a top-level `core.*` name.
-from core import protocol_leak as _protocol_leak
+from agent_protocol_core import protocol_leak as _protocol_leak
 from core import envelope as _core_envelope
 from identity import card_view as _identity_card_view
 # 世界书注入侧的标头/上限/截断标记与 V2 共用同一份定义(纯模块,无 enclave 依赖)。
@@ -202,6 +202,7 @@ from voice.message_filter import (
     conversation_rows as _conversation_rows,
 )
 from voice import transcript_store as _voice_transcript_store
+from memory.card_leak_signals import IO_LEAK_SIGNALS
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -4143,13 +4144,13 @@ def _split_tagged_thinking(text: str) -> tuple[str, str]:
     plain terminal text where an upstream wrapper serialized reasoning as
     `<think>...</think>`, `<reasoning>...</reasoning>`, or `<thought>...</thought>`.
 
-    2026-08-08 起委托 ``core.self_thinking`` 的共享内核：此前 V1/V2 各一套判据、
+    2026-08-08 起委托 ``agent_protocol_core.self_thinking`` 的共享内核：此前 V1/V2 各一套判据、
     各漏各的——这条正则要求开闭成对，一个孤立的 `</think>`（开标签在上游被吃掉）
     配不上对，于是整段思考原样进了用户气泡（prod 实例）。闸关掉时保留下面的
     原正则行为，逐字节不变。
     """
     raw = str(text or "")
-    from core import self_thinking as _st
+    from agent_protocol_core import self_thinking as _st
 
     if _st.gate_enabled():
         # sanitize=False：本次统一的是剥离**判据**，V1 的展示格式（保留换行、
@@ -4678,10 +4679,10 @@ def _sanitize_thinking_summary(text: str) -> str:
     text = text.replace("\r\n", "\n").strip()
     if not text:
         return ""
-    # 词表来自共享内核(core.self_thinking.INTERNAL_FIELD_TERMS)。
+    # 词表来自共享内核(agent_protocol_core.self_thinking.INTERNAL_FIELD_TERMS)。
     # V1 的**处置**不变:仍逐行丢弃、仍用宽匹配 —— 只是不再自己维护一份字面量,
     # 「两代词表漂移」由构造消除,不必靠测试去追源码(codex2 review 2026-08-17)。
-    from core import self_thinking as _st_terms
+    from agent_protocol_core import self_thinking as _st_terms
 
     blocked = re.compile(_st_terms.internal_field_terms_pattern(), re.IGNORECASE)
     kept: list[str] = []
@@ -4784,7 +4785,7 @@ def _prefer_thinking(dst: AgentTurn, src: AgentTurn) -> None:
     if not dst.thinking_summary:
         take = True
     else:
-        from core import self_thinking as _self_thinking_v1
+        from agent_protocol_core import self_thinking as _self_thinking_v1
 
         if _self_thinking_v1.enabled():
             take = src.thinking_self_authored and not dst.thinking_self_authored
@@ -10972,7 +10973,7 @@ def _wake_self_thinking_allowed() -> bool:
     唯一堵住它的是模板那句 "Return JSON exactly in this shape",于是 App 里
     主动消息的思考链**永远是空的**。这里放开的就是这一句。
     """
-    from core import self_thinking as _self_thinking_v1
+    from agent_protocol_core import self_thinking as _self_thinking_v1
 
     return bool(_self_thinking_v1.enabled()) and _supports_mandatory_self_thinking_v1()
 
@@ -17357,7 +17358,9 @@ def _process_migrate_jobs(jobs: list) -> float:
                 extra={"migrate_result": {"status": "failed", "reason": reason}},
             )
             continue
-        upgrades, unmigrated_ids, err = parse_migrated_cards(reply_text, allowed_ids=allowed_ids)
+        upgrades, unmigrated_ids, err = parse_migrated_cards(
+            reply_text, allowed_ids=allowed_ids, signals=IO_LEAK_SIGNALS
+        )
         if err:
             update_proactive_job_status(
                 job_id, "failed", err,
@@ -18033,7 +18036,7 @@ def _process_messages(messages: list) -> float:
         # last message" framing) and the transcript header added below stays
         # topmost. The consumer's existing tagged-thinking extraction peels the
         # <think> block into thinking_summary. Same kill switch as V2.
-        from core import self_thinking as _self_thinking_v1
+        from agent_protocol_core import self_thinking as _self_thinking_v1
 
         if (
             _self_thinking_v1.enabled()

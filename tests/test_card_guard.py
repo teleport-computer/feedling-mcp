@@ -20,11 +20,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from memory_garden.text.card_guard import (  # noqa: E402
-    bucket_pollution_reason,
+    bucket_pollution_reason as _kernel_bucket_pollution_reason,
     default_bucket_for_text,
-    field_pollution_reason,
-    hard_field_pollution_reason,
+    field_pollution_reason as _kernel_field_pollution_reason,
+    hard_field_pollution_reason as _kernel_hard_field_pollution_reason,
 )
+from functools import partial  # noqa: E402
+
+from memory.card_leak_signals import IO_LEAK_SIGNALS  # noqa: E402
+
+# 这个文件测的是 **io 的**闸。在 import 层绑一次识别器，而不是逐个调用点加参数 ——
+# 漏一处就是悄悄在测通用集，而通用集本来就拦不住 io 的残片。
+bucket_pollution_reason = partial(_kernel_bucket_pollution_reason, signals=IO_LEAK_SIGNALS)
+field_pollution_reason = partial(_kernel_field_pollution_reason, signals=IO_LEAK_SIGNALS)
+hard_field_pollution_reason = partial(_kernel_hard_field_pollution_reason, signals=IO_LEAK_SIGNALS)
 
 # --- 现场原样 --------------------------------------------------------------
 

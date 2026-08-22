@@ -14,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from memory import actions  # noqa: E402
+from memory.card_leak_signals import IO_LEAK_SIGNALS  # noqa: E402
 
 
 # --- 纯函数:桶降级 --------------------------------------------------------
@@ -125,10 +126,11 @@ def test_inner_default_bucket_english_description_only():
 
 def test_migrate_polluted_bucket_gets_localized_default():
     from memory_garden.prompts.migrate import parse_migrated_cards
-    upgrades, _unmigrated, err = parse_migrated_cards(
+    upgrades, _unmigrated, err = parse_migrated_cards(  # io 的闸，用 io 的识别器
         '{"upgrades": [{"id": "m1", "summary": "用户喜欢普洱茶",'
         ' "content": "上次视频里提到", "bucket": "long_term_preference_or_event_v1"}]}',
         allowed_ids={"m1"},
+        signals=IO_LEAK_SIGNALS,
     )
     assert err is None
     assert len(upgrades) == 1

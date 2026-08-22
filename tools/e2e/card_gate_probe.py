@@ -28,6 +28,7 @@ from tools.e2e.probe_common import mem_fetch, mem_index, new_marker  # noqa: E40
 # card_text 的判据要在断言里复用 —— 探针和线上必须是同一把尺子。
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "backend"))
 from memory_garden.text.card_text import card_text_rejection  # noqa: E402
+from memory.card_leak_signals import IO_LEAK_SIGNALS
 
 CAPTURE_POLL_SEC = 300.0
 POLL_EVERY_SEC = 15.0
@@ -124,7 +125,7 @@ def main() -> int:
                 summary = summary or str(fetched[0].get("summary") or "")
                 content = content or str(fetched[0].get("content") or "")
 
-        rejection = card_text_rejection(summary=summary, content=content)
+        rejection = card_text_rejection(summary=summary, content=content, signals=IO_LEAK_SIGNALS)
         check("landed card passes the very gate that guards writes",
               rejection is None, rejection or "?", pass_detail="clean")
         check("summary is a real sentence, not a placeholder",

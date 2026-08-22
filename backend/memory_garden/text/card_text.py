@@ -20,7 +20,8 @@ import re
 import unicodedata
 
 from . import card_guard
-from core import self_thinking
+from .leak_signals import GENERIC_SIGNALS, LeakSignals
+from agent_protocol_core import self_thinking
 from ..prompts.buckets import normalize_bucket_language
 
 # 卡上会被用户亲眼看到的文字字段(bucket/threads 也显示在花园里)。
@@ -155,7 +156,8 @@ def placeholder_reason(text: str) -> str | None:
     return None
 
 
-def card_text_rejection(*, summary: str, content: str, guard: bool = True) -> str | None:
+def card_text_rejection(*, summary: str, content: str, guard: bool = True,
+                        signals: LeakSignals = GENERIC_SIGNALS) -> str | None:
     """硬字段体检。返回 ``None``=可以落库,否则 ``"<字段>_<原因>"``。
 
     与旧判据的差别:旧的是「两个都空才拦」,现在是**两个都必须是真内容**。
@@ -173,9 +175,9 @@ def card_text_rejection(*, summary: str, content: str, guard: bool = True) -> st
         return f"content_{reason}"
     if guard:
         # 硬字段用从严判据(强证据 / ≥2弱共现)—— 误杀=整卡丢弃,代价高。
-        if card_guard.hard_field_pollution_reason(summary):
+        if card_guard.hard_field_pollution_reason(summary, signals):
             return "summary_protocol_leak"
-        if card_guard.hard_field_pollution_reason(content):
+        if card_guard.hard_field_pollution_reason(content, signals):
             return "content_protocol_leak"
     if substantive_len(summary) < MIN_SUMMARY_CHARS:
         return "summary_too_short"
@@ -185,7 +187,8 @@ def card_text_rejection(*, summary: str, content: str, guard: bool = True) -> st
 
 
 def sanitize_card_labels(
-    *, bucket: str, threads: list[str], guard: bool = True, lang_text: str = ""
+    *, bucket: str, threads: list[str], guard: bool = True, lang_text: str = "",
+    signals: LeakSignals = GENERIC_SIGNALS,
 ) -> tuple[str, list[str], list[str]]:
     """清洗软字段。返回 ``(bucket, threads, reasons)``,``reasons`` 供调用方观测。
 
@@ -208,7 +211,7 @@ def sanitize_card_labels(
         clean_bucket = ""
     # 软字段的「模型原始输出泄漏」:桶另查精确 taxonomy denylist,命中即丢(降级到默认桶
     # 由调用层做);threads 逐项丢脏项、留干净项。硬字段(summary/content)才整卡打回。
-    elif guard and clean_bucket and card_guard.bucket_pollution_reason(clean_bucket):
+    elif guard and clean_bucket and card_guard.bucket_pollution_reason(clean_bucket, signals):
         reasons.append("bucket_protocol_leak")
         clean_bucket = ""
     # Q3:干净桶按卡片语言归一(COMMON 桶换语言;自定义桶不动)。
@@ -223,7 +226,7 @@ def sanitize_card_labels(
         if reason:
             reasons.append(f"threads_{reason}")
             continue
-        if guard and card_guard.field_pollution_reason(text):
+        if guard and card_guard.field_pollution_reason(text, signals):
             reasons.append("threads_protocol_leak")
             continue
         clean_threads.append(text)

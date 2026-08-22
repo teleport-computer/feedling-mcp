@@ -23,8 +23,8 @@ from __future__ import annotations
 import os
 import re
 
-from core import protocol_leak
 from ..prompts.buckets import _text_is_chinese
+from .leak_signals import GENERIC_SIGNALS, LeakSignals
 
 
 def guard_enabled() -> bool:
@@ -37,44 +37,23 @@ def guard_enabled() -> bool:
         "0", "false", "off", "no",
     )
 
-# harmony 特殊 token(强证据):``<|channel|>`` / ``<|message|>`` / ``<|start|>`` 等。
-_HARMONY_SPECIAL_RE = re.compile(r"<\|(?:channel|message|start|end|constrain|return)\|>")
-# 通道前缀 + tool-route(强证据):analysis/commentary/final 通道词紧邻 ``to=functions.<name>``。
-# 这正是本次事故串的形态,也是「模型把内部通道文本漏成字段值」的高置信指纹。
-_CHANNEL_ROUTE_RE = re.compile(r"\b(?:analysis|commentary|final)\b[^\n]{0,40}?\bto=functions\.\w+")
-# 裸 tool-route(弱证据):单独一个 ``to=functions.x`` —— 正常 prose 也可能字面提到它。
-_BARE_ROUTE_RE = re.compile(r"\bto=functions\.\w+")
-# provider 报错回显(弱证据):``output error code: NNN``。
-_PROVIDER_ERROR_RE = re.compile(r"output error code:\s*\d{3}", re.IGNORECASE)
-
-# 已知机器 taxonomy 残片(精确匹配)。形状无法区分合法自定义桶,故只精确列举。
-_BUCKET_DENYLIST = frozenset({
-    "long_term_preference_or_event_v1",
-})
+#: 判据强弱怎么权衡留在内核（见 leak_signals 的说明）；**识别器由宿主提供**。
+#: io 那套（harmony token / to=functions.x / 报错回显 / 自家协议键名 / 桶 denylist）
+#: 已搬到 ``memory/card_leak_signals.py`` —— 它们照着 io 的线格式调，对别的宿主无效。
 
 
-def _strong_signal(t: str) -> bool:
-    """强证据:harmony 特殊 token,或通道前缀紧邻 tool-route。正常内容几乎不可能出现。"""
-    return bool(_HARMONY_SPECIAL_RE.search(t) or _CHANNEL_ROUTE_RE.search(t))
+def _strong_signal(t: str, signals: LeakSignals) -> str | None:
+    """强证据:命中即判脏。具体指纹由宿主给,内核不认任何协议格式。"""
+    return signals.strong_reason(t)
 
 
-def _weak_signal_count(t: str) -> int:
-    """弱证据个数。**单独一个弱证据不足以判硬字段脏** —— 用户贴 JSON / 讨论 400 /
-    字面提到 ``to=functions.x`` 都会命中单个弱证据(codex code_review:``ORPHAN_JSON_TAIL``
-    自身就被 protocol_leak 标注为「无法和用户贴 JSON 区分」的弱信号)。"""
-    n = 0
-    if _BARE_ROUTE_RE.search(t):
-        n += 1
-    if protocol_leak.looks_like_protocol_head(t):
-        n += 1
-    if protocol_leak.is_orphan_json_tail(t):
-        n += 1
-    if _PROVIDER_ERROR_RE.search(t):
-        n += 1
-    return n
+def _weak_signal_count(t: str, signals: LeakSignals) -> int:
+    """弱证据个数。**单独一个弱证据不足以判硬字段脏** —— 用户贴 JSON、正当讨论一个
+    400、字面提到一个工具名，都会命中单个弱证据。这条权衡是内核的，识别器是宿主的。"""
+    return len(signals.weak_reasons(t))
 
 
-def hard_field_pollution_reason(text) -> str | None:
+def hard_field_pollution_reason(text, signals: LeakSignals = GENERIC_SIGNALS) -> str | None:
     """**硬字段(summary/content)**判据 —— 误杀代价高(整卡丢弃 / 400),故从严:
     只在**强证据**、或**≥2 个弱证据共现**时判脏。本次事故串含通道前缀+route(强),仍被抓。
 
@@ -84,42 +63,41 @@ def hard_field_pollution_reason(text) -> str | None:
     t = str(text or "")
     if not t.strip():
         return None
-    if _strong_signal(t):
-        return "harmony_marker"
-    if _weak_signal_count(t) >= 2:
+    strong = _strong_signal(t, signals)
+    if strong:
+        return strong
+    if _weak_signal_count(t, signals) >= 2:
         return "multi_weak_leak"
     return None
 
 
-def field_pollution_reason(text) -> str | None:
+def field_pollution_reason(text, signals: LeakSignals = GENERIC_SIGNALS) -> str | None:
     """**软字段(bucket/threads)**判据 —— 都是短标签,误杀=就地清洗/丢弃、代价低,故从宽:
     强证据或**任一弱证据**即判脏。正常短标签(``工作`` / ``user_onboarding``)不会命中弱证据。
     """
     t = str(text or "")
     if not t.strip():
         return None
-    if _strong_signal(t):
-        return "harmony_marker"
-    if _BARE_ROUTE_RE.search(t):
-        return "bare_tool_route"
-    if protocol_leak.looks_like_protocol_head(t):
-        return "protocol_head"
-    if protocol_leak.is_orphan_json_tail(t):
-        return "torn_json_tail"
+    strong = _strong_signal(t, signals)
+    if strong:
+        return strong
+    weak = signals.weak_reasons(t)
+    if weak:
+        return weak[0]
     # 注:报错回显不在软字段单独判脏 —— 到这里真正的 to=functions / 撕裂尾巴已被上面返回,
     # 剩下的 "output error code" + 松散 "to=" 子串(redirect_to=/邮箱)几乎全是假阳性
     # (codex code_review)。报错回显只在 _weak_signal_count 里作为「需第二个弱证据」的一票。
     return None
 
 
-def bucket_pollution_reason(text) -> str | None:
+def bucket_pollution_reason(text, signals: LeakSignals = GENERIC_SIGNALS) -> str | None:
     """桶专用:软字段级泄漏 + 精确 taxonomy denylist。**不含形状规则**(见 docstring)。"""
     t = str(text or "").strip()
     if not t:
         return None
-    if t in _BUCKET_DENYLIST:
+    if t in signals.bucket_denylist:
         return "known_taxonomy_residue"
-    return field_pollution_reason(t)
+    return field_pollution_reason(t, signals)
 
 
 def default_bucket_for_text(text) -> str:
