@@ -186,14 +186,43 @@ def test_unrelated_branch_advance_fails_closed_without_changing_origin(
         check=False,
     )
 
-    assert result.returncode != 0
-    assert "the newer workflow owns deployment" in result.stdout
+    assert result.returncode == 1
+    assert (
+        "::error title=deployment-superseded::pre advanced from trigger "
+        f"{release.trigger_sha} to {advanced_sha}; "
+        "the newer workflow owns deployment"
+    ) in result.stdout
     assert _git(stale_workflow, "rev-parse", "HEAD") == release.trigger_sha
     assert _git(stale_workflow, "status", "--porcelain") == ""
     assert _git(stale_workflow, "ls-remote", "origin", "refs/heads/pre") == (
         origin_before
     )
     assert origin_before.split()[0] == advanced_sha
+    assert not (tmp_path / "failed-output").exists()
+
+
+def test_true_release_contract_failure_is_not_marked_as_superseded(
+    tmp_path: Path,
+):
+    release = _make_release_repo(tmp_path)
+    runner = release.checkout / RUNNER_COMPOSE
+    runner.write_text(
+        runner.read_text().replace(
+            'FEEDLING_PLAINTEXT_SHADOW_ENABLED: "0"',
+            'FEEDLING_PLAINTEXT_SHADOW_ENABLED: "1"',
+        )
+    )
+
+    result = _pin(
+        release.checkout,
+        release.trigger_sha,
+        tmp_path / "failed-output",
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "must keep the plaintext-shadow drain disabled" in result.stdout
+    assert "title=deployment-superseded" not in result.stdout
     assert not (tmp_path / "failed-output").exists()
 
 
