@@ -827,6 +827,65 @@ def test_event_path_windows_use_closed_days_and_declare_partial_coverage(
     }
 
 
+def test_event_path_window_active_users_are_distinct_across_days(clean_rollup):
+    """Route populations dedupe one active user appearing on several days."""
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO lane_daily_rollup
+              (user_id, day, route, lane, completed)
+            VALUES
+              ('usr_resident_a', '2030-06-01', 'resident', 'heartbeat', 1),
+              ('usr_resident_a', '2030-06-07', 'resident', 'heartbeat', 1),
+              ('usr_resident_a', '2030-06-07', 'resident', 'capture', 1),
+              ('usr_resident_b', '2030-06-01', 'resident', 'heartbeat', 1),
+              ('usr_resident_b', '2030-06-07', 'resident', 'heartbeat', 1),
+              ('usr_resident_b', '2030-06-07', 'resident', 'capture', 1),
+              ('usr_model_a', '2030-06-01', 'model_api', 'chat', 1),
+              ('usr_model_a', '2030-06-07', 'model_api', 'chat', 1),
+              ('usr_model_a', '2030-06-07', 'model_api', 'capture', 1),
+              ('usr_model_b', '2030-06-01', 'model_api', 'chat', 1),
+              ('usr_model_b', '2030-06-07', 'model_api', 'chat', 1),
+              ('usr_model_b', '2030-06-07', 'model_api', 'capture', 1)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO lane_rollup_watermark (route, backfill_from, through_day)
+            VALUES
+              ('resident', '2030-06-01', '2030-06-07'),
+              ('model_api', '2030-06-01', '2030-06-07')
+            """
+        )
+        repeated = {
+            (str(route), str(user_id)): (int(day_count), int(row_count))
+            for route, user_id, day_count, row_count in conn.execute(
+                """
+                SELECT route, user_id, count(DISTINCT day), count(*)
+                FROM lane_daily_rollup
+                GROUP BY route, user_id
+                ORDER BY route, user_id
+                """
+            ).fetchall()
+        }
+
+    # Prove the mutation fixture before trusting the result: every user occurs
+    # on two days and in two lanes on the endpoint day.  Dropping DISTINCT from
+    # either the 24h or 7d product count must therefore change the result.
+    assert repeated == {
+        ("model_api", "usr_model_a"): (2, 3),
+        ("model_api", "usr_model_b"): (2, 3),
+        ("resident", "usr_resident_a"): (2, 3),
+        ("resident", "usr_resident_b"): (2, 3),
+    }
+
+    payload = db.admin_event_path_rollup_windows(through_day="2030-06-07")
+    windows = {row["key"]: row for row in payload["windows"]}
+    for key in ("24h", "7d"):
+        assert windows[key]["routes"]["resident"]["active_users"] == 2
+        assert windows[key]["routes"]["model_api"]["active_users"] == 2
+
+
 def test_event_path_windows_distinguish_covered_zero_from_no_source(clean_rollup):
     with db.get_pool().connection() as conn:
         conn.execute(
@@ -837,6 +896,7 @@ def test_event_path_windows_distinguish_covered_zero_from_no_source(clean_rollup
     payload = db.admin_event_path_rollup_windows(through_day="2030-06-07")
     one_day = next(row for row in payload["windows"] if row["key"] == "24h")
     assert one_day["routes"]["resident"]["coverage"]["level"] == "green"
+    assert one_day["routes"]["resident"]["active_users"] == 0
     assert one_day["routes"]["resident"]["lanes"] == {}
     assert one_day["routes"]["model_api"]["coverage"]["level"] == "red"
 

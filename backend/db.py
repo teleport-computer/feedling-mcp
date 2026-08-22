@@ -5976,15 +5976,19 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
             )
             rows = conn.execute(
                 """
-                WITH cells AS (
+                WITH filtered AS (
+                  SELECT user_id, day, route, lane, enqueue_source,
+                         completed, failed, expired, superseded, failure_codes
+                  FROM lane_daily_rollup
+                  WHERE day >= %s AND day <= %s
+                    AND route IN ('resident', 'model_api')
+                ), cells AS (
                   SELECT day, route, lane, enqueue_source,
                          coalesce(sum(completed), 0)::bigint AS completed,
                          coalesce(sum(failed), 0)::bigint AS failed,
                          coalesce(sum(expired), 0)::bigint AS expired,
                          coalesce(sum(superseded), 0)::bigint AS superseded
-                  FROM lane_daily_rollup
-                  WHERE day >= %s AND day <= %s
-                    AND route IN ('resident', 'model_api')
+                  FROM filtered
                   GROUP BY day, route, lane, enqueue_source
                 ), code_counts AS (
                   SELECT r.day, r.route, r.lane, r.enqueue_source,
@@ -5993,26 +5997,32 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                            CASE WHEN code.value ~ '^[0-9]+$'
                                 THEN code.value::bigint ELSE 0 END
                          ), 0)::bigint AS count
-                  FROM lane_daily_rollup r
+                  FROM filtered r
                   CROSS JOIN LATERAL jsonb_each_text(r.failure_codes) AS code
-                  WHERE r.day >= %s AND r.day <= %s
-                    AND r.route IN ('resident', 'model_api')
                   GROUP BY r.day, r.route, r.lane, r.enqueue_source, code.key
                 ), codes AS (
                   SELECT day, route, lane, enqueue_source,
                          jsonb_object_agg(code, count) AS failure_codes
                   FROM code_counts
                   GROUP BY day, route, lane, enqueue_source
+                ), route_users AS (
+                  SELECT route,
+                         count(DISTINCT user_id)
+                           FILTER (WHERE day = %s)::bigint AS active_users_24h,
+                         count(DISTINCT user_id)::bigint AS active_users_7d
+                  FROM filtered
+                  GROUP BY route
                 )
                 SELECT c.day, c.route, c.lane, c.enqueue_source,
                        c.completed, c.failed, c.expired, c.superseded,
-                       coalesce(x.failure_codes, '{}'::jsonb)
+                       coalesce(x.failure_codes, '{}'::jsonb),
+                       u.active_users_24h, u.active_users_7d
                 FROM cells c
                 LEFT JOIN codes x USING (day, route, lane, enqueue_source)
+                JOIN route_users u USING (route)
                 ORDER BY c.day, c.route, c.lane, c.enqueue_source
                 """,
-                (earliest.isoformat(), end_day.isoformat(),
-                 earliest.isoformat(), end_day.isoformat()),
+                (earliest.isoformat(), end_day.isoformat(), end_day.isoformat()),
             ).fetchall()
             watermarks = {
                 str(row[0]): {
@@ -6045,6 +6055,7 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                                 "covered_days": 0, "required_days": days,
                                 "backfill_from": None, "through_day": None,
                             },
+                            "active_users": None,
                             "lanes": {}, "lane_sources": {},
                         }
                         for route in ("resident", "model_api")
@@ -6055,7 +6066,16 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
         }
 
     by_day: dict[tuple[str, str, str, str], dict] = {}
+    active_users_by_route = {
+        "resident": {"24h": 0, "7d": 0},
+        "model_api": {"24h": 0, "7d": 0},
+    }
     for row in rows:
+        route = str(row[1])
+        active_users_by_route[route] = {
+            "24h": int(row[9] or 0),
+            "7d": int(row[10] or 0),
+        }
         by_day[(str(row[0]), str(row[1]), str(row[2]), str(row[3] or ""))] = {
             "completed": int(row[4] or 0),
             "failed": int(row[5] or 0),
@@ -6117,6 +6137,7 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                         source_bucket["failure_codes"].get(code, 0) + count
                     )
             routes[route] = {
+                "active_users": active_users_by_route[route][key],
                 "coverage": {
                     "level": coverage_level,
                     "covered_days": covered_days,

@@ -9637,8 +9637,6 @@ def _event_path_master_payload(frozen: dict) -> dict:
                 detail=(
                     "V1 冻结 failed 混合 failed 与 skipped，failure_codes 又不含原 status；"
                     "按 T197 无法无损拆出 operational failure，不能叫失败率。"
-                    "这盖住托管 runtime 的多数用户：resident_cli 234 vs V2 32 "
-                    "（测于 2026-08-21/22；该端点现已超时，未复核）"
                 )
             )
 
@@ -9749,7 +9747,23 @@ def _event_path_master_payload(frozen: dict) -> dict:
             "day_count": raw_window.get("day_count"),
         }
         path_windows.append({**window_meta, "rows": path_rows})
-        runtime_windows.append({**window_meta, "rows": runtime_rows})
+        runtime_active_users = {}
+        for runtime, route in (("runtime_v1", "resident"),
+                               ("runtime_v2", "model_api")):
+            route_data = (raw_window.get("routes") or {}).get(route, {})
+            coverage = route_data.get("coverage") or {}
+            active_users = route_data.get("active_users")
+            runtime_active_users[runtime] = (
+                int(active_users)
+                if coverage.get("level") == "green"
+                and active_users is not None
+                else None
+            )
+        runtime_windows.append({
+            **window_meta,
+            "active_users": runtime_active_users,
+            "rows": runtime_rows,
+        })
     return {
         "timezone": frozen.get("timezone") or "Asia/Shanghai",
         "closed_through_day": frozen.get("closed_through_day"),
@@ -9963,7 +9977,8 @@ def _render_event_master_cell(cell: dict, *, action: str, path: str,
 
 
 def _render_event_master_tables(master: dict) -> str:
-    def render_windows(*, windows, columns, title, note):
+    def render_windows(*, windows, columns, title, note,
+                       show_runtime_population=False):
         sections = []
         for window in windows or []:
             start = str(window.get("start_day") or "")
@@ -9993,8 +10008,32 @@ def _render_event_master_tables(master: dict) -> str:
                     f"<tr><td><b>{html.escape(action)}</b>"
                     f"<div class='evt-desc'>{html.escape(desc)}</div></td>{cells}</tr>"
                 )
+            active_users = window.get("active_users")
+            population = ""
+            # Route populations belong only to the runtime-family diagnostic.
+            # The access-path table cannot split the resident route into
+            # self-hosted vs APIKey-V1, so even an accidentally supplied map
+            # must never be rendered there.
+            if show_runtime_population and isinstance(active_users, dict):
+                parts = []
+                for col in columns:
+                    key = str(col.get("key") or "")
+                    label = str(col.get("label") or key)
+                    count = active_users.get(key)
+                    value = (
+                        "人数不报（冻结覆盖不完整或来源未提供）"
+                        if count is None
+                        else f"{int(count)} 人"
+                    )
+                    parts.append(f"{label} {value}")
+                population = (
+                    "<div class='evt-desc'>窗口内 runtime route 活跃用户"
+                    "（冻结行按 user_id 去重）："
+                    + html.escape(" · ".join(parts)) + "</div>"
+                )
             sections.append(
                 f"<h3>{html.escape(window_label)}</h3>"
+                f"{population}"
                 f"<table class='evt-master'><thead><tr><th>可独立失败的动作</th>"
                 f"{heads}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
             )
@@ -10021,6 +10060,7 @@ def _render_event_master_tables(master: dict) -> str:
             windows=master.get("runtime_windows"),
             columns=master.get("runtime_paths") or [],
             title="Runtime family 辅助表（不可冒充接入路径）", note=runtime_note,
+            show_runtime_population=True,
         )
     )
 
