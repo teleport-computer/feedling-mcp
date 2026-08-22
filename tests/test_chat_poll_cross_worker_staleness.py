@@ -103,6 +103,45 @@ def test_poll_serves_message_committed_outside_this_workers_cache(user):
     )
 
 
+def test_poll_redelivers_unanswered_row_older_than_hot_cache(user):
+    uid, api_key = user
+    client = make_client()
+    store = core_store.get_store(uid)
+    now = time.time()
+    unanswered_ts = now - 120
+    _write_user_message_bypassing_cache(uid, "m_outside_hot_cache", unanswered_ts)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO chat_messages (user_id,msg_id,ts,doc) "
+            "SELECT %s, 'tail-' || g::text, %s + g, "
+            "jsonb_build_object('id','tail-' || g::text,'role','assistant',"
+            "'source','chat','ts',%s + g) "
+            "FROM generate_series(1,300) AS g",
+            (uid, unanswered_ts, unanswered_ts),
+        )
+    store.chat_hot_cache_limit = 256
+    store.reload_chat_hot_strict()
+    assert all(
+        row.get("id") != "m_outside_hot_cache" for row in store.chat_messages
+    )
+    monkeypatch_reload = store.reload
+    store.reload = lambda: (_ for _ in ()).throw(
+        AssertionError("durable poll must not reload the whole store")
+    )
+    try:
+        res = client.get(
+            f"/v1/chat/poll?since={now - 60:.3f}&timeout=0",
+            headers={"X-API-Key": api_key},
+        )
+    finally:
+        store.reload = monkeypatch_reload
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    assert "m_outside_hot_cache" in [
+        row.get("id") for row in res.get_json()["messages"]
+    ]
+
+
 def test_v2_wake_incrementally_refreshes_cached_worker(user, monkeypatch):
     uid, _api_key = user
     store = core_store.get_store(uid)

@@ -1132,34 +1132,20 @@ def _read_tail_window(
 
     Skip 规则与 `_read_messages` 一致：无 `body_ct` 或 `K_enclave is None` 的合成/
     本地-only 行跳过；`content_type == "image"` 走 "[image]" 简写，不经 enclave。"""
-    store = core_store.get_store(user_id)
-    reload_chat = getattr(store, "reload_chat_strict", None)
-    if callable(reload_chat):
-        rows = reload_chat()
-    else:  # lightweight test doubles retain the older reload seam
-        reload_store = getattr(store, "reload", None)
-        if callable(reload_store):
-            reload_store()
-        rows = list(getattr(store, "chat_messages", []) or [])
-    rows = sorted(rows, key=lambda m: m.get("ts") or 0.0)
     if limit <= 0:
         return []
-    candidates = [m for m in rows if m.get("ts") is not None and m.get("ts") > after_ts]
-    if exclude_synthetic_sources:
-        # Summary-coverage callers only: `verify_ping`/`resident_maintenance`
-        # rows are deleted once their probe completes, so folding one into an
-        # IMMUTABLE leaf freezes a coverage claim that the row itself will not
-        # honour — validate_canonical_frontier then fails every later turn.
-        # The seq-based reader already excludes them; this ts-based sibling
-        # kept the hole open for whichever caller still reaches it.
-        candidates = [
-            m for m in candidates
-            if str(m.get("source") or "")
-            not in ("verify_ping", "resident_maintenance")
-        ]
-    # Bound enclave work before decrypting, so every selected caption can be
-    # preserved without an independent cap that silently changes row content.
-    rows = candidates[:limit] if oldest_first else candidates[-limit:]
+    rows = db.chat_messages_after_seq(
+        user_id,
+        0,
+        limit=int(limit),
+        oldest_first=oldest_first,
+        exclude_synthetic_sources=exclude_synthetic_sources,
+    )
+    rows = [
+        row
+        for row in rows
+        if row.get("ts") is not None and float(row["ts"]) > float(after_ts)
+    ]
     return _decrypt_chat_rows(user_id, rows, user_only=False)
 
 
@@ -3442,14 +3428,9 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
                     user_id,
                     type(exc).__name__.lower(),
                 )
-        try:
-            store.reload_chat_strict()
-        except Exception as exc:  # noqa: BLE001 — cross-worker reload/poll is fallback
-            log.warning(
-                "[v2.reply] local chat cache refresh failed user=%s code=%s",
-                user_id,
-                type(exc).__name__.lower(),
-            )
+        store.apply_committed_chat_rows([
+            msg for msg, _inserted, _finish in records
+        ])
         if any(inserted for _msg, inserted, _finish in records):
             try:
                 # Runtime V2's runner-owned sweep is the sole capture producer.

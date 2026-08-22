@@ -4063,7 +4063,7 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         extra=extra,
     )
     if lane == "scheduled":
-        db.chat_append_strict(
+        seq = db.chat_append_strict(
             user_id,
             message_id,
             float(message["ts"]),
@@ -4077,7 +4077,8 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
             != str(job_id)
         ):
             raise RuntimeError("scheduled failure reply delivery was not adopted")
-        store.reload()
+        persisted["seq"] = int(seq)
+        store.apply_committed_chat_rows([persisted])
         store.notify_chat_waiters()
         try:
             wake_bus.notify("chat", user_id)
@@ -4095,7 +4096,8 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         require_cursor_advance=True,
     )
     if seq:
-        store.reload()
+        message["seq"] = int(seq)
+        store.apply_committed_chat_rows([message])
         store.notify_chat_waiters()
         try:
             wake_bus.notify("chat", user_id)

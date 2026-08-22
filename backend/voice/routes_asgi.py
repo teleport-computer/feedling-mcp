@@ -486,10 +486,9 @@ async def cancel_voice_call(
         handoff = results.delete_call_state(user_id, call_id)
         cleanup = voice_cleanup.delete_call_messages(user_id, call_id)
         store = core_store.get_store(user_id)
-        # Reload from the authoritative rows: older assistant messages may be
-        # discoverable only through reply_to_message_id and carry no call id in
-        # this worker's stale cache.
-        store.reload()
+        # Apply the authoritative delete events; older assistant messages may
+        # be discoverable only through reply_to_message_id in durable storage.
+        store.ensure_chat_fresh(force=True)
         store.notify_chat_waiters()
         wake_bus.notify("chat", user_id)
         if cleanup["remaining"] > 0:

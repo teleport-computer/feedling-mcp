@@ -267,34 +267,35 @@ git commit -m "perf(chat): verify resident loop with point reads"
 - Modify: `backend/hosted/chat_send_core.py`
 - Modify: `tests/test_chat_poll_cross_worker_staleness.py`
 - Modify: `tests/test_v2_serve_worker.py`
-- Modify: `tests/test_v2_history_safety.py`
+- Modify: `tests/test_v2_p0_history_safety.py`
 - Modify: `tests/test_chat_response_finalize_cas.py`
+- Modify: `tests/test_voice_gateway.py`
 
 **Interfaces:**
 - Resident selection consumes `chat_poll_candidates_strict`; `chat_try_claim_reply` remains final CAS.
 - Runtime V2 consumes `chat_messages_after_seq(..., through_seq=..., oldest_first=False)`.
 - Commit paths consume `apply_committed_chat_rows`.
 
-- [ ] **Step 1: Add cache-boundary RED tests**
+- [x] **Step 1: Add cache-boundary RED tests**
 
 With more than 256 rows, assert an older unanswered row in the redelivery window remains claimable. Assert Runtime V2 returns the identical seq membership and does not call `reload_chat_strict()`.
 
-- [ ] **Step 2: Run focused RED tests**
+- [x] **Step 2: Run focused RED tests**
 
 ```bash
 FEEDLING_TEST_PG='postgresql://postgres:test@127.0.0.1:55432/postgres' \
   .venv-test/bin/python -m pytest tests/test_chat_poll_cross_worker_staleness.py tests/test_v2_serve_worker.py tests/test_v2_history_safety.py tests/test_chat_response_finalize_cas.py -q
 ```
 
-- [ ] **Step 3: Refactor resident and V2 reads**
+- [x] **Step 3: Refactor resident and V2 reads**
 
 Use durable candidates while preserving batch 5, one-hour window, claim TTL, source exclusions, abandoned-claim exemption, legacy-adjacent repair, and superseded-tail CAS. Read V2 prompt rows directly by seq and frozen `through_seq`.
 
-- [ ] **Step 4: Remove broad post-commit reloads**
+- [x] **Step 4: Remove broad post-commit reloads**
 
 Apply returned parent/reply rows locally. Voice/hosted paths use `ensure_chat_fresh(force=True)` only when the committed row is unavailable.
 
-- [ ] **Step 5: Run tests and commit**
+- [x] **Step 5: Run tests and commit**
 
 ```bash
 git add backend/chat/poll_core.py backend/chat/service.py backend/model_api_runtime/v2/serve_worker.py backend/model_api_runtime/v2/jobs_store.py backend/voice/routes_asgi.py backend/hosted/chat_send_core.py tests/test_chat_poll_cross_worker_staleness.py tests/test_v2_serve_worker.py tests/test_v2_history_safety.py tests/test_chat_response_finalize_cas.py
