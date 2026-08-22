@@ -55,7 +55,7 @@ _DRAIN_GATES = {
     "agent_action_queue": "SELECT count(*) FROM agent_action_queue",
     "active_v2_effect_outbox": (
         "SELECT count(*) FROM v2_effect_outbox "
-        "WHERE status NOT IN ('applied','discarded')"
+        "WHERE status NOT IN ('applied','applied_with_results','discarded')"
     ),
     "active_v2_terminal_failure_outbox": (
         "SELECT count(*) FROM v2_terminal_failure_outbox "

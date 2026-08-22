@@ -23,4 +23,3 @@ def migration_database_url() -> str:
     if url.startswith("postgres://"):
         return "postgresql+psycopg://" + url[len("postgres://"):]
     return url
-

@@ -246,7 +246,7 @@ def test_tee_version_table_is_isolated():
 
 
 def test_tee_primary_startup_refuses_unprepared_shadow(monkeypatch):
-    """A schema head alone is not proof that the frozen prepare completed."""
+    """A schema head alone is not proof that primary triggers are active."""
     import db
 
     with _tee_conn() as c:
@@ -259,7 +259,7 @@ def test_tee_primary_startup_refuses_unprepared_shadow(monkeypatch):
 
     monkeypatch.setenv("DATABASE_URL", os.environ["TEE_DATABASE_URL"])
     monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "tee")
-    with pytest.raises(RuntimeError, match="frozen Phase-4 prepare"):
+    with pytest.raises(RuntimeError, match="primary triggers are incomplete"):
         db.init_schema()
 
     with _tee_conn() as c:

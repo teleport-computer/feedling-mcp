@@ -101,6 +101,14 @@ change must not be interpreted as an API guarantee.
   error path instead of accepting a URL that would fail later in the HTTP
   client. Explicit ports from `1` through `65535` remain valid.
 
+- **Managed production can open per-user plaintext writes as part of a
+  TEE-primary release unit.** The gate remains closed by default, accepts only
+  an explicit `0` or `1`, and is delivered consistently to the API, in-CVM
+  worker, and independent runners. CI refuses to open it while the legacy RDS
+  schema selector is active. Known accounts with an unset or `off` preference
+  then create plaintext rows; explicit `on` accounts, unknown users, and
+  existing historical ciphertext remain encrypted.
+
 - **Managed deployments reuse healthy persisted ingress certificates without
   blocking public traffic on an unnecessary ACME renewal.** A recreated ingress
   verifies that every stored certificate is valid for at least seven days and
@@ -137,6 +145,15 @@ change must not be interpreted as an API guarantee.
   performs real state transitions in a forced-rollback transaction. A database
   switch can no longer report healthy while the first voice session fails on a
   missing lifecycle table.
+
+- **Managed TEE database promotion can retain terminal historical ciphertext
+  without changing account encryption preferences.** The migration copies the
+  original raw envelope only after an exact count-and-digest approval, records a
+  reversible audit marker, and verifies every preserved source/destination pair.
+  This preserves device readability when the user's key remains valid; it does
+  not repair an unusable enclave wrap or grant the service new plaintext access.
+  Promotion now distinguishes fully audited preservation from unresolved,
+  malformed, or requeued work, which remains blocking.
 
 - **Managed production supports a separately gated decrypted PostgreSQL
   shadow after TEE-primary promotion.** The TEE database remains authoritative;
@@ -247,6 +264,11 @@ change must not be interpreted as an API guarantee.
   the owner and app roles target the same database, checks the exact TEE migration
   head, rejects stale shadow dual-write wiring, and exercises the Phase-4
   application startup contract before changing any confidential VM.
+
+- **TEE-primary startup no longer depends on the Phase-4 audit marker.** Startup
+  still fails closed unless the database is at the exact release migration head
+  and all required Chat lifecycle triggers are enabled, but reconciliation of
+  mutable `server_config` data can no longer block a fully prepared database.
 
 - **Self-hosted resident replies no longer become permanently lost when a long
   agent turn crosses the consumer freshness window.** Resident liveness now

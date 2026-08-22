@@ -690,6 +690,7 @@ jobs:
             tests/test_tee_replication_workflow_guard.py \
             tests/test_tee_requeue.py \
             tests/test_tee_requeue_coverage.py \
+            tests/test_tee_primary_startup.py \
             tests/test_tee_schema.py \
             tests/test_tee_snapshot.py \
             tests/test_tee_sync_metrics.py \
@@ -1338,6 +1339,9 @@ jobs:
     permissions:
       contents: read
       packages: read
+    outputs:
+      database_schema: ${{ steps.prod_release_config.outputs.database_schema }}
+      plaintext_writes_accepted: ${{ steps.prod_release_config.outputs.plaintext_writes_accepted }}
     steps:
       - uses: actions/checkout@v4
       - name: Check standalone prod runner CVM topology
@@ -1367,9 +1371,11 @@ jobs:
           done
 
       - name: Require complete production Runtime V2 configuration
+        id: prod_release_config
         env:
           DATABASE_URL:                  ${{ secrets.DATABASE_URL }}
           FEEDLING_DATABASE_SCHEMA:      ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA || 'rds' }}
+          FEEDLING_PLAINTEXT_WRITES_ACCEPTED: ${{ vars.PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED || '0' }}
           TEE_DATABASE_URL:              ${{ secrets.PROD_TEE_DATABASE_URL }}
           FEEDLING_TEE_DUAL_WRITE:       ${{ secrets.PROD_FEEDLING_TEE_DUAL_WRITE }}
           PLAINTEXT_SHADOW_DATABASE_URL: ${{ secrets.PROD_PLAINTEXT_SHADOW_DATABASE_URL }}
@@ -1404,6 +1410,14 @@ jobs:
             rds|tee) ;;
             *) echo "::error::PROD_FEEDLING_DATABASE_SCHEMA must be exactly rds or tee"; missing=1 ;;
           esac
+          case "$FEEDLING_PLAINTEXT_WRITES_ACCEPTED" in
+            0|1) ;;
+            *) echo "::error::PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED must be exactly 0 or 1"; missing=1 ;;
+          esac
+          if [ "$FEEDLING_PLAINTEXT_WRITES_ACCEPTED" = "1" ] && [ "$FEEDLING_DATABASE_SCHEMA" != "tee" ]; then
+            echo "::error::PROD plaintext writes require FEEDLING_DATABASE_SCHEMA=tee"
+            missing=1
+          fi
           if [ "$FEEDLING_DATABASE_SCHEMA" = "tee" ]; then
             if [ -n "$TEE_DATABASE_URL" ]; then
               echo "::error::PROD_TEE_DATABASE_URL must be empty for TEE primary"
@@ -1433,15 +1447,19 @@ jobs:
               missing=1
             fi
           fi
-          exit "$missing"
+          if [ "$missing" -ne 0 ]; then
+            exit "$missing"
+          fi
+          echo "database_schema=$FEEDLING_DATABASE_SCHEMA" >> "$GITHUB_OUTPUT"
+          echo "plaintext_writes_accepted=$FEEDLING_PLAINTEXT_WRITES_ACCEPTED" >> "$GITHUB_OUTPUT"
 
       # PROD promotion uses the owner DSN only for read-only preflight checks;
       # the deployed main and runner CVMs both receive the app-role DATABASE_URL.
       # Fail before either CVM is mutated if the two credentials point at
       # different databases, the owner migration is behind, the app role is
-      # wrong, or the Phase-4 prepared marker/startup contract is missing.
+      # wrong, or the TEE migration-head/primary-trigger contract is incomplete.
       - name: Prepare PROD TEE schema preflight credentials
-        if: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        if: ${{ steps.prod_release_config.outputs.database_schema == 'tee' }}
         env:
           PROD_CA_PEM: ${{ secrets.PROD_TEE_PG_CA_PEM }}
           PROD_DSN: ${{ secrets.PROD_TEE_MIGRATION_DSN }}
@@ -1452,22 +1470,22 @@ jobs:
           test -s /tmp/prod-tee-ca.crt || { echo "::error::PROD_TEE_PG_CA_PEM is required for TEE-primary deploy preflight"; exit 1; }
 
       - name: Set up Python for PROD TEE schema preflight
-        if: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        if: ${{ steps.prod_release_config.outputs.database_schema == 'tee' }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install PROD TEE schema preflight dependencies
-        if: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        if: ${{ steps.prod_release_config.outputs.database_schema == 'tee' }}
         run: |
           python -m pip install --upgrade pip
           pip install --require-hashes -r backend/requirements.lock
 
       - name: Validate PROD database topology without exposing DSNs
-        if: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        if: ${{ steps.prod_release_config.outputs.database_schema == 'tee' }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          FEEDLING_DATABASE_SCHEMA: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA || 'rds' }}
+          FEEDLING_DATABASE_SCHEMA: ${{ steps.prod_release_config.outputs.database_schema }}
           PLAINTEXT_SHADOW_DATABASE_URL: ${{ secrets.PROD_PLAINTEXT_SHADOW_DATABASE_URL }}
           FEEDLING_PLAINTEXT_SHADOW_ENABLED: ${{ vars.PROD_FEEDLING_PLAINTEXT_SHADOW_ENABLED || '0' }}
           TEE_DATABASE_URL: ${{ secrets.PROD_TEE_DATABASE_URL }}
@@ -1475,7 +1493,7 @@ jobs:
         run: python deploy/check-database-topology.py
 
       - name: Require PROD TEE schema at release head before mutating any CVM
-        if: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        if: ${{ steps.prod_release_config.outputs.database_schema == 'tee' }}
         env:
           PROD_DSN: ${{ secrets.PROD_TEE_MIGRATION_DSN }}
           APP_DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -1940,6 +1958,8 @@ jobs:
       cancel-in-progress: false
     outputs:
       cvm_id: ${{ steps.cvmid.outputs.cvm_id }}
+      database_schema: ${{ needs.validate-prod-runner-topology.outputs.database_schema }}
+      plaintext_writes_accepted: ${{ needs.validate-prod-runner-topology.outputs.plaintext_writes_accepted }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -2086,7 +2106,8 @@ jobs:
           # via the encrypted env channel — carries DB credentials, NOT baked
           # into compose_hash. The backend fails fast at boot if this is empty.
           DATABASE_URL:        ${{ secrets.DATABASE_URL }}
-          FEEDLING_DATABASE_SCHEMA: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA || 'rds' }}
+          FEEDLING_DATABASE_SCHEMA: ${{ needs.validate-prod-runner-topology.outputs.database_schema }}
+          FEEDLING_PLAINTEXT_WRITES_ACCEPTED: ${{ needs.validate-prod-runner-topology.outputs.plaintext_writes_accepted }}
           # TEE 明文影子库双写（feedling-io-db-prod 独立 pg CVM）。best-effort 镜像，
           # mirror 永不 raise。两个都空 = OFF。app 角色 DSN、sslmode=require。加密 env
           # 通道，不烧 compose_hash（同 DATABASE_URL）。⚠️ 开启触发 prod enclave 全量
@@ -2161,6 +2182,7 @@ jobs:
             -e "FEEDLING_ADMIN_PASSWORD=$FEEDLING_ADMIN_PASSWORD" \
             -e "DATABASE_URL=$DATABASE_URL" \
             -e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA" \
+            -e "FEEDLING_PLAINTEXT_WRITES_ACCEPTED=$FEEDLING_PLAINTEXT_WRITES_ACCEPTED" \
             -e "TEE_DATABASE_URL=$TEE_DATABASE_URL" \
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
             -e "PLAINTEXT_SHADOW_DATABASE_URL=$PLAINTEXT_SHADOW_DATABASE_URL" \
@@ -2257,6 +2279,7 @@ jobs:
         env:
           FEEDLING_API_URL:     ${{ vars.PROD_API_URL || 'https://api.feedling.app' }}
           FEEDLING_ENCLAVE_URL: ${{ vars.PROD_MAIN_ENCLAVE_URL }}
+          FEEDLING_CANARY_EXPECT_PLAINTEXT: ${{ needs.validate-prod-runner-topology.outputs.plaintext_writes_accepted }}
         run: |
           python3 -m pip install --quiet cryptography
           python3 tools/deploy_canary.py
@@ -3180,7 +3203,8 @@ jobs:
           AGENT_MAX_CHILDREN:            ${{ vars.AGENT_MAX_CHILDREN }}
           # Reused from the main prod CVM — MUST match (esp. the token secret).
           DATABASE_URL:                  ${{ secrets.DATABASE_URL }}
-          FEEDLING_DATABASE_SCHEMA:      ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA || 'rds' }}
+          FEEDLING_DATABASE_SCHEMA:      ${{ needs.deploy-cvm.outputs.database_schema }}
+          FEEDLING_PLAINTEXT_WRITES_ACCEPTED: ${{ needs.deploy-cvm.outputs.plaintext_writes_accepted }}
           R2_ENDPOINT:                   ${{ secrets.R2_ENDPOINT }}
           R2_ACCESS_KEY_ID:              ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY:          ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -3197,6 +3221,14 @@ jobs:
           if [ -z "$FEEDLING_API_URL" ] || [ -z "$FEEDLING_ENCLAVE_URL" ]; then
             echo "::error::PROD_MAIN_API_URL / PROD_MAIN_ENCLAVE_URL not set — runner can't reach the main CVM"; exit 1
           fi
+          case "$FEEDLING_PLAINTEXT_WRITES_ACCEPTED" in
+            0|1) ;;
+            *) echo "::error::PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED must be exactly 0 or 1"; exit 1 ;;
+          esac
+          if [ "$FEEDLING_PLAINTEXT_WRITES_ACCEPTED" = "1" ] && [ "$FEEDLING_DATABASE_SCHEMA" != "tee" ]; then
+            echo "::error::PROD plaintext writes require FEEDLING_DATABASE_SCHEMA=tee"
+            exit 1
+          fi
           printf '%s\n' "$IDS" | while IFS= read -r CVM_ID; do
             [ -z "$CVM_ID" ] && continue
             echo ">>> deploy prod runner CVM: $CVM_ID"
@@ -3210,6 +3242,7 @@ jobs:
               -e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN" \
               -e "DATABASE_URL=$DATABASE_URL" \
               -e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA" \
+              -e "FEEDLING_PLAINTEXT_WRITES_ACCEPTED=$FEEDLING_PLAINTEXT_WRITES_ACCEPTED" \
               -e "R2_ENDPOINT=$R2_ENDPOINT" \
               -e "R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
               -e "R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \

@@ -200,10 +200,6 @@ def init_schema() -> None:
                     "SELECT version_num FROM alembic_tee_version"
                 ).fetchall()
             }
-            marker_row = conn.execute(
-                "SELECT value FROM server_config WHERE key = %s",
-                (_TEE_PRIMARY_PREPARED_KEY,),
-            ).fetchone()
             enabled_triggers = {
                 str(row[0])
                 for row in conn.execute(
@@ -219,22 +215,11 @@ def init_schema() -> None:
                 f"expected={sorted(expected_heads)} actual={sorted(actual_heads)}; "
                 "run the owner-only alembic_tee migration workflow before startup"
             )
-        marker = None
-        if marker_row is not None:
-            try:
-                marker = json.loads(bytes(marker_row[0]).decode("utf-8"))
-            except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
-                marker = None
-        if (
-            not isinstance(marker, dict)
-            or marker.get("prepared") is not True
-            or set(marker.get("tee_heads") or ()) != expected_heads
-            or enabled_triggers != _TEE_PRIMARY_TRIGGERS
-        ):
+        if enabled_triggers != _TEE_PRIMARY_TRIGGERS:
             raise RuntimeError(
-                "TEE database has not completed the frozen Phase-4 prepare: "
-                f"marker_ok={isinstance(marker, dict) and marker.get('prepared') is True} "
-                f"enabled_triggers={sorted(enabled_triggers)}; run "
+                "TEE database primary triggers are incomplete: "
+                f"expected={sorted(_TEE_PRIMARY_TRIGGERS)} "
+                f"actual={sorted(enabled_triggers)}; run "
                 "admin.phase4_cutover --apply --confirm-writes-frozen before startup"
             )
         log.info("[db] TEE schema at head (read-only assertion: %s)",

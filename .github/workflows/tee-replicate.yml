@@ -12,19 +12,17 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        # 前瞻性输入：目前只有 test；Phase 8 上 prod 后用它选择对应的
-        # secrets 组（PROD_ADMIN_BASE_URL / PROD_ADMIN_KEY）。
         description: 目标环境
         type: choice
-        options: [test]
+        options: [test, prod]
         required: true
       action:
-        description: reconcile/replicate/reflow/prune/verify
+        description: status/reconcile/snapshot/replicate/reflow/prune/verify
         type: choice
-        options: [reconcile, replicate, reflow, prune, verify]
+        options: [status, reconcile, snapshot, replicate, reflow, prune, verify]
         required: true
       table:
-        description: 表名（replicate/reflow/prune 必填；reconcile 留空=全表）
+        description: 表名（replicate/reflow/prune 必填；reconcile/snapshot 留空=全表）
         required: false
       qps:
         description: reflow 限速；0=不限速，留空=服务端默认 2
@@ -37,7 +35,7 @@ on:
         type: boolean
         default: true
       confirm:
-        description: 非 dry_run 的写操作必须填字面 MIGRATE（服务端校验）
+        description: 非 dry_run：test 填 MIGRATE，prod 填 MIGRATE-PROD
         required: false
 
 permissions:
@@ -53,8 +51,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Trigger admin tee-replication endpoint
         env:
-          BASE_URL: ${{ secrets.TEST_ADMIN_BASE_URL }}
-          ADMIN_KEY: ${{ secrets.TEST_ADMIN_KEY }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          TEST_BASE_URL: ${{ secrets.TEST_ADMIN_BASE_URL }}
+          PROD_BASE_URL: ${{ vars.PROD_MAIN_API_URL }}
+          TEST_ADMIN_KEY: ${{ secrets.TEST_ADMIN_KEY }}
+          PROD_ADMIN_KEY: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
           ACTION: ${{ inputs.action }}
           TABLE_IN: ${{ inputs.table }}
           DRY_RUN_IN: ${{ inputs.dry_run }}
@@ -62,6 +63,18 @@ jobs:
           QPS_IN: ${{ inputs.qps }}
           EXPECTED_STALE_IN: ${{ inputs.expected_stale }}
         run: |
+          case "$ENVIRONMENT" in
+            test) BASE_URL="$TEST_BASE_URL"; ADMIN_KEY="$TEST_ADMIN_KEY" ;;
+            prod) BASE_URL="$PROD_BASE_URL"; ADMIN_KEY="$PROD_ADMIN_KEY" ;;
+            *) echo "::error::unknown environment: $ENVIRONMENT"; exit 1 ;;
+          esac
+          test -n "$BASE_URL" || { echo "::error::${ENVIRONMENT} admin base URL is empty"; exit 1; }
+          test -n "$ADMIN_KEY" || { echo "::error::${ENVIRONMENT} admin key is empty"; exit 1; }
+          if [ "$ACTION" = "status" ]; then
+            curl -fsS "$BASE_URL/v1/admin/tee-replication/status" \
+              -H "X-Admin-Token: $ADMIN_KEY" | jq .
+            exit 0
+          fi
           body=$(python scripts/tee/replication_workflow_guard.py build)
           echo "request body: $body"
           # 不用 curl -f：非 2xx 也要把响应体（{"error": ...}）打给操作者看，

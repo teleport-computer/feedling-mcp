@@ -94,7 +94,11 @@ def test_phase4_prepare_copies_frame_bridge_and_aligns_sequences(monkeypatch):
                 "VALUES (%s, 'chat', 'completed') RETURNING id",
                 (uid,),
             ).fetchone()[0]
-            for suffix, status in (("applied", "applied"), ("discarded", "discarded")):
+            for suffix, status in (
+                ("applied", "applied"),
+                ("applied-results", "applied_with_results"),
+                ("discarded", "discarded"),
+            ):
                 source.execute(
                     "INSERT INTO v2_effect_outbox "
                     "(effect_id, user_id, job_id, effect_type, "
@@ -175,14 +179,29 @@ def test_phase4_prepare_copies_frame_bridge_and_aligns_sequences(monkeypatch):
             "cancel_winner": "cancelled",
             "finalize_winner": "finalized",
         }
+        assert report["primary_contract"]["marker"][
+            "tee_terminal_ciphertext_preserved"
+        ] == 2
+        assert report["primary_contract"]["marker"][
+            "preserved_plan_sha256"
+        ] == report["preserved_plan_sha256"]
         assert set(report["primary_contract"]["enabled_triggers"]) == {
             "chat_messages_retire_r2_body",
             "chat_message_archive_retire_r2_body",
             "chat_message_archive_immutable",
         }
 
-        # The same app role now passes startup's read-only head + prepared
-        # marker + trigger assertion; no RDS Alembic table is created.
+        # The marker is audit metadata, not a durable safety boundary. A later
+        # server_config reconciliation may remove it after the frozen prepare,
+        # while the migration head and primary triggers remain authoritative.
+        with psycopg.connect(destination_url, autocommit=True) as destination:
+            destination.execute(
+                "DELETE FROM server_config WHERE key = %s",
+                (db._TEE_PRIMARY_PREPARED_KEY,),
+            )
+
+        # The same app role passes startup's read-only head + trigger
+        # assertion without the optional marker; no RDS Alembic table is created.
         monkeypatch.setenv("DATABASE_URL", destination_url)
         monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "tee")
         db.init_schema()
@@ -229,6 +248,48 @@ def test_phase4_prepare_copies_frame_bridge_and_aligns_sequences(monkeypatch):
                         sql.Identifier(database)
                     )
                 )
+def test_phase4_pending_gate_blocks_every_unaudited_reason(backend_env):
+    import db
+    from admin import phase4_cutover
+    from tee_replicator import terminal_preservation as preservation
+
+    uid = f"usr_phase4_gate_{uuid.uuid4().hex[:12]}"
+    with psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as tee:
+        tee.execute("DELETE FROM tee_pending_device_migration")
+        tee.execute(
+            "INSERT INTO users (user_id,created_at,doc) VALUES (%s,'',%s)",
+            (uid, Jsonb({"user_id": uid})),
+        )
+        tee.execute(
+            "INSERT INTO tee_pending_device_migration "
+            "(user_id,table_name,item_id,reason) VALUES "
+            "(%s,'chat_messages','terminal','pdm:no_k_enclave'),"
+            "(%s,'chat_messages','requeue','requeue:source_updated'),"
+            "(%s,'chat_messages','malformed','preserved_ciphertext:v1:bad'),"
+            "(%s,'chat_messages','missing-source',%s)",
+            (
+                uid,
+                uid,
+                uid,
+                uid,
+                preservation.encode_preserved_reason(
+                    "a" * 64, "decrypt_failed:historical"
+                ),
+            ),
+        )
+        with db.get_pool().connection() as source:
+            gate = phase4_cutover._pending_gate(source, tee)
+
+        assert gate["tee_pending_device_migration_blocking"] == 4
+        assert gate["tee_terminal_ciphertext_preserved"] == 0
+        assert gate["preserved_mismatches"] == [
+            "missing_source:chat_messages:1"
+        ]
+
+        tee.execute("DELETE FROM tee_pending_device_migration")
+        tee.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
 def test_phase4_voice_session_smoke_fails_closed_when_table_is_missing(backend_env):
     """A green schema head cannot hide a missing runtime-critical voice table."""
     from admin import phase4_cutover

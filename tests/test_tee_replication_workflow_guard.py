@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).parent.parent / "scripts/tee/replication_workflow_guard.py"
+WORKFLOW = Path(__file__).parent.parent / ".github/workflows/tee-replicate.yml"
 
 
 def _run(*args: str, env: dict[str, str] | None = None):
@@ -22,6 +23,13 @@ def _run(*args: str, env: dict[str, str] | None = None):
         capture_output=True,
         check=False,
     )
+
+
+def test_workflow_exposes_snapshot_action():
+    """The guarded backend action must be dispatchable without ad-hoc SQL."""
+    workflow = WORKFLOW.read_text()
+    assert "options: [status, reconcile, snapshot, replicate, reflow, prune, verify]" in workflow
+    assert "snapshot 留空=全表" in workflow
 
 
 def test_build_emits_typed_reflow_request():
@@ -45,6 +53,57 @@ def test_build_emits_typed_reflow_request():
         "qps": 20.5,
         "expected_stale": 21,
     }
+
+
+def test_build_translates_prod_apply_confirmation_for_server():
+    result = _run(
+        "build",
+        env={
+            "ENVIRONMENT": "prod",
+            "ACTION": "replicate",
+            "TABLE_IN": "chat_messages",
+            "DRY_RUN_IN": "false",
+            "CONFIRM_IN": "MIGRATE-PROD",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "action": "replicate",
+        "table": "chat_messages",
+        "dry_run": False,
+        "confirm": "MIGRATE",
+        "qps": None,
+        "expected_stale": None,
+    }
+
+
+def test_build_rejects_prod_apply_without_prod_specific_confirmation():
+    for confirm in ("", "MIGRATE"):
+        result = _run(
+            "build",
+            env={
+                "ENVIRONMENT": "prod",
+                "ACTION": "replicate",
+                "TABLE_IN": "memory_moments",
+                "DRY_RUN_IN": "false",
+                "CONFIRM_IN": confirm,
+            },
+        )
+        assert result.returncode != 0
+        assert "MIGRATE-PROD" in result.stderr
+
+
+def test_build_rejects_unknown_environment():
+    result = _run(
+        "build",
+        env={
+            "ENVIRONMENT": "production",
+            "ACTION": "replicate",
+            "DRY_RUN_IN": "true",
+        },
+    )
+    assert result.returncode != 0
+    assert "ENVIRONMENT" in result.stderr
 
 
 def test_build_rejects_malformed_or_nonfinite_numbers():
@@ -74,6 +133,47 @@ def test_check_rejects_green_http_with_failed_apply(tmp_path):
         env={"ACTION": "prune", "DRY_RUN_IN": "false"},
     )
     assert result.returncode != 0
+
+
+def test_check_rejects_snapshot_apply_with_failed_table(tmp_path):
+    response = tmp_path / "response.json"
+    response.write_text(
+        json.dumps(
+            {
+                "action": "snapshot",
+                "dry_run": False,
+                "failures": 1,
+                "tables": [{"table": "agent_jobs", "ok": False}],
+            }
+        )
+    )
+    result = _run(
+        "check",
+        "200",
+        str(response),
+        env={"ACTION": "snapshot", "DRY_RUN_IN": "false"},
+    )
+    assert result.returncode != 0
+
+
+def test_check_accepts_successful_single_table_snapshot(tmp_path):
+    response = tmp_path / "response.json"
+    response.write_text(
+        json.dumps(
+            {
+                "action": "snapshot",
+                "dry_run": False,
+                "tables": [{"table": "agent_jobs", "ok": True, "copied": 1}],
+            }
+        )
+    )
+    result = _run(
+        "check",
+        "200",
+        str(response),
+        env={"ACTION": "snapshot", "DRY_RUN_IN": "false"},
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_check_accepts_successful_apply_and_read_only_dry_run(tmp_path):
