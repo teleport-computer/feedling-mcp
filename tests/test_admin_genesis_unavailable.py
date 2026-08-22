@@ -222,3 +222,43 @@ def test_unreadable_cohort_week_renders_differently_from_immature():
     assert "坏值" in unreadable
     # 反向:合法的「还没走完」不许被报成坏值。
     assert "坏值" not in immature
+
+
+# --------------------------------------------------------------------------- #
+# T245 域13:「省略型」—— 一句话从页面上蒸发,而缺席不留痕迹
+# --------------------------------------------------------------------------- #
+
+def test_unreadable_retention_says_so_instead_of_dropping_the_whole_clause():
+    """⭐ 省略型是本单最隐蔽的一类。
+
+    改之前:`d14.pct` 坏值 → `except: pass` → 「新来 100 个能留住 N 个」**整句消失**,
+    而读的人**无从知道这里本该有一句**。
+    它既不返回 0 也不返回 None —— **它让一条陈述消失,而缺席不留痕迹。**
+    """
+    good = data_track._home_human_summary(
+        {"wau": 10, "prev_wau": 10}, {"curve": {"d14": {"pct": 42}}}, None)
+    bad = data_track._home_human_summary(
+        {"wau": 10, "prev_wau": 10}, {"curve": {"d14": {"pct": "abc"}}}, None)
+
+    # 前提:正常那份确实产生了这句话,否则本条无从对比。
+    assert "留住" in good
+    assert "42" in good
+
+    assert "读不出来" in bad
+    # 反向:正常时不许乱报。
+    assert "读不出来" not in good
+
+
+def test_no_previous_week_and_unreadable_previous_week_differ():
+    """首周(本来就没有上一周)与「上一周读不出来」必须不同形。"""
+    first_week = data_track._home_human_summary({"wau": 10, "prev_wau": None},
+                                                None, None)
+    unreadable = data_track._home_human_summary({"wau": 10, "prev_wau": "abc"},
+                                                None, None)
+
+    # 前提:两份的 wau 相同,唯一差别是 prev_wau。
+    assert first_week != unreadable
+    assert "比不了" in unreadable
+    assert "比不了" not in first_week
+    # 首周不该出现任何对比从句
+    assert "比上一周" not in first_week

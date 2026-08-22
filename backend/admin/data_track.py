@@ -6938,11 +6938,20 @@ def _home_human_summary(
     prev_wau = (pulse or {}).get("prev_wau")
     if wau is not None:
         head = f"近 7 天 <b>{int(wau)}</b> 人在用"
-        try:
-            diff = int(wau) - int(prev_wau)
-        except (TypeError, ValueError):
+        # ⚠️ 「本来就没有上一周」(首周)与「上一周的数读不出来」原本都让
+        # 对比从句静默消失 —— 读的人无从知道这里本该有句话。前者正常,后者要修数据。
+        prev_unreadable = False
+        if prev_wau is None:
             diff = None
-        if diff is not None and diff != 0:
+        else:
+            try:
+                diff = int(wau) - int(prev_wau)
+            except (TypeError, ValueError):
+                diff = None
+                prev_unreadable = True
+        if prev_unreadable:
+            head += "（上一周的数读不出来，比不了）"
+        elif diff is not None and diff != 0:
             head += f"（比上一周{'多' if diff > 0 else '少'} {abs(diff)} 个）"
         elif diff == 0:
             head += "（和上一周持平）"
@@ -6953,7 +6962,11 @@ def _home_human_summary(
             kept = int(round(float(d14["pct"])))
             clauses.append(f"新来 100 个能留住 <b>{kept}</b> 个")
         except (TypeError, ValueError):
-            pass
+            # ⚠️ 原本是 `pass` —— **整句话从页面上蒸发**,
+            # 而读的人**无从知道这里本该有一句**。
+            # 这是「省略型」:它既不返回 0 也不返回 None,它让一条陈述消失 ——
+            # 比显示一个坏值更难发现,因为**缺席不留痕迹**。
+            clauses.append("留存率读不出来")
     if queue is not None:
         rows = [r for r in (queue.get("rows") or []) if isinstance(r, dict)]
         if rows:
