@@ -246,6 +246,8 @@ jobs:
   python-tests:
     name: test_api.py (multi-tenant)
     runs-on: ubuntu-24.04
+    env:
+      FEEDLING_CI_EXECUTION_JOB: python-tests
     # All per-user data lives in Postgres now (see backend/db.py), so the
     # backend cannot start without a reachable DB. Provision a throwaway one.
     services:
@@ -263,6 +265,12 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
+
+      - name: Bind execution evidence to exact checkout
+        continue-on-error: true
+        run: |
+          echo "FEEDLING_CI_EXECUTION_HEAD_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "FEEDLING_CI_EXECUTION_EVIDENCE_DIR=$RUNNER_TEMP/feedling-ci-execution-evidence" >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -300,6 +308,13 @@ jobs:
 
       - name: Run test suite
         run: python tests/test_api.py http://127.0.0.1:5001 --multi-tenant
+
+      - name: Attest successful custom test runner
+        continue-on-error: true
+        run: >-
+          python tools/ci_execution_evidence.py attest
+          --runner tests/test_api.py
+          --output "$FEEDLING_CI_EXECUTION_EVIDENCE_DIR/custom-test-api.json"
 
       - name: Stop test backend (the isolation suite spawns its own)
         if: always()
@@ -755,6 +770,7 @@ jobs:
             tests/test_db_health_timeouts.py \
             tests/test_access_mode_runtime_sync_unit.py \
             tests/test_pytest_coverage_ratchet.py \
+            tests/test_ci_execution_evidence.py \
             tests/test_mcp_client.py \
             tests/test_mcp_probe_tools_required.py \
             tests/test_mcp_status.py \
@@ -841,9 +857,20 @@ jobs:
             tests/test_data_track_debug.py \
             -v
 
+      - name: Upload execution evidence (report only)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-execution-evidence-python-tests
+          path: ${{ runner.temp }}/feedling-ci-execution-evidence
+          if-no-files-found: ignore
+
   runtime-v2-coverage:
     name: Runtime V2 coverage (profile=${{ matrix.profile_enabled }})
     runs-on: ubuntu-24.04
+    env:
+      FEEDLING_CI_EXECUTION_JOB: runtime-v2-coverage/profile=${{ matrix.profile_enabled }}
     strategy:
       fail-fast: false
       matrix:
@@ -863,6 +890,12 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
+
+      - name: Bind execution evidence to exact checkout
+        continue-on-error: true
+        run: |
+          echo "FEEDLING_CI_EXECUTION_HEAD_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "FEEDLING_CI_EXECUTION_EVIDENCE_DIR=$RUNNER_TEMP/feedling-ci-execution-evidence" >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -909,6 +942,63 @@ jobs:
             tests/test_v2_worker_tool_loop.py \
             tests/test_v2_deterministic_compaction.py \
             -v
+
+      - name: Upload execution evidence (report only)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-execution-evidence-runtime-v2-${{ matrix.profile_enabled }}
+          path: ${{ runner.temp }}/feedling-ci-execution-evidence
+          if-no-files-found: ignore
+
+  ci-execution-evidence-report:
+    name: CI execution evidence (report only)
+    if: always()
+    continue-on-error: true
+    needs: [python-tests, runtime-v2-coverage]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download producer evidence
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ci-execution-evidence-*
+          path: /tmp/feedling-ci-execution-evidence
+
+      - name: Build exact-SHA configured/executed report
+        continue-on-error: true
+        env:
+          PYTHON_JOB_RESULT: ${{ needs.python-tests.result }}
+          RUNTIME_JOB_RESULT: ${{ needs.runtime-v2-coverage.result }}
+        run: |
+          python tools/ci_execution_evidence.py report \
+            --workflow .github/workflows/ci.yml \
+            --tests-dir tests \
+            --baseline .github/pytest-uncovered-baseline.txt \
+            --evidence-dir /tmp/feedling-ci-execution-evidence \
+            --expected-head-sha "$(git rev-parse HEAD)" \
+            --producer python-tests=python-tests \
+            --producer runtime-v2-coverage=runtime-v2-coverage/profile=0 \
+            --producer runtime-v2-coverage=runtime-v2-coverage/profile=1 \
+            --producer-result "python-tests=$PYTHON_JOB_RESULT" \
+            --producer-result "runtime-v2-coverage=$RUNTIME_JOB_RESULT" \
+            --output /tmp/ci-execution-evidence-report.json \
+            --markdown /tmp/ci-execution-evidence-report.md
+          cat /tmp/ci-execution-evidence-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload configured/executed report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-execution-evidence-report
+          path: |
+            /tmp/ci-execution-evidence-report.json
+            /tmp/ci-execution-evidence-report.md
+          if-no-files-found: ignore
 
   # -------------------------------------------------------------------------
   # Docker — confirm the hash-pinned build stays reproducible

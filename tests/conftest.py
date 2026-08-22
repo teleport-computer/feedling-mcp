@@ -419,6 +419,8 @@ if not _provisioned:
         "test_capabilities_tool_schema.py",
         # 豁免名单棘轮(2026-08-10)。纯:只读两个文本文件,自带 sys.path 引导。
         "test_pytest_coverage_ratchet.py",
+        # Phase A CI 执行证据量具：临时文件 + 子进程 pytest，不碰 DB/网络。
+        "test_ci_execution_evidence.py",
     }
     collect_ignore = sorted(
         f
@@ -755,3 +757,36 @@ def client(backend_env):
     from asgi_test_client import make_client
 
     return make_client()
+
+
+# Phase A CI execution evidence is opt-in through environment variables.  Keep
+# the hook wiring here so every normal pytest invocation records actual call
+# outcomes without depending on terminal verbosity.  The implementation is
+# fail-open and is a no-op outside configured CI producer jobs.
+_ci_execution_evidence = None
+_ci_execution_evidence_import_attempted = False
+
+
+def _load_ci_execution_evidence():
+    """Load the optional observer without making conftest collection depend on it."""
+    global _ci_execution_evidence, _ci_execution_evidence_import_attempted
+    if not _ci_execution_evidence_import_attempted:
+        _ci_execution_evidence_import_attempted = True
+        try:
+            from tools import ci_execution_evidence
+        except Exception:
+            return None
+        _ci_execution_evidence = ci_execution_evidence
+    return _ci_execution_evidence
+
+
+def pytest_runtest_logreport(report):
+    observer = _load_ci_execution_evidence()
+    if observer is not None:
+        observer.pytest_runtest_logreport(report)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    observer = _load_ci_execution_evidence()
+    if observer is not None:
+        observer.pytest_sessionfinish(session, exitstatus)
