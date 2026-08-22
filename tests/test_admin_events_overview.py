@@ -307,6 +307,7 @@ def _master_frozen(*, v1="green", v2="green") -> dict:
             "end_day": "2030-06-07", "day_count": 1,
             "routes": {
                 "resident": {
+                    "active_users": 17,
                     "coverage": {"level": v1, "covered_days": 1,
                                  "required_days": 1},
                     "lanes": {"heartbeat": {
@@ -317,6 +318,7 @@ def _master_frozen(*, v1="green", v2="green") -> dict:
                     "lane_sources": {},
                 },
                 "model_api": {
+                    "active_users": 5,
                     "coverage": {"level": v2,
                                  "covered_days": 1 if v2 == "green" else 0,
                                  "required_days": 1},
@@ -353,9 +355,15 @@ def test_master_does_not_relabel_mixed_v1_runtime_as_an_access_path():
     assert "failed 混合 failed 与 skipped" in (
         runtime_heartbeat["cells"]["runtime_v1"]["detail"]
     )
-    assert "resident_cli 234 vs V2 32" in (
-        runtime_heartbeat["cells"]["runtime_v1"]["detail"]
-    )
+    assert "resident_cli 234 vs V2 32" not in str(payload)
+    assert payload["runtime_windows"][0]["active_users"] == {
+        "runtime_v1": 17,
+        "runtime_v2": 5,
+    }
+    page = data_track_module._render_event_master_tables(payload)
+    assert "冻结行按 user_id 去重" in page
+    assert "V1 runtime（混合接入方式） 17 人" in page
+    assert "V2 runtime（APIKey） 5 人" in page
     assert "混合接入方式" in payload["runtime_paths"][0]["label"]
 
 
@@ -372,6 +380,57 @@ def test_complete_zero_and_missing_probe_render_differently():
     assert "🟢" in metric and "0 次终态作业" in metric
     assert "🔴" in missing and "当前记不到这一级" in missing
     assert metric != missing
+
+
+def test_runtime_population_does_not_turn_missing_or_partial_into_zero():
+    frozen = _master_frozen(v2="yellow")
+    del frozen["windows"][0]["routes"]["resident"]["active_users"]
+    payload = data_track_module._event_path_master_payload(frozen)
+    assert payload["runtime_windows"][0]["active_users"] == {
+        "runtime_v1": None,
+        "runtime_v2": None,
+    }
+    page = data_track_module._render_event_master_tables(payload)
+    assert page.count("人数不报（冻结覆盖不完整或来源未提供）") == 2
+    assert "V1 runtime（混合接入方式） 0 人" not in page
+    assert "V2 runtime（APIKey） 0 人" not in page
+
+
+def test_route_population_is_never_rendered_as_an_access_path_population():
+    payload = data_track_module._event_path_master_payload(_master_frozen())
+
+    runtime_window = {
+        **payload["runtime_windows"][0],
+        "active_users": {"runtime_v1": 9, "runtime_v2": 9},
+    }
+    runtime_page = data_track_module._render_event_master_tables({
+        **payload,
+        "windows": [],
+        "runtime_windows": [runtime_window],
+    })
+    # First prove the probe is wired correctly: this exact field is visible on
+    # the runtime table before we rely on its absence from the path table.
+    assert "窗口内 runtime route 活跃用户" in runtime_page
+    assert "V1 runtime（混合接入方式） 9 人" in runtime_page
+    assert "V2 runtime（APIKey） 9 人" in runtime_page
+
+    path_window = {
+        **payload["windows"][0],
+        "active_users": {
+            "resident": 9,
+            "apikey_v1": 9,
+            "apikey_v2": 9,
+        },
+    }
+    path_page = data_track_module._render_event_master_tables({
+        **payload,
+        "windows": [path_window],
+        "runtime_windows": [],
+    })
+    assert "窗口内 runtime route 活跃用户" not in path_page
+    assert "自有服务器 9 人" not in path_page
+    assert "APIKey-V1 9 人" not in path_page
+    assert "APIKey-V2 9 人" not in path_page
 
 
 def test_model_call_probe_coverage_mutation_changes_cell_shape(monkeypatch):
