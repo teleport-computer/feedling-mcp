@@ -856,6 +856,8 @@ jobs:
             tests/test_admin_debug_turn_view.py \
             tests/test_data_track_debug.py \
             tests/test_admin_discarded_reason.py \
+            tests/test_admin_concentration.py \
+            tests/test_admin_concentration_e2e.py \
             -v
 
       - name: Upload execution evidence (report only)

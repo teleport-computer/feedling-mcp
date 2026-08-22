@@ -9693,6 +9693,10 @@ def _event_path_master_payload(frozen: dict) -> dict:
                 "completed + operational failure；control、明确用户侧不可用、"
                 "superseded 剔除；未知码/expired 仍算 operational failure"
             ),
+            # 原样透传:上游给什么就带什么,脏数据由 _concentration_line 统一判。
+            # ⚠️ 这里**不做**校验,否则「上游没给」和「上游给了但不合法」会在
+            # 两个地方各判一次,两处规则迟早分叉。
+            "concentration": counts.get("concentration"),
         }
 
     path_windows = []
@@ -9951,6 +9955,43 @@ _EVENT_COVERAGE_MARK = {
 }
 
 
+def _concentration_line(raw: object) -> str:
+    """一行集中度,贴在率的旁边。
+
+    **为什么必须有**(2026-08-22 prod 实证,不是设计洁癖):
+    V1 心跳 14 个活跃号里 **6 个整周零成功**,663 次失败 = V1 心跳失败的 66%;
+    V2 25 个号里 1 个整周零成功,剔掉它整体从 11.2% 降到 9.0%。
+    表上那个「56% 失败」会被读成「一半心跳在失败」,真相却是
+    「**6 个号从来没成功过,其余大致正常**」——
+    活跃用户只有十几个时,平均值几乎必然被少数坏号主导。
+    ⇒ 数是对的,**但它回答的不是读表人以为的那个问题**。
+
+    两个数各抓一类,都不设阈值:
+      ``users_zero_success``       抓「持续坏掉的账号」——可穷举、可直接去修
+      ``top_user_failure_share``  抓上一条漏掉的:有成功但失败量压倒性的号
+
+    ⛔ 不许设阈值只在「集中度高」时显示:阈值会把健康情形藏起来,于是
+       「没显示」同时意味着「不集中」和「没算」,又造一个歧义空格。
+    ⚠️ 同理,缺失时显式说「未计算」而不是留空 ——
+       「0 人零成功」是一个**真结论**(这格是健康的),与「没算」必须不同形。
+    """
+    if not isinstance(raw, dict):
+        return " · 集中度未计算"
+    try:
+        active = int(raw.get("users_active"))
+        zero = int(raw.get("users_zero_success"))
+    except (TypeError, ValueError):
+        return " · 集中度未计算"
+    if active < 0 or zero < 0 or zero > active:
+        return " · 集中度未计算"
+    line = f" · 零成功 {zero}/{active} 人"
+    share = raw.get("top_user_failure_share")
+    if isinstance(share, (int, float)) and not isinstance(share, bool):
+        if math.isfinite(share) and 0.0 <= share <= 1.0:
+            line += f" · 失败最集中的一个用户占 {share * 100:.0f}%"
+    return line
+
+
 def _render_event_master_cell(cell: dict, *, action: str, path: str,
                               window: str) -> str:
     level = str(cell.get("coverage") or "red")
@@ -9984,6 +10025,7 @@ def _render_event_master_cell(cell: dict, *, action: str, path: str,
         detail = (
             f"分母={denominator}（成功 {success} + 失败 {failure}；"
             f"{rule}）{excluded}{controls}"
+            f"{_concentration_line(cell.get('concentration'))}"
         )
         return (f"<td>{headline}<div class='evt-cell-scope'>"
                 f"{html.escape(scope)}<br>{html.escape(detail)}</div></td>")
