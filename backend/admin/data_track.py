@@ -2415,22 +2415,53 @@ def _finite_ms(value):
     return out if (math.isfinite(out) and out >= 0) else None
 
 
-def _known_job_lanes() -> frozenset:
+def _load_jobs_store_trace_vocabulary() -> tuple[frozenset, frozenset]:
+    """Read the trace vocabulary from its producer.
+
+    Kept as a small seam so an import/read failure can be tested without
+    teaching the admin consumer a second copy of either closed set.
+    """
+    from model_api_runtime.v2 import jobs_store as _js
+
+    return frozenset(_js.LANES), frozenset(_js.ENQUEUE_REASON_CODES)
+
+
+def _trace_vocabulary() -> tuple[frozenset, frozenset] | None:
+    """Return producer-owned lane/reason sets, or an explicit unavailable.
+
+    Both producer exports are non-empty closed sets. Empty therefore cannot be
+    a healthy reading. Failures are deliberately not cached: a transient import
+    failure must not blind the admin surface until process restart.
+    """
+    global _TRACE_VOCABULARY_CACHE
+    if _TRACE_VOCABULARY_CACHE is not None:
+        return _TRACE_VOCABULARY_CACHE
+    try:
+        lanes, enqueue_reasons = _load_jobs_store_trace_vocabulary()
+        if not lanes or not enqueue_reasons:
+            return None
+    except Exception:  # noqa: BLE001 — render degraded state instead of 500
+        return None
+    _TRACE_VOCABULARY_CACHE = (lanes, enqueue_reasons)
+    return _TRACE_VOCABULARY_CACHE
+
+
+_TRACE_VOCABULARY_CACHE = None
+_TRACE_VOCABULARY_UNSET = object()
+
+
+def _known_job_lanes() -> frozenset | None:
     """后台任务的 lane 闭集,**从产生方读**,不在管理端抄一份。"""
-    global _KNOWN_JOB_LANES_CACHE
-    if _KNOWN_JOB_LANES_CACHE is None:
-        try:
-            from model_api_runtime.v2 import jobs_store as _js
-            _KNOWN_JOB_LANES_CACHE = frozenset(_js.LANES)
-        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
-            _KNOWN_JOB_LANES_CACHE = frozenset()
-    return _KNOWN_JOB_LANES_CACHE
+    vocabulary = _trace_vocabulary()
+    return vocabulary[0] if vocabulary is not None else None
 
 
-_KNOWN_JOB_LANES_CACHE = None
-
-
-def _debug_trace_group_turns(events: list[dict]) -> list[dict]:
+def _debug_trace_group_turns(
+    events: list[dict], *, known_job_lanes=_TRACE_VOCABULARY_UNSET,
+) -> list[dict]:
+    if known_job_lanes is _TRACE_VOCABULARY_UNSET:
+        known_job_lanes = _known_job_lanes()
+    lane_values = known_job_lanes if known_job_lanes is not None else frozenset()
     buckets: dict[tuple[str, str], list[dict]] = {}
     for ev in events:
         trace_id = str(ev.get("trace_id") or "ungrouped")
@@ -2474,7 +2505,7 @@ def _debug_trace_group_turns(events: list[dict]) -> list[dict]:
             (
                 str(e.get("lane") or "")
                 for e in ordered
-                if str(e.get("lane") or "") in _known_job_lanes()
+                if str(e.get("lane") or "") in lane_values
             ),
             "",
         ) or next(
@@ -2482,7 +2513,7 @@ def _debug_trace_group_turns(events: list[dict]) -> list[dict]:
                 str((e.get("detail") or {}).get("lane") or "")
                 for e in ordered
                 if isinstance(e.get("detail"), dict)
-                and str((e.get("detail") or {}).get("lane") or "") in _known_job_lanes()
+                and str((e.get("detail") or {}).get("lane") or "") in lane_values
             ),
             "",
         )
@@ -2829,22 +2860,22 @@ def _is_registered_failure_code(value: str) -> bool:
     return value in _known_failure_codes() or value in _known_error_classes()
 
 
-def _trace_public_fields() -> dict:
+def _trace_public_fields(*, vocabulary=_TRACE_VOCABULARY_UNSET) -> dict:
     """事件类型 -> {键: 允许取值集合 或 _TRACE_PUBLIC_SHAPE}。
 
     惰性构建:`jobs_store` 在 `data_track` 之下,模块级导入会把管理端接进运行时
     的导入链(仓内既有做法同此,见 `_v2_wake_activity_detail`)。
     """
     global _TRACE_PUBLIC_FIELDS_CACHE
-    if _TRACE_PUBLIC_FIELDS_CACHE is not None:
+    if vocabulary is _TRACE_VOCABULARY_UNSET:
+        vocabulary = _trace_vocabulary()
+    if vocabulary is not None and _TRACE_PUBLIC_FIELDS_CACHE is not None:
         return _TRACE_PUBLIC_FIELDS_CACHE
-    try:
-        from model_api_runtime.v2 import jobs_store as _js
-        lanes = frozenset(_js.LANES)
-        enqueue_reasons = frozenset(_js.ENQUEUE_REASON_CODES)
-    except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
+    if vocabulary is None:
         lanes = frozenset()
         enqueue_reasons = frozenset()
+    else:
+        lanes, enqueue_reasons = vocabulary
     outcomes = frozenset(db.TRACE_OUTCOME_CLASSES)
     job_outcomes = frozenset({"completed", "failed", "rescheduled", "superseded"})
     voice_stage = frozenset({
@@ -2881,14 +2912,21 @@ def _trace_public_fields() -> dict:
             "stage": voice_stage, "runtime": runtime_kind,
             "error_code": _TRACE_PUBLIC_FAILURE_CODE,
         }
-    _TRACE_PUBLIC_FIELDS_CACHE = table
+    # Only a producer-backed table is healthy enough to cache. The degraded
+    # table still preserves unrelated public fields, but the next request must
+    # retry the producer import.
+    if vocabulary is not None:
+        _TRACE_PUBLIC_FIELDS_CACHE = table
     return table
 
 
 _TRACE_PUBLIC_FIELDS_CACHE = None
 
 
-def _expose_declared_trace_fields(ev: dict, raw_detail, public_detail) -> None:
+def _expose_declared_trace_fields(
+    ev: dict, raw_detail, public_detail,
+    *, trace_public_fields=_TRACE_VOCABULARY_UNSET,
+) -> None:
     """把该事件显式声明过的字段放回明文。
 
     两层收口:键必须被这个事件声明过,**且**值必须落在产生方集合里。
@@ -2896,7 +2934,9 @@ def _expose_declared_trace_fields(ev: dict, raw_detail, public_detail) -> None:
     """
     if not isinstance(raw_detail, dict) or not isinstance(public_detail, dict):
         return
-    allowed = _trace_public_fields().get(str(ev.get("type") or ""))
+    if trace_public_fields is _TRACE_VOCABULARY_UNSET:
+        trace_public_fields = _trace_public_fields()
+    allowed = trace_public_fields.get(str(ev.get("type") or ""))
     if not allowed:
         return
     for key, spec in allowed.items():
@@ -2910,10 +2950,17 @@ def _expose_declared_trace_fields(ev: dict, raw_detail, public_detail) -> None:
             public_detail[key] = value
 
 
-def _debug_event_public_json(ev: dict) -> dict:
+def _debug_event_public_json(
+    ev: dict, *, trace_public_fields=_TRACE_VOCABULARY_UNSET,
+) -> dict:
     raw_detail = ev.get("detail") or {}
     public_detail = _debug_redact_value(raw_detail)
-    _expose_declared_trace_fields(ev, raw_detail, public_detail)
+    _expose_declared_trace_fields(
+        ev,
+        raw_detail,
+        public_detail,
+        trace_public_fields=trace_public_fields,
+    )
     if ev.get("type") in memory_dream_trace.DREAM_TRACE_TYPES:
         # Dream rewrites private memory. Its public diagnostic contract is an
         # exact closed shape: any new/unknown key invalidates the whole detail
@@ -3134,6 +3181,7 @@ def _debug_filter_options(events: list[dict]) -> dict:
 
 
 def _data_track_debug_payload() -> dict:
+    trace_vocabulary = _trace_vocabulary()
     filters = _data_track_request_filters()
     limit = int(filters.get("limit") or 100)
     offset = int(filters.get("offset") or 0)
@@ -3232,7 +3280,12 @@ def _data_track_debug_payload() -> dict:
             }
 
     all_events = sorted(all_events, key=lambda e: float(e.get("ts") or 0), reverse=True)
-    turns = _debug_trace_group_turns(all_events)
+    turns = _debug_trace_group_turns(
+        all_events,
+        known_job_lanes=(
+            trace_vocabulary[0] if trace_vocabulary is not None else None
+        ),
+    )
     if status_filter and status_filter != "all":
         turns = [t for t in turns if t.get("terminal_status") == status_filter]
         allowed = {(t["user_id"], t["trace_id"]) for t in turns}
@@ -3297,6 +3350,11 @@ def _data_track_debug_payload() -> dict:
             "page": str(page or ""),
         },
         "options": _debug_filter_options(all_events_raw),
+        "observability": {
+            "trace_vocabulary": (
+                "ok" if trace_vocabulary is not None else "unavailable"
+            ),
+        },
         "pagination": pagination,
         "users": users_out,
         "turns": turns_out,
@@ -9131,6 +9189,16 @@ def _render_turn_identity(turn: dict) -> str:
 
 def _render_data_track_debug_page(payload: dict) -> str:
     summary = payload["summary"]
+    trace_vocabulary_status = str(
+        (payload.get("observability") or {}).get("trace_vocabulary") or "unavailable"
+    )
+    trace_public_fields = _trace_public_fields(
+        vocabulary=(
+            _TRACE_VOCABULARY_UNSET
+            if trace_vocabulary_status == "ok"
+            else None
+        )
+    )
     filters = payload.get("filters", {})
     options = payload.get("options", {})
     users = payload.get("users", [])
@@ -9195,7 +9263,12 @@ def _render_data_track_debug_page(payload: dict) -> str:
             copy_button("copy user", ev.get("user_id") or ""),
             copy_button("copy trace", ev.get("trace_id") or ""),
             copy_button("copy type", ev.get("type") or ""),
-            copy_button("copy JSON", _debug_event_public_json(ev)),
+            copy_button(
+                "copy JSON",
+                _debug_event_public_json(
+                    ev, trace_public_fields=trace_public_fields,
+                ),
+            ),
         ]
         if include_open_turn:
             href = _data_track_page_href(view="debug", mode="timeline", user_id=ev.get("user_id") or "", trace_id=ev.get("trace_id") or "", offset=0, reveal=None)
@@ -9215,7 +9288,9 @@ def _render_data_track_debug_page(payload: dict) -> str:
         # 这正是 T130 那条:单测绿 = 代码对,证不了页面看得见。
         detail = _debug_json(
             ev.get("detail") if revealed
-            else _debug_event_public_json(ev).get("detail") or {}
+            else _debug_event_public_json(
+                ev, trace_public_fields=trace_public_fields,
+            ).get("detail") or {}
         )
         excerpt = _debug_json(ev.get("content_excerpt") if revealed else _debug_content_summary(ev.get("content_excerpt") or {}))
         if not detail and not excerpt and not revealed:
@@ -9324,6 +9399,13 @@ def _render_data_track_debug_page(payload: dict) -> str:
         _render_metric("turns", summary["turns_total"]),
         _render_metric("stalled / error", f"{summary['stalled_turns']} / {summary['error_turns']}"),
     ])
+    vocabulary_warning = (
+        "<div class='observability-warning'>Trace 词表暂不可用；"
+        "后台任务 lane / enqueue reason 闭集字段未展示，"
+        "不能读成“事件没有这些字段”。</div>"
+        if trace_vocabulary_status != "ok"
+        else ""
+    )
     refresh_meta = "" if reveal_key else '<meta http-equiv="refresh" content="30">'
 
     page_unit = "turns" if mode == "timeline" else "events"
@@ -9440,6 +9522,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
     pre {{ white-space:pre-wrap; word-break:break-word; background:#fff7f0; border:1px solid var(--line); border-radius:6px; padding:10px; max-height:360px; overflow:auto; }}
     .redacted-note,.reveal-note {{ border-radius:6px; padding:8px; margin:7px 0; }} .redacted-note {{ color:var(--muted); background:#f6efe8; border:1px solid var(--line); }} .reveal-note {{ color:#8a4a00; background:#fff8ed; border:1px solid #e8c59d; }}
     .stall {{ color:var(--warn); background:#fff8e8; border:1px solid #f0d7a5; border-radius:6px; padding:8px; margin-top:8px; }}
+    .observability-warning {{ color:var(--warn); background:#fff8e8; border:1px solid #f0d7a5; border-radius:6px; padding:10px; margin:14px 0; }}
 {_NAV_GROUP_CSS}
   </style>
 </head>
@@ -9448,6 +9531,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
   <h1>Feedling Debug Logs</h1>
   <div class="muted">Admin-only debug view. Reads the append-only TEE trace table; no instrumentation writes here. Generated {html.escape(_bj_iso(summary["generated_at"]))}.</div>
   {_render_data_track_view_nav("debug")}
+  {vocabulary_warning}
   <section class="metrics">{metrics}</section>
   <div class="modebar">
     <div class="mode-left">

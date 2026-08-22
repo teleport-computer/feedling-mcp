@@ -90,6 +90,9 @@ def _usage_report_admission():
     finally:
         _USAGE_REPORT_GATE.release()
 
+# Keep this producer export non-empty. The admin trace consumer uses that
+# invariant to distinguish a failed vocabulary load from a healthy reading;
+# making lanes optional/dynamic requires an explicit availability contract.
 LANES = {
     "chat",
     "manual_wake",
@@ -357,7 +360,9 @@ JOB_FAILURE_CODES = frozenset({
 # an internal persistence field and can carry migration/private coordination
 # values; the trace producer emits a reason only when it is registered here.
 # Admin consumes this export directly and therefore never has to infer that a
-# snake_case-looking string came from us.
+# snake_case-looking string came from us. Keep the export non-empty: admin uses
+# that invariant to report a failed vocabulary load as unavailable rather than
+# as a healthy empty allowlist.
 ENQUEUE_REASON_CODES = frozenset({
     # Foreground/recovery producers (chat itself is intentionally not traced by
     # the generic enqueue hook, but keeping the complete queue vocabulary here

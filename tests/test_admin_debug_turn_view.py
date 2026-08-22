@@ -463,10 +463,12 @@ def test_admin_enqueue_allowlist_tracks_a_producer_export_mutation(monkeypatch):
         "ENQUEUE_REASON_CODES",
         jobs_store.ENQUEUE_REASON_CODES | {probe},
     )
+    monkeypatch.setattr(data_track, "_TRACE_VOCABULARY_CACHE", None)
     monkeypatch.setattr(data_track, "_TRACE_PUBLIC_FIELDS_CACHE", None)
     try:
         assert _public("agent.job.enqueued", {"reason": probe})["reason"] == probe
     finally:
+        data_track._TRACE_VOCABULARY_CACHE = None
         data_track._TRACE_PUBLIC_FIELDS_CACHE = None
 
 
