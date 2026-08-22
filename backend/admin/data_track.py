@@ -5684,7 +5684,7 @@ def _render_chat_reliability_page(report: dict | None, *, within_hours: int) -> 
             f"<td>{html.escape(str(row.get('final_effect_status') or 'missing'))}</td>"
             f"<td>{html.escape(str(row.get('provider') or '—'))} / {html.escape(str(row.get('model') or '—'))}</td>"
             f"<td>{_fmt_count(row.get('model_calls'))} / {_fmt_count(row.get('retries'))}</td>"
-            f"<td><code>{html.escape(str(row.get('last_error') or '—'))}</code></td>"
+            f"{_failure_code_cell(row.get('last_error'), missing='—')}"
             f"<td>{html.escape(_ops_time(row.get('created_at')))}</td>"
             "</tr>"
         )

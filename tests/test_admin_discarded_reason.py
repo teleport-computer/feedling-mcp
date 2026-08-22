@@ -59,23 +59,75 @@ def test_missing_code_is_not_rendered_as_the_discarded_code():
     assert "other" in none_value
 
 
-def test_every_failure_code_render_site_goes_through_the_helper():
-    """三个渲染出口都必须走同一个助手。
+def test_no_render_site_puts_a_row_field_into_a_bare_code_cell():
+    """任何 ``<td><code>`` 里塞 ``row.get(...)`` 的写法都必须走助手。
 
-    ⚠️ 这条是为了防「只改了看得见的那一处」:2026-08-22 同一文件里
-    三处渲染失败码,兜底值曾经是 other / other / **runtime_failed** 三种,
-    异类的那一处正是把两件事混成一个词的地方。
-    判据取自源码而非渲染结果 —— 渲染结果只能证明「我构造到的那条路对了」。
+    ⚠️ **这条我改过两次,两次都因为我把「我知道的东西」写进了判据:**
+
+      第一版按字面量 grep 找出口,数出「三处」——实际有四处
+      (第四处兜底值是 ``—``,是这条测试自己扫出来的)。
+      第二版正则写死字段名 ``code|error_code`` ——
+      **仍然漏掉 ``last_error``**,由 codex2 在 PR 复审中抓到:
+      同一页 ``runtime_failed`` 出现两次,只有一次带「原因已丢弃」。
+
+    ⇒ 判据不能列举**我想得到的字段名**,只能钉**形状**:
+      「``<td><code>`` 里出现 ``row.get(...)``」——不管那个键叫什么。
+    ⚠️ 也不再断言「调用次数 >= N」:那同样是在编码我此刻知道的出口数量,
+      新增一个出口时它不会红。
     """
     source = Path(data_track.__file__).read_text(encoding="utf-8")
 
-    # 前提:助手确实存在且被引用,否则下面的计数恒为 0、这条测试恒绿。
+    # 前提:助手存在。否则下面的扫描恒为空、这条测试恒绿。
     assert "def _failure_code_cell(" in source
-    assert source.count("_failure_code_cell(") >= 4  # 1 处定义 + 3 处调用
 
-    # 不许再有绕过助手、直接把失败码塞进 <td><code> 的写法。
-    bypass = re.findall(
-        r"<td><code>\{html\.escape\(str\(row\.get\('(?:code|error_code)'\)[^}]*\}</code></td>",
+    found = set(re.findall(
+        r"<td><code>\{html\.escape\(str\(row\.get\('([a-z_]+)'\)[^}]*\}</code></td>",
         source,
+    ))
+
+    # 可审豁免:每一条都必须写明**为什么它不是失败码**。
+    # ⚠️ 这不是「已知问题清单」,是「已判定无关」清单 ——
+    #    新出现的键会直接红,逼下一个人做一次判断,而不是默认放行。
+    #    (同 Supervisor 2026-08-22 对 actionlint 基线的口径:基线必须可审,
+    #     既有条目要写明为何保留,否则它退化成没人敢动也没人知道为什么的清单。)
+    NOT_A_FAILURE_CODE = {
+        "job_id",   # 任务标识,不是失败原因;它永远不会取值 runtime_failed
+    }
+
+    bypass = sorted(found - NOT_A_FAILURE_CODE)
+    assert bypass == [], (
+        "以下键被直接渲染进 <td><code>,绕过了 _failure_code_cell。"
+        "若它确实可能取到失败码,请改走助手;若确实无关,请加进 "
+        f"NOT_A_FAILURE_CODE 并写明理由:{bypass}"
     )
-    assert bypass == [], f"仍有绕过助手的失败码渲染:{bypass}"
+
+
+def test_whole_chat_page_never_shows_a_bare_discarded_code():
+    """整页行为断言:同一页上每一处 ``runtime_failed`` 都必须带说明。
+
+    ⚠️ 这条来自 codex2 的 PR 复审反例(2026-08-22):
+    「失败原因 Top」那格已经带了说明,而「最近 chat 任务」那格仍是裸的 ——
+    **同一页两个同值,一个有说明一个没有**,读表的人只会看见离他最近的那个。
+
+    ⭐ 它与上面那条源码扫描互补,缺一不可:
+      源码扫描抓「有没有新出口绕过助手」——但只在写法长得像已知形状时有效;
+      本条抓「**页面上真的还有没有裸值**」——不依赖任何写法。
+    """
+    report = {
+        "outcomes": {}, "reply_delivery": {}, "failure_delivery": {},
+        "reply_quality": {},
+        "failure_reasons": [{"code": "runtime_failed", "count": 7}],
+        "recent_jobs": [{"user_id": "usr_x", "status": "failed",
+                         "last_error": "runtime_failed"}],
+    }
+    page = data_track._render_chat_reliability_page(report, within_hours=24)
+
+    # 前提:这份构造确实让该值在页面上出现了不止一次 ——
+    # 否则「每一处都带说明」可能只是因为只有一处。
+    occurrences = page.count("runtime_failed")
+    assert occurrences >= 2, f"构造未产生多处同值(仅 {occurrences} 处),本条无意义"
+
+    assert page.count("原因已丢弃") == occurrences, (
+        f"页面上 runtime_failed 出现 {occurrences} 次,"
+        f"但只有 {page.count('原因已丢弃')} 次带说明"
+    )
