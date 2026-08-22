@@ -529,8 +529,10 @@ def test_outcome_classifier_is_shared_with_the_ops_dashboard():
 
     for code in jobs_store.CONTROL_OUTCOME_CODES:
         assert jobs_store.terminal_outcome_class(code) == "control"
+    for code in jobs_store.USER_UNAVAILABLE_OUTCOME_CODES:
+        assert jobs_store.terminal_outcome_class(code) == "user_unavailable"
     for code in jobs_store.SAFETY_SUPPRESSION_CODES:
-        assert jobs_store.terminal_outcome_class(code) == "safety_suppression"
+        assert jobs_store.terminal_outcome_class(code) == "operational_failure"
     for code in jobs_store.TIMEOUT_OUTCOME_CODES:
         assert jobs_store.terminal_outcome_class(code) == "timeout"
     # An unclassified code stays operational rather than being guessed into a
@@ -540,6 +542,7 @@ def test_outcome_classifier_is_shared_with_the_ops_dashboard():
     # Whatever it returns must be a member of the one shared vocabulary.
     every_code = (
         jobs_store.CONTROL_OUTCOME_CODES
+        | jobs_store.USER_UNAVAILABLE_OUTCOME_CODES
         | jobs_store.SAFETY_SUPPRESSION_CODES
         | jobs_store.TIMEOUT_OUTCOME_CODES
         | {"anything_else"}

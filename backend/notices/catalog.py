@@ -78,6 +78,34 @@ ERROR_CLASSES = frozenset({
     "image_generation_failed",
 })
 
+# Seven 2026-08-21: only these exact provider/account outcomes are explicit
+# enough to remove from Feedling's failure numerator.  Everything else --
+# including a future/unknown code, rate limiting, capability mismatches, safety
+# suppression, and empty replies -- remains our failure until investigated.
+#
+# V1 ``proactive_jobs.status_reason`` and V2 ``agent_jobs.last_error`` are
+# deliberately separate keyspaces.  Keep two named sets even where the words
+# overlap; merging them is how a value valid in one runtime gets misclassified
+# in the other.  T220 parity tests lock both sets to their producer exports.
+USER_UNAVAILABLE_V1_REASONS = frozenset({
+    "quota_insufficient",
+    "extraction_failed:quota_insufficient",
+    "image_generation_quota_insufficient",
+    "auth_invalid",
+    "image_generation_auth_invalid",
+    "model_not_found",
+    "image_generation_model_not_found",
+})
+USER_UNAVAILABLE_V2_OUTCOME_CODES = frozenset({
+    "turn_failed:quota_insufficient",
+    "extraction_failed:quota_insufficient",
+    "turn_failed:image_generation_quota_insufficient",
+    "turn_failed:auth_invalid",
+    "turn_failed:image_generation_auth_invalid",
+    "turn_failed:model_not_found",
+    "turn_failed:image_generation_model_not_found",
+})
+
 # error_class -> (blame, user_text)
 _CATALOG: dict[str, tuple[str, str]] = {
     "quota_insufficient": (

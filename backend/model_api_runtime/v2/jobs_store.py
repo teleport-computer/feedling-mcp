@@ -329,6 +329,12 @@ SAFETY_SUPPRESSION_CODES = frozenset({
     "wake_failed:protocol_fragment_suppressed",
     "wake_failed:malformed_self_thinking_suppressed",
 })
+# Persisted V2 error-code keyspace.  Do not merge this with resident/V1
+# ``status_reason``.  The notices catalog owns the explicit Seven-approved
+# subset; this alias prevents the runtime and admin consumers copying it.
+USER_UNAVAILABLE_OUTCOME_CODES = (
+    notices_catalog.USER_UNAVAILABLE_V2_OUTCOME_CODES
+)
 TIMEOUT_OUTCOME_CODES = frozenset({
     "queue_timeout",
     "lease_timeout",
@@ -465,7 +471,7 @@ def _notify_job_enqueued(
 
 
 def terminal_outcome_class(error_code: str) -> str:
-    """Map a terminal error code to the shared four-value outcome taxonomy.
+    """Map a terminal error code to the shared outcome taxonomy.
 
     This lived inside the operations-dashboard query as two local frozensets, so
     the dashboard was the only thing that could tell a deliberate control
@@ -481,8 +487,8 @@ def terminal_outcome_class(error_code: str) -> str:
     code = str(error_code or "")
     if code in CONTROL_OUTCOME_CODES:
         return "control"
-    if code in SAFETY_SUPPRESSION_CODES:
-        return "safety_suppression"
+    if code in USER_UNAVAILABLE_OUTCOME_CODES:
+        return "user_unavailable"
     if code in TIMEOUT_OUTCOME_CODES:
         return "timeout"
     return "operational_failure"
@@ -6160,14 +6166,21 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
         safety_suppressions = sum(
             int(item.get("count") or 0)
             for item in lane_failures
-            if item.get("outcome_class") == "safety_suppression"
+            if item.get("code") in SAFETY_SUPPRESSION_CODES
         )
-        # Expiries are always operational incidents.  Only the two allowlisted
-        # failed-job classes above are removed from the hard-failure numerator.
+        user_unavailable = sum(
+            int(item.get("count") or 0)
+            for item in lane_failures
+            if item.get("outcome_class") == "user_unavailable"
+        )
+        # Expiries/timeouts and safety suppressions are operational incidents.
+        # Only explicit control outcomes and Seven's exact user-unavailable
+        # codes leave our numerator. Unknown/new codes stay in it by default.
         operational_failures = max(
             0,
-            failed + expired - control_outcomes - safety_suppressions,
+            failed + expired - control_outcomes - user_unavailable,
         )
+        health_denominator = completed + operational_failures
         capture = capture_by_lane.get(lane)
         lanes.append({
             "lane": lane or "unknown",
@@ -6179,8 +6192,10 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
             "queue_expired": int((outcome or {}).get("queue_expired") or 0),
             "lease_expired": int((outcome or {}).get("lease_expired") or 0),
             "operational_failures": operational_failures,
+            "health_denominator": health_denominator,
             "control_outcomes": control_outcomes,
             "safety_suppressions": safety_suppressions,
+            "user_unavailable": user_unavailable,
             "empty_reply_suppressions": int(
                 (outcome or {}).get("empty_reply_suppressions") or 0
             ),
@@ -6188,8 +6203,8 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
                 float(failed + expired) / float(resolved) if resolved else None
             ),
             "operational_failure_rate": (
-                float(operational_failures) / float(resolved)
-                if resolved else None
+                float(operational_failures) / float(health_denominator)
+                if health_denominator else None
             ),
             "p50_ok_ms": _optional_ms(latency_by_lane.get(lane), "p50_ms"),
             "p95_ok_ms": _optional_ms(latency_by_lane.get(lane), "p95_ms"),
