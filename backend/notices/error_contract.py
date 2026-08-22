@@ -165,15 +165,15 @@ def _resident_specs() -> tuple[ErrorSpec, ...]:
 
 def _vision_specs() -> tuple[ErrorSpec, ...]:
     rows = (
-        ("vision_model_auth_invalid", "user_provider", "视觉模型的 API Key 无效或已过期，请到设置里重新保存。", "The vision-model API key is invalid or expired. Save it again in Settings."),
-        ("vision_model_quota_insufficient", "user_provider", "视觉模型服务额度不足，充值后再试。", "The vision-model service has insufficient quota. Add credit and try again."),
-        ("vision_model_not_found", "user_provider", "当前视觉模型不可用，请到设置里更换模型。", "The vision model is unavailable. Choose another model in Settings."),
-        ("vision_model_incompatible", "user_provider", "当前视觉模型无法读取这张图片，请到设置里更换模型。", "The vision model cannot read this image. Choose another model in Settings."),
-        ("vision_model_rate_limited", "provider_transient", "视觉模型请求太多，请稍等几分钟再试。", "The vision-model service is rate limited. Try again in a few minutes."),
-        ("vision_model_unavailable", "provider_transient", "视觉模型暂时无法连接，请稍后重试。", "The vision-model service is temporarily unavailable. Try again later."),
-        ("vision_model_empty_response", "provider_transient", "视觉模型没有返回图片内容，请重试或更换模型。", "The vision model returned no image description. Try again or choose another model."),
+        ("vision_model_auth_invalid", "user_provider", "视觉模型的 API Key 无效或已过期，请到设置里重新保存。", "The vision model API key is invalid or expired. Save it again in Settings."),
+        ("vision_model_quota_insufficient", "user_provider", "视觉模型服务额度不足，充值后再试。", "The vision model service is out of quota. Top it up, then try again."),
+        ("vision_model_not_found", "user_provider", "当前视觉模型不可用，请到设置里更换模型。", "The selected vision model is unavailable. Choose another model in Settings."),
+        ("vision_model_incompatible", "user_provider", "当前视觉模型无法读取这张图片，请到设置里更换模型。", "The selected vision model could not read this image. Choose another model in Settings."),
+        ("vision_model_rate_limited", "provider_transient", "视觉模型请求太多，请稍等几分钟再试。", "The vision model is rate limited. Try again in a few minutes."),
+        ("vision_model_unavailable", "provider_transient", "视觉模型暂时无法连接，请稍后重试。", "The vision model is temporarily unavailable. Try again later."),
+        ("vision_model_empty_response", "provider_transient", "视觉模型没有返回图片内容，请重试或更换模型。", "The vision model returned no image description. Retry or choose another model."),
         ("vision_model_not_ready", "user_provider", "视觉模型尚未准备好，请到设置里重新保存或更换模型。", "The vision model is not ready. Save it again or choose another model in Settings."),
-        ("vision_model_failed", "provider_transient", "视觉模型处理失败，请重试；如果仍失败，请更换模型。", "Vision processing failed. Try again or choose another model."),
+        ("vision_model_failed", "provider_transient", "视觉模型处理失败，请重试；如果仍失败，请更换模型。", "The vision model could not process this image. Retry or choose another model."),
         ("vision_image_unavailable", "system", "图片已上传，但视觉服务没能读取它，请重新发送。", "The image was uploaded, but the vision service could not read it. Send it again."),
     )
     return tuple(
