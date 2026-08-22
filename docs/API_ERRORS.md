@@ -369,8 +369,9 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 
 > 本节与上面所有表格是**两套完全不同的命名空间**——上面的 slug 是 HTTP
 > `{"error": "<slug>"}` 顶层字段值；这里列的是 `GET /v1/notices` 返回条目里
-> `error_class` 字段的取值，对应 `backend/notices/catalog.py` 的
-> `_CATALOG`，只用于通知中心展示话术，从不出现在 HTTP 错误响应体里。
+> `error_class` 字段的取值由 `backend/notices/error_contract.py` 的
+> `ErrorSpec` 注册表唯一拥有；`backend/notices/catalog.py` 的 `_CATALOG`
+> 是派生兼容视图。它只用于通知中心展示话术，从不出现在 HTTP 错误响应体里。
 > `blame` 语义同 `docs/FRONTEND_ERROR_CONTRACT.md` §二分类；`severity`
 > 取值 `error`/`warning`，决定通知中心 UI 展示优先级（`warning` 语气弱化，
 > 不打扰用户）。「状态码」列在本节恒为 `—`（notice 不走 HTTP 状态码，此列
@@ -394,6 +395,7 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 | `provider_incompatible` | — | user_provider | error | chat：Runtime V2 provider/tool loop 把上游「不支持某参数/工具」类错误分类上报（`classify_upstream`/`_ERROR_CLASS_RULES` 命中） |
 | `context_overflow` | — | user_provider | error | chat：这轮对话超出模型上下文窗口 |
 | `content_filtered` | — | provider_transient | error | chat：回复被上游内容策略拦截 |
+| `error_class_unregistered` | — | system | error | vision/image-generation 动态边界收到未注册分类；不透传或保存原始值，只写 content-free 拒绝计数 |
 | `genesis_failed` | — | system | error | genesis：蒸馏 job 整体失败（`service.mark_failed`；先过 `classify_upstream` 分类，未命中时兜底到本类） |
 | `genesis_partial` | — | system | warning | genesis：蒸馏跑完但有记忆卡片被丢弃（`apply_reducer_output` / `plaintext.py` 直传路径统计 dropped>0） |
 | `import_failed` | — | system | error | history_import：聊天记录导入失败 |

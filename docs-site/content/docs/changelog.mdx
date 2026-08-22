@@ -10,6 +10,22 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime error classifications now have one authoritative registry.** Chat,
+  vision, and image-generation paths derive their public `error_class`, blame,
+  safe text, and matching rules from the same server-owned specification.
+  Unknown dynamic classifications now become the system-owned
+  `error_class_unregistered` fallback; their raw value and fingerprints are not
+  retained. Content-free per-boundary counters make registry misses observable
+  without exposing provider output. Self-hosted resident consumers repeatedly
+  report monotonic absolute counters so retries are idempotent and a transient
+  failed report is retried on later requests.
+
+- **Self-hosted resident replies now suppress pure provider end sentinels using
+  the same predicate as hosted Runtime V2.** This closes the resident `</s>` and
+  `<end_of_turn>` leak while preserving mixed text such as `hello </s>` and
+  normal HTML/tokenizer discussion; suppression is intentionally whole-message
+  only.
+
 - **Memory Dream runs now have content-free, end-to-end diagnostics.** Resident
   V1 and hosted Runtime V2 correlate Dream start, model completion or failure,
   and the final write outcome under one job trace. Operators can distinguish a

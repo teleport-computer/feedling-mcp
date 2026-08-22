@@ -60,6 +60,7 @@ import provider_client
 import provider_health
 from voice import transcript_store as voice_transcript_store
 from notices import catalog as notices_catalog
+from notices import error_contract, rejection_stats
 from provider_types import (
     MCP_TRANSPORT_FAILURE_ERROR,
     ProviderMedia,
@@ -1141,7 +1142,12 @@ class DedicatedVisionUnavailable(RuntimeError):
         upstream_detail: str = "",
     ):
         super().__init__(message)
-        self.error_code = error_code
+        self.error_code = error_contract.resolve_untrusted(
+            error_code,
+            domain="vision",
+            boundary="v2_dedicated_vision",
+            reporter=rejection_stats.record_hosted,
+        ).code
         self.model = str(model or "")[:96]
         self.provider = str(provider or "")[:80]
         self.status_code = status_code if isinstance(status_code, int) else None
@@ -1164,7 +1170,12 @@ class ImageGenerationUnavailable(RuntimeError):
         upstream_detail: str = "",
     ):
         super().__init__(message)
-        self.error_code = str(error_code or "image_generation_failed")[:64]
+        self.error_code = error_contract.resolve_untrusted(
+            error_code,
+            domain="image_generation",
+            boundary="v2_image_generation",
+            reporter=rejection_stats.record_hosted,
+        ).code
         self.model = str(model or "")[:96]
         self.provider = str(provider or "")[:80]
         self.status_code = status_code if isinstance(status_code, int) else None

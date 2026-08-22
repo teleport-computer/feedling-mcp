@@ -126,7 +126,6 @@ import sys
 import tempfile
 import threading
 import time
-import unicodedata
 import urllib.parse
 import uuid
 import xml.etree.ElementTree as _ET
@@ -156,7 +155,10 @@ import generated_image
 # sys.path via the insert above, so it imports as a top-level `core.*` name.
 from core import protocol_leak as _protocol_leak
 from core import envelope as _core_envelope
+from core import tool_markup_leak as _tool_markup_leak
 from identity import card_view as _identity_card_view
+from notices import error_contract as _error_contract
+from notices import rejection_stats as _rejection_stats
 # 世界书注入侧的标头/上限/截断标记与 V2 共用同一份定义(纯模块,无 enclave 依赖)。
 # 各写一份就会漂——本文件前台原本就漂成了没有 UNTRUSTED 标注的弱版本。
 import worldbook_match as _worldbook_match
@@ -830,6 +832,17 @@ def _clear_proactive_failure() -> None:
 AgentErrorNotice = namedtuple("AgentErrorNotice", "error_class blame user_text detail")
 
 
+def _notice_for_code(
+    error_class: str,
+    detail: str,
+    *,
+    language: str = "",
+) -> AgentErrorNotice:
+    """The sole production constructor for classified user-facing errors."""
+    spec = _error_contract.require_spec(error_class)
+    return AgentErrorNotice(spec.code, spec.blame, spec.text(language), detail)
+
+
 class VisionObserverFailure(RuntimeError):
     """Safe error contract returned by the dedicated visual observer endpoint."""
 
@@ -844,7 +857,13 @@ class VisionObserverFailure(RuntimeError):
         provider: str = "",
     ):
         super().__init__(error_class)
-        self.error_class = error_class[:64] or "vision_model_failed"
+        spec = _error_contract.resolve_untrusted(
+            error_class,
+            domain="vision",
+            boundary="resident_vision_response",
+            reporter=_report_contract_rejection,
+        )
+        self.error_class = spec.code
         self.status_code = status_code
         self.detail = detail[:160]
         self.raw_user_text = raw_user_text
@@ -866,7 +885,13 @@ class ImageGenerationFailure(RuntimeError):
         provider: str = "",
     ):
         super().__init__(error_class)
-        self.error_class = error_class[:64] or "image_generation_failed"
+        spec = _error_contract.resolve_untrusted(
+            error_class,
+            domain="image_generation",
+            boundary="resident_image_generation_response",
+            reporter=_report_contract_rejection,
+        )
+        self.error_class = spec.code
         self.status_code = status_code
         self.detail = detail[:160]
         self.raw_user_text = raw_user_text
@@ -874,53 +899,7 @@ class ImageGenerationFailure(RuntimeError):
         self.provider = _sanitize_thinking_meta(provider, max_len=80)
 
 
-def _vision_failure_user_text(error_class: str, raw_user_text: str) -> str:
-    raw = raw_user_text or ""
-    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", raw))
-    has_latin = bool(re.search(r"[A-Za-z]", raw))
-    archive_language = str(
-        globals().get("_whoami_cache", {}).get("archive_language") or ""
-    ).strip().lower()
-    chinese = has_cjk or (
-        not has_latin and archive_language.startswith("zh")
-    )
-    zh = {
-        "vision_model_required": (
-            "由于当前模型没有视觉能力，模型无法收到图片信息，"
-            "建议更改模型或在设置页单独添加视觉模型"
-        ),
-        "vision_model_auth_invalid": "视觉模型的 API Key 无效或已过期，请到设置里重新保存。",
-        "vision_model_quota_insufficient": "视觉模型服务额度不足，充值后再试。",
-        "vision_model_not_found": "当前视觉模型不可用，请到设置里更换模型。",
-        "vision_model_incompatible": "当前视觉模型无法读取这张图片，请到设置里更换模型。",
-        "vision_model_rate_limited": "视觉模型请求太多，请稍等几分钟再试。",
-        "vision_image_unavailable": "图片已上传，但视觉服务没能读取它，请重新发送。",
-        "vision_model_empty_response": "视觉模型没有返回图片内容，请重试或更换模型。",
-        "vision_model_not_ready": "视觉模型尚未准备好，请到设置里重新保存或更换模型。",
-        "vision_model_unavailable": "视觉模型暂时无法连接，请稍后重试。",
-        "vision_model_failed": "视觉模型处理失败，请重试；如果仍失败，请更换模型。",
-    }
-    en = {
-        "vision_model_required": (
-            "Your current model can't process images, so it didn't receive this "
-            "picture. Switch models, or add a dedicated vision model in Settings."
-        ),
-        "vision_model_auth_invalid": "The vision model API key is invalid or expired. Save it again in Settings.",
-        "vision_model_quota_insufficient": "The vision model service is out of quota. Top it up, then try again.",
-        "vision_model_not_found": "The selected vision model is unavailable. Choose another model in Settings.",
-        "vision_model_incompatible": "The selected vision model could not read this image. Choose another model in Settings.",
-        "vision_model_rate_limited": "The vision model is rate limited. Try again in a few minutes.",
-        "vision_image_unavailable": "The image was uploaded, but the vision service could not read it. Send it again.",
-        "vision_model_empty_response": "The vision model returned no image description. Retry or choose another model.",
-        "vision_model_not_ready": "The vision model is not ready. Save it again or choose another model in Settings.",
-        "vision_model_unavailable": "The vision model is temporarily unavailable. Try again later.",
-        "vision_model_failed": "The vision model could not process this image. Retry or choose another model.",
-    }
-    fallback = "视觉模型处理失败，请重试。" if chinese else "The vision model could not process this image. Try again."
-    return (zh if chinese else en).get(error_class, fallback)
-
-
-def _image_generation_failure_user_text(error_class: str, raw_user_text: str) -> str:
+def _failure_language(raw_user_text: str) -> str:
     raw = raw_user_text or ""
     has_cjk = bool(re.search(r"[\u4e00-\u9fff]", raw))
     has_latin = bool(re.search(r"[A-Za-z]", raw))
@@ -928,120 +907,15 @@ def _image_generation_failure_user_text(error_class: str, raw_user_text: str) ->
         globals().get("_whoami_cache", {}).get("archive_language") or ""
     ).strip().lower()
     chinese = has_cjk or (not has_latin and archive_language.startswith("zh"))
-    zh = {
-        "image_generation_model_required": "当前模型不能生成图片，请到设置里添加生图模型。",
-        "image_generation_model_incompatible": "当前生图模型无法生成图片，请到设置里更换模型。",
-        "image_generation_auth_invalid": "生图模型的 API Key 无效或已过期，请到设置里重新保存。",
-        "image_generation_quota_insufficient": "生图模型服务额度不足，充值后再试。",
-        "image_generation_model_not_found": "当前生图模型不可用，请到设置里更换模型。",
-        "image_generation_model_not_ready": "生图模型尚未准备好，请到设置里重新保存或更换模型。",
-        "image_generation_rate_limited": "生图模型请求太多，请稍等几分钟再试。",
-        "image_generation_unavailable": "生图模型暂时无法连接，请稍后重试。",
-        "image_generation_invalid_output": "生图模型没有返回有效图片，请重试或更换模型。",
-        "image_generation_invalid_prompt": "这次生图请求没有正确送达，我们会尽快排查。",
-        "image_generation_failed": "图片生成失败，请重试；如果仍失败，请更换模型。",
-    }
-    en = {
-        "image_generation_model_required": "Your current model can't generate images. Add an image generation model in Settings.",
-        "image_generation_model_incompatible": "This image generation model can't create images. Choose another model in Settings.",
-        "image_generation_auth_invalid": "The image generation API key is invalid or expired. Save it again in Settings.",
-        "image_generation_quota_insufficient": "The image generation service has insufficient quota. Add credit and try again.",
-        "image_generation_model_not_found": "The image generation model is unavailable. Choose another model in Settings.",
-        "image_generation_model_not_ready": "The image generation model isn't ready. Save it again or choose another model in Settings.",
-        "image_generation_rate_limited": "The image generation service is rate limited. Try again in a few minutes.",
-        "image_generation_unavailable": "The image generation service is temporarily unavailable. Try again later.",
-        "image_generation_invalid_output": "The image generation model returned no valid image. Try again or choose another model.",
-        "image_generation_invalid_prompt": "This image request wasn't delivered correctly. We'll investigate.",
-        "image_generation_failed": "Image generation failed. Try again or choose another model.",
-    }
-    fallback = "图片生成失败，请重试。" if chinese else "Image generation failed. Try again."
-    return (zh if chinese else en).get(error_class, fallback)
+    return "zh" if chinese else "en"
 
-_ERROR_CLASS_RULES = (
-    ("model_mismatch", "system",
-     "当前运行时没有成功加载所选模型，请重新选择模型或稍后重试。",
-     re.compile(r"\bmodel_mismatch\b", re.I)),
-    # 次序即优先级：quota 必须先于 auth/rate（403+「额度」语义是余额不是权限）
-    ("quota_insufficient", "user_provider",
-     "模型服务额度不足，充值后再发消息即可恢复。",
-     re.compile(r"余额|额度|insufficient_quota|credit balance|requires more credits"
-                r"|payment required|\b402\b|provider_http_402|quota", re.I)),
-    ("auth_invalid", "user_provider",
-     "API Key 无效或已过期，请到设置里重新保存。",
-     re.compile(r"invalid ?(x-)?api.?key|unauthorized|authentication|\b401\b"
-                r"|provider_http_40[13]", re.I)),
-    # 上游下线/改名一个模型时的措辞五花八门，窄正则会让「改个模型名就好」的错误掉进
-    # unknown/blame=system —— 那一档按纪律【不许】引导用户改配置，用户于是永远收不到
-    # 真正原因（2026-07-25 usr_a40e3713eb189d38：DeepSeek 把 deepseek-chat 并入 V4 线，
-    # 报错原文 "The supported API model names are deepseek-v4-pro or deepseek-v4-flash,
-    # but you passed deepseek-chat" 三条规则一条都不命中）。下面每一条都对应真实观测到
-    # 的上游措辞，不做「400 + model」这类宽匹配（400 出现在太多无关报文里）。
-    ("model_not_found", "user_provider",
-     "模型名不可用，请检查设置里的模型名。",
-     re.compile(r"invalid model name|model_not_found|no such model|unknown model"
-                r"|supported .{0,40}model names"      # DeepSeek: "The supported API model names are …"
-                r"|model .{0,80}does not exist"       # OpenAI: "The model `x` does not exist…"
-                r"|not a valid model"
-                r"|model[ _]not[ _]found", re.I)),
-    ("cli_config_invalid", "user_provider",
-     "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。",
-     re.compile(r"missing the \{message\} placeholder", re.I)),
-    # Real provider responses observed 2026-07-30 when text-only models received
-    # an image_url block:
-    #   provider_http_400: Failed to deserialize ... unknown variant
-    #   `image_url`, expected `text`                  (DeepSeek native)
-    #   No endpoints found that support image input  (OpenRouter)
-    # Keep this ahead of provider_incompatible's broad "unknown variant" rule
-    # and the broad 404+model fallback in classify_agent_error so a text-only
-    # main model gets the dedicated Settings guidance.
-    ("vision_model_required", "user_provider",
-     "由于当前模型没有视觉能力，模型无法收到图片信息，建议更改模型或在设置页单独添加视觉模型",
-     re.compile(r"unknown variant `image_url`, expected `text`"
-                r"|no endpoints found that support image input", re.I)),
-    ("provider_incompatible", "user_provider",
-     "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。",
-     re.compile(r"unknown variant|not supported|unsupported (parameter|tool)"
-                r"|invalid_request_error.*tool", re.I)),
-    ("context_overflow", "user_provider",
-     "这次对话太长超出了模型上限，可精简后再试。",
-     re.compile(r"context.{0,20}(length|window)|maximum context"
-                r"|too many tokens|prompt is too long", re.I)),
-    ("content_filtered", "provider_transient",
-     "这次回复被模型的内容策略拦下了，换个说法再试。",
-     re.compile(r"content_filter|content policy|safety|blocked by", re.I)),
-    ("rate_limited", "provider_transient",
-     "模型服务限流了，稍等几分钟再试。",
-     re.compile(r"\b429\b|provider_http_429|too many requests|rate.?limit", re.I)),
-    ("upstream_unavailable", "provider_transient",
-     "你的模型服务暂时不可用，稍后会自动恢复。",
-     # "ended without finish_reason": an openai-compatible relay cut the SSE
-     # stream mid-turn (pi surfaces it verbatim). Without this signature it
-     # fell to `unknown`/blame=system — "连接模型服务时出了问题" blamed US for
-     # the relay's flakiness (usr_6f5a, 2026-07-17, 24 bubbles).
-     re.compile(r"\b5\d{2}\b|provider_http_5\d{2}|overloaded|timed? ?out"
-                r"|connection (refused|reset|error)"
-                r"|unreachable|stream disconnected"
-                r"|ended without finish_reason", re.I)),
+
+_ERROR_CLASS_RULES = tuple(
+    (spec.code, spec.blame, spec.safe_text_zh, spec.matcher())
+    for spec in _error_contract.matcher_specs()
 )
-
-# 机读全集导出，供 backend/notices/catalog.py 的一致性测试比对（spec Phase B /
-# B3）：_ERROR_CLASS_RULES 里的规则类 + classify_agent_error 硬编码分支里的
-# turn_timeout / provider_empty_reply / reply_parse_failed / model_not_found
-# （裸 404+model）/ unknown。只是把已有分类逻辑的 error_class 取值收成集合，
-# 不改分类逻辑本身。
 CONSUMER_ERROR_CLASSES = frozenset(
-    {klass for klass, _blame, _text, _pat in _ERROR_CLASS_RULES}
-    | {
-        "turn_timeout", "platform_queue_timeout", "platform_execution_timeout",
-        "provider_timeout", "provider_empty_reply", "reply_parse_failed",
-        "model_not_found", "unknown",
-        "image_generation_model_required", "image_generation_model_incompatible",
-        "image_generation_auth_invalid", "image_generation_quota_insufficient",
-        "image_generation_model_not_found", "image_generation_model_not_ready",
-        "image_generation_rate_limited", "image_generation_unavailable",
-        "image_generation_invalid_output", "image_generation_invalid_prompt",
-        "image_generation_failed",
-    }
+    spec.code for spec in _error_contract.consumer_specs()
 )
 
 
@@ -1102,98 +976,59 @@ def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
     """三层错误来源（claude/codex CLI 经 _cli_error_detail、stderr 兜底）已汇聚成
     异常文本；这里只做只读分类，永不抛出。"""
     if isinstance(exc, VisionObserverFailure):
-        blame = (
-            "user_provider"
-            if exc.error_class in {
-                "vision_model_required",
-                "vision_model_auth_invalid",
-                "vision_model_quota_insufficient",
-                "vision_model_not_found",
-                "vision_model_incompatible",
-                "vision_model_not_ready",
-            }
-            else "provider_transient"
-        )
         detail_parts = [exc.error_class]
         if exc.status_code is not None:
             detail_parts.append(f"HTTP {exc.status_code}")
         if exc.detail:
             detail_parts.append(exc.detail)
-        return AgentErrorNotice(
+        return _notice_for_code(
             exc.error_class,
-            blame,
-            _vision_failure_user_text(exc.error_class, exc.raw_user_text),
             " · ".join(detail_parts)[:200],
+            language=_failure_language(exc.raw_user_text),
         )
 
     if isinstance(exc, ImageGenerationFailure):
-        blame = (
-            "user_provider"
-            if exc.error_class in {
-                "image_generation_model_required",
-                "image_generation_model_incompatible",
-                "image_generation_auth_invalid",
-                "image_generation_quota_insufficient",
-                "image_generation_model_not_found",
-                "image_generation_model_not_ready",
-            }
-            else (
-                "system"
-                if exc.error_class == "image_generation_invalid_prompt"
-                else "provider_transient"
-            )
-        )
         detail_parts = [exc.error_class]
         if exc.status_code is not None:
             detail_parts.append(f"HTTP {exc.status_code}")
         if exc.detail:
             detail_parts.append(exc.detail)
-        return AgentErrorNotice(
+        return _notice_for_code(
             exc.error_class,
-            blame,
-            _image_generation_failure_user_text(
-                exc.error_class, exc.raw_user_text
-            ),
             " · ".join(detail_parts)[:200],
+            language=_failure_language(exc.raw_user_text),
         )
 
     detail = str(exc)[:200]
     if isinstance(exc, subprocess.TimeoutExpired):
-        return AgentErrorNotice("turn_timeout", "system",
-                                "这轮回复超时了，稍后再试。", detail)
+        return _notice_for_code("turn_timeout", detail)
     text = str(exc)
     if "no usable reply" in text:
-        return AgentErrorNotice("reply_parse_failed", "system",
-                                "系统处理回复时出了问题，我们会尽快排查。", detail)
+        return _notice_for_code("reply_parse_failed", detail)
     lowered = text.lower()
     # Specific semantic rules must run before the broad 404+model compatibility
     # fallback. OpenRouter's image rejection is a 404 and wrappers may include
     # the model id; classifying that as model_not_found would send the user to
     # edit a valid model name instead of adding a vision route.
-    for klass, blame, user_text, pat in _ERROR_CLASS_RULES:
+    for klass, _blame, _user_text, pat in _ERROR_CLASS_RULES:
         if pat.search(text):
-            return AgentErrorNotice(klass, blame, user_text, detail)
+            return _notice_for_code(klass, detail)
     # 「空回复」判定**必须排在规则表之后**:pi 退出码永远是 0，API 错误(配额/鉴权/
     # 断流)只体现在 detail 里，那条异常同时带空回复标记和错误详情 —— 先判空会把
     # quota_insufficient 之类更具体的分类整个遮蔽掉(codex2 gatekeep 2026-08-06)。
     # 规则表没命中 = 真的只是「成功但没内容」，那才归 provider 的瞬时问题。
     if SANITIZED_TO_EMPTY_MARK in text:
         # provider 给过文本、我们清空的 —— 归 system,与下面成对。
-        return AgentErrorNotice("reply_parse_failed", "system",
-                                "系统处理回复时出了问题，我们会尽快排查。", detail)
+        return _notice_for_code("reply_parse_failed", detail)
     if EMPTY_PROVIDER_REPLY_MARK in text:
         # 2026-08-07(usr_7f30d63f 分诊):模型/中转返回 200 但内容为空(断流、
         # 配额紧张时的假成功等)。这不是我们的解析问题 —— 归 provider,
         # 别再把中转抽风包装成「系统出了问题」让用户来找我们。
-        return AgentErrorNotice(
-            "provider_empty_reply", "provider_transient",
-            "你的模型服务这次返回了空回复，稍后再试；反复出现请检查模型渠道或中转的稳定性。",
-            detail)
+        return _notice_for_code("provider_empty_reply", detail)
     # 404 需与 model 同现才算模型错（裸 404 归 upstream_unavailable 太粗、归 auth 又错）
     if re.search(r"\b404\b", text) and "model" in lowered:
-        return AgentErrorNotice("model_not_found", "user_provider",
-                                "模型名不可用，请检查设置里的模型名。", detail)
-    return AgentErrorNotice("unknown", "system", "连接模型服务时出了问题。", detail)
+        return _notice_for_code("model_not_found", detail)
+    return _notice_for_code("unknown", detail)
 
 
 def _system_notice_body(notice: AgentErrorNotice) -> str:
@@ -1654,6 +1489,27 @@ def _consumer_capabilities(hosted: bool = False) -> str:
     if hosted:
         caps += ["web_search_v1", "web_fetch_v1"]
     return ",".join(caps)
+
+
+def _contract_report_token(value: str, fallback: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.:@+-]+", "_", str(value or ""))[:96]
+    return cleaned or fallback
+
+
+_CONTRACT_REJECTION_REPORTER = _rejection_stats.ResidentRejectionReporter(
+    writer_id=_contract_report_token(
+        f"resident:{CONSUMER_ID}:{uuid.uuid4().hex[:12]}", "resident:unknown"
+    ),
+    release_sha=_contract_report_token(RUNNING_COMMIT, "unknown"),
+)
+
+
+def _report_contract_rejection(domain: str, boundary: str, fallback: str) -> None:
+    report = _CONTRACT_REJECTION_REPORTER.record(domain, boundary, fallback)
+    # The same monotonic absolute totals ride every later poll/health/response
+    # request. Commit ambiguity or a transient network loss therefore cannot
+    # make the only diagnostic disappear, and replay cannot double-count it.
+    _HEADERS[_rejection_stats.HEADER_NAME] = report
 
 
 _HEADERS = {
@@ -14355,31 +14211,11 @@ def _proactive_control_reason_from_result(agent_result: Any, replies: list[str])
     ).strip()
 
 
-def _is_degenerate_reply(text: Any) -> bool:
-    """True when a reply carries no actual content — only
-    whitespace/punctuation/separators (e.g. ".", "。", "…").
-
-    Flaky openai-compatible relays can cut the SSE stream right after the
-    first token; pi still closes the assistant message with that fragment,
-    and without this check the consumer posts it as a chat bubble (seen live
-    2026-07-17: a 2-hour heartbeat posting a bare "." twice). Letters, digits,
-    CJK and emoji all count as content — only a reply with none of those is
-    degenerate.
-
-    BOTH lanes use this now. It was proactive-only from 2026-07-17 to
-    2026-07-25 on the reasoning that "a foreground turn the user started still
-    surfaces whatever came back" — but what came back was a bare "。", which is
-    worse than the honest fallback line, and it poisons the transcript: on the
-    NEXT turn the agent reads that orphan period back out of its own history,
-    has no memory of writing it, and blames the USER for sending it (usr_36038f,
-    openai_compatible relay + pi + a link dropping 15+ connections/day, accused
-    her of sending periods across two days; she had sent none). Foreground
-    can't just go silent, so the caller substitutes the visible fallback."""
-    for ch in str(text or ""):
-        cat = unicodedata.category(ch)
-        if cat[0] in ("L", "N") or cat == "So":
-            return False
-    return True
+# V1 and V2 intentionally expose the same function object. The core predicate
+# keeps the 2026-07-17 bare-period relay incident behaviour and additionally
+# suppresses a pure closed-set model sentinel. Mixed text is preserved because
+# the sentinel branch uses fullmatch.
+_is_degenerate_reply = _tool_markup_leak.is_degenerate_visible_text
 
 
 # Back-compat alias: the proactive lane and its tests named this first.

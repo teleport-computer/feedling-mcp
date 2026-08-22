@@ -193,7 +193,7 @@ GET /v1/notices?include_resolved=<bool, 默认 true>
 - 语义：不算对用户消息的回复（不影响已回复状态）、不推送（兜底话术那条已推过）、失败重试期间不会重复出现（服务端已做排他与去抖）。
 
 回合错误的 error_class 全集（同时会双写进通知中心）：
-`quota_insufficient` · `auth_invalid` · `model_not_found` · `vision_model_required` · `rate_limited` · `upstream_unavailable` · `turn_timeout` · `provider_empty_reply` · `reply_parse_failed` · `unknown`
+`quota_insufficient` · `auth_invalid` · `model_not_found` · `vision_model_required` · `rate_limited` · `upstream_unavailable` · `turn_timeout` · `provider_empty_reply` · `reply_parse_failed` · `unknown` · `error_class_unregistered`
 
 > `provider_empty_reply`（provider_transient，2026-08-07 新增）：模型/中转
 > transport 成功、协议可识别，但 assistant 内容为空（断流、配额紧张时的 200
@@ -239,10 +239,13 @@ worker 内存时才落库，跨 worker 可能静默写失败。
 | `turn_failure_blame` / `reply_blame` | `user_provider` \| `provider_transient` \| `system` | 决定渲染，见下 |
 | `turn_failure_user_text` / `reply_user_text` | ≤500 字 | 服务端已组好的用户可见文案，**直接显示，不要本地映射** |
 
-**blame 与 user_text 由服务端按 `error_class` 查 `notices/catalog.py` 下发，不采信
+**blame 与 user_text 由服务端按 `error_class` 查
+`notices/error_contract.py` 的 `ErrorSpec` 注册表下发，不采信
 poster 提交的值**（`chat_core._turn_failure_attribution`）。理由是归责红线：透传意味着
 一个写错的 consumer 能把我们自己的故障标成 `user_provider`、让用户白跑一趟改配置。
-未知 `error_class` 一律落 `system`——宁可我们背锅，也不误导用户。客户端因此可以信任
+vision/image-generation 动态边界的未知值先映射为已注册的
+`error_class_unregistered`（system），且不保存 raw/fingerprint；其他旧入口的未知
+`error_class` 也一律落 `system`——宁可我们背锅，也不误导用户。客户端因此可以信任
 这两个字段，无需再做合法性判断。
 | `reply_to_message_id` | 消息 id | 兜底消息指向的用户消息，客户端靠它配对 |
 

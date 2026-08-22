@@ -7670,6 +7670,74 @@ def stop_trace_write_stats_writer(writer_id: str) -> None:
     mirror.execute(_TRACE_WRITE_STATS_HEALTH_STOP_SQL, params)
 
 
+# --- Public-contract rejection visibility (T239/T255) -------------------- #
+
+_CONTRACT_REJECTION_STATS_UPSERT_SQL = """
+INSERT INTO contract_rejection_stats (
+    contract_domain, boundary, fallback, release_sha, writer_id,
+    total, first_seen, last_seen
+) VALUES (%s,%s,%s,%s,%s,%s,to_timestamp(%s),to_timestamp(%s))
+ON CONFLICT (contract_domain, boundary, fallback, release_sha, writer_id)
+DO UPDATE SET
+    total = GREATEST(contract_rejection_stats.total, EXCLUDED.total),
+    first_seen = LEAST(contract_rejection_stats.first_seen, EXCLUDED.first_seen),
+    last_seen = GREATEST(contract_rejection_stats.last_seen, EXCLUDED.last_seen)
+"""
+
+
+def upsert_contract_rejection_stats(rows: list[tuple]) -> None:
+    """Absorb content-free per-writer absolute totals idempotently."""
+    if not rows:
+        return
+    normalized = [tuple(row) for row in rows]
+    with get_pool().connection() as conn:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.executemany(_CONTRACT_REJECTION_STATS_UPSERT_SQL, normalized)
+    from tee_shadow import mirror
+    mirror.execute_many([
+        (_CONTRACT_REJECTION_STATS_UPSERT_SQL, row) for row in normalized
+    ])
+
+
+def contract_rejection_stats_measurement(
+    *, release_sha: str = "", now_epoch: float | None = None,
+) -> dict:
+    """Return controlled dimensions for admin consumers; never rejected raw."""
+    now_value = float(now_epoch if now_epoch is not None else time.time())
+    params: list = [now_value - 86400]
+    release_clause = ""
+    if release_sha:
+        release_clause = " AND release_sha = %s"
+        params.append(str(release_sha)[:64])
+    sql = (
+        "SELECT contract_domain, boundary, fallback, release_sha, "
+        "SUM(total), extract(epoch FROM MIN(first_seen)), "
+        "extract(epoch FROM MAX(last_seen)) "
+        "FROM contract_rejection_stats "
+        "WHERE last_seen >= to_timestamp(%s)" + release_clause +
+        " GROUP BY contract_domain, boundary, fallback, release_sha "
+        "ORDER BY MAX(last_seen) DESC"
+    )
+    with get_pool().connection() as conn:
+        rows = conn.execute(sql, tuple(params)).fetchall()
+    return {
+        "window_seconds": 86400,
+        "release_sha": str(release_sha)[:64],
+        "rows": [
+            {
+                "contract_domain": str(row[0]),
+                "boundary": str(row[1]),
+                "fallback": str(row[2]),
+                "release_sha": str(row[3]),
+                "total": int(row[4]),
+                "first_seen": float(row[5]),
+                "last_seen": float(row[6]),
+            }
+            for row in rows
+        ],
+    }
+
+
 def trace_write_stats_measurement(
     *, days: int = 7, now_epoch: float | None = None,
 ) -> dict:

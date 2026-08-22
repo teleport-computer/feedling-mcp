@@ -41,6 +41,8 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
     # the DB write + context build OFF the loop.
     remote_addr = request.client.host if request.client else ""
     consumer_info = chat_consumer._consumer_headers_from_map(request.headers, remote_addr)
+    rejection_report = request.headers.get(chat_consumer.CONTRACT_REJECTION_HEADER) or ""
+    await threadpool.run_db(chat_consumer.record_contract_rejections, rejection_report)
     await threadpool.run_db(chat_consumer._record_consumer_event, store, "poll", info=consumer_info)
     await threadpool.run_db(
         resident_maintenance.maybe_handle_poll,
@@ -180,6 +182,8 @@ async def chat_response(request: Request, auth: AuthResult = Depends(require_aut
     # Consumer identity read on the loop (cheap), used off the loop.
     remote_addr = request.client.host if request.client else ""
     consumer_info = chat_consumer._consumer_headers_from_map(request.headers, remote_addr)
+    rejection_report = request.headers.get(chat_consumer.CONTRACT_REJECTION_HEADER) or ""
+    await threadpool.run_db(chat_consumer.record_contract_rejections, rejection_report)
     consumer_id = chat_service._parse_consumer_id(request.headers, request.query_params)
     allow_verify_reply = await threadpool.run_db(
         _allow_verify_reply_with_fresh_pending_check, store, payload

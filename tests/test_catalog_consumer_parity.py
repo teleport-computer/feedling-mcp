@@ -132,6 +132,13 @@ def _consumer_blame_map() -> dict[str, str]:
                 crc.ImageGenerationFailure(error_class)
             )
             out[error_class] = notice.blame
+        elif error_class.startswith("vision_"):
+            notice = crc.classify_agent_error(
+                crc.VisionObserverFailure(error_class)
+            )
+            out[error_class] = notice.blame
+        elif error_class == "error_class_unregistered":
+            out[error_class] = catalog.blame_for(error_class)
     return out
 
 

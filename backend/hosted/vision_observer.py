@@ -10,6 +10,7 @@ import debug_trace
 import provider_client
 from capabilities import registry as cap_registry
 from core import envelope as core_envelope
+from notices import error_contract, rejection_stats
 
 
 log = logging.getLogger(__name__)
@@ -36,8 +37,14 @@ class VisionObserverError(RuntimeError):
         detail: str = "",
         upstream_detail: str = "",
     ):
-        super().__init__(error_code)
-        self.error_code = error_code
+        spec = error_contract.resolve_untrusted(
+            error_code,
+            domain="vision",
+            boundary="hosted_vision_observer",
+            reporter=rejection_stats.record_hosted,
+        )
+        super().__init__(spec.code)
+        self.error_code = spec.code
         self.status_code = status_code
         self.retryable = retryable
         self.detail = detail[:160]
