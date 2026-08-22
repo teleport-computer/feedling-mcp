@@ -3927,6 +3927,32 @@ def _runtime_failure_code(raw) -> str:
     return code[:_RUNTIME_FAILURE_CODE_MAX]
 
 
+# ``runtime_failed`` **不是一种运行时错误**。它是净化层对「原始 reason 存在、
+# 但没通过安全白名单 ``^[a-z0-9_:-]{1,120}$``」的整段替换（``db.py`` 的
+# ``_LANE_ROLLUP_CODE_RE``、``memory_metadata`` 的同形 SQL CASE）。白名单不许
+# 大写、空格、句点，所以**任何一句人类可读的错误消息都会被抹成它**。
+#
+# 为什么值得单独标注：2026-08-22 prod 实测，V1 心跳有 6 个账号整周零成功、663
+# 次失败（占 V1 心跳失败 66%），失败码 100% 是它。读表的人会得出「运行时坏了」，
+# 而真相是「**此处原本有答案，被我们删了**」——两者的下一步动作完全不同。
+_DISCARDED_REASON_CODE = "runtime_failed"
+_DISCARDED_REASON_NOTE = "原因已丢弃（原始文本未通过安全白名单），不是一种运行时错误"
+
+
+def _failure_code_cell(raw: object, *, missing: str = "other") -> str:
+    """渲染一个失败码 ``<td>``。
+
+    ⚠️ ``missing`` 默认 ``other``，与本文件其余两处失败码渲染保持同一个词。
+    绝不能拿 ``runtime_failed`` 当缺值兜底：那会让「原因被我们丢弃」和「本来
+    就没有失败码」在页面上长成同一个字符串，而它们指向两件不同的事。
+    """
+    code = str(raw or "").strip() or str(missing)
+    cell = f"<code>{html.escape(code)}</code>"
+    if code == _DISCARDED_REASON_CODE:
+        cell += f"<div class='evt-desc'>{html.escape(_DISCARDED_REASON_NOTE)}</div>"
+    return f"<td>{cell}</td>"
+
+
 def _runtime_health_level(
     payload: dict, delivery: dict | None = None
 ) -> tuple[str, list[str]]:
@@ -5033,7 +5059,7 @@ def _render_runtime_health_page(
                 "<tr>"
                 f"<td>{name}</td>"
                 f"<td>{RUNTIME_OUTCOME_CLASS_LABELS[outcome_class]}</td>"
-                f"<td><code>{html.escape(code)}</code></td>"
+                f"{_failure_code_cell(code)}"
                 f"<td>{error_class_html}</td>"
                 f"<td>{_fmt_count(count)}</td>"
                 "</tr>"
@@ -5592,14 +5618,14 @@ def _render_imports_page(report: dict | None, *, within_hours: int) -> str:
             f"<td>{html.escape(status_labels.get(status, status))}{' · 超过15m未更新' if is_stuck else ''}</td>"
             f"<td class='{evidence_cls}'>{evidence_text}</td>"
             f"<td>{_fmt_count(row.get('memory_action_count'))} / {'有' if row.get('has_identity_evidence') else '无'}</td>"
-            f"<td><code>{html.escape(str(row.get('error_code') or '—'))}</code></td>"
+            f"{_failure_code_cell(row.get('error_code'), missing='—')}"
             f"<td>{html.escape(_ops_time(row.get('created_at')))}</td>"
             f"<td>{html.escape(_ops_time(row.get('updated_at')))}</td>"
             "</tr>"
         )
     failure_rows = "".join(
         "<tr>"
-        f"<td><code>{html.escape(str(row.get('error_code') or 'other'))}</code></td>"
+        f"{_failure_code_cell(row.get('error_code'))}"
         f"<td>{_fmt_count(row.get('count'))}</td></tr>"
         for row in report.get("failure_reasons") or []
     )
@@ -5640,7 +5666,7 @@ def _render_chat_reliability_page(report: dict | None, *, within_hours: int) -> 
     reply_quality = report.get("reply_quality") or {}
     failure_rows = "".join(
         "<tr>"
-        f"<td><code>{html.escape(str(row.get('code') or 'runtime_failed'))}</code></td>"
+        f"{_failure_code_cell(row.get('code'))}"
         f"<td>{_fmt_count(row.get('count'))}</td></tr>"
         for row in report.get("failure_reasons") or []
     )
