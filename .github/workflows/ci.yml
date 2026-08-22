@@ -247,7 +247,6 @@ jobs:
     name: test_api.py (multi-tenant)
     runs-on: ubuntu-24.04
     env:
-      FEEDLING_CI_EXECUTION_EVIDENCE_DIR: ${{ runner.temp }}/feedling-ci-execution-evidence
       FEEDLING_CI_EXECUTION_JOB: python-tests
     # All per-user data lives in Postgres now (see backend/db.py), so the
     # backend cannot start without a reachable DB. Provision a throwaway one.
@@ -269,7 +268,9 @@ jobs:
 
       - name: Bind execution evidence to exact checkout
         continue-on-error: true
-        run: echo "FEEDLING_CI_EXECUTION_HEAD_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+        run: |
+          echo "FEEDLING_CI_EXECUTION_HEAD_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "FEEDLING_CI_EXECUTION_EVIDENCE_DIR=$RUNNER_TEMP/feedling-ci-execution-evidence" >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -862,14 +863,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ci-execution-evidence-python-tests
-          path: ${{ env.FEEDLING_CI_EXECUTION_EVIDENCE_DIR }}
+          path: ${{ runner.temp }}/feedling-ci-execution-evidence
           if-no-files-found: ignore
 
   runtime-v2-coverage:
     name: Runtime V2 coverage (profile=${{ matrix.profile_enabled }})
     runs-on: ubuntu-24.04
     env:
-      FEEDLING_CI_EXECUTION_EVIDENCE_DIR: ${{ runner.temp }}/feedling-ci-execution-evidence
       FEEDLING_CI_EXECUTION_JOB: runtime-v2-coverage/profile=${{ matrix.profile_enabled }}
     strategy:
       fail-fast: false
@@ -893,7 +893,9 @@ jobs:
 
       - name: Bind execution evidence to exact checkout
         continue-on-error: true
-        run: echo "FEEDLING_CI_EXECUTION_HEAD_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+        run: |
+          echo "FEEDLING_CI_EXECUTION_HEAD_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "FEEDLING_CI_EXECUTION_EVIDENCE_DIR=$RUNNER_TEMP/feedling-ci-execution-evidence" >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -947,7 +949,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ci-execution-evidence-runtime-v2-${{ matrix.profile_enabled }}
-          path: ${{ env.FEEDLING_CI_EXECUTION_EVIDENCE_DIR }}
+          path: ${{ runner.temp }}/feedling-ci-execution-evidence
           if-no-files-found: ignore
 
   ci-execution-evidence-report:

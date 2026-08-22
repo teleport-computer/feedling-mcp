@@ -12,6 +12,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tools import ci_execution_evidence as evidence
@@ -19,6 +21,7 @@ from tools import ci_execution_evidence as evidence
 
 HEAD_SHA = "a" * 40
 PRODUCERS = ["python-tests=python-tests"]
+CI_WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
 
 
 def _fixture_repo(tmp_path: Path, workflow_text: str, *test_names: str):
@@ -73,6 +76,21 @@ def _report(paths, **kwargs):
 
 def _files_by_path(report: dict) -> dict[str, dict]:
     return {item["path"]: item for item in report["files"]}
+
+
+def test_job_env_does_not_use_runner_context_before_a_runner_exists():
+    """GitHub rejects the whole workflow before creating jobs in this shape."""
+    workflow = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
+    invalid = []
+    for job_name, job in workflow["jobs"].items():
+        for env_name, value in (job.get("env") or {}).items():
+            if "${{ runner." in str(value):
+                invalid.append(f"{job_name}.env.{env_name}")
+
+    assert invalid == [], (
+        "runner context is unavailable in jobs.<job_id>.env; bind it inside a "
+        f"step instead: {invalid}"
+    )
 
 
 def test_comment_only_filename_is_configured_but_unassigned_unknown(tmp_path):
