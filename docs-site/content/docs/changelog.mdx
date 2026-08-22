@@ -10,6 +10,59 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Memory Dream runs now have content-free, end-to-end diagnostics.** Resident
+  V1 and hosted Runtime V2 correlate Dream start, model completion or failure,
+  and the final write outcome under one job trace. Operators can distinguish a
+  clean no-op, successful application, partial writes, provider or parser
+  failures, deterministic mapping or blast-radius rejection, and failed writes.
+  Failed or budget-truncated full-card reads are reported as degraded context
+  instead of looking like an ordinary model no-op. The admin surface exposes
+  only closed outcome enums, booleans, duration, and fixed counts; card ids,
+  prompts, replies, summaries, and raw errors remain hidden.
+
+- **Image-generation route health now reflects provider failures, not server
+  processing bugs.** A provider call can still mark its saved route failed or
+  unsupported, but failures while decrypting local configuration, interpreting
+  the normalized media shape, decoding base64, or validating raster output no
+  longer poison that persistent route status. Unexpected media-processing bugs
+  in direct generation and setup reach the standard request-ID-backed internal
+  error path, while existing explicit configuration errors keep their current
+  responses. Runtime V2 reports a system-owned image-processing failure to the
+  turn so the assistant can still answer instead of blaming the user's model.
+  The setup probe now runs the same media normalization as real generation,
+  closing the gap where a route test could pass but every real image failed
+  afterward.
+
+- **Hosted proactive replies now suppress leaked provider end sentinels instead
+  of displaying them as messages.** A narrow whole-message check recognizes
+  common relay tokens such as `</s>`, `<|endoftext|>`, and `<|im_end|>` while
+  preserving ordinary HTML, comparisons, and emoticons. After the active wake
+  outlet removes protocol markup, a reply with no real visible content completes
+  as a measured sleep and creates no delivery effect. Scheduled reminders retain
+  their existing must-deliver failure behavior, and explicit `stay_silent`
+  semantics are unchanged. Runtime Health reports these empty-content proactive
+  suppressions separately by lane.
+
+- **Hosted Runtime V2 temporarily emits at most one text reply bubble per
+  turn.** The model-facing `reply` tool and its mid-turn text delivery path have
+  been removed after they caused a progress bubble and terminal answer to appear
+  as duplicate replies. `send_file`, `generate_image`, and proactive
+  `stay_silent` behavior are unchanged. A provider that returns no usable final
+  text still receives the existing one-shot correction attempt and then fails
+  with the existing `empty_reply` outcome; an earlier progress bubble is no
+  longer promoted into a successful final answer. The Admin chat-reliability
+  view reports both turns with at least two `reply_planned` events and
+  `turn_failed:empty_reply` failures so the duplicate-reply regression and the
+  accepted capability tradeoff can be monitored independently.
+
+- **Unattended screen-watch turns no longer receive platform mutation tools.**
+  A proactive screen-watch turn carrying a fresh frame has no user message, so
+  screen text is its only instruction source. From 2026-08-21 such turns are
+  offered no memory write, wake schedule/cancel, or workspace write/delete
+  tools, in addition to the identity writes already withheld. Reading memory,
+  inspecting the screen, and replying are unchanged, as is foreground Chat with
+  a shared screen, where the user's own message is present in the turn.
+
 - **Independent resident screen turns now retain user-configured MCP tools in
   both foreground Chat and proactive lanes.** Under an explicit 2026-08-21
   trust-boundary decision, resident/CLI turns receiving pixels keep both
@@ -130,9 +183,11 @@ change must not be interpreted as an API guarantee.
 - **Persistence failures no longer look like successful memory, trace, or World
   Book operations.** A Memory Garden index request returns `503` when its
   database read fails instead of returning an empty garden; changing the debug
-  trace switch returns an error unless the stored setting can be read back; and
-  deleting a World Book entry returns `404` when the entry does not exist and a
-  server error when storage is unavailable, instead of always returning
+  trace switch returns an error unless the stored setting can be read back;
+  saving a World Book entry returns a server error unless the database accepted
+  the write; and deleting a World Book entry returns `404` when the entry does
+  not exist and a server error when storage is unavailable, instead of always
+  returning
   `{\"ok\": true}`. Internal writes that only record cleanup or delivery
   bookkeeping remain explicitly best-effort and do not rewrite an already-real
   delivery outcome.
@@ -144,11 +199,7 @@ change must not be interpreted as an API guarantee.
   keeps read-only user MCP tools but removes mutating MCP tools, web, and
   `task`; reading private workspace or memory data still leaves both read-only
   and mutating user MCP available under the user-selected-infrastructure trust
-  boundary. Scheduled wakes that already published a `reply`-tool bubble can
-  now promote that same encrypted bubble when the provider closes without more
-  text: user-input-consuming promotions advance the exact reply cursor, while
-  purely proactive promotions finish without moving it or creating a duplicate
-  message.
+  boundary.
 
 - **An image-generation provider may now answer with a link, and the server
   retrieves it.** Some providers return `data[].url` from the image endpoint

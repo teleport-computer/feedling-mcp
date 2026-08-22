@@ -277,9 +277,19 @@ _CHAT_FILE_BOUNDARY_POLICY = (
     "创建或送达。如果文件仍有用，把缺少的依据清楚标在文件里，别编造摘要来填空。"
 )
 
+_CHAT_CANVAS_POLICY = (
+    "当一个小型交互体验比普通聊天更适合表达对方的想法时，你也可以主动选择制作 Canvas。"
+    "把它写成一个完整、离线、自包含的 UTF-8 文件，路径使用 "
+    "/workspace/<安全文件名>.io.html；HTML、CSS、JavaScript 和数据都必须内联。"
+    "用对方当前回复语言写简洁的 <title>，IO 会把它作为卡片标题；更新已有 Canvas 时"
+    "保留原路径，只有对方要求重命名时才修改 <title>。除非对方询问，否则请谈论体验本身，"
+    "不要向对方展示内部源码或实现术语。"
+)
+
 _CHAT_FILE_POLICY = _join_policy_blocks(
     _CHAT_FILE_FORMAT_POLICY,
     _CHAT_FILE_BOUNDARY_POLICY,
+    _CHAT_CANVAS_POLICY,
 )
 
 _CHAT_POLICY_AFTER_THINKING = _join_policy_blocks(

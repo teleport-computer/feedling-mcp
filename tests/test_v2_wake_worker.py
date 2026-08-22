@@ -448,8 +448,8 @@ def test_wake_full_chain_strips_tool_markup_after_user_decrypt(monkeypatch, lane
     ]
 
 
-def test_wake_markup_only_reply_fails_silently_without_bubble(monkeypatch):
-    """Wake keeps its existing degenerate lifecycle after sanitization."""
+def test_wake_markup_only_reply_sleeps_without_bubble(monkeypatch):
+    """A cleaned-empty weak wake is a measured sleep, not a failed job."""
     uid = "u_wake_tool_markup_only"
     conftest.seed_user(uid)
     _reset(uid)
@@ -478,11 +478,19 @@ def test_wake_markup_only_reply_fails_silently_without_bubble(monkeypatch):
         )
     )
 
-    assert status == "failed"
+    assert status == "completed"
     assert writes == []
-    assert _job_status(job_id) == (
-        "failed",
-        "wake_failed:degenerate_reply_suppressed",
+    with db.get_pool().connection() as conn:
+        outcome = conn.execute(
+            "SELECT status,last_error,wake_result,wake_result_reason "
+            "FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+    assert outcome == (
+        "completed",
+        None,
+        "sleep",
+        jobs_store.EMPTY_VISIBLE_REPLY_SUPPRESSED_REASON,
     )
 
 
@@ -985,7 +993,7 @@ def test_wake_injects_attention_facts_as_non_user_application_data(monkeypatch):
     )
 
 
-def test_run_wake_degenerate_reply_fails_silently(monkeypatch):
+def test_run_wake_degenerate_reply_sleeps_silently(monkeypatch):
     uid = "u_wake_degenerate_reply"
     conftest.seed_user(uid)
     _reset(uid)
@@ -1024,12 +1032,20 @@ def test_run_wake_degenerate_reply_fails_silently(monkeypatch):
         )
     )
 
-    assert status == "failed"
+    assert status == "completed"
     assert write_called["n"] == 0
     assert surface_called["n"] == 0
-    assert _job_status(job_id) == (
-        "failed",
-        "wake_failed:degenerate_reply_suppressed",
+    with db.get_pool().connection() as conn:
+        outcome = conn.execute(
+            "SELECT status,last_error,wake_result,wake_result_reason "
+            "FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+    assert outcome == (
+        "completed",
+        None,
+        "sleep",
+        jobs_store.EMPTY_VISIBLE_REPLY_SUPPRESSED_REASON,
     )
     assert not any(event["kind"] == "error" for event in _status_events(uid))
 
@@ -1147,7 +1163,7 @@ def test_heartbeat_stay_silent_completes_with_auditable_reason(monkeypatch):
     assert silence[0]["trace_id"] == trace_id
     assert silence[0]["job_id"] == str(job_id)
     assert silence[0]["status"] == "warning"
-    assert silence[0]["outcome_class"] == "safety_suppression"
+    assert silence[0]["outcome_class"] == "operational_failure"
     assert silence[0]["detail"] == {
         "lane": "heartbeat",
         "cause": "suppressed",
@@ -2979,12 +2995,22 @@ def test_screen_watch_prefetch_injects_bounded_ocr_app_and_pixels(monkeypatch):
         name for name in cap_registry.WRITE_ACTIONS if name.startswith("identity_")
     }
     assert identity_writes.isdisjoint(offered)
-    assert {
-        "memory_write",
-        "schedule_wake",
-        cap_tool_schema.REPLY_TOOL,
-        "screen_read",
-    } <= offered
+    # ⚠️ 2026-08-21(T107)**这段断言被反向了,是裁定不是把红的改绿**。
+    # 改前锁的是「屏幕轮里 memory_write / schedule_wake 仍在场」——那正是被利用的面。
+    # Seven 原话:「只有 OCR、用户没有发消息的时候就禁掉;只有用户发消息的时候,
+    # 回复那个轮次才带上 Tool」。
+    # 依据是代码可达性:screen_watch 分支只下架 identity 写与 memory_organize,
+    # memory_write / schedule_wake 在有 frame 的无人值守轮里仍被 offer,而这一轮
+    # 的唯一指令来源就是屏幕上那段字。提示词抬头是软标注,约束不了模型的选择。
+    # (模型侧选择率探针的数字与口径边界见台账 T107;那次工具面比生产宽、
+    #  只记工具名不验参数,不在这里承重。)
+    assert {"memory_write", "schedule_wake"}.isdisjoint(offered), (
+        "无人值守的屏幕轮不许再提供平台写工具(T107)"
+    )
+    # 读屏能力仍保留；T208 删除了所有 lane 的模型侧 reply tool，
+    # 可见文本改由 terminal response 单路径产生。
+    assert "screen_read" in offered
+    assert "reply" not in offered
 
 
 def test_screen_watch_without_frames_keeps_identity_writes(monkeypatch):
@@ -3071,8 +3097,26 @@ def test_wake_provider_tool_surface_trace_carries_wake_kind(monkeypatch):
         "terminal_text_round_reason": "none",
         "force_text_fallback_reason": "none",
         "empty_response_recovery_used": False,
+        "model_call_event_cap": 32,
+        "model_call_events_observed": 2,
+        "model_call_events_emitted": 2,
+        "model_call_events_dropped": 0,
         "wake_kind": "scheduled",
     }
+    model_events = [
+        trace
+        for trace in traces
+        if trace["type"].startswith("agent.model.call.")
+    ]
+    assert [event["type"] for event in model_events] == [
+        "agent.model.call.start",
+        "agent.model.call.done",
+    ]
+    assert all(event["detail"]["lane"] == "scheduled" for event in model_events)
+    assert all(
+        event["detail"]["wake_kind"] == "scheduled"
+        for event in model_events
+    )
 
 
 def test_scheduled_wake_empty_reply_fails_instead_of_completing_silently(monkeypatch):
@@ -3191,278 +3235,6 @@ def test_scheduled_wake_empty_reply_recovers_on_the_correction_retry(monkeypatch
     assert len(calls) == 2, calls
 
 
-def _scheduled_promotion_deps(uid):
-    def _read_after_seq(_user_id: str, after_seq: int):
-        return [
-            {
-                "id": row["id"],
-                "seq": int(row["seq"]),
-                "ts": float(row.get("ts") or 0),
-                "role": row.get("role"),
-                "content": row.get("test_plaintext") or "",
-            }
-            for row in db.chat_messages_after_seq(uid, after_seq, limit=None)
-            if row.get("role") == "user"
-        ]
-
-    deps = _wake_deps(tail=[])
-    deps.read_messages_after_seq = _read_after_seq
-    deps.apply_pending_effects = serve_worker._apply_pending_effects_for_user
-    return deps
-
-
-def _patch_scheduled_promotion_envelope(monkeypatch, uid):
-    def _fake_build(store, plaintext, *, item_id=None):
-        assert store.user_id == uid
-        return (
-            {
-                "v": 1,
-                "id": str(item_id),
-                "owner_user_id": uid,
-                "visibility": "shared",
-                "body_ct": bytes(plaintext).decode("utf-8"),
-                "nonce": "nonce",
-                "K_user": "sealed-user-key",
-                "K_enclave": "sealed-enclave-key",
-            },
-            "",
-        )
-
-    monkeypatch.setattr(
-        worker.core_envelope,
-        "_build_shared_envelope_for_store",
-        _fake_build,
-    )
-
-
-def _scheduled_promotion_effects(uid, job_id):
-    with db.get_pool().connection() as conn:
-        return conn.execute(
-            "SELECT effect_id,effect_type,status,payload "
-            "FROM v2_effect_outbox WHERE user_id=%s AND job_id=%s "
-            "ORDER BY enqueue_seq",
-            (uid, job_id),
-        ).fetchall()
-
-
-def _promotion_provider_rounds():
-    return [
-        {
-            "reply": "",
-            "tool_calls": [{
-                "id": "scheduled-reply",
-                "name": "reply",
-                "args": {"text": "该喝水啦"},
-            }],
-            "usage": {},
-        },
-        _empty_round(),
-        _empty_round(),
-    ]
-
-
-def test_scheduled_intermediate_promotion_is_terminal_without_user_input(
-    monkeypatch,
-):
-    uid = "u_wake_sched_promote_terminal"
-    conftest.seed_user(uid)
-    _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
-    claimed_by = _claim(job_id)
-    assert jobs_store.mark_running(job_id, claimed_by=claimed_by)
-    _patch_scheduled_promotion_envelope(monkeypatch, uid)
-    _script_provider(monkeypatch, _promotion_provider_rounds())
-
-    status = asyncio.run(worker._run_wake(
-        job_id,
-        uid,
-        "scheduled",
-        _scheduled_promotion_deps(uid),
-        _BYOK,
-        asyncio.Semaphore(4),
-        claimed_by,
-    ))
-
-    assert status == "completed"
-    assert _job_status(job_id) == ("completed", None)
-    assert v2_cursor.load_seq(core_store.get_store(uid)) == 0
-    effects = _scheduled_promotion_effects(uid, job_id)
-    assert [(row[1], row[2]) for row in effects] == [
-        (v2_effect_outbox.INTERMEDIATE_REPLY_EFFECT_TYPE, "applied"),
-        (v2_effect_outbox.TERMINAL_REPLY_EFFECT_TYPE, "applied"),
-    ]
-    source_id, source_payload = str(effects[0][0]), effects[0][3]
-    promoted_payload = effects[1][3]
-    assert promoted_payload["envelope"] == source_payload["envelope"]
-    assert promoted_payload[
-        v2_effect_outbox.PROMOTED_INTERMEDIATE_EFFECT_ID_KEY
-    ] == source_id
-    assert "reply_through_seq" not in promoted_payload
-    assert set(promoted_payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY]) == {
-        "claimed_by",
-        "input_generation",
-        "observed_user_seq",
-    }
-    store = core_store.get_store(uid)
-    store.reload()
-    bubbles = [
-        row for row in store.chat_messages if row.get("role") == "openclaw"
-    ]
-    assert len(bubbles) == 1
-    assert bubbles[0]["id"] == source_payload["envelope"]["id"]
-    with db.get_pool().connection() as conn:
-        terminal_failures = conn.execute(
-            "SELECT count(*) FROM v2_terminal_failure_outbox WHERE job_id=%s",
-            (job_id,),
-        ).fetchone()[0]
-    assert terminal_failures == 0
-
-
-def test_scheduled_intermediate_promotion_is_final_for_consumed_user_input(
-    monkeypatch,
-):
-    uid = "u_wake_sched_promote_final"
-    conftest.seed_user(uid)
-    _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
-    claimed_by = _claim(job_id)
-    assert jobs_store.mark_running(job_id, claimed_by=claimed_by)
-    _patch_scheduled_promotion_envelope(monkeypatch, uid)
-    responses = iter(_promotion_provider_rounds())
-    inserted_seq = {}
-    provider_calls = 0
-
-    async def _provider(_config, _messages, *, tools=None, **_kwargs):
-        nonlocal provider_calls
-        provider_calls += 1
-        if provider_calls == 1:
-            message_id = "scheduled-late-user"
-            db.chat_append_strict(
-                uid,
-                message_id,
-                time.time(),
-                {
-                    "id": message_id,
-                    "role": "user",
-                    "source": "model_api",
-                    "ts": time.time(),
-                    "body_ct": "cipher-user",
-                    "nonce": "n",
-                    "K_user": "k",
-                    "K_enclave": "e",
-                    "test_plaintext": "顺便提醒我带伞",
-                },
-                5000,
-            )
-            inserted_seq["value"] = db.chat_max_seq(uid)
-        return next(responses)
-
-    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
-    status = asyncio.run(worker._run_wake(
-        job_id,
-        uid,
-        "scheduled",
-        _scheduled_promotion_deps(uid),
-        _BYOK,
-        asyncio.Semaphore(4),
-        claimed_by,
-    ))
-
-    assert status == "completed"
-    consumed_seq = inserted_seq["value"]
-    assert v2_cursor.load_seq(core_store.get_store(uid)) == consumed_seq
-    effects = _scheduled_promotion_effects(uid, job_id)
-    assert [(row[1], row[2]) for row in effects] == [
-        (v2_effect_outbox.INTERMEDIATE_REPLY_EFFECT_TYPE, "applied"),
-        (v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE, "applied"),
-    ]
-    source_id, source_payload = str(effects[0][0]), effects[0][3]
-    promoted_payload = effects[1][3]
-    assert promoted_payload["envelope"] == source_payload["envelope"]
-    assert promoted_payload["reply_through_seq"] == consumed_seq
-    assert promoted_payload[
-        v2_effect_outbox.PROMOTED_INTERMEDIATE_EFFECT_ID_KEY
-    ] == source_id
-    assert promoted_payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY][
-        "through_seq"
-    ] == consumed_seq
-    store = core_store.get_store(uid)
-    store.reload()
-    bubbles = [
-        row for row in store.chat_messages if row.get("role") == "openclaw"
-    ]
-    assert len(bubbles) == 1
-    assert bubbles[0]["id"] == source_payload["envelope"]["id"]
-    assert _job_status(job_id) == ("completed", None)
-    with db.get_pool().connection() as conn:
-        terminal_failures = conn.execute(
-            "SELECT count(*) FROM v2_terminal_failure_outbox WHERE job_id=%s",
-            (job_id,),
-        ).fetchone()[0]
-    assert terminal_failures == 0
-
-
-def test_scheduled_intermediate_promotion_fails_closed_after_owner_loss(
-    monkeypatch,
-):
-    uid = "u_wake_sched_promote_owner_loss"
-    conftest.seed_user(uid)
-    _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
-    claimed_by = _claim(job_id)
-    assert jobs_store.mark_running(job_id, claimed_by=claimed_by)
-    _patch_scheduled_promotion_envelope(monkeypatch, uid)
-    _script_provider(monkeypatch, _promotion_provider_rounds())
-    real_last = v2_effect_outbox.last_promotable_intermediate_reply
-
-    def _lose_owner_after_callback_fence(**kwargs):
-        receipt = real_last(**kwargs)
-        assert receipt is not None
-        assert jobs_store.mark_failed(
-            job_id,
-            "injected_owner_loss",
-            claimed_by=claimed_by,
-        )
-        return receipt
-
-    monkeypatch.setattr(
-        v2_effect_outbox,
-        "last_promotable_intermediate_reply",
-        _lose_owner_after_callback_fence,
-    )
-    surfaced = []
-    monkeypatch.setattr(
-        worker,
-        "_surface_terminal_error",
-        lambda deps, user_id, failed_job_id, code: surfaced.append(
-            (user_id, failed_job_id, code)
-        ),
-    )
-
-    status = asyncio.run(worker._run_wake(
-        job_id,
-        uid,
-        "scheduled",
-        _scheduled_promotion_deps(uid),
-        _BYOK,
-        asyncio.Semaphore(4),
-        claimed_by,
-        attempt_count=2,
-    ))
-
-    assert status == "failed"
-    effects = _scheduled_promotion_effects(uid, job_id)
-    assert [(row[1], row[2]) for row in effects] == [
-        (v2_effect_outbox.INTERMEDIATE_REPLY_EFFECT_TYPE, "applied"),
-    ]
-    assert _job_status(job_id) == ("failed", "injected_owner_loss")
-    store = core_store.get_store(uid)
-    store.reload()
-    assert len([
-        row for row in store.chat_messages if row.get("role") == "openclaw"
-    ]) == 1
-
-
 # ------------------------------------------------------------------
 # 世界书:主动开口的四条道也要认得这个世界（Seven 2026-08-10）
 #
@@ -3472,8 +3244,9 @@ def test_scheduled_intermediate_promotion_fails_closed_after_owner_loss(
 
 def _wake_deps_with_worldbook(seen, *, block="〈世界书〉墨白历,一年十四个月。", boom=False,
                               tail=None, **kw):
-    def _read(user_id, messages, *, runtime_token):
+    def _read(user_id, messages, *, runtime_token, trace_context=None):
         seen["messages"] = list(messages or [])
+        seen["trace_context"] = trace_context
         seen["n"] = seen.get("n", 0) + 1
         if boom:
             raise RuntimeError("worldbook_match_failed")

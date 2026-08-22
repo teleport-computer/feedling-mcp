@@ -107,6 +107,15 @@ def _deps(**over):
     return worker.TurnDeps(**base)
 
 
+def _trace_collector():
+    events = []
+
+    def _emit(user_id, event_type, **kwargs):
+        events.append({"user_id": user_id, "type": event_type, **kwargs})
+
+    return events, _emit
+
+
 def test_dream_is_a_lane_with_background_priority():
     assert "dream" in jobs_store.LANES
     assert jobs_store.LANE_PRIORITY["dream"] == jobs_store.LANE_PRIORITY["capture"]
@@ -199,6 +208,258 @@ def test_extraction_lane_applies_actions_and_completes(monkeypatch, lane):
     assert _job_row(job_id)[0] == "completed"
 
 
+def test_dream_lifecycle_trace_correlates_model_and_write_outcome(monkeypatch):
+    uid = "u_x_dream_trace"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream", trace_id="trace-dream")
+    job = jobs_store.claim_next_job("w")
+
+    async def _fake_extract(**_kwargs):
+        return ([{
+            "op": "merge",
+            "card_ids": ["old-a", "old-b"],
+            "rationale": "同一京都计划的演进",
+            "result": {"summary": "s", "content": "c"},
+        }], None)
+
+    async def _profile_enqueue(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(extraction, "extract", _fake_extract)
+    monkeypatch.setattr(worker, "_enqueue_profile_if_due", _profile_enqueue)
+    traces, emit_trace = _trace_collector()
+
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(emit_debug_trace=emit_trace),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert [row["type"] for row in traces] == [
+        "memory.dream.start",
+        "memory.dream.model.start",
+        "memory.dream.model.done",
+        "memory.dream.done",
+    ]
+    assert all(
+        row["trace_id"] == str(job["trace_id"])
+        and row["job_id"] == str(job_id)
+        for row in traces
+    )
+    assert traces[-1]["detail"] == {
+        "runtime": "hosted_v2",
+        "lane": "dream",
+        "outcome": "applied",
+        "degraded_context": False,
+        "counts": {
+            "actions": 1,
+            "active_cards": 2,
+            "applied": 1,
+            "failed": 0,
+            "merged": 1,
+            "model_attempts": 1,
+            "organized": 2,
+            "proposals": 1,
+            "skipped": 0,
+        },
+    }
+
+
+def test_dream_partial_write_is_visible_without_marking_job_failed(monkeypatch):
+    uid = "u_x_dream_partial_trace"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+
+    async def _fake_extract(**_kwargs):
+        return ([
+            {
+                "op": "thicken",
+                "card_ids": ["old-a"],
+                "rationale": "同一计划的补充",
+                "result": {"summary": "s1", "content": "c1"},
+            },
+            {
+                "op": "supersede",
+                "card_ids": ["old-b"],
+                "rationale": "同一计划的更新",
+                "result": {"summary": "s2", "content": "c2"},
+            },
+        ], None)
+
+    def _partial(_uid, actions):
+        return {
+            "results": [
+                {"status": "ok", "action": actions[0]["type"]},
+                {"status": "error", "error": "storage_error"},
+            ],
+        }
+
+    async def _profile_enqueue(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(extraction, "extract", _fake_extract)
+    monkeypatch.setattr(worker, "_enqueue_profile_if_due", _profile_enqueue)
+    traces, emit_trace = _trace_collector()
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(apply_memory_actions=_partial, emit_debug_trace=emit_trace),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert _job_row(job_id)[0] == "completed"
+    terminal = traces[-1]
+    assert terminal["type"] == "memory.dream.done"
+    assert terminal["status"] == "warning"
+    assert terminal["detail"]["outcome"] == "partial"
+    assert terminal["detail"]["counts"]["applied"] == 1
+    assert terminal["detail"]["counts"]["failed"] == 1
+
+
+def test_dream_all_writes_rejected_emits_write_rejected_terminal(monkeypatch):
+    uid = "u_x_dream_write_rejected_trace"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+
+    async def _fake_extract(**_kwargs):
+        return ([{
+            "op": "merge",
+            "card_ids": ["old-a", "old-b"],
+            "rationale": "同一计划的演进",
+            "result": {"summary": "s", "content": "c"},
+        }], None)
+
+    monkeypatch.setattr(extraction, "extract", _fake_extract)
+    traces, emit_trace = _trace_collector()
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(
+            apply_memory_actions=lambda _uid, _actions: {
+                "results": [{"status": "error", "error": "storage_error"}],
+            },
+            emit_debug_trace=emit_trace,
+        ),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "failed"
+    assert _job_row(job_id)[0] == "failed"
+    terminal = traces[-1]
+    assert terminal["type"] == "memory.dream.error"
+    assert terminal["status"] == "error"
+    assert terminal["detail"]["outcome"] == "write_rejected"
+    assert terminal["detail"]["counts"]["applied"] == 0
+    assert terminal["detail"]["counts"]["failed"] == 1
+
+
+def test_dream_metric_failure_does_not_emit_a_second_overall_terminal(monkeypatch):
+    uid = "u_x_dream_metric_terminal_trace"
+    _seed_v2(uid)
+    jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+
+    async def _fake_extract(**_kwargs):
+        return ([{
+            "op": "merge",
+            "card_ids": ["old-a", "old-b"],
+            "rationale": "同一计划的演进",
+            "result": {"summary": "s", "content": "c"},
+        }], None)
+
+    async def _profile_enqueue(*_args, **_kwargs):
+        return True
+
+    class _Metrics:
+        def __init__(self):
+            self.flush_calls = 0
+
+        def bind_provider(self, _provider):
+            return None
+
+        def add_call(self, _usage):
+            return None
+
+        def flush(self, *, failed, status):
+            self.flush_calls += 1
+            if self.flush_calls == 1:
+                raise RuntimeError("metric_write_failed")
+
+    monkeypatch.setattr(extraction, "extract", _fake_extract)
+    monkeypatch.setattr(worker, "_enqueue_profile_if_due", _profile_enqueue)
+    traces, emit_trace = _trace_collector()
+    metrics = _Metrics()
+    assert asyncio.run(worker.process_job(
+        job,
+        _deps(emit_debug_trace=emit_trace),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+        tm=metrics,
+    )) == "failed"
+
+    overall = [
+        row for row in traces
+        if row["type"] in {"memory.dream.done", "memory.dream.error"}
+    ]
+    assert [row["type"] for row in overall] == ["memory.dream.done"]
+    assert metrics.flush_calls == 2
+
+
+def test_dream_context_degradation_is_not_indistinguishable_from_model_noop(
+    monkeypatch,
+):
+    uid = "u_x_dream_degraded_trace"
+    _seed_v2(uid)
+    jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+
+    async def _empty(**_kwargs):
+        return [], None
+
+    monkeypatch.setattr(extraction, "extract", _empty)
+    traces, emit_trace = _trace_collector()
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(
+            read_dream_memory_context=lambda _uid: {
+                "cards": "",
+                "card_items": [],
+                "_diagnostic_cards_outcome": "unavailable",
+            },
+            emit_debug_trace=emit_trace,
+        ),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    context_error = next(
+        row for row in traces
+        if row["type"] == "memory.extraction.context.error"
+    )
+    assert context_error["detail"] == {
+        "runtime": "hosted_v2",
+        "lane": "dream",
+        "component": "cards",
+        "outcome": "unavailable",
+    }
+    terminal = traces[-1]
+    assert terminal["type"] == "memory.dream.done"
+    assert terminal["status"] == "warning"
+    assert terminal["detail"]["outcome"] == "noop"
+    assert terminal["detail"]["degraded_context"] is True
+
+
 def test_dream_blast_radius_fuse_fails_whole_job(monkeypatch):
     """2026-08-05 阀门重构:语义审查员已拆,834→1 的最后防线是确定性保险丝——
     单晚要退休的卡 > 活跃卡 80% 且 ≥10 张 → 整个 job 失败,不部分执行。"""
@@ -233,6 +494,7 @@ def test_dream_blast_radius_fuse_fails_whole_job(monkeypatch):
     monkeypatch.setattr(extraction, "extract", _fake_extract)
     applied = {}
 
+    traces, emit_trace = _trace_collector()
     deps = _deps(
         read_memory_context=lambda _uid: {
             "ai_name": "小克", "user_name": "Z", "buckets": "B",
@@ -240,6 +502,7 @@ def test_dream_blast_radius_fuse_fails_whole_job(monkeypatch):
             "card_items": cards,
         },
         apply_memory_actions=lambda _uid, actions: applied.update(n=len(actions)) or {"status": "ok"},
+        emit_debug_trace=emit_trace,
     )
 
     status = asyncio.run(worker.process_job(
@@ -249,6 +512,10 @@ def test_dream_blast_radius_fuse_fails_whole_job(monkeypatch):
     assert applied == {}                       # 熔断在任何写入之前
     row = _job_row(job_id)
     assert row == ("failed", "extraction_failed:dream_blast_radius_exceeded")
+    terminal = traces[-1]
+    assert terminal["type"] == "memory.dream.error"
+    assert terminal["status"] == "error"
+    assert terminal["detail"]["outcome"] == "guard_rejected"
 
 
 def test_dream_below_fuse_threshold_applies_normally(monkeypatch):

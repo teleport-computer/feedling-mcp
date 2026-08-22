@@ -326,6 +326,7 @@ if not _provisioned:
         "test_hosted_agent_runtime_cutover.py",
         "test_worldbook_match.py",
         "test_worldbook_readside_core.py",
+        "test_capability_worldbook.py",
         "test_no_app_py_regression.py",
         "test_asgi_waiters.py",
         "test_quoted_memory_context.py",

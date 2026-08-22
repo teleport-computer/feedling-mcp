@@ -34,12 +34,17 @@ class VisionObserverError(RuntimeError):
         status_code: int | None = None,
         retryable: bool = False,
         detail: str = "",
+        upstream_detail: str = "",
     ):
         super().__init__(error_code)
         self.error_code = error_code
         self.status_code = status_code
         self.retryable = retryable
         self.detail = detail[:160]
+        # Kept separate from display-safe ``detail`` so response builders and
+        # tenant-readable debug traces cannot expose a provider response body
+        # by accidentally serializing the public failure shape.
+        self.upstream_detail = str(upstream_detail or "")[:240]
 
 
 def classify_vision_error(exc: BaseException) -> VisionObserverError:
@@ -97,6 +102,7 @@ def classify_vision_error(exc: BaseException) -> VisionObserverError:
             "vision_model_failed",
         },
         detail=type(exc).__name__,
+        upstream_detail=str(getattr(exc, "response_detail", "") or ""),
     )
 
 
@@ -321,12 +327,13 @@ def observe_pinned_message(
         )
         log.warning(
             "[vision.observer] provider call failed user=%s route=%s "
-            "error=%s class=%s status=%s",
+            "error=%s class=%s status=%s upstream_detail=%r",
             str(store.user_id)[:8],
             route_id[:8],
             type(exc).__name__,
             failure.error_code,
             failure.status_code,
+            failure.upstream_detail,
         )
         return {
             "error": "vision_observer_failed",

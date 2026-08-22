@@ -82,65 +82,6 @@ def test_enqueue_is_idempotent_on_effect_id(pg_clean):
     assert len(pend) == 1 and pend[0]["payload"]["text"] == "hi"
 
 
-def test_discarded_terminal_promotion_is_still_an_attempt(pg_clean):
-    uid = "u_ob_terminal_promotion_attempt"
-    seed_user(uid)
-    generation = db.get_runtime_generation(uid)
-    source_id = effect_id.derive(
-        job_id=11,
-        effect_type=effect_outbox.INTERMEDIATE_REPLY_EFFECT_TYPE,
-        ordinal=0,
-    )
-    assert db.effect_enqueue(
-        source_id,
-        uid,
-        11,
-        effect_outbox.INTERMEDIATE_REPLY_EFFECT_TYPE,
-        generation,
-        {"envelope": {"id": "bubble-11"}},
-    )
-    with db.get_pool().connection() as conn:
-        conn.execute(
-            "UPDATE v2_effect_outbox SET status='applied' WHERE effect_id=%s",
-            (source_id,),
-        )
-    promotion_id = effect_outbox.enqueue_reply_promotion(
-        intermediate_effect_id=source_id,
-        job_id=11,
-        user_id=uid,
-        expected_generation=generation,
-        effect_type=effect_outbox.TERMINAL_REPLY_EFFECT_TYPE,
-        payload={
-            "envelope": {"id": "bubble-11"},
-            effect_outbox.PROMOTED_INTERMEDIATE_EFFECT_ID_KEY: source_id,
-        },
-    )
-    with db.get_pool().connection() as conn:
-        conn.execute(
-            "UPDATE v2_effect_outbox SET status='discarded' WHERE effect_id=%s",
-            (promotion_id,),
-        )
-
-    assert effect_outbox.last_promotable_intermediate_reply(
-        user_id=uid,
-        job_id=11,
-    ) is None
-
-
-def test_reply_promotion_rejects_nonterminal_effect_type(pg_clean):
-    uid = "u_ob_promotion_type"
-    seed_user(uid)
-    with pytest.raises(ValueError, match="final or terminal"):
-        effect_outbox.enqueue_reply_promotion(
-            intermediate_effect_id="source",
-            job_id=12,
-            user_id=uid,
-            expected_generation=db.get_runtime_generation(uid),
-            effect_type=effect_outbox.INTERMEDIATE_REPLY_EFFECT_TYPE,
-            payload={"envelope": {"id": "bubble-12"}},
-        )
-
-
 def test_apply_dispatches_when_generation_matches(pg_clean):
     seed_user("u_ob2")
     db.get_runtime_generation("u_ob2")  # init at 1

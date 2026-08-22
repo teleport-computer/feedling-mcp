@@ -194,7 +194,7 @@ def test_default_codex_cmd_bypasses_bwrap_sandbox():
     assert "--sandbox workspace-write" not in cmd
 
 
-def test_default_codex_cmd_requests_reasoning_summary_events():
+def test_default_codex_cmd_inherits_reasoning_and_requests_summary_events():
     # Codex only surfaces reasoning to the resident consumer if the CLI is asked
     # to run with reasoning enabled. The consumer already parses agent_reasoning
     # / reasoning events into the thinking disclosure. OpenAI native summaries
@@ -204,8 +204,33 @@ def test_default_codex_cmd_requests_reasoning_summary_events():
         user_id="u_1", home="/h",
     )
     cmd = env["AGENT_CLI_CMD"]
-    assert "-c model_reasoning_effort=medium" in cmd
+    assert "model_reasoning_effort=" not in cmd
     assert "-c model_reasoning_summary=detailed" in cmd
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        ("low", "low"),
+        ("medium", "medium"),
+        ("high", "high"),
+        ("off", "none"),
+    ],
+)
+def test_default_codex_cmd_honors_user_reasoning_effort(configured, expected):
+    env = spawners.consumer_env(
+        {},
+        {
+            "api_key": "fk",
+            "provider_key": "sk-oai",
+            "driver": "codex",
+            "reasoning_effort": configured,
+        },
+        user_id="u_1",
+        home="/h",
+    )
+
+    assert f"-c model_reasoning_effort={expected}" in env["AGENT_CLI_CMD"]
 
 
 # ---- V1 web capability: block the drivers' NATIVE web tools so the model is

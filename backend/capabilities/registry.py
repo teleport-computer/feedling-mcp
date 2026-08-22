@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from capabilities import memory
+from capabilities import memory, worldbook
 from capabilities import history
 from capabilities import voice, perception, screen, photo, identity, chat, web, wake, workspace
 from capabilities import errors
@@ -21,6 +21,7 @@ CAPABILITIES: dict[str, Callable[..., CapabilityResult]] = {
     "voice_transcript_read": lambda store, **kw: voice.transcript_read(store, **kw),
     "memory_write": lambda store, **kw: memory.write(store, **kw),
     "memory_search": lambda store, **kw: memory.search(store, **kw),
+    "worldbook_match": lambda store, **kw: worldbook.match(store, **kw),
     "history_search": lambda store, **kw: history.search(store, **kw),
     "history_fetch": lambda store, **kw: history.fetch(store, **kw),
     "perception_snapshot": lambda store, **kw: perception.snapshot(store, **kw),
@@ -53,8 +54,15 @@ READ_ACTIONS = frozenset(set(CAPABILITIES) - WRITE_ACTIONS)
 
 
 def run_capability(action_type: str, store, *, api_key=None, runtime_token=None,
-                   params=None) -> CapabilityResult:
+                   params=None, trace_context=None) -> CapabilityResult:
     fn = CAPABILITIES.get(action_type)
     if fn is None:
         return err(errors.INVALID, f"unknown capability: {action_type}", retryable=False)
-    return fn(store, api_key=api_key, runtime_token=runtime_token, params=params)
+    kwargs = {
+        "api_key": api_key,
+        "runtime_token": runtime_token,
+        "params": params,
+    }
+    if action_type == "worldbook_match":
+        kwargs["trace_context"] = trace_context
+    return fn(store, **kwargs)

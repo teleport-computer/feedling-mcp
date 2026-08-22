@@ -78,7 +78,7 @@ class ParseRetry(NamedTuple):
     build_truncation_prompt: Callable[[str], str] | None = None
 
 
-_PROVIDER_FAILURE_CODES = frozenset(
+PUBLIC_PROVIDER_FAILURE_CODES = frozenset(
     {
         "auth_invalid",
         "content_filtered",
@@ -100,7 +100,7 @@ def provider_failure_code_from_reason(reason: str) -> str | None:
     if not raw.startswith(prefix):
         return None
     code = raw[len(prefix) :]
-    return code if code in _PROVIDER_FAILURE_CODES else "unknown"
+    return code if code in PUBLIC_PROVIDER_FAILURE_CODES else "unknown"
 
 
 def _provider_failure_code(exc: BaseException) -> str:

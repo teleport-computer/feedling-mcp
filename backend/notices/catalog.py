@@ -74,7 +74,36 @@ ERROR_CLASSES = frozenset({
     "image_generation_unavailable",
     "image_generation_invalid_output",
     "image_generation_invalid_prompt",
+    "image_generation_internal_error",
     "image_generation_failed",
+})
+
+# Seven 2026-08-21: only these exact provider/account outcomes are explicit
+# enough to remove from Feedling's failure numerator.  Everything else --
+# including a future/unknown code, rate limiting, capability mismatches, safety
+# suppression, and empty replies -- remains our failure until investigated.
+#
+# V1 ``proactive_jobs.status_reason`` and V2 ``agent_jobs.last_error`` are
+# deliberately separate keyspaces.  Keep two named sets even where the words
+# overlap; merging them is how a value valid in one runtime gets misclassified
+# in the other.  T220 parity tests lock both sets to their producer exports.
+USER_UNAVAILABLE_V1_REASONS = frozenset({
+    "quota_insufficient",
+    "extraction_failed:quota_insufficient",
+    "image_generation_quota_insufficient",
+    "auth_invalid",
+    "image_generation_auth_invalid",
+    "model_not_found",
+    "image_generation_model_not_found",
+})
+USER_UNAVAILABLE_V2_OUTCOME_CODES = frozenset({
+    "turn_failed:quota_insufficient",
+    "extraction_failed:quota_insufficient",
+    "turn_failed:image_generation_quota_insufficient",
+    "turn_failed:auth_invalid",
+    "turn_failed:image_generation_auth_invalid",
+    "turn_failed:model_not_found",
+    "turn_failed:image_generation_model_not_found",
 })
 
 # error_class -> (blame, user_text)
@@ -180,6 +209,8 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "provider_transient", "生图模型没有返回有效图片，请重试或更换模型。"),
     "image_generation_invalid_prompt": (
         "system", "这次生图请求没有正确送达，我们会尽快排查。"),
+    "image_generation_internal_error": (
+        "system", "图片生成后的系统处理出了问题，我们会尽快排查。"),
     "image_generation_failed": (
         "provider_transient", "图片生成失败，请重试；如果仍失败，请更换模型。"),
 }

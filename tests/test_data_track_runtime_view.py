@@ -74,6 +74,7 @@ def _lane(**overrides) -> dict:
         "superseded": 0,
         "queue_expired": 0,
         "lease_expired": 0,
+        "empty_reply_suppressions": 0,
         "failure_rate": 0.0,
         "p50_ok_ms": 18_500,
         "p95_ok_ms": 38_100,
@@ -138,14 +139,14 @@ def test_runtime_health_level_red_on_high_failure_rate():
     assert any("失败率" in r for r in reasons)
 
 
-def test_runtime_health_level_guard_is_warning_not_hard_failure():
+def test_runtime_health_level_safety_suppression_stays_in_our_failure_rate():
     lane = _lane(
         lane="heartbeat",
         completed=90,
         failed=10,
         failure_rate=0.10,
-        operational_failures=0,
-        operational_failure_rate=0.0,
+        operational_failures=10,
+        operational_failure_rate=0.10,
         safety_suppressions=10,
     )
 
@@ -153,7 +154,7 @@ def test_runtime_health_level_guard_is_warning_not_hard_failure():
 
     assert level == "warn"
     assert any("安全抑制" in reason for reason in reasons)
-    assert not any("系统故障率" in reason for reason in reasons)
+    assert any("我方失败率" in reason for reason in reasons)
 
 
 def test_runtime_health_level_chat_keeps_user_impact_rate():
@@ -325,34 +326,29 @@ def test_runtime_failure_code_buckets_unknown_free_text():
     assert _dt._runtime_failure_code(None) == "other"
 
 
-def test_runtime_failure_code_truncates_long_valid_code():
-    # 新语义：形状合法（scope:kind，只含 [a-z0-9_]）的码无论多长都放行、截断到 64。
+def test_runtime_failure_code_rejects_unregistered_shaped_code():
+    # 字符形状证明不了来源；长得像码的任意串仍必须落 other。
     long_code = "wake_failed:" + ("x" * 200)
-    result = _dt._runtime_failure_code(long_code)
-    assert result == long_code[:64]
-    assert len(result) == 64
+    assert _dt._runtime_failure_code(long_code) == "other"
 
 
 def test_runtime_failure_code_rejects_free_text_after_known_prefix():
-    # 这是被移除的行为：旧实现只要 startswith("turn_failed:") 就无条件放行 +
-    # 截断，哪怕冒号后是含空格/中文的自由文本（"turn_failed: 我的身份证号是
-    # 1234" 这种）。新实现按形状校验，冒号后必须仍是 [a-z0-9_]+，自由文本一律
-    # 落 other。
+    # 旧实现只要前缀/形状匹配就可能放行；现在只认产生方精确成员。
     leaked = "turn_failed:" + ("我的身份证号是 1234 " * 20)
     assert _dt._runtime_failure_code(leaked) == "other"
 
 
 def test_runtime_failure_code_covers_non_chat_lane_shapes():
-    # I-2: 白名单曾经只放行 turn_failed:/queue_timeout/lease_timeout 三种形状，
-    # 其余全部写入点（wake_failed:*/extraction_failed:*/compaction_failed:*/
-    # mcp_mutation_outcome_unknown/runtime_expired）塌成 other。heartbeat lane
-    # 的失败码正是 wake_failed:*，本页专门给 heartbeat 加了日报口径链接，不能
-    # 让它的失败原因永远只显示 other。
+    # I-2: 这些非 chat 真实写入点都必须出现在产生方导出里，不能塌成 other。
     assert _dt._runtime_failure_code("wake_failed:timeouterror") == "wake_failed:timeouterror"
     assert _dt._runtime_failure_code("extraction_failed:valueerror") == "extraction_failed:valueerror"
     assert _dt._runtime_failure_code("compaction_failed:keyerror") == "compaction_failed:keyerror"
     assert _dt._runtime_failure_code("mcp_mutation_outcome_unknown") == "mcp_mutation_outcome_unknown"
     assert _dt._runtime_failure_code("runtime_expired") == "runtime_expired"
+
+
+def test_runtime_failure_code_rejects_forged_known_prefix():
+    assert _dt._runtime_failure_code("turn_failed:secret_token") == "other"
 
 
 def test_runtime_failure_code_rejects_malformed_shapes():
@@ -446,6 +442,24 @@ def test_render_runtime_health_page_shows_conclusion_and_lanes(bound_request):
     assert "chat" in html_out
     assert "heartbeat" in html_out
     assert "Worker 池" in html_out
+
+
+def test_render_runtime_health_page_shows_empty_proactive_suppression_metric(
+    bound_request,
+):
+    html_out = _dt._render_runtime_health_page(
+        _payload([
+            _lane(
+                lane="heartbeat",
+                sampled_jobs=7,
+                completed=7,
+                empty_reply_suppressions=3,
+            )
+        ])
+    )
+
+    assert "空内容主动抑制" in html_out
+    assert "<td>3</td>" in html_out
 
 
 def test_render_runtime_health_page_warns_service_when_delivery_is_missing(
@@ -549,6 +563,9 @@ def test_render_runtime_health_page_declares_scope_split(bound_request):
     # 与 Proactive 日报页的口径分工必须写在页面上，否则两页数字打架时无从判断
     html_out = _dt._render_runtime_health_page(_payload())
     assert "运行时视角" in html_out
+    assert "unknown、上游限流、安全抑制、空回复" in html_out
+    assert "superseded 不进任何失败率分子或分母" in html_out
+    assert "总体=本实例托管 Runtime V2" in html_out
     assert "Proactive 日报" in html_out
 
 
@@ -881,8 +898,8 @@ def test_render_runtime_health_page_token_columns_are_dash_without_data(bound_re
     # 精确断言：chat 行的 token / 缓存命中 / 上报覆盖 三列都渲染成 muted 的 —。
     # 只写 `assert "—" in html_out` 是无效断言——页面别处本来就有 —。
     # 数量是 3 而非 2：命中率与上报覆盖率已拆成两列（2026-07-30 审计）。
-    # 新增控制/抑制拆分后，旧 payload 对这两列也只能显示未知（—）。
-    assert chat_row.count("<td class='muted'>—</td>") == 6
+    # 控制/明确用户侧/抑制拆分后，旧 payload 对三列都只能显示未知（—）。
+    assert chat_row.count("<td class='muted'>—</td>") == 7
     # maintenance 的数字绝不能串到 chat 行上
     assert "951.2k" not in chat_row
 
@@ -902,10 +919,10 @@ def test_render_runtime_health_page_includes_token_only_lane(bound_request):
     assert "87.3%" in row
     # 健康列（样本/成功/失败/过期/superseded/失败率/p50/p95/capture）没有
     # 任何数据来源——必须显 —，不得显 0（0 意味着"确认过是零"，这里是
-    # "压根没被健康查询看见"）。新表把控制/抑制与两种失败率拆开，故共有
-    # 7 个 muted dash；样本/成功/失败/过期/系统故障五列不带 muted class，
+    # "压根没被健康查询看见"）。新表把控制/用户侧/抑制与两种失败率拆开，故共有
+    # 9 个 muted dash；样本/成功/失败/过期/我方故障五列不带 muted class，
     # 内容也必须是 — 而非 0。
-    assert row.count("<td class='muted'>—</td>") == 8
+    assert row.count("<td class='muted'>—</td>") == 9
     assert "<td>—</td>" in row  # 样本/成功/失败/过期这几列（不带 muted class）
     assert ">0<" not in row and "0 / 0" not in row
 
@@ -1079,8 +1096,8 @@ def test_render_runtime_health_page_separates_two_coverages(bound_request):
 
 def test_render_runtime_health_page_coverage_columns_dash_without_data(bound_request):
     html_out = _dt._render_runtime_health_page(_payload(), _tokens(lane_name="other"))
-    # chat 行 token/命中/覆盖均未知；旧 payload 的控制/抑制列也未知。
-    assert _lane_row_html(html_out, "chat").count("<td class='muted'>—</td>") == 6
+    # chat 行 token/命中/覆盖均未知；旧 payload 的控制/用户侧/抑制列也未知。
+    assert _lane_row_html(html_out, "chat").count("<td class='muted'>—</td>") == 7
 
 
 def test_runtime_page_links_drop_params_it_ignores():

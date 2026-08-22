@@ -28,7 +28,7 @@ def _model_limit(context_window_tokens: int = 2_048) -> frontier.ModelPromptLimi
 
 
 _REAL_TOOL_COUNT = 69
-_REAL_TOOL_CATALOG_BYTES = 34_800
+_REAL_TOOL_CATALOG_BYTES = 35_552
 
 
 def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
@@ -36,7 +36,7 @@ def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
 
     The fixture is derived from the real platform catalog rather than copying a
     toy schema list. ASCII description padding makes the combined canonical
-    payload exactly 34,800 bytes while keeping 69 independently named tools.
+    payload exactly 35,552 bytes while keeping 69 independently named tools.
     The 2026-08-17 increase records the real `stay_silent` wake schema: it adds
     341 bytes by itself and 267 bytes net when replacing one synthetic MCP tool
     in this fixed-count mixed catalog.
@@ -48,6 +48,20 @@ def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
     memory tools, memory_organize now makes the direct bulk-action route
     explicit, and identity_dimensions_set makes its identity_get step
     conditional instead of unconditional. It records catalog size only.
+    The 2026-08-21 increase to 35,118 records the pull-only worldbook_match
+    schema while preserving the captured MCP description padding.
+    The 2026-08-21 increase to 35,229 (+111 bytes) records the history_search
+    escalation contract: memory_search is stated as the default path, and the
+    tool is told never to be called in the same batch as memory_search (Seven
+    2026-08-21). It records catalog size only.
+    ⚠️ 为什么是抬记录值而不是把描述写短:那段措辞是**被实测过的**
+    (40 轮 × 60 用例:hist_search_1 0%→75%、hist_search_2 35%→67.5%,
+    同批多调 19.6%→9.6%,无关 54 题 90.3%→90.7% 无误伤)。改一个字就是换了
+    一个变量,那组数字就不再描述线上跑的东西。111 字节 = 目录的 0.32%,
+    而这个常量本来就是**记录实际大小的账本**(上面四条历史增记就是先例),
+    不是预算上限。
+    The 2026-08-22 increase to 35,552 records the bounded Canvas write and delivery copy,
+    which adds 323 bytes without changing the tool count.
     """
     platform = list(tool_schema.build_tool_specs())
     mcp_count = _REAL_TOOL_COUNT - len(platform)
@@ -878,7 +892,7 @@ def test_budget_pressure_keeps_complete_directory_and_folds_only_non_resident():
 
 def test_pressure_keeps_explicitly_resolved_schema_full():
     messages = [{"role": "user", "content": "use the resolved tool"}]
-    floor = ToolSpec("reply", "reply", {"type": "object"})
+    floor = ToolSpec("memory_search", "search memory", {"type": "object"})
     resolved = ToolSpec(
         "mcp__calendar__events",
         "calendar events " * 20,
@@ -925,7 +939,11 @@ def test_required_resident_floor_exhaustion_fails_loud_without_trimming():
     resident_tools = [
         ToolSpec(
             name,
-            ("oversized resident manual " * 1_000 if name == "reply" else name),
+            (
+                "oversized resident manual " * 1_000
+                if name == "memory_search"
+                else name
+            ),
             {"type": "object"},
         )
         for name in sorted(frontier._CORE_TOOL_FLOOR_NAMES)
@@ -972,7 +990,7 @@ def test_pressure_folded_platform_schema_search_becomes_protected():
 
 def test_under_pressure_policy_keeps_full_fit_and_leaves_search_latent():
     tools = [
-        ToolSpec("reply", "reply", {"type": "object"}),
+        ToolSpec("direct_answer", "answer directly", {"type": "object"}),
         ToolSpec(
             "workspace_read",
             "read a file",
@@ -998,12 +1016,12 @@ def test_under_pressure_policy_keeps_full_fit_and_leaves_search_latent():
         safety_margin_tokens=128,
     )
 
-    assert plan.included_tool_names == ("reply", "workspace_read")
+    assert plan.included_tool_names == ("direct_answer", "workspace_read")
     assert plan.pressure_collapsed_tool_names == ()
     assert not plan.schema_recovery_needed
 
 
-def test_runtime_v2_catalog_has_five_resident_and_thirty_one_foldable_tools():
+def test_runtime_v2_catalog_has_four_resident_and_thirty_two_foldable_tools():
     specs = tool_schema.build_tool_specs()
     resident = [
         spec for spec in specs
@@ -1014,8 +1032,8 @@ def test_runtime_v2_catalog_has_five_resident_and_thirty_one_foldable_tools():
         if spec.name not in frontier._CORE_TOOL_FLOOR_NAMES
     ]
 
-    assert len(resident) == 5
-    assert len(foldable) == 31
+    assert len(resident) == 4
+    assert len(foldable) == 32
     assert all(
         len(tool_surface.collapsed_tool_spec(spec).description)
         <= tool_surface.MAX_COLLAPSED_DESCRIPTION_CHARS
@@ -1366,8 +1384,8 @@ def test_fourteen_mcp_catalog_pressure_reaches_provider_with_memory_floor(
         "memory_fetch",
         "memory_write",
         "memory_organize",
-        "reply",
     }.issubset(sent_names)
+    assert "reply" not in sent_names
     assert {tool.name for tool in mcp_tools}.issubset(sent_names)
     assert "large_read" in sent_names
     sent_by_name = {spec.name: spec for spec in calls[0][1]}

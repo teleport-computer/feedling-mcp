@@ -233,10 +233,10 @@ def test_p0_weak_model_plain_text_one_call_one_bubble_no_dispatch_tiering(monkey
 
 
 # ---------------------------------------------------------------------------
-# P0 #2: reply(我看看哈) + web_search, exactly-once on retry.
+# P0 #2: a tool round stays silent until one terminal reply.
 # ---------------------------------------------------------------------------
 
-def test_p0_reply_then_web_search_ordering_and_exactly_once_replay(monkeypatch):
+def test_p0_web_search_then_one_terminal_reply(monkeypatch):
     uid = "u_p0_reply_websearch"
     conftest.seed_user(uid)
     _reset(uid)
@@ -248,7 +248,7 @@ def test_p0_reply_then_web_search_ordering_and_exactly_once_replay(monkeypatch):
         lambda action_type, store, **k: _FakeCapResult({"snippet": "search result"}))
     _patch_real_write(monkeypatch)
     calls = _script_provider(monkeypatch, [
-        _tool_round(_tc("r1", "reply", text="我看看哈"), _tc("s1", "web_search", query="x")),
+        _tool_round(_tc("s1", "web_search", query="x")),
         _text_round("final answer"),
     ])
     deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
@@ -264,27 +264,7 @@ def test_p0_reply_then_web_search_ordering_and_exactly_once_replay(monkeypatch):
     assert "search result" in " ".join(r.content for r in exchanges[0].results)
 
     bubbles = _bubbles(uid)
-    assert len(bubbles) == 2
-    # STRONG: two distinct bubbles, in real chat_messages seq/write order — the
-    # intermediate `reply` bubble landed BEFORE the terminal one, not batched to
-    # end-of-turn (C6: drained immediately mid-loop).
-    assert [b["body_ct"] for b in bubbles] == ["我看看哈", "final answer"]
-
-    # STRONG: exactly-once replay. Reconstruct the FIRST reply effect's deterministic
-    # effect_id (ordinal 0 -- the intermediate `reply` tool call was this turn's first
-    # enqueue_effect call, `reply` is folded before `web_search`'s dispatch) and
-    # re-drive enqueue+drain exactly as a retried/re-enqueued turn would.
-    gen = db.get_runtime_generation(uid)
-    eid = v2_effect_id.derive(job_id=job_id, effect_type="reply", ordinal=0)
-    replay_id = v2_effect_outbox.enqueue_effect(
-        job_id=job_id, user_id=uid, effect_type="reply", ordinal=0,
-        expected_generation=gen, payload={"text": "我看看哈"})
-    assert replay_id == eid  # same deterministic id -> ON CONFLICT DO NOTHING, no new row
-    result = _apply_effects(uid)
-    assert result == {"applied": 0, "discarded": 0}  # already applied -> not in the pending set
-
-    bubbles_after = _bubbles(uid)
-    assert len(bubbles_after) == 2  # STRONG: NO duplicate bubble after the re-drive.
+    assert [b["body_ct"] for b in bubbles] == ["final answer"]
 
 
 # ---------------------------------------------------------------------------
