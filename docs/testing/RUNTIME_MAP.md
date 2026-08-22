@@ -101,9 +101,9 @@ resident 侧才是 HTTP 客户端,POST `/v1/memory/*`。
 
 | prompt | 唯一实现 | 谁在用 |
 |---|---|---|
-| capture | `backend/memgarden/prompts/capture.py` | V2 + resident(都经 `memory/capture_prompt_v1.py` 适配壳) |
-| dream | `backend/memgarden/prompts/dream.py` | V2 + resident(都经 `memory/dream_prompt_v1.py` 适配壳) |
-| migrate | `backend/memgarden/prompts/migrate.py` | **只有 resident**;V2 侧无调用方,老壳 `memory/migrate_prompt_v1.py` 已在 `5e50e79e` 删除 |
+| capture | `memgarden/prompts/capture.py`（外部包） | V2 + resident(都经 `memory/capture_prompt_v1.py` 适配壳) |
+| dream | `memgarden/prompts/dream.py`（外部包） | V2 + resident(都经 `memory/dream_prompt_v1.py` 适配壳) |
+| migrate | `memgarden/prompts/migrate.py`（外部包） | **只有 resident**;V2 侧无调用方,老壳 `memory/migrate_prompt_v1.py` 已在 `5e50e79e` 删除 |
 
 `memory/*_prompt_v1.py` 现在**不是纯 re-export**:它们是适配层,补齐称呼规则后转调内核
 (所以壳与内核签名不同,别用 `is` 判定两者等同)。

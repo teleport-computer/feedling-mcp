@@ -439,7 +439,8 @@ jobs:
             tests/test_route_b_card_shape_recall.py \
             tests/test_route_b_sensitive_gate.py \
             tests/test_memory_injection_observability.py \
-            tests/test_memgarden_purity.py \
+            tests/test_memgarden_is_a_real_dependency.py \
+            tests/test_card_leak_signals_wired.py \
             tests/test_memgarden_policies.py \
             tests/test_memgarden_capture_golden.py \
             tests/test_memgarden_dream_migrate_golden.py \

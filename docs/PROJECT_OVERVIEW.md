@@ -480,7 +480,7 @@ tab 概念，`below_floor` 的三个 per-tab key 仅为响应形状兼容保留�
 所有变更写入 `user_logs` 的 `memory_changes` 流；批量捕获（聊天历史蒸馏
 成记忆卡）走 `memory_capture_jobs` 流跟踪进度。
 
-**检索（喂给 agent 的上下文怎么选）**：`backend/memgarden/scoring/relevance.py`，
+**检索（喂给 agent 的上下文怎么选）**：`memgarden/scoring/relevance.py`（外部包），
 纯函数、不依赖向量库——
 
 - resident 路径（宽松）：最多 3 张转折卡（标题前缀 `转折｜`，最新

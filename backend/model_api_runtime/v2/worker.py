@@ -84,7 +84,7 @@ from core import provider_usage
 from agent_protocol_core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
-from memgarden import dream_trace as memory_dream_trace
+from memory import dream_trace as memory_dream_trace
 from memgarden import timestamps as memory_timestamps
 from core.downloadable_reply import sanitize_downloadable_reply
 from perception.glance import (

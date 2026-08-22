@@ -530,7 +530,7 @@ flowchart TD
 
 ### 3.3 [历史] legacy 记忆上下文选择
 
-挑选逻辑在 `backend/memgarden/scoring/relevance.py`（纯函数），**执行在
+挑选逻辑在 `memgarden/scoring/relevance.py`（外部包）（纯函数），**执行在
 enclave 内**（enclave 解密历史时顺带运行）。托管路线用严格模式，
 核心思想是"记忆是候选，不是平台塞给模型的事实"：
 

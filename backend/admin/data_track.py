@@ -35,7 +35,7 @@ from bootstrap import gates as boot_gates
 from core import store as core_store
 from core import util as core_util
 from identity import service as identity_service
-from memgarden import dream_trace as memory_dream_trace
+from memory import dream_trace as memory_dream_trace
 
 
 _PROVIDER_ATTEMPT_STREAM = "provider_attempts"

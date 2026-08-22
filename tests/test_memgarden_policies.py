@@ -183,25 +183,28 @@ def test_language_rule_rejects_unknown_policy_like_get_policy_does():
 
 
 def test_language_rule_is_wired_into_both_sides():
-    """语言规则已接线：capture 与 genesis 都从本模块取，不再各写一份。
+    """语言规则只有一份：capture（内核里）与 genesis（io 侧）都从 policies 取。
 
-    这是本批真正消除的第二处重复（第一处是 curated_archive 的两段）。
+    ⚠️ 2026-08-23 起内核是外部包，读不到它的源文件了 —— capture 那一半改为**行为**
+    断言（渲染出来的提示词里含 policies 出的那段），genesis 那一半仍读 io 的源码。
     """
     import pathlib
 
+    from memgarden.policies import language_rule
+    from memgarden.prompts.capture import build_capture_prompt
+
+    prompt = build_capture_prompt(
+        ai_name="io", user_name="老王", naming_rule="叫他老王。", buckets="工作",
+        threads="", identity="", window="hi", cards="", locale="zh-Hans",
+    )
+    rule = language_rule("conversation_capture", locale="zh-Hans",
+                         indent="     ", first_prefix="   · ")
+    assert rule in prompt, "capture 的提示词里没有 policies 出的那段语言规则"
+
     root = pathlib.Path(__file__).resolve().parents[1] / "backend"
-    capture_src = (root / "memgarden" / "prompts" / "capture.py").read_text(encoding="utf-8")
     genesis_src = (root / "genesis" / "prompts.py").read_text(encoding="utf-8")
-
-    assert "{language_rule}" in capture_src, "capture 模板没有语言占位符"
-    assert "policies_language_rule" in capture_src, "capture 没调 language_rule"
     assert "mg_policies.language_rule" in genesis_src, "genesis 没调 language_rule"
-
-    # 两边都不许再出现内联的旧文本
-    for name, src in (("capture", capture_src), ("genesis", genesis_src)):
-        assert "用 TA 跟你对话的语言记" not in src, f"{name} 里还留着旧的内联文本"
-        assert "用素材原文的语言——中文素材" not in src, f"{name} 里还留着旧的内联文本"
-
+    assert "用素材原文的语言——中文素材" not in genesis_src, "genesis 里还留着旧的内联文本"
 
 def test_language_basis_reads_as_a_relationship_not_a_placeholder():
     """对话语言以双方关系表达，不再用内部占位词指用户。"""
