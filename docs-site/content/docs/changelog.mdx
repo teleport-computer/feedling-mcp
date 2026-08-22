@@ -10,6 +10,8 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Reduced multi-worker chat database egress by synchronizing bounded per-user change events and using durable point/window queries for verify, resident poll, and Runtime V2 prompt reads. Public API schemas and end-to-end encryption behavior are unchanged; gap detection retains a bounded snapshot fallback.
+
 - **Independent resident screen turns now retain user-configured MCP tools in
   both foreground Chat and proactive lanes.** Under an explicit 2026-08-21
   trust-boundary decision, resident/CLI turns receiving pixels keep both

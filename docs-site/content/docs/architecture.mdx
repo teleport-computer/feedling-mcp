@@ -5,6 +5,12 @@ description: Understand Feedling's components, data flows, encryption boundaries
 
 import { ArchitectureDiagram } from '@/components/architecture-diagram';
 
+## Multi-worker chat consistency
+
+PostgreSQL is the durable source of truth for chat. Each backend worker keeps a bounded per-user hot projection and advances it with versioned change events delivered through PostgreSQL `LISTEN/NOTIFY`. Notifications are only wake hints: workers verify durable versions, apply contiguous events, and fall back to a bounded snapshot when events are missing, reset, or too far behind.
+
+Correctness-sensitive reads do not depend on cache freshness. Verify uses exact ping/reply lookups, resident poll selects bounded durable unanswered candidates before its atomic claim, and Runtime V2 freezes prompt membership by sequence. Chat envelopes remain opaque to this synchronization layer, and telemetry contains no message documents, ciphertext, keys, or connection strings.
+
 Feedling separates ciphertext persistence from authorized decryption and agent
 execution. Managed production uses a main confidential VM for the public API and
 trusted-decrypt service, separate confidential-VM capacity for hosted agents,

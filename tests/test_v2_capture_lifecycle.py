@@ -132,8 +132,8 @@ def test_transactional_v2_reply_refreshes_without_legacy_enqueue(monkeypatch):
                 "content_type": content_type,
             }
 
-        def reload_chat_strict(self):
-            return []
+        def apply_committed_chat_rows(self, rows):
+            self.chat_messages.extend(dict(row) for row in rows)
 
         def notify_chat_waiters(self):
             return None
@@ -171,6 +171,9 @@ def test_transactional_v2_reply_refreshes_without_legacy_enqueue(monkeypatch):
 
     assert refreshed == [True]
     assert legacy == []
+    assert [(row["id"], row["seq"]) for row in store.chat_messages] == [
+        ("reply-tx", 7)
+    ]
 
 
 def test_v2_device_boundary_and_compatibility_endpoints_never_write_legacy(

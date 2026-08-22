@@ -47,6 +47,11 @@ WORKER_ID = uuid.uuid4().hex
 # notify refreshes that store in place (which also wakes its long-poll waiters).
 _TARGETED_STORE_CHANNELS = frozenset({"proactive", "frames", "blob"})
 _CHAT_SYNC_MODES = frozenset({"legacy", "observe", "incremental"})
+_CHAT_SYNC_RESULTS = frozenset({"applied", "skipped", "error", "mismatch"})
+_CHAT_SYNC_REASONS = frozenset({
+    "legacy_payload", "legacy_mode", "already_fresh", "event_sync",
+    "observe_sample", "observe_control", "sync_failed", "fingerprint_diff",
+})
 
 # Extra per-channel handlers injected by the assembly layer for targets core may
 # not import upward (channel -> [fn(user_id)]). E.g. asgi/lifespan.py wires the
@@ -94,6 +99,23 @@ def _observe_chat_user(user_id: str) -> bool:
     return int.from_bytes(digest[:4], "big") % 100 == 0
 
 
+def _chat_sync_telemetry(
+    *, user_id: str, mode: str, result: str, reason: str, hot_rows: int
+) -> None:
+    """Emit content-free fixed-enum sync telemetry."""
+    if mode not in _CHAT_SYNC_MODES:
+        raise ValueError("invalid chat sync telemetry mode")
+    if result not in _CHAT_SYNC_RESULTS:
+        raise ValueError("invalid chat sync telemetry result")
+    if reason not in _CHAT_SYNC_REASONS:
+        raise ValueError("invalid chat sync telemetry reason")
+    user_hash = hashlib.sha256(str(user_id).encode("utf-8")).hexdigest()[:16]
+    log.info(
+        "chat_sync mode=%s result=%s reason=%s user_hash=%s hot_rows=%d",
+        mode, result, reason, user_hash, max(0, int(hot_rows)),
+    )
+
+
 def _chat_cache_fingerprint(store) -> str:
     with store.chat_lock:
         identity = [
@@ -128,11 +150,25 @@ def _dispatch_chat(data: dict, user_id: str) -> None:
     mode = _chat_sync_mode()
     if not is_v2 or mode == "legacy":
         _reload_legacy_chat(store)
+        _chat_sync_telemetry(
+            user_id=user_id, mode=mode, result="applied",
+            reason="legacy_payload" if not is_v2 else "legacy_mode",
+            hot_rows=len(store.chat_messages),
+        )
         return
     if mode == "incremental":
         if int(getattr(store, "chat_version", 0)) >= target_version:
+            _chat_sync_telemetry(
+                user_id=user_id, mode=mode, result="skipped",
+                reason="already_fresh", hot_rows=len(store.chat_messages),
+            )
             return
-        store.ensure_chat_fresh(force=True, target_version=target_version)
+        ok = store.ensure_chat_fresh(force=True, target_version=target_version)
+        _chat_sync_telemetry(
+            user_id=user_id, mode=mode, result="applied" if ok else "error",
+            reason="event_sync" if ok else "sync_failed",
+            hot_rows=len(store.chat_messages),
+        )
         return
 
     # observe: production behavior stays legacy. For a deterministic 1% sample,
@@ -144,12 +180,26 @@ def _dispatch_chat(data: dict, user_id: str) -> None:
             incremental_hash = _chat_cache_fingerprint(store)
         else:
             log.warning("chat_sync_observe_incremental_error")
+            _chat_sync_telemetry(
+                user_id=user_id, mode=mode, result="error",
+                reason="sync_failed", hot_rows=len(store.chat_messages),
+            )
     _reload_legacy_chat(store)
     if (
         incremental_hash is not None
         and incremental_hash != _chat_cache_fingerprint(store)
     ):
         log.warning("chat_sync_observe_mismatch")
+        _chat_sync_telemetry(
+            user_id=user_id, mode=mode, result="mismatch",
+            reason="fingerprint_diff", hot_rows=len(store.chat_messages),
+        )
+    else:
+        _chat_sync_telemetry(
+            user_id=user_id, mode=mode, result="applied",
+            reason=("observe_sample" if incremental_hash else "observe_control"),
+            hot_rows=len(store.chat_messages),
+        )
 
 
 def register_handler(channel: str, fn: Callable[[str], None]) -> None:

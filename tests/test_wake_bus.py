@@ -297,6 +297,30 @@ def test_chat_sync_mode_is_validated(monkeypatch):
         wake_bus._chat_sync_mode()
 
 
+def test_chat_sync_telemetry_is_fixed_enum_and_content_free(caplog):
+    caplog.set_level("INFO", logger="feedling.wake_bus")
+    user_id = "usr_private_telemetry"
+    wake_bus._chat_sync_telemetry(
+        user_id=user_id,
+        mode="incremental",
+        result="applied",
+        reason="event_sync",
+        hot_rows=17,
+    )
+    text = caplog.text
+    assert "mode=incremental result=applied reason=event_sync" in text
+    assert "hot_rows=17" in text
+    assert user_id not in text
+    for secret in ("body_ct", "K_user", "postgresql://", "message_ids"):
+        assert secret not in text
+
+    with pytest.raises(ValueError):
+        wake_bus._chat_sync_telemetry(
+            user_id=user_id, mode="bad", result="applied",
+            reason="event_sync", hot_rows=0,
+        )
+
+
 def test_observe_mode_compares_identity_only_and_keeps_legacy_result(
     monkeypatch, caplog,
 ):

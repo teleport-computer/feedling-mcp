@@ -318,15 +318,15 @@ git commit -m "perf(chat): query durable poll and prompt windows directly"
 - Produces bounded sync/version/gap/fallback/hot-row/verify/poll metrics.
 - Produces exact `legacy`, `observe`, `incremental`, rollout, and rollback procedures.
 
-- [ ] **Step 1: Add privacy and enum tests**
+- [x] **Step 1: Add privacy and enum tests**
 
 Assert telemetry uses fixed mode/result/reason values, hashes user IDs, and rejects event docs, ciphertext, keys, and DSNs.
 
-- [ ] **Step 2: Implement telemetry and documentation**
+- [x] **Step 2: Implement telemetry and documentation**
 
 Document flags, event cleanup, gap diagnosis, 5%/25%/50%/100% stable-user rollout, 5,000→1,024→256 cache sequence, CloudWatch NetworkTransmit, and `pg_stat_statements` checks. Update architecture and Unreleased changelog; public API remains unchanged.
 
-- [ ] **Step 3: Run repository verification**
+- [x] **Step 3: Run repository verification**
 
 ```bash
 ~/fleet/bus/which_tests.sh --vs origin/test
