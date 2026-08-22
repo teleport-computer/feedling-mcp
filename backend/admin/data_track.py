@@ -582,10 +582,17 @@ def _safe_genesis_job(job: dict | None) -> dict:
 def _genesis_stats(store: UserStore, *, include_jobs: bool = False) -> dict:
     state = db.get_blob(store.user_id, "genesis_state")
     state_doc = state if isinstance(state, dict) else {}
+    # ⚠️ 读失败与「这个用户确实没有 genesis 任务」**必须不同形**。
+    # 改这里之前,两者都产出 `jobs=[] / job_count=0` —— 而它们的下一步相反:
+    # 前者去修读取,后者就是正常。观测面把「量不到」显示成「量到了零」,
+    # 是本单(T245)要治的那个病本身,而这一处正在**我们用来看见故障的那个面上**。
+    # 状态词沿用本文件已有的 `ok`/`unavailable`,不另造词表。
+    jobs_source = "ok"
     try:
         jobs_raw = db.genesis_list_jobs(store.user_id, limit=5 if include_jobs else 1)
-    except Exception:
+    except Exception:  # noqa: BLE001 — 观测面降级展示,不 500
         jobs_raw = []
+        jobs_source = "unavailable"
     jobs = [_safe_genesis_job(j) for j in jobs_raw if isinstance(j, dict)]
     latest = jobs[0] if jobs else {}
     return {
@@ -601,6 +608,9 @@ def _genesis_stats(store: UserStore, *, include_jobs: bool = False) -> dict:
         "persona_ref_present": bool(str(state_doc.get("persona_ref") or "").strip() or latest.get("persona_ref_present")),
         "error": str(state_doc.get("error") or latest.get("error") or "")[:240],
         "job_count": len(jobs),
+        # `unavailable` 时上面那些由 latest_job 兜底的字段同样不可信 ——
+        # 读的人必须先看这一格,再决定要不要相信 job_count / job_status。
+        "jobs_source": jobs_source,
         "latest_job": latest,
         "jobs": jobs if include_jobs else [],
     }
@@ -10852,6 +10862,14 @@ def _render_user_detail_page(user: dict) -> str:
     responder = user.get("responder") if isinstance(user.get("responder"), dict) else {}
     responder_name = str(responder.get("effective_responder") or "none")
     mismatch = bool(responder.get("mismatch"))
+    # ⚠️ 这张卡以前显示 `status or 'none'` —— **读库失败与「确实没有蒸馏」同形**。
+    # 两者的下一步相反(修读取 / 这就是正常),所以必须在页面上就分开,
+    # 而不是只在 JSON 里分开:大多数人看的是这张卡,不是 payload。
+    _genesis = user.get("genesis") if isinstance(user.get("genesis"), dict) else {}
+    if str(_genesis.get("jobs_source") or "ok") != "ok":
+        genesis_cell = "<span class='warn'>取不到（读取失败）</span>"
+    else:
+        genesis_cell = html.escape(str(_genesis.get("status") or "none"))
     mismatch_reasons = ", ".join(
         str(reason) for reason in responder.get("mismatch_reasons") or []
     )
@@ -10911,7 +10929,7 @@ def _render_user_detail_page(user: dict) -> str:
     <div class="card"><div class="value">{html.escape(_format_duration(user['onboarding']['stuck_for_sec']))}</div><div class="label">stuck for</div></div>
     <div class="card"><div class="value">{user['chat']['total']}</div><div class="label">chat messages</div></div>
     <div class="card"><div class="value">{user['memory']['total']}</div><div class="label">memories</div></div>
-    <div class="card"><div class="value">{html.escape(user.get('genesis', {}).get('status') or 'none')}</div><div class="label">genesis distill</div></div>
+    <div class="card"><div class="value">{genesis_cell}</div><div class="label">genesis distill</div></div>
     <div class="card"><div class="value">{user['proactive']['proactive_messages']}</div><div class="label">proactive writes</div></div>
     <div class="card"><div class="value">{html.escape(user.get('provider_state') or 'ok')}</div><div class="label">provider state</div></div>
     <div class="card"><div class="value">{html.escape(_bj_iso(user.get('last_provider_success_at')) or 'never')}</div><div class="label">last provider success</div></div>
