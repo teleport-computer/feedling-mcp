@@ -11842,7 +11842,7 @@ def _chat_insert_on_cursor(
 def _chat_append_impl(
     user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int,
     *, coverage_gated: bool = False,
-) -> None:
+) -> int:
     """Insert one durable chat message. Idempotent on msg_id. Raises on the
     primary database write (``chat_append_strict`` relies on this so a DB failure
     cannot be mistaken for delivery); R2 offload stays best-effort.
@@ -11878,11 +11878,12 @@ def _chat_append_impl(
     # No retention cleanup follows an append. R2/TEE copies live for exactly as
     # long as the durable source row and are retired only by explicit user/account
     # deletion or replacement of that same row.
+    return int(_seq)
 
 
 def chat_append_strict(
     user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int,
-) -> None:
+) -> int:
     """Persist one chat message or raise on the primary database write.
 
     V2 uses this path for model replies so a database failure cannot be mistaken
@@ -11892,7 +11893,9 @@ def chat_append_strict(
     ``max_messages`` bounds only callers' hot caches; it never trims the durable
     source transcript.
     """
-    _chat_append_impl(user_id, msg_id, ts, doc, max_messages, coverage_gated=True)
+    return _chat_append_impl(
+        user_id, msg_id, ts, doc, max_messages, coverage_gated=True
+    )
 
 
 class ResidentReplyRejected(RuntimeError):
@@ -12891,7 +12894,13 @@ def chat_append_effect_with_cursor(
     return seq, inserted
 
 
-def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int) -> None:
+def chat_append(
+    user_id: str,
+    msg_id: str,
+    ts: float,
+    doc: dict,
+    max_messages: int,
+) -> int | None:
     """Best-effort legacy (pre-V2) durable chat write.
 
     ``max_messages`` is retained for API compatibility and only bounds the
@@ -12899,9 +12908,12 @@ def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: i
     deletion source-retention rule as V2.
     """
     try:
-        _chat_append_impl(user_id, msg_id, ts, doc, max_messages, coverage_gated=False)
+        return _chat_append_impl(
+            user_id, msg_id, ts, doc, max_messages, coverage_gated=False
+        )
     except Exception as e:
         log.error("[db] chat_append(%s,%s) failed: %s", user_id, msg_id, e)
+        return None
 
 
 class RuntimeControlChangedError(RuntimeError):

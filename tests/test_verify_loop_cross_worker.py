@@ -25,6 +25,7 @@ from __future__ import annotations
 import base64
 import itertools
 import sys
+import threading
 import uuid
 from pathlib import Path
 
@@ -107,13 +108,15 @@ def test_verify_loop_finds_cross_worker_ack(client, monkeypatch):
     )
 
     real_reload = store.reload
-    fired = {"acked": False}
+    fired = {"acked": False, "started": False}
+    responder_lock = threading.Lock()
 
     def reload_as_if_worker_b():
         # First poll-loop reload: play "worker B" answering the probe. Persist
         # the hidden ack through a SEPARATE store instance, which writes the DB
         # but never touches worker A's cache — exactly the cross-worker split.
-        if not fired["acked"]:
+        should_answer = False
+        with responder_lock:
             ping = next(
                 (
                     m for m in store.chat_messages
@@ -121,18 +124,21 @@ def test_verify_loop_finds_cross_worker_ack(client, monkeypatch):
                 ),
                 None,
             )
-            if ping is not None:
-                worker_b = UserStore(user_id)
-                # resident_reply_to is the real ack linkage: it persists via
-                # db.chat_append_resident_reply, sets reply_to_message_id, and
-                # CAS-marks the ping — exactly what /v1/chat/response does.
-                worker_b.append_chat(
-                    "openclaw",
-                    "verify_ping",
-                    _env("wb_ack_" + uuid.uuid4().hex[:8], user_id),
-                    resident_reply_to=ping["id"],
-                )
-                fired["acked"] = True
+            if ping is not None and not fired["started"]:
+                fired["started"] = True
+                should_answer = True
+        if should_answer:
+            worker_b = UserStore(user_id)
+            # resident_reply_to is the real ack linkage: it persists via
+            # db.chat_append_resident_reply, sets reply_to_message_id, and
+            # CAS-marks the ping — exactly what /v1/chat/response does.
+            worker_b.append_chat(
+                "openclaw",
+                "verify_ping",
+                _env("wb_ack_" + uuid.uuid4().hex[:8], user_id),
+                resident_reply_to=ping["id"],
+            )
+            fired["acked"] = True
         real_reload()
 
     monkeypatch.setattr(store, "reload", reload_as_if_worker_b)

@@ -138,6 +138,13 @@ def test_skip_entries_must_justify():
     assert not lazy, f"这些 SKIP 条目的理由太含糊，需要写清为什么永远不进 TEE：{lazy}"
 
 
+def test_chat_change_control_is_primary_local_but_required_after_promotion():
+    for table in ("chat_change_state", "chat_change_events"):
+        entry = reg.REGISTRY[table]
+        assert entry.lane == reg.SKIP
+        assert entry.tee_required is True
+
+
 # RDS 表名 → TEE 侧对应表名，仅用于两侧不同名的少数情况。
 # frame_envelopes：RDS 存 inline 密文信封，TEE 侧是形状完全不同的 frames
 # （R2 存储层指针，见 alembic_tee 0001 baseline 的说明）。worker 用

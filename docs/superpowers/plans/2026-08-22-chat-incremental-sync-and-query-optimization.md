@@ -38,6 +38,9 @@
 
 **Files:**
 - Create: `backend/alembic/versions/0098_chat_change_events.py`
+- Create: `backend/alembic_tee/versions/0034_chat_poll_index.py`
+- Modify: `backend/tee_shadow/table_registry.py`
+- Modify: `backend/admin/plaintext_shadow.py`
 - Create: `tests/test_chat_change_events.py`
 - Modify: `.github/workflows/ci.yml`
 - Modify: `tests/test_v2_jobs_migration.py`
@@ -47,11 +50,11 @@
 - Produces `chat_change_events(user_id, version, operation, message_ids, created_at)`.
 - Produces `{v:2,c:"chat",u:<user>,r:<version>}` on the existing PostgreSQL wake channel.
 
-- [ ] **Step 1: Write real-Postgres RED tests**
+- [x] **Step 1: Write real-Postgres RED tests**
 
 Cover schema/trigger existence, one and multi-row INSERT, UPDATE, one-row DELETE, 65-row DELETE, two users in one statement, transaction rollback, and deleting a parent `users` row. Assert one version per user per statement, sorted unique IDs, `reset` above 64 IDs, no row or notification after rollback, and no recreated change-control row during account-delete cascade.
 
-- [ ] **Step 2: Register the DB-backed test in CI and verify RED**
+- [x] **Step 2: Register the DB-backed test in CI and verify RED**
 
 Add `tests/test_chat_change_events.py` to the explicit DB-backed list in `.github/workflows/ci.yml`, then run:
 
@@ -62,11 +65,11 @@ FEEDLING_TEST_PG='postgresql://postgres:test@127.0.0.1:55432/postgres' \
 
 Expected: FAIL because revision 0098 and its schema do not exist.
 
-- [ ] **Step 3: Implement migration and triggers**
+- [x] **Step 3: Implement migration and triggers**
 
 Create separate AFTER STATEMENT INSERT, UPDATE, and DELETE triggers with transition tables. For each affected user whose `users` row still exists, atomically increment state, insert `upsert`, `delete`, or `reset`, and call `pg_notify`. Events contain IDs only, never `doc`; the existence guard prevents a parent-user cascade from recreating child control rows.
 
-- [ ] **Step 4: Create the poll index concurrently**
+- [x] **Step 4: Create the poll index concurrently**
 
 Inside Alembic `autocommit_block()` execute:
 
@@ -75,7 +78,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_chat_messages_user_ts_seq
 ON chat_messages (user_id, ts, seq);
 ```
 
-- [ ] **Step 5: Verify upgrade/downgrade and commit**
+- [x] **Step 5: Verify upgrade/downgrade and commit**
 
 Run the tests from Step 2, downgrade to 0097, upgrade to head, and require one head. Then:
 
@@ -101,26 +104,26 @@ git commit -m "feat(chat): capture durable per-user change events"
 - Produces `chat_verify_reply_strict(user_id: str, ping_id: str, ping_ts: float) -> dict | None`.
 - Produces `chat_poll_candidates_strict(user_id: str, since: float, redelivery_floor: float, limit: int) -> list[dict]`.
 
-- [ ] **Step 1: Write RED tests for all six primitives**
+- [x] **Step 1: Write RED tests for all six primitives**
 
 Test empty users, relational `msg_id/ts/seq` authority, ordered events, deduplicated point reads, verify source/role/parent/time rejection, and an unanswered row inside the one-hour redelivery window but older than a 256-row tail.
 
-- [ ] **Step 2: Run RED tests**
+- [x] **Step 2: Run RED tests**
 
 ```bash
 FEEDLING_TEST_PG='postgresql://postgres:test@127.0.0.1:55432/postgres' \
   .venv-test/bin/python -m pytest tests/test_db.py tests/test_v2_cursor.py -q
 ```
 
-- [ ] **Step 3: Implement the snapshot and event reads**
+- [x] **Step 3: Implement the snapshot and event reads**
 
 `chat_load_hot_snapshot_strict` uses one read-only repeatable-read transaction: read version, then newest rows, then normalize relational identity/order into each result. Validate non-negative versions and cap batch/ID inputs at 256.
 
-- [ ] **Step 4: Implement verify and resident candidate queries**
+- [x] **Step 4: Implement verify and resident candidate queries**
 
 Verify uses `(user_id,msg_id)` point reads for ping and reply. Poll candidates select `ts > since` plus unanswered user rows newer than `redelivery_floor`, order by seq, and limit 256; claim ownership remains in the existing CAS.
 
-- [ ] **Step 5: Prove index use and commit**
+- [x] **Step 5: Prove index use and commit**
 
 Seed 14,000 rows for one test user and use `EXPLAIN (ANALYZE, BUFFERS)` to assert none of the new queries performs a full-table sequential scan. Then:
 
@@ -135,6 +138,7 @@ git commit -m "feat(chat): add bounded sync and poll queries"
 
 **Files:**
 - Modify: `backend/core/store.py`
+- Modify: `backend/db.py`
 - Create: `tests/test_chat_incremental_sync.py`
 - Modify: `.github/workflows/ci.yml`
 
@@ -143,11 +147,11 @@ git commit -m "feat(chat): add bounded sync and poll queries"
 - Produces `UserStore.ensure_chat_fresh(*, force: bool = False, target_version: int | None = None) -> bool`.
 - Produces `UserStore.apply_committed_chat_rows(rows: list[dict], *, version: int | None = None) -> None`.
 
-- [ ] **Step 1: Write state-machine RED tests**
+- [x] **Step 1: Write state-machine RED tests**
 
 Cover continuous upsert, update, delete, reset, duplicate, gap, overflow, expired history, seq ordering, trimming, fail-open ordinary read, strict failure, and waiter wake only after successful application.
 
-- [ ] **Step 2: Register and run RED tests**
+- [x] **Step 2: Register and run RED tests**
 
 Register the DB-backed file in CI and run:
 
@@ -156,15 +160,15 @@ FEEDLING_TEST_PG='postgresql://postgres:test@127.0.0.1:55432/postgres' \
   .venv-test/bin/python -m pytest tests/test_chat_incremental_sync.py -q
 ```
 
-- [ ] **Step 3: Add cache state and limit parsing**
+- [x] **Step 3: Add cache state and limit parsing**
 
 Add `chat_version`, `chat_max_seq`, and private `chat_messages_by_id`. Parse `FEEDLING_CHAT_HOT_CACHE_LIMIT`, default 5000, clamp 64–5000. Update list/index atomically under `chat_lock`.
 
-- [ ] **Step 4: Implement reconciliation**
+- [x] **Step 4: Implement reconciliation**
 
 Coalesce ordinary version checks for one second; forced wakes bypass coalescing. Read DB outside `chat_lock`, then atomically apply. Reset/gap/overflow calls only `reload_chat_hot_strict`, never `reload()`.
 
-- [ ] **Step 5: Preserve local fast paths and commit**
+- [x] **Step 5: Preserve local fast paths and commit**
 
 Use the ID index for append/finalize/update/delete and trim list/index together. Run:
 

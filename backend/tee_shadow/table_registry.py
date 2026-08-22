@@ -280,6 +280,20 @@ REGISTRY: dict[str, Entry] = {
     # ---------------------------------------------------------------- #
     "alembic_version": Entry(
         SKIP, "RDS 迁移链自己的版本表；TEE 有独立的 alembic_tee_version，两条链互不感知"),
+    "chat_change_state": Entry(
+        SKIP,
+        "当前 primary 的 per-user chat cache 版本控制面；版本只对应本库写序列，"
+        "跨库复制会制造无意义的版本缺口。TEE-primary 后由本库 statement trigger "
+        "实时产生，不搬 RDS 历史",
+        required_in_tee=True,
+    ),
+    "chat_change_events": Entry(
+        SKIP,
+        "当前 primary 的短期 chat cache replay 控制面，只含 message id、不含正文；"
+        "与 chat_change_state 同属本库写序列，TEE-primary 后由本库 trigger 产生，"
+        "不复制 RDS 历史",
+        required_in_tee=True,
+    ),
     "genesis_import_chunks": Entry(
         SKIP,
         "入住导入的 staging 数据，冻结窗口内处理完即弃，非用户资产；不搬 RDS 历史，"

@@ -773,6 +773,7 @@ jobs:
             tests/test_pre_runtime_preflight.py \
             tests/test_pre_test_migration_convergence.py \
             tests/test_chat_change_events.py \
+            tests/test_chat_incremental_sync.py \
             tests/test_v2_jobs_migration.py \
             tests/test_lane_rollup.py \
             tests/test_data_track_snapshot_golden.py \
