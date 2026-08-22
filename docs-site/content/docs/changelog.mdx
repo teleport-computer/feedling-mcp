@@ -214,6 +214,11 @@ change must not be interpreted as an API guarantee.
   head, rejects stale shadow dual-write wiring, and exercises the Phase-4
   application startup contract before changing any confidential VM.
 
+- **TEE-primary startup no longer depends on the Phase-4 audit marker.** Startup
+  still fails closed unless the database is at the exact release migration head
+  and all required Chat lifecycle triggers are enabled, but reconciliation of
+  mutable `server_config` data can no longer block a fully prepared database.
+
 - **Self-hosted resident replies no longer become permanently lost when a long
   agent turn crosses the consumer freshness window.** Resident liveness now
   follows the newest poll or accepted response activity, and a current response

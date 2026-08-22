@@ -797,8 +797,9 @@ The apply invocation also requires `TEE_MIGRATION_DATABASE_URL` for the TEE
 owner role. Revision 0011 creates the Chat R2-retirement and archive-immutability
 triggers disabled, so it is safe to migrate before the freeze; apply enables
 them only after data copying, then writes a head-bound prepared marker. TEE-mode
-application startup checks that marker and the three enabled triggers read-only
-and refuses to boot if the prepare was skipped or only partially completed.
+application startup checks the migration head and three enabled triggers
+read-only and refuses to boot if the prepare was skipped or only partially
+completed. The marker remains audit metadata and is not a startup dependency.
 
 The complete encrypted/plaintext two-account release order, inventory queries,
 and test/prod promotion checklist are in
