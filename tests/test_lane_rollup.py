@@ -171,15 +171,18 @@ def test_freeze_day_rerun_writes_nothing(clean_rollup):
         assert db._lane_rollup_freeze_day(conn, day=date(2030, 6, 1), zone=zone) == 0
 
 
-def test_failure_codes_collapse_free_text(clean_rollup):
+def test_failure_codes_collapse_free_text_and_log_diagnosis(clean_rollup, caplog):
     uid = "usr_rollup_sanitize"
     seed_user(uid)
     fin = datetime(2030, 6, 1, 2, 0, tzinfo=timezone.utc)
+    raw_reason = "Provider Error with prompt fragment"
+    assert not db._LANE_ROLLUP_CODE_RE.match(raw_reason)
     _insert_job(uid, "chat", "failed", finished=fin,
-                last_error="Traceback (most recent call last): boom")
+                last_error=raw_reason)
     _insert_job(uid, "chat", "failed", finished=fin,
                 last_error="turn_failed:empty_reply")
-    db.freeze_completed_lane_days(now_epoch=_NOW_EPOCH)
+    with caplog.at_level("WARNING", logger=db.log.name):
+        db.freeze_completed_lane_days(now_epoch=_NOW_EPOCH)
     (row,) = _cells(user_id=uid)
     assert row["failure_codes"] == {
         "runtime_failed": 1,
@@ -189,7 +192,11 @@ def test_failure_codes_collapse_free_text(clean_rollup):
     # user content) and a frozen forever-row — assert the regex is actually
     # the module's, not a lookalike.
     assert db._LANE_ROLLUP_CODE_RE.match("turn_failed:empty_reply")
-    assert not db._LANE_ROLLUP_CODE_RE.match("Traceback (most recent call last)")
+    assert raw_reason in caplog.text
+    assert "source=lane_rollup_v2" in caplog.text
+    assert f"user_id='{uid}'" in caplog.text
+    assert "lane='chat'" in caplog.text
+    assert "day=2030-06-01" in caplog.text
 
 
 def test_admin_lane_rollup_filters_and_pagination(clean_rollup):
@@ -535,6 +542,48 @@ def test_resident_freeze_infers_lanes_like_the_events_page(clean_rollup):
     assert cells["capture"]["failed"] == 1
     assert all(r["route"] == "resident" and r["enqueue_source"] == ""
                for r in _cells(user_id=uid))
+
+
+def test_resident_freeze_logs_discarded_reason_without_leaking_cell(
+        clean_rollup, caplog):
+    uid = "usr_rollup_res_discarded_reason"
+    _seed_resident(uid)
+    t = datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc)
+    raw_reason = "Provider Error includes private prompt fragment"
+    assert not db._LANE_ROLLUP_CODE_RE.match(raw_reason)
+    _log_job(uid, ts=t, status="failed", kind="heartbeat_tick",
+             status_reason=raw_reason)
+    _log_job(uid, ts=t, status="failed", kind="heartbeat_tick",
+             status_reason=raw_reason)
+
+    with caplog.at_level("WARNING", logger=db.log.name):
+        db.freeze_completed_resident_lane_days(now_epoch=_NOW_EPOCH)
+
+    (cell,) = _cells(user_id=uid)
+    assert cell["failure_codes"] == {"runtime_failed": 2}
+    assert raw_reason in caplog.text
+    assert caplog.text.count(raw_reason) == 1
+    assert "source=lane_rollup_v1" in caplog.text
+    assert f"user_id='{uid}'" in caplog.text
+    assert "lane='heartbeat'" in caplog.text
+    assert "day=2030-06-01" in caplog.text
+    assert "count=2" in caplog.text
+
+
+def test_discarded_reason_operational_log_is_bounded(caplog):
+    raw_reason = "Provider Error " + ("x" * 600) + "END_SENTINEL"
+    assert not db._LANE_ROLLUP_CODE_RE.match(raw_reason)
+    with caplog.at_level("WARNING", logger=db.log.name):
+        assert db.content_free_failure_code(
+            raw_reason,
+            source="mutation_probe",
+            user_id="usr_probe",
+            lane="heartbeat",
+            day="2030-06-01",
+        ) == "runtime_failed"
+    assert "Provider Error" in caplog.text
+    assert "END_SENTINEL" not in caplog.text
+    assert "truncated=True" in caplog.text
 
 
 def test_resident_freeze_excludes_hosted_users(clean_rollup):
