@@ -43,31 +43,31 @@ def test_kernel_dream_prompt_takes_naming_rule_as_param():
     assert "叫他老王。" in text
 
 
-def test_kernel_prompts_do_not_import_identity():
-    """结构判据：内核 prompt 模块的源码里不出现 identity。"""
-    import pathlib
+def test_kernel_does_not_reach_into_the_host_identity_system():
+    """内核不认识 io 的身份体系 —— 称呼规则必须由宿主装配好传进去。
 
-    root = (
-        pathlib.Path(__file__).resolve().parents[1]
-        / "backend"
-        / "memgarden"
-        / "prompts"
+    ⚠️ 2026-08-23 起内核是外部包，**读不到它的源文件了**。原来这条扫
+    `backend/memgarden/prompts/*.py` 的源码，删掉本地副本之后目录不存在、
+    匹配数为 0、测试照样绿 —— 变成了一个空扫描（codex code_review 抓到）。
+
+    改成行为断言：内核不导出任何 identity 相关的东西，而宿主传进去的称呼规则
+    确实出现在产出里。源码级的纯度由包自己的 tests/test_purity.py 负责。
+    """
+    import memgarden.prompts.capture as cap
+    import memgarden.prompts.dream as drm
+
+    for mod in (cap, drm):
+        leaked = [n for n in dir(mod) if "identity" in n.lower()]
+        assert not leaked, f"{mod.__name__} 导出了 identity 相关符号：{leaked}"
+        assert "identity" not in getattr(mod, "__dict__", {}), mod.__name__
+
+    from memory.capture_prompt_v1 import build_capture_prompt
+
+    text = build_capture_prompt(
+        ai_name="io", user_name="老王", buckets="", threads="",
+        identity="认识三个月", window="hi", cards="", locale="zh-Hans",
     )
-    offenders = [
-        p.name
-        for p in root.glob("*.py")
-        if "identity" in p.read_text(encoding="utf-8").split("\n\n\n")[0]
-        and "import" in p.read_text(encoding="utf-8").split("\n\n\n")[0]
-    ]
-    # 更直接的判据交给 test_memgarden_purity.py 的 AST 守卫；
-    # 这里只做一次可读性检查，确保 import 段没有 identity。
-    src_heads = {
-        p.name: "\n".join(p.read_text(encoding="utf-8").splitlines()[:40])
-        for p in root.glob("*.py")
-    }
-    bad = [name for name, head in src_heads.items() if "from identity" in head]
-    assert not bad, f"内核 prompt 模块仍 import identity: {bad} / {offenders}"
-
+    assert "老王" in text, "宿主装配的称呼没进到产出里"
 
 def test_compat_shell_preserves_original_naming_semantics():
     """兼容壳必须保留「naming_rule 用原值、user_name 用 sanitize 后的值」。

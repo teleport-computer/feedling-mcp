@@ -269,7 +269,12 @@ if not _provisioned:
         "test_card_guard.py",
         # Memory Garden 内核（2026-08-14）：纯函数包，零 DB / 零网络。
         # 六个文件都在「DATABASE_URL 指向不可达地址」的环境下实测通过。
-        "test_memgarden_purity.py",
+        # 2026-08-23：test_memgarden_purity.py 已删（内核成了外部包，纯度守卫
+        # 搬进包自己的仓库）。以下三条是接入这批新增的纯守卫 —— 都不碰 DB，
+        # 无 Postgres 时也该跑，否则本地「全绿」是假的。
+        "test_memgarden_is_a_real_dependency.py",
+        "test_card_leak_signals_wired.py",
+        "test_memgarden_dream_migrate_golden.py",
         "test_memgarden_policies.py",
         "test_memgarden_capture_golden.py",
         "test_memgarden_prompt_params.py",

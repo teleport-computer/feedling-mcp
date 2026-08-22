@@ -45,10 +45,23 @@ def test_kernel_is_not_imported_from_backend():
     assert (REPO / "backend") not in where.parents, f"memgarden 来自 backend/：{where}"
 
 
-def test_lock_pins_an_immutable_release_url():
-    """lock 里必须钉死一个具体版本的 wheel，且带哈希。
+def test_lock_pins_a_hash_locked_release_asset():
+    """lock 里必须钉一个具体版本的 wheel URL，且带哈希。
 
-    钉分支（@main）会让构建不可复现 —— compose 哈希上链的整条证明链就失效了。
+    ⚠️ **哈希锁住的是字节，不是出处。** 这条测试之前叫 "immutable"，那是过度声称
+    （codex code_review 2026-08-23 指出，实测 GitHub Release 的 `immutable` 字段
+    确实是 false）。准确的说法是：
+
+        能保证   同一个 URL 被换成不同字节时，构建会失败而不是静默换包
+        不保证   这些字节由公开 tag 的源码构建 —— tag 可移动、asset 可删可重传，
+                 而且 tag 未签名、没有 build attestation
+
+    要补上「出处」这一环，得由 tag 绑定的 CI 构建 Release 并生成 artifact
+    attestation，升级依赖时验证 tag commit / digest / provenance 三者。那是独立
+    一批活，见 HANDOFF 里的待拍板项。
+
+    这里守住的是底线：钉分支（@main）会让构建完全不可复现，compose 哈希上链的
+    整条证明链直接失效。
     """
     lock = (REPO / "backend" / "requirements.lock").read_text(encoding="utf-8")
     lines = lock.splitlines()

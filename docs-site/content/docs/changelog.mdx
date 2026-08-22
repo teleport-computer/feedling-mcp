@@ -10,6 +10,18 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **The memory judgment kernel is now an external, source-available package.**
+  What is worth remembering, bucket assignment, per-turn recall, and
+  consolidation timing moved out of this repository into `memgarden`
+  (Apache-2.0). It is installed at image build time from a version-pinned,
+  hash-locked GitHub Release wheel, so the code still ends up inside the
+  measured image and under the on-chain compose hash. Self-hosters should note
+  that a cold build now needs egress to `github.com`, and that the pinned lock
+  must be used rather than resolving the dependency loosely. The hash pin
+  guarantees the installed bytes match the reviewed artifact; it does not yet
+  attest that those bytes were built from the tagged source. No API contract
+  changes.
+
 - **Memory Dream runs now have content-free, end-to-end diagnostics.** Resident
   V1 and hosted Runtime V2 correlate Dream start, model completion or failure,
   and the final write outcome under one job trace. Operators can distinguish a

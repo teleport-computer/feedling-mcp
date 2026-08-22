@@ -150,3 +150,66 @@ def test_every_guard_call_site_passes_io_signals():
         "这些调用点漏了 IO_LEAK_SIGNALS —— 会静默退回通用集，io 的残片拦不住：\n  "
         + "\n  ".join(offenders)
     )
+
+
+# --------------------------------------------------------------------------- #
+# parser：两条 runtime 拿到的必须是绑了 io 识别器的那个
+# --------------------------------------------------------------------------- #
+
+
+def test_shell_parsers_are_wrapped_not_the_raw_kernel_ones():
+    """两条 runtime 都从 memory.*_prompt_v1 取 parser，那层必须已经绑好识别器。
+
+    **这条是 codex 2026-08-23 抓到的洞。** 内核 parser 内部会调文本闸，signals
+    不传就退回通用集 —— io 的残片一个都拦不住，而且不报错。宿主侧扫自己的调用点
+    发现不了，因为漏传发生在包里面。
+
+    绑在壳这一层（而不是让每个 runtime 调用点自己传）是结构性保证：调用点会增加，
+    漏一个就是一条无声失防的路。
+    """
+    import memgarden.prompts.capture as kernel_capture
+    import memgarden.prompts.dream as kernel_dream
+    from memory.capture_prompt_v1 import parse_capture_cards
+    from memory.dream_prompt_v1 import parse_dream_consolidations
+
+    assert parse_capture_cards is not kernel_capture.parse_capture_cards, (
+        "壳没有包装 parse_capture_cards —— runtime 拿到的是裸内核版本"
+    )
+    assert parse_dream_consolidations is not kernel_dream.parse_dream_consolidations, (
+        "壳没有包装 parse_dream_consolidations"
+    )
+
+
+ACCIDENT_CARD = (
+    '{"cards":[{"action":"add","type":"fact",'
+    '"summary":"' + HARMONY_ROUTE + '",'
+    '"content":"正常正文内容写在这里，长度足够通过实义字数检查",'
+    '"bucket":"工作","threads":["加班"],"importance":0.5,"pulse":0.3}]}'
+)
+
+
+def test_capture_parser_rejects_the_accident_string_end_to_end():
+    """走 runtime 真正用的那个 parser —— 事故串必须在这里就被拒。
+
+    拦不住的后果不是「多一张脏卡」：解析完立刻封加密信封，下游看不到明文，
+    再也没有第二道闸。
+    """
+    from memory.capture_prompt_v1 import parse_capture_cards
+
+    cards, err = parse_capture_cards(ACCIDENT_CARD, policy="conversation_capture",
+                                     strict=False)
+    assert not cards, f"事故串落成卡了：{cards}"
+    assert err and "protocol_leak" in err, f"拒了但理由不对：{err}"
+
+
+def test_clean_card_still_passes_the_same_parser():
+    """闸要拦得住脏的，也要放得过干净的 —— 只测前者会掩盖误杀。"""
+    from memory.capture_prompt_v1 import parse_capture_cards
+
+    clean = (
+        '{"cards":[{"action":"add","type":"fact","summary":"老王不吃辣",'
+        '"content":"吃辣就胃疼，点菜时要避开辣菜，这是他反复提过的偏好",'
+        '"bucket":"健康","threads":["饮食"],"importance":0.6,"pulse":0.3}]}'
+    )
+    cards, err = parse_capture_cards(clean, policy="conversation_capture", strict=False)
+    assert len(cards) == 1 and err is None, f"干净的卡被误杀了：{err}"
