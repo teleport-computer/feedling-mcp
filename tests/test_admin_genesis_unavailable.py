@@ -154,3 +154,71 @@ def test_funnel_still_renders_normal_counts_and_does_not_crash_on_bad_value():
     # 坏值那份必须照常渲染出第一阶段,不抛异常
     bad = _text(data_track._render_funnel(_funnel("abc"), compact=True))
     assert "100" in bad
+
+
+# --------------------------------------------------------------------------- #
+# T245 域14/15:安全信号本身不许因为坏数据而消失
+# --------------------------------------------------------------------------- #
+
+def test_bad_coverage_does_not_make_the_low_coverage_warning_vanish():
+    """⚠️ 本文件里最危险的一条。
+
+    改之前:`coverage` 坏值 → `float()` 抛 → `except: pass` → 警告字符串保持空
+    ⇒ **「usage 缺报较多,以上都是已知下限」整句消失**,
+      页面反而显得比数据健康时更干净。
+
+    ⭐ **数据坏了,安全信号跟着一起没了** —— 这比「显示一个错的数」更危险:
+      错的数还在提醒你这里有个量;**消失的警告让你以为这里没有问题。**
+    """
+    low = _text(data_track._home_cost_section({"coverage": 0.5}))
+    bad = _text(data_track._home_cost_section({"coverage": "abc"}))
+    healthy = _text(data_track._home_cost_section({"coverage": 0.99}))
+
+    # 前提:低覆盖那份确实触发了原有警告,否则本条无从对比。
+    assert "缺报较多" in low
+
+    # 坏值不许静默 —— 必须有话说,且与「健康」明显不同。
+    assert "读不出来" in bad
+    assert bad != healthy
+
+    # 反向:健康时不许乱报,否则这两个标记都不再携带信息。
+    assert "读不出来" not in healthy
+    assert "缺报较多" not in healthy
+
+
+def test_unreadable_cohort_week_is_not_folded_into_immature():
+    """域15:读不出是哪一周 ≠ 这一周还没走完。
+
+    ⭐ 原代码那句注释本身就说明了它们该分开:
+    「注册 3 天内还没回复 ≠ 不会回复」是**关于时间的陈述** ——
+    而坏日期根本不是那回事,是我们连是哪一周都不知道。
+    前者等一等就好,后者要去修数据。
+    """
+    assert data_track._health_t3_matured("2020-01-06") is True     # 早就成熟
+    assert data_track._health_t3_matured("2099-01-06") is False    # 还没走完
+    # 关键:坏值既不是 True 也不是 False
+    assert data_track._health_t3_matured("not-a-date") is None
+    assert data_track._health_t3_matured(None) is None
+
+
+def test_unreadable_cohort_week_renders_differently_from_immature():
+    """域15 的**渲染层**:坏值那一行必须与「未成熟」那一行不同形。
+
+    ⚠️ 这条是补上来的:我第一版只测了产生层(`_health_t3_matured` 返回 None),
+    突变「消费方把 None 并进未成熟」**全绿** ——
+    也就是我证明了「这一层分得开」,却没证明「页面上真的分开了」。
+    ⭐ 同族于本单要治的病本身:**内部区分了,不等于看得见。**
+    """
+    def _act(week: str) -> dict:
+        return {"cohorts": [{
+            "cohort_week": week, "registered": 10, "coverage_complete": True,
+        }]}
+
+    immature = _text(data_track._health_activation_table(_act("2099-01-06")))
+    unreadable = _text(data_track._health_activation_table(_act("not-a-date")))
+
+    # 前提:两份构造只差 cohort_week 这一个字段。
+    assert immature != unreadable
+    assert "坏值" in unreadable
+    # 反向:合法的「还没走完」不许被报成坏值。
+    assert "坏值" not in immature

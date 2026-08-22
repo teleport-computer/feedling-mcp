@@ -7231,7 +7231,14 @@ def _home_cost_section(cost: dict | None) -> str:
                 "<span class='muted'>usage 缺报较多，以上都是已知下限，不是全量。</span>"
             )
     except (TypeError, ValueError):
-        pass
+        # ⚠️ 这里原本是 `pass` —— 于是 coverage 坏值会让**低覆盖警告整句消失**,
+        # 页面反而显得比数据健康时更干净:**数据坏了,安全信号跟着一起没了**。
+        # 这比「显示一个错的数」更危险 —— 错的数还在提醒你这里有个量,
+        # 消失的警告让你以为这里没有问题。
+        coverage_note = (
+            "<span class='warn'>usage 覆盖率读不出来，"
+            "上面的成本数**无法判断是否为全量**。</span>"
+        )
     per_active = cost.get("per_active_user_day")
     try:
         # OverflowError：round(float('inf')) 会炸——契约上游今天只产有限值，
@@ -8412,7 +8419,7 @@ def _health_bj_this_monday() -> str:
     return (today - timedelta(days=today.weekday())).isoformat()
 
 
-def _health_t3_matured(cohort_week: str) -> bool:
+def _health_t3_matured(cohort_week: str) -> bool | None:
     """注册周的 t3 激活窗是否已全部走完（注册周 7 天 + 3 天 t3 窗）。
 
     coverage_complete 只说明漏斗行数对得上，不代表窗口走完；没成熟的周
@@ -8421,7 +8428,11 @@ def _health_t3_matured(cohort_week: str) -> bool:
     try:
         week = date.fromisoformat(str(cohort_week))
     except (TypeError, ValueError):
-        return False
+        # ⚠️ 读不出这是哪一周,与「这一周还没走完」**不是一回事**:
+        # 上面那句「注册 3 天内还没回复 ≠ 不会回复」是**关于时间的陈述**,
+        # 而这里我们连是哪一周都不知道 —— 前者等一等就好,后者要去修数据。
+        # 返回 None 让消费方各自决定怎么显示,而不是被静默并进「未成熟」。
+        return None
     today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
     return week + timedelta(days=10) <= today
 
@@ -8548,7 +8559,14 @@ def _health_activation_table(activation: dict | None) -> str:
             # 覆盖不完整的周渲染「未知」而不是 0%——缺证据 ≠ 没激活。
             rows.append(f"<tr><td>{week}</td><td>{n}</td>{unknown * 4}</tr>")
             continue
-        if not _health_t3_matured(c.get("cohort_week")):
+        matured = _health_t3_matured(c.get("cohort_week"))
+        if matured is None:
+            # ⚠️ 读不出这是哪一周 —— 与「窗口没走完」不同形:
+            # 后者等一等就好,前者要去修数据。并进「未成熟」会让它永远不被人发现。
+            bad = "<td><span class='warn' title='cohort_week 读不出来，不是「还没成熟」'>坏值</span></td>"
+            rows.append(f"<tr><td>{week}</td><td>{n}</td>{bad * 4}</tr>")
+            continue
+        if not matured:
             # 窗口没走完的周（本周/上周）渲染「未成熟」——注册 3 天内还没
             # 回复 ≠ 不会回复，确定性的 0% 是编出来的悲观。
             rows.append(f"<tr><td>{week}</td><td>{n}</td>{immature * 4}</tr>")
@@ -8745,7 +8763,9 @@ def _render_product_health_page(
         (
             c for c in (activation or {}).get("cohorts", [])
             if c.get("coverage_complete")
-            and _health_t3_matured(c.get("cohort_week"))
+            # None(读不出周)在这里与 False 同效:不选它当「最新完整周」——
+            # 这是**故意**的,一个读不出来的周不该被当成定论来源。
+            and _health_t3_matured(c.get("cohort_week")) is True
         ),
         None,
     )
