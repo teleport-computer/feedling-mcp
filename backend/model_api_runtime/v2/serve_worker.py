@@ -2842,6 +2842,11 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
         "cards": "",
         "card_items": [],
     }
+    if full_cards:
+        # Internal-only, content-free signal consumed by the Dream worker.  An
+        # empty successful index and a failed/degraded read must not both look
+        # like "the model chose to do nothing" in diagnostics.
+        ctx["_diagnostic_cards_outcome"] = "unavailable"
     try:
         body, status = memory_core.buckets(store, None, post_enclave=_post)
         if status == 200:
@@ -2915,6 +2920,11 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
                     rendered_chars += added_chars
                 ctx["card_items"] = selected
                 ctx["cards"] = "\n".join(lines)
+                ctx["_diagnostic_cards_outcome"] = (
+                    "ready" if len(selected) == len(ids) else "truncated"
+                )
+            elif full_cards:
+                ctx["_diagnostic_cards_outcome"] = "empty"
             elif not full_cards:
                 lines = [_render_card_line(item) for item in index_items]
                 ctx["cards"] = "\n".join(line for line in lines if line)

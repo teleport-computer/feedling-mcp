@@ -34,6 +34,7 @@ from bootstrap import gates as boot_gates
 from core import store as core_store
 from core import util as core_util
 from identity import service as identity_service
+from memory_garden import dream_trace as memory_dream_trace
 
 
 _PROVIDER_ATTEMPT_STREAM = "provider_attempts"
@@ -2837,6 +2838,24 @@ def _debug_event_public_json(ev: dict) -> dict:
     raw_detail = ev.get("detail") or {}
     public_detail = _debug_redact_value(raw_detail)
     _expose_declared_trace_fields(ev, raw_detail, public_detail)
+    if ev.get("type") in memory_dream_trace.DREAM_TRACE_TYPES:
+        # Dream rewrites private memory. Its public diagnostic contract is an
+        # exact closed shape: any new/unknown key invalidates the whole detail
+        # instead of inheriting the generic numeric/boolean projection.
+        public_detail = (
+            {
+                **raw_detail,
+                "counts": dict(raw_detail["counts"]),
+            }
+            if memory_dream_trace.valid_detail(raw_detail)
+            else {}
+        )
+    elif ev.get("type") == memory_dream_trace.CONTEXT_TRACE_TYPE:
+        public_detail = (
+            dict(raw_detail)
+            if memory_dream_trace.valid_context_detail(raw_detail)
+            else {}
+        )
     if (
         ev.get("type") in _WORLDBOOK_TRACE_TYPES
         and isinstance(raw_detail, dict)
@@ -8858,6 +8877,13 @@ _DEBUG_STEP_LABELS = {
     "context.build": ("📎", "组装上下文"),
     "memory.inject": ("🧠", "自动注入记忆"),
     "memory.dream.tick": ("🌙", "做梦判定"),
+    "memory.dream.start": ("🌙", "记忆整理 · 开始"),
+    "memory.dream.model.start": ("🧠", "记忆整理 · 模型开始"),
+    "memory.dream.model.done": ("🧠", "记忆整理 · 模型完成"),
+    "memory.dream.model.error": ("🧠", "记忆整理 · 模型失败"),
+    "memory.dream.done": ("🌙", "记忆整理 · 完成"),
+    "memory.dream.error": ("🌙", "记忆整理 · 失败"),
+    "memory.extraction.context.error": ("📎", "记忆整理 · 上下文降级"),
     # 2026-08-21 批。没有这些条目时,它们全部退化成通用的「• 某某」,
     # 查案的人在页面上分不出「上游拒绝」和「被新回合取代」——而那正是
     # 这一批事件被记录下来的全部理由。

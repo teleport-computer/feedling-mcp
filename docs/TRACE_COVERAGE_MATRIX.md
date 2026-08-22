@@ -48,7 +48,7 @@
 | 1a | 用户正常聊天 | 🟡 | 打模型那一段 2026-08-22 已补(§9);API 收到/worker 认领仍无 emit |
 | 1b | 入驻蒸馏 / 二次蒸馏 | 🟡 | 入队、建索引无 emit |
 | 1c | 记忆卡读写 | 🟡 | 入队、卡片入索引无 emit |
-| 1c | Dream | 🔴 | 全链仅 1 个调用点,模型调用与落库全黑 |
+| 1c | Dream | 🟡 | T217 已补两运行时处理/模型/落库终态与上下文降级；尚待 test 实弹 readback |
 | 1d | 心跳 | 🟡 | 入队↔终态已通(§3),打模型那一段 2026-08-22 已补(§9) |
 | 1e | 事件唤醒 | 🟡 | 同 1d,共用同一条路径 |
 | **1f** | **世界书** | **🟡** | 写入、匹配结果、实际进 provider 已分段；V1 pull 工具最终应用仍复用通用工具 trace |
@@ -101,9 +101,18 @@ heartbeat 46/46 两端共享同一 id、零孤儿;但 capture 19 + profile 1 **�
 | 阶段 | capture | dream |
 |---|---|---|
 | 入队 | 🔴 | 🔴 |
-| 处理 | 🟡 | 🟡(**仅 1 个调用点**) |
-| 模型调用 | 🔴 | 🔴 |
-| 结果落库 / 入索引 | 🔴 | 🔴 |
+| 处理 | 🟡 | 🟡(`memory.dream.start/done/error`,T217,2026-08-22) |
+| 模型调用 | 🔴 | 🟡(`memory.dream.model.start/done/error`,T217) |
+| 结果落库 / 入索引 | 🔴 | 🟡(终态闭集 outcome + applied/skipped/failed/organized/merged 计数,T217) |
+
+Dream 的 V1 resident 与 hosted V2 共用同一份无内容字段契约。`failed>0`
+不能只显示 `ok`:部分写入发 `memory.dream.done` + `status=warning` +
+`outcome=partial`;全败、映射拒绝和爆炸半径熔断分别落到 error 终态。
+完整卡读取失败或因预算截断另发 `memory.extraction.context.error`,并在 Dream
+终态标 `degraded_context=true`,因此“模型合法 no-op”不再和“空/残缺输入后的 no-op”
+长得一样。管理端只公开闭集枚举、布尔值和固定计数；任何额外顶层或嵌套字段会让
+整个 detail fail closed。当前覆盖来自单元/出口渲染测试,尚未在 test 部署从真实
+trace_events 回读,所以保持黄而不是绿。
 
 ## §5 genesis / 导入
 
