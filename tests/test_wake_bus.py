@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -182,14 +183,152 @@ def test_dispatch_runs_injected_handler_for_other_worker(monkeypatch):
     _reset_handlers()
 
 
-def test_dispatch_store_channel_evicts(monkeypatch):
-    # Cross-origin store-channel notify must call _evict_store for the user.
+def test_dispatch_legacy_chat_refreshes_only_chat(monkeypatch):
     from core import store as core_store
 
-    seen = []
-    monkeypatch.setattr(core_store, "_evict_store", lambda uid: seen.append(uid))
+    calls = []
+
+    class Store:
+        def reload_chat_hot_strict(self):
+            calls.append("chat")
+
+        def notify_chat_waiters(self):
+            calls.append("chat_waiters")
+
+    monkeypatch.setattr(core_store, "_stores", {"u7": Store()})
+    monkeypatch.setattr(core_store, "_evict_store", lambda _uid: calls.append("all"))
+    monkeypatch.setenv("FEEDLING_CHAT_SYNC_MODE", "incremental")
+
+    wake_bus._dispatch(json.dumps({"u": "u7", "c": "chat", "o": "OTHER"}))
+
+    assert calls == ["chat", "chat_waiters"]
+
+
+def test_dispatch_v2_chat_uses_target_version_without_origin(monkeypatch):
+    from core import store as core_store
+
+    calls = []
+
+    class Store:
+        chat_version = 6
+
+        def ensure_chat_fresh(self, **kwargs):
+            calls.append(kwargs)
+            self.chat_version = max(self.chat_version, kwargs["target_version"])
+            return True
+
+    target = Store()
+    monkeypatch.setattr(core_store, "_stores", {"u7": target})
+    monkeypatch.setenv("FEEDLING_CHAT_SYNC_MODE", "incremental")
+
+    payload = {"v": 2, "c": "chat", "u": "u7", "r": 7}
+    wake_bus._dispatch(json.dumps(payload))
+    wake_bus._dispatch(json.dumps(payload))
+
+    assert calls == [{"force": True, "target_version": 7}]
+
+
+@pytest.mark.parametrize("version", [None, 0, -1, True, 1.5, "7"])
+def test_dispatch_v2_chat_rejects_malformed_versions(monkeypatch, version):
+    from core import store as core_store
+
+    calls = []
+    monkeypatch.setattr(
+        core_store,
+        "_stores",
+        {"u7": type("Store", (), {"ensure_chat_fresh": lambda *_a, **_k: calls.append(True)})()},
+    )
+    monkeypatch.setenv("FEEDLING_CHAT_SYNC_MODE", "incremental")
+
+    wake_bus._dispatch(json.dumps({"v": 2, "c": "chat", "u": "u7", "r": version}))
+
+    assert calls == []
+
+
+def test_store_channels_refresh_only_their_component(monkeypatch):
+    from core import store as core_store
+
+    calls = []
+
+    class Store:
+        user_id = "u7"
+        frames_lock = threading.Lock()
+        world_books_lock = threading.Lock()
+        proactive_job_waiters_lock = threading.Lock()
+        proactive_job_waiters = []
+
+        def _load_frames_meta(self):
+            calls.append("frames")
+
+        def _load_world_books(self):
+            calls.append("world_books")
+
+        def _load_tokens(self):
+            calls.append("tokens")
+
+        def _load_live_activity_state(self):
+            calls.append("live")
+
+        def _load_push_state(self):
+            calls.append("push")
+
+        def notify_proactive_job_waiters(self):
+            calls.append("proactive")
+
+    monkeypatch.setattr(core_store, "_stores", {"u7": Store()})
+    monkeypatch.setattr(core_store, "_evict_store", lambda _uid: calls.append("all"))
+
+    wake_bus._dispatch(json.dumps({"u": "u7", "c": "frames", "o": "OTHER"}))
+    assert calls == ["frames"]
+    calls.clear()
+    wake_bus._dispatch(json.dumps({"u": "u7", "c": "blob", "o": "OTHER"}))
+    assert calls == ["world_books", "tokens", "live", "push"]
+    calls.clear()
     wake_bus._dispatch(json.dumps({"u": "u7", "c": "proactive", "o": "OTHER"}))
-    assert seen == ["u7"]
+    assert calls == ["proactive"]
+
+
+def test_chat_sync_mode_is_validated(monkeypatch):
+    for mode in ("legacy", "observe", "incremental"):
+        monkeypatch.setenv("FEEDLING_CHAT_SYNC_MODE", mode)
+        assert wake_bus._chat_sync_mode() == mode
+    monkeypatch.setenv("FEEDLING_CHAT_SYNC_MODE", "typo")
+    with pytest.raises(RuntimeError, match="FEEDLING_CHAT_SYNC_MODE"):
+        wake_bus._chat_sync_mode()
+
+
+def test_observe_mode_compares_identity_only_and_keeps_legacy_result(
+    monkeypatch, caplog,
+):
+    from core import store as core_store
+
+    class Store:
+        chat_version = 1
+        chat_lock = threading.Lock()
+        chat_messages = [{"id": "old", "seq": 1, "body_ct": "secret"}]
+
+        def ensure_chat_fresh(self, **_kwargs):
+            self.chat_version = 2
+            self.chat_messages = [{"id": "incremental", "seq": 2}]
+            return True
+
+        def reload_chat_hot_strict(self):
+            self.chat_messages = [{"id": "legacy", "seq": 2}]
+
+        def notify_chat_waiters(self):
+            pass
+
+    target = Store()
+    monkeypatch.setattr(core_store, "_stores", {"u-private": target})
+    monkeypatch.setenv("FEEDLING_CHAT_SYNC_MODE", "observe")
+    monkeypatch.setattr(wake_bus, "_observe_chat_user", lambda _uid: True)
+
+    wake_bus._dispatch(json.dumps({"v": 2, "c": "chat", "u": "u-private", "r": 2}))
+
+    assert target.chat_messages == [{"id": "legacy", "seq": 2}]
+    assert "chat_sync_observe_mismatch" in caplog.text
+    assert "u-private" not in caplog.text
+    assert "secret" not in caplog.text
 
 
 def test_dispatch_ignores_malformed_payload():

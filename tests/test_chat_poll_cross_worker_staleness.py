@@ -22,6 +22,7 @@ Run:  python -m pytest tests/test_chat_poll_cross_worker_staleness.py -q
 from __future__ import annotations
 
 import base64
+import json
 import sys
 import time
 from pathlib import Path
@@ -34,6 +35,7 @@ from accounts import registry as accounts_registry  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
+from core import wake_bus  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -99,6 +101,30 @@ def test_poll_serves_message_committed_outside_this_workers_cache(user):
         "poll answered 'nothing pending' from a stale cache while the message "
         "was committed in Postgres — this is the 3-minute silent gap"
     )
+
+
+def test_v2_wake_incrementally_refreshes_cached_worker(user, monkeypatch):
+    uid, _api_key = user
+    store = core_store.get_store(uid)
+    _write_user_message_bypassing_cache(uid, "m_v2_wake", time.time())
+    target_version = db.chat_change_version(uid)
+    assert all(row.get("id") != "m_v2_wake" for row in store.chat_messages)
+
+    monkeypatch.setenv("FEEDLING_CHAT_SYNC_MODE", "incremental")
+    monkeypatch.setattr(
+        store,
+        "reload",
+        lambda: (_ for _ in ()).throw(AssertionError("broad reload forbidden")),
+    )
+    wake_bus._dispatch(json.dumps({
+        "v": 2,
+        "c": "chat",
+        "u": uid,
+        "r": target_version,
+    }))
+
+    assert store.chat_version == target_version
+    assert any(row.get("id") == "m_v2_wake" for row in store.chat_messages)
 
 
 def test_poll_serves_a_newer_db_only_message_alongside_a_cached_one(user):

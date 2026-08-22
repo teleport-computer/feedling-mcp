@@ -1996,6 +1996,38 @@ def _evict_store(user_id: str) -> bool:
     return True
 
 
+def _cached_store(user_id: str) -> UserStore | None:
+    """Return an existing worker-local store without creating or loading one."""
+    with _stores_lock:
+        return _stores.get(user_id)
+
+
+def _refresh_store_channel(user_id: str, channel: str) -> bool:
+    """Refresh or wake exactly one non-chat store component."""
+    store = _cached_store(user_id)
+    if store is None:
+        return False
+    previous_guard = getattr(_reload_guard, "active", False)
+    _reload_guard.active = True
+    try:
+        if channel == "frames":
+            with store.frames_lock:
+                store._load_frames_meta()
+        elif channel == "blob":
+            with store.world_books_lock:
+                store._load_world_books()
+            store._load_tokens()
+            store._load_live_activity_state()
+            store._load_push_state()
+        elif channel == "proactive":
+            store.notify_proactive_job_waiters()
+        else:
+            return False
+    finally:
+        _reload_guard.active = previous_guard
+    return True
+
+
 def get_store(user_id: str) -> UserStore:
     now = time.monotonic()
     do_reload = False

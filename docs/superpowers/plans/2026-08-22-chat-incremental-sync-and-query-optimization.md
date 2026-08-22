@@ -193,22 +193,22 @@ git commit -m "feat(chat): reconcile worker caches by durable version"
 - Legacy chat wakes call `reload_chat_hot_strict()`.
 - Frames/blob/proactive refresh only their own component.
 
-- [ ] **Step 1: Add RED compatibility tests**
+- [x] **Step 1: Add RED compatibility tests**
 
 Cover old receiver/new payload, new receiver/old payload, same-worker v1 suppression, v2 without origin, malformed version, duplicate version, channel isolation, and reconnect catch-up.
 
-- [ ] **Step 2: Run RED tests**
+- [x] **Step 2: Run RED tests**
 
 ```bash
 FEEDLING_TEST_PG='postgresql://postgres:test@127.0.0.1:55432/postgres' \
   .venv-test/bin/python -m pytest tests/test_wake_bus.py tests/test_chat_poll_cross_worker_staleness.py -q
 ```
 
-- [ ] **Step 3: Implement targeted dispatch and modes**
+- [x] **Step 3: Implement targeted dispatch and modes**
 
 Validate `FEEDLING_CHAT_SYNC_MODE=legacy|observe|incremental` at startup. Preserve strict job-cancel parsing. Observe mode compares legacy/incremental ID+seq hashes for a deterministic 1% of users and records fixed mismatch slugs only.
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 ```bash
 git add backend/core/wake_bus.py tests/test_wake_bus.py tests/test_chat_poll_cross_worker_staleness.py
