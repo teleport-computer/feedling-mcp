@@ -4457,6 +4457,51 @@ def freeze_completed_retention_cohorts(*, now_epoch: float | None = None,
 # (and therefore no user content) can ever reach a frozen cell. Same regex as
 # admin/memory_metadata.py's dream-job surface.
 _LANE_ROLLUP_CODE_RE = re.compile(r"^[a-z0-9_:-]{1,120}$")
+_DISCARDED_FAILURE_REASON_LOG_MAX_CHARS = 500
+
+
+def content_free_failure_code(
+    raw_reason: object,
+    *,
+    source: str,
+    user_id: object,
+    lane: object,
+    day: object,
+    count: object = 1,
+) -> str:
+    """Collapse free-text failures without throwing their diagnosis away.
+
+    ``status_reason`` (resident) and ``last_error`` (V2) are free text: both
+    producer APIs accept arbitrary exception/provider text, which may include
+    user content.  The durable rollup and content-free admin payload therefore
+    keep the existing allowlist and ``runtime_failed`` placeholder.  The raw
+    value is emitted only to the operational log, bounded and ``%r``-escaped
+    so newlines cannot forge another log record.
+
+    Freezers call this after grouping by raw reason, so ``count`` preserves the
+    number of affected attempts without logging hundreds of identical lines.
+    """
+    reason = str(raw_reason or "")
+    if _LANE_ROLLUP_CODE_RE.match(reason):
+        return reason
+    bounded = reason[:_DISCARDED_FAILURE_REASON_LOG_MAX_CHARS]
+    try:
+        affected = max(1, int(count))
+    except (TypeError, ValueError, OverflowError):
+        affected = 1
+    log.warning(
+        "[failure-code] discarded non-allowlisted reason "
+        "source=%s user_id=%r lane=%r day=%s count=%d "
+        "reason=%r truncated=%s",
+        str(source or "unknown")[:80],
+        str(user_id or "")[:200],
+        str(lane or "")[:120],
+        str(day or "")[:40],
+        affected,
+        bounded,
+        len(reason) > len(bounded),
+    )
+    return "runtime_failed"
 
 _LANE_ROLLUP_TERMINAL = ("completed", "failed", "expired", "superseded")
 
@@ -4535,7 +4580,14 @@ def _lane_rollup_freeze_day(conn, *, day: date, zone: ZoneInfo,
         (start, end),
     ).fetchall():
         key = (str(uid), str(lane), str(src))
-        clean = str(code) if _LANE_ROLLUP_CODE_RE.match(str(code)) else "runtime_failed"
+        clean = content_free_failure_code(
+            code,
+            source="lane_rollup_v2",
+            user_id=uid,
+            lane=lane,
+            day=day,
+            count=n,
+        )
         cell = codes.setdefault(key, {})
         cell[clean] = cell.get(clean, 0) + int(n)
     written = 0
@@ -4939,8 +4991,14 @@ def _lane_rollup_freeze_resident_day(conn, *, day: date, zone: ZoneInfo,
         (start, end),
     ).fetchall():
         key = (str(uid), str(lane))
-        clean = (str(code) if _LANE_ROLLUP_CODE_RE.match(str(code))
-                 else "runtime_failed")
+        clean = content_free_failure_code(
+            code,
+            source="lane_rollup_v1",
+            user_id=uid,
+            lane=lane,
+            day=day,
+            count=n,
+        )
         cell = codes.setdefault(key, {})
         cell[clean] = cell.get(clean, 0) + int(n)
     written = 0
