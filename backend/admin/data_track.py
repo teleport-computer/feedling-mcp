@@ -3811,6 +3811,25 @@ def _render_funnel(funnel: dict | None, *, compact: bool) -> str:
             if isinstance(s, dict):
                 prev_by_id[str(s.get("id") or "")] = s
 
+    # ⚠️ 顶层已经把「builder 失败」坍缩成「暂不可用」,**但字段级没有** ——
+    # 改这里之前,`count` 缺失(合法:W1 窗口还没人走完)与 `count` 坏值(数据出问题)
+    # **都返回 None、都显示 `—`**,而它们的下一步相反。
+    # ⭐「顶层有 unavailable」不等于「字段级有 schema」:顶层没坏、字段坏了时,
+    #   页面会显示一个**结构完整但内容失真**的东西 —— 比整块不可用更难发现。
+    # ⚠️ 修法刻意最小侵入:`_count` **仍返回 None**,不改任何下游算术
+    # (下游有 7 处直接拿它做除法/减法,换成哨兵对象会全部炸)。
+    # 「读不出来」只在**显示那一处**用独立判据区分出来。
+    def _count_unreadable(stage: dict) -> bool:
+        """有值、但读不成整数 —— 与「本来就没有」(count 缺失)是两回事。"""
+        raw = stage.get("count")
+        if raw is None:
+            return False
+        try:
+            int(raw)
+        except (TypeError, ValueError):
+            return True
+        return False
+
     def _count(stage: dict):
         raw = stage.get("count")
         if raw is None:
@@ -3864,7 +3883,15 @@ def _render_funnel(funnel: dict | None, *, compact: bool) -> str:
             rows.append(f"<div class='hfunnel-conv'>{conv}</div>")
         if count is None:
             width_pct = 0.0
-            num = "<span class='muted' title='窗口尚未走完或查询失败，判不了'>—</span>"
+            # ⚠️ 这里原本一句「窗口尚未走完**或**查询失败,判不了」——
+            # 作者自己已经写下了这两件事被混在一起,只是没分开。它们的下一步相反:
+            # 前者什么都不用做,后者要去修数据/读取。
+            if _count_unreadable(stage):
+                num = ("<span class='warn' title='本阶段有 count 值,但读不成整数——"
+                       "数据有问题,不是「还没人走完」'>坏值</span>")
+            else:
+                num = ("<span class='muted' title='本阶段暂无 count(如窗口尚未走完)'>"
+                       "—</span>")
         elif base is None or base <= 0:
             width_pct = 0.0
             num = f"{count:,}"

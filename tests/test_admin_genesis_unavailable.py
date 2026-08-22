@@ -105,3 +105,52 @@ def test_stats_marks_source_ok_on_a_genuinely_empty_result(monkeypatch):
 
     assert out["job_count"] == 0
     assert out["jobs_source"] == "ok"
+
+
+# --------------------------------------------------------------------------- #
+# T245 域12:漏斗的字段级 —— 「本来就没有」与「有值但读不出来」必须不同形
+# --------------------------------------------------------------------------- #
+
+def _funnel(count_value) -> dict:
+    """两阶段漏斗;第二阶段的 count 由调用方给,用来区分三种情形。"""
+    return {
+        "window_days": 28,
+        "stages": [
+            {"id": "a", "label": "注册", "count": 100},
+            {"id": "b", "label": "首答", "count": count_value},
+        ],
+    }
+
+
+def test_funnel_absent_count_and_unreadable_count_do_not_look_the_same():
+    """原本这两种都渲染成 `—`,连 title 都写着「尚未走完**或**查询失败」。
+
+    ⭐ 那句 title 是**作者自己写下的证据**:他知道两件事被混在一起了,只是没分开。
+    它们的下一步相反 —— 前者什么都不用做,后者要去修数据。
+    """
+    absent = _text(data_track._render_funnel(_funnel(None), compact=True))
+    unreadable = _text(data_track._render_funnel(_funnel("abc"), compact=True))
+
+    # 前提:两份构造除了那个 count 值以外完全相同,否则「显示不同」可能来自别处。
+    assert absent != unreadable
+
+    assert "坏值" in unreadable
+    # 反向:合法缺值不许被报成坏值,否则这个标记不携带信息。
+    assert "坏值" not in absent
+    assert "—" in absent
+
+
+def test_funnel_still_renders_normal_counts_and_does_not_crash_on_bad_value():
+    """坏值不许把整段漏斗炸掉 —— 观测面永不因一个坏字段而 500。
+
+    ⚠️ 这条是配套的反向保护:我第一版改法让 `_count` 返回哨兵对象,
+    而下游有 7 处直接拿它做除法/减法 —— **那会把「显示得更诚实」变成「整页崩掉」**。
+    最终改法刻意最小侵入:`_count` 仍返回 None,只在显示处加独立判据。
+    """
+    ok = _text(data_track._render_funnel(_funnel(42), compact=True))
+    assert "42" in ok
+    assert "坏值" not in ok
+
+    # 坏值那份必须照常渲染出第一阶段,不抛异常
+    bad = _text(data_track._render_funnel(_funnel("abc"), compact=True))
+    assert "100" in bad
