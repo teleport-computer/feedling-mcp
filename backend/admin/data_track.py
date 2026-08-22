@@ -27,6 +27,7 @@ from accounts import registry
 from admin import usage as admin_usage
 from chat import consumer as chat_consumer
 from memory import service as memory_service
+from notices import catalog as notices_catalog
 from notices import core as notices_core
 from proactive import service as proactive_service
 from screen import screen_read_core
@@ -128,6 +129,25 @@ def _count_rows(rows: list[dict], key: str) -> dict:
         val = str(row.get(key) or "unknown").strip() or "unknown"
         counts[val] = counts.get(val, 0) + 1
     return counts
+
+
+def _v1_proactive_outcome_class(status: object, reason: object) -> str:
+    """Classify the resident/V1 proactive status-reason keyspace.
+
+    ``skipped`` is a control-plane outcome (including heartbeat_throttled), not
+    a failed realization.  A failed job leaves our numerator only for Seven's
+    exact user-unavailable reasons.  No prefix or string-shape inference is
+    allowed: unknown/new reasons remain operational failures.
+    """
+    normalized_status = str(status or "").strip()
+    normalized_reason = str(reason or "").strip() or "unknown"
+    if normalized_status == "skipped":
+        return "control"
+    if normalized_status != "failed":
+        return ""
+    if normalized_reason in notices_catalog.USER_UNAVAILABLE_V1_REASONS:
+        return "user_unavailable"
+    return "operational_failure"
 
 
 def _safe_onboarding_validation(raw: dict) -> dict:
@@ -350,16 +370,30 @@ def _proactive_stats(store: UserStore) -> dict:
     failed_reasons: dict[str, int] = {}
     kind_lanes = {"heartbeat": 0, "screen": 0, "other": 0}
     fail_lanes = {"heartbeat": 0, "screen": 0, "other": 0}
+    control_lanes = {"heartbeat": 0, "screen": 0, "other": 0}
+    user_unavailable_lanes = {"heartbeat": 0, "screen": 0, "other": 0}
+    control_reasons: dict[str, int] = {}
+    user_unavailable_reasons: dict[str, int] = {}
     for j in jobs:
         if not isinstance(j, dict):
             continue
         raw_kind = j.get("job_kind") or j.get("wake_kind") or j.get("trigger") or ""
         lane = _classify_proactive_kind(raw_kind)
         kind_lanes[lane] += 1
-        if str(j.get("status") or "") in ("failed", "skipped"):
+        status = str(j.get("status") or "").strip()
+        reason = str(j.get("status_reason") or "").strip() or "unknown"
+        outcome_class = _v1_proactive_outcome_class(status, reason)
+        if outcome_class == "operational_failure":
             fail_lanes[lane] += 1
-            reason = str(j.get("status_reason") or "").strip() or "unknown"
             failed_reasons[reason] = failed_reasons.get(reason, 0) + 1
+        elif outcome_class == "control":
+            control_lanes[lane] += 1
+            control_reasons[reason] = control_reasons.get(reason, 0) + 1
+        elif outcome_class == "user_unavailable":
+            user_unavailable_lanes[lane] += 1
+            user_unavailable_reasons[reason] = (
+                user_unavailable_reasons.get(reason, 0) + 1
+            )
     live_status_counts = _count_rows(proactive_messages, "live_activity_status")
     alert_status_counts = _count_rows(proactive_messages, "alert_status")
     job_epochs = [core_util._to_epoch(j.get("ts") or j.get("created_at") or j.get("updated_at")) for j in jobs]
@@ -370,7 +404,7 @@ def _proactive_stats(store: UserStore) -> dict:
         + alert_status_counts.get("delivered", 0)
         + alert_status_counts.get("logged_only", 0)
     )
-    failed = sum(status_counts.get(s, 0) for s in ("failed", "skipped"))
+    failed = sum(fail_lanes.values())
     failed += sum(live_status_counts.get(s, 0) for s in ("failed", "error"))
     failed += sum(alert_status_counts.get(s, 0) for s in ("failed", "error"))
     return {
@@ -384,12 +418,16 @@ def _proactive_stats(store: UserStore) -> dict:
         "other_jobs": kind_lanes["other"],
         "heartbeat_failed": fail_lanes["heartbeat"],
         "screen_failed": fail_lanes["screen"],
+        "heartbeat_control": control_lanes["heartbeat"],
+        "screen_control": control_lanes["screen"],
+        "heartbeat_user_unavailable": user_unavailable_lanes["heartbeat"],
+        "screen_user_unavailable": user_unavailable_lanes["screen"],
         "pending_jobs": status_counts.get("pending", 0),
         "posted_jobs": status_counts.get("posted", 0) + status_counts.get("delivered", 0),
         "failed_jobs": failed,
-        # Matches the existing failure-lane lifecycle: skipped is terminal and
-        # grouped with failed, even though jobs_by_status keeps them distinct.
         "job_failed_reasons": failed_reasons,
+        "job_control_reasons": control_reasons,
+        "job_user_unavailable_reasons": user_unavailable_reasons,
         "proactive_messages": len(proactive_messages),
         "delivery_signals": delivered,
         "live_activity_status": live_status_counts,
@@ -899,7 +937,14 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
     extra = dict(snap.get("proactive_extra") or {})
     status_counts = _data_track_count_dict(extra.get("jobs_by_status"))
     kind_lanes = _bucket_proactive_kinds(_data_track_count_dict(extra.get("jobs_by_kind")))
-    fail_lanes = _bucket_proactive_kinds(_data_track_count_dict(extra.get("jobs_failed_by_kind")))
+    raw_fail_kinds = _data_track_count_dict(extra.get("jobs_failed_by_kind"))
+    fail_lanes = _bucket_proactive_kinds(raw_fail_kinds)
+    control_lanes = _bucket_proactive_kinds(
+        _data_track_count_dict(extra.get("jobs_control_by_kind"))
+    )
+    user_unavailable_lanes = _bucket_proactive_kinds(
+        _data_track_count_dict(extra.get("jobs_user_unavailable_by_kind"))
+    )
     live_status_counts = _data_track_count_dict(extra.get("live_activity_status"))
     alert_status_counts = _data_track_count_dict(extra.get("alert_status"))
     decisions = int(extra.get("decisions") or logs.get("gate_decisions", {}).get("count") or 0)
@@ -909,7 +954,12 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
         + alert_status_counts.get("delivered", 0)
         + alert_status_counts.get("logged_only", 0)
     )
-    failed = sum(status_counts.get(s, 0) for s in ("failed", "skipped"))
+    failed_reasons = _data_track_count_dict(extra.get("jobs_failed_by_reason"))
+    failed = (
+        sum(fail_lanes.values())
+        if raw_fail_kinds
+        else sum(failed_reasons.values())
+    )
     failed += sum(live_status_counts.get(s, 0) for s in ("failed", "error"))
     failed += sum(alert_status_counts.get(s, 0) for s in ("failed", "error"))
     last_at = _latest_epoch(
@@ -928,12 +978,18 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
         "other_jobs": kind_lanes["other"],
         "heartbeat_failed": fail_lanes["heartbeat"],
         "screen_failed": fail_lanes["screen"],
+        "heartbeat_control": control_lanes["heartbeat"],
+        "screen_control": control_lanes["screen"],
+        "heartbeat_user_unavailable": user_unavailable_lanes["heartbeat"],
+        "screen_user_unavailable": user_unavailable_lanes["screen"],
         "pending_jobs": status_counts.get("pending", 0),
         "posted_jobs": status_counts.get("posted", 0) + status_counts.get("delivered", 0),
         "failed_jobs": failed,
-        # Includes failed + skipped proactive jobs; delivery failures are not
-        # job reasons and remain in live_activity_status / alert_status.
-        "job_failed_reasons": _data_track_count_dict(extra.get("jobs_failed_by_reason")),
+        "job_failed_reasons": failed_reasons,
+        "job_control_reasons": _data_track_count_dict(extra.get("jobs_control_by_reason")),
+        "job_user_unavailable_reasons": _data_track_count_dict(
+            extra.get("jobs_user_unavailable_by_reason")
+        ),
         "proactive_messages": int(chat.get("proactive_messages") or 0),
         "delivery_signals": delivered,
         "live_activity_status": live_status_counts,
@@ -1226,7 +1282,9 @@ def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
     )
     chat = _data_track_chat_from_snapshot(snap)
     memory = _data_track_memory_from_snapshot(snap)
-    proactive = _data_track_proactive_from_snapshot(snap, chat)
+    proactive = _with_proactive_lens(
+        _data_track_proactive_from_snapshot(snap, chat)
+    )
     tracking = _data_track_tracking_from_snapshot(snap)
     bootstrap_events = _data_track_bootstrap_from_snapshot(snap)
     history_import = _data_track_history_import_from_snapshot(snap)
@@ -1562,7 +1620,10 @@ PROACTIVE_V1_LENS_NOTE = (
     "V1 口径:proactive_jobs 日志 + source=agent_initiated_proactive 的聊天行。"
     "Runtime V2 的唤醒 job 在 agent_jobs、回复行 source 恒为 model_api,"
     "因此 V2 用户在本块里的计数结构性为 0,pending 多为 V2 下无人排空的旧流死行。"
-    "V2 请看 v2_wake_activity / v2_wake_schedule。"
+    "V2 请看 v2_wake_activity / v2_wake_schedule。失败数=全史 status=failed 中"
+    "剔除明确用户侧七码后的数量;unknown/未登记原因仍算我方失败。skipped(含"
+    "heartbeat_throttled)单列为控制结果,不算失败;expired 沿用既有 V1 口径不计。"
+    "页面不拿 jobs 总数直接充当失败率分母。"
 )
 
 
@@ -1579,6 +1640,21 @@ def _with_proactive_lens(block: dict) -> dict:
     out = dict(block or {})
     out["lens"] = PROACTIVE_V1_LENS
     out["lens_note"] = PROACTIVE_V1_LENS_NOTE
+    out["failure_definition"] = {
+        "cohort": "resident_v1_only",
+        "window": "all_history",
+        "numerator": (
+            "status=failed excluding exact user_unavailable reasons; "
+            "unknown remains failure"
+        ),
+        "denominator": (
+            "not computed on this surface; jobs is an all-status count"
+        ),
+        "control": "status=skipped, including heartbeat_throttled",
+        "user_unavailable_reasons": sorted(
+            notices_catalog.USER_UNAVAILABLE_V1_REASONS
+        ),
+    }
     return out
 
 
@@ -3769,6 +3845,7 @@ RUNTIME_OUTCOME_CLASS_LABELS = {
     "timeout": "超时 / 失活",
     "control": "控制切流",
     "safety_suppression": "安全抑制",
+    "user_unavailable": "明确用户侧不可用",
 }
 RUNTIME_OUTCOME_CLASSES = frozenset(RUNTIME_OUTCOME_CLASS_LABELS)
 RUNTIME_OUTCOME_DEFAULT = "operational_failure"
@@ -3824,9 +3901,9 @@ def _runtime_health_level(
         rate = _runtime_operational_rate(lane)
         if rate is not None and sampled > 0:
             if rate >= _RUNTIME_HEALTH_FAILURE_BAD:
-                escalate("bad", f"{name} 系统故障率 {rate * 100:.0f}%")
+                escalate("bad", f"{name} 我方失败率 {rate * 100:.0f}%")
             elif rate >= _RUNTIME_HEALTH_FAILURE_WARN:
-                escalate("warn", f"{name} 系统故障率 {rate * 100:.0f}%")
+                escalate("warn", f"{name} 我方失败率 {rate * 100:.0f}%")
 
         # Chat is the foreground user contract: every failed/expired terminal
         # outcome matters even when the cause is an operator route change.  Keep
@@ -3994,9 +4071,9 @@ def _runtime_execution_level(
         rate = _runtime_operational_rate(lane)
         if rate is not None and sampled > 0:
             if rate >= _RUNTIME_HEALTH_FAILURE_BAD:
-                escalate("bad", f"{name} 系统故障率 {rate * 100:.0f}%")
+                escalate("bad", f"{name} 我方失败率 {rate * 100:.0f}%")
             elif rate >= _RUNTIME_HEALTH_FAILURE_WARN:
-                escalate("warn", f"{name} 系统故障率 {rate * 100:.0f}%")
+                escalate("warn", f"{name} 我方失败率 {rate * 100:.0f}%")
         raw_rate = lane.get("failure_rate")
         if name == "chat" and raw_rate is not None and sampled > 0:
             if raw_rate >= _RUNTIME_HEALTH_FAILURE_BAD:
@@ -4633,7 +4710,9 @@ def _render_runtime_health_page(
                 "expired": None,
                 "superseded": None,
                 "operational_failures": None,
+                "health_denominator": None,
                 "control_outcomes": None,
+                "user_unavailable": None,
                 "safety_suppressions": None,
                 "empty_reply_suppressions": None,
                 "failure_rate": None,
@@ -4852,6 +4931,7 @@ def _render_runtime_health_page(
             f"<td>{_fmt_count(lane.get('expired'))}</td>"
             f"<td>{_fmt_count(lane.get('operational_failures'))}</td>"
             f"<td class='muted'>{_fmt_count(lane.get('control_outcomes'))}</td>"
+            f"<td class='muted'>{_fmt_count(lane.get('user_unavailable'))}</td>"
             f"<td class='muted'>{_fmt_count(lane.get('safety_suppressions'))}</td>"
             f"<td>{_fmt_count(lane.get('empty_reply_suppressions'))}</td>"
             + raw_rate_cell
@@ -4986,8 +5066,8 @@ def _render_runtime_health_page(
   {delivery_section}
   <h2>各 lane 健康</h2>
   <div class="table-wrap"><table>
-    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>原始失败</th><th>过期</th><th>系统故障<br><span class='muted'>含过期</span></th><th>控制切流</th><th>安全抑制</th><th>空内容主动抑制</th><th>终态未成功率</th><th>系统故障率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>开口回合/回合<br><span class='muted'>仅 screen_watch</span></th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
-    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='18' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
+    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>原始失败</th><th>过期</th><th>我方失败<br><span class='muted'>含超时/安全抑制</span></th><th>控制切流</th><th>明确用户侧</th><th>安全抑制<br><span class='muted'>已计我方失败</span></th><th>空内容主动抑制</th><th>终态未成功率</th><th>我方失败率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>开口回合/回合<br><span class='muted'>仅 screen_watch</span></th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
+    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='19' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
   </table></div>
   {_render_stuck_block(stuck)}
   {_render_runtime_user_report(user_report)}
@@ -4996,9 +5076,11 @@ def _render_runtime_health_page(
     <thead><tr><th>Lane</th><th>归类</th><th>失败码</th><th>上游安全归因</th><th>次数</th></tr></thead>
     <tbody>{''.join(failure_rows) if failure_rows else "<tr><td colspan='5' class='muted'>当前窗口无未成功终态。</td></tr>"}</tbody>
   </table></div>
-  <div class="muted">“终态未成功率”保留所有 failed / expired，回答“这轮有没有正常完成”；
-  “系统故障率”只统计 provider、Runtime、排队和 lease 故障。控制切流和安全抑制仍保留原始计数，
-  但不再冒充基础设施故障。上游安全归因来自终态 outbox 的 metadata；<b>上游原始错</b>和聊天正文
+  <div class="muted">“终态未成功率”分子=全部 failed+expired，分母=completed+failed+expired，回答“这轮有没有正常完成”；
+  “我方失败率”分子=除控制切流与明确用户侧七码外的 failed+expired，分母=completed+该分子，窗口={window_hours} 小时、总体=本实例托管 Runtime V2。
+  unknown、上游限流、安全抑制、空回复与所有未登记新码都计入我方失败；superseded 不进任何失败率分子或分母。
+  控制切流、明确用户侧与安全抑制仍保留原始计数，后者只是诊断标签、不是豁免。
+  上游安全归因来自终态 outbox 的 metadata；<b>上游原始错</b>和聊天正文
   均不在本页读取，如确需查看只能走 default-off、全审计的 break-glass trajectory inspector。</div>
 </main>
 </body>
@@ -7396,8 +7478,14 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
             f"<td>{row['memory']['total']} <span class='muted'>cards</span>"
             f"<br><span class='muted'>onb {onb_mem} / live {live_mem}</span></td>"
             f"<td>{pro['proactive_messages']} <span class='muted'>sent</span>"
-            f"<br><span class='muted'>心跳 {pro.get('heartbeat_jobs', 0)}(f{pro.get('heartbeat_failed', 0)}) / "
-            f"屏幕 {pro.get('screen_jobs', 0)}(f{pro.get('screen_failed', 0)})</span></td>"
+            f"<br><span class='muted'>心跳 总{pro.get('heartbeat_jobs', 0)} "
+            f"/ 失败{pro.get('heartbeat_failed', 0)} "
+            f"/ 控制{pro.get('heartbeat_control', 0)} "
+            f"/ 用户侧{pro.get('heartbeat_user_unavailable', 0)}; "
+            f"屏幕 总{pro.get('screen_jobs', 0)} "
+            f"/ 失败{pro.get('screen_failed', 0)} "
+            f"/ 控制{pro.get('screen_control', 0)} "
+            f"/ 用户侧{pro.get('screen_user_unavailable', 0)}</span></td>"
             f"<td>{html.escape(_bj_iso(row.get('last_activity_at')))}</td>"
             "</tr>"
         )
@@ -7581,10 +7669,16 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
 	  </form>
 	  <div class="toolbar"><input id="q" placeholder="筛选 UID、route、runtime state、stage"></div>
 	  {_render_chat_coverage_note(summary.get("chat_coverage"))}
+	  <div class="note-box"><b>Proactive 失败口径（Resident / V1）</b><br>
+	  总数=该 lane 的全史 <code>proactive_jobs</code> 全状态记录，不是失败率分母；
+	  失败=<code>status=failed</code> 且不属于明确用户侧七码，未知/未登记原因仍算我方失败；
+	  控制=<code>status=skipped</code>（含 <code>heartbeat_throttled</code>），不算失败；
+	  用户侧=明确额度、Key 或模型不存在；<code>expired</code> 沿用 V1 既有口径不计。
+	  本列不含 Runtime V2 用户，V2 请看 Runtime 值班台；两边表、窗口、总体与键空间不同，不可横向对数。</div>
 	  <div class="sortbar">{sort_controls}</div>
 	  {pager}
 	  <div class="table-wrap"><table id="users">
-    <thead><tr><th>User</th><th>Onboarding route</th><th>实际 Runtime</th><th>连接</th><th>Onboarding</th><th>Steps</th><th>Chat 累计发生</th><th>Memory</th><th>Proactive 心跳/屏幕(fail)</th><th>Last activity</th></tr></thead>
+    <thead><tr><th>User</th><th>Onboarding route</th><th>实际 Runtime</th><th>连接</th><th>Onboarding</th><th>Steps</th><th>Chat 累计发生</th><th>Memory</th><th>Proactive 心跳/屏幕（全史四分法）</th><th>Last activity</th></tr></thead>
     <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='10' class='muted'>No users yet.</td></tr>"}</tbody>
   </table></div>
 </main>
@@ -8897,6 +8991,7 @@ _OUTCOME_CLASS_LABELS = {
     "timeout": "超时",
     "control": "闸拦截",
     "safety_suppression": "安全抑制",
+    "user_unavailable": "明确用户侧不可用",
 }
 
 

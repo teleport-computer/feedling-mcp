@@ -18,6 +18,7 @@ from model_api_runtime.v2 import worker  # noqa: E402
 from model_api_runtime.v2 import language_follow  # noqa: E402
 from model_api_runtime.v2 import prompt_frontier  # noqa: E402
 from model_api_runtime.v2 import summary_frontier  # noqa: E402
+from notices import catalog as notices_catalog  # noqa: E402
 
 
 def test_thinking_extra_preserves_plaintext_body():
@@ -74,6 +75,32 @@ def test_unknown_exception_class_and_scope_collapse_to_registered_buckets():
         "runtime_failed:error"
     )
     assert "turn_failed:secret_token" not in worker.PUBLIC_FAILURE_CODES
+
+
+def test_user_unavailable_outcomes_are_exact_and_producer_registered():
+    expected = frozenset({
+        "turn_failed:quota_insufficient",
+        "extraction_failed:quota_insufficient",
+        "turn_failed:image_generation_quota_insufficient",
+        "turn_failed:auth_invalid",
+        "turn_failed:image_generation_auth_invalid",
+        "turn_failed:model_not_found",
+        "turn_failed:image_generation_model_not_found",
+    })
+    assert notices_catalog.USER_UNAVAILABLE_V2_OUTCOME_CODES == expected
+    assert jobs_store.USER_UNAVAILABLE_OUTCOME_CODES == expected
+    assert expected <= worker.PUBLIC_FAILURE_CODES
+    for code in expected:
+        assert jobs_store.terminal_outcome_class(code) == "user_unavailable"
+
+    # Similar-looking capability/provider outcomes are deliberately ours.
+    for code in (
+        "turn_failed:provider_incompatible",
+        "turn_failed:rate_limited",
+        "wake_failed:quota_insufficient",
+        "unknown",
+    ):
+        assert jobs_store.terminal_outcome_class(code) == "operational_failure"
 
 
 def test_extraction_specific_codes_are_in_the_public_export():
@@ -762,7 +789,7 @@ def test_silent_reply_events_are_content_free_admin_readable_and_distinct():
         jobs_store.terminal_outcome_class(
             jobs_store.SILENT_BY_CHOICE_OUTCOME_CODE
         )
-        == "safety_suppression"
+        == "operational_failure"
     )
     choice = {
         "type": "reply.silent_by_choice",

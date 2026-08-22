@@ -38,11 +38,20 @@ except ModuleNotFoundError:
 from notices import catalog  # noqa: E402
 from notices import core  # noqa: E402
 import tools.chat_resident_consumer as crc  # noqa: E402
+from model_api_runtime.v2 import worker  # noqa: E402
 
 
 def test_catalog_covers_all_consumer_error_classes():
     missing = set(crc.CONSUMER_ERROR_CLASSES) - set(catalog.ERROR_CLASSES)
     assert not missing, f"catalog 缺 error_class: {sorted(missing)}"
+
+
+def test_user_unavailable_v1_reasons_are_producer_registered():
+    producer_codes = set(crc.CONSUMER_ERROR_CLASSES) | set(
+        worker.PUBLIC_FAILURE_CODES
+    )
+    missing = set(catalog.USER_UNAVAILABLE_V1_REASONS) - producer_codes
+    assert not missing, f"用户侧豁免未由产生方导出: {sorted(missing)}"
 
 
 def test_every_catalog_blame_is_valid():

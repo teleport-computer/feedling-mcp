@@ -1494,6 +1494,14 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
             for uid, status, count in rows:
                 ensure(out, uid).setdefault("proactive_extra", {}).setdefault("jobs_by_status", {})[status] = count
 
+            # Seven 2026-08-21: V1 has its own status_reason keyspace.  Pull
+            # the exact producer-owned exemption set lazily so db.py does not
+            # copy seven strings or merge them with V2 last_error codes.
+            from notices import catalog as notices_catalog
+            v1_user_unavailable = list(
+                notices_catalog.USER_UNAVAILABLE_V1_REASONS
+            )
+
             # Split proactive jobs by lane (heartbeat vs screen-share vs other).
             # The persisted job doc carries job_kind / wake_kind / trigger; group
             # by the first non-empty of those and let the caller bucket the raw
@@ -1509,34 +1517,61 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                        ) AS kind,
                        COUNT(*)::int AS total,
                        (COUNT(*) FILTER (
-                          WHERE doc->>'status' IN ('failed', 'skipped')))::int AS failed
+                          WHERE doc->>'status' = 'failed'
+                            AND COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''),
+                                         'unknown') <> ALL(%s::text[])))::int
+                         AS operational_failed,
+                       (COUNT(*) FILTER (
+                          WHERE doc->>'status' = 'skipped'))::int AS control,
+                       (COUNT(*) FILTER (
+                          WHERE doc->>'status' = 'failed'
+                            AND COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''),
+                                         'unknown') = ANY(%s::text[])))::int
+                         AS user_unavailable
                 FROM user_logs
                 WHERE user_id = ANY(%s) AND stream = 'proactive_jobs'
                 GROUP BY user_id, kind
                 """,
-                (ids,),
+                (v1_user_unavailable, v1_user_unavailable, ids),
             ).fetchall()
-            for uid, kind, total, failed in rows:
+            for uid, kind, total, failed, control, user_unavailable in rows:
                 pex = ensure(out, uid).setdefault("proactive_extra", {})
                 pex.setdefault("jobs_by_kind", {})[kind] = total
                 pex.setdefault("jobs_failed_by_kind", {})[kind] = failed
+                pex.setdefault("jobs_control_by_kind", {})[kind] = control
+                pex.setdefault("jobs_user_unavailable_by_kind", {})[
+                    kind
+                ] = user_unavailable
 
             rows = conn.execute(
                 """
                 SELECT user_id,
+                       CASE
+                         WHEN doc->>'status' = 'skipped' THEN 'control'
+                         WHEN COALESCE(
+                           NULLIF(BTRIM(doc->>'status_reason'), ''), 'unknown'
+                         ) = ANY(%s::text[]) THEN 'user_unavailable'
+                         ELSE 'operational_failure'
+                       END AS outcome_class,
                        COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''), 'unknown') AS reason,
                        COUNT(*)::int
                 FROM user_logs
                 WHERE user_id = ANY(%s)
                   AND stream = 'proactive_jobs'
                   AND doc->>'status' IN ('failed', 'skipped')
-                GROUP BY user_id, reason
+                GROUP BY user_id, outcome_class, reason
                 """,
-                (ids,),
+                (v1_user_unavailable, ids),
             ).fetchall()
-            for uid, reason, count in rows:
+            reason_fields = {
+                "operational_failure": "jobs_failed_by_reason",
+                "control": "jobs_control_by_reason",
+                "user_unavailable": "jobs_user_unavailable_by_reason",
+            }
+            for uid, outcome_class, reason, count in rows:
+                field = reason_fields[str(outcome_class)]
                 ensure(out, uid).setdefault("proactive_extra", {}).setdefault(
-                    "jobs_failed_by_reason", {}
+                    field, {}
                 )[reason] = count
 
             # ⚠️ 这两个维度**必须**走格子，不能留原来的全史 GROUP BY。
@@ -6816,6 +6851,7 @@ _TRACE_EVENT_COLUMNS = (
 )
 TRACE_OUTCOME_CLASSES = frozenset({
     "operational_failure", "timeout", "control", "safety_suppression",
+    "user_unavailable",
 })
 TRACE_OUTCOME_DEFAULT = "operational_failure"
 _TRACE_EVENTS_RETENTION_DAYS = 30
