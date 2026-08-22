@@ -107,6 +107,16 @@ rather than hard-delete source cards. Automatic scheduling continues to advance
 only when new non-Dream cards are added; new conversation turns alone do not
 schedule another Dream run.
 
+Dream diagnostics correlate scheduling, model execution, and the final write
+outcome without exposing memory content. The admin trace distinguishes a clean
+no-op, an applied run, a partial write, provider or parse failure, deterministic
+mapping or blast-radius rejection, and a failed write. It reports only closed
+outcome enums, booleans, duration, and fixed integer counts. A failed or
+budget-truncated full-card read is recorded separately and marks the terminal
+run as using degraded context, so it cannot be mistaken for a model choosing to
+make no changes from a complete input. Card ids, prompts, replies, summaries,
+raw errors, and other memory text are never part of this diagnostic shape.
+
 In Runtime V2 chat, the model-facing `memory_organize` tool can force-enqueue a
 Dream run when the user explicitly asks to organize or consolidate their
 memories. It bypasses the automatic scheduler's night window, minimum interval,

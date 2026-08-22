@@ -10,6 +10,16 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Memory Dream runs now have content-free, end-to-end diagnostics.** Resident
+  V1 and hosted Runtime V2 correlate Dream start, model completion or failure,
+  and the final write outcome under one job trace. Operators can distinguish a
+  clean no-op, successful application, partial writes, provider or parser
+  failures, deterministic mapping or blast-radius rejection, and failed writes.
+  Failed or budget-truncated full-card reads are reported as degraded context
+  instead of looking like an ordinary model no-op. The admin surface exposes
+  only closed outcome enums, booleans, duration, and fixed counts; card ids,
+  prompts, replies, summaries, and raw errors remain hidden.
+
 - **Image-generation route health now reflects provider failures, not server
   processing bugs.** A provider call can still mark its saved route failed or
   unsupported, but failures while decrypting local configuration, interpreting

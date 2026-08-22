@@ -93,6 +93,60 @@ def test_lane_values_come_from_the_producer_not_a_local_copy():
         assert _public("agent.job.terminal", {"lane": lane})["lane"] == lane
 
 
+def _dream_detail(**over) -> dict:
+    detail = {
+        "runtime": "hosted_v2",
+        "lane": "dream",
+        "outcome": "partial",
+        "degraded_context": False,
+        "counts": {
+            "actions": 2,
+            "active_cards": 20,
+            "applied": 1,
+            "failed": 1,
+            "merged": 1,
+            "model_attempts": 1,
+            "organized": 2,
+            "proposals": 2,
+            "skipped": 0,
+        },
+    }
+    detail.update(over)
+    return detail
+
+
+def test_dream_trace_exposes_only_its_exact_content_free_shape():
+    detail = _dream_detail()
+    assert _public("memory.dream.done", detail) == detail
+    assert _public("memory.extraction.context.error", {
+        "runtime": "hosted_v2",
+        "lane": "dream",
+        "component": "cards",
+        "outcome": "truncated",
+    }) == {
+        "runtime": "hosted_v2",
+        "lane": "dream",
+        "component": "cards",
+        "outcome": "truncated",
+    }
+
+
+def test_dream_trace_rejects_extra_top_level_or_nested_fields_wholesale():
+    assert _public("memory.dream.done", _dream_detail(
+        debug_sample="用户原话",
+    )) == {}
+    nested = _dream_detail()
+    nested["counts"] = {**nested["counts"], "prompt_chars": 1234}
+    assert _public("memory.dream.done", nested) == {}
+    assert _public("memory.extraction.context.error", {
+        "runtime": "hosted_v2",
+        "lane": "dream",
+        "component": "cards",
+        "outcome": "unavailable",
+        "card_id": "secret-card",
+    }) == {}
+
+
 # --------------------------------------------------------------------------- #
 # 2. 回合抬头
 # --------------------------------------------------------------------------- #
@@ -179,6 +233,10 @@ def test_every_event_shipped_on_20260821_has_a_human_label():
         "agent.image.generate.failed",
         "voice.gateway.turn.started", "voice.gateway.runtime.selected",
         "voice.gateway.reply.received",
+        "memory.dream.start", "memory.dream.model.start",
+        "memory.dream.model.done", "memory.dream.model.error",
+        "memory.dream.done", "memory.dream.error",
+        "memory.extraction.context.error",
     ):
         assert t in data_track._DEBUG_STEP_LABELS, f"{t} 在页面上没有标签"
 
@@ -286,6 +344,33 @@ def test_user_text_never_reaches_the_rendered_page(monkeypatch):
             _event(detail={"error_code": value}),
         ])
         assert value not in re.sub(r"<[^>]+>", " ", html_out), f"泄漏: {value!r}"
+
+
+def test_dream_terminal_outcome_is_visible_in_the_rendered_page(monkeypatch):
+    html_out = _rendered_page(monkeypatch, [
+        _event(
+            subsystem="memory",
+            type="memory.dream.done",
+            status="warning",
+            detail=_dream_detail(),
+        ),
+    ])
+    visible = re.sub(r"<[^>]+>", " ", html_out)
+    assert "partial" in visible
+    assert "hosted_v2" in visible
+
+
+def test_dream_detail_with_an_extra_private_field_is_hidden_on_the_page(monkeypatch):
+    html_out = _rendered_page(monkeypatch, [
+        _event(
+            subsystem="memory",
+            type="memory.dream.done",
+            detail=_dream_detail(debug_sample="patient_12345"),
+        ),
+    ])
+    visible = re.sub(r"<[^>]+>", " ", html_out)
+    assert "patient_12345" not in visible
+    assert "partial" not in visible
 
 
 def test_turn_header_rejects_forged_identity_in_the_rendered_page(monkeypatch):

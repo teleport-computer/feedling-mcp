@@ -3945,6 +3945,7 @@ def _install_dream_job_harness(monkeypatch, agent_reply):
         "envelope_plaintexts": [],
         "envelope_kwargs": [],
         "post_called": False,
+        "traces": [],
     }
 
     history = [
@@ -4017,6 +4018,13 @@ def _install_dream_job_harness(monkeypatch, agent_reply):
             "effects": [{"type": "memory_superseded"} for _action in actions],
         }
 
+    def _trace(subsystem, event_type, **kwargs):
+        captured["traces"].append({
+            "subsystem": subsystem,
+            "type": event_type,
+            **kwargs,
+        })
+
     monkeypatch.setattr(crc, "call_agent", _agent)
     monkeypatch.setattr(crc, "post_reply", _fail_post)
     monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
@@ -4043,6 +4051,7 @@ def _install_dream_job_harness(monkeypatch, agent_reply):
     monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
     monkeypatch.setattr(crc, "_build_envelope", _build_envelope)
     monkeypatch.setattr(crc, "execute_memory_actions", _memory_actions)
+    monkeypatch.setattr(crc, "_emit_debug_trace", _trace)
     return captured, job
 
 
@@ -4684,6 +4693,36 @@ def test_dream_job_merge_writes_multi_supersede_without_chat_or_delivery(monkeyp
     assert extra["dream_result"]["organized_count"] == 2
     assert extra["dream_result"]["merged_count"] == 1
     assert extra["questions"] == ["确认是否只是不喝牛奶？"]
+    assert [row["type"] for row in captured["traces"]] == [
+        "memory.dream.start",
+        "memory.dream.model.start",
+        "memory.dream.model.done",
+        "memory.dream.done",
+    ]
+    assert all(
+        row["trace_id"] == "dream_dispatch"
+        and row["job_id"] == "dream_dispatch"
+        for row in captured["traces"]
+    )
+    terminal = captured["traces"][-1]
+    assert terminal["status"] == "ok"
+    assert terminal["detail"] == {
+        "runtime": "resident_v1",
+        "lane": "dream",
+        "outcome": "applied",
+        "degraded_context": False,
+        "counts": {
+            "actions": 1,
+            "active_cards": 3,
+            "applied": 1,
+            "failed": 0,
+            "merged": 1,
+            "model_attempts": 1,
+            "organized": 2,
+            "proposals": 1,
+            "skipped": 0,
+        },
+    }
 
 
 def test_dream_job_thicken_and_supersede_are_memory_supersede_actions(monkeypatch):
@@ -4733,6 +4772,46 @@ def test_dream_job_thicken_and_supersede_are_memory_supersede_actions(monkeypatc
     assert extra["dream_result"]["cards_thickened"] == 1
 
 
+def test_dream_job_partial_write_is_a_warning_not_a_false_ok(monkeypatch):
+    reply = json.dumps({
+        "consolidations": [
+            {
+                "op": "thicken",
+                "card_ids": ["mem_a"],
+                "rationale": "同一偏好的补充",
+                "result": {"summary": "偏好摘要", "content": "偏好正文"},
+            },
+            {
+                "op": "supersede",
+                "card_ids": ["mem_c"],
+                "rationale": "同一习惯的更新",
+                "result": {"summary": "习惯摘要", "content": "习惯正文"},
+            },
+        ],
+        "questions_to_ask": [],
+    }, ensure_ascii=False)
+    captured, job = _install_dream_job_harness(monkeypatch, reply)
+
+    def _partial(actions):
+        captured["actions"].extend(actions)
+        return {
+            "results": [
+                {"status": "ok", "action": actions[0]["type"]},
+                {"status": "error", "error": "storage_error"},
+            ],
+        }
+
+    monkeypatch.setattr(crc, "execute_memory_actions", _partial)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+    terminal = captured["traces"][-1]
+    assert terminal["type"] == "memory.dream.done"
+    assert terminal["status"] == "warning"
+    assert terminal["detail"]["outcome"] == "partial"
+    assert terminal["detail"]["counts"]["applied"] == 1
+    assert terminal["detail"]["counts"]["failed"] == 1
+
+
 def test_dream_job_empty_consolidations_completes_noop_without_memory_write_or_chat(monkeypatch):
     captured, job = _install_dream_job_harness(
         monkeypatch,
@@ -4763,6 +4842,11 @@ def test_dream_job_bad_json_fails_without_crash_or_memory_write(monkeypatch):
     assert captured["post_called"] is False
     assert _dream_final_status(captured)[:3] == ("dream_dispatch", "failed", "no_json_object")
     assert _dream_final_status(captured)[3]["extra"]["noop_reason"] == "no_json_object"
+    assert [row["type"] for row in captured["traces"]][-2:] == [
+        "memory.dream.model.error",
+        "memory.dream.error",
+    ]
+    assert captured["traces"][-1]["detail"]["outcome"] == "parse_rejected"
 
 
 def test_process_proactive_v2_wake_routes_without_gate_judgment(monkeypatch):

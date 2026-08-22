@@ -169,6 +169,7 @@ from memory.capture_prompt_v1 import (
     sanitize_user_name,
 )
 from identity.user_naming import transcript_speaker_label
+from memory_garden import dream_trace as memory_dream_trace
 from memory_garden.text import card_guard
 from memory_garden.guards import dream_gates as memory_dream_gates
 from memory_garden.prompts.buckets import normalize_bucket_language
@@ -16249,6 +16250,52 @@ def _dream_actions_from_consolidations(
     return actions, cards_merged, cards_thickened, cards_superseded, len(organized_ids), merged_count
 
 
+def _emit_resident_dream_lifecycle(
+    event_type: str,
+    *,
+    job_id: str,
+    status: str,
+    outcome: str,
+    started_at: float,
+    degraded_context: bool = False,
+    counts: dict | None = None,
+) -> None:
+    """Emit one content-free, job-correlated resident Dream observation."""
+    _emit_debug_trace(
+        "memory",
+        event_type,
+        status=status,
+        summary="",
+        explain="",
+        detail=memory_dream_trace.detail(
+            runtime="resident_v1",
+            outcome=outcome,
+            degraded_context=degraded_context,
+            counts=counts,
+        ),
+        trace_id=job_id,
+        job_id=job_id,
+        dur_ms=max(0.0, (time.monotonic() - started_at) * 1000.0),
+    )
+
+
+def _emit_resident_dream_context_error(job_id: str) -> None:
+    _emit_debug_trace(
+        "memory",
+        memory_dream_trace.CONTEXT_TRACE_TYPE,
+        status="warning",
+        summary="",
+        explain="",
+        detail=memory_dream_trace.context_detail(
+            runtime="resident_v1",
+            component="memory_context",
+            outcome="unavailable",
+        ),
+        trace_id=job_id,
+        job_id=job_id,
+    )
+
+
 def _process_dream_jobs(jobs: list) -> float:
     """Realize memory_dream jobs through the native resident agent.
 
@@ -16273,8 +16320,32 @@ def _process_dream_jobs(jobs: list) -> float:
         except Exception as e:
             log.error("dream job claim failed id=%s: %s", job_id, e)
             continue
+        dream_started = time.monotonic()
+        dream_counts = {"active_cards": 0}
+        _emit_resident_dream_lifecycle(
+            "memory.dream.start",
+            job_id=job_id,
+            status="ok",
+            outcome="started",
+            started_at=dream_started,
+            counts=dream_counts,
+        )
         update_proactive_job_status(job_id, "realizing")
-        cards_text, card_map = _dream_cards_context()
+        try:
+            cards_text, card_map = _dream_cards_context()
+        except Exception:
+            _emit_resident_dream_context_error(job_id)
+            _emit_resident_dream_lifecycle(
+                "memory.dream.error",
+                job_id=job_id,
+                status="error",
+                outcome="context_unavailable",
+                started_at=dream_started,
+                degraded_context=True,
+                counts=dream_counts,
+            )
+            raise
+        dream_counts["active_cards"] = len(card_map)
         if not card_map:
             update_proactive_job_status(
                 job_id,
@@ -16287,6 +16358,14 @@ def _process_dream_jobs(jobs: list) -> float:
                     "questions": [],
                     "noop_reason": "dream_no_cards_available",
                 },
+            )
+            _emit_resident_dream_lifecycle(
+                "memory.dream.done",
+                job_id=job_id,
+                status="ok",
+                outcome="noop",
+                started_at=dream_started,
+                counts=dream_counts,
             )
             continue
         _identity, ai_name, user_name, _identity_text = _capture_identity_context()
@@ -16302,6 +16381,14 @@ def _process_dream_jobs(jobs: list) -> float:
         # known_ids = 喂进 prompt 的那批卡的 id:result 字段里出现任何一个即
         # 「把整理注记当成内容」(usr_a40e 墓碑卡),与内容闸同路打回重问。
         dream_known_ids = frozenset(card_map)
+        _emit_resident_dream_lifecycle(
+            "memory.dream.model.start",
+            job_id=job_id,
+            status="ok",
+            outcome="started",
+            started_at=dream_started,
+            counts=dream_counts,
+        )
         try:
             (consolidations, questions, err), bounce = _memory_agent_parse_with_bounce(
                 prompt,
@@ -16328,7 +16415,26 @@ def _process_dream_jobs(jobs: list) -> float:
                     "noop_reason": reason,
                 },
             )
+            dream_counts["model_attempts"] = 1
+            _emit_resident_dream_lifecycle(
+                "memory.dream.model.error",
+                job_id=job_id,
+                status="error",
+                outcome="provider_failed",
+                started_at=dream_started,
+                counts=dream_counts,
+            )
+            _emit_resident_dream_lifecycle(
+                "memory.dream.error",
+                job_id=job_id,
+                status="error",
+                outcome="provider_failed",
+                started_at=dream_started,
+                counts=dream_counts,
+            )
             continue
+        dream_counts["model_attempts"] = 2 if bounce else 1
+        dream_counts["proposals"] = len(consolidations or [])
         if err:
             update_proactive_job_status(
                 job_id,
@@ -16342,7 +16448,33 @@ def _process_dream_jobs(jobs: list) -> float:
                     "noop_reason": err,
                 },
             )
+            model_outcome = memory_dream_trace.reason_outcome(err)
+            _emit_resident_dream_lifecycle(
+                "memory.dream.model.error",
+                job_id=job_id,
+                status="error",
+                outcome=model_outcome,
+                started_at=dream_started,
+                counts=dream_counts,
+            )
+            _emit_resident_dream_lifecycle(
+                "memory.dream.error",
+                job_id=job_id,
+                status="error",
+                outcome=model_outcome,
+                started_at=dream_started,
+                counts=dream_counts,
+            )
             continue
+
+        _emit_resident_dream_lifecycle(
+            "memory.dream.model.done",
+            job_id=job_id,
+            status="ok",
+            outcome=("accepted" if consolidations else "no_proposals"),
+            started_at=dream_started,
+            counts=dream_counts,
+        )
 
         user_token_residual = sum(
             count_user_token_residuals(row.get("result") or {})
@@ -16371,10 +16503,19 @@ def _process_dream_jobs(jobs: list) -> float:
                 },
             )
             log.info("dream job completed noop id=%s questions=%d", job_id, len(questions))
+            _emit_resident_dream_lifecycle(
+                "memory.dream.done",
+                job_id=job_id,
+                status="ok",
+                outcome="noop",
+                started_at=dream_started,
+                counts=dream_counts,
+            )
             continue
         # 2026-08-05 复盘拆掉了这里的逐提案语义审查(弱模型自审自查既误放也
         # 误杀,每条提案还多烧一次调用)。出口防线现在全部是确定性的:parse 层
         # 的内容闸+卡id泄漏闸、mapper 的结构判据、爆炸半径保险丝。
+        dream_stage = "mapping"
         try:
             occurred_at = _format_message_time(time.time())
             (
@@ -16389,6 +16530,12 @@ def _process_dream_jobs(jobs: list) -> float:
                 card_map=card_map,
                 occurred_at=occurred_at,
             )
+            dream_counts.update({
+                "actions": len(actions),
+                "organized": organized_count,
+                "merged": merged_count,
+            })
+            dream_stage = "write"
             memory_result = execute_memory_actions(actions)
         except ValueError as e:
             reason = str(e) or "dream_invalid_memory_action"
@@ -16405,6 +16552,20 @@ def _process_dream_jobs(jobs: list) -> float:
                     "noop_reason": reason,
                     "memory_action_status": {"status": "failed", "reason": reason},
                 },
+            )
+            _emit_resident_dream_lifecycle(
+                "memory.dream.error",
+                job_id=job_id,
+                status="error",
+                outcome=(
+                    "write_failed"
+                    if dream_stage == "write"
+                    else "guard_rejected"
+                    if reason == "dream_blast_radius_exceeded"
+                    else "mapping_rejected"
+                ),
+                started_at=dream_started,
+                counts=dream_counts,
             )
             continue
         except Exception as e:
@@ -16423,8 +16584,21 @@ def _process_dream_jobs(jobs: list) -> float:
                     "memory_action_status": {"status": "failed", "reason": str(e)[:500]},
                 },
             )
+            _emit_resident_dream_lifecycle(
+                "memory.dream.error",
+                job_id=job_id,
+                status="error",
+                outcome=("write_failed" if dream_stage == "write" else "failed"),
+                started_at=dream_started,
+                counts=dream_counts,
+            )
             continue
         observation = _memory_batch_observation(actions, memory_result)
+        dream_counts.update({
+            "applied": observation["applied_count"],
+            "skipped": observation["skipped_count"],
+            "failed": observation["failed_count"],
+        })
         if observation["status"] == "failed":
             update_proactive_job_status(
                 job_id,
@@ -16450,6 +16624,14 @@ def _process_dream_jobs(jobs: list) -> float:
                     "questions": questions,
                     "noop_reason": "dream_memory_actions_failed",
                 },
+            )
+            _emit_resident_dream_lifecycle(
+                "memory.dream.error",
+                job_id=job_id,
+                status="error",
+                outcome="write_rejected",
+                started_at=dream_started,
+                counts=dream_counts,
             )
             continue
         update_proactive_job_status(
@@ -16502,6 +16684,14 @@ def _process_dream_jobs(jobs: list) -> float:
             cards_merged,
             cards_superseded,
             len(questions),
+        )
+        _emit_resident_dream_lifecycle(
+            "memory.dream.done",
+            job_id=job_id,
+            status=("warning" if observation["failed_count"] else "ok"),
+            outcome=("partial" if observation["failed_count"] else "applied"),
+            started_at=dream_started,
+            counts=dream_counts,
         )
     return latest
 
