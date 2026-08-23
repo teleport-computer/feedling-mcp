@@ -15,7 +15,9 @@ ASGI app.
 """
 from __future__ import annotations
 
+import ast
 import asyncio
+import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -84,6 +86,79 @@ def _beijing_today():
 def _cells(**filters) -> list[dict]:
     payload = db.admin_lane_rollup(**filters)
     return payload["rows"]
+
+
+def test_v1_freezer_uses_shared_terminal_predicates_without_sql_copies():
+    """The freezer must reference both shared predicates, never recopy words."""
+    source = Path(db.__file__).read_text()
+    module = ast.parse(source)
+    freezer = next(
+        node for node in module.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_lane_rollup_freeze_resident_day"
+    )
+    referenced_names = {
+        node.id for node in ast.walk(freezer) if isinstance(node, ast.Name)
+    }
+    assert {
+        "_LANE_ROLLUP_V1_OK_PRED",
+        "_LANE_ROLLUP_V1_FAIL_PRED",
+    } <= referenced_names
+
+    predicate_source = (
+        db._LANE_ROLLUP_V1_OK_PRED + db._LANE_ROLLUP_V1_FAIL_PRED
+    )
+    terminal_words = {
+        word
+        for word in re.findall(r"'([^']*)'", predicate_source)
+        if word not in {"", "status"}
+    }
+    assert terminal_words, "共享 V1 谓词必须导出非空终态词表"
+
+    handwritten = []
+    for node in ast.walk(freezer):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            continue
+        value = node.value
+        # ``completed`` / ``failed`` are also durable rollup count-column
+        # names.  Remove only those two lawful output-name positions before
+        # looking for copied status vocabulary; do not exempt the whole SQL
+        # literal, because a handwritten predicate could live beside them.
+        value = re.sub(
+            r"\bAS\s+(?:completed|failed)\b",
+            "AS <terminal_count>",
+            value,
+            flags=re.IGNORECASE,
+        )
+
+        def strip_rollup_insert_columns(match):
+            columns = re.sub(
+                r"\b(?:completed|failed)\b",
+                "<terminal_count>",
+                match.group(2),
+                flags=re.IGNORECASE,
+            )
+            return match.group(1) + columns + match.group(3)
+
+        value = re.sub(
+            r"(INSERT\s+INTO\s+lane_daily_rollup\s*\()(.*?)(\)\s*SELECT)",
+            strip_rollup_insert_columns,
+            value,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        copied_words = sorted(
+            word for word in terminal_words
+            if re.search(
+                rf"(?<![A-Za-z0-9_]){re.escape(word)}(?![A-Za-z0-9_])",
+                value,
+            )
+        )
+        if copied_words:
+            handwritten.append((node.value.strip(), copied_words))
+    assert not handwritten, (
+        "V1 freezer 不得重抄共享谓词的终态词；必须复用 OK/FAIL 谓词："
+        f"{handwritten!r}"
+    )
 
 
 @pytest.fixture()
