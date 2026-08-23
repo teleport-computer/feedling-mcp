@@ -24,14 +24,15 @@ from bootstrap import gates as boot_gates
 from core import util as core_util
 from identity import service as identity_service
 from identity.user_naming import _naming_rule, rewrite_user_reference, sanitize_user_name
-from memory_garden.text import card_guard
-from memory_garden.prompts.buckets import normalize_bucket_language
+from memgarden.text import card_guard
+from memgarden.prompts.buckets import normalize_bucket_language
 from memory import service as memory_service
-from memory_garden import timestamps as memory_timestamps
+from memgarden import timestamps as memory_timestamps
 import provider_client
 from hosted import config_store as hosted_config_store
 from notices import core as notices
 from notices import catalog
+from memory.card_leak_signals import IO_LEAK_SIGNALS
 
 
 def _history_job_kind(job_id: str) -> str:
@@ -2479,11 +2480,11 @@ def _append_import_memory_cards(store: UserStore, cards: list[dict]) -> list[dic
         # 整卡;桶脏 → 降级到按语言的默认桶;threads 逐项丢脏留净。history-import 是绕过
         # actions 层的直写路径(codex plan_review 抓到的第 14 条 producer lane)。
         if _guard_on and (
-            card_guard.field_pollution_reason(summary) or card_guard.field_pollution_reason(content)
+            card_guard.field_pollution_reason(summary, IO_LEAK_SIGNALS) or card_guard.field_pollution_reason(content, IO_LEAK_SIGNALS)
         ):
             continue
         bucket = str(card.get("bucket") or "").strip()[:80]
-        if _guard_on and bucket and card_guard.bucket_pollution_reason(bucket):
+        if _guard_on and bucket and card_guard.bucket_pollution_reason(bucket, IO_LEAK_SIGNALS):
             # 污染桶 → 按语言的本地化默认桶。
             bucket = card_guard.default_bucket_for_text(f"{summary}\n{content}")
         elif not bucket:
@@ -2494,7 +2495,7 @@ def _append_import_memory_cards(store: UserStore, cards: list[dict]) -> list[dic
             bucket = normalize_bucket_language(bucket, f"{summary}\n{content}")
         threads_in = [str(item).strip()[:80] for item in (card.get("threads") or []) if str(item or "").strip()]
         if _guard_on:
-            threads_in = [t for t in threads_in if not card_guard.field_pollution_reason(t)]
+            threads_in = [t for t in threads_in if not card_guard.field_pollution_reason(t, IO_LEAK_SIGNALS)]
         body = {
             "summary": summary,
             "content": content,

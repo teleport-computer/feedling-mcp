@@ -12,7 +12,7 @@ import pathlib
 
 import pytest
 
-from memory_garden.policies import (
+from memgarden.policies import (
     CURATED_ARCHIVE,
     DEFAULT_POLICY,
     POLICIES,
@@ -41,13 +41,13 @@ def test_curated_archive_keeps_everything():
     assert p.max_cards is None, "用户整理的档案宁多勿漏，不能有张数上限"
     assert p.keep_dates is True, "档案里的日期要原样保留"
     assert p.seed_threads_from_tags is True
-    assert "宁多勿漏" in p.selection_rubric
+    assert "When in doubt, keep it" in p.selection_rubric
 
 
 def test_history_import_filters_one_off_events():
     p = get_policy("history_import")
-    assert "一次性事件" in p.selection_rubric
-    assert "闲聊" in p.selection_rubric
+    assert "one-off events" in p.selection_rubric
+    assert "small talk" in p.selection_rubric
 
 
 def test_rubrics_are_all_different():
@@ -62,7 +62,7 @@ def test_conversation_and_archive_are_opposites():
     archive = get_policy("curated_archive")
     assert chat.max_cards is not None and archive.max_cards is None
     assert "Fewer, not more" in chat.selection_rubric
-    assert "宁多勿漏" in archive.selection_rubric  # 档案档仍是中文（走 genesis，这批没动）
+    assert "When in doubt, keep it" in archive.selection_rubric
 
 
 @pytest.mark.parametrize("empty", [None, "", "   "])
@@ -105,7 +105,7 @@ def test_policies_are_immutable():
 
 def test_language_rule_is_shared_text_with_only_the_basis_swapped():
     """措辞/举例/标点全共用，只有「依据」不同 —— 那是必要差异，不是不一致。"""
-    from memory_garden.policies import language_rule
+    from memgarden.policies import language_rule
 
     chat = language_rule("conversation_capture")
     imported = language_rule("history_import")
@@ -129,7 +129,7 @@ def test_language_rule_is_conditional_not_unconditional():
     后半句无条件生效会加剧「英文用户拿到中文卡」。
     （codex review 2026-08-14 指出。）
     """
-    from memory_garden.policies import language_rule
+    from memgarden.policies import language_rule
 
     text = language_rule("conversation_capture")
     assert "mostly Chinese, write Chinese" in text
@@ -149,7 +149,7 @@ def test_mixed_language_material_unifies_the_taxonomy_language():
     桶/线索是分类键，裂开等于同一类记忆被拆成两堆；而
     ``normalize_bucket_language`` 按每张卡自己的文字归一化，兜不住跨卡分裂。
     """
-    from memory_garden.policies import language_rule
+    from memgarden.policies import language_rule
 
     for policy in ("conversation_capture", "history_import", "curated_archive"):
         text = language_rule(policy)
@@ -159,8 +159,8 @@ def test_mixed_language_material_unifies_the_taxonomy_language():
         assert "each fact" not in text, (
             f"{policy} 又回到按条判语言 —— 这会让同一个桶裂成两种语言"
         )
-        assert "工作" in text and "Work" in text, (
-            f"{policy} 丢了「不能『工作』和 Work 并存」这个具体反例"
+        assert "never let the same bucket exist in two" in text, (
+            f"{policy} 丢了「同一个桶不许两种语言并存」这条"
         )
     assert "Keep proper nouns" in text
 
@@ -173,7 +173,7 @@ def test_language_rule_rejects_unknown_policy_like_get_policy_does():
     """
     import pytest as _pytest
 
-    from memory_garden.policies import UnknownPolicyError, language_rule
+    from memgarden.policies import UnknownPolicyError, language_rule
 
     with _pytest.raises(UnknownPolicyError):
         language_rule("nonexistent")
@@ -183,29 +183,32 @@ def test_language_rule_rejects_unknown_policy_like_get_policy_does():
 
 
 def test_language_rule_is_wired_into_both_sides():
-    """语言规则已接线：capture 与 genesis 都从本模块取，不再各写一份。
+    """语言规则只有一份：capture（内核里）与 genesis（io 侧）都从 policies 取。
 
-    这是本批真正消除的第二处重复（第一处是 curated_archive 的两段）。
+    ⚠️ 2026-08-23 起内核是外部包，读不到它的源文件了 —— capture 那一半改为**行为**
+    断言（渲染出来的提示词里含 policies 出的那段），genesis 那一半仍读 io 的源码。
     """
     import pathlib
 
+    from memgarden.policies import language_rule
+    from memgarden.prompts.capture import build_capture_prompt
+
+    prompt = build_capture_prompt(
+        ai_name="io", user_name="老王", naming_rule="叫他老王。", buckets="工作",
+        threads="", identity="", window="hi", cards="", locale="zh-Hans",
+    )
+    rule = language_rule("conversation_capture", locale="zh-Hans",
+                         indent="     ", first_prefix="   · ")
+    assert rule in prompt, "capture 的提示词里没有 policies 出的那段语言规则"
+
     root = pathlib.Path(__file__).resolve().parents[1] / "backend"
-    capture_src = (root / "memory_garden" / "prompts" / "capture.py").read_text(encoding="utf-8")
     genesis_src = (root / "genesis" / "prompts.py").read_text(encoding="utf-8")
-
-    assert "{language_rule}" in capture_src, "capture 模板没有语言占位符"
-    assert "policies_language_rule" in capture_src, "capture 没调 language_rule"
     assert "mg_policies.language_rule" in genesis_src, "genesis 没调 language_rule"
-
-    # 两边都不许再出现内联的旧文本
-    for name, src in (("capture", capture_src), ("genesis", genesis_src)):
-        assert "用 TA 跟你对话的语言记" not in src, f"{name} 里还留着旧的内联文本"
-        assert "用素材原文的语言——中文素材" not in src, f"{name} 里还留着旧的内联文本"
-
+    assert "用素材原文的语言——中文素材" not in genesis_src, "genesis 里还留着旧的内联文本"
 
 def test_language_basis_reads_as_a_relationship_not_a_placeholder():
     """对话语言以双方关系表达，不再用内部占位词指用户。"""
-    from memory_garden.policies import language_rule
+    from memgarden.policies import language_rule
 
     assert "the language of your conversation" in language_rule("conversation_capture")
     assert "the language of the source material" in language_rule("history_import")
@@ -222,7 +225,7 @@ def test_genesis_keep_all_comes_from_policies_not_its_own_copy():
     这条一旦红，说明有人在 genesis 那边又写回了一份字面量。
     """
     from genesis import prompts as gp
-    from memory_garden.policies import KEEP_ALL_MAP_SUFFIX, KEEP_ALL_WRITE_SUFFIX
+    from memgarden.policies import KEEP_ALL_MAP_SUFFIX, KEEP_ALL_WRITE_SUFFIX
 
     assert gp.FACT_MAP_KEEP_ALL_SUFFIX == "\n\n" + KEEP_ALL_MAP_SUFFIX
     assert gp.FACT_WRITE_KEEP_ALL_SUFFIX == "\n\n" + KEEP_ALL_WRITE_SUFFIX
@@ -236,7 +239,7 @@ def test_history_import_is_also_single_source_now():
     又不移动任何文本。
     """
     from genesis import prompts as gp
-    from memory_garden.policies import (
+    from memgarden.policies import (
         HISTORY_IMPORT_FILTER_RUBRIC,
         HISTORY_IMPORT_OPENING_RUBRIC,
     )
@@ -250,15 +253,16 @@ def test_history_import_is_also_single_source_now():
     # genesis 里不许再出现字面量副本
     src = pathlib.Path(__file__).resolve().parents[1] / "backend" / "genesis" / "prompts.py"
     text = src.read_text(encoding="utf-8")
-    assert "闲聊/临时情绪/玩笑/未确认猜测/一次性事件不抽。" not in text, "字面量副本又写回来了"
+    assert "Do not extract small talk, passing moods, jokes" not in text.split("{__FILTER__}")[0], "字面量副本又写回来了"
 
 
 #: genesis 三个 prompt 的字节 golden。逐行 `in` 判断抓不住重排 / 重复 / 插入，
 #: 所以这里用完整哈希（codex review 2026-08-14 指出原守卫不够）。
 #: **有意改 prompt 时更新这些值，并在提交说明里写清改了什么、为什么。**
+#: 2026-08-23 提示词英文化后重算。上一代摘要对应的是中文版本。
 _GENESIS_PROMPT_GOLDEN = {
-    "FACT_MAP_PROMPT": "26dd13bcc54e83ac",
-    "COMBINED_MAP_PROMPT": "1f0721abc7aa00e6",
+    "FACT_MAP_PROMPT": "8a666759e592a301",
+    "COMBINED_MAP_PROMPT": "39fac759f4115bba",
 }
 
 
@@ -277,12 +281,17 @@ def test_genesis_prompt_is_byte_identical_to_golden(name):
     )
 
 
-def test_keep_all_text_keeps_genesis_original_punctuation():
-    """逐字保留意味着连半角标点都不许「顺手改成全角」—— 那也是改 prompt。"""
-    from memory_garden.policies import KEEP_ALL_MAP_SUFFIX
+def test_keep_all_text_states_both_halves_of_the_rule():
+    """档案档的两半意思都要在：这是手工整理的档案（不是聊天记录）+ 宁多勿漏。
 
-    assert "不是聊天记录:" in KEEP_ALL_MAP_SUFFIX, "半角冒号被改掉了"
-    assert "宁多勿漏。" in KEEP_ALL_MAP_SUFFIX
+    ⚠️ 2026-08-23 之前这条守的是**半角冒号**（那时 genesis 有一份逐字副本，
+    标点改了就是改 prompt）。英文化之后逐字副本早已消除、标点不再是判据，
+    改成守语义 —— 守一个已经没有对照物的标点，只是让测试看起来还在工作。
+    """
+    from memgarden.policies import KEEP_ALL_MAP_SUFFIX
+
+    assert "not a chat log" in KEEP_ALL_MAP_SUFFIX
+    assert "When in doubt, keep it" in KEEP_ALL_MAP_SUFFIX
 
 
 # --------------------------------------------------------------------------- #
@@ -315,7 +324,7 @@ def test_max_cards_is_actually_enforced_not_just_declared():
     codex review 2026-08-14 实测：此前传 3 张卡返回 3 张，max_cards 声明了
     却没有任何调用方消费 —— 三个档位只是「描述数据」，不是可执行策略。
     """
-    from memory_garden.prompts.capture import parse_capture_cards
+    from memgarden.prompts.capture import parse_capture_cards
 
     cards, err = parse_capture_cards(_cards_json(3))
     assert cards == []
@@ -324,7 +333,7 @@ def test_max_cards_is_actually_enforced_not_just_declared():
 
 def test_over_limit_is_a_full_batch_retry_not_a_silent_truncation():
     """超限要打回重做整批，而不是静默截掉第三张 —— 截断会丢内容且无人知晓。"""
-    from memory_garden.prompts.capture import parse_capture_cards
+    from memgarden.prompts.capture import parse_capture_cards
 
     _, err = parse_capture_cards(_cards_json(3), strict=True)
     assert "too_many_cards" in err
@@ -334,7 +343,7 @@ def test_after_retry_keeps_the_first_n_instead_of_failing_the_whole_job():
     """重问后仍超：保留前 N 张。**不能**整批失败 ——
     那会推进 capture frontier 把这段对话永久丢掉（与内容闸同一教训）。
     """
-    from memory_garden.prompts.capture import parse_capture_cards
+    from memgarden.prompts.capture import parse_capture_cards
 
     cards, err = parse_capture_cards(_cards_json(3), strict=False)
     assert len(cards) == 2 and err is None
@@ -342,7 +351,7 @@ def test_after_retry_keeps_the_first_n_instead_of_failing_the_whole_job():
 
 def test_unlimited_policies_do_not_truncate():
     """用户整理的档案不限张数 —— 传 3 张就该留 3 张。"""
-    from memory_garden.prompts.capture import parse_capture_cards
+    from memgarden.prompts.capture import parse_capture_cards
 
     for name in ("curated_archive", "history_import"):
         cards, err = parse_capture_cards(_cards_json(3), policy=name)
@@ -351,7 +360,7 @@ def test_unlimited_policies_do_not_truncate():
 
 def test_within_limit_is_untouched():
     """没超限的批次行为完全不变（守住绝大多数正常路径）。"""
-    from memory_garden.prompts.capture import parse_capture_cards
+    from memgarden.prompts.capture import parse_capture_cards
 
     for n in (0, 1, 2):
         cards, err = parse_capture_cards(_cards_json(n))
@@ -373,7 +382,7 @@ def test_voice_call_header_quotes_a_phrase_that_is_actually_in_the_prompt():
 
     引用方现在用 RESTRAINT_RULE_QUOTE 常量，这条守住常量与 rubric 不脱节。
     """
-    from memory_garden.policies import RESTRAINT_RULE_QUOTE, get_policy
+    from memgarden.policies import RESTRAINT_RULE_QUOTE, get_policy
     from voice.transcript_store import capture_window_header
 
     rubric = get_policy("conversation_capture").selection_rubric

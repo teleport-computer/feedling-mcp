@@ -16,8 +16,8 @@ from fastapi import APIRouter
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from memory_garden import observability as mg_observability
-from memory_garden.scoring.relevance import (
+from memgarden import observability as mg_observability
+from memgarden.scoring.relevance import (
     select_context_memories,
     select_context_memories_with_trace,
 )

@@ -4106,7 +4106,7 @@ the one prod user actually do to migrate to E2E?".
   garden after a successful flip.
 - Chat is intentionally skipped — many items, transient; the
   "hide from agent" affordance matters more on persistent
-  memory-garden entries.
+  memgarden entries.
 
 **Inline migration progress**
 - `FeedlingAPI` gains `@Published migrationProgress: (done, total)?`.

@@ -35,7 +35,7 @@ from bootstrap import gates as boot_gates
 from core import store as core_store
 from core import util as core_util
 from identity import service as identity_service
-from memory_garden import dream_trace as memory_dream_trace
+from memory import dream_trace as memory_dream_trace
 
 
 _PROVIDER_ATTEMPT_STREAM = "provider_attempts"
@@ -9045,6 +9045,7 @@ _DEBUG_STEP_LABELS = {
     "route.decided": ("🧭", "路由决策"),
     "context.build": ("📎", "组装上下文"),
     "memory.inject": ("🧠", "自动注入记忆"),
+    "memory.capture.language": ("🌐", "落卡语言判定"),
     "memory.dream.tick": ("🌙", "做梦判定"),
     "memory.dream.start": ("🌙", "记忆整理 · 开始"),
     "memory.dream.model.start": ("🧠", "记忆整理 · 模型开始"),

@@ -23,7 +23,7 @@ from typing import Any, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from chat.reply_language import infer_reply_language_policy, local_time_labels
-from core import self_thinking
+from agent_protocol_core import self_thinking
 import worldbook_match
 from voice.message_filter import VOICE_CALL_RECORD_ROLE, conversation_rows
 from identity import card_policy

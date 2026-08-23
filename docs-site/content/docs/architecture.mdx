@@ -849,6 +849,38 @@ job; they are removed by explicit owning job/account deletion. Keep provider
 review opt-in until a BYOK budget and retention/GC policy are chosen. Turning
 review off never turns trajectory capture off.
 
+## Build-time supply chain for the memory kernel
+
+The memory system's judgment layer — what is worth remembering, which bucket a
+card belongs to, which cards to recall for a turn, and when to consolidate — is
+an external package (`memgarden`, Apache-2.0, source at
+`github.com/teleport-computer/memgarden`). It is not vendored into this
+repository.
+
+It is installed at image build time from a versioned GitHub Release wheel pinned
+by sha256 in `backend/requirements.lock`, alongside its only non-stdlib
+dependency (`agent-protocol-core`). The installed bytes therefore end up inside
+the measured image like any other dependency, and the compose hash published
+on-chain covers them.
+
+What the hash pin does and does not establish:
+
+| | |
+| --- | --- |
+| Guaranteed | The wheel installed in a build is byte-identical to the reviewed artifact. Replacing the Release asset under the same URL fails the build rather than silently swapping the package. |
+| Not guaranteed | That those bytes were produced from the source at the public tag. The tag is not signed and there is no build provenance attestation yet, so a repository administrator could publish a wheel that does not match the tagged source. |
+
+Two operational consequences follow. A cold build now requires egress to
+`github.com` and `release-assets.githubusercontent.com`; if the Release asset is
+deleted, builds fail loudly rather than falling back. And upgrading the kernel is
+a deliberate, reviewable change: a new Release, a new URL and hash in the lock,
+and a normal pull request.
+
+The kernel is pure judgment: no network, no database, no filesystem, and no
+access to plaintext beyond the strings the host passes in. Encryption, key
+handling, storage, scheduling, identity assembly, and audit remain in this
+repository and are unaffected by this change.
+
 ## Managed and self-hosted trust models
 
 | Deployment | Confidential-compute guarantee | Appropriate boundary |

@@ -37,6 +37,18 @@ change must not be interpreted as an API guarantee.
   normal HTML/tokenizer discussion; suppression is intentionally whole-message
   only.
 
+- **The memory judgment kernel is now an external, source-available package.**
+  What is worth remembering, bucket assignment, per-turn recall, and
+  consolidation timing moved out of this repository into `memgarden`
+  (Apache-2.0). It is installed at image build time from a version-pinned,
+  hash-locked GitHub Release wheel, so the code still ends up inside the
+  measured image and under the on-chain compose hash. Self-hosters should note
+  that a cold build now needs egress to `github.com`, and that the pinned lock
+   must be used rather than resolving the dependency loosely. The hash pin
+   guarantees the installed bytes match the reviewed artifact; it does not yet
+   attest that those bytes were built from the tagged source. No API contract
+   changes.
+
 - **Hosted Runtime V2 now stops tool-only loops before the hard provider-call
   limit.** After a configurable number of consecutive responses containing only
   tool calls and no visible text (`FEEDLING_V2_MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS`,

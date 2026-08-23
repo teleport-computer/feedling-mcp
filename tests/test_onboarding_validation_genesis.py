@@ -78,8 +78,8 @@ def test_model_api_validate_uses_processing_genesis_job_for_onboarding_steps(mon
     assert "蒸馏" not in pending_required
     assert steps["history_import"]["messages_parsed"] == 120
     assert steps["history_import"]["timeline_span_days"] == 9
-    assert steps["memory_garden"]["passing"] is True
-    assert steps["memory_garden"]["required"] == ""
+    assert steps["memgarden"]["passing"] is True
+    assert steps["memgarden"]["required"] == ""
     assert steps["identity_card"]["passing"] is False
     assert steps["relationship_anchor"]["passing"] is False
     assert steps["hosted_chat"]["passing"] is False
@@ -148,7 +148,7 @@ def test_model_api_validate_failed_job_keeps_artifacts_lit_but_overall_fails(mon
 
     assert steps["identity_card"]["passing"] is True          # landed artifact stays lit
     assert steps["relationship_anchor"]["passing"] is True
-    assert steps["memory_garden"]["passing"] is True
+    assert steps["memgarden"]["passing"] is True
     assert steps["history_import"]["passing"] is False         # overall anchor fails
     assert body["passing"] is False                            # onboarding still fails
     assert body["stage"] == "history_import"
@@ -254,8 +254,8 @@ def test_model_api_validate_marks_genesis_done_steps_complete(monkeypatch):
     assert body["stage"] == "complete"
     assert body["passing"] is True
     assert steps["history_import"]["passing"] is True
-    assert steps["memory_garden"]["passing"] is True
-    assert steps["memory_garden"]["memory_action_count"] == 2
+    assert steps["memgarden"]["passing"] is True
+    assert steps["memgarden"]["memory_action_count"] == 2
     assert steps["identity_card"]["passing"] is True
     assert steps["relationship_anchor"]["passing"] is True
     assert steps["hosted_chat"]["passing"] is True

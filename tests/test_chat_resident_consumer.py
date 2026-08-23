@@ -405,7 +405,7 @@ def test_v1_foreground_self_thinking_skips_only_exact_fable(
          patch.object(crc, "post_reply", return_value={"id": "reply-msg-fable"}):
         result_ts = crc._process_messages([msg])
 
-    from core import self_thinking
+    from agent_protocol_core import self_thinking
 
     assert result_ts == pytest.approx(1112.75)
     instruction_present = self_thinking.INSTRUCTION.strip() in captured["message"]
@@ -12641,7 +12641,7 @@ def test_thinking_denylist_calls_through_to_shared_vocabulary(monkeypatch):
       · sentinel 行被丢 → 证明真的走了共享 helper
       · 旧词表的词在替身下不被误判 → 证明没有第二个词表来源
     """
-    from core import self_thinking
+    from agent_protocol_core import self_thinking
 
     monkeypatch.setattr(
         self_thinking, "internal_field_terms_pattern", lambda: "(zzsentinelzz)"
@@ -12803,7 +12803,7 @@ def test_wake_templates_share_the_foreground_thinking_switch(monkeypatch):
 
     分开写会产生一种没人预料得到的状态:前台已经关了、主动道还在 think。
     """
-    from core import self_thinking as _st
+    from agent_protocol_core import self_thinking as _st
 
     monkeypatch.setattr(_st, "enabled", lambda: True)
     monkeypatch.setattr(crc, "_supports_mandatory_self_thinking_v1", lambda: True)

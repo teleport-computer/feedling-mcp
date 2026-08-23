@@ -23,13 +23,13 @@ import pathlib
 import pytest
 
 from memory.capture_prompt_v1 import build_capture_prompt as build_via_shell
-from memory_garden.policies import CURATED_ARCHIVE, HISTORY_IMPORT
-from memory_garden.prompts.capture import build_capture_prompt as build_via_kernel
+from memgarden.policies import CURATED_ARCHIVE, HISTORY_IMPORT
+from memgarden.prompts.capture import build_capture_prompt as build_via_kernel
 
 _FIXTURE = (
     pathlib.Path(__file__).resolve().parent
     / "fixtures"
-    / "memory_garden"
+    / "memgarden"
     / "capture_prompt_baseline.json"
 )
 
@@ -115,7 +115,7 @@ def test_prompt_is_byte_identical_to_baseline(case_name):
 @pytest.mark.parametrize("case_name", sorted(CASES))
 def test_language_block_comes_from_the_shared_rule(case_name):
     """语言段来自共用规则，且**目标语言是被指定的、不是让模型猜的**。"""
-    from memory_garden.policies import language_rule
+    from memgarden.policies import language_rule
 
     locale = CASES[case_name]["locale"]
     actual = build_via_shell(**CASES[case_name])
@@ -136,7 +136,7 @@ def test_only_one_bucket_language_is_offered(case_name):
     才需要 ``normalize_bucket_language`` 常态纠错。给模型一个它不该做的选择题，
     它就会做错。
     """
-    from memory_garden.prompts.buckets import BUCKET_SETS
+    from memgarden.prompts.buckets import BUCKET_SETS
 
     locale = CASES[case_name]["locale"]
     actual = build_via_shell(**CASES[case_name])
@@ -174,14 +174,23 @@ def test_instructions_are_english_and_only_literals_stay_chinese():
     allowed = set(
         "工作 目标与成长 家庭 朋友 宠物 我们的关系 情绪与安抚 偏好与边界 "
         "个性与价值观 健康 爱好 金钱 饮食 地点与旅行 用户 对方 争执 吵架 "
-        "妈妈 界面 留存 满意度 用户界面 用户留存 健康 简体中文 这个人 "
+        "妈妈 房子 界面 留存 满意度 用户界面 用户留存 健康 简体中文 这个人 "
         "不要用 指代本人的 猜测性别的他 也不要用第二人称 来指代本人 "
         "如果材料里明确出现了本人希望被称呼的名字 就用那个名字 "
         "没有名字时优先省略主语 例如 常在深夜写代码 累了会突然沉默 "
         "需要主语时 按身份卡 你们的关系 旧卡和对话里的线索判断性别 "
         "用 或 线索不足以判断 才用中性的".split()
     )
-    leaked = [run for run in chinese_runs if run not in allowed]
+    # 中文花园的**称谓规则整段是中文的**，这是对的：它讲的是「卡里别写哪些中文词」，
+    # 翻成英文就教不清了（英文里根本没有「用户」这个词要防）。规则由
+    # memgarden.naming.referent_rule(locale) 按语言取，所以这里整段豁免。
+    from identity.user_naming import _naming_rule
+    from memgarden.naming import referent_rule
+
+    referent_zh = set(re.findall(r"[一-鿿]{2,}", referent_rule("zh-Hans")))
+    naming_zh = set(re.findall(r"[一-鿿]{2,}", _naming_rule("老王", locale="zh-Hans")))
+    leaked = [r for r in chinese_runs
+              if r not in allowed and r not in referent_zh and r not in naming_zh]
     assert not leaked, f"这些中文说明没翻译干净：{sorted(set(leaked))}"
 
 
@@ -190,7 +199,7 @@ def test_kernel_default_and_fallbacks_match_baseline_typical(policy_name):
     """内核层：默认档与「没传」的回落产出同一份文本（除语言段外与基线一致）。
 
     注意未知名不在这里 —— 它现在会抛 UnknownPolicyError，见
-    test_memory_garden_policies.py::test_unknown_policy_name_raises。
+    test_memgarden_policies.py::test_unknown_policy_name_raises。
     """
     from identity.user_naming import _naming_rule, sanitize_user_name
 

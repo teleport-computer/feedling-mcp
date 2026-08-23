@@ -14,16 +14,17 @@ from bootstrap import gates as boot_gates
 from core import envelope as core_envelope
 from core import util as core_util
 from identity import service as identity_service
-from memory_garden.text import card_guard
-from memory_garden.text import card_text
+from memgarden.text import card_guard
+from memgarden.text import card_text
 from memory import service as memory_service
-from memory_garden import timestamps as memory_timestamps
-from memory_garden.prompts.buckets import normalize_bucket_language
+from memgarden import timestamps as memory_timestamps
+from memgarden.prompts.buckets import normalize_bucket_language
 from memory.source_policy import (
     MAX_MEMORY_SUPERSEDE_TARGETS,
     MEMORY_CAPTURE_MODE_VALUES,
     MEMORY_SOURCE_VALUES,
 )
+from memory.card_leak_signals import IO_LEAK_SIGNALS
 
 
 log = logging.getLogger(__name__)
@@ -268,12 +269,12 @@ def _memory_inner_from_action(
         # add/upgrade 走这条;supersede 的脏桶在合并前已被剔除,这里看到的是继承来的干净桶。
         # ⚠️ 语言判定用【原始】summary/content(不是合成 content —— 后者带中文「记忆:」标签,
         # 会把纯英文卡误判成中文,codex code_review Minor)。
-        if card_guard.bucket_pollution_reason(bucket):
+        if card_guard.bucket_pollution_reason(bucket, IO_LEAK_SIGNALS):
             raw_text = f"{summary}\n{str(data.get('content') or data.get('description') or '')}"
             bucket = card_guard.default_bucket_for_text(raw_text)
         # threads 也是用户可见软字段,同样可能承载残片(proactive/genesis/继承旧卡的 threads
         # 都过这里);逐项滤脏、留净(codex code_review Important:此前只 guard 了 bucket)。
-        threads = [t for t in threads if not card_guard.field_pollution_reason(t)]
+        threads = [t for t in threads if not card_guard.field_pollution_reason(t, IO_LEAK_SIGNALS)]
     # Backstop: the model still labels a Chinese card with an English common bucket (and
     # vice versa) despite the guidance. Map it back to the card's own language here.
     # ⚠️ 注意:这并非「所有写入路径的唯一关口」—— capture/dream/migrate/history-import 等
@@ -483,8 +484,8 @@ def _memory_add_action(
     if not description and mem_type not in {"quote", "event"}:
         return {"status": "error", "error": "description_required", "action": "memory.add"}, [], 400
     if card_guard.guard_enabled() and (
-        card_guard.hard_field_pollution_reason(summary)
-        or card_guard.hard_field_pollution_reason(_memory_content_from_action(raw, summary))
+        card_guard.hard_field_pollution_reason(summary, IO_LEAK_SIGNALS)
+        or card_guard.hard_field_pollution_reason(_memory_content_from_action(raw, summary), IO_LEAK_SIGNALS)
     ):
         # 硬字段混进模型原始输出/协议残片 → 整卡不落(桶脏由 _memory_inner 降级,不到这里)。
         # 查的是【真正会被存的 content】(_memory_content_from_action 优先取 content 字段),
@@ -682,8 +683,8 @@ def _memory_upgrade_action(store: UserStore, api_key: str | None, action: dict) 
     if not inner.get("summary"):
         return {"status": "error", "error": "summary_required", "action": "memory.upgrade"}, [], 400
     if card_guard.guard_enabled() and (
-        card_guard.hard_field_pollution_reason(inner.get("summary"))
-        or card_guard.hard_field_pollution_reason(inner.get("content"))
+        card_guard.hard_field_pollution_reason(inner.get("summary"), IO_LEAK_SIGNALS)
+        or card_guard.hard_field_pollution_reason(inner.get("content"), IO_LEAK_SIGNALS)
     ):
         return {"status": "error", "error": "memory_card_polluted", "action": "memory.upgrade"}, [], 400
     if _memory_tombstone_reason(inner.get("summary"), inner.get("content")):
@@ -820,19 +821,19 @@ def _memory_supersede_action(
         # (那个开关只管协议残片检测;挂上去=止血时顺手重开本事故路,codex2 P1)。
         return {"status": "error", "error": "memory_card_tombstone", "action": "memory.supersede"}, [], 400
     if card_guard.guard_enabled():
-        if card_guard.hard_field_pollution_reason(summary) or card_guard.hard_field_pollution_reason(
+        if card_guard.hard_field_pollution_reason(summary, IO_LEAK_SIGNALS) or card_guard.hard_field_pollution_reason(
             _memory_content_from_action(raw, summary)
-        ):
+        , IO_LEAK_SIGNALS):
             # 硬字段脏 → 整个 supersede 打回,旧卡保持 active(此处 return 在退休旧卡之前)。
             # 查真正会存的 content(不是 description),污染常在 content 里。
             return {"status": "error", "error": "memory_card_polluted", "action": "memory.supersede"}, [], 400
 
-        if card_guard.bucket_pollution_reason(str(raw.get("bucket") or "")):
+        if card_guard.bucket_pollution_reason(str(raw.get("bucket") or ""), IO_LEAK_SIGNALS):
             # 脏桶视为「模型没给桶」→ 从 raw 剔除,让下面的合并继承旧卡的桶,而不是用残片覆盖。
             raw = {k: v for k, v in raw.items() if k != "bucket"}
         _raw_threads = raw.get("threads")
         if isinstance(_raw_threads, list):
-            _clean_threads = [t for t in _raw_threads if not card_guard.field_pollution_reason(str(t or ""))]
+            _clean_threads = [t for t in _raw_threads if not card_guard.field_pollution_reason(str(t or ""), IO_LEAK_SIGNALS)]
             if not _clean_threads and _raw_threads:
                 # 所给 threads 全是残片 → 视为未提供 → 继承旧卡 threads(与脏桶同待遇,行为显式)。
                 raw = {k: v for k, v in raw.items() if k != "threads"}

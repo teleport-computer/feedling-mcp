@@ -30,8 +30,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from capabilities import tool_schema  # noqa: E402
 from genesis import prompts as genesis_prompts  # noqa: E402
 from memory.capture_prompt_v1 import build_capture_prompt  # noqa: E402
-from memory_garden.prompts import buckets as prompts_v1  # noqa: E402
-from memory_garden.prompts.migrate import build_migrate_prompt  # noqa: E402
+from memgarden.prompts import buckets as prompts_v1  # noqa: E402
+from memgarden.prompts.migrate import build_migrate_prompt as _kernel_build_migrate_prompt  # noqa: E402
+
+# 这批测试写在 locale 成为必填参数之前。在 import 这层绑一次默认值，
+# 而不是给 13 个调用点各加一个参数 —— 后者今晚已经弄坏过文件三次。
+# 需要测另一种语言的用例显式传 locale= 覆盖即可。
+from functools import partial as _partial  # noqa: E402
+
+build_migrate_prompt = _partial(_kernel_build_migrate_prompt, locale="zh-Hans")
+
 
 
 # --------------------------------------------------------------------------- #

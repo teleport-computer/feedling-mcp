@@ -140,7 +140,7 @@ In `tests/test_memory_migration.py`, retain `actions` and import the migrated pr
 
 ```python
 from memory import actions, migration
-from memory_garden.prompts import migrate as mp
+from memgarden.prompts import migrate as mp
 ```
 
 In `tests/test_v2_jobs_migration.py`, retain TEST's derived-head database-install checks during the merge. Task 2 will then add exact assertions for the new release head before creating the convergence revisions.
@@ -356,9 +356,9 @@ FEEDLING_TEST_PG='postgresql://postgres:test@127.0.0.1:55432/postgres' \
 ```bash
 FEEDLING_TEST_PG='postgresql://postgres:test@127.0.0.1:55432/postgres' \
   /Users/zhengzhihao/Projects/teleport/feedling-mcp/.venv-test/bin/python -m pytest \
-  tests/test_memory_garden_purity.py \
-  tests/test_memory_garden_storage_port.py \
-  tests/test_memory_garden_dreaming.py \
+  tests/test_memgarden_purity.py \
+  tests/test_memgarden_storage_port.py \
+  tests/test_memgarden_dreaming.py \
   tests/test_genesis_profile_dual_write.py \
   tests/test_genesis_identity_field_lock.py \
   tests/test_identity_actions.py \

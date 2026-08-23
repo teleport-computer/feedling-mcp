@@ -439,13 +439,14 @@ jobs:
             tests/test_route_b_card_shape_recall.py \
             tests/test_route_b_sensitive_gate.py \
             tests/test_memory_injection_observability.py \
-            tests/test_memory_garden_purity.py \
-            tests/test_memory_garden_policies.py \
-            tests/test_memory_garden_capture_golden.py \
-            tests/test_memory_garden_dream_migrate_golden.py \
-            tests/test_memory_garden_prompt_params.py \
-            tests/test_memory_garden_storage_port.py \
-            tests/test_memory_garden_dreaming.py \
+            tests/test_memgarden_is_a_real_dependency.py \
+            tests/test_card_leak_signals_wired.py \
+            tests/test_memgarden_policies.py \
+            tests/test_memgarden_capture_golden.py \
+            tests/test_memgarden_dream_migrate_golden.py \
+            tests/test_memgarden_prompt_params.py \
+            tests/test_memgarden_storage_port.py \
+            tests/test_memgarden_dreaming.py \
             -v
 
       - name: Perception kernel unit tests
@@ -1094,6 +1095,53 @@ jobs:
 
       - name: Compile all Python
         run: python -m compileall -q backend tools 2>/dev/null || python -m compileall -q backend
+
+      - name: Verify the memory kernel's build provenance
+        # 锁里的 sha256 只证明「装进镜像的字节 = Release 上那份字节」。这一步再证明
+        # 「那份字节由 memgarden 仓库的 CI 从公开 tag 编出来」—— 有仓库权限的人换掉
+        # wheel 时，哈希会变（构建直接失败）；但如果他们连哈希一起改了，只有出处
+        # 凭证能拆穿。两道合起来才是完整的一环。
+        #
+        # 失败不阻断构建（continue-on-error）：凭证是 2026-08-23 起才有的，
+        # 旧版本没有，而且 GitHub 的凭证服务挂掉不该让整条 CI 红。
+        # 但它会在 job summary 里留下明确的红字，不会静默通过。
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          python - <<'PY' > /tmp/mg_urls.txt
+          import re, pathlib
+          lock = pathlib.Path("backend/requirements.lock").read_text()
+          for line in lock.splitlines():
+              m = re.match(r"^(memgarden|agent-protocol-core) @ (\S+\.whl)", line)
+              if m:
+                  print(m.group(2))
+          PY
+          if [ ! -s /tmp/mg_urls.txt ]; then
+            echo "::error::lock 里找不到 memgarden 的 wheel URL —— 依赖形态被改过？"
+            exit 1
+          fi
+          ok=1
+          while read -r url; do
+            f="/tmp/$(basename "$url")"
+            curl -sSL -o "$f" "$url"
+            echo "--- $(basename "$f") ---"
+            if gh attestation verify "$f" --repo teleport-computer/memgarden; then
+              echo "  出处已验证"
+            else
+              echo "::warning::$(basename "$f") 没有可验证的构建出处凭证"
+              ok=0
+            fi
+          done < /tmp/mg_urls.txt
+          {
+            echo "### 记忆内核的构建出处"
+            if [ "$ok" = "1" ]; then
+              echo "✅ 两个 wheel 都能验证由 memgarden 仓库的 CI 从公开 tag 构建"
+            else
+              echo "⚠️ 有 wheel 缺少出处凭证 —— 哈希仍然锁着字节，但无法证明它由公开源码编出"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # -------------------------------------------------------------------------
   # DCAP parser — Python reference tests

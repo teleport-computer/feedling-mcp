@@ -11,7 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from core import self_thinking  # noqa: E402
+from agent_protocol_core import self_thinking  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
 from model_api_runtime.v2 import tool_loop  # noqa: E402
 from model_api_runtime.v2 import worker  # noqa: E402
@@ -1248,7 +1248,7 @@ def test_checkpoint_degradation_never_logs_arbitrary_detail_or_code(
 
 
 # ── B4-5 (#3):思考气泡的内部【字段名】黑名单 ─────────────────────────
-# 词表共享(core.self_thinking),**宽度按道分开**:
+# 词表共享(agent_protocol_core.self_thinking),**宽度按道分开**:
 #   V1 逐行丢弃 → 宽匹配;V2 整段替换成 marker → 窄匹配(只认泄漏形状)。
 
 

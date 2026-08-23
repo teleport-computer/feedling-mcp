@@ -34,7 +34,7 @@ from psycopg.types.json import Jsonb
 
 import db
 from core import wake_bus
-from memory_garden import timestamps as memory_timestamps
+from memgarden import timestamps as memory_timestamps
 from model_api_runtime.v2 import usage_reporting
 from notices import catalog as notices_catalog
 from proactive import capture_daily

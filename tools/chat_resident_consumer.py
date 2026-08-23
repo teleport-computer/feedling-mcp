@@ -158,7 +158,7 @@ from hosted import visual_transport as _visual_transport
 
 # Shared torn-protocol-JSON leak detector (backend/core, pure). backend/ is on
 # sys.path via the insert above, so it imports as a top-level `core.*` name.
-from core import protocol_leak as _protocol_leak
+from agent_protocol_core import protocol_leak as _protocol_leak
 from core import envelope as _core_envelope
 from core import tool_markup_leak as _tool_markup_leak
 from identity import card_view as _identity_card_view
@@ -176,11 +176,11 @@ from memory.capture_prompt_v1 import (
     sanitize_user_name,
 )
 from identity.user_naming import transcript_speaker_label
-from memory_garden import dream_trace as memory_dream_trace
-from memory_garden.text import card_guard
-from memory_garden.guards import dream_gates as memory_dream_gates
-from memory_garden.prompts.buckets import normalize_bucket_language
-from memory_garden.text.card_text import (
+from memory import dream_trace as memory_dream_trace
+from memgarden.text import card_guard
+from memgarden.guards import dream_gates as memory_dream_gates
+from memgarden.prompts.buckets import normalize_bucket_language
+from memgarden.text.card_text import (
     count_user_token_residuals,
     is_retryable_parse_error,
 )
@@ -189,9 +189,10 @@ from memory.dream_prompt_v1 import (
     build_dream_retry_prompt,
     parse_dream_consolidations,
 )
-from memory_garden.prompts.migrate import build_migrate_prompt, parse_migrated_cards
+from memgarden.prompts.migrate import build_migrate_prompt, parse_migrated_cards
 from chat.reply_language import (
     format_time_anchor,
+    garden_language_decision,
     infer_garden_language,
     infer_reply_language_policy,
     reply_language_system_line,
@@ -209,6 +210,7 @@ from voice.message_filter import (
     conversation_rows as _conversation_rows,
 )
 from voice import transcript_store as _voice_transcript_store
+from memory.card_leak_signals import IO_LEAK_SIGNALS
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -2396,7 +2398,7 @@ def _unmark_seen(keys) -> None:
 def _emit_injection_trace(log: dict | None) -> None:
     """把 enclave 带回来的注入记录落成一条 debug trace。
 
-    记录本身已经是内容无关的（见 memory_garden/observability.py）；
+    记录本身已经是内容无关的（见 memgarden/observability.py）；
     这里只负责转发，不再加工 —— 加工会让「什么算内容」这件事散成两处。
     失败一律吞掉：可观测性绝不能拖垮聊天。
     """
@@ -4038,13 +4040,13 @@ def _split_tagged_thinking(text: str) -> tuple[str, str]:
     plain terminal text where an upstream wrapper serialized reasoning as
     `<think>...</think>`, `<reasoning>...</reasoning>`, or `<thought>...</thought>`.
 
-    2026-08-08 起委托 ``core.self_thinking`` 的共享内核：此前 V1/V2 各一套判据、
+    2026-08-08 起委托 ``agent_protocol_core.self_thinking`` 的共享内核：此前 V1/V2 各一套判据、
     各漏各的——这条正则要求开闭成对，一个孤立的 `</think>`（开标签在上游被吃掉）
     配不上对，于是整段思考原样进了用户气泡（prod 实例）。闸关掉时保留下面的
     原正则行为，逐字节不变。
     """
     raw = str(text or "")
-    from core import self_thinking as _st
+    from agent_protocol_core import self_thinking as _st
 
     if _st.gate_enabled():
         # sanitize=False：本次统一的是剥离**判据**，V1 的展示格式（保留换行、
@@ -4573,10 +4575,10 @@ def _sanitize_thinking_summary(text: str) -> str:
     text = text.replace("\r\n", "\n").strip()
     if not text:
         return ""
-    # 词表来自共享内核(core.self_thinking.INTERNAL_FIELD_TERMS)。
+    # 词表来自共享内核(agent_protocol_core.self_thinking.INTERNAL_FIELD_TERMS)。
     # V1 的**处置**不变:仍逐行丢弃、仍用宽匹配 —— 只是不再自己维护一份字面量,
     # 「两代词表漂移」由构造消除,不必靠测试去追源码(codex2 review 2026-08-17)。
-    from core import self_thinking as _st_terms
+    from agent_protocol_core import self_thinking as _st_terms
 
     blocked = re.compile(_st_terms.internal_field_terms_pattern(), re.IGNORECASE)
     kept: list[str] = []
@@ -4679,7 +4681,7 @@ def _prefer_thinking(dst: AgentTurn, src: AgentTurn) -> None:
     if not dst.thinking_summary:
         take = True
     else:
-        from core import self_thinking as _self_thinking_v1
+        from agent_protocol_core import self_thinking as _self_thinking_v1
 
         if _self_thinking_v1.enabled():
             take = src.thinking_self_authored and not dst.thinking_self_authored
@@ -10905,7 +10907,7 @@ def _wake_self_thinking_allowed() -> bool:
     唯一堵住它的是模板那句 "Return JSON exactly in this shape",于是 App 里
     主动消息的思考链**永远是空的**。这里放开的就是这一句。
     """
-    from core import self_thinking as _self_thinking_v1
+    from agent_protocol_core import self_thinking as _self_thinking_v1
 
     return bool(_self_thinking_v1.enabled()) and _supports_mandatory_self_thinking_v1()
 
@@ -15392,7 +15394,7 @@ def _memory_agent_parse_with_bounce(
     _note_agent_turn_success()
     parsed = parse(reply_text, strict=True)
     err = parsed[-1]
-    # 谓词与 V2 的 ParseRetry.should_retry 是同一个(memory_garden.text.card_text)。两条 lane
+    # 谓词与 V2 的 ParseRetry.should_retry 是同一个(memgarden.text.card_text)。两条 lane
     # 必须共用一份判据,否则同一个模型在托管和自建上会得到不同的重问行为 ——
     # json_decode_error 以前不在重问范围,注释说它「各有自己的退避路径」,实测那条
     # 路是空的:usr_450ee421e16a3b5a 连续 6 次失败,reask_count 全是 0。
@@ -15632,10 +15634,20 @@ def _process_capture_jobs(jobs: list) -> float:
         buckets_text, threads_text = _capture_memory_terms_context()
         # 花园的分类语言。已有桶优先 —— 一个花园只用一种语言的桶，
         # 不因为这轮对话换了语言就长出并存的第二套。
-        capture_locale = infer_garden_language(
+        _lang = garden_language_decision(
             identity,
             existing_buckets=buckets_text,
             archive_language=str(_whoami_cache.get("archive_language") or "").strip(),
+        )
+        capture_locale = _lang["locale"]
+        # 落卡语言错了是「看得见症状、看不见原因」的一类问题 —— 用户只会说
+        # 「怎么变英文了」。把判定和依据落库，出问题时能直接查到当时算的是什么。
+        # 字段全部内容无关：语言标签、依据名、桶名里的字符计数（不是桶名本身）。
+        _emit_debug_trace(
+            "memory", "memory.capture.language",
+            summary=f"落卡语言 {_lang['locale']}（依据 {_lang['basis']}）",
+            explain="这轮落卡用哪种语言写卡，以及凭什么这么判。桶名本身不落库。",
+            detail=_lang,
         )
         prompt = build_capture_prompt(
             ai_name=ai_name,
@@ -16273,11 +16285,18 @@ def _process_dream_jobs(jobs: list) -> float:
         recent_text = _dream_recent_conversations_context(
             user_label=user_name, agent_label=ai_name
         )
+        _dream_buckets, _dream_threads = _capture_memory_terms_context()
         prompt = build_dream_prompt(
             ai_name=ai_name,
             user_name=user_name,
             cards=cards_text,
             recent_conversations=recent_text,
+            # 与 capture 同源：整理的是同一个花园，不能夜里换一种语言的桶。
+            locale=infer_garden_language(
+                _identity,
+                existing_buckets=_dream_buckets,
+                archive_language=str(_whoami_cache.get("archive_language") or "").strip(),
+            ),
         )
         # known_ids = 喂进 prompt 的那批卡的 id:result 字段里出现任何一个即
         # 「把整理注记当成内容」(usr_a40e 墓碑卡),与内容闸同路打回重问。
@@ -17247,6 +17266,11 @@ def _process_migrate_jobs(jobs: list) -> float:
             user_name=user_name,
             old_cards=_migrate_render_old_cards(batch),
             vocab=f"已有桶: {buckets_text}\n已有线索: {threads_text}",
+            locale=infer_garden_language(
+                _identity,
+                existing_buckets=buckets_text,
+                archive_language=str(_whoami_cache.get("archive_language") or "").strip(),
+            ),
         )
         try:
             reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
@@ -17258,7 +17282,9 @@ def _process_migrate_jobs(jobs: list) -> float:
                 extra={"migrate_result": {"status": "failed", "reason": reason}},
             )
             continue
-        upgrades, unmigrated_ids, err = parse_migrated_cards(reply_text, allowed_ids=allowed_ids)
+        upgrades, unmigrated_ids, err = parse_migrated_cards(
+            reply_text, allowed_ids=allowed_ids, signals=IO_LEAK_SIGNALS
+        )
         if err:
             update_proactive_job_status(
                 job_id, "failed", err,
@@ -17993,7 +18019,7 @@ def _process_messages(messages: list) -> float:
         # last message" framing) and the transcript header added below stays
         # topmost. The consumer's existing tagged-thinking extraction peels the
         # <think> block into thinking_summary. Same kill switch as V2.
-        from core import self_thinking as _self_thinking_v1
+        from agent_protocol_core import self_thinking as _self_thinking_v1
 
         if (
             _self_thinking_v1.enabled()
@@ -19719,17 +19745,17 @@ def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> s
         if _guard_on:
             _summary = str(card.get("summary") or "")
             _content = str(card.get("content") or "")
-            if card_guard.hard_field_pollution_reason(_summary) or card_guard.hard_field_pollution_reason(_content):
+            if card_guard.hard_field_pollution_reason(_summary, IO_LEAK_SIGNALS) or card_guard.hard_field_pollution_reason(_content, IO_LEAK_SIGNALS):
                 continue
             _bucket = str(card.get("bucket") or "").strip()
-            if _bucket and card_guard.bucket_pollution_reason(_bucket):
+            if _bucket and card_guard.bucket_pollution_reason(_bucket, IO_LEAK_SIGNALS):
                 card["bucket"] = card_guard.default_bucket_for_text(f"{_summary}\n{_content}")
             elif _bucket:
                 # Q3:干净桶按卡片语言归一(与 capture/dream/migrate/history 一致;此前漏了这条路)。
                 card["bucket"] = normalize_bucket_language(_bucket, f"{_summary}\n{_content}")
             _threads = card.get("threads")
             if isinstance(_threads, list):
-                card["threads"] = [t for t in _threads if not card_guard.field_pollution_reason(str(t or ""))]
+                card["threads"] = [t for t in _threads if not card_guard.field_pollution_reason(str(t or ""), IO_LEAK_SIGNALS)]
         # Long-term-memory distill (keep_all ← material_kind == "memory_summary") carries the
         # user's original per-card date through fact_write. Preserve it so decades of uploaded
         # memories don't all collapse onto today. Chat-history distill keeps the "now" stamp;

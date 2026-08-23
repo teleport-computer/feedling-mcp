@@ -1040,7 +1040,7 @@ def test_memory_summary_source_feeds_fact_write_material_without_maps(monkeypatc
             if task_id.startswith("fact-write"):
                 system = kwargs["messages"][0]["content"]
                 assert prompts.FACT_WRITE_KEEP_ALL_SUFFIX in system
-                assert "date 或 occurred_at" in system
+                assert "`date` or `occurred_at`" in system
                 assert "tags" in system and "threads" in system
                 payload = json.loads(kwargs["messages"][1]["content"])
                 assert payload["fact_digest"] == []

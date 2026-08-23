@@ -26,7 +26,7 @@ BACKEND = pathlib.Path(__file__).resolve().parent.parent / "backend"
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
-from memory_garden import observability as obs  # noqa: E402
+from memgarden import observability as obs  # noqa: E402
 
 SECRET = "崽崽是公的柯基，喜欢吃鸡胸肉"
 
