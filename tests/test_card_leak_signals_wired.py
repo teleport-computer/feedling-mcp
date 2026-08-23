@@ -213,3 +213,52 @@ def test_clean_card_still_passes_the_same_parser():
     )
     cards, err = parse_capture_cards(clean, policy="conversation_capture", strict=False)
     assert len(cards) == 1 and err is None, f"干净的卡被误杀了：{err}"
+
+
+# --------------------------------------------------------------------------- #
+# 落卡语言的判定要可观测，且记录里不许有用户内容
+# --------------------------------------------------------------------------- #
+
+
+def test_language_decision_is_observable_and_content_free():
+    """落卡语言错了是「看得见症状、看不见原因」的一类问题。
+
+    用户只会说「怎么变英文了」；没有这条记录，我们查不到当时算的是什么语言、
+    凭什么这么判。2026-08-23 把提示词换成英文指令之后，这条路径的风险显著上升。
+
+    但记录本身不许带用户内容 —— **桶名是用户写的**。只落语言标签、依据名、
+    以及桶名里的字符计数。
+    """
+    import json
+
+    from chat.reply_language import garden_language_decision
+
+    d = garden_language_decision({}, existing_buckets="崽崽、我们的关系、房贷")
+    assert d["locale"] == "zh-Hans"
+    assert d["basis"] == "existing_buckets"
+
+    blob = json.dumps(d, ensure_ascii=False)
+    for secret in ("崽崽", "我们的关系", "房贷"):
+        assert secret not in blob, f"桶名 {secret} 漏进了落库记录"
+    assert d["bucket_cjk"] > 0, "计数丢了 —— 那这条记录就没有诊断价值了"
+
+
+def test_both_runtimes_emit_the_language_decision():
+    """两条 runtime 都要发，否则「只有 V2 变英文了」这类问题横向对比不了。"""
+    import pathlib as _p
+
+    repo = _p.Path(__file__).resolve().parents[1]
+    for f in ("tools/chat_resident_consumer.py",
+              "backend/model_api_runtime/v2/worker.py"):
+        src = (repo / f).read_text(encoding="utf-8")
+        assert "memory.capture.language" in src, f"{f} 没发落卡语言事件"
+        assert "garden_language_decision" in src, f"{f} 没用带依据的那个判定"
+
+
+def test_the_event_is_registered_in_the_admin_board():
+    """没注册的话事件落了库但面板上看不到 —— 等于没埋。"""
+    import pathlib as _p
+
+    repo = _p.Path(__file__).resolve().parents[1]
+    src = (repo / "backend" / "admin" / "data_track.py").read_text(encoding="utf-8")
+    assert '"memory.capture.language"' in src, "新事件没注册进 admin 面板"

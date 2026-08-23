@@ -185,6 +185,7 @@ from memory.dream_prompt_v1 import (
 from memgarden.prompts.migrate import build_migrate_prompt, parse_migrated_cards
 from chat.reply_language import (
     format_time_anchor,
+    garden_language_decision,
     infer_garden_language,
     infer_reply_language_policy,
     reply_language_system_line,
@@ -15732,10 +15733,20 @@ def _process_capture_jobs(jobs: list) -> float:
         buckets_text, threads_text = _capture_memory_terms_context()
         # 花园的分类语言。已有桶优先 —— 一个花园只用一种语言的桶，
         # 不因为这轮对话换了语言就长出并存的第二套。
-        capture_locale = infer_garden_language(
+        _lang = garden_language_decision(
             identity,
             existing_buckets=buckets_text,
             archive_language=str(_whoami_cache.get("archive_language") or "").strip(),
+        )
+        capture_locale = _lang["locale"]
+        # 落卡语言错了是「看得见症状、看不见原因」的一类问题 —— 用户只会说
+        # 「怎么变英文了」。把判定和依据落库，出问题时能直接查到当时算的是什么。
+        # 字段全部内容无关：语言标签、依据名、桶名里的字符计数（不是桶名本身）。
+        _emit_debug_trace(
+            "memory", "memory.capture.language",
+            summary=f"落卡语言 {_lang['locale']}（依据 {_lang['basis']}）",
+            explain="这轮落卡用哪种语言写卡，以及凭什么这么判。桶名本身不落库。",
+            detail=_lang,
         )
         prompt = build_capture_prompt(
             ai_name=ai_name,

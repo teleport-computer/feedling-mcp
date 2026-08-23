@@ -71,6 +71,7 @@ from capabilities import registry as cap_registry
 from capabilities import result_budget as cap_result_budget
 from capabilities import tool_schema as cap_tool_schema
 from chat.reply_language import (
+    garden_language_decision,
     infer_garden_language,
     infer_reply_language_policy,
     reply_language_system_line,
@@ -11462,9 +11463,28 @@ async def _run_extraction(
                 # 花园的分类语言。已有桶优先 —— 一个花园只用一种语言的桶，
                 # 不因为这轮对话换了语言就长出并存的第二套。
                 # 与 V1 consumer 走同一个 helper，两条 runtime 不许各判各的。
-                capture_locale = infer_garden_language(
+                _lang = garden_language_decision(
                     None, existing_buckets=str(ctx.get("buckets") or "")
                 )
+                capture_locale = _lang["locale"]
+                # 与 V1 同源、同样落库 —— 两条 runtime 的语言判定要能横向对比，
+                # 否则「只有 V2 用户变英文了」这种问题查不出来。
+                if deps.emit_debug_trace is not None:
+                    try:
+                        await asyncio.to_thread(
+                            deps.emit_debug_trace,
+                            user_id,
+                            "memory.capture.language",
+                            status="ok",
+                            summary=f"落卡语言 {_lang['locale']}（依据 {_lang['basis']}）",
+                            explain="这轮落卡用哪种语言写卡，以及凭什么这么判。桶名本身不落库。",
+                            trace_id=str(trace_id or job_id),
+                            turn_id=str(trace_id or job_id),
+                            job_id=str(job_id),
+                            detail=dict(_lang),
+                        )
+                    except Exception:  # noqa: BLE001 — 观测失败绝不影响落卡
+                        pass
                 prompt = build_capture_prompt(
                     ai_name=ctx.get("ai_name", ""),
                     user_name=ctx.get("user_name", ""),
