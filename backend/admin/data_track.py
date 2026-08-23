@@ -132,25 +132,6 @@ def _count_rows(rows: list[dict], key: str) -> dict:
     return counts
 
 
-def _v1_proactive_outcome_class(status: object, reason: object) -> str:
-    """Classify the resident/V1 proactive status-reason keyspace.
-
-    ``skipped`` is a control-plane outcome (including heartbeat_throttled), not
-    a failed realization.  A failed job leaves our numerator only for Seven's
-    exact user-unavailable reasons.  No prefix or string-shape inference is
-    allowed: unknown/new reasons remain operational failures.
-    """
-    normalized_status = str(status or "").strip()
-    normalized_reason = str(reason or "").strip() or "unknown"
-    if normalized_status == "skipped":
-        return "control"
-    if normalized_status != "failed":
-        return ""
-    if normalized_reason in notices_catalog.USER_UNAVAILABLE_V1_REASONS:
-        return "user_unavailable"
-    return "operational_failure"
-
-
 def _safe_onboarding_validation(raw: dict) -> dict:
     def scrub_step(step: dict) -> dict:
         blocked = {"relationship_anchor_evidence"}
@@ -383,7 +364,9 @@ def _proactive_stats(store: UserStore) -> dict:
         kind_lanes[lane] += 1
         status = str(j.get("status") or "").strip()
         reason = str(j.get("status_reason") or "").strip() or "unknown"
-        outcome_class = _v1_proactive_outcome_class(status, reason)
+        outcome_class = notices_catalog.v1_proactive_outcome_class(
+            status, reason
+        )
         if outcome_class == "operational_failure":
             fail_lanes[lane] += 1
             failed_reasons[reason] = failed_reasons.get(reason, 0) + 1
@@ -9736,19 +9719,49 @@ def _event_path_master_payload(frozen: dict) -> dict:
             for code, count in (counts.get("failure_codes") or {}).items()
         }
         if runtime == "runtime_v1":
-            # The V1 freezer deliberately reused one ``failed`` counter for
-            # status=failed AND status=skipped.  T197 classifies every skipped
-            # row as control, but ``failure_codes`` retained only its reason,
-            # not the status needed by _v1_proactive_outcome_class.  Subtracting
-            # only the V1 user-unavailable reasons would still turn unknown
-            # skipped controls into Feedling failures.  Do not print a rate
-            # that the frozen cell cannot reconstruct losslessly.
-            return unavailable(
-                detail=(
-                    "V1 冻结 failed 混合 failed 与 skipped，failure_codes 又不含原 status；"
-                    "按 T197 无法无损拆出 operational failure，不能叫失败率。"
+            outcome_level = str(coverage.get("outcome_level") or "red")
+            if outcome_level != "green":
+                # Existing cells predate status-aware outcome counters.  Their
+                # new columns contain migration defaults, not measured zeroes;
+                # keep the old honest refusal until the whole requested window
+                # is at or after outcomes_from.
+                return unavailable(
+                    coverage=outcome_level,
+                    detail=(
+                        "V1 outcome 分类仅从 "
+                        f"{coverage.get('outcomes_from') or '尚未开始'} 起冻结；"
+                        f"本窗口覆盖 {int(coverage.get('outcome_covered_days') or 0)}"
+                        f"/{int(coverage.get('required_days') or 0)} 天。"
+                        "过去的日子没有回填，不能把默认 0 叫失败率。"
+                    ),
                 )
-            )
+            operational = int(counts.get("operational_failures") or 0)
+            control_outcomes = int(counts.get("control_outcomes") or 0)
+            user_unavailable = int(counts.get("user_unavailable") or 0)
+            classified = operational + control_outcomes + user_unavailable
+            if classified != failed:
+                return unavailable(
+                    detail=(
+                        "V1 冻结 outcome 计数与 failed 不守恒："
+                        f"classified={classified}, failed={failed}；"
+                        "不能从残缺格子计算失败率。"
+                    )
+                )
+            return {
+                "state": "metric", "coverage": "green",
+                "success": completed, "failure": operational,
+                "failed": failed, "expired": expired,
+                "superseded": superseded,
+                "raw_non_success": failed,
+                "control_outcomes": control_outcomes,
+                "user_unavailable": user_unavailable,
+                "denominator": completed + operational,
+                "denominator_rule": (
+                    "completed + operational failure；control、明确用户侧不可用、"
+                    "superseded 剔除；过去的日子没有回填"
+                ),
+                "concentration": counts.get("concentration"),
+            }
 
         # V2 last_error has a producer-owned classifier.  T197 removes only
         # explicit control and user-unavailable outcomes; unknown codes,
