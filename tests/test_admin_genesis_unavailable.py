@@ -186,6 +186,27 @@ def test_bad_coverage_does_not_make_the_low_coverage_warning_vanish():
     assert "缺报较多" not in healthy
 
 
+def test_missing_coverage_is_not_reported_as_unreadable():
+    """coverage 缺失(合法的「本来就没有」)不许误报成「读不出来」。
+
+    与 genesis 的 test_missing_marker_is_treated_as_ok_not_as_failure 对称:
+    cost section 此前只钉了坏值方向,缺失方向没人喂 ——
+    删掉 `coverage is not None and` 的突变可以在全绿下存活
+    (float(None) 抛 TypeError 落进 except,合法缺失被渲染成坏数据警告)。
+    """
+    missing = _text(data_track._home_cost_section({}))
+
+    # 前提(防恒真):同一函数、坏值那份确实产出「读不出来」,
+    # 否则下面的阴性断言在文案改词后会静默变成永真。
+    bad = _text(data_track._home_cost_section({"coverage": "abc"}))
+    assert "读不出来" in bad
+
+    # 缺失 ≠ 读不出来。
+    assert "读不出来" not in missing
+    # 缺失也不触发低覆盖警告 —— 那句是给「量到了且低」的。
+    assert "缺报较多" not in missing
+
+
 def test_unreadable_cohort_week_is_not_folded_into_immature():
     """域15:读不出是哪一周 ≠ 这一周还没走完。
 
