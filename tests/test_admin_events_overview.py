@@ -309,11 +309,22 @@ def _master_frozen(*, v1="green", v2="green") -> dict:
                 "resident": {
                     "active_users": 17,
                     "coverage": {"level": v1, "covered_days": 1,
-                                 "required_days": 1},
+                                 "required_days": 1,
+                                 "outcomes_from": "2030-06-07",
+                                 "outcome_level": v1,
+                                 "outcome_covered_days": (
+                                     1 if v1 == "green" else 0
+                                 )},
                     "lanes": {"heartbeat": {
-                        "completed": 9, "failed": 1,
+                        "completed": 9, "failed": 2,
                         "expired": 0, "superseded": 0,
-                        "failure_codes": {"heartbeat_throttled": 1},
+                        "operational_failures": 1,
+                        "control_outcomes": 1,
+                        "user_unavailable": 0,
+                        "failure_codes": {
+                            "heartbeat_throttled": 1,
+                            "wake_failed:providererror": 1,
+                        },
                     }},
                     "lane_sources": {},
                 },
@@ -351,10 +362,10 @@ def test_master_does_not_relabel_mixed_v1_runtime_as_an_access_path():
     assert heartbeat["cells"]["apikey_v2"]["state"] == "metric"
 
     runtime_heartbeat = _master_row(payload, "heartbeat", runtime=True)
-    assert runtime_heartbeat["cells"]["runtime_v1"]["state"] == "unavailable"
-    assert "failed 混合 failed 与 skipped" in (
-        runtime_heartbeat["cells"]["runtime_v1"]["detail"]
-    )
+    assert runtime_heartbeat["cells"]["runtime_v1"]["state"] == "metric"
+    assert runtime_heartbeat["cells"]["runtime_v1"]["failure"] == 1
+    assert runtime_heartbeat["cells"]["runtime_v1"]["control_outcomes"] == 1
+    assert runtime_heartbeat["cells"]["runtime_v1"]["denominator"] == 10
     assert "resident_cli 234 vs V2 32" not in str(payload)
     assert payload["runtime_windows"][0]["active_users"] == {
         "runtime_v1": 17,
@@ -394,6 +405,37 @@ def test_runtime_population_does_not_turn_missing_or_partial_into_zero():
     assert page.count("人数不报（冻结覆盖不完整或来源未提供）") == 2
     assert "V1 runtime（混合接入方式） 0 人" not in page
     assert "V2 runtime（APIKey） 0 人" not in page
+
+
+def test_v1_rate_is_withheld_when_raw_or_outcome_coverage_is_not_green():
+    raw_partial = data_track_module._event_path_master_payload(
+        _master_frozen(v1="yellow")
+    )
+    raw_cell = _master_row(
+        raw_partial, "heartbeat", runtime=True
+    )["cells"]["runtime_v1"]
+    assert raw_cell["state"] == "coverage_gap"
+    assert "denominator" not in raw_cell
+
+    outcome_partial_source = _master_frozen()
+    coverage = outcome_partial_source["windows"][0]["routes"]["resident"][
+        "coverage"
+    ]
+    coverage.update({
+        "outcomes_from": "2030-06-08",
+        "outcome_level": "red",
+        "outcome_covered_days": 0,
+    })
+    outcome_partial = data_track_module._event_path_master_payload(
+        outcome_partial_source
+    )
+    outcome_cell = _master_row(
+        outcome_partial, "heartbeat", runtime=True
+    )["cells"]["runtime_v1"]
+    assert outcome_cell["state"] == "unavailable"
+    assert outcome_cell["coverage"] == "red"
+    assert "过去的日子没有回填" in outcome_cell["detail"]
+    assert "denominator" not in outcome_cell
 
 
 def test_route_population_is_never_rendered_as_an_access_path_population():

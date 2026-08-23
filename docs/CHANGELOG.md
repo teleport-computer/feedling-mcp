@@ -47,6 +47,19 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-23 — V1 冻结格保留 operational outcome 分类
+
+**[DONE] Runtime family 辅助表不再把 V1 `skipped` 控制结果算成系统失败。**
+
+- V1 `status + status_reason` 分类器下沉到 `notices/catalog.py`，管理端实时视图与
+  每日冻结器共用同一纯函数；`skipped`、明确用户侧不可用和 operational failure
+  分别落入冻结格，失败分母只保留 `completed + operational failure`。
+- 新增独立 `outcomes_from` 水位。迁移前的冻结格不会回填，列默认 0 也不代表历史
+  测得零失败；只有新分类完整覆盖整个窗口时才发布百分比，其余窗口继续明确显示
+  不可计算。
+- RDS 与 TEE 迁移同步新增三类计数和水位约束；删号后的匿名聚合也逐类相加，保持
+  冻结历史的分类守恒。
+
 ## 2026-08-20 — TEE Redis 暂停并标记废弃
 
 test / pre / prod 三套 Redis CVM 在持续零业务流量的状态下停止。全仓确认没有
