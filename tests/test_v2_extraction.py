@@ -1013,11 +1013,15 @@ def test_dream_prompt_pairs_evolution_example_with_independent_health_example():
         user_name="阿霖",
         cards="[]",
         recent_conversations="[]",
+        locale="zh-Hans",
     )
 
-    assert "想去京都看红叶" in prompt and "已经订了京都机票" in prompt
-    assert "坚持骑行" in prompt and "最近失眠" in prompt
-    assert "两件独立的事，不能合并" in prompt
+    # 2026-08-23：提示词英文化后，模板里的合并示例也换成了英文。
+    # 断言的是**示例还在**（那是教模型「什么算同一件事的演进」的关键），
+    # 不是具体用哪个例子。
+    assert "autumn leaves in Kyoto" in prompt and "booked the Kyoto flights" in prompt
+    assert "keeps up the cycling" in prompt and "not sleeping well lately" in prompt
+    assert "are two separate things" in prompt
 
 
 def test_dream_guard_rejects_rationale_free_proposal():

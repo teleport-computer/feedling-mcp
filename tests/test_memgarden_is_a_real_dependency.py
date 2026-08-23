@@ -79,3 +79,53 @@ def test_declared_in_requirements_not_just_the_lock(mod):
     """requirements.txt 也要有 —— 只写进 lock 的话，下次 compile 就被抹掉了。"""
     req = (REPO / "backend" / "requirements.txt").read_text(encoding="utf-8")
     assert mod.replace("_", "-") in req, f"{mod} 没写进 requirements.txt"
+
+
+def test_every_prompt_builder_call_passes_a_locale():
+    """全仓每个 build_*_prompt 调用都必须显式给 locale。
+
+    **这条是栽了三次才加的。** locale 是必填参数，漏传会 TypeError —— 听上去
+    很安全，问题在于**本地跑不到就发现不了**：
+
+      第一次  test_card_user_referent.py    文件名不匹配我挑测试用的模式
+      第二次  test_v2_extraction_lanes.py   本地无 Postgres，它 error 而非执行断言
+      第三次  test_v2_extraction*.py ×4     同样是文件名不匹配，CI 才炸出来
+
+    三次的共同点是「我按文件名猜哪些测试相关」。这条不猜，扫全仓语法树。
+    在 CI 之前跑，比让 CI 用 15 分钟告诉你便宜得多。
+    """
+    import ast
+
+    BUILDERS = {"build_capture_prompt", "build_dream_prompt", "build_migrate_prompt"}
+    SKIP_DIRS = (".deps/", ".venv/", "docs-site/", "node_modules/")
+    repo = pathlib.Path(__file__).resolve().parents[1]
+
+    offenders = []
+    for path in repo.rglob("*.py"):
+        rel = str(path.relative_to(repo))
+        if any(rel.startswith(d) or f"/{d}" in rel for d in SKIP_DIRS):
+            continue
+        try:
+            src = path.read_text(encoding="utf-8")
+            tree = ast.parse(src)
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        # 在 import 层用 partial 绑过 locale 的，调用点不必再传
+        bound = {b for b in BUILDERS if f"{b} = _partial(" in src}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = (fn.attr if isinstance(fn, ast.Attribute)
+                    else fn.id if isinstance(fn, ast.Name) else None)
+            if name not in BUILDERS or name in bound:
+                continue
+            call = ast.unparse(node)
+            # **kwargs 展开的：参数在别处（fixture / dict），这里看不出来
+            if "locale" in call or "**" in call:
+                continue
+            offenders.append(f"{rel}:{node.lineno} {name}")
+
+    assert not offenders, (
+        "这些调用没传 locale —— 运行到就 TypeError：\n  " + "\n  ".join(offenders)
+    )
