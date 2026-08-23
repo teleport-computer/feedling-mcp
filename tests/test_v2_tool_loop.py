@@ -3286,3 +3286,53 @@ def test_empty_wake_on_unforced_provider_fails_closed(monkeypatch):
     assert len(provider.calls) == 1
     empty_event = next(payload for kind, payload in events if kind == "empty_provider_response")
     assert empty_event["action"] == "fail_wake_choice_unsupported"
+
+
+def test_empty_wake_without_stay_silent_catalog_fails_closed(monkeypatch):
+    """A partial platform catalog cannot enter the forced-choice phase.
+
+    This is a runtime degradation contract, not merely a provider capability
+    check: if a stale or partially assembled process lacks ``stay_silent``, the
+    wake keeps the existing ``empty_reply`` failure code and records why the
+    second call was unsafe to make.
+    """
+    provider = _ScriptedProvider([
+        {"reply": "", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    monkeypatch.setattr(
+        tool_loop,
+        "_CATALOG",
+        [
+            spec
+            for spec in tool_loop._catalog()
+            if spec.name != cap_tool_schema.STAY_SILENT_TOOL
+        ],
+    )
+    events = []
+
+    async def record(event_kind, payload):
+        events.append((event_kind, payload))
+
+    async def on_stay_silent(_reason):
+        return None
+
+    with pytest.raises(tool_loop.ProviderEmptyReply, match="empty_reply"):
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=_RecordingReply(),
+            on_stay_silent=on_stay_silent,
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            max_calls=2,
+            require_reply=False,
+            on_trajectory_event=record,
+        ))
+
+    assert len(provider.calls) == 1
+    empty_event = next(
+        payload for kind, payload in events if kind == "empty_provider_response"
+    )
+    assert empty_event["action"] == "fail_wake_choice_tool_unavailable"

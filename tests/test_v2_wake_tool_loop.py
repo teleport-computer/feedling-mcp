@@ -11,8 +11,8 @@ Key wake-specific differences from the chat lane, both asserted here:
 - No synthetic user message: explicitly scheduled/manual wakes can run on an
   empty coalesce/fold, while an ordinary heartbeat with no real chat history
   completes without calling the provider.
-- An empty terminal reply is NOT a no-filler failure here (unlike chat) — it's
-  a legitimate "weak wake sleeps": the job still completes, with zero bubbles.
+- An empty wake round is recovered into an explicit reply/stay_silent choice;
+  explicit silence still completes with zero bubbles.
 """
 from __future__ import annotations
 
@@ -128,7 +128,7 @@ def _script_provider(monkeypatch, responses):
     calls = []
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
-        calls.append({"messages": messages, "tools": tools})
+        calls.append({"messages": messages, "tools": tools, **_kwargs})
         return next(it)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
@@ -138,6 +138,10 @@ def _script_provider(monkeypatch, responses):
 def _text_round(text, *, prompt_tokens=1, completion_tokens=1):
     return {"reply": text, "tool_calls": [],
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
+
+
+def _stay_silent_round(reason="没有值得打扰用户的新信息"):
+    return _tool_round(_tc("stay-silent-test", "stay_silent", reason=reason))
 
 
 def _tool_round(*tool_calls, prompt_tokens=1, completion_tokens=1):
@@ -291,7 +295,7 @@ def test_wake_enqueued_without_sink_is_not_counted_as_visible(monkeypatch):
 
 
 # ------------------------------------------------------------------
-# Weak wake sleeps: empty terminal text is NOT a no-filler failure here.
+# Weak wake sleeps after the forced explicit choice, with no visible bubble.
 # ------------------------------------------------------------------
 
 def test_wake_empty_terminal_text_completes_with_zero_bubbles(monkeypatch):
@@ -302,7 +306,9 @@ def test_wake_empty_terminal_text_completes_with_zero_bubbles(monkeypatch):
     job = jobs_store.claim_next_job("w")
 
     _patch_real_write(monkeypatch)
-    _script_provider(monkeypatch, [_text_round("")])
+    calls = _script_provider(
+        monkeypatch, [_text_round(""), _stay_silent_round()]
+    )
     surface_called = {"n": 0}
     monkeypatch.setattr(
         worker, "_surface_terminal_error",
@@ -317,6 +323,7 @@ def test_wake_empty_terminal_text_completes_with_zero_bubbles(monkeypatch):
         job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), str(job["claimed_by"])))
 
     assert status == "completed"
+    assert calls[1]["tool_choice"] == "required"
     assert _bubbles(uid) == []
     assert sink_calls == []
     assert surface_called["n"] == 0
@@ -405,6 +412,7 @@ def test_wake_memory_write_is_authorized_applied_and_not_refused(monkeypatch):
             }],
         )),
         _text_round(""),
+        _stay_silent_round(),
     ])
     sink_calls = []
     deps = _wake_deps(tail=[], sink_calls=sink_calls)
@@ -422,7 +430,8 @@ def test_wake_memory_write_is_authorized_applied_and_not_refused(monkeypatch):
     ))
 
     assert status == "completed"
-    assert len(calls) == 2
+    assert len(calls) == 3
+    assert calls[2]["tool_choice"] == "required"
     # Round 1 carries the native assistant call and call-id-matched write result.
     exchanges = [m for m in calls[1]["messages"] if isinstance(m, ToolExchange)]
     assert len(exchanges) == 1
@@ -542,6 +551,7 @@ def test_wake_identity_write_is_visibly_refused_and_not_enqueued(
     calls = _script_provider(monkeypatch, [
         _tool_round(tool_call),
         _text_round(""),
+        _stay_silent_round(),
     ])
     sink_calls = []
     deps = _wake_deps(tail=[], sink_calls=sink_calls)
@@ -557,7 +567,8 @@ def test_wake_identity_write_is_visibly_refused_and_not_enqueued(
     ))
 
     assert status == "completed"
-    assert len(calls) == 2
+    assert len(calls) == 3
+    assert calls[2]["tool_choice"] == "required"
     exchanges = [m for m in calls[1]["messages"] if isinstance(m, ToolExchange)]
     assert len(exchanges) == 1
     result = exchanges[0].results[0]
@@ -672,6 +683,7 @@ def test_wake_photo_read_observation_is_pull_on_demand(monkeypatch):
             "photo-1", "photo_read", photo_id="p1", include_image=True
         )),
         _text_round(""),
+        _stay_silent_round(),
     ])
     deps = _wake_deps(tail=[], observe_photo=_observe_photo)
 
@@ -705,7 +717,9 @@ def test_wake_without_photo_read_never_observes_photo(monkeypatch):
     def _observe_photo(*_a, **_k):
         raise AssertionError("photo wake must stay pull-on-demand")
 
-    _script_provider(monkeypatch, [_text_round("")])
+    _script_provider(
+        monkeypatch, [_text_round(""), _stay_silent_round()]
+    )
     deps = _wake_deps(tail=[], observe_photo=_observe_photo)
 
     status = asyncio.run(worker._run_wake(

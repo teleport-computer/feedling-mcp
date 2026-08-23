@@ -1121,6 +1121,9 @@ async def run_tool_loop(
 
         messages = build_messages(list(transcript))
         turn_catalog = _turn_catalog()
+        wake_choice_tool_available = any(
+            spec.name == tool_schema.STAY_SILENT_TOOL for spec in turn_catalog
+        )
         # Reserve the configured final provider attempt for a terminal reply.
         # ``max_calls`` is the deployment-configurable stop threshold; the loop
         # must not grow an unbounded second budget after reaching it.
@@ -1352,7 +1355,20 @@ async def run_tool_loop(
                 None,
             )
             if stay_silent_spec is None:
-                raise RuntimeError("wake choice requires stay_silent tool")
+                await _trajectory(
+                    "wake_choice_unavailable",
+                    {
+                        "round": attempts + 1,
+                        "action": "fail_wake_choice_tool_unavailable",
+                    },
+                )
+                exc = ProviderEmptyReply("empty_reply")
+                if on_provider_failure is not None:
+                    try:
+                        await on_provider_failure(exc)
+                    except Exception:
+                        pass
+                raise exc
             tools = [_WAKE_REPLY_TOOL_SPEC, stay_silent_spec]
             surface_candidate_tools = list(tools)
             surface_reason = "wake_choice_required"
@@ -2056,6 +2072,7 @@ async def run_tool_loop(
                 on_stay_silent is not None
                 and not wake_choice_recovery_used
                 and wake_choice_supported
+                and wake_choice_tool_available
                 and attempts < max_calls
                 and tool_calls_used < max_tool_calls_per_turn
             )
@@ -2065,6 +2082,8 @@ async def run_tool_loop(
                 action = "fail_forced_wake_choice_empty"
             elif not wake_choice_supported:
                 action = "fail_wake_choice_unsupported"
+            elif not wake_choice_tool_available:
+                action = "fail_wake_choice_tool_unavailable"
             else:
                 action = "fail_wake_choice_budget_exhausted"
             await _trajectory(
