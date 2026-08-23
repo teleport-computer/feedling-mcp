@@ -35,8 +35,14 @@ def _tick(*, now_epoch: float | None = None) -> list[str]:
     # in one source must not starve the other (same pattern as dau_snapshot's
     # growth/retention riders).
     try:
+        # Dependency inversion: db.py owns the transaction and supplies its
+        # verbatim users documents; the accounts layer supplies only the pure
+        # binding classifier.  Never pass registry._users here.
+        from accounts import registry
+
         resident = db.freeze_completed_resident_lane_days(
-            now_epoch=now_epoch, tz="Asia/Shanghai")
+            now_epoch=now_epoch, tz="Asia/Shanghai",
+            binding_classifier=registry.connected_resident_user_ids)
         if resident:
             log.info("[lane-rollup] froze resident Beijing days: %s",
                      ",".join(resident))

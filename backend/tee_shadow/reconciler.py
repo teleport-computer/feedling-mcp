@@ -73,8 +73,10 @@ TABLES: dict[str, tuple[tuple[str, ...], str]] = {
     # 镜像；本 reconciler 是漏写后的扶正通道（格子写后不变、语句幂等，按 PK
     # 对齐即收敛）。
     "lane_daily_rollup": (
-        ("user_id", "day", "route", "lane", "enqueue_source"),
-        "user_id, day, route, lane, enqueue_source, completed, failed, "
+        ("user_id", "day", "route", "lane", "enqueue_source",
+         "access_path", "mode_source"),
+        "user_id, day, route, lane, enqueue_source, access_path, mode_source, "
+        "completed, failed, "
         "expired, superseded, failure_codes, "
         "operational_failures, control_outcomes, user_unavailable, "
         # ⚠️ 说话四列（0093 / tee 0025）必须列在这里。漏列**不会报错**——扶正
@@ -87,6 +89,7 @@ TABLES: dict[str, tuple[tuple[str, ...], str]] = {
     "lane_rollup_watermark": (
         ("route",),
         "route, backfill_from, through_day, voice_from, outcomes_from, "
+        "access_path_from, "
         "frozen_at",
     ),
     # 聊天格子（0094 / tee 0026）。同样写后不变、语句幂等，按 PK 对齐即收敛。

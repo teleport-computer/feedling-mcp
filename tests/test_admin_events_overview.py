@@ -299,6 +299,41 @@ def test_history_import_rolling_rate_counts_every_attempt_not_latest_per_user():
 
 
 def _master_frozen(*, v1="green", v2="green") -> dict:
+    v1_coverage = {
+        "level": v1,
+        "covered_days": 1 if v1 == "green" else 0,
+        "required_days": 1,
+        "effective_from": "2030-06-07",
+        "outcomes_from": "2030-06-07",
+        "outcome_level": v1,
+        "outcome_covered_days": 1 if v1 == "green" else 0,
+    }
+    v2_coverage = {
+        "level": v2,
+        "covered_days": 1 if v2 == "green" else 0,
+        "required_days": 1,
+        "effective_from": "2030-06-07",
+    }
+    heartbeat = {
+        "completed": 9, "failed": 2,
+        "expired": 0, "superseded": 0,
+        "operational_failures": 1,
+        "control_outcomes": 1,
+        "user_unavailable": 0,
+        "failure_codes": {
+            "heartbeat_throttled": 1,
+            "wake_failed:providererror": 1,
+        },
+    }
+    chat = {
+        "completed": 6, "failed": 4,
+        "expired": 0, "superseded": 2,
+        "failure_codes": {
+            "extraction_failed:quota_insufficient": 1,
+            "extraction_failed:upstream_unavailable": 3,
+        },
+    }
+
     return {
         "timezone": "Asia/Shanghai",
         "closed_through_day": "2030-06-07",
@@ -308,40 +343,76 @@ def _master_frozen(*, v1="green", v2="green") -> dict:
             "routes": {
                 "resident": {
                     "active_users": 17,
-                    "coverage": {"level": v1, "covered_days": 1,
-                                 "required_days": 1,
-                                 "outcomes_from": "2030-06-07",
-                                 "outcome_level": v1,
-                                 "outcome_covered_days": (
-                                     1 if v1 == "green" else 0
-                                 )},
-                    "lanes": {"heartbeat": {
-                        "completed": 9, "failed": 2,
-                        "expired": 0, "superseded": 0,
-                        "operational_failures": 1,
-                        "control_outcomes": 1,
-                        "user_unavailable": 0,
-                        "failure_codes": {
-                            "heartbeat_throttled": 1,
-                            "wake_failed:providererror": 1,
-                        },
-                    }},
+                    "coverage": dict(v1_coverage),
+                    "lanes": {"heartbeat": dict(heartbeat)},
                     "lane_sources": {},
                 },
                 "model_api": {
                     "active_users": 5,
-                    "coverage": {"level": v2,
-                                 "covered_days": 1 if v2 == "green" else 0,
-                                 "required_days": 1},
-                    "lanes": {"chat": {
-                        "completed": 6, "failed": 4,
-                        "expired": 0, "superseded": 2,
-                        "failure_codes": {
-                            "extraction_failed:quota_insufficient": 1,
-                            "extraction_failed:upstream_unavailable": 3,
-                        },
+                    "coverage": dict(v2_coverage),
+                    "lanes": {"chat": dict(chat)},
+                    "lane_sources": {},
+                },
+            },
+            "paths": {
+                "self_hosted": {
+                    "active_users": 11,
+                    "mode_sources": {
+                        "not_applicable": {"active_users": 11, "attempts": 11},
+                    },
+                    "coverage": dict(v1_coverage),
+                    "lanes": {"heartbeat": dict(heartbeat)},
+                    "lane_sources": {},
+                },
+                "resident_v1": {
+                    "active_users": 3,
+                    "mode_sources": {
+                        "explicit": {"active_users": 2, "attempts": 8},
+                        "default": {"active_users": 1, "attempts": 3},
+                    },
+                    "coverage": dict(v1_coverage),
+                    "lanes": {"heartbeat": {
+                        **heartbeat, "completed": 7, "failed": 1,
+                        "operational_failures": 1, "control_outcomes": 0,
+                        "failure_codes": {"wake_failed:providererror": 1},
                     }},
                     "lane_sources": {},
+                },
+                "apikey_v1": {
+                    "active_users": 3,
+                    "mode_sources": {
+                        "explicit": {"active_users": 2, "attempts": 6},
+                        "default": {"active_users": 1, "attempts": 2},
+                    },
+                    "coverage": dict(v1_coverage),
+                    "lanes": {"heartbeat": {
+                        **heartbeat, "completed": 6, "failed": 2,
+                    }},
+                    "lane_sources": {},
+                },
+                "apikey_v2": {
+                    "active_users": 5,
+                    "mode_sources": {
+                        "explicit": {"active_users": 4, "attempts": 10},
+                        "default": {"active_users": 1, "attempts": 2},
+                    },
+                    "coverage": dict(v2_coverage),
+                    "lanes": {"chat": dict(chat)},
+                    "lane_sources": {},
+                },
+                **{
+                    path: {
+                        "active_users": 0,
+                        "mode_sources": {},
+                        "coverage": dict(v1_coverage),
+                        "lanes": {},
+                        "lane_sources": {},
+                    }
+                    for path in (
+                        "unbound_no_route",
+                        "hosted_unclassified_v1",
+                        "v2_control_v1_source",
+                    )
                 },
             },
         }],
@@ -356,24 +427,18 @@ def _master_row(payload: dict, key: str, *, runtime=False) -> dict:
 def test_master_declares_distinct_v1_access_path_collection_mechanisms():
     payload = data_track_module._event_path_master_payload(_master_frozen())
     heartbeat = _master_row(payload, "heartbeat")
-    resident = heartbeat["cells"]["resident"]
+    self_hosted = heartbeat["cells"]["self_hosted"]
+    resident_v1 = heartbeat["cells"]["resident_v1"]
     apikey_v1 = heartbeat["cells"]["apikey_v1"]
-    assert resident["state"] == "unavailable"
-    assert apikey_v1["state"] == "unavailable"
-    assert resident["detail"] != apikey_v1["detail"]
-    assert resident["detail"] == (
-        "本列口径是 V1 冻结的 resident 桶;桶的成员由 "
-        "onboarding_route='resident' 决定，不是接入方式快照 —— "
-        "托管用户若 onboarding_route 也写作 resident 会一并落入，"
-        "且没有事件发生时的 access_mode，无法逐格剔除。"
-    )
-    assert apikey_v1["detail"] == (
-        "托管 APIKey-V1 的作业当前不进任何冻结格:V1 冻结按 "
-        "onboarding_route='resident' 取数，"
-        "onboarding_route='model_api' 的托管 V1 用户被整体排除;"
-        "他们又不产生 agent_jobs，所以 V2 桶里也没有。"
-        "这一格不是「拆不开」，是「未采集」。"
-    )
+    assert self_hosted["state"] == "metric"
+    assert resident_v1["state"] == "metric"
+    assert apikey_v1["state"] == "metric"
+    assert self_hosted["success"] == 9
+    assert resident_v1["success"] == 7
+    assert apikey_v1["success"] == 6
+    assert "资格→接入方式×effective runtime 分层" in apikey_v1[
+        "denominator_rule"
+    ]
     assert heartbeat["cells"]["apikey_v2"]["state"] == "metric"
 
     runtime_heartbeat = _master_row(payload, "heartbeat", runtime=True)
@@ -381,10 +446,9 @@ def test_master_declares_distinct_v1_access_path_collection_mechanisms():
     assert runtime_heartbeat["cells"]["runtime_v1"]["failure"] == 1
     assert runtime_heartbeat["cells"]["runtime_v1"]["control_outcomes"] == 1
     assert runtime_heartbeat["cells"]["runtime_v1"]["denominator"] == 10
-    assert (
-        "分母仅含 onboarding_route='resident' 的用户，托管 APIKey-V1 不在其中"
-        in runtime_heartbeat["cells"]["runtime_v1"]["denominator_rule"]
-    )
+    assert "本格仅是 Runtime V1 家族辅助汇总" in runtime_heartbeat[
+        "cells"
+    ]["runtime_v1"]["denominator_rule"]
     assert "resident_cli 234 vs V2 32" not in str(payload)
     assert "25,207" not in str(payload)
     assert payload["runtime_windows"][0]["active_users"] == {
@@ -463,7 +527,10 @@ def test_route_population_is_never_rendered_as_an_access_path_population():
 
     runtime_window = {
         **payload["runtime_windows"][0],
-        "active_users": {"runtime_v1": 9, "runtime_v2": 9},
+        "active_users": {
+            "runtime_v1": 9, "runtime_v2": 8,
+            "self_hosted": 71, "apikey_v1": 72,
+        },
     }
     runtime_page = data_track_module._render_event_master_tables({
         **payload,
@@ -474,14 +541,16 @@ def test_route_population_is_never_rendered_as_an_access_path_population():
     # the runtime table before we rely on its absence from the path table.
     assert "窗口内 runtime route 活跃用户" in runtime_page
     assert "V1 runtime（混合接入方式） 9 人" in runtime_page
-    assert "V2 runtime（APIKey） 9 人" in runtime_page
+    assert "V2 runtime（APIKey） 8 人" in runtime_page
+    assert "自建 Resident 71 人" not in runtime_page
+    assert "APIKey-V1 72 人" not in runtime_page
 
     path_window = {
         **payload["windows"][0],
         "active_users": {
-            "resident": 9,
-            "apikey_v1": 9,
-            "apikey_v2": 9,
+            **payload["windows"][0]["active_users"],
+            "runtime_v1": 81,
+            "runtime_v2": 82,
         },
     }
     path_page = data_track_module._render_event_master_tables({
@@ -490,9 +559,12 @@ def test_route_population_is_never_rendered_as_an_access_path_population():
         "runtime_windows": [],
     })
     assert "窗口内 runtime route 活跃用户" not in path_page
-    assert "自有服务器 9 人" not in path_page
-    assert "APIKey-V1 9 人" not in path_page
-    assert "APIKey-V2 9 人" not in path_page
+    assert "窗口内路径活跃用户" in path_page
+    assert "自建 Resident 11 人" in path_page
+    assert "APIKey-V1 3 人" in path_page
+    assert "APIKey-V2 5 人" in path_page
+    assert "V1 runtime（混合接入方式） 81 人" not in path_page
+    assert "V2 runtime（APIKey） 82 人" not in path_page
 
 
 def test_model_call_probe_coverage_mutation_changes_cell_shape(monkeypatch):
@@ -511,8 +583,16 @@ def test_model_call_probe_coverage_mutation_changes_cell_shape(monkeypatch):
 
     assert "🔴" in red_html
     assert "🟡" in yellow_html
-    assert "有 V2 调用点" not in red_html
-    assert "有 V2 调用点" in yellow_html
+    red_runtime = _master_row(
+        red_payload, "model_call", runtime=True
+    )["cells"]["runtime_v2"]
+    yellow_runtime = _master_row(
+        yellow_payload, "model_call", runtime=True
+    )["cells"]["runtime_v2"]
+    assert red_runtime["coverage"] == "red"
+    assert red_runtime["detail"] == "这一动作×runtime family 零探针"
+    assert yellow_runtime["coverage"] == "yellow"
+    assert yellow_runtime["detail"] == "有调用点但尚无同源北京日冻结分母"
     assert red_html != yellow_html
 
 
@@ -526,7 +606,7 @@ def test_metric_cell_states_action_path_window_and_denominator():
     assert chat["cells"]["apikey_v2"]["user_unavailable"] == 1
     page = data_track_module._render_event_master_tables(payload)
     assert "动作=正常聊天 · 整个回复任务" in page
-    assert "路径=apikey_v2" in page
+    assert "路径=APIKey-V2" in page
     assert "窗口=最近 1 个已关闭北京日（2030-06-07 至 2030-06-07）" in page
     assert "分母=9（成功 6 + 失败 3" in page
     assert "用户侧不可用 1（剔除）" in page
@@ -536,14 +616,18 @@ def test_metric_cell_states_action_path_window_and_denominator():
 def test_v2_operational_failure_rate_excludes_control_but_keeps_unknown():
     frozen = _master_frozen()
     chat = frozen["windows"][0]["routes"]["model_api"]["lanes"]["chat"]
-    chat.update({
+    updated = {
         "completed": 5, "failed": 3, "expired": 0, "superseded": 0,
         "failure_codes": {
             "runtime_mode_changed": 1,
             "extraction_failed:quota_insufficient": 1,
             "future_unknown_code": 1,
         },
-    })
+    }
+    chat.update(updated)
+    frozen["windows"][0]["paths"]["apikey_v2"]["lanes"]["chat"].update(
+        updated
+    )
     payload = data_track_module._event_path_master_payload(frozen)
     cell = _master_row(payload, "chat_job")["cells"]["apikey_v2"]
     assert cell["raw_non_success"] == 3

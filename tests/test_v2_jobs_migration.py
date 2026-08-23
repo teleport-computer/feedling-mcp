@@ -78,9 +78,13 @@ def test_agent_jobs_chain_has_one_installed_head_and_available_at_baseline():
     script = ScriptDirectory.from_config(cfg)
 
     heads = script.get_heads()
-    assert heads == ["0099_contract_rejection_stats"]
+    assert heads == ["0100_lane_rollup_access_paths"]
+    assert (script.get_revision("0100_lane_rollup_access_paths").down_revision
+            == "0099_contract_rejection_stats")
     assert (script.get_revision("0099_contract_rejection_stats").down_revision
             == "0098_v1_lane_outcome_counts")
+    assert (script.get_revision("0098_v1_lane_outcome_counts").down_revision
+            == "0097_v2_job_recovery_events")
     assert (script.get_revision("0097_v2_job_recovery_events").down_revision
             == "0096_trace_write_stats_health")
     assert (script.get_revision("0096_trace_write_stats_health").down_revision
@@ -210,7 +214,7 @@ def test_perception_signal_schema_is_installed_at_the_merged_head():
             "AND indexname='ix_agent_jobs_pending_available_at'"
         ).fetchone()
 
-    assert installed_head == ("0099_contract_rejection_stats",)
+    assert installed_head == ("0100_lane_rollup_access_paths",)
     assert available_at[:2] == ("timestamp with time zone", "NO")
     assert "now()" in str(available_at[2])
     assert pending_index is not None
@@ -278,7 +282,7 @@ def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
             "AND tgrelid='v2_turn_metrics'::regclass"
         ).fetchone()[0]
 
-    assert heads == {"0099_contract_rejection_stats"}
+    assert heads == {"0100_lane_rollup_access_paths"}
     assert tables == {
         "v2_usage_daily_users",
         "v2_usage_daily_dimensions",

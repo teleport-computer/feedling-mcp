@@ -9679,15 +9679,22 @@ _EVENT_CATEGORIES = [
 ]
 
 # T244's comparison table is intentionally independent from the older
-# VPS/API day drill below.  These are actions that can fail independently;
-# mappings exist only where the frozen source records that exact unit.  The
-# rollup's ``route`` is a runtime family, not an access mode: its V1 bucket
-# mixes Your Server users with hosted APIKey-V1 users.  A current access mode
-# join is not a lawful substitute for the missing event-time snapshot.
-_EVENT_MASTER_PATHS = (
-    ("resident", "resident"),
-    ("apikey_v1", "apikey_v1"),
-    ("apikey_v2", "apikey_v2"),
+# VPS/API day drill below. These are actions that can fail independently;
+# mappings exist only where the frozen source records that exact unit. ``route``
+# remains the runtime family. T289 adds a separate freeze-time ``access_path``
+# axis; it is deliberately unavailable before its own watermark.
+_EVENT_MASTER_PATH_LABELS = {
+    "self_hosted": "自建 Resident",
+    "resident_v1": "Resident-V1（托管）",
+    "apikey_v1": "APIKey-V1",
+    "apikey_v2": "APIKey-V2",
+    "unbound_no_route": "无托管资格且无 Resident binding",
+    "hosted_unclassified_v1": "托管 V1 · 接入方式未分类",
+    "v2_control_v1_source": "当前 V2 控制却出现 V1 源",
+}
+_EVENT_MASTER_PATHS = tuple(
+    (path, _EVENT_MASTER_PATH_LABELS[path])
+    for path in db.LANE_ROLLUP_ACCESS_PATHS
 )
 _EVENT_MASTER_ACTIONS = (
     {"key": "onboarding_job", "label": "入驻蒸馏 · 整单",
@@ -9746,14 +9753,7 @@ _EVENT_MASTER_ACTIONS = (
 
 
 def _event_path_master_payload(frozen: dict) -> dict:
-    """Build both the requested access-path table and a runtime-family aid.
-
-    Only Runtime V2 implies one access path (hosted API key).  Runtime V1 does
-    not: its frozen bucket mixes Your Server and hosted APIKey-V1 users, so the
-    two requested V1 access cells stay unavailable.  The raw V1 aggregate is
-    still useful and is exposed in a separate, differently shaped table where
-    nobody can mistake it for an access-path comparison.
-    """
+    """Build the frozen access-path table and runtime-family diagnostic."""
 
     def unavailable(*, coverage="red", detail=""):
         return {
@@ -9761,9 +9761,14 @@ def _event_path_master_payload(frozen: dict) -> dict:
             "message": "当前记不到这一级", "detail": detail,
         }
 
-    def metric_cell(raw_window: dict, runtime: str, mapping) -> dict:
+    def metric_cell(raw_window: dict, runtime: str, mapping,
+                    *, path: str | None = None) -> dict:
         source_route = "resident" if runtime == "runtime_v1" else "model_api"
-        route_data = (raw_window.get("routes") or {}).get(source_route, {})
+        route_data = (
+            (raw_window.get("paths") or {}).get(path, {})
+            if path is not None
+            else (raw_window.get("routes") or {}).get(source_route, {})
+        )
         coverage = route_data.get("coverage") or {}
         level = str(coverage.get("level") or "red")
         lane, enqueue_source = mapping
@@ -9788,6 +9793,7 @@ def _event_path_master_payload(frozen: dict) -> dict:
                 "message": "当前窗口不可计算",
                 "covered_days": int(coverage.get("covered_days") or 0),
                 "required_days": int(coverage.get("required_days") or 0),
+                "effective_from": coverage.get("effective_from"),
             }
         completed = int(counts.get("completed") or 0)
         failed = int(counts.get("failed") or 0)
@@ -9838,8 +9844,11 @@ def _event_path_master_payload(frozen: dict) -> dict:
                 "denominator_rule": (
                     "completed + operational failure；control、明确用户侧不可用、"
                     "superseded 剔除；过去的日子没有回填；"
-                    "分母仅含 onboarding_route='resident' 的用户，"
-                    "托管 APIKey-V1 不在其中"
+                    + (
+                        "成员按冻结时 route 资格→接入方式×effective runtime 分层"
+                        if path is not None
+                        else "本格仅是 Runtime V1 家族辅助汇总"
+                    )
                 ),
                 "concentration": counts.get("concentration"),
             }
@@ -9892,38 +9901,21 @@ def _event_path_master_payload(frozen: dict) -> dict:
                         "message": "N/A（产品当前不执行）",
                     }
                     continue
-                # Only Runtime V2 identifies an access path by itself.
-                runtime_mapping = (action.get("runtime_metrics") or {}).get("runtime_v2")
-                runtime_probe = (action.get("runtime_probe") or {}).get("runtime_v2")
-                if path == "apikey_v2" and runtime_mapping:
+                runtime = (
+                    "runtime_v2" if path == "apikey_v2" else "runtime_v1"
+                )
+                runtime_mapping = (action.get("runtime_metrics") or {}).get(runtime)
+                runtime_probe = (action.get("runtime_probe") or {}).get(runtime)
+                if runtime_mapping:
                     path_cells[path] = metric_cell(
-                        raw_window, "runtime_v2", runtime_mapping)
-                elif path == "apikey_v2" and runtime_probe:
+                        raw_window, runtime, runtime_mapping, path=path)
+                elif runtime_probe:
                     path_cells[path] = unavailable(
                         coverage=runtime_probe,
                         detail=(
-                            "有 V2 调用点，但尚无同源北京日冻结分母"
+                            f"有 {runtime} 调用点，但尚无同源北京日冻结分母"
                             if runtime_probe == "yellow"
-                            else "V2 在这一动作上零探针"
-                        ),
-                    )
-                elif path == "resident":
-                    path_cells[path] = unavailable(
-                        detail=(
-                            "本列口径是 V1 冻结的 resident 桶;桶的成员由 "
-                            "onboarding_route='resident' 决定，不是接入方式快照 —— "
-                            "托管用户若 onboarding_route 也写作 resident 会一并落入，"
-                            "且没有事件发生时的 access_mode，无法逐格剔除。"
-                        ),
-                    )
-                elif path == "apikey_v1":
-                    path_cells[path] = unavailable(
-                        detail=(
-                            "托管 APIKey-V1 的作业当前不进任何冻结格:V1 冻结按 "
-                            "onboarding_route='resident' 取数，"
-                            "onboarding_route='model_api' 的托管 V1 用户被整体排除;"
-                            "他们又不产生 agent_jobs，所以 V2 桶里也没有。"
-                            "这一格不是「拆不开」，是「未采集」。"
+                            else f"{runtime} 在这一动作上零探针"
                         ),
                     )
                 else:
@@ -9966,7 +9958,24 @@ def _event_path_master_payload(frozen: dict) -> dict:
             "end_day": raw_window.get("end_day"),
             "day_count": raw_window.get("day_count"),
         }
-        path_windows.append({**window_meta, "rows": path_rows})
+        path_data = raw_window.get("paths") or {}
+        path_windows.append({
+            **window_meta,
+            "active_users": {
+                path: (path_data.get(path) or {}).get("active_users")
+                for path, _label in _EVENT_MASTER_PATHS
+            },
+            "mode_sources": {
+                path: (path_data.get(path) or {}).get("mode_sources") or {}
+                for path, _label in _EVENT_MASTER_PATHS
+            },
+            "effective_from": {
+                path: ((path_data.get(path) or {}).get("coverage") or {})
+                .get("effective_from")
+                for path, _label in _EVENT_MASTER_PATHS
+            },
+            "rows": path_rows,
+        })
         runtime_active_users = {}
         for runtime, route in (("runtime_v1", "resident"),
                                ("runtime_v2", "model_api")):
@@ -9996,10 +10005,10 @@ def _event_path_master_payload(frozen: dict) -> dict:
         ],
         "runtime_windows": runtime_windows,
         "access_gap": (
-            "V1 冻结格没有事件发生时的 access_mode；resident 与 APIKey-V1 "
-            "无法诚实拆开，不能用当前 access_mode 回填。"
+            "接入路径取冻结时快照，不是事件发生时快照；历史不回填。"
+            "每列只从页面标出的生效日起可读，之前不可用不等于 0。"
         ),
-        "self_deployed": "⬛ 结构性不可得，不在本表范围",
+        "self_deployed": "自建判据 = 无 active tested hosted route + connected resident binding",
     }
 
 # Plain-language: what each row actually is. Shown under every event label so the
@@ -10223,7 +10232,10 @@ def _render_event_master_cell(cell: dict, *, action: str, path: str,
         covered = int(cell.get("covered_days") or 0)
         required = int(cell.get("required_days") or 0)
         message = str(cell.get("message") or "当前窗口不可计算")
+        effective_from = str(cell.get("effective_from") or "")
         detail = f"冻结覆盖 {covered}/{required} 个北京日；拒绝用残缺窗口算率"
+        if effective_from:
+            detail += f"；此列自 {effective_from} 起有效，此前无数据不等于 0"
         return (f"<td>{mark} <b>{html.escape(message)}</b>"
                 f"<div class='evt-cell-scope'>{html.escape(scope)}<br>"
                 f"{html.escape(detail)}</div></td>")
@@ -10236,7 +10248,8 @@ def _render_event_master_cell(cell: dict, *, action: str, path: str,
 
 def _render_event_master_tables(master: dict) -> str:
     def render_windows(*, windows, columns, title, note,
-                       show_runtime_population=False):
+                       show_runtime_population=False,
+                       show_path_population=False):
         sections = []
         for window in windows or []:
             start = str(window.get("start_day") or "")
@@ -10268,10 +10281,9 @@ def _render_event_master_tables(master: dict) -> str:
                 )
             active_users = window.get("active_users")
             population = ""
-            # Route populations belong only to the runtime-family diagnostic.
-            # The access-path table cannot split the resident route into
-            # self-hosted vs APIKey-V1, so even an accidentally supplied map
-            # must never be rendered there.
+            # Runtime-family and access-path populations are distinct maps.
+            # Render each only in its matching table so neither denominator
+            # can leak into the other even when both are present in a window.
             if show_runtime_population and isinstance(active_users, dict):
                 parts = []
                 for col in columns:
@@ -10287,6 +10299,40 @@ def _render_event_master_tables(master: dict) -> str:
                 population = (
                     "<div class='evt-desc'>窗口内 runtime route 活跃用户"
                     "（冻结行按 user_id 去重）："
+                    + html.escape(" · ".join(parts)) + "</div>"
+                )
+            if show_path_population and isinstance(active_users, dict):
+                sources = window.get("mode_sources") or {}
+                effective = window.get("effective_from") or {}
+                parts = []
+                for col in columns:
+                    key = str(col.get("key") or "")
+                    label = str(col.get("label") or key)
+                    count = active_users.get(key)
+                    if count is None:
+                        value = "人数不可用"
+                    else:
+                        value = f"{int(count)} 人"
+                    source = sources.get(key) or {}
+                    if key in {"apikey_v1", "resident_v1",
+                               "hosted_unclassified_v1",
+                               "v2_control_v1_source"}:
+                        explicit = int(
+                            (source.get("explicit") or {}).get("active_users") or 0
+                        )
+                        default = int(
+                            (source.get("default") or {}).get("active_users") or 0
+                        )
+                        value += f"（显式 {explicit} / 默认 {default}）"
+                    from_day = effective.get(key)
+                    value += (
+                        f"；此列自 {from_day} 起有效"
+                        if from_day else "；此列尚未开始采集"
+                    )
+                    parts.append(f"{label} {value}")
+                population = (
+                    "<div class='evt-desc'>窗口内路径活跃用户"
+                    "（冻结行按 user_id 去重；默认=raw hosted_runtime_mode 缺失）："
                     + html.escape(" · ".join(parts)) + "</div>"
                 )
             sections.append(
@@ -10313,6 +10359,7 @@ def _render_event_master_tables(master: dict) -> str:
         render_windows(
             windows=master.get("windows"), columns=master.get("paths") or [],
             title="事件 × 接入路径成功/失败率（北京日冻结）", note=path_note,
+            show_path_population=True,
         )
         + render_windows(
             windows=master.get("runtime_windows"),

@@ -356,7 +356,10 @@ _PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "genesis_import_outputs": ("user_id", "job_id", "output_type"),
     "notify_relay_configs": ("auth_token",),
     "notify_relay_logs": ("id",),
-    "lane_daily_rollup": ("user_id", "day", "route", "lane", "enqueue_source"),
+    "lane_daily_rollup": (
+        "user_id", "day", "route", "lane", "enqueue_source",
+        "access_path", "mode_source",
+    ),
     "lane_rollup_watermark": ("route",),
     "chat_daily_rollup": ("user_id", "day"),
     "chat_rollup_watermark": ("scope",),
