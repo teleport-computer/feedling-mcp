@@ -271,6 +271,21 @@ def _text_round(text, *, prompt_tokens=1, completion_tokens=1):
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
 
 
+def _stay_silent_round(*, prompt_tokens=1, completion_tokens=1):
+    return {
+        "reply": "",
+        "tool_calls": [{
+            "id": "stay-silent-test",
+            "name": "stay_silent",
+            "args": {"reason": "没有值得打扰用户的新信息"},
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+        },
+    }
+
+
 def _tool_round(*tool_calls, prompt_tokens=1, completion_tokens=1):
     """A scripted non-terminal round: one or more tool_calls (built via `_tc`
     below), no plain-text bubble (accompanying text would be preamble, not a
@@ -1956,16 +1971,17 @@ def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
 
 
 def test_run_wake_weak_wake_still_records_whole_turn_metric_with_call_counted(monkeypatch):
-    """An empty terminal reply is a SUCCESSFUL weak-wake sleep, but it's still a
-    REAL, billed provider call — the metric row must count it, not silently
-    drop to model_calls=0 the way a pre-fix failed wake used to."""
+    """The empty round and forced explicit sleep are both billed model calls."""
     uid = "u_w_wake_turnmetric_weak"
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     job = jobs_store.claim_next_job("w")
 
-    _script_provider(monkeypatch, [_text_round("", prompt_tokens=9, completion_tokens=0)])
+    _script_provider(monkeypatch, [
+        _text_round("", prompt_tokens=9, completion_tokens=0),
+        _stay_silent_round(prompt_tokens=2, completion_tokens=1),
+    ])
     monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: 1)
     monkeypatch.setattr(worker.db, "chat_seqs_after_seq", lambda *_a, **_k: [1])
 
@@ -1990,8 +2006,8 @@ def test_run_wake_weak_wake_still_records_whole_turn_metric_with_call_counted(mo
             "SELECT prompt_tokens, model_calls, failed, status "
             "FROM v2_turn_metrics WHERE job_id=%s", (job_id,)).fetchone()
     assert row is not None
-    assert row[0] == 9
-    assert row[1] == 1
+    assert row[0] == 11
+    assert row[1] == 2
     assert row[2] is False
     assert row[3] == "ok"
 

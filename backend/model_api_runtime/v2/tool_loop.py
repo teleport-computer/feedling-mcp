@@ -9,7 +9,7 @@ import json
 import posixpath
 import re
 import time
-from provider_types import ProviderResponse, ToolExchange, ToolResult
+from provider_types import ProviderResponse, ToolExchange, ToolResult, ToolSpec
 from capabilities import registry as cap_registry
 from capabilities import result_budget
 from capabilities import tool_schema
@@ -79,6 +79,31 @@ _FILE_DELIVERY_TOOLS = frozenset(
 # Other providers may expose tools but do not accept this exact forcing shape.
 _NAMED_TOOL_CHOICE_PROVIDERS = frozenset(
     {"openai", "openrouter", "openai_compatible", "deepseek", "anthropic", "gemini", "bedrock"}
+)
+_WAKE_REPLY_TOOL = "reply"
+_WAKE_REPLY_TOOL_SPEC = ToolSpec(
+    name=_WAKE_REPLY_TOOL,
+    description=(
+        "Deliver one non-empty visible reply and end this proactive wake turn. "
+        "Use stay_silent instead when there is nothing worth interrupting the user for."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "text": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The complete user-visible reply.",
+            }
+        },
+        "required": ["text"],
+        "additionalProperties": False,
+    },
+)
+_WAKE_CHOICE_INSTRUCTION = (
+    "The previous proactive-wake response ended without visible text or a tool "
+    "call. End the wake now by calling exactly one offered tool: call reply with "
+    "the complete visible message, or call stay_silent with a non-empty reason."
 )
 _EMPTY_RESPONSE_CORRECTION = (
     "The previous response completed without visible text or a client tool call. "
@@ -600,14 +625,10 @@ async def run_tool_loop(
     # thought in the native channel — shown raw, often in the wrong language — and
     # skips the <think>. Default False → other lanes unchanged.
     suppress_native_reasoning: bool = False,
-    # Whether a text-free provider reply is an ERROR. Defaults to True, which
-    # is the chat lane's rule (a terminal turn with no text is the no-filler
-    # failure). The wake lane is the opposite — "weak wake sleeps": a model
-    # that chooses to stay silent is a legitimate outcome, not a failure — and
-    # must pass False, otherwise provider_client raises
-    # ProviderError("provider response had no usable reply text") on the very
-    # response that means "nothing to say" (`required = require_reply and not
-    # tool_calls`), and the wake fails silently.
+    # Whether a text-free provider reply is an immediate ERROR. Defaults to
+    # True for foreground chat. Wake passes False so this loop can inspect an
+    # empty 200 and force the bounded reply/stay_silent choice itself; the
+    # provider parser must not fail before lane policy runs.
     require_reply: bool = True,
     # One lane-specific correction may be appended after a semantically empty
     # provider success. Callers that carry a stronger delivery contract (for
@@ -784,6 +805,8 @@ async def run_tool_loop(
     force_text_fallback_reason = ""
     empty_response_recovery_used = False
     empty_response_retry_instruction = ""
+    wake_choice_recovery_used = False
+    wake_choice_required = False
     final_reply_correction_request: FinalReplyCorrectionRequest | None = None
     final_reply_correction_instruction = ""
     external_content_seen = False
@@ -1098,6 +1121,9 @@ async def run_tool_loop(
 
         messages = build_messages(list(transcript))
         turn_catalog = _turn_catalog()
+        wake_choice_tool_available = any(
+            spec.name == tool_schema.STAY_SILENT_TOOL for spec in turn_catalog
+        )
         # Reserve the configured final provider attempt for a terminal reply.
         # ``max_calls`` is the deployment-configurable stop threshold; the loop
         # must not grow an unbounded second budget after reaching it.
@@ -1105,7 +1131,7 @@ async def run_tool_loop(
             force_text_fallback
             or final_reply_correction_request is not None
             or compact_delivery_confirmation_needed
-            or attempts == max_calls - 1
+            or (attempts == max_calls - 1 and not wake_choice_required)
         )
         terminal_text_round_reason = "none"
         if terminal_text_round:
@@ -1122,7 +1148,7 @@ async def run_tool_loop(
                     )
                 )
             )
-        # Five bounded corrections share the same transient system suffix:
+        # Bounded corrections share the same transient system suffix:
         # missing file delivery, an unbacked image claim, a semantically empty
         # response, foreground language correction, and the tools-disabled
         # terminal answer. None is persisted in the transcript.
@@ -1139,6 +1165,7 @@ async def run_tool_loop(
                 delivery_retry_instruction,
                 image_claim_retry_instruction,
                 empty_response_retry_instruction,
+                _WAKE_CHOICE_INSTRUCTION if wake_choice_required else "",
                 final_reply_correction_instruction,
                 terminal_text_instruction,
             )
@@ -1318,6 +1345,34 @@ async def run_tool_loop(
                         extra_tool_recovery_name,
                     }
                 ]
+        if wake_choice_required:
+            stay_silent_spec = next(
+                (
+                    spec
+                    for spec in turn_catalog
+                    if spec.name == tool_schema.STAY_SILENT_TOOL
+                ),
+                None,
+            )
+            if stay_silent_spec is None:
+                await _trajectory(
+                    "wake_choice_unavailable",
+                    {
+                        "round": attempts + 1,
+                        "action": "fail_wake_choice_tool_unavailable",
+                    },
+                )
+                exc = ProviderEmptyReply("empty_reply")
+                if on_provider_failure is not None:
+                    try:
+                        await on_provider_failure(exc)
+                    except Exception:
+                        pass
+                raise exc
+            tools = [_WAKE_REPLY_TOOL_SPEC, stay_silent_spec]
+            surface_candidate_tools = list(tools)
+            surface_reason = "wake_choice_required"
+            forced_delivery_tool = ""
         compact_delivery_phase = ""
         if compact_delivery_confirmation_needed:
             compact_delivery_phase = "confirm"
@@ -1364,6 +1419,11 @@ async def run_tool_loop(
         if forced_delivery_tool:
             required_schema_names = set(required_schema_names) | {
                 forced_delivery_tool
+            }
+        if wake_choice_required:
+            required_schema_names = {
+                _WAKE_REPLY_TOOL,
+                tool_schema.STAY_SILENT_TOOL,
             }
         pressure_collapsed_specs = {}
         if refresh_pressure_collapsed_extra_tool_specs is not None:
@@ -1548,6 +1608,7 @@ async def run_tool_loop(
                 "messages": messages,
                 "tools": tools,
                 "forced_tool": forced_delivery_tool,
+                "wake_choice_required": wake_choice_required,
                 "compact_delivery_phase": compact_delivery_phase,
                 "prompt_frontier": frontier_plan,
                 "tail_window": tail_window,
@@ -1572,6 +1633,8 @@ async def run_tool_loop(
             provider_kwargs = {"tools": tools, "require_reply": False}
             if terminal_schema_guard and tools is not None:
                 provider_kwargs["tool_choice"] = "none"
+            if wake_choice_required:
+                provider_kwargs["tool_choice"] = "required"
             if allow_image_output and not terminal_text_round:
                 provider_kwargs["allow_image_output"] = True
             if (
@@ -1647,6 +1710,7 @@ async def run_tool_loop(
                             "empty_response_recovery": bool(
                                 empty_response_retry_instruction
                             ),
+                            "wake_choice_required": wake_choice_required,
                         }
                     )
                 except Exception:
@@ -1654,7 +1718,9 @@ async def run_tool_loop(
             result = await provider_client.reliable_chat_completion_async(
                 provider_config,
                 messages,
-                max_attempts=(1 if forced_delivery_tool else 2),
+                max_attempts=(
+                    1 if forced_delivery_tool or wake_choice_required else 2
+                ),
                 base_delay_sec=0.2,
                 max_delay_sec=1.0,
                 absolute_deadline=absolute_deadline,
@@ -1899,16 +1965,168 @@ async def run_tool_loop(
         result = provider_client.without_runtime_provider_attempt_trace(result)
         pr = ProviderResponse.from_result(result)
 
+        if wake_choice_required:
+            wake_reply_calls = [
+                tc for tc in pr.tool_calls if tc.name == _WAKE_REPLY_TOOL
+            ]
+            stay_silent_calls = [
+                tc
+                for tc in pr.tool_calls
+                if tc.name == tool_schema.STAY_SILENT_TOOL
+            ]
+            selected_call = pr.tool_calls[0] if len(pr.tool_calls) == 1 else None
+            selected_reply_text = (
+                selected_call.args.get("text")
+                if selected_call is not None
+                and selected_call.name == _WAKE_REPLY_TOOL
+                and selected_call.args_ok
+                and set(selected_call.args) <= {"text"}
+                else None
+            )
+            reply_text = (
+                selected_reply_text.strip()
+                if isinstance(selected_reply_text, str)
+                else ""
+            )
+            silent_reason = (
+                str(selected_call.args.get("reason") or "").strip()
+                if selected_call is not None
+                and selected_call.name == tool_schema.STAY_SILENT_TOOL
+                and selected_call.args_ok
+                else ""
+            )
+            valid_reply_choice = bool(
+                selected_call is not None
+                and selected_call.id
+                and len(wake_reply_calls) == 1
+                and reply_text
+                and not pr.media
+                and len(reply_text) <= max_assistant_tool_text_chars
+            )
+            valid_silent_choice = bool(
+                selected_call is not None
+                and selected_call.id
+                and len(stay_silent_calls) == 1
+                and silent_reason
+                and not pr.media
+                and tool_schema.validate_tool_args(
+                    tool_schema.STAY_SILENT_TOOL,
+                    selected_call.args,
+                )
+                is None
+            )
+            await _trajectory(
+                "wake_choice_response",
+                {
+                    "round": attempts,
+                    "choice": (
+                        _WAKE_REPLY_TOOL
+                        if valid_reply_choice
+                        else (
+                            tool_schema.STAY_SILENT_TOOL
+                            if valid_silent_choice
+                            else "invalid"
+                        )
+                    ),
+                    "tool_call_count": len(pr.tool_calls),
+                    "provider_text_present": bool(pr.text.strip()),
+                },
+            )
+            if valid_reply_choice:
+                tool_calls_used += 1
+                # Feed the selected text into the ordinary terminal-text path.
+                # Any provider text beside the call is only a preamble, exactly
+                # like other tool rounds, and is never published separately.
+                pr = ProviderResponse(
+                    text=reply_text,
+                    tool_calls=[],
+                    usage=pr.usage,
+                    raw=pr.raw,
+                    assistant_turn=None,
+                    media=(),
+                )
+                wake_choice_required = False
+            elif valid_silent_choice:
+                wake_choice_required = False
+            else:
+                exc = ProviderEmptyReply("empty_reply")
+                if on_provider_failure is not None:
+                    try:
+                        await on_provider_failure(exc)
+                    except Exception:
+                        pass
+                raise exc
+
         if (
             not require_reply
+            and on_stay_silent is not None
             and not pr.text.strip()
             and not pr.tool_calls
             and not pr.media
         ):
-            # A weak wake deliberately accepts a provider success with no
-            # semantic output.  Record that fact before the ordinary final
-            # reply callback no-ops on empty text; otherwise it is
-            # indistinguishable from an explicit stay_silent tool choice.
+            wake_choice_supported = (
+                on_stay_silent is not None
+                and provider_name in _NAMED_TOOL_CHOICE_PROVIDERS
+            )
+            can_force_wake_choice = (
+                on_stay_silent is not None
+                and not wake_choice_recovery_used
+                and wake_choice_supported
+                and wake_choice_tool_available
+                and attempts < max_calls
+                and tool_calls_used < max_tool_calls_per_turn
+            )
+            if can_force_wake_choice:
+                action = "force_wake_choice"
+            elif wake_choice_required:
+                action = "fail_forced_wake_choice_empty"
+            elif not wake_choice_supported:
+                action = "fail_wake_choice_unsupported"
+            elif not wake_choice_tool_available:
+                action = "fail_wake_choice_tool_unavailable"
+            else:
+                action = "fail_wake_choice_budget_exhausted"
+            await _trajectory(
+                "empty_provider_response",
+                {
+                    "round": attempts,
+                    "reason": "empty_provider_success",
+                    "response_shape": _empty_response_shape(pr),
+                    "action": action,
+                },
+            )
+            if on_empty_provider_response is not None:
+                try:
+                    await on_empty_provider_response(_empty_response_shape(pr))
+                except Exception:
+                    # Plaintext diagnostics are best-effort and cannot alter
+                    # the recovery/failure decision below.
+                    pass
+            if can_force_wake_choice:
+                wake_choice_recovery_used = True
+                wake_choice_required = True
+                reasoning_fragments.clear()
+                seen_reasoning_fragments.clear()
+                _progress("wake_choice_retry_boundary")
+                continue
+            exc = ProviderEmptyReply("empty_reply")
+            if on_provider_failure is not None:
+                try:
+                    await on_provider_failure(exc)
+                except Exception:
+                    pass
+            raise exc
+
+        if (
+            not require_reply
+            and on_stay_silent is None
+            and not pr.text.strip()
+            and not pr.tool_calls
+            and not pr.media
+        ):
+            # Non-wake internal callers retain the historical weak empty-success
+            # behavior. The forced two-choice contract is lane-gated by the
+            # presence of the wake-only stay_silent callback.
             await _trajectory(
                 "empty_provider_response",
                 {
@@ -1922,8 +2140,6 @@ async def run_tool_loop(
                 try:
                     await on_empty_provider_response(_empty_response_shape(pr))
                 except Exception:
-                    # Diagnostics are best-effort and cannot change the weak
-                    # wake's established require_reply=False success policy.
                     pass
 
         if (

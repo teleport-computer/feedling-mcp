@@ -10117,11 +10117,11 @@ async def _run_wake(
                 add_usage=_add_usage,
                 max_calls=_TURN_MAX_LLM_CALLS,
                 # "Weak wake sleeps": staying silent is this lane's documented
-                # success case (`_on_reply` no-ops on empty text), so a
-                # text-free provider reply must come back as "" rather than
-                # raising. Without this the lane failed 100% of the time on
-                # test with `wake_failed:providererror` while the provider
-                # answered 200 OK — the model simply had nothing to say.
+                # success case. Keep the provider parser permissive so the
+                # tool loop can recognize a structurally valid empty 200 and
+                # spend one bounded follow-up on the forced reply/stay_silent
+                # choice. Explicit stay_silent remains success; an empty forced
+                # choice fails closed through the existing empty_reply path.
                 #
                 # `scheduled` 是唯一的例外，必须留在 require_reply=True 上。
                 # opened/closed 屏幕共享边沿都只是普通 wake 事实，由模型结合

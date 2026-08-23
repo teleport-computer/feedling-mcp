@@ -2262,6 +2262,7 @@ def _build_openai_responses_payload(
     tools: "list[ToolSpec] | None" = None,
     prompt_cache_key: str = "",
     allow_image_output: bool = False,
+    tool_choice: str | dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
     instructions, input_items = _openai_responses_input(messages)
     if response_format:
@@ -2283,6 +2284,17 @@ def _build_openai_responses_payload(
         encoded_tools.append({"type": "image_generation"})
     if encoded_tools:
         payload["tools"] = encoded_tools
+        if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+            function = tool_choice.get("function")
+            name = (
+                str(function.get("name") or "")
+                if isinstance(function, dict)
+                else ""
+            )
+            if name:
+                payload["tool_choice"] = {"type": "function", "name": name}
+        elif tool_choice is not None:
+            payload["tool_choice"] = copy.deepcopy(tool_choice)
     if cache_key := _cache_key(prompt_cache_key):
         payload["prompt_cache_key"] = cache_key
 
@@ -3558,6 +3570,8 @@ def _build_bedrock_payload(
         payload["toolConfig"] = {"tools": _encode_tools_bedrock(tools)}
         if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
             payload["toolConfig"]["toolChoice"] = {"tool": {"name": tool_choice["function"]["name"]}}
+        elif tool_choice == "required":
+            payload["toolConfig"]["toolChoice"] = {"any": {}}
 
     if _cache_key(prompt_cache_key):
         # Converse evaluates cache checkpoints in tools -> system -> messages
@@ -3784,6 +3798,8 @@ def _build_gemini_payload(
         payload["tools"] = _encode_tools_gemini(tools)
         if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
             payload["toolConfig"] = {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [tool_choice["function"]["name"]]}}
+        elif tool_choice == "required":
+            payload["toolConfig"] = {"functionCallingConfig": {"mode": "ANY"}}
 
     url = f"{base_url.rstrip('/')}/models/{quote(model, safe='')}:generateContent"
     headers = {
@@ -4751,6 +4767,7 @@ async def _chat_completion_async_impl(
             include_reasoning=include_reasoning,
             tools=tools,
             prompt_cache_key=config.prompt_cache_key,
+            tool_choice=tool_choice,
         )
 
         async def post_bedrock(request_payload: dict[str, Any]) -> httpx.Response:
@@ -4869,6 +4886,7 @@ async def _chat_completion_async_impl(
             tools=tools,
             prompt_cache_key=config.prompt_cache_key,
             allow_image_output=allow_image_output,
+            tool_choice=tool_choice,
         )
 
         async def post_responses(request_payload: dict[str, Any]) -> httpx.Response:

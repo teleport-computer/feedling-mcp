@@ -10,6 +10,17 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted proactive wakes now make an explicit speak-or-sleep choice after an
+  empty model round.** The first round still receives the full wake tool surface.
+  If it ends without visible text or a tool call, including after earlier tool
+  work in the same turn, Runtime V2 spends one attempt from the existing turn
+  budget on only `reply` and `stay_silent` and requires one of them. A selected
+  `stay_silent` completes the wake with its auditable reason; the existing
+  thinking-only silence form remains supported. Providers that cannot enforce
+  the choice, exhausted turns, and invalid forced responses fail through the
+  existing `empty_reply` outcome instead of being accepted as unclassified
+  silence.
+
 - **Dedicated image observation now has a bounded, exact-main recovery path.**
   Rate limiting, temporary unavailability, an empty observation, or an explicitly
   truncated observation can send only the affected image to the exact current
