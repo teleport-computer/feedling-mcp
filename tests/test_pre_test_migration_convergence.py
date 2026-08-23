@@ -79,9 +79,9 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0035_contract_rejection_stats"]
+    (head,) = script.get_heads()
     assert (
-        script.get_revision("0035_contract_rejection_stats").down_revision
+        script.get_revision(head).down_revision
         == "0034_v1_lane_outcome_counts"
     )
     assert (
@@ -231,6 +231,8 @@ def test_tee_0029_upgrades_to_voice_merge_head(monkeypatch):
     database_url = _database_url(admin_url, database)
     cfg = Config(str(ROOT / "backend/alembic_tee/alembic.ini"))
     cfg.set_main_option("script_location", str(ROOT / "backend/alembic_tee"))
+    expected_head = _scripts("alembic_tee").get_current_head()
+    assert expected_head is not None
 
     with psycopg.connect(admin_url, autocommit=True) as admin:
         admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
@@ -264,7 +266,7 @@ def test_tee_0029_upgrades_to_voice_merge_head(monkeypatch):
         with psycopg.connect(database_url, autocommit=True) as conn:
             assert conn.execute(
                 "SELECT version_num FROM alembic_tee_version"
-            ).fetchall() == [("0035_contract_rejection_stats",)]
+            ).fetchall() == [(expected_head,)]
             assert conn.execute(
                 "SELECT to_regclass('public.voice_call_sessions')"
             ).fetchone() == ("voice_call_sessions",)
@@ -274,7 +276,7 @@ def test_tee_0029_upgrades_to_voice_merge_head(monkeypatch):
             assert conn.execute(
                 "SELECT convert_from(value,'UTF8')::jsonb->'tee_heads' "
                 "FROM server_config WHERE key='phase4_primary_prepared'"
-            ).fetchone() == (["0035_contract_rejection_stats"],)
+            ).fetchone() == ([expected_head],)
     finally:
         with psycopg.connect(admin_url, autocommit=True) as admin:
             admin.execute(
