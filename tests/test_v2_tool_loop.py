@@ -1408,18 +1408,24 @@ def test_preamble_text_with_tool_calls_is_not_a_bubble(monkeypatch):
     assert outcome.rounds == 2
 
 
-def test_budget_bound_last_call_keeps_history_schema_and_forbids_tools(monkeypatch):
-    """If every round returns a tool_call, the loop's LAST provider call
-    keeps the schema referenced by native history but sets tool_choice=none, so
-    strict providers can validate the transcript without extending the loop."""
+def test_configured_budget_stops_tool_only_loop_and_requests_complete_reply(
+    monkeypatch,
+):
+    """A model that only calls tools gets one fresh, explicit answer request.
+
+    The stall threshold is independent from the hard ``max_calls`` ceiling. Its
+    next attempt keeps schemas required by native history, forbids tool execution,
+    and asks the model to use existing information. The user receives that complete
+    model reply rather than the worker's generic failure fallback.
+    """
     provider = _ScriptedProvider([
         {
-            "reply": "looking 1",
+            "reply": "",
             "tool_calls": [{"id": "1", "name": "memory_search", "args": {"query": "a"}}],
             "usage": {},
         },
         {
-            "reply": "looking 2",
+            "reply": "",
             "tool_calls": [{"id": "2", "name": "memory_search", "args": {"query": "b"}}],
             "usage": {},
         },
@@ -1437,6 +1443,10 @@ def test_budget_bound_last_call_keeps_history_schema_and_forbids_tools(monkeypat
 
     build_messages = TranscriptBuildMessages()
     fold = _RecordingFold([])
+    surfaces = []
+
+    async def record_surface(detail):
+        surfaces.append(detail)
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
         provider_config=_TEST_PROVIDER_CONFIG,
@@ -1445,7 +1455,9 @@ def test_budget_bound_last_call_keeps_history_schema_and_forbids_tools(monkeypat
         on_reply=on_reply,
         fold_new_messages=fold,
         add_usage=_noop_add_usage,
-        max_calls=3,
+        max_calls=15,
+        max_consecutive_tool_only_rounds=2,
+        on_provider_tool_surface=record_surface,
     ))
 
     assert len(provider.calls) == 3
@@ -1453,6 +1465,10 @@ def test_budget_bound_last_call_keeps_history_schema_and_forbids_tools(monkeypat
     assert provider.calls[1]["tools"] is not None
     assert {spec.name for spec in provider.calls[2]["tools"]} == {"memory_search"}
     assert provider.calls[2]["tool_choice"] == "none"
+    terminal_system = provider.calls[2]["messages"][0]
+    assert terminal_system["role"] == "system"
+    assert "Using only the information already available" in terminal_system["content"]
+    assert "write one complete, self-contained reply" in terminal_system["content"]
     assert any(
         isinstance(message, ToolExchange)
         and message.calls[0].name == "memory_search"
@@ -1461,6 +1477,7 @@ def test_budget_bound_last_call_keeps_history_schema_and_forbids_tools(monkeypat
     assert outcome.final_text == "final terminal text"
     assert outcome.rounds == 3
     assert outcome.stop_reason == "final_text"
+    assert surfaces[-1]["force_text_fallback_reason"] == "tool_only_stall"
     # never a filler: the terminal text is exactly what the model said.
     assert on_reply.calls[-1] == ("final terminal text", True)
 
@@ -1479,6 +1496,7 @@ def test_terminal_tool_choice_none_is_never_dispatched_if_provider_ignores_it(
             "tool_calls": [{"id": "g2", "name": "identity_get", "args": {}}],
             "usage": {},
         },
+        {"reply": "complete answer", "tool_calls": [], "usage": {}},
     ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     dispatch = _RecordingDispatch()
@@ -1490,12 +1508,71 @@ def test_terminal_tool_choice_none_is_never_dispatched_if_provider_ignores_it(
         on_reply=_RecordingReply(),
         fold_new_messages=_RecordingFold([[]]),
         add_usage=_noop_add_usage,
-        max_calls=2,
+        max_calls=4,
+        max_consecutive_tool_only_rounds=1,
     ))
 
     assert len(dispatch.calls) == 1
     assert [tc.id for tc in dispatch.calls[0]] == ["g1"]
     assert provider.calls[1]["tool_choice"] == "none"
+    assert provider.calls[2]["tool_choice"] == "none"
+    assert outcome.final_text == "complete answer"
+    assert outcome.stop_reason == "final_text"
+
+
+def test_terminal_tool_call_retries_exhaust_then_terminate_with_telemetry(
+    monkeypatch,
+):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{"id": "g1", "name": "identity_get", "args": {}}],
+            "usage": {},
+        },
+        *[
+            {
+                "reply": "still trying",
+                "tool_calls": [
+                    {"id": f"terminal-{index}", "name": "identity_get", "args": {}}
+                ],
+                "usage": {},
+            }
+            for index in range(3)
+        ],
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch()
+    trajectory = []
+
+    async def record_trajectory(event_kind, detail):
+        trajectory.append((event_kind, detail))
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=5,
+        max_consecutive_tool_only_rounds=1,
+        max_terminal_tool_call_retries=2,
+        on_trajectory_event=record_trajectory,
+    ))
+
+    rejected = [
+        detail
+        for event_kind, detail in trajectory
+        if event_kind == "protocol_fallback"
+        and detail["reason"] == "terminal_tool_call_rejected"
+    ]
+    assert len(provider.calls) == 4
+    assert len(dispatch.calls) == 1
+    assert [detail["action"] for detail in rejected] == [
+        "retry",
+        "retry",
+        "terminate",
+    ]
     assert outcome.stop_reason == "budget_exhausted"
 
 
@@ -2284,6 +2361,57 @@ def test_malformed_args_gets_one_tools_disabled_fallback_without_dispatch(monkey
     assert [call["tools"] is None for call in provider.calls] == [False, True]
     assert reply.calls == [("I could not use tools, but here is the answer.", True)]
     assert outcome.rounds == 2
+
+
+def test_tools_disabled_fallback_retries_terminal_tool_call_within_bound(
+    monkeypatch,
+):
+    """A transient broken terminal response gets a bounded fresh chance."""
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "bad-1",
+                "name": "web_search",
+                "args": {},
+                "args_raw": "{",
+                "args_ok": False,
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "half-finished preamble",
+            "tool_calls": [{
+                "id": "bad-2",
+                "name": "web_search",
+                "args": {"query": "x"},
+            }],
+            "usage": {},
+        },
+        {"reply": "complete after retry", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    reply = _RecordingReply()
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=reply,
+        fold_new_messages=_RecordingFold([[]]),
+        add_usage=_noop_add_usage,
+        max_calls=15,
+    ))
+
+    assert len(provider.calls) == 3
+    assert provider.calls[1]["tools"] is None
+    assert provider.calls[2]["tools"] is None
+    assert "write one complete, self-contained reply" in (
+        provider.calls[1]["messages"][0]["content"]
+    )
+    assert reply.calls == [("complete after retry", True)]
+    assert outcome.rounds == 3
+    assert outcome.stop_reason == "final_text"
 
 
 def test_malformed_reasoning_turn_disables_reasoning_for_text_fallback(monkeypatch):

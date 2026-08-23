@@ -2051,11 +2051,11 @@ def test_chat_turn_always_replies_even_when_model_only_calls_tools(monkeypatch):
     """BUG-4 structural successor (Task 7): in the old json_planner pipeline, a
     plan that never asked for `final_response` could silently swallow the turn
     (fixed back then by forcing `wants_reply=True` for the chat lane). In the
-    unified tool loop this can no longer happen BY CONSTRUCTION:
-    `tool_loop.run_tool_loop`'s last round keeps referenced schemas but sets
-    `tool_choice=none`, so a model that just keeps calling tools every round
-    still gets forced to a real reply at the `_TURN_MAX_LLM_CALLS`
-    budget — never a placeholder, never a silent swallow."""
+    unified tool loop this can no longer happen BY CONSTRUCTION. After the
+    independently configured consecutive tool-only threshold, the next round
+    keeps referenced schemas but sets `tool_choice=none`, so the model is forced
+    to a real reply before the hard `_TURN_MAX_LLM_CALLS` budget — never a
+    placeholder, never a silent swallow."""
     uid = "u_w_loop_bug4"
     conftest.seed_user(uid)
     _reset(uid)
@@ -2063,8 +2063,8 @@ def test_chat_turn_always_replies_even_when_model_only_calls_tools(monkeypatch):
     job = jobs_store.claim_next_job("w")
 
     monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
-    n = worker._TURN_MAX_LLM_CALLS
-    script = [_tool_round(_tc(f"c{i}", "memory_index")) for i in range(n - 1)]
+    n = worker.MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS
+    script = [_tool_round(_tc(f"c{i}", "memory_index")) for i in range(n)]
     script.append(_text_round("MODEL REPLY"))
     calls = _script_provider(monkeypatch, script)
 
@@ -2077,10 +2077,62 @@ def test_chat_turn_always_replies_even_when_model_only_calls_tools(monkeypatch):
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
-    assert len(calls) == n            # ran to the budget, no early silent stop
+    assert len(calls) == n + 1
+    assert len(calls) < worker._TURN_MAX_LLM_CALLS
     assert {spec.name for spec in calls[-1]["tools"]} == {"memory_index"}
     assert calls[-1]["tool_choice"] == "none"
-    assert written.get("text") == "MODEL REPLY"       # forced reply at the cap — no silent swallow
+    assert written.get("text") == "MODEL REPLY"  # early forced reply, no swallow
+
+
+def test_chat_terminal_tool_call_retries_stop_at_worker_configured_bound(
+    monkeypatch,
+):
+    """The production worker must pass its bounded terminal-retry setting.
+
+    One ordinary tool-only round enters the terminal phase. The model then
+    ignores every tool_choice=none request; the worker must stop after the
+    configured retry count plus the original terminal attempt, without
+    dispatching those terminal calls or writing a model bubble.
+    """
+    uid = "u_w_terminal_tool_retry_bound"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+    monkeypatch.setattr(worker, "MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS", 1)
+    retries = worker.MAX_TERMINAL_TOOL_CALL_RETRIES
+    terminal_rounds = retries + 1
+    script = [_tool_round(_tc("initial", "memory_index"))]
+    script.extend(
+        _tool_round(_tc(f"terminal-{index}", "memory_index"))
+        for index in range(terminal_rounds)
+    )
+    calls = _script_provider(monkeypatch, script)
+
+    deps = _deps(messages=[
+        {"id": "m1", "ts": 10.0, "role": "user", "content": "hello"},
+    ])
+    written = {}
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda store, text: written.update(text=text) or {"id": "r1"},
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "failed"
+    assert len(calls) == 1 + terminal_rounds
+    assert all(call["tool_choice"] == "none" for call in calls[1:])
+    assert written == {}
+    assert _job_status(job_id) == (
+        "failed",
+        "turn_failed:tool_budget_exhausted",
+    )
 
 
 def test_second_round_receives_first_round_native_tool_exchange(monkeypatch):
