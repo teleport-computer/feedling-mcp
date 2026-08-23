@@ -16373,11 +16373,18 @@ def _process_dream_jobs(jobs: list) -> float:
         recent_text = _dream_recent_conversations_context(
             user_label=user_name, agent_label=ai_name
         )
+        _dream_buckets, _dream_threads = _capture_memory_terms_context()
         prompt = build_dream_prompt(
             ai_name=ai_name,
             user_name=user_name,
             cards=cards_text,
             recent_conversations=recent_text,
+            # 与 capture 同源：整理的是同一个花园，不能夜里换一种语言的桶。
+            locale=infer_garden_language(
+                _identity,
+                existing_buckets=_dream_buckets,
+                archive_language=str(_whoami_cache.get("archive_language") or "").strip(),
+            ),
         )
         # known_ids = 喂进 prompt 的那批卡的 id:result 字段里出现任何一个即
         # 「把整理注记当成内容」(usr_a40e 墓碑卡),与内容闸同路打回重问。
@@ -17347,6 +17354,11 @@ def _process_migrate_jobs(jobs: list) -> float:
             user_name=user_name,
             old_cards=_migrate_render_old_cards(batch),
             vocab=f"已有桶: {buckets_text}\n已有线索: {threads_text}",
+            locale=infer_garden_language(
+                _identity,
+                existing_buckets=buckets_text,
+                archive_language=str(_whoami_cache.get("archive_language") or "").strip(),
+            ),
         )
         try:
             reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))

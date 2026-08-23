@@ -206,12 +206,12 @@ def test_all_three_write_paths_carry_the_naming_rule():
     capture = build_capture_prompt(ai_name="小柒", user_name="", buckets="",
                                    threads="", identity="", window="- 对方: hi",
                                    locale="zh-Hans")
-    dream = build_dream_prompt(ai_name="小柒", user_name="", cards="", recent_conversations="")
+    dream = build_dream_prompt(ai_name="小柒", user_name="", cards="", recent_conversations="", locale="zh-Hans")
     for prompt, who in ((capture, "capture"), (dream, "dream")):
         assert "「用户」" in prompt or '"用户"' in prompt, who   # 明令禁用
         assert "对方" in prompt, who                            # 无名时的中性主语
     # 做梦还必须被要求**回头修**旧卡里的老写法,否则历史包袱永远不会自愈
-    assert "整理旧卡" in dream
+    assert "While tidying old cards" in dream
 
     import hosted.history_import as hi
     assert "_naming_rule" in Path(

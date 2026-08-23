@@ -38,10 +38,18 @@ from memory.card_leak_signals import IO_LEAK_SIGNALS  # noqa: E402
 card_text_rejection = partial(_kernel_card_text_rejection, signals=IO_LEAK_SIGNALS)
 sanitize_card_labels = partial(_kernel_sanitize_card_labels, signals=IO_LEAK_SIGNALS)
 from memory.dream_prompt_v1 import (  # noqa: E402
-    build_dream_prompt,
+    build_dream_prompt as _kernel_build_dream_prompt,
     build_dream_retry_prompt,
     parse_dream_consolidations,
 )
+
+# 这批测试写在 locale 成为必填参数之前。在 import 这层绑一次默认值，
+# 而不是给 13 个调用点各加一个参数 —— 后者今晚已经弄坏过文件三次。
+# 需要测另一种语言的用例显式传 locale= 覆盖即可。
+from functools import partial as _partial  # noqa: E402
+
+build_dream_prompt = _partial(_kernel_build_dream_prompt, locale="zh-Hans")
+
 
 
 # --- 判据本身 ---------------------------------------------------------------

@@ -11406,6 +11406,11 @@ async def _run_extraction(
                 user_name=ctx.get("user_name", ""),
                 cards=ctx.get("cards", ""),
                 recent_conversations=window,
+                # 做梦整理的是同一个花园，语言判据必须跟 capture 同源，
+                # 否则夜里整理一遍会把桶换成另一种语言。
+                locale=infer_garden_language(
+                    None, existing_buckets=str(ctx.get("buckets") or "")
+                ),
             )
             # parse_dream_consolidations 返回 (consolidations, questions, err)。
             # questions 属于「主动提问」= wake 语义，本轮明确丢弃（spec §5.3）。

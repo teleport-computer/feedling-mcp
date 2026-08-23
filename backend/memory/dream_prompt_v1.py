@@ -18,14 +18,20 @@ def build_dream_prompt(
     user_name: str,
     cards: str,
     recent_conversations: str,
+    locale: str,
 ) -> str:
-    """旧签名不变；称呼规则在这层装配后传给内核。"""
+    """称呼规则在这层装配后传给内核。
+
+    ``locale`` 必填、无默认 —— 同 capture：给了默认，漏改的调用点会安静地按错语言
+    整理记忆，必填则当场炸出来。取自 ``chat.reply_language.infer_garden_language``。
+    """
     return _kernel.build_dream_prompt(
         ai_name=ai_name,
         user_name=sanitize_user_name(user_name),
-        naming_rule=_naming_rule(user_name),
+        naming_rule=_naming_rule(user_name, locale=locale),
         cards=cards,
         recent_conversations=recent_conversations,
+        locale=locale,
     )
 
 

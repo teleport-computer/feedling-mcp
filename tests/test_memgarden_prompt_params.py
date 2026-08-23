@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 
+
 def test_kernel_capture_prompt_takes_naming_rule_as_param():
     from memgarden.prompts.capture import build_capture_prompt
 
@@ -39,6 +40,7 @@ def test_kernel_dream_prompt_takes_naming_rule_as_param():
         naming_rule="叫他老王。",
         cards="（暂无）",
         recent_conversations="（暂无）",
+        locale="zh-Hans",
     )
     assert "叫他老王。" in text
 

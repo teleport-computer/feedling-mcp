@@ -174,14 +174,23 @@ def test_instructions_are_english_and_only_literals_stay_chinese():
     allowed = set(
         "工作 目标与成长 家庭 朋友 宠物 我们的关系 情绪与安抚 偏好与边界 "
         "个性与价值观 健康 爱好 金钱 饮食 地点与旅行 用户 对方 争执 吵架 "
-        "妈妈 界面 留存 满意度 用户界面 用户留存 健康 简体中文 这个人 "
+        "妈妈 房子 界面 留存 满意度 用户界面 用户留存 健康 简体中文 这个人 "
         "不要用 指代本人的 猜测性别的他 也不要用第二人称 来指代本人 "
         "如果材料里明确出现了本人希望被称呼的名字 就用那个名字 "
         "没有名字时优先省略主语 例如 常在深夜写代码 累了会突然沉默 "
         "需要主语时 按身份卡 你们的关系 旧卡和对话里的线索判断性别 "
         "用 或 线索不足以判断 才用中性的".split()
     )
-    leaked = [run for run in chinese_runs if run not in allowed]
+    # 中文花园的**称谓规则整段是中文的**，这是对的：它讲的是「卡里别写哪些中文词」，
+    # 翻成英文就教不清了（英文里根本没有「用户」这个词要防）。规则由
+    # memgarden.naming.referent_rule(locale) 按语言取，所以这里整段豁免。
+    from identity.user_naming import _naming_rule
+    from memgarden.naming import referent_rule
+
+    referent_zh = set(re.findall(r"[一-鿿]{2,}", referent_rule("zh-Hans")))
+    naming_zh = set(re.findall(r"[一-鿿]{2,}", _naming_rule("老王", locale="zh-Hans")))
+    leaked = [r for r in chinese_runs
+              if r not in allowed and r not in referent_zh and r not in naming_zh]
     assert not leaked, f"这些中文说明没翻译干净：{sorted(set(leaked))}"
 
 

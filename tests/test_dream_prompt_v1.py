@@ -6,9 +6,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from memory.dream_prompt_v1 import (  # noqa: E402
     DREAM_OPS,
-    build_dream_prompt,
+    build_dream_prompt as _kernel_build_dream_prompt,
     parse_dream_consolidations,
 )
+
+# 这批测试写在 locale 成为必填参数之前。在 import 这层绑一次默认值，
+# 而不是给 13 个调用点各加一个参数 —— 后者今晚已经弄坏过文件三次。
+# 需要测另一种语言的用例显式传 locale= 覆盖即可。
+from functools import partial as _partial  # noqa: E402
+
+build_dream_prompt = _partial(_kernel_build_dream_prompt, locale="zh-Hans")
+
 
 _FENCE = "`" * 3
 
@@ -24,16 +32,16 @@ def test_prompt_renders_with_context_and_escaped_json():
     assert '"op": "merge | thicken | supersede"' in p
     assert '"rationale"' in p
     # red line present
-    assert "superseded" in p and "不删" in p
-    assert "关于这个人的一切" in p
-    assert "你们现在没有在对话" in p
-    assert "留着问这个人" in p
+    assert "superseded" in p and "do NOT delete it" in p
+    assert "everything you remember about this person" in p
+    assert "You are not in a conversation right now" in p
+    assert "saved to ask this person" in p
 
 
 def test_prompt_falls_back_to_neutral_defaults():
     p = build_dream_prompt(ai_name="", user_name="", cards="", recent_conversations="")
     assert "（暂无卡）" in p and "（这几天没有新对话）" in p
-    assert p.startswith("你是 我——这个人 的伴侣。")
+    assert p.startswith("You are 这个人, 这个人's companion.")
 
 
 def test_prompt_naming_rule_and_backfill_instruction():
@@ -49,8 +57,8 @@ def test_prompt_naming_rule_and_backfill_instruction():
     assert "不要用「TA」指代本人" in flat
     # Backfill is scoped: only TA that refers to the PERSON gets rewritten;
     # TA correctly referring to the AI (the app-surface meaning) is preserved.
-    assert '指代本人的"用户"/"user"/「TA」/「你」/「对方」按上面那条' in flat
-    assert "指代你（AI）的「TA」" in flat and "保留不动" in flat
+    assert "rewriteanysystemlabelorplaceholderthatreferstothisperson" in flat
+    assert "inacardthatreferstoYOU(theAI)" in flat and "leaveitalone" in flat
     p2 = build_dream_prompt(ai_name="", user_name="", cards="", recent_conversations="")
     assert "优先省略主语" in p2
 
@@ -69,11 +77,11 @@ def test_dream_backfill_does_not_downgrade_correct_pronouns():
         ai_name="小柒", user_name="", cards="", recent_conversations="",
     ).replace("\n", "").replace(" ", "")
     assert "猜测性别的他或她" not in flat, "追溯改写清单里不能再有性别代词"
-    assert "旧卡里已经在用的「他」/「她」保留不动" in flat
+    assert "alreadyinanoldcardthatreadscorrectlystaysasitis" in flat
     # 反过来:旧卡里的「对方」进了改写清单 —— 线索够就该上调成 他/她,
     # 存量脏卡靠 dream 自愈,不用单独回填。
-    assert "/「对方」按上面那条" in flat
-    assert "没名字但线索够就用「他」/「她」" in flat
+    assert "accordingtotheruleabove" in flat
+    assert "用「他」或「她」" in flat and "才用中性的「对方」" in flat
 
 
 def test_reserved_placeholder_user_name_treated_as_unknown():
@@ -181,9 +189,9 @@ def test_dream_ops_are_merge_thicken_supersede():
 def test_prompt_forbids_tombstone_notes_and_card_ids():
     p = build_dream_prompt(ai_name="", user_name="", cards="", recent_conversations="")
     flat = p.replace("\n", "").replace(" ", "")
-    assert "新卡的内容本身" in flat
-    assert "已被X取代" in flat.replace("「", "").replace("」", "")
-    assert "绝不出现卡id" in flat
+    assert "carriesthecontentoftheNEWcardaftermergingorthickening" in flat
+    assert "bookkeepingnoteslike\"supersededbyX\"" in flat
+    assert "neverputacardidinsideafield" in flat
 
 
 def _consolidation_raw(summary: str, content: str) -> str:

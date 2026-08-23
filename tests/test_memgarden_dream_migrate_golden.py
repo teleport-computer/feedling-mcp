@@ -88,7 +88,10 @@ def test_fixture_covers_the_shapes_that_break_templates() -> None:
 
         assert "all_empty" in cases, f"{kind} 基线缺全空用例"
         empty_params = cases["all_empty"]["params"]
-        non_empty = {k: v for k, v in empty_params.items() if str(v).strip()}
+        # locale 是必填参数（没有默认值），不算「填了内容」——
+        # 这个用例守的是「其余参数全空时模板的默认措辞」。
+        non_empty = {k: v for k, v in empty_params.items()
+                     if str(v).strip() and k != "locale"}
         assert not non_empty, (
             f"{kind}.all_empty 已经不是全空了:{sorted(non_empty)} —— "
             "这个用例的意义就是压默认档措辞,填了值就守不住了"
@@ -135,15 +138,17 @@ def test_dream_shell_is_an_adapter_not_a_second_template() -> None:
         user_name=raw_user_name,
         cards="卡1: 老婆是重庆人",
         recent_conversations="用户:今天开了一天会",
+        locale="zh-Hans",
     )
 
     via_shell = build_dream_via_shell(**params)
     via_kernel = kernel.build_dream_prompt(
         ai_name=params["ai_name"],
         user_name=sanitize_user_name(raw_user_name),
-        naming_rule=_naming_rule(raw_user_name),
+        naming_rule=_naming_rule(raw_user_name, locale=params["locale"]),
         cards=params["cards"],
         recent_conversations=params["recent_conversations"],
+        locale=params["locale"],
     )
 
     assert via_shell == via_kernel, (
