@@ -872,6 +872,7 @@ jobs:
             tests/test_admin_discarded_reason.py \
             tests/test_admin_concentration.py \
             tests/test_admin_concentration_e2e.py \
+            tests/test_admin_genesis_unavailable.py \
             -v
 
       - name: Upload execution evidence (report only)
