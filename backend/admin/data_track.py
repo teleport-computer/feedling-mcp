@@ -132,25 +132,6 @@ def _count_rows(rows: list[dict], key: str) -> dict:
     return counts
 
 
-def _v1_proactive_outcome_class(status: object, reason: object) -> str:
-    """Classify the resident/V1 proactive status-reason keyspace.
-
-    ``skipped`` is a control-plane outcome (including heartbeat_throttled), not
-    a failed realization.  A failed job leaves our numerator only for Seven's
-    exact user-unavailable reasons.  No prefix or string-shape inference is
-    allowed: unknown/new reasons remain operational failures.
-    """
-    normalized_status = str(status or "").strip()
-    normalized_reason = str(reason or "").strip() or "unknown"
-    if normalized_status == "skipped":
-        return "control"
-    if normalized_status != "failed":
-        return ""
-    if normalized_reason in notices_catalog.USER_UNAVAILABLE_V1_REASONS:
-        return "user_unavailable"
-    return "operational_failure"
-
-
 def _safe_onboarding_validation(raw: dict) -> dict:
     def scrub_step(step: dict) -> dict:
         blocked = {"relationship_anchor_evidence"}
@@ -383,7 +364,9 @@ def _proactive_stats(store: UserStore) -> dict:
         kind_lanes[lane] += 1
         status = str(j.get("status") or "").strip()
         reason = str(j.get("status_reason") or "").strip() or "unknown"
-        outcome_class = _v1_proactive_outcome_class(status, reason)
+        outcome_class = notices_catalog.v1_proactive_outcome_class(
+            status, reason
+        )
         if outcome_class == "operational_failure":
             fail_lanes[lane] += 1
             failed_reasons[reason] = failed_reasons.get(reason, 0) + 1
@@ -2415,22 +2398,53 @@ def _finite_ms(value):
     return out if (math.isfinite(out) and out >= 0) else None
 
 
-def _known_job_lanes() -> frozenset:
+def _load_jobs_store_trace_vocabulary() -> tuple[frozenset, frozenset]:
+    """Read the trace vocabulary from its producer.
+
+    Kept as a small seam so an import/read failure can be tested without
+    teaching the admin consumer a second copy of either closed set.
+    """
+    from model_api_runtime.v2 import jobs_store as _js
+
+    return frozenset(_js.LANES), frozenset(_js.ENQUEUE_REASON_CODES)
+
+
+def _trace_vocabulary() -> tuple[frozenset, frozenset] | None:
+    """Return producer-owned lane/reason sets, or an explicit unavailable.
+
+    Both producer exports are non-empty closed sets. Empty therefore cannot be
+    a healthy reading. Failures are deliberately not cached: a transient import
+    failure must not blind the admin surface until process restart.
+    """
+    global _TRACE_VOCABULARY_CACHE
+    if _TRACE_VOCABULARY_CACHE is not None:
+        return _TRACE_VOCABULARY_CACHE
+    try:
+        lanes, enqueue_reasons = _load_jobs_store_trace_vocabulary()
+        if not lanes or not enqueue_reasons:
+            return None
+    except Exception:  # noqa: BLE001 — render degraded state instead of 500
+        return None
+    _TRACE_VOCABULARY_CACHE = (lanes, enqueue_reasons)
+    return _TRACE_VOCABULARY_CACHE
+
+
+_TRACE_VOCABULARY_CACHE = None
+_TRACE_VOCABULARY_UNSET = object()
+
+
+def _known_job_lanes() -> frozenset | None:
     """后台任务的 lane 闭集,**从产生方读**,不在管理端抄一份。"""
-    global _KNOWN_JOB_LANES_CACHE
-    if _KNOWN_JOB_LANES_CACHE is None:
-        try:
-            from model_api_runtime.v2 import jobs_store as _js
-            _KNOWN_JOB_LANES_CACHE = frozenset(_js.LANES)
-        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
-            _KNOWN_JOB_LANES_CACHE = frozenset()
-    return _KNOWN_JOB_LANES_CACHE
+    vocabulary = _trace_vocabulary()
+    return vocabulary[0] if vocabulary is not None else None
 
 
-_KNOWN_JOB_LANES_CACHE = None
-
-
-def _debug_trace_group_turns(events: list[dict]) -> list[dict]:
+def _debug_trace_group_turns(
+    events: list[dict], *, known_job_lanes=_TRACE_VOCABULARY_UNSET,
+) -> list[dict]:
+    if known_job_lanes is _TRACE_VOCABULARY_UNSET:
+        known_job_lanes = _known_job_lanes()
+    lane_values = known_job_lanes if known_job_lanes is not None else frozenset()
     buckets: dict[tuple[str, str], list[dict]] = {}
     for ev in events:
         trace_id = str(ev.get("trace_id") or "ungrouped")
@@ -2474,7 +2488,7 @@ def _debug_trace_group_turns(events: list[dict]) -> list[dict]:
             (
                 str(e.get("lane") or "")
                 for e in ordered
-                if str(e.get("lane") or "") in _known_job_lanes()
+                if str(e.get("lane") or "") in lane_values
             ),
             "",
         ) or next(
@@ -2482,7 +2496,7 @@ def _debug_trace_group_turns(events: list[dict]) -> list[dict]:
                 str((e.get("detail") or {}).get("lane") or "")
                 for e in ordered
                 if isinstance(e.get("detail"), dict)
-                and str((e.get("detail") or {}).get("lane") or "") in _known_job_lanes()
+                and str((e.get("detail") or {}).get("lane") or "") in lane_values
             ),
             "",
         )
@@ -2829,22 +2843,22 @@ def _is_registered_failure_code(value: str) -> bool:
     return value in _known_failure_codes() or value in _known_error_classes()
 
 
-def _trace_public_fields() -> dict:
+def _trace_public_fields(*, vocabulary=_TRACE_VOCABULARY_UNSET) -> dict:
     """事件类型 -> {键: 允许取值集合 或 _TRACE_PUBLIC_SHAPE}。
 
     惰性构建:`jobs_store` 在 `data_track` 之下,模块级导入会把管理端接进运行时
     的导入链(仓内既有做法同此,见 `_v2_wake_activity_detail`)。
     """
     global _TRACE_PUBLIC_FIELDS_CACHE
-    if _TRACE_PUBLIC_FIELDS_CACHE is not None:
+    if vocabulary is _TRACE_VOCABULARY_UNSET:
+        vocabulary = _trace_vocabulary()
+    if vocabulary is not None and _TRACE_PUBLIC_FIELDS_CACHE is not None:
         return _TRACE_PUBLIC_FIELDS_CACHE
-    try:
-        from model_api_runtime.v2 import jobs_store as _js
-        lanes = frozenset(_js.LANES)
-        enqueue_reasons = frozenset(_js.ENQUEUE_REASON_CODES)
-    except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
+    if vocabulary is None:
         lanes = frozenset()
         enqueue_reasons = frozenset()
+    else:
+        lanes, enqueue_reasons = vocabulary
     outcomes = frozenset(db.TRACE_OUTCOME_CLASSES)
     job_outcomes = frozenset({"completed", "failed", "rescheduled", "superseded"})
     voice_stage = frozenset({
@@ -2881,14 +2895,21 @@ def _trace_public_fields() -> dict:
             "stage": voice_stage, "runtime": runtime_kind,
             "error_code": _TRACE_PUBLIC_FAILURE_CODE,
         }
-    _TRACE_PUBLIC_FIELDS_CACHE = table
+    # Only a producer-backed table is healthy enough to cache. The degraded
+    # table still preserves unrelated public fields, but the next request must
+    # retry the producer import.
+    if vocabulary is not None:
+        _TRACE_PUBLIC_FIELDS_CACHE = table
     return table
 
 
 _TRACE_PUBLIC_FIELDS_CACHE = None
 
 
-def _expose_declared_trace_fields(ev: dict, raw_detail, public_detail) -> None:
+def _expose_declared_trace_fields(
+    ev: dict, raw_detail, public_detail,
+    *, trace_public_fields=_TRACE_VOCABULARY_UNSET,
+) -> None:
     """把该事件显式声明过的字段放回明文。
 
     两层收口:键必须被这个事件声明过,**且**值必须落在产生方集合里。
@@ -2896,7 +2917,9 @@ def _expose_declared_trace_fields(ev: dict, raw_detail, public_detail) -> None:
     """
     if not isinstance(raw_detail, dict) or not isinstance(public_detail, dict):
         return
-    allowed = _trace_public_fields().get(str(ev.get("type") or ""))
+    if trace_public_fields is _TRACE_VOCABULARY_UNSET:
+        trace_public_fields = _trace_public_fields()
+    allowed = trace_public_fields.get(str(ev.get("type") or ""))
     if not allowed:
         return
     for key, spec in allowed.items():
@@ -2910,10 +2933,17 @@ def _expose_declared_trace_fields(ev: dict, raw_detail, public_detail) -> None:
             public_detail[key] = value
 
 
-def _debug_event_public_json(ev: dict) -> dict:
+def _debug_event_public_json(
+    ev: dict, *, trace_public_fields=_TRACE_VOCABULARY_UNSET,
+) -> dict:
     raw_detail = ev.get("detail") or {}
     public_detail = _debug_redact_value(raw_detail)
-    _expose_declared_trace_fields(ev, raw_detail, public_detail)
+    _expose_declared_trace_fields(
+        ev,
+        raw_detail,
+        public_detail,
+        trace_public_fields=trace_public_fields,
+    )
     if ev.get("type") in memory_dream_trace.DREAM_TRACE_TYPES:
         # Dream rewrites private memory. Its public diagnostic contract is an
         # exact closed shape: any new/unknown key invalidates the whole detail
@@ -3134,6 +3164,7 @@ def _debug_filter_options(events: list[dict]) -> dict:
 
 
 def _data_track_debug_payload() -> dict:
+    trace_vocabulary = _trace_vocabulary()
     filters = _data_track_request_filters()
     limit = int(filters.get("limit") or 100)
     offset = int(filters.get("offset") or 0)
@@ -3232,7 +3263,12 @@ def _data_track_debug_payload() -> dict:
             }
 
     all_events = sorted(all_events, key=lambda e: float(e.get("ts") or 0), reverse=True)
-    turns = _debug_trace_group_turns(all_events)
+    turns = _debug_trace_group_turns(
+        all_events,
+        known_job_lanes=(
+            trace_vocabulary[0] if trace_vocabulary is not None else None
+        ),
+    )
     if status_filter and status_filter != "all":
         turns = [t for t in turns if t.get("terminal_status") == status_filter]
         allowed = {(t["user_id"], t["trace_id"]) for t in turns}
@@ -3297,6 +3333,11 @@ def _data_track_debug_payload() -> dict:
             "page": str(page or ""),
         },
         "options": _debug_filter_options(all_events_raw),
+        "observability": {
+            "trace_vocabulary": (
+                "ok" if trace_vocabulary is not None else "unavailable"
+            ),
+        },
         "pagination": pagination,
         "users": users_out,
         "turns": turns_out,
@@ -3925,6 +3966,32 @@ def _runtime_failure_code(raw) -> str:
     if not code or not _is_registered_failure_code(code):
         return "other"
     return code[:_RUNTIME_FAILURE_CODE_MAX]
+
+
+# ``runtime_failed`` **不是一种运行时错误**。它是净化层对「原始 reason 存在、
+# 但没通过安全白名单 ``^[a-z0-9_:-]{1,120}$``」的整段替换（``db.py`` 的
+# ``_LANE_ROLLUP_CODE_RE``、``memory_metadata`` 的同形 SQL CASE）。白名单不许
+# 大写、空格、句点，所以**任何一句人类可读的错误消息都会被抹成它**。
+#
+# 为什么值得单独标注：2026-08-22 prod 实测，V1 心跳有 6 个账号整周零成功、663
+# 次失败（占 V1 心跳失败 66%），失败码 100% 是它。读表的人会得出「运行时坏了」，
+# 而真相是「**此处原本有答案，被我们删了**」——两者的下一步动作完全不同。
+_DISCARDED_REASON_CODE = "runtime_failed"
+_DISCARDED_REASON_NOTE = "原因已丢弃（原始文本未通过安全白名单），不是一种运行时错误"
+
+
+def _failure_code_cell(raw: object, *, missing: str = "other") -> str:
+    """渲染一个失败码 ``<td>``。
+
+    ⚠️ ``missing`` 默认 ``other``，与本文件其余两处失败码渲染保持同一个词。
+    绝不能拿 ``runtime_failed`` 当缺值兜底：那会让「原因被我们丢弃」和「本来
+    就没有失败码」在页面上长成同一个字符串，而它们指向两件不同的事。
+    """
+    code = str(raw or "").strip() or str(missing)
+    cell = f"<code>{html.escape(code)}</code>"
+    if code == _DISCARDED_REASON_CODE:
+        cell += f"<div class='evt-desc'>{html.escape(_DISCARDED_REASON_NOTE)}</div>"
+    return f"<td>{cell}</td>"
 
 
 def _runtime_health_level(
@@ -5033,7 +5100,7 @@ def _render_runtime_health_page(
                 "<tr>"
                 f"<td>{name}</td>"
                 f"<td>{RUNTIME_OUTCOME_CLASS_LABELS[outcome_class]}</td>"
-                f"<td><code>{html.escape(code)}</code></td>"
+                f"{_failure_code_cell(code)}"
                 f"<td>{error_class_html}</td>"
                 f"<td>{_fmt_count(count)}</td>"
                 "</tr>"
@@ -5592,14 +5659,14 @@ def _render_imports_page(report: dict | None, *, within_hours: int) -> str:
             f"<td>{html.escape(status_labels.get(status, status))}{' · 超过15m未更新' if is_stuck else ''}</td>"
             f"<td class='{evidence_cls}'>{evidence_text}</td>"
             f"<td>{_fmt_count(row.get('memory_action_count'))} / {'有' if row.get('has_identity_evidence') else '无'}</td>"
-            f"<td><code>{html.escape(str(row.get('error_code') or '—'))}</code></td>"
+            f"{_failure_code_cell(row.get('error_code'), missing='—')}"
             f"<td>{html.escape(_ops_time(row.get('created_at')))}</td>"
             f"<td>{html.escape(_ops_time(row.get('updated_at')))}</td>"
             "</tr>"
         )
     failure_rows = "".join(
         "<tr>"
-        f"<td><code>{html.escape(str(row.get('error_code') or 'other'))}</code></td>"
+        f"{_failure_code_cell(row.get('error_code'))}"
         f"<td>{_fmt_count(row.get('count'))}</td></tr>"
         for row in report.get("failure_reasons") or []
     )
@@ -5640,7 +5707,7 @@ def _render_chat_reliability_page(report: dict | None, *, within_hours: int) -> 
     reply_quality = report.get("reply_quality") or {}
     failure_rows = "".join(
         "<tr>"
-        f"<td><code>{html.escape(str(row.get('code') or 'runtime_failed'))}</code></td>"
+        f"{_failure_code_cell(row.get('code'))}"
         f"<td>{_fmt_count(row.get('count'))}</td></tr>"
         for row in report.get("failure_reasons") or []
     )
@@ -5658,7 +5725,7 @@ def _render_chat_reliability_page(report: dict | None, *, within_hours: int) -> 
             f"<td>{html.escape(str(row.get('final_effect_status') or 'missing'))}</td>"
             f"<td>{html.escape(str(row.get('provider') or '—'))} / {html.escape(str(row.get('model') or '—'))}</td>"
             f"<td>{_fmt_count(row.get('model_calls'))} / {_fmt_count(row.get('retries'))}</td>"
-            f"<td><code>{html.escape(str(row.get('last_error') or '—'))}</code></td>"
+            f"{_failure_code_cell(row.get('last_error'), missing='—')}"
             f"<td>{html.escape(_ops_time(row.get('created_at')))}</td>"
             "</tr>"
         )
@@ -9106,6 +9173,16 @@ def _render_turn_identity(turn: dict) -> str:
 
 def _render_data_track_debug_page(payload: dict) -> str:
     summary = payload["summary"]
+    trace_vocabulary_status = str(
+        (payload.get("observability") or {}).get("trace_vocabulary") or "unavailable"
+    )
+    trace_public_fields = _trace_public_fields(
+        vocabulary=(
+            _TRACE_VOCABULARY_UNSET
+            if trace_vocabulary_status == "ok"
+            else None
+        )
+    )
     filters = payload.get("filters", {})
     options = payload.get("options", {})
     users = payload.get("users", [])
@@ -9170,7 +9247,12 @@ def _render_data_track_debug_page(payload: dict) -> str:
             copy_button("copy user", ev.get("user_id") or ""),
             copy_button("copy trace", ev.get("trace_id") or ""),
             copy_button("copy type", ev.get("type") or ""),
-            copy_button("copy JSON", _debug_event_public_json(ev)),
+            copy_button(
+                "copy JSON",
+                _debug_event_public_json(
+                    ev, trace_public_fields=trace_public_fields,
+                ),
+            ),
         ]
         if include_open_turn:
             href = _data_track_page_href(view="debug", mode="timeline", user_id=ev.get("user_id") or "", trace_id=ev.get("trace_id") or "", offset=0, reveal=None)
@@ -9190,7 +9272,9 @@ def _render_data_track_debug_page(payload: dict) -> str:
         # 这正是 T130 那条:单测绿 = 代码对,证不了页面看得见。
         detail = _debug_json(
             ev.get("detail") if revealed
-            else _debug_event_public_json(ev).get("detail") or {}
+            else _debug_event_public_json(
+                ev, trace_public_fields=trace_public_fields,
+            ).get("detail") or {}
         )
         excerpt = _debug_json(ev.get("content_excerpt") if revealed else _debug_content_summary(ev.get("content_excerpt") or {}))
         if not detail and not excerpt and not revealed:
@@ -9299,6 +9383,13 @@ def _render_data_track_debug_page(payload: dict) -> str:
         _render_metric("turns", summary["turns_total"]),
         _render_metric("stalled / error", f"{summary['stalled_turns']} / {summary['error_turns']}"),
     ])
+    vocabulary_warning = (
+        "<div class='observability-warning'>Trace 词表暂不可用；"
+        "后台任务 lane / enqueue reason 闭集字段未展示，"
+        "不能读成“事件没有这些字段”。</div>"
+        if trace_vocabulary_status != "ok"
+        else ""
+    )
     refresh_meta = "" if reveal_key else '<meta http-equiv="refresh" content="30">'
 
     page_unit = "turns" if mode == "timeline" else "events"
@@ -9415,6 +9506,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
     pre {{ white-space:pre-wrap; word-break:break-word; background:#fff7f0; border:1px solid var(--line); border-radius:6px; padding:10px; max-height:360px; overflow:auto; }}
     .redacted-note,.reveal-note {{ border-radius:6px; padding:8px; margin:7px 0; }} .redacted-note {{ color:var(--muted); background:#f6efe8; border:1px solid var(--line); }} .reveal-note {{ color:#8a4a00; background:#fff8ed; border:1px solid #e8c59d; }}
     .stall {{ color:var(--warn); background:#fff8e8; border:1px solid #f0d7a5; border-radius:6px; padding:8px; margin-top:8px; }}
+    .observability-warning {{ color:var(--warn); background:#fff8e8; border:1px solid #f0d7a5; border-radius:6px; padding:10px; margin:14px 0; }}
 {_NAV_GROUP_CSS}
   </style>
 </head>
@@ -9423,6 +9515,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
   <h1>Feedling Debug Logs</h1>
   <div class="muted">Admin-only debug view. Reads the append-only TEE trace table; no instrumentation writes here. Generated {html.escape(_bj_iso(summary["generated_at"]))}.</div>
   {_render_data_track_view_nav("debug")}
+  {vocabulary_warning}
   <section class="metrics">{metrics}</section>
   <div class="modebar">
     <div class="mode-left">
@@ -9627,19 +9720,49 @@ def _event_path_master_payload(frozen: dict) -> dict:
             for code, count in (counts.get("failure_codes") or {}).items()
         }
         if runtime == "runtime_v1":
-            # The V1 freezer deliberately reused one ``failed`` counter for
-            # status=failed AND status=skipped.  T197 classifies every skipped
-            # row as control, but ``failure_codes`` retained only its reason,
-            # not the status needed by _v1_proactive_outcome_class.  Subtracting
-            # only the V1 user-unavailable reasons would still turn unknown
-            # skipped controls into Feedling failures.  Do not print a rate
-            # that the frozen cell cannot reconstruct losslessly.
-            return unavailable(
-                detail=(
-                    "V1 冻结 failed 混合 failed 与 skipped，failure_codes 又不含原 status；"
-                    "按 T197 无法无损拆出 operational failure，不能叫失败率。"
+            outcome_level = str(coverage.get("outcome_level") or "red")
+            if outcome_level != "green":
+                # Existing cells predate status-aware outcome counters.  Their
+                # new columns contain migration defaults, not measured zeroes;
+                # keep the old honest refusal until the whole requested window
+                # is at or after outcomes_from.
+                return unavailable(
+                    coverage=outcome_level,
+                    detail=(
+                        "V1 outcome 分类仅从 "
+                        f"{coverage.get('outcomes_from') or '尚未开始'} 起冻结；"
+                        f"本窗口覆盖 {int(coverage.get('outcome_covered_days') or 0)}"
+                        f"/{int(coverage.get('required_days') or 0)} 天。"
+                        "过去的日子没有回填，不能把默认 0 叫失败率。"
+                    ),
                 )
-            )
+            operational = int(counts.get("operational_failures") or 0)
+            control_outcomes = int(counts.get("control_outcomes") or 0)
+            user_unavailable = int(counts.get("user_unavailable") or 0)
+            classified = operational + control_outcomes + user_unavailable
+            if classified != failed:
+                return unavailable(
+                    detail=(
+                        "V1 冻结 outcome 计数与 failed 不守恒："
+                        f"classified={classified}, failed={failed}；"
+                        "不能从残缺格子计算失败率。"
+                    )
+                )
+            return {
+                "state": "metric", "coverage": "green",
+                "success": completed, "failure": operational,
+                "failed": failed, "expired": expired,
+                "superseded": superseded,
+                "raw_non_success": failed,
+                "control_outcomes": control_outcomes,
+                "user_unavailable": user_unavailable,
+                "denominator": completed + operational,
+                "denominator_rule": (
+                    "completed + operational failure；control、明确用户侧不可用、"
+                    "superseded 剔除；过去的日子没有回填"
+                ),
+                "concentration": counts.get("concentration"),
+            }
 
         # V2 last_error has a producer-owned classifier.  T197 removes only
         # explicit control and user-unavailable outcomes; unknown codes,
@@ -9668,6 +9791,10 @@ def _event_path_master_payload(frozen: dict) -> dict:
                 "completed + operational failure；control、明确用户侧不可用、"
                 "superseded 剔除；未知码/expired 仍算 operational failure"
             ),
+            # 原样透传:上游给什么就带什么,脏数据由 _concentration_line 统一判。
+            # ⚠️ 这里**不做**校验,否则「上游没给」和「上游给了但不合法」会在
+            # 两个地方各判一次,两处规则迟早分叉。
+            "concentration": counts.get("concentration"),
         }
 
     path_windows = []
@@ -9926,6 +10053,43 @@ _EVENT_COVERAGE_MARK = {
 }
 
 
+def _concentration_line(raw: object) -> str:
+    """一行集中度,贴在率的旁边。
+
+    **为什么必须有**(2026-08-22 prod 实证,不是设计洁癖):
+    V1 心跳 14 个活跃号里 **6 个整周零成功**,663 次失败 = V1 心跳失败的 66%;
+    V2 25 个号里 1 个整周零成功,剔掉它整体从 11.2% 降到 9.0%。
+    表上那个「56% 失败」会被读成「一半心跳在失败」,真相却是
+    「**6 个号从来没成功过,其余大致正常**」——
+    活跃用户只有十几个时,平均值几乎必然被少数坏号主导。
+    ⇒ 数是对的,**但它回答的不是读表人以为的那个问题**。
+
+    两个数各抓一类,都不设阈值:
+      ``users_zero_success``       抓「持续坏掉的账号」——可穷举、可直接去修
+      ``top_user_failure_share``  抓上一条漏掉的:有成功但失败量压倒性的号
+
+    ⛔ 不许设阈值只在「集中度高」时显示:阈值会把健康情形藏起来,于是
+       「没显示」同时意味着「不集中」和「没算」,又造一个歧义空格。
+    ⚠️ 同理,缺失时显式说「未计算」而不是留空 ——
+       「0 人零成功」是一个**真结论**(这格是健康的),与「没算」必须不同形。
+    """
+    if not isinstance(raw, dict):
+        return " · 集中度未计算"
+    try:
+        active = int(raw.get("users_active"))
+        zero = int(raw.get("users_zero_success"))
+    except (TypeError, ValueError):
+        return " · 集中度未计算"
+    if active < 0 or zero < 0 or zero > active:
+        return " · 集中度未计算"
+    line = f" · 零成功 {zero}/{active} 人"
+    share = raw.get("top_user_failure_share")
+    if isinstance(share, (int, float)) and not isinstance(share, bool):
+        if math.isfinite(share) and 0.0 <= share <= 1.0:
+            line += f" · 失败最集中的一个用户占 {share * 100:.0f}%"
+    return line
+
+
 def _render_event_master_cell(cell: dict, *, action: str, path: str,
                               window: str) -> str:
     level = str(cell.get("coverage") or "red")
@@ -9959,6 +10123,7 @@ def _render_event_master_cell(cell: dict, *, action: str, path: str,
         detail = (
             f"分母={denominator}（成功 {success} + 失败 {failure}；"
             f"{rule}）{excluded}{controls}"
+            f"{_concentration_line(cell.get('concentration'))}"
         )
         return (f"<td>{headline}<div class='evt-cell-scope'>"
                 f"{html.escape(scope)}<br>{html.escape(detail)}</div></td>")

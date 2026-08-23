@@ -14,7 +14,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db  # noqa: E402
-from conftest import configure_model_api_route, seed_user  # noqa: E402
+from conftest import configure_model_api_route, seed_user, BACKGROUND_EVENT_TIMEOUT  # noqa: E402
 from chat import chat_core  # noqa: E402
 from core import store as core_store  # noqa: E402
 from hosted import config_store  # noqa: E402
@@ -216,7 +216,7 @@ def test_config_mutation_lock_serializes_runtime_transition(monkeypatch):
 
     def _transition():
         try:
-            assert lock_held.wait(timeout=3)
+            assert lock_held.wait(timeout=BACKGROUND_EVENT_TIMEOUT)
             transition_started.set()
             config_store.set_hosted_runtime_mode(
                 store, config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
@@ -230,7 +230,7 @@ def test_config_mutation_lock_serializes_runtime_transition(monkeypatch):
     holder.start()
     transition.start()
     try:
-        assert transition_started.wait(timeout=3)
+        assert transition_started.wait(timeout=BACKGROUND_EVENT_TIMEOUT)
         assert not transition_done.wait(timeout=0.15)
     finally:
         release_lock.set()
@@ -280,7 +280,7 @@ def test_config_lock_waiters_do_not_open_one_db_session_each(monkeypatch):
 
     def waiter(index: int):
         try:
-            assert holding.wait(timeout=2)
+            assert holding.wait(timeout=BACKGROUND_EVENT_TIMEOUT)
             with db.hosted_runtime_config_mutation_lock(f"u_waiter_{index}"):
                 pass
         except BaseException as exc:
@@ -288,7 +288,7 @@ def test_config_lock_waiters_do_not_open_one_db_session_each(monkeypatch):
 
     holder_thread = threading.Thread(target=holder, daemon=True)
     holder_thread.start()
-    assert holding.wait(timeout=2)
+    assert holding.wait(timeout=BACKGROUND_EVENT_TIMEOUT)
     waiters = [
         threading.Thread(target=waiter, args=(index,), daemon=True)
         for index in range(12)

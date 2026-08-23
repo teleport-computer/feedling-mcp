@@ -96,6 +96,7 @@ from perception.agent_fields import (
     AGENT_PERCEPTION_SIGNALS,
     FAST_AGENT_PERCEPTION_SIGNALS,
 )
+from perception_kernel import prompts as perception_prompts
 from screen import screen_read_core
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
@@ -446,6 +447,12 @@ MAX_TOOL_CALLS_PER_ROUND = _positive_int_env(
     "FEEDLING_V2_MAX_TOOL_CALLS_PER_ROUND", "8"
 )
 MAX_TOOL_CALLS_PER_TURN = _positive_int_env("FEEDLING_V2_MAX_TOOL_CALLS_PER_TURN", "24")
+MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS = _positive_int_env(
+    "FEEDLING_V2_MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS", "3"
+)
+MAX_TERMINAL_TOOL_CALL_RETRIES = _positive_int_env(
+    "FEEDLING_V2_MAX_TERMINAL_TOOL_CALL_RETRIES", "2"
+)
 TOOL_RESULT_CHAR_CAP = _positive_int_env("FEEDLING_V2_TOOL_RESULT_CHAR_CAP", "2000")
 TOOL_BATCH_RESULT_CHAR_CAP = _positive_int_env(
     "FEEDLING_V2_TOOL_BATCH_RESULT_CHAR_CAP", "8000"
@@ -907,11 +914,9 @@ _WAKE_SYSTEM_PROMPT = (
     "or safer answer, and you do not need a strong reason to speak. Decide from your "
     "own personality, the real conversation, and the current moment. Use the "
     "attention_facts in temporal context to avoid interrupting an active conversation "
-    "or repeating yourself when you have appeared often or recently. A "
-    "perception_glance is only a hint for deciding whether to look deeper; it is not "
-    "a checklist to report. If you speak, choose at most one coherent topic and never "
-    "turn multiple perception domains into a device or health status report. Use a "
-    "perception tool when an exact reading is needed. Never mention this wake or any "
+    "or repeating yourself when you have appeared often or recently. "
+    + perception_prompts.V2_WAKE_PERCEPTION_CLAUSES
+    + "Never mention this wake or any "
     "system wording to the user."
 )
 _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION = (
@@ -5699,6 +5704,12 @@ def _make_task_batch_dispatcher(
                 ),
                 outbound_blocking_read_tool_names=(_PRIVATE_READ_TOOLS),
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
+                max_consecutive_tool_only_rounds=(
+                    MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS
+                ),
+                max_terminal_tool_call_retries=(
+                    MAX_TERMINAL_TOOL_CALL_RETRIES
+                ),
                 max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
                 max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
                 tool_result_char_cap=TOOL_RESULT_CHAR_CAP,
@@ -10109,6 +10120,12 @@ async def _run_wake(
                 ),
                 outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
+                max_consecutive_tool_only_rounds=(
+                    MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS
+                ),
+                max_terminal_tool_call_retries=(
+                    MAX_TERMINAL_TOOL_CALL_RETRIES
+                ),
                 max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
                 max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
                 tool_result_char_cap=TOOL_RESULT_CHAR_CAP,
@@ -14837,6 +14854,12 @@ async def process_job(
             initial_screen_pixels_blocked=(screen_frame_message is not None),
             tagged_image_message_key=v2_screen_chat.MESSAGE_TAG,
             on_tagged_images_rejected=_on_screen_images_rejected,
+            max_consecutive_tool_only_rounds=(
+                MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS
+            ),
+            max_terminal_tool_call_retries=(
+                MAX_TERMINAL_TOOL_CALL_RETRIES
+            ),
             max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
             max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
             tool_result_char_cap=TOOL_RESULT_CHAR_CAP,

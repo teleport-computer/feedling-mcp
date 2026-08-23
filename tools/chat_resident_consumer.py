@@ -150,6 +150,8 @@ try:
 except ImportError:
     _ENCRYPTION_AVAILABLE = False
 
+from perception_kernel import prompts as perception_prompts
+
 import generated_image
 
 # Shared torn-protocol-JSON leak detector (backend/core, pure). backend/ is on
@@ -14874,9 +14876,7 @@ def _native_reachout_tool_instructions() -> str:
 def _native_reachout_perception_context(presence: dict, change: list, domains: dict | None = None) -> str:
     parts = [
         "real_signal_context:",
-        "This is a low-resolution glance, not a list of things to report. It helps you decide WHETHER to look closer "
-        "and WHERE — not what to say. Most fields you just note and move on; if one makes you want to understand the "
-        "moment better, pull the matching tool for detail. Treat missing fields as unknown.",
+        perception_prompts.V1_GLANCE_HOWTO,
     ]
     if presence:
         parts.append("presence_hints_json:\n" + json.dumps(presence, ensure_ascii=False, sort_keys=True))
@@ -14884,17 +14884,7 @@ def _native_reachout_perception_context(presence: dict, change: list, domains: d
         parts.append("presence_hints_json: {}")
     if domains:
         parts.append("cross_domain_board_json:\n" + json.dumps(domains, ensure_ascii=False, sort_keys=True))
-        parts.append(
-            "Reading the board: each domain (location/media/app/health/weather/mood/reminders/calendar/photos/screen) "
-            "is laid out evenly — health is just one entry, not the headline. Pick at most 2-3 things that stand out "
-            "to you; you may combine across domains, and prefer lived, human context (music, place, an app, a photo, "
-            "an overdue reminder) over the raw figures. Do NOT recite exact numbers (minutes, degrees, counts, sleep "
-            "figures) — use them only to notice what's genuinely about the user; if a number actually matters, pull "
-            "the tool for it. novelty hints (new_artist / long_dwell) are light factual context, not a directive. "
-            "If signals lean low or vulnerable (late hour, sad music, poor sleep), be lighter, not heavier — don't "
-            "diagnose, don't stack worries; one warm, light touch is enough. If nothing stands out, staying quiet is "
-            "equally fine."
-        )
+        parts.append(perception_prompts.V1_BOARD_HOWTO)
     elif change:
         # Back-compat: an older backend without the board still returns top-N deltas.
         parts.append("perception_change_json:\n" + json.dumps(change, ensure_ascii=False, sort_keys=True))

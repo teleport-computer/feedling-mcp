@@ -46,6 +46,8 @@ _WORKSPACE_REVISION_RE = re.compile(r"\brevision\s+(\d+)\b", re.IGNORECASE)
 # direct callers/tests inherit these safe defaults.
 DEFAULT_MAX_TOOL_CALLS_PER_ROUND = 8
 DEFAULT_MAX_TOOL_CALLS_PER_TURN = 24
+DEFAULT_MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS = 3
+DEFAULT_MAX_TERMINAL_TOOL_CALL_RETRIES = 2
 DEFAULT_TOOL_RESULT_CHAR_CAP = 2000
 DEFAULT_TOOL_BATCH_RESULT_CHAR_CAP = 8000
 DEFAULT_MAX_TOOL_ARGS_CHARS = 16000
@@ -83,6 +85,12 @@ _EMPTY_RESPONSE_CORRECTION = (
     "Complete the user's request now. Return either non-empty visible answer text "
     "or a valid call to one of the offered client tools. Do not return a "
     "thinking-only response."
+)
+_TERMINAL_TEXT_INSTRUCTION = (
+    "Stop calling tools. Using only the information already available in this "
+    "conversation and the tool results above, write one complete, self-contained "
+    "reply to the user now. Do not emit a tool call, a partial preamble, or "
+    "internal reasoning."
 )
 _CONTENT_FREE_STOP_REASONS = frozenset(
     {
@@ -127,6 +135,7 @@ _PROVIDER_FORCE_TEXT_FALLBACK_REASONS = frozenset(
         "tool_schema_rejected",
         "final_reply_correction",
         "invalid_or_over_budget_tool_exchange",
+        "tool_only_stall",
         "other",
     }
 )
@@ -627,6 +636,12 @@ async def run_tool_loop(
     initial_untrusted_screen_only: bool = False,
     tagged_image_message_key: str = "",
     on_tagged_images_rejected=None,
+    max_consecutive_tool_only_rounds: int = (
+        DEFAULT_MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS
+    ),
+    max_terminal_tool_call_retries: int = (
+        DEFAULT_MAX_TERMINAL_TOOL_CALL_RETRIES
+    ),
     max_tool_calls_per_round: int = DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
     max_tool_calls_per_turn: int = DEFAULT_MAX_TOOL_CALLS_PER_TURN,
     tool_result_char_cap: int = DEFAULT_TOOL_RESULT_CHAR_CAP,
@@ -698,6 +713,14 @@ async def run_tool_loop(
     max_tool_calls_per_round = _positive_limit(
         max_tool_calls_per_round, name="max_tool_calls_per_round"
     )
+    max_consecutive_tool_only_rounds = _positive_limit(
+        max_consecutive_tool_only_rounds,
+        name="max_consecutive_tool_only_rounds",
+    )
+    max_terminal_tool_call_retries = _positive_limit(
+        max_terminal_tool_call_retries,
+        name="max_terminal_tool_call_retries",
+    )
     max_tool_calls_per_turn = _positive_limit(
         max_tool_calls_per_turn, name="max_tool_calls_per_turn"
     )
@@ -752,6 +775,8 @@ async def run_tool_loop(
     replied_intermediate = False
     attempts = 0
     tool_calls_used = 0
+    consecutive_tool_only_rounds = 0
+    terminal_tool_call_retries = 0
     reasoning_fragments: list[str] = []
     seen_reasoning_fragments: set[str] = set()
     force_text_fallback = False
@@ -1022,6 +1047,7 @@ async def run_tool_loop(
             # after-first behavior until their timestamp seam is removed.
             folded = await fold_new_messages()
             if folded:
+                consecutive_tool_only_rounds = 0
                 if final_reply_correction_request is not None:
                     _cancel_final_reply_correction()
                 # A newly arrived user message changes the answer target. Do not
@@ -1071,25 +1097,9 @@ async def run_tool_loop(
 
         messages = build_messages(list(transcript))
         turn_catalog = _turn_catalog()
-        # 四道有界纠正共用同一条临时 system suffix 注入通道：文件投递缺失、
-        # 生图谎报、语义空回复，以及 chat 最终回复的语言纠偏。各自最多打回
-        # 一次，不写入 transcript。
-        retry_instructions = "\n\n".join(
-            instruction
-            for instruction in (
-                delivery_retry_instruction,
-                image_claim_retry_instruction,
-                empty_response_retry_instruction,
-                final_reply_correction_instruction,
-            )
-            if instruction
-        )
-        if retry_instructions:
-            messages = _with_system_suffix(messages, retry_instructions)
-        # Reserve the final provider attempt for a terminal reply. Providers with
-        # a real tool_choice=none keep schemas referenced by their native history;
-        # other wires omit tools as before. A 400/422 schema rejection or repeated
-        # malformed call also forces this bounded fallback.
+        # Reserve the configured final provider attempt for a terminal reply.
+        # ``max_calls`` is the deployment-configurable stop threshold; the loop
+        # must not grow an unbounded second budget after reaching it.
         terminal_text_round = (
             force_text_fallback
             or final_reply_correction_request is not None
@@ -1111,6 +1121,33 @@ async def run_tool_loop(
                     )
                 )
             )
+        # Five bounded corrections share the same transient system suffix:
+        # missing file delivery, an unbacked image claim, a semantically empty
+        # response, foreground language correction, and the tools-disabled
+        # terminal answer. None is persisted in the transcript.
+        terminal_text_instruction = (
+            _TERMINAL_TEXT_INSTRUCTION
+            if terminal_text_round
+            and final_reply_correction_request is None
+            and not compact_delivery_confirmation_needed
+            else ""
+        )
+        retry_instructions = "\n\n".join(
+            instruction
+            for instruction in (
+                delivery_retry_instruction,
+                image_claim_retry_instruction,
+                empty_response_retry_instruction,
+                final_reply_correction_instruction,
+                terminal_text_instruction,
+            )
+            if instruction
+        )
+        if retry_instructions:
+            messages = _with_system_suffix(messages, retry_instructions)
+        # Providers with a real tool_choice=none keep schemas referenced by their
+        # native history; other wires omit tools as before. A 400/422 schema
+        # rejection or repeated malformed call also forces this bounded fallback.
         historical_tool_names = {
             call.name
             for item in transcript
@@ -1998,8 +2035,38 @@ async def run_tool_loop(
         empty_response_retry_instruction = ""
         _capture_reasoning(pr.raw)
 
-        # A tools-disabled request is terminal even if a broken relay invents a
-        # tool call anyway.  Never execute an undeclared call; use only its text.
+        # This request was already an explicit request for a complete answer using
+        # existing information. If a broken relay or model still invents a tool
+        # call, do not publish its accompanying ``pr.text``: text beside a tool call
+        # is only a preamble and may be partial or claim an operation that was never
+        # executed. Give transient provider failures a small configurable number of
+        # fresh chances, then terminate without returning to tool dispatch or the
+        # malformed-exchange fallback.
+        if terminal_text_round and pr.tool_calls and (
+            tools is not None or pr.text.strip()
+        ):
+            retrying = (
+                terminal_tool_call_retries < max_terminal_tool_call_retries
+                and attempts < max_calls
+            )
+            await _trajectory(
+                "protocol_fallback",
+                {
+                    "round": attempts,
+                    "reason": "terminal_tool_call_rejected",
+                    "action": "retry" if retrying else "terminate",
+                    "retry": terminal_tool_call_retries,
+                },
+            )
+            if retrying:
+                terminal_tool_call_retries += 1
+                _progress("terminal_tool_call_retry_boundary")
+                continue
+            break
+
+        # A tools-disabled request is terminal. The guard above has already
+        # rejected any undeclared call carrying text. A wholly text-free broken
+        # response retains the existing empty-reply failure classification.
         if tools is None or not pr.tool_calls:
             # 伴侣声称画好了却一张图都没有 —— 打回去让它自己纠正。
             #
@@ -2690,6 +2757,22 @@ async def run_tool_loop(
                 assistant_turn=pr.assistant_turn,
             )
         )
+        if pr.tool_calls and not pr.text.strip() and not pr.media:
+            consecutive_tool_only_rounds += 1
+        else:
+            consecutive_tool_only_rounds = 0
+        if (
+            consecutive_tool_only_rounds
+            >= max_consecutive_tool_only_rounds
+            and attempts < max_calls
+        ):
+            # This is intentionally independent of ``max_calls``. The latter is
+            # the absolute provider-call ceiling; this configurable threshold
+            # detects a model that is making only tool calls without producing
+            # any visible text, and reserves one fresh round for a complete
+            # answer from the observations already collected.
+            force_text_fallback = True
+            force_text_fallback_reason = "tool_only_stall"
     # Only reachable for max_calls == 0, or when a malformed response consumed the
     # last reserved attempt before a fallback could be made.
     await _trajectory(

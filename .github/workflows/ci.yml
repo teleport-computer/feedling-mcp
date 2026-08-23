@@ -449,6 +449,18 @@ jobs:
             tests/test_memgarden_dreaming.py \
             -v
 
+      - name: Perception kernel unit tests
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m pytest \
+            tests/test_perception_kernel_catalog.py \
+            tests/test_perception_kernel_projection.py \
+            tests/test_perception_kernel_purity.py \
+            tests/test_perception_kernel_wake.py \
+            tests/test_perception_prompt_golden.py \
+            -v
+
       - name: Guard top-level pytest discovery coverage
         run: |
           export LC_ALL=C
@@ -772,6 +784,7 @@ jobs:
             tests/test_access_mode_runtime_sync_unit.py \
             tests/test_pytest_coverage_ratchet.py \
             tests/test_ci_execution_evidence.py \
+            tests/test_no_global_sleep_patching.py \
             tests/test_mcp_client.py \
             tests/test_mcp_probe_tools_required.py \
             tests/test_mcp_status.py \
@@ -856,6 +869,9 @@ jobs:
             tests/test_write_side_format_routing.py \
             tests/test_admin_debug_turn_view.py \
             tests/test_data_track_debug.py \
+            tests/test_admin_discarded_reason.py \
+            tests/test_admin_concentration.py \
+            tests/test_admin_concentration_e2e.py \
             -v
 
       - name: Upload execution evidence (report only)

@@ -12,7 +12,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 import db
-from conftest import seed_user
+from conftest import seed_user, BACKGROUND_EVENT_TIMEOUT
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import usage_rollup
@@ -446,7 +446,7 @@ def test_day_user_and_dimension_facts_share_one_repeatable_read_snapshot():
 
     updater = threading.Thread(target=update_source_during_rebuild)
     updater.start()
-    assert started.wait(timeout=1)
+    assert started.wait(timeout=BACKGROUND_EVENT_TIMEOUT)
     try:
         usage_rollup.recompute_local_day(day)
     finally:

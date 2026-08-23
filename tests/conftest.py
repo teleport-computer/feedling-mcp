@@ -16,6 +16,8 @@ If no Postgres is reachable, the whole suite is skipped with a clear message
 rather than failing with confusing connection errors.
 """
 
+import time
+import types
 import copy
 import os
 import sys
@@ -426,6 +428,22 @@ if not _provisioned:
         "test_pytest_coverage_ratchet.py",
         # Phase A CI 执行证据量具：临时文件 + 子进程 pytest，不碰 DB/网络。
         "test_ci_execution_evidence.py",
+        # 感知内核纯度守卫(2026-08-19, 感知内核提取 Task 1)。纯:AST walk + 文件系统扫描,
+        # 零 DB/零网络。自带 sys.path 引导(backend/ 枚举)。
+        "test_perception_kernel_purity.py",
+        # 感知 prompt 基线快照(2026-08-19, 感知内核提取 Task 0)。纯:比对
+        # V2 模块级常量字符串 + 调用 chat_resident_consumer 的一个纯函数,
+        # 不碰 DB/网络。自带 sys.path 引导(backend/ + tools/)。
+        "test_perception_prompt_golden.py",
+        # 感知能力表等价性(2026-08-19, 感知内核提取 Task 2)。纯:import 两个
+        # 声明模块比对对象同一性 + 字典遍历,零 DB/零网络。
+        "test_perception_kernel_catalog.py",
+        # 字段投影/权限判据/一瞥等价性(2026-08-19, 感知内核提取 Task 3)。纯:import
+        # 两侧模块比对对象同一性 + 纯函数调用,零 DB/零网络。自带 sys.path 引导。
+        "test_perception_kernel_projection.py",
+        # 叫醒判据(2026-08-19, 感知内核提取 Task 7)。纯:只 import
+        # perception_kernel.wake 调纯函数,零 DB/零网络/零时钟(时间由测试传入)。
+        "test_perception_kernel_wake.py",
     }
     collect_ignore = sorted(
         f
@@ -433,6 +451,68 @@ if not _provisioned:
         if f.startswith("test_") and f.endswith(".py") and f not in _PURE_UNIT
     )
 
+
+
+
+# 等某个后台线程/事件"发生"时用的超时上限。
+#
+# `threading.Event.wait(timeout=N)` 在事件被 set 的那一刻**立刻返回** —— N 只在
+# 出问题时才起作用。所以短超时买不到任何速度,只买到了 flake:CI 越忙,线程越晚
+# 被调度,而 CI 忙正是我们连续合入的时候。2026-08-22 就有一次
+# `test_async_write_enqueue_is_awaited_without_blocking_event_loop` 在满负载下
+# 超过 2s 而红,单跑 5/5 通过。
+#
+# ⚠️ 只用于**正向**等待(assert X.wait(...) —— "这件事应当发生")。
+# 负向断言(assert not X.wait(...) —— "这件事不该在 N 内发生")**不得**套用:
+# 那里的 N 是被断言的性质本身,改大就是改测试要测的东西。
+BACKGROUND_EVENT_TIMEOUT = 30
+
+def capture_sleeps(monkeypatch, module, sink=None, *, on_sleep=None):
+    """Replace *module*'s `time` reference with one whose `sleep` records into `sink`.
+
+    Why not `monkeypatch.setattr(module.time, "sleep", sink.append)`: that mutates
+    the **process-global** stdlib `time` module.  Any background thread that sleeps
+    while the test runs then appends into the test's own list, and the assertion
+    fails for a reason that has nothing to do with the code under test.  That is
+    exactly how `test_run_forever_backoff_is_bounded` produced `assert 1.0 == 30.0`
+    on 2026-08-22: a wake-bus reconnect thread's `sleep(1.0)` landed in the list.
+
+    Why not a bare `SimpleNamespace(sleep=...)`: most modules here also call
+    `time.time` / `time.monotonic` / `time.strftime` (chat_resident_consumer uses
+    `monotonic` 50 times).  Dropping them would break the code under test for a
+    reason unrelated to what the test is checking.  So every other attribute is
+    delegated to the real module and only `sleep` is replaced.
+
+    Returns the sink list so callers can assert on the recorded durations.
+    """
+    if sink is None:
+        sink = []
+    real = module.time
+
+    def _sleep(seconds=0):
+        sink.append(seconds)
+        if on_sleep is not None:
+            # 有些站点的替身不是"抑制睡眠",而是**驱动**被测循环:推进假时钟、
+            # 投递一条 ack。把它们一律换成记录器会抽掉发动机,循环永不前进 ——
+            # 2026-08-23 我这么干过一次,test_verify_loop_gc_dangling_pointer 直接挂死。
+            on_sleep(seconds)
+
+    fake = types.SimpleNamespace(
+        **{name: getattr(real, name) for name in dir(real) if not name.startswith("_")}
+    )
+    fake.sleep = _sleep
+    process_sleep = time.sleep
+    monkeypatch.setattr(module, "time", fake)
+    # 自验:替换必须只作用于 *module* 的引用,不得碰到进程全局的 stdlib sleep。
+    # 没有这一条,这个 helper 就没有回归网 —— 把它改回
+    # `monkeypatch.setattr(module.time, "sleep", ...)` 之后所有测试仍然全绿,
+    # 因为污染只在"后台线程恰好在此刻睡了一下"时才显形,而那是非确定性的。
+    # 实测:2026-08-22 打这条突变时 698 passed 全绿,加上本断言后才咬得住。
+    assert time.sleep is process_sleep, (
+        "capture_sleeps mutated the process-global time.sleep; it must only replace "
+        f"{module.__name__}'s reference"
+    )
+    return sink
 
 def seed_user(user_id: str, **doc) -> None:
     """Test-only: insert a minimal row into the ``users`` table so per-user
