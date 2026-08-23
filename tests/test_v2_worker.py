@@ -2246,6 +2246,56 @@ def test_chat_terminal_tool_call_retries_stop_at_worker_configured_bound(
     )
 
 
+def test_chat_terminal_tool_call_retries_honor_worker_override(monkeypatch):
+    """The chat worker must wire its retry override into the tool loop."""
+    uid = "u_w_terminal_tool_retry_override"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+    monkeypatch.setattr(worker, "MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS", 1)
+    library_default = (
+        worker.v2_tool_loop.DEFAULT_MAX_TERMINAL_TOOL_CALL_RETRIES
+    )
+    monkeypatch.setattr(
+        worker,
+        "MAX_TERMINAL_TOOL_CALL_RETRIES",
+        library_default + 1,
+    )
+    terminal_rounds = worker.MAX_TERMINAL_TOOL_CALL_RETRIES + 1
+    script = [_tool_round(_tc("initial", "memory_index"))]
+    script.extend(
+        _tool_round(_tc(f"terminal-{index}", "memory_index"))
+        for index in range(terminal_rounds)
+    )
+    calls = _script_provider(monkeypatch, script)
+
+    deps = _deps(messages=[
+        {"id": "m1", "ts": 10.0, "role": "user", "content": "hello"},
+    ])
+    written = {}
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda store, text: written.update(text=text) or {"id": "r1"},
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "failed"
+    assert len(calls) == 1 + terminal_rounds
+    assert all(call["tool_choice"] == "none" for call in calls[1:])
+    assert written == {}
+    assert _job_status(job_id) == (
+        "failed",
+        "turn_failed:tool_budget_exhausted",
+    )
+
+
 def test_second_round_receives_first_round_native_tool_exchange(monkeypatch):
     """Successor of the old planner-prior_action_results test: in the unified
     loop, a read tool's result is fed back as grounding context to the NEXT
