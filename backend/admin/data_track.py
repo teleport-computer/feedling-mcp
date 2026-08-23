@@ -9759,7 +9759,9 @@ def _event_path_master_payload(frozen: dict) -> dict:
                 "denominator": completed + operational,
                 "denominator_rule": (
                     "completed + operational failure；control、明确用户侧不可用、"
-                    "superseded 剔除；过去的日子没有回填"
+                    "superseded 剔除；过去的日子没有回填；"
+                    "分母仅含 onboarding_route='resident' 的用户，"
+                    "托管 APIKey-V1 不在其中"
                 ),
                 "concentration": counts.get("concentration"),
             }
@@ -9827,11 +9829,23 @@ def _event_path_master_payload(frozen: dict) -> dict:
                             else "V2 在这一动作上零探针"
                         ),
                     )
-                elif path in {"resident", "apikey_v1"}:
+                elif path == "resident":
                     path_cells[path] = unavailable(
                         detail=(
-                            "V1 冻结格混合 resident 与 APIKey-V1，"
-                            "没有事件发生时的 access_mode 快照"
+                            "本列口径是 V1 冻结的 resident 桶;桶的成员由 "
+                            "onboarding_route='resident' 决定，不是接入方式快照 —— "
+                            "托管用户若 onboarding_route 也写作 resident 会一并落入，"
+                            "且没有事件发生时的 access_mode，无法逐格剔除。"
+                        ),
+                    )
+                elif path == "apikey_v1":
+                    path_cells[path] = unavailable(
+                        detail=(
+                            "托管 APIKey-V1 的作业当前不进任何冻结格:V1 冻结按 "
+                            "onboarding_route='resident' 取数，"
+                            "onboarding_route='model_api' 的托管 V1 用户被整体排除;"
+                            "他们又不产生 agent_jobs，所以 V2 桶里也没有。"
+                            "这一格不是「拆不开」，是「未采集」。"
                         ),
                     )
                 else:
