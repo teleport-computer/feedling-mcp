@@ -9,6 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import provider_client as pc  # noqa: E402
+from conftest import capture_sleeps  # noqa: E402
 from provider_types import ToolSpec  # noqa: E402
 
 
@@ -64,7 +65,7 @@ def test_reliable_retry_wrapper_uses_shared_delay_algorithm(monkeypatch):
         "_reliable_retry_delay_sec",
         lambda attempt, **kwargs: sleeps.append((attempt, kwargs)) or 0.125,
     )
-    monkeypatch.setattr(pc.time, "sleep", lambda value: sleeps.append(value))
+    capture_sleeps(monkeypatch, pc, sleeps)
 
     assert pc.reliable_chat_completion(object(), [], max_attempts=2)["reply"] == "ok"
     assert sleeps[-1] == 0.125
