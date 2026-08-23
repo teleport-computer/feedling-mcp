@@ -20,6 +20,24 @@ from memgarden.prompts.buckets import COMMON_BUCKETS_GUIDANCE_V1
 # string early and json.loads rejects the whole reply (observed live: haiku-4.5
 # voice-map -> "Expecting ',' delimiter"). Forcing escape + bare-JSON output fixed it
 # 3/3 in env replay. The worker parser still adds repair/retry as defense-in-depth.
+#: 蒸馏产出的输出语言约束。
+#:
+#: ⚠️ 这条以前是**隐式**的：指令是中文，模型自然用中文答。2026-08-23 指令改英文后
+#: 那个保证就没了 —— 中文用户的 agent 人格会被写成英文，而人格只在 onboarding
+#: 生成一次、直接当 system prompt 用，事后很难重来。所以必须显式写死。
+#:
+#: 依据是**素材原文的语言**，不是指令的语言，也不是用户当前说什么 ——
+#: 导入一批中文历史，产出就该是中文，哪怕这段指令是英文写的。
+_OUTPUT_LANGUAGE_RULE = (
+    "\n\nOutput language: write every human-readable field you produce in the language "
+    "of the source material, NOT the language of these instructions. If the material is "
+    "in Chinese, write Chinese; if it is in English, write English; if it mixes both, "
+    "follow the dominant one. This applies to prose you compose — summaries, "
+    "descriptions, notes, persona text, adjectives. Verbatim quotes and proper nouns "
+    "always keep their original form, and fixed JSON keys and enum values "
+    "(\"user|relationship\", \"fact|event|quote|moment\") stay exactly as written."
+)
+
 _STRICT_JSON_SUFFIX = (
     "\n\nStrict output requirement: emit exactly one valid JSON value that "
     "json.loads can parse directly. No markdown fences, no prose before or after.\n"
@@ -27,7 +45,13 @@ _STRICT_JSON_SUFFIX = (
     "a double quote becomes \\\" , a newline becomes \\n, a tab becomes \\t, "
     "a backslash becomes \\\\.\n"
     "CJK quotation marks 「」『』“”‘’ are kept as-is and need no escaping."
+    # 输出语言约束挂在这里，是因为每个 JSON builder 都会拼上这个后缀 ——
+    # 挂一处覆盖全部，比给 6 个 builder 各加一次少一个漏掉的机会。
+    # markdown 输出的 persona builder 不走这条，它在自己那里单独拼。
+    + _OUTPUT_LANGUAGE_RULE
 )
+
+
 
 
 VOICE_MAP_PROMPT = """You are reading ONE CHUNK of a real conversation between a person and their AI companion.
@@ -219,6 +243,10 @@ def persona_build_messages(
         PERSONA_BUILD_PROMPT
         + (PERSONA_UPDATE_MERGE_SUFFIX if has_existing else "")
         + _user_naming_instruction(user_name)
+        # persona 输出的是 markdown、不走 JSON 后缀，所以在这里单独拼语言约束。
+        # 漏了它的后果最重：人格是 agent 的 system prompt，只在 onboarding
+        # 生成一次，中文用户会拿到一份英文人格。
+        + _OUTPUT_LANGUAGE_RULE
     )
     payload = {
         "persona_material": persona_material or "",
