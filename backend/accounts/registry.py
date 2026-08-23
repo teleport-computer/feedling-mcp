@@ -245,6 +245,38 @@ def _normalize_user_entry(user_entry: dict) -> bool:
     return changed
 
 
+def connected_resident_user_ids(user_docs: list[dict]) -> set[str]:
+    """Classify connected resident bindings from caller-owned documents.
+
+    This is deliberately a pure projection over ``user_docs``.  The lane
+    freezer injects documents read inside its own PostgreSQL transaction, so
+    consulting this process's ``_users`` cache (or taking ``_users_lock``)
+    would reintroduce a stale cross-snapshot join.  Normalize deep copies to
+    retain the registry's legacy-key/binding compatibility rules without
+    mutating either the caller's documents or module state.
+    """
+    connected: set[str] = set()
+    for raw in user_docs:
+        if not isinstance(raw, dict):
+            continue
+        user_entry = copy.deepcopy(raw)
+        _normalize_user_entry(user_entry)
+        user_id = str(user_entry.get("user_id") or "").strip()
+        if not user_id:
+            continue
+        for binding in user_entry.get("access_bindings") or []:
+            if not isinstance(binding, dict):
+                continue
+            mode = _normalize_access_mode(
+                str(binding.get("access_mode") or binding.get("route") or "")
+            )
+            status = str(binding.get("status") or "connected").strip().lower()
+            if mode == "resident" and status == "connected":
+                connected.add(user_id)
+                break
+    return connected
+
+
 def _normalize_all_users() -> bool:
     changed = False
     for user_entry in _users:

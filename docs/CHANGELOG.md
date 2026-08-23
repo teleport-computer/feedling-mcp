@@ -47,6 +47,19 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-24 — V1 冻结按接入路径拆分并补齐托管人群
+
+**[DONE] 事件健康表不再把 Runtime V1 家族误当成一种接入方式。**
+
+- V1 冻结先按 active-tested hosted route 分层，再按接入方式与 effective runtime
+  拆出 APIKey-V1、托管 Resident-V1、自建 Resident、无 route/binding 和接入未分类；
+  原先被 onboarding route 过滤掉的托管 APIKey-V1 作业从生效日起进入冻结格。
+- 每格保存 `access_path` 与 `mode_source`；缺失的 raw runtime control 仍按生产默认
+  执行 V1，但明确标为 `default`，与 `explicit` 分开显示。connected resident binding
+  从冻结事务内的用户文档经 accounts 纯分类器注入，不读取进程缓存。
+- 新增 `access_path_from` 水位。历史不回填，管理页逐列显示“此列自某日起有效”；
+  生效日前的 `unavailable` 不等于零。RDS/TEE 双迁移、镜像扶正主键和匿名归并同步。
+
 ## 2026-08-23 — V1 冻结格保留 operational outcome 分类
 
 **[DONE] Runtime family 辅助表不再把 V1 `skipped` 控制结果算成系统失败。**

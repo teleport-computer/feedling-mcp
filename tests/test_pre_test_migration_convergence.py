@@ -26,7 +26,11 @@ def _database_url(base: str, database: str) -> str:
 
 def test_rds_pre_and_test_heads_converge():
     script = _scripts("alembic")
-    assert script.get_heads() == ["0099_contract_rejection_stats"]
+    assert script.get_heads() == ["0100_lane_rollup_access_paths"]
+    assert (
+        script.get_revision("0100_lane_rollup_access_paths").down_revision
+        == "0099_contract_rejection_stats"
+    )
     assert (
         script.get_revision("0099_contract_rejection_stats").down_revision
         == "0098_v1_lane_outcome_counts"
@@ -80,8 +84,13 @@ def test_rds_pre_and_test_heads_converge():
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
     (head,) = script.get_heads()
+    assert head == "0036_lane_rollup_access_paths"
     assert (
         script.get_revision(head).down_revision
+        == "0035_contract_rejection_stats"
+    )
+    assert (
+        script.get_revision("0035_contract_rejection_stats").down_revision
         == "0034_v1_lane_outcome_counts"
     )
     assert (
@@ -218,6 +227,10 @@ def test_tee_migrations_reuse_the_rds_contract_sql():
     assert (
         tee.get_revision("0035_contract_rejection_stats").module._UP
         == rds.get_revision("0099_contract_rejection_stats").module._UP
+    )
+    assert (
+        tee.get_revision("0036_lane_rollup_access_paths").module._UP
+        == rds.get_revision("0100_lane_rollup_access_paths").module._UP
     )
 
 
