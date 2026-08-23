@@ -12,6 +12,7 @@ dict）+ 一个记录调用的 enqueue_write_effect 驱动，纯 asyncio，无 D
 """
 from __future__ import annotations
 
+import logging
 import asyncio
 import base64
 import json
@@ -28,6 +29,8 @@ from screen import screen_read_core  # noqa: E402
 from screen.screen_read_core import ScreenResult  # noqa: E402
 from model_api_runtime.v2 import executor as v2_executor  # noqa: E402
 from provider_types import ToolCall, ToolResult  # noqa: E402
+
+from conftest import BACKGROUND_EVENT_TIMEOUT
 
 
 class _FakeResult:
@@ -117,6 +120,49 @@ def test_one_read_exception_is_isolated_from_successful_sibling(monkeypatch):
     assert "web result" in results[1].content
     assert enqueued == []
 
+
+
+SECRET = "user-secret-marker-must-not-reach-plaintext-logs"
+
+
+def test_swallowed_read_is_attributable_in_the_log(monkeypatch, caplog):
+    """吞掉的读必须在日志里可归因,而 wire 上的字符串必须逐字不变。
+
+    在此之前,「契约错误」(比如多传一个 kwarg 的 TypeError)和「运行时故障」
+    (比如数据库超时)产出的是同样四个字 ``error: capability_failed``,
+    在生产里无法区分 —— T216 那次 CI 红就是这个形状,而生产没有 CI 兜底。
+
+    ⚠️ 断言分三侧,因为它们服务三个不同的面:
+      · 日志**必须**含异常类型 + 工具名 + 栈坐标 —— 这是我们 debug 的面
+      · 日志**必须不**含异常消息 —— 消息可能带解密后的用户内容,而明文 stdout
+        与加密 trajectory 不是同一个存储层(见下方负向断言)
+      · content:必须**逐字不变** —— 它不是 debug 面,它被回灌给 provider,
+        而且 worker.py:1950 会剥掉 ``error: `` 前缀后做**全等**集合匹配,
+        在这里多加一个字都会静默改掉历史预扫描的计数。
+    """
+    def _run_capability(action_type, store, *, api_key, runtime_token, params):
+        if action_type == "memory_index":
+            raise RuntimeError(SECRET)
+        return _FakeResult(True, {"body": "ok"})
+
+    tool_calls = [ToolCall(id="failed", name="memory_index", args={})]
+    with caplog.at_level(logging.ERROR, logger="feedling.runtime_v2.executor"):
+        results, _ = _run(
+            tool_calls, turn_authorization=False,
+            run_capability=_run_capability, monkeypatch=monkeypatch)
+
+    assert results[0].content == "error: capability_failed"
+    blob = "\n".join(r.getMessage() + (r.exc_text or "") for r in caplog.records)
+    assert "RuntimeError" in blob, "log must carry the exception class; without it the two failure classes stay indistinguishable"
+    assert "memory_index" in blob, "log must say which tool failed"
+    assert "executor.py:" in blob, "log must carry stack coordinates so the failing line is findable"
+    # ⚠️ 负向断言,守的是 trust boundary:异常**消息**可能带解密后的查询词或卡片正文,
+    # 而 worker 日志是明文 stdout —— 与加密 trajectory 不是同一个存储层。
+    # 详情属于加密侧,平铺日志只留封闭词表(参照 provider_attempt_ledger 的 bounded error_class)。
+    assert SECRET not in blob, (
+        "exception message leaked into the plaintext worker log; capability reads handle "
+        "decrypted user content, so only class + coordinates may be logged"
+    )
 
 def test_photo_read_with_image_invokes_observer_and_hides_base64(monkeypatch):
     seen = []
@@ -339,7 +385,7 @@ def test_read_parallelism_is_bounded_by_configured_limit(monkeypatch):
             started_count += 1
             max_active = max(max_active, active)
             started.set()
-        assert release.wait(timeout=2)
+        assert release.wait(timeout=BACKGROUND_EVENT_TIMEOUT)
         with lock:
             active -= 1
         return _FakeResult(True, {"body": action_type})
@@ -360,7 +406,7 @@ def test_read_parallelism_is_bounded_by_configured_limit(monkeypatch):
             enqueue_write_effect=lambda _tc: None,
             read_parallelism=1,
         ))
-        assert await asyncio.to_thread(started.wait, 1.0)
+        assert await asyncio.to_thread(started.wait, BACKGROUND_EVENT_TIMEOUT)
         await asyncio.sleep(0.03)
         with lock:
             assert started_count == 1
@@ -456,7 +502,7 @@ def test_async_write_enqueue_is_awaited_without_blocking_event_loop(monkeypatch)
 
     def slow_sync_persist():
         started.set()
-        assert release.wait(timeout=2)
+        assert release.wait(timeout=BACKGROUND_EVENT_TIMEOUT)
 
     async def enqueue_write_effect(_tc):
         await asyncio.to_thread(slow_sync_persist)
@@ -482,7 +528,7 @@ def test_async_write_enqueue_is_awaited_without_blocking_event_loop(monkeypatch)
                 await asyncio.sleep(0.005)
 
         heartbeat_task = asyncio.create_task(heartbeat())
-        assert await asyncio.to_thread(started.wait, 1.0)
+        assert await asyncio.to_thread(started.wait, BACKGROUND_EVENT_TIMEOUT)
         await asyncio.sleep(0.03)
         assert not dispatch_task.done()
         assert ticks["n"] >= 3
