@@ -818,6 +818,7 @@ jobs:
             tests/test_v2_pool_fault_injection.py \
             tests/test_v2_pool_supervisor.py \
             tests/test_capture_prompt_v1.py \
+            tests/test_contract_rejection_stats.py \
             tests/test_data_track_runtime_view.py \
             tests/test_data_track_ops_views.py \
             tests/test_ops_dashboard_queries.py \

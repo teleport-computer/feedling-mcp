@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from hosted import vision_observer
+from hosted import vision_observer, visual_transport
 import provider_client
 
 
@@ -41,7 +41,7 @@ def test_observe_image_uses_bounded_reliable_provider_call(monkeypatch):
 
     monkeypatch.setattr(
         vision_observer.provider_client,
-        "reliable_chat_completion",
+        "reliable_chat_completion_isolated",
         fake_reliable,
     )
     config = object()
@@ -57,9 +57,51 @@ def test_observe_image_uses_bounded_reliable_provider_call(monkeypatch):
     assert captured["kwargs"]["max_attempts"] == 2
     assert captured["kwargs"]["base_delay_sec"] == 0.5
     assert captured["kwargs"]["timeout"] == 45.0
+    assert captured["kwargs"]["max_tokens"] == (
+        visual_transport.VISUAL_OUTPUT_MAX_TOKENS
+    )
     assert captured["messages"][0]["content"][1]["image_url"]["url"] == (
         "data:image/jpeg;base64,encoded-image"
     )
+
+
+def test_observe_image_rejects_nonempty_token_limited_reply(monkeypatch):
+    monkeypatch.setattr(
+        vision_observer.provider_client,
+        "reliable_chat_completion_isolated",
+        lambda *_args, **_kwargs: {
+            "reply": "A partial but nonempty observation.",
+            "stop_reason": "MAX_TOKENS",
+        },
+    )
+
+    with pytest.raises(vision_observer.VisionObserverError) as caught:
+        vision_observer.observe_image(
+            object(), image_mime="image/png", image_b64="encoded-image"
+        )
+
+    assert caught.value.error_code == "vision_model_failed"
+    assert caught.value.reason == "output_truncated"
+    assert caught.value.detail == "output_truncated"
+    assert caught.value.retryable is False
+
+
+@pytest.mark.parametrize("stop_reason", [None, "", "provider_new_reason"])
+def test_observe_image_accepts_nonempty_reply_with_unknown_stop_reason(
+    monkeypatch, stop_reason
+):
+    monkeypatch.setattr(
+        vision_observer.provider_client,
+        "reliable_chat_completion_isolated",
+        lambda *_args, **_kwargs: {
+            "reply": "A complete observation.",
+            "stop_reason": stop_reason,
+        },
+    )
+
+    assert vision_observer.observe_image(
+        object(), image_mime="image/png", image_b64="encoded-image"
+    ) == "A complete observation."
 
 
 def test_observe_image_exposes_safe_auth_failure(monkeypatch):
@@ -68,7 +110,7 @@ def test_observe_image_exposes_safe_auth_failure(monkeypatch):
 
     monkeypatch.setattr(
         vision_observer.provider_client,
-        "reliable_chat_completion",
+        "reliable_chat_completion_isolated",
         fail,
     )
 
@@ -95,7 +137,7 @@ def test_observe_image_exposes_transient_exhaustion(monkeypatch):
 
     monkeypatch.setattr(
         vision_observer.provider_client,
-        "reliable_chat_completion",
+        "reliable_chat_completion_isolated",
         fail,
     )
 
@@ -332,3 +374,51 @@ def test_observe_pinned_failure_body_stays_out_of_tenant_response_and_trace(
     assert events[-1]["detail"]["status_code"] == 500
     assert upstream_detail not in json.dumps({"body": body, "events": events})
     assert upstream_detail in caplog.text
+
+
+def test_observe_pinned_truncation_returns_stable_nonretryable_reason(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        vision_observer.debug_trace,
+        "trace_event",
+        lambda _store, **kwargs: events.append(kwargs),
+    )
+    monkeypatch.setattr(
+        vision_observer.db,
+        "model_api_route_get",
+        lambda *_args: {"provider": "openrouter", "model": "vision/model"},
+    )
+    monkeypatch.setattr(
+        vision_observer.cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            ok=True,
+            error=None,
+            data={"image_b64": "private-image-bytes", "image_mime": "image/png"},
+        ),
+    )
+    monkeypatch.setattr(
+        vision_observer,
+        "load_provider_config",
+        lambda *_args, **_kwargs: object(),
+    )
+    failure = vision_observer.classify_vision_error(
+        visual_transport.VisualOutputTruncated()
+    )
+    monkeypatch.setattr(
+        vision_observer,
+        "observe_image",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    body, status = vision_observer.observe_pinned_message(
+        _Store([_image_row()]),
+        {"message_id": "msg-image", "route_id": "route-vision"},
+        caller_api_key=None,
+    )
+
+    assert status == 502
+    assert body["error_class"] == "vision_model_failed"
+    assert body["reason"] == "output_truncated"
+    assert body["retryable"] is False
+    assert events[-1]["detail"]["reason"] == "output_truncated"

@@ -81,6 +81,7 @@ from hosted import config_store as hosted_config_store
 from hosted import mcp_core
 from hosted import mcp_status
 from hosted import mcp_tools
+from hosted import visual_transport
 from hosted import vision_observer
 from identity import card_policy
 from memory import memory_core
@@ -858,11 +859,22 @@ def _resolve_provider(user_id: str):
         b"feedling:v2:prompt-cache-route:v1\0" + scope_bytes,
         hashlib.sha256,
     ).hexdigest()
+    version = db.model_api_active_route_version(user_id)
+    exact_version = ""
+    if (
+        isinstance(version, dict)
+        and str(version.get("route_id") or "") == runtime.hosted_route_id
+        and str(version.get("provider") or "") == runtime.provider
+        and str(version.get("model") or "") == runtime.model
+        and str(version.get("base_url") or "") == runtime.base_url
+    ):
+        exact_version = str(version.get("updated_at_token") or "")
     return replace(
         runtime,
         prompt_cache_key=f"feedling-v2-{cache_key}",
         prompt_cache_route_fingerprint=f"feedling-v2-route-{route_fingerprint}",
         capture_attempt_trace=True,
+        hosted_route_updated_at=exact_version,
     ), {}
 
 
@@ -2196,14 +2208,120 @@ def _observe_photo(
     )
 
 
+_VISION_BATCH_BUDGET_POLICY_VERSION = "derived-v2"
+
+
+def _vision_batch_candidate_budget_sec(image_count: int) -> float:
+    return visual_transport.visual_batch_budget_sec(image_count)
+
+
+def _emit_vision_batch_budget_evaluation(
+    user_id: str,
+    *,
+    actual_image_count: int,
+    started_at: float,
+    succeeded: bool,
+) -> None:
+    actual_dur_ms = max(0.0, (time.monotonic() - started_at) * 1000.0)
+    enforced_budget_ms = (
+        _vision_batch_candidate_budget_sec(actual_image_count) * 1000.0
+    )
+    deadline_reached = actual_dur_ms >= enforced_budget_ms
+    try:
+        _emit_v2_debug_trace_for_user(
+            user_id,
+            "vision.batch.budget.evaluated",
+            status="ok",
+            summary="enforced_deadline_evaluated",
+            detail={
+                "policy_version": _VISION_BATCH_BUDGET_POLICY_VERSION,
+                "actual_image_count": actual_image_count,
+                "configured_image_limit": v2_worker._TAIL_IMAGE_LIMIT,
+                "enforced_budget_ms": enforced_budget_ms,
+                "fixed_overhead_ms": (
+                    visual_transport.VISUAL_BATCH_FIXED_OVERHEAD_SEC * 1000.0
+                ),
+                "deadline_reached": deadline_reached,
+                "completed_successfully": succeeded,
+                "actual_dur_ms": actual_dur_ms,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — telemetry never changes behavior
+        log.warning(
+            "[v2.vision] batch budget trace failed user=%s error=%s",
+            str(user_id)[:8],
+            type(exc).__name__,
+        )
+
+
 def _read_vision_observations(
     user_id: str,
     targets: list[dict],
-) -> dict[str, str]:
-    """Send pinned V2 images to their observer and return text-only data.
+    *,
+    main_provider_config: provider_client.ProviderConfig | None = None,
+) -> v2_worker.VisionObservationBatch:
+    """Observe a batch under one absolute deadline and privacy fence."""
+    actual_image_count = sum(isinstance(item, dict) for item in targets)
+    started_at = time.monotonic()
+    absolute_deadline = started_at + _vision_batch_candidate_budget_sec(
+        actual_image_count
+    )
+    succeeded = False
+    try:
+        batch = _read_vision_observations_with_deadline(
+            user_id,
+            targets,
+            absolute_deadline=absolute_deadline,
+            main_provider_config=main_provider_config,
+        )
+        succeeded = all(
+            bool(outcome.observation) for outcome in batch.outcomes.values()
+        )
+        return batch
+    finally:
+        _emit_vision_batch_budget_evaluation(
+            user_id,
+            actual_image_count=actual_image_count,
+            started_at=started_at,
+            succeeded=succeeded,
+        )
+
+
+def _main_vision_route_is_verified(
+    user_id: str,
+    config: provider_client.ProviderConfig | None,
+) -> bool:
+    """Require a current ``ok`` verdict for this exact resolved main route."""
+    if config is None:
+        return False
+    route_id = str(getattr(config, "hosted_route_id", "") or "")
+    updated_at = str(getattr(config, "hosted_route_updated_at", "") or "")
+    configured_status = str(
+        getattr(config, "hosted_vision_test_status", "") or ""
+    ).strip().lower()
+    if not route_id or not updated_at or configured_status != "ok":
+        return False
+    verdict = db.model_api_active_route_vision_verdict(user_id)
+    return bool(
+        isinstance(verdict, dict)
+        and str(verdict.get("id") or "") == route_id
+        and str(verdict.get("updated_at") or "") == updated_at
+        and str(verdict.get("vision_test_status") or "").strip().lower() == "ok"
+    )
+
+
+def _read_vision_observations_with_deadline(
+    user_id: str,
+    targets: list[dict],
+    *,
+    absolute_deadline: float,
+    main_provider_config: provider_client.ProviderConfig | None,
+) -> v2_worker.VisionObservationBatch:
+    """Send pinned images to dedicated routes and retain per-target results.
 
     The route id was stored with the accepted chat row. Missing/deleted/stale
-    routes fail the turn; raw pixels never fall through to the main provider.
+    routes remain hard failures. Only the worker's explicit fallback policy may
+    authorize a second raw-pixel read for a provider failure.
     """
     normalized = [
         {
@@ -2221,7 +2339,7 @@ def _read_vision_observations(
     images = _read_images(user_id, [item["message_id"] for item in normalized])
     token = _mint_runtime_token(user_id)
     configs: dict[str, provider_client.ProviderConfig] = {}
-    observations: dict[str, str] = {}
+    outcomes: dict[str, v2_worker.VisionObservationOutcome] = {}
     for item in normalized:
         message_id = item["message_id"]
         route_id = item["route_id"]
@@ -2269,10 +2387,11 @@ def _read_vision_observations(
             detail={"provider": provider, "model": model},
         )
         try:
-            observations[message_id] = vision_observer.observe_image(
+            observation = vision_observer.observe_image(
                 config,
                 image_mime=mime,
                 image_b64=image_b64,
+                absolute_deadline=absolute_deadline,
             )
         except vision_observer.VisionObserverError as failure:
             # Fixed route metadata, never inferred from model prose. The worker
@@ -2289,6 +2408,7 @@ def _read_vision_observations(
                     "error_class": failure.error_code,
                     "status_code": failure.status_code,
                     "retryable": failure.retryable,
+                    **({"reason": failure.reason} if failure.reason else {}),
                 },
                 dur_ms=(time.monotonic() - started_at) * 1000,
             )
@@ -2304,7 +2424,15 @@ def _read_vision_observations(
                 failure.status_code,
                 failure.upstream_detail,
             )
-            raise
+            outcomes[message_id] = v2_worker.VisionObservationOutcome(
+                error_code=failure.error_code,
+                reason=failure.reason,
+                model=model,
+                provider=provider,
+                status_code=failure.status_code,
+                upstream_detail=failure.upstream_detail,
+            )
+            continue
         emit_provider_trace(
             "vision.provider.completed",
             status="ok",
@@ -2312,7 +2440,18 @@ def _read_vision_observations(
             detail={"provider": provider, "model": model},
             dur_ms=(time.monotonic() - started_at) * 1000,
         )
-    return observations
+        outcomes[message_id] = v2_worker.VisionObservationOutcome(
+            observation=str(observation or "").strip(),
+            model=model,
+            provider=provider,
+        )
+    return v2_worker.VisionObservationBatch(
+        outcomes=outcomes,
+        absolute_deadline=float(absolute_deadline),
+        main_vision_verified=_main_vision_route_is_verified(
+            user_id, main_provider_config
+        ),
+    )
 
 
 def _read_files(user_id: str, message_ids: list[str]) -> dict[str, dict]:
@@ -5546,6 +5685,39 @@ if _TURN_STALL_TIMEOUT_SEC < _MIN_TURN_STALL_TIMEOUT_SEC:
         "FEEDLING_V2_TURN_STALL_TIMEOUT_SEC (or legacy "
         "FEEDLING_V2_TURN_HARD_TIMEOUT_SEC) must be at least 210s"
     )
+
+
+def _validate_vision_batch_budget_below_stall(
+    *,
+    configured_image_limit: int,
+    turn_stall_timeout_sec: float,
+) -> float:
+    nominal_batch_sec = _vision_batch_candidate_budget_sec(configured_image_limit)
+    if nominal_batch_sec >= turn_stall_timeout_sec:
+        per_image_sec = provider_client.reliable_chat_nominal_envelope_sec(
+            request_inactivity_timeout_sec=(
+                visual_transport.VISUAL_REQUEST_INACTIVITY_TIMEOUT_SEC
+            ),
+            max_attempts=visual_transport.VISUAL_MAX_ATTEMPTS,
+            base_delay_sec=visual_transport.VISUAL_RETRY_BASE_DELAY_SEC,
+        )
+        raise RuntimeError(
+            "FEEDLING_V2_TAIL_IMAGE_LIMIT visual retry envelope must stay below "
+            "FEEDLING_V2_TURN_STALL_TIMEOUT_SEC "
+            f"(per_image={per_image_sec:.3f}s, "
+            f"image_limit={configured_image_limit}, "
+            "fixed_overhead="
+            f"{visual_transport.VISUAL_BATCH_FIXED_OVERHEAD_SEC:.3f}s, "
+            f"nominal={nominal_batch_sec:.3f}s, "
+            f"stall={turn_stall_timeout_sec:.3f}s)"
+        )
+    return nominal_batch_sec
+
+
+_VISION_BATCH_CONFIGURED_NOMINAL_SEC = _validate_vision_batch_budget_below_stall(
+    configured_image_limit=v2_worker._TAIL_IMAGE_LIMIT,
+    turn_stall_timeout_sec=_TURN_STALL_TIMEOUT_SEC,
+)
 
 
 # An MCP call only refreshes the per-turn stall clock after its bounded async

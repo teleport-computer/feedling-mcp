@@ -2,6 +2,8 @@
 不起真 worker/真 enclave。"""
 import asyncio
 import json
+import os
+import subprocess
 import sys
 import time
 import types
@@ -456,6 +458,87 @@ def test_mcp_call_timeout_must_leave_watchdog_stall_margin():
                 mcp_call_timeout_sec=unsafe_timeout,
                 turn_stall_timeout_sec=240.0,
             )
+
+
+def test_visual_batch_nominal_retry_envelope_fits_stall_budget():
+    configured_limit = worker._TAIL_IMAGE_LIMIT
+    expected = serve_worker.visual_transport.visual_batch_budget_sec(
+        configured_limit
+    )
+    assert serve_worker._validate_vision_batch_budget_below_stall(
+        configured_image_limit=configured_limit,
+        turn_stall_timeout_sec=240.0,
+    ) == pytest.approx(expected)
+    assert serve_worker._VISION_BATCH_CONFIGURED_NOMINAL_SEC == pytest.approx(
+        expected
+    )
+
+    overhead = serve_worker.visual_transport.VISUAL_BATCH_FIXED_OVERHEAD_SEC
+    with pytest.raises(
+        RuntimeError,
+        match=rf"fixed_overhead={overhead:.3f}s",
+    ):
+        serve_worker._validate_vision_batch_budget_below_stall(
+            configured_image_limit=configured_limit + 1,
+            turn_stall_timeout_sec=240.0,
+        )
+
+
+def test_visual_batch_startup_budget_tracks_nondefault_image_limit():
+    backend = str(Path(__file__).parent.parent / "backend")
+    configured_limit = 1
+    env = os.environ.copy()
+    env["FEEDLING_V2_TAIL_IMAGE_LIMIT"] = str(configured_limit)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                f"import sys; sys.path.insert(0, {backend!r}); "
+                "from model_api_runtime.v2 import serve_worker; "
+                "print(serve_worker._VISION_BATCH_CONFIGURED_NOMINAL_SEC)"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    expected = serve_worker.visual_transport.visual_batch_budget_sec(
+        configured_limit
+    )
+    assert float(result.stdout.strip()) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("raw", ["0", "-1"])
+def test_tail_image_limit_fails_serve_worker_startup_when_nonpositive(raw):
+    backend = str(Path(__file__).parent.parent / "backend")
+    env = os.environ.copy()
+    env["FEEDLING_V2_TAIL_IMAGE_LIMIT"] = raw
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                f"import sys; sys.path.insert(0, {backend!r}); "
+                "from model_api_runtime.v2 import serve_worker"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert (
+        "FEEDLING_V2_TAIL_IMAGE_LIMIT must be a positive integer"
+        in result.stderr
+    )
 
 
 def test_chat_absolute_budget_includes_bounded_mcp_turn_allowance():

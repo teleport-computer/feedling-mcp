@@ -116,6 +116,11 @@ TABLES: dict[str, tuple[tuple[str, ...], str]] = {
         "failures_total, max_consecutive_failures, dirty_rows, stopped_at, "
         "updated_at",
     ),
+    "contract_rejection_stats": (
+        ("contract_domain", "boundary", "fallback", "release_sha", "writer_id"),
+        "contract_domain, boundary, fallback, release_sha, writer_id, total, "
+        "first_seen, last_seen",
+    ),
     "v2_job_recovery_events": (
         ("job_id", "job_attempt_count"),
         "job_id, job_attempt_count, lane, recovery, reason, created_at",

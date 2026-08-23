@@ -26,10 +26,10 @@ def _database_url(base: str, database: str) -> str:
 
 def test_rds_pre_and_test_heads_converge():
     script = _scripts("alembic")
-    assert script.get_heads() == ["0098_v1_lane_outcome_counts"]
+    assert script.get_heads() == ["0099_contract_rejection_stats"]
     assert (
-        script.get_revision("0098_v1_lane_outcome_counts").down_revision
-        == "0097_v2_job_recovery_events"
+        script.get_revision("0099_contract_rejection_stats").down_revision
+        == "0098_v1_lane_outcome_counts"
     )
     assert (
         script.get_revision("0097_v2_job_recovery_events").down_revision
@@ -79,10 +79,10 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0034_v1_lane_outcome_counts"]
+    assert script.get_heads() == ["0035_contract_rejection_stats"]
     assert (
-        script.get_revision("0034_v1_lane_outcome_counts").down_revision
-        == "0033_trace_events"
+        script.get_revision("0035_contract_rejection_stats").down_revision
+        == "0034_v1_lane_outcome_counts"
     )
     assert (
         script.get_revision("0033_trace_events").down_revision
@@ -216,8 +216,8 @@ def test_tee_migrations_reuse_the_rds_contract_sql():
         == rds.get_revision("0097_v2_job_recovery_events").module._UP
     )
     assert (
-        tee.get_revision("0034_v1_lane_outcome_counts").module._UP
-        == rds.get_revision("0098_v1_lane_outcome_counts").module._UP
+        tee.get_revision("0035_contract_rejection_stats").module._UP
+        == rds.get_revision("0099_contract_rejection_stats").module._UP
     )
 
 
@@ -264,7 +264,7 @@ def test_tee_0029_upgrades_to_voice_merge_head(monkeypatch):
         with psycopg.connect(database_url, autocommit=True) as conn:
             assert conn.execute(
                 "SELECT version_num FROM alembic_tee_version"
-            ).fetchall() == [("0034_v1_lane_outcome_counts",)]
+            ).fetchall() == [("0035_contract_rejection_stats",)]
             assert conn.execute(
                 "SELECT to_regclass('public.voice_call_sessions')"
             ).fetchone() == ("voice_call_sessions",)
@@ -274,7 +274,7 @@ def test_tee_0029_upgrades_to_voice_merge_head(monkeypatch):
             assert conn.execute(
                 "SELECT convert_from(value,'UTF8')::jsonb->'tee_heads' "
                 "FROM server_config WHERE key='phase4_primary_prepared'"
-            ).fetchone() == (["0034_v1_lane_outcome_counts"],)
+            ).fetchone() == (["0035_contract_rejection_stats"],)
     finally:
         with psycopg.connect(admin_url, autocommit=True) as admin:
             admin.execute(

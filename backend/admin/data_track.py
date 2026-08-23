@@ -2841,8 +2841,14 @@ def _known_error_classes() -> frozenset:
         try:
             from notices import catalog as _catalog
             _KNOWN_ERROR_CLASSES_CACHE = frozenset(_catalog.ERROR_CLASSES)
-        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
-            _KNOWN_ERROR_CLASSES_CACHE = frozenset()
+        except Exception as exc:  # noqa: BLE001 - unavailable is not empty
+            # This registry used to be a literal and therefore could not fail
+            # to load.  Returning an empty set after T255 made it producer-owned
+            # would turn a broken measuring instrument into a plausible partial
+            # result: jobs_store-only codes stayed visible while catalog-only
+            # codes silently became "other".  Fail this one new boundary loudly;
+            # T245 owns how the admin page will render the unavailable state.
+            raise RuntimeError("error_class_registry_unavailable") from exc
     return _KNOWN_ERROR_CLASSES_CACHE
 
 
@@ -2850,7 +2856,9 @@ _KNOWN_ERROR_CLASSES_CACHE = None
 
 
 def _is_registered_failure_code(value: str) -> bool:
-    return value in _known_failure_codes() or value in _known_error_classes()
+    known_failures = _known_failure_codes()
+    known_error_classes = _known_error_classes()
+    return value in known_failures or value in known_error_classes
 
 
 def _trace_public_fields(*, vocabulary=_TRACE_VOCABULARY_UNSET) -> dict:

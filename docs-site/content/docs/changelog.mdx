@@ -10,6 +10,33 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Dedicated image observation now has a bounded, exact-main recovery path.**
+  Rate limiting, temporary unavailability, an empty observation, or an explicitly
+  truncated observation can send only the affected image to the exact current
+  main route when that route's image-control verdict is still `ok`. Authentication,
+  quota, route, compatibility, image-read, and unknown failures remain
+  fail-closed. Mixed batches keep successful items as observation text and
+  decrypt only eligible failed IDs again; the observer and all recovery calls
+  consume one monotonic absolute deadline. Hosted Runtime V2 and the official
+  resident follow the same closed failure policy, and a recovery failure keeps
+  the main provider's native public error classification.
+
+- **Runtime error classifications now have one authoritative registry.** Chat,
+  vision, and image-generation paths derive their public `error_class`, blame,
+  safe text, and matching rules from the same server-owned specification.
+  Unknown dynamic classifications now become the system-owned
+  `error_class_unregistered` fallback; their raw value and fingerprints are not
+  retained. Content-free per-boundary counters make registry misses observable
+  without exposing provider output. Self-hosted resident consumers repeatedly
+  report monotonic absolute counters so retries are idempotent and a transient
+  failed report is retried on later requests.
+
+- **Self-hosted resident replies now suppress pure provider end sentinels using
+  the same predicate as hosted Runtime V2.** This closes the resident `</s>` and
+  `<end_of_turn>` leak while preserving mixed text such as `hello </s>` and
+  normal HTML/tokenizer discussion; suppression is intentionally whole-message
+  only.
+
 - **The memory judgment kernel is now an external, source-available package.**
   What is worth remembering, bucket assignment, per-turn recall, and
   consolidation timing moved out of this repository into `memgarden`
@@ -17,10 +44,10 @@ change must not be interpreted as an API guarantee.
   hash-locked GitHub Release wheel, so the code still ends up inside the
   measured image and under the on-chain compose hash. Self-hosters should note
   that a cold build now needs egress to `github.com`, and that the pinned lock
-  must be used rather than resolving the dependency loosely. The hash pin
-  guarantees the installed bytes match the reviewed artifact; it does not yet
-  attest that those bytes were built from the tagged source. No API contract
-  changes.
+   must be used rather than resolving the dependency loosely. The hash pin
+   guarantees the installed bytes match the reviewed artifact; it does not yet
+   attest that those bytes were built from the tagged source. No API contract
+   changes.
 
 - **Hosted Runtime V2 now stops tool-only loops before the hard provider-call
   limit.** After a configurable number of consecutive responses containing only
@@ -30,8 +57,8 @@ change must not be interpreted as an API guarantee.
   provider ignores that terminal request and emits another tool call, Runtime V2
   neither publishes the accompanying partial preamble nor executes the call. It
   uses any remaining provider-call budget to retry the terminal request at most
-  `FEEDLING_V2_MAX_TERMINAL_TOOL_CALL_RETRIES` times (two by default), then
-  terminates the loop if the provider still refuses to return text.
+   `FEEDLING_V2_MAX_TERMINAL_TOOL_CALL_RETRIES` times (two by default), then
+   terminates the loop if the provider still refuses to return text.
 
 - **Memory Dream runs now have content-free, end-to-end diagnostics.** Resident
   V1 and hosted Runtime V2 correlate Dream start, model completion or failure,
