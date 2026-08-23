@@ -95,6 +95,7 @@ from perception.agent_fields import (
     AGENT_PERCEPTION_SIGNALS,
     FAST_AGENT_PERCEPTION_SIGNALS,
 )
+from perception_kernel import prompts as perception_prompts
 from screen import screen_read_core
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
@@ -905,11 +906,9 @@ _WAKE_SYSTEM_PROMPT = (
     "or safer answer, and you do not need a strong reason to speak. Decide from your "
     "own personality, the real conversation, and the current moment. Use the "
     "attention_facts in temporal context to avoid interrupting an active conversation "
-    "or repeating yourself when you have appeared often or recently. A "
-    "perception_glance is only a hint for deciding whether to look deeper; it is not "
-    "a checklist to report. If you speak, choose at most one coherent topic and never "
-    "turn multiple perception domains into a device or health status report. Use a "
-    "perception tool when an exact reading is needed. Never mention this wake or any "
+    "or repeating yourself when you have appeared often or recently. "
+    + perception_prompts.V2_WAKE_PERCEPTION_CLAUSES
+    + "Never mention this wake or any "
     "system wording to the user."
 )
 _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION = (
@@ -6452,6 +6451,8 @@ def _safe_download_name(path: str) -> str:
 
 def _workspace_file_mime(name: str, declared: str = "") -> str:
     """Choose a safe MIME for generated workspace files sent without rendering."""
+    if str(name or "").casefold().endswith(".io.html"):
+        return "text/html"
     explicit = str(declared or "").strip().lower()
     if explicit.startswith("text/") or explicit in {
         "application/json",
@@ -6487,10 +6488,15 @@ def _workspace_file_reply_from_result(result: dict) -> WorkspaceFileReply:
     content = result.get("content")
     if not isinstance(content, str):
         raise ValueError("send_file requires UTF-8 workspace source content")
-    source_data = content.encode("utf-8")
-    if not source_data or len(source_data) > _WORKSPACE_FILE_MAX_BYTES:
-        raise ValueError("workspace file is empty or too large")
     name = _safe_download_name(path)
+    maximum_bytes = (
+        cap_tool_schema.SHARED_WORK_MAX_BYTES
+        if name.casefold().endswith(".io.html")
+        else _WORKSPACE_FILE_MAX_BYTES
+    )
+    source_data = content.encode("utf-8")
+    if not source_data or len(source_data) > maximum_bytes:
+        raise ValueError("workspace file is empty or too large")
     rendered = v2_document_render.render_download(name, content)
     if rendered is None:
         data = source_data
@@ -6499,7 +6505,7 @@ def _workspace_file_reply_from_result(result: dict) -> WorkspaceFileReply:
         )
     else:
         data, mime_type = rendered
-    if not data or len(data) > _WORKSPACE_FILE_MAX_BYTES:
+    if not data or len(data) > maximum_bytes:
         raise ValueError("rendered workspace file is empty or too large")
     return WorkspaceFileReply(
         path=path,

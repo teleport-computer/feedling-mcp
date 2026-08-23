@@ -3321,10 +3321,15 @@ def _reply_message_fields(payload: dict) -> tuple[str, dict]:
     ):
         raise RuntimeError("invalid reply file mime")
     byte_count = raw.get("file_byte_count")
+    maximum_file_bytes = (
+        cap_tool_schema.SHARED_WORK_MAX_BYTES
+        if name.casefold().endswith(".io.html")
+        else v2_worker._WORKSPACE_FILE_MAX_BYTES
+    )
     if (
         type(byte_count) is not int
         or byte_count <= 0
-        or byte_count > v2_worker._WORKSPACE_FILE_MAX_BYTES
+        or byte_count > maximum_file_bytes
     ):
         raise RuntimeError("invalid reply file size")
     return "file", {

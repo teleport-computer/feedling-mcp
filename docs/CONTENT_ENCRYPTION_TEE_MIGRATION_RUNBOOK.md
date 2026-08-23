@@ -53,8 +53,12 @@ and attachment plaintext binary uses strict `body_b64`; large objects may use a
    ciphertext using the guarded procedure below, run strict verification, then
    perform Phase 4 and switch both units to TEE.
 7. Open `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` only after compatible clients and
-   regression evidence exist, one environment at a time. This per-user write
-   gate is independent from the all-plaintext shadow described below.
+   regression evidence exist, one environment at a time. Production uses the
+   fail-closed `PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED` repository variable;
+   CI accepts `1` only when `PROD_FEEDLING_DATABASE_SCHEMA=tee` and forwards the
+   same value to the API, in-CVM worker, and every independent runner. This
+   per-user write gate is independent from the all-plaintext shadow described
+   below.
 
 ## Post-promotion plaintext shadow
 
@@ -63,7 +67,8 @@ The release has two explicit production gates:
 1. **Gate 1 — TEE primary.** Promote the current TEE PostgreSQL database to
    `DATABASE_URL`, set `FEEDLING_DATABASE_SCHEMA=tee` for every release unit,
    remove the legacy `TEE_DATABASE_URL` dual-write wiring, and verify encrypted
-   canaries, backups, the exact migration head, and the prepared marker.
+   canaries, backups, the exact migration head, and the enabled primary
+   triggers. The prepared marker remains audit metadata, not a startup gate.
 2. **Gate 2 — decrypted shadow.** Only after Gate 1 is healthy, provide an
    independent PostgreSQL 17 app DSN as `PLAINTEXT_SHADOW_DATABASE_URL` and set
    `FEEDLING_PLAINTEXT_SHADOW_ENABLED=1` on the main backend. The protected CI
@@ -133,8 +138,12 @@ unreachable.
 Stop API writes, main `serve-worker`, and the independent runner. Drain Genesis
 chunks/jobs, voice handoffs, agent jobs, the action queue, both V2 outboxes, and
 active requeue work. Take and verify a TEE backup before changing terminal
-rows. Migrate the TEE database to the exact release head, then confirm that the
-destination has both that single head and the voice lifecycle fence:
+rows. Migrate the TEE database to the exact release head before running the
+release-local preservation command; the command rejects a different head or
+database fingerprint.
+
+Before generating a preservation plan, confirm that the migrated destination
+has both the release head and the voice lifecycle fence:
 
 ```sql
 SELECT version_num FROM alembic_tee_version;
@@ -142,7 +151,9 @@ SELECT to_regclass('public.voice_call_sessions');
 ```
 
 The first query must return exactly the release's single TEE head and the second
-must return `voice_call_sessions`. Complete a TEST voice session
+must return `voice_call_sessions`. Any earlier preservation dry-run was bound to
+the previous head and is invalid after this migration; regenerate its count and
+SHA-256 from the exact release checkout. Complete a TEST voice session
 create/cancel/finalize smoke before entering the production write freeze.
 
 From the exact release being promoted, first obtain a read-only aggregate plan:
@@ -173,6 +184,14 @@ device only when its `K_user` is still valid. Preservation does not synthesize a
 working `K_enclave` and therefore does not make previously undecryptable content
 readable to hosted agents.
 
+The Phase 4 re-audit does not transfer large inline frame ciphertext back
+through the database gateway. For `frame_envelopes` only, each database computes
+an ephemeral MD5 plus UTF-8 text length for the large JSON columns and the
+operator compares those transport checksums with the remaining scalar columns.
+This MD5 is not encryption, authentication, or an ownership proof and is never
+stored; the already-reviewed SHA-256 preservation marker remains the ownership
+and plan-digest authority.
+
 Before the first TEE-primary write, the exact operation can be reversed with the
 same reviewed count and digest:
 
@@ -200,15 +219,19 @@ app role to execute a voice-session create/cancel/finalize smoke inside a
 forced-rollback transaction. Apply additionally requires the TEE owner DSN in
 `TEE_MIGRATION_DATABASE_URL`; it copies the frame bridge and Chat generation
 fences, aligns sequences, enables TEE contracts, and writes the head-bound
-prepared marker. The gate reports unresolved pending rows separately from
-fully audited preserved ciphertext. Only the former blocks promotion; the
-preserved count and aggregate digest are embedded in the prepared marker.
+prepared marker. The gate reports unresolved pending rows separately from fully
+audited preserved ciphertext. Only the former blocks promotion; the preserved
+count and aggregate digest are embedded in the prepared marker.
 
 Before traffic resumes, point main and runner at the same TEE app DSN, set
-`FEEDLING_DATABASE_SCHEMA=tee`, and remove `TEE_DATABASE_URL`/dual-write. Startup
-must assert the TEE head and marker without DDL. After the first TEE-primary
-write, frozen RDS is not a lossless rollback target; reverse-reconcile or restore
-TEE changes before switching a DSN back.
+`FEEDLING_DATABASE_SCHEMA=tee`, and remove `TEE_DATABASE_URL`/dual-write. To open
+the plaintext tier in the same maintenance window, also set
+`PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1`; CI rejects that value with the RDS
+schema selector, and all production write processes receive the same gate.
+Startup must assert the TEE head and primary triggers without DDL; it does not
+depend on the optional prepared-marker row. After the first
+TEE-primary write, frozen RDS is not a lossless rollback target;
+reverse-reconcile or restore TEE changes before switching a DSN back.
 
 ## Shape inventory
 

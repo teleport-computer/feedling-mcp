@@ -246,6 +246,8 @@ jobs:
   python-tests:
     name: test_api.py (multi-tenant)
     runs-on: ubuntu-24.04
+    env:
+      FEEDLING_CI_EXECUTION_JOB: python-tests
     # All per-user data lives in Postgres now (see backend/db.py), so the
     # backend cannot start without a reachable DB. Provision a throwaway one.
     services:
@@ -263,6 +265,12 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
+
+      - name: Bind execution evidence to exact checkout
+        continue-on-error: true
+        run: |
+          echo "FEEDLING_CI_EXECUTION_HEAD_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "FEEDLING_CI_EXECUTION_EVIDENCE_DIR=$RUNNER_TEMP/feedling-ci-execution-evidence" >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -300,6 +308,13 @@ jobs:
 
       - name: Run test suite
         run: python tests/test_api.py http://127.0.0.1:5001 --multi-tenant
+
+      - name: Attest successful custom test runner
+        continue-on-error: true
+        run: >-
+          python tools/ci_execution_evidence.py attest
+          --runner tests/test_api.py
+          --output "$FEEDLING_CI_EXECUTION_EVIDENCE_DIR/custom-test-api.json"
 
       - name: Stop test backend (the isolation suite spawns its own)
         if: always()
@@ -431,6 +446,18 @@ jobs:
             tests/test_memory_garden_prompt_params.py \
             tests/test_memory_garden_storage_port.py \
             tests/test_memory_garden_dreaming.py \
+            -v
+
+      - name: Perception kernel unit tests
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m pytest \
+            tests/test_perception_kernel_catalog.py \
+            tests/test_perception_kernel_projection.py \
+            tests/test_perception_kernel_purity.py \
+            tests/test_perception_kernel_wake.py \
+            tests/test_perception_prompt_golden.py \
             -v
 
       - name: Guard top-level pytest discovery coverage
@@ -690,6 +717,7 @@ jobs:
             tests/test_tee_replication_workflow_guard.py \
             tests/test_tee_requeue.py \
             tests/test_tee_requeue_coverage.py \
+            tests/test_tee_primary_startup.py \
             tests/test_tee_schema.py \
             tests/test_tee_snapshot.py \
             tests/test_tee_sync_metrics.py \
@@ -722,6 +750,7 @@ jobs:
           python -m pytest \
             tests/test_ci_image_tag_width.py \
             tests/test_deploy_yaml_strict.py \
+            tests/test_release_pin_cas.py \
             tests/test_frame_r2_deploy_config.py \
             tests/test_admin_runtime_mode.py \
             tests/test_hosted_runtime_policy.py \
@@ -753,6 +782,7 @@ jobs:
             tests/test_db_health_timeouts.py \
             tests/test_access_mode_runtime_sync_unit.py \
             tests/test_pytest_coverage_ratchet.py \
+            tests/test_ci_execution_evidence.py \
             tests/test_mcp_client.py \
             tests/test_mcp_probe_tools_required.py \
             tests/test_mcp_status.py \
@@ -837,11 +867,25 @@ jobs:
             tests/test_write_side_format_routing.py \
             tests/test_admin_debug_turn_view.py \
             tests/test_data_track_debug.py \
+            tests/test_admin_discarded_reason.py \
+            tests/test_admin_concentration.py \
+            tests/test_admin_concentration_e2e.py \
             -v
+
+      - name: Upload execution evidence (report only)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-execution-evidence-python-tests
+          path: ${{ runner.temp }}/feedling-ci-execution-evidence
+          if-no-files-found: ignore
 
   runtime-v2-coverage:
     name: Runtime V2 coverage (profile=${{ matrix.profile_enabled }})
     runs-on: ubuntu-24.04
+    env:
+      FEEDLING_CI_EXECUTION_JOB: runtime-v2-coverage/profile=${{ matrix.profile_enabled }}
     strategy:
       fail-fast: false
       matrix:
@@ -861,6 +905,12 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
+
+      - name: Bind execution evidence to exact checkout
+        continue-on-error: true
+        run: |
+          echo "FEEDLING_CI_EXECUTION_HEAD_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "FEEDLING_CI_EXECUTION_EVIDENCE_DIR=$RUNNER_TEMP/feedling-ci-execution-evidence" >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -907,6 +957,63 @@ jobs:
             tests/test_v2_worker_tool_loop.py \
             tests/test_v2_deterministic_compaction.py \
             -v
+
+      - name: Upload execution evidence (report only)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-execution-evidence-runtime-v2-${{ matrix.profile_enabled }}
+          path: ${{ runner.temp }}/feedling-ci-execution-evidence
+          if-no-files-found: ignore
+
+  ci-execution-evidence-report:
+    name: CI execution evidence (report only)
+    if: always()
+    continue-on-error: true
+    needs: [python-tests, runtime-v2-coverage]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download producer evidence
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ci-execution-evidence-*
+          path: /tmp/feedling-ci-execution-evidence
+
+      - name: Build exact-SHA configured/executed report
+        continue-on-error: true
+        env:
+          PYTHON_JOB_RESULT: ${{ needs.python-tests.result }}
+          RUNTIME_JOB_RESULT: ${{ needs.runtime-v2-coverage.result }}
+        run: |
+          python tools/ci_execution_evidence.py report \
+            --workflow .github/workflows/ci.yml \
+            --tests-dir tests \
+            --baseline .github/pytest-uncovered-baseline.txt \
+            --evidence-dir /tmp/feedling-ci-execution-evidence \
+            --expected-head-sha "$(git rev-parse HEAD)" \
+            --producer python-tests=python-tests \
+            --producer runtime-v2-coverage=runtime-v2-coverage/profile=0 \
+            --producer runtime-v2-coverage=runtime-v2-coverage/profile=1 \
+            --producer-result "python-tests=$PYTHON_JOB_RESULT" \
+            --producer-result "runtime-v2-coverage=$RUNTIME_JOB_RESULT" \
+            --output /tmp/ci-execution-evidence-report.json \
+            --markdown /tmp/ci-execution-evidence-report.md
+          cat /tmp/ci-execution-evidence-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload configured/executed report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-execution-evidence-report
+          path: |
+            /tmp/ci-execution-evidence-report.json
+            /tmp/ci-execution-evidence-report.md
+          if-no-files-found: ignore
 
   # -------------------------------------------------------------------------
   # Docker — confirm the hash-pinned build stays reproducible
@@ -1337,6 +1444,9 @@ jobs:
     permissions:
       contents: read
       packages: read
+    outputs:
+      database_schema: ${{ steps.prod_release_config.outputs.database_schema }}
+      plaintext_writes_accepted: ${{ steps.prod_release_config.outputs.plaintext_writes_accepted }}
     steps:
       - uses: actions/checkout@v4
       - name: Check standalone prod runner CVM topology
@@ -1366,9 +1476,11 @@ jobs:
           done
 
       - name: Require complete production Runtime V2 configuration
+        id: prod_release_config
         env:
           DATABASE_URL:                  ${{ secrets.DATABASE_URL }}
           FEEDLING_DATABASE_SCHEMA:      ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA || 'rds' }}
+          FEEDLING_PLAINTEXT_WRITES_ACCEPTED: ${{ vars.PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED || '0' }}
           TEE_DATABASE_URL:              ${{ secrets.PROD_TEE_DATABASE_URL }}
           FEEDLING_TEE_DUAL_WRITE:       ${{ secrets.PROD_FEEDLING_TEE_DUAL_WRITE }}
           PLAINTEXT_SHADOW_DATABASE_URL: ${{ secrets.PROD_PLAINTEXT_SHADOW_DATABASE_URL }}
@@ -1403,6 +1515,14 @@ jobs:
             rds|tee) ;;
             *) echo "::error::PROD_FEEDLING_DATABASE_SCHEMA must be exactly rds or tee"; missing=1 ;;
           esac
+          case "$FEEDLING_PLAINTEXT_WRITES_ACCEPTED" in
+            0|1) ;;
+            *) echo "::error::PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED must be exactly 0 or 1"; missing=1 ;;
+          esac
+          if [ "$FEEDLING_PLAINTEXT_WRITES_ACCEPTED" = "1" ] && [ "$FEEDLING_DATABASE_SCHEMA" != "tee" ]; then
+            echo "::error::PROD plaintext writes require FEEDLING_DATABASE_SCHEMA=tee"
+            missing=1
+          fi
           if [ "$FEEDLING_DATABASE_SCHEMA" = "tee" ]; then
             if [ -n "$TEE_DATABASE_URL" ]; then
               echo "::error::PROD_TEE_DATABASE_URL must be empty for TEE primary"
@@ -1432,15 +1552,19 @@ jobs:
               missing=1
             fi
           fi
-          exit "$missing"
+          if [ "$missing" -ne 0 ]; then
+            exit "$missing"
+          fi
+          echo "database_schema=$FEEDLING_DATABASE_SCHEMA" >> "$GITHUB_OUTPUT"
+          echo "plaintext_writes_accepted=$FEEDLING_PLAINTEXT_WRITES_ACCEPTED" >> "$GITHUB_OUTPUT"
 
       # PROD promotion uses the owner DSN only for read-only preflight checks;
       # the deployed main and runner CVMs both receive the app-role DATABASE_URL.
       # Fail before either CVM is mutated if the two credentials point at
       # different databases, the owner migration is behind, the app role is
-      # wrong, or the Phase-4 prepared marker/startup contract is missing.
+      # wrong, or the TEE migration-head/primary-trigger contract is incomplete.
       - name: Prepare PROD TEE schema preflight credentials
-        if: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        if: ${{ steps.prod_release_config.outputs.database_schema == 'tee' }}
         env:
           PROD_CA_PEM: ${{ secrets.PROD_TEE_PG_CA_PEM }}
           PROD_DSN: ${{ secrets.PROD_TEE_MIGRATION_DSN }}
@@ -1451,22 +1575,22 @@ jobs:
           test -s /tmp/prod-tee-ca.crt || { echo "::error::PROD_TEE_PG_CA_PEM is required for TEE-primary deploy preflight"; exit 1; }
 
       - name: Set up Python for PROD TEE schema preflight
-        if: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        if: ${{ steps.prod_release_config.outputs.database_schema == 'tee' }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install PROD TEE schema preflight dependencies
-        if: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        if: ${{ steps.prod_release_config.outputs.database_schema == 'tee' }}
         run: |
           python -m pip install --upgrade pip
           pip install --require-hashes -r backend/requirements.lock
 
       - name: Validate PROD database topology without exposing DSNs
-        if: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        if: ${{ steps.prod_release_config.outputs.database_schema == 'tee' }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          FEEDLING_DATABASE_SCHEMA: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA || 'rds' }}
+          FEEDLING_DATABASE_SCHEMA: ${{ steps.prod_release_config.outputs.database_schema }}
           PLAINTEXT_SHADOW_DATABASE_URL: ${{ secrets.PROD_PLAINTEXT_SHADOW_DATABASE_URL }}
           FEEDLING_PLAINTEXT_SHADOW_ENABLED: ${{ vars.PROD_FEEDLING_PLAINTEXT_SHADOW_ENABLED || '0' }}
           TEE_DATABASE_URL: ${{ secrets.PROD_TEE_DATABASE_URL }}
@@ -1474,7 +1598,7 @@ jobs:
         run: python deploy/check-database-topology.py
 
       - name: Require PROD TEE schema at release head before mutating any CVM
-        if: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        if: ${{ steps.prod_release_config.outputs.database_schema == 'tee' }}
         env:
           PROD_DSN: ${{ secrets.PROD_TEE_MIGRATION_DSN }}
           APP_DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -1939,6 +2063,8 @@ jobs:
       cancel-in-progress: false
     outputs:
       cvm_id: ${{ steps.cvmid.outputs.cvm_id }}
+      database_schema: ${{ needs.validate-prod-runner-topology.outputs.database_schema }}
+      plaintext_writes_accepted: ${{ needs.validate-prod-runner-topology.outputs.plaintext_writes_accepted }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -2085,7 +2211,8 @@ jobs:
           # via the encrypted env channel — carries DB credentials, NOT baked
           # into compose_hash. The backend fails fast at boot if this is empty.
           DATABASE_URL:        ${{ secrets.DATABASE_URL }}
-          FEEDLING_DATABASE_SCHEMA: ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA || 'rds' }}
+          FEEDLING_DATABASE_SCHEMA: ${{ needs.validate-prod-runner-topology.outputs.database_schema }}
+          FEEDLING_PLAINTEXT_WRITES_ACCEPTED: ${{ needs.validate-prod-runner-topology.outputs.plaintext_writes_accepted }}
           # TEE 明文影子库双写（feedling-io-db-prod 独立 pg CVM）。best-effort 镜像，
           # mirror 永不 raise。两个都空 = OFF。app 角色 DSN、sslmode=require。加密 env
           # 通道，不烧 compose_hash（同 DATABASE_URL）。⚠️ 开启触发 prod enclave 全量
@@ -2160,6 +2287,7 @@ jobs:
             -e "FEEDLING_ADMIN_PASSWORD=$FEEDLING_ADMIN_PASSWORD" \
             -e "DATABASE_URL=$DATABASE_URL" \
             -e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA" \
+            -e "FEEDLING_PLAINTEXT_WRITES_ACCEPTED=$FEEDLING_PLAINTEXT_WRITES_ACCEPTED" \
             -e "TEE_DATABASE_URL=$TEE_DATABASE_URL" \
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
             -e "PLAINTEXT_SHADOW_DATABASE_URL=$PLAINTEXT_SHADOW_DATABASE_URL" \
@@ -2256,6 +2384,7 @@ jobs:
         env:
           FEEDLING_API_URL:     ${{ vars.PROD_API_URL || 'https://api.feedling.app' }}
           FEEDLING_ENCLAVE_URL: ${{ vars.PROD_MAIN_ENCLAVE_URL }}
+          FEEDLING_CANARY_EXPECT_PLAINTEXT: ${{ needs.validate-prod-runner-topology.outputs.plaintext_writes_accepted }}
         run: |
           python3 -m pip install --quiet cryptography
           python3 tools/deploy_canary.py
@@ -3179,7 +3308,8 @@ jobs:
           AGENT_MAX_CHILDREN:            ${{ vars.AGENT_MAX_CHILDREN }}
           # Reused from the main prod CVM — MUST match (esp. the token secret).
           DATABASE_URL:                  ${{ secrets.DATABASE_URL }}
-          FEEDLING_DATABASE_SCHEMA:      ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA || 'rds' }}
+          FEEDLING_DATABASE_SCHEMA:      ${{ needs.deploy-cvm.outputs.database_schema }}
+          FEEDLING_PLAINTEXT_WRITES_ACCEPTED: ${{ needs.deploy-cvm.outputs.plaintext_writes_accepted }}
           R2_ENDPOINT:                   ${{ secrets.R2_ENDPOINT }}
           R2_ACCESS_KEY_ID:              ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY:          ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -3196,6 +3326,14 @@ jobs:
           if [ -z "$FEEDLING_API_URL" ] || [ -z "$FEEDLING_ENCLAVE_URL" ]; then
             echo "::error::PROD_MAIN_API_URL / PROD_MAIN_ENCLAVE_URL not set — runner can't reach the main CVM"; exit 1
           fi
+          case "$FEEDLING_PLAINTEXT_WRITES_ACCEPTED" in
+            0|1) ;;
+            *) echo "::error::PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED must be exactly 0 or 1"; exit 1 ;;
+          esac
+          if [ "$FEEDLING_PLAINTEXT_WRITES_ACCEPTED" = "1" ] && [ "$FEEDLING_DATABASE_SCHEMA" != "tee" ]; then
+            echo "::error::PROD plaintext writes require FEEDLING_DATABASE_SCHEMA=tee"
+            exit 1
+          fi
           printf '%s\n' "$IDS" | while IFS= read -r CVM_ID; do
             [ -z "$CVM_ID" ] && continue
             echo ">>> deploy prod runner CVM: $CVM_ID"
@@ -3209,6 +3347,7 @@ jobs:
               -e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN" \
               -e "DATABASE_URL=$DATABASE_URL" \
               -e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA" \
+              -e "FEEDLING_PLAINTEXT_WRITES_ACCEPTED=$FEEDLING_PLAINTEXT_WRITES_ACCEPTED" \
               -e "R2_ENDPOINT=$R2_ENDPOINT" \
               -e "R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
               -e "R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \

@@ -1163,7 +1163,7 @@ def test_heartbeat_stay_silent_completes_with_auditable_reason(monkeypatch):
     assert silence[0]["trace_id"] == trace_id
     assert silence[0]["job_id"] == str(job_id)
     assert silence[0]["status"] == "warning"
-    assert silence[0]["outcome_class"] == "safety_suppression"
+    assert silence[0]["outcome_class"] == "operational_failure"
     assert silence[0]["detail"] == {
         "lane": "heartbeat",
         "cause": "suppressed",

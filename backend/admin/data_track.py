@@ -27,6 +27,7 @@ from accounts import registry
 from admin import usage as admin_usage
 from chat import consumer as chat_consumer
 from memory import service as memory_service
+from notices import catalog as notices_catalog
 from notices import core as notices_core
 from proactive import service as proactive_service
 from screen import screen_read_core
@@ -129,6 +130,25 @@ def _count_rows(rows: list[dict], key: str) -> dict:
         val = str(row.get(key) or "unknown").strip() or "unknown"
         counts[val] = counts.get(val, 0) + 1
     return counts
+
+
+def _v1_proactive_outcome_class(status: object, reason: object) -> str:
+    """Classify the resident/V1 proactive status-reason keyspace.
+
+    ``skipped`` is a control-plane outcome (including heartbeat_throttled), not
+    a failed realization.  A failed job leaves our numerator only for Seven's
+    exact user-unavailable reasons.  No prefix or string-shape inference is
+    allowed: unknown/new reasons remain operational failures.
+    """
+    normalized_status = str(status or "").strip()
+    normalized_reason = str(reason or "").strip() or "unknown"
+    if normalized_status == "skipped":
+        return "control"
+    if normalized_status != "failed":
+        return ""
+    if normalized_reason in notices_catalog.USER_UNAVAILABLE_V1_REASONS:
+        return "user_unavailable"
+    return "operational_failure"
 
 
 def _safe_onboarding_validation(raw: dict) -> dict:
@@ -351,16 +371,30 @@ def _proactive_stats(store: UserStore) -> dict:
     failed_reasons: dict[str, int] = {}
     kind_lanes = {"heartbeat": 0, "screen": 0, "other": 0}
     fail_lanes = {"heartbeat": 0, "screen": 0, "other": 0}
+    control_lanes = {"heartbeat": 0, "screen": 0, "other": 0}
+    user_unavailable_lanes = {"heartbeat": 0, "screen": 0, "other": 0}
+    control_reasons: dict[str, int] = {}
+    user_unavailable_reasons: dict[str, int] = {}
     for j in jobs:
         if not isinstance(j, dict):
             continue
         raw_kind = j.get("job_kind") or j.get("wake_kind") or j.get("trigger") or ""
         lane = _classify_proactive_kind(raw_kind)
         kind_lanes[lane] += 1
-        if str(j.get("status") or "") in ("failed", "skipped"):
+        status = str(j.get("status") or "").strip()
+        reason = str(j.get("status_reason") or "").strip() or "unknown"
+        outcome_class = _v1_proactive_outcome_class(status, reason)
+        if outcome_class == "operational_failure":
             fail_lanes[lane] += 1
-            reason = str(j.get("status_reason") or "").strip() or "unknown"
             failed_reasons[reason] = failed_reasons.get(reason, 0) + 1
+        elif outcome_class == "control":
+            control_lanes[lane] += 1
+            control_reasons[reason] = control_reasons.get(reason, 0) + 1
+        elif outcome_class == "user_unavailable":
+            user_unavailable_lanes[lane] += 1
+            user_unavailable_reasons[reason] = (
+                user_unavailable_reasons.get(reason, 0) + 1
+            )
     live_status_counts = _count_rows(proactive_messages, "live_activity_status")
     alert_status_counts = _count_rows(proactive_messages, "alert_status")
     job_epochs = [core_util._to_epoch(j.get("ts") or j.get("created_at") or j.get("updated_at")) for j in jobs]
@@ -371,7 +405,7 @@ def _proactive_stats(store: UserStore) -> dict:
         + alert_status_counts.get("delivered", 0)
         + alert_status_counts.get("logged_only", 0)
     )
-    failed = sum(status_counts.get(s, 0) for s in ("failed", "skipped"))
+    failed = sum(fail_lanes.values())
     failed += sum(live_status_counts.get(s, 0) for s in ("failed", "error"))
     failed += sum(alert_status_counts.get(s, 0) for s in ("failed", "error"))
     return {
@@ -385,12 +419,16 @@ def _proactive_stats(store: UserStore) -> dict:
         "other_jobs": kind_lanes["other"],
         "heartbeat_failed": fail_lanes["heartbeat"],
         "screen_failed": fail_lanes["screen"],
+        "heartbeat_control": control_lanes["heartbeat"],
+        "screen_control": control_lanes["screen"],
+        "heartbeat_user_unavailable": user_unavailable_lanes["heartbeat"],
+        "screen_user_unavailable": user_unavailable_lanes["screen"],
         "pending_jobs": status_counts.get("pending", 0),
         "posted_jobs": status_counts.get("posted", 0) + status_counts.get("delivered", 0),
         "failed_jobs": failed,
-        # Matches the existing failure-lane lifecycle: skipped is terminal and
-        # grouped with failed, even though jobs_by_status keeps them distinct.
         "job_failed_reasons": failed_reasons,
+        "job_control_reasons": control_reasons,
+        "job_user_unavailable_reasons": user_unavailable_reasons,
         "proactive_messages": len(proactive_messages),
         "delivery_signals": delivered,
         "live_activity_status": live_status_counts,
@@ -900,7 +938,14 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
     extra = dict(snap.get("proactive_extra") or {})
     status_counts = _data_track_count_dict(extra.get("jobs_by_status"))
     kind_lanes = _bucket_proactive_kinds(_data_track_count_dict(extra.get("jobs_by_kind")))
-    fail_lanes = _bucket_proactive_kinds(_data_track_count_dict(extra.get("jobs_failed_by_kind")))
+    raw_fail_kinds = _data_track_count_dict(extra.get("jobs_failed_by_kind"))
+    fail_lanes = _bucket_proactive_kinds(raw_fail_kinds)
+    control_lanes = _bucket_proactive_kinds(
+        _data_track_count_dict(extra.get("jobs_control_by_kind"))
+    )
+    user_unavailable_lanes = _bucket_proactive_kinds(
+        _data_track_count_dict(extra.get("jobs_user_unavailable_by_kind"))
+    )
     live_status_counts = _data_track_count_dict(extra.get("live_activity_status"))
     alert_status_counts = _data_track_count_dict(extra.get("alert_status"))
     decisions = int(extra.get("decisions") or logs.get("gate_decisions", {}).get("count") or 0)
@@ -910,7 +955,12 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
         + alert_status_counts.get("delivered", 0)
         + alert_status_counts.get("logged_only", 0)
     )
-    failed = sum(status_counts.get(s, 0) for s in ("failed", "skipped"))
+    failed_reasons = _data_track_count_dict(extra.get("jobs_failed_by_reason"))
+    failed = (
+        sum(fail_lanes.values())
+        if raw_fail_kinds
+        else sum(failed_reasons.values())
+    )
     failed += sum(live_status_counts.get(s, 0) for s in ("failed", "error"))
     failed += sum(alert_status_counts.get(s, 0) for s in ("failed", "error"))
     last_at = _latest_epoch(
@@ -929,12 +979,18 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
         "other_jobs": kind_lanes["other"],
         "heartbeat_failed": fail_lanes["heartbeat"],
         "screen_failed": fail_lanes["screen"],
+        "heartbeat_control": control_lanes["heartbeat"],
+        "screen_control": control_lanes["screen"],
+        "heartbeat_user_unavailable": user_unavailable_lanes["heartbeat"],
+        "screen_user_unavailable": user_unavailable_lanes["screen"],
         "pending_jobs": status_counts.get("pending", 0),
         "posted_jobs": status_counts.get("posted", 0) + status_counts.get("delivered", 0),
         "failed_jobs": failed,
-        # Includes failed + skipped proactive jobs; delivery failures are not
-        # job reasons and remain in live_activity_status / alert_status.
-        "job_failed_reasons": _data_track_count_dict(extra.get("jobs_failed_by_reason")),
+        "job_failed_reasons": failed_reasons,
+        "job_control_reasons": _data_track_count_dict(extra.get("jobs_control_by_reason")),
+        "job_user_unavailable_reasons": _data_track_count_dict(
+            extra.get("jobs_user_unavailable_by_reason")
+        ),
         "proactive_messages": int(chat.get("proactive_messages") or 0),
         "delivery_signals": delivered,
         "live_activity_status": live_status_counts,
@@ -1227,7 +1283,9 @@ def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
     )
     chat = _data_track_chat_from_snapshot(snap)
     memory = _data_track_memory_from_snapshot(snap)
-    proactive = _data_track_proactive_from_snapshot(snap, chat)
+    proactive = _with_proactive_lens(
+        _data_track_proactive_from_snapshot(snap, chat)
+    )
     tracking = _data_track_tracking_from_snapshot(snap)
     bootstrap_events = _data_track_bootstrap_from_snapshot(snap)
     history_import = _data_track_history_import_from_snapshot(snap)
@@ -1563,7 +1621,10 @@ PROACTIVE_V1_LENS_NOTE = (
     "V1 口径:proactive_jobs 日志 + source=agent_initiated_proactive 的聊天行。"
     "Runtime V2 的唤醒 job 在 agent_jobs、回复行 source 恒为 model_api,"
     "因此 V2 用户在本块里的计数结构性为 0,pending 多为 V2 下无人排空的旧流死行。"
-    "V2 请看 v2_wake_activity / v2_wake_schedule。"
+    "V2 请看 v2_wake_activity / v2_wake_schedule。失败数=全史 status=failed 中"
+    "剔除明确用户侧七码后的数量;unknown/未登记原因仍算我方失败。skipped(含"
+    "heartbeat_throttled)单列为控制结果,不算失败;expired 沿用既有 V1 口径不计。"
+    "页面不拿 jobs 总数直接充当失败率分母。"
 )
 
 
@@ -1580,6 +1641,21 @@ def _with_proactive_lens(block: dict) -> dict:
     out = dict(block or {})
     out["lens"] = PROACTIVE_V1_LENS
     out["lens_note"] = PROACTIVE_V1_LENS_NOTE
+    out["failure_definition"] = {
+        "cohort": "resident_v1_only",
+        "window": "all_history",
+        "numerator": (
+            "status=failed excluding exact user_unavailable reasons; "
+            "unknown remains failure"
+        ),
+        "denominator": (
+            "not computed on this surface; jobs is an all-status count"
+        ),
+        "control": "status=skipped, including heartbeat_throttled",
+        "user_unavailable_reasons": sorted(
+            notices_catalog.USER_UNAVAILABLE_V1_REASONS
+        ),
+    }
     return out
 
 
@@ -2339,22 +2415,53 @@ def _finite_ms(value):
     return out if (math.isfinite(out) and out >= 0) else None
 
 
-def _known_job_lanes() -> frozenset:
+def _load_jobs_store_trace_vocabulary() -> tuple[frozenset, frozenset]:
+    """Read the trace vocabulary from its producer.
+
+    Kept as a small seam so an import/read failure can be tested without
+    teaching the admin consumer a second copy of either closed set.
+    """
+    from model_api_runtime.v2 import jobs_store as _js
+
+    return frozenset(_js.LANES), frozenset(_js.ENQUEUE_REASON_CODES)
+
+
+def _trace_vocabulary() -> tuple[frozenset, frozenset] | None:
+    """Return producer-owned lane/reason sets, or an explicit unavailable.
+
+    Both producer exports are non-empty closed sets. Empty therefore cannot be
+    a healthy reading. Failures are deliberately not cached: a transient import
+    failure must not blind the admin surface until process restart.
+    """
+    global _TRACE_VOCABULARY_CACHE
+    if _TRACE_VOCABULARY_CACHE is not None:
+        return _TRACE_VOCABULARY_CACHE
+    try:
+        lanes, enqueue_reasons = _load_jobs_store_trace_vocabulary()
+        if not lanes or not enqueue_reasons:
+            return None
+    except Exception:  # noqa: BLE001 — render degraded state instead of 500
+        return None
+    _TRACE_VOCABULARY_CACHE = (lanes, enqueue_reasons)
+    return _TRACE_VOCABULARY_CACHE
+
+
+_TRACE_VOCABULARY_CACHE = None
+_TRACE_VOCABULARY_UNSET = object()
+
+
+def _known_job_lanes() -> frozenset | None:
     """后台任务的 lane 闭集,**从产生方读**,不在管理端抄一份。"""
-    global _KNOWN_JOB_LANES_CACHE
-    if _KNOWN_JOB_LANES_CACHE is None:
-        try:
-            from model_api_runtime.v2 import jobs_store as _js
-            _KNOWN_JOB_LANES_CACHE = frozenset(_js.LANES)
-        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
-            _KNOWN_JOB_LANES_CACHE = frozenset()
-    return _KNOWN_JOB_LANES_CACHE
+    vocabulary = _trace_vocabulary()
+    return vocabulary[0] if vocabulary is not None else None
 
 
-_KNOWN_JOB_LANES_CACHE = None
-
-
-def _debug_trace_group_turns(events: list[dict]) -> list[dict]:
+def _debug_trace_group_turns(
+    events: list[dict], *, known_job_lanes=_TRACE_VOCABULARY_UNSET,
+) -> list[dict]:
+    if known_job_lanes is _TRACE_VOCABULARY_UNSET:
+        known_job_lanes = _known_job_lanes()
+    lane_values = known_job_lanes if known_job_lanes is not None else frozenset()
     buckets: dict[tuple[str, str], list[dict]] = {}
     for ev in events:
         trace_id = str(ev.get("trace_id") or "ungrouped")
@@ -2398,7 +2505,7 @@ def _debug_trace_group_turns(events: list[dict]) -> list[dict]:
             (
                 str(e.get("lane") or "")
                 for e in ordered
-                if str(e.get("lane") or "") in _known_job_lanes()
+                if str(e.get("lane") or "") in lane_values
             ),
             "",
         ) or next(
@@ -2406,7 +2513,7 @@ def _debug_trace_group_turns(events: list[dict]) -> list[dict]:
                 str((e.get("detail") or {}).get("lane") or "")
                 for e in ordered
                 if isinstance(e.get("detail"), dict)
-                and str((e.get("detail") or {}).get("lane") or "") in _known_job_lanes()
+                and str((e.get("detail") or {}).get("lane") or "") in lane_values
             ),
             "",
         )
@@ -2753,22 +2860,22 @@ def _is_registered_failure_code(value: str) -> bool:
     return value in _known_failure_codes() or value in _known_error_classes()
 
 
-def _trace_public_fields() -> dict:
+def _trace_public_fields(*, vocabulary=_TRACE_VOCABULARY_UNSET) -> dict:
     """事件类型 -> {键: 允许取值集合 或 _TRACE_PUBLIC_SHAPE}。
 
     惰性构建:`jobs_store` 在 `data_track` 之下,模块级导入会把管理端接进运行时
     的导入链(仓内既有做法同此,见 `_v2_wake_activity_detail`)。
     """
     global _TRACE_PUBLIC_FIELDS_CACHE
-    if _TRACE_PUBLIC_FIELDS_CACHE is not None:
+    if vocabulary is _TRACE_VOCABULARY_UNSET:
+        vocabulary = _trace_vocabulary()
+    if vocabulary is not None and _TRACE_PUBLIC_FIELDS_CACHE is not None:
         return _TRACE_PUBLIC_FIELDS_CACHE
-    try:
-        from model_api_runtime.v2 import jobs_store as _js
-        lanes = frozenset(_js.LANES)
-        enqueue_reasons = frozenset(_js.ENQUEUE_REASON_CODES)
-    except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
+    if vocabulary is None:
         lanes = frozenset()
         enqueue_reasons = frozenset()
+    else:
+        lanes, enqueue_reasons = vocabulary
     outcomes = frozenset(db.TRACE_OUTCOME_CLASSES)
     job_outcomes = frozenset({"completed", "failed", "rescheduled", "superseded"})
     voice_stage = frozenset({
@@ -2805,14 +2912,21 @@ def _trace_public_fields() -> dict:
             "stage": voice_stage, "runtime": runtime_kind,
             "error_code": _TRACE_PUBLIC_FAILURE_CODE,
         }
-    _TRACE_PUBLIC_FIELDS_CACHE = table
+    # Only a producer-backed table is healthy enough to cache. The degraded
+    # table still preserves unrelated public fields, but the next request must
+    # retry the producer import.
+    if vocabulary is not None:
+        _TRACE_PUBLIC_FIELDS_CACHE = table
     return table
 
 
 _TRACE_PUBLIC_FIELDS_CACHE = None
 
 
-def _expose_declared_trace_fields(ev: dict, raw_detail, public_detail) -> None:
+def _expose_declared_trace_fields(
+    ev: dict, raw_detail, public_detail,
+    *, trace_public_fields=_TRACE_VOCABULARY_UNSET,
+) -> None:
     """把该事件显式声明过的字段放回明文。
 
     两层收口:键必须被这个事件声明过,**且**值必须落在产生方集合里。
@@ -2820,7 +2934,9 @@ def _expose_declared_trace_fields(ev: dict, raw_detail, public_detail) -> None:
     """
     if not isinstance(raw_detail, dict) or not isinstance(public_detail, dict):
         return
-    allowed = _trace_public_fields().get(str(ev.get("type") or ""))
+    if trace_public_fields is _TRACE_VOCABULARY_UNSET:
+        trace_public_fields = _trace_public_fields()
+    allowed = trace_public_fields.get(str(ev.get("type") or ""))
     if not allowed:
         return
     for key, spec in allowed.items():
@@ -2834,10 +2950,17 @@ def _expose_declared_trace_fields(ev: dict, raw_detail, public_detail) -> None:
             public_detail[key] = value
 
 
-def _debug_event_public_json(ev: dict) -> dict:
+def _debug_event_public_json(
+    ev: dict, *, trace_public_fields=_TRACE_VOCABULARY_UNSET,
+) -> dict:
     raw_detail = ev.get("detail") or {}
     public_detail = _debug_redact_value(raw_detail)
-    _expose_declared_trace_fields(ev, raw_detail, public_detail)
+    _expose_declared_trace_fields(
+        ev,
+        raw_detail,
+        public_detail,
+        trace_public_fields=trace_public_fields,
+    )
     if ev.get("type") in memory_dream_trace.DREAM_TRACE_TYPES:
         # Dream rewrites private memory. Its public diagnostic contract is an
         # exact closed shape: any new/unknown key invalidates the whole detail
@@ -3058,6 +3181,7 @@ def _debug_filter_options(events: list[dict]) -> dict:
 
 
 def _data_track_debug_payload() -> dict:
+    trace_vocabulary = _trace_vocabulary()
     filters = _data_track_request_filters()
     limit = int(filters.get("limit") or 100)
     offset = int(filters.get("offset") or 0)
@@ -3156,7 +3280,12 @@ def _data_track_debug_payload() -> dict:
             }
 
     all_events = sorted(all_events, key=lambda e: float(e.get("ts") or 0), reverse=True)
-    turns = _debug_trace_group_turns(all_events)
+    turns = _debug_trace_group_turns(
+        all_events,
+        known_job_lanes=(
+            trace_vocabulary[0] if trace_vocabulary is not None else None
+        ),
+    )
     if status_filter and status_filter != "all":
         turns = [t for t in turns if t.get("terminal_status") == status_filter]
         allowed = {(t["user_id"], t["trace_id"]) for t in turns}
@@ -3221,6 +3350,11 @@ def _data_track_debug_payload() -> dict:
             "page": str(page or ""),
         },
         "options": _debug_filter_options(all_events_raw),
+        "observability": {
+            "trace_vocabulary": (
+                "ok" if trace_vocabulary is not None else "unavailable"
+            ),
+        },
         "pagination": pagination,
         "users": users_out,
         "turns": turns_out,
@@ -3825,6 +3959,7 @@ RUNTIME_OUTCOME_CLASS_LABELS = {
     "timeout": "超时 / 失活",
     "control": "控制切流",
     "safety_suppression": "安全抑制",
+    "user_unavailable": "明确用户侧不可用",
 }
 RUNTIME_OUTCOME_CLASSES = frozenset(RUNTIME_OUTCOME_CLASS_LABELS)
 RUNTIME_OUTCOME_DEFAULT = "operational_failure"
@@ -3848,6 +3983,32 @@ def _runtime_failure_code(raw) -> str:
     if not code or not _is_registered_failure_code(code):
         return "other"
     return code[:_RUNTIME_FAILURE_CODE_MAX]
+
+
+# ``runtime_failed`` **不是一种运行时错误**。它是净化层对「原始 reason 存在、
+# 但没通过安全白名单 ``^[a-z0-9_:-]{1,120}$``」的整段替换（``db.py`` 的
+# ``_LANE_ROLLUP_CODE_RE``、``memory_metadata`` 的同形 SQL CASE）。白名单不许
+# 大写、空格、句点，所以**任何一句人类可读的错误消息都会被抹成它**。
+#
+# 为什么值得单独标注：2026-08-22 prod 实测，V1 心跳有 6 个账号整周零成功、663
+# 次失败（占 V1 心跳失败 66%），失败码 100% 是它。读表的人会得出「运行时坏了」，
+# 而真相是「**此处原本有答案，被我们删了**」——两者的下一步动作完全不同。
+_DISCARDED_REASON_CODE = "runtime_failed"
+_DISCARDED_REASON_NOTE = "原因已丢弃（原始文本未通过安全白名单），不是一种运行时错误"
+
+
+def _failure_code_cell(raw: object, *, missing: str = "other") -> str:
+    """渲染一个失败码 ``<td>``。
+
+    ⚠️ ``missing`` 默认 ``other``，与本文件其余两处失败码渲染保持同一个词。
+    绝不能拿 ``runtime_failed`` 当缺值兜底：那会让「原因被我们丢弃」和「本来
+    就没有失败码」在页面上长成同一个字符串，而它们指向两件不同的事。
+    """
+    code = str(raw or "").strip() or str(missing)
+    cell = f"<code>{html.escape(code)}</code>"
+    if code == _DISCARDED_REASON_CODE:
+        cell += f"<div class='evt-desc'>{html.escape(_DISCARDED_REASON_NOTE)}</div>"
+    return f"<td>{cell}</td>"
 
 
 def _runtime_health_level(
@@ -3880,9 +4041,9 @@ def _runtime_health_level(
         rate = _runtime_operational_rate(lane)
         if rate is not None and sampled > 0:
             if rate >= _RUNTIME_HEALTH_FAILURE_BAD:
-                escalate("bad", f"{name} 系统故障率 {rate * 100:.0f}%")
+                escalate("bad", f"{name} 我方失败率 {rate * 100:.0f}%")
             elif rate >= _RUNTIME_HEALTH_FAILURE_WARN:
-                escalate("warn", f"{name} 系统故障率 {rate * 100:.0f}%")
+                escalate("warn", f"{name} 我方失败率 {rate * 100:.0f}%")
 
         # Chat is the foreground user contract: every failed/expired terminal
         # outcome matters even when the cause is an operator route change.  Keep
@@ -4050,9 +4211,9 @@ def _runtime_execution_level(
         rate = _runtime_operational_rate(lane)
         if rate is not None and sampled > 0:
             if rate >= _RUNTIME_HEALTH_FAILURE_BAD:
-                escalate("bad", f"{name} 系统故障率 {rate * 100:.0f}%")
+                escalate("bad", f"{name} 我方失败率 {rate * 100:.0f}%")
             elif rate >= _RUNTIME_HEALTH_FAILURE_WARN:
-                escalate("warn", f"{name} 系统故障率 {rate * 100:.0f}%")
+                escalate("warn", f"{name} 我方失败率 {rate * 100:.0f}%")
         raw_rate = lane.get("failure_rate")
         if name == "chat" and raw_rate is not None and sampled > 0:
             if raw_rate >= _RUNTIME_HEALTH_FAILURE_BAD:
@@ -4689,7 +4850,9 @@ def _render_runtime_health_page(
                 "expired": None,
                 "superseded": None,
                 "operational_failures": None,
+                "health_denominator": None,
                 "control_outcomes": None,
+                "user_unavailable": None,
                 "safety_suppressions": None,
                 "empty_reply_suppressions": None,
                 "failure_rate": None,
@@ -4908,6 +5071,7 @@ def _render_runtime_health_page(
             f"<td>{_fmt_count(lane.get('expired'))}</td>"
             f"<td>{_fmt_count(lane.get('operational_failures'))}</td>"
             f"<td class='muted'>{_fmt_count(lane.get('control_outcomes'))}</td>"
+            f"<td class='muted'>{_fmt_count(lane.get('user_unavailable'))}</td>"
             f"<td class='muted'>{_fmt_count(lane.get('safety_suppressions'))}</td>"
             f"<td>{_fmt_count(lane.get('empty_reply_suppressions'))}</td>"
             + raw_rate_cell
@@ -4953,7 +5117,7 @@ def _render_runtime_health_page(
                 "<tr>"
                 f"<td>{name}</td>"
                 f"<td>{RUNTIME_OUTCOME_CLASS_LABELS[outcome_class]}</td>"
-                f"<td><code>{html.escape(code)}</code></td>"
+                f"{_failure_code_cell(code)}"
                 f"<td>{error_class_html}</td>"
                 f"<td>{_fmt_count(count)}</td>"
                 "</tr>"
@@ -5042,8 +5206,8 @@ def _render_runtime_health_page(
   {delivery_section}
   <h2>各 lane 健康</h2>
   <div class="table-wrap"><table>
-    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>原始失败</th><th>过期</th><th>系统故障<br><span class='muted'>含过期</span></th><th>控制切流</th><th>安全抑制</th><th>空内容主动抑制</th><th>终态未成功率</th><th>系统故障率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>开口回合/回合<br><span class='muted'>仅 screen_watch</span></th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
-    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='18' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
+    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>原始失败</th><th>过期</th><th>我方失败<br><span class='muted'>含超时/安全抑制</span></th><th>控制切流</th><th>明确用户侧</th><th>安全抑制<br><span class='muted'>已计我方失败</span></th><th>空内容主动抑制</th><th>终态未成功率</th><th>我方失败率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>开口回合/回合<br><span class='muted'>仅 screen_watch</span></th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
+    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='19' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
   </table></div>
   {_render_stuck_block(stuck)}
   {_render_runtime_user_report(user_report)}
@@ -5052,9 +5216,11 @@ def _render_runtime_health_page(
     <thead><tr><th>Lane</th><th>归类</th><th>失败码</th><th>上游安全归因</th><th>次数</th></tr></thead>
     <tbody>{''.join(failure_rows) if failure_rows else "<tr><td colspan='5' class='muted'>当前窗口无未成功终态。</td></tr>"}</tbody>
   </table></div>
-  <div class="muted">“终态未成功率”保留所有 failed / expired，回答“这轮有没有正常完成”；
-  “系统故障率”只统计 provider、Runtime、排队和 lease 故障。控制切流和安全抑制仍保留原始计数，
-  但不再冒充基础设施故障。上游安全归因来自终态 outbox 的 metadata；<b>上游原始错</b>和聊天正文
+  <div class="muted">“终态未成功率”分子=全部 failed+expired，分母=completed+failed+expired，回答“这轮有没有正常完成”；
+  “我方失败率”分子=除控制切流与明确用户侧七码外的 failed+expired，分母=completed+该分子，窗口={window_hours} 小时、总体=本实例托管 Runtime V2。
+  unknown、上游限流、安全抑制、空回复与所有未登记新码都计入我方失败；superseded 不进任何失败率分子或分母。
+  控制切流、明确用户侧与安全抑制仍保留原始计数，后者只是诊断标签、不是豁免。
+  上游安全归因来自终态 outbox 的 metadata；<b>上游原始错</b>和聊天正文
   均不在本页读取，如确需查看只能走 default-off、全审计的 break-glass trajectory inspector。</div>
 </main>
 </body>
@@ -5510,14 +5676,14 @@ def _render_imports_page(report: dict | None, *, within_hours: int) -> str:
             f"<td>{html.escape(status_labels.get(status, status))}{' · 超过15m未更新' if is_stuck else ''}</td>"
             f"<td class='{evidence_cls}'>{evidence_text}</td>"
             f"<td>{_fmt_count(row.get('memory_action_count'))} / {'有' if row.get('has_identity_evidence') else '无'}</td>"
-            f"<td><code>{html.escape(str(row.get('error_code') or '—'))}</code></td>"
+            f"{_failure_code_cell(row.get('error_code'), missing='—')}"
             f"<td>{html.escape(_ops_time(row.get('created_at')))}</td>"
             f"<td>{html.escape(_ops_time(row.get('updated_at')))}</td>"
             "</tr>"
         )
     failure_rows = "".join(
         "<tr>"
-        f"<td><code>{html.escape(str(row.get('error_code') or 'other'))}</code></td>"
+        f"{_failure_code_cell(row.get('error_code'))}"
         f"<td>{_fmt_count(row.get('count'))}</td></tr>"
         for row in report.get("failure_reasons") or []
     )
@@ -5558,7 +5724,7 @@ def _render_chat_reliability_page(report: dict | None, *, within_hours: int) -> 
     reply_quality = report.get("reply_quality") or {}
     failure_rows = "".join(
         "<tr>"
-        f"<td><code>{html.escape(str(row.get('code') or 'runtime_failed'))}</code></td>"
+        f"{_failure_code_cell(row.get('code'))}"
         f"<td>{_fmt_count(row.get('count'))}</td></tr>"
         for row in report.get("failure_reasons") or []
     )
@@ -5576,7 +5742,7 @@ def _render_chat_reliability_page(report: dict | None, *, within_hours: int) -> 
             f"<td>{html.escape(str(row.get('final_effect_status') or 'missing'))}</td>"
             f"<td>{html.escape(str(row.get('provider') or '—'))} / {html.escape(str(row.get('model') or '—'))}</td>"
             f"<td>{_fmt_count(row.get('model_calls'))} / {_fmt_count(row.get('retries'))}</td>"
-            f"<td><code>{html.escape(str(row.get('last_error') or '—'))}</code></td>"
+            f"{_failure_code_cell(row.get('last_error'), missing='—')}"
             f"<td>{html.escape(_ops_time(row.get('created_at')))}</td>"
             "</tr>"
         )
@@ -7452,8 +7618,14 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
             f"<td>{row['memory']['total']} <span class='muted'>cards</span>"
             f"<br><span class='muted'>onb {onb_mem} / live {live_mem}</span></td>"
             f"<td>{pro['proactive_messages']} <span class='muted'>sent</span>"
-            f"<br><span class='muted'>心跳 {pro.get('heartbeat_jobs', 0)}(f{pro.get('heartbeat_failed', 0)}) / "
-            f"屏幕 {pro.get('screen_jobs', 0)}(f{pro.get('screen_failed', 0)})</span></td>"
+            f"<br><span class='muted'>心跳 总{pro.get('heartbeat_jobs', 0)} "
+            f"/ 失败{pro.get('heartbeat_failed', 0)} "
+            f"/ 控制{pro.get('heartbeat_control', 0)} "
+            f"/ 用户侧{pro.get('heartbeat_user_unavailable', 0)}; "
+            f"屏幕 总{pro.get('screen_jobs', 0)} "
+            f"/ 失败{pro.get('screen_failed', 0)} "
+            f"/ 控制{pro.get('screen_control', 0)} "
+            f"/ 用户侧{pro.get('screen_user_unavailable', 0)}</span></td>"
             f"<td>{html.escape(_bj_iso(row.get('last_activity_at')))}</td>"
             "</tr>"
         )
@@ -7637,10 +7809,16 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
 	  </form>
 	  <div class="toolbar"><input id="q" placeholder="筛选 UID、route、runtime state、stage"></div>
 	  {_render_chat_coverage_note(summary.get("chat_coverage"))}
+	  <div class="note-box"><b>Proactive 失败口径（Resident / V1）</b><br>
+	  总数=该 lane 的全史 <code>proactive_jobs</code> 全状态记录，不是失败率分母；
+	  失败=<code>status=failed</code> 且不属于明确用户侧七码，未知/未登记原因仍算我方失败；
+	  控制=<code>status=skipped</code>（含 <code>heartbeat_throttled</code>），不算失败；
+	  用户侧=明确额度、Key 或模型不存在；<code>expired</code> 沿用 V1 既有口径不计。
+	  本列不含 Runtime V2 用户，V2 请看 Runtime 值班台；两边表、窗口、总体与键空间不同，不可横向对数。</div>
 	  <div class="sortbar">{sort_controls}</div>
 	  {pager}
 	  <div class="table-wrap"><table id="users">
-    <thead><tr><th>User</th><th>Onboarding route</th><th>实际 Runtime</th><th>连接</th><th>Onboarding</th><th>Steps</th><th>Chat 累计发生</th><th>Memory</th><th>Proactive 心跳/屏幕(fail)</th><th>Last activity</th></tr></thead>
+    <thead><tr><th>User</th><th>Onboarding route</th><th>实际 Runtime</th><th>连接</th><th>Onboarding</th><th>Steps</th><th>Chat 累计发生</th><th>Memory</th><th>Proactive 心跳/屏幕（全史四分法）</th><th>Last activity</th></tr></thead>
     <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='10' class='muted'>No users yet.</td></tr>"}</tbody>
   </table></div>
 </main>
@@ -8960,6 +9138,7 @@ _OUTCOME_CLASS_LABELS = {
     "timeout": "超时",
     "control": "闸拦截",
     "safety_suppression": "安全抑制",
+    "user_unavailable": "明确用户侧不可用",
 }
 
 
@@ -9010,6 +9189,16 @@ def _render_turn_identity(turn: dict) -> str:
 
 def _render_data_track_debug_page(payload: dict) -> str:
     summary = payload["summary"]
+    trace_vocabulary_status = str(
+        (payload.get("observability") or {}).get("trace_vocabulary") or "unavailable"
+    )
+    trace_public_fields = _trace_public_fields(
+        vocabulary=(
+            _TRACE_VOCABULARY_UNSET
+            if trace_vocabulary_status == "ok"
+            else None
+        )
+    )
     filters = payload.get("filters", {})
     options = payload.get("options", {})
     users = payload.get("users", [])
@@ -9074,7 +9263,12 @@ def _render_data_track_debug_page(payload: dict) -> str:
             copy_button("copy user", ev.get("user_id") or ""),
             copy_button("copy trace", ev.get("trace_id") or ""),
             copy_button("copy type", ev.get("type") or ""),
-            copy_button("copy JSON", _debug_event_public_json(ev)),
+            copy_button(
+                "copy JSON",
+                _debug_event_public_json(
+                    ev, trace_public_fields=trace_public_fields,
+                ),
+            ),
         ]
         if include_open_turn:
             href = _data_track_page_href(view="debug", mode="timeline", user_id=ev.get("user_id") or "", trace_id=ev.get("trace_id") or "", offset=0, reveal=None)
@@ -9094,7 +9288,9 @@ def _render_data_track_debug_page(payload: dict) -> str:
         # 这正是 T130 那条:单测绿 = 代码对,证不了页面看得见。
         detail = _debug_json(
             ev.get("detail") if revealed
-            else _debug_event_public_json(ev).get("detail") or {}
+            else _debug_event_public_json(
+                ev, trace_public_fields=trace_public_fields,
+            ).get("detail") or {}
         )
         excerpt = _debug_json(ev.get("content_excerpt") if revealed else _debug_content_summary(ev.get("content_excerpt") or {}))
         if not detail and not excerpt and not revealed:
@@ -9203,6 +9399,13 @@ def _render_data_track_debug_page(payload: dict) -> str:
         _render_metric("turns", summary["turns_total"]),
         _render_metric("stalled / error", f"{summary['stalled_turns']} / {summary['error_turns']}"),
     ])
+    vocabulary_warning = (
+        "<div class='observability-warning'>Trace 词表暂不可用；"
+        "后台任务 lane / enqueue reason 闭集字段未展示，"
+        "不能读成“事件没有这些字段”。</div>"
+        if trace_vocabulary_status != "ok"
+        else ""
+    )
     refresh_meta = "" if reveal_key else '<meta http-equiv="refresh" content="30">'
 
     page_unit = "turns" if mode == "timeline" else "events"
@@ -9319,6 +9522,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
     pre {{ white-space:pre-wrap; word-break:break-word; background:#fff7f0; border:1px solid var(--line); border-radius:6px; padding:10px; max-height:360px; overflow:auto; }}
     .redacted-note,.reveal-note {{ border-radius:6px; padding:8px; margin:7px 0; }} .redacted-note {{ color:var(--muted); background:#f6efe8; border:1px solid var(--line); }} .reveal-note {{ color:#8a4a00; background:#fff8ed; border:1px solid #e8c59d; }}
     .stall {{ color:var(--warn); background:#fff8e8; border:1px solid #f0d7a5; border-radius:6px; padding:8px; margin-top:8px; }}
+    .observability-warning {{ color:var(--warn); background:#fff8e8; border:1px solid #f0d7a5; border-radius:6px; padding:10px; margin:14px 0; }}
 {_NAV_GROUP_CSS}
   </style>
 </head>
@@ -9327,6 +9531,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
   <h1>Feedling Debug Logs</h1>
   <div class="muted">Admin-only debug view. Reads the append-only TEE trace table; no instrumentation writes here. Generated {html.escape(_bj_iso(summary["generated_at"]))}.</div>
   {_render_data_track_view_nav("debug")}
+  {vocabulary_warning}
   <section class="metrics">{metrics}</section>
   <div class="modebar">
     <div class="mode-left">
@@ -9411,6 +9616,286 @@ _EVENT_CATEGORIES = [
     ("other", "其他"),
 ]
 
+# T244's comparison table is intentionally independent from the older
+# VPS/API day drill below.  These are actions that can fail independently;
+# mappings exist only where the frozen source records that exact unit.  The
+# rollup's ``route`` is a runtime family, not an access mode: its V1 bucket
+# mixes Your Server users with hosted APIKey-V1 users.  A current access mode
+# join is not a lawful substitute for the missing event-time snapshot.
+_EVENT_MASTER_PATHS = (
+    ("resident", "resident"),
+    ("apikey_v1", "apikey_v1"),
+    ("apikey_v2", "apikey_v2"),
+)
+_EVENT_MASTER_ACTIONS = (
+    {"key": "onboarding_job", "label": "入驻蒸馏 · 整单",
+     "desc": "一次 history import job 的整体终态；身份卡/记忆/问候不是独立 attempt。"},
+    {"key": "onboarding_identity", "label": "入驻蒸馏 · 身份卡写入",
+     "desc": "当前 job 只保留最终汇总，无法把这一件 artifact 单独作为分母。"},
+    {"key": "onboarding_memory", "label": "入驻蒸馏 · 长期记忆写入",
+     "desc": "当前 job 只保留最终汇总，无法把这一件 artifact 单独作为分母。"},
+    {"key": "onboarding_history", "label": "入驻蒸馏 · 历史聊天落库",
+     "desc": "历史聊天当前仅作为蒸馏输入，不写入 chat_messages。", "na": True},
+    {"key": "onboarding_greeting", "label": "入驻蒸馏 · 首次问候写入",
+     "desc": "问候与整单共用一个终态，没有独立失败账本。"},
+    {"key": "redistill_identity", "label": "二次蒸馏 · 身份卡写入",
+     "desc": "终态会覆盖原 phase，当前不能定位到这一级。"},
+    {"key": "redistill_memory", "label": "二次蒸馏 · 长期记忆写入",
+     "desc": "终态会覆盖原 phase，当前不能定位到这一级。"},
+    {"key": "redistill_history", "label": "二次蒸馏 · 历史聊天落库",
+     "desc": "二次蒸馏不执行历史聊天落库。", "na": True},
+    {"key": "chat_job", "label": "正常聊天 · 整个回复任务",
+     "desc": "V2 以 chat job 终态计；resident 回复和 V1 没有同源冻结格。",
+     "runtime_metrics": {"runtime_v2": ("chat", None)}},
+    {"key": "model_call", "label": "正常聊天 · 单次模型调用",
+     "desc": "trace 有调用点不等于有可冻结的 attempt 分母。",
+     # Current source tree contains the V1 and T209 V2 callsites, but the
+     # coverage matrix has not promoted them beyond yellow live-fire status.
+     "runtime_probe": {"runtime_v1": "yellow", "runtime_v2": "yellow"}},
+    {"key": "capture", "label": "记忆整理 · Capture",
+     "desc": "一次 capture job 的终态。",
+     "runtime_metrics": {"runtime_v1": ("capture", None),
+                         "runtime_v2": ("capture", None)}},
+    {"key": "dream", "label": "记忆整理 · Dream",
+     "desc": "一次 dream job 的终态。",
+     "runtime_metrics": {"runtime_v1": ("dream", None),
+                         "runtime_v2": ("dream", None)}},
+    {"key": "migrate", "label": "记忆整理 · Migrate",
+     "desc": "resident 有独立 migrate 终态；V2 maintenance 不是同一动作。",
+     "runtime_metrics": {"runtime_v1": ("migrate", None)}},
+    {"key": "heartbeat", "label": "主动任务 · 时钟心跳",
+     "desc": "一次 heartbeat job 的终态；是否最终说话不是成功判据。",
+     "runtime_metrics": {"runtime_v1": ("heartbeat", None),
+                         "runtime_v2": ("heartbeat", "clock")}},
+    {"key": "event_wake", "label": "主动任务 · 事件唤醒",
+     "desc": "V2 可按 perception 来源分开；resident 的 trigger 混入定时来源。",
+     "runtime_metrics": {"runtime_v2": ("heartbeat", "perception")}},
+    {"key": "scheduled", "label": "主动任务 · 定时唤醒",
+     "desc": "V2 有独立 scheduled lane；resident 当前折进 trigger。",
+     "runtime_metrics": {"runtime_v2": ("scheduled", None)}},
+    {"key": "manual_wake", "label": "主动任务 · 手动唤醒",
+     "desc": "V2 有独立 manual_wake lane。",
+     "runtime_metrics": {"runtime_v2": ("manual_wake", None)}},
+    {"key": "screen", "label": "主动任务 · 屏幕观察",
+     "desc": "一次 screen/screen_watch job 的终态。",
+     "runtime_metrics": {"runtime_v1": ("screen", None),
+                         "runtime_v2": ("screen_watch", None)}},
+)
+
+
+def _event_path_master_payload(frozen: dict) -> dict:
+    """Build both the requested access-path table and a runtime-family aid.
+
+    Only Runtime V2 implies one access path (hosted API key).  Runtime V1 does
+    not: its frozen bucket mixes Your Server and hosted APIKey-V1 users, so the
+    two requested V1 access cells stay unavailable.  The raw V1 aggregate is
+    still useful and is exposed in a separate, differently shaped table where
+    nobody can mistake it for an access-path comparison.
+    """
+
+    def unavailable(*, coverage="red", detail=""):
+        return {
+            "state": "unavailable", "coverage": coverage,
+            "message": "当前记不到这一级", "detail": detail,
+        }
+
+    def metric_cell(raw_window: dict, runtime: str, mapping) -> dict:
+        source_route = "resident" if runtime == "runtime_v1" else "model_api"
+        route_data = (raw_window.get("routes") or {}).get(source_route, {})
+        coverage = route_data.get("coverage") or {}
+        level = str(coverage.get("level") or "red")
+        lane, enqueue_source = mapping
+        if enqueue_source is None:
+            counts = (route_data.get("lanes") or {}).get(lane, {})
+        else:
+            counts = (((route_data.get("lane_sources") or {}).get(lane) or {})
+                      .get(enqueue_source, {}))
+        if level in {"timeout", "read_error"}:
+            # The DB reader owns this wording together with the state.  Do not
+            # copy a fallback here: duplicated producer text can silently
+            # diverge while the fallback remains unreachable in normal data.
+            message = str(coverage["message"])
+            return {
+                "state": level, "coverage": level,
+                "message": message,
+                "detail": "下一步是修读取路径，不是补埋点",
+            }
+        if level != "green":
+            return {
+                "state": "coverage_gap", "coverage": level,
+                "message": "当前窗口不可计算",
+                "covered_days": int(coverage.get("covered_days") or 0),
+                "required_days": int(coverage.get("required_days") or 0),
+            }
+        completed = int(counts.get("completed") or 0)
+        failed = int(counts.get("failed") or 0)
+        expired = int(counts.get("expired") or 0)
+        superseded = int(counts.get("superseded") or 0)
+        failure_codes = {
+            str(code): int(count or 0)
+            for code, count in (counts.get("failure_codes") or {}).items()
+        }
+        if runtime == "runtime_v1":
+            # The V1 freezer deliberately reused one ``failed`` counter for
+            # status=failed AND status=skipped.  T197 classifies every skipped
+            # row as control, but ``failure_codes`` retained only its reason,
+            # not the status needed by _v1_proactive_outcome_class.  Subtracting
+            # only the V1 user-unavailable reasons would still turn unknown
+            # skipped controls into Feedling failures.  Do not print a rate
+            # that the frozen cell cannot reconstruct losslessly.
+            return unavailable(
+                detail=(
+                    "V1 冻结 failed 混合 failed 与 skipped，failure_codes 又不含原 status；"
+                    "按 T197 无法无损拆出 operational failure，不能叫失败率。"
+                )
+            )
+
+        # V2 last_error has a producer-owned classifier.  T197 removes only
+        # explicit control and user-unavailable outcomes; unknown codes,
+        # expiries and timeouts remain Feedling operational failures.
+        from model_api_runtime.v2 import jobs_store as v2_jobs_store
+        control_outcomes = sum(
+            count for code, count in failure_codes.items()
+            if v2_jobs_store.terminal_outcome_class(code) == "control"
+        )
+        user_unavailable = sum(
+            count for code, count in failure_codes.items()
+            if v2_jobs_store.terminal_outcome_class(code) == "user_unavailable"
+        )
+        raw_non_success = failed + expired
+        failure = max(0, raw_non_success - control_outcomes - user_unavailable)
+        return {
+            "state": "metric", "coverage": "green",
+            "success": completed, "failure": failure,
+            "failed": failed, "expired": expired,
+            "superseded": superseded,
+            "raw_non_success": raw_non_success,
+            "control_outcomes": control_outcomes,
+            "user_unavailable": user_unavailable,
+            "denominator": completed + failure,
+            "denominator_rule": (
+                "completed + operational failure；control、明确用户侧不可用、"
+                "superseded 剔除；未知码/expired 仍算 operational failure"
+            ),
+            # 原样透传:上游给什么就带什么,脏数据由 _concentration_line 统一判。
+            # ⚠️ 这里**不做**校验,否则「上游没给」和「上游给了但不合法」会在
+            # 两个地方各判一次,两处规则迟早分叉。
+            "concentration": counts.get("concentration"),
+        }
+
+    path_windows = []
+    runtime_windows = []
+    for raw_window in frozen.get("windows", []):
+        path_rows = []
+        runtime_rows = []
+        for action in _EVENT_MASTER_ACTIONS:
+            path_cells = {}
+            runtime_cells = {}
+            for path, _label in _EVENT_MASTER_PATHS:
+                if action.get("na"):
+                    path_cells[path] = {
+                        "state": "not_applicable", "coverage": "black",
+                        "message": "N/A（产品当前不执行）",
+                    }
+                    continue
+                # Only Runtime V2 identifies an access path by itself.
+                runtime_mapping = (action.get("runtime_metrics") or {}).get("runtime_v2")
+                runtime_probe = (action.get("runtime_probe") or {}).get("runtime_v2")
+                if path == "apikey_v2" and runtime_mapping:
+                    path_cells[path] = metric_cell(
+                        raw_window, "runtime_v2", runtime_mapping)
+                elif path == "apikey_v2" and runtime_probe:
+                    path_cells[path] = unavailable(
+                        coverage=runtime_probe,
+                        detail=(
+                            "有 V2 调用点，但尚无同源北京日冻结分母"
+                            if runtime_probe == "yellow"
+                            else "V2 在这一动作上零探针"
+                        ),
+                    )
+                elif path in {"resident", "apikey_v1"}:
+                    path_cells[path] = unavailable(
+                        detail=(
+                            "V1 冻结格混合 resident 与 APIKey-V1，"
+                            "没有事件发生时的 access_mode 快照"
+                        ),
+                    )
+                else:
+                    path_cells[path] = unavailable(
+                        detail="没有可用于该动作×路径的独立冻结探针")
+
+            for runtime in ("runtime_v1", "runtime_v2"):
+                if action.get("na"):
+                    runtime_cells[runtime] = {
+                        "state": "not_applicable", "coverage": "black",
+                        "message": "N/A（产品当前不执行）",
+                    }
+                    continue
+                mapping = (action.get("runtime_metrics") or {}).get(runtime)
+                probe_level = (action.get("runtime_probe") or {}).get(runtime)
+                if mapping:
+                    runtime_cells[runtime] = metric_cell(raw_window, runtime, mapping)
+                elif probe_level:
+                    runtime_cells[runtime] = unavailable(
+                        coverage=probe_level,
+                        detail=(
+                            "有调用点但尚无同源北京日冻结分母"
+                            if probe_level == "yellow"
+                            else "这一动作×runtime family 零探针"
+                        ),
+                    )
+                else:
+                    runtime_cells[runtime] = unavailable(
+                        detail="没有该动作×runtime family 的独立冻结探针")
+
+            base_row = {
+                "key": action["key"], "label": action["label"],
+                "description": action["desc"],
+            }
+            path_rows.append({**base_row, "cells": path_cells})
+            runtime_rows.append({**base_row, "cells": runtime_cells})
+        window_meta = {
+            "key": raw_window.get("key"),
+            "start_day": raw_window.get("start_day"),
+            "end_day": raw_window.get("end_day"),
+            "day_count": raw_window.get("day_count"),
+        }
+        path_windows.append({**window_meta, "rows": path_rows})
+        runtime_active_users = {}
+        for runtime, route in (("runtime_v1", "resident"),
+                               ("runtime_v2", "model_api")):
+            route_data = (raw_window.get("routes") or {}).get(route, {})
+            coverage = route_data.get("coverage") or {}
+            active_users = route_data.get("active_users")
+            runtime_active_users[runtime] = (
+                int(active_users)
+                if coverage.get("level") == "green"
+                and active_users is not None
+                else None
+            )
+        runtime_windows.append({
+            **window_meta,
+            "active_users": runtime_active_users,
+            "rows": runtime_rows,
+        })
+    return {
+        "timezone": frozen.get("timezone") or "Asia/Shanghai",
+        "closed_through_day": frozen.get("closed_through_day"),
+        "paths": [{"key": key, "label": label}
+                  for key, label in _EVENT_MASTER_PATHS],
+        "windows": path_windows,
+        "runtime_paths": [
+            {"key": "runtime_v1", "label": "V1 runtime（混合接入方式）"},
+            {"key": "runtime_v2", "label": "V2 runtime（APIKey）"},
+        ],
+        "runtime_windows": runtime_windows,
+        "access_gap": (
+            "V1 冻结格没有事件发生时的 access_mode；resident 与 APIKey-V1 "
+            "无法诚实拆开，不能用当前 access_mode 回填。"
+        ),
+        "self_deployed": "⬛ 结构性不可得，不在本表范围",
+    }
+
 # Plain-language: what each row actually is. Shown under every event label so the
 # page is self-explanatory (no tribal knowledge needed to read it).
 _EVENT_DESCRIPTIONS = {
@@ -9437,6 +9922,10 @@ def _data_track_events_payload() -> dict:
     raw_day = str(request.args.get("day") or "").strip()
     day = _validated_dau_day(raw_day) if raw_day else _events_today()
     raw = db.admin_events_overview(day=day)
+    frozen_master = _event_path_master_payload(
+        db.admin_event_path_rollup_windows(tz="Asia/Shanghai")
+    )
+    import_overall = db.admin_history_import_job_rolling_windows()
 
     def blank():
         return {"vps": _blank_evt_stat(), "api": _blank_evt_stat()}
@@ -9483,6 +9972,8 @@ def _data_track_events_payload() -> dict:
     return {
         "generated_at": datetime.now().isoformat(),
         "categories": [{"key": k, **cats[k]} for k, _ in _EVENT_CATEGORIES],
+        "event_path_master": frozen_master,
+        "history_import_overall": import_overall,
         "day": day,
         "note": "Onboarding 漏斗 + 回复延迟为下一阶段；本页先给 成功率/次数/中位耗时(job类)/兜底率，VPS·API 分列。按北京时区单日统计。",
     }
@@ -9542,6 +10033,225 @@ def _render_events_day_nav(day: str) -> str:
   </div>"""
 
 
+_EVENT_COVERAGE_MARK = {
+    "green": "🟢", "yellow": "🟡", "red": "🔴", "black": "⬛",
+    "timeout": "⏱️", "read_error": "⚠️",
+}
+
+
+def _concentration_line(raw: object) -> str:
+    """一行集中度,贴在率的旁边。
+
+    **为什么必须有**(2026-08-22 prod 实证,不是设计洁癖):
+    V1 心跳 14 个活跃号里 **6 个整周零成功**,663 次失败 = V1 心跳失败的 66%;
+    V2 25 个号里 1 个整周零成功,剔掉它整体从 11.2% 降到 9.0%。
+    表上那个「56% 失败」会被读成「一半心跳在失败」,真相却是
+    「**6 个号从来没成功过,其余大致正常**」——
+    活跃用户只有十几个时,平均值几乎必然被少数坏号主导。
+    ⇒ 数是对的,**但它回答的不是读表人以为的那个问题**。
+
+    两个数各抓一类,都不设阈值:
+      ``users_zero_success``       抓「持续坏掉的账号」——可穷举、可直接去修
+      ``top_user_failure_share``  抓上一条漏掉的:有成功但失败量压倒性的号
+
+    ⛔ 不许设阈值只在「集中度高」时显示:阈值会把健康情形藏起来,于是
+       「没显示」同时意味着「不集中」和「没算」,又造一个歧义空格。
+    ⚠️ 同理,缺失时显式说「未计算」而不是留空 ——
+       「0 人零成功」是一个**真结论**(这格是健康的),与「没算」必须不同形。
+    """
+    if not isinstance(raw, dict):
+        return " · 集中度未计算"
+    try:
+        active = int(raw.get("users_active"))
+        zero = int(raw.get("users_zero_success"))
+    except (TypeError, ValueError):
+        return " · 集中度未计算"
+    if active < 0 or zero < 0 or zero > active:
+        return " · 集中度未计算"
+    line = f" · 零成功 {zero}/{active} 人"
+    share = raw.get("top_user_failure_share")
+    if isinstance(share, (int, float)) and not isinstance(share, bool):
+        if math.isfinite(share) and 0.0 <= share <= 1.0:
+            line += f" · 失败最集中的一个用户占 {share * 100:.0f}%"
+    return line
+
+
+def _render_event_master_cell(cell: dict, *, action: str, path: str,
+                              window: str) -> str:
+    level = str(cell.get("coverage") or "red")
+    mark = _EVENT_COVERAGE_MARK.get(level, "🔴")
+    scope = (f"动作={action} · 路径={path} · 窗口={window}")
+    state = str(cell.get("state") or "unavailable")
+    if state == "metric":
+        denominator = int(cell.get("denominator") or 0)
+        success = int(cell.get("success") or 0)
+        failure = int(cell.get("failure") or 0)
+        rule = str(cell.get("denominator_rule") or "")
+        if denominator:
+            success_rate = success / denominator * 100
+            failure_rate = failure / denominator * 100
+            headline = (
+                f"{mark} <b>{success_rate:.1f}% 成功</b> · "
+                f"<b>{failure_rate:.1f}% 失败</b>"
+            )
+        else:
+            headline = f"{mark} <b>0 次终态作业</b> · 成功/失败率 —"
+        controls = ""
+        if int(cell.get("superseded") or 0):
+            controls = f" · superseded {int(cell['superseded'])}（剔除）"
+        excluded = ""
+        if int(cell.get("user_unavailable") or 0):
+            excluded += (
+                f" · 用户侧不可用 {int(cell['user_unavailable'])}（剔除）"
+            )
+        if int(cell.get("control_outcomes") or 0):
+            excluded += f" · control {int(cell['control_outcomes'])}（剔除）"
+        detail = (
+            f"分母={denominator}（成功 {success} + 失败 {failure}；"
+            f"{rule}）{excluded}{controls}"
+            f"{_concentration_line(cell.get('concentration'))}"
+        )
+        return (f"<td>{headline}<div class='evt-cell-scope'>"
+                f"{html.escape(scope)}<br>{html.escape(detail)}</div></td>")
+    if state == "coverage_gap":
+        covered = int(cell.get("covered_days") or 0)
+        required = int(cell.get("required_days") or 0)
+        message = str(cell.get("message") or "当前窗口不可计算")
+        detail = f"冻结覆盖 {covered}/{required} 个北京日；拒绝用残缺窗口算率"
+        return (f"<td>{mark} <b>{html.escape(message)}</b>"
+                f"<div class='evt-cell-scope'>{html.escape(scope)}<br>"
+                f"{html.escape(detail)}</div></td>")
+    message = str(cell.get("message") or "当前记不到这一级")
+    detail = str(cell.get("detail") or "")
+    return (f"<td>{mark} <b>{html.escape(message)}</b>"
+            f"<div class='evt-cell-scope'>{html.escape(scope)}"
+            f"{('<br>' + html.escape(detail)) if detail else ''}</div></td>")
+
+
+def _render_event_master_tables(master: dict) -> str:
+    def render_windows(*, windows, columns, title, note,
+                       show_runtime_population=False):
+        sections = []
+        for window in windows or []:
+            start = str(window.get("start_day") or "")
+            end = str(window.get("end_day") or "")
+            day_count = int(window.get("day_count") or 0)
+            window_label = (
+                f"最近 {day_count} 个已关闭北京日（{start} 至 {end}）"
+            )
+            heads = "".join(
+                f"<th>{html.escape(str(col.get('label') or col.get('key') or ''))}</th>"
+                for col in columns
+            )
+            rows = []
+            for row in window.get("rows") or []:
+                action = str(row.get("label") or "")
+                desc = str(row.get("description") or "")
+                cells = "".join(
+                    _render_event_master_cell(
+                        (row.get("cells") or {}).get(str(col.get("key")), {}),
+                        action=action,
+                        path=str(col.get("label") or col.get("key") or ""),
+                        window=window_label,
+                    )
+                    for col in columns
+                )
+                rows.append(
+                    f"<tr><td><b>{html.escape(action)}</b>"
+                    f"<div class='evt-desc'>{html.escape(desc)}</div></td>{cells}</tr>"
+                )
+            active_users = window.get("active_users")
+            population = ""
+            # Route populations belong only to the runtime-family diagnostic.
+            # The access-path table cannot split the resident route into
+            # self-hosted vs APIKey-V1, so even an accidentally supplied map
+            # must never be rendered there.
+            if show_runtime_population and isinstance(active_users, dict):
+                parts = []
+                for col in columns:
+                    key = str(col.get("key") or "")
+                    label = str(col.get("label") or key)
+                    count = active_users.get(key)
+                    value = (
+                        "人数不报（冻结覆盖不完整或来源未提供）"
+                        if count is None
+                        else f"{int(count)} 人"
+                    )
+                    parts.append(f"{label} {value}")
+                population = (
+                    "<div class='evt-desc'>窗口内 runtime route 活跃用户"
+                    "（冻结行按 user_id 去重）："
+                    + html.escape(" · ".join(parts)) + "</div>"
+                )
+            sections.append(
+                f"<h3>{html.escape(window_label)}</h3>"
+                f"{population}"
+                f"<table class='evt-master'><thead><tr><th>可独立失败的动作</th>"
+                f"{heads}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
+            )
+        return (
+            f"<section class='evt-master-section'><h2>{html.escape(title)}</h2>"
+            f"<div class='note-box'>{html.escape(note)}</div>{''.join(sections)}</section>"
+        )
+
+    path_note = (
+        str(master.get("access_gap") or "") + " " +
+        str(master.get("self_deployed") or "") +
+        "。APIKey-V1 与 V2 的失败分母词表不同，不可把百分比直接当同一把尺。"
+    )
+    runtime_note = (
+        "这是 runtime family 辅助诊断，不是接入路径表。V1 runtime 同时包含 "
+        "resident 与托管 APIKey-V1；V2 runtime 对应 hosted APIKey-V2。"
+    )
+    return (
+        render_windows(
+            windows=master.get("windows"), columns=master.get("paths") or [],
+            title="事件 × 接入路径成功/失败率（北京日冻结）", note=path_note,
+        )
+        + render_windows(
+            windows=master.get("runtime_windows"),
+            columns=master.get("runtime_paths") or [],
+            title="Runtime family 辅助表（不可冒充接入路径）", note=runtime_note,
+            show_runtime_population=True,
+        )
+    )
+
+
+def _render_history_import_overall(report: dict) -> str:
+    calculated_at = _bj_iso(report.get("calculated_at"))
+    level = str(report.get("coverage") or "red")
+    mark = _EVENT_COVERAGE_MARK.get(level, "🔴")
+    reason = str(report.get("reason") or
+                 "无路径快照、未物理冻结；T247 补")
+    rows = []
+    for window in report.get("windows") or []:
+        completed = int(window.get("completed") or 0)
+        failed = int(window.get("failed") or 0)
+        denominator = int(window.get("denominator") or 0)
+        if denominator:
+            success_rate = completed / denominator * 100
+            failure_rate = failed / denominator * 100
+            rates = f"{success_rate:.1f}% 成功 · {failure_rate:.1f}% 失败"
+        else:
+            rates = "0 次终态 job · 成功/失败率 —"
+        rows.append(
+            f"<tr><td>{html.escape(str(window.get('label') or '滚动窗口'))}</td>"
+            f"<td><b>{html.escape(rates)}</b><div class='evt-cell-scope'>"
+            f"分母={denominator} 个全部路径 terminal job（completed {completed} + "
+            f"failed {failed}）</div></td></tr>"
+        )
+    body = ("".join(rows) or
+            "<tr><td colspan='2' class='bad'>🔴 即时重算失败，当前不可用</td></tr>")
+    return f"""<section class='evt-master-section import-overall'>
+      <h2>全路径合计（滚动窗口 · 即时重算 · 未冻结）</h2>
+      <div class='note-box'><b>{mark} 覆盖：</b>{html.escape(reason)}。
+      计算时刻（北京）：<b>{html.escape(calculated_at)}</b>。这里的“全路径”仅含服务端可见的 resident/APIKey，
+      不含自部署；本块与三路径列不同构，禁止用于 V1/V2 比较。</div>
+      <table><thead><tr><th>滚动窗口</th><th>整单入驻蒸馏终态</th></tr></thead>
+      <tbody>{body}</tbody></table>
+    </section>"""
+
+
 def _render_events_page(payload: dict) -> str:
     cats = payload.get("categories", [])
 
@@ -9592,7 +10302,7 @@ def _render_events_page(payload: dict) -> str:
 <style>
   :root {{ color-scheme: light; --fg:#1b201d; --muted:#68706a; --line:#dddcd4; --bg:#f5f4ef; --card:#fcfbf8; --accent:#416b56; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }}
   body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
-  main {{ max-width:920px; margin:0 auto; padding:28px 24px 48px; }}
+  main {{ max-width:1380px; margin:0 auto; padding:28px 24px 48px; }}
   h1 {{ font-size:24px; margin:0 0 4px; }} h2 {{ font-size:15px; margin:24px 0 10px; }}
   .muted {{ color:var(--muted); }} .ok {{ color:var(--ok); }} .warn {{ color:var(--warn); }} .bad {{ color:var(--bad); }}
   .viewbar {{ display:flex; flex-wrap:wrap; gap:8px; margin:14px 0 18px; }}
@@ -9604,13 +10314,21 @@ def _render_events_page(payload: dict) -> str:
   th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; background:#f4ece5; }}
   tr:last-child td {{ border-bottom:0; }} b {{ font-size:15px; }}
   .evt-desc {{ font-size:12px; color:var(--muted); line-height:1.5; margin-top:3px; max-width:520px; font-weight:400; text-transform:none; letter-spacing:0; }}
+  .evt-cell-scope {{ font-size:11px; color:var(--muted); line-height:1.45; margin-top:5px; min-width:190px; }}
+  .evt-master-section {{ margin:28px 0 34px; }}
+  .evt-master-section h3 {{ font-size:14px; margin:18px 0 8px; }}
+  .evt-master {{ table-layout:fixed; }}
+  .evt-master th:first-child {{ width:19%; }}
   .note-box {{ background:#fff8ef; border:1px solid #e8d8be; border-radius:8px; padding:12px 14px; margin:14px 0; font-size:13px; line-height:1.65; color:#5a4d3c; }}
 {_NAV_GROUP_CSS}
 </style></head><body><main>
   <h1>事件健康度</h1>
-  <div class="muted">VPS=resident 自托管；API=model_api 托管。统计口径 = <b>{html.escape(str(payload.get('day') or ''))}</b> 当天（北京时间）。Generated {html.escape(_bj_iso(payload.get('generated_at')))}.</div>
+  <div class="muted">下方旧表按当前 onboarding route 折成 model_api / 非 model_api 两桶，仅供钻取。统计口径 = <b>{html.escape(str(payload.get('day') or ''))}</b> 当天（北京时间）。Generated {html.escape(_bj_iso(payload.get('generated_at')))}.</div>
   {_render_data_track_view_nav("events")}
   {_render_events_day_nav(str(payload.get('day') or ''))}
+  {_render_history_import_overall(payload.get('history_import_overall') or {})}
+  {_render_event_master_tables(payload.get('event_path_master') or {})}
+  <h2>旧版单日钻取（实时源，仅供定位）</h2>
   <div class="note-box">
     <b>每一格怎么读：</b>
     <b>成功率</b> = 完成 ÷（完成 + 失败）（回复类 = 真回复 ÷ 用户消息数，越高越健康）；

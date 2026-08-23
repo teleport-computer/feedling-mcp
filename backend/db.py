@@ -200,10 +200,6 @@ def init_schema() -> None:
                     "SELECT version_num FROM alembic_tee_version"
                 ).fetchall()
             }
-            marker_row = conn.execute(
-                "SELECT value FROM server_config WHERE key = %s",
-                (_TEE_PRIMARY_PREPARED_KEY,),
-            ).fetchone()
             enabled_triggers = {
                 str(row[0])
                 for row in conn.execute(
@@ -219,22 +215,11 @@ def init_schema() -> None:
                 f"expected={sorted(expected_heads)} actual={sorted(actual_heads)}; "
                 "run the owner-only alembic_tee migration workflow before startup"
             )
-        marker = None
-        if marker_row is not None:
-            try:
-                marker = json.loads(bytes(marker_row[0]).decode("utf-8"))
-            except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
-                marker = None
-        if (
-            not isinstance(marker, dict)
-            or marker.get("prepared") is not True
-            or set(marker.get("tee_heads") or ()) != expected_heads
-            or enabled_triggers != _TEE_PRIMARY_TRIGGERS
-        ):
+        if enabled_triggers != _TEE_PRIMARY_TRIGGERS:
             raise RuntimeError(
-                "TEE database has not completed the frozen Phase-4 prepare: "
-                f"marker_ok={isinstance(marker, dict) and marker.get('prepared') is True} "
-                f"enabled_triggers={sorted(enabled_triggers)}; run "
+                "TEE database primary triggers are incomplete: "
+                f"expected={sorted(_TEE_PRIMARY_TRIGGERS)} "
+                f"actual={sorted(enabled_triggers)}; run "
                 "admin.phase4_cutover --apply --confirm-writes-frozen before startup"
             )
         log.info("[db] TEE schema at head (read-only assertion: %s)",
@@ -1494,6 +1479,14 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
             for uid, status, count in rows:
                 ensure(out, uid).setdefault("proactive_extra", {}).setdefault("jobs_by_status", {})[status] = count
 
+            # Seven 2026-08-21: V1 has its own status_reason keyspace.  Pull
+            # the exact producer-owned exemption set lazily so db.py does not
+            # copy seven strings or merge them with V2 last_error codes.
+            from notices import catalog as notices_catalog
+            v1_user_unavailable = list(
+                notices_catalog.USER_UNAVAILABLE_V1_REASONS
+            )
+
             # Split proactive jobs by lane (heartbeat vs screen-share vs other).
             # The persisted job doc carries job_kind / wake_kind / trigger; group
             # by the first non-empty of those and let the caller bucket the raw
@@ -1509,34 +1502,61 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                        ) AS kind,
                        COUNT(*)::int AS total,
                        (COUNT(*) FILTER (
-                          WHERE doc->>'status' IN ('failed', 'skipped')))::int AS failed
+                          WHERE doc->>'status' = 'failed'
+                            AND COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''),
+                                         'unknown') <> ALL(%s::text[])))::int
+                         AS operational_failed,
+                       (COUNT(*) FILTER (
+                          WHERE doc->>'status' = 'skipped'))::int AS control,
+                       (COUNT(*) FILTER (
+                          WHERE doc->>'status' = 'failed'
+                            AND COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''),
+                                         'unknown') = ANY(%s::text[])))::int
+                         AS user_unavailable
                 FROM user_logs
                 WHERE user_id = ANY(%s) AND stream = 'proactive_jobs'
                 GROUP BY user_id, kind
                 """,
-                (ids,),
+                (v1_user_unavailable, v1_user_unavailable, ids),
             ).fetchall()
-            for uid, kind, total, failed in rows:
+            for uid, kind, total, failed, control, user_unavailable in rows:
                 pex = ensure(out, uid).setdefault("proactive_extra", {})
                 pex.setdefault("jobs_by_kind", {})[kind] = total
                 pex.setdefault("jobs_failed_by_kind", {})[kind] = failed
+                pex.setdefault("jobs_control_by_kind", {})[kind] = control
+                pex.setdefault("jobs_user_unavailable_by_kind", {})[
+                    kind
+                ] = user_unavailable
 
             rows = conn.execute(
                 """
                 SELECT user_id,
+                       CASE
+                         WHEN doc->>'status' = 'skipped' THEN 'control'
+                         WHEN COALESCE(
+                           NULLIF(BTRIM(doc->>'status_reason'), ''), 'unknown'
+                         ) = ANY(%s::text[]) THEN 'user_unavailable'
+                         ELSE 'operational_failure'
+                       END AS outcome_class,
                        COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''), 'unknown') AS reason,
                        COUNT(*)::int
                 FROM user_logs
                 WHERE user_id = ANY(%s)
                   AND stream = 'proactive_jobs'
                   AND doc->>'status' IN ('failed', 'skipped')
-                GROUP BY user_id, reason
+                GROUP BY user_id, outcome_class, reason
                 """,
-                (ids,),
+                (v1_user_unavailable, ids),
             ).fetchall()
-            for uid, reason, count in rows:
+            reason_fields = {
+                "operational_failure": "jobs_failed_by_reason",
+                "control": "jobs_control_by_reason",
+                "user_unavailable": "jobs_user_unavailable_by_reason",
+            }
+            for uid, outcome_class, reason, count in rows:
+                field = reason_fields[str(outcome_class)]
                 ensure(out, uid).setdefault("proactive_extra", {}).setdefault(
-                    "jobs_failed_by_reason", {}
+                    field, {}
                 )[reason] = count
 
             # ⚠️ 这两个维度**必须**走格子，不能留原来的全史 GROUP BY。
@@ -4437,6 +4457,51 @@ def freeze_completed_retention_cohorts(*, now_epoch: float | None = None,
 # (and therefore no user content) can ever reach a frozen cell. Same regex as
 # admin/memory_metadata.py's dream-job surface.
 _LANE_ROLLUP_CODE_RE = re.compile(r"^[a-z0-9_:-]{1,120}$")
+_DISCARDED_FAILURE_REASON_LOG_MAX_CHARS = 500
+
+
+def content_free_failure_code(
+    raw_reason: object,
+    *,
+    source: str,
+    user_id: object,
+    lane: object,
+    day: object,
+    count: object = 1,
+) -> str:
+    """Collapse free-text failures without throwing their diagnosis away.
+
+    ``status_reason`` (resident) and ``last_error`` (V2) are free text: both
+    producer APIs accept arbitrary exception/provider text, which may include
+    user content.  The durable rollup and content-free admin payload therefore
+    keep the existing allowlist and ``runtime_failed`` placeholder.  The raw
+    value is emitted only to the operational log, bounded and ``%r``-escaped
+    so newlines cannot forge another log record.
+
+    Freezers call this after grouping by raw reason, so ``count`` preserves the
+    number of affected attempts without logging hundreds of identical lines.
+    """
+    reason = str(raw_reason or "")
+    if _LANE_ROLLUP_CODE_RE.match(reason):
+        return reason
+    bounded = reason[:_DISCARDED_FAILURE_REASON_LOG_MAX_CHARS]
+    try:
+        affected = max(1, int(count))
+    except (TypeError, ValueError, OverflowError):
+        affected = 1
+    log.warning(
+        "[failure-code] discarded non-allowlisted reason "
+        "source=%s user_id=%r lane=%r day=%s count=%d "
+        "reason=%r truncated=%s",
+        str(source or "unknown")[:80],
+        str(user_id or "")[:200],
+        str(lane or "")[:120],
+        str(day or "")[:40],
+        affected,
+        bounded,
+        len(reason) > len(bounded),
+    )
+    return "runtime_failed"
 
 _LANE_ROLLUP_TERMINAL = ("completed", "failed", "expired", "superseded")
 
@@ -4515,7 +4580,14 @@ def _lane_rollup_freeze_day(conn, *, day: date, zone: ZoneInfo,
         (start, end),
     ).fetchall():
         key = (str(uid), str(lane), str(src))
-        clean = str(code) if _LANE_ROLLUP_CODE_RE.match(str(code)) else "runtime_failed"
+        clean = content_free_failure_code(
+            code,
+            source="lane_rollup_v2",
+            user_id=uid,
+            lane=lane,
+            day=day,
+            count=n,
+        )
         cell = codes.setdefault(key, {})
         cell[clean] = cell.get(clean, 0) + int(n)
     written = 0
@@ -4919,8 +4991,14 @@ def _lane_rollup_freeze_resident_day(conn, *, day: date, zone: ZoneInfo,
         (start, end),
     ).fetchall():
         key = (str(uid), str(lane))
-        clean = (str(code) if _LANE_ROLLUP_CODE_RE.match(str(code))
-                 else "runtime_failed")
+        clean = content_free_failure_code(
+            code,
+            source="lane_rollup_v1",
+            user_id=uid,
+            lane=lane,
+            day=day,
+            count=n,
+        )
         cell = codes.setdefault(key, {})
         cell[clean] = cell.get(clean, 0) + int(n)
     written = 0
@@ -5903,6 +5981,387 @@ def admin_proactive_heartbeat_overspeed(*, since_epoch: float = 0.0, days: int =
         return {}
 
 
+_ADMIN_EVENT_READ_TIMEOUT_MS = 5000
+
+
+def _admin_event_read_failure(exc: Exception) -> tuple[str, str]:
+    """Map DB read failure to a user-actionable display state."""
+    if str(getattr(exc, "sqlstate", "") or "") == "57014":
+        return "timeout", "取数超时（记了，但这里读不出来）"
+    return "read_error", "取数失败（记了，但这里读不出来）"
+
+
+def admin_event_path_rollup_windows(*, through_day: str = "",
+                                    tz: str = "Asia/Shanghai") -> dict:
+    """Aggregate the immutable lane cells for the event×path master table.
+
+    Both windows end on the same last *closed* Beijing calendar day.  This
+    reader deliberately never mixes ``admin_lane_rollup``'s live tail into the
+    result: a partially observed day would make a low failure rate look better
+    than it is.  Watermarks are converted into an explicit per-window coverage
+    level so a true zero remains distinguishable from an unmeasured cell.
+
+    ``model_api`` here is Runtime V2's ``agent_jobs`` freezer.  It must not be
+    relabelled as a generic API-key bucket; APIKey-V1 has no equivalent frozen
+    source and is declared unavailable by the presentation layer.
+    """
+    zone = ZoneInfo(tz)
+    raw_end = str(through_day or "").strip()
+    if raw_end:
+        if not _VALID_DAY.match(raw_end):
+            raise ValueError(
+                f"admin_event_path_rollup_windows: bad day {raw_end!r}, "
+                "want YYYY-MM-DD"
+            )
+        try:
+            end_day = date.fromisoformat(raw_end)
+        except ValueError as exc:
+            raise ValueError(
+                f"admin_event_path_rollup_windows: bad day {raw_end!r}, "
+                "want YYYY-MM-DD"
+            ) from exc
+    else:
+        end_day = datetime.now(zone).date() - timedelta(days=1)
+
+    specs = (("24h", 1), ("7d", 7))
+    earliest = end_day - timedelta(days=6)
+    try:
+        with get_pool().connection(
+                timeout=_ADMIN_EVENT_READ_TIMEOUT_MS / 1000) as conn:
+            conn.execute(
+                "SELECT set_config('statement_timeout', %s, true)",
+                (f"{_ADMIN_EVENT_READ_TIMEOUT_MS}ms",),
+            )
+            rows = conn.execute(
+                """
+                WITH filtered AS (
+                  SELECT user_id, day, route, lane, enqueue_source,
+                         completed, failed, expired, superseded, failure_codes
+                  FROM lane_daily_rollup
+                  WHERE day >= %s AND day <= %s
+                    AND route IN ('resident', 'model_api')
+                ), cells AS (
+                  SELECT day, route, lane, enqueue_source,
+                         coalesce(sum(completed), 0)::bigint AS completed,
+                         coalesce(sum(failed), 0)::bigint AS failed,
+                         coalesce(sum(expired), 0)::bigint AS expired,
+                         coalesce(sum(superseded), 0)::bigint AS superseded
+                  FROM filtered
+                  GROUP BY day, route, lane, enqueue_source
+                ), code_counts AS (
+                  SELECT r.day, r.route, r.lane, r.enqueue_source,
+                         code.key AS code,
+                         coalesce(sum(
+                           CASE WHEN code.value ~ '^[0-9]+$'
+                                THEN code.value::bigint ELSE 0 END
+                         ), 0)::bigint AS count
+                  FROM filtered r
+                  CROSS JOIN LATERAL jsonb_each_text(r.failure_codes) AS code
+                  GROUP BY r.day, r.route, r.lane, r.enqueue_source, code.key
+                ), codes AS (
+                  SELECT day, route, lane, enqueue_source,
+                         jsonb_object_agg(code, count) AS failure_codes
+                  FROM code_counts
+                  GROUP BY day, route, lane, enqueue_source
+                ), route_users AS (
+                  SELECT route,
+                         count(DISTINCT user_id)
+                           FILTER (WHERE day = %s)::bigint AS active_users_24h,
+                         count(DISTINCT user_id)::bigint AS active_users_7d
+                  FROM filtered
+                  GROUP BY route
+                ), per_user_lane AS (
+                  SELECT route, lane, user_id,
+                         bool_or(day = %s) AS active_24h,
+                         coalesce(sum(completed)
+                           FILTER (WHERE day = %s), 0)::bigint AS completed_24h,
+                         coalesce(sum(failed)
+                           FILTER (WHERE day = %s), 0)::bigint AS failed_24h,
+                         coalesce(sum(completed), 0)::bigint AS completed_7d,
+                         coalesce(sum(failed), 0)::bigint AS failed_7d
+                  FROM filtered
+                  GROUP BY route, lane, user_id
+                ), lane_concentration AS (
+                  SELECT route, lane,
+                         count(*) FILTER (WHERE active_24h)::bigint
+                           AS users_active_24h,
+                         count(*) FILTER (
+                           WHERE active_24h
+                             AND completed_24h = 0 AND failed_24h > 0
+                         )::bigint AS users_zero_success_24h,
+                         max(failed_24h) FILTER (WHERE active_24h)::double precision
+                           / nullif(sum(failed_24h)
+                             FILTER (WHERE active_24h), 0)
+                           AS top_user_failure_share_24h,
+                         count(*)::bigint AS users_active_7d,
+                         count(*) FILTER (
+                           WHERE completed_7d = 0 AND failed_7d > 0
+                         )::bigint AS users_zero_success_7d,
+                         max(failed_7d)::double precision
+                           / nullif(sum(failed_7d), 0)
+                           AS top_user_failure_share_7d
+                  FROM per_user_lane
+                  GROUP BY route, lane
+                )
+                SELECT c.day, c.route, c.lane, c.enqueue_source,
+                       c.completed, c.failed, c.expired, c.superseded,
+                       coalesce(x.failure_codes, '{}'::jsonb),
+                       u.active_users_24h, u.active_users_7d,
+                       jsonb_build_object(
+                         'users_active', lc.users_active_24h,
+                         'users_zero_success', lc.users_zero_success_24h,
+                         'top_user_failure_share',
+                           lc.top_user_failure_share_24h
+                       ) AS concentration_24h,
+                       jsonb_build_object(
+                         'users_active', lc.users_active_7d,
+                         'users_zero_success', lc.users_zero_success_7d,
+                         'top_user_failure_share',
+                           lc.top_user_failure_share_7d
+                       ) AS concentration_7d
+                FROM cells c
+                LEFT JOIN codes x USING (day, route, lane, enqueue_source)
+                JOIN route_users u USING (route)
+                JOIN lane_concentration lc USING (route, lane)
+                ORDER BY c.day, c.route, c.lane, c.enqueue_source
+                """,
+                (
+                    earliest.isoformat(), end_day.isoformat(),
+                    end_day.isoformat(), end_day.isoformat(),
+                    end_day.isoformat(), end_day.isoformat(),
+                ),
+            ).fetchall()
+            watermarks = {
+                str(row[0]): {
+                    "backfill_from": str(row[1]),
+                    "through_day": str(row[2]),
+                }
+                for row in conn.execute(
+                    "SELECT route, backfill_from, through_day "
+                    "FROM lane_rollup_watermark "
+                    "WHERE route IN ('resident', 'model_api')"
+                ).fetchall()
+            }
+    except Exception as exc:  # noqa: BLE001 - admin evidence degrades closed
+        level, message = _admin_event_read_failure(exc)
+        log.error("[db] admin_event_path_rollup_windows failed: %s", exc)
+        return {
+            "timezone": tz,
+            "closed_through_day": end_day.isoformat(),
+            "read_status": {"level": level, "message": message},
+            "windows": [
+                {
+                    "key": key,
+                    "start_day": (end_day - timedelta(days=days - 1)).isoformat(),
+                    "end_day": end_day.isoformat(),
+                    "day_count": days,
+                    "routes": {
+                        route: {
+                            "coverage": {
+                                "level": level, "message": message,
+                                "covered_days": 0, "required_days": days,
+                                "backfill_from": None, "through_day": None,
+                            },
+                            "active_users": None,
+                            "lanes": {}, "lane_sources": {},
+                        }
+                        for route in ("resident", "model_api")
+                    },
+                }
+                for key, days in specs
+            ],
+        }
+
+    by_day: dict[tuple[str, str, str, str], dict] = {}
+    active_users_by_route = {
+        "resident": {"24h": 0, "7d": 0},
+        "model_api": {"24h": 0, "7d": 0},
+    }
+    concentration_by_lane: dict[tuple[str, str], dict[str, dict]] = {}
+    for row in rows:
+        route = str(row[1])
+        lane = str(row[2])
+        active_users_by_route[route] = {
+            "24h": int(row[9] or 0),
+            "7d": int(row[10] or 0),
+        }
+        concentration_by_lane[(route, lane)] = {
+            "24h": dict(row[11]),
+            "7d": dict(row[12]),
+        }
+        by_day[(str(row[0]), str(row[1]), str(row[2]), str(row[3] or ""))] = {
+            "completed": int(row[4] or 0),
+            "failed": int(row[5] or 0),
+            "expired": int(row[6] or 0),
+            "superseded": int(row[7] or 0),
+            "failure_codes": {
+                str(code): int(count or 0)
+                for code, count in dict(row[8] or {}).items()
+            },
+        }
+
+    windows: list[dict] = []
+    for key, day_count in specs:
+        start_day = end_day - timedelta(days=day_count - 1)
+        routes: dict[str, dict] = {}
+        for route in ("resident", "model_api"):
+            wm = watermarks.get(route)
+            covered_days = 0
+            if wm:
+                covered_start = max(start_day,
+                                    date.fromisoformat(wm["backfill_from"]))
+                covered_end = min(end_day,
+                                  date.fromisoformat(wm["through_day"]))
+                if covered_end >= covered_start:
+                    covered_days = (covered_end - covered_start).days + 1
+            coverage_level = (
+                "green" if covered_days == day_count
+                else "yellow" if covered_days
+                else "red"
+            )
+
+            lanes: dict[str, dict] = {}
+            lane_sources: dict[str, dict[str, dict]] = {}
+            for (raw_day, raw_route, lane, enqueue_source), counts in by_day.items():
+                if raw_route != route or not start_day.isoformat() <= raw_day <= end_day.isoformat():
+                    continue
+                bucket = lanes.setdefault(
+                    lane,
+                    {"completed": 0, "failed": 0,
+                     "expired": 0, "superseded": 0,
+                     "failure_codes": {}},
+                )
+                for field in ("completed", "failed", "expired", "superseded"):
+                    bucket[field] += counts[field]
+                for code, count in counts["failure_codes"].items():
+                    bucket["failure_codes"][code] = (
+                        bucket["failure_codes"].get(code, 0) + count
+                    )
+                source_bucket = lane_sources.setdefault(lane, {}).setdefault(
+                    enqueue_source,
+                    {"completed": 0, "failed": 0,
+                     "expired": 0, "superseded": 0,
+                     "failure_codes": {}},
+                )
+                for field in ("completed", "failed", "expired", "superseded"):
+                    source_bucket[field] += counts[field]
+                for code, count in counts["failure_codes"].items():
+                    source_bucket["failure_codes"][code] = (
+                        source_bucket["failure_codes"].get(code, 0) + count
+                    )
+            # Concentration is a window-wide (route, lane) fact.  Do not sum
+            # daily distinct-user counts: the same user may occupy several
+            # frozen days.  Source-split UI cells intentionally receive the
+            # same lane-level fact; the contract groups by route+lane, not by
+            # enqueue_source.  Partial coverage must expose no plausible-looking
+            # concentration value.
+            if coverage_level == "green":
+                for lane, bucket in lanes.items():
+                    concentration = concentration_by_lane.get(
+                        (route, lane), {}
+                    ).get(key)
+                    if concentration is not None:
+                        bucket["concentration"] = dict(concentration)
+                        for source_bucket in lane_sources.get(lane, {}).values():
+                            source_bucket["concentration"] = dict(concentration)
+            routes[route] = {
+                "active_users": active_users_by_route[route][key],
+                "coverage": {
+                    "level": coverage_level,
+                    "covered_days": covered_days,
+                    "required_days": day_count,
+                    "backfill_from": wm["backfill_from"] if wm else None,
+                    "through_day": wm["through_day"] if wm else None,
+                },
+                "lanes": lanes,
+                "lane_sources": lane_sources,
+            }
+        windows.append({
+            "key": key,
+            "start_day": start_day.isoformat(),
+            "end_day": end_day.isoformat(),
+            "day_count": day_count,
+            "routes": routes,
+        })
+    return {
+        "timezone": tz,
+        "closed_through_day": end_day.isoformat(),
+        "windows": windows,
+    }
+
+
+def admin_history_import_job_rolling_windows() -> dict:
+    """Count every terminal history-import job in live rolling windows.
+
+    This is intentionally *not* the frozen path table above.  History import
+    blobs have no event-time access-mode snapshot and no physical daily
+    freezer.  The admin page therefore renders this result in a separate block
+    whose title and red coverage marker declare that lower evidence quality.
+
+    Every blob is one attempt and every attempt is counted.  Do not replace
+    this with the per-user ``DISTINCT ON`` query used by the user-detail page:
+    a failed attempt followed by a successful retry must remain two attempts.
+    """
+    calculated_at = datetime.now(timezone.utc)
+    oldest = calculated_at - timedelta(days=7)
+    terminal_expr = (
+        "CASE WHEN doc->>'status' = 'completed' THEN doc->>'completed_at' "
+        "WHEN doc->>'status' = 'failed' THEN doc->>'failed_at' END"
+    )
+    try:
+        with get_pool().connection(
+                timeout=_ADMIN_EVENT_READ_TIMEOUT_MS / 1000) as conn:
+            conn.execute(
+                "SELECT set_config('statement_timeout', %s, true)",
+                (f"{_ADMIN_EVENT_READ_TIMEOUT_MS}ms",),
+            )
+            rows = conn.execute(
+                f"""
+                SELECT doc->>'status', ({terminal_expr})::timestamptz
+                FROM user_blobs
+                WHERE kind LIKE 'history_import_job:%%'
+                  AND doc->>'status' IN ('completed', 'failed')
+                  AND ({terminal_expr}) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'
+                  AND ({terminal_expr})::timestamptz > %s
+                  AND ({terminal_expr})::timestamptz <= %s
+                """,
+                (oldest, calculated_at),
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001 - admin evidence degrades closed
+        level, message = _admin_event_read_failure(exc)
+        log.error("[db] admin_history_import_job_rolling_windows failed: %s", exc)
+        return {
+            "calculated_at": calculated_at.isoformat(),
+            "coverage": level,
+            "reason": f"{message}；无路径快照、未物理冻结；T247 补",
+            "windows": [],
+        }
+
+    windows = []
+    for key, days in (("rolling_1d", 1), ("rolling_7d", 7)):
+        start = calculated_at - timedelta(days=days)
+        selected = [(str(status), terminal_at) for status, terminal_at in rows
+                    if terminal_at is not None and terminal_at > start]
+        completed = sum(status == "completed" for status, _ in selected)
+        failed = sum(status == "failed" for status, _ in selected)
+        windows.append({
+            "key": key,
+            "label": f"过去 {days} 个滚动日",
+            "start_at": start.isoformat(),
+            "end_at": calculated_at.isoformat(),
+            "completed": completed,
+            "failed": failed,
+            "denominator": completed + failed,
+            "denominator_rule": "全部 terminal history import job（completed + failed）",
+        })
+    return {
+        "calculated_at": calculated_at.isoformat(),
+        "coverage": "red",
+        "reason": "无路径快照、未物理冻结；T247 补",
+        "windows": windows,
+    }
+
+
 def admin_v2_heartbeat_daily(*, since_epoch: float = 0.0, days: int = 30,
                              tz: str = "Asia/Shanghai") -> dict[str, dict]:
     """Runtime V2 心跳日聚合:{day: {jobs, completed, failed, expired}}。
@@ -6010,7 +6469,12 @@ def admin_events_overview(*, day: str = "", tz: str = "Asia/Shanghai") -> dict:
 
     def _run(key, sql):
         try:
-            with get_pool().connection() as conn:
+            with get_pool().connection(
+                    timeout=_ADMIN_EVENT_READ_TIMEOUT_MS / 1000) as conn:
+                conn.execute(
+                    "SELECT set_config('statement_timeout', %s, true)",
+                    (f"{_ADMIN_EVENT_READ_TIMEOUT_MS}ms",),
+                )
                 rows = conn.execute(sql).fetchall()
             return rows
         except Exception as e:  # noqa: BLE001
@@ -6816,6 +7280,7 @@ _TRACE_EVENT_COLUMNS = (
 )
 TRACE_OUTCOME_CLASSES = frozenset({
     "operational_failure", "timeout", "control", "safety_suppression",
+    "user_unavailable",
 })
 TRACE_OUTCOME_DEFAULT = "operational_failure"
 _TRACE_EVENTS_RETENTION_DAYS = 30

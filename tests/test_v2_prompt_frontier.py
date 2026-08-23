@@ -28,7 +28,7 @@ def _model_limit(context_window_tokens: int = 2_048) -> frontier.ModelPromptLimi
 
 
 _REAL_TOOL_COUNT = 69
-_REAL_TOOL_CATALOG_BYTES = 35_229
+_REAL_TOOL_CATALOG_BYTES = 35_552
 
 
 def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
@@ -36,7 +36,7 @@ def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
 
     The fixture is derived from the real platform catalog rather than copying a
     toy schema list. ASCII description padding makes the combined canonical
-    payload exactly 35,118 bytes while keeping 69 independently named tools.
+    payload exactly 35,552 bytes while keeping 69 independently named tools.
     The 2026-08-17 increase records the real `stay_silent` wake schema: it adds
     341 bytes by itself and 267 bytes net when replacing one synthetic MCP tool
     in this fixed-count mixed catalog.
@@ -60,6 +60,8 @@ def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
     一个变量,那组数字就不再描述线上跑的东西。111 字节 = 目录的 0.32%,
     而这个常量本来就是**记录实际大小的账本**(上面四条历史增记就是先例),
     不是预算上限。
+    The 2026-08-22 increase to 35,552 records the bounded Canvas write and delivery copy,
+    which adds 323 bytes without changing the tool count.
     """
     platform = list(tool_schema.build_tool_specs())
     mcp_count = _REAL_TOOL_COUNT - len(platform)

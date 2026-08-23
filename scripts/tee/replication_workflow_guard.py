@@ -38,11 +38,21 @@ def _dry_run() -> bool:
 
 
 def build() -> int:
+    environment = os.environ.get("ENVIRONMENT", "test").strip()
+    if environment not in ("test", "prod"):
+        raise ValueError("ENVIRONMENT must be test or prod")
+    dry_run = _dry_run()
+    confirm = os.environ.get("CONFIRM_IN", "").strip()
+    if not dry_run:
+        expected = "MIGRATE-PROD" if environment == "prod" else "MIGRATE"
+        if confirm != expected:
+            raise ValueError(f"{environment} apply requires {expected}")
+        confirm = "MIGRATE"
     payload = {
         "action": os.environ.get("ACTION", "").strip(),
         "table": os.environ.get("TABLE_IN", "").strip() or None,
-        "dry_run": _dry_run(),
-        "confirm": os.environ.get("CONFIRM_IN", "").strip() or None,
+        "dry_run": dry_run,
+        "confirm": confirm or None,
         "qps": _optional_float("QPS_IN"),
         "expected_stale": _optional_int("EXPECTED_STALE_IN"),
     }
@@ -57,6 +67,16 @@ def check(http_code: str, response_path: str) -> int:
     body = json.loads(Path(response_path).read_text())
     if not _dry_run() and os.environ.get("ACTION") in ("reflow", "prune"):
         if body.get("ok") is not True or body.get("failures") != 0:
+            return 1
+    if not _dry_run() and os.environ.get("ACTION") == "snapshot":
+        failures = body.get("failures")
+        if failures is None:
+            tables = body.get("tables")
+            if not isinstance(tables, list) or not tables:
+                return 1
+            if any(not isinstance(table, dict) or table.get("ok") is not True for table in tables):
+                return 1
+        elif failures != 0:
             return 1
     return 0
 

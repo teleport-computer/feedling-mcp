@@ -148,7 +148,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: &enclave-image ghcr.io/teleport-computer/feedling:f7c1f84
+    image: &enclave-image ghcr.io/teleport-computer/feedling:3cde1e9
     command: &enclave-command ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -231,7 +231,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:f7c1f84
+    image: ghcr.io/teleport-computer/feedling:3cde1e9
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -304,6 +304,8 @@ services:
       # encrypted deploy input; the literal gate defaults off for Gate 1.
       PLAINTEXT_SHADOW_DATABASE_URL: "${PLAINTEXT_SHADOW_DATABASE_URL:-}"
       FEEDLING_PLAINTEXT_SHADOW_ENABLED: "${FEEDLING_PLAINTEXT_SHADOW_ENABLED:-0}"
+      # PROD is fail-closed. CI admits 1 only together with TEE-primary wiring.
+      FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "${FEEDLING_PLAINTEXT_WRITES_ACCEPTED:-0}"
       FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY: "${FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY:-}"
       # Cloudflare R2 (S3-compatible) offload for the heavy frame ciphertext
       # (backend/object_storage.py). Injected via `phala deploy -e R2_*=...`
@@ -450,7 +452,7 @@ services:
   # separate agent-runner CVM(s) (deploy/docker-compose.phala.prod.runner.yaml),
   # which this compose change does NOT touch (§7b: "runner CVM: 不动").
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:f7c1f84
+    image: ghcr.io/teleport-computer/feedling:3cde1e9
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
@@ -464,6 +466,8 @@ services:
       FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
       # Only the backend owns the elected decrypted-shadow drain.
       FEEDLING_PLAINTEXT_SHADOW_ENABLED: "0"
+      # Must match the backend; CI admits 1 only with TEE-primary wiring.
+      FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "${FEEDLING_PLAINTEXT_WRITES_ACCEPTED:-0}"
       # frame_get resolves R2-backed photo pointers in this process.
       R2_ENDPOINT: "${R2_ENDPOINT:-}"
       R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"
@@ -560,7 +564,7 @@ services:
       retries: 3
 
   cpu-recorder:
-    image: ghcr.io/teleport-computer/feedling:f7c1f84
+    image: ghcr.io/teleport-computer/feedling:3cde1e9
     container_name: cpu-recorder
     command: ["python", "-u", "ops/cpu_recorder.py"]
     restart: unless-stopped
