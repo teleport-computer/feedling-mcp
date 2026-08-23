@@ -47,6 +47,7 @@ _WORKSPACE_REVISION_RE = re.compile(r"\brevision\s+(\d+)\b", re.IGNORECASE)
 DEFAULT_MAX_TOOL_CALLS_PER_ROUND = 8
 DEFAULT_MAX_TOOL_CALLS_PER_TURN = 24
 DEFAULT_MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS = 3
+DEFAULT_MAX_TERMINAL_TOOL_CALL_RETRIES = 2
 DEFAULT_TOOL_RESULT_CHAR_CAP = 2000
 DEFAULT_TOOL_BATCH_RESULT_CHAR_CAP = 8000
 DEFAULT_MAX_TOOL_ARGS_CHARS = 16000
@@ -638,6 +639,9 @@ async def run_tool_loop(
     max_consecutive_tool_only_rounds: int = (
         DEFAULT_MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS
     ),
+    max_terminal_tool_call_retries: int = (
+        DEFAULT_MAX_TERMINAL_TOOL_CALL_RETRIES
+    ),
     max_tool_calls_per_round: int = DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
     max_tool_calls_per_turn: int = DEFAULT_MAX_TOOL_CALLS_PER_TURN,
     tool_result_char_cap: int = DEFAULT_TOOL_RESULT_CHAR_CAP,
@@ -713,6 +717,10 @@ async def run_tool_loop(
         max_consecutive_tool_only_rounds,
         name="max_consecutive_tool_only_rounds",
     )
+    max_terminal_tool_call_retries = _positive_limit(
+        max_terminal_tool_call_retries,
+        name="max_terminal_tool_call_retries",
+    )
     max_tool_calls_per_turn = _positive_limit(
         max_tool_calls_per_turn, name="max_tool_calls_per_turn"
     )
@@ -768,6 +776,7 @@ async def run_tool_loop(
     attempts = 0
     tool_calls_used = 0
     consecutive_tool_only_rounds = 0
+    terminal_tool_call_retries = 0
     reasoning_fragments: list[str] = []
     seen_reasoning_fragments: set[str] = set()
     force_text_fallback = False
@@ -2026,22 +2035,33 @@ async def run_tool_loop(
         empty_response_retry_instruction = ""
         _capture_reasoning(pr.raw)
 
-        # This request was already the one fresh, explicit request for a complete
-        # answer using existing information. If a broken relay or model still
-        # invents a tool call, do not publish its accompanying ``pr.text``: text
-        # beside a tool call is only a preamble and may be partial or claim an
-        # operation that was never executed. Also do not resend the same terminal
-        # request until the whole turn budget is gone.
+        # This request was already an explicit request for a complete answer using
+        # existing information. If a broken relay or model still invents a tool
+        # call, do not publish its accompanying ``pr.text``: text beside a tool call
+        # is only a preamble and may be partial or claim an operation that was never
+        # executed. Give transient provider failures a small configurable number of
+        # fresh chances, then terminate without returning to tool dispatch or the
+        # malformed-exchange fallback.
         if terminal_text_round and pr.tool_calls and (
             tools is not None or pr.text.strip()
         ):
+            retrying = (
+                terminal_tool_call_retries < max_terminal_tool_call_retries
+                and attempts < max_calls
+            )
             await _trajectory(
                 "protocol_fallback",
                 {
                     "round": attempts,
                     "reason": "terminal_tool_call_rejected",
+                    "action": "retry" if retrying else "terminate",
+                    "retry": terminal_tool_call_retries,
                 },
             )
+            if retrying:
+                terminal_tool_call_retries += 1
+                _progress("terminal_tool_call_retry_boundary")
+                continue
             break
 
         # A tools-disabled request is terminal. The guard above has already

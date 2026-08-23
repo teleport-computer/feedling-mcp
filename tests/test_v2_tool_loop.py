@@ -1443,6 +1443,10 @@ def test_configured_budget_stops_tool_only_loop_and_requests_complete_reply(
 
     build_messages = TranscriptBuildMessages()
     fold = _RecordingFold([])
+    surfaces = []
+
+    async def record_surface(detail):
+        surfaces.append(detail)
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
         provider_config=_TEST_PROVIDER_CONFIG,
@@ -1453,6 +1457,7 @@ def test_configured_budget_stops_tool_only_loop_and_requests_complete_reply(
         add_usage=_noop_add_usage,
         max_calls=15,
         max_consecutive_tool_only_rounds=2,
+        on_provider_tool_surface=record_surface,
     ))
 
     assert len(provider.calls) == 3
@@ -1472,6 +1477,7 @@ def test_configured_budget_stops_tool_only_loop_and_requests_complete_reply(
     assert outcome.final_text == "final terminal text"
     assert outcome.rounds == 3
     assert outcome.stop_reason == "final_text"
+    assert surfaces[-1]["force_text_fallback_reason"] == "tool_only_stall"
     # never a filler: the terminal text is exactly what the model said.
     assert on_reply.calls[-1] == ("final terminal text", True)
 
@@ -1490,6 +1496,7 @@ def test_terminal_tool_choice_none_is_never_dispatched_if_provider_ignores_it(
             "tool_calls": [{"id": "g2", "name": "identity_get", "args": {}}],
             "usage": {},
         },
+        {"reply": "complete answer", "tool_calls": [], "usage": {}},
     ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     dispatch = _RecordingDispatch()
@@ -1501,12 +1508,71 @@ def test_terminal_tool_choice_none_is_never_dispatched_if_provider_ignores_it(
         on_reply=_RecordingReply(),
         fold_new_messages=_RecordingFold([[]]),
         add_usage=_noop_add_usage,
-        max_calls=2,
+        max_calls=4,
+        max_consecutive_tool_only_rounds=1,
     ))
 
     assert len(dispatch.calls) == 1
     assert [tc.id for tc in dispatch.calls[0]] == ["g1"]
     assert provider.calls[1]["tool_choice"] == "none"
+    assert provider.calls[2]["tool_choice"] == "none"
+    assert outcome.final_text == "complete answer"
+    assert outcome.stop_reason == "final_text"
+
+
+def test_terminal_tool_call_retries_exhaust_then_terminate_with_telemetry(
+    monkeypatch,
+):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{"id": "g1", "name": "identity_get", "args": {}}],
+            "usage": {},
+        },
+        *[
+            {
+                "reply": "still trying",
+                "tool_calls": [
+                    {"id": f"terminal-{index}", "name": "identity_get", "args": {}}
+                ],
+                "usage": {},
+            }
+            for index in range(3)
+        ],
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch()
+    trajectory = []
+
+    async def record_trajectory(event_kind, detail):
+        trajectory.append((event_kind, detail))
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=5,
+        max_consecutive_tool_only_rounds=1,
+        max_terminal_tool_call_retries=2,
+        on_trajectory_event=record_trajectory,
+    ))
+
+    rejected = [
+        detail
+        for event_kind, detail in trajectory
+        if event_kind == "protocol_fallback"
+        and detail["reason"] == "terminal_tool_call_rejected"
+    ]
+    assert len(provider.calls) == 4
+    assert len(dispatch.calls) == 1
+    assert [detail["action"] for detail in rejected] == [
+        "retry",
+        "retry",
+        "terminate",
+    ]
     assert outcome.stop_reason == "budget_exhausted"
 
 
@@ -2297,10 +2363,10 @@ def test_malformed_args_gets_one_tools_disabled_fallback_without_dispatch(monkey
     assert outcome.rounds == 2
 
 
-def test_tools_disabled_fallback_is_not_retried_when_model_calls_tools_again(
+def test_tools_disabled_fallback_retries_terminal_tool_call_within_bound(
     monkeypatch,
 ):
-    """A broken terminal response cannot consume the remaining provider budget."""
+    """A transient broken terminal response gets a bounded fresh chance."""
     provider = _ScriptedProvider([
         {
             "reply": "",
@@ -2322,7 +2388,7 @@ def test_tools_disabled_fallback_is_not_retried_when_model_calls_tools_again(
             }],
             "usage": {},
         },
-        {"reply": "must not be requested", "tool_calls": [], "usage": {}},
+        {"reply": "complete after retry", "tool_calls": [], "usage": {}},
     ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     reply = _RecordingReply()
@@ -2337,14 +2403,15 @@ def test_tools_disabled_fallback_is_not_retried_when_model_calls_tools_again(
         max_calls=15,
     ))
 
-    assert len(provider.calls) == 2
+    assert len(provider.calls) == 3
     assert provider.calls[1]["tools"] is None
+    assert provider.calls[2]["tools"] is None
     assert "write one complete, self-contained reply" in (
         provider.calls[1]["messages"][0]["content"]
     )
-    assert reply.calls == []
-    assert outcome.rounds == 2
-    assert outcome.stop_reason == "budget_exhausted"
+    assert reply.calls == [("complete after retry", True)]
+    assert outcome.rounds == 3
+    assert outcome.stop_reason == "final_text"
 
 
 def test_malformed_reasoning_turn_disables_reasoning_for_text_fallback(monkeypatch):
