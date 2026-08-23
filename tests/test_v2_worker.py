@@ -6,6 +6,7 @@ stubbing enclave-bound reads, capability execution, and provider responses.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -18,7 +19,7 @@ import pytest
 import conftest
 import db
 import provider_client
-from provider_types import ToolExchange
+from provider_types import ToolCall, ToolExchange
 from capabilities import registry as cap_registry
 from core import store as core_store
 from model_api_runtime.v2 import compaction as v2_compaction
@@ -2310,6 +2311,116 @@ def test_chat_terminal_tool_call_retries_honor_worker_override(monkeypatch):
         "failed",
         "turn_failed:tool_budget_exhausted",
     )
+
+
+def test_wake_terminal_tool_call_retries_honor_worker_override(monkeypatch):
+    """The wake worker must wire its retry override into the tool loop."""
+    uid = "u_w_wake_terminal_tool_retry_override"
+    conftest.seed_user(uid)
+    _reset(uid)
+    _job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    job = jobs_store.claim_next_job("w")
+
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: _FakeCapResult({}),
+    )
+    monkeypatch.setattr(worker, "MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS", 1)
+    library_default = (
+        worker.v2_tool_loop.DEFAULT_MAX_TERMINAL_TOOL_CALL_RETRIES
+    )
+    monkeypatch.setattr(
+        worker,
+        "MAX_TERMINAL_TOOL_CALL_RETRIES",
+        library_default + 1,
+    )
+    terminal_rounds = worker.MAX_TERMINAL_TOOL_CALL_RETRIES + 1
+    script = [_tool_round(_tc("initial", "memory_index"))]
+    script.extend(
+        _tool_round(_tc(f"terminal-{index}", "memory_index"))
+        for index in range(terminal_rounds)
+    )
+    calls = _script_provider(monkeypatch, script)
+
+    deps = _deps(messages=[
+        {"id": "m1", "ts": 10.0, "role": "user", "content": "hello"},
+    ])
+    written = {}
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda store, text: written.update(text=text) or {"id": "r1"},
+    )
+    asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert len(calls) == 1 + terminal_rounds
+    assert all(call["tool_choice"] == "none" for call in calls[1:])
+    assert written == {}
+
+
+def test_task_dispatcher_terminal_tool_call_retries_honor_worker_override(
+    monkeypatch,
+):
+    """The task-child dispatcher must wire its retry override into the loop."""
+    uid = "u_w_task_terminal_tool_retry_override"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: _FakeCapResult({}),
+    )
+    monkeypatch.setattr(worker, "MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS", 1)
+    library_default = (
+        worker.v2_tool_loop.DEFAULT_MAX_TERMINAL_TOOL_CALL_RETRIES
+    )
+    monkeypatch.setattr(
+        worker,
+        "MAX_TERMINAL_TOOL_CALL_RETRIES",
+        library_default + 1,
+    )
+    terminal_rounds = worker.MAX_TERMINAL_TOOL_CALL_RETRIES + 1
+    expected_calls = 1 + terminal_rounds
+    call_cap = expected_calls + terminal_rounds
+    monkeypatch.setattr(
+        worker,
+        "_SUBAGENT_MAX_LLM_CALLS",
+        call_cap,
+    )
+
+    script = [_tool_round(_tc("initial", "memory_index"))]
+    script.extend(
+        _tool_round(_tc(f"terminal-{index}", "memory_index"))
+        for index in range(call_cap - 1)
+    )
+    calls = _script_provider(monkeypatch, script)
+    dispatcher = worker._make_task_batch_dispatcher(
+        provider_config=_BYOK,
+        store=core_store.get_store(uid),
+        api_key=None,
+        runtime_token="rt",
+        enclave_sem=asyncio.Semaphore(1),
+        trusted_system_blocks=(),
+        add_usage=lambda _usage: None,
+    )
+    task_call = ToolCall(
+        "parent-task",
+        worker.v2_subagents.TASK_TOOL,
+        {"prompt": "Inspect memory without changing it."},
+    )
+
+    (result,) = asyncio.run(dispatcher([task_call]))
+
+    assert json.loads(result.content) == {
+        "status": "error",
+        "error": "subagent_failed",
+    }
+    assert len(calls) == expected_calls
+    assert all(call["tool_choice"] == "none" for call in calls[1:])
 
 
 def test_second_round_receives_first_round_native_tool_exchange(monkeypatch):
