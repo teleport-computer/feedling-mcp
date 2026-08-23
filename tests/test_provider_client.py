@@ -588,6 +588,43 @@ def test_provider_specific_named_tool_choice_wire_shapes():
     assert bedrock["toolConfig"]["toolChoice"] == {"tool": {"name": "workspace_write"}}
 
 
+def test_provider_specific_required_tool_choice_wire_shapes():
+    tool = ToolSpec("reply", "reply once", {"type": "object", "properties": {}})
+    messages = [{"role": "user", "content": "choose now"}]
+
+    openai_chat = pc._build_openai_compat_payload(
+        provider="openai", model="gpt-4.1", messages=messages,
+        temperature=None, max_tokens=700, response_format=None,
+        extra_body=None, include_reasoning=False, tools=[tool],
+        tool_choice="required")
+    assert openai_chat["tool_choice"] == "required"
+
+    openai_responses, _url, _headers = pc._build_openai_responses_payload(
+        model="gpt-5", base_url="https://api.openai.com/v1", key="k",
+        messages=messages, max_tokens=700, response_format=None,
+        tools=[tool], tool_choice="required")
+    assert openai_responses["tool_choice"] == "required"
+
+    anthropic, _url, _headers = pc._build_anthropic_payload(
+        model="claude-opus-4-8", base_url="https://api.anthropic.com/v1", key="k",
+        messages=messages, max_tokens=700, temperature=None,
+        response_format=None, tools=[tool], tool_choice="required")
+    assert anthropic["tool_choice"] == {"type": "any"}
+
+    gemini, _url, _headers = pc._build_gemini_payload(
+        model="gemini-2.5-pro",
+        base_url="https://generativelanguage.googleapis.com/v1beta", key="k",
+        messages=messages, max_tokens=700, temperature=None,
+        response_format=None, tools=[tool], tool_choice="required")
+    assert gemini["toolConfig"]["functionCallingConfig"] == {"mode": "ANY"}
+
+    bedrock, _url, _headers = pc._build_bedrock_payload(
+        model="anthropic.claude-3", base_url="https://bedrock.example", key="k",
+        messages=messages, max_tokens=700, temperature=None,
+        response_format=None, tools=[tool], tool_choice="required")
+    assert bedrock["toolConfig"]["toolChoice"] == {"any": {}}
+
+
 def test_parse_openai_compat_body_result_shape():
     resp = FakeResponse(200, {
         "id": "chatcmpl-1",

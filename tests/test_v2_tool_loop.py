@@ -3158,3 +3158,131 @@ def test_stay_silent_is_hidden_without_callback(monkeypatch):
         max_calls=2,
     ))
     assert "stay_silent" not in {spec.name for spec in provider.calls[0]["tools"]}
+
+
+def test_empty_wake_forces_reply_or_stay_silent_on_same_turn_budget(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "", "tool_calls": [], "usage": {}},
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "silent-forced",
+                "name": "stay_silent",
+                "args": {"reason": "没有值得打扰用户的新信息"},
+            }],
+            "usage": {},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    reasons = []
+
+    async def on_stay_silent(reason):
+        reasons.append(reason)
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        on_stay_silent=on_stay_silent,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=2,
+        require_reply=False,
+    ))
+
+    first_names = {spec.name for spec in provider.calls[0]["tools"]}
+    second_names = {spec.name for spec in provider.calls[1]["tools"]}
+    assert {"memory_write", "schedule_wake", "stay_silent"} <= first_names
+    assert "tool_choice" not in provider.calls[0]
+    assert second_names == {"reply", "stay_silent"}
+    assert provider.calls[1]["tool_choice"] == "required"
+    assert reasons == ["没有值得打扰用户的新信息"]
+    assert outcome.rounds == 2
+    assert outcome.stop_reason == "stay_silent"
+
+
+def test_tool_then_empty_wake_forces_terminal_reply_without_preamble_duplicate(
+    monkeypatch,
+):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "memory-1",
+                "name": "memory_search",
+                "args": {"query": "recent context"},
+            }],
+            "usage": {},
+        },
+        {"reply": "", "tool_calls": [], "usage": {}},
+        {
+            "reply": "这段伴随工具调用的文字不能单独投递",
+            "tool_calls": [{
+                "id": "reply-forced",
+                "name": "reply",
+                "args": {"text": "这是唯一的终局回复"},
+            }],
+            "usage": {},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    replies = _RecordingReply()
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=replies,
+        on_stay_silent=lambda _reason: None,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=3,
+        require_reply=False,
+    ))
+
+    assert provider.calls[2]["tool_choice"] == "required"
+    assert {spec.name for spec in provider.calls[2]["tools"]} == {
+        "reply",
+        "stay_silent",
+    }
+    assert replies.calls == [("这是唯一的终局回复", True)]
+    assert outcome.final_text == "这是唯一的终局回复"
+    assert outcome.stop_reason == "final_text"
+
+
+def test_empty_wake_on_unforced_provider_fails_closed(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    unsupported = provider_client.ProviderConfig(
+        provider="unsupported",
+        model="weak-test-model",
+        api_key="test-key",
+    )
+    events = []
+
+    async def record(event_kind, payload):
+        events.append((event_kind, payload))
+
+    async def on_stay_silent(_reason):
+        return None
+
+    with pytest.raises(tool_loop.ProviderEmptyReply, match="empty_reply"):
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=unsupported,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=_RecordingReply(),
+            on_stay_silent=on_stay_silent,
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            max_calls=2,
+            require_reply=False,
+            on_trajectory_event=record,
+        ))
+
+    assert len(provider.calls) == 1
+    empty_event = next(payload for kind, payload in events if kind == "empty_provider_response")
+    assert empty_event["action"] == "fail_wake_choice_unsupported"
