@@ -503,6 +503,15 @@ def test_provider_roundtrip_trace_records_cap_closure_without_user_content(monke
     jobs_store.enqueue_job(uid, "chat", trace_id=turn_trace_id)
     job = jobs_store.claim_next_job("w")
     _patch_real_write(monkeypatch)
+    # This test owns the independent hard-max telemetry path. Keep the newer
+    # consecutive tool-only stall threshold from pre-empting round 15; its
+    # default early-closure behavior is covered by
+    # test_chat_turn_always_replies_even_when_model_only_calls_tools.
+    monkeypatch.setattr(
+        worker,
+        "MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS",
+        worker._TURN_MAX_LLM_CALLS,
+    )
 
     dispatched = []
     turn = _FakeMcpTurn(

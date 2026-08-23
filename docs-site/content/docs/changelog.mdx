@@ -37,6 +37,17 @@ change must not be interpreted as an API guarantee.
   normal HTML/tokenizer discussion; suppression is intentionally whole-message
   only.
 
+- **Hosted Runtime V2 now stops tool-only loops before the hard provider-call
+  limit.** After a configurable number of consecutive responses containing only
+  tool calls and no visible text (`FEEDLING_V2_MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS`,
+  three by default), the next attempt disables further tool use and tells the
+  model to answer from the conversation and tool results already available. If a
+  provider ignores that terminal request and emits another tool call, Runtime V2
+  neither publishes the accompanying partial preamble nor executes the call. It
+  uses any remaining provider-call budget to retry the terminal request at most
+   `FEEDLING_V2_MAX_TERMINAL_TOOL_CALL_RETRIES` times (two by default), then
+   terminates the loop if the provider still refuses to return text.
+
 - **Memory Dream runs now have content-free, end-to-end diagnostics.** Resident
   V1 and hosted Runtime V2 correlate Dream start, model completion or failure,
   and the final write outcome under one job trace. Operators can distinguish a
