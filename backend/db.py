@@ -6070,17 +6070,66 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                          count(DISTINCT user_id)::bigint AS active_users_7d
                   FROM filtered
                   GROUP BY route
+                ), per_user_lane AS (
+                  SELECT route, lane, user_id,
+                         bool_or(day = %s) AS active_24h,
+                         coalesce(sum(completed)
+                           FILTER (WHERE day = %s), 0)::bigint AS completed_24h,
+                         coalesce(sum(failed)
+                           FILTER (WHERE day = %s), 0)::bigint AS failed_24h,
+                         coalesce(sum(completed), 0)::bigint AS completed_7d,
+                         coalesce(sum(failed), 0)::bigint AS failed_7d
+                  FROM filtered
+                  GROUP BY route, lane, user_id
+                ), lane_concentration AS (
+                  SELECT route, lane,
+                         count(*) FILTER (WHERE active_24h)::bigint
+                           AS users_active_24h,
+                         count(*) FILTER (
+                           WHERE active_24h
+                             AND completed_24h = 0 AND failed_24h > 0
+                         )::bigint AS users_zero_success_24h,
+                         max(failed_24h) FILTER (WHERE active_24h)::double precision
+                           / nullif(sum(failed_24h)
+                             FILTER (WHERE active_24h), 0)
+                           AS top_user_failure_share_24h,
+                         count(*)::bigint AS users_active_7d,
+                         count(*) FILTER (
+                           WHERE completed_7d = 0 AND failed_7d > 0
+                         )::bigint AS users_zero_success_7d,
+                         max(failed_7d)::double precision
+                           / nullif(sum(failed_7d), 0)
+                           AS top_user_failure_share_7d
+                  FROM per_user_lane
+                  GROUP BY route, lane
                 )
                 SELECT c.day, c.route, c.lane, c.enqueue_source,
                        c.completed, c.failed, c.expired, c.superseded,
                        coalesce(x.failure_codes, '{}'::jsonb),
-                       u.active_users_24h, u.active_users_7d
+                       u.active_users_24h, u.active_users_7d,
+                       jsonb_build_object(
+                         'users_active', lc.users_active_24h,
+                         'users_zero_success', lc.users_zero_success_24h,
+                         'top_user_failure_share',
+                           lc.top_user_failure_share_24h
+                       ) AS concentration_24h,
+                       jsonb_build_object(
+                         'users_active', lc.users_active_7d,
+                         'users_zero_success', lc.users_zero_success_7d,
+                         'top_user_failure_share',
+                           lc.top_user_failure_share_7d
+                       ) AS concentration_7d
                 FROM cells c
                 LEFT JOIN codes x USING (day, route, lane, enqueue_source)
                 JOIN route_users u USING (route)
+                JOIN lane_concentration lc USING (route, lane)
                 ORDER BY c.day, c.route, c.lane, c.enqueue_source
                 """,
-                (earliest.isoformat(), end_day.isoformat(), end_day.isoformat()),
+                (
+                    earliest.isoformat(), end_day.isoformat(),
+                    end_day.isoformat(), end_day.isoformat(),
+                    end_day.isoformat(), end_day.isoformat(),
+                ),
             ).fetchall()
             watermarks = {
                 str(row[0]): {
@@ -6128,11 +6177,17 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
         "resident": {"24h": 0, "7d": 0},
         "model_api": {"24h": 0, "7d": 0},
     }
+    concentration_by_lane: dict[tuple[str, str], dict[str, dict]] = {}
     for row in rows:
         route = str(row[1])
+        lane = str(row[2])
         active_users_by_route[route] = {
             "24h": int(row[9] or 0),
             "7d": int(row[10] or 0),
+        }
+        concentration_by_lane[(route, lane)] = {
+            "24h": dict(row[11]),
+            "7d": dict(row[12]),
         }
         by_day[(str(row[0]), str(row[1]), str(row[2]), str(row[3] or ""))] = {
             "completed": int(row[4] or 0),
@@ -6194,6 +6249,21 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                     source_bucket["failure_codes"][code] = (
                         source_bucket["failure_codes"].get(code, 0) + count
                     )
+            # Concentration is a window-wide (route, lane) fact.  Do not sum
+            # daily distinct-user counts: the same user may occupy several
+            # frozen days.  Source-split UI cells intentionally receive the
+            # same lane-level fact; the contract groups by route+lane, not by
+            # enqueue_source.  Partial coverage must expose no plausible-looking
+            # concentration value.
+            if coverage_level == "green":
+                for lane, bucket in lanes.items():
+                    concentration = concentration_by_lane.get(
+                        (route, lane), {}
+                    ).get(key)
+                    if concentration is not None:
+                        bucket["concentration"] = dict(concentration)
+                        for source_bucket in lane_sources.get(lane, {}).values():
+                            source_bucket["concentration"] = dict(concentration)
             routes[route] = {
                 "active_users": active_users_by_route[route][key],
                 "coverage": {

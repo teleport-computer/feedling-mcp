@@ -419,6 +419,24 @@ if not _provisioned:
         "test_capabilities_tool_schema.py",
         # 豁免名单棘轮(2026-08-10)。纯:只读两个文本文件,自带 sys.path 引导。
         "test_pytest_coverage_ratchet.py",
+        # Phase A CI 执行证据量具：临时文件 + 子进程 pytest，不碰 DB/网络。
+        "test_ci_execution_evidence.py",
+        # 感知内核纯度守卫(2026-08-19, 感知内核提取 Task 1)。纯:AST walk + 文件系统扫描,
+        # 零 DB/零网络。自带 sys.path 引导(backend/ 枚举)。
+        "test_perception_kernel_purity.py",
+        # 感知 prompt 基线快照(2026-08-19, 感知内核提取 Task 0)。纯:比对
+        # V2 模块级常量字符串 + 调用 chat_resident_consumer 的一个纯函数,
+        # 不碰 DB/网络。自带 sys.path 引导(backend/ + tools/)。
+        "test_perception_prompt_golden.py",
+        # 感知能力表等价性(2026-08-19, 感知内核提取 Task 2)。纯:import 两个
+        # 声明模块比对对象同一性 + 字典遍历,零 DB/零网络。
+        "test_perception_kernel_catalog.py",
+        # 字段投影/权限判据/一瞥等价性(2026-08-19, 感知内核提取 Task 3)。纯:import
+        # 两侧模块比对对象同一性 + 纯函数调用,零 DB/零网络。自带 sys.path 引导。
+        "test_perception_kernel_projection.py",
+        # 叫醒判据(2026-08-19, 感知内核提取 Task 7)。纯:只 import
+        # perception_kernel.wake 调纯函数,零 DB/零网络/零时钟(时间由测试传入)。
+        "test_perception_kernel_wake.py",
     }
     collect_ignore = sorted(
         f
@@ -755,3 +773,36 @@ def client(backend_env):
     from asgi_test_client import make_client
 
     return make_client()
+
+
+# Phase A CI execution evidence is opt-in through environment variables.  Keep
+# the hook wiring here so every normal pytest invocation records actual call
+# outcomes without depending on terminal verbosity.  The implementation is
+# fail-open and is a no-op outside configured CI producer jobs.
+_ci_execution_evidence = None
+_ci_execution_evidence_import_attempted = False
+
+
+def _load_ci_execution_evidence():
+    """Load the optional observer without making conftest collection depend on it."""
+    global _ci_execution_evidence, _ci_execution_evidence_import_attempted
+    if not _ci_execution_evidence_import_attempted:
+        _ci_execution_evidence_import_attempted = True
+        try:
+            from tools import ci_execution_evidence
+        except Exception:
+            return None
+        _ci_execution_evidence = ci_execution_evidence
+    return _ci_execution_evidence
+
+
+def pytest_runtest_logreport(report):
+    observer = _load_ci_execution_evidence()
+    if observer is not None:
+        observer.pytest_runtest_logreport(report)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    observer = _load_ci_execution_evidence()
+    if observer is not None:
+        observer.pytest_sessionfinish(session, exitstatus)

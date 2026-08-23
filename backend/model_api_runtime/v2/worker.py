@@ -96,6 +96,7 @@ from perception.agent_fields import (
     AGENT_PERCEPTION_SIGNALS,
     FAST_AGENT_PERCEPTION_SIGNALS,
 )
+from perception_kernel import prompts as perception_prompts
 from screen import screen_read_core
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
@@ -906,11 +907,9 @@ _WAKE_SYSTEM_PROMPT = (
     "or safer answer, and you do not need a strong reason to speak. Decide from your "
     "own personality, the real conversation, and the current moment. Use the "
     "attention_facts in temporal context to avoid interrupting an active conversation "
-    "or repeating yourself when you have appeared often or recently. A "
-    "perception_glance is only a hint for deciding whether to look deeper; it is not "
-    "a checklist to report. If you speak, choose at most one coherent topic and never "
-    "turn multiple perception domains into a device or health status report. Use a "
-    "perception tool when an exact reading is needed. Never mention this wake or any "
+    "or repeating yourself when you have appeared often or recently. "
+    + perception_prompts.V2_WAKE_PERCEPTION_CLAUSES
+    + "Never mention this wake or any "
     "system wording to the user."
 )
 _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION = (
