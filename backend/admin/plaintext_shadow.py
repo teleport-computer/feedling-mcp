@@ -13,6 +13,7 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import alembic_tee
 import db
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -24,7 +25,6 @@ from tee_replicator import worker
 from tee_shadow import mirror, reconciler, snapshot, table_registry, verify
 
 
-_SCHEMA_HEAD = "0036_lane_rollup_access_paths"
 _INSERT_SHAPE = re.compile(
     r"INSERT\s+INTO\s+([a-zA-Z0-9_]+)\s*\((.*?)\)\s*"
     r"(?:OVERRIDING\s+SYSTEM\s+VALUE\s*)?VALUES",
@@ -161,13 +161,21 @@ def _restore_evidence(
 
 
 def preflight() -> dict:
-    policy = config.require_target()
     failures: list[str] = []
+    try:
+        schema_head = alembic_tee.current_head()
+    except alembic_tee.MigrationHeadError:
+        return {
+            "schema_head": None,
+            "failure_slugs": ["application_migration_chain_invalid"],
+            "ok": False,
+        }
+    policy = config.require_target()
     primary_dsn = os.environ.get("DATABASE_URL", "")
     result: dict[str, Any] = {
         "primary_fingerprint": _endpoint_fingerprint(primary_dsn),
         "target_fingerprint": _endpoint_fingerprint(policy.dsn),
-        "schema_head": _SCHEMA_HEAD,
+        "schema_head": schema_head,
     }
 
     with db.get_pool().connection() as primary, mirror.get_target_pool(
@@ -187,9 +195,9 @@ def preflight() -> dict:
         target_head = _head(target)
         result["primary_head"] = primary_head
         result["target_head"] = target_head
-        if primary_head != _SCHEMA_HEAD:
+        if primary_head != schema_head:
             failures.append("primary_migration_mismatch")
-        if target_head != _SCHEMA_HEAD:
+        if target_head != schema_head:
             failures.append("target_migration_mismatch")
 
         version = int(target.execute("SHOW server_version_num").fetchone()[0])
@@ -309,7 +317,7 @@ def _validated_restore_claims(
 ) -> dict:
     if set(payload) != _RESTORE_CLAIM_KEYS:
         raise RuntimeError("trusted infrastructure evidence payload keys are invalid")
-    if payload["schema_head"] != _SCHEMA_HEAD:
+    if payload["schema_head"] != alembic_tee.current_head():
         raise RuntimeError("trusted infrastructure evidence schema head is stale")
     if target_fingerprint is not None and (
         payload["target_fingerprint"] != target_fingerprint
@@ -738,11 +746,17 @@ def strict_report() -> dict:
 
 
 def status() -> dict:
+    try:
+        schema_head = alembic_tee.current_head()
+        schema_failures: list[str] = []
+    except alembic_tee.MigrationHeadError:
+        schema_head = None
+        schema_failures = ["application_migration_chain_invalid"]
     target = config.load_target()
     if target is None:
         return {
             "enabled": False,
-            "schema_head": _SCHEMA_HEAD,
+            "schema_head": schema_head,
             "target_ok": False,
             "trigger_audit_ok": None,
             "pending_keys": 0,
@@ -750,10 +764,10 @@ def status() -> dict:
             "oldest_pending_seconds": None,
             "latest_run": None,
             "latest_restore_evidence": None,
-            "failure_slugs": [],
+            "failure_slugs": schema_failures,
         }
 
-    failures: list[str] = []
+    failures = list(schema_failures)
     pending = quarantined = 0
     oldest = None
     audit_ok = False
@@ -803,7 +817,7 @@ def status() -> dict:
         failures.append("target_unavailable")
     return {
         "enabled": True,
-        "schema_head": _SCHEMA_HEAD,
+        "schema_head": schema_head,
         "target_ok": target_ok,
         "target_probe_ms": target_probe_ms,
         "trigger_audit_ok": audit_ok,

@@ -187,13 +187,9 @@ def init_schema() -> None:
     assertion and must never run the RDS chain against that database.
     """
     if database_schema() == "tee":
-        from alembic.script import ScriptDirectory
-        from alembic.config import Config
+        import alembic_tee
 
-        here = Path(__file__).resolve().parent
-        cfg = Config(str(here / "alembic_tee" / "alembic.ini"))
-        cfg.set_main_option("script_location", str(here / "alembic_tee"))
-        expected_heads = set(ScriptDirectory.from_config(cfg).get_heads())
+        expected_heads = {alembic_tee.current_head()}
         with _schema_lock, psycopg.connect(_database_url(), autocommit=True) as conn:
             actual_heads = {
                 str(row[0])

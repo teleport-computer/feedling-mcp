@@ -6,6 +6,7 @@ from pathlib import Path
 import psycopg
 import pytest
 
+import alembic_tee
 from tee_shadow import table_registry
 from admin import plaintext_shadow
 
@@ -54,8 +55,7 @@ def test_plaintext_shadow_control_revision_is_head() -> None:
         os.environ["TEE_DATABASE_URL"],
         "SELECT version_num FROM alembic_tee_version",
     )
-    assert rows == [("0036_lane_rollup_access_paths",)]
-    assert plaintext_shadow._SCHEMA_HEAD == "0036_lane_rollup_access_paths"
+    assert rows == [(alembic_tee.current_head(),)]
 
 
 def test_dirty_key_control_plane_contains_no_content_columns() -> None:
