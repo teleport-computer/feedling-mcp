@@ -582,10 +582,17 @@ def _safe_genesis_job(job: dict | None) -> dict:
 def _genesis_stats(store: UserStore, *, include_jobs: bool = False) -> dict:
     state = db.get_blob(store.user_id, "genesis_state")
     state_doc = state if isinstance(state, dict) else {}
+    # ⚠️ 读失败与「这个用户确实没有 genesis 任务」**必须不同形**。
+    # 改这里之前,两者都产出 `jobs=[] / job_count=0` —— 而它们的下一步相反:
+    # 前者去修读取,后者就是正常。观测面把「量不到」显示成「量到了零」,
+    # 是本单(T245)要治的那个病本身,而这一处正在**我们用来看见故障的那个面上**。
+    # 状态词沿用本文件已有的 `ok`/`unavailable`,不另造词表。
+    jobs_source = "ok"
     try:
         jobs_raw = db.genesis_list_jobs(store.user_id, limit=5 if include_jobs else 1)
-    except Exception:
+    except Exception:  # noqa: BLE001 — 观测面降级展示,不 500
         jobs_raw = []
+        jobs_source = "unavailable"
     jobs = [_safe_genesis_job(j) for j in jobs_raw if isinstance(j, dict)]
     latest = jobs[0] if jobs else {}
     return {
@@ -601,6 +608,9 @@ def _genesis_stats(store: UserStore, *, include_jobs: bool = False) -> dict:
         "persona_ref_present": bool(str(state_doc.get("persona_ref") or "").strip() or latest.get("persona_ref_present")),
         "error": str(state_doc.get("error") or latest.get("error") or "")[:240],
         "job_count": len(jobs),
+        # `unavailable` 时上面那些由 latest_job 兜底的字段同样不可信 ——
+        # 读的人必须先看这一格,再决定要不要相信 job_count / job_status。
+        "jobs_source": jobs_source,
         "latest_job": latest,
         "jobs": jobs if include_jobs else [],
     }
@@ -3809,6 +3819,25 @@ def _render_funnel(funnel: dict | None, *, compact: bool) -> str:
             if isinstance(s, dict):
                 prev_by_id[str(s.get("id") or "")] = s
 
+    # ⚠️ 顶层已经把「builder 失败」坍缩成「暂不可用」,**但字段级没有** ——
+    # 改这里之前,`count` 缺失(合法:W1 窗口还没人走完)与 `count` 坏值(数据出问题)
+    # **都返回 None、都显示 `—`**,而它们的下一步相反。
+    # ⭐「顶层有 unavailable」不等于「字段级有 schema」:顶层没坏、字段坏了时,
+    #   页面会显示一个**结构完整但内容失真**的东西 —— 比整块不可用更难发现。
+    # ⚠️ 修法刻意最小侵入:`_count` **仍返回 None**,不改任何下游算术
+    # (下游有 7 处直接拿它做除法/减法,换成哨兵对象会全部炸)。
+    # 「读不出来」只在**显示那一处**用独立判据区分出来。
+    def _count_unreadable(stage: dict) -> bool:
+        """有值、但读不成整数 —— 与「本来就没有」(count 缺失)是两回事。"""
+        raw = stage.get("count")
+        if raw is None:
+            return False
+        try:
+            int(raw)
+        except (TypeError, ValueError):
+            return True
+        return False
+
     def _count(stage: dict):
         raw = stage.get("count")
         if raw is None:
@@ -3862,7 +3891,15 @@ def _render_funnel(funnel: dict | None, *, compact: bool) -> str:
             rows.append(f"<div class='hfunnel-conv'>{conv}</div>")
         if count is None:
             width_pct = 0.0
-            num = "<span class='muted' title='窗口尚未走完或查询失败，判不了'>—</span>"
+            # ⚠️ 这里原本一句「窗口尚未走完**或**查询失败,判不了」——
+            # 作者自己已经写下了这两件事被混在一起,只是没分开。它们的下一步相反:
+            # 前者什么都不用做,后者要去修数据/读取。
+            if _count_unreadable(stage):
+                num = ("<span class='warn' title='本阶段有 count 值,但读不成整数——"
+                       "数据有问题,不是「还没人走完」'>坏值</span>")
+            else:
+                num = ("<span class='muted' title='本阶段暂无 count(如窗口尚未走完)'>"
+                       "—</span>")
         elif base is None or base <= 0:
             width_pct = 0.0
             num = f"{count:,}"
@@ -6909,11 +6946,20 @@ def _home_human_summary(
     prev_wau = (pulse or {}).get("prev_wau")
     if wau is not None:
         head = f"近 7 天 <b>{int(wau)}</b> 人在用"
-        try:
-            diff = int(wau) - int(prev_wau)
-        except (TypeError, ValueError):
+        # ⚠️ 「本来就没有上一周」(首周)与「上一周的数读不出来」原本都让
+        # 对比从句静默消失 —— 读的人无从知道这里本该有句话。前者正常,后者要修数据。
+        prev_unreadable = False
+        if prev_wau is None:
             diff = None
-        if diff is not None and diff != 0:
+        else:
+            try:
+                diff = int(wau) - int(prev_wau)
+            except (TypeError, ValueError):
+                diff = None
+                prev_unreadable = True
+        if prev_unreadable:
+            head += "（上一周的数读不出来，比不了）"
+        elif diff is not None and diff != 0:
             head += f"（比上一周{'多' if diff > 0 else '少'} {abs(diff)} 个）"
         elif diff == 0:
             head += "（和上一周持平）"
@@ -6924,7 +6970,11 @@ def _home_human_summary(
             kept = int(round(float(d14["pct"])))
             clauses.append(f"新来 100 个能留住 <b>{kept}</b> 个")
         except (TypeError, ValueError):
-            pass
+            # ⚠️ 原本是 `pass` —— **整句话从页面上蒸发**,
+            # 而读的人**无从知道这里本该有一句**。
+            # 这是「省略型」:它既不返回 0 也不返回 None,它让一条陈述消失 ——
+            # 比显示一个坏值更难发现,因为**缺席不留痕迹**。
+            clauses.append("留存率读不出来")
     if queue is not None:
         rows = [r for r in (queue.get("rows") or []) if isinstance(r, dict)]
         if rows:
@@ -7202,7 +7252,14 @@ def _home_cost_section(cost: dict | None) -> str:
                 "<span class='muted'>usage 缺报较多，以上都是已知下限，不是全量。</span>"
             )
     except (TypeError, ValueError):
-        pass
+        # ⚠️ 这里原本是 `pass` —— 于是 coverage 坏值会让**低覆盖警告整句消失**,
+        # 页面反而显得比数据健康时更干净:**数据坏了,安全信号跟着一起没了**。
+        # 这比「显示一个错的数」更危险 —— 错的数还在提醒你这里有个量,
+        # 消失的警告让你以为这里没有问题。
+        coverage_note = (
+            "<span class='warn'>usage 覆盖率读不出来，"
+            "上面的成本数**无法判断是否为全量**。</span>"
+        )
     per_active = cost.get("per_active_user_day")
     try:
         # OverflowError：round(float('inf')) 会炸——契约上游今天只产有限值，
@@ -8383,7 +8440,7 @@ def _health_bj_this_monday() -> str:
     return (today - timedelta(days=today.weekday())).isoformat()
 
 
-def _health_t3_matured(cohort_week: str) -> bool:
+def _health_t3_matured(cohort_week: str) -> bool | None:
     """注册周的 t3 激活窗是否已全部走完（注册周 7 天 + 3 天 t3 窗）。
 
     coverage_complete 只说明漏斗行数对得上，不代表窗口走完；没成熟的周
@@ -8392,7 +8449,11 @@ def _health_t3_matured(cohort_week: str) -> bool:
     try:
         week = date.fromisoformat(str(cohort_week))
     except (TypeError, ValueError):
-        return False
+        # ⚠️ 读不出这是哪一周,与「这一周还没走完」**不是一回事**:
+        # 上面那句「注册 3 天内还没回复 ≠ 不会回复」是**关于时间的陈述**,
+        # 而这里我们连是哪一周都不知道 —— 前者等一等就好,后者要去修数据。
+        # 返回 None 让消费方各自决定怎么显示,而不是被静默并进「未成熟」。
+        return None
     today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
     return week + timedelta(days=10) <= today
 
@@ -8519,7 +8580,14 @@ def _health_activation_table(activation: dict | None) -> str:
             # 覆盖不完整的周渲染「未知」而不是 0%——缺证据 ≠ 没激活。
             rows.append(f"<tr><td>{week}</td><td>{n}</td>{unknown * 4}</tr>")
             continue
-        if not _health_t3_matured(c.get("cohort_week")):
+        matured = _health_t3_matured(c.get("cohort_week"))
+        if matured is None:
+            # ⚠️ 读不出这是哪一周 —— 与「窗口没走完」不同形:
+            # 后者等一等就好,前者要去修数据。并进「未成熟」会让它永远不被人发现。
+            bad = "<td><span class='warn' title='cohort_week 读不出来，不是「还没成熟」'>坏值</span></td>"
+            rows.append(f"<tr><td>{week}</td><td>{n}</td>{bad * 4}</tr>")
+            continue
+        if not matured:
             # 窗口没走完的周（本周/上周）渲染「未成熟」——注册 3 天内还没
             # 回复 ≠ 不会回复，确定性的 0% 是编出来的悲观。
             rows.append(f"<tr><td>{week}</td><td>{n}</td>{immature * 4}</tr>")
@@ -8716,7 +8784,9 @@ def _render_product_health_page(
         (
             c for c in (activation or {}).get("cohorts", [])
             if c.get("coverage_complete")
-            and _health_t3_matured(c.get("cohort_week"))
+            # None(读不出周)在这里与 False 同效:不选它当「最新完整周」——
+            # 这是**故意**的,一个读不出来的周不该被当成定论来源。
+            and _health_t3_matured(c.get("cohort_week")) is True
         ),
         None,
     )
@@ -10860,6 +10930,14 @@ def _render_user_detail_page(user: dict) -> str:
     responder = user.get("responder") if isinstance(user.get("responder"), dict) else {}
     responder_name = str(responder.get("effective_responder") or "none")
     mismatch = bool(responder.get("mismatch"))
+    # ⚠️ 这张卡以前显示 `status or 'none'` —— **读库失败与「确实没有蒸馏」同形**。
+    # 两者的下一步相反(修读取 / 这就是正常),所以必须在页面上就分开,
+    # 而不是只在 JSON 里分开:大多数人看的是这张卡,不是 payload。
+    _genesis = user.get("genesis") if isinstance(user.get("genesis"), dict) else {}
+    if str(_genesis.get("jobs_source") or "ok") != "ok":
+        genesis_cell = "<span class='warn'>取不到（读取失败）</span>"
+    else:
+        genesis_cell = html.escape(str(_genesis.get("status") or "none"))
     mismatch_reasons = ", ".join(
         str(reason) for reason in responder.get("mismatch_reasons") or []
     )
@@ -10919,7 +10997,7 @@ def _render_user_detail_page(user: dict) -> str:
     <div class="card"><div class="value">{html.escape(_format_duration(user['onboarding']['stuck_for_sec']))}</div><div class="label">stuck for</div></div>
     <div class="card"><div class="value">{user['chat']['total']}</div><div class="label">chat messages</div></div>
     <div class="card"><div class="value">{user['memory']['total']}</div><div class="label">memories</div></div>
-    <div class="card"><div class="value">{html.escape(user.get('genesis', {}).get('status') or 'none')}</div><div class="label">genesis distill</div></div>
+    <div class="card"><div class="value">{genesis_cell}</div><div class="label">genesis distill</div></div>
     <div class="card"><div class="value">{user['proactive']['proactive_messages']}</div><div class="label">proactive writes</div></div>
     <div class="card"><div class="value">{html.escape(user.get('provider_state') or 'ok')}</div><div class="label">provider state</div></div>
     <div class="card"><div class="value">{html.escape(_bj_iso(user.get('last_provider_success_at')) or 'never')}</div><div class="label">last provider success</div></div>
