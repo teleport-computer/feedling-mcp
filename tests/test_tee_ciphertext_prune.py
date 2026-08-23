@@ -12,6 +12,8 @@ import pytest
 from tee_replicator import worker as tee_worker
 from tee_shadow import ciphertext_prune
 
+from conftest import capture_sleeps
+
 
 # --------------------------------------------------------------------------- #
 # 配置层守卫
@@ -230,7 +232,7 @@ def test_retries_on_dropped_connection(monkeypatch):
     """
     import psycopg
 
-    monkeypatch.setattr(ciphertext_prune.time, "sleep", lambda *_: None)
+    capture_sleeps(monkeypatch, ciphertext_prune)
     calls = {"n": 0}
     deleted: list = []
     good = _FakeConn([("u1", "stale")], deleted)
@@ -255,7 +257,7 @@ def test_gives_up_after_bounded_retries(monkeypatch):
     """重试有界——连不上就落报告，不能无限重试卡死整个 tick。"""
     import psycopg
 
-    monkeypatch.setattr(ciphertext_prune.time, "sleep", lambda *_: None)
+    capture_sleeps(monkeypatch, ciphertext_prune)
     calls = {"n": 0}
 
     class _DeadPool:

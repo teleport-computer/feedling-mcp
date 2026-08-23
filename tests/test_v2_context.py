@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
-from core import self_thinking
+from agent_protocol_core import self_thinking
 from chat.reply_language import format_time_anchor, infer_reply_language_policy
 from capabilities import tool_schema
 from model_api_runtime.v2 import context, language_follow, worker

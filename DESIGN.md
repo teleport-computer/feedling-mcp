@@ -298,6 +298,6 @@ no raw point numbers, no raw font strings in view files.
 | 2026-04-20 | DESIGN.md created via `/design-consultation` | Phase B's `/plan-design-review` Pass 5 blocked on having a system to calibrate against. System built on peer research (Linear, Granola, Dia, Replika, Apple's own iOS apps). |
 | 2026-04-20 | Aesthetic direction: *warm minimalism / iOS-native artful* | Feedling wants Replika's warmth (it's a companion) + Linear's discipline (it's cryptographically credible). Neither extreme alone fits. |
 | 2026-04-20 | No custom illustrations | Locked in during `/plan-design-review` Pass 4. SF Symbols + typography + single accent eliminates AI-slop risk. |
-| 2026-04-20 | Muted sage-green accent, NOT iOS system blue | iOS-blue makes the app look generic; sage-green evokes growth + memory-garden + quiet confidence. |
+| 2026-04-20 | Muted sage-green accent, NOT iOS system blue | iOS-blue makes the app look generic; sage-green evokes growth + memgarden + quiet confidence. |
 | 2026-04-20 | Instrument Serif for display only | A serif at the "first impression" + "trust context" moments gives Feedling a voice. SF Pro everywhere else keeps the hot path fast and iOS-native. |
 | 2026-04-20 | Warm dark mode (paper undertone) | Reads as "after-dark Feedling" instead of "UI-with-colors-inverted." |

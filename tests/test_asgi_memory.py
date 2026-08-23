@@ -36,7 +36,7 @@ from memory import memory_core  # noqa: E402
 from memory import routes_asgi as memory_asgi  # noqa: E402
 from memory import service as memory_service  # noqa: E402
 import memory_readside_core  # noqa: E402
-from memory_garden import timestamps as memory_timestamps  # noqa: E402
+from memgarden import timestamps as memory_timestamps  # noqa: E402
 
 _SECRET = "test-runtime-secret"
 

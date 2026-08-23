@@ -170,6 +170,30 @@ def infer_garden_language(
     与 io 回复语言同源（``infer_reply_language_policy``），所以不会出现
     「io 用英文跟你说话、却给你一个中文桶」这种自相矛盾。
     """
+    return garden_language_decision(
+        identity,
+        existing_buckets=existing_buckets,
+        locale=locale,
+        archive_language=archive_language,
+    )["locale"]
+
+
+def garden_language_decision(
+    identity: dict | None,
+    *,
+    existing_buckets: str = "",
+    locale: str = "",
+    archive_language: str = "",
+) -> dict:
+    """同 :func:`infer_garden_language`，但把**判定依据**一并返回，供落库观测。
+
+    为什么需要它：落卡语言错了是**看得见症状、看不见原因**的一类问题 ——
+    用户只会说「怎么变英文了」，而我们查不到当时算出的是什么语言、凭什么算的。
+    2026-08-23 提示词英文化之后，这条路径的风险显著上升，必须能观测。
+
+    返回的字段全部**内容无关**：语言标签、依据名、以及桶名里的字符计数 ——
+    桶名本身是用户内容，绝不落库。
+    """
     # 已有桶优先，且**不走 infer_reply_language_policy 的证据门槛**。
     # 那个门槛（32 字符）是给散文调的；桶名天生就短 —— "Work / Health / Pets"
     # 只有 14 个拉丁字母，喂进去会被判成证据不足、回落成中文，
@@ -179,12 +203,24 @@ def infer_garden_language(
         cjk = len(_CJK_RE.findall(buckets))
         latin = len(_LATIN_RE.findall(buckets))
         if cjk or latin:
-            return "zh-Hans" if cjk >= latin else "en"
+            return {
+                "locale": "zh-Hans" if cjk >= latin else "en",
+                "basis": "existing_buckets",
+                "bucket_cjk": cjk,
+                "bucket_latin": latin,
+            }
 
     # 还没有任何桶（新花园的第一张卡）才看身份卡 / locale / 归档语言。
-    return infer_reply_language_policy(
+    policy = infer_reply_language_policy(
         identity or {}, [], locale=locale, archive_language=archive_language
-    ).language
+    )
+    return {
+        "locale": policy.language,
+        "basis": f"reply_language:{policy.source}",
+        "bucket_cjk": 0,
+        "bucket_latin": 0,
+        "confidence": round(float(policy.confidence or 0.0), 2),
+    }
 
 
 def reply_language_system_line(policy: ReplyLanguagePolicy, *, proactive: bool = False) -> str:

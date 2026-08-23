@@ -895,10 +895,10 @@ def test_onboarding_validate_steps_progression(backend):
     )
     body = r.json()
     assert body["passing"] is False
-    # A' (2026-06): memory_garden is informational (passing=True, blocking=False),
+    # A' (2026-06): memgarden is informational (passing=True, blocking=False),
     # so the first blocking step for a fresh user is identity_card, not memory.
     assert body["stage"] == "identity_card"
-    mg = next(s for s in body["steps"] if s["id"] == "memory_garden")
+    mg = next(s for s in body["steps"] if s["id"] == "memgarden")
     assert mg["passing"] is True and mg["blocking"] is False
 
     _seed_passing_bootstrap(backend["base_url"], user_id, api_key)

@@ -45,7 +45,7 @@ import provider_client
 from content_encryption import build_envelope
 from capabilities import registry as cap_registry
 from capabilities import tool_schema as cap_tool_schema
-from core import self_thinking
+from agent_protocol_core import self_thinking
 from core import store as core_store
 from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import cursor as v2_cursor

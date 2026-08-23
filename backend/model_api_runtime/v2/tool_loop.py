@@ -13,7 +13,7 @@ from provider_types import ProviderResponse, ToolExchange, ToolResult
 from capabilities import registry as cap_registry
 from capabilities import result_budget
 from capabilities import tool_schema
-from core import protocol_leak
+from agent_protocol_core import protocol_leak
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import provenance
 from model_api_runtime.v2 import tool_surface

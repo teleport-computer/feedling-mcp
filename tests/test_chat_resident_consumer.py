@@ -405,7 +405,7 @@ def test_v1_foreground_self_thinking_skips_only_exact_fable(
          patch.object(crc, "post_reply", return_value={"id": "reply-msg-fable"}):
         result_ts = crc._process_messages([msg])
 
-    from core import self_thinking
+    from agent_protocol_core import self_thinking
 
     assert result_ts == pytest.approx(1112.75)
     instruction_present = self_thinking.INSTRUCTION.strip() in captured["message"]
@@ -533,7 +533,7 @@ def test_whoami_startup_retries_keep_fixed_delay(monkeypatch):
     monkeypatch.setattr(crc, "_load_whoami", lambda: False)
     monkeypatch.setattr(crc, "WHOAMI_STARTUP_RETRIES", 3)
     monkeypatch.setattr(crc, "WHOAMI_STARTUP_RETRY_DELAY_SEC", 5)
-    monkeypatch.setattr(crc.time, "sleep", lambda delay: sleeps.append(delay))
+    capture_sleeps(monkeypatch, crc, sleeps)
 
     assert crc._load_whoami_with_retries() is False
     assert sleeps == [5, 5]
@@ -543,7 +543,7 @@ def test_whoami_reply_refresh_retries_use_exponential_backoff(monkeypatch):
     sleeps = []
 
     monkeypatch.setattr(crc, "_load_whoami", lambda: False)
-    monkeypatch.setattr(crc.time, "sleep", lambda delay: sleeps.append(delay))
+    capture_sleeps(monkeypatch, crc, sleeps)
 
     assert crc._load_whoami_with_retries(
         attempts=3,
@@ -1062,7 +1062,7 @@ def test_enclave_fetch_logs_response_body_on_http_error(monkeypatch, caplog):
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://127.0.0.1:5003")
     monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
     # 503 is transient (retried); don't actually sleep the backoff in the test.
-    monkeypatch.setattr(crc.time, "sleep", lambda *_: None)
+    capture_sleeps(monkeypatch, crc)
 
     with caplog.at_level("WARNING"):
         result = crc._fetch_from_enclave(since=0.0, limit=20)
@@ -1089,7 +1089,7 @@ def test_fetch_from_enclave_retries_transient_502(monkeypatch):
     mock_client.get.side_effect = [err, ok]
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://enc")
     monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
-    monkeypatch.setattr(crc.time, "sleep", lambda *_: None)
+    capture_sleeps(monkeypatch, crc)
 
     result = crc._fetch_from_enclave(since=0.0, limit=20)
 
@@ -1106,7 +1106,7 @@ def test_fetch_from_enclave_retries_transient_network_error(monkeypatch):
     mock_client.get.side_effect = [_httpx.ConnectError("boom"), ok]
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://enc")
     monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
-    monkeypatch.setattr(crc.time, "sleep", lambda *_: None)
+    capture_sleeps(monkeypatch, crc)
 
     result = crc._fetch_from_enclave(since=0.0, limit=20)
 
@@ -1124,7 +1124,7 @@ def test_fetch_from_enclave_no_retry_on_permanent_4xx(monkeypatch):
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://enc")
     monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
     slept: list = []
-    monkeypatch.setattr(crc.time, "sleep", lambda d: slept.append(d))
+    capture_sleeps(monkeypatch, crc, slept)
 
     result = crc._fetch_from_enclave(since=0.0, limit=20)
 
@@ -1143,7 +1143,7 @@ def test_fetch_from_enclave_gives_up_after_max_attempts(monkeypatch):
         502, json={"error": "backend_unreachable"}, request=_httpx.Request("GET", url))
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://enc")
     monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
-    monkeypatch.setattr(crc.time, "sleep", lambda *_: None)
+    capture_sleeps(monkeypatch, crc)
 
     result = crc._fetch_from_enclave(since=0.0, limit=20)
 
@@ -8279,7 +8279,7 @@ def test_voice_delta_final_marker_retries_idempotently(monkeypatch):
 
     monkeypatch.setattr(crc._HTTP, "post", _post)
     monkeypatch.setattr(crc, "VOICE_STREAM_FINAL_ATTEMPTS", 3)
-    monkeypatch.setattr(crc.time, "sleep", lambda _seconds: None)
+    capture_sleeps(monkeypatch, crc)
     publisher = crc._VoiceDeltaPublisher("parent-retry")
 
     assert publisher._post(0, "完整回答", final=True) is True
@@ -12383,6 +12383,8 @@ def test_hidden_vision_probe_uses_isolated_session_and_posts_only_observed(monke
 
 import worldbook_match as _worldbook_match
 
+from conftest import capture_sleeps
+
 
 class _FakeWorldbookHTTP:
     def __init__(self, block="〈世界书〉墨白历,一年十四个月。", status=200):
@@ -12639,7 +12641,7 @@ def test_thinking_denylist_calls_through_to_shared_vocabulary(monkeypatch):
       · sentinel 行被丢 → 证明真的走了共享 helper
       · 旧词表的词在替身下不被误判 → 证明没有第二个词表来源
     """
-    from core import self_thinking
+    from agent_protocol_core import self_thinking
 
     monkeypatch.setattr(
         self_thinking, "internal_field_terms_pattern", lambda: "(zzsentinelzz)"
@@ -12801,7 +12803,7 @@ def test_wake_templates_share_the_foreground_thinking_switch(monkeypatch):
 
     分开写会产生一种没人预料得到的状态:前台已经关了、主动道还在 think。
     """
-    from core import self_thinking as _st
+    from agent_protocol_core import self_thinking as _st
 
     monkeypatch.setattr(_st, "enabled", lambda: True)
     monkeypatch.setattr(crc, "_supports_mandatory_self_thinking_v1", lambda: True)

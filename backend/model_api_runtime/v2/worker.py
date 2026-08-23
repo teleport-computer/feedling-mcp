@@ -71,21 +71,22 @@ from capabilities import registry as cap_registry
 from capabilities import result_budget as cap_result_budget
 from capabilities import tool_schema as cap_tool_schema
 from chat.reply_language import (
+    garden_language_decision,
     infer_garden_language,
     infer_reply_language_policy,
     reply_language_system_line,
 )
 from core import chat_activity as core_chat_activity
 from core import envelope as core_envelope
-from core import protocol_leak
+from agent_protocol_core import protocol_leak
 from core import tool_markup_leak
 from core import util as core_util
 from core import provider_usage
-from core import self_thinking
+from agent_protocol_core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
-from memory_garden import dream_trace as memory_dream_trace
-from memory_garden import timestamps as memory_timestamps
+from memory import dream_trace as memory_dream_trace
+from memgarden import timestamps as memory_timestamps
 from core.downloadable_reply import sanitize_downloadable_reply
 from perception.glance import (
     perception_glance_fingerprint,
@@ -95,6 +96,7 @@ from perception.agent_fields import (
     AGENT_PERCEPTION_SIGNALS,
     FAST_AGENT_PERCEPTION_SIGNALS,
 )
+from perception_kernel import prompts as perception_prompts
 from screen import screen_read_core
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
@@ -134,20 +136,21 @@ from memory.capture_prompt_v1 import (
     parse_capture_cards,
 )
 from identity.user_naming import transcript_speaker_label
-from memory_garden.text.card_text import (
+from memgarden.text.card_text import (
     build_truncation_retry_prompt,
     card_text_rejection,
     count_user_token_residuals,
     is_retryable_parse_error,
     sanitize_card_labels,
 )
-from memory_garden.text import card_guard
-from memory_garden.guards import dream_gates as memory_dream_gates
+from memgarden.text import card_guard
+from memgarden.guards import dream_gates as memory_dream_gates
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
     build_dream_retry_prompt,
     parse_dream_consolidations,
 )
+from memory.card_leak_signals import IO_LEAK_SIGNALS
 
 log = logging.getLogger("feedling.runtime_v2.worker")
 
@@ -911,11 +914,9 @@ _WAKE_SYSTEM_PROMPT = (
     "or safer answer, and you do not need a strong reason to speak. Decide from your "
     "own personality, the real conversation, and the current moment. Use the "
     "attention_facts in temporal context to avoid interrupting an active conversation "
-    "or repeating yourself when you have appeared often or recently. A "
-    "perception_glance is only a hint for deciding whether to look deeper; it is not "
-    "a checklist to report. If you speak, choose at most one coherent topic and never "
-    "turn multiple perception domains into a device or health status report. Use a "
-    "perception tool when an exact reading is needed. Never mention this wake or any "
+    "or repeating yourself when you have appeared often or recently. "
+    + perception_prompts.V2_WAKE_PERCEPTION_CLAUSES
+    + "Never mention this wake or any "
     "system wording to the user."
 )
 _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION = (
@@ -6007,6 +6008,7 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             summary=summary,
             content=content or summary,
             guard=guard_on,
+            signals=IO_LEAK_SIGNALS,
         )
         if rejection:
             raise ValueError(f"memory_card_rejected:{rejection}")
@@ -6015,6 +6017,7 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             threads=list(inner.get("threads") or []),
             guard=guard_on,
             lang_text=f"{summary}\n{content}",
+            signals=IO_LEAK_SIGNALS,
         )
         if bucket:
             inner["bucket"] = bucket
@@ -9330,7 +9333,7 @@ async def _run_wake(
             # the real reply, and surface the block in the thinking channel instead of
             # native reasoning. Same kill switch. Fail-closed: a malformed block →
             # silence (a legitimate wake outcome), never a leaked tag.
-            from core import self_thinking as _st_wake
+            from agent_protocol_core import self_thinking as _st_wake
 
             _wake_self_thinking_on = _st_wake.enabled()
             # 与聊天出口同样解耦：关掉 self-thinking 不能顺带关掉安全剥离
@@ -9997,7 +10000,7 @@ async def _run_wake(
                     raise
 
         await _fence_wake_effect("wake turn")
-        from core import self_thinking as _st_wake_loop
+        from agent_protocol_core import self_thinking as _st_wake_loop
 
         async def _on_wake_screen_images_rejected(
             _exc: BaseException,
@@ -11421,6 +11424,11 @@ async def _run_extraction(
                 user_name=ctx.get("user_name", ""),
                 cards=ctx.get("cards", ""),
                 recent_conversations=window,
+                # 做梦整理的是同一个花园，语言判据必须跟 capture 同源，
+                # 否则夜里整理一遍会把桶换成另一种语言。
+                locale=infer_garden_language(
+                    None, existing_buckets=str(ctx.get("buckets") or "")
+                ),
             )
             # parse_dream_consolidations 返回 (consolidations, questions, err)。
             # questions 属于「主动提问」= wake 语义，本轮明确丢弃（spec §5.3）。
@@ -11472,9 +11480,28 @@ async def _run_extraction(
                 # 花园的分类语言。已有桶优先 —— 一个花园只用一种语言的桶，
                 # 不因为这轮对话换了语言就长出并存的第二套。
                 # 与 V1 consumer 走同一个 helper，两条 runtime 不许各判各的。
-                capture_locale = infer_garden_language(
+                _lang = garden_language_decision(
                     None, existing_buckets=str(ctx.get("buckets") or "")
                 )
+                capture_locale = _lang["locale"]
+                # 与 V1 同源、同样落库 —— 两条 runtime 的语言判定要能横向对比，
+                # 否则「只有 V2 用户变英文了」这种问题查不出来。
+                if deps.emit_debug_trace is not None:
+                    try:
+                        await asyncio.to_thread(
+                            deps.emit_debug_trace,
+                            user_id,
+                            "memory.capture.language",
+                            status="ok",
+                            summary=f"落卡语言 {_lang['locale']}（依据 {_lang['basis']}）",
+                            explain="这轮落卡用哪种语言写卡，以及凭什么这么判。桶名本身不落库。",
+                            trace_id=str(trace_id or job_id),
+                            turn_id=str(trace_id or job_id),
+                            job_id=str(job_id),
+                            detail=dict(_lang),
+                        )
+                    except Exception:  # noqa: BLE001 — 观测失败绝不影响落卡
+                        pass
                 prompt = build_capture_prompt(
                     ai_name=ctx.get("ai_name", ""),
                     user_name=ctx.get("user_name", ""),
@@ -13787,7 +13814,7 @@ async def process_job(
             # text; which thinking to surface (self-authored vs native) and its
             # provenance are decided at seal time. Fail-closed on malformed <think>:
             # never leak a raw tag, never promote private thinking to the reply.
-            from core import self_thinking
+            from agent_protocol_core import self_thinking
 
             self_thinking_on = self_thinking.enabled()
             # 安全剥离与「要不要写/展示自写 thinking」必须解耦：FEEDLING_V2_SELF_THINKING
@@ -14743,7 +14770,7 @@ async def process_job(
         # which the seal surfaces cleanly (same as V1). Gated on the same kill switch;
         # when self-thinking is OFF this is False and the old include_reasoning path is
         # unchanged.
-        from core import self_thinking as _self_thinking_v2
+        from agent_protocol_core import self_thinking as _self_thinking_v2
 
         outcome = await v2_tool_loop.run_tool_loop(
             provider_config=provider_config,

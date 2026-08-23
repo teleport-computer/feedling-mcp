@@ -18,7 +18,7 @@ def test_floor_note_appended_to_system():
     msgs = prompts.fact_write_messages([{"summary": "s"}], floor_note=note)
     assert note in msgs[0]["content"]
     # note 在 keep_all 后、STRICT JSON 尾注前
-    assert msgs[0]["content"].index(note) < msgs[0]["content"].index("JSON")
+    assert msgs[0]["content"].index(note) < msgs[0]["content"].index("Strict output requirement")
 
 
 def test_floor_note_composes_with_keep_all():
@@ -26,7 +26,7 @@ def test_floor_note_composes_with_keep_all():
     ka_only = prompts.fact_write_messages([{"summary": "s"}], keep_all=True)
     both = prompts.fact_write_messages([{"summary": "s"}], keep_all=True, floor_note=note)
 
-    assert "长期档案" in both[0]["content"]
+    assert "curated for long-term keeping" in both[0]["content"]
     assert note in both[0]["content"]
 
     # keep_all suffix stays ANCHORED: strip the note insertion → byte-identical to keep_all-only

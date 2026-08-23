@@ -5,8 +5,8 @@ import uuid
 from datetime import date
 from typing import Any
 
-from memory_garden import timestamps as memory_timestamps
-from memory_garden.prompts.buckets import MEMORY_WRITE_GUIDANCE_V1
+from memgarden import timestamps as memory_timestamps
+from memgarden.prompts.buckets import MEMORY_WRITE_GUIDANCE_V1
 
 
 IDENTITY_STRING_FIELDS = (

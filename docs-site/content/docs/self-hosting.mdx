@@ -263,6 +263,21 @@ that must not be retained there; a terse generic alert text avoids the
 concern entirely. See the API reference (Notify Relay tag) for the full
 request schemas.
 
+## Building requires egress to GitHub Releases
+
+The memory judgment kernel is an external package (`memgarden`, Apache-2.0) that
+is installed at image build time from a version-pinned, hash-locked GitHub
+Release wheel. A cold build therefore needs outbound access to `github.com` and
+`release-assets.githubusercontent.com`. Builds fail loudly if the asset is
+unreachable; there is no silent fallback.
+
+Install from `backend/requirements.lock` with `pip install --require-hashes`, as
+the reference Dockerfile does. Resolving the dependency loosely — or pointing it
+at a branch instead of the pinned Release — makes your build unreproducible and
+breaks the guarantee that your image contains the reviewed bytes. If your build
+environment has no egress, mirror the two pinned wheels internally and keep the
+same hashes.
+
 ## Use the repository deployment files as references
 
 Pin a commit or immutable image digest. Review these files together:

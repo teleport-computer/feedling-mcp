@@ -106,6 +106,25 @@ USER_UNAVAILABLE_V2_OUTCOME_CODES = frozenset({
     "turn_failed:image_generation_model_not_found",
 })
 
+
+def v1_proactive_outcome_class(status: object, reason: object) -> str:
+    """Classify the resident/V1 proactive status-reason keyspace.
+
+    ``skipped`` is a control-plane outcome (including heartbeat_throttled), not
+    a failed realization.  A failed job leaves our numerator only for Seven's
+    exact user-unavailable reasons.  No prefix or string-shape inference is
+    allowed: unknown/new reasons remain operational failures.
+    """
+    normalized_status = str(status or "").strip()
+    normalized_reason = str(reason or "").strip() or "unknown"
+    if normalized_status == "skipped":
+        return "control"
+    if normalized_status != "failed":
+        return ""
+    if normalized_reason in USER_UNAVAILABLE_V1_REASONS:
+        return "user_unavailable"
+    return "operational_failure"
+
 # error_class -> (blame, user_text)
 _CATALOG: dict[str, tuple[str, str]] = {
     "quota_insufficient": (
