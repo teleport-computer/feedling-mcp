@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db
 from model_api_runtime.v2 import effect_outbox, effect_id, jobs_store
 
-from conftest import seed_user
+from conftest import seed_user, BACKGROUND_EVENT_TIMEOUT
 from incident_guard_reference import legacy_wake_should_publish
 
 pytestmark = pytest.mark.skipif(
@@ -577,7 +577,7 @@ def test_final_reply_apply_first_serializes_send_after_dispatch(pg_clean):
     def blocking_dispatch(_effect_type, payload):
         assert effect_outbox.FINAL_REPLY_FENCE_KEY not in payload
         dispatch_entered.set()
-        assert release_dispatch.wait(timeout=3)
+        assert release_dispatch.wait(timeout=BACKGROUND_EVENT_TIMEOUT)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         apply_future = pool.submit(
@@ -585,7 +585,7 @@ def test_final_reply_apply_first_serializes_send_after_dispatch(pg_clean):
             uid,
             dispatch=blocking_dispatch,
         )
-        assert dispatch_entered.wait(timeout=3)
+        assert dispatch_entered.wait(timeout=BACKGROUND_EVENT_TIMEOUT)
         send_future = pool.submit(
             db.chat_append_and_enqueue,
             uid,
@@ -653,7 +653,7 @@ def test_exact_disposition_waits_for_concurrent_applier_commit(pg_clean):
 
     def blocking_dispatch(_effect_type, _payload):
         dispatch_entered.set()
-        assert release_dispatch.wait(timeout=3)
+        assert release_dispatch.wait(timeout=BACKGROUND_EVENT_TIMEOUT)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         apply_future = pool.submit(
@@ -661,7 +661,7 @@ def test_exact_disposition_waits_for_concurrent_applier_commit(pg_clean):
             uid,
             dispatch=blocking_dispatch,
         )
-        assert dispatch_entered.wait(timeout=3)
+        assert dispatch_entered.wait(timeout=BACKGROUND_EVENT_TIMEOUT)
         disposition_future = pool.submit(
             effect_outbox.get_effect_disposition,
             eid,
@@ -960,7 +960,7 @@ def test_final_reply_blocked_past_lease_expiry_is_not_dispatched(
                     uid,
                     dispatch=lambda *args: seen.append(args),
                 )
-                assert apply_entered.wait(timeout=3)
+                assert apply_entered.wait(timeout=BACKGROUND_EVENT_TIMEOUT)
                 time.sleep(0.4)
         result = future.result(timeout=3)
 
@@ -1170,7 +1170,7 @@ def test_concurrent_applier_observes_atomic_ambiguous_failure_backoff(
 
     def ambiguous_dispatch(_effect_type, _payload):
         first_dispatch_entered.set()
-        assert release_first_dispatch.wait(timeout=3)
+        assert release_first_dispatch.wait(timeout=BACKGROUND_EVENT_TIMEOUT)
         raise db.EffectDeliveryUncertainError("sink claim outcome unknown")
 
     def forbidden_second_dispatch(_effect_type, _payload):
@@ -1182,13 +1182,13 @@ def test_concurrent_applier_observes_atomic_ambiguous_failure_backoff(
             uid,
             dispatch=ambiguous_dispatch,
         )
-        assert first_dispatch_entered.wait(timeout=3)
+        assert first_dispatch_entered.wait(timeout=BACKGROUND_EVENT_TIMEOUT)
         second = pool.submit(
             effect_outbox.apply_pending_effects,
             uid,
             dispatch=forbidden_second_dispatch,
         )
-        assert second_snapshot_ready.wait(timeout=3)
+        assert second_snapshot_ready.wait(timeout=BACKGROUND_EVENT_TIMEOUT)
         release_first_dispatch.set()
 
         with pytest.raises(db.EffectDeliveryUncertainError):
@@ -1224,7 +1224,7 @@ def test_cutover_waits_for_generation_fenced_effect_transaction(pg_clean):
 
     def blocking_dispatch(_effect_type, _payload):
         dispatch_entered.set()
-        assert release_dispatch.wait(timeout=3), "test did not release dispatch"
+        assert release_dispatch.wait(timeout=BACKGROUND_EVENT_TIMEOUT), "test did not release dispatch"
 
     def advance_generation():
         cutover_started.set()
@@ -1236,9 +1236,9 @@ def test_cutover_waits_for_generation_fenced_effect_transaction(pg_clean):
         apply_future = pool.submit(
             effect_outbox.apply_pending_effects, uid, dispatch=blocking_dispatch
         )
-        assert dispatch_entered.wait(timeout=3), "effect never reached dispatch"
+        assert dispatch_entered.wait(timeout=BACKGROUND_EVENT_TIMEOUT), "effect never reached dispatch"
         cutover_future = pool.submit(advance_generation)
-        assert cutover_started.wait(timeout=3), "cutover task never started"
+        assert cutover_started.wait(timeout=BACKGROUND_EVENT_TIMEOUT), "cutover task never started"
 
         try:
             with pytest.raises(FutureTimeoutError):
@@ -1296,7 +1296,7 @@ def test_delete_waiter_does_not_deadlock_nested_reply_sink(
 
     def nested_reply_dispatch(_effect_type, _payload):
         dispatch_entered.set()
-        assert exclusive_called.wait(timeout=3), "delete never requested fence"
+        assert exclusive_called.wait(timeout=BACKGROUND_EVENT_TIMEOUT), "delete never requested fence"
 
         # Wait until PostgreSQL itself reports the delete backend sleeping on
         # the advisory lock.  This makes the ordering deterministic rather than
@@ -1338,7 +1338,7 @@ def test_delete_waiter_does_not_deadlock_nested_reply_sink(
             uid,
             dispatch=nested_reply_dispatch,
         )
-        assert dispatch_entered.wait(timeout=3), "effect never reached dispatch"
+        assert dispatch_entered.wait(timeout=BACKGROUND_EVENT_TIMEOUT), "effect never reached dispatch"
         delete_future = pool.submit(db.delete_user, uid)
 
         assert apply_future.result(timeout=5) == {"applied": 1, "discarded": 0}

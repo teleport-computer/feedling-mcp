@@ -20,6 +20,8 @@ from tools.e2e.probe_common import (
     BLOCKED_EVIDENCE, BLOCKING, PASS, PRODUCT_FAIL, worst,
 )
 
+from conftest import capture_sleeps
+
 
 def _r(outcome):
     """Probe case functions return (result, detail); grab the result."""
@@ -100,7 +102,7 @@ def test_wait_proactive_reply_correlates_by_job_id_only(monkeypatch):
     # a late ORDINARY reply (no proactive_job_id) must be POLLED and then rejected —
     # patched clock/sleep so the loop actually inspects the row before timing out.
     clock = {"t": 100.0}
-    monkeypatch.setattr(exp.time, "sleep", lambda *_a: None)
+    capture_sleeps(monkeypatch, exp)
     monkeypatch.setattr(exp.time, "time", lambda: clock.__setitem__("t", clock["t"] + 2) or clock["t"])
     ordinary = FakeClient(lambda m, p, **kw: FakeResp(200, {"messages": [
         {"role": "agent", "id": "a2", "reply_to_message_id": "u1"}]}))
@@ -254,7 +256,7 @@ def test_injected_text_blocks_on_empty_fetch(monkeypatch):
     c = FakeClient(handler)
     # short-circuit the capture poll wait
     monkeypatch.setattr(exp, "new_marker", lambda: mk)
-    monkeypatch.setattr(exp.time, "sleep", lambda *_a: None)
+    capture_sleeps(monkeypatch, exp)
     # capture loop uses memory_summaries via index; give it the marker quickly
     c.memory_summaries = lambda limit=100: [f"cat {mk}"]
     assert _r(exp._injected_text(c)) == BLOCKED_EVIDENCE
