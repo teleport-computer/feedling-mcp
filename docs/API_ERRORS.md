@@ -93,7 +93,7 @@
 | `vision_observer_invalid_request` | 400 | — | resident 视觉观察请求缺少 message_id 或 route_id | |
 | `vision_route_mismatch` | 409 | system | 请求 route_id 与消息发送时固定的 route 不一致，拒绝重新路由 | |
 | `vision_image_unavailable` | 502 | system | enclave 未能返回该消息的解密图片 | |
-| `vision_observer_failed` | 502 | provider_transient | 专用视觉模型观察失败；fail-closed，不把原图回退给主模型 | |
+| `vision_observer_failed` | 502 | provider_transient | 专用视觉模型观察失败；仅限限流、暂时不可用、空响应或明确 `output_truncated` 且当前主模型精确视觉验证为 `ok` 时，运行时才可在同一绝对 deadline 的剩余时间内把失败项原图交给主模型；鉴权、额度、路由缺失/删除、不兼容、读图和未知失败均 fail-closed | |
 | `invalid_vision_mode` | 400 | user_provider | mode 不是 follow_main 或 dedicated | |
 
 ## `GET /v1/model_api/usage`（provider 账单/额度查询）

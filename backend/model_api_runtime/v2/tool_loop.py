@@ -648,6 +648,7 @@ async def run_tool_loop(
     on_tail_window=None,
     on_prompt_frontier_exhaustion=None,
     on_prompt_frontier_exhausted_detail=None,
+    absolute_deadline: float | None = None,
 ) -> LoopOutcome:
     """Run one chronological, provider-native tool transcript.
 
@@ -1619,6 +1620,7 @@ async def run_tool_loop(
                 max_attempts=(1 if forced_delivery_tool else 2),
                 base_delay_sec=0.2,
                 max_delay_sec=1.0,
+                absolute_deadline=absolute_deadline,
                 **provider_kwargs,
             )
         except Exception as exc:
@@ -1659,6 +1661,7 @@ async def run_tool_loop(
                         max_attempts=1,
                         base_delay_sec=0.2,
                         max_delay_sec=1.0,
+                        absolute_deadline=absolute_deadline,
                         **provider_kwargs,
                     )
                     # A successful text-only retry confirms that the rejected

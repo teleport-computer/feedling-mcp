@@ -182,6 +182,30 @@ def test_empty_tool_calls_is_final_reply_no_dispatch(monkeypatch):
     assert progress == ["round_boundary", "provider_start", "provider_complete"]
 
 
+def test_tool_loop_threads_visual_fallback_deadline_to_main_provider(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "hello", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(
+        provider_client, "reliable_chat_completion_async", provider
+    )
+    deadline = 12345.5
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=1,
+        absolute_deadline=deadline,
+    ))
+
+    assert outcome.final_text == "hello"
+    assert provider.calls[0]["absolute_deadline"] == deadline
+
+
 def test_provider_call_trace_failure_does_not_change_the_reply(monkeypatch):
     provider = _ScriptedProvider([
         {"reply": "hello", "stop_reason": "end_turn", "tool_calls": [], "usage": {}},

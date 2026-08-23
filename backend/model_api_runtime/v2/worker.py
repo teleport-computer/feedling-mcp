@@ -49,7 +49,7 @@ import time
 import uuid
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable
 
@@ -58,6 +58,7 @@ import generated_image
 import provider_attempt_ledger
 import provider_client
 import provider_health
+import vision_policy
 from voice import transcript_store as voice_transcript_store
 from notices import catalog as notices_catalog
 from notices import error_contract, rejection_stats
@@ -684,7 +685,7 @@ if not math.isfinite(_PROMPT_CATCHUP_DEADLINE_SEC) or _PROMPT_CATCHUP_DEADLINE_S
 
 # 每回合最多注入最近 N 张图。enclave 容量有限（每张图一次往返），且无 prompt caching ——
 # tail 里的图片每个回合都要重发，token 成本随图片数线性上升。
-_TAIL_IMAGE_LIMIT = int(os.environ.get("FEEDLING_V2_TAIL_IMAGE_LIMIT", "2"))
+_TAIL_IMAGE_LIMIT = _positive_int_env("FEEDLING_V2_TAIL_IMAGE_LIMIT", "2")
 # 单张图 b64 上限；超限跳过注入、退化成文本标记（不引入图像缩放依赖）。
 # 必须 >= 入库上限 hosted/turn.MODEL_API_MAX_IMAGE_BYTES(=2_000_000 原始字节) 的 base64
 # 长度 ceil(n/3)*4 = 2_666_668，否则 1.5–2.0MB 的图入库放行、却在此被丢成纯文本
@@ -1139,6 +1140,7 @@ class DedicatedVisionUnavailable(RuntimeError):
         provider: str = "",
         status_code: int | None = None,
         upstream_detail: str = "",
+        reason: str = "",
     ):
         super().__init__(message)
         self.error_code = error_contract.resolve_untrusted(
@@ -1150,9 +1152,51 @@ class DedicatedVisionUnavailable(RuntimeError):
         self.model = str(model or "")[:96]
         self.provider = str(provider or "")[:80]
         self.status_code = status_code if isinstance(status_code, int) else None
+        self.reason = str(reason or "")[:80]
         # Internal-only carrier. Never add this value to terminal status events,
         # trajectories, debug traces, or user-facing exception messages.
         self.upstream_detail = str(upstream_detail or "")[:240]
+
+
+@dataclass(frozen=True)
+class VisionObservationOutcome:
+    """One dedicated route result without carrying raw image bytes."""
+
+    observation: str = ""
+    error_code: str = ""
+    reason: str = ""
+    model: str = ""
+    provider: str = ""
+    status_code: int | None = None
+    upstream_detail: str = ""
+
+
+@dataclass(frozen=True)
+class VisionObservationBatch:
+    """Per-target dedicated results plus the shared privacy/deadline fence."""
+
+    outcomes: dict[str, VisionObservationOutcome]
+    absolute_deadline: float
+    main_vision_verified: bool
+
+
+@dataclass
+class VisionFallbackState:
+    """Turn-local state threaded from image injection into the main provider."""
+
+    absolute_deadline: float | None = None
+    selected_count: int = 0
+    selected_at: float | None = None
+    completed_emitted: bool = False
+    # Prompt-frontier recovery may rebuild the same tail before the first main
+    # provider call. Reuse dedicated results so a rebuild cannot mint a fresh
+    # visual deadline or repeat a paid observer request.
+    batch_cache: dict[
+        tuple[tuple[str, str], ...], VisionObservationBatch
+    ] = field(default_factory=dict)
+    selected_batch_keys: set[tuple[tuple[str, str], ...]] = field(
+        default_factory=set
+    )
 
 
 class ImageGenerationUnavailable(RuntimeError):
@@ -7464,6 +7508,7 @@ async def _read_seq_adaptive_prompt_context(
     add_usage: Callable[[dict | None], None] | None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
     active_image_ids: set[str] | None = None,
+    vision_fallback_state: VisionFallbackState | None = None,
     tail_cap: int | None = None,
 ) -> tuple[str, list[dict], list[list[dict]], bool, int, str, str, str]:
     """Read one exact core plus summary-covered complete-turn replay.
@@ -7545,6 +7590,9 @@ async def _read_seq_adaptive_prompt_context(
             read_images=deps.read_images,
             active_image_ids=active_image_ids,
             read_vision_observations=deps.read_vision_observations,
+            main_provider_config=provider_config,
+            vision_fallback_state=vision_fallback_state,
+            emit_debug_trace=deps.emit_debug_trace,
         )
         tail = await asyncio.to_thread(
             _inject_tail_files,
@@ -7560,6 +7608,9 @@ async def _read_seq_adaptive_prompt_context(
                 read_images=deps.read_images,
                 active_image_ids=active_image_ids,
                 read_vision_observations=deps.read_vision_observations,
+                main_provider_config=provider_config,
+                vision_fallback_state=vision_fallback_state,
+                emit_debug_trace=deps.emit_debug_trace,
             )
             optional_rows = await asyncio.to_thread(
                 _inject_tail_files,
@@ -12138,6 +12189,9 @@ def _inject_tail_images(
     read_images,
     active_image_ids: set[str] | None = None,
     read_vision_observations=None,
+    main_provider_config: Any = None,
+    vision_fallback_state: VisionFallbackState | None = None,
+    emit_debug_trace: Callable[..., None] | None = None,
 ) -> list[dict]:
     """Materialize V2 image rows without crossing the selected privacy route.
 
@@ -12162,30 +12216,177 @@ def _inject_tail_images(
         and str(row["id"]) in active_ids
     ]
     observations: dict[str, str] = {}
+    fallback_fetched: dict[str, dict] = {}
     if dedicated_targets:
         if read_vision_observations is None:
             raise DedicatedVisionUnavailable("vision observer is not wired")
-        try:
-            observations = read_vision_observations(user_id, dedicated_targets) or {}
-        except Exception as exc:  # noqa: BLE001 — stable V2 failure surface below
-            safe_code = str(
-                getattr(exc, "error_code", "") or "vision_model_failed"
-            )[:64]
-            raise DedicatedVisionUnavailable(
-                "vision observer failed",
-                error_code=safe_code,
-                model=str(getattr(exc, "model", "") or ""),
-                provider=str(getattr(exc, "provider", "") or ""),
-                status_code=getattr(exc, "status_code", None),
-                upstream_detail=str(
-                    getattr(exc, "upstream_detail", "") or ""
-                ),
-            ) from exc
-        if any(
-            not str(observations.get(item["message_id"]) or "").strip()
+        batch_key = tuple(
+            (item["message_id"], item["route_id"])
             for item in dedicated_targets
-        ):
-            raise DedicatedVisionUnavailable("vision observation missing")
+        )
+        batch = (
+            vision_fallback_state.batch_cache.get(batch_key)
+            if vision_fallback_state is not None
+            else None
+        )
+        batch_was_cached = batch is not None
+        if batch is None:
+            try:
+                batch = read_vision_observations(
+                    user_id,
+                    dedicated_targets,
+                    main_provider_config=main_provider_config,
+                )
+            except Exception as exc:  # noqa: BLE001 — stable V2 failure surface below
+                safe_code = str(
+                    getattr(exc, "error_code", "") or "vision_model_failed"
+                )[:64]
+                raise DedicatedVisionUnavailable(
+                    "vision observer failed",
+                    error_code=safe_code,
+                    model=str(getattr(exc, "model", "") or ""),
+                    provider=str(getattr(exc, "provider", "") or ""),
+                    status_code=getattr(exc, "status_code", None),
+                    upstream_detail=str(
+                        getattr(exc, "upstream_detail", "") or ""
+                    ),
+                    reason=str(getattr(exc, "reason", "") or ""),
+                ) from exc
+
+        if isinstance(batch, VisionObservationBatch):
+            outcomes = batch.outcomes
+        elif isinstance(batch, dict):
+            # Compatibility seam for non-production callers that still return
+            # the pre-A2 success-only shape. It cannot authorize fallback.
+            outcomes = {
+                str(message_id): VisionObservationOutcome(
+                    observation=str(observation or "").strip()
+                )
+                for message_id, observation in batch.items()
+            }
+            batch = VisionObservationBatch(
+                outcomes=outcomes,
+                absolute_deadline=time.monotonic(),
+                main_vision_verified=False,
+            )
+        else:
+            raise DedicatedVisionUnavailable("vision observation batch invalid")
+        if vision_fallback_state is not None and not batch_was_cached:
+            vision_fallback_state.batch_cache[batch_key] = batch
+
+        failures: list[tuple[str, VisionObservationOutcome]] = []
+        for item in dedicated_targets:
+            message_id = item["message_id"]
+            outcome = outcomes.get(message_id)
+            if outcome is None:
+                failures.append(
+                    (message_id, VisionObservationOutcome(
+                        error_code="vision_model_failed"
+                    ))
+                )
+                continue
+            observation = str(outcome.observation or "").strip()
+            if observation:
+                observations[message_id] = observation
+            else:
+                failures.append((message_id, outcome))
+
+        if failures:
+            first_failure = failures[0][1]
+
+            def raise_dedicated(message: str) -> None:
+                raise DedicatedVisionUnavailable(
+                    message,
+                    error_code=(
+                        first_failure.error_code or "vision_model_failed"
+                    ),
+                    model=first_failure.model,
+                    provider=first_failure.provider,
+                    status_code=first_failure.status_code,
+                    upstream_detail=first_failure.upstream_detail,
+                    reason=first_failure.reason,
+                )
+
+            all_eligible = all(
+                vision_policy.is_main_fallback_eligible(
+                    outcome.error_code, outcome.reason
+                )
+                for _message_id, outcome in failures
+            )
+            remaining = float(batch.absolute_deadline) - time.monotonic()
+            selected_count = (
+                len(failures)
+                if all_eligible and batch.main_vision_verified and remaining > 0
+                else 0
+            )
+            skipped_reason = "none"
+            if not all_eligible:
+                skipped_reason = "ineligible_failure"
+            elif not batch.main_vision_verified:
+                skipped_reason = "main_route_unverified"
+            elif remaining <= 0:
+                skipped_reason = "deadline_exhausted"
+            if emit_debug_trace is not None and not batch_was_cached:
+                try:
+                    emit_debug_trace(
+                        user_id,
+                        "vision.fallback.evaluated",
+                        status="ok" if selected_count else "gated",
+                        summary="vision_fallback_evaluated",
+                        explain=(
+                            "Records only closed-set routing and deadline state; "
+                            "no message ids, image bytes, captions, or observations."
+                        ),
+                        detail={
+                            "eligible_failure_count": (
+                                len(failures) if all_eligible else 0
+                            ),
+                            "main_vision_verified": bool(
+                                batch.main_vision_verified
+                            ),
+                            "remaining_budget": (
+                                "positive" if remaining > 0 else "expired"
+                            ),
+                            "selected_count": selected_count,
+                            "skipped_reason": skipped_reason,
+                        },
+                    )
+                except Exception as trace_exc:  # noqa: BLE001 — best effort
+                    log.warning(
+                        "[v2.vision] fallback evaluation trace failed "
+                        "user=%s code=%s",
+                        user_id,
+                        type(trace_exc).__name__.lower(),
+                    )
+            if selected_count <= 0:
+                raise_dedicated("vision fallback was not authorized")
+            if read_images is None:
+                raise_dedicated("vision fallback image reader is not wired")
+            selected_ids = [message_id for message_id, _outcome in failures]
+            try:
+                # Deliberate second read: this is the auditable disclosure gate.
+                # Successful dedicated targets are absent from this exact list.
+                fallback_fetched = read_images(user_id, selected_ids) or {}
+            except Exception as exc:  # noqa: BLE001 — preserve dedicated identity
+                raise_dedicated("vision fallback image read failed")
+            if any(
+                not str(
+                    (fallback_fetched.get(message_id) or {}).get("image_b64") or ""
+                )
+                for message_id in selected_ids
+            ):
+                raise_dedicated("vision fallback image payload missing")
+            if (
+                vision_fallback_state is not None
+                and batch_key not in vision_fallback_state.selected_batch_keys
+            ):
+                vision_fallback_state.absolute_deadline = float(
+                    batch.absolute_deadline
+                )
+                vision_fallback_state.selected_count += selected_count
+                vision_fallback_state.selected_batch_keys.add(batch_key)
+                if vision_fallback_state.selected_at is None:
+                    vision_fallback_state.selected_at = time.monotonic()
 
     wanted = [
         str(row["id"])
@@ -12205,6 +12406,9 @@ def _inject_tail_images(
         message_id = str(row.get("id") or "")
         route_id = str(row.get("vision_route_id") or "")
         if row.get("has_image") and route_id:
+            if message_id not in active_ids:
+                out.append(row)
+                continue
             observation = str(observations.get(message_id) or "").strip()
             if observation:
                 caption = context.text_of(row.get("content"))
@@ -12221,8 +12425,23 @@ def _inject_tail_images(
                     + observation_block
                 )
                 out.append({**row, "content": content})
-            else:
-                out.append(row)
+                continue
+            got = fallback_fetched.get(message_id)
+            b64 = str((got or {}).get("image_b64") or "")
+            if not b64 or len(b64) > _IMAGE_MAX_B64_CHARS:
+                raise DedicatedVisionUnavailable(
+                    "vision fallback image payload invalid"
+                )
+            mime = str((got or {}).get("image_mime") or "image/jpeg")
+            blocks: list[dict] = []
+            caption = context.text_of(row.get("content"))
+            if caption and caption != "[image]":
+                blocks.append({"type": "text", "text": caption})
+            blocks.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            })
+            out.append({**row, "content": blocks})
             continue
 
         got = fetched.get(message_id) if row.get("has_image") else None
@@ -12289,6 +12508,53 @@ def _inject_tail_files(tail: list[dict], *, user_id: str, read_files) -> list[di
         note = "\n（文件内容较长，已截断）" if got.get("truncated") else ""
         out.append({**row, "content": f"[file: {name}]\n{text}{note}"})
     return out
+
+
+def _emit_vision_fallback_completed(
+    deps: TurnDeps,
+    user_id: str,
+    state: VisionFallbackState,
+    *,
+    outcome: str,
+    error_class: str = "",
+) -> None:
+    """Emit the content-free terminal half of a selected main fallback."""
+    if (
+        state.selected_count <= 0
+        or state.completed_emitted
+        or deps.emit_debug_trace is None
+    ):
+        return
+    state.completed_emitted = True
+    started_at = state.selected_at
+    dur_ms = (
+        max(0.0, (time.monotonic() - started_at) * 1000.0)
+        if started_at is not None
+        else 0.0
+    )
+    try:
+        deps.emit_debug_trace(
+            user_id,
+            "vision.fallback.completed",
+            status="ok" if outcome == "success" else "error",
+            summary="vision_fallback_completed",
+            explain=(
+                "Records only fallback count, terminal class, and duration; "
+                "no message ids, image bytes, captions, observations, or replies."
+            ),
+            dur_ms=dur_ms,
+            detail={
+                "selected_count": int(state.selected_count),
+                "outcome": "success" if outcome == "success" else "error",
+                "error_class": str(error_class or "none")[:80],
+            },
+        )
+    except Exception as trace_exc:  # noqa: BLE001 — telemetry is best effort
+        log.warning(
+            "[v2.vision] fallback completion trace failed user=%s code=%s",
+            user_id,
+            type(trace_exc).__name__.lower(),
+        )
 
 
 async def _ensure_prompt_coverage_or_degrade(
@@ -12407,6 +12673,7 @@ async def process_job(
     mcp_offered_names: tuple[str, ...] = ()
     mcp_called_names: list[str] = []
     mcp_turn_outcome = "failed"
+    vision_fallback_state = VisionFallbackState()
     provider_roundtrip_trace = (
         _provider_tool_surface_callback(
             deps,
@@ -12953,6 +13220,7 @@ async def process_job(
                     for row in coalesced
                     if row.get("has_image") and row.get("id")
                 },
+                vision_fallback_state=vision_fallback_state,
                 tail_cap=_TAIL_HARD_CAP,
             )
             if ordered_chat_replies:
@@ -14695,6 +14963,7 @@ async def process_job(
                         for row in coalesced
                         if row.get("has_image") and row.get("id")
                     },
+                    vision_fallback_state=vision_fallback_state,
                     tail_cap=_TAIL_HARD_CAP,
                 )
                 if ordered_chat_replies:
@@ -14844,7 +15113,20 @@ async def process_job(
                     deps, user_id, lane
                 )
             ),
+            absolute_deadline=(
+                vision_fallback_state.absolute_deadline
+                if vision_fallback_state.selected_count > 0
+                else None
+            ),
         )
+        if vision_fallback_state.selected_count > 0:
+            await asyncio.to_thread(
+                _emit_vision_fallback_completed,
+                deps,
+                user_id,
+                vision_fallback_state,
+                outcome="success",
+            )
         if pushed_screen_frame_ids:
             await asyncio.to_thread(
                 jobs_store.upsert_wake_schedule,
@@ -15138,9 +15420,19 @@ async def process_job(
         log.info("[v2.worker] job %s stopped at rollout fence: %s", job_id, e)
         return "failed"
     except Exception as e:  # noqa: BLE001 - terminal outbox owns failure visibility
+        if vision_fallback_state.selected_count > 0:
+            await asyncio.to_thread(
+                _emit_vision_fallback_completed,
+                deps,
+                user_id,
+                vision_fallback_state,
+                outcome="error",
+                error_class=_turn_failure_error_class(e),
+            )
         failure_exc: BaseException = e
         if (
             not isinstance(e, DedicatedVisionUnavailable)
+            and vision_fallback_state.selected_count <= 0
             and any(bool(row.get("has_image")) for row in coalesced)
         ):
             classified = _turn_failure_error_class(e)

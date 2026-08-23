@@ -387,6 +387,92 @@ def test_process_job_end_to_end_writes_reply_and_completes(monkeypatch):
     assert "action_digest" in state  # non-sensitive digest only; no capability data leaked here
 
 
+def test_process_job_passes_selected_vision_deadline_to_tool_loop(monkeypatch):
+    """A raw-pixel fallback may use only the dedicated batch's remaining time."""
+    uid = "u_w_vision_deadline"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-vision-deadline")
+    deadline = worker.time.monotonic() + 60.0
+
+    async def read_prompt_context(*_args, vision_fallback_state, **_kwargs):
+        vision_fallback_state.absolute_deadline = deadline
+        vision_fallback_state.selected_count = 1
+        return "", [], [], False, 0, "", "", ""
+
+    async def coverage_is_current(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        worker,
+        "_read_seq_adaptive_prompt_context",
+        read_prompt_context,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_ensure_prompt_coverage_or_degrade",
+        coverage_is_current,
+    )
+    monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: 0)
+    monkeypatch.setattr(
+        worker.db,
+        "chat_recent_genuine_turn_boundary_seq",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "get_chat_tail_anchor",
+        lambda _uid: None,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_emit_vision_fallback_completed",
+        lambda *_args, **_kwargs: None,
+    )
+    captured = {}
+
+    async def run_loop(*, absolute_deadline, on_reply, **_kwargs):
+        captured["absolute_deadline"] = absolute_deadline
+        await on_reply("MODEL REPLY", final=True)
+        return worker.v2_tool_loop.LoopOutcome(
+            "MODEL REPLY",
+            1,
+            "completed",
+            False,
+        )
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", run_loop)
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda _store, _text: {"id": "r-vision-deadline"},
+    )
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [
+            {"id": "m1", "ts": 10.0, "role": "user", "content": "image"}
+        ],
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        read_summary_with_seq=lambda _uid: ("", 0.0, 0, 0),
+        read_tail_after_seq=lambda *_args, **_kwargs: [],
+        apply_pending_effects=_apply_effects,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert captured["absolute_deadline"] == deadline
+
+
 def test_chat_still_calls_provider_and_restores_unhealthy_state(monkeypatch):
     uid = "u_w_provider_health_chat_probe"
     conftest.seed_user(uid)
@@ -1480,6 +1566,31 @@ def test_positive_worker_integer_settings_fail_closed(monkeypatch, raw):
 def test_positive_worker_integer_setting_accepts_value(monkeypatch):
     monkeypatch.setenv("TEST_V2_POSITIVE_INT", "3")
     assert worker._positive_int_env("TEST_V2_POSITIVE_INT", "1") == 3
+
+
+@pytest.mark.parametrize("raw", ["0", "-1"])
+def test_tail_image_limit_fails_worker_startup_when_nonpositive(raw):
+    backend = str(Path(__file__).parent.parent / "backend")
+    env = os.environ.copy()
+    env["FEEDLING_V2_TAIL_IMAGE_LIMIT"] = raw
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                f"import sys; sys.path.insert(0, {backend!r}); "
+                "from model_api_runtime.v2 import worker"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "FEEDLING_V2_TAIL_IMAGE_LIMIT must be a positive integer" in result.stderr
 
 
 # ------------------------------------------------------------------

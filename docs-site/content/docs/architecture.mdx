@@ -72,6 +72,19 @@ protects persisted content and the storage path; it does not hide the prompt
 from the model selected to process it. When visible push text is enabled, that
 notification text also passes through the external push provider.
 
+A selected dedicated image observer is normally the only model provider that
+receives an image's pixels; the main provider receives an untrusted text
+observation. If the observer is rate-limited, temporarily unavailable, empty, or
+explicitly truncated, Runtime V2 may disclose only those failed images to the
+exact current main route, and only while that route's exact image-control verdict
+is still `ok`. Authentication, quota, route, compatibility, image-read, and
+unknown failures do not cross that fallback boundary. Mixed batches retain text
+for successful observations and decrypt only failed image IDs again. The
+observer and every main recovery call share one absolute deadline, so recovery
+does not extend the turn's visual-processing budget. The official resident uses
+the same closed failure policy and only trusts the image verdict pinned into its
+currently spawned main-agent entry.
+
 Managed provider routes resolve every explicit HTTPS base URL on each
 validation, including the validation immediately before runtime calls, and
 reject the route when any answer is not publicly reachable. This reuses the

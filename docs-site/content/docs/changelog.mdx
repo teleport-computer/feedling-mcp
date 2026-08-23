@@ -10,6 +10,17 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Dedicated image observation now has a bounded, exact-main recovery path.**
+  Rate limiting, temporary unavailability, an empty observation, or an explicitly
+  truncated observation can send only the affected image to the exact current
+  main route when that route's image-control verdict is still `ok`. Authentication,
+  quota, route, compatibility, image-read, and unknown failures remain
+  fail-closed. Mixed batches keep successful items as observation text and
+  decrypt only eligible failed IDs again; the observer and all recovery calls
+  consume one monotonic absolute deadline. Hosted Runtime V2 and the official
+  resident follow the same closed failure policy, and a recovery failure keeps
+  the main provider's native public error classification.
+
 - **Runtime error classifications now have one authoritative registry.** Chat,
   vision, and image-generation paths derive their public `error_class`, blame,
   safe text, and matching rules from the same server-owned specification.

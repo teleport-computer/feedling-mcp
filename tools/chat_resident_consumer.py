@@ -152,6 +152,9 @@ except ImportError:
 from perception_kernel import prompts as perception_prompts
 
 import generated_image
+import provider_client as _provider_client
+import vision_policy as _vision_policy
+from hosted import visual_transport as _visual_transport
 
 # Shared torn-protocol-JSON leak detector (backend/core, pure). backend/ is on
 # sys.path via the insert above, so it imports as a top-level `core.*` name.
@@ -549,6 +552,9 @@ FOREGROUND_WORLDBOOK_CONTEXT_MODE = os.environ.get(
 SCREEN_VISION_TEST_STATUS = os.environ.get(
     "FEEDLING_AGENT_VISION_TEST_STATUS", "untested"
 ).strip().lower()
+_RESIDENT_VISION_PRIMARY_BUDGET_SEC = (
+    _visual_transport.visual_batch_budget_sec(1)
+)
 # Foreground chat continuity. Resume-capable runtimes get one canonical Enclave
 # bridge per session; stateless Codex and hosted Claude get it on every turn.
 #   auto (default) — inject once for Codex with `exec resume`, always for older
@@ -857,6 +863,7 @@ class VisionObserverFailure(RuntimeError):
         raw_user_text: str = "",
         model: str = "",
         provider: str = "",
+        reason: str = "",
     ):
         super().__init__(error_class)
         spec = _error_contract.resolve_untrusted(
@@ -871,6 +878,7 @@ class VisionObserverFailure(RuntimeError):
         self.raw_user_text = raw_user_text
         self.model = _sanitize_thinking_meta(model, max_len=96)
         self.provider = _sanitize_thinking_meta(provider, max_len=80)
+        self.reason = _sanitize_thinking_meta(reason, max_len=80)
 
 
 class ImageGenerationFailure(RuntimeError):
@@ -3160,13 +3168,41 @@ def _image_file_paths_for_msg(msg: dict) -> list[str]:
     return paths
 
 
-def _vision_observation(message_id: str, route_id: str) -> str:
+def _remaining_deadline_timeout(
+    absolute_deadline: float | None,
+    *,
+    cap_sec: float,
+) -> float:
+    if absolute_deadline is None:
+        return float(cap_sec)
+    remaining = float(absolute_deadline) - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("vision fallback absolute deadline exceeded")
+    return min(float(cap_sec), remaining)
+
+
+def _resident_main_vision_verified() -> bool:
+    """The probe verdict is pinned to this immutable spawned agent entry."""
+    return (
+        SCREEN_VISION_TEST_STATUS == "ok"
+        and not _screen_runtime_unsupported
+    )
+
+
+def _vision_observation(
+    message_id: str,
+    route_id: str,
+    *,
+    absolute_deadline: float | None = None,
+) -> str:
     """Resolve a pinned observer without exposing pixels to the main agent."""
     response = _HTTP.post(
         f"{FEEDLING_API_URL}/v1/vision/observe",
         headers=_HEADERS,
         json={"message_id": message_id, "route_id": route_id},
-        timeout=100,
+        timeout=_remaining_deadline_timeout(
+            absolute_deadline, cap_sec=100.0
+        ),
     )
     try:
         body = response.json() or {}
@@ -3181,6 +3217,7 @@ def _vision_observation(message_id: str, route_id: str) -> str:
             detail=str(body.get("detail") or "")[:160],
             model=str(body.get("model") or ""),
             provider=str(body.get("provider") or ""),
+            reason=str(body.get("reason") or ""),
         )
     observation = str(body.get("observation") or "").strip()
     if not observation:
@@ -7153,6 +7190,7 @@ def _call_agent_http_simple(
     stream_update: Callable[[int, str, bool], None] | None = None,
     request_id: str = "",
     cancellation: _VoiceTurnCancellation | None = None,
+    absolute_deadline: float | None = None,
 ) -> Any:
     headers = _agent_http_headers()
     if request_id and AGENT_HTTP_REQUEST_ID_HEADER:
@@ -7171,14 +7209,18 @@ def _call_agent_http_simple(
             AGENT_HTTP_URL,
             payload=payload,
             headers=headers,
-            timeout=60,
+            timeout=_remaining_deadline_timeout(
+                absolute_deadline, cap_sec=60.0
+            ),
         )
         if stream_update is not None
         else _HTTP.post(
             AGENT_HTTP_URL,
             json=payload,
             headers=headers,
-            timeout=60,
+            timeout=_remaining_deadline_timeout(
+                absolute_deadline, cap_sec=60.0
+            ),
         )
     )
     if cancellation is not None:
@@ -7258,6 +7300,7 @@ def _call_agent_http_openai(
     stream_update: Callable[[int, str, bool], None] | None = None,
     request_id: str = "",
     cancellation: _VoiceTurnCancellation | None = None,
+    absolute_deadline: float | None = None,
 ) -> Any:
     headers = _agent_http_headers()
     if request_id and AGENT_HTTP_REQUEST_ID_HEADER:
@@ -7289,11 +7332,18 @@ def _call_agent_http_openai(
             AGENT_HTTP_URL,
             payload=payload,
             headers=headers,
-            timeout=120,
+            timeout=_remaining_deadline_timeout(
+                absolute_deadline, cap_sec=120.0
+            ),
         )
     else:
         resp = _HTTP.post(
-            AGENT_HTTP_URL, json=payload, headers=headers, timeout=120
+            AGENT_HTTP_URL,
+            json=payload,
+            headers=headers,
+            timeout=_remaining_deadline_timeout(
+                absolute_deadline, cap_sec=120.0
+            ),
         )
     if cancellation is not None:
         cancellation.add_cancel_callback(resp.close)
@@ -7311,7 +7361,12 @@ def _call_agent_http_openai(
                 payload["stream"] = False
                 headers.pop("Accept", None)
                 resp = _HTTP.post(
-                    AGENT_HTTP_URL, json=payload, headers=headers, timeout=120
+                    AGENT_HTTP_URL,
+                    json=payload,
+                    headers=headers,
+                    timeout=_remaining_deadline_timeout(
+                        absolute_deadline, cap_sec=120.0
+                    ),
                 )
                 if cancellation is not None:
                     cancellation.add_cancel_callback(resp.close)
@@ -7388,6 +7443,7 @@ def call_agent_http(
     stream_update: Callable[[int, str, bool], None] | None = None,
     request_id: str = "",
     cancellation: _VoiceTurnCancellation | None = None,
+    absolute_deadline: float | None = None,
 ) -> Any:
     if not AGENT_HTTP_URL:
         raise ValueError("AGENT_HTTP_URL is not set for http mode")
@@ -7398,6 +7454,7 @@ def call_agent_http(
             stream_update=stream_update,
             request_id=request_id,
             cancellation=cancellation,
+            absolute_deadline=absolute_deadline,
         )
     if AGENT_HTTP_PROTOCOL in {"simple", "generic", "json"}:
         return _call_agent_http_simple(
@@ -7406,6 +7463,7 @@ def call_agent_http(
             stream_update=stream_update,
             request_id=request_id,
             cancellation=cancellation,
+            absolute_deadline=absolute_deadline,
         )
     raise ValueError(f"unknown AGENT_HTTP_PROTOCOL: {AGENT_HTTP_PROTOCOL!r}")
 
@@ -9785,6 +9843,7 @@ def call_agent_cli(
     isolated_session: bool = False,
     outbound_fence: bool = False,
     cancellation: _VoiceTurnCancellation | None = None,
+    absolute_deadline: float | None = None,
 ) -> Any:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
@@ -9872,11 +9931,18 @@ def call_agent_cli(
     _run_kwargs: dict = {
         "capture_output": True,
         "text": True,
-        "timeout": AGENT_TURN_TIMEOUT_SEC,
+        "timeout": _remaining_deadline_timeout(
+            absolute_deadline, cap_sec=float(AGENT_TURN_TIMEOUT_SEC)
+        ),
         "env": child_env,
         "encoding": "utf-8",
         "errors": "replace",
     }
+
+    def _refresh_cli_deadline() -> None:
+        _run_kwargs["timeout"] = _remaining_deadline_timeout(
+            absolute_deadline, cap_sec=float(AGENT_TURN_TIMEOUT_SEC)
+        )
     if _cli_cwd:
         _run_kwargs["cwd"] = _cli_cwd
     if _is_pi_cmd(cmd):
@@ -9925,6 +9991,7 @@ def call_agent_cli(
                     "codex exec path: %s",
                     exc,
                 )
+                _refresh_cli_deadline()
                 result = _run_cli_subprocess(
                     cmd,
                     _run_kwargs,
@@ -9934,6 +10001,7 @@ def call_agent_cli(
                     **run_extra,
                 )
         else:
+            _refresh_cli_deadline()
             result = _run_cli_subprocess(
                 cmd,
                 _run_kwargs,
@@ -10159,6 +10227,7 @@ def call_agent_cli(
             command_sid = _cli_flag_value(cmd, "--session-id")
             if stdin_msg is not None:
                 _run_kwargs["input"] = stdin_msg
+            _refresh_cli_deadline()
             result = _run_cli_subprocess(
                 cmd,
                 _run_kwargs,
@@ -10237,6 +10306,7 @@ def call_agent_cli(
                 summary="pi stream cut; single retry",
                 explain="上游把流式回复中途掐断(无 finish_reason)——立即重试本轮一次",
             )
+            _refresh_cli_deadline()
             result = _run_cli_subprocess(
                 cmd,
                 _run_kwargs,
@@ -10671,6 +10741,7 @@ def call_agent(
     isolated_session: bool = False,
     outbound_fence: bool = False,
     cancellation: _VoiceTurnCancellation | None = None,
+    absolute_deadline: float | None = None,
 ) -> Any:
     # `_turn_reply_parse_failed` is a per-turn signal: reset it at entry so a
     # prior turn's failure (or a suppressed leak below) never bleeds into this
@@ -10696,6 +10767,8 @@ def call_agent(
                 http_kwargs["request_id"] = trace_id
             if cancellation is not None:
                 http_kwargs["cancellation"] = cancellation
+            if absolute_deadline is not None:
+                http_kwargs["absolute_deadline"] = absolute_deadline
             return call_agent_http(message, **http_kwargs)
         if AGENT_MODE == "cli":
             cli_kwargs: dict[str, Any] = {
@@ -10712,6 +10785,8 @@ def call_agent(
                 cli_kwargs["outbound_fence"] = True
             if isolated_session:
                 cli_kwargs["isolated_session"] = True
+            if absolute_deadline is not None:
+                cli_kwargs["absolute_deadline"] = absolute_deadline
             return call_agent_cli(message, **cli_kwargs)
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
@@ -17624,6 +17699,9 @@ def _process_messages(messages: list) -> float:
         image_payloads: list[dict[str, str]] = []
         image_paths: list[str] = []
         vision_observer_failed: VisionObserverFailure | None = None
+        vision_fallback_deadline: float | None = None
+        vision_fallback_selected = False
+        vision_fallback_started_at: float | None = None
 
         if content_type == "image":
             # Image messages legitimately have content == "" — the JPEG
@@ -17635,22 +17713,78 @@ def _process_messages(messages: list) -> float:
             )
             vision_route_id = str(msg.get("vision_route_id") or "").strip()
             if vision_route_id:
+                vision_fallback_deadline = (
+                    time.monotonic() + _RESIDENT_VISION_PRIMARY_BUDGET_SEC
+                )
                 try:
                     observation = _vision_observation(
                         str(msg.get("id") or msg.get("message_id") or ""),
                         vision_route_id,
+                        absolute_deadline=vision_fallback_deadline,
                     )
                     content = _vision_observation_content(content, observation)
                 except Exception as exc:
                     if isinstance(exc, VisionObserverFailure):
                         exc.raw_user_text = raw_user_content_for_lang
-                        vision_observer_failed = exc
+                        failure = exc
                     else:
-                        vision_observer_failed = VisionObserverFailure(
-                            "vision_model_unavailable",
+                        failure = VisionObserverFailure(
+                            "vision_model_failed",
                             detail=type(exc).__name__,
                             raw_user_text=raw_user_content_for_lang,
                         )
+                    eligible = _vision_policy.is_main_fallback_eligible(
+                        failure.error_class, failure.reason
+                    )
+                    main_verified = _resident_main_vision_verified()
+                    remaining = (
+                        float(vision_fallback_deadline) - time.monotonic()
+                    )
+                    if eligible and main_verified and remaining > 0:
+                        image_payloads = _image_payloads_from_msg(msg)
+                        image_paths = (
+                            _image_file_paths_for_msg(msg)
+                            if image_payloads
+                            else []
+                        )
+                    if image_payloads:
+                        vision_fallback_selected = True
+                        vision_fallback_started_at = time.monotonic()
+                    else:
+                        vision_observer_failed = failure
+                    skipped_reason = "none"
+                    if not eligible:
+                        skipped_reason = "ineligible_failure"
+                    elif not main_verified:
+                        skipped_reason = "main_entry_unverified"
+                    elif remaining <= 0:
+                        skipped_reason = "deadline_exhausted"
+                    elif not image_payloads:
+                        skipped_reason = "image_payload_missing"
+                    _emit_debug_trace(
+                        "vision",
+                        "vision.fallback.evaluated",
+                        status="ok" if vision_fallback_selected else "gated",
+                        trace_id=str(
+                            msg.get("id") or msg.get("message_id") or ""
+                        ),
+                        summary="vision fallback evaluated",
+                        explain=(
+                            "仅记录闭集路由与 deadline 状态；不记录图片、caption、"
+                            "observation 或回复。"
+                        ),
+                        detail={
+                            "eligible_failure_count": 1 if eligible else 0,
+                            "main_vision_verified": main_verified,
+                            "remaining_budget": (
+                                "positive" if remaining > 0 else "expired"
+                            ),
+                            "selected_count": (
+                                1 if vision_fallback_selected else 0
+                            ),
+                            "skipped_reason": skipped_reason,
+                        },
+                    )
                     log.error(
                         "dedicated vision observer failed [id=%s route=%s]: %s",
                         msg.get("id") or msg.get("message_id") or "",
@@ -17937,6 +18071,12 @@ def _process_messages(messages: list) -> float:
         pending_failure_notice: BaseException | None = None
         pending_failure_is_parse_only = False
 
+        def _vision_fallback_deadline_kwargs() -> dict[str, float]:
+            if not vision_fallback_selected:
+                return {}
+            assert vision_fallback_deadline is not None
+            return {"absolute_deadline": vision_fallback_deadline}
+
         def _dispatch_foreground_agent(turn_content: str) -> Any:
             _start_voice_cancellation()
             fence_kwargs = {"outbound_fence": True} if screen_pixel_turn else {}
@@ -17945,12 +18085,14 @@ def _process_messages(messages: list) -> float:
                 if voice_cancellation is not None
                 else {}
             )
+            deadline_kwargs = _vision_fallback_deadline_kwargs()
             if use_resident_chat_v2_profile:
                 return call_agent(
                     _resident_foreground_chat_message_v2(turn_content),
                     trace_id=trace_id, lane="chat",
                     stream_update=voice_stream_update,
                     **cancellation_kwargs,
+                    **deadline_kwargs,
                     **fence_kwargs,
                     **attempt_kwargs)
             if image_payloads or image_paths:
@@ -17962,6 +18104,7 @@ def _process_messages(messages: list) -> float:
                     lane="chat",
                     stream_update=voice_stream_update,
                     **cancellation_kwargs,
+                    **deadline_kwargs,
                     **fence_kwargs,
                     **attempt_kwargs,
                 )
@@ -17971,6 +18114,7 @@ def _process_messages(messages: list) -> float:
                 lane="chat",
                 stream_update=voice_stream_update,
                 **cancellation_kwargs,
+                **deadline_kwargs,
                 **fence_kwargs,
                 **attempt_kwargs,
             )
@@ -18083,7 +18227,30 @@ def _process_messages(messages: list) -> float:
         except Exception as e:
             _stop_voice_runtime(abort_stream=True)
             log.error("agent call failed; posting user-visible fallback: %s", e)
-            if content_type == "image" and not isinstance(e, VisionObserverFailure):
+            if vision_fallback_selected:
+                fallback_notice = classify_agent_error(e)
+                _emit_debug_trace(
+                    "vision",
+                    "vision.fallback.completed",
+                    status="error",
+                    trace_id=trace_id,
+                    dur_ms=(
+                        (time.monotonic() - vision_fallback_started_at) * 1000
+                        if vision_fallback_started_at is not None
+                        else 0.0
+                    ),
+                    summary="vision fallback completed",
+                    detail={
+                        "selected_count": 1,
+                        "outcome": "error",
+                        "error_class": fallback_notice.error_class,
+                    },
+                )
+            if (
+                content_type == "image"
+                and not isinstance(e, VisionObserverFailure)
+                and not vision_fallback_selected
+            ):
                 e = VisionObserverFailure(
                     _vision_probe_error_code(e),
                     detail=type(e).__name__,
@@ -18118,6 +18285,24 @@ def _process_messages(messages: list) -> float:
                 latest = max(latest, ts)
                 continue
         else:
+            if vision_fallback_selected:
+                _emit_debug_trace(
+                    "vision",
+                    "vision.fallback.completed",
+                    status="ok",
+                    trace_id=trace_id,
+                    dur_ms=(
+                        (time.monotonic() - vision_fallback_started_at) * 1000
+                        if vision_fallback_started_at is not None
+                        else 0.0
+                    ),
+                    summary="vision fallback completed",
+                    detail={
+                        "selected_count": 1,
+                        "outcome": "success",
+                        "error_class": "none",
+                    },
+                )
             # call_agent did not raise — the prompt (catalog included) was
             # delivered to the model this turn, regardless of whether the
             # reply below turns out to be parseable. Confirm the pending
@@ -18174,6 +18359,7 @@ def _process_messages(messages: list) -> float:
                         ),
                         trace_id=trace_id,
                         lane="chat",
+                        **_vision_fallback_deadline_kwargs(),
                     )
                     if (retry_failure_class := _consume_reply_parse_failed()):
                         pending_failure_is_parse_only = True
@@ -18209,6 +18395,7 @@ def _process_messages(messages: list) -> float:
                             _image_claim_retry_prompt(),
                             trace_id=trace_id,
                             lane="chat",
+                            **_vision_fallback_deadline_kwargs(),
                         )
                         if (retry_failure_class := _consume_reply_parse_failed()):
                             pending_failure_is_parse_only = True

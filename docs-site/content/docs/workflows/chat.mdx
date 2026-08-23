@@ -163,8 +163,12 @@ key-scoped `models/user` catalog for its picker. A new dedicated selection
 succeeds only after the real image probe records `ok`; `mode: "follow_main"`
 preserves the existing main-model image path. If a route that was selected
 earlier later becomes non-`ok`, Settings keeps that choice visible for diagnosis,
-but image observation fails closed and never sends the pixels to a fallback
-model.
+but the dedicated route cannot silently change. A narrow recovery path may use
+the exact current main route only when that main route has its own current `ok`
+image verdict and the dedicated call failed with rate limiting, temporary
+unavailability, an empty reply, or an explicitly truncated reply. Authentication,
+quota, missing-route, incompatible-model, image-read, and unclassified failures
+remain fail-closed and do not disclose pixels to the main model.
 
 Use `POST /v1/vision/config` when adding a dedicated image model. It creates or
 reuses the saved route, runs the randomized image check, and selects the route
@@ -177,8 +181,12 @@ model cannot accept images.
 When a dedicated route is configured, IO records that exact route before the
 image turn is stored. Runtime V2 or the official resident then sends pixels only
 to that route, asks for a neutral visual observation, marks the result as
-untrusted data, and passes only that text to the main agent. A vision-call
-failure does not fall back to sending the raw image to the main model.
+untrusted data, and passes only that text to the main agent. The narrow recovery
+path above receives no additional time budget: the dedicated observation and
+every main-model recovery attempt share one monotonic absolute deadline. If a
+batch contains both successful observations and eligible failures, successful
+items remain observation text and only the failed item IDs are decrypted again
+for the verified main route. The runtime never resends successful items' pixels.
 
 `POST /v1/vision/routes/{route_id}/test` repeats the capability check without
 changing the selection. Each accepted image turn records the dedicated route it
@@ -190,7 +198,9 @@ to the main model.
 Runtime V1 and VPS report whether a fresh official resident poll advertises
 `vision_observer_v1`, but that capability signal does not block image ingestion.
 Follow-main keeps the existing image path unchanged; a selected dedicated route
-stays pinned rather than silently falling back to the main model. `POST
+stays pinned rather than being replaced by another dedicated route. The same
+closed failure list and exact-main-verdict gate apply to the official resident;
+an older or untested resident main entry receives no fallback pixels. `POST
 /v1/vision/observe` is the authenticated resident-facing observer exchange for
 the message's pinned route.
 
