@@ -47,6 +47,24 @@ USER_UNAVAILABLE_V2_OUTCOME_CODES = frozenset({
 })
 
 
+def v1_proactive_outcome_class(status: object, reason: object) -> str:
+    """Classify the resident/V1 proactive status-reason keyspace.
+
+    ``skipped`` is a control-plane outcome (including heartbeat_throttled), not
+    a failed realization. A failed job leaves our numerator only for Seven's
+    exact user-unavailable reasons. Unknown reasons remain operational failures.
+    """
+    normalized_status = str(status or "").strip()
+    normalized_reason = str(reason or "").strip() or "unknown"
+    if normalized_status == "skipped":
+        return "control"
+    if normalized_status != "failed":
+        return ""
+    if normalized_reason in USER_UNAVAILABLE_V1_REASONS:
+        return "user_unavailable"
+    return "operational_failure"
+
+
 _FALLBACK_BLAME = "system"
 _FALLBACK_USER_TEXT = "连接模型服务时出了问题。"
 

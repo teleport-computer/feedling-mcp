@@ -6,6 +6,8 @@ import pytest
 
 from tools import prompt_cache_canary as canary
 
+from conftest import capture_sleeps
+
 
 def _proof(
     *,
@@ -236,7 +238,7 @@ def test_wait_for_reply_ignores_transient_metrics_outage(monkeypatch) -> None:
             return 503, {"error": "temporarily unavailable"}
         raise AssertionError(f"unexpected request: {method} {url}")
 
-    monkeypatch.setattr(canary.time, "sleep", lambda _seconds: None)
+    capture_sleeps(monkeypatch, canary)
 
     canary._wait_for_reply(
         _config(),

@@ -1,13 +1,13 @@
 """Content-free registry contract rejection counters.
 
-Revision ID: 0098_contract_rejection_stats
-Revises: 0097_v2_job_recovery_events
+Revision ID: 0099_contract_rejection_stats
+Revises: 0098_v1_lane_outcome_counts
 """
 from alembic import op
 
 
-revision = "0098_contract_rejection_stats"
-down_revision = "0097_v2_job_recovery_events"
+revision = "0099_contract_rejection_stats"
+down_revision = "0098_v1_lane_outcome_counts"
 branch_labels = None
 depends_on = None
 

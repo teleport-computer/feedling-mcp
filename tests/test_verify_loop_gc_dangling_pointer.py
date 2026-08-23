@@ -29,6 +29,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from chat import chat_core  # noqa: E402
 from bootstrap import gates as boot_gates  # noqa: E402
 
+from conftest import capture_sleeps
+
 
 def test_gc_keeps_real_reply_deletes_only_verify_ping_rows():
     """The dangling-pointer regression: a real chat reply that landed after the
@@ -194,7 +196,7 @@ def test_verify_loop_requires_decrypt_health_before_minting_sticky_green(monkeyp
             )
         resident = {"passing": True, "decrypt_health": health}
         monkeypatch.setattr(chat_core.time, "time", lambda: clock["now"])
-        monkeypatch.setattr(chat_core.time, "sleep", sleep)
+        capture_sleeps(monkeypatch, chat_core, on_sleep=sleep)
         monkeypatch.setattr(
             chat_core.accounts_onboarding,
             "_load_onboarding_route",

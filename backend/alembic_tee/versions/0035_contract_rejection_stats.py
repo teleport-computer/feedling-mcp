@@ -1,13 +1,13 @@
 """Content-free registry contract rejection counters.
 
-Revision ID: 0034_contract_rejection_stats
-Revises: 0033_trace_events
+Revision ID: 0035_contract_rejection_stats
+Revises: 0034_v1_lane_outcome_counts
 """
 from alembic import op
 
 
-revision = "0034_contract_rejection_stats"
-down_revision = "0033_trace_events"
+revision = "0035_contract_rejection_stats"
+down_revision = "0034_v1_lane_outcome_counts"
 branch_labels = None
 depends_on = None
 
@@ -33,7 +33,7 @@ _UPDATE_PREPARED_HEAD = """
 UPDATE server_config
 SET value = convert_to(
   jsonb_set(convert_from(value, 'UTF8')::jsonb, '{tee_heads}',
-            '["0034_contract_rejection_stats"]'::jsonb)::text,
+            '["0035_contract_rejection_stats"]'::jsonb)::text,
   'UTF8'
 )
 WHERE key = 'phase4_primary_prepared'

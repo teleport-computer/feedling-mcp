@@ -40,6 +40,8 @@ from core import store as core_store  # noqa: E402
 from core.store import UserStore  # noqa: E402
 from accounts import registry  # noqa: E402
 
+from conftest import capture_sleeps
+
 
 def _b64(raw: bytes) -> str:
     return base64.b64encode(raw).decode("ascii")
@@ -100,7 +102,7 @@ def test_verify_loop_finds_cross_worker_ack(client, monkeypatch):
         lambda *a, **k: {"blocks_verify": False},
     )
     # Deterministic: no real 2s waits, no wake-bus / introduction side effects.
-    monkeypatch.setattr(chat_core.time, "sleep", lambda *_a, **_k: None)
+    capture_sleeps(monkeypatch, chat_core)
     monkeypatch.setattr(store, "notify_chat_waiters", lambda *a, **k: None)
     monkeypatch.setattr(
         chat_core, "_maybe_enqueue_resident_introduction", lambda *a, **k: None

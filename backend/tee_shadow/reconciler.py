@@ -76,6 +76,7 @@ TABLES: dict[str, tuple[tuple[str, ...], str]] = {
         ("user_id", "day", "route", "lane", "enqueue_source"),
         "user_id, day, route, lane, enqueue_source, completed, failed, "
         "expired, superseded, failure_codes, "
+        "operational_failures, control_outcomes, user_unavailable, "
         # ⚠️ 说话四列（0093 / tee 0025）必须列在这里。漏列**不会报错**——扶正
         # 会把它们按默认值 0 写进 TEE，而 test 的 primary 就是 TEE，于是被读的
         # 那一份悄悄变成「谁都没说过话」。列漂移交给
@@ -85,7 +86,8 @@ TABLES: dict[str, tuple[tuple[str, ...], str]] = {
     ),
     "lane_rollup_watermark": (
         ("route",),
-        "route, backfill_from, through_day, voice_from, frozen_at",
+        "route, backfill_from, through_day, voice_from, outcomes_from, "
+        "frozen_at",
     ),
     # 聊天格子（0094 / tee 0026）。同样写后不变、语句幂等，按 PK 对齐即收敛。
     "chat_daily_rollup": (

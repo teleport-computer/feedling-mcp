@@ -8,6 +8,7 @@ Run:  python -m pytest tests/test_catalog_consumer_parity.py -q
 """
 from __future__ import annotations
 
+import ast
 import os
 import sys
 import types
@@ -52,6 +53,34 @@ def test_user_unavailable_v1_reasons_are_producer_registered():
     )
     missing = set(catalog.USER_UNAVAILABLE_V1_REASONS) - producer_codes
     assert not missing, f"用户侧豁免未由产生方导出: {sorted(missing)}"
+
+
+def test_v1_outcome_classifier_has_one_catalog_definition_and_admin_imports_it():
+    backend = Path(__file__).parent.parent / "backend"
+    catalog_tree = ast.parse((backend / "notices" / "catalog.py").read_text())
+    admin_tree = ast.parse((backend / "admin" / "data_track.py").read_text())
+    definitions = [
+        node for node in ast.walk(catalog_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "v1_proactive_outcome_class"
+    ]
+    admin_copies = [
+        node for node in ast.walk(admin_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in {
+            "v1_proactive_outcome_class", "_v1_proactive_outcome_class"
+        }
+    ]
+    admin_calls = [
+        node for node in ast.walk(admin_tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "notices_catalog"
+        and node.attr == "v1_proactive_outcome_class"
+    ]
+    assert len(definitions) == 1
+    assert not admin_copies, "admin 不得保留 outcome classifier 副本"
+    assert admin_calls, "admin 必须调用 notices.catalog 的共享分类器"
 
 
 def test_every_catalog_blame_is_valid():

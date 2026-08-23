@@ -783,6 +783,7 @@ jobs:
             tests/test_access_mode_runtime_sync_unit.py \
             tests/test_pytest_coverage_ratchet.py \
             tests/test_ci_execution_evidence.py \
+            tests/test_no_global_sleep_patching.py \
             tests/test_mcp_client.py \
             tests/test_mcp_probe_tools_required.py \
             tests/test_mcp_status.py \

@@ -13,6 +13,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import deploy_canary as dc  # noqa: E402
 
+from conftest import capture_sleeps
+
 # A real X25519 pk (the live prod enclave content pk) so from_public_bytes works.
 PK = "2d642ec1f54719d8c6088e8cbaf394961cb804a533bd4d7366d48d1d543f5620"
 
@@ -63,7 +65,7 @@ def test_transient_transport_failure_is_retried(canary_env, monkeypatch, capsys)
         return inner(method, url, **kw)
 
     monkeypatch.setattr(dc, "_http", flaky)
-    monkeypatch.setattr(dc.time, "sleep", lambda s: None)
+    capture_sleeps(monkeypatch, dc)
     dc.main()  # no SystemExit
     assert "CANARY OK" in capsys.readouterr().out
     assert blips == {"whoami": 0, "reset": 0}  # retries actually consumed the blips
@@ -86,7 +88,7 @@ def test_register_transport_blip_retries_with_fresh_key(canary_env, monkeypatch,
         return inner(method, url, body=body, **kw)
 
     monkeypatch.setattr(dc, "_http", flaky)
-    monkeypatch.setattr(dc.time, "sleep", lambda s: None)
+    capture_sleeps(monkeypatch, dc)
     dc.main()  # no SystemExit
     assert "CANARY OK" in capsys.readouterr().out
     assert len(register_keys) == 2
@@ -103,7 +105,7 @@ def test_persistent_transport_failure_still_fails(canary_env, monkeypatch, capsy
         return inner(method, url, **kw)
 
     monkeypatch.setattr(dc, "_http", dead_whoami)
-    monkeypatch.setattr(dc.time, "sleep", lambda s: None)
+    capture_sleeps(monkeypatch, dc)
     with pytest.raises(SystemExit) as e:
         dc.main()
     assert e.value.code == 1
