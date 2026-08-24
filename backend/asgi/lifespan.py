@@ -116,7 +116,7 @@ def _start_lane_rollup_leader() -> None:
 
 
 def _start_trace_events_monitor_leader() -> None:
-    """Detect a stuck DEFAULT/horizon/capacity issue on one TEE worker."""
+    """Detect trace storage/partition failures on one selected-primary worker."""
     from admin import trace_events_monitor
     from core import leader as core_leader
 
@@ -209,12 +209,10 @@ async def lifespan(app):
         _start_dau_snapshot_leader()
         _start_runtime_reconciler_leader()
         _start_lane_rollup_leader()
-        # trace_events is TEE-only.  RDS rollback processes have no such table
-        # and must not produce a false missing-table alarm.
-        import db
-
-        if db.database_schema() == "tee":
-            _start_trace_events_monitor_leader()
+        # Both selected-primary migration chains carry trace_events.  Monitor
+        # the table chosen by DATABASE_URL; this remains read-only and does not
+        # create or repair partitions with the application worker.
+        _start_trace_events_monitor_leader()
         # (6b) TEE 影子库自动同步单例 — 仅在双写已接时选举（env 决定，接=重部署）。
         from admin import plaintext_shadow_scheduler
         from tee_shadow import mirror as _tee_mirror

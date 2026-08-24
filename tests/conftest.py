@@ -820,9 +820,9 @@ def backend_env(tmp_path, monkeypatch):
 def tee_primary(monkeypatch):
     """Run a focused endpoint test against the migrated TEE-primary schema.
 
-    Generic backend tests intentionally use the legacy-chain database so both
-    migration families stay covered. T184 trace_events exists only in TEE, so
-    real trace endpoint tests opt into the topology they run under in test/prod.
+    Generic backend tests use the RDS-chain database so both migration families
+    stay covered.  Focused TEE tests opt into the independent owner-migrated
+    topology rather than assuming equal DDL means equal migration mechanics.
     """
     import db
 

@@ -1,4 +1,4 @@
-"""T184/A: additive TEE trace table, retention machinery, and read contract."""
+"""T184/T306 selected-primary trace storage and retention contracts."""
 
 from __future__ import annotations
 
@@ -115,6 +115,34 @@ def test_migration_has_beijing_bounds_no_fk_and_stable_indexes():
         / "backend/alembic_tee/versions/0033_trace_events.py"
     ).read_text()
     assert "AT TIME ZONE 'Asia/Shanghai'" in migration
+
+
+def test_partition_maintenance_has_an_explicit_rds_owner_channel(monkeypatch):
+    monkeypatch.setenv(
+        "TRACE_EVENTS_MIGRATION_DATABASE_URL",
+        "postgresql://rds-owner/trace",
+    )
+    monkeypatch.setenv(
+        "TEE_MIGRATION_DATABASE_URL",
+        "postgresql://tee-owner/trace",
+    )
+    assert partitions._migration_database_url() == "postgresql://rds-owner/trace"
+
+    monkeypatch.delenv("TRACE_EVENTS_MIGRATION_DATABASE_URL")
+    assert partitions._migration_database_url() == "postgresql://tee-owner/trace"
+
+    monkeypatch.delenv("TEE_MIGRATION_DATABASE_URL")
+    with pytest.raises(RuntimeError, match="TRACE_EVENTS_MIGRATION_DATABASE_URL"):
+        partitions._migration_database_url()
+
+    workflow = (
+        Path(__file__).parents[1]
+        / ".github/workflows/rds-trace-partitions.yml"
+    ).read_text()
+    assert "workflow_dispatch:" in workflow
+    assert "TRACE_EVENTS_MIGRATION_DATABASE_URL" in workflow
+    assert "python -m admin.trace_events_partitions" in workflow
+    assert "MAINTAIN-RDS-TRACE-PROD" in workflow
 
 
 def test_strict_insert_and_query_use_ts_id_order(tee_primary):
