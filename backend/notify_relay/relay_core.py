@@ -26,6 +26,7 @@ import uuid
 import db
 from push import apns
 from push.live_activity import build_content_state, build_live_activity_aps
+from push.sounds import NOTIFICATION_SOUND_NAME
 from tee_shadow import mirror
 
 AUTH_TOKEN_PREFIX = "nrt_"
@@ -233,7 +234,10 @@ def _build_alert(content: dict) -> tuple[dict, str, str]:
     subtitle = str(content.get("subtitle") or "").strip()
     if subtitle:
         alert["subtitle"] = subtitle
-    aps: dict = {"alert": alert, "sound": content.get("sound") or "default"}
+    aps: dict = {
+        "alert": alert,
+        "sound": content.get("sound") or NOTIFICATION_SOUND_NAME,
+    }
     badge = content.get("badge")
     if isinstance(badge, int) and not isinstance(badge, bool):
         aps["badge"] = badge
