@@ -1,4 +1,9 @@
-"""Turn-child 子进程入口（Hosted Runtime V2 PR D，D1 结构拆分，Task 2）。
+"""Runtime V2 单 slot 子进程入口。
+
+当前三池/单 slot 拓扑见
+``docs/superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md``；
+progress、watchdog 与历史安全不变量见保留的
+``docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md``。
 
 `serve_worker._serve`（父进程）不再直接 `asyncio.create_task(v2_worker.run_worker_loop
 (...))`——那样 turn slot 跟 reaper/heartbeat/scheduler/Genesis 共用一个事件循环，一个

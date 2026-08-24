@@ -5332,7 +5332,7 @@ _HEARTBEAT_INTERVAL_SEC = _positive_float_env(
     "FEEDLING_V2_HEARTBEAT_INTERVAL_SEC", "10"
 )
 
-# D3 (Task 4, PR-D plan): capacity must reflect the turn-child's ACTUAL health, not
+# Capacity must reflect the turn-child's actual health, not
 # a configured aggregate — otherwise a heartbeat tick ~10s after the
 # watchdog (Task 3) writes capacity=0 on a kill would silently re-advertise full
 # capacity for a child that is mid-SIGKILL/respawn, letting admission race new turns
@@ -5375,7 +5375,7 @@ async def _heartbeat_loop(
     with no error). Reuses the same ``worker_id`` this process passes to
     ``claim_next_job``/``run_worker_loop`` — one row per live process.
 
-    D3 (Task 4): ``capacity`` is DERIVED from ``supervisor.poll_liveness()`` each
+    ``capacity`` is derived from ``supervisor.poll_liveness()`` each
     tick — 0 if the turn-child is dead or its progress is older than
     ``capacity_stale_sec``, else one. This
     is deliberately the same shape as (and agrees with) the watchdog's own kill
@@ -5635,7 +5635,7 @@ _SCHEDULER_INTERVAL_SEC = _positive_float_env(
     "FEEDLING_V2_SCHEDULER_INTERVAL_SEC", "30"
 )
 
-# D2 (Task 3, watchdog.py) is the module that actually ACTS on this — comparing it
+# The watchdog module acts on this value — comparing it
 # against `child_supervisor.ChildSupervisor.poll_liveness()["last_progress_age_sec"]`
 # to decide `should_kill`. It's defined here (not in watchdog.py) because the
 # ChildSupervisor this constant configures is constructed in `_serve`, and this same
@@ -6040,10 +6040,9 @@ async def _reconcile_loop(
 ) -> None:
     """Periodic orphan-message and durable-effect reconciliation.
 
-    PR-D 的 retained history-safety decision：periodic wiring for
-    `db.reconcile_unenqueued_v2_messages`
+    Periodic wiring for `db.reconcile_unenqueued_v2_messages`
     — the A7 orphan-message sweeper that was built but never invoked anywhere (its own
-    docstring deferred the periodic call to "PR D's sweeper"). Without this loop, a
+    docstring deferred the periodic call to a parent-owned sweeper). Without this loop, a
     `db_action_v2` user whose newest chat message never got a matching `agent_jobs`
     row (a bug, a manual data fix, or a message written before A7 existed) stays
     silently unanswered forever — nothing else in the pool re-derives "has an

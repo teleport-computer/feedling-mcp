@@ -1606,7 +1606,7 @@ class TurnDeps:
     # landed：本地加密（core_envelope，非 enclave 往返）+ CAS 写回 v2_conversation_summary
     # （Task 2 storage）。expected_version 不匹配（别的回合已推进过摘要）时返回 False，
     # 调用方按丢弃本次压缩处理，不重试、不报错——下一回合会用新版本重新压缩。默认 None：同上。
-    # watermark_seq（D5/Task 9）是可选的第 5 个位置参数——_run_compaction 只有在能拿到折叠
+    # watermark_seq 是可选的第 5 个位置参数——_run_compaction 只有在能拿到折叠
     # 批次最后一行的精确 seq 时才会传它（生产路径总是能拿到；某些窄签名的测试 fake 只接 4
     # 个参数，_run_compaction 会退化成旧的 4 参调用，两边都不破）。
     # Segmented production path. Leaf summaries and higher-level checkpoints
@@ -7985,7 +7985,7 @@ async def _assert_prompt_covers_seq(
 
 
 async def _assert_prompt_covers(user_id: str, tail_limit: int) -> None:
-    """Post-assembly hard assertion (D6/Task 10): every message with
+    """Post-assembly prompt-coverage assertion: every message with
     ``seq > watermark_seq`` must be inside the tail window this turn is about
     to hand the model. Re-derives ``watermark_seq`` fresh from the DB
     (``jobs_store.get_summary_row``) rather than reusing
@@ -8429,7 +8429,7 @@ async def _run_wake(
             ):
                 raise RuntimeModeChanged(f"user rolled back before {effect}")
 
-        # D6/Task 10: close a compaction backlog gap BEFORE reading the actual
+        # Close a compaction backlog gap before reading the actual
         # prompt content — see `_ensure_prompt_coverage`'s docstring. Only run
         # when both seq-native readers are wired; a
         # coverage check is meaningless without a real tail reader to bound.
@@ -13266,7 +13266,7 @@ async def process_job(
                 )
                 optional_anchor_seq = None
         if seq_context:
-            # D6/Task 10: close a compaction backlog gap BEFORE reading the
+            # Close a compaction backlog gap before reading the
             # actual prompt content — see `_ensure_prompt_coverage`'s
             # docstring. Common case (no gap) costs two cheap indexed reads
             # and returns immediately without touching the enclave/LLM.
@@ -16373,7 +16373,7 @@ async def _slot_loop(
     （行为与改动前完全一致）；非 None 时这个 slot 只抢白名单里的 lane——`run_worker_loop`
     用它给部分 slot 划专用车道（见 `_reserved_lane_slots`）。
 
-    progress_cb（可选，PR D Task 2 + hard-timeout fix）：`progress_cb(slot_id, turn_start)`
+    progress_cb（可选，per-slot progress / hard-timeout safety）：`progress_cb(slot_id, turn_start)`
     在真实 slot 活动的天然边界调用——claim 到一个 job 之后（即将进入 `_run_turn`）、
     `_run_turn` 跑完、每次空转 poll 醒来，以及 task-local `_report_turn_progress` 转发的
     provider round / reliable retry / tool batch / compaction batch 边界。这样一个合法长回合会
@@ -16551,7 +16551,7 @@ async def run_worker_loop(
     `FEEDLING_V2_CHAT_RESERVED_SLOTS` 显式设置时覆盖默认的 max(1, max_workers // 2)；
     留空/未设置时用默认值。
 
-    progress_cb（可选，PR D Task 2）：原样转给每个 `_slot_loop`，附带该 slot 在
+    progress_cb（可选）：原样转给每个 `_slot_loop`，附带该 slot 在
     `assignments` 里的下标作为 `slot_id`——见 `_slot_loop` 自己的 docstring。默认 None：
     向后兼容既有调用方/测试。
 

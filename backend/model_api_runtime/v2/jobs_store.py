@@ -10510,7 +10510,7 @@ def get_summary_row(user_id) -> dict | None:
     {"summary_envelope": dict|None, "watermark_ts": float, "version": int,
     "watermark_seq": int}，无行返回 None（该用户从未压缩过）。
 
-    ``watermark_seq``（D5/Task 9，migration 0031）与 ``watermark_ts`` 同一行
+    ``watermark_seq``（migration 0031）与 ``watermark_ts`` 同一行
     并存：新压缩写入的行两者都是真值（见 ``upsert_summary_row_cas``）；但
     0031 之前就存在的行只有 ``watermark_ts``、``watermark_seq`` 落着迁移
     默认值 0。这里做一次性懒翻译——``watermark_seq==0`` 但
@@ -10563,7 +10563,7 @@ def upsert_summary_row_cas(
     否则走 UPDATE ... WHERE version=expected_version（不匹配说明摘要在别处已被
     推进，本次写入是过期/丢失的 CAS，返回 False）。成功返回 True。
 
-    ``watermark_seq``（D5/Task 9）与 ``watermark_ts`` 在同一次 CAS 写入里
+    ``watermark_seq`` 与 ``watermark_ts`` 在同一次 CAS 写入里
     原子推进——同一行、同一个 UPDATE 语句，不是两次写。``None``（默认，
     向后兼容旧调用方/旧测试 fixture 未传这个参数的场景）在 UPDATE 分支用
     ``COALESCE`` 保留该行原有的 watermark_seq（不清零、不误伤未真正推进
