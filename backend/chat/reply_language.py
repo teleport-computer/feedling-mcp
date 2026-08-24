@@ -176,10 +176,27 @@ def infer_garden_language(
     # 于是一个英文花园会突然开始长中文桶。实测踩到过。
     buckets = str(existing_buckets or "")
     if buckets.strip():
-        cjk = len(_CJK_RE.findall(buckets))
-        latin = len(_LATIN_RE.findall(buckets))
-        if cjk or latin:
-            return "zh-Hans" if cjk >= latin else "en"
+        # ⚠️ **按桶投票，绝不按字符数。**
+        #
+        # 2026-08-24 线上事故：原来比的是整串里 CJK 与拉丁**字符**的个数。中英文桶名
+        # 长度根本不对等 —— 中文桶平均 3.4 字符（「工作」），英文桶平均 11.6
+        # （「Our relationship」），**一个英文桶顶三个半中文桶**。实测「6 个中文桶 +
+        # 3 个英文桶」就会被判成英文花园。
+        #
+        # 而那几个英文桶是更早一个 bug 的残留（老提示词同时给中英两套让模型挑，约
+        # 1/3 的中文记忆被贴错桶）。两个 bug 单独看都不致命，叠起来是自我强化的回路：
+        #
+        #     旧残留 → 判成英文花园 → 新卡全用英文桶 → 英文桶更多 → …
+        #
+        # 真实后果：一个 226 张卡的中文花园两天内新落的卡整个变成英文。
+        #
+        # 一个桶一票，长度不参与。平票算中文 —— 这个不对称是刻意的：把中文花园翻成
+        # 英文是用户能立刻看见的破坏，保持中文最多是"没跟上"，代价小得多。
+        names = [b.strip() for b in re.split(r"[、,/\n]+", buckets) if b.strip()]
+        zh = sum(1 for n in names if _CJK_RE.search(n))
+        en = sum(1 for n in names if not _CJK_RE.search(n) and _LATIN_RE.search(n))
+        if zh or en:
+            return "zh-Hans" if zh >= en else "en"
 
     # 还没有任何桶（新花园的第一张卡）才看身份卡 / locale / 归档语言。
     return infer_reply_language_policy(
