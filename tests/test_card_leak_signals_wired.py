@@ -240,7 +240,7 @@ def test_language_decision_is_observable_and_content_free():
     blob = json.dumps(d, ensure_ascii=False)
     for secret in ("崽崽", "我们的关系", "房贷"):
         assert secret not in blob, f"桶名 {secret} 漏进了落库记录"
-    assert d["bucket_cjk"] > 0, "计数丢了 —— 那这条记录就没有诊断价值了"
+    assert d["bucket_zh"] > 0, "计数丢了 —— 那这条记录就没有诊断价值了"
 
 
 def test_both_runtimes_emit_the_language_decision():
@@ -262,3 +262,60 @@ def test_the_event_is_registered_in_the_admin_board():
     repo = _p.Path(__file__).resolve().parents[1]
     src = (repo / "backend" / "admin" / "data_track.py").read_text(encoding="utf-8")
     assert '"memory.capture.language"' in src, "新事件没注册进 admin 面板"
+
+
+# --------------------------------------------------------------------------- #
+# 花园语言判定：按桶投票，绝不按字符数
+# --------------------------------------------------------------------------- #
+
+
+def test_a_few_english_buckets_cannot_flip_a_chinese_garden():
+    """**线上事故（2026-08-24）。** 一个真实用户的中文花园两天内整个翻成了英文。
+
+    根因：原实现比的是整串里 CJK 与拉丁**字符**的个数。中英文桶名长度不对等 ——
+    「工作」两个字符，「Our relationship」十五个，**一个英文桶顶七个中文桶**。
+
+    而那几个英文桶本身是旧 bug 的残留（老提示词同时给中英两套让模型挑，约 1/3 的
+    中文记忆被贴上英文公共桶）。于是形成自我强化的回路：
+
+        旧残留的英文桶 → 判定成"英文花园" → 新卡全用英文桶 → 英文桶更多 → …
+
+    一个桶一票，长度不参与。
+    """
+    from chat.reply_language import garden_language_decision
+
+    # 事故现场的形状：中英各半，但英文桶名长得多
+    d = garden_language_decision(
+        {}, existing_buckets="我们的关系、工作、健康、Our relationship、Feelings & comfort、GitHub"
+    )
+    assert d["locale"] == "zh-Hans", f"中英各半的花园被判成了 {d['locale']}"
+
+    # 压倒性多数是中文，绝不能被两个英文桶掀翻
+    d = garden_language_decision(
+        {}, existing_buckets=(
+            "工作、健康、宠物、家庭、朋友、爱好、金钱、饮食、"
+            "Our relationship、Feelings & comfort"
+        )
+    )
+    assert d["locale"] == "zh-Hans"
+    assert d["bucket_zh"] == 8 and d["bucket_en"] == 2
+
+
+def test_a_genuinely_english_garden_still_reads_as_english():
+    """修完不能矫枉过正 —— 真英文花园还得判成英文。"""
+    from chat.reply_language import garden_language_decision
+
+    d = garden_language_decision({}, existing_buckets="Work / Health / Pets / Family")
+    assert d["locale"] == "en" and d["bucket_en"] == 4
+
+
+def test_a_tie_stays_chinese():
+    """平票保持中文。
+
+    不对称是刻意的：把中文花园翻成英文是**用户能立刻看见的破坏性变化**
+    （他的记忆卡突然换了语言）；保持中文最多是"没跟上"，代价小得多。
+    """
+    from chat.reply_language import garden_language_decision
+
+    d = garden_language_decision({}, existing_buckets="工作、健康、Work、Health")
+    assert d["locale"] == "zh-Hans"

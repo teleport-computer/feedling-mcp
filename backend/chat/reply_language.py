@@ -12,6 +12,12 @@ import re
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from memgarden.garden_language import (
+    count_bucket_languages,
+    garden_language_from_buckets,
+    split_bucket_names,
+)
+
 
 @dataclass(frozen=True)
 class ReplyLanguagePolicy:
@@ -187,28 +193,47 @@ def garden_language_decision(
 ) -> dict:
     """同 :func:`infer_garden_language`，但把**判定依据**一并返回，供落库观测。
 
-    为什么需要它：落卡语言错了是**看得见症状、看不见原因**的一类问题 ——
-    用户只会说「怎么变英文了」，而我们查不到当时算出的是什么语言、凭什么算的。
-    2026-08-23 提示词英文化之后，这条路径的风险显著上升，必须能观测。
+    为什么需要它：落卡语言错了是**看得见症状、看不见原因**的一类问题 —— 用户只会
+    说「怎么变英文了」，而我们事后查不到当时算出的是什么、凭什么算的。
+    2026-08-24 那次事故正是如此：症状明显，但没有任何一条记录能说明判据当时看到了
+    什么，只能靠翻用户的桶去反推。
 
-    返回的字段全部**内容无关**：语言标签、依据名、以及桶名里的字符计数 ——
-    桶名本身是用户内容，绝不落库。
+    返回的字段全部**内容无关**：语言标签、依据名、桶的计数。桶名本身是用户内容，
+    绝不落库。
     """
     # 已有桶优先，且**不走 infer_reply_language_policy 的证据门槛**。
     # 那个门槛（32 字符）是给散文调的；桶名天生就短 —— "Work / Health / Pets"
     # 只有 14 个拉丁字母，喂进去会被判成证据不足、回落成中文，
     # 于是一个英文花园会突然开始长中文桶。实测踩到过。
-    buckets = str(existing_buckets or "")
-    if buckets.strip():
-        cjk = len(_CJK_RE.findall(buckets))
-        latin = len(_LATIN_RE.findall(buckets))
-        if cjk or latin:
-            return {
-                "locale": "zh-Hans" if cjk >= latin else "en",
-                "basis": "existing_buckets",
-                "bucket_cjk": cjk,
-                "bucket_latin": latin,
-            }
+    #
+    # ⚠️ **判据本身在内核里**（``memgarden.garden_language``），不在这个文件。
+    #
+    # 2026-08-24 线上事故就出在这段逻辑曾经写在 io 自己这儿：原实现比的是整串里
+    # CJK 与拉丁**字符**的个数。中英文桶名长度根本不对等 —— 中文桶「工作」两个
+    # 字符，英文桶「Our relationship」十五个，**一个英文桶顶七个中文桶**。于是
+    # 「8 个中文桶 + 2 个英文桶」被判成英文花园。
+    #
+    # 而那几个英文桶本身是旧 bug 的残留（老提示词同时给中英两套让模型挑，约 1/3
+    # 的中文记忆被贴上英文公共桶）。旧残留 → 被读成"这是英文花园" → 新卡全用英文
+    # 桶 → 英文桶更多，**自我强化**。真实用户的中文花园两天内整个翻成了英文。
+    #
+    # 搬进内核，是因为**错的是算法，不是 io 的数据**：任何接入方都要做同一件判断，
+    # 判据留在这里等于让每个接入方各踩一遍。内核那边有语料 eval 守着它，语料里就有
+    # 事故当天的真实桶构成（evals/corpus/gardens.jsonl 里的 g_incident_0824）。
+    # io 这边只负责**取证** —— 桶名从哪来、没有桶时看什么，那才是宿主的数据。
+    names = split_bucket_names(str(existing_buckets or ""))
+    from_buckets = garden_language_from_buckets(names)
+    if from_buckets:
+        zh, en = count_bucket_languages(names)
+        return {
+            "locale": from_buckets,
+            "basis": "existing_buckets",
+            "bucket_zh": zh,
+            "bucket_en": en,
+            # 计入不投票的桶（纯数字/符号），所以可能大于 zh+en —— 这是观测量,
+            # 反映"这个花园有几个桶",不是"几张票"。
+            "bucket_total": len(names),
+        }
 
     # 还没有任何桶（新花园的第一张卡）才看身份卡 / locale / 归档语言。
     policy = infer_reply_language_policy(
@@ -217,9 +242,10 @@ def garden_language_decision(
     return {
         "locale": policy.language,
         "basis": f"reply_language:{policy.source}",
-        "bucket_cjk": 0,
-        "bucket_latin": 0,
-        "confidence": round(float(policy.confidence or 0.0), 2),
+        "bucket_zh": 0,
+        "bucket_en": 0,
+        "bucket_total": 0,
+        "confidence": policy.confidence,
     }
 
 
