@@ -1248,23 +1248,14 @@ def write_response(
         delivery = None
         if source == proactive_service.PROACTIVE_JOB_SOURCE:
             delivery = _proactive_delivery_decision_v2(store, payload)
-        if delivery is not None and not delivery.allow_visible_delivery:
-            delivery_fields.update({
-                "push_decision": "suppressed",
-                "push_reason": delivery.reason,
-                "alert_status": "suppressed",
-                "alert_reason": delivery.reason,
-                "live_activity_status": "suppressed",
-                "live_activity_reason": delivery.reason,
-            })
-        else:
-            delivery_fields.update(push_service._deliver_ai_message_push_if_background(
-                store,
-                body=visible_push_body,
-                title=payload.get("title", "") or "IO",
-                data=payload.get("data") if isinstance(payload.get("data"), dict) else {},
-                visual_state=payload.get("visualState") or payload.get("visual_state") or "reply",
-            ))
+        delivery_fields.update(push_service._deliver_ai_message_push_if_background(
+            store,
+            body=visible_push_body,
+            title=payload.get("title", "") or "IO",
+            data=payload.get("data") if isinstance(payload.get("data"), dict) else {},
+            visual_state=payload.get("visualState") or payload.get("visual_state") or "reply",
+            alert_delivery=delivery,
+        ))
     if delivery_fields:
         updated = store.update_chat_message_metadata(msg["id"], delivery_fields)
         if updated:

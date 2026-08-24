@@ -2442,9 +2442,10 @@ def test_proactive_chat_response_records_push_delivery_results(tmp_path, monkeyp
     assert msg["live_activity_status"] == "delivered"
 
 
-def test_proactive_chat_response_delivery_off_writes_chat_without_push(tmp_path, monkeypatch):
+def test_proactive_chat_response_delivery_off_suppresses_alert_not_live_activity(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    monkeypatch.setattr("push.service.AI_MSG_LIVE_ACTIVITY", True)
     core_store._stores.clear()
 
     sent_push_types = []
@@ -2476,6 +2477,7 @@ def test_proactive_chat_response_delivery_off_writes_chat_without_push(tmp_path,
             "registered_at": "2026-05-24T00:00:00",
         },
     ]
+    store._save_tokens()
 
     client = make_client()
     headers = {"X-API-Key": api_key}
@@ -2505,14 +2507,14 @@ def test_proactive_chat_response_delivery_off_writes_chat_without_push(tmp_path,
     )
 
     assert resp.status_code == 200
-    assert sent_push_types == []
+    assert sent_push_types == ["liveactivity"]
     snapshot = proactive_dashboard._proactive_debug_snapshot(store)
     msg = snapshot["proactive_messages"][0]
     assert msg["alert_preview"] == "这条应该静默写入。"
     assert msg["push_decision"] == "suppressed"
     assert msg["push_reason"] == "reminders_delivery_disabled"
     assert msg["alert_status"] == "suppressed"
-    assert msg["live_activity_status"] == "disabled"
+    assert msg["live_activity_status"] == "delivered"
 
 
 def test_ai_chat_response_pushes_when_app_background(tmp_path, monkeypatch):
@@ -2651,7 +2653,7 @@ def test_ai_chat_response_respects_global_system_notifications_off(tmp_path, mon
     msg = store.chat_messages[-1]
     assert msg["push_decision"] == "suppress"
     assert msg["push_reason"] == "reminders_delivery_disabled"
-    assert msg["live_activity_status"] == "suppressed"
+    assert msg["live_activity_status"] == "disabled"
     assert msg["alert_status"] == "suppressed"
 
 

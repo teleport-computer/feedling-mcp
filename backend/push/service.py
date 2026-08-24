@@ -7,6 +7,7 @@ import db
 from accounts import registry
 from core.store import UserStore
 from proactive.controls_v2 import (
+    DeliveryDecisionV2,
     USER_MESSAGE_SOURCE_V2,
     evaluate_delivery_v2,
     load_settings_v2_for_store,
@@ -170,6 +171,7 @@ def _deliver_ai_message_push_if_background(
     title: str = "",
     data: dict | None = None,
     visual_state: str = "reply",
+    alert_delivery: DeliveryDecisionV2 | None = None,
 ) -> dict:
     # Two-tier gate (see _send_chat_alert): free in-memory negative, then
     # authoritative DB check to close the stale-worker race after a cross-worker
@@ -190,10 +192,8 @@ def _deliver_ai_message_push_if_background(
             "alert_reason": "empty_body",
         }
 
-    delivery = evaluate_delivery_v2(
-        load_settings_v2_for_store(store),
-        source=USER_MESSAGE_SOURCE_V2,
-    )
+    delivery = alert_delivery or evaluate_delivery_v2(
+        load_settings_v2_for_store(store), source=USER_MESSAGE_SOURCE_V2)
     decision = _ai_push_decision(store)
     should_push = bool(decision.get("should_push"))
     fields: dict = {
