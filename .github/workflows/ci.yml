@@ -1095,6 +1095,13 @@ jobs:
       - name: Compile all Python
         run: python -m compileall -q backend tools 2>/dev/null || python -m compileall -q backend
 
+      - name: 花园语言判定 eval
+        # 不是单测的重复。单测证明函数按写的那样跑；这条证明**判出来的语言是对的**。
+        # 2026-08-24 线上事故（中文花园被判成英文、新卡整个变语言）属于后者：
+        # 当时的单测只覆盖「全中文」「全英文」两个干净极端，而现实里只有混合态。
+        # 语料里 g03/g04 就是事故现场的形状。
+        run: python3 evals/language.py
+
       - name: Verify the memory kernel's build provenance
         # 锁里的 sha256 只证明「装进镜像的字节 = Release 上那份字节」。这一步再证明
         # 「那份字节由 memgarden 仓库的 CI 从公开 tag 编出来」—— 有仓库权限的人换掉
