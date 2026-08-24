@@ -10,6 +10,18 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 Chat now makes one bounded correction attempt when a
+  final reply omits its self-authored thinking block.** The correction is
+  text-only, reuses the existing `<think>` contract without asking the model to
+  shorten or suppress its reasoning, and never applies to intermediate tool
+  rounds or background lanes. A valid retry supplies the separately encrypted
+  thinking attachment; an unavailable, malformed, thinking-only, or still-absent
+  retry preserves the original usable reply without a marker or native-reasoning
+  fallback. The extra provider round can incur a second provider charge and is
+  counted through the same per-turn usage metrics and provider-attempt ledger as
+  the existing language-correction rewrite. The `thinking.surfaced` trace records
+  only a bounded retry count, never thinking or reply content.
+
 - Managed RDS-primary deployments now install the same append-only,
   Beijing-day-partitioned `trace_events` schema as TEE-primary deployments.
   This restores the operator data-track debug read and trace writer when RDS is

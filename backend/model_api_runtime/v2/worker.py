@@ -456,6 +456,15 @@ MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS = _positive_int_env(
 MAX_TERMINAL_TOOL_CALL_RETRIES = _positive_int_env(
     "FEEDLING_V2_MAX_TERMINAL_TOOL_CALL_RETRIES", "2"
 )
+# Foreground self-thinking format correction shares the tool loop's existing
+# final-reply rewrite path.  Keep this as a named hard bound instead of growing
+# a second provider-call budget beside ``max_calls``.
+MAX_SELF_THINKING_ABSENT_RETRIES = 1
+_SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION = (
+    "上一轮最终回复缺少规定的 <think>…</think> 结构。"
+    "请重新输出最终回复，严格遵守以下既有契约：\n\n"
+    + self_thinking.INSTRUCTION.strip()
+)
 TOOL_RESULT_CHAR_CAP = _positive_int_env("FEEDLING_V2_TOOL_RESULT_CHAR_CAP", "2000")
 TOOL_BATCH_RESULT_CHAR_CAP = _positive_int_env(
     "FEEDLING_V2_TOOL_BATCH_RESULT_CHAR_CAP", "8000"
@@ -6706,6 +6715,7 @@ async def _emit_thinking_surfaced_trace(
     lane: str,
     branch: str,
     chars: int,
+    retried: int = 0,
 ) -> None:
     """Emit one content-free terminal thinking decision, best-effort."""
     if emit_debug_trace is None:
@@ -6717,6 +6727,7 @@ async def _emit_thinking_surfaced_trace(
     )
     safe_lane = "wake" if lane == "wake" else "chat"
     safe_chars = max(0, int(chars))
+    safe_retried = max(0, min(int(retried), MAX_SELF_THINKING_ABSENT_RETRIES))
     # ``model`` is user-configurable for compatible relays.  Match the existing
     # plaintext thinking metadata bound instead of letting an arbitrary string
     # expand the server-visible trace payload.
@@ -6729,14 +6740,15 @@ async def _emit_thinking_surfaced_trace(
             status="ok",
             summary=f"V2 thinking {safe_branch} ({safe_chars} chars)",
             explain=(
-                "Records only the selected branch, character count, model, and "
-                "lane; no thinking text or fragment is included."
+                "Records only the selected branch, character count, retry count, "
+                "model, and lane; no thinking text or fragment is included."
             ),
             detail={
                 "branch": safe_branch,
                 "chars": safe_chars,
                 "model": model,
                 "lane": safe_lane,
+                "retried": safe_retried,
             },
         )
     except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a reply
@@ -14046,6 +14058,10 @@ async def process_job(
         language_correction_pending = False
         language_correction_outcome = "skipped"
         thinking_language_correction_pending = False
+        self_thinking_absent_retry_requests = 0
+        self_thinking_absent_retried = 0
+        self_thinking_absent_retry_pending = False
+        self_thinking_absent_retry_response_seen = False
 
         def _cancel_language_correction() -> None:
             nonlocal language_correction_attempted
@@ -14055,6 +14071,16 @@ async def process_job(
             language_correction_pending = False
             language_correction_outcome = "skipped"
             thinking_language_correction_pending = False
+
+        def _cancel_self_thinking_absent_retry() -> None:
+            nonlocal self_thinking_absent_retry_requests
+            nonlocal self_thinking_absent_retried
+            nonlocal self_thinking_absent_retry_pending
+            nonlocal self_thinking_absent_retry_response_seen
+            self_thinking_absent_retry_requests = 0
+            self_thinking_absent_retried = 0
+            self_thinking_absent_retry_pending = False
+            self_thinking_absent_retry_response_seen = False
 
         async def _on_reply(
             text: str | WorkspaceFileReply,
@@ -14074,6 +14100,10 @@ async def process_job(
             nonlocal language_correction_attempted
             nonlocal language_correction_pending, language_correction_outcome
             nonlocal thinking_language_correction_pending
+            nonlocal self_thinking_absent_retry_requests
+            nonlocal self_thinking_absent_retried
+            nonlocal self_thinking_absent_retry_pending
+            nonlocal self_thinking_absent_retry_response_seen
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
             raw_reply_text = "" if file_reply is not None else str(text or "").strip()
             text = raw_reply_text
@@ -14117,6 +14147,7 @@ async def process_job(
             _st_gate_on = self_thinking.gate_enabled()
             self_thinking_text = ""
             self_thinking_failed = False
+            self_thinking_status = None
             if (_st_gate_on or self_thinking_on) and file_reply is None and text:
                 _st_split = (
                     self_thinking.strip_all_thinking
@@ -14124,6 +14155,7 @@ async def process_job(
                     else self_thinking.split_thinking
                 )
                 _st_status, _st_thinking, _st_reply = _st_split(text)
+                self_thinking_status = _st_status
                 if _st_status == self_thinking.COMPLETE:
                     text = _st_reply
                     self_thinking_text = _st_thinking
@@ -14250,26 +14282,74 @@ async def process_job(
                     if not pending_file_replies:
                         raise TurnError("internal_file_reference_without_attachment")
             if correction_outcome:
-                safe_outcomes = {
-                    "corrected",
-                    "kept_original_still_mismatch",
-                    "retry_error",
-                    "retry_empty",
-                    "skipped",
-                }
-                language_correction_outcome = (
-                    correction_outcome
-                    if correction_outcome in safe_outcomes
-                    else "skipped"
-                )
-                language_correction_attempted = (
-                    language_correction_outcome != "skipped"
-                )
-                language_correction_pending = False
-                thinking_language_correction_pending = False
+                if self_thinking_absent_retry_pending:
+                    # The loop republishes the first usable reply when the bounded
+                    # correction errors, is empty, is rejected, or has no call
+                    # budget. Count only a provider call that actually happened.
+                    if (
+                        correction_outcome != "skipped"
+                        and not self_thinking_absent_retry_response_seen
+                    ):
+                        self_thinking_absent_retried += 1
+                    self_thinking_absent_retry_pending = False
+                    self_thinking_absent_retry_response_seen = False
+                else:
+                    safe_outcomes = {
+                        "corrected",
+                        "kept_original_still_mismatch",
+                        "retry_error",
+                        "retry_empty",
+                        "skipped",
+                    }
+                    language_correction_outcome = (
+                        correction_outcome
+                        if correction_outcome in safe_outcomes
+                        else "skipped"
+                    )
+                    language_correction_attempted = (
+                        language_correction_outcome != "skipped"
+                    )
+                    language_correction_pending = False
+                    thinking_language_correction_pending = False
             elif final and file_reply is None and not image_replies and text:
+                retry_completed = False
+                if self_thinking_absent_retry_pending:
+                    self_thinking_absent_retried += 1
+                    self_thinking_absent_retry_response_seen = True
+                    if (
+                        self_thinking_status == self_thinking.COMPLETE
+                        and not self_thinking_failed
+                    ):
+                        self_thinking_absent_retry_pending = False
+                        self_thinking_absent_retry_response_seen = False
+                        retry_completed = True
+                    else:
+                        # A correction may improve the saved candidate only by
+                        # satisfying the existing COMPLETE contract. ABSENT,
+                        # SILENT, FAILED, and internal-term failures all preserve
+                        # the first usable reply without surfacing a new marker.
+                        return v2_tool_loop.FinalReplyCorrectionRejected()
+                elif (
+                    self_thinking_on
+                    and self_thinking_status == self_thinking.ABSENT
+                    and self_thinking_absent_retry_requests
+                    < MAX_SELF_THINKING_ABSENT_RETRIES
+                ):
+                    self_thinking_absent_retry_requests += 1
+                    self_thinking_absent_retry_pending = True
+                    return v2_tool_loop.FinalReplyCorrectionRequest(
+                        instruction=_SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION,
+                        original_text=raw_reply_text,
+                        original_reasoning=reasoning,
+                        on_cancel=_cancel_self_thinking_absent_retry,
+                    )
+                # One correction round is already consumed after an ABSENT retry.
+                # Publish a valid COMPLETE result directly instead of asking the
+                # generic one-rewrite loop for a second language rewrite (which
+                # would otherwise fail open to the original ABSENT candidate).
                 if (
-                    self_thinking_text
+                    not retry_completed
+                    and self_thinking_text
                     and not thinking_language_correction_pending
                     and not correction_outcome
                 ):
@@ -14303,7 +14383,8 @@ async def process_job(
                         # rewrite.
                         return v2_tool_loop.FinalReplyCorrectionRejected()
                 elif (
-                    follow_outcome == "mismatch"
+                    not retry_completed
+                    and follow_outcome == "mismatch"
                     and user_script not in {"indeterminate", "mixed"}
                     and reply_script not in {"indeterminate", "mixed"}
                 ):
@@ -14646,6 +14727,7 @@ async def process_job(
                             lane="chat",
                             branch=_thinking_branch,
                             chars=_thinking_chars,
+                            retried=self_thinking_absent_retried,
                         )
                     if final and not language_trace_emitted:
                         language_trace_emitted = True
@@ -14733,6 +14815,7 @@ async def process_job(
                     lane="chat",
                     branch=_thinking_branch,
                     chars=_thinking_chars,
+                    retried=self_thinking_absent_retried,
                 )
             if final and not language_trace_emitted:
                 language_trace_emitted = True
