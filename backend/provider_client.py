@@ -1809,6 +1809,74 @@ def _encode_tool_results_bedrock(results) -> list[dict[str, Any]]:
     ]
 
 
+_GEMINI_UNSUPPORTED_SCHEMA_KEYS = frozenset({
+    "additionalProperties",
+    "enforceItemBounds",
+})
+_SCHEMA_MAP_KEYS = frozenset({
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+    "patternProperties",
+    "properties",
+})
+_OPAQUE_SCHEMA_VALUE_KEYS = frozenset({
+    "const",
+    "default",
+    "example",
+    "examples",
+})
+
+
+def _adapt_tool_schema_gemini(schema: Any) -> Any:
+    """Return a Gemini-compatible copy of one JSON Schema node.
+
+    Gemini's function-declaration schema is narrower than JSON Schema.  In
+    particular, its v1beta endpoint rejects ``additionalProperties`` and our
+    local-only ``enforceItemBounds`` marker, and accepts enum members only as
+    strings.  Keep every other constraint intact: this is a wire adapter, not a
+    replacement for the source schema or the server-side argument validator.
+
+    Schema maps need special handling because their keys are parameter names,
+    not schema keywords.  A tool is therefore still allowed to have a property
+    literally named ``additionalProperties`` or ``enum``.
+    """
+    if not isinstance(schema, dict):
+        return copy.deepcopy(schema)
+
+    adapted: dict[Any, Any] = {}
+    for key, value in schema.items():
+        if key in _GEMINI_UNSUPPORTED_SCHEMA_KEYS:
+            continue
+        if key == "enum":
+            if isinstance(value, list) and all(
+                isinstance(item, str) for item in value
+            ):
+                adapted[key] = list(value)
+            continue
+        if key in _OPAQUE_SCHEMA_VALUE_KEYS:
+            adapted[key] = copy.deepcopy(value)
+            continue
+        if key in _SCHEMA_MAP_KEYS and isinstance(value, dict):
+            adapted[key] = {
+                name: _adapt_tool_schema_gemini(child_schema)
+                for name, child_schema in value.items()
+            }
+            continue
+        if isinstance(value, dict):
+            adapted[key] = _adapt_tool_schema_gemini(value)
+        elif isinstance(value, list):
+            adapted[key] = [
+                _adapt_tool_schema_gemini(item)
+                if isinstance(item, dict)
+                else copy.deepcopy(item)
+                for item in value
+            ]
+        else:
+            adapted[key] = copy.deepcopy(value)
+    return adapted
+
+
 def _encode_tools_gemini(tools) -> list[dict]:
     return [
         {
@@ -1816,7 +1884,7 @@ def _encode_tools_gemini(tools) -> list[dict]:
                 {
                     "name": t.name,
                     "description": t.description,
-                    "parameters": t.parameters,
+                    "parameters": _adapt_tool_schema_gemini(t.parameters),
                 }
                 for t in tools
             ]
