@@ -1721,10 +1721,8 @@ class TurnDeps:
     # 有）。best-effort：实现方吞掉自身异常，调用点也再兜一层 —— 推送失败绝不能
     # 把一个已经成功发布回复的回合打成 failed。None（所有不接线的测试/legacy
     # 调用方）= 特性关闭，行为与补齐推送之前完全一致。``lane`` 是本次唤醒的 lane
-    # 名（chat lane 传空字符串）：backend 端用它推 manual（lane == "manual_wake"）与
-    # 真实 wake source，对齐 V1 `_proactive_delivery_decision_v2` 从 job 推 manual
-    # 的做法 —— 之前这里硬编码 source="heartbeat"/manual=False，导致关了
-    # reminders_delivery 的用户在 V2 手动唤醒收不到推送（V1 会走 manual_bypass）。
+    # 名（chat lane 传空字符串），backend 端据此保留真实 wake source。系统通知
+    # 关闭时 manual wake 仍可运行并写入聊天，但不再绕过可见通知总开关。
     # 返回 True 只表示 APNs 接受了 alert（设备专注/静音/通知设置不可见，是实际响铃的
     # 上界）；任何关闭、前台压制、无 token、出网失败都返回 False。chat lane 忽略该
     # 返回值；wake lane 只把它写入决策后的影子观测，绝不回灌判据。

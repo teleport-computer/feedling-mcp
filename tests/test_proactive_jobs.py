@@ -2595,6 +2595,66 @@ def test_ai_chat_response_pushes_when_app_background(tmp_path, monkeypatch):
     assert msg["alert_status"] == "delivered"
 
 
+def test_ai_chat_response_respects_global_system_notifications_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    core_store._stores.clear()
+
+    sent = []
+    monkeypatch.setattr(
+        push_apns,
+        "_send_apns",
+        lambda *args, **kwargs: sent.append((args, kwargs)) or {"status": "delivered"},
+    )
+
+    api_key = "test_ai_push_notifications_off_key"
+    user_id = "usr_ai_push_notifications_off"
+    registry._key_to_user[registry._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
+    store = core_store.get_store(user_id)
+    store.tokens = [{
+        "type": "device",
+        "token": "device-token",
+        "status": "active",
+        "registered_at": "2026-06-01T00:00:01",
+    }]
+    store._save_tokens()
+    store.save_proactive_settings({"reminders_delivery": False})
+    store.append_device_event(proactive_service._make_device_event("ios", "app_presence", {
+        "scene_phase": "background",
+        "is_foreground": False,
+        "selected_tab": "chat",
+        "is_chat_visible": False,
+    }))
+
+    resp = make_client().post(
+        "/v1/chat/response",
+        headers={"X-API-Key": api_key},
+        json={
+            "envelope": {
+                "id": "msg_ai_notifications_off",
+                "v": 1,
+                "body_ct": "ct",
+                "nonce": "nonce",
+                "K_user": "k-user",
+                "K_enclave": "k-enclave",
+                "visibility": "shared",
+                "owner_user_id": user_id,
+            },
+            "source": "chat",
+            "alert_body": "消息仍写入，但不要发系统通知。",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert sent == []
+    msg = store.chat_messages[-1]
+    assert msg["push_decision"] == "suppress"
+    assert msg["push_reason"] == "reminders_delivery_disabled"
+    assert msg["live_activity_status"] == "suppressed"
+    assert msg["alert_status"] == "suppressed"
+
+
 def test_ai_chat_response_suppresses_push_when_app_foreground(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)

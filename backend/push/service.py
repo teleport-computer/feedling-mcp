@@ -6,6 +6,11 @@ import time
 import db
 from accounts import registry
 from core.store import UserStore
+from proactive.controls_v2 import (
+    USER_MESSAGE_SOURCE_V2,
+    evaluate_delivery_v2,
+    load_settings_v2_for_store,
+)
 from push import apns, live_activity
 from push.sounds import NOTIFICATION_SOUND_NAME
 from push import tokens as push_tokens
@@ -22,9 +27,9 @@ def _env_flag(name: str, default: bool) -> bool:
 
 # Received AI messages (chat replies + proactive) no longer expand the Dynamic
 # Island — they deliver only the system alert, which stacks in Notification
-# Center instead of flashing away. The Live Activity module and its explicit
-# /v1/push/{dynamic-island,live-activity,live-start} routes are untouched and stay
-# available for other/future uses; only this AI-message trigger is gated. Set
+# Center instead of flashing away. Explicit push and Live Activity routes remain
+# available for other/future uses, but the global System Notifications preference
+# gates their visible delivery too. Set
 # FEEDLING_AI_MSG_LIVE_ACTIVITY=1 to restore the old dual (Live Activity + alert)
 # behavior.
 AI_MSG_LIVE_ACTIVITY = _env_flag("FEEDLING_AI_MSG_LIVE_ACTIVITY", False)
@@ -176,6 +181,30 @@ def _deliver_ai_message_push_if_background(
                 "live_activity_status": "skipped", "live_activity_reason": "account_gone",
                 "alert_status": "skipped", "alert_reason": "account_gone"}
     visible_body = (body or "").strip()
+    if not visible_body:
+        return {
+            "push_decision": "skip",
+            "push_reason": "empty_body",
+            "live_activity_status": "skipped",
+            "live_activity_reason": "empty_body",
+            "alert_status": "skipped",
+            "alert_reason": "empty_body",
+        }
+
+    delivery = evaluate_delivery_v2(
+        load_settings_v2_for_store(store),
+        source=USER_MESSAGE_SOURCE_V2,
+    )
+    if not delivery.allow_visible_delivery:
+        return {
+            "push_decision": "suppress",
+            "push_reason": delivery.reason,
+            "live_activity_status": "suppressed",
+            "live_activity_reason": delivery.reason,
+            "alert_status": "suppressed",
+            "alert_reason": delivery.reason,
+        }
+
     decision = _ai_push_decision(store)
     fields: dict = {
         "push_decision": "send" if decision.get("should_push") else "suppress",
@@ -184,17 +213,6 @@ def _deliver_ai_message_push_if_background(
     }
     if decision.get("age_sec") not in ("", None):
         fields["app_presence_age_sec"] = str(decision.get("age_sec"))[:20]
-
-    if not visible_body:
-        fields.update({
-            "push_decision": "skip",
-            "push_reason": "empty_body",
-            "live_activity_status": "skipped",
-            "live_activity_reason": "empty_body",
-            "alert_status": "skipped",
-            "alert_reason": "empty_body",
-        })
-        return fields
 
     if not decision.get("should_push"):
         reason = str(decision.get("reason") or "app_foreground")[:120]

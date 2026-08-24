@@ -603,8 +603,7 @@ def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypat
     assert kw["body"] == reply_text[:240]
     assert kw["is_wake"] is True, "wake lane must push with is_wake=True"
     assert kw["lane"] == "manual_wake", (
-        "backend derives manual/source from this — a copy-paste bug here "
-        "silently breaks the reminders_delivery-off manual-wake bypass"
+        "backend must receive the real wake source for delivery metadata and diagnostics"
     )
     runtime_message = next(
         message
