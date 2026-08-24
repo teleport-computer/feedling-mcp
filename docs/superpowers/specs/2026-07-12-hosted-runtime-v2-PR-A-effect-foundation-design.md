@@ -1,9 +1,34 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # Hosted Runtime V2 — PR A: Control Plane / Effect Foundation (Design)
 
 > Sub-project A of @sxysun's next-round Hosted Runtime V2 directive. Formalized
 > 2026-07-12 on `feat/hosted-runtime-v2` @ 172b4ab (post PR #70 explicit-enrollment
 > baseline). B/C/D depend on this. **Not to be deployed / no user flipped until the
 > 7 P0 fault injections are green.**
+
+> **Lifecycle:** LANDED / CURRENT DECISION RECORD. The detailed component prose
+> below is a 2026-07 design-time baseline, including its former rollout gates and
+> file:line assumptions; it is not an assertion of the current deployment state.
+
+## Landed/current reconciliation (2026-08-24)
+
+The core decision remains current: durable V2 effects are generation-fenced and
+idempotent, jobs pin the authoritative generation, `resident → draining → v2`
+is the cutover barrier, and reply progress is ordered by per-user `seq`, not
+timestamps. The present implementation is in
+`backend/model_api_runtime/v2/effect_outbox.py`, `cutover.py`, `cursor.py`, and
+`jobs_store.py`, with the state/transaction primitives in `backend/db.py` and
+the V2 send route in `backend/hosted/chat_send_core.py`. Current tests exercise
+replay/claim release and ABA fencing (`tests/test_v2_p0_exactly_once.py`,
+`tests/test_v2_p0_aba.py`), cursor integrity at identical timestamps
+(`tests/test_v2_p0_seq_integrity.py`, `tests/test_v2_reply_cursor_seq.py`), and
+atomic send/enqueue (`tests/test_v2_send_enqueue_atomic.py`). Later V1 fencing,
+additional effect types, and recovery paths extend this foundation; they do not
+replace its decision. Current runtime selection and coexistence remain owned by
+the dual-runtime decision and `docs/CURRENT_STATE.md`.
 
 ## Goal
 

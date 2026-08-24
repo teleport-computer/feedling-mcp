@@ -76,3 +76,32 @@ worker/wake 测试覆盖真实 loop、worker 和 executor 的行为，而非仅�
 所有原始精确路径已重写为 archive 路径或在归档文档内改为可解析的相对链接；basename 搜索只保留
 有效 archive、retained design 与审计说明。生产 Python 未引用 implementation plan；归档记录可被
 文档引用，但不作为运行指引。
+
+## 批次 3：PR-A effect foundation 与 PR-B provider transport/telemetry
+
+审计日期：2026-08-24。结论：两份 design 的核心决策均仍由当前代码和聚焦测试支撑，保留为
+`decision` / `canonical_owner: self`；两份 implementation plan 已被实现，改为 `historical` /
+`implemented` 并归档。设计中的部署门槛、旧目录与当时的实现快照均明确为历史基线，不能覆盖
+[`CURRENT_STATE.md`](../CURRENT_STATE.md) 或现行 dual-runtime 控制面。
+
+| 原文档 | 状态与当前 owner | 仓库引用方 / backlinks | 实现 / 测试证据 | 兼容义务 | archive / retain 路径 |
+|---|---|---|---|---|---|
+| PR-A effect-foundation design | `decision`; self | 配套 PR-A plan（现为 archive historical record）；后续 PR-C design 以其 outbox 接口为前提 | `backend/model_api_runtime/v2/effect_outbox.py`、`cutover.py`、`cursor.py`、`jobs_store.py`、`backend/db.py` 与 `backend/hosted/chat_send_core.py`；`tests/test_v2_p0_exactly_once.py`、`test_v2_p0_aba.py`、`test_v2_p0_seq_integrity.py`、`test_v2_send_enqueue_atomic.py` | 保留 generation fencing、draining、seq cursor、重放幂等与原子 send/enqueue；不得破坏 Resident/V2 双向切换或 rollback | retain: [PR-A design](../superpowers/specs/2026-07-12-hosted-runtime-v2-PR-A-effect-foundation-design.md) |
+| PR-A effect-foundation plan | `historical` / `implemented`; PR-A design | 仅历史实现记录；原 source-spec backlink 仍指向 retained design，无生产调用者 | 同上；P0 replay、ABA 与相同 timestamp 的 seq integrity 覆盖计划的基础保证 | 历史任务步骤不构成运行手册；持久化 effect、cursor 和 generation contract 仍由 retained design / code / tests 约束 | [archive plan](../archive/superpowers/plans/2026-07-12-hosted-runtime-v2-PR-A-effect-foundation.md) |
+| PR-B provider transport/telemetry design | `decision`; self | 配套 PR-B plan（现为 archive historical record）；PR-C unified-loop decision 消费其 transport | `backend/provider_client.py`、`backend/provider_types.py`、`backend/model_api_runtime/v2/jobs_store.py`、migration `0029_v2_turn_metrics_whole_turn.py`；`tests/test_provider_tools_acceptance.py`、`test_provider_tool_transcript_wire.py`、`test_provider_async_native.py`、`test_provider_malformed_tool_fallback.py`、`test_v2_whole_turn_metric.py` | 保持 text caller 的 dict compatibility、四 wire 的 tool-call identity / transcript codec、native async、usage normalization 与每 job telemetry 幂等；provider 失败与工具 schema fallback 不得改变既有语义 | retain: [PR-B design](../superpowers/specs/2026-07-13-hosted-runtime-v2-PR-B-provider-transport-telemetry-design.md) |
+| PR-B provider transport/telemetry plan | `historical` / `implemented`; PR-B design | 仅历史实现记录；无生产代码把该 plan 当 operating documentation | 同上；四 wire call-id round trip、async no-thread bridge、malformed fallback 与 whole-turn upsert 覆盖落地边界 | 历史 plan 不授权回退至 text-only transport 或 append-only metric；PR-C loop 仍须使用 retained decision 的兼容接口 | [archive plan](../archive/superpowers/plans/2026-07-13-hosted-runtime-v2-PR-B-provider-transport-telemetry.md) |
+
+### 批次 3 rationale transfer
+
+- PR-A retained decision 接管 effect outbox、generation fence、seq cursor 和 send/enqueue
+  一致性的长期理由；当前 Resident/V2 coexistence 的最终选择仍由 dual-runtime decision 管理。
+- PR-B retained decision 接管 provider-native transport、tool codec、dict-return compatibility、
+  native async 及 idempotent whole-turn telemetry；PR-C 是该 transport 的当前消费者，而非替代者。
+- 本批次只分类、归档和修复 Markdown 生命周期材料；没有修改 runtime、部署、数据库、API、wire/
+  security contract、测试或 `tools/chat_resident_consumer.py`。
+
+### 批次 3 引用检查
+
+精确路径与 basename 搜索确认：PR-A 的 source-spec backlink 继续解析到 retained design；两份
+moved plan 的所有外部可解析链接均使用 archive 路径或 retained decision。生产 Python 没有引用
+implementation plan；archive 的任务步骤仅保留可追溯性，不是 operating documentation。
