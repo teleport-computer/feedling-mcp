@@ -2512,7 +2512,7 @@ def test_proactive_chat_response_delivery_off_writes_chat_without_push(tmp_path,
     assert msg["push_decision"] == "suppressed"
     assert msg["push_reason"] == "reminders_delivery_disabled"
     assert msg["alert_status"] == "suppressed"
-    assert msg["live_activity_status"] == "suppressed"
+    assert msg["live_activity_status"] == "disabled"
 
 
 def test_ai_chat_response_pushes_when_app_background(tmp_path, monkeypatch):

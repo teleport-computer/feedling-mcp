@@ -74,6 +74,34 @@ def _token(user_id, scope):
     )
 
 
+def _configure_notifications_off(monkeypatch):
+    from proactive import controls_v2
+
+    monkeypatch.setattr(
+        push_service,
+        "load_settings_v2_for_store",
+        lambda store: controls_v2.resolve_settings_v2({"reminders_delivery": False}),
+    )
+    monkeypatch.setattr(push_service, "AI_MSG_LIVE_ACTIVITY", False)
+    monkeypatch.setattr(
+        push_service,
+        "_ai_push_decision",
+        lambda store: {
+            "should_push": True,
+            "reason": "app_background",
+            "phase": "background",
+            "age_sec": "5",
+        },
+    )
+    monkeypatch.setattr(
+        push_service,
+        "_send_chat_alert",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("ordinary Push must stay suppressed")
+        ),
+    )
+
+
 def test_wrong_scope_is_forbidden(app_obj, user):
     status, _ = _post(
         app_obj,
@@ -116,15 +144,7 @@ def test_delivers_and_writes_back_metadata(app_obj, user, monkeypatch):
 
 
 def test_wake_respects_reminders_delivery_off(app_obj, user, monkeypatch):
-    from proactive import controls_v2
-
-    monkeypatch.setattr(
-        controls_v2, "load_settings_v2_for_store",
-        lambda store: controls_v2.resolve_settings_v2({"reminders_delivery": False}))
-    called = {"n": 0}
-    monkeypatch.setattr(
-        push_service, "_deliver_ai_message_push_if_background",
-        lambda *a, **k: called.update(n=called["n"] + 1) or {})
+    _configure_notifications_off(monkeypatch)
     written = {}
     monkeypatch.setattr(
         core_store.UserStore, "update_chat_message_metadata",
@@ -140,20 +160,12 @@ def test_wake_respects_reminders_delivery_off(app_obj, user, monkeypatch):
     assert status == 200
     assert body["status"] == "suppressed"
     assert body["apns_alert_sent"] is False
-    assert called["n"] == 0
     assert written["fields"]["alert_status"] == "suppressed"
+    assert written["fields"]["live_activity_status"] == "disabled"
 
 
 def test_user_reply_respects_global_system_notifications_off(app_obj, user, monkeypatch):
-    from proactive import controls_v2
-
-    monkeypatch.setattr(
-        controls_v2, "load_settings_v2_for_store",
-        lambda store: controls_v2.resolve_settings_v2({"reminders_delivery": False}))
-    called = {"n": 0}
-    monkeypatch.setattr(
-        push_service, "_deliver_ai_message_push_if_background",
-        lambda *a, **k: called.update(n=called["n"] + 1) or {})
+    _configure_notifications_off(monkeypatch)
     written = {}
     monkeypatch.setattr(
         core_store.UserStore, "update_chat_message_metadata",
@@ -169,21 +181,13 @@ def test_user_reply_respects_global_system_notifications_off(app_obj, user, monk
     assert status == 200
     assert body["status"] == "suppressed"
     assert body["apns_alert_sent"] is False
-    assert called["n"] == 0
     assert written["fields"]["push_reason"] == "reminders_delivery_disabled"
+    assert written["fields"]["live_activity_status"] == "disabled"
 
 
 def test_manual_wake_respects_global_system_notifications_off(app_obj, user, monkeypatch):
     """Manual wake still writes chat but cannot bypass the global notification switch."""
-    from proactive import controls_v2
-
-    monkeypatch.setattr(
-        controls_v2, "load_settings_v2_for_store",
-        lambda store: controls_v2.resolve_settings_v2({"reminders_delivery": False}))
-    called = {"n": 0}
-    monkeypatch.setattr(
-        push_service, "_deliver_ai_message_push_if_background",
-        lambda *a, **k: called.update(n=called["n"] + 1) or {})
+    _configure_notifications_off(monkeypatch)
     written = {}
     monkeypatch.setattr(
         core_store.UserStore, "update_chat_message_metadata",
@@ -200,8 +204,8 @@ def test_manual_wake_respects_global_system_notifications_off(app_obj, user, mon
     assert status == 200
     assert body["status"] == "suppressed"
     assert body["apns_alert_sent"] is False
-    assert called["n"] == 0
     assert written["fields"]["alert_status"] == "suppressed"
+    assert written["fields"]["live_activity_status"] == "disabled"
 
 
 def test_non_manual_wake_lane_still_respects_reminders_delivery_off(
@@ -210,15 +214,7 @@ def test_non_manual_wake_lane_still_respects_reminders_delivery_off(
     """Sibling to the manual-bypass test above: a non-manual wake lane
     (heartbeat) must still be suppressed when `reminders_delivery` is off —
     guards against a fix that accidentally makes every wake manual."""
-    from proactive import controls_v2
-
-    monkeypatch.setattr(
-        controls_v2, "load_settings_v2_for_store",
-        lambda store: controls_v2.resolve_settings_v2({"reminders_delivery": False}))
-    called = {"n": 0}
-    monkeypatch.setattr(
-        push_service, "_deliver_ai_message_push_if_background",
-        lambda *a, **k: called.update(n=called["n"] + 1) or {})
+    _configure_notifications_off(monkeypatch)
     written = {}
     monkeypatch.setattr(
         core_store.UserStore, "update_chat_message_metadata",
@@ -235,8 +231,8 @@ def test_non_manual_wake_lane_still_respects_reminders_delivery_off(
     assert status == 200
     assert body["status"] == "suppressed"
     assert body["apns_alert_sent"] is False
-    assert called["n"] == 0
     assert written["fields"]["alert_status"] == "suppressed"
+    assert written["fields"]["live_activity_status"] == "disabled"
 
 
 def test_empty_body_is_skipped(app_obj, user, monkeypatch):
