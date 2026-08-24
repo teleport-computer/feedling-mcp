@@ -1,18 +1,20 @@
 ---
-document_lifecycle: current
-canonical_owner: self
+document_lifecycle: historical
+canonical_owner: docs/CURRENT_STATE.md
+historical_reason: superseded
+superseded_by: docs/CURRENT_STATE.md
 ---
 # Hosted Runtime V2 — Current Parity and Completion Matrix
 
-> **CURRENT SOURCE OF TRUTH — 2026-07-27.** This page describes the current
-> Runtime V2 source and managed deployment manifests. A live environment changes
-> only after this source is deployed. Use
-> [`deploy/HOSTED_RUNTIME_V2_ROLLOUT.md`](../deploy/HOSTED_RUNTIME_V2_ROLLOUT.md)
-> for operational gates and
-> [`docs/superpowers/specs/runtime-v2-parity-matrix.md`](superpowers/specs/runtime-v2-parity-matrix.md)
-> for the detailed capability-to-facade mapping. The dated design plans and
-> [`HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md`](HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md)
-> are historical evidence, not live status.
+> **HISTORICAL / SUPERSEDED SNAPSHOT — not a current runtime or deployment
+> source.** This matrix records a point-in-time Runtime V2 capability/topology
+> assessment. Its `v2_only` and Resident-retirement claims must not be used as
+> current facts. Current runtime/deployment behavior comes from
+> [`CURRENT_STATE.md`](CURRENT_STATE.md), the exact deployed
+> `release.git_commit`, and the compose files at that SHA. The retained matrix
+> remains useful as historical capability/guard evidence; its queue-wait row
+> also records the durable correction that over-SLA telemetry never returns 503
+> or rejects before persistence.
 
 ## Status legend
 

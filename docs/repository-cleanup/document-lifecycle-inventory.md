@@ -9,9 +9,9 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 
 | Lifecycle | Classified documents |
 |---|---:|
-| `current` | 16 |
+| `current` | 15 |
 | `decision` | 7 |
-| `historical` | 18 |
+| `historical` | 19 |
 | `generated` | 1 |
 
 ## current
@@ -22,7 +22,6 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/API_ERRORS.md`
 - `docs/CURRENT_STATE.md`
 - `docs/DOCUMENT_LIFECYCLE.md`
-- `docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md`
 - `docs/PROJECT_OVERVIEW.md`
 - `docs/repository-cleanup/README.md`
 - `docs/repository-cleanup/agent-diagnostic-benchmark.md`
@@ -46,6 +45,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 ## historical
 
 - `docs/CHANGELOG.md`
+- `docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md`
 - `docs/archive/superpowers/plans/2026-07-08-hosted-runtime-v2-C-action-queue-planner.md`
 - `docs/archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D-admission-ceiling.md`
 - `docs/archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D0-rollout-infrastructure.md`

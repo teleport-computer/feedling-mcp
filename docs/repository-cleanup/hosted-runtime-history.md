@@ -155,6 +155,7 @@ partial-supersession 链接保持可解析。生成的 lifecycle inventory 由�
 |---|---|---|---|---|---|
 | §6 admission-ceiling design | `decision`; self；顶部 current reconciliation 取代旧 503 作为可执行结论 | 配套 plan 改为 archive historical record；本审计页记录 retain/archive 决定 | [`chat_send_core.py`](../../backend/hosted/chat_send_core.py) 对 foreground capacity、`chat`/`manual_wake` in-flight、recent chat mean 只记录 `admission_over_sla`；[`test_chat_send_v2_enqueue.py`](../../tests/test_chat_send_v2_enqueue.py) 覆盖 overload 后仍 202、原子入库/enqueue、coalesce/preemption 与估算异常 fail-open | live overload 不得在持久化前丢弃用户输入；foreground scope 必须只计 `chat`/`manual_wake`；`workers_alive`、runtime control、kill switch、provider/config failures 保持独立 fail-closed gates | retain: [design](../superpowers/specs/2026-07-09-hosted-runtime-v2-D-admission-ceiling-design.md) |
 | §6 admission-ceiling implementation plan | `historical` / `implemented`; retained design | 无生产实现调用者；所有 task/checklist 均明确为不可执行历史记录 | [`admission.py`](../../backend/model_api_runtime/v2/admission.py)、[`jobs_store.py`](../../backend/model_api_runtime/v2/jobs_store.py)、[`test_v2_admission.py`](../../tests/test_v2_admission.py) 与 [`test_v2_jobs_store.py`](../../tests/test_v2_jobs_store.py) 保留估算及 queue metrics 的实现证据 | 历史 `busy` response、旧路径、旧 line numbers 与 NO-COMMIT/worktree 指令不得被当作 current runbook；当前对外承诺以 [Chat workflow](../../docs-site/content/docs/workflows/chat.mdx) 为准 | [archive plan](../archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D-admission-ceiling.md) |
+| Hosted Runtime V2 parity matrix | `historical` / `superseded`; [`CURRENT_STATE.md`](../CURRENT_STATE.md) | 多份既有设计、计划、测试与运维材料仍以它保存能力/guard 考古链接；其 canonical owner 与 `superseded_by` 都解析至 `CURRENT_STATE.md` | 其中的 queue-wait row 保留 live-overload telemetry 不得 pre-persistence 503 的历史更正；当前 dual/per-user runtime 与 resident topology 的实现/测试证据以 CURRENT_STATE 和当前代码为准 | 不得将 matrix 的 `v2_only`、单一 deployment topology 或 Resident retirement 断言用于当前操作；当前事实必须核对 CURRENT_STATE、exact deployed SHA 与该 SHA compose | retain in place: [parity matrix](../HOSTED_RUNTIME_V2_PARITY_MATRIX.md) |
 
 ### 批次 5 rationale transfer
 
@@ -168,7 +169,11 @@ partial-supersession 链接保持可解析。生成的 lifecycle inventory 由�
 - `isolation_events.admission_rejects.over_sla` 是 legacy-shaped 的 zero/default metrics
   label，不从 `admission_over_sla` telemetry 取值，且不表示消息被拒绝；任何改名或移除
   都是单独的 wire-compatible cleanup，不属于本批次。
-- 本批次变更 lifecycle Markdown、生成的 inventory、active parity 表述，并作一项文档层
+- parity matrix 的 broad `v2_only` / Resident-retirement 拓扑断言已与当前 dual/per-user
+  runtime 冲突；它原位改为 `historical` / `superseded` 并由 CURRENT_STATE 接管。历史
+  capability/guard links 保留，但不再授权以该矩阵判断 live deployment。
+- 本批次变更 lifecycle Markdown、生成的 inventory、parity matrix 的生命周期/telemetry
+  表述，并作一项文档层
   API error-contract 修正（删除已失效的 live-overload `busy` / 503 行）及指定 Python/test
   注释或 docstring 的诊断用语规范；不修改 runtime、数据库、schema、compose、API/wire/
   security 行为、公开 `docs-site/`、`deploy/` 或
@@ -181,5 +186,6 @@ partial-supersession 链接保持可解析。生成的 lifecycle inventory 由�
 `docs-site/`，而是继续由 [Chat workflow](../../docs-site/content/docs/workflows/chat.mdx) 说明。
 审查复核同时移除了 [`API_ERRORS.md`](../API_ERRORS.md) 中已失效的 live-overload
 `busy` / 503 / `queue_over_sla` 行，避免将 telemetry 误发布为 HTTP error contract。
-当前 [`HOSTED_RUNTIME_V2_PARITY_MATRIX.md`](../HOSTED_RUNTIME_V2_PARITY_MATRIX.md) 也将
-该能力表述为 queue-wait/capacity telemetry，并明确 over-SLA 不会在持久化前返回 503 或拒绝。
+保留在原位的 [`HOSTED_RUNTIME_V2_PARITY_MATRIX.md`](../HOSTED_RUNTIME_V2_PARITY_MATRIX.md)
+现为 `historical` / `superseded`，其 owner/backlink 指向 `CURRENT_STATE.md`；它仍将该能力
+表述为 queue-wait/capacity telemetry，并明确 over-SLA 不会在持久化前返回 503 或拒绝。
