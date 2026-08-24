@@ -12,6 +12,14 @@ change must not be interpreted as an API guarantee.
 
 - Reduced multi-worker chat database egress by synchronizing bounded per-user change events and using durable point/window queries for verify, resident poll, and Runtime V2 prompt reads. Public API schemas and end-to-end encryption behavior are unchanged; gap detection retains a bounded snapshot fallback.
 
+- **The iOS System Notifications switch now gates every IO system notification.**
+  Turning it off suppresses proactive alerts, manual-wake alerts, and replies to
+  user-authored messages while preserving the corresponding chat records. The
+  iOS client also unregisters from remote notifications and suppresses its
+  identity-change local notifications, so self-hosted relay traffic cannot
+  bypass the same device-level choice. Re-enabling the switch re-registers the
+  device and refreshes an existing relay enrollment.
+
 - **iOS notification alerts now use a device-selected local sound.** APNs sends
   one stable sound filename for regular notifications; the iOS app owns the
   corresponding file in its local `Library/Sounds` directory. Older clients and

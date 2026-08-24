@@ -198,6 +198,39 @@ def test_notification_delivered_parity(asgi_app_obj, user, monkeypatch):
     assert _norm_msg(ab) == _norm_msg(fb) == {"status": "delivered", "message_id": "<msg>"}
 
 
+@pytest.mark.parametrize("path", [
+    "/v1/push/notification",
+    "/v1/push/dynamic-island",
+    "/v1/push/live-activity",
+    "/v1/push/live-start",
+])
+def test_global_system_notifications_off_suppresses_explicit_push_routes(
+    asgi_app_obj, user, monkeypatch, path
+):
+    uid, api_key = user
+    core_store.get_store(uid).save_proactive_settings({"reminders_delivery": False})
+    monkeypatch.setattr(
+        apns,
+        "_send_apns_to_active_tokens",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("APNs must stay suppressed")),
+    )
+    monkeypatch.setattr(
+        apns,
+        "_send_apns",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("APNs must stay suppressed")),
+    )
+
+    payload = {"activity_id": "la_off", "title": "hi", "body": "still stored elsewhere"}
+    fs, fb = _flask_post(path, payload, {"X-API-Key": api_key})
+    as_, ab = _asgi_post(asgi_app_obj, path, payload, {"X-API-Key": api_key})
+
+    assert fs == as_ == 200
+    assert ab == fb == {
+        "status": "suppressed",
+        "reason": "reminders_delivery_disabled",
+    }
+
+
 # --------------------------------------------------------------------------- #
 # POST /v1/push/dynamic-island  &  /v1/push/live-activity
 # --------------------------------------------------------------------------- #

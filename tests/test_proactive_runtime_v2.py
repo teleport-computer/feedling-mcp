@@ -278,7 +278,7 @@ def test_dnd_keeps_broadcast_edge_thinkable_but_blocks_visible_delivery():
     assert delivery.reason == "reminders_delivery_disabled"
 
 
-def test_manual_wake_bypasses_user_silencing_gates():
+def test_manual_wake_runs_but_does_not_bypass_global_notification_switch():
     settings = resolve_settings_v2({
         "switches": {
             "ambient": False,
@@ -293,10 +293,20 @@ def test_manual_wake_bypasses_user_silencing_gates():
 
     assert wake_decision.accepted is True
     assert wake_decision.reason == "manual_bypass"
-    assert delivery_decision.allow_visible_delivery is True
-    assert delivery_decision.reason == "manual_bypass"
+    assert delivery_decision.allow_visible_delivery is False
+    assert delivery_decision.reason == "reminders_delivery_disabled"
     assert action_decision.accepted is True
     assert action_decision.reason == "manual_bypass"
+
+
+def test_user_message_reply_does_not_bypass_global_notification_switch():
+    settings = resolve_settings_v2({"switches": {"reminders_delivery": False}})
+
+    delivery = evaluate_delivery_v2(settings, source="user_message")
+
+    assert delivery.allow_chat_write is True
+    assert delivery.allow_visible_delivery is False
+    assert delivery.reason == "reminders_delivery_disabled"
 
 
 def test_manual_wake_does_not_bypass_scheduled_capability_switch():

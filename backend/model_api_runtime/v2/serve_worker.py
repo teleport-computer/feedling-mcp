@@ -693,11 +693,8 @@ def _send_reply_push(
     compose 内网交过去（与 V1 consumer 走 HTTP 传 push_body 是同一个姿态）。
     完全 best-effort：任何异常都在这里吞掉并记日志，绝不冒到回合上。
 
-    ``lane`` 是本次唤醒的 V2 lane 名（chat lane 传空字符串），backend 用它推
-    manual（``lane == "manual_wake"``）与真实 wake source，对齐 V1
-    `_proactive_delivery_decision_v2` 从 job 推 manual 的做法 —— 缺这个字段会让
-    manual wake 被当成非 manual，关了 reminders_delivery 的用户收不到手动唤醒
-    推送（v2-push-parity 分支审查 Minor #1）。
+    ``lane`` 是本次唤醒的 V2 lane 名（chat lane 传空字符串），保留真实来源供
+    backend 做投递决策和诊断。系统通知关闭时所有 lane 都只写聊天，不发送推送。
     """
     api_url = os.environ.get("FEEDLING_API_URL", "").strip()
     if not api_url:

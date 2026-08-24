@@ -22,6 +22,7 @@ from datetime import datetime
 
 from core import store as core_store
 from core.store import UserStore
+from proactive import controls_v2
 from push import apns
 from push import live_activity
 from push.sounds import NOTIFICATION_SOUND_NAME
@@ -33,6 +34,16 @@ def list_tokens(store: UserStore, *, active_only: bool) -> dict:
     if active_only:
         tokens = [t for t in tokens if push_tokens._entry_is_active(t)]
     return {"tokens": tokens}
+
+
+def _global_notification_suppression(store: UserStore) -> dict | None:
+    decision = controls_v2.evaluate_delivery_v2(
+        controls_v2.load_settings_v2_for_store(store),
+        source=controls_v2.USER_MESSAGE_SOURCE_V2,
+    )
+    if decision.allow_visible_delivery:
+        return None
+    return {"status": "suppressed", "reason": decision.reason}
 
 
 def register_token(store: UserStore, *, payload: dict) -> dict:
@@ -87,6 +98,8 @@ def register_token(store: UserStore, *, payload: dict) -> dict:
 
 
 def notification(store: UserStore, *, payload: dict) -> dict:
+    if suppression := _global_notification_suppression(store):
+        return suppression
     if not push_tokens._select_token(store, push_tokens._is_device_token, active_only=True):
         print(f"[notification:{store.user_id}] no device token — logged: {payload}")
         return {"status": "logged", "message_id": f"msg_{uuid.uuid4().hex[:8]}"}
@@ -109,14 +122,20 @@ def notification(store: UserStore, *, payload: dict) -> dict:
 
 
 def dynamic_island(store: UserStore, *, payload: dict) -> dict:
+    if suppression := _global_notification_suppression(store):
+        return suppression
     return live_activity.push_live_activity_dict(store, payload)
 
 
 def live_activity_update(store: UserStore, *, payload: dict) -> dict:
+    if suppression := _global_notification_suppression(store):
+        return suppression
     return live_activity.push_live_activity_dict(store, payload)
 
 
 def live_start(store: UserStore, *, payload: dict) -> dict:
+    if suppression := _global_notification_suppression(store):
+        return suppression
     return live_activity.push_live_start_dict(store, payload)
 
 
@@ -126,10 +145,9 @@ def ai_reply_push(store: UserStore, *, payload: dict) -> dict:
     V2 的 serve-worker 没有 APNs 私钥（只注入 backend），所以它把已落库回复的
     明文正文交到这里。正文只经过内存：不写库、不进日志正文。
 
-    ``is_wake`` 为真表示这是 agent 主动发起的消息，额外受用户的
-    ``reminders_delivery`` 开关管辖；用户发消息后的应答不受该开关影响。
+    ``reminders_delivery`` 是 iOS 的全局系统通知开关。无论消息来自 agent
+    主动唤醒还是用户消息后的回复，关闭时都只写入聊天，不发送可见推送。
     """
-    from proactive.controls_v2 import evaluate_delivery_v2, load_settings_v2_for_store
     from push import service as push_service
 
     msg_id = str(payload.get("msg_id") or "").strip()
@@ -145,9 +163,9 @@ def ai_reply_push(store: UserStore, *, payload: dict) -> dict:
         # screen_watch) the serve-worker sent this wake reply's push under.
         # Mirrors V1's ``_proactive_delivery_decision_v2`` (chat/chat_core.py),
         # which derives ``source``/``manual`` from the wake job rather than
-        # hardcoding them -- manual==True routes through
-        # ``evaluate_delivery_v2``'s ``manual_bypass`` and is delivered even
-        # when the user has turned ``reminders_delivery`` off. Back-compat: a
+        # hardcoding them. The global notification gate now runs before that
+        # source-specific decision, so manual only describes the wake and never
+        # bypasses a disabled notification preference. Back-compat: a
         # caller that predates this field (payload has no "lane" key at all)
         # falls back to the pre-fix constants instead of erroring.
         if "lane" in payload:
@@ -156,23 +174,27 @@ def ai_reply_push(store: UserStore, *, payload: dict) -> dict:
         else:
             source = "heartbeat"
             manual = False
-        decision = evaluate_delivery_v2(
-            load_settings_v2_for_store(store), source=source, manual=manual)
-        if not decision.allow_visible_delivery:
-            fields = {
-                "push_decision": "suppressed",
-                "push_reason": decision.reason,
-                "alert_status": "suppressed",
-                "alert_reason": decision.reason,
-                "live_activity_status": "suppressed",
-                "live_activity_reason": decision.reason,
-            }
-            store.update_chat_message_metadata(msg_id, fields)
-            return {
-                "status": "suppressed",
-                "reason": decision.reason,
-                "apns_alert_sent": False,
-            }
+    else:
+        source = controls_v2.USER_MESSAGE_SOURCE_V2
+        manual = False
+
+    decision = controls_v2.evaluate_delivery_v2(
+        controls_v2.load_settings_v2_for_store(store), source=source, manual=manual)
+    if not decision.allow_visible_delivery:
+        fields = {
+            "push_decision": "suppressed",
+            "push_reason": decision.reason,
+            "alert_status": "suppressed",
+            "alert_reason": decision.reason,
+            "live_activity_status": "suppressed",
+            "live_activity_reason": decision.reason,
+        }
+        store.update_chat_message_metadata(msg_id, fields)
+        return {
+            "status": "suppressed",
+            "reason": decision.reason,
+            "apns_alert_sent": False,
+        }
 
     fields = push_service._deliver_ai_message_push_if_background(
         store, body=body[:240], title="IO", data={}, visual_state="reply")
