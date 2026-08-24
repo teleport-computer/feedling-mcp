@@ -1,3 +1,8 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/CURRENT_STATE.md
+historical_reason: point-in-time
+---
 # Feedling MCP — Changelog
 
 > This is the historical timeline of landmark diffs: it records when a decision

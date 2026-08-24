@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # 测试怎么做 — 从这里开始
 
 > 2026-08-14 重整。**这个目录以前有 6 份文档、没有主次,不知道该从哪进。**

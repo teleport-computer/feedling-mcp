@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: docs/CURRENT_STATE.md
+---
 # feedling-mcp-v1
 
 Feedling gives your Personal Agent a body on iOS — Dynamic Island, Live

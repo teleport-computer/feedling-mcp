@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Repository guidance for coding agents
 
 ## Reading order on session start

@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Agent 排查基准
 
 本基准衡量仓库能否让一个全新会话快速选中正确 runtime 和证据链。它不是知识问答：答案必须来自被测 commit，不能使用其他会话的记忆。

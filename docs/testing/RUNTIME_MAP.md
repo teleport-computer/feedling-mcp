@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # 概念 → 各运行时坐标对照表
 
 > **做跨运行时对照之前先查这张表,不要直接 grep 符号名。**

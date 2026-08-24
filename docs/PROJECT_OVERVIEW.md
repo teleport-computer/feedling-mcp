@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: docs/CURRENT_STATE.md
+---
 # Feedling 项目总览（功能 · 架构 · 信任链）
 
 > 面向第一次接触本项目的工程师 / 审计者 / 合作者的导读文档。
