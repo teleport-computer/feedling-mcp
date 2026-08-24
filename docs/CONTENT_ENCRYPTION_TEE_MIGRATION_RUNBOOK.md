@@ -86,11 +86,12 @@ is the sole drain owner.
 Every release that advances `alembic_tee` must apply that same release head to
 the decrypted-shadow target with `PLAINTEXT_SHADOW_MIGRATION_DATABASE_URL`
 before, or in the same maintenance window as, the TEE primary migration. This
-includes a TEE-primary-only table such as `trace_events`: the table is not added
-to shadow replication, but the exact-head gate still requires the target's
-schema version to advance. Migrating only the primary makes the elected drain
-stop deliberately on head mismatch; treat that stop as a failed deployment
-sequence, not as ordinary replication lag.
+includes a primary-local table such as `trace_events`: both selectable primary
+migration chains carry its schema, but it is not added to shadow replication.
+The exact-head gate still requires the TEE decrypted-shadow target's schema
+version to advance. Migrating only the TEE primary makes the elected drain stop
+deliberately on head mismatch; treat that stop as a failed deployment sequence,
+not as ordinary replication lag.
 
 The source control tables contain keys, generations, counters, timestamps, and
 fixed error slugs only. The drain claims dirty keys with short

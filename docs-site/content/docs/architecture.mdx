@@ -442,21 +442,27 @@ lets an authorized administrator compare whether two searches used the same
 trimmed query during the trace-retention window, but it is not ciphertext and
 must not be exposed through a public debug route.
 
-In the managed TEE-primary topology, each trace event is an append-only row in
-the authoritative TEE PostgreSQL database. Daily partitions use Beijing-day
-boundaries and retain 30 days. A default partition preserves events if rolling
-partition maintenance is late, but any row in that partition is a degraded
-state that the backend reports independently of the owner-only repair command.
+In managed deployments, each trace event is an append-only row in the selected
+primary PostgreSQL database. The RDS and TEE migration chains carry the same
+table, index, and partition contract, but the service writes only the database
+selected as primary; it does not mirror or double-write trace rows. Daily
+partitions use Beijing-day boundaries and retain 30 days. A default partition
+preserves events if rolling partition maintenance is late, but any row in that
+partition is a degraded state that the backend reports independently of the
+owner-only repair command.
+
 Trace summaries, explanations, bounded structured detail, and explicitly
-captured content excerpts are plaintext operational data inside the TEE trust
-boundary; they are not end-to-end encrypted user envelopes. The table has no
-foreign key to the account row: deleting an account intentionally leaves its
-recent trace queryable by exact uid for incident diagnosis until retention or
-an explicit operator trace clear removes it. Each event also carries the same
-outcome classification used by Runtime job reporting: operational failure,
-timeout, control flow, or safety suppression. Keeping that vocabulary shared
-prevents trace investigation and the operational failure-rate dashboard from
-assigning the same terminal outcome to different buckets.
+captured content excerpts are plaintext operational data; they are not
+end-to-end encrypted user envelopes. Their trust boundary follows the selected
+database: RDS-primary deployments store them in RDS, while TEE-primary
+deployments store them in TEE PostgreSQL. The table has no foreign key to the
+account row: deleting an account intentionally leaves its recent trace
+queryable by exact uid for incident diagnosis until retention or an explicit
+operator trace clear removes it. Each event also carries the same outcome
+classification used by Runtime job reporting: operational failure, timeout,
+control flow, or safety suppression. Keeping that vocabulary shared prevents
+trace investigation and the operational failure-rate dashboard from assigning
+the same terminal outcome to different buckets.
 
 See the [Memory workflow](/docs/workflows/memory) for the complete envelope,
 selection, fetch, and action contracts.

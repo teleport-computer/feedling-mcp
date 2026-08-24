@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Managed RDS-primary deployments now install the same append-only,
+  Beijing-day-partitioned `trace_events` schema as TEE-primary deployments.
+  This restores the operator data-track debug read and trace writer when RDS is
+  selected. Trace rows remain plaintext operational data in the selected
+  primary only—there is no mirroring or double-write—and rolling partition
+  maintenance uses an explicit migration credential outside the request path.
+
 - Reduced multi-worker chat database egress by synchronizing bounded per-user change events and using durable point/window queries for verify, resident poll, and Runtime V2 prompt reads. Public API schemas and end-to-end encryption behavior are unchanged; gap detection retains a bounded snapshot fallback.
 
 - **The iOS System Notifications switch now gates IO's ordinary message-style

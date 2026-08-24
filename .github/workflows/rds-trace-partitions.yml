@@ -1,0 +1,68 @@
+name: RDS trace partition maintenance
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [test, pre, prod]
+        required: true
+      confirm:
+        description: 'Enter MAINTAIN-RDS-TRACE (prod: MAINTAIN-RDS-TRACE-PROD)'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  maintain:
+    runs-on: ubuntu-24.04
+    concurrency: rds-trace-partitions-${{ inputs.environment }}
+    steps:
+      - name: Confirmation guard
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          if [ "$ENVIRONMENT" = "prod" ]; then
+            want=MAINTAIN-RDS-TRACE-PROD
+          else
+            want=MAINTAIN-RDS-TRACE
+          fi
+          test "$CONFIRM" = "$want" || {
+            echo "::error::confirmation mismatch for ${ENVIRONMENT}"
+            exit 1
+          }
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.environment == 'prod' && 'main' || inputs.environment == 'pre' && 'pre' || 'test' }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install migration dependencies
+        run: pip install --require-hashes -r backend/requirements.lock
+
+      - name: Maintain selected RDS trace partitions
+        env:
+          PYTHONPATH: backend
+          ENVIRONMENT: ${{ inputs.environment }}
+          TEST_DSN: ${{ secrets.TEST_DATABASE_URL }}
+          PRE_DSN: ${{ secrets.PRE_DATABASE_URL }}
+          PROD_DSN: ${{ secrets.DATABASE_URL }}
+        run: |
+          case "$ENVIRONMENT" in
+            test) dsn="$TEST_DSN" ;;
+            pre)  dsn="$PRE_DSN" ;;
+            prod) dsn="$PROD_DSN" ;;
+            *) echo "::error::unknown environment: $ENVIRONMENT"; exit 1 ;;
+          esac
+          test -n "$dsn" || {
+            echo "::error::RDS migration credential is not configured for ${ENVIRONMENT}"
+            exit 1
+          }
+          export TRACE_EVENTS_MIGRATION_DATABASE_URL="$dsn"
+          python -m admin.trace_events_partitions

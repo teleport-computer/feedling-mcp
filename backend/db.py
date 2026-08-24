@@ -7755,7 +7755,7 @@ def _mirror_proactive_settings_current(user_id: str) -> None:
         )
 
 
-# --- Append-only TEE-primary debug trace (T184) --------------------------- #
+# --- Append-only selected-primary debug trace (T184/T306) ---------------- #
 
 _TRACE_EVENT_COLUMNS = (
     "id", "user_id", "ts", "subsystem", "type", "status", "outcome_class", "actor",
@@ -7781,10 +7781,9 @@ def insert_trace_events_strict(
 ) -> int:
     """Insert one immutable row per event; normalize unknown outcome classes.
 
-    This is intentionally not mirrored and not available in the RDS migration
-    chain: after TEE-primary promotion ``trace_events`` has exactly one writer
-    and one authoritative copy.  T184's traffic switch calls this helper in a
-    later batch; landing it with the additive schema keeps that cutover small.
+    This is intentionally not mirrored.  Both migration chains carry the same
+    table contract, but ``get_pool()`` selects exactly one primary, so a running
+    deployment still has one writer and one authoritative copy.
     """
     uid = str(user_id or "").strip()
     if not uid:
