@@ -8,7 +8,7 @@ canonical_owner: self
 
 ## 元数据
 
-仓库自有 Markdown 在文件第一行使用 YAML front matter：
+仓库自有 Markdown/MDX 在文件第一行使用 YAML front matter：
 
 ```yaml
 ---
@@ -24,7 +24,7 @@ canonical_owner: docs/CURRENT_STATE.md
 - `historical`：已实施、被取代、被否决或只代表一个时间点的证据；
 - `generated`：可由确定性命令重建，生成器而非输出文件是权威源。
 
-`canonical_owner` 必填。独立权威文档填 `self`；派生文档填仓库相对路径。current 文档只能指向 current/decision Markdown，不能把 archive、historical 或 generated 文档当唯一权威。
+`canonical_owner` 必填。独立权威文档填 `self`；派生文档填仓库内相对路径，不能使用绝对路径或 `..` 越出仓库。current 文档只能指向 current/decision Markdown/MDX，不能把源码、archive、historical 或 generated 文档当唯一权威。
 
 historical 文档还必须设置：
 
@@ -32,7 +32,7 @@ historical 文档还必须设置：
 historical_reason: implemented  # implemented | superseded | rejected | point-in-time
 ```
 
-`superseded` 还要提供存在的 `superseded_by` 路径。generated 文档必须提供完整的 `generator` 命令，并把 `canonical_owner` 指向生成器。
+`superseded` 还要提供仓库内 `superseded_by` 路径，目标必须是 current/decision Markdown/MDX。generated 文档必须提供完整的 `generator` 命令，并把 `canonical_owner` 指向生成器。
 
 ## 转换规则
 
@@ -45,7 +45,7 @@ historical_reason: implemented  # implemented | superseded | rejected | point-in
 
 ## 增量执行
 
-当前 CI 只检查相对 PR 目标分支新增或修改的仓库自有 Markdown：
+当前 CI 只检查相对 PR 目标分支新增或修改的仓库自有 Markdown/MDX：
 
 ```bash
 python3 tools/check_document_lifecycle.py --changed-vs origin/test
@@ -53,7 +53,7 @@ python3 tools/check_document_lifecycle.py --changed-vs origin/test
 
 `contracts/lib/` 和 `vendor/` 属于第三方内容，不由本规则改写。全量迁移完成后才能把 CI 收紧为 `--all`；不得为了过 CI 把未评审历史批量标成 current。
 
-查看已分类文档的确定性清单：
+查看 Git 已跟踪、已分类文档的确定性清单（不会吸收本地未跟踪笔记）：
 
 ```bash
 python3 tools/check_document_lifecycle.py --all --report
