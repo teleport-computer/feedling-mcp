@@ -147,6 +147,64 @@ def test_v2_turn_failure_classification_uses_shared_notice_vocabulary(exc, expec
     assert worker._turn_failure_error_class(exc) == expected
 
 
+@pytest.mark.parametrize("status_code", [408, 500])
+def test_image_generation_wrapper_keeps_internal_http_diagnostics(status_code):
+    upstream_detail = f"IMAGE_WORKER_UPSTREAM_{status_code}_SECRET"
+    try:
+        provider_client._raise_for_provider_status(
+            provider_client.httpx.Response(status_code, text=upstream_detail)
+        )
+    except provider_client.ProviderError as exc:
+        failure = worker._image_generation_unavailable_from_exception(
+            exc,
+            _BYOK,
+        )
+    else:
+        raise AssertionError("expected injected provider failure")
+
+    assert failure.status_code == status_code
+    assert failure.upstream_detail == upstream_detail
+    assert upstream_detail not in str(failure)
+
+
+def test_image_generation_dependency_bug_is_system_owned():
+    async def broken_dependency(*_args, **_kwargs):
+        raise TypeError("internal provider-response adapter drift")
+
+    with pytest.raises(worker.ImageGenerationInternalError) as raised:
+        asyncio.run(
+            worker._call_image_generation_dependency(
+                broken_dependency,
+                user_id="usr_image_internal",
+                prompt="a small red robot",
+                provider_config=_BYOK,
+                api_key=None,
+                runtime_token="runtime-token",
+            )
+        )
+
+    failure = raised.value
+    assert failure.error_code == "image_generation_internal_error"
+    assert failure.provider == _BYOK.provider
+    assert failure.model == _BYOK.model
+    assert isinstance(failure.__cause__, TypeError)
+    assert "adapter drift" not in str(failure)
+
+
+def test_image_generation_internal_error_reaches_system_classification():
+    failure = worker.ImageGenerationInternalError(
+        model="gpt-image-test",
+        provider="openai",
+    )
+
+    assert worker._turn_failure_error_class(failure) == (
+        "image_generation_internal_error"
+    )
+    assert worker._safe_failure_code("turn_failed", failure) == (
+        "turn_failed:image_generation_internal_error"
+    )
+
+
 class _FakeCapResult:
     def __init__(self, data=None, ok=True):
         self._data = data or {}
@@ -1293,32 +1351,52 @@ def test_run_worker_loop_survives_transient_claim_error(monkeypatch):
 
 def test_slot_exception_path_backs_off_on_persistent_failure(monkeypatch):
     """Verify that when claim_next_job persistently fails (e.g., DB outage),
-    the exception handler waits poll_interval before retrying, rather than
-    hot-looping and flooding logs/connection pool."""
-    rec = {}
+    every failed claim crosses the poll wait seam before the next claim.  The
+    sequence assertion proves the causal ordering without using wall-clock
+    time; merely asserting that the shared wait helper was called would be too
+    weak because idle and kill-switch paths call the same helper.  Pinning this
+    helper rather than any sleep is intentional: it keeps backoff responsive to
+    both stop and wake events instead of making the slot uninterruptible."""
     stop = asyncio.Event()
     calls = {"n": 0}
+    events = []
 
     def _always_fail(worker_id, lanes=None):
         calls["n"] += 1
-        raise RuntimeError("persistent db outage")
+        if calls["n"] <= 3:
+            events.append(("failure", calls["n"]))
+            raise RuntimeError("persistent db outage")
+        # A broken exception path with no wait reaches this idle iteration.  It
+        # then exits through the fake wait below instead of hanging the test,
+        # leaving an event sequence that fails the exact assertion.
+        events.append(("empty", calls["n"]))
+        return None
+
+    async def _record_wait(stop_event_arg, wake_event, poll_interval):
+        assert stop_event_arg is stop
+        assert wake_event is None
+        assert poll_interval == 0.05
+        events.append(("wait", calls["n"]))
+        if calls["n"] >= 3:
+            stop_event_arg.set()
 
     monkeypatch.setattr(jobs_store, "claim_next_job", _always_fail)
+    monkeypatch.setattr(worker.kill_switch, "turns_halted", lambda: False)
+    monkeypatch.setattr(worker, "_wait_for_job_or_stop", _record_wait)
 
-    async def _driver():
-        task = asyncio.create_task(worker.run_worker_loop(
-            "w-backoff", max_workers=1, poll_interval=0.05, stop_event=stop, deps=_ok_deps(rec),
-        ))
-        # Let it run for ~0.1s (enough for 2-3 poll_interval cycles if backing off,
-        # but would be ~20+ attempts if hot-looping).
-        await asyncio.sleep(0.1)
-        stop.set()
-        await asyncio.wait_for(task, timeout=2.0)
+    asyncio.run(worker._slot_loop(
+        "w-backoff",
+        poll_interval=0.05,
+        stop_event=stop,
+        deps=_ok_deps({}),
+    ))
 
-    asyncio.run(_driver())
-    # With backoff: ~2-3 attempts in 0.1s (0.05s poll_interval + overhead).
-    # Without backoff: would be 20+ attempts.
-    assert calls["n"] <= 4, f"Too many attempts ({calls['n']}) suggests hot-loop without backoff"
+    assert calls["n"] == 3
+    assert events == [
+        ("failure", 1), ("wait", 1),
+        ("failure", 2), ("wait", 2),
+        ("failure", 3), ("wait", 3),
+    ]
 
 
 def test_slot_recovery_failure_does_not_kill_slot(monkeypatch):

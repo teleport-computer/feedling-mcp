@@ -25,7 +25,6 @@ import pytest
 import conftest
 import db
 import provider_client
-import worldbook_match
 from admin import data_track as admin_data_track
 from provider_types import ToolCall, ToolExchange
 from capabilities import registry as cap_registry
@@ -569,10 +568,7 @@ def test_language_follow_emits_once_for_terminal_visible_body_after_thinking(
     )
     private_thinking = "这是绝对不能参与回复文字系统分类的私密中文思考内容"
     _script_provider(monkeypatch, [
-        _tool_round(
-            _tc("r1", "reply", text="我先查一下"),
-            _tc("s1", "web_search", query="x"),
-        ),
+        _tool_round(_tc("s1", "web_search", query="x")),
         _text_round(
             f"<think>{private_thinking}</think>"
             "This is the final visible English response"
@@ -599,7 +595,6 @@ def test_language_follow_emits_once_for_terminal_visible_body_after_thinking(
 
     assert status == "completed", _job_status_row(job["id"])
     assert [row["body_ct"] for row in _bubbles(uid)] == [
-        "我先查一下",
         "This is the final visible English response",
     ]
     language_traces = [
@@ -815,7 +810,7 @@ def test_chat_tool_surface_keeps_memory_delete(monkeypatch):
     assert chat_ops == ["add", "update", "delete"]
 
 
-def test_chat_worldbook_matches_current_turn_without_rewriting_user_text(
+def test_chat_worldbook_is_pull_only_and_available_as_native_tool(
     monkeypatch,
 ):
     monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
@@ -826,19 +821,25 @@ def test_chat_worldbook_matches_current_turn_without_rewriting_user_text(
     job = jobs_store.claim_next_job("w-worldbook")
     _patch_real_write(monkeypatch)
 
-    calls = _script_provider(monkeypatch, [_text_round("The queen remembers you.")])
-    observed: dict = {}
+    calls = _script_provider(monkeypatch, [
+        _tool_round(_tc("wb-1", "worldbook_match", query="Luna")),
+        _text_round("The queen remembers you."),
+    ])
+    eager_reads = []
+    capability_calls = []
 
-    def read_worldbook(user_id, messages, *, runtime_token):
-        observed.update({
-            "user_id": user_id,
-            "messages": messages,
-            "runtime_token": runtime_token,
-        })
-        return {
+    def read_worldbook(*args, **kwargs):
+        eager_reads.append((args, kwargs))
+        raise AssertionError("foreground world book must be pull-only")
+
+    def run_capability(action_type, store, **kwargs):
+        capability_calls.append((action_type, kwargs))
+        return _FakeCapResult({
             "block": "<world_book>\nLuna is queen of the Moon Court.\n</world_book>",
             "matched_names": ["Moon Court"],
-        }
+        })
+
+    monkeypatch.setattr(cap_registry, "run_capability", run_capability)
 
     turn_messages = [{
         "id": "m-worldbook",
@@ -865,23 +866,22 @@ def test_chat_worldbook_matches_current_turn_without_rewriting_user_text(
     )
 
     assert status == "completed"
-    assert observed == {
-        "user_id": uid,
-        "messages": [{"role": "user", "content": "Tell me about Luna"}],
-        "runtime_token": "rt",
-    }
+    assert eager_reads == []
+    assert capability_calls[0][0] == "worldbook_match"
+    assert capability_calls[0][1]["params"] == {"query": "Luna"}
+    assert any(tool.name == "worldbook_match" for tool in calls[0]["tools"])
+    assert any(
+        "Luna is queen of the Moon Court." in content
+        for content in _tool_result_contents(calls[1])
+    )
     provider_messages = calls[0]["messages"]
-    worldbook_messages = [
-        message
-        for message in provider_messages
-        if isinstance(message, dict)
+    assert not any(
+        isinstance(message, dict)
         and str(message.get("content") or "").startswith(
             v2_context.WORLD_BOOK_CONTEXT_HEADER + "\n"
         )
-    ]
-    assert len(worldbook_messages) == 1
-    assert worldbook_messages[0]["role"] == "user"
-    assert "Luna is queen of the Moon Court." in worldbook_messages[0]["content"]
+        for message in provider_messages
+    )
     assert [
         message
         for message in provider_messages
@@ -895,9 +895,7 @@ def test_chat_worldbook_matches_current_turn_without_rewriting_user_text(
     )
 
 
-def test_worldbook_truncation_reaches_provider_and_data_track_without_content(
-    monkeypatch,
-):
+def test_worldbook_pull_result_is_bounded_before_next_provider_call(monkeypatch):
     monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
     uid = "u_toolloop_worldbook_truncation"
     conftest.seed_user(uid)
@@ -907,14 +905,19 @@ def test_worldbook_truncation_reaches_provider_and_data_track_without_content(
     _patch_real_write(monkeypatch)
 
     rare_secret = "T047_WORLDBOOK_SECRET_MUST_NOT_REACH_ADMIN"
-    raw_worldbook = (
-        "<world_book>\n"
-        + ("W" * worldbook_match.CONTEXT_CHAR_CAP)
-        + rare_secret
-        + "\n</world_book>"
+    raw_worldbook = "<world_book>\n" + ("W" * 4_000) + rare_secret + "\n</world_book>"
+    calls = _script_provider(monkeypatch, [
+        _tool_round(_tc("wb-large", "worldbook_match", query="setting")),
+        _text_round("bounded"),
+    ])
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: _FakeCapResult({
+            "block": raw_worldbook,
+            "matched_names": ["large setting"],
+        }),
     )
-    calls = _script_provider(monkeypatch, [_text_round("bounded")])
-    traces = []
     turn_messages = [{
         "id": "m-worldbook-truncated",
         "ts": 10.0,
@@ -924,12 +927,8 @@ def test_worldbook_truncation_reaches_provider_and_data_track_without_content(
     deps = _deps(messages=turn_messages)
     deps.read_summary = lambda _uid: ("", 0.0, 0)
     deps.read_tail = lambda _uid, _after_ts, _limit: list(turn_messages)
-    deps.read_worldbook_context = lambda *_args, **_kwargs: {
-        "block": raw_worldbook,
-        "matched_names": [],
-    }
-    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
-        {"user_id": user_id, "type": event_type, **fields}
+    deps.read_worldbook_context = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("foreground world book must be pull-only")
     )
 
     status = asyncio.run(
@@ -943,30 +942,9 @@ def test_worldbook_truncation_reaches_provider_and_data_track_without_content(
     )
 
     assert status == "completed"
-    provider_payload = json.dumps(calls[0]["messages"], ensure_ascii=False)
-    assert worldbook_match.TRUNCATION_MARKER.strip() in provider_payload
-    truncation = next(
-        trace for trace in traces if trace["type"] == "context.truncation"
-    )
-    assert truncation == {
-        "user_id": uid,
-        "type": "context.truncation",
-        "status": "warning",
-        "summary": "",
-        "explain": "",
-        "detail": {
-            "counts": {
-                "profile_cards_truncated": 0,
-                "worldbook_truncated": 1,
-            }
-        },
-    }
-    raw_admin_material = json.dumps(
-        admin_data_track._debug_event_public_json(truncation),
-        ensure_ascii=False,
-    )
+    provider_payload = "\n".join(_tool_result_contents(calls[1]))
+    assert "...[truncated]" in provider_payload
     assert rare_secret not in provider_payload
-    assert rare_secret not in raw_admin_material
 
 
 def test_empty_provider_response_reaches_debug_trace_without_content(monkeypatch):
@@ -1136,8 +1114,13 @@ def test_chat_thinking_only_keeps_existing_required_reply_fallback(monkeypatch):
     assert _job_status_row(job_id)[0] == "completed"
 
 
-def test_degenerate_terminal_reply_becomes_attributed_fallback(monkeypatch):
-    uid = "u_toolloop_degenerate_fallback"
+@pytest.mark.parametrize("provider_text", ["。", "</s>"])
+def test_degenerate_terminal_reply_becomes_attributed_fallback(
+    monkeypatch, provider_text
+):
+    uid = "u_toolloop_degenerate_fallback_" + (
+        "sentinel" if provider_text == "</s>" else "punctuation"
+    )
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
@@ -1151,7 +1134,7 @@ def test_degenerate_terminal_reply_becomes_attributed_fallback(monkeypatch):
         return real_write(store, text, extra=extra)
 
     monkeypatch.setattr(worker, "_write_encrypted_reply", _capture_write)
-    _script_provider(monkeypatch, [_text_round("。")])
+    _script_provider(monkeypatch, [_text_round(provider_text)])
     deps = _deps(
         messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "晚安呀"}]
     )
@@ -1173,8 +1156,8 @@ def test_degenerate_terminal_reply_becomes_attributed_fallback(monkeypatch):
     assert _job_status_row(job_id)[0] == "completed"
 
 
-def test_degenerate_intermediate_is_dropped_before_real_final_reply(monkeypatch):
-    uid = "u_toolloop_degenerate_intermediate"
+def test_degenerate_tool_preamble_is_not_a_bubble(monkeypatch):
+    uid = "u_toolloop_degenerate_preamble"
     conftest.seed_user(uid)
     _reset(uid)
     jobs_store.enqueue_job(uid, "chat")
@@ -1188,10 +1171,11 @@ def test_degenerate_intermediate_is_dropped_before_real_final_reply(monkeypatch)
     _script_provider(
         monkeypatch,
         [
-            _tool_round(
-                _tc("r1", "reply", text="."),
-                _tc("s1", "web_search", query="x"),
-            ),
+            {
+                "reply": ".",
+                "tool_calls": [_tc("s1", "web_search", query="x")],
+                "usage": {},
+            },
             _text_round("在的，怎么了"),
         ],
     )
@@ -1385,95 +1369,6 @@ def test_foreground_wrapped_reply_payload_is_not_lost(monkeypatch):
 
     assert status == "completed"
     assert [bubble["body_ct"] for bubble in _bubbles(uid)] == ["真正的回复内容"]
-
-
-def test_chat_intermediate_reply_tool_tail_with_reasoning_suppressed(monkeypatch):
-    """Codex code-review #1: an intermediate `reply` tool call carrying a torn
-    tail, with the head in the round's reasoning, must not produce a leaked
-    bubble. The reasoning is now passed to the intermediate sink so the chat lane
-    sees STRONG evidence; the following real terminal reply still lands."""
-    uid = "u_toolloop_torn_intermediate"
-    conftest.seed_user(uid)
-    _reset(uid)
-    jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w-torn-mid")
-    monkeypatch.setattr(
-        cap_registry,
-        "run_capability",
-        lambda action_type, store, **kwargs: _FakeCapResult({"snippet": "r"}),
-    )
-    # The round carries reasoning (the torn head), which the worker surfaces via
-    # the envelope path — stub it (as the reasoning-surfacing test does) so the
-    # sealed bodies are readable and no unwired-assembly error masks the check.
-    _stub_envelope_build(monkeypatch)
-    # Same structure as test_degenerate_intermediate_is_dropped_before_real_final_
-    # reply: a real tool call (web_search) rides alongside the suppressed reply so
-    # the loop continues to the terminal reply, isolating the suppression itself.
-    _script_provider(
-        monkeypatch,
-        [
-            {
-                "reply": "",
-                "tool_calls": [
-                    _tc("r1", "reply", text=_TORN_TAIL),
-                    _tc("s1", "web_search", query="x"),
-                ],
-                "reasoning": _TORN_HEAD,
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
-            },
-            _text_round("在的，怎么了"),
-        ],
-    )
-    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "在吗"}])
-
-    status = asyncio.run(
-        worker.process_job(job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt")
-    )
-
-    assert status == "completed"
-    bubbles = [b["body_ct"] for b in _bubbles(uid)]
-    # THE invariant: the torn tail never reaches a bubble; the real terminal does.
-    assert _TORN_TAIL not in bubbles
-    assert bubbles == ["在的，怎么了"]
-
-
-def test_chat_intermediate_reply_tool_upstream_envelope_is_suppressed(monkeypatch):
-    """The final-effect guard also covers a relay wrapper inside reply(text=...)."""
-    uid = "u_toolloop_upstream_envelope_intermediate"
-    conftest.seed_user(uid)
-    _reset(uid)
-    jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w-upstream-envelope-mid")
-    monkeypatch.setattr(
-        cap_registry,
-        "run_capability",
-        lambda action_type, store, **kwargs: _FakeCapResult({"snippet": "r"}),
-    )
-    _patch_real_write(monkeypatch)
-    _script_provider(
-        monkeypatch,
-        [
-            _tool_round(
-                _tc("r1", "reply", text=_UPSTREAM_RESPONSE_ENVELOPE),
-                _tc("s1", "web_search", query="x"),
-            ),
-            _text_round("在的，怎么了"),
-        ],
-    )
-    deps = _deps(
-        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "在吗"}]
-    )
-
-    status = asyncio.run(
-        worker.process_job(
-            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
-        )
-    )
-
-    assert status == "completed"
-    bubbles = [bubble["body_ct"] for bubble in _bubbles(uid)]
-    assert _UPSTREAM_RESPONSE_ENVELOPE not in bubbles
-    assert bubbles == ["在的，怎么了"]
 
 
 def test_torn_protocol_evidence_lane_policy():
@@ -2380,14 +2275,13 @@ def test_ordered_chat_replies_settle_each_user_message_separately(monkeypatch):
     assert reply_payload["reply_to_message_id"] == "A"
 
 
-def test_new_turn_after_intermediate_failure_starts_after_failure_cursor(
+def test_new_turn_after_tool_failure_starts_after_failure_cursor(
     monkeypatch,
 ):
     """An assistant-only prompt snapshot advance cannot poison the final fence.
 
-    The first worker publishes an intermediate reply, then crashes. The retry's
-    all-role tail includes that bubble after the newest user row, while the
-    compound final reply must still fence and advance only through the user seq.
+    The first worker completes a tool round, then crashes. The compound final
+    reply on a later user turn must fence and advance only through the user seq.
     """
     uid = "u_toolloop_intermediate_crash_retry_cursor"
     conftest.seed_user(uid)
@@ -2509,9 +2403,9 @@ def test_new_turn_after_intermediate_failure_starts_after_failure_cursor(
             first_attempt_calls += 1
             if first_attempt_calls == 1:
                 return _tool_round(
-                    _tc("checking", "reply", text="I am still checking."),
+                    _tc("checking", "memory_search", query="investigate"),
                 )
-            raise RuntimeError("injected worker crash after intermediate reply")
+            raise RuntimeError("injected worker crash after tool round")
         retry_messages.append(list(messages))
         return _text_round("final answer after retry")
 
@@ -2567,7 +2461,7 @@ def test_new_turn_after_intermediate_failure_starts_after_failure_cursor(
 
     assert retry_status == "completed"
     assert len(retry_messages) == 1
-    assert "I am still checking." in str(retry_messages[0])
+    assert "I am still checking." not in str(retry_messages[0])
     assert "please try once more" in str(retry_messages[0])
     assert v2_cursor.load_seq(core_store.get_store(uid)) == new_user_seq
     assert _job_status_row(retry_job_id) == ("completed", None)
@@ -3088,290 +2982,6 @@ def _job_status_row(job_id):
     return row
 
 
-def test_reply_tool_bubble_can_atomically_close_chat_without_second_message(
-    monkeypatch,
-):
-    uid = "u_toolloop_promote_intermediate"
-    conftest.seed_user(uid)
-    _reset(uid)
-    generation = db.get_runtime_generation(uid)
-    input_seq, job_id = db.chat_append_and_enqueue(
-        uid,
-        "promotion-parent",
-        10.0,
-        _user_doc("promotion-parent", "answer this"),
-        5000,
-        "chat",
-        expected_generation=generation,
-    )
-    job = jobs_store.claim_next_job("w-promote-intermediate")
-    assert job is not None and job["id"] == job_id
-    _stub_envelope_build(monkeypatch)
-
-    def read_after_seq(_user_id: str, after_seq: int):
-        return [
-            {
-                "id": row["id"],
-                "seq": int(row["seq"]),
-                "ts": float(row.get("ts") or 0),
-                "role": row.get("role"),
-                "content": row.get("test_plaintext") or "",
-            }
-            for row in db.chat_messages_after_seq(uid, after_seq, limit=None)
-            if row.get("role") == "user"
-        ]
-
-    calls = _script_provider(
-        monkeypatch,
-        [
-            _tool_round(_tc("r1", "reply", text="complete answer")),
-            {
-                "reply": "",
-                "reasoning": "no additional visible body",
-                "stop_reason": "end_turn",
-                "tool_calls": [],
-                "usage": {"completion_tokens": 3930},
-            },
-            {
-                "reply": "",
-                "reasoning": "still complete",
-                "stop_reason": "end_turn",
-                "tool_calls": [],
-                "usage": {"completion_tokens": 2},
-            },
-        ],
-    )
-    deps = worker.TurnDeps(
-        web_tools_enabled=lambda _uid: True,
-        read_messages=lambda _uid: read_after_seq(uid, 0),
-        read_messages_after_seq=read_after_seq,
-        read_tail_after_seq=lambda _uid, after_seq, limit, **kwargs: read_after_seq(
-            uid, after_seq
-        ),
-        read_summary_with_seq=lambda _uid: ("", 0.0, 0, 0),
-        resolve_provider=lambda _uid: (_BYOK, {}),
-        mint_enclave_token=lambda _uid: "rt",
-        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
-    )
-
-    status = asyncio.run(
-        worker.process_job(
-            job,
-            deps,
-            provider_config=_BYOK,
-            api_key=None,
-            runtime_token="rt",
-        )
-    )
-
-    assert status == "completed"
-    assert len(calls) == 3  # the existing semantic-empty recovery still ran once
-    bubbles = _bubbles(uid)
-    assert len(bubbles) == 1
-    assert bubbles[0]["body_ct"] == "complete answer"
-    assert _job_status_row(job_id) == ("completed", None)
-    assert v2_cursor.load_seq(core_store.get_store(uid)) == input_seq
-    parent = db.chat_doc_for_seq(uid, input_seq)
-    assert parent["reply_status"] == "replied"
-    assert parent["reply_message_id"] == bubbles[0]["id"]
-
-    with db.get_pool().connection() as conn:
-        effects = conn.execute(
-            "SELECT effect_id,effect_type,status,payload "
-            "FROM v2_effect_outbox WHERE user_id=%s AND job_id=%s "
-            "ORDER BY enqueue_seq",
-            (uid, job_id),
-        ).fetchall()
-    assert [(row[1], row[2]) for row in effects] == [
-        (v2_effect_outbox.INTERMEDIATE_REPLY_EFFECT_TYPE, "applied"),
-        (v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE, "applied"),
-    ]
-    source_effect_id = str(effects[0][0])
-    final_payload = effects[1][3]
-    replay_id = v2_effect_outbox.enqueue_reply_promotion(
-        intermediate_effect_id=source_effect_id,
-        job_id=job_id,
-        user_id=uid,
-        expected_generation=generation,
-        payload=final_payload,
-    )
-    assert replay_id == str(effects[1][0])
-    assert serve_worker._apply_pending_effects_for_user(uid) == {
-        "applied": 0,
-        "discarded": 0,
-    }
-    assert len(_bubbles(uid)) == 1
-
-
-def test_removing_reply_promotion_regresses_to_two_chat_messages(monkeypatch):
-    """Mutation guard: the old empty-reply failure adds a terminal error bubble."""
-    uid = "u_toolloop_promote_intermediate_mutation"
-    conftest.seed_user(uid)
-    _reset(uid)
-    generation = db.get_runtime_generation(uid)
-    _input_seq, job_id = db.chat_append_and_enqueue(
-        uid,
-        "promotion-mutation-parent",
-        10.0,
-        _user_doc("promotion-mutation-parent", "answer this"),
-        5000,
-        "chat",
-        expected_generation=generation,
-    )
-    job = jobs_store.claim_next_job("w-promote-intermediate-mutation")
-    assert job is not None and job["id"] == job_id
-    _stub_envelope_build(monkeypatch)
-
-    def read_after_seq(_user_id: str, after_seq: int):
-        return [
-            {
-                "id": row["id"],
-                "seq": int(row["seq"]),
-                "ts": float(row.get("ts") or 0),
-                "role": row.get("role"),
-                "content": row.get("test_plaintext") or "",
-            }
-            for row in db.chat_messages_after_seq(uid, after_seq, limit=None)
-            if row.get("role") == "user"
-        ]
-
-    _script_provider(
-        monkeypatch,
-        [
-            _tool_round(_tc("r1", "reply", text="complete answer")),
-            {
-                "reply": "",
-                "reasoning": "no additional visible body",
-                "stop_reason": "end_turn",
-                "tool_calls": [],
-                "usage": {},
-            },
-            {
-                "reply": "",
-                "reasoning": "still complete",
-                "stop_reason": "end_turn",
-                "tool_calls": [],
-                "usage": {},
-            },
-        ],
-    )
-    real_loop = worker.v2_tool_loop.run_tool_loop
-
-    async def run_without_promotion(**kwargs):
-        kwargs["on_promote_last_intermediate"] = None
-        return await real_loop(**kwargs)
-
-    monkeypatch.setattr(
-        worker.v2_tool_loop,
-        "run_tool_loop",
-        run_without_promotion,
-    )
-    deps = worker.TurnDeps(
-        web_tools_enabled=lambda _uid: True,
-        read_messages=lambda _uid: read_after_seq(uid, 0),
-        read_messages_after_seq=read_after_seq,
-        read_tail_after_seq=lambda _uid, after_seq, limit, **kwargs: read_after_seq(
-            uid, after_seq
-        ),
-        read_summary_with_seq=lambda _uid: ("", 0.0, 0, 0),
-        resolve_provider=lambda _uid: (_BYOK, {}),
-        mint_enclave_token=lambda _uid: "rt",
-        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
-    )
-
-    status = asyncio.run(
-        worker.process_job(
-            job,
-            deps,
-            provider_config=_BYOK,
-            api_key=None,
-            runtime_token="rt",
-        )
-    )
-
-    assert status == "failed"
-    assert len(_bubbles(uid)) == 2
-
-
-def test_intermediate_reply_then_terminal_text_and_exactly_once_replay(monkeypatch):
-    """Two-round script: round 0 the model calls `reply` (intermediate bubble)
-    ALONGSIDE a `web_search` read tool call; round 1 the model stops with plain
-    terminal text. Both bubbles land via the PR A effect outbox, the
-    intermediate one visible BEFORE the terminal one (C6: drained immediately,
-    not batched to end-of-turn). Then a re-drive that re-enqueues the SAME
-    effect_id (job_id + effect_type + ordinal are what `effect_id.derive`
-    hashes — a retry of the same turn reproduces it exactly) must NOT produce a
-    duplicate bubble (PR A's ON CONFLICT DO NOTHING + pending-only drain)."""
-    uid = "u_toolloop_tworound"
-    conftest.seed_user(uid)
-    _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w")
-
-    monkeypatch.setattr(
-        cap_registry,
-        "run_capability",
-        lambda action_type, store, **k: _FakeCapResult({"snippet": "search result"}),
-    )
-    _patch_real_write(monkeypatch)
-    calls = _script_provider(
-        monkeypatch,
-        [
-            _tool_round(
-                _tc("r1", "reply", text="intermediate"),
-                _tc("s1", "web_search", query="x"),
-            ),
-            _text_round("final answer"),
-        ],
-    )
-    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
-
-    status = asyncio.run(
-        worker.process_job(
-            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
-        )
-    )
-
-    assert status == "completed"
-    assert len(calls) == 2
-    # Round 1 carries the native assistant call and call-id-matched observation.
-    exchanges = [m for m in calls[1]["messages"] if isinstance(m, ToolExchange)]
-    assert len(exchanges) == 1
-    assert "search result" in " ".join(r.content for r in exchanges[0].results)
-
-    bubbles = _bubbles(uid)
-    assert len(bubbles) == 2
-    # `_bubbles` reflects chat_messages' `seq` (identity-column) order, i.e. real
-    # write order: the intermediate bubble must land before the terminal one.
-    assert [b["body_ct"] for b in bubbles] == ["intermediate", "final answer"]
-
-    # Exactly-once replay: reconstruct the FIRST reply effect's deterministic id
-    # (ordinal 0 -- the intermediate `reply` tool call was the turn's first
-    # enqueue_effect call) and re-drive enqueue+drain exactly as a retried turn
-    # would.
-    gen = db.get_runtime_generation(uid)
-    eid = v2_effect_id.derive(job_id=job_id, effect_type="reply", ordinal=0)
-    replay_id = v2_effect_outbox.enqueue_effect(
-        job_id=job_id,
-        user_id=uid,
-        effect_type="reply",
-        ordinal=0,
-        expected_generation=gen,
-        payload={"text": "intermediate"},
-    )
-    assert (
-        replay_id == eid
-    )  # same deterministic id -> ON CONFLICT DO NOTHING, no new row
-    result = _apply_effects(uid)
-    assert result == {
-        "applied": 0,
-        "discarded": 0,
-    }  # already applied -> not in the pending set
-
-    bubbles_after = _bubbles(uid)
-    assert len(bubbles_after) == 2  # NO duplicate bubble
-
-
 # ------------------------------------------------------------------
 # PR C final review, BUG #2 (minor, no-filler): if the unified loop returns a
 # LoopOutcome with NO reply produced (final_text empty AND replied_intermediate
@@ -3773,26 +3383,26 @@ def test_half_open_halt_gives_the_still_working_tool_a_collateral_error(monkeypa
 
 
 def test_child_subagent_tool_schemas_are_protected_from_folding(monkeypatch):
-    """子 agent 的 7 件工具全部标为「不可折叠」。
+    """子 agent 的 8 件工具全部标为「不可折叠」。
 
-    为什么必须是保护、而不是折叠+恢复:子 agent 的整个工具面只有 7 件,其中
+    为什么必须是保护、而不是折叠+恢复:子 agent 的整个工具面只有 8 件,其中
     只有 `memory_search` 是常驻;而 `mcp_tool_search` **不在**
     `_SUBAGENT_ALLOWED_TOOLS` 里 —— 一旦被折成空参数表,它没有任何取回口,
     表现是「看着工具名填不出参数」,在系统里和「模型自己不想调」无法区分。
 
     ⚠️ 这条是**结构性**断言,不是端到端复现。我没能构造出真正让子轮折叠的
-    用例:7 份说明书合计约 1k token,要触发折叠需要模型写出 20k token 级别的
-    task prompt。所以这里钉住的是契约本身(保护集 == 全部 7 件)与它的三个
-    前提(工具面是这 7 件、只有一件常驻、没有 mcp_tool_search);任何一条被
+    用例:8 份说明书合计约 1k token,要触发折叠需要模型写出 20k token 级别的
+    task prompt。所以这里钉住的是契约本身(保护集 == 全部 8 件)与它的三个
+    前提(工具面是这 8 件、只有一件常驻、没有 mcp_tool_search);任何一条被
     改动,这个保护的必要性就变了,应当重新判断而不是照旧。
     """
     from model_api_runtime.v2 import tool_surface as v2_tool_surface
 
     allowed = set(worker._SUBAGENT_ALLOWED_TOOLS)
-    assert len(allowed) == 7
+    assert len(allowed) == 8
     # 前提一:没有恢复口。
     assert cap_tool_schema.MCP_TOOL_SEARCH_TOOL not in allowed
-    # 前提二:只有一件是常驻工具,其余 6 件都在可折叠面上。
+    # 前提二:只有一件是常驻工具,其余 7 件都在可折叠面上。
     assert allowed & set(v2_tool_surface.RESIDENT_TOOL_NAMES) == {"memory_search"}
 
     uid = "u_child_protected"
@@ -3806,7 +3416,7 @@ def test_child_subagent_tool_schemas_are_protected_from_folding(monkeypatch):
     real_run_tool_loop = worker.v2_tool_loop.run_tool_loop
 
     async def _spy(**kwargs):
-        if kwargs.get("allow_reply_tool") is False:
+        if kwargs.get("max_calls") == worker._SUBAGENT_MAX_LLM_CALLS:
             seen_child_kwargs.append(kwargs)
         return await real_run_tool_loop(**kwargs)
 

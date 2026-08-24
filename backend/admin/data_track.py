@@ -27,6 +27,7 @@ from accounts import registry
 from admin import usage as admin_usage
 from chat import consumer as chat_consumer
 from memory import service as memory_service
+from notices import catalog as notices_catalog
 from notices import core as notices_core
 from proactive import service as proactive_service
 from screen import screen_read_core
@@ -34,6 +35,7 @@ from bootstrap import gates as boot_gates
 from core import store as core_store
 from core import util as core_util
 from identity import service as identity_service
+from memory_garden import dream_trace as memory_dream_trace
 
 
 _PROVIDER_ATTEMPT_STREAM = "provider_attempts"
@@ -128,6 +130,25 @@ def _count_rows(rows: list[dict], key: str) -> dict:
         val = str(row.get(key) or "unknown").strip() or "unknown"
         counts[val] = counts.get(val, 0) + 1
     return counts
+
+
+def _v1_proactive_outcome_class(status: object, reason: object) -> str:
+    """Classify the resident/V1 proactive status-reason keyspace.
+
+    ``skipped`` is a control-plane outcome (including heartbeat_throttled), not
+    a failed realization.  A failed job leaves our numerator only for Seven's
+    exact user-unavailable reasons.  No prefix or string-shape inference is
+    allowed: unknown/new reasons remain operational failures.
+    """
+    normalized_status = str(status or "").strip()
+    normalized_reason = str(reason or "").strip() or "unknown"
+    if normalized_status == "skipped":
+        return "control"
+    if normalized_status != "failed":
+        return ""
+    if normalized_reason in notices_catalog.USER_UNAVAILABLE_V1_REASONS:
+        return "user_unavailable"
+    return "operational_failure"
 
 
 def _safe_onboarding_validation(raw: dict) -> dict:
@@ -350,16 +371,30 @@ def _proactive_stats(store: UserStore) -> dict:
     failed_reasons: dict[str, int] = {}
     kind_lanes = {"heartbeat": 0, "screen": 0, "other": 0}
     fail_lanes = {"heartbeat": 0, "screen": 0, "other": 0}
+    control_lanes = {"heartbeat": 0, "screen": 0, "other": 0}
+    user_unavailable_lanes = {"heartbeat": 0, "screen": 0, "other": 0}
+    control_reasons: dict[str, int] = {}
+    user_unavailable_reasons: dict[str, int] = {}
     for j in jobs:
         if not isinstance(j, dict):
             continue
         raw_kind = j.get("job_kind") or j.get("wake_kind") or j.get("trigger") or ""
         lane = _classify_proactive_kind(raw_kind)
         kind_lanes[lane] += 1
-        if str(j.get("status") or "") in ("failed", "skipped"):
+        status = str(j.get("status") or "").strip()
+        reason = str(j.get("status_reason") or "").strip() or "unknown"
+        outcome_class = _v1_proactive_outcome_class(status, reason)
+        if outcome_class == "operational_failure":
             fail_lanes[lane] += 1
-            reason = str(j.get("status_reason") or "").strip() or "unknown"
             failed_reasons[reason] = failed_reasons.get(reason, 0) + 1
+        elif outcome_class == "control":
+            control_lanes[lane] += 1
+            control_reasons[reason] = control_reasons.get(reason, 0) + 1
+        elif outcome_class == "user_unavailable":
+            user_unavailable_lanes[lane] += 1
+            user_unavailable_reasons[reason] = (
+                user_unavailable_reasons.get(reason, 0) + 1
+            )
     live_status_counts = _count_rows(proactive_messages, "live_activity_status")
     alert_status_counts = _count_rows(proactive_messages, "alert_status")
     job_epochs = [core_util._to_epoch(j.get("ts") or j.get("created_at") or j.get("updated_at")) for j in jobs]
@@ -370,7 +405,7 @@ def _proactive_stats(store: UserStore) -> dict:
         + alert_status_counts.get("delivered", 0)
         + alert_status_counts.get("logged_only", 0)
     )
-    failed = sum(status_counts.get(s, 0) for s in ("failed", "skipped"))
+    failed = sum(fail_lanes.values())
     failed += sum(live_status_counts.get(s, 0) for s in ("failed", "error"))
     failed += sum(alert_status_counts.get(s, 0) for s in ("failed", "error"))
     return {
@@ -384,12 +419,16 @@ def _proactive_stats(store: UserStore) -> dict:
         "other_jobs": kind_lanes["other"],
         "heartbeat_failed": fail_lanes["heartbeat"],
         "screen_failed": fail_lanes["screen"],
+        "heartbeat_control": control_lanes["heartbeat"],
+        "screen_control": control_lanes["screen"],
+        "heartbeat_user_unavailable": user_unavailable_lanes["heartbeat"],
+        "screen_user_unavailable": user_unavailable_lanes["screen"],
         "pending_jobs": status_counts.get("pending", 0),
         "posted_jobs": status_counts.get("posted", 0) + status_counts.get("delivered", 0),
         "failed_jobs": failed,
-        # Matches the existing failure-lane lifecycle: skipped is terminal and
-        # grouped with failed, even though jobs_by_status keeps them distinct.
         "job_failed_reasons": failed_reasons,
+        "job_control_reasons": control_reasons,
+        "job_user_unavailable_reasons": user_unavailable_reasons,
         "proactive_messages": len(proactive_messages),
         "delivery_signals": delivered,
         "live_activity_status": live_status_counts,
@@ -899,7 +938,14 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
     extra = dict(snap.get("proactive_extra") or {})
     status_counts = _data_track_count_dict(extra.get("jobs_by_status"))
     kind_lanes = _bucket_proactive_kinds(_data_track_count_dict(extra.get("jobs_by_kind")))
-    fail_lanes = _bucket_proactive_kinds(_data_track_count_dict(extra.get("jobs_failed_by_kind")))
+    raw_fail_kinds = _data_track_count_dict(extra.get("jobs_failed_by_kind"))
+    fail_lanes = _bucket_proactive_kinds(raw_fail_kinds)
+    control_lanes = _bucket_proactive_kinds(
+        _data_track_count_dict(extra.get("jobs_control_by_kind"))
+    )
+    user_unavailable_lanes = _bucket_proactive_kinds(
+        _data_track_count_dict(extra.get("jobs_user_unavailable_by_kind"))
+    )
     live_status_counts = _data_track_count_dict(extra.get("live_activity_status"))
     alert_status_counts = _data_track_count_dict(extra.get("alert_status"))
     decisions = int(extra.get("decisions") or logs.get("gate_decisions", {}).get("count") or 0)
@@ -909,7 +955,12 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
         + alert_status_counts.get("delivered", 0)
         + alert_status_counts.get("logged_only", 0)
     )
-    failed = sum(status_counts.get(s, 0) for s in ("failed", "skipped"))
+    failed_reasons = _data_track_count_dict(extra.get("jobs_failed_by_reason"))
+    failed = (
+        sum(fail_lanes.values())
+        if raw_fail_kinds
+        else sum(failed_reasons.values())
+    )
     failed += sum(live_status_counts.get(s, 0) for s in ("failed", "error"))
     failed += sum(alert_status_counts.get(s, 0) for s in ("failed", "error"))
     last_at = _latest_epoch(
@@ -928,12 +979,18 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
         "other_jobs": kind_lanes["other"],
         "heartbeat_failed": fail_lanes["heartbeat"],
         "screen_failed": fail_lanes["screen"],
+        "heartbeat_control": control_lanes["heartbeat"],
+        "screen_control": control_lanes["screen"],
+        "heartbeat_user_unavailable": user_unavailable_lanes["heartbeat"],
+        "screen_user_unavailable": user_unavailable_lanes["screen"],
         "pending_jobs": status_counts.get("pending", 0),
         "posted_jobs": status_counts.get("posted", 0) + status_counts.get("delivered", 0),
         "failed_jobs": failed,
-        # Includes failed + skipped proactive jobs; delivery failures are not
-        # job reasons and remain in live_activity_status / alert_status.
-        "job_failed_reasons": _data_track_count_dict(extra.get("jobs_failed_by_reason")),
+        "job_failed_reasons": failed_reasons,
+        "job_control_reasons": _data_track_count_dict(extra.get("jobs_control_by_reason")),
+        "job_user_unavailable_reasons": _data_track_count_dict(
+            extra.get("jobs_user_unavailable_by_reason")
+        ),
         "proactive_messages": int(chat.get("proactive_messages") or 0),
         "delivery_signals": delivered,
         "live_activity_status": live_status_counts,
@@ -1226,7 +1283,9 @@ def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
     )
     chat = _data_track_chat_from_snapshot(snap)
     memory = _data_track_memory_from_snapshot(snap)
-    proactive = _data_track_proactive_from_snapshot(snap, chat)
+    proactive = _with_proactive_lens(
+        _data_track_proactive_from_snapshot(snap, chat)
+    )
     tracking = _data_track_tracking_from_snapshot(snap)
     bootstrap_events = _data_track_bootstrap_from_snapshot(snap)
     history_import = _data_track_history_import_from_snapshot(snap)
@@ -1562,7 +1621,10 @@ PROACTIVE_V1_LENS_NOTE = (
     "V1 口径:proactive_jobs 日志 + source=agent_initiated_proactive 的聊天行。"
     "Runtime V2 的唤醒 job 在 agent_jobs、回复行 source 恒为 model_api,"
     "因此 V2 用户在本块里的计数结构性为 0,pending 多为 V2 下无人排空的旧流死行。"
-    "V2 请看 v2_wake_activity / v2_wake_schedule。"
+    "V2 请看 v2_wake_activity / v2_wake_schedule。失败数=全史 status=failed 中"
+    "剔除明确用户侧七码后的数量;unknown/未登记原因仍算我方失败。skipped(含"
+    "heartbeat_throttled)单列为控制结果,不算失败;expired 沿用既有 V1 口径不计。"
+    "页面不拿 jobs 总数直接充当失败率分母。"
 )
 
 
@@ -1579,6 +1641,21 @@ def _with_proactive_lens(block: dict) -> dict:
     out = dict(block or {})
     out["lens"] = PROACTIVE_V1_LENS
     out["lens_note"] = PROACTIVE_V1_LENS_NOTE
+    out["failure_definition"] = {
+        "cohort": "resident_v1_only",
+        "window": "all_history",
+        "numerator": (
+            "status=failed excluding exact user_unavailable reasons; "
+            "unknown remains failure"
+        ),
+        "denominator": (
+            "not computed on this surface; jobs is an all-status count"
+        ),
+        "control": "status=skipped, including heartbeat_throttled",
+        "user_unavailable_reasons": sorted(
+            notices_catalog.USER_UNAVAILABLE_V1_REASONS
+        ),
+    }
     return out
 
 
@@ -2310,6 +2387,49 @@ def _debug_trace_detect_stall(events: list[dict]) -> bool:
     return bool(open_stems)
 
 
+# `str.isdigit()` 会接受全角 １２３、上标 ²、以及 200 位的数字 —— DB 的 id 是
+# ASCII 有界整数,直接钉死形状。
+_JOB_ID_RE = re.compile(r"[0-9]{1,20}")
+
+
+def _finite_ms(value):
+    """**非有限 或 负数**一律归一成 None,在数据边界,不在渲染边界。
+
+    ⚠️ 我说过一句「挡在渲染层就所有出口一次覆盖」——**那句是错的**,
+    今天第三次把「我希望它是这样」说成「它是这样」。
+    `_debug_ms` 只挡 HTML;`/v1/admin/data-track/debug` 这个 JSON 端点
+    直接带原始值出去,而 Starlette 对 NaN/±Inf **抛 ValueError ⇒ 整个端点 500**。
+    ⇒ 渲染层是**最后一条**出口,不是唯一一条。归一化必须放在数据产出的地方。
+    """
+    try:
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        # ⚠️ `OverflowError` 是**第三种**:`float(10**400)` 抛的既不是 TypeError
+        # 也不是 ValueError。只抓两种,一个超大整数就能把端点打 500。
+        return None
+    # ⚠️ `>= 0` 这半边是**第二轮才补上的**,而它漏掉的方式与非有限值**完全同形**:
+    # 渲染层 `_debug_ms` 一直查着 `value < 0`,所以 HTML 看不见负数,
+    # **而 JSON 端点照样公开 `dur_ms=-5.0`,并把总耗时拉成负数。**
+    # ⇒ 同一个不对称第二次咬我:**人眼出口是好的、机器出口是坏的,所以自查发现不了。**
+    # 判据两半必须都写在数据边界,不能一半在这、一半在渲染层。
+    return out if (math.isfinite(out) and out >= 0) else None
+
+
+def _known_job_lanes() -> frozenset:
+    """后台任务的 lane 闭集,**从产生方读**,不在管理端抄一份。"""
+    global _KNOWN_JOB_LANES_CACHE
+    if _KNOWN_JOB_LANES_CACHE is None:
+        try:
+            from model_api_runtime.v2 import jobs_store as _js
+            _KNOWN_JOB_LANES_CACHE = frozenset(_js.LANES)
+        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
+            _KNOWN_JOB_LANES_CACHE = frozenset()
+    return _KNOWN_JOB_LANES_CACHE
+
+
+_KNOWN_JOB_LANES_CACHE = None
+
+
 def _debug_trace_group_turns(events: list[dict]) -> list[dict]:
     buckets: dict[tuple[str, str], list[dict]] = {}
     for ev in events:
@@ -2323,17 +2443,115 @@ def _debug_trace_group_turns(events: list[dict]) -> list[dict]:
         any_error = any(str(e.get("status") or "") in {"error", "failed"} for e in ordered)
         any_blocked = any(str(e.get("status") or "") == "blocked" for e in ordered)
         terminal = "stalled" if stalled else ("error" if any_error else ("blocked" if any_blocked else "ok"))
+        # ⚠️ **每个值都有限,不代表和有限。** 两个 1e308 相加就是 inf,
+        # 而我上一轮的守卫只看单个值 —— 端点照样 500。
+        # ⇒ **聚合结果本身也要过同一道判据**:守住每个输入 ≠ 守住输出。
         total = 0.0
         for ev in ordered:
-            try:
-                total += float(ev.get("dur_ms") or 0)
-            except (TypeError, ValueError):
-                continue
+            one = _finite_ms(ev.get("dur_ms"))
+            if one is not None:
+                total += one
+        # ⚠️ 这里**上一版写的是 `or 0.0`** —— 那是把「不可表示」改写成
+        # 「总耗时 0.0」,**一个精确的假值**。两个 1e308 的真实总时长是未知,不是零。
+        # 而我在同一个 PR 里刚因为「排队 0ms」被打回过同一个病 ——
+        # **修好一处,又在另一处复现。** 保留 None:算不出来就说算不出来。
+        total = _finite_ms(total)
         title = (
             next((str(e.get("explain") or "") for e in ordered if str(e.get("explain") or "")), "")
             or next((str(e.get("summary") or "") for e in ordered if str(e.get("summary") or "")), "")
             or trace_id
         )
+        # Route/job identity, read off the events rather than re-derived: the
+        # writer already decided which lane and job this turn belongs to, and a
+        # second derivation here could disagree with the one that produced the
+        # failure-rate panels.
+        # 抬头是**第三条**输出通路 —— 它既不过 `_debug_redact_value` 也不过
+        # public projection。第一版我一边在信里问搭档「有没有别的出口绕过去」,
+        # 一边自己新开了一个:实跑 lane=alice / job_id=secret_token /
+        # outcome_class=patient_12345 三项全显示。
+        # ⇒ 这里只接受**闭集成员**;job_id 只接受纯数字;其余一律不显示。
+        lane = next(
+            (
+                str(e.get("lane") or "")
+                for e in ordered
+                if str(e.get("lane") or "") in _known_job_lanes()
+            ),
+            "",
+        ) or next(
+            (
+                str((e.get("detail") or {}).get("lane") or "")
+                for e in ordered
+                if isinstance(e.get("detail"), dict)
+                and str((e.get("detail") or {}).get("lane") or "") in _known_job_lanes()
+            ),
+            "",
+        )
+        job_id = next(
+            (
+                str(e.get("job_id") or "")
+                for e in ordered
+                if _JOB_ID_RE.fullmatch(str(e.get("job_id") or ""))
+            ),
+            "",
+        )
+        # `outcome_class` has no success member: it is only meaningful on an
+        # event whose own status is not ok (T189). Reading it off an ok event
+        # would surface the *default* -- on 2026-08-21 that was 111 of 132 live
+        # rows carrying `operational_failure` while nothing had failed.
+        outcome_class = next(
+            (
+                str(e.get("outcome_class") or "")
+                for e in ordered
+                if str(e.get("status") or "ok") not in {"ok", "started"}
+                and str(e.get("outcome_class") or "") in db.TRACE_OUTCOME_CLASSES
+            ),
+            "",
+        )
+        # Queue wait vs execution, kept apart on purpose. `dur_ms` on the
+        # terminal event measures execution only; it rides on the terminal half
+        # of an enqueue->terminal pair, which invites reading it as "time since
+        # enqueue". Showing one merged number hands that misreading to whoever
+        # reads the page next.
+        enqueued_ts = next(
+            (float(e.get("ts") or 0) for e in ordered
+             if str(e.get("type") or "").endswith(".enqueued")),
+            None,
+        )
+        terminal_ev = next(
+            (e for e in reversed(ordered)
+             if str(e.get("type") or "").endswith(".terminal")),
+            None,
+        )
+        queue_wait_ms = None
+        exec_ms = None
+        if terminal_ev is not None:
+            try:
+                exec_ms = float(terminal_ev.get("dur_ms") or 0) or None
+            except (TypeError, ValueError):
+                exec_ms = None
+            # ⚠️ 不可判定就留 None,**绝不夹到 0**。
+            # 第一版用 `max(0.0, ...)`,于是时钟回拨、终态缺失、跨度小于执行时长
+            # 三种情况**全部显示成「排队 0ms」** —— 把「我不知道」伪装成一个
+            # 精确的事实。我在请审信里写过「宁可显示未知也不要显示错的秒数」,
+            # 而实现正好相反,是 codex2 实跑三例查出来的。
+            #
+            # ⚠️ 还有一层夹紧检不出来的:enqueue 与 terminal 由 web / worker
+            # **两个进程**各自用 `time.time()` 写,**正向时钟偏移无法识别**。
+            # 所以这个数只在明显自洽时才显示;要真正可信的排队时长,
+            # 应改用同一个 DB 时钟下的 job created/claimed(另开单)。
+            # ⚠️ 上一版只验了 span_ms 有限,**没验 exec_ms** ⇒ NaN/±Inf 会直接
+            # 渲染成「执行 nanms」「执行 infms」。不可判定要**两端都验**。
+            if exec_ms is not None and not (math.isfinite(exec_ms) and exec_ms >= 0):
+                exec_ms = None
+            if enqueued_ts is not None and exec_ms is not None:
+                terminal_ts = float(terminal_ev.get("ts") or 0)
+                span_ms = (terminal_ts - enqueued_ts) * 1000.0
+                if (
+                    math.isfinite(span_ms)
+                    and terminal_ts > enqueued_ts
+                    and span_ms >= exec_ms
+                ):
+                    queue_wait_ms = round(span_ms - exec_ms, 1)
         turns.append({
             "user_id": user_id,
             "trace_id": trace_id,
@@ -2341,9 +2559,14 @@ def _debug_trace_group_turns(events: list[dict]) -> list[dict]:
             "title": title,
             "first_ts": ordered[0].get("ts") if ordered else 0,
             "last_ts": ordered[-1].get("ts") if ordered else 0,
-            "total_dur_ms": round(total, 1),
+            "total_dur_ms": round(total, 1) if total is not None else None,
             "terminal_status": terminal,
             "is_stalled": stalled,
+            "lane": lane,
+            "job_id": job_id,
+            "outcome_class": outcome_class,
+            "queue_wait_ms": queue_wait_ms,
+            "exec_ms": round(exec_ms, 1) if exec_ms is not None else None,
         })
     turns.sort(key=lambda t: float(t.get("last_ts") or 0), reverse=True)
     return turns
@@ -2434,6 +2657,15 @@ _SILENT_REPLY_PUBLIC_ENUMS = {
     "cause": frozenset({"suppressed", "empty_response"}),
 }
 
+_MODEL_CALL_TRACE_TYPES = frozenset({
+    "agent.model.call.start",
+    "agent.model.call.done",
+    "agent.model.call.error",
+})
+_MODEL_CALL_FINISH_REASONS = _EMPTY_RESPONSE_PUBLIC_ENUMS["stop_reason"] | {
+    "unspecified", "timeout", "http_error", "provider_error",
+}
+
 _LANGUAGE_FOLLOW_PUBLIC_ENUMS = {
     "user_script": frozenset({
         "han", "latin", "kana", "hangul", "cyrillic", "other", "mixed",
@@ -2480,10 +2712,238 @@ _PROMPT_FRONTIER_PUBLIC_BYTE_COMPONENTS = frozenset({
     "screen", "tool_transcript",
 })
 
+_WORLDBOOK_TRACE_TYPES = frozenset({
+    "worldbook.entry.write.completed",
+    "worldbook.match.completed",
+    "worldbook.context.applied",
+})
+_WORLDBOOK_PUBLIC_ENUMS = {
+    "operation": frozenset({"upsert", "match"}),
+    "outcome": frozenset({
+        "stored", "rejected", "failed", "no_entries", "matched",
+        "no_match", "partial", "unavailable",
+    }),
+    "reason": frozenset({
+        "", "committed", "request_invalid", "envelope_invalid",
+        "content_too_long", "worldbook_validate_failed",
+        "worldbook_validate_unavailable", "validation_failed",
+        "storage_error", "readside_unavailable",
+    }),
+    "lane": frozenset({
+        "api", "chat", "heartbeat", "scheduled", "manual_wake",
+        "screen_watch",
+    }),
+    "runtime": frozenset({"resident_v1", "hosted_v2"}),
+    "source": frozenset({"eager_context", "tool_result"}),
+}
+
+
+# --- 2026-08-21 批事件的公开字段(T219) ------------------------------------- #
+#
+# 照 `_EMPTY_RESPONSE_PUBLIC_ENUMS` 那一族的既有做法:**按事件类型放行,不是按键名
+# 全局放行**。默认仍然是「detail 里的字符串一律遮住」,每个事件显式声明自己哪几个
+# 键、哪几个取值可以出。
+#
+# ⚠️ 我第一版做成了全局的形状检查(只看字符串长得像不像错误码),被
+# `test_provider_roundtrip_trace_closed_enums_are_admin_readable` 挡了下来 ——
+# 那条用例同时断言「`lane` 在某个事件上看得见」和「`lane` 在 `mcp.surface.*` 上必须
+# 仍被遮住」。**一个全局规则会把这个刻意的 fail-closed 默认在整页掀翻。**
+# 那条断言是对的,不该为了让我的改动变绿去改它。
+#
+# 取值集合一律**从产生方的模块读**,不在这里抄一份:抄一份就会在别人改常量时
+# 静默失配,而失配的表现是「字段忽然消失」,没有人会因此收到告警。
+_TRACE_PUBLIC_FAILURE_CODE = object()  # 值必须命中产生方显式导出
+
+# ⚠️ 这一格改过两次,两次都错在**同一个方向:想从字符串本身推断它的来源**。
+#
+#   第一版  字符形状(小写/下划线/最多一个冒号)
+#           搭档当场构造反例:`alice` / `secret_token` / `patient_12345` 全部通过。
+#   第二版  前缀白名单 + startswith
+#           **两个方向同时错**,搭档各给了实例:
+#             泄漏侧  `turn_failed:secret_token`  前缀匹配 ⇒ 原样公开
+#             隐藏侧  `scheduled_wake` / `voice_turn_not_accepted` / `empty_reply`
+#                     全是真实生产码 ⇒ 反而被判 False
+#           我在请审信里写过「后半段来自我们自己的封闭词表」——
+#           **那是假话:`startswith` 根本不检查后半段。** 我把「我希望它是这样」
+#           写成了「它是这样」。
+#
+# ⇒ 结论:**形状和前缀都证明不了来源,只有产生者能证明。**
+# 现在只认**产生方模块显式导出的集合成员**,不做任何字符串推断。
+# T220 已让 V2 worker、jobs_store 与 voice gateway 各自导出并在写入边界归一化；
+# `wake_failed:providererror` 等真实码因此可见,未知后缀仍保持遮蔽。
+
+
+def _known_failure_codes() -> frozenset:
+    """产生方**显式导出**的失败码集合,从模块读,管理端不抄也不推断。"""
+    global _KNOWN_FAILURE_CODES_CACHE
+    if _KNOWN_FAILURE_CODES_CACHE is None:
+        codes: set[str] = set()
+        try:
+            from model_api_runtime.v2 import jobs_store as _js
+            codes |= set(_js.CONTROL_OUTCOME_CODES)
+            codes |= set(_js.JOB_FAILURE_CODES)
+            codes |= set(_js.SAFETY_SUPPRESSION_CODES)
+            codes |= set(_js.TIMEOUT_OUTCOME_CODES)
+        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
+            pass
+        try:
+            from model_api_runtime.v2 import worker as _worker
+            codes |= set(_worker.PUBLIC_FAILURE_CODES)
+        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
+            pass
+        try:
+            from voice import error_codes as _voice_error_codes
+            codes |= set(_voice_error_codes.VOICE_GATEWAY_ERROR_CODES)
+        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
+            pass
+        _KNOWN_FAILURE_CODES_CACHE = frozenset(codes)
+    return _KNOWN_FAILURE_CODES_CACHE
+
+
+_KNOWN_FAILURE_CODES_CACHE = None
+
+
+# ⚠️ 这里**曾经**是我在管理端手抄的一份表,而注释还写着「从产生方读」——
+# **注释描述的是我的意图,不是代码的行为。今天第二次犯同一个毛病。**
+# 后果不只是抄漏(`provider_timeout` / `provider_empty_reply` 都判 False),
+# 还让我据此宣布了一个**根本不存在的「视觉缺口」**:
+# `vision_model_unavailable` 一直就在权威导出里。
+#
+# `notices/catalog.py` 的 `ERROR_CLASSES`(50 个)就是那份权威表 ——
+# 它同时是客户端文案的 slug 来源,**改它等于改对外契约**,所以它必然被维护。
+def _known_error_classes() -> frozenset:
+    global _KNOWN_ERROR_CLASSES_CACHE
+    if _KNOWN_ERROR_CLASSES_CACHE is None:
+        try:
+            from notices import catalog as _catalog
+            _KNOWN_ERROR_CLASSES_CACHE = frozenset(_catalog.ERROR_CLASSES)
+        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
+            _KNOWN_ERROR_CLASSES_CACHE = frozenset()
+    return _KNOWN_ERROR_CLASSES_CACHE
+
+
+_KNOWN_ERROR_CLASSES_CACHE = None
+
+
+def _is_registered_failure_code(value: str) -> bool:
+    return value in _known_failure_codes() or value in _known_error_classes()
+
+
+def _trace_public_fields() -> dict:
+    """事件类型 -> {键: 允许取值集合 或 _TRACE_PUBLIC_SHAPE}。
+
+    惰性构建:`jobs_store` 在 `data_track` 之下,模块级导入会把管理端接进运行时
+    的导入链(仓内既有做法同此,见 `_v2_wake_activity_detail`)。
+    """
+    global _TRACE_PUBLIC_FIELDS_CACHE
+    if _TRACE_PUBLIC_FIELDS_CACHE is not None:
+        return _TRACE_PUBLIC_FIELDS_CACHE
+    try:
+        from model_api_runtime.v2 import jobs_store as _js
+        lanes = frozenset(_js.LANES)
+        enqueue_reasons = frozenset(_js.ENQUEUE_REASON_CODES)
+    except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
+        lanes = frozenset()
+        enqueue_reasons = frozenset()
+    outcomes = frozenset(db.TRACE_OUTCOME_CLASSES)
+    job_outcomes = frozenset({"completed", "failed", "rescheduled", "superseded"})
+    voice_stage = frozenset({
+        "revision_check", "before_content", "before_final", "deadline",
+        "runtime", "gateway",
+    })
+    runtime_kind = frozenset({"resident", "v2", "unknown"})
+    table = {
+        "agent.job.enqueued": {
+            "lane": lanes, "enqueue_source": lanes,
+            "reason": enqueue_reasons,
+        },
+        "agent.job.terminal": {
+            "lane": lanes, "outcome": job_outcomes,
+            "outcome_class": outcomes,
+            "error_code": _TRACE_PUBLIC_FAILURE_CODE,
+        },
+        "vision.provider.called": {},
+        "vision.provider.completed": {
+            "error_class": _TRACE_PUBLIC_FAILURE_CODE,
+        },
+        "agent.image.generate.failed": {
+            "error_code": _TRACE_PUBLIC_FAILURE_CODE,
+            "classified": _TRACE_PUBLIC_FAILURE_CODE,
+        },
+    }
+    for etype in (
+        "voice.gateway.turn.started", "voice.gateway.turn.runtime_rejected",
+        "voice.gateway.turn.timed_out", "voice.gateway.turn.not_accepted",
+        "voice.gateway.turn.superseded", "voice.gateway.reply.received",
+        "voice.gateway.runtime.selected",
+    ):
+        table[etype] = {
+            "stage": voice_stage, "runtime": runtime_kind,
+            "error_code": _TRACE_PUBLIC_FAILURE_CODE,
+        }
+    _TRACE_PUBLIC_FIELDS_CACHE = table
+    return table
+
+
+_TRACE_PUBLIC_FIELDS_CACHE = None
+
+
+def _expose_declared_trace_fields(ev: dict, raw_detail, public_detail) -> None:
+    """把该事件显式声明过的字段放回明文。
+
+    两层收口:键必须被这个事件声明过,**且**值必须落在产生方集合里。
+    任何未声明的键、任何未登记的值,一律维持既有的遮蔽。
+    """
+    if not isinstance(raw_detail, dict) or not isinstance(public_detail, dict):
+        return
+    allowed = _trace_public_fields().get(str(ev.get("type") or ""))
+    if not allowed:
+        return
+    for key, spec in allowed.items():
+        value = raw_detail.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        if spec is _TRACE_PUBLIC_FAILURE_CODE:
+            if _is_registered_failure_code(value):
+                public_detail[key] = value
+        elif value in spec:
+            public_detail[key] = value
+
 
 def _debug_event_public_json(ev: dict) -> dict:
     raw_detail = ev.get("detail") or {}
     public_detail = _debug_redact_value(raw_detail)
+    _expose_declared_trace_fields(ev, raw_detail, public_detail)
+    if ev.get("type") in memory_dream_trace.DREAM_TRACE_TYPES:
+        # Dream rewrites private memory. Its public diagnostic contract is an
+        # exact closed shape: any new/unknown key invalidates the whole detail
+        # instead of inheriting the generic numeric/boolean projection.
+        public_detail = (
+            {
+                **raw_detail,
+                "counts": dict(raw_detail["counts"]),
+            }
+            if memory_dream_trace.valid_detail(raw_detail)
+            else {}
+        )
+    elif ev.get("type") == memory_dream_trace.CONTEXT_TRACE_TYPE:
+        public_detail = (
+            dict(raw_detail)
+            if memory_dream_trace.valid_context_detail(raw_detail)
+            else {}
+        )
+    if (
+        ev.get("type") in _WORLDBOOK_TRACE_TYPES
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        # World Book diagnostics expose only producer-normalized enums plus
+        # generic numeric/boolean counters. Entry ids, names, keywords, query
+        # text, and matched content stay behind the default string redactor.
+        for key, allowed_values in _WORLDBOOK_PUBLIC_ENUMS.items():
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed_values:
+                public_detail[key] = value
     if (
         ev.get("type") == "provider.empty_response"
         and isinstance(raw_detail, dict)
@@ -2615,6 +3075,31 @@ def _debug_event_public_json(ev: dict) -> dict:
                 and v2_worker._normalize_provider_trace_lane(value) == value
             ):
                 public_detail[key] = value
+    if (
+        ev.get("type") in _MODEL_CALL_TRACE_TYPES
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        from model_api_runtime.v2 import worker as v2_worker
+
+        if raw_detail.get("driver") == "v2":
+            public_detail["driver"] = "v2"
+        for key in ("lane", "wake_kind"):
+            value = raw_detail.get(key)
+            if (
+                isinstance(value, str)
+                and v2_worker._normalize_provider_trace_lane(value) == value
+            ):
+                public_detail[key] = value
+        finish_reason = raw_detail.get("finish_reason")
+        if finish_reason in _MODEL_CALL_FINISH_REASONS:
+            public_detail["finish_reason"] = finish_reason
+        provider_error_class = raw_detail.get("provider_error_class")
+        if provider_error_class in {"transient", "provider_config", "unknown"}:
+            public_detail["provider_error_class"] = provider_error_class
+        error_class = raw_detail.get("error_class")
+        if isinstance(error_class, str) and error_class in _known_error_classes():
+            public_detail["error_class"] = error_class
     return {
         "ts": ev.get("ts"),
         "user_id": ev.get("user_id"),
@@ -2622,7 +3107,9 @@ def _debug_event_public_json(ev: dict) -> dict:
         "subsystem": ev.get("subsystem"),
         "type": ev.get("type"),
         "status": ev.get("status"),
-        "dur_ms": ev.get("dur_ms"),
+        # JSON 端点直接吐这个 dict —— 非有限值会让 Starlette 抛 ValueError,
+        # 整个 /v1/admin/data-track/debug 变 500。归一化必须在这里,不是在渲染层。
+        "dur_ms": _finite_ms(ev.get("dur_ms")),
         "summary": ev.get("summary"),
         "explain": ev.get("explain"),
         "detail": public_detail,
@@ -2696,6 +3183,20 @@ def _data_track_debug_payload() -> dict:
         since_epoch=since_epoch,
         limit=scan_limit,
     )
+    # ⭐ 归一化放在**事件刚进来的这一刻**,而不是任何一个出口。
+    #
+    # 我为这一格改过三次,每次都以为"这次覆盖全了":
+    #   ① 只在算排队/执行时挡      -> 「总耗时」累加漏了
+    #   ② 挪到渲染层 `_debug_ms`   -> 我说「所有出口一次覆盖」,**那句是错的**:
+    #                                JSON 端点绕过渲染层,Starlette 对 NaN/±Inf 抛
+    #                                ValueError ⇒ 整个端点 500,而页面看起来一切正常
+    #   ③ 加在事件投影的构造点      -> `events` 与 `turns[].rows` 带的是**原始事件**,仍漏
+    #
+    # ⇒ 教训不是"再往下挪一层",是:**只要归一化放在出口,就得数清楚有几个出口 ——
+    # 而我三次都数错了。放在入口就不用数。**
+    for _ev in all_events_raw:
+        if isinstance(_ev, dict) and "dur_ms" in _ev:
+            _ev["dur_ms"] = _finite_ms(_ev.get("dur_ms"))
     event_user_ids = {
         str(event.get("user_id") or "")
         for event in all_events_raw
@@ -3392,22 +3893,15 @@ _RUNTIME_HEALTH_PENDING_BAD_SEC = 180
 # 跑出稳态分布后再收紧，收紧前不要把它当灵敏的告警用。
 _RUNTIME_DELIVERY_AGE_WARN_SEC = 3600
 _RUNTIME_DELIVERY_AGE_BAD_SEC = 21600
-_RUNTIME_FAILURE_CODE_MAX = 64
-# 按形状放行，不按枚举前缀放行。agent_jobs.last_error 的真实写入点远不止
-# turn_failed:/queue_timeout/lease_timeout 三种（wake_failed:*、
-# extraction_failed:*、compaction_failed:*、mcp_mutation_outcome_unknown、
-# runtime_expired 都是 mark_failed/mark_expired 落库的合法码），枚举前缀白名单
-# 会把 chat 之外每条 lane 的失败原因塌成 other。所有已知写入点产出的码都是
-# "scope:kind" 或裸 "snake_case"，且只含小写字母/数字/下划线——照此收紧，而不
-# 是照 jobs_store._TERMINAL_ERROR_CODE_RE（那个更宽松的 `:`/`-` 全字符集是给
-# outbox 用的，admin 层不 import model_api_runtime，故在此单独定义）。
-_RUNTIME_FAILURE_CODE_RE = re.compile(r"^[a-z0-9_]+(:[a-z0-9_]+)?$")
+_RUNTIME_FAILURE_CODE_MAX = 120
+# 与单回合 trace 共用产生方导出，不在日报投影里另造一套形状/前缀规则。
 _RUNTIME_ERROR_CLASS_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 RUNTIME_OUTCOME_CLASS_LABELS = {
     "operational_failure": "执行故障",
     "timeout": "超时 / 失活",
     "control": "控制切流",
     "safety_suppression": "安全抑制",
+    "user_unavailable": "明确用户侧不可用",
 }
 RUNTIME_OUTCOME_CLASSES = frozenset(RUNTIME_OUTCOME_CLASS_LABELS)
 RUNTIME_OUTCOME_DEFAULT = "operational_failure"
@@ -3426,14 +3920,9 @@ def _runtime_operational_rate(lane: dict):
 
 
 def _runtime_failure_code(raw) -> str:
-    """失败码白名单化：只放行已知形状（scope:kind 或裸 snake_case），其余归入
-    other。
-
-    形状校验而非前缀校验：`turn_failed:` 前缀曾经无条件放行 + 截断，哪怕冒号
-    后是含空格/中文的自由文本也会被截断显示——这是本函数要堵住的口子。
-    """
+    """只放行产生方显式导出的失败码；未知值统一归入 ``other``。"""
     code = str(raw or "").strip()
-    if not code or not _RUNTIME_FAILURE_CODE_RE.fullmatch(code):
+    if not code or not _is_registered_failure_code(code):
         return "other"
     return code[:_RUNTIME_FAILURE_CODE_MAX]
 
@@ -3468,9 +3957,9 @@ def _runtime_health_level(
         rate = _runtime_operational_rate(lane)
         if rate is not None and sampled > 0:
             if rate >= _RUNTIME_HEALTH_FAILURE_BAD:
-                escalate("bad", f"{name} 系统故障率 {rate * 100:.0f}%")
+                escalate("bad", f"{name} 我方失败率 {rate * 100:.0f}%")
             elif rate >= _RUNTIME_HEALTH_FAILURE_WARN:
-                escalate("warn", f"{name} 系统故障率 {rate * 100:.0f}%")
+                escalate("warn", f"{name} 我方失败率 {rate * 100:.0f}%")
 
         # Chat is the foreground user contract: every failed/expired terminal
         # outcome matters even when the cause is an operator route change.  Keep
@@ -3638,9 +4127,9 @@ def _runtime_execution_level(
         rate = _runtime_operational_rate(lane)
         if rate is not None and sampled > 0:
             if rate >= _RUNTIME_HEALTH_FAILURE_BAD:
-                escalate("bad", f"{name} 系统故障率 {rate * 100:.0f}%")
+                escalate("bad", f"{name} 我方失败率 {rate * 100:.0f}%")
             elif rate >= _RUNTIME_HEALTH_FAILURE_WARN:
-                escalate("warn", f"{name} 系统故障率 {rate * 100:.0f}%")
+                escalate("warn", f"{name} 我方失败率 {rate * 100:.0f}%")
         raw_rate = lane.get("failure_rate")
         if name == "chat" and raw_rate is not None and sampled > 0:
             if raw_rate >= _RUNTIME_HEALTH_FAILURE_BAD:
@@ -4277,8 +4766,11 @@ def _render_runtime_health_page(
                 "expired": None,
                 "superseded": None,
                 "operational_failures": None,
+                "health_denominator": None,
                 "control_outcomes": None,
+                "user_unavailable": None,
                 "safety_suppressions": None,
+                "empty_reply_suppressions": None,
                 "failure_rate": None,
                 "operational_failure_rate": None,
                 "p50_ok_ms": None,
@@ -4495,7 +4987,9 @@ def _render_runtime_health_page(
             f"<td>{_fmt_count(lane.get('expired'))}</td>"
             f"<td>{_fmt_count(lane.get('operational_failures'))}</td>"
             f"<td class='muted'>{_fmt_count(lane.get('control_outcomes'))}</td>"
+            f"<td class='muted'>{_fmt_count(lane.get('user_unavailable'))}</td>"
             f"<td class='muted'>{_fmt_count(lane.get('safety_suppressions'))}</td>"
+            f"<td>{_fmt_count(lane.get('empty_reply_suppressions'))}</td>"
             + raw_rate_cell
             + operational_rate_cell
             + _ms_cell(lane.get("p50_ok_ms"))
@@ -4628,8 +5122,8 @@ def _render_runtime_health_page(
   {delivery_section}
   <h2>各 lane 健康</h2>
   <div class="table-wrap"><table>
-    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>原始失败</th><th>过期</th><th>系统故障<br><span class='muted'>含过期</span></th><th>控制切流</th><th>安全抑制</th><th>终态未成功率</th><th>系统故障率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>开口回合/回合<br><span class='muted'>仅 screen_watch</span></th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
-    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='17' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
+    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>原始失败</th><th>过期</th><th>我方失败<br><span class='muted'>含超时/安全抑制</span></th><th>控制切流</th><th>明确用户侧</th><th>安全抑制<br><span class='muted'>已计我方失败</span></th><th>空内容主动抑制</th><th>终态未成功率</th><th>我方失败率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>开口回合/回合<br><span class='muted'>仅 screen_watch</span></th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
+    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='19' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
   </table></div>
   {_render_stuck_block(stuck)}
   {_render_runtime_user_report(user_report)}
@@ -4638,9 +5132,11 @@ def _render_runtime_health_page(
     <thead><tr><th>Lane</th><th>归类</th><th>失败码</th><th>上游安全归因</th><th>次数</th></tr></thead>
     <tbody>{''.join(failure_rows) if failure_rows else "<tr><td colspan='5' class='muted'>当前窗口无未成功终态。</td></tr>"}</tbody>
   </table></div>
-  <div class="muted">“终态未成功率”保留所有 failed / expired，回答“这轮有没有正常完成”；
-  “系统故障率”只统计 provider、Runtime、排队和 lease 故障。控制切流和安全抑制仍保留原始计数，
-  但不再冒充基础设施故障。上游安全归因来自终态 outbox 的 metadata；<b>上游原始错</b>和聊天正文
+  <div class="muted">“终态未成功率”分子=全部 failed+expired，分母=completed+failed+expired，回答“这轮有没有正常完成”；
+  “我方失败率”分子=除控制切流与明确用户侧七码外的 failed+expired，分母=completed+该分子，窗口={window_hours} 小时、总体=本实例托管 Runtime V2。
+  unknown、上游限流、安全抑制、空回复与所有未登记新码都计入我方失败；superseded 不进任何失败率分子或分母。
+  控制切流、明确用户侧与安全抑制仍保留原始计数，后者只是诊断标签、不是豁免。
+  上游安全归因来自终态 outbox 的 metadata；<b>上游原始错</b>和聊天正文
   均不在本页读取，如确需查看只能走 default-off、全审计的 break-glass trajectory inspector。</div>
 </main>
 </body>
@@ -4750,6 +5246,7 @@ def _ops_chat_level(report: dict | None) -> tuple[str, list[str]]:
         return "unknown", ["聊天统计暂不可用"]
     outcomes = report.get("outcomes") or {}
     delivery = report.get("reply_delivery") or {}
+    reply_quality = report.get("reply_quality") or {}
     settled = int(report.get("settled_jobs") or 0)
     failed = int(outcomes.get("failed") or 0) + int(outcomes.get("expired") or 0)
     reasons: list[str] = []
@@ -4773,6 +5270,10 @@ def _ops_chat_level(report: dict | None) -> tuple[str, list[str]]:
     if reconciliation:
         level = "bad"
         reasons.append(f"{reconciliation} 个 final reply 需要人工 reconcile")
+    multi_reply_turns = int(reply_quality.get("multi_reply_turns") or 0)
+    if multi_reply_turns:
+        level = "bad"
+        reasons.append(f"{multi_reply_turns} 个回合计划了至少 2 条可见回复")
     if not reasons:
         reasons.append("服务端交付可观测；客户端接收 ACK 尚未采集")
     return level, reasons
@@ -5136,6 +5637,7 @@ def _render_chat_reliability_page(report: dict | None, *, within_hours: int) -> 
     outcomes = report.get("outcomes") or {}
     delivery = report.get("reply_delivery") or {}
     failure_delivery = report.get("failure_delivery") or {}
+    reply_quality = report.get("reply_quality") or {}
     failure_rows = "".join(
         "<tr>"
         f"<td><code>{html.escape(str(row.get('code') or 'runtime_failed'))}</code></td>"
@@ -5182,8 +5684,10 @@ def _render_chat_reliability_page(report: dict | None, *, within_hours: int) -> 
       {_render_metric('Completed 无 applied', _fmt_count(delivery.get('completed_without_final_applied')))}
       {_render_metric('失败 fallback 已投递', _fmt_count(failure_delivery.get('fallback_reply_delivered')))}
       {_render_metric('失败 fallback 待投递', _fmt_count(failure_delivery.get('fallback_reply_pending')))}
+      {_render_metric('≥2 条可见回复的回合', f"{_fmt_count(reply_quality.get('multi_reply_turns'))} / {_fmt_ratio(reply_quality.get('multi_reply_turn_rate'))}")}
+      {_render_metric('Empty reply 失败', f"{_fmt_count(reply_quality.get('empty_reply_failures'))} / {_fmt_ratio(reply_quality.get('empty_reply_failure_rate'))}")}
     </section>
-    <div class="note-box"><b>两条率不能混：</b>“Admitted → final reply 服务端 applied”以窗口内全部 chat agent_jobs 为同一 cohort，回答进入 Runtime 的 turn 有多少已经落地最终回复；“终态完成率”只在 completed / failed / expired 终态中计算 completed。最终回复只认明确 final effect，或带 <code>reply_through_seq</code> 的 legacy reply；普通中间 reply 不计。服务端 applied 比“模型 API 200”更接近用户结果，但仍<b>不等于设备收到或用户已读</b>；客户端 delivery ACK 当前不可用，因此页面不会给“用户真的收到”绿灯。同一用户在单飞回合中追加的多条消息会折入一个 job，所以 admitted 是 turns，不是原始消息条数。</div>
+    <div class="note-box"><b>这些率不能混：</b>“Admitted → final reply 服务端 applied”以窗口内全部 chat agent_jobs 为同一 cohort，回答进入 Runtime 的 turn 有多少已经落地最终回复；“终态完成率”只在 completed / failed / expired 终态中计算 completed。两个回归指标也以已结算回合为分母：“≥2 条可见回复”按既有 trajectory <code>reply_planned</code> 事件计数，是服务端计划证据而非客户端 ACK；“Empty reply”按既有 <code>turn_failed:empty_reply</code> 终态码计数。最终回复只认明确 final effect，或带 <code>reply_through_seq</code> 的 legacy reply；历史普通中间 reply 不计。服务端 applied 比“模型 API 200”更接近用户结果，但仍<b>不等于设备收到或用户已读</b>；客户端 delivery ACK 当前不可用，因此页面不会给“用户真的收到”绿灯。同一用户在单飞回合中追加的多条消息会折入一个 job，所以 admitted 是 turns，不是原始消息条数。</div>
     <h2>失败原因 Top</h2><div class="table-wrap"><table><thead><tr><th>失败码</th><th>次数</th></tr></thead><tbody>{failure_rows or "<tr><td colspan='2' class='muted'>窗口内无失败。</td></tr>"}</tbody></table></div>
     <h2>最近 chat jobs</h2><div class="table-wrap"><table><thead><tr><th>User</th><th>Job</th><th>Job 状态</th><th>Final effect</th><th>Provider / Model</th><th>Calls / retries</th><th>失败码</th><th>创建 UTC</th></tr></thead><tbody>{''.join(recent_rows) if recent_rows else "<tr><td colspan='8' class='muted'>窗口内无 chat。</td></tr>"}</tbody></table></div>
     """
@@ -7030,8 +7534,14 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
             f"<td>{row['memory']['total']} <span class='muted'>cards</span>"
             f"<br><span class='muted'>onb {onb_mem} / live {live_mem}</span></td>"
             f"<td>{pro['proactive_messages']} <span class='muted'>sent</span>"
-            f"<br><span class='muted'>心跳 {pro.get('heartbeat_jobs', 0)}(f{pro.get('heartbeat_failed', 0)}) / "
-            f"屏幕 {pro.get('screen_jobs', 0)}(f{pro.get('screen_failed', 0)})</span></td>"
+            f"<br><span class='muted'>心跳 总{pro.get('heartbeat_jobs', 0)} "
+            f"/ 失败{pro.get('heartbeat_failed', 0)} "
+            f"/ 控制{pro.get('heartbeat_control', 0)} "
+            f"/ 用户侧{pro.get('heartbeat_user_unavailable', 0)}; "
+            f"屏幕 总{pro.get('screen_jobs', 0)} "
+            f"/ 失败{pro.get('screen_failed', 0)} "
+            f"/ 控制{pro.get('screen_control', 0)} "
+            f"/ 用户侧{pro.get('screen_user_unavailable', 0)}</span></td>"
             f"<td>{html.escape(_bj_iso(row.get('last_activity_at')))}</td>"
             "</tr>"
         )
@@ -7215,10 +7725,16 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
 	  </form>
 	  <div class="toolbar"><input id="q" placeholder="筛选 UID、route、runtime state、stage"></div>
 	  {_render_chat_coverage_note(summary.get("chat_coverage"))}
+	  <div class="note-box"><b>Proactive 失败口径（Resident / V1）</b><br>
+	  总数=该 lane 的全史 <code>proactive_jobs</code> 全状态记录，不是失败率分母；
+	  失败=<code>status=failed</code> 且不属于明确用户侧七码，未知/未登记原因仍算我方失败；
+	  控制=<code>status=skipped</code>（含 <code>heartbeat_throttled</code>），不算失败；
+	  用户侧=明确额度、Key 或模型不存在；<code>expired</code> 沿用 V1 既有口径不计。
+	  本列不含 Runtime V2 用户，V2 请看 Runtime 值班台；两边表、窗口、总体与键空间不同，不可横向对数。</div>
 	  <div class="sortbar">{sort_controls}</div>
 	  {pager}
 	  <div class="table-wrap"><table id="users">
-    <thead><tr><th>User</th><th>Onboarding route</th><th>实际 Runtime</th><th>连接</th><th>Onboarding</th><th>Steps</th><th>Chat 累计发生</th><th>Memory</th><th>Proactive 心跳/屏幕(fail)</th><th>Last activity</th></tr></thead>
+    <thead><tr><th>User</th><th>Onboarding route</th><th>实际 Runtime</th><th>连接</th><th>Onboarding</th><th>Steps</th><th>Chat 累计发生</th><th>Memory</th><th>Proactive 心跳/屏幕（全史四分法）</th><th>Last activity</th></tr></thead>
     <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='10' class='muted'>No users yet.</td></tr>"}</tbody>
   </table></div>
 </main>
@@ -8417,9 +8933,18 @@ def _debug_json(obj) -> str:
 
 
 def _debug_ms(ms) -> str:
+    """毫秒渲染。**非有限值一律不渲染。**
+
+    我原本只在算排队/执行时挡 NaN/±Inf,而我自己的整页断言当场咬到:
+    「总耗时」是**另一条累加路径**(`total += float(dur_ms or 0)`),NaN 会一路
+    传到抬头渲染成「nanms」。
+    ⇒ 挡在**格式化这一层**,所有出口一次覆盖 —— 挡在算的那一层只能覆盖我想到的那些。
+    """
     try:
         value = float(ms or 0)
     except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(value) or value < 0:
         return ""
     return f"{value:.0f}ms" if value else ""
 
@@ -8446,8 +8971,36 @@ _DEBUG_STEP_LABELS = {
     "context.build": ("📎", "组装上下文"),
     "memory.inject": ("🧠", "自动注入记忆"),
     "memory.dream.tick": ("🌙", "做梦判定"),
+    "memory.dream.start": ("🌙", "记忆整理 · 开始"),
+    "memory.dream.model.start": ("🧠", "记忆整理 · 模型开始"),
+    "memory.dream.model.done": ("🧠", "记忆整理 · 模型完成"),
+    "memory.dream.model.error": ("🧠", "记忆整理 · 模型失败"),
+    "memory.dream.done": ("🌙", "记忆整理 · 完成"),
+    "memory.dream.error": ("🌙", "记忆整理 · 失败"),
+    "memory.extraction.context.error": ("📎", "记忆整理 · 上下文降级"),
+    # 2026-08-21 批。没有这些条目时,它们全部退化成通用的「• 某某」,
+    # 查案的人在页面上分不出「上游拒绝」和「被新回合取代」——而那正是
+    # 这一批事件被记录下来的全部理由。
+    "agent.job.enqueued": ("📥", "后台任务 · 入队"),
+    "agent.job.terminal": ("📤", "后台任务 · 结束"),
+    "vision.provider.called": ("👁", "视觉模型 · 开始调用"),
+    "vision.provider.completed": ("👁", "视觉模型 · 调用结束"),
+    "agent.image.generate.start": ("🎨", "生图 · 开始"),
+    "agent.image.generate.done": ("🎨", "生图 · 成功"),
+    "agent.image.generate.failed": ("🎨", "生图 · 失败"),
+    # 语音四个失败出口在页面上本来长得一模一样。标签里必须写出
+    # 「仍返回 200」——那是这条道最反直觉、最容易被当成成功的地方:
+    # 返回 4xx 会让 ElevenLabs 拆掉整通电话,所以失败是「说出来」的。
+    "voice.gateway.turn.started": ("📞", "语音 · 回合开始"),
+    "voice.gateway.runtime.selected": ("📞", "语音 · 选定运行时"),
+    "voice.gateway.reply.received": ("📞", "语音 · 拿到回复"),
+    "voice.gateway.turn.runtime_rejected": ("📞", "语音 · 上游拒绝(仍返回 200)"),
+    "voice.gateway.turn.timed_out": ("📞", "语音 · 等超时(仍返回 200)"),
+    "voice.gateway.turn.not_accepted": ("📞", "语音 · 未受理(502)"),
+    "voice.gateway.turn.superseded": ("📞", "语音 · 被新回合取代(静默结束)"),
     "agent.model.call.start": ("🧠", "调用模型 · 开始"),
     "agent.model.call.done": ("🧠", "调用模型 · 完成"),
+    "agent.model.call.error": ("🧠", "调用模型 · 失败"),
     "agent.tool.call": ("🔧", "调用工具"),
     "thinking.surfaced": ("💭", "思考展示 · 分支"),
     "reply.language_follow": ("🌐", "语言跟随"),
@@ -8494,6 +9047,60 @@ def _debug_friendly_step(ev: dict) -> tuple[str, str]:
     tail = typ.split(".")[-1] if typ else ""
     label = f"{base} · {tail}" if base and tail else (base or tail or "事件")
     return (icon, label)
+
+
+_OUTCOME_CLASS_LABELS = {
+    "operational_failure": "运行故障",
+    "timeout": "超时",
+    "control": "闸拦截",
+    "safety_suppression": "安全抑制",
+    "user_unavailable": "明确用户侧不可用",
+}
+
+
+def _render_turn_identity(turn: dict) -> str:
+    """回合抬头的身份与耗时。
+
+    **`outcome_class` 只在这一回合真的没成功时才出现。** 它没有「成功」这一档,
+    ok 事件带的是默认值 —— 2026-08-21 实弹里 132 行有 111 行是 ok 却带着
+    `operational_failure`。无条件渲染会让页面凭空多出一批看起来在报错的行,
+    而**页面上「看起来像失败」和「真的失败」的代价是不一样的**:前者会让人
+    去追一个不存在的故障。
+
+    **排队与执行分开写,不合并成一个总数。** 终态事件上的 `dur_ms` 只含执行时长,
+    可它偏偏挂在 enqueue->terminal 这一对的终态那半边,极易被读成「从入队到结束」。
+    给一个合并数字等于把这个误读留给下一个人 —— 这正是 T197 在失败率上踩过的同一个坑:
+    **一个值脱离它的前提被展示。**
+    """
+    bits: list[str] = []
+    lane = str(turn.get("lane") or "")
+    if lane:
+        bits.append(f"<span class='muted'>道 {html.escape(lane)}</span>")
+    job_id = str(turn.get("job_id") or "")
+    if job_id:
+        bits.append(f"<span class='muted mono'>job {html.escape(job_id)}</span>")
+    outcome = str(turn.get("outcome_class") or "")
+    if outcome and str(turn.get("terminal_status") or "ok") != "ok":
+        label = _OUTCOME_CLASS_LABELS.get(outcome, outcome)
+        bits.append(f"<span class='pill bad'>{html.escape(label)}</span>")
+    queue_ms = turn.get("queue_wait_ms")
+    exec_ms = turn.get("exec_ms")
+    # 「排队」这两个字只在**算得出来**时才出现。
+    # 我自己的整页断言咬到了这一处:上一版只要执行时长存在就渲染「排队 …」,
+    # 于是时钟回拨那种算不出来的情形,页面上还是写着「排队」两个字 ——
+    # **把「我不知道」渲染成一个看起来有值的字段。**
+    if queue_ms is not None and exec_ms is not None:
+        bits.append(
+            "<span class='muted'>排队 "
+            f"{html.escape(_debug_ms(queue_ms))} · 执行 "
+            f"{html.escape(_debug_ms(exec_ms))}</span>"
+        )
+    elif exec_ms is not None:
+        bits.append(
+            f"<span class='muted'>执行 {html.escape(_debug_ms(exec_ms))}"
+            "<span class='muted'>(排队时长不可判定)</span></span>"
+        )
+    return "".join(bits)
 
 
 def _render_data_track_debug_page(payload: dict) -> str:
@@ -8575,7 +9182,15 @@ def _render_data_track_debug_page(payload: dict) -> str:
 
     def event_detail_block(ev: dict) -> str:
         revealed = bool(reveal_key and reveal_key == _debug_event_key(ev))
-        detail = _debug_json(ev.get("detail") if revealed else _debug_redact_value(ev.get("detail") or {}))
+        # 走 **同一套** public projection,而不是直接调脱敏。
+        # 第一版我只改了 `_debug_event_public_json`(JSON 端点用的那条),
+        # 页面上肉眼看的这条仍直连 `_debug_redact_value` ⇒ **页面一个字都没变**,
+        # 而我的单测全绿,因为**我测的是函数不是页面**。codex2 实跑整页才发现。
+        # 这正是 T130 那条:单测绿 = 代码对,证不了页面看得见。
+        detail = _debug_json(
+            ev.get("detail") if revealed
+            else _debug_event_public_json(ev).get("detail") or {}
+        )
         excerpt = _debug_json(ev.get("content_excerpt") if revealed else _debug_content_summary(ev.get("content_excerpt") or {}))
         if not detail and not excerpt and not revealed:
             return ""
@@ -8658,7 +9273,8 @@ def _render_data_track_debug_page(payload: dict) -> str:
             f"<h3><span>{mark}</span> <span>{html.escape(str(turn.get('title') or ''))}</span>"
             f"<span class='pill {status_cls}'>{html.escape(status)}</span>"
             f"<span class='muted mono'>{html.escape(str(turn.get('user_id') or ''))} · {html.escape(str(turn.get('trace_id') or ''))}</span>"
-            f"<span class='muted'>{html.escape(_debug_ms(turn.get('total_dur_ms')))}</span></h3>"
+            f"<span class='muted'>{html.escape(_debug_ms(turn.get('total_dur_ms')))}</span>"
+            f"{_render_turn_identity(turn)}</h3>"
             f"{''.join(rows_html)}{stalled_note}"
             "</section>"
         )

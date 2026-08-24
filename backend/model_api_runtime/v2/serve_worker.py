@@ -51,7 +51,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -2241,18 +2241,77 @@ def _read_vision_observations(
             configs[route_id] = config
 
         mime = str(image.get("image_mime") or "image/jpeg")
+        provider = str(config.provider or "")[:80]
+        model = str(config.model or "")[:96]
+        started_at = time.monotonic()
+
+        def emit_provider_trace(event_type: str, **kwargs) -> None:
+            try:
+                _emit_v2_debug_trace_for_user(
+                    user_id,
+                    event_type,
+                    trace_id=message_id,
+                    turn_id=message_id,
+                    **kwargs,
+                )
+            except Exception as trace_exc:  # noqa: BLE001 — diagnostics are best effort
+                log.warning(
+                    "[v2.vision] provider trace failed user=%s message=%s error=%s",
+                    str(user_id)[:8],
+                    message_id[:8],
+                    type(trace_exc).__name__,
+                )
+
+        emit_provider_trace(
+            "vision.provider.called",
+            status="started",
+            summary="provider_call",
+            detail={"provider": provider, "model": model},
+        )
         try:
             observations[message_id] = vision_observer.observe_image(
                 config,
                 image_mime=mime,
                 image_b64=image_b64,
             )
-        except vision_observer.VisionObserverError as exc:
+        except vision_observer.VisionObserverError as failure:
             # Fixed route metadata, never inferred from model prose. The worker
             # can carry it to the terminal activity/fallback projection.
-            exc.model = str(config.model or "")[:96]
-            exc.provider = str(config.provider or "")[:80]
+            failure.model = model
+            failure.provider = provider
+            emit_provider_trace(
+                "vision.provider.completed",
+                status="error",
+                summary=failure.error_code,
+                detail={
+                    "provider": provider,
+                    "model": model,
+                    "error_class": failure.error_code,
+                    "status_code": failure.status_code,
+                    "retryable": failure.retryable,
+                },
+                dur_ms=(time.monotonic() - started_at) * 1000,
+            )
+            log.warning(
+                "[v2.vision] provider call failed user=%s message=%s route=%s "
+                "provider=%s model=%s class=%s status=%s upstream_detail=%r",
+                str(user_id)[:8],
+                message_id[:8],
+                route_id[:8],
+                provider,
+                model,
+                failure.error_code,
+                failure.status_code,
+                failure.upstream_detail,
+            )
             raise
+        emit_provider_trace(
+            "vision.provider.completed",
+            status="ok",
+            summary="provider_call_complete",
+            detail={"provider": provider, "model": model},
+            dur_ms=(time.monotonic() - started_at) * 1000,
+        )
     return observations
 
 
@@ -2479,19 +2538,19 @@ async def _generate_image_for_chat(
         explain="开始生成图片（记录用的是哪条路由，不含提示词）。",
         detail=dict(_image_route_detail),
     )
-    try:
-        result = await provider_client.generate_image_async(config, prompt)
-        media = ProviderResponse.from_result(result).media
-        if not media:
-            raise provider_client.ProviderError("image_generation_invalid_output")
-        _emit_v2_debug_trace(
-            _image_store, "agent.image.generate.done", status="ok",
-            summary="image generation done",
-            explain="图片生成成功。",
-            detail={**_image_route_detail, "media_count": len(media)},
-        )
-    except Exception as exc:  # noqa: BLE001 - stable capability surface
+
+    async def raise_provider_failure(exc: BaseException) -> NoReturn:
+        """Classify and persist only failures raised by the provider seam."""
         classified = provider_client.classify_provider_error(exc)
+        raw_status_code = getattr(exc, "status_code", None)
+        status_code = (
+            raw_status_code if isinstance(raw_status_code, int) else None
+        )
+        upstream_detail = str(
+            getattr(exc, "upstream_detail", "")
+            or getattr(exc, "response_detail", "")
+            or ""
+        )[:240]
         incompatible = classified in {"provider_config", "provider_incompatible"} or (
             str(exc).strip().lower()
             in {"image_generation_model_unsupported", "image_generation_invalid_output"}
@@ -2532,7 +2591,19 @@ async def _generate_image_for_chat(
                 "error_code": code,
                 "classified": classified,
                 "incompatible": incompatible,
+                "status_code": status_code,
             },
+        )
+        log.warning(
+            "[v2.image] generation failed user=%s provider=%s model=%s "
+            "error=%s code=%s status=%s upstream_detail=%r",
+            str(user_id)[:8],
+            _image_route_detail["provider"],
+            _image_route_detail["model"],
+            type(exc).__name__,
+            code,
+            status_code,
+            upstream_detail,
         )
         if isinstance(route, dict) and route.get("id"):
             await asyncio.to_thread(
@@ -2557,7 +2628,26 @@ async def _generate_image_for_chat(
             error_code=code,
             model=str(getattr(config, "model", "") or ""),
             provider=str(getattr(config, "provider", "") or ""),
+            status_code=status_code,
+            upstream_detail=upstream_detail,
         ) from exc
+
+    try:
+        result = await provider_client.generate_image_async(config, prompt)
+    except Exception as exc:  # noqa: BLE001 - this try contains only provider I/O
+        await raise_provider_failure(exc)
+
+    media = ProviderResponse.from_result(result).media
+    if not media:
+        await raise_provider_failure(
+            provider_client.ProviderError("image_generation_invalid_output")
+        )
+    _emit_v2_debug_trace(
+        _image_store, "agent.image.generate.done", status="ok",
+        summary="image generation done",
+        explain="图片生成成功。",
+        detail={**_image_route_detail, "media_count": len(media)},
+    )
 
     target = route
     if target is None:
@@ -2752,6 +2842,11 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
         "cards": "",
         "card_items": [],
     }
+    if full_cards:
+        # Internal-only, content-free signal consumed by the Dream worker.  An
+        # empty successful index and a failed/degraded read must not both look
+        # like "the model chose to do nothing" in diagnostics.
+        ctx["_diagnostic_cards_outcome"] = "unavailable"
     try:
         body, status = memory_core.buckets(store, None, post_enclave=_post)
         if status == 200:
@@ -2825,6 +2920,11 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
                     rendered_chars += added_chars
                 ctx["card_items"] = selected
                 ctx["cards"] = "\n".join(lines)
+                ctx["_diagnostic_cards_outcome"] = (
+                    "ready" if len(selected) == len(ids) else "truncated"
+                )
+            elif full_cards:
+                ctx["_diagnostic_cards_outcome"] = "empty"
             elif not full_cards:
                 lines = [_render_card_line(item) for item in index_items]
                 ctx["cards"] = "\n".join(line for line in lines if line)
@@ -3221,10 +3321,15 @@ def _reply_message_fields(payload: dict) -> tuple[str, dict]:
     ):
         raise RuntimeError("invalid reply file mime")
     byte_count = raw.get("file_byte_count")
+    maximum_file_bytes = (
+        cap_tool_schema.SHARED_WORK_MAX_BYTES
+        if name.casefold().endswith(".io.html")
+        else v2_worker._WORKSPACE_FILE_MAX_BYTES
+    )
     if (
         type(byte_count) is not int
         or byte_count <= 0
-        or byte_count > v2_worker._WORKSPACE_FILE_MAX_BYTES
+        or byte_count > maximum_file_bytes
     ):
         raise RuntimeError("invalid reply file size")
     return "file", {
@@ -4461,6 +4566,7 @@ def _read_worldbook_context(
     messages: list[dict],
     *,
     runtime_token: str,
+    trace_context: dict | None = None,
 ) -> dict:
     """Match this foreground turn against the user's encrypted World Book."""
     body, status = worldbook_core.match(
@@ -4468,6 +4574,16 @@ def _read_worldbook_context(
         {"messages": list(messages or [])},
         api_key=None,
         runtime_token=str(runtime_token or ""),
+        **(
+            {
+                "trace_id": str(trace_context.get("trace_id") or ""),
+                "job_id": str(trace_context.get("job_id") or ""),
+                "lane": str(trace_context.get("lane") or ""),
+                "actor": "host_agent_runtime",
+            }
+            if isinstance(trace_context, dict)
+            else {}
+        ),
     )
     if status != 200:
         raise RuntimeError("worldbook_match_failed")
@@ -4696,7 +4812,7 @@ async def _load_mcp_turn_observed(store, *, lane: str = "chat", **kwargs):
 def _emit_v2_debug_trace(store, event_type: str, *, status: str,
                          detail: dict, summary: str = "", explain: str = "",
                          dur_ms: float | None = None,
-                         trace_id: str = "", job_id: str = "",
+                         trace_id: str = "", turn_id: str = "", job_id: str = "",
                          outcome_class: str = "") -> None:
     from diagnostics import diagnostics_core
 
@@ -4709,6 +4825,8 @@ def _emit_v2_debug_trace(store, event_type: str, *, status: str,
         event["dur_ms"] = dur_ms
     # Added only when supplied, so the ~40 existing call sites keep emitting a
     # byte-identical payload.
+    if turn_id:
+        event["turn_id"] = str(turn_id)
     if job_id:
         event["job_id"] = str(job_id)
     if outcome_class:
@@ -5004,12 +5122,17 @@ def _emit_job_enqueued_trace(user_id: str, lane: str, *, reason: str, trace_id: 
     real indexed columns by insert_trace_events_strict, so putting them in
     detail is what populates them.
     """
+    detail = {"lane": lane, "enqueue_source": lane}
+    public_reason = jobs_store.public_enqueue_reason(reason)
+    if public_reason:
+        detail["reason"] = public_reason
     _emit_v2_debug_trace_for_user(
         user_id,
         "agent.job.enqueued",
         status="ok",
         trace_id=trace_id,
-        detail={"lane": lane, "reason": reason, "enqueue_source": lane},
+        turn_id=trace_id,
+        detail=detail,
     )
 
 

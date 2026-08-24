@@ -758,6 +758,7 @@ def test_openrouter_openai_production_prompt_has_large_stable_cache_prefix() -> 
 
     first = build(first_messages)
     second = build(second_messages)
+    tool_names = {spec.name for spec in tools}
     assert {
         "web_search",
         "web_fetch",
@@ -765,8 +766,8 @@ def test_openrouter_openai_production_prompt_has_large_stable_cache_prefix() -> 
         "workspace_read",
         "workspace_write",
         "task",
-        "reply",
-    }.issubset({spec.name for spec in tools})
+    }.issubset(tool_names)
+    assert "reply" not in tool_names
     assert first["session_id"] == second["session_id"] == CACHE_KEY
     assert first["tools"] == second["tools"]
     assert len(long_user) == 9000

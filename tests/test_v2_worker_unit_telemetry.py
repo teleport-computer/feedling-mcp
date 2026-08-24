@@ -18,6 +18,8 @@ from model_api_runtime.v2 import worker  # noqa: E402
 from model_api_runtime.v2 import language_follow  # noqa: E402
 from model_api_runtime.v2 import prompt_frontier  # noqa: E402
 from model_api_runtime.v2 import summary_frontier  # noqa: E402
+from notices import catalog as notices_catalog  # noqa: E402
+from provider_types import ToolCall, ToolExchange, ToolResult  # noqa: E402
 
 
 def test_thinking_extra_preserves_plaintext_body():
@@ -47,6 +49,68 @@ def test_wake_safety_suppressions_keep_distinct_stable_codes(reason):
     exc = worker.TurnError(reason)
     assert worker._safe_failure_code("wake_failed", exc) == f"wake_failed:{reason}"
     assert worker._turn_failure_error_class(exc) == "reply_parse_failed"
+
+
+def test_safe_failure_codes_are_members_of_the_producer_export():
+    samples = (
+        ("wake_failed", RuntimeError("private detail")),
+        ("wake_failed", TimeoutError("private detail")),
+        ("turn_failed", tool_loop.ProviderEmptyReply("private detail")),
+        ("compaction_failed", KeyError("private detail")),
+        ("extraction_failed", ValueError("private detail")),
+    )
+    for scope, exc in samples:
+        code = worker._safe_failure_code(scope, exc)
+        assert code in worker.PUBLIC_FAILURE_CODES
+        assert "private" not in code
+
+
+def test_unknown_exception_class_and_scope_collapse_to_registered_buckets():
+    class SecretToken(RuntimeError):
+        pass
+
+    assert worker._safe_failure_code("wake_failed", SecretToken("private")) == (
+        "wake_failed:error"
+    )
+    assert worker._safe_failure_code("secret_scope", SecretToken("private")) == (
+        "runtime_failed:error"
+    )
+    assert "turn_failed:secret_token" not in worker.PUBLIC_FAILURE_CODES
+
+
+def test_user_unavailable_outcomes_are_exact_and_producer_registered():
+    expected = frozenset({
+        "turn_failed:quota_insufficient",
+        "extraction_failed:quota_insufficient",
+        "turn_failed:image_generation_quota_insufficient",
+        "turn_failed:auth_invalid",
+        "turn_failed:image_generation_auth_invalid",
+        "turn_failed:model_not_found",
+        "turn_failed:image_generation_model_not_found",
+    })
+    assert notices_catalog.USER_UNAVAILABLE_V2_OUTCOME_CODES == expected
+    assert jobs_store.USER_UNAVAILABLE_OUTCOME_CODES == expected
+    assert expected <= worker.PUBLIC_FAILURE_CODES
+    for code in expected:
+        assert jobs_store.terminal_outcome_class(code) == "user_unavailable"
+
+    # Similar-looking capability/provider outcomes are deliberately ours.
+    for code in (
+        "turn_failed:provider_incompatible",
+        "turn_failed:rate_limited",
+        "wake_failed:quota_insufficient",
+        "unknown",
+    ):
+        assert jobs_store.terminal_outcome_class(code) == "operational_failure"
+
+
+def test_extraction_specific_codes_are_in_the_public_export():
+    for code in (
+        "extraction_failed:auth_invalid",
+        "extraction_failed:invalid_card_content",
+        "extraction_failed:memory_write_rejected",
+    ):
+        assert code in worker.PUBLIC_FAILURE_CODES
 
 
 def test_provider_attempt_ledger_inherits_job_lane_when_event_omits_it(monkeypatch):
@@ -726,7 +790,7 @@ def test_silent_reply_events_are_content_free_admin_readable_and_distinct():
         jobs_store.terminal_outcome_class(
             jobs_store.SILENT_BY_CHOICE_OUTCOME_CODE
         )
-        == "safety_suppression"
+        == "operational_failure"
     )
     choice = {
         "type": "reply.silent_by_choice",
@@ -882,6 +946,69 @@ def test_provider_roundtrip_trace_normalizes_unknowns_and_admin_redacts_forgery(
         assert forged_public[key].startswith("<redacted string")
 
 
+def test_provider_model_call_trace_cap_keeps_head_and_latest_round():
+    from admin import data_track
+
+    captured = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: captured.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+    trace = worker._provider_tool_surface_callback(
+        deps, "u_model_call_cap", "chat", "trace-model-call-cap"
+    )
+    assert trace is not None
+
+    async def record() -> None:
+        for round_number in range(1, 19):
+            await trace.record_model_call("start", {
+                "round": round_number,
+                "provider": "anthropic",
+                "model": "claude-test",
+                "prompt": "PRIVATE PROMPT MUST NOT ENTER TRACE",
+            })
+            await trace.record_model_call("done", {
+                "round": round_number,
+                "provider": "anthropic",
+                "model": "claude-test",
+                "finish_reason": "end_turn",
+                "reply": "PRIVATE REPLY MUST NOT ENTER TRACE",
+                "dur_ms": float(round_number),
+            })
+        await trace.emit_summary()
+
+    asyncio.run(record())
+
+    model_events = [
+        event
+        for event in captured
+        if event["type"].startswith("agent.model.call.")
+    ]
+    assert len(model_events) == worker._MODEL_CALL_TRACE_EVENT_CAP == 32
+    assert [event["detail"]["round"] for event in model_events[:30:2]] == list(
+        range(1, 16)
+    )
+    assert [event["detail"]["round"] for event in model_events[-2:]] == [18, 18]
+    summary = next(
+        event for event in captured if event["type"] == "mcp.roundtrip.provider"
+    )
+    assert summary["detail"]["model_call_event_cap"] == 32
+    assert summary["detail"]["model_call_events_observed"] == 36
+    assert summary["detail"]["model_call_events_emitted"] == 32
+    assert summary["detail"]["model_call_events_dropped"] == 4
+    public = data_track._debug_event_public_json(model_events[-1])
+    assert public["detail"]["lane"] == "chat"
+    assert public["detail"]["driver"] == "v2"
+    assert public["detail"]["finish_reason"] == "end_turn"
+    assert data_track._debug_friendly_step({
+        "type": "agent.model.call.error",
+        "subsystem": "agent",
+    }) == ("🧠", "调用模型 · 失败")
+    serialized = repr(captured)
+    assert "PRIVATE PROMPT" not in serialized
+    assert "PRIVATE REPLY" not in serialized
+
+
 def test_combined_memory_worldbook_message_keeps_truncation_trace_visible():
     captured = {}
 
@@ -919,6 +1046,87 @@ def test_combined_memory_worldbook_message_keeps_truncation_trace_visible():
             }
         },
     }
+
+
+def test_worldbook_context_applied_trace_is_content_free_and_emitted_once():
+    from admin import data_track
+
+    traces = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append({
+        "user_id": user_id,
+        "type": event_type,
+        **fields,
+    })
+    private_context = "private setting body that must not enter telemetry"
+    provider_request = {"messages": [{
+        "role": "user",
+        "content": (
+            worker.context.WORLD_BOOK_CONTEXT_HEADER
+            + "\n<world_book>"
+            + private_context
+            + "</world_book>"
+        ),
+    }]}
+    sink = worker._ledger_tapped_sink(
+        None,
+        deps=deps,
+        user_id="u-worldbook-applied",
+        lane="scheduled",
+        trace_id="trace-worldbook",
+        job_id="job-worldbook",
+    )
+
+    asyncio.run(sink("provider_request", provider_request))
+    asyncio.run(sink("provider_request", provider_request))
+
+    events = [
+        event for event in traces
+        if event["type"] == "worldbook.context.applied"
+    ]
+    assert len(events) == 1
+    event = events[0]
+    assert set(event) == {
+        "user_id", "type", "status", "summary", "explain", "trace_id",
+        "turn_id", "job_id", "detail",
+    }
+    assert set(event["detail"]) == {
+        "runtime", "lane", "source", "carrier_chars", "truncated",
+    }
+    assert event["trace_id"] == "trace-worldbook"
+    assert event["job_id"] == "job-worldbook"
+    assert event["detail"] == {
+        "runtime": "hosted_v2",
+        "lane": "scheduled",
+        "source": "eager_context",
+        "carrier_chars": len(provider_request["messages"][0]["content"]),
+        "truncated": False,
+    }
+    assert private_context not in repr(event)
+    assert data_track._debug_event_public_json(event)["detail"] == event["detail"]
+
+
+def test_worldbook_tool_result_observation_contains_shape_only():
+    private_context = "private tool result body"
+    request = {"messages": [ToolExchange(
+        calls=(ToolCall(id="call-wb", name="worldbook_match", args={}),),
+        results=(ToolResult(
+            call_id="call-wb",
+            content=f"<world_book>{private_context}</world_book>",
+        ),),
+    )]}
+
+    observation = worker._worldbook_context_observation(request)
+
+    assert set(observation) == {"source", "carrier_chars", "truncated"}
+    assert observation == {
+        "source": "tool_result",
+        "carrier_chars": len(
+            f"<world_book>{private_context}</world_book>"
+        ),
+        "truncated": False,
+    }
+    assert private_context not in repr(observation)
 
 
 def test_post_fold_checkpoint_exhaustion_is_content_free_degradation(monkeypatch):

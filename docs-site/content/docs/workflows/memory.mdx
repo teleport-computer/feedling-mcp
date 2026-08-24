@@ -6,10 +6,18 @@ description: Store encrypted memory cards, inspect the index, and fetch selected
 Memory separates ciphertext storage from enclave-authorized read projections.
 
 Runtime V2 permits memory-card deletion only during foreground Chat, when the
-user is present in the turn. Background heartbeat, scheduled, manual-wake, and
-screen-watch turns can add or update cards but cannot delete them; the delete
-operation is omitted from their tool schema and independently refused by the
-execution gate.
+user is present in the turn. Background heartbeat, scheduled, and manual-wake
+turns can add or update cards but cannot delete them; the delete operation is
+omitted from their tool schema and independently refused by the execution gate.
+
+An unattended screen-watch turn that carries a fresh screen frame is narrower
+still: from 2026-08-21 it is offered no platform mutation tools at all, so it
+can neither add nor update a card. The only instruction source in that turn is
+text that happened to appear on the user's screen, and the model cannot
+reliably separate it from something the user asked for. Reading memory,
+inspecting the screen, and replying remain available. Screen-watch turns
+without a fresh frame, and foreground Chat turns where the user did send a
+message, keep the usual write surface.
 
 ## Hosted profile refresh execution
 
@@ -98,6 +106,16 @@ operations leave every original card active, and accepted operations supersede
 rather than hard-delete source cards. Automatic scheduling continues to advance
 only when new non-Dream cards are added; new conversation turns alone do not
 schedule another Dream run.
+
+Dream diagnostics correlate scheduling, model execution, and the final write
+outcome without exposing memory content. The admin trace distinguishes a clean
+no-op, an applied run, a partial write, provider or parse failure, deterministic
+mapping or blast-radius rejection, and a failed write. It reports only closed
+outcome enums, booleans, duration, and fixed integer counts. A failed or
+budget-truncated full-card read is recorded separately and marks the terminal
+run as using degraded context, so it cannot be mistaken for a model choosing to
+make no changes from a complete input. Card ids, prompts, replies, summaries,
+raw errors, and other memory text are never part of this diagnostic shape.
 
 In Runtime V2 chat, the model-facing `memory_organize` tool can force-enqueue a
 Dream run when the user explicitly asks to organize or consolidate their

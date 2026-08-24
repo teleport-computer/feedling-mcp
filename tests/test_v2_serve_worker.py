@@ -3,6 +3,7 @@
 import asyncio
 import json
 import sys
+import time
 import types
 from contextlib import contextmanager
 from pathlib import Path
@@ -20,6 +21,19 @@ from model_api_runtime.v2 import (
     worker,
 )
 import debug_trace
+
+
+@pytest.fixture(autouse=True)
+def _guard_process_sleep(monkeypatch):
+    """No test in this module may mutate the process-global sleep function.
+
+    Depending on ``monkeypatch`` is intentional: this fixture's teardown runs
+    before monkeypatch restores changes, so an unsafe patch through a module's
+    shared stdlib ``time`` object cannot repair itself before the assertion.
+    """
+    process_sleep = time.sleep
+    yield
+    assert time.sleep is process_sleep
 
 
 def _fake_serve_from_script(script, calls):
@@ -44,7 +58,12 @@ def test_run_forever_relaunches_crashes_then_exits_on_clean_return(monkeypatch):
         _fake_serve_from_script(
             [RuntimeError("boom1"), RuntimeError("boom2"), None], calls),
     )
-    monkeypatch.setattr(serve_worker.time, "sleep", sleeps.append)
+    # Replace this module's reference instead of mutating ``time.sleep`` on the
+    # process-global stdlib module. Background wake-bus threads also use that
+    # object and can otherwise append unrelated sleeps to this test's list.
+    monkeypatch.setattr(
+        serve_worker, "time", SimpleNamespace(sleep=sleeps.append)
+    )
 
     serve_worker._run_forever("w-test", 1.0)
 
@@ -59,7 +78,9 @@ def test_run_forever_clean_return_does_not_relaunch(monkeypatch):
     calls, sleeps = [], []
     monkeypatch.setattr(
         serve_worker, "_serve", _fake_serve_from_script([None], calls))
-    monkeypatch.setattr(serve_worker.time, "sleep", sleeps.append)
+    monkeypatch.setattr(
+        serve_worker, "time", SimpleNamespace(sleep=sleeps.append)
+    )
 
     serve_worker._run_forever("w-test", 1.0)
 
@@ -347,7 +368,9 @@ def test_run_forever_backoff_is_bounded(monkeypatch):
     script = [RuntimeError(f"boom{i}") for i in range(8)] + [None]
     monkeypatch.setattr(
         serve_worker, "_serve", _fake_serve_from_script(script, calls))
-    monkeypatch.setattr(serve_worker.time, "sleep", sleeps.append)
+    monkeypatch.setattr(
+        serve_worker, "time", SimpleNamespace(sleep=sleeps.append)
+    )
 
     serve_worker._run_forever("w-test", 1.0)
 
@@ -617,6 +640,47 @@ def test_v2_debug_trace_user_seam_resolves_store_and_preserves_duration(monkeypa
     ]
 
 
+def test_job_enqueue_trace_uses_trace_id_as_turn_id(monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        serve_worker,
+        "_emit_v2_debug_trace_for_user",
+        lambda user_id, event_type, **kwargs: captured.append(
+            (user_id, event_type, kwargs)
+        ),
+    )
+
+    serve_worker._emit_job_enqueued_trace(
+        "usr_enqueue",
+        "capture",
+        reason="quiet_window",
+        trace_id="trace-enqueue-123",
+    )
+
+    assert captured[0][0:2] == ("usr_enqueue", "agent.job.enqueued")
+    assert captured[0][2]["trace_id"] == "trace-enqueue-123"
+    assert captured[0][2]["turn_id"] == "trace-enqueue-123"
+
+
+def test_job_enqueue_trace_emits_only_exported_reasons(monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        serve_worker,
+        "_emit_v2_debug_trace_for_user",
+        lambda user_id, event_type, **kwargs: captured.append(kwargs),
+    )
+
+    serve_worker._emit_job_enqueued_trace(
+        "usr_enqueue", "scheduled", reason="scheduled_wake", trace_id="t1"
+    )
+    serve_worker._emit_job_enqueued_trace(
+        "usr_enqueue", "scheduled", reason="secret_token", trace_id="t2"
+    )
+
+    assert captured[0]["detail"]["reason"] == "scheduled_wake"
+    assert "reason" not in captured[1]["detail"]
+
+
 @pytest.mark.parametrize(
     "event_type",
     ["mcp.surface.schema_folded", "mcp.surface.schema_recovered"],
@@ -681,10 +745,12 @@ def test_v2_debug_trace_payload_preserves_turn_trace_id(monkeypatch):
         explain="content-free",
         detail={"lane": "chat"},
         trace_id="trace-current-turn",
+        turn_id="turn-current-turn",
     )
 
     assert captured[0][0] is store
     assert captured[0][1]["event"]["trace_id"] == "trace-current-turn"
+    assert captured[0][1]["event"]["turn_id"] == "turn-current-turn"
 
 
 def test_context_truncation_reaches_final_debug_event_without_upstream_content(
@@ -2166,6 +2232,40 @@ def test_worldbook_reader_forwards_current_turn_and_runtime_token(monkeypatch):
         serve_worker.build_production_deps().read_worldbook_context
         is serve_worker._read_worldbook_context
     )
+
+
+def test_worldbook_reader_forwards_trusted_trace_context(monkeypatch):
+    observed = {}
+    monkeypatch.setattr(
+        serve_worker.core_store, "get_store", lambda uid: f"store:{uid}"
+    )
+
+    def match(store, payload, **kwargs):
+        observed.update(store=store, payload=payload, **kwargs)
+        return {"block": ""}, 200
+
+    monkeypatch.setattr(serve_worker.worldbook_core, "match", match)
+    serve_worker._read_worldbook_context(
+        "u-worldbook",
+        [],
+        runtime_token="runtime-secret",
+        trace_context={
+            "trace_id": "trace-wb",
+            "job_id": "job-wb",
+            "lane": "scheduled",
+        },
+    )
+
+    assert observed == {
+        "store": "store:u-worldbook",
+        "payload": {"messages": []},
+        "api_key": None,
+        "runtime_token": "runtime-secret",
+        "trace_id": "trace-wb",
+        "job_id": "job-wb",
+        "lane": "scheduled",
+        "actor": "host_agent_runtime",
+    }
 
 
 def _catalog_traces(monkeypatch, store, *, fingerprint, specs, emit_fails=False):

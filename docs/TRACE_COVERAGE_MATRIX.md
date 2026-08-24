@@ -1,239 +1,235 @@
 # Trace 覆盖矩阵
 
-> 状态:第一版骨架(claude2, 2026-08-19)。这份文档是 Task#4「repo trace 权威文档」
-> 的承重章节 —— 先有矩阵才谈得上"查案人带着问题来能不能不猜地答"。
+> 第二版(claude2, 2026-08-21)。**按产品事件重画,不再按代码里已有的东西画。**
+>
+> 第一版是照着「代码里有哪些 emit」画的,于是**世界书和语音通话从来没进过视野** ——
+> 不是标成红,是整条流水线在表里不存在。Seven 2026-08-21 给出产品侧的事件清单后才暴露。
+> ⇒ **画覆盖表必须从「产品有哪些事件」出发,否则盲区会隐身:一张只画已知的表,
+> 天然画不出未知。**
 
-## 这份矩阵怎么读
+## ⚠️ 这张表会腐烂,所以每格都标了「哪天、被哪一单改成这样」
 
-三色定义(与 Supervisor 2026-08-18 定稿一致):
+**一份按现状写的表,天生会随着修复而过期。** 第一版就是这么变成假的:
+它描述的是 T184 换存储**之前**的世界,还用现在时说「这就是待解决的问题」。
+本版起,凡是被某一单改变状态的格子,都注明**日期 + 单号**。
+读的时候先看那个日期 —— **它告诉你这一格有多新,以及该不该重新核一遍。**
+
+## 怎么读
 
 | 色 | 含义 | 判据 |
 |---|---|---|
 | 🟢 绿 | **实弹见过** | 人为制造该跃迁缺失,格子会变红 |
-| 🟡 黄 | 有调用点,**未实弹复验** | 代码里有 emit,但没人验证过它真的接上了 |
+| 🟡 黄 | 有调用点,**未实弹复验** | 代码里有 emit,没人验证过它真的接上了 |
 | 🔴 红 | 零探针 | 这一段什么都不留 |
-| ⬛ 结构性不可得 | **不是 bug,不要追** | 数据在用户自己的机器上,服务端结构上看不到 |
+| ⬛ 结构性不可得 | **不是 bug,不要追** | 数据在用户自己机器上,服务端看不到 |
 
-⚠️ **绿必须是实弹见过,不是"代码里有调用"。** T130 的教训:221 个单测全绿、
-突变全咬住,实弹一查 wake 道 trace_id 全空。探针存在 ≠ 探针接线。所以本版里
-**没有任何绿格** —— 现有调用点一律先标黄,复验一个转一个。
+⚠️ **绿必须实弹见过。** 2026-08-21 兑现过一次:T189 四格坚持只标黄,
+实弹一跑就发现唤醒道 30% 的 trace_id 是空的(见 §3)。**若当时翻绿,那 30% 会以
+「已验证」身份躺在盘面上。**
 
-每条流水线要回答的必答题(标准修订②):
-**「这条路在哪里可能什么都不留就退出?」** —— 开始/结束都有代码位置,
-"被吞"恰恰是代码什么都没做的地方,它不会自己冒出来,必须逐条去问。
+## 点算方法(以及它为什么重要)
 
-## 一、trace 事件写到哪里(容量边界)
+本版按**事件名前缀**点算,不按文件点算。
+按文件会把同一文件里别的功能算进来 —— 第一版就因此把生图高估了(`serve_worker.py`
+里同时住着视觉、生图和唤醒的 emit)。
 
-| 项 | 值 | 出处 |
-|---|---|---|
-| 发射函数 | `trace_event(store, *, subsystem, type, summary, explain, detail, content_excerpt, actor, status, trace_id, turn_id, job_id, dur_ms)` | `backend/debug_trace.py:330` |
-| 落地 | 用户维度 blob `v1_flow_trace`,经 `db.append_blob_events_strict()` | `debug_trace.py:217` |
-| 容量 | **2500 条/用户**(verbose 模式 1000) | `debug_trace.py:42` |
-| TTL | **48 小时** | `debug_trace.py:47` |
-| 淘汰 | 环形 FIFO | — |
-| 异步队列 | 上限 5000 | `debug_trace.py:57` |
-| 调用点总数 | 47 处,分布 18 个模块 | — |
-
-**这就是 T138 要解决的那件事**:环 + TTL ⇒ 事发后想查,ring 里已经没有。
-在 append-only 表落地之前,任何"去 trace 里查三天前那件事"的期待都是落空的。
-
-## 二、按流水线的覆盖
-
-### 1. chat 送达(Hosted V2)
-
-| 阶段 | 状态 | 坐标 |
-|---|---|---|
-| API 收到 | 🔴 | `hosted/chat_send_core.py` HTTP 层无 emit |
-| 入队 | 🟡 | `chat_send_core.py:132,146,171` |
-| worker 认领 | 🔴 | `v2/worker.py` 认领处无 emit |
-| provider 回合(tool loop) | 🔴 | `v2/tool_loop.py` provider 调用全程无 emit |
-| 回复定稿 | 🟡 | `chat_send_core.py:204,218,248,256,361,375` |
-| 落库发布 | 🟡 | `chat_send_core.py:507,584` |
-| 客户端取走 | 🟡 | `chat/poll_core.py:88` |
-
-**哪里可能什么都不留就退出**:provider 回合整段。空回复三修不透那个洞就住在这一段。
-
-### 2. 唤醒道(heartbeat / scheduled / manual_wake / screen_watch)
-
-| 阶段 | 状态 | 坐标 |
-|---|---|---|
-| 触发事件 | 🟡 | `perception/service.py:762-844` 写 user_logs |
-| 入队（Q2） | 🟡 | `agent.job.enqueued`；与终态复用 job 自带 `trace_id` |
-| 唤醒上下文读取 | 🔴 | `v2/worker.py` |
-| provider 回合 | 🔴 | 见下方【已证实 1】 |
-| **空回复归因（Q6）** | 🟡 | `reply.silent_by_choice` / `reply.silent_empty_response`；只进后台、用户侧仍无消息 |
-| 回复发布(若有) | 🔴 | 唤醒道回复不发 trace |
-
-**哪里仍可能什么都不留就退出**:provider 回合本身仍无开始/结束事件。
-非 scheduled 道的空回复现在有两类 content-free 归因探针，但尚未在 test
-部署上跑实弹，所以只标黄；期3a 的 `silent_undeclared` 仍是盲区计量，
-不是该归因探针的实弹证明。
-
-### 3. 记忆 capture
-
-| 阶段 | 状态 | 坐标 |
-|---|---|---|
-| 入队 | 🔴 | `proactive/capture_scheduler.py` |
-| 处理 | 🟡 | `capture_scheduler.py:741,762,775` / `capture_jobs.py:321` |
-| 卡片入索引 | 🔴 | 读侧无 emit |
-| 用户读到 | 🟡 | `memory/memory_core.py:129` |
-
-### 4. 记忆 dream
-
-| 阶段 | 状态 | 坐标 |
-|---|---|---|
-| 入队 | 🔴 | `proactive/dream_scheduler.py` |
-| 处理 | 🟡 | `dream_scheduler.py:260` |
-| dream 模型调用 | 🔴 | — |
-| 结果落库 | 🔴 | — |
-
-### 5. genesis / 导入
-
-| 阶段 | 状态 | 坐标 |
-|---|---|---|
-| 入队 | 🔴 | `genesis/service.py` |
-| 文件摄入 | 🟡 | `genesis/plaintext.py:80` |
-| 建卡 | 🟡 | `genesis/genesis_core.py:89,131,662,673` / `worker.py:122,144` |
-| 索引 | 🔴 | — |
-
-### 6. 模型路线添加 / 测试(setup_core)
-
-| 阶段 | 状态 | 坐标 |
-|---|---|---|
-| 建路线 | 🔴 | `hosted/setup_core.py` |
-| provider 探测（Q1：建路线 / 测试） | 🟡 | `model_api.provider_probe.started/finished/runtime_fenced` + always-on attempt ledger |
-| 视觉探测执行 | 🔴 | `setup_core.py:381` |
-| 目录声明与探测结果打架 | 🟡 | `setup_core.py:262`(**仅**此一处) |
-| 结果落库 | 🔴 | `setup_core.py:277` |
-
-⚠️ **这条链路真金白银打中转站扣 token,失败归因目前只能靠读代码推断。**
-与 T128 trace-retention 同族(事发后想查、ring 里没有)。案主 claude4 有
-usr_450ee 的事件窗口与 ring 查询配方。
-
-### 7. 生图
-
-| 阶段 | 状态 | 坐标 |
-|---|---|---|
-| 工具调用 | 🔴 | `capabilities/image_gen.py` |
-| provider 调用 | 🔴 | `provider_client.py` |
-| 结果回传 | 🔴 | tool_loop 内 |
-| 消息发布 | 🟡 | 走 chat 回复路径 |
-
-### 8. vision
-
-| 阶段 | 状态 | 坐标 |
-|---|---|---|
-| 观测/测试 | 🟡 | `hosted/vision_observer.py:192,231,255,285,305,339` |
-| 视觉模型调用 | 🔴 | tool_loop 内 |
-| 回复生成 | 🟡 | 走 chat 回复路径 |
-
-### 9. MCP 工具面
-
-| 阶段 | 状态 | 坐标 |
-|---|---|---|
-| schema 折叠 / tool search resolve（Q8） | 🟡 | `mcp.surface.schema_folded/recovered`，name 集合经 `bounded_names` 带截断标记 |
-| 工具派发 | 🔴 | — |
-| 变更落地 | 🔴 | — |
-
-**Q8 现状**:name 级 folded/recovered 事件及 collapsed/resolved/protected
-集合已经有调用点；每轮集合不变去重，search 恢复吸收本轮折叠变化。
-尚未在 test 部署上跑一轮真实 fold + search，故只标黄。
-
-### 10. resident(V1)poll 环
-
-| 阶段 | 状态 | 说明 |
-|---|---|---|
-| poll 请求到达 | 🟡 | `chat/poll_core.py:88` |
-| 待送消息返回 | 🟡 | 同上 |
-| **poll 环处理** | ⬛ | 在用户自己机器上 |
-| **provider 调用** | ⬛ | 同上 |
-| **工具执行** | ⬛ | 同上 |
-| 回复回传 | 🟡 | 走 chat 摄入路径 |
-
-⬛ 三格是**结构性不可得,不是 bug,不要追**。V1/resident 的 provider 与工具面
-运行在用户自有服务器上(见 `docs/ACCESS_ROUTES.md` 路线②),服务端只能看见
-跨网络边界的那部分。任何"给 resident 补上 provider 埋点"的提案都要先回答
-"数据怎么离开用户机器",而那是产品/隐私问题不是工程问题。
-
-## 三、判据怎么选：缺失不产生证据，存在才产生证据
-
-这条不是理论，是本轮 T138 块 0 实际撞出来的，写在这里因为它决定**每一格该怎么验**。
-
-### 自指陷阱
-
-「持久化失败要能被外面看到」听起来显然，但落地时会撞上：
-**失败态要跨进程可读 ⇒ 得写进库；而写库正是失败的那条路** ⇒ DB 挂的时候，
-"我失败了"这件事也写不进去。**最需要它的时刻，它恰好是空的。**
-
-### 解法：让"成功"自己过期，而不是让"失败"去登记
-
-| | 失败侧信号 | 存在侧信号 |
-|---|---|---|
-| 形态 | 失败计数、错误日志 | `last_success_at` 心跳 |
-| 何时写 | **失败时**才写 | **成功时**才写 |
-| 故障下 | 可能根本写不进去 | 不写 → 时间差自己涨 → 自然暴露 |
-| 覆盖崩溃 | ❌ 崩溃时计数器同归于尽 | ✅ 停止更新即可见 |
-
-⇒ **判据锚在"最后一次成功距今多久"**，超阈值即不健康。失败时不需要写任何东西。
-
-### 同一条的其他实例（本仓已发生过）
-
-- **删除查不出**：被删的行不出现在任何后续扫描里 ⇒ 必须在删除**那一刻**留痕，
-  事后轮询结构上失明
-- **shell 吃掉正文**：被替换的内容不留残留 ⇒ 查"有没有残留"恒绿，
-  要查"反引号还在不在"
-- **冻结格子被改写**：水位让第二次冻结根本不回访 ⇒ 断言恒真，
-  要清掉水位强制回访才测得到
-- **stale 时的近似值**：心跳过期时 `dirty_rows` 必须报 unknown，
-  **不能拿旧的 0 冒充当前积压**（codex2 定块 0 形状时加的，比我建议的更严）
-
-### 落到矩阵上
-
-每一格标绿之前问一句：**我用来判断它的信号，是在"好"的时候产生，还是在"坏"的时候产生？**
-只在"坏"的时候产生的信号，在真的坏掉时往往产生不了。
+⚠️ 另有两次量具事故,记在这里免得重犯:
+- 用 zsh 循环传多个路径给 grep,**zsh 默认不做词分割** ⇒ 多路径被当成一个不存在的路径名,
+  `2>/dev/null` 吞掉报错,返回 0。据此差点报「聊天和记忆卡零记录」(真值 15 和 11)。
+- 正则 `"[a-z_]+\.[a-z_.]+"` 会把 `asgi_app.py` 里的**模块路径**(`voice.routes_asgi`)
+  当成事件名。**下「有/没有」结论前先跑一个已知为真的阳性对照。**
 
 ---
 
-## 四、已证实的判定
+## 总览(按 Seven 2026-08-21 的产品事件清单)
 
-### 【已证实 1】非 scheduled 唤醒道的空回复检测整段不执行
-`v2/worker.py:9075` → `require_reply=(lane == "scheduled")`。
-`heartbeat`/`manual_wake`/`screen_watch` 传 `False`,于是
-`provider_client.py:2185` 的 `if require_reply and not reply and not tool_calls
-and not media` 整条判断不成立,空回复静默走完、终态 ok、零条消息。
+| # | 产品事件 | 覆盖 | 最大缺口 |
+|---|---|---|---|
+| 1a | 用户正常聊天 | 🟡 | 打模型那一段 2026-08-22 已补(§9);API 收到/worker 认领仍无 emit |
+| 1b | 入驻蒸馏 / 二次蒸馏 | 🟡 | 入队、建索引无 emit |
+| 1c | 记忆卡读写 | 🟡 | 入队、卡片入索引无 emit |
+| 1c | Dream | 🟡 | T217 已补两运行时处理/模型/落库终态与上下文降级；尚待 test 实弹 readback |
+| 1d | 心跳 | 🟡 | 入队↔终态已通(§3),打模型那一段 2026-08-22 已补(§9) |
+| 1e | 事件唤醒 | 🟡 | 同 1d,共用同一条路径 |
+| **1f** | **世界书** | **🟡** | 写入、匹配结果、实际进 provider 已分段；V1 pull 工具最终应用仍复用通用工具 trace |
+| 2a | 视觉模型调用 | 🟡 | provider 往返已有(T203),回复生成仍走 chat |
+| 2b | 生图模型调用 | 🟡 | provider 往返已有(T204) |
+| **2c** | **语音通话** | **🔴** | **整条零调用点,且失败被伪装成 HTTP 200** |
 
-### 【代码接线、待实弹】模型路线添加/测试路径
-正常路径现有 `model_api.provider_probe.started/finished`，失败回滚有
-`runtime_fenced`；真钱调用另写 always-on provider-attempt ledger，避免用户关闭
-debug trace 后证据消失。尚未在 test 部署上造成功、`invalid_output`、回滚三次，
-所以 Q1 仍是黄，不是绿。
+---
 
-### 【UNKNOWN,不入红格】broadcast_opened「源头三个配置关着 / 下游六处是孤儿」
+## §1 trace 写到哪(容量边界)
 
-**来源**:Supervisor 的长期记忆条目(「边沿要是一等事件」),给种子清单时未回核。
+| 项 | 值 | 出处 |
+|---|---|---|
+| 落地 | **append-only 表 `trace_events`**,按天分区 | `db.insert_trace_events_strict` |
+| 保留 | **30 天** | `db._TRACE_EVENTS_RETENTION_DAYS` |
+| 销号 | **不删** —— 事后查 bug 用 | T184 决策 |
+| 读侧 | `db.query_trace_events`,admin `/v1/admin/data-track/debug` | `admin/data_track.py` |
 
-**代码层已证伪**(claude2 与 Supervisor 各自独立核过,结论一致):
-- `proactive/controls_v2.py:44-55` `default_switches_v2()` —— 九个开关
-  **全部默认 True**,不存在"三个关着";
-- `broadcast_opened` **有产有消,不是孤儿**:
-  产于 `perception/differ_v2.py:200`、`perception/service.py:736`;
-  消费于 `controls_v2.py:265`、`proactive/gate.py:84,97`、`glance.py:22`、
-  `adapters_v2.py:27`、`admin/data_track.py:826`。
+⚠️ **第一版此处写的是「2500 条/用户、48 小时、环形 FIFO」并说「这就是待解决的问题」——
+那是 T184 换存储之前的状态,已过时。** 文档说反话比没有文档更坏:它会让读的人
+以为「查三天前」办不到,从而根本不去查。
 
-**仅存的可能**:那句"三个配置"指的不是代码默认值,而是 **prod 上的按用户配置 /
-运行时开关**。代码默认 True ≠ 生产实际开着 —— V2 记忆维护 lane 刚出过同款:
-开关要声明在 serve-worker,prod 漏配导致整条 lane 从未在生产跑过。
-**这需要查 prod 实际配置才能定,未查之前不下结论。**
+## §2 chat 送达(Hosted V2)
 
-**为什么保持 UNKNOWN 而不是红**:红格是要排优先级、派人干活的。编码一个假红格
-会把修复引向错的地方,比留空更坏。这一格的存在本身也是提醒:
-**记忆记录的是写下那一刻的事实,不保证今天仍成立;拿记忆当实证之前要回核。**
+| 阶段 | 状态 | 坐标 |
+|---|---|---|
+| API 收到 | 🔴 | HTTP 层无 emit |
+| 入队 | 🟡 | `hosted/chat_send_core.py`(全文件 12 个调用点) |
+| worker 认领 | 🔴 | — |
+| provider 回合(打模型) | 🟡 | `agent.model.call.*`(T209,2026-08-22)—— 见 §9 |
+| 回复定稿 / 落库 / 客户端取走 | 🟡 | `chat_send_core.py` / `chat/poll_core.py` |
 
-## 五、下一步
+## §3 唤醒道(heartbeat / scheduled / manual_wake / screen_watch)
 
-1. 把黄格逐个实弹复验转绿 —— 判据是"人为制造缺失,格子会红",不是"读代码觉得对"
-2. Q1/Q2/Q6/Q8 四格在 test 部署上逐条跑实弹；当前有调用点但均只标黄
-3. T138 append-only 表落地前,本矩阵所有结论都受 2500 条/48h 环的限制:
-   **矩阵说"有探针"不等于"事发后查得到"**
-4. 覆盖边界(partial_before / 截断标记)随读数自报 —— 需求 #4,与 T138 读端点同一格
-5. SNAPSHOT 表级失败出口(需求 #8):超阀时该表静默停更,是"被吞"的第二个教科书例
+| 阶段 | 状态 | 坐标 |
+|---|---|---|
+| 入队 | 🟢 | `agent.job.enqueued` |
+| 终态 | 🟢 | `agent.job.terminal`,与入队**同一个 trace_id** |
+| provider 回合 | 🟡 | 同 §9(T209,2026-08-22) |
+| 空回复归因 | 🟡 | `reply.silent_by_choice` / `reply.silent_empty_response` |
+
+**这两格是全表唯一的绿,而且是实弹换来的。** 2026-08-21 在 test 上取 66 对事件:
+heartbeat 46/46 两端共享同一 id、零孤儿;但 capture 19 + profile 1 **两端 id 全空**,
+30% 不可 join。代码里 `trace_id=None` 的产生者共 **5 个**,实弹只暴露了 2 个 ——
+**未观测到的三个不是没坏,是取样窗口里没跑**(dream 每晚才跑)。
+⇒ 修法下沉到 `enqueue_job` 队列边界兜底,新增后台产生者不可能再漏。
+
+## §4 记忆 capture / dream
+
+| 阶段 | capture | dream |
+|---|---|---|
+| 入队 | 🔴 | 🔴 |
+| 处理 | 🟡 | 🟡(`memory.dream.start/done/error`,T217,2026-08-22) |
+| 模型调用 | 🔴 | 🟡(`memory.dream.model.start/done/error`,T217) |
+| 结果落库 / 入索引 | 🔴 | 🟡(终态闭集 outcome + applied/skipped/failed/organized/merged 计数,T217) |
+
+Dream 的 V1 resident 与 hosted V2 共用同一份无内容字段契约。`failed>0`
+不能只显示 `ok`:部分写入发 `memory.dream.done` + `status=warning` +
+`outcome=partial`;全败、映射拒绝和爆炸半径熔断分别落到 error 终态。
+完整卡读取失败或因预算截断另发 `memory.extraction.context.error`,并在 Dream
+终态标 `degraded_context=true`,因此“模型合法 no-op”不再和“空/残缺输入后的 no-op”
+长得一样。管理端只公开闭集枚举、布尔值和固定计数；任何额外顶层或嵌套字段会让
+整个 detail fail closed。当前覆盖来自单元/出口渲染测试,尚未在 test 部署从真实
+trace_events 回读,所以保持黄而不是绿。
+
+## §5 genesis / 导入
+
+| 阶段 | 状态 |
+|---|---|
+| 入队 | 🔴 |
+| 文件摄入 / 建卡 | 🟡(`genesis.plaintext.*` 11 个事件名、`genesis.worker.*` 13 个) |
+| 索引 | 🔴 |
+
+## §6 世界书（T216 已补主链分段）
+
+| 阶段 | 状态 | 坐标 |
+|---|---|---|
+| 写入 / 更新 | 🟢 | `worldbook.entry.write.completed`：`stored/rejected/failed`，数据库拒绝写入时 API 返回 500 且不改本地缓存 |
+| 匹配结果 | 🟢 | `worldbook.match.completed`：区分 `no_entries/no_match/matched/partial/unavailable`，只带候选/命中/拒绝/不可用/字符计数 |
+| 注入提示词 | 🟡 | `worldbook.context.applied`：resident V1 eager 在 prompt 装配点记录，hosted V2 eager/tool-result 在最终 provider request 边界记录；V1 pull 工具沿用 `agent.tool.call` + 后端 match 事件 |
+
+**为什么要紧**:usr_99c3eca0 曾报「世界书存不进去」,随后又报「存进去了但命中不了」。
+**这是两条完全不同的排查路径**。T216 后先看 write event 是否 `stored`，再看
+match event 是 `no_entries`、`no_match` 还是 `unavailable`；命中后再看 applied event
+是否出现。事件不记录 entry id/name、关键词、查询或世界书正文，后台只公开闭集枚举、
+布尔值和计数。
+
+## §7 视觉
+
+| 阶段 | 状态 | 坐标 |
+|---|---|---|
+| provider 往返 | 🟡 | `vision.provider.called/completed`(T203 新增) |
+| 上游 status | 🟡 | trace 带 `status_code`;**body 只进运维日志** |
+| 观测/测试 | 🟡 | `vision.observe.*` / `vision.catalog_probe.*` |
+
+## §8 生图
+
+| 阶段 | 状态 | 坐标 |
+|---|---|---|
+| 开始 / 完成 / 失败 | 🟡 | `agent.image.generate.start/done/failed` |
+| 上游 status | 🟡 | 失败事件带 `status_code`(T204 新增) |
+
+⚠️ 生图比视觉多一条租户出口:**失败会回灌给模型**(`tool_loop.py` 的 `ToolResult`),
+模型拿到什么就可能说出什么。回灌只含稳定 error_code,有突变守卫。
+
+## §9 V2 打模型那一段 —— **2026-08-22 已补(T209)**
+
+| 事实 | 出处 |
+|---|---|
+| `v2/tool_loop.py` **零 trace 调用点** | 2502 行,grep 计数 0 |
+| `agent.model.call.*` **只有 V1 消费端在产生** | `tools/chat_resident_consumer.py:9960/10101/10157/10351` |
+| 我们**早就知道**,写在探针注释里 | `tools/e2e/user_mcp_handshake_probe.py:192` 「V2 emits no `agent.model.call.done` at all」 |
+| **管理端已建好展示,产生端没接** | `admin/data_track.py:8449-8450` 有 🧠「调用模型 · 开始/完成」的图标与标签 |
+
+⇒ 曾经的后果:对一个 V2 用户,管理端那两行**永远是空的**。
+**「没测量」和「没发生」在页面上长得一模一样。**
+这是「建好了 ≠ 接上了」的纯粹形态,而且是**展示端建好、产生端没接**。
+
+### 现状(T209,2026-08-22)
+
+V2 聊天与唤醒的主循环现在在**同一个逻辑 provider 边界**发
+`agent.model.call.start / .done / .error`,**沿用 V1 已有的事件名**(管理端图例与
+部署探针都已在消费它们)。字段只出 driver/provider/model/lane/round/finish_reason/
+status_code/error_class,**不出 prompt、回复、推理、工具参数与结果、上游 body**。
+
+⚠️ **每轮事件数硬上限 32**,与 `_TURN_MAX_LLM_CALLS` 解耦;超出时保留前 15 轮 + 最新一轮,
+丢弃数记在既有的 `mcp.roundtrip.provider` 摘要里 ⇒ **截断可数,不是静默丢**。
+(理由:聊天是量最大的道、一轮多次往返,打满 `_QUEUE_MAX=5000` 会让**别的道的 trace 一起丢** ——
+那比"没埋点"更坏。)
+
+⭐ 同批**删掉了探针里为 V2 开的永久免检**
+(`tools/e2e/user_mcp_handshake_probe.py`,原 `runtime != "resident" or ...`)。
+**留着它的话,探针会对「V2 到底有没有发这个事件」永远给绿 —— 修好了和没修一模一样。**
+
+⚠️ 时序:CI 跑的是探针的**单元测试**;实弹探针在 **merge 之后、deploy pin 落下之前**
+打 test 会 FAIL,**那不是回归,是镜像还没换。**
+
+## §10 语音通话 ⚠️ 第一版整条缺席
+
+**先纠正一个常见误解:我们不调用语音模型。**
+`voice/routes_asgi.py` 第一行:"Per-user ElevenLabs Custom LLM gateway" ——
+**ElevenLabs 打进来把我们当 LLM**,STT/TTS 都在他们那边。
+真正在我们这儿发生的是一次普通聊天回合(转给 `chat_send_core`)。
+⇒ 语音不是「零覆盖」,是**覆盖被网关这一层挡住了**。
+
+| 项 | 值 |
+|---|---|
+| `voice/routes_asgi.py` | 1192 行,trace 调用点 **0** |
+| `voice/cleanup.py` / `voice/results.py` | **0** / **0** |
+
+**四个失败出口(行号已核实)**
+
+| 出口 | 位置 | 行为 |
+|---|---|---|
+| A 上游/运行时 >=400 | `:922-934` | **说出失败文案 + HTTP 200** |
+| B 拿不到 message_id | `:937` | JSON 502 —— **唯一真返回 HTTP 错误的** |
+| C 115 秒超时 | `:951` / `:1097` | 合成 `turn_timeout` 文案说出去 + 200 |
+| D 被新回合取代 | `:983/:1019/:1109` | skip_turn,静默结束 |
+
+⚠️ **A 出口的行为是故意的,不许改**:一旦用户真实语音已到达,返回 4xx/5xx 会让
+ElevenLabs **拆掉整通电话**。
+
+⇒ **一次失败的语音回合,从 HTTP 层看是 200 + 一段正常 SSE 流。
+任何基于状态码的成功率,在这条道上恒等于 100%。** 唯一痕迹是一行 `log.warning`。
+
+Seven 2026-08-21 定:**用户听到「我暂时没接上」算失败**;但具体分档等 trace 补上后
+一起摊开确认 ⇒ **T206 只补事实,不定 outcome_class。**
+
+---
+
+## 附:失败分档(Seven 2026-08-21)
+
+    健康度 = 成功 / (成功 + 真故障 + 超时)
+
+- **超时算失败**(用户等到的结果一样是没收到)
+- **控制面拦截**(限流 / 被取代 / 用户自己先开口了)**从分母剔除** —— 是闸在工作,不是故障
+- ⭐ **「用户侧不可用」不算失败**(用户自己没钱了;废号还在跑心跳)——
+  **现有四档表达不了这一档**,`terminal_outcome_class` 对未知码默认归 `operational_failure`,
+  所以 `extraction_failed:quota_insufficient` 现在被算成我们的故障。**待 T197 处理。**
+
+⚠️ **每个数字旁边必须写清:时间窗、分子分母定义、算的是谁。**
+2026-08-21 同一个 admin、同一天,「心跳失败率」读出 16% / 19% / 51% ——
+差异有三处:**表不同(V2 agent_jobs vs V1 proactive_jobs)、窗口不同(24h vs 全史)、
+总体不同(V2 用户 vs V1 用户)**。⇒ **它们从来不是同一件事的三个读数,不能并排。**

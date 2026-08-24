@@ -369,6 +369,7 @@ jobs:
             tests/test_enclave_frame_caption.py \
             tests/test_enclave_visual_plaintext.py \
             tests/test_io_cli_web.py \
+            tests/test_io_cli_worldbook.py \
             tests/test_proactive_agent_protocol_v2.py \
             tests/test_tool_markup_leak.py \
             tests/test_memory_search_retry_guidance.py \
@@ -713,6 +714,7 @@ jobs:
             tests/test_worldbook_readside_core.py \
             tests/test_worldbook_routes.py \
             tests/test_worldbook_store.py \
+            tests/test_worldbook_trace.py \
             -v
 
       - name: Run Hosted Runtime V2 safety and prompt-cache suites
@@ -722,6 +724,7 @@ jobs:
           python -m pytest \
             tests/test_ci_image_tag_width.py \
             tests/test_deploy_yaml_strict.py \
+            tests/test_release_pin_cas.py \
             tests/test_frame_r2_deploy_config.py \
             tests/test_admin_runtime_mode.py \
             tests/test_hosted_runtime_policy.py \
@@ -748,6 +751,7 @@ jobs:
             tests/test_capabilities_memory.py \
             tests/test_chat_activity_projection.py \
             tests/test_capabilities_tool_schema.py \
+            tests/test_capability_worldbook.py \
             tests/test_debug_trace.py \
             tests/test_db_health_timeouts.py \
             tests/test_access_mode_runtime_sync_unit.py \
@@ -805,6 +809,8 @@ jobs:
             tests/test_v2_mutation_recovery.py \
             tests/test_v2_reconcile.py \
             tests/test_v2_tool_loop.py \
+            tests/test_t208_reply_tool_removal.py \
+            tests/test_t210_wake_sentinel_suppression.py \
             tests/test_v2_turn_budget_defaults.py \
             tests/test_v2_tool_loop_mcp.py \
             tests/test_v2_worker_mcp.py \
@@ -832,6 +838,7 @@ jobs:
             tests/test_tee_carry_verbatim.py \
             tests/test_uploaded_envelope_gate.py \
             tests/test_write_side_format_routing.py \
+            tests/test_admin_debug_turn_view.py \
             tests/test_data_track_debug.py \
             -v
 

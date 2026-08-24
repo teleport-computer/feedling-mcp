@@ -22,6 +22,24 @@ class FakeResponse:
         return self._body
 
 
+@pytest.mark.parametrize("status_code", [408, 500])
+def test_provider_http_error_keeps_bounded_internal_response_detail(status_code):
+    upstream_detail = "UPSTREAM_DIAGNOSTIC_FRAGMENT:" + ("x" * 300)
+
+    with pytest.raises(pc.ProviderError) as caught:
+        pc._raise_for_provider_status(
+            httpx.Response(status_code, text=upstream_detail)
+        )
+
+    assert caught.value.status_code == status_code
+    assert caught.value.response_detail == upstream_detail[:240]
+    # T159's existing provider-body echo remains unchanged; the new structured
+    # field is an internal carrier, not a replacement public contract.
+    assert str(caught.value) == (
+        f"provider_http_{status_code}: {upstream_detail[:240]}"
+    )
+
+
 def _fake_client(monkeypatch, response_body: dict) -> list[dict]:
     calls: list[dict] = []
 

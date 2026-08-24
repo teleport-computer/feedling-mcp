@@ -100,6 +100,9 @@ def test_recent_runtime_health_excludes_superseded_from_failure_rate():
     assert lanes["chat"]["superseded"] == 2
     assert lanes["chat"]["completed"] == 1
     assert lanes["chat"]["failure_rate"] == pytest.approx(0.0)
+    assert lanes["chat"]["health_denominator"] == 1
+    assert lanes["chat"]["operational_failures"] == 0
+    assert lanes["chat"]["operational_failure_rate"] == pytest.approx(0.0)
 
 
 def test_recent_runtime_health_splits_expiry_reasons():
@@ -114,7 +117,7 @@ def test_recent_runtime_health_splits_expiry_reasons():
     assert lanes["chat"]["failure_rate"] == pytest.approx(1.0)
 
 
-def test_recent_runtime_health_separates_operational_control_and_safety():
+def test_recent_runtime_health_counts_safety_and_unknown_but_exempts_user():
     _add_job("u_rh_hb_ok_split", "heartbeat", "completed")
     _add_job(
         "u_rh_hb_guard",
@@ -132,29 +135,35 @@ def test_recent_runtime_health_separates_operational_control_and_safety():
         "u_rh_hb_provider",
         "heartbeat",
         "failed",
-        last_error="wake_failed:providererror",
+        last_error="unknown",
+    )
+    _add_job(
+        "u_rh_hb_user",
+        "heartbeat",
+        "failed",
+        last_error="turn_failed:quota_insufficient",
     )
 
     heartbeat = {
         row["lane"]: row for row in jobs_store.recent_runtime_health()["lanes"]
     }["heartbeat"]
 
-    assert heartbeat["sampled_jobs"] == 4
-    assert heartbeat["failure_rate"] == pytest.approx(3 / 4)
-    assert heartbeat["operational_failures"] == 1
-    assert heartbeat["operational_failure_rate"] == pytest.approx(1 / 4)
+    assert heartbeat["sampled_jobs"] == 5
+    assert heartbeat["failure_rate"] == pytest.approx(4 / 5)
+    assert heartbeat["operational_failures"] == 2
+    assert heartbeat["health_denominator"] == 3
+    assert heartbeat["operational_failure_rate"] == pytest.approx(2 / 3)
     assert heartbeat["control_outcomes"] == 1
+    assert heartbeat["user_unavailable"] == 1
     assert heartbeat["safety_suppressions"] == 1
     classes = {
         row["code"]: row["outcome_class"]
         for row in heartbeat["top_failures"]
     }
-    assert classes["wake_failed:providererror"] == "operational_failure"
+    assert classes["unknown"] == "operational_failure"
     assert classes["turns_halted"] == "control"
-    assert (
-        classes["wake_failed:degenerate_reply_suppressed"]
-        == "safety_suppression"
-    )
+    assert classes["wake_failed:degenerate_reply_suppressed"] == "operational_failure"
+    assert classes["turn_failed:quota_insufficient"] == "user_unavailable"
 
 
 def test_recent_runtime_health_respects_window():
@@ -181,6 +190,8 @@ def test_recent_runtime_health_zero_sample_rate_is_none():
     assert lanes["chat"]["superseded"] == 2
     assert lanes["chat"]["sampled_jobs"] == 0
     assert lanes["chat"]["failure_rate"] is None  # 零样本，不是零失败
+    assert lanes["chat"]["health_denominator"] == 0
+    assert lanes["chat"]["operational_failure_rate"] is None
 
 
 def test_recent_runtime_health_is_empty_without_history():
