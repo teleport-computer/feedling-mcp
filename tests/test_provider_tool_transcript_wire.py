@@ -14,6 +14,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import provider_client as pc
+from model_api_runtime.v2 import tool_loop
 from provider_types import NativeAssistantTurn, ToolCall, ToolExchange, ToolResult
 
 
@@ -156,3 +157,44 @@ def test_normalized_exchange_has_deterministic_openai_chat_fallback():
     assert encoded[0]["role"] == "assistant"
     assert [call["id"] for call in encoded[0]["tool_calls"]] == ["call_a", "call_b"]
     assert [message["tool_call_id"] for message in encoded[1:]] == ["call_a", "call_b"]
+
+
+def _rejected_exchange():
+    return tool_loop._rejected_tool_exchange(
+        [ToolCall("provider-real", "web_search", {"query": "weather"})],
+        assistant_text="trying",
+        rejection_reasons=["terminal_tool_call_rejected"],
+        attempt=2,
+    )
+
+
+def test_rejected_exchange_synthesizes_valid_openai_compatible_wire():
+    exchange = _rejected_exchange()
+    encoded = pc._encode_messages_openai_chat([exchange])
+
+    call_id = exchange.calls[0].id
+    assert encoded[0]["tool_calls"][0]["id"] == call_id
+    assert encoded[1]["tool_call_id"] == call_id
+    assert "工具当前不可用,请用纯文本直接回复" in encoded[1]["content"]
+
+
+def test_rejected_exchange_synthesizes_valid_anthropic_wire():
+    exchange = _rejected_exchange()
+    _system, encoded = pc._split_system_messages_anthropic([exchange])
+
+    call_id = exchange.calls[0].id
+    assert encoded[0]["content"][1]["id"] == call_id
+    assert encoded[1]["content"][0]["tool_use_id"] == call_id
+    assert encoded[1]["content"][0]["type"] == "tool_result"
+
+
+def test_rejected_exchange_synthesizes_valid_gemini_wire():
+    exchange = _rejected_exchange()
+    _system, encoded = pc._split_system_messages_gemini([exchange])
+
+    assert encoded[0]["parts"][1]["functionCall"]["name"] == "web_search"
+    response = encoded[1]["parts"][0]["functionResponse"]
+    assert response["name"] == "web_search"
+    assert "工具当前不可用,请用纯文本直接回复" in (
+        response["response"]["content"]
+    )
