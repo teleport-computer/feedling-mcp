@@ -5,8 +5,10 @@
 tee_shadow.reconciler.TABLES。三处互不校验，谁都不是全集，所以 Runtime V2 的
 19 张新表可以一张都没登记而无人发现（2026-07-27 实测 RDS 61 张 / TEE 20 张）。
 
-本模块是那个"全集"。规则：**每一张 RDS 表必须有且只有一条登记**，由
-tests/test_tee_table_registry.py 强制。加了 RDS 表却没登记 lane 的改动合不进去。
+本模块是那个"全集"。规则：**每一张独立 RDS 表必须有且只有一条登记**，由
+tests/test_tee_table_registry.py 强制。声明式分区的物理子表没有独立的数据流语义，
+因此由守卫从 pg_inherits 验证并继承已登记根表的 lane；它们不按日期逐张写进这里。
+加了 RDS 表却没登记 lane、或分区子表找不到已登记根表的改动都合不进去。
 
 lane 语义见下面常量的注释。注册表是纯数据 + 查询 helper，不做任何 I/O——它被
 scheduler、verify、snapshot 三处消费，必须能在任何上下文里安全 import。
@@ -298,6 +300,13 @@ REGISTRY: dict[str, Entry] = {
         "当前 primary 的短期 chat cache replay 控制面，只含 message id、不含正文；"
         "与 chat_change_state 同属本库写序列，TEE-primary 后由本库 trigger 产生，"
         "不复制 RDS 历史",
+        required_in_tee=True,
+    ),
+    "trace_events": Entry(
+        SKIP,
+        "selected primary 的本地诊断事件；RDS-primary 与 TEE-primary 各自只写本库，"
+        "跨库复制会混合两个主库时期的观测权威并制造重复事件。切主后由新主库本地产生，"
+        "不搬旧主库历史；DEFAULT 与每日物理分区继承本条 lane",
         required_in_tee=True,
     ),
     "genesis_import_chunks": Entry(
