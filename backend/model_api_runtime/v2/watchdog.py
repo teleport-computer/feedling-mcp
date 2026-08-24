@@ -1,8 +1,11 @@
-"""D2 watchdog + hard-timeout（Hosted Runtime V2 PR D，见
-``docs/superpowers/plans/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety.md``
-Task 3）。
+"""Runtime V2 的 per-slot watchdog 与 hard-timeout。
 
-**为什么要拆成 pure decision + 一个薄 parent loop**：D1（Task 2, ``child_supervisor.py``）
+其历史设计理由与保留的 progress/lease/write-fence/outbox 安全不变量见
+``docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md``；
+当前 one-process-per-slot 拓扑见
+``docs/superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md``。
+
+**为什么要拆成 pure decision + 一个薄 parent loop**：``child_supervisor.py``
 把 turn slots 挪进一个独立可 SIGKILL 的子进程，`ChildSupervisor.poll_liveness()` 能看出
 它是否卡死（`last_progress_age_sec` 过旧），但**谁来看、看到了就杀**是另一件事——那件事
 需要跑在父进程的事件循环里（有 asyncio.gather 的那个），且必须能被单测在完全不碰真实

@@ -1,14 +1,41 @@
-# Runtime V2 三池与单 Slot 进程隔离设计
+---
+document_lifecycle: decision
+canonical_owner: self
+---
+# Runtime V2 三池与单 Slot 进程隔离决策
+
+## 当前对照（2026-08-24）
+
+本决策是 Runtime V2 当前池拓扑的 canonical owner：
+`pool_config.py` 无条件构造 `foreground`、`wake`、`heavy` 三个逻辑池，
+`pool_supervisor.py`、`slot_protocol.py`、`child_supervisor.py` 与
+`turn_child.py` 让每个 `SlotSpec` 对应一个子进程，`serve_worker.py` 负责
+父进程监督、心跳、watchdog 与恢复。`tests/test_v2_pool_config.py`、
+`test_v2_pool_supervisor.py`、`test_v2_child_supervisor.py`、
+`test_v2_pool_fault_injection.py` 与 `test_v2_watchdog.py` 覆盖配置、单 slot
+隔离、故障恢复和 owner-fenced claim recovery。
+
+代码默认 slot 数是 `4/2/2`（foreground/wake/heavy），但部署数量由环境 compose
+显式变量决定；仓库默认值不证明任何 live 环境已采用该数量。本文的 2026-08-14 事故编号、
+机器规格、初始/扩容数量、分阶段 rollout gate 与当时 test/pre/prod 数量均为历史或
+环境特定证据。当前部署事实必须以 [`CURRENT_STATE.md`](../../CURRENT_STATE.md)、目标环境
+的 `release.git_commit` 和该 SHA 的 compose 为准。
+
+本决策取代 [PR-D pool/history decision](2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md)
+中「一个 child 承载多 slot、watchdog 重启整池」的故障域；不取代 PR-D 的进度时钟、
+lease/write fence、outbox 幂等、kill switch 或历史完整性义务。
 
 - 日期：2026-08-14
-- 状态：设计方向已确认，书面规范待复核
+- 历史状态：设计方向已确认，书面规范待复核
 - 目标分支：`test`
 - 优先级：P0 Chat 抢占与即时 claim 回收；P1 三池/单 Slot 进程；P2 Profile 与容量优化
 - 取代范围：取代 `2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md`
   中“一个 turn-child 承载全部 slot、watchdog 整池重启”的故障域设计；保留其进度时钟、
   lease/write fence、outbox 幂等、kill switch 与历史完整性设计。
 
-## 1. 摘要
+## 历史设计快照（2026-08-14）
+
+### 1. 摘要
 
 生产 Runtime V2 当前由一个 `turn_child` 进程运行 4 个 asyncio slot。虽然其中默认有 2 个
 slot 只领取 `chat/manual_wake`，所有 slot 仍共享一个进程。任一 Profile、Heartbeat 或其他
@@ -29,7 +56,7 @@ slot 进程即只杀一个 Job。Chat 入队时原子抢占同用户的非 Chat 
 退出；数据库状态已经先行终结，因此旧进程即使尚未退出也不能再写。watchdog 杀进程后立即按
 `job_id + claimed_by` 回收 claim，不再等待 lease 自然过期。
 
-## 2. 已确认的事故事实
+### 2. 已确认的事故事实（点时事故证据）
 
 2026-08-14 的生产事故中，两条 Chat 都通过了入口准入，但从未被领取：
 

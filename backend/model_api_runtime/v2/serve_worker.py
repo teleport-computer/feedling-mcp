@@ -6040,7 +6040,8 @@ async def _reconcile_loop(
 ) -> None:
     """Periodic orphan-message and durable-effect reconciliation.
 
-    D9 (Task 7, PR-D plan): periodic wiring for `db.reconcile_unenqueued_v2_messages`
+    PR-D 的 retained history-safety decision：periodic wiring for
+    `db.reconcile_unenqueued_v2_messages`
     — the A7 orphan-message sweeper that was built but never invoked anywhere (its own
     docstring deferred the periodic call to "PR D's sweeper"). Without this loop, a
     `db_action_v2` user whose newest chat message never got a matching `agent_jobs`
@@ -6228,18 +6229,21 @@ def _start_genesis_thread(worker_id: str):
 
 
 async def _serve(worker_id: str, *, poll_interval: float) -> None:
-    """PARENT process loop (D1 结构拆分后，见
-    `docs/superpowers/plans/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety.md`
-    Task 2). turn slot 不再是这里的 `asyncio.create_task`——它们跑在一个由
+    """PARENT process loop.
+
+    当前三池/单 slot 进程拓扑见
+    `docs/superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md`；
+    progress、kill switch 与历史安全不变量见保留的
+    `docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md`。
+    turn slot 不再是这里的 `asyncio.create_task`——它们跑在一个由
     `child_supervisor.ChildSupervisor` spawn/监督的独立子进程里（`turn_child.main`）,
     这样一个 slot 里卡死的同步调用不会拖死本进程的事件循环，本进程才能保住
     SIGKILL 那个子进程的权力。`_reaper_loop`/`_heartbeat_loop`/`_scheduler_loop`/
     Genesis 线程未改动，仍在本（父）进程里跑。
 
-    D2（Task 3）在 `tasks` 里加了 `_watchdog_loop`，读 `supervisor.poll_liveness()` 判定
+    `_watchdog_loop` 读 `supervisor.poll_liveness()` 判定
     卡死并调 `supervisor.kill_and_respawn()`——子进程崩溃/卡死不会让 `asyncio.gather(*tasks)`
-    跟着报错退出（父进程能在没有存活子进程的情况下继续跑并把它救回来，这正是 Task 2 要求的
-    "子进程崩溃不能带崩父进程"，Task 3 在此基础上补上"卡死了要主动救"）。
+    跟着报错退出（父进程能在没有存活子进程的情况下继续跑并把它救回来）。
     """
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()

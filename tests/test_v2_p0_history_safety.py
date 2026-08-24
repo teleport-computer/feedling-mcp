@@ -1,6 +1,7 @@
 """P0 acceptance tests for Hosted Runtime V2 PR D, Half-B (history safety).
 
-Task 11 of docs/superpowers/plans/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety.md.
+the retained PR-D history-safety decision:
+``docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md``.
 Builds on Tasks 6-10 (all already in this working tree):
 
   - Task 6  (worker._run_compaction CAS-loss requeue)   — see test_v2_compaction_cas_requeue.py

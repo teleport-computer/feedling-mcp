@@ -1,4 +1,29 @@
-# Hosted Runtime V2 — PR D: Pool / History Safety — Design
+---
+document_lifecycle: decision
+canonical_owner: self
+---
+# Hosted Runtime V2 — PR D: Pool / History Safety — Decision and historical design record
+
+## Current reconciliation (2026-08-24)
+
+This decision remains the canonical owner for the retained PR-D safety
+invariants: progress/stall and absolute clocks, owner-fenced lease and write
+recovery, effect-outbox idempotency, the live turn kill switch, seq-based
+cursor/effect boundaries, prompt-coverage catch-up, durable source retention,
+CAS-loss requeue, and the parent reconcile sweeper. Current implementation is
+in `watchdog.py`, `child_supervisor.py`, `kill_switch.py`, `cursor.py`,
+`worker.py`, `serve_worker.py`, and `db.py`; the focused watchdog,
+kill-switch, history/cursor, compaction, and reconcile tests exercise those
+invariants.
+
+The D1--D3 **shared multi-slot child and whole-pool restart topology** is
+superseded by the retained [three-pool slot-isolation decision](2026-08-14-runtime-v2-three-pool-slot-isolation-design.md).
+Runtime V2 now has the three logical `foreground`, `wake`, and `heavy` pools,
+and each configured slot is one child process. `pool_config.py`,
+`pool_supervisor.py`, `slot_protocol.py`, `turn_child.py`, and `serve_worker.py`
+are the current topology owners. The original current-state snapshot and
+rollout gate below are historical evidence as of 2026-07-13, not operating
+instructions or a current deployment claim.
 
 > **Historical retention note (2026-07-18):** D7's coverage-gated deletion has
 > been superseded. Summary coverage now controls prompt compaction only; raw
@@ -6,11 +31,11 @@
 > deleted by the 5,000-row hot-window limit or a summary watermark. See
 > `docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md` for current behavior.
 
-**Status:** Approved (design), awaiting spec review → plan
+**Historical status (2026-07-13):** Approved (design), awaiting spec review → plan.
 **Depends on:** PR A (effect foundation `d7e19a9`) + PR B (transport) + PR C (unified tool loop) — all merged.
 **Directive:** @sxysun 4-PR next round — PR D is the final "pool/history safety" PR. **7 P0 fault injections must be green before any deploy / any internal-user flip.** PR D lands the pool + history P0s, completing the set.
 
-## Goal
+## Historical goal and design snapshot (2026-07-13)
 
 Make the V2 turn pool a **killable/restartable crash domain** with a split stall/absolute-budget watchdog and health-reflecting capacity, add a **live kill switch** that halts admission/claim + fences active writes but never touches Genesis/import, and close the **history-integrity** gaps: migrate reply/cutover/summary to the stable seq cursor, enforce a prompt invariant (every message is covered by a committed summary OR appears verbatim in the prompt), retain raw chat/R2 source history independently of prompt compaction, and make compaction CAS-loss retry/requeue instead of silently abandoning.
 
@@ -18,7 +43,7 @@ Make the V2 turn pool a **killable/restartable crash domain** with a split stall
 - **Crash domain = a child PROCESS.** Turn slots move to a killable/restartable turn-child subprocess; the parent supervisor keeps heartbeat/reaper/scheduler/Genesis-thread. The watchdog SIGKILLs a wedged child, writes capacity=0, and respawns it.
 - **Prompt invariant = synchronous catch-up compaction.** When messages have accumulated past the summary watermark beyond the tail window, run a synchronous catch-up compaction to cover the gap BEFORE assembling the turn's prompt (bounded prompt, guaranteed coverage).
 
-## Current state (grounding — verified, file:line)
+## Historical current-state snapshot (2026-07-13, superseded where noted)
 
 - **Pool is one process, one loop:** `serve_worker._serve`/`main` (serve_worker.py:1321-1387) runs `asyncio.run` of `run_worker_loop` (N=`MAX_WORKERS`=4 `_slot_loop` tasks, worker.py:1521-1558/1452-1518) + `_reaper_loop` + `_heartbeat_loop` + `_scheduler_loop` as sibling asyncio tasks, plus Genesis on a **separate OS thread** (`_start_genesis_thread`, serve_worker.py:1268-1318). Docker `restart: unless-stopped` (deploy/docker-compose.phala.prod.runner.yaml) restarts only on process DEATH, not on wedge.
 - **No hard-timeout on a turn:** `_slot_loop`'s `await _run_turn(job, deps)` is never wall-clock-bounded (grep-confirmed). Per-HTTP timeouts exist deep in provider_client/enclave; `_TURN_MAX_LLM_CALLS=6` bounds round COUNT not time. A truly-wedged coroutine occupies its slot forever. `reaper.py` + job-lease TTL (`RUNNING_TTL_SEC`=300) marks the DB job row failed (data-plane) but never touches the physically wedged coroutine (process-plane).
@@ -38,19 +63,19 @@ Make the V2 turn pool a **killable/restartable crash domain** with a split stall
 
 ### Half A — Pool safety
 
-#### D1 — Turn-child subprocess + parent supervisor (`serve_worker.py` split; new `backend/model_api_runtime/v2/turn_child.py`)
+#### D1 — Historical shared turn-child subprocess + parent supervisor (superseded topology)
 
 Split `serve_worker._serve` into:
 - **Parent supervisor**: runs `_reaper_loop`, `_heartbeat_loop` (now health-derived, D3), `_scheduler_loop`, the Genesis thread, the NEW watchdog loop (D2), the kill-switch poll (D4), and the reconcile sweeper (D9). The parent OWNS the turn-child lifecycle: `spawn_turn_child()` → `subprocess`/`multiprocessing.Process` running `turn_child.main()` (which runs `run_worker_loop`'s N slots). The parent can `SIGKILL` + respawn the child.
 - **Turn child** (`turn_child.py`): a minimal entrypoint that re-initializes the DB pool + config in the fresh process and runs `run_worker_loop`. It emits a **liveness/progress signal** the parent reads — a per-slot "last progress ts" over a pipe (preferred, immediate) OR a child-level heartbeat row; on each claim/round-boundary a slot updates its progress marker. Shared-nothing: the child re-opens its own pool; parent and child coordinate only via the pipe + DB.
 
-#### D2 — Watchdog + split stall/absolute budgets (`backend/model_api_runtime/v2/watchdog.py`, new; parent loop)
+#### D2 — Watchdog + split stall/absolute budgets (retained invariant; topology superseded)
 
 A parent watchdog tracks four distinct signals instead of treating turn age as proof of a wedge: (a) process death or a stale event-loop heartbeat is an unconditional kill; (b) stale slot progress with no active turn kills only while jobs are claimable (all slots wedged before/around claim); (c) an active turn whose real provider/tool/compaction progress has stalled beyond `FEEDLING_V2_TURN_STALL_TIMEOUT_SEC` (default 240s) kills; and (d) a turn whose total age exceeds the deliberately larger `FEEDLING_V2_TURN_ABSOLUTE_TIMEOUT_SEC` (default 1500s) kills even if it keeps manufacturing progress. The absolute minimum is validated at startup against prompt catch-up plus every bounded provider wire and a setup/write margin; at current defaults it is 1440s. This split permits a legitimate 600s history catch-up and multi-round provider envelope while retaining a finite ceiling. The legacy `FEEDLING_V2_TURN_HARD_TIMEOUT_SEC` is only a stall-budget alias and values below 210s fail startup, so remove any old 180s deployment override.
 
 The watchdog queries queue state only when that result can change a pre-turn decision, retains at most one in-flight blocking query, and bounds both queue reads and the best-effort `capacity=0` write by `FEEDLING_V2_WATCHDOG_DB_TIMEOUT_SEC` (default 5s). On trigger it attempts `capacity=0` (D3), then `SIGKILL`s and respawns the child even if the database is unavailable. In-flight jobs the killed child held are recovered by the reaper's lease TTL (marks them failed/requeuable) — PR A's idempotent outbox makes a re-drive exactly-once. Long-running healthy jobs renew their owner-fenced lease while active; a killed child stops renewing. The watchdog NEVER touches Genesis (separate thread in the parent).
 
-#### D3 — Capacity reflects health (`serve_worker._heartbeat_loop`)
+#### D3 — Capacity reflects health (retained invariant; per-slot topology supersedes shared-child wording)
 
 Replace the constant `capacity=MAX_WORKERS` with a value derived from actual child state: `capacity = 0` when the child is dead/killed/restarting; otherwise the live free-slot count (or `MAX_WORKERS` while the child is confirmed alive via a fresh progress signal). The heartbeat writes capacity=0 the instant the watchdog decides to kill, so admission's `workers_alive`/`live_worker_capacity` reflect the outage within one heartbeat/watchdog interval (acceptance: "capacity zeroes within a watchdog interval").
 

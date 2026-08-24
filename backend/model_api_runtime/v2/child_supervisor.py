@@ -1,7 +1,9 @@
-"""``ChildSupervisor`` — 通用的「spawn 一个子进程 + 用 Pipe 侦测它是否还活着/还在动」
-工具类（Hosted Runtime V2 PR D，D1 结构拆分，见
-``docs/superpowers/plans/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety.md``
-Task 2）。
+"""``ChildSupervisor`` — 一个 slot 的子进程与 progress-pipe 监督工具。
+
+当前 per-slot 拓扑见
+``docs/superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md``；
+历史上形成的 progress、lease/write-fence 与恢复安全理由见
+``docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md``。
 
 **为什么是子进程而不是子协程**：拆分前，turn slot 是 ``serve_worker._serve`` 里
 ``asyncio.gather`` 的一个协程任务（``run_worker_loop``），跟 reaper/heartbeat/scheduler
@@ -50,8 +52,8 @@ catch-up 不会再因为绝对年龄超过旧 180s 就被误杀，而 event-loop
     ...
     supervisor.stop()  # 优雅：SIGTERM + join，超时才 SIGKILL
 
-D2（Task 3）的 watchdog 循环会另外调 `poll_liveness()` + `kill_and_respawn()`——本任务
-（D1/Task 2）只负责把子进程立起来、能被父进程干净地 stop，不做自动踢杀。
+watchdog 循环会另外调 `poll_liveness()` + `kill_and_respawn()`；本类只负责把单 slot
+子进程立起来、能被父进程干净地 stop，不做自动踢杀。
 """
 from __future__ import annotations
 

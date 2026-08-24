@@ -106,3 +106,39 @@ worker/wake 测试覆盖真实 loop、worker 和 executor 的行为，而非仅�
 精确路径与 basename 搜索确认：PR-A 的 source-spec backlink 继续解析到 retained design；两份
 moved plan 的所有外部可解析链接均使用 archive 路径或 retained decision。生产 Python 没有引用
 implementation plan；archive 的任务步骤仅保留可追溯性，不是 operating documentation。
+
+## 批次 4：PR-D pool/history safety 与三池单 slot 隔离
+
+审计日期：2026-08-24。结论：保留两份 design 为 `decision` / `canonical_owner: self`，并将
+两份已落地 implementation plan 移入 archive，标为 `historical` / `implemented`。PR-D 的
+共享多 slot child、整池 watchdog 重启与其原始 `MAX_WORKERS=4` 快照已经被三池决策取代；
+其 progress clock、owner-fenced lease/write recovery、effect-outbox 幂等、live kill switch、
+seq cursor、prompt coverage、durable source retention、CAS-loss requeue 与 reconcile sweeper
+仍是当前必须保持的安全义务。
+
+| 原文档 | 状态与当前 owner | 仓库引用方 / backlinks | 实现 / 测试 / 部署证据 | 兼容义务 | archive / retain 路径 |
+|---|---|---|---|---|---|
+| PR-D pool/history design | `decision`; self；共享 child/整池重启部分由三池决策取代 | `watchdog.py`、`child_supervisor.py`、`serve_worker.py` 及 P0 tests 已改链到 retained decisions；配套 plan 为 historical record | `watchdog.py` 的 stall/absolute 与 capacity-zero→kill→recover 顺序；`kill_switch.py` 和 `chat_send_core.py` 的 live halt；`cursor.py`、`worker.py`、`db.py` 的 seq/coverage/requeue/reconcile；`test_v2_watchdog.py`、`test_v2_kill_switch.py`、`test_v2_p0_history_safety.py`、`test_v2_compaction_cas_requeue.py`、`test_v2_reconcile_sweeper.py` | 保留 Genesis 隔离、generation/owner fence、effect idempotency、durable raw source、prompt coverage 和 re-drive 语义；不可恢复 shared-child topology | retain: [PR-D design](../superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md) |
+| PR-D pool/history plan | `historical` / `implemented`; PR-D design | 无生产 Python implementation-plan backlink；历史步骤仅留存 | 上述当前代码与 focused safety tests 证明核心步骤已落地 | 任务清单不是运行手册；拓扑部分须服从三池决策 | [archive plan](../archive/superpowers/plans/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety.md) |
+| Three-pool slot-isolation design | `decision`; self | PR-D retained decision 将被替代的故障域明确委派给它；配套 plan 为 historical record | `pool_config.py` 默认 `4/2/2` 与 lane allowlists；`pool_supervisor.py` / `slot_protocol.py` / `turn_child.py` 每 `SlotSpec` 一进程；`serve_worker.py` parent fleet；`test_v2_pool_config.py`、`test_v2_pool_supervisor.py`、`test_v2_child_supervisor.py`、`test_v2_pool_fault_injection.py`、`test_v2_watchdog.py` | 三个逻辑池与 per-slot process 是当前 topology；Chat preemption、即时且 owner-fenced recovery、资源预算不得倒退；V1/V2/Resident coexistence、per-user switching、rollback 与 VPS self-update 不受本批次改变 | retain: [three-pool design](../superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md) |
+| Three-pool slot-isolation plan | `historical` / `implemented`; three-pool design | 无生产消费者；部署/rollout 叙述只作为 point-in-time evidence | `deploy/docker-compose.phala.test.yaml` 明确覆写为 `2/1/1`；其他 compose 未在本批次被当作 live slot-count 证据；代码默认仍为 `4/2/2` | 历史 test/pre/prod 数量、机器规格和 rollout gate 不授权当前操作；live 环境须以 `release.git_commit` 和该 SHA compose 核对 | [archive plan](../archive/superpowers/plans/2026-08-14-runtime-v2-three-pool-slot-isolation.md) |
+
+### 批次 4 partial-supersession rationale
+
+- PR-D 向三池决策只转移故障域：从「一个 child 承载多个 slot、杀整个 child」改为三个 pool、
+  每 slot 一个 child、只 kill/recover 该 slot 的 active claim。进度时钟和健康容量语义继续存在，
+  但按 per-slot 实现。
+- PR-D 的 kill switch、lease/write fence、outbox idempotency、seq/reply cursor、history
+  coverage/catch-up、raw source retention、CAS-loss requeue 与 orphan reconcile 不因拓扑替换而
+  失效，仍由 retained PR-D decision 和当前代码/tests 约束。
+- `pool_config.py` 的 `4/2/2` 是代码默认，test compose 的 `2/1/1` 是环境覆写；两者不能推断
+  pre/prod 的当前运行数量。当前运行与部署事实仍由 `CURRENT_STATE.md`、exact deployed SHA 和
+  对应 compose 共同决定。
+- 本批次仅变更 lifecycle Markdown 与 Python/test 注释或 docstring；不修改运行行为、测试逻辑、
+  数据库、compose、public API/wire/security contract 或 `tools/chat_resident_consumer.py`。
+
+### 批次 4 引用检查
+
+精确路径和 basename 搜索确认生产 Python 不再引用任一 implementation plan；测试中的 invariant
+说明直接指向 retained decision。所有 moved-plan 链接使用 archive 路径，设计之间的
+partial-supersession 链接保持可解析。生成的 lifecycle inventory 由检查器重新生成。

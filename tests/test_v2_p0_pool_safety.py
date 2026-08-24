@@ -1,5 +1,5 @@
 """Hosted Runtime V2 PR D, Task 5 — Half-A P0 / acceptance tests
-(``docs/superpowers/plans/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety.md``).
+(``docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md``).
 
 This module re-asserts the STRONG acceptance properties Tasks 1-4 (kill_switch,
 child_supervisor.ChildSupervisor, watchdog.should_kill/_watchdog_loop, the
