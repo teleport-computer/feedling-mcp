@@ -123,6 +123,7 @@ from proactive import capture_scheduler
 from proactive import dream_scheduler
 from proactive import gate as proactive_gate
 from perception import service as perception_service
+from perception import store as perception_store
 from perception.glance import V1_PRESENCE_HINT_FIELDS
 from workspace.artifacts import ArtifactWorkspace, artifact_text_view_path
 from workspace.backends import WorkspaceNotFound, model_writable_path
@@ -1858,10 +1859,24 @@ def _wake_decision_for_user(user_id: str, trigger: str = "heartbeat") -> dict:
     normalized_trigger = str(trigger or "heartbeat").strip().lower() or "heartbeat"
     payload = {"trigger": normalized_trigger}
     d = proactive_gate._build_proactive_v2_wake_decision(store, payload)
+    schedule = jobs_store.get_wake_schedule(user_id)
+    has_pending_followup = bool(
+        schedule and schedule.get("pending_followup_source_job_id") is not None
+    )
+    block_reason = str(d.get("reason") or "")
+    # A durable perception follow-up is evidence, so the next normally due
+    # heartbeat may bypass only signal-absence suppression. Ownership, DND,
+    # provider health, activation, and the upper interval clock stay strong.
+    if has_pending_followup and block_reason in {"no_recent_frames"}:
+        block_reason = ""
     return {
-        "should_wake": bool(d.get("should_wake_agent")),
+        "should_wake": bool(d.get("should_wake_agent")) or (
+            has_pending_followup and not block_reason
+        ),
         "wake_interval_sec": int(d.get("wake_interval_sec") or 7200),
-        "block_reason": str(d.get("reason") or ""),
+        "decision_at": float(d.get("ts") or time.time()),
+        "block_reason": block_reason,
+        "has_pending_followup": has_pending_followup,
     }
 
 
@@ -5084,14 +5099,12 @@ def _build_scheduler_deps():
     """装配 `model_api_runtime.v2.scheduler.run_scheduler_tick` 要的 deps（D3 Task 5）。
     scheduler.py 是纯模块（不 import hosted/agent_runtime/proactive）——这里把它接到真实
     实现：due_heartbeat_users（Task 2 落的 v2_wake_schedule 表）、_wake_decision_for_user
-    （Task 3 适配器，包一层 proactive_gate，读专用，本身不 enqueue）、enqueue_job("heartbeat")
+    （Task 3 适配器，包一层 proactive_gate，读专用，本身不 enqueue）、原子消费
+    heartbeat_next_tick_at、enqueue_scheduled_heartbeat（建 job 后消费 follow-up marker）
     /upsert_wake_schedule(next_heartbeat_at=...)。
 
-    leader-election 有意跳过（见 D3 plan Task 5 说明）：`enqueue_job` 走
-    ux_agent_jobs_singleflight 分区唯一索引，多个 serve_worker 进程的 scheduler tick
-    并发对同一用户各自判定 should_wake 也只会各自 INSERT 一次、第二个撞唯一索引 coalesce
-    成同一行——重复调度天然无害。prod 只跑一个 serve-worker 容器，这条不变量目前甚至用
-    不上，但即使将来横向扩容也不需要另起一套选主。"""
+    多进程无需另做 leader election：settings blob 的单条 CAS 是每个 interval 的放行权，
+    只有 won=True 的调用方能入队；agent_jobs single-flight 仍是队列层的第二道防线。"""
     return types.SimpleNamespace(
         eligible_users=lambda: admin_core.list_runtime_modes().get(
             hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, []
@@ -5103,8 +5116,13 @@ def _build_scheduler_deps():
         ),
         due_users=lambda: jobs_store.due_heartbeat_users(),
         wake_decision=_wake_decision_for_user,
-        enqueue_heartbeat=lambda uid: jobs_store.enqueue_job(
-            uid, "heartbeat", trace_id=uuid.uuid4().hex
+        consume_heartbeat_tick=lambda uid, **kwargs: (
+            core_store.consume_proactive_heartbeat_tick(uid, **kwargs)
+        ),
+        enqueue_heartbeat=lambda uid: jobs_store.enqueue_scheduled_heartbeat(
+            uid,
+            trace_id=uuid.uuid4().hex,
+            context_stream=perception_store.V2_WAKE_CONTEXT_STREAM,
         ),
         advance_heartbeat=lambda uid, next_at: jobs_store.upsert_wake_schedule(
             uid, next_heartbeat_at=next_at
@@ -5228,6 +5246,7 @@ def wire_assembly() -> None:
     core_wake_bus.register_handler("v2_jobs", v2_worker.on_v2_job_notify)
     core_wake_bus.register_job_cancel_handler(_JOB_CANCEL_ROUTER.handle)
     jobs_store.on_job_enqueued = _emit_job_enqueued_trace
+    jobs_store.on_followup_marker = _emit_followup_marker_trace
     core_wake_bus.start_listener()
 
 
@@ -5249,6 +5268,32 @@ def _emit_job_enqueued_trace(user_id: str, lane: str, *, reason: str, trace_id: 
         status="ok",
         trace_id=trace_id,
         turn_id=trace_id,
+        detail=detail,
+    )
+
+
+def _emit_followup_marker_trace(
+    user_id: str,
+    action: str,
+    *,
+    source_job_id: int,
+    generation: int,
+    successor_job_id: int | None,
+    moved_context_count: int,
+) -> None:
+    detail = {
+        "action": str(action),
+        "source_job_id": int(source_job_id),
+        "generation": int(generation),
+        "moved_context_count": max(0, int(moved_context_count)),
+    }
+    if successor_job_id is not None:
+        detail["successor_job_id"] = int(successor_job_id)
+    _emit_v2_debug_trace_for_user(
+        user_id,
+        "agent.wake_followup.marker",
+        status="ok",
+        job_id=(str(successor_job_id) if successor_job_id is not None else ""),
         detail=detail,
     )
 

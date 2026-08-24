@@ -423,6 +423,7 @@ def public_enqueue_reason(reason: object) -> str:
 # debug_trace and must not reach upward for it.  Left None in contexts that do
 # not wire it (tests, tools), where enqueue must still work.
 on_job_enqueued = None
+on_followup_marker = None
 
 
 def _trace_id_for_enqueue(lane: str, trace_id: object | None) -> str | None:
@@ -473,6 +474,33 @@ def _notify_job_enqueued(
         on_job_enqueued(user_id, lane, reason=reason, trace_id=trace_id)
     except Exception as exc:  # pragma: no cover - defensive
         log.warning("[jobs_store] enqueue trace hook failed: %s", exc)
+
+
+def _notify_followup_marker(
+    user_id: str,
+    action: str,
+    *,
+    source_job_id: int,
+    generation: int,
+    successor_job_id: int | None = None,
+    moved_context_count: int = 0,
+) -> None:
+    """Emit the durable marker lifecycle through an assembly-layer hook."""
+    if on_followup_marker is None:
+        return
+    try:
+        on_followup_marker(
+            str(user_id),
+            str(action),
+            source_job_id=int(source_job_id),
+            generation=int(generation),
+            successor_job_id=(
+                int(successor_job_id) if successor_job_id is not None else None
+            ),
+            moved_context_count=max(0, int(moved_context_count)),
+        )
+    except Exception as exc:  # pragma: no cover - diagnostics are fail-open
+        log.warning("[jobs_store] follow-up marker trace hook failed: %s", exc)
 
 
 def terminal_outcome_class(error_code: str) -> str:
@@ -1180,6 +1208,232 @@ def enqueue_job(
     return result
 
 
+def _insert_wake_context_on_cursor(
+    cur,
+    *,
+    user_id: str,
+    context_stream: str,
+    context_doc: dict,
+    context_ts: float,
+    item_job_id: int,
+) -> tuple[int, dict]:
+    payload = dict(context_doc)
+    payload["agent_job_id"] = int(item_job_id)
+    cur.execute(
+        "INSERT INTO user_logs (user_id,stream,ts,item_key,doc) "
+        "VALUES (%s,%s,%s,%s,%s) RETURNING seq",
+        (
+            str(user_id),
+            str(context_stream),
+            float(context_ts),
+            str(int(item_job_id)),
+            Jsonb(payload),
+        ),
+    )
+    return int(cur.fetchone()["seq"]), payload
+
+
+def _mirror_wake_context(
+    *,
+    user_id: str,
+    context_stream: str,
+    seq: int,
+    context_ts: float,
+    item_job_id: int,
+    payload: dict,
+) -> None:
+    from tee_shadow import mirror
+
+    mirror.execute(
+        "INSERT INTO user_logs (user_id,stream,seq,ts,item_key,doc) "
+        "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (user_id,stream,seq) DO NOTHING",
+        (
+            str(user_id),
+            str(context_stream),
+            int(seq),
+            float(context_ts),
+            str(int(item_job_id)),
+            Jsonb(payload),
+        ),
+    )
+
+
+def _active_heartbeat_on_cursor(
+    cur,
+    *,
+    user_id: str,
+    runtime_generation: int,
+) -> dict | None:
+    """Lock and return one live heartbeat without creating a replacement."""
+    cur.execute(
+        "SELECT id,status,expected_runtime_generation,deadline_at,"
+        "queue_deadline_at,lease_expires_at FROM agent_jobs "
+        "WHERE user_id=%s AND lane='heartbeat' "
+        "AND status IN ('pending','claimed','running') "
+        "ORDER BY id LIMIT 1 FOR UPDATE",
+        (str(user_id),),
+    )
+    row = cur.fetchone()
+    if (
+        row is None
+        or row["expected_runtime_generation"] is None
+        or int(row["expected_runtime_generation"]) != int(runtime_generation)
+    ):
+        return None
+    cur.execute(
+        "SELECT CASE WHEN status='pending' THEN "
+        "COALESCE(queue_deadline_at,deadline_at) <= clock_timestamp() "
+        "ELSE COALESCE(lease_expires_at,deadline_at) IS NOT NULL "
+        "AND COALESCE(lease_expires_at,deadline_at) <= clock_timestamp() "
+        "END AS stale FROM agent_jobs WHERE id=%s",
+        (int(row["id"]),),
+    )
+    if bool(cur.fetchone()["stale"]):
+        return None
+    return dict(row)
+
+
+def _set_followup_marker_on_cursor(
+    cur,
+    *,
+    user_id: str,
+    source_job_id: int,
+    consumed_context_seq: int,
+    generation_delta: int = 1,
+) -> int:
+    """Set/increment one serialized user marker and return its generation."""
+    cur.execute(
+        "INSERT INTO v2_wake_schedule (user_id) VALUES (%s) "
+        "ON CONFLICT (user_id) DO NOTHING",
+        (str(user_id),),
+    )
+    cur.execute(
+        "SELECT pending_followup_generation,pending_followup_source_job_id,"
+        "pending_followup_consumed_context_seq FROM v2_wake_schedule "
+        "WHERE user_id=%s FOR UPDATE",
+        (str(user_id),),
+    )
+    marker = cur.fetchone()
+    if marker is None:
+        raise RuntimeError("follow-up schedule row missing")
+    existing_source = marker["pending_followup_source_job_id"]
+    if existing_source is not None and int(existing_source) != int(source_job_id):
+        raise RuntimeError("conflicting heartbeat follow-up marker source")
+    existing_cursor = marker["pending_followup_consumed_context_seq"]
+    if (
+        existing_cursor is not None
+        and int(existing_cursor) != max(0, int(consumed_context_seq))
+    ):
+        raise RuntimeError("conflicting heartbeat follow-up marker cursor")
+    generation = int(marker["pending_followup_generation"] or 0) + max(
+        1, int(generation_delta)
+    )
+    cur.execute(
+        "UPDATE v2_wake_schedule SET pending_followup_generation=%s,"
+        "pending_followup_source_job_id=%s,"
+        "pending_followup_consumed_context_seq=%s,updated_at=now() "
+        "WHERE user_id=%s",
+        (
+            generation,
+            int(source_job_id),
+            max(0, int(consumed_context_seq)),
+            str(user_id),
+        ),
+    )
+    return generation
+
+
+def _associate_followup_marker_on_cursor(
+    cur,
+    *,
+    user_id: str,
+    successor_job_id: int,
+    context_stream: str,
+) -> dict | None:
+    """Move pending rows to a new heartbeat, clearing only after a real move."""
+    cur.execute(
+        "SELECT pending_followup_generation,pending_followup_source_job_id,"
+        "pending_followup_consumed_context_seq FROM v2_wake_schedule "
+        "WHERE user_id=%s FOR UPDATE",
+        (str(user_id),),
+    )
+    marker = cur.fetchone()
+    if marker is None or marker["pending_followup_source_job_id"] is None:
+        return None
+    source_job_id = int(marker["pending_followup_source_job_id"])
+    consumed_context_seq = max(
+        0, int(marker["pending_followup_consumed_context_seq"] or 0)
+    )
+    generation = max(1, int(marker["pending_followup_generation"] or 1))
+    cur.execute(
+        "UPDATE user_logs SET item_key=%s,"
+        "doc=jsonb_set(doc,'{agent_job_id}',to_jsonb(%s::bigint),true) "
+        "WHERE user_id=%s AND stream=%s AND item_key=%s AND seq>%s",
+        (
+            str(int(successor_job_id)),
+            int(successor_job_id),
+            str(user_id),
+            str(context_stream),
+            str(source_job_id),
+            consumed_context_seq,
+        ),
+    )
+    moved_context_count = int(cur.rowcount)
+    if moved_context_count <= 0:
+        return {
+            "consumed": False,
+            "source_job_id": source_job_id,
+            "consumed_context_seq": consumed_context_seq,
+            "generation": generation,
+            "moved_context_count": 0,
+        }
+    cur.execute(
+        "UPDATE agent_jobs SET input_generation=input_generation+%s WHERE id=%s",
+        (generation, int(successor_job_id)),
+    )
+    cur.execute(
+        "UPDATE v2_wake_schedule SET pending_followup_generation=NULL,"
+        "pending_followup_source_job_id=NULL,"
+        "pending_followup_consumed_context_seq=NULL,updated_at=now() "
+        "WHERE user_id=%s AND pending_followup_source_job_id=%s",
+        (str(user_id), source_job_id),
+    )
+    return {
+        "consumed": True,
+        "source_job_id": source_job_id,
+        "consumed_context_seq": consumed_context_seq,
+        "generation": generation,
+        "moved_context_count": moved_context_count,
+    }
+
+
+def _mirror_followup_association(
+    *,
+    user_id: str,
+    successor_job_id: int,
+    context_stream: str,
+    association: dict | None,
+) -> None:
+    if not association or not association.get("consumed"):
+        return
+    from tee_shadow import mirror
+
+    mirror.execute(
+        "UPDATE user_logs SET item_key=%s,"
+        "doc=jsonb_set(doc,'{agent_job_id}',to_jsonb(%s::bigint),true) "
+        "WHERE user_id=%s AND stream=%s AND item_key=%s AND seq>%s",
+        (
+            str(int(successor_job_id)),
+            int(successor_job_id),
+            str(user_id),
+            str(context_stream),
+            str(int(association["source_job_id"])),
+            int(association["consumed_context_seq"]),
+        ),
+    )
+
+
 def enqueue_job_with_context_log(
     user_id: str,
     lane: str,
@@ -1207,7 +1461,7 @@ def enqueue_job_with_context_log(
     if priority is None:
         priority = LANE_PRIORITY.get(lane, 0)
 
-    inserted: tuple[int, bool, int, dict] | None = None
+    inserted: tuple[int, bool, int, dict, dict | None] | None = None
     for _ in range(4):
         try:
             with _pool().connection() as conn:
@@ -1234,29 +1488,34 @@ def enqueue_job_with_context_log(
                             priority=int(priority),
                             expected_generation=expected_generation,
                         )
-                        payload = dict(context_doc)
-                        payload["agent_job_id"] = int(job_id)
-                        cur.execute(
-                            "INSERT INTO user_logs "
-                            "(user_id,stream,ts,item_key,doc) "
-                            "VALUES (%s,%s,%s,%s,%s) RETURNING seq",
-                            (
-                                str(user_id),
-                                str(context_stream),
-                                float(context_ts),
-                                str(int(job_id)),
-                                Jsonb(payload),
-                            ),
+                        association = (
+                            _associate_followup_marker_on_cursor(
+                                cur,
+                                user_id=str(user_id),
+                                successor_job_id=int(job_id),
+                                context_stream=str(context_stream),
+                            )
+                            if lane == "heartbeat" and expected_generation is not None
+                            else None
                         )
-                        seq = int(cur.fetchone()["seq"])
-                        inserted = (int(job_id), bool(coalesced), seq, payload)
+                        seq, payload = _insert_wake_context_on_cursor(
+                            cur,
+                            user_id=str(user_id),
+                            context_stream=str(context_stream),
+                            context_doc=context_doc,
+                            context_ts=float(context_ts),
+                            item_job_id=int(job_id),
+                        )
+                        inserted = (
+                            int(job_id), bool(coalesced), seq, payload, association
+                        )
             break
         except psycopg.errors.UniqueViolation:
             continue
     if inserted is None:
         raise RuntimeError("could not atomically enqueue job context")
 
-    job_id, coalesced, seq, payload = inserted
+    job_id, coalesced, seq, payload, association = inserted
     # Fired here, before the mirror write: the authoritative job is already
     # durable at this point, and a mirror failure must not be able to swallow
     # the enqueue event for a job that really exists.  The hook is fail-open, so
@@ -1265,20 +1524,287 @@ def enqueue_job_with_context_log(
         user_id, lane, reason=reason or "", trace_id=trace_id or "",
         result=(job_id, coalesced),
     )
-    from tee_shadow import mirror
-
-    mirror.execute(
-        "INSERT INTO user_logs (user_id,stream,seq,ts,item_key,doc) "
-        "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s,%s) "
-        "ON CONFLICT (user_id,stream,seq) DO NOTHING",
-        (
+    if association and association.get("consumed"):
+        _notify_followup_marker(
             str(user_id),
-            str(context_stream),
-            seq,
-            float(context_ts),
-            str(job_id),
-            Jsonb(payload),
-        ),
+            "consumed",
+            source_job_id=int(association["source_job_id"]),
+            generation=int(association["generation"]),
+            successor_job_id=int(job_id),
+            moved_context_count=int(association["moved_context_count"]),
+        )
+    _mirror_followup_association(
+        user_id=str(user_id),
+        successor_job_id=int(job_id),
+        context_stream=str(context_stream),
+        association=association,
+    )
+    _mirror_wake_context(
+        user_id=str(user_id),
+        context_stream=str(context_stream),
+        seq=seq,
+        context_ts=float(context_ts),
+        item_job_id=int(job_id),
+        payload=payload,
+    )
+    return job_id, coalesced
+
+
+def append_context_to_active_heartbeat(
+    user_id: str,
+    *,
+    context_stream: str,
+    context_doc: dict,
+    context_ts: float,
+) -> tuple[int, bool] | None:
+    """Coalesce context only when a live heartbeat already exists.
+
+    Unlike ``enqueue_job_with_context_log`` this helper never creates a job.
+    Perception uses it before consulting the interval clock so an in-flight
+    heartbeat keeps its historical late-input behavior without opening a new
+    unthrottled producer when no job exists.
+    """
+    inserted: tuple[int, int, dict] | None = None
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT hosted_runtime_state,runtime_generation "
+                    "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
+                    (str(user_id),),
+                )
+                control = cur.fetchone()
+                if control is None or str(control["hosted_runtime_state"]) != "v2":
+                    return None
+                active = _active_heartbeat_on_cursor(
+                    cur,
+                    user_id=str(user_id),
+                    runtime_generation=int(control["runtime_generation"]),
+                )
+                if active is None:
+                    return None
+                job_id = int(active["id"])
+                cur.execute(
+                    "UPDATE agent_jobs SET input_generation=input_generation+1 "
+                    "WHERE id=%s",
+                    (job_id,),
+                )
+                seq, payload = _insert_wake_context_on_cursor(
+                    cur,
+                    user_id=str(user_id),
+                    context_stream=str(context_stream),
+                    context_doc=context_doc,
+                    context_ts=float(context_ts),
+                    item_job_id=job_id,
+                )
+                inserted = (job_id, seq, payload)
+    if inserted is None:
+        return None
+    job_id, seq, payload = inserted
+    _mirror_wake_context(
+        user_id=str(user_id),
+        context_stream=str(context_stream),
+        seq=seq,
+        context_ts=float(context_ts),
+        item_job_id=job_id,
+        payload=payload,
+    )
+    return job_id, True
+
+
+def defer_heartbeat_context(
+    user_id: str,
+    *,
+    context_stream: str,
+    context_doc: dict,
+    context_ts: float,
+) -> dict:
+    """Coalesce a raced active heartbeat or stage context behind its marker."""
+    inserted: tuple[int, int, dict, bool, int] | None = None
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT hosted_runtime_state,runtime_generation "
+                    "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
+                    (str(user_id),),
+                )
+                control = cur.fetchone()
+                if control is None or str(control["hosted_runtime_state"]) != "v2":
+                    raise RuntimeError("cannot defer heartbeat outside Runtime V2")
+                active = _active_heartbeat_on_cursor(
+                    cur,
+                    user_id=str(user_id),
+                    runtime_generation=int(control["runtime_generation"]),
+                )
+                if active is not None:
+                    item_job_id = int(active["id"])
+                    cur.execute(
+                        "UPDATE agent_jobs SET input_generation=input_generation+1 "
+                        "WHERE id=%s",
+                        (item_job_id,),
+                    )
+                    generation = 0
+                    deferred = False
+                else:
+                    cur.execute(
+                        "INSERT INTO v2_wake_schedule (user_id) VALUES (%s) "
+                        "ON CONFLICT (user_id) DO NOTHING",
+                        (str(user_id),),
+                    )
+                    cur.execute(
+                        "SELECT pending_followup_source_job_id,"
+                        "pending_followup_consumed_context_seq "
+                        "FROM v2_wake_schedule WHERE user_id=%s FOR UPDATE",
+                        (str(user_id),),
+                    )
+                    marker = cur.fetchone()
+                    if marker is None:
+                        raise RuntimeError("follow-up schedule row missing")
+                    if marker["pending_followup_source_job_id"] is None:
+                        cur.execute(
+                            "SELECT nextval(pg_get_serial_sequence('agent_jobs','id')) "
+                            "AS source_job_id"
+                        )
+                        item_job_id = int(cur.fetchone()["source_job_id"])
+                        consumed_context_seq = 0
+                    else:
+                        item_job_id = int(marker["pending_followup_source_job_id"])
+                        consumed_context_seq = max(
+                            0,
+                            int(marker["pending_followup_consumed_context_seq"] or 0),
+                        )
+                    generation = _set_followup_marker_on_cursor(
+                        cur,
+                        user_id=str(user_id),
+                        source_job_id=item_job_id,
+                        consumed_context_seq=consumed_context_seq,
+                    )
+                    deferred = True
+                seq, payload = _insert_wake_context_on_cursor(
+                    cur,
+                    user_id=str(user_id),
+                    context_stream=str(context_stream),
+                    context_doc=context_doc,
+                    context_ts=float(context_ts),
+                    item_job_id=item_job_id,
+                )
+                inserted = (item_job_id, seq, payload, deferred, generation)
+    if inserted is None:  # pragma: no cover - transaction either returns or raises
+        raise RuntimeError("could not persist deferred heartbeat context")
+    item_job_id, seq, payload, deferred, generation = inserted
+    if deferred:
+        _notify_followup_marker(
+            str(user_id),
+            "set",
+            source_job_id=item_job_id,
+            generation=generation,
+        )
+    _mirror_wake_context(
+        user_id=str(user_id),
+        context_stream=str(context_stream),
+        seq=seq,
+        context_ts=float(context_ts),
+        item_job_id=item_job_id,
+        payload=payload,
+    )
+    return {
+        "job_id": None if deferred else item_job_id,
+        "coalesced": not deferred,
+        "deferred": deferred,
+        "source_job_id": item_job_id if deferred else None,
+        "generation": generation if deferred else None,
+    }
+
+
+def enqueue_scheduled_heartbeat(
+    user_id: str,
+    *,
+    trace_id: str | None,
+    context_stream: str,
+) -> tuple[int, bool]:
+    """Atomically enqueue one scheduled heartbeat and consume its marker."""
+    normalized_trace_id = _trace_id_for_enqueue("heartbeat", trace_id)
+    inserted: tuple[int, bool, dict | None] | None = None
+    for _attempt in range(4):
+        try:
+            with _pool().connection() as conn:
+                with conn.transaction():
+                    with conn.cursor(row_factory=dict_row) as cur:
+                        cur.execute(
+                            "SELECT hosted_runtime_state,runtime_generation "
+                            "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
+                            (str(user_id),),
+                        )
+                        control = cur.fetchone()
+                        if (
+                            control is None
+                            or str(control["hosted_runtime_state"]) != "v2"
+                        ):
+                            raise RuntimeError(
+                                "cannot enqueue scheduled heartbeat outside Runtime V2"
+                            )
+                        active = _active_heartbeat_on_cursor(
+                            cur,
+                            user_id=str(user_id),
+                            runtime_generation=int(control["runtime_generation"]),
+                        )
+                        if active is not None:
+                            # This interval is already represented. A scheduler
+                            # tick carries no new input, so it must not bump the
+                            # generation and manufacture an empty late marker.
+                            job_id, coalesced = int(active["id"]), True
+                            association = None
+                        else:
+                            job_id, coalesced = coalesce_or_insert_on_cursor(
+                                cur,
+                                str(user_id),
+                                "heartbeat",
+                                reason=None,
+                                trace_id=normalized_trace_id,
+                                priority=int(LANE_PRIORITY.get("heartbeat", 0)),
+                                expected_generation=int(
+                                    control["runtime_generation"]
+                                ),
+                            )
+                            association = (
+                                _associate_followup_marker_on_cursor(
+                                    cur,
+                                    user_id=str(user_id),
+                                    successor_job_id=int(job_id),
+                                    context_stream=str(context_stream),
+                                )
+                                if not coalesced
+                                else None
+                            )
+                        inserted = (int(job_id), bool(coalesced), association)
+            break
+        except psycopg.errors.UniqueViolation:
+            continue
+    if inserted is None:
+        raise RuntimeError("could not atomically enqueue scheduled heartbeat")
+    job_id, coalesced, association = inserted
+    _notify_job_enqueued(
+        str(user_id),
+        "heartbeat",
+        reason="",
+        trace_id=normalized_trace_id or "",
+        result=(job_id, coalesced),
+    )
+    if association and association.get("consumed"):
+        _notify_followup_marker(
+            str(user_id),
+            "consumed",
+            source_job_id=int(association["source_job_id"]),
+            generation=int(association["generation"]),
+            successor_job_id=job_id,
+            moved_context_count=int(association["moved_context_count"]),
+        )
+    _mirror_followup_association(
+        user_id=str(user_id),
+        successor_job_id=job_id,
+        context_stream=str(context_stream),
+        association=association,
     )
     return job_id, coalesced
 
@@ -1791,17 +2317,17 @@ def finish_wake_job(
     wake_result: str | None = None,
     wake_result_reason: str | None = None,
 ) -> tuple[bool, int | None]:
-    """Complete a wake, persist its glance, and hand input to one successor.
+    """Complete a wake, persist its glance, and mark late input for scheduling.
 
     Context producers increment ``input_generation`` and append ``user_logs``
-    under the same active-job lock. Rows newer than the worker's consumed
-    context cursor are reassigned to the successor in this transaction. Thus
-    finalization winning creates a fresh job for a later producer, while the
-    producer winning forces this finalizer to preserve its input.
+    under the same active-job lock. A producer that wins before finalization
+    writes a user-level follow-up marker, but does not create an immediately
+    claimable successor or move context. The next admitted scheduler heartbeat
+    associates rows newer than the consumed cursor and only then clears it.
 
     ``completed_perception_glance_fingerprint`` is supplied only for a proven
     ordinary heartbeat. Its ordered shallow merge shares this transaction with
-    completion and successor creation. A final-reply effect may already have
+    completion and marker creation. A final-reply effect may already have
     completed the exact source; the same-source merge remains idempotent.
     """
     completed_fingerprint = (
@@ -1811,8 +2337,7 @@ def finish_wake_job(
         if completed_perception_glance_fingerprint is not None
         else None
     )
-    successor_id: int | None = None
-    moved_context = False
+    marker_generation: int | None = None
     user_id = ""
     with _pool().connection() as conn:
         with conn.transaction():
@@ -1835,7 +2360,7 @@ def finish_wake_job(
                     return False, None
                 runtime_generation = int(control["runtime_generation"])
                 cur.execute(
-                    "SELECT lane,status,input_generation,priority,"
+                    "SELECT lane,status,input_generation,"
                     "expected_runtime_generation,lease_expires_at "
                     "FROM agent_jobs WHERE id=%s AND claimed_by=%s FOR UPDATE",
                     (int(job_id), str(claimed_by)),
@@ -1885,53 +2410,24 @@ def finish_wake_job(
                 if clear_wake_backoff:
                     _clear_wake_backoff_on_cursor(cur, user_id)
                 if has_late_input:
-                    cur.execute(
-                        "INSERT INTO agent_jobs "
-                        "(user_id,lane,status,reason,priority,"
-                        "expected_runtime_generation) "
-                        "VALUES (%s,'heartbeat','pending',"
-                        "'coalesced_perception_followup',%s,%s) RETURNING id",
-                        (
-                            user_id,
-                            int(row["priority"]),
-                            runtime_generation,
+                    marker_generation = _set_followup_marker_on_cursor(
+                        cur,
+                        user_id=user_id,
+                        source_job_id=int(job_id),
+                        consumed_context_seq=max(0, int(consumed_context_seq)),
+                        generation_delta=(
+                            int(row["input_generation"] or 0)
+                            - int(observed_generation)
                         ),
                     )
-                    successor_id = int(cur.fetchone()["id"])
-                    cur.execute(
-                        "UPDATE user_logs SET item_key=%s,"
-                        "doc=jsonb_set(doc,'{agent_job_id}',"
-                        "to_jsonb(%s::bigint),true) "
-                        "WHERE user_id=%s AND stream=%s AND item_key=%s "
-                        "AND seq>%s",
-                        (
-                            str(successor_id),
-                            successor_id,
-                            user_id,
-                            str(context_stream),
-                            str(int(job_id)),
-                            max(0, int(consumed_context_seq)),
-                        ),
-                    )
-                    moved_context = bool(cur.rowcount)
-
-    if successor_id is not None and moved_context:
-        from tee_shadow import mirror
-
-        mirror.execute(
-            "UPDATE user_logs SET item_key=%s,"
-            "doc=jsonb_set(doc,'{agent_job_id}',to_jsonb(%s::bigint),true) "
-            "WHERE user_id=%s AND stream=%s AND item_key=%s AND seq>%s",
-            (
-                str(successor_id),
-                successor_id,
-                user_id,
-                str(context_stream),
-                str(int(job_id)),
-                max(0, int(consumed_context_seq)),
-            ),
+    if marker_generation is not None:
+        _notify_followup_marker(
+            user_id,
+            "set",
+            source_job_id=int(job_id),
+            generation=marker_generation,
         )
-    return True, successor_id
+    return True, None
 
 
 def mark_failed(
@@ -12162,7 +12658,9 @@ def get_wake_schedule(user_id) -> dict | None:
                 "last_screen_watch_frame_id, last_screen_chat_frame_id, self_wake_streak, "
                 "self_wake_user_seq, self_wake_last_effect_id, "
                 "self_wake_last_effect_accepted, proactive_fail_streak, "
-                "proactive_fail_user_seq, updated_at "
+                "proactive_fail_user_seq, pending_followup_generation, "
+                "pending_followup_source_job_id, "
+                "pending_followup_consumed_context_seq, updated_at "
                 "FROM v2_wake_schedule WHERE user_id=%s",
                 (user_id,),
             )

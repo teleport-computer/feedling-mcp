@@ -233,6 +233,7 @@ def test_v2_perception_wake_uses_agent_jobs_instead_of_legacy_queue(monkeypatch)
     user_store = types.SimpleNamespace(
         proactive_activation_ready=lambda: True,
         append_proactive_job=lambda job: legacy_jobs.append(job),
+        load_proactive_settings=lambda: {"wake_interval_sec": 900},
     )
     monkeypatch.setattr(core_store, "get_store", lambda _uid: user_store)
     monkeypatch.setattr(
@@ -247,6 +248,14 @@ def test_v2_perception_wake_uses_agent_jobs_instead_of_legacy_queue(monkeypatch)
             enqueued.append((uid, lane, kwargs)),
             (123, False),
         )[1],
+    )
+    monkeypatch.setattr(
+        jobs_store, "append_context_to_active_heartbeat", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        core_store,
+        "consume_proactive_heartbeat_tick",
+        lambda *_a, **_k: (1900.0, True),
     )
     monkeypatch.setattr(
         core_wake_bus,
@@ -292,9 +301,122 @@ def test_v2_perception_wake_uses_agent_jobs_instead_of_legacy_queue(monkeypatch)
     assert legacy_jobs == []
 
 
-def test_v2_photo_wake_carries_id_scene_and_time_into_context(monkeypatch):
+def test_v2_perception_inside_interval_defers_context_without_job(monkeypatch):
+    deferred = []
+    enqueued = []
+    notified = []
+    user_store = types.SimpleNamespace(
+        proactive_activation_ready=lambda: True,
+        load_proactive_settings=lambda: {"wake_interval_sec": 900},
+    )
+    monkeypatch.setattr(core_store, "get_store", lambda _uid: user_store)
+    monkeypatch.setattr(
+        hosted_config_store,
+        "get_hosted_runtime_mode_strict",
+        lambda _store: hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2,
+    )
+    monkeypatch.setattr(
+        jobs_store, "append_context_to_active_heartbeat", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        core_store,
+        "consume_proactive_heartbeat_tick",
+        lambda *_a, **_k: (1900.0, False),
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "enqueue_job_with_context_log",
+        lambda *_a, **_k: enqueued.append((_a, _k)),
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "defer_heartbeat_context",
+        lambda uid, **kwargs: deferred.append((uid, kwargs)) or {"deferred": True},
+    )
+    monkeypatch.setattr(
+        core_wake_bus,
+        "notify",
+        lambda *args: notified.append(args),
+    )
+    monkeypatch.setattr(service.store, "trim_v2_wake_context", lambda _uid: None)
+    event = types.SimpleNamespace(
+        user_id="u_v2_deferred",
+        wake_id="wake-deferred",
+        source="perception_event",
+        trigger="arrived_at_anchor",
+        change_digest="location changed",
+        origin_refs=("device:1",),
+        presence_hints={},
+        payload={},
+        created_at=100.0,
+        manual=False,
+    )
+
+    service._fire_wake_event_v2(event)
+
+    assert len(deferred) == 1
+    assert deferred[0][0] == event.user_id
+    assert deferred[0][1]["context_doc"]["wake_id"] == event.wake_id
+    assert enqueued == []
+    assert notified == []
+
+
+def test_v2_manual_perception_uses_shared_scope_predicate_and_bypasses_clock(
+    monkeypatch,
+):
+    from proactive import gate as proactive_gate
+
     enqueued = []
     user_store = types.SimpleNamespace(proactive_activation_ready=lambda: True)
+    monkeypatch.setattr(core_store, "get_store", lambda _uid: user_store)
+    monkeypatch.setattr(
+        hosted_config_store,
+        "get_hosted_runtime_mode_strict",
+        lambda _store: hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2,
+    )
+    monkeypatch.setattr(
+        jobs_store, "append_context_to_active_heartbeat", lambda *_a, **_k: None
+    )
+    assert (
+        service._is_throttled_heartbeat_scope
+        is proactive_gate._is_throttled_heartbeat_scope
+    )
+    monkeypatch.setattr(
+        core_store,
+        "consume_proactive_heartbeat_tick",
+        lambda *_a, **_k: pytest.fail("manual perception consulted interval clock"),
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "enqueue_job_with_context_log",
+        lambda uid, lane, **kwargs: enqueued.append((uid, lane, kwargs)) or (1, False),
+    )
+    monkeypatch.setattr(core_wake_bus, "notify", lambda *_a: None)
+    monkeypatch.setattr(service.store, "trim_v2_wake_context", lambda _uid: None)
+    event = types.SimpleNamespace(
+        user_id="u_v2_manual",
+        wake_id="wake-manual",
+        source="perception_event",
+        trigger="manual_force",
+        change_digest="user requested wake",
+        origin_refs=("user:1",),
+        presence_hints={},
+        payload={},
+        created_at=100.0,
+        manual=True,
+    )
+
+    service._fire_wake_event_v2(event)
+
+    assert len(enqueued) == 1
+
+
+def test_v2_photo_wake_carries_id_scene_and_time_into_context(monkeypatch):
+    enqueued = []
+    user_store = types.SimpleNamespace(
+        proactive_activation_ready=lambda: True,
+        load_proactive_settings=lambda: {"wake_interval_sec": 900},
+    )
     monkeypatch.setattr(core_store, "get_store", lambda _uid: user_store)
     monkeypatch.setattr(
         hosted_config_store,
@@ -308,6 +430,14 @@ def test_v2_photo_wake_carries_id_scene_and_time_into_context(monkeypatch):
             enqueued.append((uid, lane, kwargs)),
             (123, False),
         )[1],
+    )
+    monkeypatch.setattr(
+        jobs_store, "append_context_to_active_heartbeat", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        core_store,
+        "consume_proactive_heartbeat_tick",
+        lambda *_a, **_k: (1900.0, True),
     )
     monkeypatch.setattr(core_wake_bus, "notify", lambda *_args: None)
     monkeypatch.setattr(service.store, "trim_v2_wake_context", lambda uid: None)

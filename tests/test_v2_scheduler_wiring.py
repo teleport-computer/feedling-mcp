@@ -21,16 +21,63 @@ from model_api_runtime.v2 import serve_worker  # noqa: E402
 def test_enqueue_heartbeat_enqueues_on_the_heartbeat_lane(monkeypatch):
     calls = []
     monkeypatch.setattr(
-        jobs_store, "enqueue_job",
-        lambda uid, lane, **kw: calls.append((uid, lane, kw)))
+        jobs_store, "enqueue_scheduled_heartbeat",
+        lambda uid, **kw: calls.append((uid, kw)))
 
     deps = serve_worker._build_scheduler_deps()
     deps.enqueue_heartbeat("u1")
 
     assert len(calls) == 1
-    uid, lane, kwargs = calls[0]
-    assert (uid, lane) == ("u1", "heartbeat")
+    uid, kwargs = calls[0]
+    assert uid == "u1"
     assert re.fullmatch(r"[0-9a-f]{32}", kwargs["trace_id"])
+    assert kwargs["context_stream"] == "v2_perception_wake_context"
+
+
+def test_consume_heartbeat_tick_delegates_to_atomic_core_helper(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        serve_worker.core_store,
+        "consume_proactive_heartbeat_tick",
+        lambda uid, **kw: calls.append((uid, kw)) or (1900.0, True),
+    )
+
+    result = serve_worker._build_scheduler_deps().consume_heartbeat_tick(
+        "u1", now=1000.0, wake_interval_sec=900
+    )
+
+    assert result == (1900.0, True)
+    assert calls == [("u1", {"now": 1000.0, "wake_interval_sec": 900})]
+
+
+def test_followup_marker_trace_contains_source_and_consumption(monkeypatch):
+    emitted = []
+    monkeypatch.setattr(
+        serve_worker,
+        "_emit_v2_debug_trace_for_user",
+        lambda *args, **kwargs: emitted.append((args, kwargs)),
+    )
+
+    serve_worker._emit_followup_marker_trace(
+        "u1",
+        "consumed",
+        source_job_id=41,
+        generation=2,
+        successor_job_id=42,
+        moved_context_count=2,
+    )
+
+    assert emitted == [(('u1', 'agent.wake_followup.marker'), {
+        "status": "ok",
+        "job_id": "42",
+        "detail": {
+            "action": "consumed",
+            "source_job_id": 41,
+            "generation": 2,
+            "moved_context_count": 2,
+            "successor_job_id": 42,
+        },
+    })]
 
 
 def test_advance_heartbeat_upserts_next_heartbeat_at(monkeypatch):

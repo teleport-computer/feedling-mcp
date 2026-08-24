@@ -29,6 +29,44 @@ def _enable_v2(uid: str) -> None:
     set_v2_runtime_owner(uid)
 
 
+@pytest.mark.parametrize(
+    ("reason", "expected_should_wake"),
+    [
+        ("no_recent_frames", True),
+        ("dnd", False),
+    ],
+)
+def test_followup_marker_bypasses_only_weak_signal_blockers(
+    monkeypatch, reason, expected_should_wake
+):
+    marker_store = object()
+    monkeypatch.setattr(core_store, "get_store", lambda _uid: marker_store)
+    monkeypatch.setattr(
+        hosted_config_store,
+        "hosted_runtime_v2_enabled_strict",
+        lambda _store: True,
+    )
+    monkeypatch.setattr(
+        proactive_gate,
+        "_build_proactive_v2_wake_decision",
+        lambda *_a, **_k: {
+            "should_wake_agent": False,
+            "wake_interval_sec": 900,
+            "reason": reason,
+        },
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "get_wake_schedule",
+        lambda _uid: {"pending_followup_source_job_id": 123},
+    )
+
+    decision = _wake_decision_for_user("usr_marker_gate", trigger="heartbeat_no_frame")
+
+    assert decision["should_wake"] is expected_should_wake
+    assert decision["block_reason"] == ("" if expected_should_wake else reason)
+
+
 def test_wake_decision_blocks_unactivated_user():
     """Landmine 3: 未激活用户（从未 first_chat_ok_at）零烧钱唤醒——
     should_wake=False，block_reason 是 gate 的 ACTIVATION_PENDING_REASON。"""

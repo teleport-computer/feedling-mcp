@@ -16,6 +16,7 @@ class FakeDeps:
         self._raise_for = raise_for or set()
         self.enqueued = []
         self.advanced = []
+        self.consumed = []
 
     def due_users(self):
         return list(self._users)
@@ -27,6 +28,10 @@ class FakeDeps:
 
     def enqueue_heartbeat(self, user_id):
         self.enqueued.append(user_id)
+
+    def consume_heartbeat_tick(self, user_id, *, now, wake_interval_sec):
+        self.consumed.append((user_id, now, wake_interval_sec))
+        return now + wake_interval_sec, True
 
     def advance_heartbeat(self, user_id, next_at_epoch):
         self.advanced.append((user_id, next_at_epoch))
@@ -56,6 +61,7 @@ def test_zero_burn_blocked_does_not_enqueue_but_still_advances():
     result = scheduler.run_scheduler_tick(deps, now=now)
 
     assert deps.enqueued == []  # zero-burn: no job, no model call
+    assert deps.consumed == []
     assert deps.advanced == [("u2", now + 1800)]
     assert result == {"considered": 1, "enqueued": 0, "skipped": 1,
                       "scheduled_fired": 0, "extraction_enqueued": 0,
@@ -95,6 +101,43 @@ def test_final_runtime_mode_fence_blocks_enqueue_after_decision():
     assert deps.enqueued == []
     assert deps.advanced == []
     assert result["skipped"] == 1
+
+
+def test_losing_atomic_heartbeat_tick_does_not_enqueue_but_advances_schedule():
+    deps = FakeDeps(
+        users=["raced"],
+        decisions={"raced": {
+            "should_wake": True,
+            "wake_interval_sec": 900,
+            "block_reason": "",
+        }},
+    )
+    deps.consume_heartbeat_tick = lambda *_args, **_kwargs: (1900.0, False)
+
+    result = scheduler.run_scheduler_tick(deps, now=1000.0)
+
+    assert deps.enqueued == []
+    assert deps.advanced == [("raced", 1900.0)]
+    assert result["enqueued"] == 0
+    assert result["skipped"] == 1
+
+
+def test_gate_decision_anchor_drives_both_clock_cas_and_next_schedule():
+    deps = FakeDeps(
+        users=["anchored"],
+        decisions={"anchored": {
+            "should_wake": True,
+            "wake_interval_sec": 900,
+            "decision_at": 1000.25,
+            "block_reason": "",
+        }},
+    )
+
+    scheduler.run_scheduler_tick(deps, now=1000.0)
+
+    assert deps.consumed == [("anchored", 1000.25, 900)]
+    assert deps.advanced == [("anchored", 1900.25)]
+    assert deps.enqueued == ["anchored"]
 
 
 def test_mixed_batch_two_wake_one_blocked():
@@ -247,6 +290,7 @@ def test_one_eligible_snapshot_filters_every_scheduler_lane():
         "should_wake": True, "wake_interval_sec": 60, "block_reason": "",
     }
     deps.enqueue_heartbeat = lambda uid: seen["heartbeat"].append(uid)
+    deps.consume_heartbeat_tick = lambda uid, **_kwargs: (0.0, True)
     deps.advance_heartbeat = lambda uid, ts: None
     deps.extraction_users = lambda: ["resident", "v2"]
     deps.tick_extraction = lambda uid: seen["extract"].append(uid) or 1

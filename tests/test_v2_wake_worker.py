@@ -1949,7 +1949,7 @@ def test_generation_change_before_atomic_heartbeat_completion_fences_fingerprint
     )
 
 
-def test_run_perception_wake_hands_late_context_to_successor(monkeypatch):
+def test_run_perception_wake_hands_late_context_to_next_scheduled_job(monkeypatch):
     from perception import store as perception_store
 
     uid = "u_wake_perception_late_context"
@@ -2056,13 +2056,25 @@ def test_run_perception_wake_hands_late_context_to_successor(monkeypatch):
         ).fetchall()
     assert jobs[0][0] == job_id
     assert jobs[0][1] == "completed"
-    assert jobs[1][1:] == ("pending", "coalesced_perception_followup")
+    assert len(jobs) == 1
+    marker = jobs_store.get_wake_schedule(uid)
+    assert marker["pending_followup_source_job_id"] == job_id
+
+    successor_id, coalesced = jobs_store.enqueue_scheduled_heartbeat(
+        uid,
+        trace_id="next-scheduled-heartbeat",
+        context_stream=perception_store.V2_WAKE_CONTEXT_STREAM,
+    )
+    assert coalesced is False
     successor_context = perception_store.read_v2_wake_context(
-        uid, int(jobs[1][0])
+        uid, successor_id
     )
     assert [item["wake_id"] for item in successor_context] == ["wake-late"]
     original_context = perception_store.read_v2_wake_context(uid, job_id)
     assert [item["wake_id"] for item in original_context] == ["wake-first"]
+    marker = jobs_store.get_wake_schedule(uid)
+    assert marker["pending_followup_source_job_id"] is None
+    assert marker["pending_followup_generation"] is None
 
 
 def test_production_deps_wire_bounded_perception_wake_context(monkeypatch):

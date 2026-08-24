@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -223,3 +225,80 @@ def test_heartbeat_deadline_cas_retries_without_clobbering_peer_write(monkeypatc
     assert attempts[1][0]["peer_field"] == "concurrent"
     assert attempts[1][1]["peer_field"] == "concurrent"
     assert attempts[1][1][core_store.HEARTBEAT_NEXT_TICK_AT_KEY] == 1900.0
+
+
+def test_consume_heartbeat_tick_returns_one_atomic_winner(monkeypatch):
+    state = {
+        core_store.HEARTBEAT_NEXT_TICK_AT_KEY: 0.0,
+        "peer_field": "preserve",
+    }
+
+    monkeypatch.setattr(
+        core_store,
+        "_read_proactive_heartbeat_settings",
+        lambda _uid: dict(state),
+    )
+
+    def _cas(_uid, _kind, expected, replacement, *, insert_if_missing=False):
+        assert insert_if_missing is False
+        if expected != state:
+            return False
+        state.clear()
+        state.update(replacement)
+        return True
+
+    monkeypatch.setattr(db, "set_blob_if_unchanged", _cas)
+
+    first = core_store.consume_proactive_heartbeat_tick(
+        "usr_consume_cas", now=1000.0, wake_interval_sec=900
+    )
+    second = core_store.consume_proactive_heartbeat_tick(
+        "usr_consume_cas", now=1000.0, wake_interval_sec=900
+    )
+
+    assert first == (1900.0, True)
+    assert second == (1900.0, False)
+    assert state == {
+        core_store.HEARTBEAT_NEXT_TICK_AT_KEY: 1900.0,
+        "peer_field": "preserve",
+    }
+
+
+def test_consume_heartbeat_tick_stale_read_interleaving_has_exactly_one_winner(
+    monkeypatch,
+):
+    state = {core_store.HEARTBEAT_NEXT_TICK_AT_KEY: 0.0}
+    state_lock = threading.Lock()
+    first_read_barrier = threading.Barrier(2)
+    local = threading.local()
+
+    def _read(_uid):
+        with state_lock:
+            snapshot = dict(state)
+        reads = getattr(local, "reads", 0)
+        local.reads = reads + 1
+        if reads == 0:
+            first_read_barrier.wait(timeout=5)
+        return snapshot
+
+    def _cas(_uid, _kind, expected, replacement, *, insert_if_missing=False):
+        with state_lock:
+            if expected != state:
+                return False
+            state.clear()
+            state.update(replacement)
+            return True
+
+    monkeypatch.setattr(core_store, "_read_proactive_heartbeat_settings", _read)
+    monkeypatch.setattr(db, "set_blob_if_unchanged", _cas)
+
+    def _consume():
+        return core_store.consume_proactive_heartbeat_tick(
+            "usr_interleaved_cas", now=1000.0, wake_interval_sec=900
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(lambda _index: _consume(), range(2)))
+
+    assert sorted(won for _value, won in outcomes) == [False, True]
+    assert {value for value, _won in outcomes} == {1900.0}

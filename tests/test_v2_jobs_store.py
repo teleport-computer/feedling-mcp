@@ -1587,8 +1587,8 @@ def test_runtime_state_upsert_merges_patch():
     assert jobs_store.get_runtime_state("u_js_10") == {"a": 1, "b": 2}
 
 
-def test_finish_wake_job_persists_glance_before_successor_handoff():
-    """Completion, state merge, and late-input successor share one commit."""
+def test_finish_wake_job_persists_glance_and_marks_late_input_without_successor():
+    """Completion, state merge, and deferred marker share one commit."""
     uid = "u_js_glance_successor_atomic"
     seed_user(uid)
     _reset(uid)
@@ -1610,16 +1610,125 @@ def test_finish_wake_job_persists_glance_before_successor_handoff():
     )
 
     assert completed is True
-    assert successor_id is not None
+    assert successor_id is None
     assert jobs_store.get_runtime_state(uid) == {
         "preserved": "state",
         "last_completed_perception_glance_fingerprint": "b" * 64,
         "last_completed_perception_glance_source_job_id": job_id,
     }
+    schedule = jobs_store.get_wake_schedule(uid)
+    assert schedule["pending_followup_source_job_id"] == job_id
+    assert schedule["pending_followup_consumed_context_seq"] == 0
+    assert schedule["pending_followup_generation"] == 1
     with db.get_pool().connection() as conn:
         assert conn.execute(
-            "SELECT status FROM agent_jobs WHERE id=%s", (successor_id,)
-        ).fetchone()[0] == "pending"
+            "SELECT count(*) FROM agent_jobs WHERE user_id=%s AND lane='heartbeat'",
+            (uid,),
+        ).fetchone()[0] == 1
+
+
+def test_deferred_heartbeat_context_moves_to_next_scheduled_job():
+    from perception import store as perception_store
+
+    uid = "u_js_deferred_perception_context"
+    seed_user(uid)
+    _reset(uid)
+
+    deferred = jobs_store.defer_heartbeat_context(
+        uid,
+        context_stream=perception_store.V2_WAKE_CONTEXT_STREAM,
+        context_doc={
+            "wake_id": "wake-deferred",
+            "trigger": "arrived_at_anchor",
+            "change_digest": "arrived home",
+        },
+        context_ts=100.0,
+    )
+
+    assert deferred["deferred"] is True
+    assert deferred["job_id"] is None
+    marker = jobs_store.get_wake_schedule(uid)
+    assert marker["pending_followup_source_job_id"] == deferred["source_job_id"]
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM agent_jobs WHERE user_id=%s AND lane='heartbeat'",
+            (uid,),
+        ).fetchone()[0] == 0
+
+    job_id, coalesced = jobs_store.enqueue_scheduled_heartbeat(
+        uid,
+        trace_id="scheduled-after-defer",
+        context_stream=perception_store.V2_WAKE_CONTEXT_STREAM,
+    )
+
+    assert coalesced is False
+    context = perception_store.read_v2_wake_context(uid, job_id)
+    assert [item["wake_id"] for item in context] == ["wake-deferred"]
+    marker = jobs_store.get_wake_schedule(uid)
+    assert marker["pending_followup_source_job_id"] is None
+    assert marker["pending_followup_consumed_context_seq"] is None
+    assert marker["pending_followup_generation"] is None
+
+
+def test_scheduled_tick_coalesces_active_heartbeat_without_empty_generation():
+    from perception import store as perception_store
+
+    uid = "u_js_scheduled_active_no_empty_followup"
+    seed_user(uid)
+    _reset(uid)
+    job_id, coalesced = jobs_store.enqueue_job(uid, "heartbeat")
+    assert coalesced is False
+
+    same_id, coalesced = jobs_store.enqueue_scheduled_heartbeat(
+        uid,
+        trace_id="scheduled-covered-by-active",
+        context_stream=perception_store.V2_WAKE_CONTEXT_STREAM,
+    )
+
+    assert (same_id, coalesced) == (job_id, True)
+    assert jobs_store.get_input_generation(job_id, claimed_by="nobody") is None
+    with db.get_pool().connection() as conn:
+        generation = conn.execute(
+            "SELECT input_generation FROM agent_jobs WHERE id=%s", (job_id,)
+        ).fetchone()[0]
+    assert generation == 0
+
+
+def test_followup_context_rebind_is_mirrored_to_tee(monkeypatch):
+    from perception import store as perception_store
+    from tee_shadow import mirror
+
+    monkeypatch.setenv("FEEDLING_TEE_DUAL_WRITE", "1")
+    uid = "u_js_followup_rebind_mirror"
+    seed_user(uid)
+    _reset(uid)
+    deferred = jobs_store.defer_heartbeat_context(
+        uid,
+        context_stream=perception_store.V2_WAKE_CONTEXT_STREAM,
+        context_doc={"wake_id": "wake-mirror", "trigger": "photo_added"},
+        context_ts=100.0,
+    )
+    source_job_id = deferred["source_job_id"]
+    with mirror.get_tee_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT item_key FROM user_logs WHERE user_id=%s AND stream=%s",
+            (uid, perception_store.V2_WAKE_CONTEXT_STREAM),
+        ).fetchone() == (str(source_job_id),)
+
+    job_id, coalesced = jobs_store.enqueue_scheduled_heartbeat(
+        uid,
+        trace_id="scheduled-mirror-consume",
+        context_stream=perception_store.V2_WAKE_CONTEXT_STREAM,
+    )
+
+    assert coalesced is False
+    with mirror.get_tee_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT item_key,doc->>'agent_job_id' FROM user_logs "
+            "WHERE user_id=%s AND stream=%s",
+            (uid, perception_store.V2_WAKE_CONTEXT_STREAM),
+        ).fetchone()
+    assert row == (str(job_id), str(job_id))
 
 
 def test_completed_wake_retry_cannot_overwrite_newer_glance_source():

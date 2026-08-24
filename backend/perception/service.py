@@ -27,6 +27,7 @@ from typing import Any, Callable, Mapping
 from content_encryption import random_item_id
 from core import envelope as core_envelope
 from core import enclave as core_enclave  # noqa: F401 — 读侧已改走 core_envelope.read_envelope_body；
+from proactive.gate import _is_throttled_heartbeat_scope
 # 这行保留是因为测试 monkeypatch `<module>.core_enclave` 上的
 # _decrypt_envelope_via_enclave（patch 的是共享模块对象，仍然生效）。
 
@@ -886,20 +887,47 @@ def _fire_wake_event_v2(event) -> None:
                     "scene": str(photo.get("scene") or "")[:200],
                     "time_of_day": str(photo.get("time_of_day") or "")[:80],
                 })
-            job_id, _ = jobs_store.enqueue_job_with_context_log(
+            context_kwargs = {
+                "context_stream": store.V2_WAKE_CONTEXT_STREAM,
+                "context_doc": context_doc,
+                "context_ts": float(event.created_at or _now()),
+            }
+            active = jobs_store.append_context_to_active_heartbeat(
                 event.user_id,
-                "heartbeat",
-                reason=str(event.trigger or event.source or "perception_event")[:120],
-                trace_id=str(event.wake_id or "")[:160] or None,
-                context_stream=store.V2_WAKE_CONTEXT_STREAM,
-                context_doc=context_doc,
-                context_ts=float(event.created_at or _now()),
+                **context_kwargs,
             )
+            if active is not None:
+                store.trim_v2_wake_context(event.user_id)
+                core_wake_bus.notify("v2_jobs", event.user_id)
+                return
+
+            heartbeat_scoped = _is_throttled_heartbeat_scope(
+                "heartbeat",
+                manual=bool(event.manual),
+            )
+            admitted = not heartbeat_scoped
+            if heartbeat_scoped:
+                settings = s.load_proactive_settings()
+                _tick_at, admitted = core_store.consume_proactive_heartbeat_tick(
+                    event.user_id,
+                    now=_now(),
+                    wake_interval_sec=settings.get("wake_interval_sec"),
+                )
+            if admitted:
+                jobs_store.enqueue_job_with_context_log(
+                    event.user_id,
+                    "heartbeat",
+                    reason=str(event.trigger or event.source or "perception_event")[:120],
+                    trace_id=str(event.wake_id or "")[:160] or None,
+                    **context_kwargs,
+                )
+                core_wake_bus.notify("v2_jobs", event.user_id)
+            else:
+                jobs_store.defer_heartbeat_context(
+                    event.user_id,
+                    **context_kwargs,
+                )
             store.trim_v2_wake_context(event.user_id)
-            # A coalesced pending job may have been discovered only through a
-            # slow poll. Notify after every successful association so the new
-            # context is visible promptly; duplicate NOTIFY is harmless.
-            core_wake_bus.notify("v2_jobs", event.user_id)
             return
         job = {
             "job_id": core_util._new_public_id("pj"),
