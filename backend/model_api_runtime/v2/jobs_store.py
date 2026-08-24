@@ -4946,8 +4946,10 @@ def workers_alive(*, within_sec: int = 30, pool: str | None = None) -> bool:
 
 
 def live_worker_count(*, within_sec: int = 30, pool: str | None = None) -> int:
-    """窗口内有心跳的 serve_worker TURN 进程数（workers_alive 的计数版，喂 admission
-    ceiling）。genesis 心跳不计入——它不占 turn 槽位。"""
+    """窗口内有心跳的 serve_worker TURN 进程数（queue telemetry 的计数版）。
+
+    genesis 心跳不计入——它不占 turn 槽位。
+    """
     with _pool().connection() as conn:
         with conn.cursor() as cur:
             query = (
@@ -5261,7 +5263,7 @@ def recent_watchdog_recovery_counts(*, within_hours: int = 24) -> dict[str, int]
 def inflight_job_count(*, lanes: set[str] | None = None) -> int:
     """Count pending/claimed/running Jobs, optionally within selected lanes.
 
-    Runtime admission must pass its pool's lane set.  The unfiltered form is
+    Runtime capacity telemetry must pass its pool's lane set. The unfiltered form is
     retained for aggregate Admin observability only.
     """
     with _pool().connection() as conn:

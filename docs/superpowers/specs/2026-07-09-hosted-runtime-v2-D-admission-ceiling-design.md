@@ -1,4 +1,31 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # Hosted Runtime V2 — §6 Admission Ceiling 设计
+
+## 当前协调（2026-08-24）
+
+> **Current decision.** Hosted Chat 的 live overload 是队列等待遥测，绝不在
+> 持久化前拒绝用户消息。变更
+> `7c08413a0d3657f6fd1214767bba4011959e77fd` 已有意取代本设计的旧 503 合同；
+> 当前对外行为以[Chat workflow](../../../docs-site/content/docs/workflows/chat.mdx)
+> 为准：live 但 overload 的 foreground pool 仍接收加密消息，并在同一事务中
+> append/enqueue 或 coalesce Chat Job。
+
+当前估算仍有诊断价值，但只产生 fail-open telemetry：它读取
+`jobs_store.live_worker_capacity(within_sec=30, pool="foreground")`、
+`inflight_job_count(lanes={"chat", "manual_wake"})`、最近 `chat` 服务时长，以及
+现有 `admission.py` 的纯函数/常量。估算异常同样放行。`workers_alive(pool="foreground")`
+的 liveness、runtime-control 变更、kill switch，以及 provider/configuration failures
+仍是彼此独立的 fail-closed gates；它们必须在消息入库前保持拒绝语义。
+
+## 历史快照（2026-07-09 原始设计；不得作为当前执行指引）
+
+下方原文保留以解释当时的实现与测试边界。其 **Goal**、Architecture、503 `busy`
+response shape、rollout/test facts、文件路径和行号都是 point-in-time snapshot；尤其是
+“超 SLA 则不落库”的指令已经失效，不能覆盖本页上方的 current decision、
+[`CURRENT_STATE.md`](../../CURRENT_STATE.md) 或当前 public Chat workflow。
 
 > 子项目 D 的第一片。来源：`~/downloads/feedling-runtime-v2-walkthrough.html`（2026-07-08，sxysun + Claude）§6 send 路径 admission ceiling + §9 merge 前置。承接 Step 1 的 V2 存活闸（`workers_alive`）。
 

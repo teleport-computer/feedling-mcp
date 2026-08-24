@@ -10,8 +10,8 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 | Lifecycle | Classified documents |
 |---|---:|
 | `current` | 14 |
-| `decision` | 6 |
-| `historical` | 17 |
+| `decision` | 7 |
+| `historical` | 18 |
 | `generated` | 1 |
 
 ## current
@@ -33,6 +33,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 
 ## decision
 
+- `docs/superpowers/specs/2026-07-09-hosted-runtime-v2-D-admission-ceiling-design.md`
 - `docs/superpowers/specs/2026-07-12-hosted-runtime-v2-PR-A-effect-foundation-design.md`
 - `docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-B-provider-transport-telemetry-design.md`
 - `docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop-design.md`
@@ -44,6 +45,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 
 - `docs/CHANGELOG.md`
 - `docs/archive/superpowers/plans/2026-07-08-hosted-runtime-v2-C-action-queue-planner.md`
+- `docs/archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D-admission-ceiling.md`
 - `docs/archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D0-rollout-infrastructure.md`
 - `docs/archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D4-loadtest-rollout-killresident.md`
 - `docs/archive/superpowers/plans/2026-07-10-hosted-runtime-v2-agent-loop.md`

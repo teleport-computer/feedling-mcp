@@ -142,3 +142,35 @@ seq cursor、prompt coverage、durable source retention、CAS-loss requeue 与 r
 精确路径和 basename 搜索确认生产 Python 不再引用任一 implementation plan；测试中的 invariant
 说明直接指向 retained decision。所有 moved-plan 链接使用 archive 路径，设计之间的
 partial-supersession 链接保持可解析。生成的 lifecycle inventory 由检查器重新生成。
+
+## 批次 5：admission-ceiling 历史合同与当前 queue telemetry
+
+审计日期：2026-08-24。结论：保留 2026-07-09 design 为 `decision` /
+`canonical_owner: self`，并将已实现的配套 implementation plan 归档为 `historical` /
+`implemented`。原先“超过 SLA 在持久化前返回 503 `busy`”的产品合同已由
+`7c08413a0d3657f6fd1214767bba4011959e77fd` 有意取代；当前 public Chat workflow
+规定 live-but-overloaded pool 仍须接收消息，容量估算只作 fail-open telemetry。
+
+| 原文档 | 状态与当前 owner | 仓库引用方 / backlinks | 实现 / 测试证据 | 兼容义务 | archive / retain 路径 |
+|---|---|---|---|---|---|
+| §6 admission-ceiling design | `decision`; self；顶部 current reconciliation 取代旧 503 作为可执行结论 | 配套 plan 改为 archive historical record；本审计页记录 retain/archive 决定 | [`chat_send_core.py`](../../backend/hosted/chat_send_core.py) 对 foreground capacity、`chat`/`manual_wake` in-flight、recent chat mean 只记录 `admission_over_sla`；[`test_chat_send_v2_enqueue.py`](../../tests/test_chat_send_v2_enqueue.py) 覆盖 overload 后仍 202、原子入库/enqueue、coalesce/preemption 与估算异常 fail-open | live overload 不得在持久化前丢弃用户输入；foreground scope 必须只计 `chat`/`manual_wake`；`workers_alive`、runtime control、kill switch、provider/config failures 保持独立 fail-closed gates | retain: [design](../superpowers/specs/2026-07-09-hosted-runtime-v2-D-admission-ceiling-design.md) |
+| §6 admission-ceiling implementation plan | `historical` / `implemented`; retained design | 无生产实现调用者；所有 task/checklist 均明确为不可执行历史记录 | [`admission.py`](../../backend/model_api_runtime/v2/admission.py)、[`jobs_store.py`](../../backend/model_api_runtime/v2/jobs_store.py)、[`test_v2_admission.py`](../../tests/test_v2_admission.py) 与 [`test_v2_jobs_store.py`](../../tests/test_v2_jobs_store.py) 保留估算及 queue metrics 的实现证据 | 历史 `busy` response、旧路径、旧 line numbers 与 NO-COMMIT/worktree 指令不得被当作 current runbook；当前对外承诺以 [Chat workflow](../../docs-site/content/docs/workflows/chat.mdx) 为准 | [archive plan](../archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D-admission-ceiling.md) |
+
+### 批次 5 rationale transfer
+
+- 保留的 design 仍说明为什么 queue estimate 是纯函数、foreground-only 的近似及其失败模式；
+  但其顶部 reconciliation 明确将 admission 阈值改为 telemetry classification，不能再驱动
+  pre-persistence 503。
+- `live_worker_capacity(within_sec=30, pool="foreground")`、`chat`/`manual_wake` 的
+  in-flight scope 和 recent-`chat` mean 是当前估算输入；容量估算或其 DB 读取失败时必须
+  fail open。此点不削弱 liveness、runtime-control、kill-switch 或 provider/configuration
+  的 fail-closed 边界。
+- 本批次只变更 lifecycle Markdown 及生成的 inventory；不修改 runtime、数据库、schema、
+  compose、API/wire/security/public docs、`deploy/`、`docs-site/` 或
+  `tools/chat_resident_consumer.py`。
+
+### 批次 5 引用检查
+
+精确路径和 basename 搜索应只留下 retained design、archive plan 与本审计记录；archive plan
+到 retained design 的 owner link 可解析。当前 public behavior 的来源不迁入或修改
+`docs-site/`，而是继续由 [Chat workflow](../../docs-site/content/docs/workflows/chat.mdx) 说明。
