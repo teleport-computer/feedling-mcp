@@ -2511,7 +2511,7 @@ def test_proactive_chat_response_delivery_off_suppresses_alert_not_live_activity
     snapshot = proactive_dashboard._proactive_debug_snapshot(store)
     msg = snapshot["proactive_messages"][0]
     assert msg["alert_preview"] == "这条应该静默写入。"
-    assert msg["push_decision"] == "suppressed"
+    assert msg["push_decision"] == "suppress"
     assert msg["push_reason"] == "reminders_delivery_disabled"
     assert msg["alert_status"] == "suppressed"
     assert msg["live_activity_status"] == "delivered"
