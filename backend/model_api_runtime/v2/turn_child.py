@@ -116,8 +116,8 @@ async def _event_loop_heartbeat(
       the per-turn stall watchdog.
 
     Keeping them separate also prevents a normal 60-second async provider wait
-    from looking like a dead 45-second child merely because all slots happen to
-    be busy while another job is queued.
+    in this child’s one slot from looking like a dead 45-second child merely
+    because another job is queued.
     """
     while not stop_event.is_set():
         try:
@@ -155,7 +155,8 @@ async def _run(
         except (NotImplementedError, RuntimeError):
             # 极少数平台/事件循环组合不支持 add_signal_handler——退化为"收不到干净 drain
             # 信号"，但进程仍然会被裸 SIGTERM 杀掉（只是跳过 drain），父进程的 SIGKILL
-            # 路径（watchdog kill_and_respawn）完全不受影响，那条本来就是不可 catch 的。
+            # 路径完全不受影响：parent fleet/serve_worker 负责确认 kill、按精确
+            # job_id + claimed_by 恢复 claim 并启动 replacement；SIGKILL 本来不可 catch。
             log.warning("[v2.turn_child] add_signal_handler unsupported for %s", sig)
 
     deps = serve_worker.build_production_deps()

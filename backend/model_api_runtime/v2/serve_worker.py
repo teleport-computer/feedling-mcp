@@ -5381,8 +5381,8 @@ async def _heartbeat_loop(
     is deliberately the same shape as (and agrees with) the watchdog's own kill
     threshold: whichever of the two loops ticks next while the child is down keeps
     writing capacity=0, so they reinforce rather than race each other back to a
-    stale "full capacity" row (see the watchdog module docstring's "capacity=0 must
-    be written before kill_and_respawn" note for the other half of this contract).
+    stale "full capacity" row (see the watchdog module docstring's capacity-zero
+    before confirmed-kill/exact-recovery sequence for the other half of this contract).
 
     Emits one heartbeat immediately on startup (before the first sleep) so a
     just-started pool is visible right away rather than only after the first
@@ -5793,7 +5793,7 @@ def _jobs_claimable() -> bool:
     `jobs_claimable` guard) — `pending_job_count()` counts only rows still
     `status='pending'` whose durable `available_at` fence is due (queued and
     ready, not yet claimed by ANY worker slot), which is
-    exactly "all slots stuck while work waits": a wedged child claims nothing, so
+    exactly "this slot is stuck while work waits": a wedged child claims nothing, so
     genuinely queued work sits at `pending` instead of draining into `claimed`/
     `running`. Deliberately NOT `inflight_job_count()` (pending+claimed+running) —
     that would stay truthy even while a healthy child is mid-turn on already-claimed

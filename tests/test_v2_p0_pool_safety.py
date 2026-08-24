@@ -1,28 +1,29 @@
-"""P0 acceptance tests for retained PR-D pool-safety invariants.
+"""Compatibility regressions for retained PR-D pool-safety invariants.
 
-The canonical owner is
-``docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md``:
-D1--D3 progress/watchdog/health capacity and D4 live kill-switch safety. This
-module re-asserts their joint behavior (kill switch, `ChildSupervisor`,
-`watchdog.should_kill`/`_watchdog_loop`, and health-derived heartbeat) using fake
-supervisors / monkeypatched jobs_store — no real turn work is ever spawned:
+The retained PR-D decision is
+``docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md``.
+The watchdog fakes below intentionally exercise the earlier compatibility wrapper
+surface, including a shared-child-shaped aggregate-progress model and its
+``kill_and_respawn`` fallback. They do not constitute current D1--D3 topology
+acceptance: current one-process-per-`SlotSpec` acceptance belongs to
+``test_v2_pool_supervisor.py`` and real-process fault isolation to
+``test_v2_pool_fault_injection.py``, under
+``docs/superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md``.
 
-1. P0 — all slots stuck: capacity=0 is recorded strictly BEFORE
-   kill_and_respawn() runs (so admission observes the drop before the SIGKILL
-   races a fresh claim in), and the kill path never touches Genesis: a
-   ``kind='genesis'`` heartbeat row's ``beat_at`` is byte-for-byte unchanged
-   across the whole watchdog tick (not merely "still fresh" — literally
-   untouched), and grep-level source inspection confirms watchdog.py contains
-   no genesis reference at all.
-2. Kill switch: real DB-backed ``kill_switch.set_turns_halted`` flips
+This module retains three narrow regression checks:
+
+1. The legacy wrapper writes capacity=0 before its compatibility respawn action
+   and remains Genesis-blind: a ``kind='genesis'`` heartbeat row's ``beat_at``
+   is byte-for-byte unchanged across the watchdog tick, and source inspection
+   confirms watchdog.py contains no Genesis reference.
+2. D4 kill switch: real DB-backed ``kill_switch.set_turns_halted`` flips
    chat_send_core admission to 503 turns_halted and back; the ``_slot_loop``
    claim gate never calls ``claim_next_job`` while halted; the Genesis claim
    function (``db.genesis_claim_uploaded_jobs``) is provably ungated (grep at
    test time confirms no kill_switch import/reference in db.py at all, and the
    function is still callable while halted).
-3. watchdog.should_kill — focused re-assertion of the three acceptance
-   branches (all-stuck+claimable → kill, healthy+fresh → no kill,
-   stale-but-idle → no kill) at the P0 level.
+3. The pure compatibility decision helper covers all-stuck+claimable → kill,
+   healthy+fresh → no kill, and stale-but-idle → no kill.
 """
 from __future__ import annotations
 
@@ -87,13 +88,13 @@ def _genesis_beat_at(worker_id: str):
 
 
 # ---------------------------------------------------------------------------
-# P0 #1 — all slots stuck: capacity zeroes strictly before kill_and_respawn,
-# and the kill path is provably Genesis-blind.
+# Compatibility P0 #1 — shared-child-shaped fake: capacity zeroes strictly
+# before its wrapper respawn action, and the path is Genesis-blind.
 # ---------------------------------------------------------------------------
 
 class _WedgedSupervisor:
     """Fake supervisor: the child process is alive but its progress is older
-    than CHILD_LIVENESS_TIMEOUT — the "all slots stuck" wedge signal."""
+    than CHILD_LIVENESS_TIMEOUT — the legacy aggregate-progress wedge signal."""
 
     def __init__(self):
         self.kill_calls = 0
@@ -123,7 +124,7 @@ def test_p0_all_slots_stuck_zeroes_capacity_before_kill_and_genesis_unaffected(m
 
     def _spy_heartbeat(worker_id, *, pool, kind="turn", capacity=1):
         # The watchdog's own contract (watchdog.py's `_watchdog_loop` docstring
-        # and Task 3's kill branch) is to write ONLY the turn worker's row with
+        # defines this legacy wrapper branch to write ONLY the turn worker's row with
         # capacity=0 — assert that's exactly what happens, nothing genesis-kind
         # and nothing but capacity=0.
         assert kind == "turn", f"watchdog must never write a non-turn heartbeat, got kind={kind!r}"
@@ -165,7 +166,7 @@ def test_p0_all_slots_stuck_zeroes_capacity_before_kill_and_genesis_unaffected(m
 
     asyncio.run(_driver())
 
-    # (a) capacity=0 was recorded, (b) kill_and_respawn ran, (c) in that order.
+    # (a) capacity=0 was recorded, (b) the legacy wrapper ran, (c) in that order.
     assert supervisor.kill_calls >= 1
     assert "capacity_zero" in order
     assert "kill_and_respawn" in order
@@ -184,22 +185,20 @@ def test_p0_all_slots_stuck_zeroes_capacity_before_kill_and_genesis_unaffected(m
 
 
 # ---------------------------------------------------------------------------
-# P0 #1b — hard-timeout fix: a SINGLE wedged turn (other slots fine, so the
-# freshest-progress staleness clause (b) never fires) still zeroes capacity and
-# kills, via clause (c)/current_turn_age_sec. Before this fix, `should_kill`'s
-# clause (c) was dead code (nothing populated `current_turn_age_sec`), so this
-# acceptance item ("hard timeout -> capacity=0 -> restart turn child") was
-# nominal only — a wedged turn's slot silently stayed occupied until the
-# data-plane job-lease reaper marked the DB row failed (~300s later), with no
-# process-level kill at all.
+# Compatibility P0 #1b — a shared-child-shaped fake reports fresh aggregate
+# progress while one modeled turn has exceeded its hard timeout. This preserves
+# the old helper's `current_turn_age_sec` decision branch; it is not evidence
+# about the current one-child-one-slot fleet. Current per-slot fault acceptance
+# is covered by test_v2_pool_fault_injection.py.
 # ---------------------------------------------------------------------------
 
 class _SingleWedgedTurnSupervisor:
-    """Fake supervisor: the child process is alive, progress is FRESH overall
-    (other slots are healthy and cycling), but one turn has been running longer
-    than the hard timeout. This is precisely the case clause (b) cannot see —
-    `last_progress_age_sec` stays fresh because other slots keep claiming/
-    completing/idle-polling — only `current_turn_age_sec` catches it."""
+    """Legacy fake with fresh aggregate progress and one overdue modeled turn.
+
+    Current SlotFleet children each contain exactly one slot, so this
+    shared-child-shaped fixture exists only to retain compatibility coverage for
+    the pure watchdog helper.
+    """
 
     def __init__(self, current_turn_age_sec: float, order: "list[str] | None" = None):
         self._current_turn_age_sec = current_turn_age_sec
@@ -209,7 +208,7 @@ class _SingleWedgedTurnSupervisor:
     def poll_liveness(self) -> dict:
         return {
             "alive": True,
-            "last_progress_age_sec": 1.0,  # fresh — other slots are fine
+            "last_progress_age_sec": 1.0,  # legacy aggregate progress is fresh
             "current_turn_age_sec": self._current_turn_age_sec,
         }
 
@@ -422,8 +421,8 @@ def test_kill_switch_genesis_claim_path_is_ungated(monkeypatch):
 
 # ---------------------------------------------------------------------------
 # watchdog.should_kill — focused P0-level re-assertion of the three
-# acceptance branches (Task 3's fuller exhaustive suite lives in
-# tests/test_v2_watchdog.py; this is the acceptance-level spot-check).
+# decision branches; the fuller compatibility suite lives in
+# tests/test_v2_watchdog.py).
 # ---------------------------------------------------------------------------
 
 def test_should_kill_true_for_all_stuck_and_claimable():

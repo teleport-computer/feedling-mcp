@@ -97,7 +97,7 @@ def test_5000_identical_ts_and_summary_watermark_preserve_every_source_row():
     summary_row = jobs_store.get_summary_row(uid)
     assert summary_row is not None
     watermark_seq = summary_row["watermark_seq"]
-    # Sanity: the lazy ts->seq back-compat translation (Task 9) placed the
+    # Sanity: the D5--D6 seq-boundary compatibility translation placed the
     # watermark exactly at the last old message, not beyond it.
     old_last_seq = db.chat_seq_for_msg_id(uid, f"old{n_old - 1:02d}")
     assert watermark_seq == old_last_seq
@@ -159,8 +159,8 @@ def test_5000_identical_ts_and_summary_watermark_preserve_every_source_row():
 
 
 # ---------------------------------------------------------------------------
-# P0 #2 — prompt coverage after catch-up (Task 10's synchronous catch-up
-# compaction closes the "silently dropped between watermark and tail" hole).
+# P0 #2 — D6 prompt coverage after synchronous catch-up compaction closes the
+# "silently dropped between watermark and tail" hole.
 # ---------------------------------------------------------------------------
 
 
@@ -323,7 +323,7 @@ def test_prompt_coverage_no_false_gap_under_multiuser_seq_interleaving(monkeypat
 
 # ---------------------------------------------------------------------------
 # P0 #3 — compaction CAS-loss requeues, never permanently abandons a
-# still-over-budget tail (Task 6).
+# still-over-budget tail (D8 CAS-loss requeue).
 # ---------------------------------------------------------------------------
 
 
