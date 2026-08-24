@@ -15,6 +15,116 @@ INGRESS_COMPOSES = (
     ROOT / "deploy" / "docker-compose.phala.test.yaml",
     ROOT / "deploy" / "docker-compose.phala.pre.yaml",
 )
+PG_BACKUP_HEALTH = ROOT / "deploy" / "postgres" / "check-backup-health.sh"
+
+
+def _run_pg_backup_health(mode: str, **values: str) -> subprocess.CompletedProcess[str]:
+    assert PG_BACKUP_HEALTH.exists(), "PG backup health evaluator is missing"
+    return subprocess.run(
+        ["bash", str(PG_BACKUP_HEALTH), mode],
+        capture_output=True,
+        text=True,
+        env={**os.environ, **values},
+    )
+
+
+def test_pg_backup_monitor_accepts_idle_archiver_when_r2_matches():
+    archiver = _run_pg_backup_health(
+        "archiver",
+        LAST_ARCHIVED_WAL="00000001000002A8000000B1",
+        CURRENT_WAL="00000001000002A8000000B2",
+        UNRESOLVED_ARCHIVE_FAILURE="0",
+        READY_COUNT="0",
+        OLDEST_READY_AGE_SEC="0",
+        WAL_MB="96",
+    )
+    assert archiver.returncode == 0, archiver.stderr
+
+    r2 = _run_pg_backup_health(
+        "r2",
+        LAST_ARCHIVED_WAL="00000001000002A8000000B1",
+        NEWEST_WAL_KEY="prod/wal-g/wal_005/00000001000002A8000000B1.lz4",
+        BASE_AGE_SEC="3600",
+    )
+    assert r2.returncode == 0, r2.stderr
+
+
+@pytest.mark.parametrize(
+    ("mode", "values", "error_slug"),
+    [
+        (
+            "archiver",
+            {
+                "LAST_ARCHIVED_WAL": "00000001000002A8000000B1",
+                "CURRENT_WAL": "00000001000002A8000000B2",
+                "UNRESOLVED_ARCHIVE_FAILURE": "1",
+                "READY_COUNT": "0",
+                "OLDEST_READY_AGE_SEC": "0",
+                "WAL_MB": "96",
+            },
+            "ARCHIVE_FAILURE_UNRESOLVED",
+        ),
+        (
+            "archiver",
+            {
+                "LAST_ARCHIVED_WAL": "00000001000002A8000000B1",
+                "CURRENT_WAL": "00000001000002A8000000B2",
+                "UNRESOLVED_ARCHIVE_FAILURE": "0",
+                "READY_COUNT": "1",
+                "OLDEST_READY_AGE_SEC": "600",
+                "WAL_MB": "96",
+            },
+            "ARCHIVE_READY_STALE",
+        ),
+        (
+            "archiver",
+            {
+                "LAST_ARCHIVED_WAL": "00000001000002A8000000B1",
+                "CURRENT_WAL": "00000001000002A8000000B2",
+                "UNRESOLVED_ARCHIVE_FAILURE": "0",
+                "READY_COUNT": "0",
+                "OLDEST_READY_AGE_SEC": "0",
+                "WAL_MB": "4096",
+            },
+            "WAL_DIR_TOO_LARGE",
+        ),
+        (
+            "r2",
+            {
+                "LAST_ARCHIVED_WAL": "00000001000002A8000000B1",
+                "NEWEST_WAL_KEY": "prod/wal-g/wal_005/00000001000002A8000000B0.lz4",
+                "BASE_AGE_SEC": "3600",
+            },
+            "R2_WAL_MISMATCH",
+        ),
+        (
+            "r2",
+            {
+                "LAST_ARCHIVED_WAL": "00000001000002A8000000B1",
+                "NEWEST_WAL_KEY": "prod/wal-g/wal_005/00000001000002A8000000B1.lz4",
+                "BASE_AGE_SEC": "93600",
+            },
+            "BASE_BACKUP_STALE",
+        ),
+    ],
+)
+def test_pg_backup_monitor_rejects_real_backup_failures(mode, values, error_slug):
+    result = _run_pg_backup_health(mode, **values)
+    assert result.returncode != 0
+    assert error_slug in result.stderr
+
+
+def test_pg_backup_workflow_reconciles_database_wal_with_r2():
+    path = ROOT / ".github" / "workflows" / "pg-monitor.yml"
+    workflow = path.read_text()
+    load_yaml_strict(workflow, source_name=str(path.relative_to(ROOT)))
+
+    assert "archiver stale" not in workflow
+    assert "pg_ls_archive_statusdir()" in workflow
+    assert "LAST_ARCHIVED_WAL" in workflow
+    assert "NEWEST_WAL_KEY" in workflow
+    assert "check-backup-health.sh archiver" in workflow
+    assert "check-backup-health.sh r2" in workflow
 
 
 def test_strict_loader_rejects_duplicate_mapping_keys():
