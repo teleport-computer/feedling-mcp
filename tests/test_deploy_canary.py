@@ -71,6 +71,32 @@ def test_transient_transport_failure_is_retried(canary_env, monkeypatch, capsys)
     assert blips == {"whoami": 0, "reset": 0}  # retries actually consumed the blips
 
 
+def test_reset_timeout_then_unauthorized_proves_cleanup(
+    canary_env, monkeypatch, capsys
+):
+    """A reset response can time out after the delete committed.  The retry's
+    401 proves that the throwaway API key no longer authenticates and must be
+    accepted as successful cleanup instead of failing an otherwise green deploy.
+    """
+    inner = _stub_http(reset_status=401)
+    resets = {"remaining_timeouts": 1}
+
+    def committed_but_response_lost(method, url, **kw):
+        if (
+            url.endswith("/v1/account/reset")
+            and resets["remaining_timeouts"] > 0
+        ):
+            resets["remaining_timeouts"] -= 1
+            return 0, {"error": "transport: The read operation timed out"}
+        return inner(method, url, **kw)
+
+    monkeypatch.setattr(dc, "_http", committed_but_response_lost)
+    capture_sleeps(monkeypatch, dc)
+    dc.main()
+    assert "CANARY OK" in capsys.readouterr().out
+    assert resets["remaining_timeouts"] == 0
+
+
 def test_register_transport_blip_retries_with_fresh_key(canary_env, monkeypatch, capsys):
     """Register is not idempotent: a timed-out response may mean the account WAS
     created (CI run #723 — same-key retry hit 409 account_exists_for_key). A
