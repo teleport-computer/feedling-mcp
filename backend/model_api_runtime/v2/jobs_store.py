@@ -10518,7 +10518,7 @@ def get_summary_row(user_id) -> dict | None:
     strictly-less）现算一个替身返回，不回写库（下一次真正压缩发生时才会
     落一个精确值）。选在读侧做而不是把翻译推给每个调用方，是因为
     ``get_summary_row`` 只有一个实现、调用方（当前的 ``_read_summary``、
-    未来 Task 10 的 prompt-invariant 边界读取）都自动拿到一致语义，不用人人
+    当前 prompt-invariant 边界读取）都自动拿到一致语义，不用人人
     记得先查有没有 watermark_seq 再翻译一次。"""
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
