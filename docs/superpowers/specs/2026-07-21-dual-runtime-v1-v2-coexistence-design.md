@@ -1,7 +1,11 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # 双运行时共存（V1 agent-runner + V2 主 CVM 内嵌）+ per-user allowlist 切换 — 设计 spec
 
 日期：2026-07-21
-状态：待评审
+状态：已接受；当前运行状态与后续修订以 `docs/CURRENT_STATE.md` 为准
 分支基底：`pre`（含 `ec377440` merge），新分支 `feat/dual-runtime`
 前置调查：V2 三面隔离审计全 clean；V1 退役 commit = `2b294a1f`（73 文件，-10019 行）；
 退役前的 `chat_send_core` 本身就是 shipped 过的 V1/V2 双分支路由器。

@@ -1,3 +1,8 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/repository-cleanup/README.md
+historical_reason: point-in-time
+---
 # 仓库清理基线（2026-08-24）
 
 本快照建立在分支 `docs/repo-cleanup-plan-20260824`、commit `20dc0a5d52d4628b612e1d164c64b0138b9d87b5` 上；当时 `origin/test` 为 `ba838980523e2dda55c6e1c52dc65fd7ad6ce1e8`。它位于清理方案提交之后、阶段 1 实现提交之前。

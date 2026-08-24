@@ -1,6 +1,10 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Feedling 仓库完整清理计划
 
-> 状态：待评审方案
+> 状态：已确认，执行中
 >
 > 目标分支：`test`
 >

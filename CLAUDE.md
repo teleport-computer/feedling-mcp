@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: AGENTS.md
+---
 # CLAUDE.md — repo-level guidance
 
 ## Design System

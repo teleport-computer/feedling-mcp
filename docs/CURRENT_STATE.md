@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Feedling 当前状态
 
 > 本文只描述当前仓库中的运行时与部署接线。它是 agent 和工程师的 current-state 入口，但源码配置不等于 live 环境已经部署；线上结论还必须核对目标环境返回的 exact `release.git_commit`。
