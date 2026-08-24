@@ -37,14 +37,16 @@ canonical_owner: self
 
 ## 引用检查
 
-归档前，D0 plan/spec 只有彼此引用；D4 plan/spec 除彼此引用外，只有
-`scripts/loadtest/run_loadtest.py` 把 D4 plan 当作操作说明。该生产代码引用已经改为
-当前 README。生成的生命周期清单会随新路径重建，不视为人工调用者。
+归档前，D0 plan/spec 只有彼此引用；D4 plan/spec 除彼此引用外，
+`scripts/loadtest/run_loadtest.py` 与 `scripts/loadtest/compare_tokens.py` 都有继承的
+操作/比较指引。前者现在指向当前 README；后者现在指向当前 README 和 token baseline，
+不再把 archived D4 Task 5 当作运行手册。生成的生命周期清单会随新路径重建，不视为人工调用者。
 
 ## 批次 2：retired staged-planner 与 PR-C unified-loop 谱系
 
-审计日期：2026-08-24。结论：archive 四份已落地且被统一 loop 取代的设计/计划；保留
-中间 agent-loop 设计作为被后续多模态设计引用的决策考古；PR-C design 是当前 `decision`。
+审计日期：2026-08-24。结论：archive 三份被统一 loop 取代的设计/计划，另 archive 一份
+实现该 unified loop 的已落地 PR-C implementation plan；保留中间 agent-loop 设计作为被后续
+多模态设计引用的决策考古；PR-C design 是当前 `decision`。
 在归档前复核 `backend/model_api_runtime/v2/tool_loop.py`：它声明“一套 loop 供每个模型使用”、
 没有 `is_official` 分支；`worker.py` 的 chat、wake 与 child 三个入口均直接调用
 `v2_tool_loop.run_tool_loop`。`tests/test_v2_p0_unified_loop.py` 以及 focused tool-loop/
