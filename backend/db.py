@@ -16869,7 +16869,7 @@ def frame_prune_to(user_id: str, max_frames: int) -> list[str]:
 
 
 def log_append(user_id: str, stream: str, doc: dict,
-               ts: float | None = None, item_key: str | None = None) -> None:
+               ts: float | None = None, item_key: str | None = None) -> bool:
     sql = ("INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
            "VALUES (%s, %s, %s, %s, %s) RETURNING seq")
     try:
@@ -16877,9 +16877,9 @@ def log_append(user_id: str, stream: str, doc: dict,
             row = conn.execute(sql, (user_id, stream, ts, item_key, Jsonb(doc))).fetchone()
     except Exception as e:
         log.error("[db] log_append(%s,%s) failed: %s", user_id, stream, e)
-        return
+        return False
     if row is None:
-        return
+        return False
     # Mirror with the PRIMARY-assigned seq pinned explicitly (OVERRIDING SYSTEM
     # VALUE): user_logs.seq is GENERATED ALWAYS AS IDENTITY, so a plain INSERT
     # on the TEE side would mint its own, independent seq and break the
@@ -16893,6 +16893,7 @@ def log_append(user_id: str, stream: str, doc: dict,
         "ON CONFLICT (user_id, stream, seq) DO NOTHING"
     )
     mirror.execute(mirror_sql, (user_id, stream, row[0], ts, item_key, Jsonb(doc)))
+    return True
 
 
 def log_append_numbered(
@@ -17044,6 +17045,27 @@ def log_trim(user_id: str, stream: str, max_rows: int,
         return
     from tee_shadow import mirror
     mirror.execute(sql, params)
+
+
+def log_clear(user_id: str, stream: str) -> bool:
+    """Delete one user's entire append-log stream from primary and TEE.
+
+    This is deliberately narrower than accepting an arbitrary predicate: callers
+    use it only when a whole bounded stream has reached its semantic terminal
+    state.  Return whether the primary delete completed so best-effort callers can
+    avoid claiming that a clear happened when the database write failed.
+    """
+    sql = "DELETE FROM user_logs WHERE user_id = %s AND stream = %s"
+    params = (user_id, stream)
+    try:
+        with get_pool().connection() as conn:
+            conn.execute(sql, params)
+    except Exception as e:
+        log.error("[db] log_clear(%s,%s) failed: %s", user_id, stream, e)
+        return False
+    from tee_shadow import mirror
+    mirror.execute(sql, params)
+    return True
 
 
 def log_prune_older_than(user_id: str, stream: str, cutoff_epoch: float) -> None:
