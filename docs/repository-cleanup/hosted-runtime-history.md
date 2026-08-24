@@ -174,3 +174,5 @@ partial-supersession 链接保持可解析。生成的 lifecycle inventory 由�
 精确路径和 basename 搜索应只留下 retained design、archive plan 与本审计记录；archive plan
 到 retained design 的 owner link 可解析。当前 public behavior 的来源不迁入或修改
 `docs-site/`，而是继续由 [Chat workflow](../../docs-site/content/docs/workflows/chat.mdx) 说明。
+审查复核同时移除了 [`API_ERRORS.md`](../API_ERRORS.md) 中已失效的 live-overload
+`busy` / 503 / `queue_over_sla` 行，避免将 telemetry 误发布为 HTTP error contract。
