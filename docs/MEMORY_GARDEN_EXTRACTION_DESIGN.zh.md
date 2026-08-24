@@ -380,7 +380,7 @@ memory/source_policy.py   33 行   来源枚举
 ### 提取出来的是什么:一个包,三种壳,N 个适配器
 
 ```
-memory-garden 包
+memgarden 包
 │
 ├── 谁来调(壳)                       └── 数据存哪(适配器)
 │   ├── 直接 import ← IO 用这个           ├── postgres(+ 加密中间件)← IO 用这个
@@ -391,10 +391,10 @@ memory-garden 包
 **壳和适配器是正交的,任意组合:**
 
 ```
-memory-garden serve --storage sqlite://~/.memory-garden/db    MCP 壳 + SQLite
-memory-garden serve --storage postgres://...                  MCP 壳 + Postgres
-memory-garden dream  --storage sqlite://...                   CLI 壳 + SQLite
-from memory_garden import ...                                 无壳,直接调函数
+memgarden serve --storage sqlite://~/.memgarden/db    MCP 壳 + SQLite
+memgarden serve --storage postgres://...                  MCP 壳 + Postgres
+memgarden dream  --storage sqlite://...                   CLI 壳 + SQLite
+from memgarden import ...                                 无壳,直接调函数
 ```
 
 壳只负责「把外面的调用翻译成内核函数调用」,不参与存储决策;适配器只负责「数据落到哪、

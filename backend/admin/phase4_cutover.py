@@ -23,12 +23,10 @@ import hashlib
 import json
 import os
 import uuid
-from pathlib import Path
 from typing import Iterable
 
+import alembic_tee
 import psycopg
-from alembic.config import Config
-from alembic.script import ScriptDirectory
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
@@ -89,10 +87,7 @@ def _fingerprint(conn: psycopg.Connection) -> tuple[str, str, int]:
 
 
 def _expected_tee_heads() -> set[str]:
-    here = Path(__file__).resolve().parents[1]
-    cfg = Config(str(here / "alembic_tee" / "alembic.ini"))
-    cfg.set_main_option("script_location", str(here / "alembic_tee"))
-    return set(ScriptDirectory.from_config(cfg).get_heads())
+    return {alembic_tee.current_head()}
 
 
 def _actual_tee_heads(conn: psycopg.Connection) -> set[str]:

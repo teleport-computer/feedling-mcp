@@ -10,6 +10,9 @@ import debug_trace
 import provider_client
 from capabilities import registry as cap_registry
 from core import envelope as core_envelope
+from notices import error_contract, rejection_stats
+from hosted import visual_transport
+import vision_policy
 
 
 log = logging.getLogger(__name__)
@@ -23,6 +26,8 @@ _OBSERVATION_PROMPT = (
     "Return a concise neutral observation for another model."
 )
 
+is_main_fallback_eligible = vision_policy.is_main_fallback_eligible
+
 
 class VisionObserverError(RuntimeError):
     """Display-safe visual-route failure shared by hosted and resident paths."""
@@ -34,18 +39,39 @@ class VisionObserverError(RuntimeError):
         status_code: int | None = None,
         retryable: bool = False,
         detail: str = "",
+        upstream_detail: str = "",
+        reason: str = "",
     ):
-        super().__init__(error_code)
-        self.error_code = error_code
+        spec = error_contract.resolve_untrusted(
+            error_code,
+            domain="vision",
+            boundary="hosted_vision_observer",
+            reporter=rejection_stats.record_hosted,
+        )
+        super().__init__(spec.code)
+        self.error_code = spec.code
         self.status_code = status_code
         self.retryable = retryable
         self.detail = detail[:160]
+        # Kept separate from display-safe ``detail`` so response builders and
+        # tenant-readable debug traces cannot expose a provider response body
+        # by accidentally serializing the public failure shape.
+        self.upstream_detail = str(upstream_detail or "")[:240]
+        self.reason = str(reason or "")[:80]
 
 
 def classify_vision_error(exc: BaseException) -> VisionObserverError:
     """Reduce provider/runtime failures to stable codes without raw response text."""
     if isinstance(exc, VisionObserverError):
         return exc
+
+    if isinstance(exc, visual_transport.VisualOutputTruncated):
+        return VisionObserverError(
+            "vision_model_failed",
+            retryable=False,
+            detail=exc.reason,
+            reason=exc.reason,
+        )
 
     status = getattr(exc, "status_code", None)
     status_code = int(status) if isinstance(status, int) else None
@@ -80,7 +106,10 @@ def classify_vision_error(exc: BaseException) -> VisionObserverError:
         code = "vision_model_incompatible"
     elif status_code == 429:
         code = "vision_model_rate_limited"
-    elif provider_class in {"transient", "transient_exhausted"} or (
+    elif provider_client.is_timeout_error(exc) or provider_class in {
+        "transient",
+        "transient_exhausted",
+    } or (
         status_code is not None and (status_code == 408 or status_code >= 500)
     ):
         code = "vision_model_unavailable"
@@ -97,6 +126,7 @@ def classify_vision_error(exc: BaseException) -> VisionObserverError:
             "vision_model_failed",
         },
         detail=type(exc).__name__,
+        upstream_detail=str(getattr(exc, "response_detail", "") or ""),
     )
 
 
@@ -135,32 +165,19 @@ def observe_image(
     *,
     image_mime: str,
     image_b64: str,
+    absolute_deadline: float | None = None,
 ) -> str:
     # A saved route has already passed its visual probe, so one transient
     # OpenRouter/provider blip should not turn a real image into a false
     # "could not inspect" reply. Keep the total budget below the resident's
     # 100-second request timeout and never retry key/credit/config failures.
     try:
-        result = provider_client.reliable_chat_completion(
+        result = visual_transport.request_visual_completion(
             config,
-            [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": _OBSERVATION_PROMPT},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{image_mime};base64,{image_b64}",
-                        },
-                    },
-                ],
-            }],
-            max_tokens=1200,
-            temperature=None,
-            timeout=45.0,
-            include_reasoning=False,
-            max_attempts=2,
-            base_delay_sec=0.5,
+            prompt=_OBSERVATION_PROMPT,
+            image_mime=image_mime,
+            image_b64=image_b64,
+            absolute_deadline=absolute_deadline,
         )
         observation = str(result.get("reply") or "").strip()
         if not observation:
@@ -316,17 +333,19 @@ def observe_pinned_message(
                 "error_class": failure.error_code,
                 "status_code": failure.status_code,
                 "retryable": failure.retryable,
+                **({"reason": failure.reason} if failure.reason else {}),
             },
             dur_ms=(time.monotonic() - started_at) * 1000,
         )
         log.warning(
             "[vision.observer] provider call failed user=%s route=%s "
-            "error=%s class=%s status=%s",
+            "error=%s class=%s status=%s upstream_detail=%r",
             str(store.user_id)[:8],
             route_id[:8],
             type(exc).__name__,
             failure.error_code,
             failure.status_code,
+            failure.upstream_detail,
         )
         return {
             "error": "vision_observer_failed",
@@ -334,6 +353,7 @@ def observe_pinned_message(
             "error_class": failure.error_code,
             "status_code": failure.status_code,
             "retryable": failure.retryable,
+            **({"reason": failure.reason} if failure.reason else {}),
             **identity,
         }, 502
     debug_trace.trace_event(

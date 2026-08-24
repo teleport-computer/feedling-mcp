@@ -25,6 +25,35 @@ def test_visible_text_degeneracy_is_public_and_stable(text, expected):
     assert tool_markup_leak.is_degenerate_visible_text(text) is expected
 
 
+@pytest.mark.parametrize("sentinel", tool_markup_leak.MODEL_SENTINEL_TOKENS)
+def test_provider_end_sentinel_is_degenerate_only_as_the_whole_message(sentinel):
+    assert tool_markup_leak.is_degenerate_visible_text(sentinel) is True
+    assert tool_markup_leak.is_degenerate_visible_text(f"  {sentinel}\n") is True
+    assert tool_markup_leak.is_degenerate_visible_text(sentinel * 2) is True
+    assert tool_markup_leak.is_degenerate_visible_text(f"正文{sentinel}") is False
+    assert tool_markup_leak.is_degenerate_visible_text(f"{sentinel}正文") is False
+
+
+def test_unbarred_end_of_turn_sentinel_is_degenerate():
+    # Keep this case independent from MODEL_SENTINEL_TOKENS so deleting the
+    # production entry cannot also delete its regression-test parameter.
+    assert tool_markup_leak.is_degenerate_visible_text("<end_of_turn>") is True
+
+
+@pytest.mark.parametrize(
+    "normal_text",
+    (
+        "<3",
+        "a < b",
+        "<strong>正常 HTML</strong>",
+        "<s>旧式删除线</s>",
+        "<end_of_turn> 是模型的结束符",
+    ),
+)
+def test_sentinel_detection_preserves_normal_angle_bracket_text(normal_text):
+    assert tool_markup_leak.is_degenerate_visible_text(normal_text) is False
+
+
 def test_real_parameter_leak_is_removed_but_reply_body_survives():
     raw = (
         '<parameter name="tool_name">reply</parameter>\n'

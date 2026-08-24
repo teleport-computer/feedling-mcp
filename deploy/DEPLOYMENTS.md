@@ -341,8 +341,8 @@ only the Python Runtime V2 `serve-worker`.
 Third environment: `pre` branch → `deploy-pre-cvm` CI job → this CVM. It shares
 the test Phala account/key, R2 buckets, runtime-token secret and most feature-flag
 vars (all `TEST_*` references in the CI job are deliberate), while DB, AppAuth
-contract, domain and CVM are pre-specific. Hosted runtime ownership is V2-only
-in test, pre, and production.
+contract, domain and CVM are pre-specific. The current source manifests for
+test, pre, and production all set the hosted runtime policy to `dual`.
 
 | | |
 |---|---|
@@ -350,7 +350,7 @@ in test, pre, and production.
 | CVM ID | `82485d6f-9c23-48f1-9bdd-5a0d38531c3e` (also in `deploy/pre-cvm-id.txt`) |
 | App ID | `7d18a1f234a0d90e5f643cac8283b6048451b8f7` |
 | Created | 2026-07-07 as `feedling-io-pre`, `tdx.small`, **Phala KMS** (prod9). Provisioned locally via `phala deploy` (no `--cvm-id` ⇒ new app) without secrets, to mint the app_id; the healthy secret-bearing deploy is the CI `deploy-pre-cvm` job. |
-| Current/live Compose | Deployment unit `deploy/docker-compose.phala.pre.yaml`; recorded live service set matches test: `ingress`, `backend`, `enclave`, with `pre-api.feedling.app` + `_pre` volumes. `FEEDLING_IO_ONBOARDING_BRANCH` stays `test` (io-onboarding has no pre branch). `FEEDLING_HOSTED_RUNTIME_POLICY` is literal `v2_only`; no encrypted env can select resident. |
+| Current/live Compose | Deployment unit `deploy/docker-compose.phala.pre.yaml`; recorded live service set matches test: `ingress`, `backend`, `enclave`, with `pre-api.feedling.app` + `_pre` volumes. `FEEDLING_IO_ONBOARDING_BRANCH` stays `test` (io-onboarding has no pre branch). `FEEDLING_HOSTED_RUNTIME_POLICY` is literal `dual` in both the backend and pooled worker; this measured compose value is not selected by encrypted env, while each user's persisted ownership fence selects `resident_cli` or `db_action_v2`. |
 | Release/source topology | The staged `deploy/docker-compose.phala.pre.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, and `serve-worker`; this source row is not evidence that the custom domain has been deployed or is live. |
 | Public API | `https://pre-api.feedling.app` (dstack-ingress auto-creates the CF DNS records once CI injects `CF_*`) |
 | Attestation | `https://7d18a1f234a0d90e5f643cac8283b6048451b8f7-5003s.dstack-pha-prod9.phala.network/attestation` (repo var `PRE_MAIN_ENCLAVE_URL`) |

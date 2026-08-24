@@ -142,6 +142,12 @@ REGISTRY: dict[str, Entry] = {
         "主库与 agent_jobs 状态转移同事务追加，提交后热镜像，漏镜像由 reconciler "
         "按 job_id+job_attempt_count 扶正；滚动窗口不能由 agent_jobs 当前态反推",
     ),
+    "contract_rejection_stats": Entry(
+        MIRROR,
+        "error_class 契约拒绝的 content-free 绝对计数（RDS 0098/TEE 0034）；"
+        "每进程×受控三元组单调更新，主写后热镜像，漏镜像由 reconciler 按五列"
+        "复合主键扶正；writer 随发布永久增长，不能进 20 万行硬阀的 SNAPSHOT",
+    ),
 
     # ---------------------------------------------------------------- #
     # CIPHERTEXT —— 装信封的表，经 enclave 解密成明文写进 TEE。
@@ -364,13 +370,19 @@ _PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "genesis_import_outputs": ("user_id", "job_id", "output_type"),
     "notify_relay_configs": ("auth_token",),
     "notify_relay_logs": ("id",),
-    "lane_daily_rollup": ("user_id", "day", "route", "lane", "enqueue_source"),
+    "lane_daily_rollup": (
+        "user_id", "day", "route", "lane", "enqueue_source",
+        "access_path", "mode_source",
+    ),
     "lane_rollup_watermark": ("route",),
     "chat_daily_rollup": ("user_id", "day"),
     "chat_rollup_watermark": ("scope",),
     "trace_write_stats": ("day", "writer_id", "subsystem", "event_type", "lane"),
     "trace_write_stats_health": ("writer_id",),
     "v2_job_recovery_events": ("job_id", "job_attempt_count"),
+    "contract_rejection_stats": (
+        "contract_domain", "boundary", "fallback", "release_sha", "writer_id"
+    ),
     "chat_messages": ("user_id", "msg_id"),
     "memory_moments": ("user_id", "moment_id"),
     "world_book_entries": ("user_id", "entry_id"),

@@ -190,6 +190,8 @@ def test_call_agent_cli_emits_error_on_nonzero_rc(monkeypatch):
     assert types_seen == ["agent.model.call.start", "agent.model.call.error"]
     assert calls[1]["status"] == "error"
     assert calls[1]["trace_id"] == "trace-err"
+    assert calls[1]["detail"]["error_class"] == "unknown"
+    assert calls[1]["detail"]["error_class"] in crc.CONSUMER_ERROR_CLASSES
 
 
 def test_call_agent_cli_emits_error_on_timeout_and_reraises(monkeypatch):
@@ -213,6 +215,60 @@ def test_call_agent_cli_emits_error_on_timeout_and_reraises(monkeypatch):
     assert error_event["status"] == "error"
     assert error_event["trace_id"] == "trace-timeout"
     assert "超时" in error_event["explain"]
+    assert error_event["detail"]["error_class"] == "turn_timeout"
+    assert error_event["detail"]["error_class"] in crc.CONSUMER_ERROR_CLASSES
+
+
+def test_call_agent_cli_clamps_subprocess_to_absolute_deadline(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
+    monkeypatch.setattr(
+        crc,
+        "_prepare_cli_command",
+        lambda message, image_paths=None, lane="background": (
+            ["mycli", "ask", message],
+            None,
+        ),
+    )
+    monkeypatch.setattr(crc.time, "monotonic", lambda: 100.0)
+    seen = {}
+    result = subprocess.CompletedProcess(
+        args=["mycli", "ask", "hi"],
+        returncode=0,
+        stdout='{"type":"result","duration_ms":10}',
+        stderr="",
+    )
+
+    def _fake_run(*args, **kwargs):
+        seen["timeout"] = kwargs["timeout"]
+        return result
+
+    monkeypatch.setattr(crc.subprocess, "run", _fake_run)
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *args, **kwargs: None)
+
+    crc.call_agent_cli("hi", absolute_deadline=100.25)
+
+    assert seen["timeout"] == pytest.approx(0.25)
+
+
+def test_call_agent_cli_expired_absolute_deadline_never_spawns(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
+    monkeypatch.setattr(
+        crc,
+        "_prepare_cli_command",
+        lambda message, image_paths=None, lane="background": (
+            ["mycli", "ask", message],
+            None,
+        ),
+    )
+    monkeypatch.setattr(crc.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        crc.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("expired deadline must not spawn"),
+    )
+
+    with pytest.raises(TimeoutError, match="absolute deadline exceeded"):
+        crc.call_agent_cli("hi", absolute_deadline=99.0)
 
 
 def test_call_agent_threads_trace_id_to_cli(monkeypatch):

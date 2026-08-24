@@ -708,6 +708,29 @@ def cmd_voice_transcript_read(args):
     })
 
 
+def cmd_worldbook_match(args):
+    """Match the current request against the user's configured World Book.
+
+    This is deliberately model-invoked instead of resident-prefetched: ordinary
+    conversation pays no World Book network/decrypt cost, while the model can
+    still request the canonical matched block whenever the setting matters.
+    """
+    api_url, auth = _require_backend()
+    query = str(args.query or "").strip()
+    if not query:
+        _emit({"ok": False, "error": "worldbook-match needs --query <text>"}, 2)
+    status, body = _http_json(
+        "POST",
+        f"{api_url}/v1/worldbook/match",
+        auth,
+        payload={"message": query},
+        timeout=20,
+    )
+    if status == 200 and isinstance(body, dict):
+        _emit({"ok": True, **body})
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
 def cmd_memory_fetch(args):
     """Verbatim decrypted memory cards by id (plaintext-safe). POST /v1/memory/fetch."""
     api_url, auth = _require_backend()
@@ -1969,6 +1992,13 @@ def main():
     vtr.add_argument("--call-id", dest="call_id", required=True, help="call id from voice-transcript-list")
     vtr.add_argument("--offset", type=int, default=0, help="character offset to continue from")
     vtr.set_defaults(func=cmd_voice_transcript_read)
+
+    wbm = sub.add_parser(
+        "worldbook-match",
+        help="Match relevant World Book context when the current request depends on configured lore or setting.",
+    )
+    wbm.add_argument("--query", required=True, help="the current user request or question to match")
+    wbm.set_defaults(func=cmd_worldbook_match)
 
     sr = sub.add_parser("screen-recent", help="Recent screen frame metadata (no pixels).")
     sr.add_argument("--limit", type=int, default=10, help="maximum number of frames to return")

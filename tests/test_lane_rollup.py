@@ -15,10 +15,14 @@ ASGI app.
 """
 from __future__ import annotations
 
+import ast
 import asyncio
+import copy
+import re
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -26,7 +30,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db  # noqa: E402
-from conftest import seed_user  # noqa: E402
+from conftest import configure_model_api_route, seed_user  # noqa: E402
+from accounts import registry  # noqa: E402
+from admin import data_track  # noqa: E402
 from admin import lane_rollup_scheduler as sched  # noqa: E402
 from admin import routes_asgi as admin_asgi  # noqa: E402
 import asgi.lifespan as lifespan_mod  # noqa: E402
@@ -40,6 +46,9 @@ ADMIN_TOKEN = "admin-test-token"
 # 2030-06-04 12:00 Beijing as "now": days 01-03 are closed, far from the real
 # clock so the live today_partial query can never accidentally see these rows.
 _NOW_EPOCH = datetime(2030, 6, 4, 4, 0, tzinfo=timezone.utc).timestamp()
+# 2030-06-02 12:00 Beijing: with resident's 4h lag, 06-01 is the latest
+# closable day and therefore the first honest access-path day on a fresh run.
+_PATH_NOW_EPOCH = datetime(2030, 6, 2, 4, 0, tzinfo=timezone.utc).timestamp()
 
 
 def _insert_job(user_id: str, lane: str, status: str, *, finished: datetime,
@@ -83,6 +92,86 @@ def _beijing_today():
 def _cells(**filters) -> list[dict]:
     payload = db.admin_lane_rollup(**filters)
     return payload["rows"]
+
+
+def _freeze_resident_lane_days(**kwargs):
+    return db.freeze_completed_resident_lane_days(
+        binding_classifier=registry.connected_resident_user_ids,
+        **kwargs,
+    )
+
+
+def test_v1_freezer_uses_shared_terminal_predicates_without_sql_copies():
+    """The freezer must reference both shared predicates, never recopy words."""
+    source = Path(db.__file__).read_text()
+    module = ast.parse(source)
+    freezer = next(
+        node for node in module.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_lane_rollup_freeze_resident_day"
+    )
+    referenced_names = {
+        node.id for node in ast.walk(freezer) if isinstance(node, ast.Name)
+    }
+    assert {
+        "_LANE_ROLLUP_V1_OK_PRED",
+        "_LANE_ROLLUP_V1_FAIL_PRED",
+    } <= referenced_names
+
+    predicate_source = (
+        db._LANE_ROLLUP_V1_OK_PRED + db._LANE_ROLLUP_V1_FAIL_PRED
+    )
+    terminal_words = {
+        word
+        for word in re.findall(r"'([^']*)'", predicate_source)
+        if word not in {"", "status"}
+    }
+    assert terminal_words, "共享 V1 谓词必须导出非空终态词表"
+
+    handwritten = []
+    for node in ast.walk(freezer):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            continue
+        value = node.value
+        # ``completed`` / ``failed`` are also durable rollup count-column
+        # names.  Remove only those two lawful output-name positions before
+        # looking for copied status vocabulary; do not exempt the whole SQL
+        # literal, because a handwritten predicate could live beside them.
+        value = re.sub(
+            r"\bAS\s+(?:completed|failed)\b",
+            "AS <terminal_count>",
+            value,
+            flags=re.IGNORECASE,
+        )
+
+        def strip_rollup_insert_columns(match):
+            columns = re.sub(
+                r"\b(?:completed|failed)\b",
+                "<terminal_count>",
+                match.group(2),
+                flags=re.IGNORECASE,
+            )
+            return match.group(1) + columns + match.group(3)
+
+        value = re.sub(
+            r"(INSERT\s+INTO\s+lane_daily_rollup\s*\()(.*?)(\)\s*SELECT)",
+            strip_rollup_insert_columns,
+            value,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        copied_words = sorted(
+            word for word in terminal_words
+            if re.search(
+                rf"(?<![A-Za-z0-9_]){re.escape(word)}(?![A-Za-z0-9_])",
+                value,
+            )
+        )
+        if copied_words:
+            handwritten.append((node.value.strip(), copied_words))
+    assert not handwritten, (
+        "V1 freezer 不得重抄共享谓词的终态词；必须复用 OK/FAIL 谓词："
+        f"{handwritten!r}"
+    )
 
 
 @pytest.fixture()
@@ -171,15 +260,18 @@ def test_freeze_day_rerun_writes_nothing(clean_rollup):
         assert db._lane_rollup_freeze_day(conn, day=date(2030, 6, 1), zone=zone) == 0
 
 
-def test_failure_codes_collapse_free_text(clean_rollup):
+def test_failure_codes_collapse_free_text_and_log_diagnosis(clean_rollup, caplog):
     uid = "usr_rollup_sanitize"
     seed_user(uid)
     fin = datetime(2030, 6, 1, 2, 0, tzinfo=timezone.utc)
+    raw_reason = "Provider Error with prompt fragment"
+    assert not db._LANE_ROLLUP_CODE_RE.match(raw_reason)
     _insert_job(uid, "chat", "failed", finished=fin,
-                last_error="Traceback (most recent call last): boom")
+                last_error=raw_reason)
     _insert_job(uid, "chat", "failed", finished=fin,
                 last_error="turn_failed:empty_reply")
-    db.freeze_completed_lane_days(now_epoch=_NOW_EPOCH)
+    with caplog.at_level("WARNING", logger=db.log.name):
+        db.freeze_completed_lane_days(now_epoch=_NOW_EPOCH)
     (row,) = _cells(user_id=uid)
     assert row["failure_codes"] == {
         "runtime_failed": 1,
@@ -189,7 +281,11 @@ def test_failure_codes_collapse_free_text(clean_rollup):
     # user content) and a frozen forever-row — assert the regex is actually
     # the module's, not a lookalike.
     assert db._LANE_ROLLUP_CODE_RE.match("turn_failed:empty_reply")
-    assert not db._LANE_ROLLUP_CODE_RE.match("Traceback (most recent call last)")
+    assert raw_reason in caplog.text
+    assert "source=lane_rollup_v2" in caplog.text
+    assert f"user_id='{uid}'" in caplog.text
+    assert "lane='chat'" in caplog.text
+    assert "day=2030-06-01" in caplog.text
 
 
 def test_admin_lane_rollup_filters_and_pagination(clean_rollup):
@@ -257,12 +353,13 @@ def test_freeze_mirrors_each_day_as_one_atomic_group(clean_rollup, monkeypatch):
     assert all("INSERT INTO lane_daily_rollup" in s for s in cell_sqls)
     # Verbatim fidelity: the mirrored cell params are exactly the rows the
     # main path wrote (user, day, lane, counts) — not a lookalike rebuild.
-    # Param layout starts (day, lane, src, completed, failed, ...) and ENDS
+    # Param layout starts (day, lane, src, path, mode_source, completed,
+    # failed, ...) and ENDS
     # with uid, which feeds the users FOR KEY SHARE source select. uid is read
     # as p[-1], never a fixed index: adding a counted column shifts every
     # absolute position, and a hardcoded one turns a schema addition into a
     # mystery failure here instead of a real signal.
-    mirrored = {(p[-1], p[0], p[1], p[3], p[4]) for _, p in day1[:-1]}
+    mirrored = {(p[-1], p[0], p[1], p[5], p[6]) for _, p in day1[:-1]}
     stored = {(r["user_id"], r["day"], r["lane"], r["completed"], r["failed"])
               for r in _cells(user_id=uid)}
     assert mirrored == stored
@@ -407,7 +504,11 @@ def test_account_deletion_mirrors_the_anonymize_statements(clean_rollup, monkeyp
     (group,) = groups
     assert group[0][0].startswith("DELETE FROM users")
     tail = [sql for sql, _ in group[-2:]]
-    assert "ON CONFLICT (user_id, day, route, lane, enqueue_source) DO UPDATE" in tail[0]
+    normalized = " ".join(tail[0].split())
+    assert (
+        "ON CONFLICT (user_id, day, route, lane, enqueue_source, "
+        "access_path, mode_source) DO UPDATE"
+    ) in normalized
     assert tail[1].startswith("DELETE FROM lane_daily_rollup")
     # A user with no cells must NOT append the pair (mirror replay would be
     # wasted statements on every ordinary deletion).
@@ -508,7 +609,13 @@ def _log_job(user_id: str, *, stream: str = "proactive_jobs",
 
 
 def _seed_resident(user_id: str, route: str = "resident") -> None:
-    seed_user(user_id)
+    seed_user(user_id, access_bindings=[{
+        "binding_id": f"bind-{user_id}",
+        "access_mode": "resident",
+        "status": "connected",
+        "created_at": "2030-01-01T00:00:00Z",
+        "updated_at": "2030-01-01T00:00:00Z",
+    }])
     db.set_blob(user_id, "onboarding_route", {"route": route})
 
 
@@ -524,7 +631,7 @@ def test_resident_freeze_infers_lanes_like_the_events_page(clean_rollup):
     _log_job(uid, ts=t, status="completed", job_kind="memory_dream")
     _log_job(uid, ts=t, status="failed", job_kind="memory_capture",
              status_reason="extraction_failed:no_json_object")
-    db.freeze_completed_resident_lane_days(now_epoch=_NOW_EPOCH)
+    _freeze_resident_lane_days(now_epoch=_PATH_NOW_EPOCH)
     cells = {r["lane"]: r for r in _cells(user_id=uid)}
     assert cells["heartbeat"]["completed"] == 1
     assert cells["heartbeat"]["failed"] == 1
@@ -537,19 +644,356 @@ def test_resident_freeze_infers_lanes_like_the_events_page(clean_rollup):
                for r in _cells(user_id=uid))
 
 
-def test_resident_freeze_excludes_hosted_users(clean_rollup):
-    """hosted users' user_logs entries are a SECOND record of the same event
-    already frozen from agent_jobs. ⚠️ Folding them in does NOT collide on the
-    primary key — route is part of that key, so the insert succeeds and quietly
-    mints a phantom route='resident' cell for a hosted user: double-counted
-    across routes, and mislabelled. A silent extra row is worse than a raised
-    key violation. Only route='resident' belongs to this source."""
+def test_resident_freeze_preserves_status_aware_outcome_classes(clean_rollup):
+    """A shared reason shape cannot erase the status dimension.
+
+    The fixture assertion is load-bearing: without both statuses, replacing
+    the classifier with reason-only inference could stay green by coincidence.
+    """
+    uid = "usr_rollup_res_outcomes"
+    _seed_resident(uid)
+    t = datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc)
+    _log_job(uid, ts=t, status="skipped", kind="heartbeat_tick",
+             status_reason="heartbeat_throttled")
+    _log_job(uid, ts=t, status="failed", kind="heartbeat_tick",
+             status_reason="wake_failed:providererror")
+    with db.get_pool().connection() as conn:
+        statuses = {
+            str(row[0]) for row in conn.execute(
+                "SELECT doc->>'status' FROM user_logs "
+                "WHERE user_id=%s AND stream='proactive_jobs'",
+                (uid,),
+            ).fetchall()
+        }
+    assert statuses == {"failed", "skipped"}
+
+    _freeze_resident_lane_days(now_epoch=_PATH_NOW_EPOCH)
+    (cell,) = [r for r in _cells(user_id=uid) if r["lane"] == "heartbeat"]
+    assert cell["failed"] == 2
+    assert cell["operational_failures"] == 1
+    assert cell["control_outcomes"] == 1
+    assert cell["user_unavailable"] == 0
+    assert (
+        cell["operational_failures"]
+        + cell["control_outcomes"]
+        + cell["user_unavailable"]
+    ) == cell["failed"]
+
+
+def test_resident_freeze_logs_discarded_reason_without_leaking_cell(
+        clean_rollup, caplog):
+    uid = "usr_rollup_res_discarded_reason"
+    _seed_resident(uid)
+    t = datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc)
+    raw_reason = "Provider Error includes private prompt fragment"
+    assert not db._LANE_ROLLUP_CODE_RE.match(raw_reason)
+    _log_job(uid, ts=t, status="failed", kind="heartbeat_tick",
+             status_reason=raw_reason)
+    _log_job(uid, ts=t, status="failed", kind="heartbeat_tick",
+             status_reason=raw_reason)
+
+    with caplog.at_level("WARNING", logger=db.log.name):
+        _freeze_resident_lane_days(now_epoch=_NOW_EPOCH)
+
+    (cell,) = _cells(user_id=uid)
+    assert cell["failure_codes"] == {"runtime_failed": 2}
+    assert raw_reason in caplog.text
+    assert caplog.text.count(raw_reason) == 1
+    assert "source=lane_rollup_v1" in caplog.text
+    assert f"user_id='{uid}'" in caplog.text
+    assert "lane='heartbeat'" in caplog.text
+    assert "day=2030-06-01" in caplog.text
+    assert "count=2" in caplog.text
+
+
+def test_discarded_reason_operational_log_is_bounded(caplog):
+    raw_reason = "Provider Error " + ("x" * 600) + "END_SENTINEL"
+    assert not db._LANE_ROLLUP_CODE_RE.match(raw_reason)
+    with caplog.at_level("WARNING", logger=db.log.name):
+        assert db.content_free_failure_code(
+            raw_reason,
+            source="mutation_probe",
+            user_id="usr_probe",
+            lane="heartbeat",
+            day="2030-06-01",
+        ) == "runtime_failed"
+    assert "Provider Error" in caplog.text
+    assert "END_SENTINEL" not in caplog.text
+    assert "truncated=True" in caplog.text
+
+
+def test_resident_freeze_collects_hosted_v1_as_apikey_path(clean_rollup):
+    """Hosted V1 was the dominant missing population before T289.
+
+    The fixture proves both sides of the hierarchy: this user has a connected
+    resident binding *and* an eligible hosted route. Hosted qualification must
+    win, so the row is APIKey-V1 and can never leak into self_hosted.
+    """
     hosted = "usr_rollup_res_hosted"
     _seed_resident(hosted, route="model_api")
+    configure_model_api_route(hosted, provider="anthropic")
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM model_api_routes r JOIN model_api_credentials c "
+            "ON c.id=r.credential_id WHERE r.user_id=%s AND r.is_active "
+            "AND r.test_status='ok' AND lower(c.provider)=ANY(%s)",
+            (hosted, list(db.HOSTED_RUNTIME_SUPPORTED_PROVIDERS)),
+        ).fetchone()
+    assert hosted in registry.connected_resident_user_ids([db.load_user(hosted)])
     _log_job(hosted, ts=datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc),
              status="delivered", kind="heartbeat_tick")
-    db.freeze_completed_resident_lane_days(now_epoch=_NOW_EPOCH)
-    assert _cells(user_id=hosted) == []
+    _freeze_resident_lane_days(now_epoch=_PATH_NOW_EPOCH)
+    (cell,) = _cells(user_id=hosted)
+    assert cell["access_path"] == "apikey_v1"
+    assert cell["mode_source"] == "default"
+    assert cell["access_path"] != "self_hosted"
+
+
+def test_v1_path_layers_cover_self_hosted_and_unbound(clean_rollup):
+    connected = "usr_rollup_path_self"
+    unbound = "usr_rollup_path_unbound"
+    _seed_resident(connected)
+    seed_user(unbound)
+    db.set_blob(unbound, "onboarding_route", {"route": "resident"})
+    assert connected in registry.connected_resident_user_ids(
+        [db.load_user(connected)]
+    )
+    assert unbound not in registry.connected_resident_user_ids(
+        [db.load_user(unbound)]
+    )
+    t = datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc)
+    _log_job(connected, ts=t, status="delivered", kind="heartbeat_tick")
+    _log_job(unbound, ts=t, status="delivered", kind="heartbeat_tick")
+
+    _freeze_resident_lane_days(now_epoch=_PATH_NOW_EPOCH)
+    assert _cells(user_id=connected)[0]["access_path"] == "self_hosted"
+    assert _cells(user_id=unbound)[0]["access_path"] == "unbound_no_route"
+
+
+def test_hosted_v1_mode_source_preserves_explicit_vs_default(clean_rollup):
+    explicit = "usr_rollup_path_explicit"
+    defaulted = "usr_rollup_path_default"
+    for uid in (explicit, defaulted):
+        _seed_resident(uid, route="model_api")
+        configure_model_api_route(uid, provider="anthropic")
+    db.set_blob(explicit, "model_api_runtime", {
+        "hosted_runtime_mode": "resident_cli",
+    })
+    t = datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc)
+    _log_job(explicit, ts=t, status="delivered", kind="heartbeat_tick")
+    _log_job(defaulted, ts=t, status="delivered", kind="heartbeat_tick")
+
+    _freeze_resident_lane_days(now_epoch=_PATH_NOW_EPOCH)
+    explicit_cell = _cells(user_id=explicit)[0]
+    default_cell = _cells(user_id=defaulted)[0]
+    assert explicit_cell["access_path"] == default_cell["access_path"] == "apikey_v1"
+    assert explicit_cell["mode_source"] == "explicit"
+    assert default_cell["mode_source"] == "default"
+
+
+def test_explicit_v2_control_with_v1_source_is_visible_as_mismatch(clean_rollup):
+    uid = "usr_rollup_path_v2_mismatch"
+    _seed_resident(uid, route="model_api")
+    configure_model_api_route(uid, provider="anthropic")
+    db.set_blob(uid, "model_api_runtime", {
+        "hosted_runtime_mode": "db_action_v2",
+    })
+    _log_job(uid, ts=datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc),
+             status="delivered", kind="heartbeat_tick")
+
+    _freeze_resident_lane_days(now_epoch=_PATH_NOW_EPOCH)
+    (cell,) = _cells(user_id=uid)
+    assert cell["access_path"] == "v2_control_v1_source"
+    assert cell["mode_source"] == "explicit"
+    assert cell["access_path"] != "apikey_v2", (
+        "a V1-source anomaly must not be mixed into the authoritative V2 path"
+    )
+
+
+def test_binding_classifier_normalizes_legacy_docs_without_mutation():
+    raw = {
+        "user_id": "usr_rollup_legacy_binding",
+        "created_at": "2030-01-01T00:00:00Z",
+        "api_keys": [{
+            "key_id": "key-legacy",
+            "api_key_hash": "hash-legacy",
+            "access_mode": "server",
+            "created_at": "2030-01-01T00:00:00Z",
+            "revoked_at": "",
+        }],
+    }
+    before = copy.deepcopy(raw)
+    assert registry.connected_resident_user_ids([raw]) == {
+        "usr_rollup_legacy_binding"
+    }
+    assert raw == before, "pure classifier mutated its caller-owned document"
+
+
+def test_binding_classifier_has_no_registry_mutable_state_dependency():
+    source = Path(registry.__file__).read_text()
+    module = ast.parse(source)
+    classifier = next(
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "connected_resident_user_ids"
+    )
+    forbidden = {"_users", "_key_to_user", "_users_lock", "_resolve_neg_cache"}
+    referenced = {
+        node.id for node in ast.walk(classifier) if isinstance(node, ast.Name)
+    } | {
+        node.attr for node in ast.walk(classifier) if isinstance(node, ast.Attribute)
+    }
+    assert forbidden.isdisjoint(referenced), (
+        "classifier must use only injected docs, never registry mutable state"
+    )
+
+
+def test_v1_path_snapshot_uses_explicit_runtime_case_not_coalesce():
+    source = Path(db.__file__).read_text()
+    module = ast.parse(source)
+    classifier = next(
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_lane_rollup_v1_classification_snapshot"
+    )
+    sql_literals = [
+        node.value for node in ast.walk(classifier)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        and "hosted_runtime_mode" in node.value
+    ]
+    assert len(sql_literals) == 1
+    runtime_sql = sql_literals[0]
+    assert "CASE" in runtime_sql
+    assert "effective_runtime_mode" in runtime_sql
+    assert "mode_source" in runtime_sql
+    assert "COALESCE" not in runtime_sql
+
+
+def test_freezer_ignores_opposite_process_registry_cache(clean_rollup):
+    uid = "usr_rollup_stale_registry"
+    seed_user(uid)
+    db.set_blob(uid, "onboarding_route", {"route": "resident"})
+    # Make only the process cache claim a connected binding. The authoritative
+    # transaction document remains unbound; if the freezer reads _users this
+    # fixture flips to self_hosted and the test fails.
+    with registry._users_lock:
+        cached = next(u for u in registry._users if u.get("user_id") == uid)
+        cached["access_bindings"] = [{
+            "access_mode": "resident", "status": "connected",
+        }]
+    assert not (db.load_user(uid) or {}).get("access_bindings")
+    _log_job(uid, ts=datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc),
+             status="delivered", kind="heartbeat_tick")
+
+    _freeze_resident_lane_days(now_epoch=_PATH_NOW_EPOCH)
+    assert _cells(user_id=uid)[0]["access_path"] == "unbound_no_route"
+
+
+def test_empty_binding_set_is_success_and_advances_watermark(clean_rollup, caplog):
+    uid = "usr_rollup_empty_binding_success"
+    seed_user(uid)
+    db.set_blob(uid, "onboarding_route", {"route": "resident"})
+    _log_job(uid, ts=datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc),
+             status="delivered", kind="heartbeat_tick")
+
+    frozen = db.freeze_completed_resident_lane_days(
+        now_epoch=_PATH_NOW_EPOCH, binding_classifier=lambda _docs: set()
+    )
+    assert "2030-06-01" in frozen
+    assert all(
+        row["access_path"] != "self_hosted" for row in _cells(user_id=uid)
+    )
+    assert _cells(user_id=uid)[0]["access_path"] == "unbound_no_route"
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT through_day FROM lane_rollup_watermark WHERE route='resident'"
+        ).fetchone()[0] >= "2030-06-01"
+    assert "freeze_completed_resident_lane_days failed" not in caplog.text
+
+
+def test_first_path_freeze_does_not_reclassify_older_catchup_days(clean_rollup):
+    uid = "usr_rollup_no_path_backfill"
+    _seed_resident(uid)
+    _log_job(uid, ts=datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc),
+             status="delivered", kind="heartbeat_tick")
+    _log_job(uid, ts=datetime(2030, 6, 2, 3, 0, tzinfo=timezone.utc),
+             status="delivered", kind="heartbeat_tick")
+    # 06-02 is the latest closable day. 06-01 is historical catch-up and must
+    # retain the unavailable sentinel instead of receiving today's binding.
+    now = datetime(2030, 6, 3, 4, 0, tzinfo=timezone.utc).timestamp()
+    _freeze_resident_lane_days(now_epoch=now)
+
+    rows = {row["day"]: row for row in _cells(user_id=uid)}
+    assert rows["2030-06-01"]["access_path"] == "unavailable"
+    assert rows["2030-06-01"]["mode_source"] == "unavailable"
+    assert rows["2030-06-02"]["access_path"] == "self_hosted"
+    assert rows["2030-06-02"]["mode_source"] == "not_applicable"
+    assert db.admin_lane_rollup()["coverage"]["resident"][
+        "access_path_from"
+    ] == "2030-06-02"
+
+
+def test_day_retry_cannot_duplicate_a_cell_when_classification_drifts(clean_rollup):
+    """Crash recovery may rerun cells before their watermark was committed.
+
+    Path/mode are part of the anonymous aggregate key, but a live user still
+    has exactly one cell per original runtime key. The partial unique index is
+    what keeps a changed freeze-time snapshot from double-counting that retry.
+    """
+    uid = "usr_rollup_path_retry_drift"
+    _seed_resident(uid)
+    _log_job(uid, ts=datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc),
+             status="delivered", kind="heartbeat_tick")
+    with db.get_pool().connection() as conn:
+        first = db._lane_rollup_freeze_resident_day(
+            conn, day=date(2030, 6, 1), zone=ZoneInfo("Asia/Shanghai"),
+            classifications={uid: ("self_hosted", "not_applicable")},
+        )
+        retry = db._lane_rollup_freeze_resident_day(
+            conn, day=date(2030, 6, 1), zone=ZoneInfo("Asia/Shanghai"),
+            classifications={uid: ("unbound_no_route", "not_applicable")},
+        )
+    assert (first, retry) == (1, 0)
+    (cell,) = _cells(user_id=uid)
+    assert cell["access_path"] == "self_hosted"
+
+
+def test_binding_classifier_exception_aborts_identical_freeze(clean_rollup, caplog):
+    uid = "usr_rollup_binding_exception"
+    seed_user(uid)
+    db.set_blob(uid, "onboarding_route", {"route": "resident"})
+    _log_job(uid, ts=datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc),
+             status="delivered", kind="heartbeat_tick")
+
+    def fail(_docs):
+        raise RuntimeError("classifier unavailable")
+
+    with caplog.at_level("ERROR", logger=db.log.name):
+        assert db.freeze_completed_resident_lane_days(
+            now_epoch=_NOW_EPOCH, binding_classifier=fail
+        ) == []
+    assert _cells(user_id=uid) == []
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM lane_rollup_watermark WHERE route='resident'"
+        ).fetchone()[0] == 0
+    assert "classifier unavailable" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "classifier",
+    [None, lambda _docs: {"usr_unknown_from_classifier"}],
+)
+def test_binding_classifier_missing_or_unknown_id_aborts(
+        clean_rollup, classifier):
+    uid = "usr_rollup_binding_invalid"
+    seed_user(uid)
+    _log_job(uid, ts=datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc),
+             status="delivered", kind="heartbeat_tick")
+    assert db.freeze_completed_resident_lane_days(
+        now_epoch=_NOW_EPOCH, binding_classifier=classifier
+    ) == []
+    assert _cells(user_id=uid) == []
 
 
 def test_resident_freeze_buckets_by_terminal_time_and_diverges_from_events(
@@ -567,7 +1011,7 @@ def test_resident_freeze_buckets_by_terminal_time_and_diverges_from_events(
              ts=datetime(2030, 6, 1, 15, 58, tzinfo=timezone.utc),   # 06-01 23:58 北京
              terminal_at=datetime(2030, 6, 1, 16, 3, tzinfo=timezone.utc),  # 06-02 00:03
              status="delivered", kind="heartbeat_tick")
-    db.freeze_completed_resident_lane_days(now_epoch=_NOW_EPOCH)
+    _freeze_resident_lane_days(now_epoch=_NOW_EPOCH)
     (cell,) = _cells(user_id=uid)
     assert cell["day"] == "2030-06-02", "终态日才是结果发生的日子"
     board = db.admin_events_overview(day="2030-06-01", tz="Asia/Shanghai")
@@ -588,7 +1032,7 @@ def test_resident_freeze_survives_malformed_doc_timestamps(clean_rollup):
         "status": "delivered", "wake_kind": "heartbeat_tick",
         "created_at": ts.isoformat(), "completed_at": "2026-99-99T99:99:99Z",
     }, ts=ts.timestamp())
-    frozen = db.freeze_completed_resident_lane_days(now_epoch=_NOW_EPOCH)
+    frozen = _freeze_resident_lane_days(now_epoch=_NOW_EPOCH)
     assert "2030-06-01" in frozen
     (cell,) = _cells(user_id=uid)
     assert cell["completed"] == 1
@@ -609,7 +1053,7 @@ def test_resident_freeze_ignores_stale_terminal_fields(clean_rollup):
         "failed_at": ts.isoformat(),
         "status_reason": "wake_failed:providererror",
     }, ts=ts.timestamp())
-    db.freeze_completed_resident_lane_days(now_epoch=_NOW_EPOCH)
+    _freeze_resident_lane_days(now_epoch=_NOW_EPOCH)
     cells = {r["day"]: r for r in _cells(user_id=uid)}
     assert set(cells) == {"2030-06-02"}
     assert cells["2030-06-02"]["failed"] == 1
@@ -633,7 +1077,7 @@ def test_failure_codes_never_exceed_the_failed_count(clean_rollup):
              status_reason="extraction_failed:no_json_object")
     # 一次冻结覆盖两个用户:格子冻过的日子永不回访(冻结语义,4h lag 保证已关闭的
     # 日子不会再有新数据),所以先播完再冻,不能冻完再补播。
-    db.freeze_completed_resident_lane_days(now_epoch=_NOW_EPOCH)
+    _freeze_resident_lane_days(now_epoch=_NOW_EPOCH)
     (cell,) = [r for r in _cells(user_id=uid) if r["lane"] == "heartbeat"]
     assert cell["failed"] == 1
     assert sum(cell["failure_codes"].values()) == cell["failed"]
@@ -673,11 +1117,11 @@ def test_resident_freeze_lags_four_hours(clean_rollup):
     _log_job(uid, ts=datetime(2030, 6, 2, 3, 0, tzinfo=timezone.utc),
              status="delivered", kind="heartbeat_tick")
     at_0200 = datetime(2030, 6, 2, 18, 0, tzinfo=timezone.utc)   # 06-03 02:00 北京
-    frozen = db.freeze_completed_resident_lane_days(
+    frozen = _freeze_resident_lane_days(
         now_epoch=at_0200.timestamp())
     assert "2030-06-02" not in frozen
     at_0600 = datetime(2030, 6, 2, 22, 0, tzinfo=timezone.utc)   # 06-03 06:00 北京
-    frozen = db.freeze_completed_resident_lane_days(
+    frozen = _freeze_resident_lane_days(
         now_epoch=at_0600.timestamp())
     assert "2030-06-02" in frozen
 
@@ -691,7 +1135,7 @@ def test_resident_and_model_api_coexist_under_distinct_routes(clean_rollup):
     _insert_job(uid, "heartbeat", "completed", finished=fin)
     _log_job(uid, ts=fin, status="delivered", kind="heartbeat_tick")
     db.freeze_completed_lane_days(now_epoch=_NOW_EPOCH)
-    db.freeze_completed_resident_lane_days(now_epoch=_NOW_EPOCH)
+    _freeze_resident_lane_days(now_epoch=_NOW_EPOCH)
     routes = {r["route"] for r in _cells(user_id=uid)}
     assert routes == {"model_api", "resident"}
     assert len(db.admin_lane_rollup(user_id=uid, route="resident")["rows"]) == 1
@@ -703,7 +1147,7 @@ def test_resident_watermark_is_independent_of_model_api(clean_rollup):
     _seed_resident(uid)
     _log_job(uid, ts=datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc),
              status="delivered", kind="heartbeat_tick")
-    db.freeze_completed_resident_lane_days(now_epoch=_NOW_EPOCH)
+    _freeze_resident_lane_days(now_epoch=_NOW_EPOCH)
     cov = db.admin_lane_rollup()["coverage"]
     assert cov["resident"]["backfill_from"] == "2030-06-01"
     # 两条源各记各的水位:model_api 从未冻结过,所以没有 backfill_from/through_day,
@@ -717,8 +1161,8 @@ def test_resident_freeze_is_idempotent(clean_rollup):
     _seed_resident(uid)
     _log_job(uid, ts=datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc),
              status="delivered", kind="heartbeat_tick")
-    assert db.freeze_completed_resident_lane_days(now_epoch=_NOW_EPOCH)
-    assert db.freeze_completed_resident_lane_days(now_epoch=_NOW_EPOCH) == []
+    assert _freeze_resident_lane_days(now_epoch=_NOW_EPOCH)
+    assert _freeze_resident_lane_days(now_epoch=_NOW_EPOCH) == []
     assert len(_cells(user_id=uid)) == 1
 
 
@@ -728,7 +1172,7 @@ def test_resident_deleted_user_cells_are_anonymized_too(clean_rollup):
     _log_job(uid, ts=datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc),
              status="failed", kind="heartbeat_tick",
              status_reason="wake_failed:providererror")
-    db.freeze_completed_resident_lane_days(now_epoch=_NOW_EPOCH)
+    _freeze_resident_lane_days(now_epoch=_NOW_EPOCH)
     assert db.delete_user(uid) is True
     assert _cells(user_id=uid) == []
     (anon,) = _cells(user_id=db._LANE_ROLLUP_DELETED_USER)
@@ -771,6 +1215,444 @@ def test_live_topup_declares_what_it_refuses_to_scan(clean_rollup):
     assert (today_bj - cutoff).days == db._LANE_ROLLUP_LIVE_MAX_DAYS - 1
 
 
+def test_event_path_windows_use_closed_days_and_declare_partial_coverage(
+        clean_rollup):
+    """24h/7d share one fixed Beijing endpoint; missing days are not zero."""
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO lane_daily_rollup
+              (user_id, day, route, lane, completed, failed, expired, superseded,
+               failure_codes)
+            VALUES
+              ('usr_event_master', '2030-06-01', 'resident', 'heartbeat', 3, 1, 0, 0,
+               '{"unknown":1}'::jsonb),
+              ('usr_event_master', '2030-06-07', 'resident', 'heartbeat', 5, 0, 0, 0,
+               '{}'::jsonb),
+              ('usr_event_master', '2030-06-07', 'model_api', 'chat', 6, 4, 0, 2,
+               '{"extraction_failed:quota_insufficient":1,
+                 "extraction_failed:upstream_unavailable":3}'::jsonb)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO lane_rollup_watermark (route, backfill_from, through_day)
+            VALUES
+              ('resident', '2030-06-01', '2030-06-07'),
+              ('model_api', '2030-06-06', '2030-06-07')
+            """
+        )
+
+    payload = db.admin_event_path_rollup_windows(through_day="2030-06-07")
+    windows = {row["key"]: row for row in payload["windows"]}
+
+    assert windows["24h"]["start_day"] == "2030-06-07"
+    assert windows["24h"]["end_day"] == "2030-06-07"
+    assert windows["7d"]["start_day"] == "2030-06-01"
+    assert windows["7d"]["end_day"] == "2030-06-07"
+    assert windows["24h"]["routes"]["model_api"]["coverage"]["level"] == "green"
+    assert windows["7d"]["routes"]["model_api"]["coverage"] == {
+        "level": "yellow",
+        "covered_days": 2,
+        "required_days": 7,
+        "backfill_from": "2030-06-06",
+        "through_day": "2030-06-07",
+        "outcomes_from": None,
+        "outcome_level": "yellow",
+        "outcome_covered_days": 2,
+    }
+    assert windows["7d"]["routes"]["resident"]["lanes"]["heartbeat"] == {
+        "completed": 8, "failed": 1, "expired": 0, "superseded": 0,
+        "operational_failures": 0, "control_outcomes": 0,
+        "user_unavailable": 0,
+        "failure_codes": {"unknown": 1},
+        "concentration": {
+            "users_active": 1,
+            "users_zero_success": 0,
+            "top_user_failure_share": 1.0,
+        },
+    }
+    assert windows["24h"]["routes"]["model_api"]["lanes"]["chat"] == {
+        "completed": 6, "failed": 4, "expired": 0, "superseded": 2,
+        "operational_failures": 0, "control_outcomes": 0,
+        "user_unavailable": 0,
+        "failure_codes": {
+            "extraction_failed:quota_insufficient": 1,
+            "extraction_failed:upstream_unavailable": 3,
+        },
+        "concentration": {
+            "users_active": 1,
+            "users_zero_success": 0,
+            "top_user_failure_share": 1.0,
+        },
+    }
+    assert windows["24h"]["routes"]["resident"]["lanes"]["heartbeat"][
+        "concentration"
+    ] == {
+        "users_active": 1,
+        "users_zero_success": 0,
+        "top_user_failure_share": None,
+    }
+
+
+def test_v1_rate_requires_full_outcome_watermark_and_excludes_control(
+        clean_rollup):
+    """New classified cells produce a rate; old defaults remain unavailable."""
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO lane_daily_rollup
+              (user_id, day, route, lane, completed, failed,
+               operational_failures, control_outcomes, user_unavailable)
+            VALUES
+              ('usr_v1_history', '2030-06-01', 'resident', 'heartbeat', 4, 0,
+               0, 0, 0),
+              ('usr_v1_current', '2030-06-07', 'resident', 'heartbeat', 5, 3,
+               1, 1, 1)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO lane_rollup_watermark
+              (route, backfill_from, through_day, outcomes_from)
+            VALUES ('resident', '2030-06-01', '2030-06-07', '2030-06-07')
+            """
+        )
+
+    frozen = db.admin_event_path_rollup_windows(through_day="2030-06-07")
+    windows = {row["key"]: row for row in frozen["windows"]}
+    old_day = date.fromisoformat(windows["7d"]["start_day"])
+    outcomes_from = date.fromisoformat(
+        windows["7d"]["routes"]["resident"]["coverage"]["outcomes_from"]
+    )
+    assert old_day < outcomes_from, "fixture 必须真的跨过 outcome 水位"
+    assert windows["24h"]["routes"]["resident"]["coverage"][
+        "outcome_level"
+    ] == "green"
+    assert windows["7d"]["routes"]["resident"]["coverage"][
+        "outcome_level"
+    ] == "yellow"
+
+    master = data_track._event_path_master_payload(frozen)
+    master_windows = {row["key"]: row for row in master["runtime_windows"]}
+    one_day = next(
+        row for row in master_windows["24h"]["rows"]
+        if row["key"] == "heartbeat"
+    )["cells"]["runtime_v1"]
+    seven_day = next(
+        row for row in master_windows["7d"]["rows"]
+        if row["key"] == "heartbeat"
+    )["cells"]["runtime_v1"]
+    assert one_day["state"] == "metric"
+    assert one_day["raw_non_success"] == 3
+    assert one_day["failure"] == 1
+    assert one_day["control_outcomes"] == 1
+    assert one_day["user_unavailable"] == 1
+    assert one_day["denominator"] == 6
+    assert seven_day["state"] == "unavailable"
+    assert seven_day["coverage"] == "yellow"
+    assert "过去的日子没有回填" in seven_day["detail"]
+    assert "denominator" not in seven_day
+
+
+def test_v1_rate_is_withheld_when_frozen_outcomes_do_not_conserve_failed(
+        clean_rollup):
+    """A partial outcome split must not publish a plausible-looking rate."""
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO lane_daily_rollup
+              (user_id, day, route, lane, completed, failed,
+               operational_failures, control_outcomes, user_unavailable)
+            VALUES
+              ('usr_v1_incomplete', '2030-06-07', 'resident', 'heartbeat', 5, 3,
+               1, 1, 0)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO lane_rollup_watermark
+              (route, backfill_from, through_day, outcomes_from)
+            VALUES ('resident', '2030-06-07', '2030-06-07', '2030-06-07')
+            """
+        )
+
+    frozen = db.admin_event_path_rollup_windows(through_day="2030-06-07")
+    window = next(row for row in frozen["windows"] if row["key"] == "24h")
+    counts = window["routes"]["resident"]["lanes"]["heartbeat"]
+    classified = (
+        counts["operational_failures"]
+        + counts["control_outcomes"]
+        + counts["user_unavailable"]
+    )
+    failed = counts["failed"]
+    assert classified == 2
+    assert failed == 3
+    assert classified != failed, "fixture 必须真的构造出不守恒的冻结格子"
+
+    master = data_track._event_path_master_payload(frozen)
+    master_window = next(
+        row for row in master["runtime_windows"] if row["key"] == "24h"
+    )
+    cell = next(
+        row for row in master_window["rows"] if row["key"] == "heartbeat"
+    )["cells"]["runtime_v1"]
+    assert cell["state"] == "unavailable"
+    assert "不守恒" in cell["detail"]
+    assert "denominator" not in cell
+
+
+def test_event_path_window_active_users_are_distinct_across_days(clean_rollup):
+    """Route populations dedupe one active user appearing on several days."""
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO lane_daily_rollup
+              (user_id, day, route, lane, completed)
+            VALUES
+              ('usr_resident_a', '2030-06-01', 'resident', 'heartbeat', 1),
+              ('usr_resident_a', '2030-06-07', 'resident', 'heartbeat', 1),
+              ('usr_resident_a', '2030-06-07', 'resident', 'capture', 1),
+              ('usr_resident_b', '2030-06-01', 'resident', 'heartbeat', 1),
+              ('usr_resident_b', '2030-06-07', 'resident', 'heartbeat', 1),
+              ('usr_resident_b', '2030-06-07', 'resident', 'capture', 1),
+              ('usr_model_a', '2030-06-01', 'model_api', 'chat', 1),
+              ('usr_model_a', '2030-06-07', 'model_api', 'chat', 1),
+              ('usr_model_a', '2030-06-07', 'model_api', 'capture', 1),
+              ('usr_model_b', '2030-06-01', 'model_api', 'chat', 1),
+              ('usr_model_b', '2030-06-07', 'model_api', 'chat', 1),
+              ('usr_model_b', '2030-06-07', 'model_api', 'capture', 1)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO lane_rollup_watermark (route, backfill_from, through_day)
+            VALUES
+              ('resident', '2030-06-01', '2030-06-07'),
+              ('model_api', '2030-06-01', '2030-06-07')
+            """
+        )
+        repeated = {
+            (str(route), str(user_id)): (int(day_count), int(row_count))
+            for route, user_id, day_count, row_count in conn.execute(
+                """
+                SELECT route, user_id, count(DISTINCT day), count(*)
+                FROM lane_daily_rollup
+                GROUP BY route, user_id
+                ORDER BY route, user_id
+                """
+            ).fetchall()
+        }
+
+    # Prove the mutation fixture before trusting the result: every user occurs
+    # on two days and in two lanes on the endpoint day.  Dropping DISTINCT from
+    # either the 24h or 7d product count must therefore change the result.
+    assert repeated == {
+        ("model_api", "usr_model_a"): (2, 3),
+        ("model_api", "usr_model_b"): (2, 3),
+        ("resident", "usr_resident_a"): (2, 3),
+        ("resident", "usr_resident_b"): (2, 3),
+    }
+
+    payload = db.admin_event_path_rollup_windows(through_day="2030-06-07")
+    windows = {row["key"]: row for row in payload["windows"]}
+    for key in ("24h", "7d"):
+        assert windows[key]["routes"]["resident"]["active_users"] == 2
+        assert windows[key]["routes"]["model_api"]["active_users"] == 2
+
+
+def test_event_path_concentration_is_window_distinct_and_lane_scoped(
+        clean_rollup):
+    """Concentration is one (route, lane, whole-window) fact, never daily sums.
+
+    Two routes make accidental cross-route grouping visible.  Two lanes per
+    route make ``GROUP BY route`` visibly wrong.  The ``*_repeat`` users span
+    two days and never complete in heartbeat, so dropping window-level user
+    grouping or the zero-success predicate must also change the result.
+    """
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO lane_daily_rollup
+              (user_id, day, route, lane, enqueue_source, completed, failed)
+            VALUES
+              ('res_repeat', '2030-06-01', 'resident', 'heartbeat', '', 0, 2),
+              ('res_repeat', '2030-06-07', 'resident', 'heartbeat', '', 0, 3),
+              ('res_ok',     '2030-06-07', 'resident', 'heartbeat', '', 2, 1),
+              ('res_other',  '2030-06-07', 'resident', 'capture',   '', 1, 4),
+              ('v2_repeat',  '2030-06-01', 'model_api', 'heartbeat',
+               'clock', 0, 4),
+              ('v2_repeat',  '2030-06-07', 'model_api', 'heartbeat',
+               'clock', 0, 2),
+              ('v2_ok',      '2030-06-07', 'model_api', 'heartbeat',
+               'perception', 3, 1),
+              ('v2_other',   '2030-06-07', 'model_api', 'capture', '', 1, 5)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO lane_rollup_watermark (route, backfill_from, through_day)
+            VALUES
+              ('resident', '2030-06-01', '2030-06-07'),
+              ('model_api', '2030-06-06', '2030-06-07')
+            """
+        )
+        repeated = conn.execute(
+            """
+            SELECT route, lane, user_id, count(DISTINCT day)::int
+            FROM lane_daily_rollup
+            GROUP BY route, lane, user_id
+            HAVING count(DISTINCT day) > 1
+            ORDER BY route, lane, user_id
+            """
+        ).fetchall()
+        zero_success = conn.execute(
+            """
+            SELECT route, lane, user_id
+            FROM lane_daily_rollup
+            GROUP BY route, lane, user_id
+            HAVING sum(completed) = 0 AND sum(failed) > 0
+            ORDER BY route, lane, user_id
+            """
+        ).fetchall()
+
+    # Fixture anchors: without these, DISTINCT/zero-success mutations can green
+    # by coincidence while testing no repeated or persistently failing user.
+    assert repeated == [
+        ("model_api", "heartbeat", "v2_repeat", 2),
+        ("resident", "heartbeat", "res_repeat", 2),
+    ]
+    assert zero_success == [
+        ("model_api", "heartbeat", "v2_repeat"),
+        ("resident", "heartbeat", "res_repeat"),
+    ]
+
+    payload = db.admin_event_path_rollup_windows(through_day="2030-06-07")
+    windows = {row["key"]: row for row in payload["windows"]}
+
+    resident_7d = windows["7d"]["routes"]["resident"]
+    assert resident_7d["coverage"]["level"] == "green"
+    assert resident_7d["lanes"]["heartbeat"]["concentration"] == {
+        "users_active": 2,
+        "users_zero_success": 1,
+        "top_user_failure_share": pytest.approx(5 / 6),
+    }
+    assert resident_7d["lanes"]["capture"]["concentration"] == {
+        "users_active": 1,
+        "users_zero_success": 0,
+        "top_user_failure_share": 1.0,
+    }
+
+    # The endpoint-day window still dedupes by user and uses only that day.
+    resident_24h = windows["24h"]["routes"]["resident"]
+    assert resident_24h["lanes"]["heartbeat"]["concentration"] == {
+        "users_active": 2,
+        "users_zero_success": 1,
+        "top_user_failure_share": pytest.approx(3 / 4),
+    }
+
+    # model_api is green for 24h but yellow for 7d.  Partial coverage may keep
+    # raw counts for diagnostics, but must not publish a plausible concentration.
+    model_24h = windows["24h"]["routes"]["model_api"]
+    model_7d = windows["7d"]["routes"]["model_api"]
+    assert model_24h["coverage"]["level"] == "green"
+    assert model_24h["lanes"]["heartbeat"]["concentration"] == {
+        "users_active": 2,
+        "users_zero_success": 1,
+        "top_user_failure_share": pytest.approx(2 / 3),
+    }
+    # The contract is deliberately route+lane, not enqueue_source.  Both
+    # heartbeat action cells receive the same lane-level context instead of
+    # silently presenting source populations as lane populations.
+    for source in ("clock", "perception"):
+        assert model_24h["lane_sources"]["heartbeat"][source][
+            "concentration"
+        ] == model_24h["lanes"]["heartbeat"]["concentration"]
+    assert model_7d["coverage"]["level"] == "yellow"
+    assert "concentration" not in model_7d["lanes"]["heartbeat"]
+
+    # Contract seam: use this real DB payload all the way through the admin
+    # payload builder and HTML renderer.  Raw-shape assertions above pin the
+    # key and level; this additionally proves the consumer reads that exact
+    # contract.  Assert the property, not a cell count: one route fact is
+    # correctly reused by both the access-path and runtime-family tables.
+    master = data_track._event_path_master_payload(payload)
+    html_out = data_track._render_event_master_tables(master)
+    concentration_cells = [
+        cell for cell in html_out.split("<td>") if "零成功" in cell
+    ]
+    assert concentration_cells, "真实冻结 payload 渲染后没有集中度数字"
+    assert all(
+        "集中度未计算" not in cell for cell in concentration_cells
+    )
+
+
+def test_event_path_windows_distinguish_covered_zero_from_no_source(clean_rollup):
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO lane_rollup_watermark (route, backfill_from, through_day) "
+            "VALUES ('resident', '2030-06-01', '2030-06-07')"
+        )
+
+    payload = db.admin_event_path_rollup_windows(through_day="2030-06-07")
+    one_day = next(row for row in payload["windows"] if row["key"] == "24h")
+    assert one_day["routes"]["resident"]["coverage"]["level"] == "green"
+    assert one_day["routes"]["resident"]["active_users"] == 0
+    assert one_day["routes"]["resident"]["lanes"] == {}
+    assert one_day["routes"]["model_api"]["coverage"]["level"] == "red"
+
+
+def test_event_path_windows_reject_invalid_day(clean_rollup):
+    with pytest.raises(ValueError):
+        db.admin_event_path_rollup_windows(through_day="2030/06/07")
+
+
+def test_access_path_waterline_keeps_pre_migration_days_unavailable(clean_rollup):
+    uid = "usr_rollup_path_waterline"
+    seed_user(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO lane_daily_rollup
+                (user_id, day, route, lane, enqueue_source,
+                 access_path, mode_source, completed, failed)
+            VALUES (%s, '2030-06-07', 'resident', 'heartbeat', '',
+                    'apikey_v1', 'default', 1, 0)
+            """,
+            (uid,),
+        )
+        conn.execute(
+            """
+            INSERT INTO lane_rollup_watermark
+                (route, backfill_from, through_day, outcomes_from,
+                 access_path_from)
+            VALUES ('resident', '2030-06-01', '2030-06-07',
+                    '2030-06-01', '2030-06-07')
+            """
+        )
+
+    before = data_track._event_path_master_payload(
+        db.admin_event_path_rollup_windows(through_day="2030-06-06")
+    )
+    before_24h = next(w for w in before["windows"] if w["key"] == "24h")
+    before_hb = next(r for r in before_24h["rows"] if r["key"] == "heartbeat")
+    assert before_hb["cells"]["apikey_v1"]["state"] == "coverage_gap"
+    assert before_hb["cells"]["apikey_v1"]["covered_days"] == 0
+
+    after = data_track._event_path_master_payload(
+        db.admin_event_path_rollup_windows(through_day="2030-06-07")
+    )
+    after_24h = next(w for w in after["windows"] if w["key"] == "24h")
+    after_hb = next(r for r in after_24h["rows"] if r["key"] == "heartbeat")
+    assert after_hb["cells"]["apikey_v1"]["state"] == "metric"
+    assert after_24h["active_users"]["apikey_v1"] == 1
+    assert after_24h["mode_sources"]["apikey_v1"]["default"]["active_users"] == 1
+    rendered = data_track._render_event_master_tables(after)
+    assert "此列自 2030-06-07 起有效" in rendered
+    assert "显式 0 / 默认 1" in rendered
+    assert "此前无数据不等于 0" in rendered
+
+
 def test_resident_rollup_agrees_with_the_events_page(clean_rollup):
     """Cross-check against the surface these numbers must not contradict.
 
@@ -785,7 +1667,7 @@ def test_resident_rollup_agrees_with_the_events_page(clean_rollup):
     t = datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc)
     for status in ("delivered", "completed", "failed", "skipped"):
         _log_job(uid, ts=t, status=status, kind="heartbeat_tick")
-    db.freeze_completed_resident_lane_days(now_epoch=_NOW_EPOCH)
+    _freeze_resident_lane_days(now_epoch=_NOW_EPOCH)
     (cell,) = [r for r in _cells(user_id=uid) if r["lane"] == "heartbeat"]
     board = db.admin_events_overview(day="2030-06-01", tz="Asia/Shanghai")
     (hb,) = [p for p in board["proactive"]
@@ -816,7 +1698,7 @@ def test_late_terminating_job_lands_on_its_terminal_day_and_leaves_stuck(
             " VALUES ('resident', %s, %s)",
             ((creation_day - timedelta(days=1)).isoformat(),
              (creation_day - timedelta(days=1)).isoformat()))
-    db.freeze_completed_resident_lane_days()
+    _freeze_resident_lane_days()
     before = db.admin_lane_rollup(user_id=uid)
     wm = before["coverage"]["resident"]
     assert wm["through_day"] > creation_day.isoformat(), (
@@ -1175,14 +2057,30 @@ def test_endpoint_passes_filters_through(admin_env, monkeypatch):
 
 def test_scheduler_tick_delegates_with_beijing_tz(monkeypatch):
     calls = []
+    resident_calls = []
 
     def freeze(*, now_epoch=None, tz):
         calls.append((now_epoch, tz))
         return ["2030-06-03"]
 
     monkeypatch.setattr(sched.db, "freeze_completed_lane_days", freeze)
+    monkeypatch.setattr(
+        sched.db,
+        "freeze_completed_resident_lane_days",
+        lambda *, now_epoch=None, tz, binding_classifier: resident_calls.append(
+            (now_epoch, tz, binding_classifier)
+        ) or [],
+    )
+    monkeypatch.setattr(
+        sched.db, "freeze_completed_chat_days", lambda **_kwargs: []
+    )
     assert sched._tick(now_epoch=123.0) == ["2030-06-03"]
     assert calls == [(123.0, "Asia/Shanghai")]
+    assert resident_calls == [(
+        123.0,
+        "Asia/Shanghai",
+        registry.connected_resident_user_ids,
+    )]
 
 
 def test_scheduler_start_spawns_daemon_thread(monkeypatch):
@@ -1445,7 +2343,7 @@ def test_resident_spoke_follows_the_chat_row_not_the_posted_status(clean_rollup)
     _log_job_id(uid, job_id="pj-quiet", ts=t, status="completed",
                 kind="heartbeat_tick")
 
-    db.freeze_completed_resident_lane_days(now_epoch=_NOW_EPOCH)
+    _freeze_resident_lane_days(now_epoch=_NOW_EPOCH)
     (cell,) = [r for r in _cells(user_id=uid) if r["lane"] == "heartbeat"]
     assert cell["completed"] == 4
     assert cell["spoke"] == 1
@@ -1525,7 +2423,7 @@ def test_resident_spoke_survives_a_terminal_patch_days_after_delivery(clean_roll
                       kind="heartbeat_tick", terminal_at=terminal_on)
     _post_proactive_reply(uid, job, ts=delivered_on)
 
-    db.freeze_completed_resident_lane_days(now_epoch=_NOW_EPOCH)
+    _freeze_resident_lane_days(now_epoch=_NOW_EPOCH)
     cells = {(r["day"], r["lane"]): r for r in _cells(user_id=uid)}
     cell = cells[("2030-06-01", "heartbeat")]
     assert cell["completed"] == 1

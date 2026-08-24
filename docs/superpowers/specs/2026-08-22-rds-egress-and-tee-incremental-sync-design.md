@@ -59,7 +59,7 @@ For TEE synchronization, make the existing durable dirty-key outbox the real-tim
 
 ## 5. Chat change-control schema
 
-Add primary-database migration `0098_chat_change_events` with:
+Add primary-database migration `0101_chat_change_events` with:
 
 ```sql
 CREATE TABLE chat_change_state (
@@ -89,7 +89,7 @@ Install separate AFTER STATEMENT INSERT, UPDATE, and DELETE triggers using trans
 
 The trigger records changes only while the corresponding `users` row still exists. A `users` deletion already removes all cached business state and cascades through `chat_messages`; its internal cascade must not recreate change-control rows or fail its foreign-key checks.
 
-No `doc` or ciphertext is placed in the event table or notification. Trigger DDL is additive. The two change-control tables are registered as `SKIP + required_in_tee`: their RDS history is not replicated because versions are meaningful only within one primary database's write sequence, while TEE migration `0034_chat_poll_index` installs the same tables, triggers, and poll index so a promoted TEE primary produces its own local sequence.
+No `doc` or ciphertext is placed in the event table or notification. Trigger DDL is additive. The two change-control tables are registered as `SKIP + required_in_tee`: their RDS history is not replicated because versions are meaningful only within one primary database's write sequence, while TEE migration `0037_chat_poll_index` installs the same tables, triggers, and poll index so a promoted TEE primary produces its own local sequence.
 
 ## 6. Chat worker consistency model
 

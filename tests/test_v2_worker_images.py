@@ -1,4 +1,6 @@
+import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -128,7 +130,7 @@ def test_dedicated_image_becomes_untrusted_observation_not_raw_pixels():
         raw_reads.append((user_id, message_ids))
         return {"m1": {"image_mime": "image/png", "image_b64": "RAW"}}
 
-    def observe(user_id, targets):
+    def observe(user_id, targets, **_kwargs):
         observer_calls.append((user_id, targets))
         return {"m1": "A blue chart with a rising line."}
 
@@ -151,13 +153,24 @@ def test_dedicated_image_becomes_untrusted_observation_not_raw_pixels():
     assert "image_url" not in out[0]["content"]
 
 
-def test_dedicated_observer_failure_is_explicit_and_never_falls_back():
+def test_dedicated_persistent_failure_never_sends_pixels_to_main():
     tail = [{**_img_row("m1"), "vision_route_id": "vision-route"}]
 
-    def observe(_user_id, _targets):
-        raise RuntimeError("provider down")
+    def observe(_user_id, _targets, **_kwargs):
+        return worker.VisionObservationBatch(
+            outcomes={
+                "m1": worker.VisionObservationOutcome(
+                    error_code="vision_model_auth_invalid",
+                    provider="dedicated",
+                    model="vision/model",
+                    status_code=401,
+                )
+            },
+            absolute_deadline=time.monotonic() + 30,
+            main_vision_verified=True,
+        )
 
-    with pytest.raises(worker.DedicatedVisionUnavailable):
+    with pytest.raises(worker.DedicatedVisionUnavailable) as caught:
         worker._inject_tail_images(
             tail,
             user_id="u",
@@ -166,12 +179,19 @@ def test_dedicated_observer_failure_is_explicit_and_never_falls_back():
             read_vision_observations=observe,
         )
 
+    assert caught.value.error_code == "vision_model_auth_invalid"
+    assert caught.value.provider == "dedicated"
+    assert caught.value.model == "vision/model"
+    assert caught.value.status_code == 401
+
 
 def test_dedicated_observer_failure_keeps_safe_reason_code():
     tail = [{**_img_row("m1"), "vision_route_id": "vision-route"}]
 
     class ObserverFailure(RuntimeError):
         error_code = "vision_model_auth_invalid"
+        status_code = 401
+        upstream_detail = "UPSTREAM_SECRET_NOT_TENANT_VISIBLE"
 
     with pytest.raises(worker.DedicatedVisionUnavailable) as caught:
         worker._inject_tail_images(
@@ -179,15 +199,18 @@ def test_dedicated_observer_failure_keeps_safe_reason_code():
             user_id="u",
             read_images=lambda *_args: pytest.fail("raw fallback is forbidden"),
             active_image_ids={"m1"},
-            read_vision_observations=lambda *_args: (_ for _ in ()).throw(
+            read_vision_observations=lambda *_args, **_kwargs: (_ for _ in ()).throw(
                 ObserverFailure("secret provider response")
             ),
         )
 
     assert caught.value.error_code == "vision_model_auth_invalid"
+    assert caught.value.status_code == 401
+    assert caught.value.upstream_detail == "UPSTREAM_SECRET_NOT_TENANT_VISIBLE"
     assert worker._safe_failure_code("turn_failed", caught.value) == (
         "turn_failed:vision_model_auth_invalid"
     )
+    assert "UPSTREAM_SECRET_NOT_TENANT_VISIBLE" not in str(caught.value)
 
 
 def test_historical_dedicated_image_is_not_observed_or_resent():
@@ -229,7 +252,7 @@ def test_current_dedicated_image_does_not_rehydrate_historical_follow_main_pixel
         user_id="u",
         read_images=lambda *_args: pytest.fail("historical pixels must not be read"),
         active_image_ids={"current"},
-        read_vision_observations=lambda _user_id, _targets: {
+        read_vision_observations=lambda _user_id, _targets, **_kwargs: {
             "current": "A red square."
         },
     )
@@ -237,3 +260,169 @@ def test_current_dedicated_image_does_not_rehydrate_historical_follow_main_pixel
     assert out[0]["content"] == "旧图"
     assert "UNTRUSTED VISUAL OBSERVATION" in out[1]["content"]
     assert "A red square." in out[1]["content"]
+
+
+def test_verified_main_fallback_reads_only_failed_target_pixels_in_mixed_batch():
+    tail = [
+        {**_img_row("ok"), "vision_route_id": "vision-a"},
+        {**_img_row("fallback"), "vision_route_id": "vision-b"},
+    ]
+    deadline = time.monotonic() + 30
+    reads = []
+    traces = []
+    state = worker.VisionFallbackState()
+    observer_calls = 0
+
+    def observe(_user_id, _targets, **kwargs):
+        nonlocal observer_calls
+        observer_calls += 1
+        assert kwargs["main_provider_config"] == "main-config"
+        return worker.VisionObservationBatch(
+            outcomes={
+                "ok": worker.VisionObservationOutcome(
+                    observation="A green checkmark."
+                ),
+                "fallback": worker.VisionObservationOutcome(
+                    error_code="vision_model_unavailable",
+                    provider="dedicated",
+                    model="vision/model",
+                    status_code=502,
+                ),
+            },
+            absolute_deadline=deadline,
+            main_vision_verified=True,
+        )
+
+    def read_images(user_id, message_ids):
+        reads.append((user_id, list(message_ids)))
+        return {
+            "fallback": {"image_mime": "image/png", "image_b64": "RAW-FALLBACK"},
+            "ok": {"image_mime": "image/png", "image_b64": "RAW-MUST-NOT-SEND"},
+        }
+
+    out = worker._inject_tail_images(
+        tail,
+        user_id="u",
+        read_images=read_images,
+        active_image_ids={"ok", "fallback"},
+        read_vision_observations=observe,
+        main_provider_config="main-config",
+        vision_fallback_state=state,
+        emit_debug_trace=lambda user_id, event_type, **kwargs: traces.append(
+            {"user_id": user_id, "type": event_type, **kwargs}
+        ),
+    )
+
+    assert reads == [("u", ["fallback"])]
+    assert isinstance(out[0]["content"], str)
+    assert "A green checkmark." in out[0]["content"]
+    assert "RAW-MUST-NOT-SEND" not in json.dumps(out)
+    assert out[1]["content"][-1]["image_url"]["url"] == (
+        "data:image/png;base64,RAW-FALLBACK"
+    )
+    assert state.absolute_deadline == deadline
+    assert state.selected_count == 1
+    assert traces[0]["type"] == "vision.fallback.evaluated"
+    assert traces[0]["detail"] == {
+        "eligible_failure_count": 1,
+        "main_vision_verified": True,
+        "remaining_budget": "positive",
+        "selected_count": 1,
+        "skipped_reason": "none",
+    }
+    serialized = json.dumps(traces)
+    assert "RAW-FALLBACK" not in serialized
+    assert "RAW-MUST-NOT-SEND" not in serialized
+    assert "A green checkmark." not in serialized
+    assert "message_id" not in serialized
+
+    rebuilt = worker._inject_tail_images(
+        tail,
+        user_id="u",
+        read_images=read_images,
+        active_image_ids={"ok", "fallback"},
+        read_vision_observations=observe,
+        main_provider_config="main-config",
+        vision_fallback_state=state,
+        emit_debug_trace=lambda user_id, event_type, **kwargs: traces.append(
+            {"user_id": user_id, "type": event_type, **kwargs}
+        ),
+    )
+
+    assert rebuilt == out
+    assert observer_calls == 1
+    assert state.absolute_deadline == deadline
+    assert state.selected_count == 1
+    assert len(traces) == 1
+    assert reads == [("u", ["fallback"]), ("u", ["fallback"])]
+
+
+@pytest.mark.parametrize(
+    ("error_code", "reason", "eligible"),
+    [
+        ("vision_model_rate_limited", "", True),
+        ("vision_model_unavailable", "", True),
+        ("vision_model_empty_response", "", True),
+        ("vision_model_failed", "output_truncated", True),
+        ("vision_model_failed", "", False),
+        ("vision_model_auth_invalid", "", False),
+        ("vision_model_quota_insufficient", "", False),
+        ("vision_model_not_found", "", False),
+        ("vision_model_incompatible", "", False),
+        ("vision_model_not_ready", "", False),
+    ],
+)
+def test_main_fallback_eligibility_is_exact(error_code, reason, eligible):
+    import vision_policy
+
+    assert vision_policy.is_main_fallback_eligible(error_code, reason) is eligible
+
+
+def test_eligible_failure_does_not_fallback_without_exact_main_verification():
+    tail = [{**_img_row("m1"), "vision_route_id": "vision-route"}]
+
+    with pytest.raises(worker.DedicatedVisionUnavailable) as caught:
+        worker._inject_tail_images(
+            tail,
+            user_id="u",
+            read_images=lambda *_args: pytest.fail("raw fallback is forbidden"),
+            active_image_ids={"m1"},
+            read_vision_observations=lambda *_args, **_kwargs: (
+                worker.VisionObservationBatch(
+                    outcomes={
+                        "m1": worker.VisionObservationOutcome(
+                            error_code="vision_model_unavailable"
+                        )
+                    },
+                    absolute_deadline=time.monotonic() + 30,
+                    main_vision_verified=False,
+                )
+            ),
+        )
+
+    assert caught.value.error_code == "vision_model_unavailable"
+
+
+def test_eligible_failure_does_not_fallback_after_shared_deadline_expires():
+    tail = [{**_img_row("m1"), "vision_route_id": "vision-route"}]
+
+    with pytest.raises(worker.DedicatedVisionUnavailable) as caught:
+        worker._inject_tail_images(
+            tail,
+            user_id="u",
+            read_images=lambda *_args: pytest.fail("raw fallback is forbidden"),
+            active_image_ids={"m1"},
+            read_vision_observations=lambda *_args, **_kwargs: (
+                worker.VisionObservationBatch(
+                    outcomes={
+                        "m1": worker.VisionObservationOutcome(
+                            error_code="vision_model_unavailable"
+                        )
+                    },
+                    absolute_deadline=time.monotonic() - 1,
+                    main_vision_verified=True,
+                )
+            ),
+        )
+
+    assert caught.value.error_code == "vision_model_unavailable"

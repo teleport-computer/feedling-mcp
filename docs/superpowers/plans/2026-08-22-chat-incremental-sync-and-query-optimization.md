@@ -18,11 +18,11 @@
 - Logs and metrics contain no document, ciphertext, API key, connection string, or raw user ID.
 - Observe mode starts with a 5,000-row cache; cutover moves 5,000 → 1,024 → 256.
 - A reset, event gap, or more than 256 pending events rebuilds only the chat hot window.
-- Create primary migration `0098_chat_change_events` after current head `0097_v2_job_recovery_events`.
+- Create primary migration `0101_chat_change_events` after current head `0100_lane_rollup_access_paths`.
 
 ## File map
 
-- `backend/alembic/versions/0098_chat_change_events.py`: version tables, triggers, notification function, poll index.
+- `backend/alembic/versions/0101_chat_change_events.py`: version tables, triggers, notification function, poll index.
 - `backend/db.py`: snapshot, event, batch-point, verify, and poll query primitives.
 - `backend/core/store.py`: versioned chat cache state machine.
 - `backend/core/wake_bus.py`: legacy/v2 parsing and channel-specific dispatch.
@@ -37,8 +37,8 @@
 ### Task 1: Transactional chat change capture
 
 **Files:**
-- Create: `backend/alembic/versions/0098_chat_change_events.py`
-- Create: `backend/alembic_tee/versions/0034_chat_poll_index.py`
+- Create: `backend/alembic/versions/0101_chat_change_events.py`
+- Create: `backend/alembic_tee/versions/0037_chat_poll_index.py`
 - Modify: `backend/tee_shadow/table_registry.py`
 - Modify: `backend/admin/plaintext_shadow.py`
 - Create: `tests/test_chat_change_events.py`
@@ -83,7 +83,7 @@ ON chat_messages (user_id, ts, seq);
 Run the tests from Step 2, downgrade to 0097, upgrade to head, and require one head. Then:
 
 ```bash
-git add backend/alembic/versions/0098_chat_change_events.py tests/test_chat_change_events.py tests/test_v2_jobs_migration.py .github/workflows/ci.yml
+git add backend/alembic/versions/0101_chat_change_events.py tests/test_chat_change_events.py tests/test_v2_jobs_migration.py .github/workflows/ci.yml
 git commit -m "feat(chat): capture durable per-user change events"
 ```
 

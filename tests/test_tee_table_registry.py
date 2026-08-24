@@ -92,6 +92,19 @@ def test_perception_signal_state_uses_snapshot_lane():
     assert entry.lane == reg.SNAPSHOT
 
 
+def test_contract_rejection_stats_uses_mirror_lane_and_reconciler_key():
+    from tee_shadow import reconciler
+
+    entry = reg.REGISTRY.get("contract_rejection_stats")
+    expected_key = (
+        "contract_domain", "boundary", "fallback", "release_sha", "writer_id"
+    )
+    assert entry is not None
+    assert entry.lane == reg.MIRROR
+    assert entry.key_columns == expected_key
+    assert reconciler.TABLES["contract_rejection_stats"][0] == expected_key
+
+
 def test_tee_required_tables_include_synced_and_primary_local_tables():
     """A local-only SKIP lane must not exempt a TEE-primary runtime table."""
     required = set(reg.tee_required_tables())

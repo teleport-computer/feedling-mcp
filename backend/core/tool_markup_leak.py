@@ -31,6 +31,27 @@ _TAG_TOKEN_RE = re.compile(
 )
 _CODE_FENCE = "```"
 
+# Provider-native end-of-turn sentinels sometimes leak into ``content`` instead
+# of being consumed by the relay.  Match only a small, explicit, whole-message
+# family: this must never grow into a generic angle-bracket/HTML sanitizer.
+# Unbarred tags such as ``<end_of_turn>`` are safe here only because the sole
+# consumer uses ``fullmatch`` below, not because generic tags are acceptable.
+MODEL_SENTINEL_TOKENS = (
+    "</s>",
+    "<|endoftext|>",
+    "<|im_end|>",
+    "<|eot_id|>",
+    "<|end_of_text|>",
+    "<|end_of_turn|>",
+    "<end_of_turn>",
+)
+_MODEL_SENTINEL_ONLY_RE = re.compile(
+    r"(?:"
+    + "|".join(re.escape(token) for token in MODEL_SENTINEL_TOKENS)
+    + r")+",
+    flags=re.IGNORECASE,
+)
+
 
 def _merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
     if not intervals:
@@ -98,7 +119,10 @@ def _strip_unfenced_segment(text: str) -> tuple[str, str, bool]:
 
 def is_degenerate_visible_text(text: object) -> bool:
     """Mirror the visible-reply gate: empty/punctuation-only is not a reply."""
-    for char in str(text or ""):
+    visible = str(text or "").strip()
+    if _MODEL_SENTINEL_ONLY_RE.fullmatch(visible):
+        return True
+    for char in visible:
         category = unicodedata.category(char)
         if category[0] in {"L", "N"} or category == "So":
             return False

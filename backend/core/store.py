@@ -1422,6 +1422,17 @@ class UserStore:
         stored.setdefault("owner_user_id", self.user_id)
         stored.setdefault("updated_at", datetime.now().isoformat())
         with self.world_books_lock:
+            # The database is authoritative.  Mutating the process-local cache
+            # before checking this bool used to make a failed write look saved
+            # until the next worker/restart reloaded the real row set.
+            wrote = db.world_book_upsert(
+                self.user_id,
+                entry_id,
+                str(stored.get("updated_at") or ""),
+                stored,
+            )
+            if not wrote:
+                raise RuntimeError("world_book_write_failed")
             replaced = False
             for i, existing in enumerate(self.world_books):
                 if str(existing.get("id") or "") == entry_id:
@@ -1430,7 +1441,6 @@ class UserStore:
                     break
             if not replaced:
                 self.world_books.append(stored)
-            db.world_book_upsert(self.user_id, entry_id, str(stored.get("updated_at") or ""), stored)
         return stored
 
     def delete_world_book(self, entry_id: str) -> bool:

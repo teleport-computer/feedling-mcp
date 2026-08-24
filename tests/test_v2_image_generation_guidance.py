@@ -19,6 +19,7 @@ openrouter)让 AI 画一张海报,AI 回的是「模型那边暂时没接上」�
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -137,3 +138,132 @@ def test_the_guidance_copy_actually_exists_and_is_actionable():
     assert "设置" in zh and ("添加" in zh or "加" in zh), (
         f"文案没告诉用户去哪、做什么:{zh!r}"
     )
+
+
+@pytest.mark.parametrize("status_code", [408, 500])
+def test_image_generation_failure_traces_status_and_logs_internal_detail(
+    monkeypatch, caplog, status_code
+):
+    upstream_detail = f"IMAGE_UPSTREAM_{status_code}_SECRET_NOT_TENANT_VISIBLE"
+    events = []
+    monkeypatch.setattr(
+        serve_worker.db,
+        "model_api_image_generation_route",
+        lambda _uid: None,
+    )
+    monkeypatch.setattr(
+        serve_worker.db,
+        "model_api_active_route",
+        lambda _uid: None,
+    )
+    monkeypatch.setattr(
+        serve_worker.core_store,
+        "get_store",
+        lambda uid: SimpleNamespace(user_id=uid),
+    )
+    monkeypatch.setattr(
+        serve_worker,
+        "_emit_v2_debug_trace",
+        lambda _store, event_type, **kwargs: events.append(
+            {"type": event_type, **kwargs}
+        ),
+    )
+
+    async def fail_with_real_http_error(*_args, **_kwargs):
+        serve_worker.provider_client._raise_for_provider_status(
+            serve_worker.httpx.Response(status_code, text=upstream_detail)
+        )
+
+    monkeypatch.setattr(
+        serve_worker.provider_client,
+        "generate_image_async",
+        fail_with_real_http_error,
+    )
+
+    with caplog.at_level("WARNING", logger=serve_worker.log.name):
+        with pytest.raises(
+            serve_worker.v2_worker.ImageGenerationUnavailable
+        ) as caught:
+            asyncio.run(
+                serve_worker._generate_image_for_chat(
+                    "usr_test",
+                    "private image prompt",
+                    main_provider_config=_cfg(),
+                    api_key=None,
+                    runtime_token="tok",
+                )
+            )
+
+    assert caught.value.status_code == status_code
+    assert caught.value.upstream_detail == upstream_detail
+    assert upstream_detail not in str(caught.value)
+    assert [event["type"] for event in events] == [
+        "agent.image.generate.start",
+        "agent.image.generate.failed",
+    ]
+    assert events[-1]["detail"]["status_code"] == status_code
+    assert upstream_detail not in json.dumps(events)
+    assert "private image prompt" not in json.dumps(events)
+    assert upstream_detail in caplog.text
+
+
+def test_v2_internal_media_processing_bug_does_not_poison_route(monkeypatch):
+    events = []
+    marked = []
+    monkeypatch.setattr(
+        serve_worker.db,
+        "model_api_image_generation_route",
+        lambda _uid: None,
+    )
+    monkeypatch.setattr(
+        serve_worker.db,
+        "model_api_active_route",
+        lambda _uid: {"id": "active-route"},
+    )
+    monkeypatch.setattr(
+        serve_worker.db,
+        "model_api_route_mark_image_generation_test",
+        lambda _uid, _rid, **kwargs: marked.append(kwargs) or True,
+    )
+    monkeypatch.setattr(
+        serve_worker.core_store,
+        "get_store",
+        lambda uid: SimpleNamespace(user_id=uid),
+    )
+    monkeypatch.setattr(
+        serve_worker,
+        "_emit_v2_debug_trace",
+        lambda _store, event_type, **kwargs: events.append(
+            {"type": event_type, **kwargs}
+        ),
+    )
+
+    async def generated(*_args, **_kwargs):
+        return {"media": [{"mime_type": "image/png", "data_base64": "aW1hZ2U="}]}
+
+    monkeypatch.setattr(
+        serve_worker.provider_client,
+        "generate_image_async",
+        generated,
+    )
+    monkeypatch.setattr(
+        serve_worker.ProviderResponse,
+        "from_result",
+        lambda _result: (_ for _ in ()).throw(
+            TypeError("internal provider response adapter drift")
+        ),
+    )
+
+    with pytest.raises(TypeError, match="internal provider response adapter drift"):
+        asyncio.run(
+            serve_worker._generate_image_for_chat(
+                "usr_test",
+                "private image prompt",
+                main_provider_config=_cfg(),
+                api_key=None,
+                runtime_token="tok",
+            )
+        )
+
+    assert marked == [], "an internal adapter bug must not change route health"
+    assert [event["type"] for event in events] == ["agent.image.generate.start"]

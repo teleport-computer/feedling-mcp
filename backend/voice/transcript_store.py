@@ -35,7 +35,7 @@ import db
 from core import envelope as core_envelope
 from identity import identity_core
 from identity import user_naming
-from memory_garden.policies import RESTRAINT_RULE_QUOTE as _RESTRAINT_QUOTE
+from memgarden.policies import RESTRAINT_RULE_QUOTE as _RESTRAINT_QUOTE
 
 log = logging.getLogger("feedling.voice.transcript_store")
 

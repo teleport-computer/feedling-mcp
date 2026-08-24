@@ -90,6 +90,7 @@ def test_dream_context_fetches_full_cards_without_cross_run_cooldown(monkeypatch
         "2026-05-01T00:00:00Z",
         "2026-07-01T00:00:00Z",
     ]
+    assert ctx["_diagnostic_cards_outcome"] == "ready"
 
 
 def test_dream_context_budget_keeps_only_whole_cards(monkeypatch):
@@ -124,6 +125,7 @@ def test_dream_context_budget_keeps_only_whole_cards(monkeypatch):
     assert "id=m1" in ctx["cards"]
     assert "id=m2" not in ctx["cards"]
     assert ctx["card_items"][0]["content"] == "正文" * 40
+    assert ctx["_diagnostic_cards_outcome"] == "truncated"
 
 
 def test_dream_context_budget_rejects_oversized_first_card_from_final_prompt(
@@ -164,12 +166,14 @@ def test_dream_context_budget_rejects_oversized_first_card_from_final_prompt(
         user_name=ctx["user_name"],
         cards=ctx["cards"],
         recent_conversations="",
+        locale="zh-Hans",
     )
     empty_prompt = build_dream_prompt(
         ai_name=ctx["ai_name"],
         user_name=ctx["user_name"],
         cards="",
         recent_conversations="",
+        locale="zh-Hans",
     )
 
     assert ctx["card_items"] == []
@@ -184,6 +188,40 @@ def test_dream_context_budget_rejects_oversized_first_card_from_final_prompt(
     assert "kept=0/1" in budget_logs[0]
     assert "empty_context=True" in budget_logs[0]
     assert "oversized-first" not in budget_logs[0]
+    assert ctx["_diagnostic_cards_outcome"] == "truncated"
+
+
+def test_dream_context_distinguishes_empty_index_from_failed_full_card_read(
+    monkeypatch,
+):
+    serve_worker.wire_assembly()
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "token")
+    monkeypatch.setattr(
+        "memory.memory_core.buckets", lambda *a, **k: ({"buckets": []}, 200)
+    )
+    monkeypatch.setattr(
+        "memory.memory_core.threads", lambda *a, **k: ({"threads": []}, 200)
+    )
+    monkeypatch.setattr(
+        "identity.identity_core.get_identity", lambda *a, **k: ({}, 200)
+    )
+    monkeypatch.setattr(
+        "memory.memory_core.index", lambda *a, **k: ({"items": []}, 200)
+    )
+    empty = serve_worker._read_dream_memory_context("u_ctx_empty")
+    assert empty["_diagnostic_cards_outcome"] == "empty"
+
+    monkeypatch.setattr(
+        "memory.memory_core.index",
+        lambda *a, **k: ({"items": [{"id": "m1"}]}, 200),
+    )
+    monkeypatch.setattr(
+        "memory.memory_core.fetch",
+        lambda *a, **k: ({"error": "unavailable"}, 503),
+    )
+    failed = serve_worker._read_dream_memory_context("u_ctx_failed")
+    assert failed["card_items"] == []
+    assert failed["_diagnostic_cards_outcome"] == "unavailable"
 
 
 def test_capture_submit_enqueues_a_capture_agent_job(monkeypatch):

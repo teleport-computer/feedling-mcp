@@ -359,9 +359,13 @@ def test_dream_live_rig_shape_persists_all_structural_merges(monkeypatch):
         user_name="阿霖",
         cards=json.dumps(candidates, ensure_ascii=False),
         recent_conversations="[]",
+        locale="zh-Hans",
     )
-    assert "坚持骑行" in shared_prompt and "最近失眠" in shared_prompt
-    assert "两件独立的事，不能合并" in shared_prompt
+    # 2026-08-23：提示词英文化后，模板里的合并示例也换成了英文。
+    # 断言的是**示例还在**（那是教模型「什么算同一件事的演进」的关键），
+    # 不是具体用哪个例子。
+    assert "keeps up the cycling" in shared_prompt and "not sleeping well lately" in shared_prompt
+    assert "are two separate things" in shared_prompt
     moments = [_old_card(user_id, card["id"]) for card in candidates]
     saved = _install_storage(monkeypatch, moments)
     pairings = [

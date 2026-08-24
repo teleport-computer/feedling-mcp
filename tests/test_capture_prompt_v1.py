@@ -15,8 +15,8 @@ from memory.capture_prompt_v1 import (  # noqa: E402
     capture_semantic_retry_reasons,
     parse_capture_cards,
 )
-from memory_garden.text.card_text import extract_json_block  # noqa: E402
-from core import self_thinking  # noqa: E402
+from memgarden.text.card_text import extract_json_block  # noqa: E402
+from agent_protocol_core import self_thinking  # noqa: E402
 
 _FENCE = "`" * 3
 
@@ -60,10 +60,10 @@ def test_prompt_naming_rule_uses_known_name():
         locale="zh-Hans",
     )
     assert "提到 Seven 就用「Seven」" in p
-    assert 'Never use system labels like 「用户」/"user"' in p
+    assert "永远不要用" in p and "这类系统称谓" in p
     # TA is an instruction/transcript marker only — outputs must not use it.
-    assert "never use the placeholder 「TA」 for them" in p
-    assert "This person will read these cards with their own eyes" in p
+    assert "不要用「TA」指代本人" in p
+    assert "这些卡会由这个人亲眼看到" in p
 
 
 def test_prompt_naming_rule_without_name_uses_relationship_referent():
@@ -87,8 +87,8 @@ def test_prompt_naming_rule_without_name_uses_relationship_referent():
     assert "猜测性别" not in p
     # 仍然禁的三样,一样都不能松。
     assert "第二人称「你」" in p
-    assert 'Never use system labels like 「用户」/"user"' in p
-    assert "never use the placeholder 「TA」 for them" in p
+    assert "永远不要用" in p and "这类系统称谓" in p
+    assert "不要用「TA」指代本人" in p
 
 
 def test_capture_prompt_marks_对方_as_a_placeholder_label_not_a_referent():
@@ -99,8 +99,8 @@ def test_capture_prompt_marks_对方_as_a_placeholder_label_not_a_referent():
         window="- 对方: 老公我到家了",
         locale="zh-Hans",
     )
-    assert "that is only a label" in p
-    assert "how you address them inside a card follows the rule above" in p
+    assert "那只是标签" in p
+    assert "卡里怎么称呼，按上面那条规则判断" in p
 
 
 def test_reserved_placeholder_names_are_treated_as_unknown():
@@ -252,7 +252,7 @@ def test_capture_semantic_retry_requires_the_complete_batch():
 # instead of each card minting a fresh near-synonym (工作/职业/事业) or scattering.
 
 def test_capture_prompt_carries_canonical_buckets():
-    from memory_garden.prompts.buckets import COMMON_BUCKETS_V1, _COMMON_BUCKETS_ZH, _COMMON_BUCKETS_EN
+    from memgarden.prompts.buckets import COMMON_BUCKETS_V1, _COMMON_BUCKETS_ZH, _COMMON_BUCKETS_EN
     p = build_capture_prompt(
         ai_name="io", user_name="hx", buckets="（暂无）", threads="（暂无）",
         identity="x", window="y",
@@ -265,10 +265,11 @@ def test_capture_prompt_carries_canonical_buckets():
     # 不该做的选择题，它就会做错；宿主本来就知道这个花园是什么语言。
     assert _COMMON_BUCKETS_ZH in p, "中文花园该发的那套桶不见了"
     assert _COMMON_BUCKETS_EN not in p, "另一套桶又被塞回来了 —— 模型会挑错"
-    # "Pets" 仍会出现一次 —— 在防斜杠双语串的例子 no 「宠物/Pets」 里，那是要保留的。
+    # 2026-08-23：防斜杠双语串的例子改成了 "Health/健康"，不再出现 Pets，
+    # 所以中文花园里 "Pets" 应当一次都不出现。
     assert "宠物" in p
-    assert p.count("Pets") == 1, "英文桶清单又被塞回来了"
-    assert "no 「健康/Health」" in p            # 防斜杠双语串的例子仍在
+    assert "Pets" not in p, "英文桶清单又被塞回来了"
+    assert 'never write a name like "Health/健康"' in p   # 防斜杠双语串的例子仍在
     assert COMMON_BUCKETS_V1 and all(zh.strip() and en.strip() for zh, en in COMMON_BUCKETS_V1)
     # companion-tuned set (hx): 14 buckets incl. the relationship/emotion/boundary ones
     assert len(COMMON_BUCKETS_V1) == 14
@@ -278,20 +279,20 @@ def test_capture_prompt_carries_canonical_buckets():
 
 
 def test_migrate_and_genesis_share_the_same_canonical_buckets():
-    from memory_garden.prompts.buckets import _COMMON_BUCKETS_ZH
-    from memory_garden.prompts.migrate import build_migrate_prompt
+    from memgarden.prompts.buckets import _COMMON_BUCKETS_ZH
+    from memgarden.prompts.migrate import build_migrate_prompt
     from genesis.prompts import FACT_WRITE_PROMPT
-    mig = build_migrate_prompt(ai_name="io", user_name="hx", old_cards="c", vocab="（暂无）")
+    mig = build_migrate_prompt(ai_name="io", user_name="hx", old_cards="c", vocab="（暂无）", locale="zh-Hans")
     assert _COMMON_BUCKETS_ZH in mig
     # onboarding (genesis FACT_WRITE) had NO bucket guidance before A9 — now it converges too
     assert _COMMON_BUCKETS_ZH in FACT_WRITE_PROMPT
-    assert "桶名收敛" in FACT_WRITE_PROMPT
+    assert "Bucket convergence" in FACT_WRITE_PROMPT
 
 
 def test_migrate_prompt_unknown_person_does_not_leak_ta_marker():
-    from memory_garden.prompts.migrate import build_migrate_prompt
+    from memgarden.prompts.migrate import build_migrate_prompt
 
     prompt = build_migrate_prompt(
         ai_name="", user_name="TA", old_cards="", vocab=""
-    )
-    assert prompt.startswith("你是 我——这个人 的伴侣。")
+, locale="zh-Hans")
+    assert prompt.startswith("You are 这个人, 这个人's companion.")

@@ -285,6 +285,95 @@ def test_fast_proactive_snapshot_keeps_expired_out_of_failed_count():
     assert proactive["job_failed_reasons"] == {"model_timeout": 2, "unknown": 1}
 
 
+def test_trace_vocabulary_failure_is_explicit_retried_and_not_cached(monkeypatch):
+    calls = []
+
+    def flaky_loader():
+        calls.append("load")
+        if len(calls) == 1:
+            raise RuntimeError("transient import failure")
+        return frozenset({"heartbeat"}), frozenset({"manual_tick"})
+
+    monkeypatch.setattr(data_track, "_TRACE_VOCABULARY_CACHE", None)
+    monkeypatch.setattr(data_track, "_load_jobs_store_trace_vocabulary", flaky_loader)
+
+    assert data_track._trace_vocabulary() is None
+    assert data_track._TRACE_VOCABULARY_CACHE is None
+    assert data_track._trace_vocabulary() == (
+        frozenset({"heartbeat"}),
+        frozenset({"manual_tick"}),
+    )
+    assert data_track._trace_vocabulary() == data_track._TRACE_VOCABULARY_CACHE
+    assert calls == ["load", "load"]
+
+
+def test_debug_payload_rejects_empty_producer_trace_vocabulary(monkeypatch):
+    with registry._users_lock:
+        registry._users[:] = [
+            {"user_id": "user_a", "principal_id": "p_a"},
+        ]
+    _patch_blob_reads(monkeypatch, {})
+
+    cases = (
+        (frozenset(), frozenset({"manual_tick"})),
+        (frozenset({"heartbeat"}), frozenset()),
+    )
+    for lanes, enqueue_reasons in cases:
+        # Prove the test reached a non-raising producer read with exactly one
+        # empty export; otherwise unavailable could merely mean import failure.
+        assert bool(lanes) != bool(enqueue_reasons)
+        monkeypatch.setattr(data_track, "_TRACE_VOCABULARY_CACHE", None)
+        monkeypatch.setattr(
+            data_track,
+            "_load_jobs_store_trace_vocabulary",
+            lambda lanes=lanes, reasons=enqueue_reasons: (lanes, reasons),
+        )
+
+        with bind("view=debug&user_id=user_a"):
+            payload = data_track._data_track_debug_payload()
+
+        assert payload["observability"] == {"trace_vocabulary": "unavailable"}
+        assert data_track._TRACE_VOCABULARY_CACHE is None
+
+
+def test_debug_payload_marks_trace_vocabulary_failure_without_negative_caching(
+    monkeypatch,
+):
+    with registry._users_lock:
+        registry._users[:] = [
+            {"user_id": "user_a", "principal_id": "p_a"},
+        ]
+    blobs = {
+        ("user_a", "trace_events"): {
+            "events": [
+                _event(
+                    100,
+                    "user_a",
+                    "agent.job.enqueued",
+                    trace_id="t-unavailable",
+                    detail={"lane": "heartbeat", "reason": "manual_tick"},
+                )
+            ],
+        },
+    }
+    _patch_blob_reads(monkeypatch, blobs)
+    monkeypatch.setattr(data_track, "_TRACE_VOCABULARY_CACHE", None)
+
+    def unavailable_loader():
+        raise RuntimeError("jobs_store unavailable")
+
+    monkeypatch.setattr(
+        data_track, "_load_jobs_store_trace_vocabulary", unavailable_loader,
+    )
+
+    with bind("view=debug&mode=timeline&user_id=user_a"):
+        payload = data_track._data_track_debug_payload()
+
+    assert payload["observability"] == {"trace_vocabulary": "unavailable"}
+    assert payload["turns"][0]["lane"] == ""
+    assert data_track._TRACE_VOCABULARY_CACHE is None
+
+
 def test_debug_payload_groups_multi_user_trace_and_marks_stalled(monkeypatch):
     with registry._users_lock:
         registry._users[:] = [
@@ -333,11 +422,13 @@ def test_debug_payload_groups_multi_user_trace_and_marks_stalled(monkeypatch):
         "summary",
         "filters",
         "options",
+        "observability",
         "pagination",
         "users",
         "turns",
         "events",
     }
+    assert payload["observability"] == {"trace_vocabulary": "ok"}
     assert set(payload["summary"]) == {
         "generated_at",
         "users_scanned",
@@ -375,6 +466,7 @@ def test_debug_payload_treats_missing_trace_flag_as_enabled_by_default(monkeypat
     with bind("view=debug"):
         payload = data_track._data_track_debug_payload()
 
+    assert payload["observability"] == {"trace_vocabulary": "ok"}
     assert payload["users"] == [
         {
             "user_id": "user_a",
@@ -458,6 +550,49 @@ def test_debug_page_renders_nav_filters_and_redacts_plaintext_by_default(monkeyp
     assert "trace_id 时可直接定位" in html
     assert "#event-" in html
     assert "#turn-" in html
+    assert "Trace 词表暂不可用" not in html
+
+
+def test_debug_page_renders_trace_vocabulary_unavailable_as_a_warning(monkeypatch):
+    with registry._users_lock:
+        registry._users[:] = [{"user_id": "user_a", "principal_id": "p_a"}]
+
+    secret_lane = "secret_lane_must_not_render"
+    blobs = {
+        ("user_a", "trace_events"): {
+            "events": [
+                _event(
+                    100,
+                    "user_a",
+                    "agent.job.enqueued",
+                    trace_id="t-unavailable",
+                    detail={"lane": secret_lane, "reason": "manual_tick"},
+                )
+            ],
+        },
+    }
+    _patch_blob_reads(monkeypatch, blobs)
+    monkeypatch.setattr(data_track, "_TRACE_VOCABULARY_CACHE", None)
+    monkeypatch.setattr(data_track, "_TRACE_PUBLIC_FIELDS_CACHE", None)
+    load_calls = []
+
+    def unavailable_loader():
+        load_calls.append("load")
+        raise RuntimeError("jobs_store unavailable")
+
+    monkeypatch.setattr(
+        data_track, "_load_jobs_store_trace_vocabulary", unavailable_loader,
+    )
+
+    page = admin_core.page_html("view=debug&mode=timeline&user_id=user_a")
+
+    assert "Trace 词表暂不可用" in page
+    assert "不能读成“事件没有这些字段”" in page
+    assert secret_lane not in page
+    assert load_calls == ["load"]
+    assert data_track._TRACE_VOCABULARY_CACHE is None
+    assert data_track._TRACE_PUBLIC_FIELDS_CACHE is None
+
 
 
 def test_debug_page_renders_load_more_when_paginated(monkeypatch):

@@ -8,6 +8,7 @@ Run:  python -m pytest tests/test_catalog_consumer_parity.py -q
 """
 from __future__ import annotations
 
+import ast
 import os
 import sys
 import types
@@ -38,6 +39,7 @@ except ModuleNotFoundError:
 from notices import catalog  # noqa: E402
 from notices import core  # noqa: E402
 import tools.chat_resident_consumer as crc  # noqa: E402
+from model_api_runtime.v2 import worker  # noqa: E402
 
 
 def test_catalog_covers_all_consumer_error_classes():
@@ -45,9 +47,50 @@ def test_catalog_covers_all_consumer_error_classes():
     assert not missing, f"catalog 缺 error_class: {sorted(missing)}"
 
 
+def test_user_unavailable_v1_reasons_are_producer_registered():
+    producer_codes = set(crc.CONSUMER_ERROR_CLASSES) | set(
+        worker.PUBLIC_FAILURE_CODES
+    )
+    missing = set(catalog.USER_UNAVAILABLE_V1_REASONS) - producer_codes
+    assert not missing, f"用户侧豁免未由产生方导出: {sorted(missing)}"
+
+
+def test_v1_outcome_classifier_has_one_catalog_definition_and_admin_imports_it():
+    backend = Path(__file__).parent.parent / "backend"
+    catalog_tree = ast.parse((backend / "notices" / "catalog.py").read_text())
+    admin_tree = ast.parse((backend / "admin" / "data_track.py").read_text())
+    definitions = [
+        node for node in ast.walk(catalog_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "v1_proactive_outcome_class"
+    ]
+    admin_copies = [
+        node for node in ast.walk(admin_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in {
+            "v1_proactive_outcome_class", "_v1_proactive_outcome_class"
+        }
+    ]
+    admin_calls = [
+        node for node in ast.walk(admin_tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "notices_catalog"
+        and node.attr == "v1_proactive_outcome_class"
+    ]
+    assert len(definitions) == 1
+    assert not admin_copies, "admin 不得保留 outcome classifier 副本"
+    assert admin_calls, "admin 必须调用 notices.catalog 的共享分类器"
+
+
 def test_every_catalog_blame_is_valid():
     for ec in catalog.ERROR_CLASSES:
         assert catalog.blame_for(ec) in core.VALID_BLAME
+
+
+def test_every_registered_error_class_has_explicit_catalog_entry():
+    missing = set(catalog.ERROR_CLASSES) - set(catalog._CATALOG)
+    assert not missing, f"error_class 缺显式 catalog 话术: {sorted(missing)}"
 
 
 def test_vision_model_required_catalog_guidance_is_bilingual():
@@ -118,6 +161,13 @@ def _consumer_blame_map() -> dict[str, str]:
                 crc.ImageGenerationFailure(error_class)
             )
             out[error_class] = notice.blame
+        elif error_class.startswith("vision_"):
+            notice = crc.classify_agent_error(
+                crc.VisionObserverFailure(error_class)
+            )
+            out[error_class] = notice.blame
+        elif error_class == "error_class_unregistered":
+            out[error_class] = catalog.blame_for(error_class)
     return out
 
 

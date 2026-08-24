@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from admin import data_track as dt  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
+from notices import catalog as notices_catalog  # noqa: E402
 
 
 def test_v1_proactive_block_declares_its_own_blind_spot():
@@ -40,6 +41,37 @@ def test_v1_proactive_block_declares_its_own_blind_spot():
     assert "v2_wake_activity" in out["lens_note"]
     # 原始计数不许被标注动过。
     assert out["heartbeat_jobs"] == 0 and out["proactive_messages"] == 0
+
+
+def test_v1_failure_classifier_is_fail_closed_and_keeps_keyspace_separate():
+    expected = frozenset({
+        "quota_insufficient",
+        "extraction_failed:quota_insufficient",
+        "image_generation_quota_insufficient",
+        "auth_invalid",
+        "image_generation_auth_invalid",
+        "model_not_found",
+        "image_generation_model_not_found",
+    })
+    assert notices_catalog.USER_UNAVAILABLE_V1_REASONS == expected
+    for reason in expected:
+        assert notices_catalog.v1_proactive_outcome_class(
+            "failed", reason
+        ) == "user_unavailable"
+
+    assert notices_catalog.v1_proactive_outcome_class(
+        "failed", "unknown"
+    ) == "operational_failure"
+    assert notices_catalog.v1_proactive_outcome_class(
+        "failed", "rate_limited"
+    ) == "operational_failure"
+    assert notices_catalog.v1_proactive_outcome_class(
+        "skipped", "heartbeat_throttled"
+    ) == "control"
+    # A V2 scoped code is not inferred into the V1 exemption by suffix/shape.
+    assert notices_catalog.v1_proactive_outcome_class(
+        "failed", "turn_failed:quota_insufficient"
+    ) == "operational_failure"
 
 
 def test_wake_schedule_missing_row_is_a_conclusion_not_a_blank(monkeypatch):

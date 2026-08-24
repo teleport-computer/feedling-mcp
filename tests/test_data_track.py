@@ -208,6 +208,61 @@ def test_admin_data_track_aggregates_counts_without_content(client):
     assert "private evidence" not in dumped
 
 
+def test_users_surface_separates_v1_failure_control_and_user_unavailable(client):
+    user_id, _ = _register(client)
+    store = core_store.get_store(user_id)
+    for job in (
+        {
+            "job_id": "pj_ok",
+            "status": "completed",
+            "status_reason": "agent_sleep",
+            "job_kind": "heartbeat",
+        },
+        {
+            "job_id": "pj_throttled",
+            "status": "skipped",
+            "status_reason": "heartbeat_throttled",
+            "job_kind": "heartbeat",
+        },
+        {
+            "job_id": "pj_unknown",
+            "status": "failed",
+            "status_reason": "unknown",
+            "job_kind": "heartbeat",
+        },
+        {
+            "job_id": "pj_user",
+            "status": "failed",
+            "status_reason": "quota_insufficient",
+            "job_kind": "heartbeat",
+        },
+    ):
+        store.append_proactive_job(job)
+
+    response = client.get("/v1/admin/data-track/users", headers=_admin_headers())
+    assert response.status_code == 200
+    proactive = response.get_json()["users"][0]["proactive"]
+    assert proactive["lens"] == "v1_proactive_jobs_log"
+    assert proactive["failure_definition"]["window"] == "all_history"
+    assert proactive["heartbeat_jobs"] == 4
+    assert proactive["heartbeat_failed"] == 1
+    assert proactive["heartbeat_control"] == 1
+    assert proactive["heartbeat_user_unavailable"] == 1
+    assert proactive["job_failed_reasons"] == {"unknown": 1}
+    assert proactive["job_control_reasons"] == {"heartbeat_throttled": 1}
+    assert proactive["job_user_unavailable_reasons"] == {
+        "quota_insufficient": 1
+    }
+
+    page = client.get("/admin/data-track?view=users", headers=_admin_headers())
+    assert page.status_code == 200
+    body = page.get_data(as_text=True)
+    assert "心跳 总4 / 失败1 / 控制1 / 用户侧1" in body
+    assert "Proactive 失败口径（Resident / V1）" in body
+    assert "未知/未登记原因仍算我方失败" in body
+    assert "本列不含 Runtime V2 用户" in body
+
+
 def test_admin_data_track_reports_screen_frame_storage_and_freshness(client):
     user_id, _ = _register(client)
     with db.get_pool().connection() as conn:
@@ -689,7 +744,7 @@ def test_admin_data_track_sorts_before_pagination(client):
 
 # --- 2026-07 data-track redo: genesis-aware stage + activation funnel ---------
 # Regression guards for the fix that stopped counting genesis (bucket-based)
-# users as stuck at memory_garden. Pure-function tests on _data_track_fast_validation.
+# users as stuck at memgarden. Pure-function tests on _data_track_fast_validation.
 from admin import data_track as _dt  # noqa: E402
 
 
@@ -1202,7 +1257,7 @@ def test_admin_data_track_app_usage_dau_is_shanghai_day(client, monkeypatch):
     assert au["dau_today"] == 1  # only the Shanghai-today session, not the day-boundary one
 
 
-def test_fast_validation_no_memories_still_blocks_memory_garden():
+def test_fast_validation_no_memories_still_blocks_memgarden():
     v = _dt._data_track_fast_validation(
         route="model_api",
         chat={},

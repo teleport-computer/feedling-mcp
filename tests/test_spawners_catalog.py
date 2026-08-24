@@ -24,6 +24,7 @@ NEW_VERBS = (
     "cancel-wake",
     "send-file",
     "send-image",
+    "worldbook-match",
 )
 
 

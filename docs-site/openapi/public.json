@@ -8738,6 +8738,9 @@
               }
             }
           },
+          "500": {
+            "description": "World Book storage failure"
+          },
           "default": {
             "description": "Error response.",
             "content": {

@@ -59,7 +59,7 @@ if [ "$remote_sha" != "$trigger_sha" ]; then
     || [ "$remote_committer" != 'feedling-ci <ci@feedling.app>' ] \
     || [ -z "$actual_paths" ] \
     || [ -n "$unexpected_paths" ]; then
-    echo "::error::$branch advanced from trigger $trigger_sha to $remote_sha; the newer workflow owns deployment"
+    echo "::error title=deployment-superseded::$branch advanced from trigger $trigger_sha to $remote_sha; the newer workflow owns deployment"
     exit 1
   fi
 

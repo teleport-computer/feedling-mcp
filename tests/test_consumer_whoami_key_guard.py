@@ -39,6 +39,8 @@ import tools.chat_resident_consumer as crc  # noqa: E402
 
 from _fake_clock import freeze_monotonic  # noqa: E402
 
+from conftest import capture_sleeps
+
 
 OLD_PK = b"\x11" * 32
 NEW_PK = b"\x22" * 32
@@ -210,7 +212,7 @@ def test_post_reply_retries_explicitly_retryable_bootstrap_and_succeeds(monkeypa
     monkeypatch.setattr(crc, "CHAT_RESPONSE_MAX_RETRIES", 3)
     monkeypatch.setattr(crc, "CHAT_RESPONSE_RETRY_BASE_SEC", 0.5)
     monkeypatch.setattr(crc, "CHAT_RESPONSE_RETRY_MAX_ELAPSED_SEC", 10.0)
-    monkeypatch.setattr(crc.time, "sleep", sleeps.append)
+    capture_sleeps(monkeypatch, crc, sleeps)
 
     def fake_post(url, json=None, headers=None, timeout=None):
         posts.append(json)
@@ -229,7 +231,7 @@ def test_post_reply_retryable_bootstrap_has_hard_attempt_bound(monkeypatch):
     monkeypatch.setattr(crc, "CHAT_RESPONSE_MAX_RETRIES", 3)
     monkeypatch.setattr(crc, "CHAT_RESPONSE_RETRY_BASE_SEC", 0.25)
     monkeypatch.setattr(crc, "CHAT_RESPONSE_RETRY_MAX_ELAPSED_SEC", 10.0)
-    monkeypatch.setattr(crc.time, "sleep", sleeps.append)
+    capture_sleeps(monkeypatch, crc, sleeps)
 
     def fake_post(url, json=None, headers=None, timeout=None):
         posts.append(json)
@@ -252,7 +254,7 @@ def test_post_reply_retry_budget_can_disable_retry_wait(monkeypatch):
     monkeypatch.setattr(crc, "CHAT_RESPONSE_MAX_RETRIES", 3)
     monkeypatch.setattr(crc, "CHAT_RESPONSE_RETRY_BASE_SEC", 0.25)
     monkeypatch.setattr(crc, "CHAT_RESPONSE_RETRY_MAX_ELAPSED_SEC", 0.0)
-    monkeypatch.setattr(crc.time, "sleep", sleeps.append)
+    capture_sleeps(monkeypatch, crc, sleeps)
 
     def fake_post(url, json=None, headers=None, timeout=None):
         posts.append(json)

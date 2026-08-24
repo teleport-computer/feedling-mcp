@@ -56,6 +56,7 @@ _IO_CLI_VERBS = (
     # agent 根本调不到(prod 绝大多数用户在 V1 这条路上)。
     "voice-transcript-list",
     "voice-transcript-read",
+    "worldbook-match",
     "memory-index",
     "memory-fetch",
     # identity-read/-write are the rename path. Without identity-write --agent-name
@@ -152,6 +153,7 @@ _AGENT_PROMPT_FALLBACK_COMMANDS = (
     "python {io_cli} perception-history <signal> [--days <n>]\n"
     "python {io_cli} voice-transcript-list [--limit <n>]\n"
     "python {io_cli} voice-transcript-read --call-id <call_id> [--offset <n>]\n"
+    "python {io_cli} worldbook-match --query <current_request>\n"
     "python {io_cli} memory-index [--query <text>] [--limit <n>] [--bucket <name>] [--thread <tag>] [--ambient] [--include-sensitive]\n"
     "python {io_cli} memory-fetch <id> [<id> ...] [--limit <n>] [--include-archived] [--include-superseded]\n"
     "python {io_cli} memory-write [--summary <text>] [--content <text>] [--bucket <name>] [--threads <tag>] [--importance <0-1>] [--pulse <0-1>] [--type <fact|event|quote|moment>] [--source <label>]\n"
@@ -446,6 +448,18 @@ def _pi_effort(reasoning_effort: str) -> str:
     return _norm_effort(reasoning_effort) or _norm_effort(_PI_REASONING_DEFAULT)
 
 
+def _codex_effort(reasoning_effort: str) -> str:
+    """Map the user's route choice to Codex without inventing a voice default."""
+    effort = (reasoning_effort or "").strip().lower()
+    if effort in {"off", "none"}:
+        return "none"
+    if effort in {"low", "medium", "high"}:
+        return effort
+    # Blank means inherit the user's Codex config. Numeric budgets and unknown
+    # values have no exact Codex effort equivalent, so do not silently remap them.
+    return ""
+
+
 def _pi_models_json(*, base_url: str, model: str, provider: str,
                      reasoning_effort: str = "") -> str:
     """pi ``models.json`` registering the user's relay as a custom provider.
@@ -652,8 +666,9 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI, model: str =
     For claude we pre-grant the io_cli verbs (so an unattended
     ``claude -p`` runs them without an interactive permission prompt) and append
     the how-to as a system prompt from the per-user home. ``model`` is passed
-    explicitly to claude and pi; ``reasoning_effort`` is only used by pi (codex
-    reads its model from config.toml).
+    explicitly to claude and pi. ``reasoning_effort`` is applied to pi and codex;
+    when unset, codex inherits its own user config rather than a voice-specific
+    default.
     Operators can override the whole thing per roster entry via ``cli_cmd``.
     """
     if driver == "pi":
@@ -749,9 +764,13 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI, model: str =
         # 0.142.4 (`-c tools.web_search=false` / `features.web_search=false` are
         # dropped/ignored there); a home-level config.toml seeds the same key so an
         # operator cli_cmd override can't silently re-enable it (see agent_home_files).
+        codex_effort = _codex_effort(reasoning_effort)
+        effort_part = (
+            f"-c model_reasoning_effort={codex_effort} " if codex_effort else ""
+        )
         return (
             "codex exec --skip-git-repo-check --json "
-            "-c model_reasoning_effort=medium "
+            f"{effort_part}"
             "-c model_reasoning_summary=detailed "
             "-c web_search=disabled "
             "{mcp} "
@@ -1100,7 +1119,10 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     env["AGENT_CLI_CMD"] = cli_cmd or _default_cli_cmd(
         driver, home,
         model=model if driver in {"claude", "pi"} else "",
-        reasoning_effort=str(entry.get("reasoning_effort") or "") if driver == "pi" else "")
+        reasoning_effort=(
+            str(entry.get("reasoning_effort") or "")
+            if driver in {"codex", "pi"} else ""
+        ))
     # Per-user isolation: separate checkpoint, agent session, image temp dir, and
     # a per-user agent home (Claude/Codex) so nothing is shared across users.
     env["CHECKPOINT_FILE"] = f"{home}/checkpoint.json"

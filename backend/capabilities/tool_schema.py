@@ -1,10 +1,11 @@
 """Tool-schema catalog (Plan C, Task 3 / C1).
 
-Derives one `ToolSpec` per model-facing capability in `capabilities.registry.CAPABILITIES`
-(everything except the internal-only `chat_image_read`, `chat_file_read`, and
-`perception_glance`, which have no model-facing schema) plus the runtime-native `task`, `reply`, and
-`provider_usage` tools.  The unified tool loop handles these specially instead
-of dispatching them through the capability executor. `provider_usage` is
+Derives one `ToolSpec` per model-facing capability in
+`capabilities.registry.CAPABILITIES` (everything except the internal-only
+`chat_image_read`, `chat_file_read`, and `perception_glance`, which have no
+model-facing schema) plus the runtime-native `task` and `provider_usage` tools.
+The unified tool loop handles these specially instead of dispatching them
+through the capability executor. `provider_usage` is
 chat-lane only — it is deliberately absent from `worker._SUBAGENT_ALLOWED_TOOLS`
 (so subagents never see it) and is always withheld from the wake/screen_watch/
 manual_wake lane (see `worker._run_wake`); see Task 5's brief for why it is not
@@ -24,17 +25,18 @@ from capabilities import registry
 from identity import card_policy
 # Card-writing rules live with the memory package (single source of truth shared
 # with the V1 guidance block); only the op names above are V2-specific.
-from memory_garden.prompts import buckets as prompts_v1
+from memgarden.prompts import buckets as prompts_v1
 from memory.source_policy import MAX_MEMORY_SUPERSEDE_TARGETS
 from perception.agent_fields import (
     AGENT_PERCEPTION_SIGNALS,
     AGENT_SIGNAL_FIELDS,
     FAST_AGENT_PERCEPTION_SIGNALS,
 )
+from perception_kernel import prompts as perception_prompts
 
-REPLY_TOOL = "reply"
 STAY_SILENT_TOOL = "stay_silent"
 FILE_REPLY_TOOL = "send_file"
+SHARED_WORK_MAX_BYTES = 256_000
 IMAGE_REPLY_TOOL = "generate_image"
 TASK_TOOL = "task"
 PROVIDER_USAGE_TOOL = "provider_usage"
@@ -196,6 +198,15 @@ PARAMS: dict[str, dict] = {
             "thread": _STR,
             "include_sensitive": _BOOL,
         },
+        "required": ["query"],
+    },
+    # -- worldbook.py (backed by worldbook/worldbook_core.py) --
+    # Match only the current subject requested by the model. Proactive alwaysOn
+    # entries remain on the dedicated wake path and are not exposed through an
+    # empty-query tool call.
+    "worldbook_match": {
+        "type": "object",
+        "properties": {"query": _STR},
         "required": ["query"],
     },
     # -- history.py (backed by model_api_runtime/v2/history_readside.py) --
@@ -403,12 +414,6 @@ PARAMS: dict[str, dict] = {
         "required": ["prompt"],
     },
 
-    # -- synthetic reply tool --
-    REPLY_TOOL: {
-        "type": "object",
-        "properties": {"text": _STR},
-        "required": ["text"],
-    },
     STAY_SILENT_TOOL: {
         "type": "object",
         "properties": {"reason": _STR},
@@ -568,6 +573,12 @@ DESCRIPTIONS: dict[str, str] = {
                       "earlier answered memory workflow unless the current message "
                       "explicitly asks. For a "
                       "user-requested bulk rewrite or cleanup, call memory_organize."),
+    "worldbook_match": (
+        "Match the current subject against the user's World Book and return only "
+        "the relevant entries. Use it when the answer depends on user-defined lore, "
+        "characters, places, rules, or terminology. Do not call it for ordinary "
+        "conversation, and do not repeat the same query in one turn."
+    ),
     "voice_transcript_list": (
         "List this user's archived voice calls, newest first: call_id, when it "
         "happened, how long it ran, how many turns. Metadata only — no words "
@@ -582,9 +593,17 @@ DESCRIPTIONS: dict[str, str] = {
     "history_search": (
         "Search the user's raw chat history (original message text from ANY "
         "time period, beyond what is visible in context) by substring query "
-        "and/or RFC3339 time range. Use this directly for original wording "
-        "or conversation evidence; use the memory tools for remembered facts "
-        "or summaries. "
+        "and/or RFC3339 time range. "
+        # 2026-08-21 Seven 口径:memory_search 是默认路径(约 95% 的「以前的事」
+        # 它就够了),history_search 是**升级路径**,不是平行选项。两者串行,
+        # 不许同批一起调 —— 实测同批双调占了这两道题非命中的 26/40 与 20/40。
+        "memory_search is the normal path for anything the user remembers; this "
+        "tool is the escalation, not a parallel option. Reach for it when the "
+        "user names a specific past exchange or asks what was actually said "
+        "word-for-word, or after memory_search came back empty or too vague to "
+        "answer with. Do not call it in the same batch as memory_search: run "
+        "memory_search first and escalate only after seeing that its result is "
+        "missing or not specific enough. "
         "First call: give 'query' and/or 'start'/'end' (start inclusive, end "
         "exclusive, RFC3339 with explicit UTC offset; convert relative times "
         "like 'last month' yourself). 'limit' 1-5, default 3. Results are in "
@@ -635,22 +654,21 @@ DESCRIPTIONS: dict[str, str] = {
                             "If signals is omitted, ONLY the fast defaults are returned: "
                             + _PERCEPTION_DEFAULTS + ". Health and activity signals are "
                             "never included by default; request them explicitly by name. "
-                            "The app field is only the latest open/close event observed "
-                            "within 15 minutes; never claim it is the app currently in use. "
+                            + perception_prompts.PERCEPTION_TOOL_NOTES["perception_snapshot"]
+                            + " "
                             "Use perception_recent_apps for an activity trajectory."),
     "perception_recent_apps": (_PERCEPTION_USAGE_GATE
                                + "Read the merged app open/close trajectory, newest first, "
                                "with event, minutes_ago, and category. Use hours to bound "
                                "the time window and check minutes_ago before saying 'just "
-                               "now'. apps=[] means no data; disabled=true means access is "
-                               "off, not that no apps were used."),
+                               "now'. "
+                               + perception_prompts.PERCEPTION_TOOL_NOTES["perception_recent_apps"]),
     "perception_trend": (_PERCEPTION_USAGE_GATE
                          + "Read a numeric-field trend over recent days for one named signal "
                          "from " + _PERCEPTION_DOMAINS + ". Snapshot defaults do not apply: "
                          "always name the signal, and name the field when the signal has "
                          "multiple numeric fields. "
-                         "Interpret the rolling baseline as the usual level and delta as "
-                         "the current change from that baseline; do not conflate them."),
+                         + perception_prompts.PERCEPTION_TOOL_NOTES["perception_trend"]),
     "perception_history": (_PERCEPTION_USAGE_GATE
                            + "Read raw daily historical values over recent days for one named "
                            "signal from " + _PERCEPTION_DOMAINS + ". Snapshot defaults do "
@@ -710,19 +728,14 @@ DESCRIPTIONS: dict[str, str] = {
                         "send_file renders the binary document. Use expected_revision=0 "
                         "to create. Generated files must use /workspace/<filename>; "
                         "never write them under /artifacts or /skills because those "
-                        "namespaces are read-only."),
+                        "namespaces are read-only. A .io.html Canvas must be no "
+                        "larger than 256 KB of UTF-8 source; keep it compact and use "
+                        "CSS or SVG instead of embedding large base64 raster assets."),
     "workspace_delete": ("Delete an editable virtual file at its exact revision. "
                          "Artifacts and skills cannot be deleted by the model."),
     TASK_TOOL: ("Run a bounded isolated subagent on one focused task. The child can "
                 "read workspace/artifact, memory, and web data but cannot reply to "
                 "the user, mutate state, call MCP, or spawn another task."),
-    REPLY_TOOL: (
-        "Send an immediate reply bubble to the user with the given text during a "
-        "long-running task when timely progress feedback is useful. This bubble is "
-        "sent without <think>. If it already says everything you need to say, end "
-        "the turn with no additional visible text and do not repeat it. Continue "
-        "to a final visible answer only when you still have new content for the user."
-    ),
     STAY_SILENT_TOOL: (
         "Choose not to send a proactive message on this wake. Give one short, "
         "specific reason based on the current attention facts. This is a successful, "
@@ -730,6 +743,11 @@ DESCRIPTIONS: dict[str, str] = {
     ),
     FILE_REPLY_TOOL: (
         "Deliver an existing /workspace source as a downloadable attachment. "
+        "A self-contained .io.html target is presented by IO as an interactive "
+        "Canvas. Choose it when you have decided an experience belongs in the "
+        "conversation. Put everything the work needs inline so it opens offline. "
+        "Let the user experience the work itself, and discuss its source only if "
+        "they ask. "
         "Plain-text formats are sent directly; .docx and .pdf targets are rendered "
         "into real Word/PDF bytes. Preserve any format the user explicitly requested: "
         "Word means .docx and PDF means .pdf, and never replace either with Markdown. "
@@ -979,6 +997,14 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
         revision = args.get("expected_revision")
         if type(revision) is not int or revision < 0:
             return "expected_revision must be a non-negative integer"
+    if name == "workspace_write":
+        path = str(args.get("path") or "").strip().casefold()
+        content = str(args.get("content") or "")
+        if (
+            path.endswith(".io.html")
+            and len(content.encode("utf-8")) > SHARED_WORK_MAX_BYTES
+        ):
+            return "Canvas source exceeds the 256 KB UTF-8 limit"
     if name == TASK_TOOL and not str(args.get("prompt") or "").strip():
         return "task requires a non-empty prompt"
     if name == FILE_REPLY_TOOL and not str(args.get("path") or "").strip():
@@ -1011,10 +1037,15 @@ def build_tool_specs() -> list[ToolSpec]:
     for name in registry.CAPABILITIES:
         if name in _EXCLUDED:
             continue
-        specs.append(ToolSpec(name=name, description=DESCRIPTIONS[name], parameters=PARAMS[name]))
+        specs.append(
+            ToolSpec(
+                name=name,
+                description=DESCRIPTIONS[name],
+                parameters=PARAMS[name],
+            )
+        )
     for name in (
         TASK_TOOL,
-        REPLY_TOOL,
         STAY_SILENT_TOOL,
         FILE_REPLY_TOOL,
         IMAGE_REPLY_TOOL,

@@ -199,7 +199,6 @@ tests/test_redis_pool.py
 tests/test_redistill_server_merge.py
 tests/test_registry_db_fallback.py
 tests/test_relationship_days.py
-tests/test_release_pin_cas.py
 tests/test_repair_v2_bricked_frontier.py
 tests/test_reply_language.py
 tests/test_request_id.py

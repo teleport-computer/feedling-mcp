@@ -29,7 +29,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from chat import chat_core  # noqa: E402
 from bootstrap import gates as boot_gates  # noqa: E402
 
-
 def test_gc_keeps_real_reply_deletes_only_verify_ping_rows():
     """The dangling-pointer regression: a real chat reply that landed after the
     ping must survive GC; only source='verify_ping' rows (ping + ack) are removed."""

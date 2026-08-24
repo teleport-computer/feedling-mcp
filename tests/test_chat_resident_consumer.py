@@ -15,7 +15,7 @@ import threading
 import time
 import types
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -405,7 +405,7 @@ def test_v1_foreground_self_thinking_skips_only_exact_fable(
          patch.object(crc, "post_reply", return_value={"id": "reply-msg-fable"}):
         result_ts = crc._process_messages([msg])
 
-    from core import self_thinking
+    from agent_protocol_core import self_thinking
 
     assert result_ts == pytest.approx(1112.75)
     instruction_present = self_thinking.INSTRUCTION.strip() in captured["message"]
@@ -533,7 +533,7 @@ def test_whoami_startup_retries_keep_fixed_delay(monkeypatch):
     monkeypatch.setattr(crc, "_load_whoami", lambda: False)
     monkeypatch.setattr(crc, "WHOAMI_STARTUP_RETRIES", 3)
     monkeypatch.setattr(crc, "WHOAMI_STARTUP_RETRY_DELAY_SEC", 5)
-    monkeypatch.setattr(crc.time, "sleep", lambda delay: sleeps.append(delay))
+    capture_sleeps(monkeypatch, crc, sleeps)
 
     assert crc._load_whoami_with_retries() is False
     assert sleeps == [5, 5]
@@ -543,7 +543,7 @@ def test_whoami_reply_refresh_retries_use_exponential_backoff(monkeypatch):
     sleeps = []
 
     monkeypatch.setattr(crc, "_load_whoami", lambda: False)
-    monkeypatch.setattr(crc.time, "sleep", lambda delay: sleeps.append(delay))
+    capture_sleeps(monkeypatch, crc, sleeps)
 
     assert crc._load_whoami_with_retries(
         attempts=3,
@@ -821,7 +821,12 @@ def test_verify_ping_enclave_path_probes_real_agent():
          patch.object(crc, "post_reply") as mock_post:
         result_ts = crc._process_messages([ping])
 
-    mock_agent.assert_called_once_with(crc.VERIFY_PROBE_MESSAGE)
+    mock_agent.assert_called_once_with(
+        crc.VERIFY_PROBE_MESSAGE,
+        lane="background",
+        isolated_session=True,
+        cancellation=ANY,
+    )
     mock_post.assert_called_once()
     # Every verify ack binds back to THIS ping so the backend strict matcher
     # (source=verify_ping ∧ reply_to=ping id) can pair it precisely.
@@ -841,7 +846,12 @@ def test_verify_ping_poll_marker_probes_real_agent():
          patch.object(crc, "post_reply") as mock_post:
         result_ts = crc._process_messages([ping])
 
-    mock_agent.assert_called_once_with(crc.VERIFY_PROBE_MESSAGE)
+    mock_agent.assert_called_once_with(
+        crc.VERIFY_PROBE_MESSAGE,
+        lane="background",
+        isolated_session=True,
+        cancellation=ANY,
+    )
     mock_post.assert_called_once()
     assert mock_post.call_args.kwargs["reply_to_message_id"] == "ping-marker-1"
     assert result_ts == pytest.approx(4343.0)
@@ -889,25 +899,25 @@ def test_verify_ping_slow_agent_falls_back_to_canned_ack():
     # deterministically AND the background probe thread is released before the
     # test returns — a leaked sleeping thread would wake mid-next-test and
     # pollute its call_agent mock.
-    release = threading.Event()
+    cancelled = threading.Event()
 
-    def _slow(_msg):
-        release.wait(timeout=2)
+    def _slow(_msg, *, cancellation, **_kwargs):
+        cancellation.cancelled.wait(timeout=2)
+        cancelled.set()
+        cancellation.raise_if_cancelled()
         return "too late"
 
-    try:
-        with patch.object(crc, "VERIFY_PROBE_TIMEOUT_SEC", 0.01), \
-             patch.object(crc, "call_agent", side_effect=_slow), \
-             patch.object(crc, "post_reply") as mock_post:
-            crc._process_messages([ping])
-            # Canned ack still binds to the ping so a slow-path fallback ack is
-            # matched as precisely as a real-reply ack.
-            mock_post.assert_called_once_with(
-                crc.VERIFY_PING_REPLY, source="verify_ping", suppress_push=True,
-                reply_to_message_id="ping-slow-1",
-            )
-    finally:
-        release.set()
+    with patch.object(crc, "VERIFY_PROBE_TIMEOUT_SEC", 0.01), \
+         patch.object(crc, "call_agent", side_effect=_slow), \
+         patch.object(crc, "post_reply") as mock_post:
+        crc._process_messages([ping])
+        # Canned ack still binds to the ping so a slow-path fallback ack is
+        # matched as precisely as a real-reply ack.
+        mock_post.assert_called_once_with(
+            crc.VERIFY_PING_REPLY, source="verify_ping", suppress_push=True,
+            reply_to_message_id="ping-slow-1",
+        )
+    assert cancelled.wait(timeout=0.2)
 
 
 def test_verify_ping_no_usable_reply_does_not_ack():
@@ -1017,6 +1027,16 @@ def test_user_message_containing_verify_marker_is_not_short_circuited():
     assert result_ts == pytest.approx(4545.0)
 
 
+def test_enclave_timeout_bounds_connect_without_shrinking_read(monkeypatch):
+    monkeypatch.setattr(crc, "ENCLAVE_CONNECT_TIMEOUT_SEC", 5.0)
+    monkeypatch.setattr(crc, "ENCLAVE_READ_TIMEOUT_SEC", 20.0)
+
+    timeout = crc._enclave_http_timeout()
+
+    assert timeout.connect == 5.0
+    assert timeout.read == 20.0
+
+
 def test_enclave_fetch_logs_response_body_on_http_error(monkeypatch, caplog):
     """When the enclave returns a non-2xx, the consumer must log the response
     BODY, not just the bare status line.
@@ -1042,7 +1062,7 @@ def test_enclave_fetch_logs_response_body_on_http_error(monkeypatch, caplog):
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://127.0.0.1:5003")
     monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
     # 503 is transient (retried); don't actually sleep the backoff in the test.
-    monkeypatch.setattr(crc.time, "sleep", lambda *_: None)
+    capture_sleeps(monkeypatch, crc)
 
     with caplog.at_level("WARNING"):
         result = crc._fetch_from_enclave(since=0.0, limit=20)
@@ -1069,7 +1089,7 @@ def test_fetch_from_enclave_retries_transient_502(monkeypatch):
     mock_client.get.side_effect = [err, ok]
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://enc")
     monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
-    monkeypatch.setattr(crc.time, "sleep", lambda *_: None)
+    capture_sleeps(monkeypatch, crc)
 
     result = crc._fetch_from_enclave(since=0.0, limit=20)
 
@@ -1086,7 +1106,7 @@ def test_fetch_from_enclave_retries_transient_network_error(monkeypatch):
     mock_client.get.side_effect = [_httpx.ConnectError("boom"), ok]
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://enc")
     monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
-    monkeypatch.setattr(crc.time, "sleep", lambda *_: None)
+    capture_sleeps(monkeypatch, crc)
 
     result = crc._fetch_from_enclave(since=0.0, limit=20)
 
@@ -1104,7 +1124,7 @@ def test_fetch_from_enclave_no_retry_on_permanent_4xx(monkeypatch):
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://enc")
     monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
     slept: list = []
-    monkeypatch.setattr(crc.time, "sleep", lambda d: slept.append(d))
+    capture_sleeps(monkeypatch, crc, slept)
 
     result = crc._fetch_from_enclave(since=0.0, limit=20)
 
@@ -1123,7 +1143,7 @@ def test_fetch_from_enclave_gives_up_after_max_attempts(monkeypatch):
         502, json={"error": "backend_unreachable"}, request=_httpx.Request("GET", url))
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://enc")
     monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
-    monkeypatch.setattr(crc.time, "sleep", lambda *_: None)
+    capture_sleeps(monkeypatch, crc)
 
     result = crc._fetch_from_enclave(since=0.0, limit=20)
 
@@ -1204,7 +1224,7 @@ def test_screen_question_attaches_decrypted_screen_context(monkeypatch):
             ["/tmp/feedling_chat_images/screen.jpg"],
         ),
     )
-    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text: "")
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text, **_kwargs: "")
 
     with patch.object(crc, "call_agent", return_value="I can see it.") as mock_agent, \
          patch.object(crc, "post_reply") as mock_post:
@@ -1230,6 +1250,52 @@ def test_screen_context_explicit_disable_still_wins(monkeypatch):
     monkeypatch.setattr(crc, "SCREEN_CONTEXT_MODE", "disabled")
 
     assert crc._should_attach_screen_context("你能看到我的屏幕吗") is False
+
+
+def test_screen_context_tool_mode_never_prefetches(monkeypatch):
+    monkeypatch.setattr(crc, "SCREEN_CONTEXT_MODE", "tool")
+    monkeypatch.setattr(
+        crc,
+        "_fetch_screen_metadata_once",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("tool mode must not prefetch screen metadata")
+        ),
+    )
+
+    assert crc._screen_context_for_message("你能看到我的屏幕吗") == ("", [], [])
+
+
+def test_foreground_worldbook_tool_mode_never_prefetches(monkeypatch):
+    monkeypatch.setattr(crc, "FOREGROUND_WORLDBOOK_CONTEXT_MODE", "tool")
+    monkeypatch.setattr(
+        crc._HTTP,
+        "post",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("tool mode must not prefetch World Book context")
+        ),
+    )
+
+    assert crc._worldbook_context_for_foreground("今天是什么日子") == ""
+
+
+def test_foreground_worldbook_eager_mode_remains_as_rollback(monkeypatch):
+    response = MagicMock(status_code=200)
+    response.json.return_value = {
+        "block": "<world_book>影月历</world_book>",
+        "matched_names": ["历法"],
+    }
+    monkeypatch.setattr(crc, "FOREGROUND_WORLDBOOK_CONTEXT_MODE", "eager")
+    post = MagicMock(return_value=response)
+    monkeypatch.setattr(crc._HTTP, "post", post)
+
+    assert crc._worldbook_context_for_foreground(
+        "今天是什么日子", trace_id="trace-worldbook"
+    ) == (
+        "<world_book>影月历</world_book>"
+    )
+    assert post.call_args.kwargs["headers"]["X-Feedling-Trace-Id"] == (
+        "trace-worldbook"
+    )
 
 
 def test_active_screen_share_uses_recent_session_selector_without_word_heuristic(
@@ -1291,6 +1357,7 @@ def test_active_screen_share_without_ok_pixel_verdict_exposes_only_availability(
         return {"frames": [{"id": "f1", "ts": now - 3}]}
 
     monkeypatch.setattr(crc.time, "time", lambda: now)
+    monkeypatch.setattr(crc, "SCREEN_CONTEXT_MODE", "auto")
     monkeypatch.setattr(crc, "SCREEN_VISION_TEST_STATUS", "unsupported")
     monkeypatch.setattr(crc, "_fetch_screen_metadata_once", _fetch)
 
@@ -1306,6 +1373,7 @@ def test_active_screen_share_without_ok_pixel_verdict_exposes_only_availability(
 def test_stalled_screen_share_returns_restart_guidance_without_old_pixels(
     monkeypatch,
 ):
+    monkeypatch.setattr(crc, "SCREEN_CONTEXT_MODE", "auto")
     monkeypatch.setattr(
         crc,
         "_fetch_screen_metadata_once",
@@ -1343,6 +1411,7 @@ def test_stalled_screen_share_returns_restart_guidance_without_old_pixels(
 def test_ended_screen_share_keeps_prior_frames_conversational_without_decrypt(
     monkeypatch,
 ):
+    monkeypatch.setattr(crc, "SCREEN_CONTEXT_MODE", "auto")
     monkeypatch.setattr(
         crc,
         "_fetch_screen_metadata_once",
@@ -1422,7 +1491,7 @@ def test_screen_frame_provider_rejection_retries_once_without_screen_pixels(
     )
     report = MagicMock(return_value=True)
     monkeypatch.setattr(crc, "_report_runtime_error", report)
-    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text: "")
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text, **_kwargs: "")
 
     with patch.object(
         crc,
@@ -2483,6 +2552,162 @@ def test_agent_session_meta_rotates_when_turn_bound_reached(monkeypatch, tmp_pat
 
     assert crc._load_agent_session_id() == ""
     assert not crc._agent_session_file_for_user().exists()
+
+
+def test_agent_session_rotates_after_reported_input_budget(monkeypatch, tmp_path):
+    crc._agent_session_id_cache.clear()
+    crc._agent_session_meta_cache.clear()
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {"user_id": "usr_token_bound", "user_pk": None, "enclave_pk": None},
+    )
+    monkeypatch.setattr(
+        crc,
+        "AGENT_SESSION_FILE_TEMPLATE",
+        str(tmp_path / "feedling_{user_id}.json"),
+    )
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_TURNS", 0)
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_BYTES", 0)
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_INPUT_TOKENS", 32_768)
+
+    crc._save_agent_session_id("sess-large")
+    crc._record_agent_session_turn(
+        "sess-large", sent_bytes=10, received_bytes=20, input_tokens=34_158
+    )
+
+    meta = crc._load_agent_session_meta(check_bounds=False)
+    assert meta["peak_input_tokens"] == 34_158
+    assert crc._load_agent_session_id() == ""
+
+
+def test_codex_minimal_profile_disables_only_supported_optional_features(monkeypatch):
+    monkeypatch.setattr(crc, "MINIMAL_RUNTIME_PROFILE", "auto")
+    monkeypatch.setattr(
+        crc,
+        "_codex_feature_names",
+        lambda _exe: frozenset({"plugins", "memories", "shell_tool"}),
+    )
+
+    cmd = crc._inject_minimal_runtime_profile(
+        ["/opt/bin/codex", "exec", "--json"]
+    )
+
+    assert cmd == [
+        "/opt/bin/codex",
+        "--disable", "memories",
+        "--disable", "plugins",
+        "exec", "--json",
+    ]
+
+
+def test_codex_minimal_profile_flags_survive_resume_conversion():
+    cmd = [
+        "/opt/bin/codex",
+        "--disable", "plugins",
+        "exec", "--json", "--sandbox", "read-only",
+    ]
+
+    assert crc._codex_resume_command(cmd, "thread-123") == [
+        "/opt/bin/codex",
+        "--disable", "plugins",
+        "exec", "resume", "--json", "thread-123", "-",
+    ]
+
+
+def test_codex_app_server_plan_preserves_user_settings_without_effort_override(
+    monkeypatch,
+):
+    monkeypatch.setattr(crc, "CODEX_APP_SERVER_STREAM", "auto")
+
+    plan = crc._codex_app_server_plan(
+        [
+            "/opt/bin/codex",
+            "--disable", "plugins",
+            "exec", "--json",
+            "-c", "model_reasoning_effort=high",
+            "--model", "gpt-user-choice",
+            "--sandbox", "read-only",
+        ],
+        message="你好",
+        image_paths=None,
+        cwd="/work",
+        session_id="",
+        isolated_session=False,
+    )
+
+    assert plan is not None
+    assert plan.launch_cmd == [
+        "/opt/bin/codex",
+        "--disable", "plugins",
+        "-c", "model_reasoning_effort=high",
+        "app-server", "--stdio",
+    ]
+    assert plan.thread_params == {
+        "model": "gpt-user-choice",
+        "sandbox": "read-only",
+        "cwd": "/work",
+    }
+    assert "effort" not in plan.thread_params
+
+
+def test_codex_app_server_plan_inherits_default_model_and_reasoning(monkeypatch):
+    monkeypatch.setattr(crc, "CODEX_APP_SERVER_STREAM", "auto")
+
+    plan = crc._codex_app_server_plan(
+        ["/opt/bin/codex", "exec", "--json"],
+        message="hello",
+        image_paths=None,
+        cwd="/work",
+        session_id="",
+        isolated_session=False,
+    )
+
+    assert plan is not None
+    assert "model" not in plan.thread_params
+    assert "effort" not in plan.thread_params
+    assert plan.thread_params["cwd"] == "/work"
+
+
+def test_codex_app_server_plan_resumes_with_root_feature_flags(monkeypatch):
+    monkeypatch.setattr(crc, "CODEX_APP_SERVER_STREAM", "auto")
+    thread_id = "019fad75-fdac-7012-b4fb-d414f9b08302"
+
+    plan = crc._codex_app_server_plan(
+        [
+            "/opt/bin/codex", "--disable", "plugins",
+            "exec", "resume", "--json", "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox", thread_id, "-",
+        ],
+        message="继续",
+        image_paths=None,
+        cwd="/work",
+        session_id=thread_id,
+        isolated_session=False,
+    )
+
+    assert plan is not None
+    assert plan.thread_method == "thread/resume"
+    assert plan.thread_params == {
+        "approvalPolicy": "never",
+        "sandbox": "danger-full-access",
+        "cwd": "/work",
+        "threadId": thread_id,
+    }
+    assert "effort" not in plan.thread_params
+
+
+def test_codex_app_server_plan_rejects_untranslatable_profile(monkeypatch):
+    monkeypatch.setattr(crc, "CODEX_APP_SERVER_STREAM", "auto")
+
+    assert crc._codex_app_server_plan(
+        ["/opt/bin/codex", "exec", "--profile", "voice", "--json"],
+        message="hello",
+        image_paths=None,
+        cwd="/work",
+        session_id="",
+        isolated_session=False,
+    ) is None
 
 
 def _bridge_session_env(monkeypatch, tmp_path, user_id, *, max_turns=0):
@@ -3720,6 +3945,7 @@ def _install_dream_job_harness(monkeypatch, agent_reply):
         "envelope_plaintexts": [],
         "envelope_kwargs": [],
         "post_called": False,
+        "traces": [],
     }
 
     history = [
@@ -3792,6 +4018,13 @@ def _install_dream_job_harness(monkeypatch, agent_reply):
             "effects": [{"type": "memory_superseded"} for _action in actions],
         }
 
+    def _trace(subsystem, event_type, **kwargs):
+        captured["traces"].append({
+            "subsystem": subsystem,
+            "type": event_type,
+            **kwargs,
+        })
+
     monkeypatch.setattr(crc, "call_agent", _agent)
     monkeypatch.setattr(crc, "post_reply", _fail_post)
     monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
@@ -3818,6 +4051,7 @@ def _install_dream_job_harness(monkeypatch, agent_reply):
     monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
     monkeypatch.setattr(crc, "_build_envelope", _build_envelope)
     monkeypatch.setattr(crc, "execute_memory_actions", _memory_actions)
+    monkeypatch.setattr(crc, "_emit_debug_trace", _trace)
     return captured, job
 
 
@@ -4459,6 +4693,36 @@ def test_dream_job_merge_writes_multi_supersede_without_chat_or_delivery(monkeyp
     assert extra["dream_result"]["organized_count"] == 2
     assert extra["dream_result"]["merged_count"] == 1
     assert extra["questions"] == ["确认是否只是不喝牛奶？"]
+    assert [row["type"] for row in captured["traces"]] == [
+        "memory.dream.start",
+        "memory.dream.model.start",
+        "memory.dream.model.done",
+        "memory.dream.done",
+    ]
+    assert all(
+        row["trace_id"] == "dream_dispatch"
+        and row["job_id"] == "dream_dispatch"
+        for row in captured["traces"]
+    )
+    terminal = captured["traces"][-1]
+    assert terminal["status"] == "ok"
+    assert terminal["detail"] == {
+        "runtime": "resident_v1",
+        "lane": "dream",
+        "outcome": "applied",
+        "degraded_context": False,
+        "counts": {
+            "actions": 1,
+            "active_cards": 3,
+            "applied": 1,
+            "failed": 0,
+            "merged": 1,
+            "model_attempts": 1,
+            "organized": 2,
+            "proposals": 1,
+            "skipped": 0,
+        },
+    }
 
 
 def test_dream_job_thicken_and_supersede_are_memory_supersede_actions(monkeypatch):
@@ -4508,6 +4772,46 @@ def test_dream_job_thicken_and_supersede_are_memory_supersede_actions(monkeypatc
     assert extra["dream_result"]["cards_thickened"] == 1
 
 
+def test_dream_job_partial_write_is_a_warning_not_a_false_ok(monkeypatch):
+    reply = json.dumps({
+        "consolidations": [
+            {
+                "op": "thicken",
+                "card_ids": ["mem_a"],
+                "rationale": "同一偏好的补充",
+                "result": {"summary": "偏好摘要", "content": "偏好正文"},
+            },
+            {
+                "op": "supersede",
+                "card_ids": ["mem_c"],
+                "rationale": "同一习惯的更新",
+                "result": {"summary": "习惯摘要", "content": "习惯正文"},
+            },
+        ],
+        "questions_to_ask": [],
+    }, ensure_ascii=False)
+    captured, job = _install_dream_job_harness(monkeypatch, reply)
+
+    def _partial(actions):
+        captured["actions"].extend(actions)
+        return {
+            "results": [
+                {"status": "ok", "action": actions[0]["type"]},
+                {"status": "error", "error": "storage_error"},
+            ],
+        }
+
+    monkeypatch.setattr(crc, "execute_memory_actions", _partial)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+    terminal = captured["traces"][-1]
+    assert terminal["type"] == "memory.dream.done"
+    assert terminal["status"] == "warning"
+    assert terminal["detail"]["outcome"] == "partial"
+    assert terminal["detail"]["counts"]["applied"] == 1
+    assert terminal["detail"]["counts"]["failed"] == 1
+
+
 def test_dream_job_empty_consolidations_completes_noop_without_memory_write_or_chat(monkeypatch):
     captured, job = _install_dream_job_harness(
         monkeypatch,
@@ -4538,6 +4842,11 @@ def test_dream_job_bad_json_fails_without_crash_or_memory_write(monkeypatch):
     assert captured["post_called"] is False
     assert _dream_final_status(captured)[:3] == ("dream_dispatch", "failed", "no_json_object")
     assert _dream_final_status(captured)[3]["extra"]["noop_reason"] == "no_json_object"
+    assert [row["type"] for row in captured["traces"]][-2:] == [
+        "memory.dream.model.error",
+        "memory.dream.error",
+    ]
+    assert captured["traces"][-1]["detail"]["outcome"] == "parse_rejected"
 
 
 def test_process_proactive_v2_wake_routes_without_gate_judgment(monkeypatch):
@@ -7301,6 +7610,60 @@ def test_codex_thread_id_and_session_reasoning_fallback(monkeypatch, tmp_path):
     assert reasoning == "正在整理可下载内容。"
 
 
+def test_codex_resume_command_keeps_supported_flags_and_drops_creation_only():
+    cmd = [
+        "/opt/bin/codex", "exec", "--json", "--skip-git-repo-check",
+        "--sandbox", "read-only", "--profile=voice", "--image=/tmp/a.png",
+    ]
+
+    resumed = crc._codex_resume_command(cmd, "thread-123")
+
+    assert resumed == [
+        "/opt/bin/codex", "exec", "resume", "--json",
+        "--skip-git-repo-check", "--image=/tmp/a.png", "thread-123", "-",
+    ]
+
+
+def test_prepare_codex_command_resumes_stored_thread(monkeypatch):
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        "codex exec --json --skip-git-repo-check --sandbox read-only {message}",
+    )
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "thread-123")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_codex_resume_supported", lambda executable: True)
+
+    cmd, stdin_message = crc._prepare_cli_command("继续聊", lane="chat")
+
+    assert cmd == [
+        "codex", "exec", "resume", "--json", "--skip-git-repo-check",
+        "thread-123", "-",
+    ]
+    assert stdin_message == "继续聊"
+
+
+def test_prepare_codex_command_keeps_stateless_fallback_without_resume(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec --json {message}")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "thread-123")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_codex_resume_supported", lambda executable: False)
+
+    cmd, stdin_message = crc._prepare_cli_command("继续聊", lane="chat")
+
+    assert cmd == ["codex", "exec", "--json"]
+    assert stdin_message == "继续聊"
+
+
+def test_codex_missing_rollout_error_is_recognized_for_fresh_retry():
+    actual_cli_error = (
+        "thread/resume failed: no rollout found for thread id "
+        "00000000-0000-0000-0000-000000000000"
+    )
+
+    assert crc._CODEX_MISSING_SESSION_RE.search(actual_cli_error)
+
+
 # ---------------------------------------------------------------------------
 # When a codex turn calls tools, a *preamble* agent_message ("let me check…")
 # precedes the tool call and the real answer arrives in a LATER agent_message —
@@ -7487,6 +7850,135 @@ def test_call_agent_http_simple_raw_text_returns_bare_cards_body(monkeypatch):
     assert json.loads(out) == {"cards": [{"action": "add", "summary": "s", "content": "c"}]}
 
 
+def test_http_runtime_stream_publishes_only_explicit_visible_text():
+    published = []
+    stream = crc._HTTPRuntimeStream(
+        lambda segment, text, final: published.append((segment, text, final))
+    )
+
+    for line in (
+        b'{"type":"thinking_delta","delta":"private"}',
+        b'{"type":"text_delta","delta":"\xe4\xbd\xa0"}',
+        b'{"type":"text_delta","delta":"\xe5\xa5\xbd"}',
+        b'{"type":"result","body":{"response":"\xe4\xbd\xa0\xe5\xa5\xbd"}}',
+    ):
+        stream.feed(line)
+
+    assert published == [(0, "你", False), (0, "你好", False)]
+    assert stream.finish() == {"response": "你好"}
+
+
+def test_openai_http_stream_preserves_reasoning_and_tools_without_speaking_them():
+    published = []
+    stream = crc._OpenAIHTTPRuntimeStream(
+        lambda segment, text, final: published.append((segment, text, final))
+    )
+    events = [
+        {"id": "r1", "model": "m1", "choices": [{"delta": {
+            "reasoning_content": "private"}}]},
+        {"id": "r1", "model": "m1", "choices": [{"delta": {
+            "content": "你"}}]},
+        {"id": "r1", "model": "m1", "choices": [{"delta": {
+            "content": "好", "tool_calls": [{"index": 0, "id": "call_1",
+                "type": "function", "function": {
+                    "name": "weather", "arguments": '{"city":'}}]}}]},
+        {"id": "r1", "model": "m1", "choices": [{"delta": {
+            "tool_calls": [{"index": 0, "function": {
+                "arguments": '"上海"}'}}]}, "finish_reason": "tool_calls"}]},
+    ]
+
+    for event in events:
+        stream.feed("data: " + json.dumps(event, ensure_ascii=False))
+
+    body = stream.finish()
+    message = body["choices"][0]["message"]
+    assert published == [(0, "你", False), (0, "你好", False)]
+    assert message["reasoning_content"] == "private"
+    assert message["tool_calls"][0]["function"] == {
+        "name": "weather",
+        "arguments": '{"city":"上海"}',
+    }
+
+
+def test_call_agent_http_simple_streams_ndjson_and_returns_final_body(monkeypatch):
+    published = []
+    request = {}
+
+    class _Resp:
+        headers = {
+            "Content-Type": "application/x-ndjson",
+            "X-Codex-Thread-Id": "thread-1",
+        }
+        text = ""
+
+        def raise_for_status(self):
+            pass
+
+        def iter_lines(self):
+            return iter([
+                b'{"type":"text_delta","delta":"\xe4\xbd\xa0"}',
+                b'{"type":"text_delta","delta":"\xe5\xa5\xbd"}',
+                b'{"type":"result","body":{"response":"\xe4\xbd\xa0\xe5\xa5\xbd\xe3\x80\x82"}}',
+            ])
+
+        def close(self):
+            pass
+
+    def _post(url, **kwargs):
+        request.update(kwargs)
+        return _Resp()
+
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://127.0.0.1:8767/chat")
+    monkeypatch.setattr(crc, "_http_streaming_post", _post)
+    monkeypatch.setattr(crc, "_remember_http_session", lambda *a, **kw: None)
+
+    out = crc._call_agent_http_simple(
+        "hello",
+        stream_update=lambda segment, text, final: published.append(
+            (segment, text, final)
+        ),
+    )
+
+    assert out == "你好。"
+    assert request["payload"]["stream"] is True
+    assert request["payload"]["stream_format"] == "ndjson"
+    assert published == [(0, "你", False), (0, "你好", False)]
+
+
+def test_call_agent_http_simple_voice_falls_back_to_normal_json(monkeypatch):
+    published = []
+
+    class _Resp:
+        headers = {"Content-Type": "application/json"}
+        text = '{"response":"buffered"}'
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"response": "buffered"}
+
+        def read(self):
+            return self.text.encode()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://agent.local/chat")
+    monkeypatch.setattr(crc, "_http_streaming_post", lambda *a, **kw: _Resp())
+    monkeypatch.setattr(crc, "_remember_http_session", lambda *a, **kw: None)
+
+    out = crc._call_agent_http_simple(
+        "hello",
+        stream_update=lambda segment, text, final: published.append(
+            (segment, text, final)
+        ),
+    )
+
+    assert out == "buffered"
+    assert published == []
+
+
 # ---------------------------------------------------------------------------
 # pi driver: `pi --mode json` JSONL event stream parse / thinking / errors.
 # pi separates thinking from text at the event level (each completed assistant
@@ -7556,6 +8048,198 @@ def test_pi_stream_observer_emits_monotonic_text_without_thinking():
     ]
 
 
+def test_pi_stream_observer_holds_self_thinking_until_visible_reply():
+    published = []
+    observer = crc._PiStreamObserver(
+        lambda segment, text, final: published.append((segment, text, final))
+    )
+    events = [
+        {"type": "message_start", "message": {"role": "assistant"}},
+        {"type": "message_update", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "<thi"},
+        ]}},
+        {"type": "message_update", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "<think>不能说</think>你"},
+        ]}},
+        {"type": "message_end", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "<think>不能说</think>你好"},
+        ]}},
+    ]
+
+    for event in events:
+        observer.feed(json.dumps(event, ensure_ascii=False))
+
+    assert published == [(0, "你", False), (0, "你好", True)]
+
+
+def test_claude_stream_observer_emits_text_but_not_thinking_deltas():
+    published = []
+    observer = crc._ClaudeStreamObserver(
+        lambda segment, text, final: published.append((segment, text, final))
+    )
+    events = [
+        {"type": "stream_event", "event": {"type": "message_start"}},
+        {"type": "stream_event", "event": {"type": "content_block_delta",
+            "delta": {"type": "thinking_delta", "thinking": "private"}}},
+        {"type": "stream_event", "event": {"type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "你"}}},
+        {"type": "stream_event", "event": {"type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "好"}}},
+    ]
+
+    for event in events:
+        observer.feed(json.dumps(event, ensure_ascii=False))
+
+    assert published == [(0, "你", False), (0, "你好", False)]
+
+
+def test_codex_stream_observer_handles_legacy_and_flat_message_events():
+    published = []
+    observer = crc._CodexStreamObserver(
+        lambda segment, text, final: published.append((segment, text, final))
+    )
+    events = [
+        {"type": "item.completed", "item": {
+            "type": "reasoning", "text": "private"}},
+        {"type": "item.completed", "item": {
+            "type": "agent_message", "text": "我先查一下。"}},
+        {"type": "item.completed", "item": {
+            "type": "mcp_tool_call", "text": "tool args"}},
+        {"type": "agent_message", "message": "查到了。"},
+    ]
+
+    for event in events:
+        observer.feed(json.dumps(event, ensure_ascii=False))
+
+    assert published == [
+        (0, "我先查一下。", True),
+        (1, "查到了。", True),
+    ]
+
+
+def test_codex_stream_observer_buffers_split_thinking_without_duplicate_speech():
+    published = []
+    observer = crc._CodexStreamObserver(
+        lambda segment, text, final: published.append((segment, text, final))
+    )
+    events = [
+        {"type": "item.started", "item": {
+            "id": "answer", "type": "agent_message",
+        }},
+        {"type": "agent_message_delta", "delta": "<th"},
+        {"type": "agent_message_delta", "delta": "ink>不要说"},
+        {"type": "agent_message_delta", "delta": "</think>你"},
+        {"type": "agent_message_delta", "delta": "好"},
+        {"type": "item.completed", "item": {
+            "id": "answer", "type": "agent_message",
+            "text": "<think>不要说</think>你好",
+        }},
+    ]
+
+    for event in events:
+        observer.feed(json.dumps(event, ensure_ascii=False))
+
+    assert published == [(0, "你", False), (0, "你好", False)]
+
+
+def test_call_agent_cli_voice_forces_claude_partial_stream_mode(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    observed = {}
+
+    class _R:
+        returncode = 0
+        stdout = "\n".join([
+            json.dumps({"type": "stream_event", "event": {
+                "type": "message_start"}}),
+            json.dumps({"type": "stream_event", "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "你好"}}}),
+            json.dumps({"type": "result", "subtype": "success", "result": "你好"}),
+        ])
+        stderr = ""
+
+    def _run(cmd, kwargs, stdout_line=None):
+        observed["cmd"] = cmd
+        if stdout_line is not None:
+            for line in _R.stdout.splitlines(True):
+                stdout_line(line)
+        return _R()
+
+    monkeypatch.setattr(crc, "_run_cli_subprocess", _run)
+    published = []
+
+    out = crc.call_agent_cli(
+        "hi",
+        lane="chat",
+        stream_update=lambda segment, text, final: published.append(
+            (segment, text, final)
+        ),
+    )
+
+    cmd = observed["cmd"]
+    assert cmd[cmd.index("--output-format") + 1] == "stream-json"
+    assert "--include-partial-messages" in cmd
+    assert "--verbose" in cmd
+    assert published == [(0, "你好", False)]
+    assert out == "你好"
+
+
+def test_call_agent_cli_voice_uses_codex_app_server_deltas_without_effort_override(
+    monkeypatch,
+):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec --json {message}")
+    monkeypatch.setattr(crc, "CODEX_APP_SERVER_STREAM", "auto")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_codex_resume_supported", lambda _executable: False)
+    monkeypatch.setattr(crc, "_codex_feature_names", lambda _executable: frozenset())
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    observed = {}
+
+    def _app_server(plan, _kwargs, *, stdout_line, cancellation):
+        observed["plan"] = plan
+        assert cancellation is None
+        lines = [
+            json.dumps({"type": "thread.started", "thread_id": "thread-app"}),
+            json.dumps({"type": "item.started", "item": {
+                "id": "answer", "type": "agent_message",
+            }}),
+            json.dumps({"type": "agent_message_delta", "delta": "你"}),
+            json.dumps({"type": "agent_message_delta", "delta": "好"}),
+            json.dumps({"type": "item.completed", "item": {
+                "id": "answer", "type": "agent_message", "text": "你好",
+            }}),
+        ]
+        for line in lines:
+            stdout_line(line + "\n")
+        return subprocess.CompletedProcess(
+            plan.launch_cmd, 0, stdout="\n".join(lines), stderr=""
+        )
+
+    monkeypatch.setattr(crc, "_run_codex_app_server_turn", _app_server)
+    monkeypatch.setattr(
+        crc,
+        "_run_cli_subprocess",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("voice should use App Server")
+        ),
+    )
+    published = []
+
+    out = crc.call_agent_cli(
+        "hi",
+        lane="chat",
+        stream_update=lambda segment, text, final: published.append(
+            (segment, text, final)
+        ),
+    )
+
+    assert out == "你好"
+    assert published == [(0, "你", False), (0, "你好", False)]
+    assert "effort" not in observed["plan"].thread_params
+
+
 def test_voice_delta_publisher_marks_latest_segment_complete(monkeypatch):
     posted = []
 
@@ -7581,6 +8265,169 @@ def test_voice_delta_publisher_marks_latest_segment_complete(monkeypatch):
     }
 
 
+def test_voice_delta_final_marker_retries_idempotently(monkeypatch):
+    attempts = []
+
+    class _Response:
+        status_code = 200
+
+    def _post(url, **kwargs):
+        attempts.append(kwargs["json"])
+        if len(attempts) < 3:
+            raise RuntimeError("temporary timeout")
+        return _Response()
+
+    monkeypatch.setattr(crc._HTTP, "post", _post)
+    monkeypatch.setattr(crc, "VOICE_STREAM_FINAL_ATTEMPTS", 3)
+    capture_sleeps(monkeypatch, crc)
+    publisher = crc._VoiceDeltaPublisher("parent-retry")
+
+    assert publisher._post(0, "完整回答", final=True) is True
+    assert len(attempts) == 3
+    assert all(item["final"] is True for item in attempts)
+    publisher.abort()
+
+
+def test_voice_delta_nonfinal_failure_does_not_retry(monkeypatch):
+    attempts = []
+
+    def _post(url, **kwargs):
+        attempts.append(kwargs["json"])
+        raise RuntimeError("temporary timeout")
+
+    monkeypatch.setattr(crc._HTTP, "post", _post)
+    monkeypatch.setattr(crc, "VOICE_STREAM_FINAL_ATTEMPTS", 3)
+    publisher = crc._VoiceDeltaPublisher("parent-no-retry")
+
+    assert publisher._post(0, "部分", final=False) is False
+    assert len(attempts) == 1
+    publisher.abort()
+
+
+def test_voice_delta_publisher_does_not_block_and_coalesces(monkeypatch):
+    first_post_started = threading.Event()
+    release_first_post = threading.Event()
+    posted = []
+
+    class _Response:
+        status_code = 200
+
+    def _post(url, **kwargs):
+        posted.append(kwargs["json"])
+        if len(posted) == 1:
+            first_post_started.set()
+            assert release_first_post.wait(timeout=2)
+        return _Response()
+
+    monkeypatch.setattr(crc._HTTP, "post", _post)
+    publisher = crc._VoiceDeltaPublisher("parent-2")
+
+    publisher(0, "第一", False)
+    assert first_post_started.wait(timeout=1)
+    started_at = time.monotonic()
+    publisher(0, "第一段文字", False)
+    publisher(0, "第一段文字继续生成", False)
+    assert time.monotonic() - started_at < 0.1
+
+    release_first_post.set()
+    publisher.complete()
+
+    assert len(posted) == 2
+    assert posted[0]["text"] == "第一"
+    assert posted[0]["final"] is False
+    assert posted[1] == {
+        "parent_message_id": "parent-2",
+        "segment": 0,
+        "text": "第一段文字继续生成",
+        "final": True,
+    }
+
+
+def test_voice_delta_publisher_empty_completion_stops_worker(monkeypatch):
+    monkeypatch.setattr(
+        crc._HTTP,
+        "post",
+        lambda *args, **kwargs: pytest.fail("empty stream must not post"),
+    )
+    publisher = crc._VoiceDeltaPublisher("parent-empty")
+
+    publisher.complete()
+
+    assert publisher._done.wait(timeout=1)
+
+
+def test_voice_delta_publisher_drops_late_text_after_abort(monkeypatch):
+    monkeypatch.setattr(
+        crc._HTTP,
+        "post",
+        lambda *args, **kwargs: pytest.fail("aborted turn must not post"),
+    )
+    publisher = crc._VoiceDeltaPublisher("parent-aborted")
+
+    publisher.abort()
+    publisher(0, "迟到的旧回答", False)
+    publisher.complete()
+
+    assert publisher._done.wait(timeout=1)
+
+
+def test_superseded_voice_reply_is_a_terminal_skip():
+    class _Response:
+        status_code = 409
+
+        @staticmethod
+        def json():
+            return {"error": "voice_turn_superseded"}
+
+        @staticmethod
+        def raise_for_status():
+            raise AssertionError("superseded voice revisions must not retry")
+
+    assert crc._handle_post_reply_response(_Response()) == {
+        "error": "voice_turn_superseded"
+    }
+
+
+def test_already_superseded_voice_turn_never_starts_model(monkeypatch):
+    monkeypatch.setattr(
+        crc,
+        "call_agent",
+        lambda *args, **kwargs: pytest.fail("superseded voice turn reached model"),
+    )
+
+    latest = crc._process_messages([
+        {
+            "id": "voice-old",
+            "ts": 101.0,
+            "role": "user",
+            "content": "旧识别结果",
+            "voice_call_id": "call-1",
+            "voice_turn_id": "logical-1.old",
+            "voice_logical_turn_id": "logical-1",
+            "voice_turn_status": "superseded",
+            "voice_superseded_by": "voice-new",
+        }
+    ])
+
+    assert latest == 101.0
+
+
+def test_other_reply_conflicts_still_raise():
+    class _Response:
+        status_code = 409
+
+        @staticmethod
+        def json():
+            return {"error": "already_answered"}
+
+        @staticmethod
+        def raise_for_status():
+            raise RuntimeError("conflict")
+
+    with pytest.raises(RuntimeError, match="conflict"):
+        crc._handle_post_reply_response(_Response())
+
+
 def test_run_cli_subprocess_streams_lines_and_keeps_complete_output():
     seen = []
     result = crc._run_cli_subprocess(
@@ -7598,6 +8445,226 @@ def test_run_cli_subprocess_streams_lines_and_keeps_complete_output():
     assert result.returncode == 0
     assert result.stdout == "one\ntwo\n"
     assert seen == ["one\n", "two\n"]
+
+
+def _voice_revision_message(**overrides):
+    message = {
+        "id": "voice-old",
+        "role": "user",
+        "ts": 100.0,
+        "voice_call_id": "call-1",
+        "voice_turn_id": "logical-1.old",
+        "voice_logical_turn_id": "logical-1",
+        "voice_turn_status": "current",
+    }
+    message.update(overrides)
+    return message
+
+
+def test_voice_turn_watcher_cancels_for_newer_asr_revision(monkeypatch):
+    replacement = _voice_revision_message(
+        id="voice-new",
+        ts=101.0,
+        voice_turn_id="logical-1.new",
+    )
+    monkeypatch.setattr(
+        crc,
+        "poll_chat",
+        lambda *args, **kwargs: {"messages": [replacement]},
+    )
+    guard = crc._VoiceTurnCancellation(_voice_revision_message())
+    callback = threading.Event()
+    guard.add_cancel_callback(callback.set)
+
+    guard.start()
+
+    assert guard.cancelled.wait(timeout=1)
+    assert callback.wait(timeout=1)
+    assert guard.superseding_message_id == "voice-new"
+    assert guard.cancellation_reason == "asr_revision"
+    guard.close()
+
+
+def test_voice_turn_watcher_cancels_for_barge_in_with_new_logical_turn(monkeypatch):
+    replacement = _voice_revision_message(
+        id="voice-barge-in",
+        ts=101.0,
+        voice_turn_id="logical-2.complete",
+        voice_logical_turn_id="logical-2",
+    )
+    monkeypatch.setattr(
+        crc,
+        "poll_chat",
+        lambda *args, **kwargs: {"messages": [replacement]},
+    )
+    guard = crc._VoiceTurnCancellation(_voice_revision_message())
+    callback = threading.Event()
+    guard.add_cancel_callback(callback.set)
+
+    guard.start()
+
+    assert guard.cancelled.wait(timeout=1)
+    assert callback.wait(timeout=1)
+    assert guard.superseding_message_id == "voice-barge-in"
+    assert guard.superseding_logical_turn_id == "logical-2"
+    assert guard.cancellation_reason == "barge_in"
+    guard.close()
+
+
+def test_voice_revision_watcher_ignores_other_voice_turns(monkeypatch):
+    unrelated = _voice_revision_message(
+        id="voice-other",
+        ts=101.0,
+        voice_call_id="call-2",
+    )
+
+    def _poll(*args, **kwargs):
+        time.sleep(0.01)
+        return {"messages": [unrelated]}
+
+    monkeypatch.setattr(crc, "poll_chat", _poll)
+    guard = crc._VoiceTurnCancellation(_voice_revision_message())
+
+    guard.start()
+    time.sleep(0.08)
+    guard.close()
+
+    assert not guard.cancelled.is_set()
+
+
+def test_voice_turn_watcher_ignores_older_message_from_same_call(monkeypatch):
+    older = _voice_revision_message(
+        id="voice-older",
+        ts=99.0,
+        voice_turn_id="logical-0.complete",
+        voice_logical_turn_id="logical-0",
+    )
+
+    def _poll(*args, **kwargs):
+        time.sleep(0.01)
+        return {"messages": [older]}
+
+    monkeypatch.setattr(crc, "poll_chat", _poll)
+    guard = crc._VoiceTurnCancellation(_voice_revision_message())
+
+    guard.start()
+    time.sleep(0.08)
+    guard.close()
+
+    assert not guard.cancelled.is_set()
+
+
+def test_voice_cancellation_is_idempotent_for_rapid_barge_ins():
+    guard = crc._VoiceTurnCancellation(_voice_revision_message())
+    callbacks = []
+    guard.add_cancel_callback(lambda: callbacks.append("cancelled"))
+
+    guard._cancel("voice-new-1", logical_turn_id="logical-2")
+    guard._cancel("voice-new-2", logical_turn_id="logical-3")
+
+    assert callbacks == ["cancelled"]
+    assert guard.superseding_message_id == "voice-new-1"
+    assert guard.superseding_logical_turn_id == "logical-2"
+
+
+def test_voice_cancellation_terminates_any_cli_subprocess_promptly():
+    guard = crc._VoiceTurnCancellation(_voice_revision_message())
+    threading.Timer(0.1, lambda: guard._cancel("voice-new")).start()
+    started = time.monotonic()
+
+    with pytest.raises(crc.VoiceTurnSuperseded):
+        crc._run_cli_subprocess(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            {
+                "capture_output": True,
+                "text": True,
+                "timeout": 10,
+                "encoding": "utf-8",
+                "errors": "replace",
+            },
+            cancellation=guard,
+        )
+
+    assert time.monotonic() - started < 2
+
+
+def test_voice_cancellation_forgets_resumed_session(monkeypatch, tmp_path):
+    _bridge_session_env(monkeypatch, tmp_path, "usr_voice_cancel_session")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec --json {message}")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_codex_resume_supported", lambda executable: True)
+    crc._save_agent_session_id(_STALE_SID)
+    monkeypatch.setattr(
+        crc,
+        "_run_cli_subprocess",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            crc.VoiceTurnSuperseded("new voice turn")
+        ),
+    )
+
+    with pytest.raises(crc.VoiceTurnSuperseded):
+        crc.call_agent_cli("old turn")
+
+    assert crc._load_agent_session_id() == ""
+
+
+def test_voice_cancellation_closes_streaming_http_transport(monkeypatch):
+    class _Response:
+        status_code = 200
+        headers = {"Content-Type": "application/x-ndjson"}
+
+        def __init__(self):
+            self.closed = threading.Event()
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self):
+            assert self.closed.wait(timeout=2)
+            raise OSError("stream closed")
+            yield  # pragma: no cover
+
+        def close(self):
+            self.closed.set()
+
+    response = _Response()
+    monkeypatch.setattr(crc, "_http_streaming_post", lambda *a, **k: response)
+    guard = crc._VoiceTurnCancellation(_voice_revision_message())
+    threading.Timer(0.1, lambda: guard._cancel("voice-new")).start()
+
+    with pytest.raises(crc.VoiceTurnSuperseded):
+        crc._call_agent_http_simple(
+            "hello",
+            isolated_session=True,
+            stream_update=lambda *args: None,
+            request_id="voice-old",
+            cancellation=guard,
+        )
+
+    assert response.closed.is_set()
+
+
+def test_voice_http_cancel_endpoint_receives_runtime_request_id(monkeypatch):
+    posted = []
+
+    class _Response:
+        status_code = 202
+
+    monkeypatch.setattr(
+        crc,
+        "AGENT_HTTP_CANCEL_URL",
+        "http://agent.local/cancel",
+    )
+    monkeypatch.setattr(
+        crc._HTTP,
+        "post",
+        lambda url, **kwargs: posted.append((url, kwargs)) or _Response(),
+    )
+
+    crc._cancel_http_agent_request("voice-request-1")
+
+    assert posted[0][0] == "http://agent.local/cancel"
+    assert posted[0][1]["json"] == {"request_id": "voice-request-1"}
 
 
 def test_turn_content_bytes_excludes_pi_delta_frames(monkeypatch):
@@ -8959,6 +10026,49 @@ def test_call_agent_cli_heals_stale_claude_resume_once(monkeypatch, tmp_path):
     assert crc._load_agent_session_id() == "aaaaaaaa-bbbb-cccc-dddd-eeeeffff0000"
 
 
+def test_call_agent_cli_heals_stale_codex_resume_once(monkeypatch, tmp_path):
+    _bridge_session_env(monkeypatch, tmp_path, "usr_codex_stale")
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        "codex exec --json --skip-git-repo-check --sandbox read-only {message}",
+    )
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_codex_resume_supported", lambda executable: True)
+    crc._save_agent_session_id(_STALE_SID)
+    fresh_sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeffff0000"
+    ok_stream = "\n".join([
+        json.dumps({"type": "thread.started", "thread_id": fresh_sid}),
+        json.dumps({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "ok"},
+        }),
+    ])
+    runs = []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        if len(runs) == 1:
+            assert cmd[:3] == ["codex", "exec", "resume"]
+            assert "--sandbox" not in cmd
+            return subprocess.CompletedProcess(
+                cmd,
+                1,
+                stdout="",
+                stderr=f"no rollout found for thread id {_STALE_SID}",
+            )
+        assert cmd[:2] == ["codex", "exec"]
+        assert "resume" not in cmd
+        assert "--sandbox" in cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout=ok_stream, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+
+    assert crc.call_agent_cli("hello") == "ok"
+    assert len(runs) == 2
+    assert crc._load_agent_session_id() == fresh_sid
+
+
 def test_mcp_postflight_follows_the_retry_not_the_discarded_first_attempt(
     monkeypatch, tmp_path,
 ):
@@ -9584,12 +10694,10 @@ def test_foreground_message_marks_current_turn_after_unfinished_file_request(mon
     assert out.endswith("Mishap")
 
 
-def test_foreground_transcript_default_keeps_50_prior_messages(monkeypatch):
-    # Default limit is 50 messages (~25 full rounds), sitting exactly at the
-    # clamp in _recent_chat_context_for_foreground — raising it further needs
-    # both the env default AND that cap changed together.
+def test_foreground_transcript_default_keeps_8_prior_messages(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CODEX_CLI)
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_LIMIT", 8)
     now = time.time()
     hist = [
         {
@@ -9604,8 +10712,36 @@ def test_foreground_transcript_default_keeps_50_prior_messages(monkeypatch):
     out = crc._foreground_agent_message("当前这句", current_ts=now)
 
     assert "历史消息-60" in out  # newest prior message injected
-    assert "历史消息-11" in out  # 50th-from-last prior message still included
-    assert "历史消息-10" not in out  # beyond the 50-message window
+    assert "历史消息-53" in out  # eighth-from-last prior message included
+    assert "历史消息-52" not in out  # beyond the bounded bridge
+
+
+def test_foreground_transcript_omits_voice_call_archive_cards(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CODEX_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    now = time.time()
+    history = [
+        {"role": "user", "source": "chat", "content": "普通消息", "ts": now - 3},
+        {
+            "role": "openclaw",
+            "source": "voice_call_transcript",
+            "voice_call_id": "vcall_old",
+            "content": "很长的旧通话归档",
+            "ts": now - 2,
+        },
+        {"role": "agent", "source": "chat", "content": "普通回复", "ts": now - 1},
+        {"role": "user", "source": "chat", "content": "当前这句", "ts": now},
+    ]
+    monkeypatch.setattr(
+        crc,
+        "get_decrypted_history",
+        lambda since, limit=20, include_image_body=True: list(history),
+    )
+
+    out = crc._foreground_agent_message("当前这句", current_ts=now)
+
+    assert "普通消息" in out and "普通回复" in out
+    assert "很长的旧通话归档" not in out
 
 
 def test_foreground_message_no_decrypt_source_returns_plain_content(monkeypatch):
@@ -11247,13 +12383,15 @@ def test_hidden_vision_probe_uses_isolated_session_and_posts_only_observed(monke
 
 import worldbook_match as _worldbook_match
 
+from conftest import capture_sleeps
+
 
 class _FakeWorldbookHTTP:
     def __init__(self, block="〈世界书〉墨白历,一年十四个月。", status=200):
         self.block, self.status, self.sent = block, status, []
 
     def post(self, url, headers=None, json=None, timeout=None):
-        self.sent.append({"url": url, "json": json})
+        self.sent.append({"url": url, "headers": headers, "json": json})
 
         class _R:
             status_code = self.status
@@ -11309,6 +12447,55 @@ def test_scheduled_wake_worldbook_matches_the_reminder_note(monkeypatch):
     sent_messages = fake.sent[0]["json"].get("messages") or []
     assert any("青岚学院" in str(m.get("content")) for m in sent_messages), sent_messages
     assert _worldbook_match.CONTEXT_HEADER in message and "墨白历" in message
+
+
+def test_wake_worldbook_context_applied_trace_is_content_free(monkeypatch):
+    fake = _FakeWorldbookHTTP(block="private world setting")
+    events = []
+    monkeypatch.setattr(crc, "_HTTP", fake)
+    monkeypatch.setattr(
+        crc,
+        "_emit_debug_trace",
+        lambda subsystem, event_type, **fields: events.append({
+            "subsystem": subsystem,
+            "type": event_type,
+            **fields,
+        }),
+    )
+    job = {
+        "schema_version": 2,
+        "job_id": "job-worldbook",
+        "trace_id": "trace-worldbook",
+        "trigger": "scheduled_wake",
+        "scheduled_note": "private reminder",
+    }
+
+    message = crc._message_for_proactive_job(job)
+
+    assert "private world setting" in message
+    assert fake.sent[0]["headers"]["X-Feedling-Trace-Id"] == "trace-worldbook"
+    event = next(
+        event for event in events
+        if event["type"] == "worldbook.context.applied"
+    )
+    assert set(event) == {
+        "subsystem", "type", "status", "trace_id", "job_id", "summary",
+        "explain", "detail",
+    }
+    assert set(event["detail"]) == {
+        "runtime", "lane", "source", "carrier_chars", "truncated",
+    }
+    assert event["trace_id"] == "trace-worldbook"
+    assert event["detail"] == {
+        "runtime": "resident_v1",
+        "lane": "scheduled",
+        "source": "eager_context",
+        "carrier_chars": len(
+            _worldbook_match.format_context_block("private world setting")
+        ),
+        "truncated": False,
+    }
+    assert "private world setting" not in repr(event)
 
 
 def test_wake_worldbook_failure_does_not_break_the_wake(monkeypatch):
@@ -11454,7 +12641,7 @@ def test_thinking_denylist_calls_through_to_shared_vocabulary(monkeypatch):
       · sentinel 行被丢 → 证明真的走了共享 helper
       · 旧词表的词在替身下不被误判 → 证明没有第二个词表来源
     """
-    from core import self_thinking
+    from agent_protocol_core import self_thinking
 
     monkeypatch.setattr(
         self_thinking, "internal_field_terms_pattern", lambda: "(zzsentinelzz)"
@@ -11616,7 +12803,7 @@ def test_wake_templates_share_the_foreground_thinking_switch(monkeypatch):
 
     分开写会产生一种没人预料得到的状态:前台已经关了、主动道还在 think。
     """
-    from core import self_thinking as _st
+    from agent_protocol_core import self_thinking as _st
 
     monkeypatch.setattr(_st, "enabled", lambda: True)
     monkeypatch.setattr(crc, "_supports_mandatory_self_thinking_v1", lambda: True)

@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 
 import io_cli  # noqa: E402
 
+from conftest import capture_sleeps
+
 
 def test_auth_headers_prefers_api_key(monkeypatch):
     monkeypatch.setenv("FEEDLING_API_KEY", "k")
@@ -187,7 +189,7 @@ def test_terminal_activity_retries_with_vps_safe_timeout(monkeypatch):
         return (-1, {"error": "timed_out"}) if len(calls) == 1 else (200, {"status": "ok"})
 
     monkeypatch.setattr(io_cli, "_http_json", _fake_http)
-    monkeypatch.setattr(io_cli.time, "sleep", sleeps.append)
+    capture_sleeps(monkeypatch, io_cli, sleeps)
 
     io_cli._emit_turn_activity(
         types.SimpleNamespace(verb="cancel-wake"),
@@ -215,10 +217,15 @@ def test_running_activity_does_not_retry_or_delay_tool(monkeypatch):
         "_http_json",
         lambda *args, **kwargs: calls.append((args, kwargs)) or (-1, {"error": "timed_out"}),
     )
-    monkeypatch.setattr(
-        io_cli.time,
-        "sleep",
-        lambda _seconds: (_ for _ in ()).throw(AssertionError("running must not retry")),
+    # 负向替身:这里被断言的性质是"根本不该睡",所以替身要抛。用 on_sleep 保住这个性质,
+    # 同时不碰进程全局的 stdlib time.sleep —— 否则后台线程随便睡一下就会在这里炸,
+    # 而失败信息会指着一个与被测代码无关的地方。
+    capture_sleeps(
+        monkeypatch,
+        io_cli,
+        on_sleep=lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("running must not retry")
+        ),
     )
 
     io_cli._emit_turn_activity(

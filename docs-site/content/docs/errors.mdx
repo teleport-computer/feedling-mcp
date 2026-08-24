@@ -38,6 +38,18 @@ Feedling owns the failure.
 Treat unknown `blame` values as `system`/generic copy and do not drop the error
 or notice.
 
+Public runtime `error_class` values, their `blame`, and their safe localized
+fallback text now come from one server registry. If a runtime boundary receives
+an unregistered dynamic value, Feedling returns the registered
+`error_class_unregistered` system-owned fallback instead of forwarding the raw
+value. The rejected value is not stored or fingerprinted; operators receive
+only content-free counters grouped by contract domain, boundary, release, and
+writer. Clients should continue to display the server-provided safe text and
+treat newly introduced classes generically when they do not yet have local
+copy. These rejection counters are best-effort diagnostics: if persistence
+fails, Feedling records a content-free warning in service logs, so dashboard
+totals can be lower than the actual number of rejected values.
+
 Not every historical route uses the same slug for the same status, and not every
 `429` is transient. See [retry safety](/docs/reliability#retry-safety) before
 retrying a failed write.

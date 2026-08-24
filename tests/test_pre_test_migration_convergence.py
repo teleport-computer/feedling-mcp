@@ -26,9 +26,21 @@ def _database_url(base: str, database: str) -> str:
 
 def test_rds_pre_and_test_heads_converge():
     script = _scripts("alembic")
-    assert script.get_heads() == ["0098_chat_change_events"]
+    assert script.get_heads() == ["0101_chat_change_events"]
     assert (
-        script.get_revision("0098_chat_change_events").down_revision
+        script.get_revision("0101_chat_change_events").down_revision
+        == "0100_lane_rollup_access_paths"
+    )
+    assert (
+        script.get_revision("0100_lane_rollup_access_paths").down_revision
+        == "0099_contract_rejection_stats"
+    )
+    assert (
+        script.get_revision("0099_contract_rejection_stats").down_revision
+        == "0098_v1_lane_outcome_counts"
+    )
+    assert (
+        script.get_revision("0098_v1_lane_outcome_counts").down_revision
         == "0097_v2_job_recovery_events"
     )
     assert (
@@ -79,9 +91,21 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0034_chat_poll_index"]
+    assert script.get_heads() == ["0037_chat_poll_index"]
     assert (
-        script.get_revision("0034_chat_poll_index").down_revision
+        script.get_revision("0037_chat_poll_index").down_revision
+        == "0036_lane_rollup_access_paths"
+    )
+    assert (
+        script.get_revision("0036_lane_rollup_access_paths").down_revision
+        == "0035_contract_rejection_stats"
+    )
+    assert (
+        script.get_revision("0035_contract_rejection_stats").down_revision
+        == "0034_v1_lane_outcome_counts"
+    )
+    assert (
+        script.get_revision("0034_v1_lane_outcome_counts").down_revision
         == "0033_trace_events"
     )
     assert (
@@ -215,8 +239,16 @@ def test_tee_migrations_reuse_the_rds_contract_sql():
         tee.get_revision("0032_v2_job_recovery_events").module._UP
         == rds.get_revision("0097_v2_job_recovery_events").module._UP
     )
-    tee_chat = tee.get_revision("0034_chat_poll_index").module
-    rds_chat = rds.get_revision("0098_chat_change_events").module
+    assert (
+        tee.get_revision("0035_contract_rejection_stats").module._UP
+        == rds.get_revision("0099_contract_rejection_stats").module._UP
+    )
+    assert (
+        tee.get_revision("0036_lane_rollup_access_paths").module._UP
+        == rds.get_revision("0100_lane_rollup_access_paths").module._UP
+    )
+    tee_chat = tee.get_revision("0037_chat_poll_index").module
+    rds_chat = rds.get_revision("0101_chat_change_events").module
     assert tee_chat._SCHEMA_UP == rds_chat._SCHEMA_UP
     assert tee_chat._CAPTURE_UP == rds_chat._CAPTURE_UP
     assert tee_chat._POLL_INDEX == rds_chat._POLL_INDEX
@@ -232,6 +264,8 @@ def test_tee_0029_upgrades_to_voice_merge_head(monkeypatch):
     database_url = _database_url(admin_url, database)
     cfg = Config(str(ROOT / "backend/alembic_tee/alembic.ini"))
     cfg.set_main_option("script_location", str(ROOT / "backend/alembic_tee"))
+    expected_head = _scripts("alembic_tee").get_current_head()
+    assert expected_head is not None
 
     with psycopg.connect(admin_url, autocommit=True) as admin:
         admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
@@ -265,7 +299,7 @@ def test_tee_0029_upgrades_to_voice_merge_head(monkeypatch):
         with psycopg.connect(database_url, autocommit=True) as conn:
             assert conn.execute(
                 "SELECT version_num FROM alembic_tee_version"
-            ).fetchall() == [("0034_chat_poll_index",)]
+            ).fetchall() == [(expected_head,)]
             assert conn.execute(
                 "SELECT to_regclass('public.voice_call_sessions')"
             ).fetchone() == ("voice_call_sessions",)
@@ -275,7 +309,7 @@ def test_tee_0029_upgrades_to_voice_merge_head(monkeypatch):
             assert conn.execute(
                 "SELECT convert_from(value,'UTF8')::jsonb->'tee_heads' "
                 "FROM server_config WHERE key='phase4_primary_prepared'"
-            ).fetchone() == (["0034_chat_poll_index"],)
+            ).fetchone() == ([expected_head],)
     finally:
         with psycopg.connect(admin_url, autocommit=True) as admin:
             admin.execute(

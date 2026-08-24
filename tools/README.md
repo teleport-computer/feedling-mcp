@@ -195,11 +195,39 @@ AGENT_MODE=http
 AGENT_HTTP_URL=http://127.0.0.1:8080/chat
 AGENT_HTTP_TOKEN=                            # Bearer token if your endpoint requires auth
 AGENT_HTTP_FIELD=response                    # JSON field that contains the reply text
+# AGENT_HTTP_CANCEL_URL=http://127.0.0.1:8080/cancel  # recommended for voice
 ```
 
 The daemon POSTs `{"message": "<user text>"}` and reads the named field
 from the JSON response. For image messages it also includes
 `images: [{"mime_type", "data", "data_url"}]`.
+
+During a voice turn, the same endpoint receives `"stream": true` and
+`"stream_format": "ndjson"`. A simple HTTP runtime may keep returning its
+normal JSON response, or opt into incremental speech with
+`Content-Type: application/x-ndjson` (SSE is also accepted):
+
+```jsonl
+{"type":"text_delta","delta":"你"}
+{"type":"text_delta","delta":"好"}
+{"type":"result","body":{"response":"你好。"}}
+```
+
+`text_delta` is only for user-visible assistant text. Never put reasoning,
+tool arguments, logs, or status text in it. The terminal `result.body` remains
+the canonical complete runtime response and is parsed and stored exactly like
+the non-streaming JSON response. A runtime that does not implement this
+optional protocol keeps the original buffered behavior.
+
+While a voice request is active, the consumer watches the existing claim-free
+chat poll. Any newer user turn in the same call - either a revised transcript
+or a real barge-in - terminates any CLI subprocess immediately. For HTTP
+runtimes the consumer closes the response stream and, when
+`AGENT_HTTP_CANCEL_URL` is configured, POSTs
+`{"request_id":"<X-Feedling-Request-Id>"}` to that endpoint. The cancellation
+endpoint should be idempotent and return after the runtime accepts the
+cancellation. The obsolete request is never posted as a reply; the newer turn
+is processed normally by the resident loop.
 
 For Hermes' API server, use the OpenAI-compatible protocol instead of the
 simple JSON shape:
@@ -214,6 +242,10 @@ AGENT_HTTP_MODEL=hermes-agent
 
 The daemon sends `X-Hermes-Session-Key`, stores the returned
 `X-Hermes-Session-Id`, and sends it back on later turns.
+On voice turns it requests standard OpenAI-compatible SSE and speaks only
+`choices[0].delta.content`; `reasoning_content` and `tool_calls` are preserved
+for the final response but are never sent to speech. If the endpoint rejects
+streaming, the daemon retries that request once with `stream: false`.
 
 #### `AGENT_MODE=cli`
 
@@ -285,11 +317,10 @@ Make sure the image reaches the model as real vision input:
 - Any CLI with a first-class image flag: use the `{image_path}` / `{image_paths}`
   template slot so pixels are attached, not just referenced.
 
-Note screen-share frames are attached only when `SCREEN_CONTEXT_MODE=on_mention`
-(default) *and* the message mentions the screen (屏幕 / 共享 / 看到 / 这个 /
-screen / share / look at …), and only if fresher than
-`SCREEN_CONTEXT_MAX_AGE_SEC` (300s). Set `SCREEN_CONTEXT_MODE=always` to attach
-the latest frame on every turn (higher token cost / less private).
+Screen context defaults to `SCREEN_CONTEXT_MODE=tool`: ordinary turns do not
+prefetch frames, and the model uses `screen-recent` / `screen-read` when the
+screen matters. Set `SCREEN_CONTEXT_MODE=auto` or `always` to restore eager live
+share attachment (higher latency, token cost, and privacy exposure).
 
 When running under `systemd`, do not assume your interactive shell `PATH`
 is available. Prefer an absolute executable path in `AGENT_CLI_CMD`; if that
@@ -302,6 +333,20 @@ single final-answer field such as `{"reply":"..."}` plus optional
 terminal UI as a fallback path only. Session IDs, prompts, debug footers,
 and decorative output can still leak if the CLI does not offer JSON/quiet
 mode, so do not depend on text cleanup for normal operation.
+
+For self-hosted CLI residents, the model receives a compact command catalog as
+capability discovery. It calls the cataloged command directly; `--help` is only
+a one-time correction when the catalog lacks detail or the command reports a
+parameter error. The model still chooses whether and when to use a tool; the
+resident does not route by keywords.
+
+Cold/rebuilt sessions receive at most eight meaningful recent chat rows by
+default (`FEEDLING_FOREGROUND_CHAT_CONTEXT_LIMIT=8`). Voice-call archive cards
+are not replayed into that bridge; the model can inspect a relevant call with
+`voice-transcript-list` / `voice-transcript-read`. Foreground World Book matching
+also defaults to `FEEDLING_FOREGROUND_WORLDBOOK_CONTEXT=tool`, using
+`worldbook-match --query ...` only when the model decides the setting matters.
+Set the World Book mode to `eager` as a rollback.
 
 ##### Hermes example
 
@@ -378,19 +423,85 @@ matching `Bash(python <io_cli> …)` verbs too — those tools now save the decr
 picture into `IMAGE_TEMP_DIR` and return an `image_file` path the same Read grant
 covers.
 
+##### Codex CLI example
+
+```
+AGENT_CLI_CMD=codex exec --json --skip-git-repo-check --sandbox read-only
+FEEDLING_CODEX_SESSION_RESUME=true
+```
+
+When the installed CLI supports `codex exec resume`, the consumer persists the
+`thread.started` id and resumes it on later turns. Older Codex versions remain
+compatible through the existing transcript fallback. Set
+`FEEDLING_CODEX_SESSION_RESUME=false` for immediate rollback to that stateless
+behavior.
+
 ### Session bounds and failure behavior
 
-The resident owns IO-facing session continuity and keeps it bounded. For CLI
-agents that print a `session_id`, later turns resume that session until either
-bound is reached:
+The resident owns IO-facing session continuity and keeps it bounded. Hermes,
+Claude, Pi, and resume-capable Codex each reuse their native session; unsupported
+CLI runtimes keep the transcript fallback. Later turns resume until either bound
+is reached:
 
 ```
 AGENT_SESSION_MAX_TURNS=40
 AGENT_SESSION_MAX_BYTES=250000
+AGENT_SESSION_MAX_INPUT_TOKENS=32768
 ```
+
+The token bound uses provider-reported input as an exact second signal. The
+32K default is based on a measured Codex voice path: roughly 18K on the cold
+turn and 34K on the first resume. It keeps that cached resume, then rotates
+before a third turn can grow the same context again. It does not truncate a
+reply: after the completed turn crosses the bound, the next turn starts a fresh
+native session and receives the bounded canonical-history bridge.
+
+The resident also applies a capability-detected minimal voice profile by
+default:
+
+```
+FEEDLING_MINIMAL_RUNTIME_PROFILE=auto
+```
+
+Codex drops optional apps/plugins/memories and skill discovery/install surfaces
+while keeping configured user skills, shell, native vision, user MCP, and IO
+tools. Pi drops its optional
+skill/template/theme catalogs, and Claude disables slash-command discovery when
+the installed CLI advertises those flags. Unknown/older CLIs receive no guessed
+flags. Set the value to `off` for immediate rollback.
+
+Codex voice turns also use App Server's native agent-message deltas when the
+installed CLI supports it and the configured `codex exec` options can be mapped
+exactly:
+
+```
+FEEDLING_CODEX_APP_SERVER_STREAM=auto
+```
+
+The adapter never sends a turn-level reasoning-effort override. It inherits the
+user's Codex config and preserves any explicit model/reasoning config already in
+`AGENT_CLI_CMD`. A custom option with no exact App Server equivalent stays on
+the established `codex exec` path. Set this value to `off` for rollback.
 
 If a CLI template contains a fixed `--session-id`, the consumer replaces it
 with its own bounded session id so one hardcoded session cannot grow forever.
+If a resumed session disappeared upstream, the resident clears only that cached
+id and retries the current turn fresh once. If a user interrupts an in-flight
+voice turn, its session id is also cleared, so the next turn reconstructs from
+the canonical Enclave history instead of continuing a half-written model state.
+
+For Enclave-backed history, connect/TLS and response-read budgets are separate:
+
+```
+FEEDLING_ENCLAVE_CONNECT_TIMEOUT_SEC=5
+FEEDLING_ENCLAVE_READ_TIMEOUT_SEC=20
+```
+
+For voice streaming, only the idempotent final marker is retried:
+
+```
+FEEDLING_VOICE_STREAM_FINAL_ATTEMPTS=3
+```
 
 Agent-entry failures are user-visible by default:
 

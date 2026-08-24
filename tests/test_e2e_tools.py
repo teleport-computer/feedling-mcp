@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from tools.e2e import config, hosted, p0
 from tools.e2e.client import E2EClient, TEST_API, _refuse_prod
 
+from conftest import capture_sleeps
+
 
 class FakeResponse:
     def __init__(self, status_code: int, body: dict):
@@ -175,7 +177,7 @@ def test_hosted_503_retry_reuses_client_message_id(monkeypatch) -> None:
             return responses.pop(0)
 
     client = FakeClient()
-    monkeypatch.setattr(hosted.time, "sleep", lambda _seconds: None)
+    capture_sleeps(monkeypatch, hosted)
 
     sent_at, error = hosted._hosted_send(client, "hello")  # type: ignore[arg-type]
 
@@ -222,7 +224,7 @@ def test_p0_blocking_verdict() -> None:
 def _sleepless(monkeypatch):
     slept: list[float] = []
     import tools.e2e.client as client_mod
-    monkeypatch.setattr(client_mod.time, "sleep", lambda s: slept.append(s))
+    capture_sleeps(monkeypatch, client_mod, slept)
     return slept
 
 

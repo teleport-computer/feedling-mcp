@@ -36,9 +36,19 @@ log = logging.getLogger(__name__)
 
 
 class ProviderError(Exception):
-    def __init__(self, message: str, *, status_code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        response_detail: str = "",
+    ):
         super().__init__(message)
         self.status_code = status_code
+        # Internal diagnostic carrier. Callers choose explicitly whether the
+        # bounded fragment may enter an operator-only sink; tenant-visible
+        # response/trace surfaces must not serialize this attribute.
+        self.response_detail = str(response_detail or "")[:240]
 
 
 # --- Genesis v2 Step 1: shared retry wrapper + failure classification ---------
@@ -60,6 +70,20 @@ IMAGE_OUTPUT_MAX_TOKENS = 8192
 # One wall-clock budget for every link in a single image response, so a handful
 # of slow links cannot each add a fresh fetch deadline to the turn.
 IMAGE_LINK_TOTAL_DEADLINE_SECONDS = 45.0
+
+
+def normalize_stop_reason(value: Any) -> str:
+    """Normalize provider stop markers without deciding caller policy."""
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+
+
+def is_token_limit_stop_reason(value: Any) -> bool:
+    """Return whether a provider explicitly stopped at its output-token cap."""
+    return normalize_stop_reason(value) in {
+        "length",
+        "max_tokens",
+        "max_output_tokens",
+    }
 
 
 def classify_provider_error(exc: BaseException) -> str:
@@ -97,6 +121,68 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
         return float(raw) if raw is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _reliable_retry_delay_ceiling_sec(
+    attempt: int,
+    *,
+    base_delay_sec: float,
+    max_delay_sec: float,
+    retry_after_sec: float | None = None,
+) -> float:
+    """Upper edge of the real backoff+jitter window before the next attempt."""
+    delay = min(base_delay_sec * (3 ** (attempt - 1)), max_delay_sec)
+    if retry_after_sec is not None:
+        delay = min(max(delay, retry_after_sec), max_delay_sec)
+    return delay * 1.5
+
+
+def _reliable_retry_delay_sec(
+    attempt: int,
+    *,
+    base_delay_sec: float,
+    max_delay_sec: float,
+    retry_after_sec: float | None = None,
+) -> float:
+    ceiling = _reliable_retry_delay_ceiling_sec(
+        attempt,
+        base_delay_sec=base_delay_sec,
+        max_delay_sec=max_delay_sec,
+        retry_after_sec=retry_after_sec,
+    )
+    base = ceiling / 1.5
+    return base + random.uniform(0.0, ceiling - base)
+
+
+def reliable_chat_nominal_envelope_sec(
+    *,
+    request_inactivity_timeout_sec: float,
+    max_attempts: int,
+    base_delay_sec: float,
+    max_delay_sec: float = 30.0,
+) -> float:
+    """Nominal worst-case wire + retry envelope, excluding optional Retry-After.
+
+    The retry-delay ceiling is shared with the live sync/async algorithms so
+    callers can size a shadow batch policy without copying the backoff formula.
+    """
+    timeout = float(request_inactivity_timeout_sec)
+    attempts = max(1, int(max_attempts))
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("request_inactivity_timeout_sec must be finite and positive")
+    if not math.isfinite(base_delay_sec) or base_delay_sec < 0:
+        raise ValueError("base_delay_sec must be finite and non-negative")
+    if not math.isfinite(max_delay_sec) or max_delay_sec <= 0:
+        raise ValueError("max_delay_sec must be finite and positive")
+    retry_budget = sum(
+        _reliable_retry_delay_ceiling_sec(
+            attempt,
+            base_delay_sec=base_delay_sec,
+            max_delay_sec=max_delay_sec,
+        )
+        for attempt in range(1, attempts)
+    )
+    return attempts * timeout + retry_budget
 
 
 def is_timeout_error(exc: BaseException) -> bool:
@@ -154,11 +240,15 @@ def reliable_chat_completion(
                     else "transient_exhausted"
                 )
                 raise
-            delay = min(base_delay_sec * (3 ** (attempt - 1)), max_delay_sec)
             retry_after = _retry_after_seconds(exc)
-            if retry_after is not None:
-                delay = min(max(delay, retry_after), max_delay_sec)
-            time.sleep(delay + random.uniform(0.0, 0.5 * delay))
+            time.sleep(
+                _reliable_retry_delay_sec(
+                    attempt,
+                    base_delay_sec=base_delay_sec,
+                    max_delay_sec=max_delay_sec,
+                    retry_after_sec=retry_after,
+                )
+            )
     assert last_exc is not None  # loop always sets it before this point
     raise last_exc
 
@@ -242,6 +332,11 @@ class ProviderConfig:
     # trajectory. Keep this opt-in: other async callers include image/VLM
     # payloads and must not duplicate those large request bodies in memory.
     capture_attempt_trace: bool = False
+    # Hosted-only exact visual-capability fence. These values are read from the
+    # same active-route row that produced this config and never go on the wire.
+    hosted_route_id: str = ""
+    hosted_route_updated_at: str = ""
+    hosted_vision_test_status: str = ""
 
 
 _DEFAULT_BASE_URLS = {
@@ -500,6 +595,7 @@ def _raise_for_provider_status(resp: httpx.Response) -> None:
     raise ProviderError(
         f"provider_http_{resp.status_code}{suffix}",
         status_code=resp.status_code,
+        response_detail=detail,
     )
 
 
@@ -2166,6 +2262,7 @@ def _build_openai_responses_payload(
     tools: "list[ToolSpec] | None" = None,
     prompt_cache_key: str = "",
     allow_image_output: bool = False,
+    tool_choice: str | dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
     instructions, input_items = _openai_responses_input(messages)
     if response_format:
@@ -2187,6 +2284,17 @@ def _build_openai_responses_payload(
         encoded_tools.append({"type": "image_generation"})
     if encoded_tools:
         payload["tools"] = encoded_tools
+        if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+            function = tool_choice.get("function")
+            name = (
+                str(function.get("name") or "")
+                if isinstance(function, dict)
+                else ""
+            )
+            if name:
+                payload["tool_choice"] = {"type": "function", "name": name}
+        elif tool_choice is not None:
+            payload["tool_choice"] = copy.deepcopy(tool_choice)
     if cache_key := _cache_key(prompt_cache_key):
         payload["prompt_cache_key"] = cache_key
 
@@ -3462,6 +3570,8 @@ def _build_bedrock_payload(
         payload["toolConfig"] = {"tools": _encode_tools_bedrock(tools)}
         if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
             payload["toolConfig"]["toolChoice"] = {"tool": {"name": tool_choice["function"]["name"]}}
+        elif tool_choice == "required":
+            payload["toolConfig"]["toolChoice"] = {"any": {}}
 
     if _cache_key(prompt_cache_key):
         # Converse evaluates cache checkpoints in tools -> system -> messages
@@ -3688,6 +3798,8 @@ def _build_gemini_payload(
         payload["tools"] = _encode_tools_gemini(tools)
         if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
             payload["toolConfig"] = {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [tool_choice["function"]["name"]]}}
+        elif tool_choice == "required":
+            payload["toolConfig"] = {"functionCallingConfig": {"mode": "ANY"}}
 
     url = f"{base_url.rstrip('/')}/models/{quote(model, safe='')}:generateContent"
     headers = {
@@ -4655,6 +4767,7 @@ async def _chat_completion_async_impl(
             include_reasoning=include_reasoning,
             tools=tools,
             prompt_cache_key=config.prompt_cache_key,
+            tool_choice=tool_choice,
         )
 
         async def post_bedrock(request_payload: dict[str, Any]) -> httpx.Response:
@@ -4773,6 +4886,7 @@ async def _chat_completion_async_impl(
             tools=tools,
             prompt_cache_key=config.prompt_cache_key,
             allow_image_output=allow_image_output,
+            tool_choice=tool_choice,
         )
 
         async def post_responses(request_payload: dict[str, Any]) -> httpx.Response:
@@ -5068,6 +5182,7 @@ async def reliable_chat_completion_async(
     base_delay_sec: float = 1.0,
     max_delay_sec: float = 30.0,
     progress_cb: Any = None,
+    absolute_deadline: float | None = None,
     **kwargs: Any,
 ) -> Any:
     """`chat_completion_async` + bounded retry on *transient* failures only.
@@ -5111,7 +5226,36 @@ async def reliable_chat_completion_async(
         started_ns = time.monotonic_ns()
         _progress("attempt_start", attempt)
         try:
-            result = await chat_completion_async(*args, **kwargs)
+            attempt_kwargs = kwargs
+            if absolute_deadline is not None:
+                remaining = float(absolute_deadline) - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("provider absolute deadline exceeded")
+                attempt_kwargs = dict(kwargs)
+                if "timeout" in attempt_kwargs:
+                    attempt_kwargs["timeout"] = min(
+                        float(attempt_kwargs["timeout"]), remaining
+                    )
+                # ``asyncio.timeout`` exists only on Python 3.11+.  ``wait_for``
+                # preserves the required cancellation semantics on the Python
+                # 3.10 runtime as well: expiry cancels and awaits the in-flight
+                # provider coroutine, so no paid socket request survives as a
+                # detached zombie.
+                try:
+                    result = await asyncio.wait_for(
+                        chat_completion_async(*args, **attempt_kwargs),
+                        timeout=remaining,
+                    )
+                except asyncio.TimeoutError as timeout_exc:
+                    # Python 3.10's asyncio.TimeoutError is not yet an alias of
+                    # the built-in TimeoutError. Normalize the public contract
+                    # across supported runtimes after wait_for has cancelled
+                    # and joined the provider task.
+                    raise TimeoutError(
+                        "provider absolute deadline exceeded"
+                    ) from timeout_exc
+            else:
+                result = await chat_completion_async(*args, **attempt_kwargs)
             _progress("attempt_complete", attempt)
             if provider_attempt_trace is not None:
                 inner_ordinals = _extend_attempt_trace(
@@ -5154,7 +5298,15 @@ async def reliable_chat_completion_async(
             _progress("attempt_failed", attempt)
             cls = classify_provider_error(exc)
             last_exc = exc
-            terminal = cls == "provider_config" or attempt >= attempts
+            deadline_exhausted = (
+                absolute_deadline is not None
+                and time.monotonic() >= float(absolute_deadline)
+            )
+            terminal = (
+                cls == "provider_config"
+                or attempt >= attempts
+                or deadline_exhausted
+            )
             if provider_attempt_trace is not None:
                 inner_ordinals = _extend_attempt_trace(
                     provider_attempt_trace,
@@ -5200,10 +5352,41 @@ async def reliable_chat_completion_async(
                 if provider_attempt_trace is not None:
                     _attach_provider_attempt_trace(exc, provider_attempt_trace)
                 raise
-            delay = min(base_delay_sec * (3 ** (attempt - 1)), max_delay_sec)
             retry_after = _retry_after_seconds(exc)
-            if retry_after is not None:
-                delay = min(max(delay, retry_after), max_delay_sec)
-            await asyncio.sleep(delay + random.uniform(0.0, 0.5 * delay))
+            delay = _reliable_retry_delay_sec(
+                attempt,
+                base_delay_sec=base_delay_sec,
+                max_delay_sec=max_delay_sec,
+                retry_after_sec=retry_after,
+            )
+            if absolute_deadline is not None:
+                remaining = float(absolute_deadline) - time.monotonic()
+                if remaining <= 0 or delay >= remaining:
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+                    deadline_exc = TimeoutError(
+                        "provider absolute deadline exceeded during retry backoff"
+                    )
+                    deadline_exc.feedling_error_class = "transient_exhausted"
+                    if provider_attempt_trace is not None:
+                        _attach_provider_attempt_trace(
+                            deadline_exc, provider_attempt_trace
+                        )
+                    raise deadline_exc from exc
+            await asyncio.sleep(delay)
     assert last_exc is not None  # loop always sets it before this point
     raise last_exc
+
+
+def reliable_chat_completion_isolated(*args: Any, **kwargs: Any) -> Any:
+    """Run the cancellable async retry transport from a synchronous boundary."""
+
+    async def run_isolated() -> Any:
+        async with _build_shared_async_client() as client:
+            token = _isolated_async_client.set(client)
+            try:
+                return await reliable_chat_completion_async(*args, **kwargs)
+            finally:
+                _isolated_async_client.reset(token)
+
+    return asyncio.run(run_isolated())

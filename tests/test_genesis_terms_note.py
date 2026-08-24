@@ -18,7 +18,7 @@ def test_terms_note_inserted_before_firewall():
     msgs = prompts.fact_write_messages([{"summary": "s"}], terms_note=note)
     c = msgs[0]["content"]
     assert note in c
-    assert c.index(note) < c.index("防火墙")
+    assert c.index(note) < c.index("Firewall:")
 
 
 def test_terms_note_composes_with_floor_note_and_keep_all():
@@ -27,7 +27,7 @@ def test_terms_note_composes_with_floor_note_and_keep_all():
     both = prompts.fact_write_messages([{"summary": "s"}], keep_all=True,
                                        floor_note=floor, terms_note=terms)
     c = both[0]["content"]
-    assert terms in c and floor in c and "长期档案" in c
+    assert terms in c and floor in c and "curated for long-term keeping" in c
     # terms 在 floor 之前;keep_all 后缀仍锚在尾部
     assert c.index(terms) < c.index(floor)
 

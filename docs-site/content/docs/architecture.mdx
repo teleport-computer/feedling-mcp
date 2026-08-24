@@ -78,6 +78,19 @@ protects persisted content and the storage path; it does not hide the prompt
 from the model selected to process it. When visible push text is enabled, that
 notification text also passes through the external push provider.
 
+A selected dedicated image observer is normally the only model provider that
+receives an image's pixels; the main provider receives an untrusted text
+observation. If the observer is rate-limited, temporarily unavailable, empty, or
+explicitly truncated, Runtime V2 may disclose only those failed images to the
+exact current main route, and only while that route's exact image-control verdict
+is still `ok`. Authentication, quota, route, compatibility, image-read, and
+unknown failures do not cross that fallback boundary. Mixed batches retain text
+for successful observations and decrypt only failed image IDs again. The
+observer and every main recovery call share one absolute deadline, so recovery
+does not extend the turn's visual-processing budget. The official resident uses
+the same closed failure policy and only trusts the image verdict pinned into its
+currently spawned main-agent entry.
+
 Managed provider routes resolve every explicit HTTPS base URL on each
 validation, including the validation immediately before runtime calls, and
 reject the route when any answer is not publicly reachable. This reuses the
@@ -758,6 +771,20 @@ user selected and authenticated, rather than outbound destinations discovered
 by the model. This is an intentional trust-boundary difference, not a known
 resident isolation gap.
 
+Hosted Runtime V2 draws a second, separate line for unattended screen turns.
+The two questions are distinct: the pixel fence above asks whether what the
+turn saw may be *sent outward*, while this one asks whether what the turn saw
+may *instruct it to act*. A proactive screen-watch turn carries no user
+message, so text that happened to appear on the shared screen is the turn's
+only instruction source. From 2026-08-21 such a turn is offered no platform
+mutation tools at all — no memory write, no schedule or cancel wake, no
+workspace write or delete, on top of the identity writes already withheld.
+The prompt does label that content as untrusted application data rather than
+instructions, but a label constrains intent, not the model's choice, so the
+boundary is enforced on the tool surface instead. Reads, screen inspection and
+replying stay available, and a foreground Chat turn that carries pixels keeps
+its full write surface because the user's own message is present in it.
+
 The resident exception does not relax platform web egress. Screen turns still
 set `FEEDLING_OUTBOUND_FENCE=1`, and `io_cli` refuses platform `web_search` and
 `web_fetch` before making an HTTP request. An image-rejection retry stays behind
@@ -827,6 +854,38 @@ re-execution. Trajectory and review rows currently have no automatic retention
 job; they are removed by explicit owning job/account deletion. Keep provider
 review opt-in until a BYOK budget and retention/GC policy are chosen. Turning
 review off never turns trajectory capture off.
+
+## Build-time supply chain for the memory kernel
+
+The memory system's judgment layer — what is worth remembering, which bucket a
+card belongs to, which cards to recall for a turn, and when to consolidate — is
+an external package (`memgarden`, Apache-2.0, source at
+`github.com/teleport-computer/memgarden`). It is not vendored into this
+repository.
+
+It is installed at image build time from a versioned GitHub Release wheel pinned
+by sha256 in `backend/requirements.lock`, alongside its only non-stdlib
+dependency (`agent-protocol-core`). The installed bytes therefore end up inside
+the measured image like any other dependency, and the compose hash published
+on-chain covers them.
+
+What the hash pin does and does not establish:
+
+| | |
+| --- | --- |
+| Guaranteed | The wheel installed in a build is byte-identical to the reviewed artifact. Replacing the Release asset under the same URL fails the build rather than silently swapping the package. |
+| Not guaranteed | That those bytes were produced from the source at the public tag. The tag is not signed and there is no build provenance attestation yet, so a repository administrator could publish a wheel that does not match the tagged source. |
+
+Two operational consequences follow. A cold build now requires egress to
+`github.com` and `release-assets.githubusercontent.com`; if the Release asset is
+deleted, builds fail loudly rather than falling back. And upgrading the kernel is
+a deliberate, reviewable change: a new Release, a new URL and hash in the lock,
+and a normal pull request.
+
+The kernel is pure judgment: no network, no database, no filesystem, and no
+access to plaintext beyond the strings the host passes in. Encryption, key
+handling, storage, scheduling, identity assembly, and audit remain in this
+repository and are unaffected by this change.
 
 ## Managed and self-hosted trust models
 

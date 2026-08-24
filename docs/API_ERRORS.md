@@ -93,7 +93,7 @@
 | `vision_observer_invalid_request` | 400 | — | resident 视觉观察请求缺少 message_id 或 route_id | |
 | `vision_route_mismatch` | 409 | system | 请求 route_id 与消息发送时固定的 route 不一致，拒绝重新路由 | |
 | `vision_image_unavailable` | 502 | system | enclave 未能返回该消息的解密图片 | |
-| `vision_observer_failed` | 502 | provider_transient | 专用视觉模型观察失败；fail-closed，不把原图回退给主模型 | |
+| `vision_observer_failed` | 502 | provider_transient | 专用视觉模型观察失败；仅限限流、暂时不可用、空响应或明确 `output_truncated` 且当前主模型精确视觉验证为 `ok` 时，运行时才可在同一绝对 deadline 的剩余时间内把失败项原图交给主模型；鉴权、额度、路由缺失/删除、不兼容、读图和未知失败均 fail-closed | |
 | `invalid_vision_mode` | 400 | user_provider | mode 不是 follow_main 或 dedicated | |
 
 ## `GET /v1/model_api/usage`（provider 账单/额度查询）
@@ -212,6 +212,7 @@
 | `worldbook_validate_unavailable` | 503 | system | enclave 校验回环不可达 | |
 | `content_too_long` | 400 | — | 超字数上限（detail.max_chars） | |
 | `worldbook_validate_failed` | 400 | — | | |
+| `worldbook_write_failed` | 500 | system | 世界书条目未能持久化；不会写入进程内缓存 | |
 | `worldbook_match_unavailable` | 503 | system | | |
 
 ## 蒸馏 / 导入（genesis）
@@ -368,8 +369,9 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 
 > 本节与上面所有表格是**两套完全不同的命名空间**——上面的 slug 是 HTTP
 > `{"error": "<slug>"}` 顶层字段值；这里列的是 `GET /v1/notices` 返回条目里
-> `error_class` 字段的取值，对应 `backend/notices/catalog.py` 的
-> `_CATALOG`，只用于通知中心展示话术，从不出现在 HTTP 错误响应体里。
+> `error_class` 字段的取值由 `backend/notices/error_contract.py` 的
+> `ErrorSpec` 注册表唯一拥有；`backend/notices/catalog.py` 的 `_CATALOG`
+> 是派生兼容视图。它只用于通知中心展示话术，从不出现在 HTTP 错误响应体里。
 > `blame` 语义同 `docs/FRONTEND_ERROR_CONTRACT.md` §二分类；`severity`
 > 取值 `error`/`warning`，决定通知中心 UI 展示优先级（`warning` 语气弱化，
 > 不打扰用户）。「状态码」列在本节恒为 `—`（notice 不走 HTTP 状态码，此列
@@ -393,6 +395,7 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 | `provider_incompatible` | — | user_provider | error | chat：Runtime V2 provider/tool loop 把上游「不支持某参数/工具」类错误分类上报（`classify_upstream`/`_ERROR_CLASS_RULES` 命中） |
 | `context_overflow` | — | user_provider | error | chat：这轮对话超出模型上下文窗口 |
 | `content_filtered` | — | provider_transient | error | chat：回复被上游内容策略拦截 |
+| `error_class_unregistered` | — | system | error | vision/image-generation 动态边界收到未注册分类；不透传或保存原始值，只写 content-free 拒绝计数 |
 | `genesis_failed` | — | system | error | genesis：蒸馏 job 整体失败（`service.mark_failed`；先过 `classify_upstream` 分类，未命中时兜底到本类） |
 | `genesis_partial` | — | system | warning | genesis：蒸馏跑完但有记忆卡片被丢弃（`apply_reducer_output` / `plaintext.py` 直传路径统计 dropped>0） |
 | `import_failed` | — | system | error | history_import：聊天记录导入失败 |

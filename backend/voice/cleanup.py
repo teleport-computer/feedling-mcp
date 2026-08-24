@@ -86,36 +86,6 @@ def persist_transcript_card(store, preview: str, message_id: str, call_id: str,
     return True
 
 
-def _compaction_covered_seq(user_id: str) -> int:
-    """Highest chat seq already folded into the V2 conversation summary.
-
-    Rows at-or-below this seq are part of compaction's frozen source ledger:
-    deleting one would desync the frontier's frozen counts and break later
-    summary reads. Conservative in the DELETE direction — when only a legacy
-    ``watermark_ts`` exists, a row exactly at the watermark is treated as
-    covered (kept), the opposite rounding of the GC helper which protects the
-    other direction.
-    """
-    with db.get_pool().connection() as conn:
-        row = conn.execute(
-            "SELECT COALESCE(watermark_seq, 0), watermark_ts "
-            "FROM v2_conversation_summary WHERE user_id = %s",
-            (str(user_id),),
-        ).fetchone()
-        if row is None:
-            return 0
-        covered = int(row[0] or 0)
-        watermark_ts = row[1]
-        if watermark_ts:
-            ts_row = conn.execute(
-                "SELECT COALESCE(MAX(seq), 0) FROM chat_messages "
-                "WHERE user_id = %s AND ts <= %s",
-                (str(user_id), float(watermark_ts)),
-            ).fetchone()
-            covered = max(covered, int(ts_row[0] or 0))
-    return covered
-
-
 def call_message_rows(user_id: str, call_id: str) -> list[tuple[str, int]]:
     """(msg_id, seq) of every chat row belonging to one voice call.
 
@@ -149,16 +119,17 @@ def call_message_rows(user_id: str, call_id: str) -> list[tuple[str, int]]:
 def delete_call_messages(user_id: str, call_id: str) -> dict:
     """Remove the call's per-turn rows once the summary is durable.
 
-    Only rows NOT yet folded by V2 compaction are deleted (per-message
-    primitive, same one the verify-loop GC uses); a row already inside the
-    frozen summary segment is retained (``retained_covered``) because deleting
-    it would corrupt the compaction frontier — it no longer feeds future
-    context reads anyway. Returns counts so the route can verify completeness:
-    ``remaining`` > 0 means deletable rows survived (DB blips swallowed by
-    ``chat_delete``) and the finalize must NOT report success.
+    Only rows NOT yet folded by V2 compaction are deleted. Candidate discovery
+    is necessarily earlier than the delete, so the DB helper re-reads coverage
+    and deletes under one exclusive per-user chat fence. A row already inside
+    the frozen summary segment is retained (``retained_covered``); a leaf that
+    raced candidate discovery either commits first and protects the row, or
+    loses its write witness after cleanup commits. Returns counts so the route
+    can verify completeness: a successful atomic batch always reports
+    ``remaining == 0``; a transaction failure reports every discovered target
+    as remaining/unknown, and finalize must NOT report success.
     """
     smid = transcript_card_message_id(call_id)
-    covered = _compaction_covered_seq(user_id)
     # Snapshot the full row set FIRST: once the tagged user rows are deleted,
     # their replies can no longer be found through the parent predicate, so the
     # recheck must roll-call this same list rather than re-run the query.
@@ -167,33 +138,7 @@ def delete_call_messages(user_id: str, call_id: str) -> dict:
         for msg_id, seq in call_message_rows(user_id, call_id)
         if msg_id != smid
     ]
-    deleted = 0
-    retained_covered = 0
-    deletable: list[str] = []
-    for msg_id, seq in targets:
-        if seq <= covered:
-            retained_covered += 1
-            continue
-        deletable.append(msg_id)
-        try:
-            if db.chat_delete(str(user_id), msg_id):
-                deleted += 1
-        except Exception:  # noqa: BLE001 — counted below via the recheck
-            continue
-    remaining = 0
-    if deletable:
-        with db.get_pool().connection() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM chat_messages "
-                "WHERE user_id = %s AND msg_id = ANY(%s)",
-                (str(user_id), deletable),
-            ).fetchone()
-        remaining = int(row[0] or 0)
-    return {
-        "deleted": deleted,
-        "retained_covered": retained_covered,
-        "remaining": remaining,
-    }
+    return db.chat_delete_uncovered_many(str(user_id), targets)
 
 
 def transcript_turns_from_rows(

@@ -42,6 +42,7 @@ from core.store import UserStore  # noqa: E402
 from accounts import registry  # noqa: E402
 
 
+
 def _b64(raw: bytes) -> str:
     return base64.b64encode(raw).decode("ascii")
 

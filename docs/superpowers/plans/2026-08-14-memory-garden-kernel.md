@@ -1,7 +1,7 @@
 # Memory Garden 内核提取 实施计划
 
 **Goal:** 把 Memory Garden 的判断力（什么值得记 / 怎么归桶 / 挑哪几张 / 要不要整理 / 怎么整理）
-从 io 后端提取成独立包 `backend/memory_garden/`，让 V1 consumer、V2 worker、genesis 三条线
+从 io 后端提取成独立包 `backend/memgarden/`，让 V1 consumer、V2 worker、genesis 三条线
 共用同一份判断规则，消除现有的两套落卡实现。
 
 **Architecture:** 内核是纯函数包，不 import 任何 io 模块（db / identity / enclave /
@@ -10,7 +10,7 @@ accounts / bootstrap / core.store）。所有外部输入由调用方传参。�
 
 **Tech Stack:** Python 3.10，无新依赖。`backend/` 已在 sys.path 上
 （`tools/chat_resident_consumer.py:132`、`tests/conftest.py:61`），
-所以 `backend/memory_garden/` 可直接 `from memory_garden import ...`。
+所以 `backend/memgarden/` 可直接 `from memgarden import ...`。
 
 ## Global Constraints
 
@@ -69,7 +69,7 @@ accounts / bootstrap / core.store）。所有外部输入由调用方传参。�
 ## 文件结构
 
 ```
-backend/memory_garden/
+backend/memgarden/
 ├── __init__.py             公开 API 汇总导出
 ├── types.py                ← memory/source_policy.py（来源与 capture mode 枚举）
 ├── text/
@@ -101,17 +101,17 @@ backend/memory_garden/
 ### Task 1: 包骨架与守卫测试
 
 **Files:**
-- Create: `backend/memory_garden/__init__.py`
-- Create: `tests/test_memory_garden_purity.py`
+- Create: `backend/memgarden/__init__.py`
+- Create: `tests/test_memgarden_purity.py`
 
 **Interfaces:**
-- Produces: 包 `memory_garden` 可导入；`tests/test_memory_garden_purity.py::test_kernel_imports_no_io`
+- Produces: 包 `memgarden` 可导入；`tests/test_memgarden_purity.py::test_kernel_imports_no_io`
   作为后续所有批次的硬指标守卫。
 
 - [ ] **Step 1: 写守卫测试（先失败）**
 
 ```python
-"""内核纯度守卫：memory_garden 包不得 import 任何 io 模块。
+"""内核纯度守卫：memgarden 包不得 import 任何 io 模块。
 
 这是《内核提取》验收标准第 ② 条的自动化。一旦包里出现 import db 或
 import identity.user_naming，后面所有目标都塌了 —— 用测试钉死，不靠人盯。
@@ -128,7 +128,7 @@ _ALLOWED_CORE = frozenset({"protocol_leak", "self_thinking"})
 
 
 def _kernel_files():
-    root = pathlib.Path(__file__).resolve().parents[1] / "backend" / "memory_garden"
+    root = pathlib.Path(__file__).resolve().parents[1] / "backend" / "memgarden"
     return sorted(root.rglob("*.py"))
 
 
@@ -149,7 +149,7 @@ def _imported_roots(path):
 
 def test_kernel_imports_no_io():
     files = _kernel_files()
-    assert files, "memory_garden 包为空——搬迁没做或路径不对"
+    assert files, "memgarden 包为空——搬迁没做或路径不对"
     offenders = []
     for path in files:
         for root in _imported_roots(path):
@@ -168,7 +168,7 @@ def test_kernel_has_no_side_effect_imports():
     逐个 import 一遍，任何异常都说明有副作用或漏依赖。
     """
     import importlib
-    root = pathlib.Path(__file__).resolve().parents[1] / "backend" / "memory_garden"
+    root = pathlib.Path(__file__).resolve().parents[1] / "backend" / "memgarden"
     for path in _kernel_files():
         rel = path.relative_to(root.parent).with_suffix("")
         module_name = ".".join(rel.parts)
@@ -177,13 +177,13 @@ def test_kernel_has_no_side_effect_imports():
 
 - [ ] **Step 2: 跑，确认失败**
 
-Run: `cd backend && python -m pytest ../tests/test_memory_garden_purity.py -v`
-Expected: FAIL —— "memory_garden 包为空"
+Run: `cd backend && python -m pytest ../tests/test_memgarden_purity.py -v`
+Expected: FAIL —— "memgarden 包为空"
 
 - [ ] **Step 3: 建包骨架**
 
 ```python
-# backend/memory_garden/__init__.py
+# backend/memgarden/__init__.py
 """Memory Garden 内核 —— 记忆的判断力，与宿主环境无关。
 
 这个包只做判断，不做执行:
@@ -196,27 +196,27 @@ Expected: FAIL —— "memory_garden 包为空"
   加解密与 enclave · 身份装配 · 所有权校验 · gates · 审计 ·
   锁与事务 · 捞聊天记录 · 定时器 · 真正调模型
 
-硬指标: 本包不 import 任何 io 模块。由 tests/test_memory_garden_purity.py 守卫。
+硬指标: 本包不 import 任何 io 模块。由 tests/test_memgarden_purity.py 守卫。
 """
 ```
 
 - [ ] **Step 4: 建子包目录与空 `__init__.py`**
 
 ```bash
-cd backend/memory_garden
+cd backend/memgarden
 for d in text prompts scoring guards; do mkdir -p $d && touch $d/__init__.py; done
 ```
 
 - [ ] **Step 5: 跑测试确认通过**
 
-Run: `cd backend && python -m pytest ../tests/test_memory_garden_purity.py -v`
+Run: `cd backend && python -m pytest ../tests/test_memgarden_purity.py -v`
 Expected: PASS（包非空、无违规 import）
 
 - [ ] **Step 6: 提交**
 
 ```bash
-git add backend/memory_garden tests/test_memory_garden_purity.py
-git commit -m "feat(memory-garden): 包骨架 + 内核纯度守卫测试"
+git add backend/memgarden tests/test_memgarden_purity.py
+git commit -m "feat(memgarden): 包骨架 + 内核纯度守卫测试"
 ```
 
 ---
@@ -224,29 +224,29 @@ git commit -m "feat(memory-garden): 包骨架 + 内核纯度守卫测试"
 ### Task 2: 搬零依赖模块（source_policy / dream_gates / prompts_v1 / relevance）
 
 **Files:**
-- Create: `backend/memory_garden/types.py`（内容来自 `backend/memory/source_policy.py`）
-- Create: `backend/memory_garden/guards/dream_gates.py`（来自 `backend/memory/dream_gates.py`）
-- Create: `backend/memory_garden/prompts/buckets.py`（来自 `backend/memory/prompts_v1.py`）
-- Create: `backend/memory_garden/scoring/relevance.py`（来自 `backend/context_memory_selection.py`）
+- Create: `backend/memgarden/types.py`（内容来自 `backend/memory/source_policy.py`）
+- Create: `backend/memgarden/guards/dream_gates.py`（来自 `backend/memory/dream_gates.py`）
+- Create: `backend/memgarden/prompts/buckets.py`（来自 `backend/memory/prompts_v1.py`）
+- Create: `backend/memgarden/scoring/relevance.py`（来自 `backend/context_memory_selection.py`）
 - Modify: 上述四个原文件 → re-export
 
 **Interfaces:**
 - Produces: `memory.source_policy` 的 `MEMORY_SOURCE_VALUES` / `MEMORY_CAPTURE_MODE_VALUES` /
   `RESIDENT_ABSORB_SOURCE` / `RESIDENT_PATCH_SOURCE`；
-  `memory_garden.guards.dream_gates` 的 `known_id_in_text` / `result_id_leak` 等全部公开名；
-  `memory_garden.prompts.buckets` 的 `COMMON_BUCKETS_GUIDANCE_V1` /
+  `memgarden.guards.dream_gates` 的 `known_id_in_text` / `result_id_leak` 等全部公开名；
+  `memgarden.prompts.buckets` 的 `COMMON_BUCKETS_GUIDANCE_V1` /
   `normalize_bucket_language` / `COMMON_BUCKETS_V1`，以及私有名
   `_text_is_chinese` / `_COMMON_BUCKETS_ZH` / `_COMMON_BUCKETS_EN`（有跨模块引用，必须显式 re-export）；
-  `memory_garden.scoring.relevance` 的 `memory_relevance_details` 等。
+  `memgarden.scoring.relevance` 的 `memory_relevance_details` 等。
 
 - [ ] **Step 1: 逐个 `git mv` 搬文件**
 
 ```bash
 cd backend
-git mv memory/source_policy.py            memory_garden/types.py
-git mv memory/dream_gates.py              memory_garden/guards/dream_gates.py
-git mv memory/prompts_v1.py               memory_garden/prompts/buckets.py
-git mv context_memory_selection.py        memory_garden/scoring/relevance.py
+git mv memory/source_policy.py            memgarden/types.py
+git mv memory/dream_gates.py              memgarden/guards/dream_gates.py
+git mv memory/prompts_v1.py               memgarden/prompts/buckets.py
+git mv context_memory_selection.py        memgarden/scoring/relevance.py
 ```
 
 ⚠️ 用 `git mv` 而不是复制删除，保住 blame 历史。
@@ -268,20 +268,20 @@ from memory.source_policy import (  # noqa: F401
 
 ```python
 # backend/memory/dream_gates.py
-"""已搬至 memory_garden.guards.dream_gates —— 保留 re-export。"""
-from memory_garden.guards.dream_gates import *  # noqa: F401,F403
+"""已搬至 memgarden.guards.dream_gates —— 保留 re-export。"""
+from memgarden.guards.dream_gates import *  # noqa: F401,F403
 ```
 
 ```python
 # backend/memory/prompts_v1.py
-"""已搬至 memory_garden.prompts.buckets —— 保留 re-export。
+"""已搬至 memgarden.prompts.buckets —— 保留 re-export。
 
 私有名 _text_is_chinese / _COMMON_BUCKETS_ZH / _COMMON_BUCKETS_EN 有跨模块引用
 （card_guard.py:27、tests/test_capture_prompt_v1.py:244,263），`import *` 不覆盖，
 必须显式列出。
 """
-from memory_garden.prompts.buckets import *  # noqa: F401,F403
-from memory_garden.prompts.buckets import (  # noqa: F401
+from memgarden.prompts.buckets import *  # noqa: F401,F403
+from memgarden.prompts.buckets import (  # noqa: F401
     _text_is_chinese,
     _COMMON_BUCKETS_ZH,
     _COMMON_BUCKETS_EN,
@@ -290,15 +290,15 @@ from memory_garden.prompts.buckets import (  # noqa: F401
 
 ```python
 # backend/context_memory_selection.py
-"""已搬至 memory_garden.scoring.relevance —— 保留 re-export。"""
-from memory_garden.scoring.relevance import *  # noqa: F401,F403
+"""已搬至 memgarden.scoring.relevance —— 保留 re-export。"""
+from memgarden.scoring.relevance import *  # noqa: F401,F403
 ```
 
 - [ ] **Step 3: 跑纯度守卫 + 相关既有测试**
 
 Run:
 ```bash
-cd backend && python -m pytest ../tests/test_memory_garden_purity.py \
+cd backend && python -m pytest ../tests/test_memgarden_purity.py \
   ../tests/test_capture_prompt_v1.py ../tests/test_context_memories.py -v
 ```
 Expected: 全 PASS。若 `_COMMON_BUCKETS_ZH` 报 ImportError，说明 Step 2 的显式 re-export 漏了。
@@ -315,7 +315,7 @@ Expected: 收集数量与搬迁前一致，无 collection error。
 
 ```bash
 git add -A backend/ tests/
-git commit -m "refactor(memory-garden): 搬入四个零依赖纯模块，原位置 re-export"
+git commit -m "refactor(memgarden): 搬入四个零依赖纯模块，原位置 re-export"
 ```
 
 ---
@@ -323,40 +323,40 @@ git commit -m "refactor(memory-garden): 搬入四个零依赖纯模块，原位�
 ### Task 3: 搬有内部依赖的模块（protocol_leak / self_thinking / card_guard / card_text / selector）
 
 **Files:**
-- Create: `backend/memory_garden/text/protocol_leak.py`（来自 `backend/core/protocol_leak.py`）
-- Create: `backend/memory_garden/text/self_thinking.py`（来自 `backend/core/self_thinking.py`）
-- Create: `backend/memory_garden/text/card_guard.py`（来自 `backend/memory/card_guard.py`）
-- Create: `backend/memory_garden/text/card_text.py`（来自 `backend/memory/card_text.py`）
-- Create: `backend/memory_garden/scoring/selector.py`（来自 `backend/memory_index_selector.py`）
+- Create: `backend/memgarden/text/protocol_leak.py`（来自 `backend/core/protocol_leak.py`）
+- Create: `backend/memgarden/text/self_thinking.py`（来自 `backend/core/self_thinking.py`）
+- Create: `backend/memgarden/text/card_guard.py`（来自 `backend/memory/card_guard.py`）
+- Create: `backend/memgarden/text/card_text.py`（来自 `backend/memory/card_text.py`）
+- Create: `backend/memgarden/scoring/selector.py`（来自 `backend/memory_index_selector.py`）
 - Modify: 五个原文件 → re-export
 
 **Interfaces:**
-- Consumes: Task 2 产出的 `memory_garden.prompts.buckets`
-- Produces: `memory_garden.text.card_text` 的字段校验入口、
-  `memory_garden.text.card_guard` 的泄漏检测入口、
-  `memory_garden.scoring.selector` 的选卡入口
+- Consumes: Task 2 产出的 `memgarden.prompts.buckets`
+- Produces: `memgarden.text.card_text` 的字段校验入口、
+  `memgarden.text.card_guard` 的泄漏检测入口、
+  `memgarden.scoring.selector` 的选卡入口
 
 - [ ] **Step 1: 搬文件**
 
 ```bash
 cd backend
-git mv core/protocol_leak.py       memory_garden/text/protocol_leak.py
-git mv core/self_thinking.py       memory_garden/text/self_thinking.py
-git mv memory/card_guard.py        memory_garden/text/card_guard.py
-git mv memory/card_text.py         memory_garden/text/card_text.py
-git mv memory_index_selector.py    memory_garden/scoring/selector.py
+git mv core/protocol_leak.py       memgarden/text/protocol_leak.py
+git mv core/self_thinking.py       memgarden/text/self_thinking.py
+git mv memory/card_guard.py        memgarden/text/card_guard.py
+git mv memory/card_text.py         memgarden/text/card_text.py
+git mv memory_index_selector.py    memgarden/scoring/selector.py
 ```
 
 - [ ] **Step 2: 把包内 import 改成相对引用**
 
-`memory_garden/text/card_guard.py`：
+`memgarden/text/card_guard.py`：
 ```python
 from . import protocol_leak
 from ..prompts.buckets import _text_is_chinese
 ```
 （原为 `from core import protocol_leak` / `from memory.prompts_v1 import _text_is_chinese`）
 
-`memory_garden/text/card_text.py`：
+`memgarden/text/card_text.py`：
 ```python
 from . import card_guard
 from . import self_thinking
@@ -365,7 +365,7 @@ from ..prompts.buckets import normalize_bucket_language
 （原为 `from core import self_thinking` / `from memory import card_guard` /
 `from memory.prompts_v1 import normalize_bucket_language`）
 
-`memory_garden/scoring/selector.py`：
+`memgarden/scoring/selector.py`：
 ```python
 from .relevance import memory_relevance_details
 ```
@@ -378,8 +378,8 @@ commit 进旧内容并推上共享分支。
 
 ```python
 # backend/core/protocol_leak.py
-"""已搬至 memory_garden.text.protocol_leak —— 保留 re-export。"""
-from memory_garden.text.protocol_leak import *  # noqa: F401,F403
+"""已搬至 memgarden.text.protocol_leak —— 保留 re-export。"""
+from memgarden.text.protocol_leak import *  # noqa: F401,F403
 ```
 
 同形写 `core/self_thinking.py`、`memory/card_guard.py`、`memory/card_text.py`、
@@ -389,7 +389,7 @@ from memory_garden.text.protocol_leak import *  # noqa: F401,F403
 
 Run:
 ```bash
-cd backend && python -m pytest ../tests/test_memory_garden_purity.py \
+cd backend && python -m pytest ../tests/test_memgarden_purity.py \
   ../tests/test_memory_index_selector.py ../tests/test_context_memories.py -v
 ```
 Expected: 全 PASS。守卫测试会检查包内没有 `import core.*` / `import memory.*` 残留。
@@ -406,7 +406,7 @@ cd backend && python -m pytest ../tests -k "card or leak or thinking or selector
 
 ```bash
 git add -A backend/ tests/
-git commit -m "refactor(memory-garden): 搬入 text/scoring 模块，包内改相对引用"
+git commit -m "refactor(memgarden): 搬入 text/scoring 模块，包内改相对引用"
 ```
 
 ---
@@ -414,14 +414,14 @@ git commit -m "refactor(memory-garden): 搬入 text/scoring 模块，包内改�
 ### Task 4: prompt 三件套进包，identity 依赖改传参
 
 **Files:**
-- Create: `backend/memory_garden/prompts/capture.py`（来自 `backend/memory/capture_prompt_v1.py`）
-- Create: `backend/memory_garden/prompts/dream.py`（来自 `backend/memory/dream_prompt_v1.py`）
-- Create: `backend/memory_garden/prompts/migrate.py`（来自 `backend/memory/migrate_prompt_v1.py`）
+- Create: `backend/memgarden/prompts/capture.py`（来自 `backend/memory/capture_prompt_v1.py`）
+- Create: `backend/memgarden/prompts/dream.py`（来自 `backend/memory/dream_prompt_v1.py`）
+- Create: `backend/memgarden/prompts/migrate.py`（来自 `backend/memory/migrate_prompt_v1.py`）
 - Modify: 三个原文件 → re-export
-- Test: `tests/test_memory_garden_prompt_params.py`
+- Test: `tests/test_memgarden_prompt_params.py`
 
 **Interfaces:**
-- Consumes: `memory_garden.prompts.buckets`
+- Consumes: `memgarden.prompts.buckets`
 - Produces: `build_capture_prompt(..., naming_rule, user_name)` /
   `build_dream_prompt(..., naming_rule, user_name)` —— 称呼规则改为显式入参，
   不再由内核 `from identity.user_naming import ...`
@@ -438,7 +438,7 @@ import pytest
 
 
 def test_capture_prompt_takes_naming_rule_as_param():
-    from memory_garden.prompts.capture import build_capture_prompt
+    from memgarden.prompts.capture import build_capture_prompt
     text = build_capture_prompt(
         ai_name="io",
         user_name="老王",
@@ -451,7 +451,7 @@ def test_capture_prompt_takes_naming_rule_as_param():
 
 
 def test_dream_prompt_takes_naming_rule_as_param():
-    from memory_garden.prompts.dream import build_dream_prompt
+    from memgarden.prompts.dream import build_dream_prompt
     text = build_dream_prompt(
         ai_name="io",
         user_name="老王",
@@ -464,15 +464,15 @@ def test_dream_prompt_takes_naming_rule_as_param():
 
 - [ ] **Step 2: 跑，确认失败（模块不存在）**
 
-Run: `cd backend && python -m pytest ../tests/test_memory_garden_prompt_params.py -v`
+Run: `cd backend && python -m pytest ../tests/test_memgarden_prompt_params.py -v`
 
 - [ ] **Step 3: 搬文件并改签名**
 
 ```bash
 cd backend
-git mv memory/capture_prompt_v1.py   memory_garden/prompts/capture.py
-git mv memory/dream_prompt_v1.py     memory_garden/prompts/dream.py
-git mv memory/migrate_prompt_v1.py   memory_garden/prompts/migrate.py
+git mv memory/capture_prompt_v1.py   memgarden/prompts/capture.py
+git mv memory/dream_prompt_v1.py     memgarden/prompts/dream.py
+git mv memory/migrate_prompt_v1.py   memgarden/prompts/migrate.py
 ```
 
 三个文件里：删掉 `from identity.user_naming import _naming_rule, sanitize_user_name`，
@@ -483,14 +483,14 @@ git mv memory/migrate_prompt_v1.py   memory_garden/prompts/migrate.py
 
 ```python
 # backend/memory/capture_prompt_v1.py
-"""已搬至 memory_garden.prompts.capture —— 保留 re-export 与旧签名。
+"""已搬至 memgarden.prompts.capture —— 保留 re-export 与旧签名。
 
 内核不再 import identity；此处这层薄壳负责装配称呼规则，
 让现有调用方（V1 consumer、V2 worker、genesis）无需改动。
 """
 from identity.user_naming import _naming_rule, sanitize_user_name  # noqa: F401
-from memory_garden.prompts import capture as _kernel
-from memory_garden.prompts.capture import parse_capture_cards  # noqa: F401
+from memgarden.prompts import capture as _kernel
+from memgarden.prompts.capture import parse_capture_cards  # noqa: F401
 
 
 def build_capture_prompt(*, ai_name, user_name, cards, window_text, **kwargs):
@@ -513,17 +513,17 @@ dream / migrate 同形。
 
 Run:
 ```bash
-cd backend && python -m pytest ../tests/test_memory_garden_prompt_params.py \
-  ../tests/test_memory_garden_purity.py \
+cd backend && python -m pytest ../tests/test_memgarden_prompt_params.py \
+  ../tests/test_memgarden_purity.py \
   ../tests/test_capture_prompt_v1.py -v
 ```
-Expected: 全 PASS。纯度守卫此时应确认 `memory_garden` 内再无 `identity` 引用。
+Expected: 全 PASS。纯度守卫此时应确认 `memgarden` 内再无 `identity` 引用。
 
 - [ ] **Step 6: 提交**
 
 ```bash
 git add -A backend/ tests/
-git commit -m "refactor(memory-garden): prompt 三件套进包，称呼规则改为显式入参"
+git commit -m "refactor(memgarden): prompt 三件套进包，称呼规则改为显式入参"
 ```
 
 ---
@@ -531,9 +531,9 @@ git commit -m "refactor(memory-garden): prompt 三件套进包，称呼规则改
 ### Task 5: 策略档位 —— 消除 genesis 与 capture 的半拟合
 
 **Files:**
-- Create: `backend/memory_garden/policies.py`
-- Create: `tests/test_memory_garden_policies.py`
-- Modify: `backend/memory_garden/prompts/capture.py`（接受 policy 参数）
+- Create: `backend/memgarden/policies.py`
+- Create: `tests/test_memgarden_policies.py`
+- Modify: `backend/memgarden/prompts/capture.py`（接受 policy 参数）
 
 **Interfaces:**
 - Produces: `POLICIES` 字典与 `get_policy(name)`，档位名
@@ -552,7 +552,7 @@ git commit -m "refactor(memory-garden): prompt 三件套进包，称呼规则改
 """三个策略档位必须共用同一套结构，但尺子各不相同。"""
 import pytest
 
-from memory_garden.policies import get_policy, POLICIES
+from memgarden.policies import get_policy, POLICIES
 
 
 def test_three_policies_exist():
@@ -585,7 +585,7 @@ def test_policies_do_not_share_the_same_rubric():
 
 - [ ] **Step 2: 跑，确认失败**
 
-Run: `cd backend && python -m pytest ../tests/test_memory_garden_policies.py -v`
+Run: `cd backend && python -m pytest ../tests/test_memgarden_policies.py -v`
 
 - [ ] **Step 3: 实现 policies.py**
 
@@ -621,7 +621,7 @@ class CapturePolicy:
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cd backend && python -m pytest ../tests/test_memory_garden_policies.py -v`
+Run: `cd backend && python -m pytest ../tests/test_memgarden_policies.py -v`
 
 - [ ] **Step 5: 让 capture prompt 接受 policy 参数（默认保持现行为）**
 
@@ -639,7 +639,7 @@ cd backend && python -m pytest ../tests -k "capture or genesis or prompt or poli
 
 ```bash
 git add -A backend/ tests/
-git commit -m "feat(memory-garden): 三个策略档位收进一处，尺子保持不同"
+git commit -m "feat(memgarden): 三个策略档位收进一处，尺子保持不同"
 ```
 
 ---
@@ -647,8 +647,8 @@ git commit -m "feat(memory-garden): 三个策略档位收进一处，尺子保�
 ### Task 6: 存储 port 与适配器能力声明
 
 **Files:**
-- Create: `backend/memory_garden/storage.py`
-- Create: `tests/test_memory_garden_storage_port.py`
+- Create: `backend/memgarden/storage.py`
+- Create: `tests/test_memgarden_storage_port.py`
 
 **Interfaces:**
 - Produces: `StoragePort` 协议、`Capabilities` 数据类、`Degradation` 上报结构
@@ -660,7 +660,7 @@ git commit -m "feat(memory-garden): 三个策略档位收进一处，尺子保�
 
 ```python
 """存储 port：能力声明 + 显式降级。"""
-from memory_garden.storage import Capabilities, Degradation, plan_degradations
+from memgarden.storage import Capabilities, Degradation, plan_degradations
 
 
 def test_full_capability_adapter_has_no_degradation():
@@ -696,7 +696,7 @@ def test_every_missing_capability_is_reported():
 
 - [ ] **Step 2: 跑，确认失败**
 
-Run: `cd backend && python -m pytest ../tests/test_memory_garden_storage_port.py -v`
+Run: `cd backend && python -m pytest ../tests/test_memgarden_storage_port.py -v`
 
 - [ ] **Step 3: 实现 storage.py**
 
@@ -735,13 +735,13 @@ class Degradation:
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cd backend && python -m pytest ../tests/test_memory_garden_storage_port.py -v`
+Run: `cd backend && python -m pytest ../tests/test_memgarden_storage_port.py -v`
 
 - [ ] **Step 5: 提交**
 
 ```bash
 git add -A backend/ tests/
-git commit -m "feat(memory-garden): 存储 port 与适配器能力声明"
+git commit -m "feat(memgarden): 存储 port 与适配器能力声明"
 ```
 
 ---
@@ -810,7 +810,7 @@ grep -rnE "from (memory|core) import [a-zA-Z_, ]*<模块名>|from (memory|core)\
 
 ## 留给 hx 拍的点（做成可切换，拍完可丝滑改）
 
-1. **包的最终落点**：现在放 `backend/memory_garden/`（跟现有 import 风格一致、
+1. **包的最终落点**：现在放 `backend/memgarden/`（跟现有 import 风格一致、
    sys.path 已覆盖）。将来要独立发布就整目录搬出去 + 加 pyproject。
    如果希望现在就放仓库根，改动是一次 `git mv` + 一处 sys.path。
 2. **策略档位的数量与命名**：现在三个（conversation_capture / history_import /
