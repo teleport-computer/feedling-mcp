@@ -50,8 +50,8 @@ if [[ "$head_branch" == hotfix/* ]]; then
   extra="$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 999)"
   max="${HOTFIX_MAX_COMMITS:-10}"
   if (( extra > max )); then
-    echo "::error title=Hotfix carries too much::'$head_branch' 相对 main 有 $extra 个提交\
-（上限 $max）。hotfix 通道只用于自成一体的紧急修复 —— 这个数字说明它合进了别的分支，\
+    echo "::error title=Hotfix carries too much::'${head_branch}' 相对 main 有 ${extra} 个提交\
+（上限 ${max}）。hotfix 通道只用于自成一体的紧急修复 —— 这个数字说明它合进了别的分支，\
 那样等于用 hotfix 的名义放行整条线。走常规的 test/pre 路线，或把分支重建干净。" >&2
     exit 1
   fi

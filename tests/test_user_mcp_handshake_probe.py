@@ -124,16 +124,19 @@ def test_expect_any_accepts_whatever_the_verdict_says():
 def _v2(**detail):
     """A V2 turn as production actually emits it.
 
-    ⚠️ No `agent.model.call.done`: V2 does not emit one (verified on test —
-    its events are enclave.call.*, memory.index.called, mcp.surface.resolved,
-    chat.message). The runtime receipt rides on the surface event's own
-    `driver` field. The earlier helper here handed the classifier a V1-shaped
-    receipt that never exists on this path, so the tests passed while every
-    real V2 run timed out and reported "no observation".
+    T209 made model-call receipts common to both runtimes. V2 keeps runtime
+    attribution on the surface event and puts provider/model/lane on the model
+    receipt, so this fixture carries both production facts.
     """
     base = {"driver": "v2", "expected": 1, "resolved": 1, "skipped": []}
     base.update(detail)
-    return [{"type": "mcp.surface.resolved", "detail": base}]
+    return [
+        {"type": "agent.model.call.done", "detail": {
+            "driver": "v2", "provider": "anthropic",
+            "model": "claude-test", "lane": "chat",
+        }},
+        {"type": "mcp.surface.resolved", "detail": base},
+    ]
 
 
 def test_v2_zero_expected_is_not_a_pass():
@@ -266,9 +269,12 @@ def test_polling_waits_for_the_runtime_specific_terminal_event():
     assert terminal_event_type("resident") == "mcp.surface.registered"
     assert terminal_event_type("v2") == "mcp.surface.resolved"
 
-    # V2:surface 事件本身就是终点(它自带 driver),没有独立的 turn 回执
+    # V2:surface 事件自带 driver,但仍须等独立的模型完成回执。
     v2_done = [{"type": "mcp.surface.resolved"}]
-    assert observation_complete(v2_done, "v2")
+    assert not observation_complete(v2_done, "v2")
+    assert observation_complete(
+        [*v2_done, {"type": "agent.model.call.done"}], "v2"
+    )
     assert not observation_complete(v2_done, "resident")
     # V1:MCP 事件到了但 turn 回执还没到 —— 还不能收(埋点是各自独立的守护线程发的)
     assert not observation_complete([{"type": "mcp.surface.registered"}], "resident")
@@ -277,17 +283,17 @@ def test_polling_waits_for_the_runtime_specific_terminal_event():
         "resident")
 
 
-def test_v2_needs_no_v1_turn_receipt():
-    """V2 的运行时回执在 surface 事件自己身上。
-
-    要求 agent.model.call.done(V1 才有)会让每次 V2 运行等满超时再报「没有观测」——
-    这个探针**第三次**在同一个位置要求 V1 专属信号了,所以单独锁一条。
-    """
+def test_v2_requires_the_shared_model_call_receipt():
+    """V2 surface 到了但模型完成事件没到，仍然属于观测不完整。"""
     from tools.e2e.user_mcp_handshake_probe import observation_complete
     events = _v2()
     assert observation_complete(events, "v2")
     code, _ = classify(events, runtime="v2", expect="ok", server_count=1)
     assert code == 0
+    surface_only = [
+        event for event in events if event["type"] != "agent.model.call.done"
+    ]
+    assert not observation_complete(surface_only, "v2")
 
 
 def test_v2_still_rejects_a_surface_event_from_the_wrong_runtime():

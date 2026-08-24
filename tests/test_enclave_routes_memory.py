@@ -178,6 +178,72 @@ def test_worldbook_messages_must_be_list(client, _authed):
     assert r.get_json() == {"error": "messages must be a list"}
 
 
+def test_worldbook_decrypt_cache_reuses_unchanged_ciphertext(
+    client, _authed, monkeypatch
+):
+    from enclave.routes import worldbook as route
+
+    route._worldbook_cache.clear()
+    calls = []
+    inner = json.dumps({"id": "wb-1", "name": "Moon", "content": "lore"}).encode()
+
+    def decrypt(env, user_id, content_sk):
+        calls.append((env["body_ct"], user_id, content_sk))
+        return inner
+
+    monkeypatch.setattr(envmod, "decrypt_envelope", decrypt)
+    body = {
+        "world_books": [{
+            "id": "wb-1",
+            "visibility": "shared",
+            "K_enclave": "key",
+            "body_ct": "cipher-v1",
+        }],
+        "messages": [],
+    }
+
+    first = client.post("/v1/worldbook/match", json=body, headers={"X-API-Key": "k"})
+    second = client.post("/v1/worldbook/match", json=body, headers={"X-API-Key": "k"})
+
+    assert first.status_code == 200 and second.status_code == 200
+    assert len(calls) == 1
+
+
+def test_worldbook_decrypt_cache_invalidates_when_ciphertext_changes(
+    client, _authed, monkeypatch
+):
+    from enclave.routes import worldbook as route
+
+    route._worldbook_cache.clear()
+    calls = []
+
+    def decrypt(env, user_id, content_sk):
+        calls.append(env["body_ct"])
+        return json.dumps({
+            "id": "wb-1", "name": "Moon", "content": env["body_ct"]
+        }).encode()
+
+    monkeypatch.setattr(envmod, "decrypt_envelope", decrypt)
+    base = {
+        "id": "wb-1",
+        "visibility": "shared",
+        "K_enclave": "key",
+    }
+
+    for ciphertext in ("cipher-v1", "cipher-v2"):
+        response = client.post(
+            "/v1/worldbook/match",
+            json={
+                "world_books": [{**base, "body_ct": ciphertext}],
+                "messages": [],
+            },
+            headers={"X-API-Key": "k"},
+        )
+        assert response.status_code == 200
+
+    assert calls == ["cipher-v1", "cipher-v2"]
+
+
 def test_runtime_token_only_forwards_token(client, monkeypatch):
     seen = []
     async def fake_backend_get(path, headers, params=None):

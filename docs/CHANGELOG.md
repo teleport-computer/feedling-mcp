@@ -47,6 +47,32 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-24 — V1 冻结按接入路径拆分并补齐托管人群
+
+**[DONE] 事件健康表不再把 Runtime V1 家族误当成一种接入方式。**
+
+- V1 冻结先按 active-tested hosted route 分层，再按接入方式与 effective runtime
+  拆出 APIKey-V1、托管 Resident-V1、自建 Resident、无 route/binding 和接入未分类；
+  原先被 onboarding route 过滤掉的托管 APIKey-V1 作业从生效日起进入冻结格。
+- 每格保存 `access_path` 与 `mode_source`；缺失的 raw runtime control 仍按生产默认
+  执行 V1，但明确标为 `default`，与 `explicit` 分开显示。connected resident binding
+  从冻结事务内的用户文档经 accounts 纯分类器注入，不读取进程缓存。
+- 新增 `access_path_from` 水位。历史不回填，管理页逐列显示“此列自某日起有效”；
+  生效日前的 `unavailable` 不等于零。RDS/TEE 双迁移、镜像扶正主键和匿名归并同步。
+
+## 2026-08-23 — V1 冻结格保留 operational outcome 分类
+
+**[DONE] Runtime family 辅助表不再把 V1 `skipped` 控制结果算成系统失败。**
+
+- V1 `status + status_reason` 分类器下沉到 `notices/catalog.py`，管理端实时视图与
+  每日冻结器共用同一纯函数；`skipped`、明确用户侧不可用和 operational failure
+  分别落入冻结格，失败分母只保留 `completed + operational failure`。
+- 新增独立 `outcomes_from` 水位。迁移前的冻结格不会回填，列默认 0 也不代表历史
+  测得零失败；只有新分类完整覆盖整个窗口时才发布百分比，其余窗口继续明确显示
+  不可计算。
+- RDS 与 TEE 迁移同步新增三类计数和水位约束；删号后的匿名聚合也逐类相加，保持
+  冻结历史的分类守恒。
+
 ## 2026-08-20 — TEE Redis 暂停并标记废弃
 
 test / pre / prod 三套 Redis CVM 在持续零业务流量的状态下停止。全仓确认没有
@@ -4093,7 +4119,7 @@ the one prod user actually do to migrate to E2E?".
   garden after a successful flip.
 - Chat is intentionally skipped — many items, transient; the
   "hide from agent" affordance matters more on persistent
-  memory-garden entries.
+  memgarden entries.
 
 **Inline migration progress**
 - `FeedlingAPI` gains `@Published migrationProgress: (done, total)?`.

@@ -92,6 +92,19 @@ def test_perception_signal_state_uses_snapshot_lane():
     assert entry.lane == reg.SNAPSHOT
 
 
+def test_contract_rejection_stats_uses_mirror_lane_and_reconciler_key():
+    from tee_shadow import reconciler
+
+    entry = reg.REGISTRY.get("contract_rejection_stats")
+    expected_key = (
+        "contract_domain", "boundary", "fallback", "release_sha", "writer_id"
+    )
+    assert entry is not None
+    assert entry.lane == reg.MIRROR
+    assert entry.key_columns == expected_key
+    assert reconciler.TABLES["contract_rejection_stats"][0] == expected_key
+
+
 def test_tee_required_tables_include_synced_and_primary_local_tables():
     """A local-only SKIP lane must not exempt a TEE-primary runtime table."""
     required = set(reg.tee_required_tables())
@@ -136,6 +149,13 @@ def test_skip_entries_must_justify():
     lazy = sorted(t for t in reg.tables_in_lane(reg.SKIP)
                   if reg.REGISTRY[t].reason.strip() in vague)
     assert not lazy, f"这些 SKIP 条目的理由太含糊，需要写清为什么永远不进 TEE：{lazy}"
+
+
+def test_chat_change_control_is_primary_local_but_required_after_promotion():
+    for table in ("chat_change_state", "chat_change_events"):
+        entry = reg.REGISTRY[table]
+        assert entry.lane == reg.SKIP
+        assert entry.tee_required is True
 
 
 # RDS 表名 → TEE 侧对应表名，仅用于两侧不同名的少数情况。

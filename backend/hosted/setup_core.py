@@ -41,10 +41,12 @@ import provider_client
 import provider_attempt_ledger
 from hosted import agent_runtime_cutover
 from hosted import config_store as hosted_config_store
+from hosted import image_generator
 from hosted import new_user_v2_cohort
 from hosted import turn as hosted_turn
 from hosted import vision_routing
 from hosted import vision_observer
+from hosted import visual_transport
 from model_api_runtime.v2 import prompt_frontier
 
 
@@ -469,6 +471,7 @@ def _classify_catalog_route_vision_error(
         status_code=stable.status_code,
         retryable=False,
         detail="The provider lists this model but cannot use it for visual input.",
+        upstream_detail=stable.upstream_detail,
     )
 
 
@@ -604,14 +607,13 @@ def _run_route_vision_test_or_error(
 
     # The real one-image call is always authoritative, matching real chat turns.
     encoded, expected = _vision_probe_image()
-    probe_image = f"data:image/png;base64,{encoded}"
     prompt = (
         "This is a private capability check. Inspect this image. It has four "
         "solid vertical color stripes. Reply using only four lowercase color "
         "names from left to right, separated by commas."
     )
     try:
-        result = provider_client.chat_completion(
+        result = visual_transport.request_visual_completion(
             provider_client.ProviderConfig(
                 route["provider"],
                 route["model"],
@@ -619,22 +621,11 @@ def _run_route_vision_test_or_error(
                 route["base_url"],
                 context_window_tokens=route.get("context_window_tokens"),
             ),
-            [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": probe_image},
-                    },
-                ],
-            }],
-            max_tokens=2000,
-            temperature=None,
-            timeout=45.0,
-            include_reasoning=False,
+            prompt=prompt,
+            image_mime="image/png",
+            image_b64=encoded,
         )
-    except provider_client.ProviderError as exc:
+    except (provider_client.ProviderError, visual_transport.VisualOutputTruncated) as exc:
         stable = _classify_catalog_route_vision_error(
             exc,
             catalog_model_found=exact is not None,
@@ -664,6 +655,7 @@ def _run_route_vision_test_or_error(
             "detail": stable.detail,
             "status_code": stable.status_code,
             "retryable": stable.retryable,
+            **({"reason": stable.reason} if stable.reason else {}),
         }, 400
 
     reply = str(result.get("reply") or "").strip().lower()
@@ -970,14 +962,8 @@ def _test_route_image_generation_or_error(
         context_window_tokens=route.get("context_window_tokens"),
         reasoning_effort=str(route.get("reasoning_effort") or ""),
     )
-    try:
-        result = provider_client.generate_image(
-            config,
-            "A simple blue circle centered on a plain white background.",
-        )
-        if not isinstance(result.get("media"), list) or not result["media"]:
-            raise provider_client.ProviderError("image_generation_invalid_output")
-    except Exception as exc:  # noqa: BLE001 - stable setup error contract
+
+    def provider_failure(exc: BaseException):
         code = _image_generation_error_code(exc, dedicated=True)
         status = (
             "unsupported"
@@ -992,6 +978,20 @@ def _test_route_image_generation_or_error(
         ):
             return {"error": "model_api_route_write_failed"}, 500
         return {"error": code, "retryable": status != "unsupported"}, 400
+
+    try:
+        result = provider_client.generate_image(
+            config,
+            "A simple blue circle centered on a plain white background.",
+        )
+    except Exception as exc:  # noqa: BLE001 - this try contains only provider I/O
+        return provider_failure(exc)
+
+    images = image_generator.normalize_provider_media(result)
+    if not images:
+        return provider_failure(
+            provider_client.ProviderError("image_generation_invalid_output")
+        )
 
     if not db.model_api_route_mark_image_generation_test(
         store.user_id,

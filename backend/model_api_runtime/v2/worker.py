@@ -49,7 +49,7 @@ import time
 import uuid
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable
 
@@ -58,8 +58,10 @@ import generated_image
 import provider_attempt_ledger
 import provider_client
 import provider_health
+import vision_policy
 from voice import transcript_store as voice_transcript_store
 from notices import catalog as notices_catalog
+from notices import error_contract, rejection_stats
 from provider_types import (
     MCP_TRANSPORT_FAILURE_ERROR,
     ProviderMedia,
@@ -71,20 +73,23 @@ from capabilities import registry as cap_registry
 from capabilities import result_budget as cap_result_budget
 from capabilities import tool_schema as cap_tool_schema
 from chat.reply_language import (
+    garden_language_decision,
     infer_garden_language,
     infer_reply_language_policy,
     reply_language_system_line,
+    user_written_text,
 )
 from core import chat_activity as core_chat_activity
 from core import envelope as core_envelope
-from core import protocol_leak
+from agent_protocol_core import protocol_leak
 from core import tool_markup_leak
 from core import util as core_util
 from core import provider_usage
-from core import self_thinking
+from agent_protocol_core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
-from memory_garden import timestamps as memory_timestamps
+from memory import dream_trace as memory_dream_trace
+from memgarden import timestamps as memory_timestamps
 from core.downloadable_reply import sanitize_downloadable_reply
 from perception.glance import (
     perception_glance_fingerprint,
@@ -94,6 +99,7 @@ from perception.agent_fields import (
     AGENT_PERCEPTION_SIGNALS,
     FAST_AGENT_PERCEPTION_SIGNALS,
 )
+from perception_kernel import prompts as perception_prompts
 from screen import screen_read_core
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
@@ -133,20 +139,21 @@ from memory.capture_prompt_v1 import (
     parse_capture_cards,
 )
 from identity.user_naming import transcript_speaker_label
-from memory_garden.text.card_text import (
+from memgarden.text.card_text import (
     build_truncation_retry_prompt,
     card_text_rejection,
     count_user_token_residuals,
     is_retryable_parse_error,
     sanitize_card_labels,
 )
-from memory_garden.text import card_guard
-from memory_garden.guards import dream_gates as memory_dream_gates
+from memgarden.text import card_guard
+from memgarden.guards import dream_gates as memory_dream_gates
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
     build_dream_retry_prompt,
     parse_dream_consolidations,
 )
+from memory.card_leak_signals import IO_LEAK_SIGNALS
 
 log = logging.getLogger("feedling.runtime_v2.worker")
 
@@ -443,6 +450,12 @@ MAX_TOOL_CALLS_PER_ROUND = _positive_int_env(
     "FEEDLING_V2_MAX_TOOL_CALLS_PER_ROUND", "8"
 )
 MAX_TOOL_CALLS_PER_TURN = _positive_int_env("FEEDLING_V2_MAX_TOOL_CALLS_PER_TURN", "24")
+MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS = _positive_int_env(
+    "FEEDLING_V2_MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS", "3"
+)
+MAX_TERMINAL_TOOL_CALL_RETRIES = _positive_int_env(
+    "FEEDLING_V2_MAX_TERMINAL_TOOL_CALL_RETRIES", "2"
+)
 TOOL_RESULT_CHAR_CAP = _positive_int_env("FEEDLING_V2_TOOL_RESULT_CHAR_CAP", "2000")
 TOOL_BATCH_RESULT_CHAR_CAP = _positive_int_env(
     "FEEDLING_V2_TOOL_BATCH_RESULT_CHAR_CAP", "8000"
@@ -681,7 +694,7 @@ if not math.isfinite(_PROMPT_CATCHUP_DEADLINE_SEC) or _PROMPT_CATCHUP_DEADLINE_S
 
 # 每回合最多注入最近 N 张图。enclave 容量有限（每张图一次往返），且无 prompt caching ——
 # tail 里的图片每个回合都要重发，token 成本随图片数线性上升。
-_TAIL_IMAGE_LIMIT = int(os.environ.get("FEEDLING_V2_TAIL_IMAGE_LIMIT", "2"))
+_TAIL_IMAGE_LIMIT = _positive_int_env("FEEDLING_V2_TAIL_IMAGE_LIMIT", "2")
 # 单张图 b64 上限；超限跳过注入、退化成文本标记（不引入图像缩放依赖）。
 # 必须 >= 入库上限 hosted/turn.MODEL_API_MAX_IMAGE_BYTES(=2_000_000 原始字节) 的 base64
 # 长度 ceil(n/3)*4 = 2_666_668，否则 1.5–2.0MB 的图入库放行、却在此被丢成纯文本
@@ -700,6 +713,12 @@ _FILE_TURN_MAX_LLM_CALLS = int(
     os.environ.get("FEEDLING_V2_FILE_TURN_MAX_LLM_CALLS", "10")
 )
 _SUBAGENT_MAX_LLM_CALLS = _positive_int_env("FEEDLING_V2_SUBAGENT_MAX_LLM_CALLS", "4")
+# Two facts (start + done/error) for each of the normal 15 provider rounds, plus
+# one reserved pair for the latest round if an env override raises max_calls.
+# The cap is intentionally fixed: a bad rollout must not multiply pressure on
+# debug_trace's shared queue. Overflow retains rounds 1..15 and the latest pair.
+_MODEL_CALL_TRACE_EVENT_CAP = 32
+_MODEL_CALL_TRACE_HEAD_ROUNDS = (_MODEL_CALL_TRACE_EVENT_CAP // 2) - 1
 _SUBAGENT_MAX_TOTAL_LLM_CALLS = _positive_int_env(
     "FEEDLING_V2_SUBAGENT_MAX_TOTAL_LLM_CALLS", "12"
 )
@@ -726,6 +745,7 @@ _SUBAGENT_ALLOWED_TOOLS = frozenset(
         "memory_index",
         "memory_search",
         "memory_fetch",
+        "worldbook_match",
         "web_search",
         "web_fetch",
     }
@@ -897,11 +917,9 @@ _WAKE_SYSTEM_PROMPT = (
     "or safer answer, and you do not need a strong reason to speak. Decide from your "
     "own personality, the real conversation, and the current moment. Use the "
     "attention_facts in temporal context to avoid interrupting an active conversation "
-    "or repeating yourself when you have appeared often or recently. A "
-    "perception_glance is only a hint for deciding whether to look deeper; it is not "
-    "a checklist to report. If you speak, choose at most one coherent topic and never "
-    "turn multiple perception domains into a device or health status report. Use a "
-    "perception tool when an exact reading is needed. Never mention this wake or any "
+    "or repeating yourself when you have appeared often or recently. "
+    + perception_prompts.V2_WAKE_PERCEPTION_CLAUSES
+    + "Never mention this wake or any "
     "system wording to the user."
 )
 _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION = (
@@ -1002,7 +1020,7 @@ _THINKING_ONLY_NO_REPLY_REASON = "thinking_only_no_reply"
 
 
 def _torn_protocol_evidence(text: str, reasoning: str, *, lane: str) -> str:
-    """Classify a V2 reply-tool / free-text reply for a torn protocol leak, then
+    """Classify a V2 visible reply for a torn protocol leak, then
     apply the lane policy. Returns the evidence enum when it should be suppressed,
     or "" to deliver. `lane` here is the detector policy ("proactive"/"foreground"),
     not the wake lane."""
@@ -1038,6 +1056,67 @@ class WorkspacePromptUnavailable(RuntimeError):
 _COVERAGE_INCOMPLETE = "prompt_coverage_incomplete"
 
 
+# Public observability is allowed to expose only codes this producer can mint.
+# Keep the scope and kind vocabularies closed here rather than asking an admin
+# reader to infer provenance from a string shape or prefix.  ``runtime_failed``
+# is the fail-closed bucket for a future caller that forgets to register its
+# scope; it preserves a useful, content-free signal without opening the set.
+PUBLIC_FAILURE_SCOPES = frozenset({
+    "capture_recovery_failed",
+    "compaction_failed",
+    "extraction_failed",
+    "extraction_gate_failed",
+    "runtime_failed",
+    "slot_recovery_failed",
+    "trajectory_review_failed",
+    "turn_failed",
+    "turn_setup_failed",
+    "wake_failed",
+})
+
+_GENERIC_FAILURE_KINDS = frozenset({
+    # Exception class names historically persisted by this producer. Unknown
+    # classes now collapse to ``error`` instead of expanding the public vocab.
+    "capturehalted",
+    "connectionerror",
+    "exception",
+    "keyerror",
+    "lostjoblease",
+    "oserror",
+    "providererror",
+    "runtimeerror",
+    "runtimemodechanged",
+    "timeouterror",
+    "typeerror",
+    "valueerror",
+})
+_TURN_FAILURE_KINDS = frozenset({
+    "degenerate_reply_suppressed",
+    "empty_reply",
+    "malformed_self_thinking_suppressed",
+    "no_user_messages",
+    "prompt_coverage_incomplete",
+    "prompt_coverage_incomplete:catchup_unwired",
+    "protocol_fragment_suppressed",
+    "responder_error",
+    "thinking_only_no_reply",
+    "tool_budget_exhausted",
+})
+_FRONTIER_FAILURE_KINDS = frozenset({
+    v2_prompt_frontier.PromptContextLimitUnconfigured.code,
+    v2_prompt_frontier.PromptFrontierExhausted.code,
+    v2_summary_frontier.SummaryFrontierIntegrityError.code,
+    v2_summary_frontier.SummaryFrontierExhausted.code,
+})
+_SAFE_FAILURE_KINDS = frozenset(
+    {"error", "workspace_prompt_unavailable"}
+    | set(notices_catalog.ERROR_CLASSES)
+    | set(_GENERIC_FAILURE_KINDS)
+    | set(_TURN_FAILURE_KINDS)
+    | set(_FRONTIER_FAILURE_KINDS)
+)
+
+
 def _coverage_incomplete_reason(reject_code: str = "") -> str:
     """Attach a content-free compaction reject code to the coverage error.
 
@@ -1068,11 +1147,65 @@ class DedicatedVisionUnavailable(RuntimeError):
         error_code: str = "vision_model_failed",
         model: str = "",
         provider: str = "",
+        status_code: int | None = None,
+        upstream_detail: str = "",
+        reason: str = "",
     ):
         super().__init__(message)
-        self.error_code = error_code
+        self.error_code = error_contract.resolve_untrusted(
+            error_code,
+            domain="vision",
+            boundary="v2_dedicated_vision",
+            reporter=rejection_stats.record_hosted,
+        ).code
         self.model = str(model or "")[:96]
         self.provider = str(provider or "")[:80]
+        self.status_code = status_code if isinstance(status_code, int) else None
+        self.reason = str(reason or "")[:80]
+        # Internal-only carrier. Never add this value to terminal status events,
+        # trajectories, debug traces, or user-facing exception messages.
+        self.upstream_detail = str(upstream_detail or "")[:240]
+
+
+@dataclass(frozen=True)
+class VisionObservationOutcome:
+    """One dedicated route result without carrying raw image bytes."""
+
+    observation: str = ""
+    error_code: str = ""
+    reason: str = ""
+    model: str = ""
+    provider: str = ""
+    status_code: int | None = None
+    upstream_detail: str = ""
+
+
+@dataclass(frozen=True)
+class VisionObservationBatch:
+    """Per-target dedicated results plus the shared privacy/deadline fence."""
+
+    outcomes: dict[str, VisionObservationOutcome]
+    absolute_deadline: float
+    main_vision_verified: bool
+
+
+@dataclass
+class VisionFallbackState:
+    """Turn-local state threaded from image injection into the main provider."""
+
+    absolute_deadline: float | None = None
+    selected_count: int = 0
+    selected_at: float | None = None
+    completed_emitted: bool = False
+    # Prompt-frontier recovery may rebuild the same tail before the first main
+    # provider call. Reuse dedicated results so a rebuild cannot mint a fresh
+    # visual deadline or repeat a paid observer request.
+    batch_cache: dict[
+        tuple[tuple[str, str], ...], VisionObservationBatch
+    ] = field(default_factory=dict)
+    selected_batch_keys: set[tuple[tuple[str, str], ...]] = field(
+        default_factory=set
+    )
 
 
 class ImageGenerationUnavailable(RuntimeError):
@@ -1085,11 +1218,34 @@ class ImageGenerationUnavailable(RuntimeError):
         error_code: str = "image_generation_failed",
         model: str = "",
         provider: str = "",
+        status_code: int | None = None,
+        upstream_detail: str = "",
     ):
         super().__init__(message)
-        self.error_code = str(error_code or "image_generation_failed")[:64]
+        self.error_code = error_contract.resolve_untrusted(
+            error_code,
+            domain="image_generation",
+            boundary="v2_image_generation",
+            reporter=rejection_stats.record_hosted,
+        ).code
         self.model = str(model or "")[:96]
         self.provider = str(provider or "")[:80]
+        self.status_code = status_code if isinstance(status_code, int) else None
+        # Internal-only carrier. Tenant-visible status events, trajectories,
+        # debug traces, and exception messages must never serialize this value.
+        self.upstream_detail = str(upstream_detail or "")[:240]
+
+
+class ImageGenerationInternalError(ImageGenerationUnavailable):
+    """Feedling failed after the provider seam; the saved route is not blamed."""
+
+    def __init__(self, *, model: str = "", provider: str = ""):
+        super().__init__(
+            "internal image generation processing failed",
+            error_code="image_generation_internal_error",
+            model=model,
+            provider=provider,
+        )
 
 
 def _safe_failure_code(scope: str, exc: BaseException) -> str:
@@ -1097,7 +1253,8 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
     if isinstance(exc, WorkspacePromptUnavailable):
         kind = "workspace_prompt_unavailable"
     elif isinstance(exc, (DedicatedVisionUnavailable, ImageGenerationUnavailable)):
-        kind = exc.error_code
+        candidate = str(exc.error_code or "")
+        kind = candidate if candidate in notices_catalog.ERROR_CLASSES else "error"
     elif isinstance(exc, v2_tool_loop.ProviderEmptyReply):
         kind = "empty_reply"
     elif isinstance(exc, TurnError):
@@ -1122,7 +1279,7 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
             # the other eleven TurnError sites without decrypting a trajectory.
             # The suffix, when present, is the content-free compaction reject
             # code that stalled the watermark.
-            kind = raw
+            kind = raw if raw in _TURN_FAILURE_KINDS else _COVERAGE_INCOMPLETE
         else:
             # Keep the established persisted code stable across the internal
             # responder-module removal; dashboards and clients may group by it.
@@ -1139,10 +1296,13 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
         # Frontier errors expose explicit, content-free protocol codes. Preserve
         # those codes instead of leaking Python class-name formatting into the
         # persisted status/error surface.
-        kind = exc.code
+        candidate = str(exc.code or "")
+        kind = candidate if candidate in _FRONTIER_FAILURE_KINDS else "error"
     else:
-        kind = type(exc).__name__.lower() or "error"
-    return f"{scope}:{kind}"[:120]
+        candidate = type(exc).__name__.lower()
+        kind = candidate if candidate in _GENERIC_FAILURE_KINDS else "error"
+    normalized_scope = scope if scope in PUBLIC_FAILURE_SCOPES else "runtime_failed"
+    return f"{normalized_scope}:{kind}"
 
 
 _EXTRACTION_FAILURE_REASONS = frozenset(
@@ -1167,6 +1327,33 @@ _EXTRACTION_FAILURE_REASONS = frozenset(
         "not_an_object",
         "output_truncated",
         "semantic_validation_failed_after_retry",
+    }
+)
+
+_EXTRACTION_FAILURE_KINDS = frozenset(
+    set(_EXTRACTION_FAILURE_REASONS)
+    | set(v2_extraction.PUBLIC_PROVIDER_FAILURE_CODES)
+    | {
+        "invalid_card_content",
+        "invalid_card_content_after_retry",
+        "json_decode_error",
+        "memory_write_rejected",
+    }
+)
+
+# Exact, producer-owned vocabulary consumed by admin/debug projections. This is
+# deliberately generated from the normalization inputs above, so adding a new
+# safe kind without extending the export makes producer tests fail rather than
+# silently hiding the value or inviting a copied admin allowlist.
+PUBLIC_FAILURE_CODES = frozenset(
+    {
+        f"{scope}:{kind}"
+        for scope in PUBLIC_FAILURE_SCOPES
+        for kind in _SAFE_FAILURE_KINDS
+    }
+    | {
+        f"extraction_failed:{kind}"
+        for kind in _EXTRACTION_FAILURE_KINDS
     }
 )
 
@@ -1248,6 +1435,77 @@ def _turn_failure_error_class(exc: BaseException) -> str:
     if provider_client.classify_provider_error(exc) == "transient":
         return "upstream_unavailable"
     return "unknown"
+
+
+def _image_generation_unavailable_from_exception(
+    exc: BaseException,
+    provider_config: Any,
+) -> ImageGenerationUnavailable:
+    """Preserve diagnostics while keeping the existing stable error mapping."""
+    classified = _turn_failure_error_class(exc)
+    code = {
+        "auth_invalid": "image_generation_auth_invalid",
+        "quota_insufficient": "image_generation_quota_insufficient",
+        "model_not_found": "image_generation_model_not_found",
+        "provider_incompatible": "image_generation_model_required",
+        "rate_limited": "image_generation_rate_limited",
+        "upstream_unavailable": "image_generation_unavailable",
+        "turn_timeout": "image_generation_unavailable",
+        "reply_parse_failed": "image_generation_invalid_output",
+    }.get(classified, "image_generation_failed")
+    return ImageGenerationUnavailable(
+        "image generation failed",
+        error_code=code,
+        model=str(getattr(provider_config, "model", "") or ""),
+        provider=str(getattr(provider_config, "provider", "") or ""),
+        status_code=getattr(exc, "status_code", None),
+        upstream_detail=str(
+            getattr(exc, "upstream_detail", "")
+            or getattr(exc, "response_detail", "")
+            or ""
+        ),
+    )
+
+
+def _image_generation_internal_error(
+    provider_config: Any,
+) -> ImageGenerationInternalError:
+    return ImageGenerationInternalError(
+        model=str(getattr(provider_config, "model", "") or ""),
+        provider=str(getattr(provider_config, "provider", "") or ""),
+    )
+
+
+async def _call_image_generation_dependency(
+    generate_image: Callable[..., Any],
+    *,
+    user_id: str,
+    prompt: str,
+    provider_config: Any,
+    api_key: str | None,
+    runtime_token: str,
+) -> Any:
+    """Keep assembly/processing failures system-owned at the tool boundary."""
+    try:
+        return await generate_image(
+            user_id,
+            prompt,
+            main_provider_config=provider_config,
+            api_key=api_key,
+            runtime_token=runtime_token,
+        )
+    except ImageGenerationUnavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001 - dependency seam bugs stay system-owned
+        log.exception(
+            "[v2.image] internal generation handling failed user=%s "
+            "provider=%s model=%s error=%s",
+            str(user_id)[:8],
+            str(getattr(provider_config, "provider", "") or "")[:80],
+            str(getattr(provider_config, "model", "") or "")[:96],
+            type(exc).__name__,
+        )
+        raise _image_generation_internal_error(provider_config) from exc
 
 
 def _required_file_missing_fallback(messages: list[dict]) -> str:
@@ -1464,10 +1722,8 @@ class TurnDeps:
     # 有）。best-effort：实现方吞掉自身异常，调用点也再兜一层 —— 推送失败绝不能
     # 把一个已经成功发布回复的回合打成 failed。None（所有不接线的测试/legacy
     # 调用方）= 特性关闭，行为与补齐推送之前完全一致。``lane`` 是本次唤醒的 lane
-    # 名（chat lane 传空字符串）：backend 端用它推 manual（lane == "manual_wake"）与
-    # 真实 wake source，对齐 V1 `_proactive_delivery_decision_v2` 从 job 推 manual
-    # 的做法 —— 之前这里硬编码 source="heartbeat"/manual=False，导致关了
-    # reminders_delivery 的用户在 V2 手动唤醒收不到推送（V1 会走 manual_bypass）。
+    # 名（chat lane 传空字符串），backend 端据此保留真实 wake source。系统通知
+    # 关闭时 manual wake 仍可运行并写入聊天，但不再绕过可见通知总开关。
     # 返回 True 只表示 APNs 接受了 alert（设备专注/静音/通知设置不可见，是实际响铃的
     # 上界）；任何关闭、前台压制、无 token、出网失败都返回 False。chat lane 忽略该
     # 返回值；wake lane 只把它写入决策后的影子观测，绝不回灌判据。
@@ -2122,6 +2378,10 @@ class _ProviderRoundtripTrace:
     terminal_text_round_reason: str = "none"
     force_text_fallback_reason: str = "none"
     empty_response_recovery_used: bool = False
+    model_call_events_observed: int = 0
+    model_call_events_emitted: int = 0
+    _model_call_tail_start: dict[str, Any] | None = None
+    _model_call_tail_terminal: tuple[str, dict[str, Any]] | None = None
 
     def __post_init__(self) -> None:
         self.lane = _normalize_provider_trace_lane(self.lane)
@@ -2173,7 +2433,109 @@ class _ProviderRoundtripTrace:
             detail=trace_detail,
         )
 
+    def _safe_model_call_detail(self, detail: dict[str, Any]) -> dict[str, Any]:
+        try:
+            round_number = max(1, int(detail.get("round") or 1))
+        except (TypeError, ValueError, OverflowError):
+            round_number = 1
+        safe = {
+            "driver": "v2",
+            "provider": str(detail.get("provider") or "unknown")[:48],
+            "model": str(detail.get("model") or "unknown")[:96],
+            "lane": self.lane,
+            "round": round_number,
+        }
+        if self.lane != "chat":
+            safe["wake_kind"] = self.lane
+        finish_reason = str(detail.get("finish_reason") or "")
+        if finish_reason in (
+            v2_tool_loop._CONTENT_FREE_STOP_REASONS
+            | {"unspecified", "timeout", "http_error", "provider_error"}
+        ):
+            safe["finish_reason"] = finish_reason
+        error_class = re.sub(
+            r"[^A-Za-z0-9_.-]", "", str(detail.get("error_class") or "")
+        )[:80]
+        if error_class:
+            safe["error_class"] = error_class
+        provider_error_class = str(detail.get("provider_error_class") or "")
+        if provider_error_class in {"transient", "provider_config", "unknown"}:
+            safe["provider_error_class"] = provider_error_class
+        status_code = detail.get("status_code")
+        if (
+            isinstance(status_code, int)
+            and not isinstance(status_code, bool)
+            and 100 <= status_code <= 599
+        ):
+            safe["status_code"] = status_code
+        dur_ms = detail.get("dur_ms")
+        if isinstance(dur_ms, (int, float)) and not isinstance(dur_ms, bool):
+            safe["dur_ms"] = max(0.0, float(dur_ms))
+        return safe
+
+    async def _emit_model_call_event(
+        self, event_kind: str, detail: dict[str, Any]
+    ) -> None:
+        safe = dict(detail)
+        dur_ms = safe.pop("dur_ms", None)
+        try:
+            await asyncio.to_thread(
+                self.deps.emit_debug_trace,
+                self.user_id,
+                f"agent.model.call.{event_kind}",
+                trace_id=self.trace_id,
+                status=(
+                    "started"
+                    if event_kind == "start"
+                    else ("error" if event_kind == "error" else "ok")
+                ),
+                summary=(
+                    f"V2 provider round {safe['round']} {event_kind}"
+                ),
+                explain=(
+                    "记录 V2 provider 逻辑轮次、路由、耗时与闭集结束原因;"
+                    "不记录 prompt、回复、工具参数、工具结果或上游错误正文。"
+                ),
+                detail=safe,
+                dur_ms=dur_ms,
+            )
+            self.model_call_events_emitted += 1
+        except Exception as exc:  # noqa: BLE001 -- telemetry is best-effort
+            log.warning(
+                "[v2.model_call] trace failed user=%s code=%s",
+                self.user_id,
+                type(exc).__name__.lower(),
+            )
+
+    async def record_model_call(
+        self, event_kind: str, detail: dict[str, Any]
+    ) -> None:
+        """Keep all normal rounds; on overflow retain the head and latest pair."""
+        if event_kind not in {"start", "done", "error"}:
+            return
+        safe = self._safe_model_call_detail(detail)
+        self.model_call_events_observed += 1
+        if safe["round"] <= _MODEL_CALL_TRACE_HEAD_ROUNDS:
+            await self._emit_model_call_event(event_kind, safe)
+            return
+        if event_kind == "start":
+            self._model_call_tail_start = safe
+        else:
+            self._model_call_tail_terminal = (event_kind, safe)
+
+    async def _flush_model_call_tail(self) -> None:
+        if self._model_call_tail_start is not None:
+            await self._emit_model_call_event(
+                "start", self._model_call_tail_start
+            )
+            self._model_call_tail_start = None
+        if self._model_call_tail_terminal is not None:
+            event_kind, detail = self._model_call_tail_terminal
+            await self._emit_model_call_event(event_kind, detail)
+            self._model_call_tail_terminal = None
+
     async def emit_summary(self) -> None:
+        await self._flush_model_call_tail()
         detail = {
             "lane": self.lane,
             "provider_roundtrips": self.provider_roundtrips,
@@ -2182,6 +2544,14 @@ class _ProviderRoundtripTrace:
             "terminal_text_round_reason": self.terminal_text_round_reason,
             "force_text_fallback_reason": self.force_text_fallback_reason,
             "empty_response_recovery_used": self.empty_response_recovery_used,
+            "model_call_event_cap": _MODEL_CALL_TRACE_EVENT_CAP,
+            "model_call_events_observed": self.model_call_events_observed,
+            "model_call_events_emitted": self.model_call_events_emitted,
+            "model_call_events_dropped": max(
+                0,
+                self.model_call_events_observed
+                - self.model_call_events_emitted,
+            ),
         }
         if self.lane != "chat":
             detail["wake_kind"] = self.lane
@@ -3719,6 +4089,8 @@ def _ledger_tapped_sink(
     deps: TurnDeps | None = None,
     user_id: str = "",
     lane: str = "chat",
+    trace_id: str = "",
+    job_id: str = "",
 ):
     """`recorder.record` plus the plaintext ledger mirror, for tool_loop.
 
@@ -3730,7 +4102,10 @@ def _ledger_tapped_sink(
     if recorder is None and (deps is None or deps.emit_debug_trace is None):
         return None
 
+    worldbook_context_reported = False
+
     async def _record(event_kind: str, payload: dict) -> None:
+        nonlocal worldbook_context_reported
         if recorder is not None:
             await recorder.record(event_kind, payload)
             await _mirror_provider_attempt(recorder, event_kind, payload)
@@ -3748,8 +4123,78 @@ def _ledger_tapped_sink(
                 user_id,
                 payload,
             )
+            if not worldbook_context_reported:
+                observation = _worldbook_context_observation(payload)
+                if observation is not None:
+                    worldbook_context_reported = True
+                    try:
+                        await asyncio.to_thread(
+                            deps.emit_debug_trace,
+                            user_id,
+                            "worldbook.context.applied",
+                            status=(
+                                "warning"
+                                if observation["truncated"]
+                                else "ok"
+                            ),
+                            summary="",
+                            explain="",
+                            trace_id=str(trace_id or ""),
+                            turn_id=str(trace_id or ""),
+                            job_id=str(job_id or ""),
+                            detail={
+                                "runtime": "hosted_v2",
+                                "lane": str(lane or "chat"),
+                                **observation,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001 — trace is best-effort
+                        log.warning(
+                            "[v2.worldbook] context trace failed user=%s code=%s",
+                            user_id,
+                            type(exc).__name__.lower(),
+                        )
 
     return _record
+
+
+def _worldbook_context_observation(provider_request: dict) -> dict | None:
+    """Describe only a World Book block that reached a provider request.
+
+    Wake lanes carry eager context as an application-data string. Foreground
+    Chat carries a pull result inside a native ``ToolExchange``. Inspecting the
+    trusted in-memory shape here avoids copying any content into plaintext
+    telemetry; only the carrier length and truncation bit leave this function.
+    """
+    for message in provider_request.get("messages") or ():
+        if isinstance(message, dict):
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            header = context.WORLD_BOOK_CONTEXT_HEADER + "\n"
+            if not content.startswith(header):
+                continue
+            return {
+                "source": "eager_context",
+                "carrier_chars": len(content),
+                "truncated": context.WORLD_BOOK_TRUNCATION_MARKER in content,
+            }
+        if not isinstance(message, ToolExchange):
+            continue
+        result_by_id = {str(result.call_id): result for result in message.results}
+        for call in message.calls:
+            if str(call.name or "") != "worldbook_match":
+                continue
+            result = result_by_id.get(str(call.id))
+            content = str(getattr(result, "content", "") or "")
+            if "<world_book>" not in content:
+                continue
+            return {
+                "source": "tool_result",
+                "carrier_chars": len(content),
+                "truncated": "...[truncated]" in content,
+            }
+    return None
 
 
 def _make_tool_trajectory_callback(
@@ -5274,7 +5719,7 @@ def _make_task_batch_dispatcher(
                 reasoning: str = "",
             ) -> None:
                 if not final:
-                    raise RuntimeError("subagent reply tool is disabled")
+                    raise RuntimeError("subagent intermediate replies are disabled")
 
             async def _no_fold() -> list[dict]:
                 return []
@@ -5303,17 +5748,22 @@ def _make_task_batch_dispatcher(
                     exc,
                 ),
                 disabled_tool_names=child_disabled_tools,
-                # 子 agent 的整个工具面只有 7 件,其中只有 memory_search 是常驻。
-                # 压力折叠会把另外 6 件折成空参数表,而子 agent **没有恢复口**:
+                # 子 agent 的整个工具面只有 8 件,其中只有 memory_search 是常驻。
+                # 压力折叠会把另外 7 件折成空参数表,而子 agent **没有恢复口**:
                 # mcp_tool_search 不在 _SUBAGENT_ALLOWED_TOOLS 里,折掉就再也
                 # 拿不回来。与其让它看着名字填不出参数,不如全部保护 —— 真放不下
                 # 时 PromptFrontierExhausted 是一次可见的失败,好过静默失能。
                 refresh_protected_extra_tool_names=(
                     lambda: set(_SUBAGENT_ALLOWED_TOOLS)
                 ),
-                allow_reply_tool=False,
                 outbound_blocking_read_tool_names=(_PRIVATE_READ_TOOLS),
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
+                max_consecutive_tool_only_rounds=(
+                    MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS
+                ),
+                max_terminal_tool_call_retries=(
+                    MAX_TERMINAL_TOOL_CALL_RETRIES
+                ),
                 max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
                 max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
                 tool_result_char_cap=TOOL_RESULT_CHAR_CAP,
@@ -5612,6 +6062,7 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             summary=summary,
             content=content or summary,
             guard=guard_on,
+            signals=IO_LEAK_SIGNALS,
         )
         if rejection:
             raise ValueError(f"memory_card_rejected:{rejection}")
@@ -5620,6 +6071,7 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             threads=list(inner.get("threads") or []),
             guard=guard_on,
             lang_text=f"{summary}\n{content}",
+            signals=IO_LEAK_SIGNALS,
         )
         if bucket:
             inner["bucket"] = bucket
@@ -6069,6 +6521,8 @@ def _safe_download_name(path: str) -> str:
 
 def _workspace_file_mime(name: str, declared: str = "") -> str:
     """Choose a safe MIME for generated workspace files sent without rendering."""
+    if str(name or "").casefold().endswith(".io.html"):
+        return "text/html"
     explicit = str(declared or "").strip().lower()
     if explicit.startswith("text/") or explicit in {
         "application/json",
@@ -6104,10 +6558,15 @@ def _workspace_file_reply_from_result(result: dict) -> WorkspaceFileReply:
     content = result.get("content")
     if not isinstance(content, str):
         raise ValueError("send_file requires UTF-8 workspace source content")
-    source_data = content.encode("utf-8")
-    if not source_data or len(source_data) > _WORKSPACE_FILE_MAX_BYTES:
-        raise ValueError("workspace file is empty or too large")
     name = _safe_download_name(path)
+    maximum_bytes = (
+        cap_tool_schema.SHARED_WORK_MAX_BYTES
+        if name.casefold().endswith(".io.html")
+        else _WORKSPACE_FILE_MAX_BYTES
+    )
+    source_data = content.encode("utf-8")
+    if not source_data or len(source_data) > maximum_bytes:
+        raise ValueError("workspace file is empty or too large")
     rendered = v2_document_render.render_download(name, content)
     if rendered is None:
         data = source_data
@@ -6116,7 +6575,7 @@ def _workspace_file_reply_from_result(result: dict) -> WorkspaceFileReply:
         )
     else:
         data, mime_type = rendered
-    if not data or len(data) > _WORKSPACE_FILE_MAX_BYTES:
+    if not data or len(data) > maximum_bytes:
         raise ValueError("rendered workspace file is empty or too large")
     return WorkspaceFileReply(
         path=path,
@@ -7064,6 +7523,7 @@ async def _read_seq_adaptive_prompt_context(
     add_usage: Callable[[dict | None], None] | None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
     active_image_ids: set[str] | None = None,
+    vision_fallback_state: VisionFallbackState | None = None,
     tail_cap: int | None = None,
 ) -> tuple[str, list[dict], list[list[dict]], bool, int, str, str, str]:
     """Read one exact core plus summary-covered complete-turn replay.
@@ -7145,6 +7605,9 @@ async def _read_seq_adaptive_prompt_context(
             read_images=deps.read_images,
             active_image_ids=active_image_ids,
             read_vision_observations=deps.read_vision_observations,
+            main_provider_config=provider_config,
+            vision_fallback_state=vision_fallback_state,
+            emit_debug_trace=deps.emit_debug_trace,
         )
         tail = await asyncio.to_thread(
             _inject_tail_files,
@@ -7160,6 +7623,9 @@ async def _read_seq_adaptive_prompt_context(
                 read_images=deps.read_images,
                 active_image_ids=active_image_ids,
                 read_vision_observations=deps.read_vision_observations,
+                main_provider_config=provider_config,
+                vision_fallback_state=vision_fallback_state,
+                emit_debug_trace=deps.emit_debug_trace,
             )
             optional_rows = await asyncio.to_thread(
                 _inject_tail_files,
@@ -8643,6 +9109,11 @@ async def _run_wake(
                         before_write=_before_write,
                         observe_photo=observe_photo,
                         read_parallelism=1,
+                        trace_context={
+                            "trace_id": str(trace_id or ""),
+                            "job_id": str(job_id),
+                            "lane": lane,
+                        },
                     )
                 finally:
                     effect_reservations.mark_ready(tc)
@@ -8732,6 +9203,11 @@ async def _run_wake(
                         before_write=_before_write,
                         observe_photo=observe_photo,
                         read_parallelism=1,
+                        trace_context={
+                            "trace_id": str(trace_id or ""),
+                            "job_id": str(job_id),
+                            "lane": lane,
+                        },
                     )
                 finally:
                     effect_reservations.mark_batch_ready(calls)
@@ -8872,13 +9348,45 @@ async def _run_wake(
         thinking_trace_emitted = False
         language_trace_emitted = False
         wake_self_thinking_failed = False
-        last_promotable_reply_text = ""
+
+        async def _suppress_empty_visible_reply(
+            *, final: bool, fragment: str, stage: str
+        ) -> None:
+            """Fail closed without turning weak-wake silence into an incident."""
+            nonlocal stay_silent_reason, shadow_decision_allowed
+            log.warning(
+                "[v2.worker] wake empty visible reply suppressed user=%s "
+                "job=%s lane=%s final=%s stage=%s fragment=%r",
+                user_id,
+                job_id,
+                lane,
+                final,
+                stage,
+                fragment[:20],
+            )
+            if not final:
+                return
+            # Scheduled reminders retain their must-deliver contract.  All
+            # other proactive lanes may safely sleep without publishing text.
+            if lane == "scheduled":
+                raise TurnError("degenerate_reply_suppressed")
+            stay_silent_reason = jobs_store.EMPTY_VISIBLE_REPLY_SUPPRESSED_REASON
+            shadow_decision_allowed = False
+            await _emit_silent_reply_trace(
+                deps,
+                user_id,
+                lane,
+                event_type="reply.empty_visible_suppressed",
+                cause="suppressed",
+                outcome_code=jobs_store.EMPTY_VISIBLE_REPLY_SUPPRESSED_REASON,
+                trace_id=trace_id,
+                job_id=job_id,
+            )
 
         async def _on_reply(text: str, *, final: bool, reasoning: str = "") -> None:
             nonlocal thinking_trace_emitted, language_trace_emitted
             nonlocal shadow_decision_allowed
             nonlocal wake_self_thinking_failed
-            nonlocal last_promotable_reply_text
             text = str(text or "").strip()
             wake_self_thinking_failed = False
             # Self-authored thinking (same mechanism as the chat lane): peel a leading
@@ -8886,7 +9394,7 @@ async def _run_wake(
             # the real reply, and surface the block in the thinking channel instead of
             # native reasoning. Same kill switch. Fail-closed: a malformed block →
             # silence (a legitimate wake outcome), never a leaked tag.
-            from core import self_thinking as _st_wake
+            from agent_protocol_core import self_thinking as _st_wake
 
             _wake_self_thinking_on = _st_wake.enabled()
             # 与聊天出口同样解耦：关掉 self-thinking 不能顺带关掉安全剥离
@@ -8925,17 +9433,11 @@ async def _run_wake(
                         raise TurnError(_MALFORMED_SELF_THINKING_REASON)
                     return
             if text and _is_degenerate_reply(text):
-                log.warning(
-                    "[v2.worker] wake degenerate reply suppressed user=%s "
-                    "job=%s lane=%s final=%s fragment=%r",
-                    user_id,
-                    job_id,
-                    lane,
-                    final,
-                    text[:20],
+                await _suppress_empty_visible_reply(
+                    final=final,
+                    fragment=text,
+                    stage="pre_sanitize",
                 )
-                if final:
-                    raise TurnError("degenerate_reply_suppressed")
                 return
             # Torn protocol-JSON leak (stream-cut relay split the envelope across
             # reasoning/content). Proactive policy suppresses any leak — silence
@@ -8996,14 +9498,16 @@ async def _run_wake(
                                 type(exc).__name__.lower(),
                             )
                     if _is_degenerate_reply(text):
-                        if final:
-                            raise TurnError("degenerate_reply_suppressed")
+                        await _suppress_empty_visible_reply(
+                            final=final,
+                            fragment=text,
+                            stage="post_sanitize",
+                        )
                         return
             if not text:
-                # Silence is a legitimate wake outcome — both mid-loop (an empty
-                # `reply{}` call) and terminal ("weak wake sleeps"): unlike the chat
-                # lane, an empty terminal text is NOT a failure here, so this is a
-                # plain no-op, never a raise.
+                # Silence is a legitimate terminal wake outcome ("weak wake
+                # sleeps"): unlike the chat lane, an empty terminal text is NOT
+                # a failure here, so this is a plain no-op, never a raise.
                 return
             delivery_started_ns = time.monotonic_ns()
             # The provider call may have taken minutes. Re-check ownership at
@@ -9241,8 +9745,6 @@ async def _run_wake(
                         log.warning(
                             "[v2.worker] wake reply push slot build failed user=%s: %s",
                             user_id, e)
-                    if not final:
-                        last_promotable_reply_text = text
                 if status == "applied":
                     if tm is not None:
                         tm.record_visible_reply()
@@ -9380,170 +9882,6 @@ async def _run_wake(
             )
             return rows
 
-        async def _on_promote_last_wake_intermediate() -> bool:
-            """Close a scheduled wake through its last durable reply bubble."""
-            nonlocal thinking_trace_emitted, language_trace_emitted
-            nonlocal shadow_decision_allowed
-
-            if not seq_native or lane != "scheduled":
-                return False
-            await _fence_wake_effect("reply promotion")
-            receipt = await asyncio.to_thread(
-                v2_effect_outbox.last_promotable_intermediate_reply,
-                user_id=user_id,
-                job_id=job_id,
-            )
-            if receipt is None:
-                return False
-
-            source_effect_id = str(receipt["effect_id"])
-            payload = dict(receipt["payload"])
-            payload.pop(v2_effect_outbox.REPLY_SOURCE_FENCE_KEY, None)
-            consumed_seq = (
-                int(cursor_box["seq"])
-                if int(cursor_box["seq"]) > int(wake_start_seq)
-                else None
-            )
-            if consumed_seq is not None:
-                effect_type = v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE
-                payload["reply_through_seq"] = consumed_seq
-                payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
-                    "claimed_by": claimed_by,
-                    "input_generation": int(wake_observed_generation),
-                    "through_seq": consumed_seq,
-                }
-            else:
-                effect_type = v2_effect_outbox.TERMINAL_REPLY_EFFECT_TYPE
-                payload.pop("reply_through_seq", None)
-                payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
-                    "claimed_by": claimed_by,
-                    "input_generation": int(wake_observed_generation),
-                    "observed_user_seq": int(cursor_box["seq"]),
-                }
-            payload[
-                v2_effect_outbox.PROMOTED_INTERMEDIATE_EFFECT_ID_KEY
-            ] = source_effect_id
-            if scheduled_activity_events:
-                payload.update(
-                    _activity_extra(
-                        scheduled_activity_events,
-                        turn_id=f"scheduled:{job_id}",
-                        job_id=int(job_id),
-                    )
-                )
-
-            delivery_started_ns = time.monotonic_ns()
-            effect_id = await asyncio.to_thread(
-                v2_effect_outbox.enqueue_reply_promotion,
-                intermediate_effect_id=source_effect_id,
-                job_id=job_id,
-                user_id=user_id,
-                expected_generation=gen,
-                payload=payload,
-                effect_type=effect_type,
-                claimed_by=claimed_by,
-            )
-            if deps.apply_pending_effects is not None:
-                await asyncio.to_thread(deps.apply_pending_effects, user_id)
-            disposition = await asyncio.to_thread(
-                v2_effect_outbox.get_effect_disposition,
-                effect_id,
-                user_id=user_id,
-                job_id=job_id,
-                effect_type=effect_type,
-            )
-            status = "missing" if disposition is None else disposition["status"]
-            last_error = "" if disposition is None else disposition["last_error"]
-            await _record_trajectory(
-                trajectory_recorder,
-                "reply_effect_disposition",
-                {
-                    "effect_id": effect_id,
-                    "effect_type": effect_type,
-                    "final": True,
-                    "promoted_intermediate": True,
-                    "status": status,
-                    "last_error": last_error,
-                    "duration_ms": round(
-                        max(0, time.monotonic_ns() - delivery_started_ns)
-                        / 1_000_000.0,
-                        3,
-                    ),
-                },
-                best_effort=True,
-            )
-            if status == "applied":
-                source_status = await asyncio.to_thread(
-                    jobs_store.get_job_status,
-                    job_id,
-                    user_id=user_id,
-                    claimed_by=claimed_by,
-                )
-                if source_status != "completed":
-                    raise RuntimeError(
-                        "promoted wake reply applied without completing source job"
-                    )
-                shadow_decision_allowed = True
-                if not thinking_trace_emitted:
-                    thinking_trace_emitted = True
-                    await _emit_thinking_surfaced_trace(
-                        deps.emit_debug_trace,
-                        user_id,
-                        provider_config,
-                        lane="wake",
-                        branch="none",
-                        chars=0,
-                    )
-                if not language_trace_emitted:
-                    language_trace_emitted = True
-                    await _emit_reply_language_follow_trace(
-                        deps.emit_debug_trace,
-                        user_id,
-                        user_rows=language_user_rows,
-                        visible_reply=last_promotable_reply_text,
-                        lane="wake",
-                    )
-                return True
-            if (
-                status == "discarded"
-                and last_error == v2_effect_outbox.WAKE_REPLY_CHAT_COLLISION
-            ):
-                return True
-            if (
-                status == "discarded"
-                and last_error == v2_effect_outbox.FINAL_REPLY_INPUT_ADVANCED
-            ):
-                raise v2_tool_loop.FinalReplySuperseded()
-            if (
-                status == "discarded"
-                and last_error
-                == v2_effect_outbox.FINAL_REPLY_SOURCE_JOB_INACTIVE
-            ):
-                raise LostJobLease(
-                    "wake source job became inactive before reply promotion"
-                )
-            if (
-                status == "discarded"
-                and last_error == v2_effect_outbox.FINAL_REPLY_INVALID_FENCE
-            ):
-                raise RuntimeError("invalid promoted wake reply fence")
-            if status == "discarded" and last_error in {
-                v2_effect_outbox.EFFECT_RUNTIME_STATE_CHANGED,
-                v2_effect_outbox.EFFECT_RUNTIME_GENERATION_CHANGED,
-            }:
-                code = (
-                    "runtime_mode_changed"
-                    if last_error == v2_effect_outbox.EFFECT_RUNTIME_STATE_CHANGED
-                    else "runtime_generation_changed"
-                )
-                await _fail_runtime_fence(
-                    code,
-                    "runtime ownership changed before wake reply promotion",
-                )
-            raise RuntimeError(
-                "promoted wake reply effect not durably applied: " + status
-            )
-
         # ── 世界书:主动开口的四条道也要认得这个世界（Seven 2026-08-10）
         #
         # 之前只有 chat 道注入，于是同一个伴侣在聊天里说「影月初三」、心跳主动
@@ -9582,6 +9920,11 @@ async def _run_wake(
                         user_id,
                         wake_match_messages,
                         runtime_token=token,
+                        trace_context={
+                            "trace_id": str(trace_id or ""),
+                            "job_id": str(job_id),
+                            "lane": lane,
+                        },
                     )
                 if isinstance(wb, dict):
                     worldbook_context = str(wb.get("block") or "").strip()
@@ -9718,7 +10061,7 @@ async def _run_wake(
                     raise
 
         await _fence_wake_effect("wake turn")
-        from core import self_thinking as _st_wake_loop
+        from agent_protocol_core import self_thinking as _st_wake_loop
 
         async def _on_wake_screen_images_rejected(
             _exc: BaseException,
@@ -9769,20 +10112,15 @@ async def _run_wake(
                 memory_delete_allowed=False,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,
-                on_promote_last_intermediate=(
-                    _on_promote_last_wake_intermediate
-                    if lane == "scheduled"
-                    else None
-                ),
                 fold_new_messages=fold_new_messages,
                 add_usage=_add_usage,
                 max_calls=_TURN_MAX_LLM_CALLS,
                 # "Weak wake sleeps": staying silent is this lane's documented
-                # success case (`_on_reply` no-ops on empty text), so a
-                # text-free provider reply must come back as "" rather than
-                # raising. Without this the lane failed 100% of the time on
-                # test with `wake_failed:providererror` while the provider
-                # answered 200 OK — the model simply had nothing to say.
+                # success case. Keep the provider parser permissive so the
+                # tool loop can recognize a structurally valid empty 200 and
+                # spend one bounded follow-up on the forced reply/stay_silent
+                # choice. Explicit stay_silent remains success; an empty forced
+                # choice fails closed through the existing empty_reply path.
                 #
                 # `scheduled` 是唯一的例外，必须留在 require_reply=True 上。
                 # opened/closed 屏幕共享边沿都只是普通 wake 事实，由模型结合
@@ -9817,6 +10155,11 @@ async def _run_wake(
                     exc,
                 ),
                 on_provider_tool_surface=provider_roundtrip_trace,
+                on_provider_call_event=(
+                    provider_roundtrip_trace.record_model_call
+                    if provider_roundtrip_trace is not None
+                    else None
+                ),
                 on_empty_provider_response=(
                     _empty_provider_response_debug_callback(
                         deps, user_id, lane, trace_id
@@ -9833,9 +10176,17 @@ async def _run_wake(
                     deps=deps,
                     user_id=user_id,
                     lane=lane,
+                    trace_id=str(trace_id or ""),
+                    job_id=str(job_id),
                 ),
                 outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
+                max_consecutive_tool_only_rounds=(
+                    MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS
+                ),
+                max_terminal_tool_call_retries=(
+                    MAX_TERMINAL_TOOL_CALL_RETRIES
+                ),
                 max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
                 max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
                 tool_result_char_cap=TOOL_RESULT_CHAR_CAP,
@@ -9851,6 +10202,10 @@ async def _run_wake(
                     PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
                 ),
                 initial_screen_pixels_blocked=(screen_frame_message is not None),
+                # T107:唤醒轮没有用户消息 —— 屏幕上那段字是这一轮唯一的
+                # 指令来源,所以它同时开启**注入面**的封锁(禁平台写)。
+                # 前台 `process_job` 那个调用点**故意不传这个** —— 那里有用户消息。
+                initial_untrusted_screen_only=(screen_frame_message is not None),
                 tagged_image_message_key=v2_screen_chat.MESSAGE_TAG,
                 on_tagged_images_rejected=(
                     _on_wake_screen_images_rejected
@@ -10673,6 +11028,85 @@ async def _run_profile(
         return "failed"
 
 
+async def _emit_v2_dream_lifecycle(
+    deps: TurnDeps,
+    user_id: str,
+    event_type: str,
+    *,
+    job_id: str,
+    trace_id: str,
+    status: str,
+    outcome: str,
+    started_at: float,
+    degraded_context: bool = False,
+    counts: dict | None = None,
+) -> None:
+    """Emit one content-free hosted Dream lifecycle observation."""
+    if deps.emit_debug_trace is None:
+        return
+    try:
+        await asyncio.to_thread(
+            deps.emit_debug_trace,
+            user_id,
+            event_type,
+            status=status,
+            summary="",
+            explain="",
+            trace_id=str(trace_id or job_id),
+            turn_id=str(trace_id or job_id),
+            job_id=str(job_id),
+            dur_ms=max(0.0, (time.monotonic() - started_at) * 1000.0),
+            detail=memory_dream_trace.detail(
+                runtime="hosted_v2",
+                outcome=outcome,
+                degraded_context=degraded_context,
+                counts=counts,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — observability must not fail Dream
+        log.warning(
+            "[v2.dream] lifecycle trace failed user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
+
+
+async def _emit_v2_dream_context_error(
+    deps: TurnDeps,
+    user_id: str,
+    *,
+    job_id: str,
+    trace_id: str,
+    component: str,
+    outcome: str,
+) -> None:
+    if deps.emit_debug_trace is None:
+        return
+    try:
+        await asyncio.to_thread(
+            deps.emit_debug_trace,
+            user_id,
+            memory_dream_trace.CONTEXT_TRACE_TYPE,
+            status="warning",
+            summary="",
+            explain="",
+            trace_id=str(trace_id or job_id),
+            turn_id=str(trace_id or job_id),
+            job_id=str(job_id),
+            detail=memory_dream_trace.context_detail(
+                runtime="hosted_v2",
+                component=component,
+                outcome=outcome,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — observability must not fail Dream
+        log.warning(
+            "[v2.dream] context trace failed user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
+
+
 async def _run_extraction(
     job_id,
     user_id: str,
@@ -10683,6 +11117,7 @@ async def _run_extraction(
     claimed_by: str | None = None,
     tm: "TurnMetrics | None" = None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
+    trace_id: str = "",
 ) -> str:
     """capture / dream：后台记忆抽取。自成一体的 try/except —— 绝不落进 process_job 那个
     chat-turn 的 except（那条会 emit 用户可见的 error status + record_terminal_error）。
@@ -10693,8 +11128,29 @@ async def _run_extraction(
     extraction_status_recorded = False
     extraction_failure_detail: dict[str, Any] = {}
     capture_window: dict[str, Any] = {}
+    dream_started = time.monotonic()
+    dream_counts: dict[str, int] = {}
+    dream_degraded_context = False
+    dream_stage = "context"
+    dream_terminal_outcome = "failed"
+    dream_model_attempts = 0
+    dream_context_reader_failed = False
+    dream_terminal_emitted = False
     # call_id -> 该通电话的全文明文。只在 capture lane 填充（见 enclave_sem 闸内）。
     voice_transcripts: dict[str, str] = {}
+
+    if lane == "dream":
+        await _emit_v2_dream_lifecycle(
+            deps,
+            user_id,
+            "memory.dream.start",
+            job_id=str(job_id),
+            trace_id=trace_id,
+            status="ok",
+            outcome="started",
+            started_at=dream_started,
+            counts=dream_counts,
+        )
 
     async def _ensure_capture_not_halted(stage: str) -> None:
         """Bypass the polling cache at disclosure and durable-write boundaries."""
@@ -10849,6 +11305,8 @@ async def _run_extraction(
                         await asyncio.to_thread(memory_context_reader, user_id) or {}
                     )
                 except Exception as e:  # noqa: BLE001 — 上下文取数失败 → 降级，不失败（spec §3.5）
+                    if lane == "dream":
+                        dream_context_reader_failed = True
                     log.warning(
                         "[v2.worker] memory context unavailable for %s: %s", user_id, e
                     )
@@ -10902,6 +11360,32 @@ async def _run_extraction(
                         raise RuntimeError(
                             f"capture_voice_transcript_unavailable:{call_id}"
                         ) from e
+        if lane == "dream":
+            card_items = ctx.get("card_items") if isinstance(ctx, dict) else None
+            dream_counts["active_cards"] = len(
+                card_items if isinstance(card_items, list) else []
+            )
+            cards_outcome = (
+                "unavailable"
+                if dream_context_reader_failed
+                else str(ctx.get("_diagnostic_cards_outcome") or "")
+                if isinstance(ctx, dict)
+                else "unavailable"
+            )
+            if not cards_outcome:
+                cards_outcome = (
+                    "ready" if dream_counts["active_cards"] else "empty"
+                )
+            if cards_outcome in {"unavailable", "truncated"}:
+                dream_degraded_context = True
+                await _emit_v2_dream_context_error(
+                    deps,
+                    user_id,
+                    job_id=str(job_id),
+                    trace_id=trace_id,
+                    component="cards",
+                    outcome=cards_outcome,
+                )
         if lane == "capture" and deps.read_capture_state is not None and tail:
             last = tail[-1]
             last_id = str(last.get("id") or "")
@@ -11001,6 +11485,14 @@ async def _run_extraction(
                 user_name=ctx.get("user_name", ""),
                 cards=ctx.get("cards", ""),
                 recent_conversations=window,
+                # 做梦整理的是同一个花园，语言判据必须跟 capture 同源，
+                # 否则夜里整理一遍会把桶换成另一种语言 —— 也要喂同样的证据，
+                # 光同源不同证据一样会判出两个结果。
+                locale=infer_garden_language(
+                    ctx.get("identity") if isinstance(ctx.get("identity"), dict) else None,
+                    written=user_written_text(prompt_tail),
+                    existing_buckets=str(ctx.get("buckets") or ""),
+                ),
             )
             # parse_dream_consolidations 返回 (consolidations, questions, err)。
             # questions 属于「主动提问」= wake 语义，本轮明确丢弃（spec §5.3）。
@@ -11026,6 +11518,21 @@ async def _run_extraction(
                 build_truncation_prompt=build_truncation_retry_prompt,
             )
 
+        async def _extraction_trajectory(kind: str, payload: dict) -> None:
+            nonlocal dream_model_attempts
+            if lane == "dream" and kind == "provider_request":
+                dream_model_attempts += 1
+            if trajectory_recorder is not None:
+                await trajectory_recorder.record(kind, payload)
+
+        extraction_trajectory_out = (
+            _extraction_trajectory
+            if lane == "dream"
+            else trajectory_recorder.record
+            if trajectory_recorder is not None
+            else None
+        )
+
         if lane == "capture" and not prompt_tail:
             # The raw batch may consist entirely of synthetic/internal/import
             # rows. Advance its exact seq frontier through an empty durable
@@ -11034,12 +11541,41 @@ async def _run_extraction(
             items, reason = [], None
         else:
             if lane == "capture":
-                # 花园的分类语言。已有桶优先 —— 一个花园只用一种语言的桶，
-                # 不因为这轮对话换了语言就长出并存的第二套。
-                # 与 V1 consumer 走同一个 helper，两条 runtime 不许各判各的。
-                capture_locale = infer_garden_language(
-                    None, existing_buckets=str(ctx.get("buckets") or "")
+                # 花园的分类语言 —— **看这个人用什么语言，不看桶名**。
+                #
+                # 2026-08-24 之前这里只传桶名（identity 传的是 None），于是桶名是
+                # V2 上唯一的信号。那次事故就是这么被放大的：旧 bug 留下的英文桶
+                # 被读成「这是英文花园」→ 新卡全用英文桶 → 英文桶更多。而且桶名里
+                # 大量是人名/公司名（James、GitHub），压根不携带语言信息。
+                # 详见 chat/reply_language.py:garden_language_decision 的说明。
+                #
+                # 现在喂真证据：身份卡 + 这轮对话里**他自己说的话**。
+                # 取证走共用 helper，两条 runtime 不许各写一份。
+                _lang = garden_language_decision(
+                    ctx.get("identity") if isinstance(ctx.get("identity"), dict) else None,
+                    written=user_written_text(prompt_tail),
+                    # ↓ 只落观测，不参与判定。
+                    existing_buckets=str(ctx.get("buckets") or ""),
                 )
+                capture_locale = _lang["locale"]
+                # 与 V1 同源、同样落库 —— 两条 runtime 的语言判定要能横向对比，
+                # 否则「只有 V2 用户变英文了」这种问题查不出来。
+                if deps.emit_debug_trace is not None:
+                    try:
+                        await asyncio.to_thread(
+                            deps.emit_debug_trace,
+                            user_id,
+                            "memory.capture.language",
+                            status="ok",
+                            summary=f"落卡语言 {_lang['locale']}（依据 {_lang['basis']}）",
+                            explain="这轮落卡用哪种语言写卡，以及凭什么这么判。桶名本身不落库。",
+                            trace_id=str(trace_id or job_id),
+                            turn_id=str(trace_id or job_id),
+                            job_id=str(job_id),
+                            detail=dict(_lang),
+                        )
+                    except Exception:  # noqa: BLE001 — 观测失败绝不影响落卡
+                        pass
                 prompt = build_capture_prompt(
                     ai_name=ctx.get("ai_name", ""),
                     user_name=ctx.get("user_name", ""),
@@ -11076,11 +11612,7 @@ async def _run_extraction(
                         f"extraction_provider_{stage}_{attempt}"
                     ),
                     usage_out=tm.add_call if tm is not None else None,
-                    trajectory_out=(
-                        trajectory_recorder.record
-                        if trajectory_recorder is not None
-                        else None
-                    ),
+                    trajectory_out=extraction_trajectory_out,
                 )
                 _report_turn_progress("extraction_provider_complete")
                 return result
@@ -11193,6 +11725,19 @@ async def _run_extraction(
                 await _ensure_capture_not_halted("legacy_provider_call")
                 items, reason = await _invoke_capture_provider()
         elif lane != "capture":
+            dream_stage = "model"
+            await _emit_v2_dream_lifecycle(
+                deps,
+                user_id,
+                "memory.dream.model.start",
+                job_id=str(job_id),
+                trace_id=trace_id,
+                status="ok",
+                outcome="started",
+                started_at=dream_started,
+                degraded_context=dream_degraded_context,
+                counts=dream_counts,
+            )
             _report_turn_progress("extraction_provider_start")
             items, reason = await _extract_with_provider_health(
                 user_id,
@@ -11206,24 +11751,64 @@ async def _run_extraction(
                     f"extraction_provider_{stage}_{attempt}"
                 ),
                 usage_out=tm.add_call if tm is not None else None,
-                trajectory_out=(
-                    trajectory_recorder.record
-                    if trajectory_recorder is not None
-                    else None
-                ),
+                trajectory_out=extraction_trajectory_out,
             )
             _report_turn_progress("extraction_provider_complete")
+            dream_counts["model_attempts"] = max(1, dream_model_attempts)
+            dream_counts["proposals"] = len(items or [])
         if reason:
+            if lane == "dream":
+                dream_terminal_outcome = memory_dream_trace.reason_outcome(reason)
+                await _emit_v2_dream_lifecycle(
+                    deps,
+                    user_id,
+                    "memory.dream.model.error",
+                    job_id=str(job_id),
+                    trace_id=trace_id,
+                    status="error",
+                    outcome=dream_terminal_outcome,
+                    started_at=dream_started,
+                    degraded_context=dream_degraded_context,
+                    counts=dream_counts,
+                )
             raise RuntimeError(reason)
+        if lane == "dream":
+            await _emit_v2_dream_lifecycle(
+                deps,
+                user_id,
+                "memory.dream.model.done",
+                job_id=str(job_id),
+                trace_id=trace_id,
+                status="ok",
+                outcome=("accepted" if items else "no_proposals"),
+                started_at=dream_started,
+                degraded_context=dream_degraded_context,
+                counts=dream_counts,
+            )
         # 2026-08-05 复盘拆掉了这里的逐提案语义审查(弱模型自审自查既误放也误杀,
         # 每条提案还多烧一次 BYOK 调用)。出口防线现在全部是确定性的:parse 层的
         # 内容闸+卡id泄漏闸、mapper 的结构判据、下方的爆炸半径保险丝。
         if not items and lane != "capture":
             await _complete_extraction(item_count=0)
+            await _emit_v2_dream_lifecycle(
+                deps,
+                user_id,
+                "memory.dream.done",
+                job_id=str(job_id),
+                trace_id=trace_id,
+                status=("warning" if dream_degraded_context else "ok"),
+                outcome="noop",
+                started_at=dream_started,
+                degraded_context=dream_degraded_context,
+                counts=dream_counts,
+            )
+            dream_terminal_emitted = True
             if tm is not None:
                 tm.flush(failed=False, status="ok")
             return "completed"
 
+        if lane == "dream":
+            dream_stage = "mapping"
         if deps.build_memory_envelope is None:
             raise RuntimeError("extraction_memory_writer_unavailable")
         if lane == "capture" and (
@@ -11236,6 +11821,8 @@ async def _run_extraction(
         ):
             raise RuntimeError("capture_commit_protocol_unavailable")
         if lane != "capture" and deps.apply_memory_actions is None:
+            if lane == "dream":
+                dream_stage = "write"
             raise RuntimeError("extraction_memory_writer_unavailable")
 
         occurred_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -11316,6 +11903,16 @@ async def _run_extraction(
                     )
                 )
             actions, _added, _superseded = to_actions(items, **action_kwargs)
+            if lane == "dream":
+                dream_counts.update({
+                    "actions": len(actions),
+                    "organized": _superseded,
+                    "merged": sum(
+                        1
+                        for action in actions
+                        if str(action.get("dream_op") or "") == "merge"
+                    ),
+                })
             for _known, _missing, _fb in source_time_degraded:
                 log.warning(
                     "[v2.dream] source occurred_at degraded user=%s job=%s "
@@ -11335,6 +11932,7 @@ async def _run_extraction(
                 if memory_dream_gates.blast_radius_exceeded(
                     _superseded, active_count
                 ):
+                    dream_terminal_outcome = "guard_rejected"
                     await _record_trajectory(
                         trajectory_recorder,
                         "dream_blast_radius_fuse",
@@ -11398,13 +11996,23 @@ async def _run_extraction(
                 tm.flush(failed=False, status="ok")
             return "completed"
 
+        if lane == "dream":
+            dream_stage = "write"
         write_result = await asyncio.to_thread(
             deps.apply_memory_actions, user_id, actions
         )
         applied_count, skipped_count, failed_count, first_error = (
             _memory_write_result_counts(actions, write_result)
         )
+        if lane == "dream":
+            dream_counts.update({
+                "applied": applied_count,
+                "skipped": skipped_count,
+                "failed": failed_count,
+            })
         if failed_count == len(actions) and actions:
+            if lane == "dream":
+                dream_terminal_outcome = "write_rejected"
             raise RuntimeError(
                 f"extraction_memory_write_rejected:{first_error}"
             )
@@ -11432,6 +12040,24 @@ async def _run_extraction(
                 skipped_count,
                 failed_count,
             )
+        if lane == "dream":
+            await _emit_v2_dream_lifecycle(
+                deps,
+                user_id,
+                "memory.dream.done",
+                job_id=str(job_id),
+                trace_id=trace_id,
+                status=(
+                    "warning"
+                    if failed_count or dream_degraded_context
+                    else "ok"
+                ),
+                outcome=("partial" if failed_count else "applied"),
+                started_at=dream_started,
+                degraded_context=dream_degraded_context,
+                counts=dream_counts,
+            )
+            dream_terminal_emitted = True
         if tm is not None:
             tm.flush(failed=False, status="ok")
         return "completed"
@@ -11476,6 +12102,26 @@ async def _run_extraction(
         return "failed"
     except Exception as e:  # noqa: BLE001 — 背景 job：静默 mark_failed，绝不 surface/写气泡
         code = _extraction_failure_code(e)
+        if lane == "dream" and not dream_terminal_emitted:
+            if dream_terminal_outcome == "failed":
+                dream_terminal_outcome = {
+                    "context": "context_unavailable",
+                    "mapping": "mapping_rejected",
+                    "write": "write_failed",
+                }.get(dream_stage, "failed")
+            await _emit_v2_dream_lifecycle(
+                deps,
+                user_id,
+                "memory.dream.error",
+                job_id=str(job_id),
+                trace_id=trace_id,
+                status="error",
+                outcome=dream_terminal_outcome,
+                started_at=dream_started,
+                degraded_context=dream_degraded_context,
+                counts=dream_counts,
+            )
+            dream_terminal_emitted = True
         if lane != "capture" and not extraction_status_recorded:
             try:
                 await _record_extraction_status("failed")
@@ -11601,6 +12247,9 @@ def _inject_tail_images(
     read_images,
     active_image_ids: set[str] | None = None,
     read_vision_observations=None,
+    main_provider_config: Any = None,
+    vision_fallback_state: VisionFallbackState | None = None,
+    emit_debug_trace: Callable[..., None] | None = None,
 ) -> list[dict]:
     """Materialize V2 image rows without crossing the selected privacy route.
 
@@ -11625,26 +12274,177 @@ def _inject_tail_images(
         and str(row["id"]) in active_ids
     ]
     observations: dict[str, str] = {}
+    fallback_fetched: dict[str, dict] = {}
     if dedicated_targets:
         if read_vision_observations is None:
             raise DedicatedVisionUnavailable("vision observer is not wired")
-        try:
-            observations = read_vision_observations(user_id, dedicated_targets) or {}
-        except Exception as exc:  # noqa: BLE001 — stable V2 failure surface below
-            safe_code = str(
-                getattr(exc, "error_code", "") or "vision_model_failed"
-            )[:64]
-            raise DedicatedVisionUnavailable(
-                "vision observer failed",
-                error_code=safe_code,
-                model=str(getattr(exc, "model", "") or ""),
-                provider=str(getattr(exc, "provider", "") or ""),
-            ) from exc
-        if any(
-            not str(observations.get(item["message_id"]) or "").strip()
+        batch_key = tuple(
+            (item["message_id"], item["route_id"])
             for item in dedicated_targets
-        ):
-            raise DedicatedVisionUnavailable("vision observation missing")
+        )
+        batch = (
+            vision_fallback_state.batch_cache.get(batch_key)
+            if vision_fallback_state is not None
+            else None
+        )
+        batch_was_cached = batch is not None
+        if batch is None:
+            try:
+                batch = read_vision_observations(
+                    user_id,
+                    dedicated_targets,
+                    main_provider_config=main_provider_config,
+                )
+            except Exception as exc:  # noqa: BLE001 — stable V2 failure surface below
+                safe_code = str(
+                    getattr(exc, "error_code", "") or "vision_model_failed"
+                )[:64]
+                raise DedicatedVisionUnavailable(
+                    "vision observer failed",
+                    error_code=safe_code,
+                    model=str(getattr(exc, "model", "") or ""),
+                    provider=str(getattr(exc, "provider", "") or ""),
+                    status_code=getattr(exc, "status_code", None),
+                    upstream_detail=str(
+                        getattr(exc, "upstream_detail", "") or ""
+                    ),
+                    reason=str(getattr(exc, "reason", "") or ""),
+                ) from exc
+
+        if isinstance(batch, VisionObservationBatch):
+            outcomes = batch.outcomes
+        elif isinstance(batch, dict):
+            # Compatibility seam for non-production callers that still return
+            # the pre-A2 success-only shape. It cannot authorize fallback.
+            outcomes = {
+                str(message_id): VisionObservationOutcome(
+                    observation=str(observation or "").strip()
+                )
+                for message_id, observation in batch.items()
+            }
+            batch = VisionObservationBatch(
+                outcomes=outcomes,
+                absolute_deadline=time.monotonic(),
+                main_vision_verified=False,
+            )
+        else:
+            raise DedicatedVisionUnavailable("vision observation batch invalid")
+        if vision_fallback_state is not None and not batch_was_cached:
+            vision_fallback_state.batch_cache[batch_key] = batch
+
+        failures: list[tuple[str, VisionObservationOutcome]] = []
+        for item in dedicated_targets:
+            message_id = item["message_id"]
+            outcome = outcomes.get(message_id)
+            if outcome is None:
+                failures.append(
+                    (message_id, VisionObservationOutcome(
+                        error_code="vision_model_failed"
+                    ))
+                )
+                continue
+            observation = str(outcome.observation or "").strip()
+            if observation:
+                observations[message_id] = observation
+            else:
+                failures.append((message_id, outcome))
+
+        if failures:
+            first_failure = failures[0][1]
+
+            def raise_dedicated(message: str) -> None:
+                raise DedicatedVisionUnavailable(
+                    message,
+                    error_code=(
+                        first_failure.error_code or "vision_model_failed"
+                    ),
+                    model=first_failure.model,
+                    provider=first_failure.provider,
+                    status_code=first_failure.status_code,
+                    upstream_detail=first_failure.upstream_detail,
+                    reason=first_failure.reason,
+                )
+
+            all_eligible = all(
+                vision_policy.is_main_fallback_eligible(
+                    outcome.error_code, outcome.reason
+                )
+                for _message_id, outcome in failures
+            )
+            remaining = float(batch.absolute_deadline) - time.monotonic()
+            selected_count = (
+                len(failures)
+                if all_eligible and batch.main_vision_verified and remaining > 0
+                else 0
+            )
+            skipped_reason = "none"
+            if not all_eligible:
+                skipped_reason = "ineligible_failure"
+            elif not batch.main_vision_verified:
+                skipped_reason = "main_route_unverified"
+            elif remaining <= 0:
+                skipped_reason = "deadline_exhausted"
+            if emit_debug_trace is not None and not batch_was_cached:
+                try:
+                    emit_debug_trace(
+                        user_id,
+                        "vision.fallback.evaluated",
+                        status="ok" if selected_count else "gated",
+                        summary="vision_fallback_evaluated",
+                        explain=(
+                            "Records only closed-set routing and deadline state; "
+                            "no message ids, image bytes, captions, or observations."
+                        ),
+                        detail={
+                            "eligible_failure_count": (
+                                len(failures) if all_eligible else 0
+                            ),
+                            "main_vision_verified": bool(
+                                batch.main_vision_verified
+                            ),
+                            "remaining_budget": (
+                                "positive" if remaining > 0 else "expired"
+                            ),
+                            "selected_count": selected_count,
+                            "skipped_reason": skipped_reason,
+                        },
+                    )
+                except Exception as trace_exc:  # noqa: BLE001 — best effort
+                    log.warning(
+                        "[v2.vision] fallback evaluation trace failed "
+                        "user=%s code=%s",
+                        user_id,
+                        type(trace_exc).__name__.lower(),
+                    )
+            if selected_count <= 0:
+                raise_dedicated("vision fallback was not authorized")
+            if read_images is None:
+                raise_dedicated("vision fallback image reader is not wired")
+            selected_ids = [message_id for message_id, _outcome in failures]
+            try:
+                # Deliberate second read: this is the auditable disclosure gate.
+                # Successful dedicated targets are absent from this exact list.
+                fallback_fetched = read_images(user_id, selected_ids) or {}
+            except Exception as exc:  # noqa: BLE001 — preserve dedicated identity
+                raise_dedicated("vision fallback image read failed")
+            if any(
+                not str(
+                    (fallback_fetched.get(message_id) or {}).get("image_b64") or ""
+                )
+                for message_id in selected_ids
+            ):
+                raise_dedicated("vision fallback image payload missing")
+            if (
+                vision_fallback_state is not None
+                and batch_key not in vision_fallback_state.selected_batch_keys
+            ):
+                vision_fallback_state.absolute_deadline = float(
+                    batch.absolute_deadline
+                )
+                vision_fallback_state.selected_count += selected_count
+                vision_fallback_state.selected_batch_keys.add(batch_key)
+                if vision_fallback_state.selected_at is None:
+                    vision_fallback_state.selected_at = time.monotonic()
 
     wanted = [
         str(row["id"])
@@ -11664,6 +12464,9 @@ def _inject_tail_images(
         message_id = str(row.get("id") or "")
         route_id = str(row.get("vision_route_id") or "")
         if row.get("has_image") and route_id:
+            if message_id not in active_ids:
+                out.append(row)
+                continue
             observation = str(observations.get(message_id) or "").strip()
             if observation:
                 caption = context.text_of(row.get("content"))
@@ -11680,8 +12483,23 @@ def _inject_tail_images(
                     + observation_block
                 )
                 out.append({**row, "content": content})
-            else:
-                out.append(row)
+                continue
+            got = fallback_fetched.get(message_id)
+            b64 = str((got or {}).get("image_b64") or "")
+            if not b64 or len(b64) > _IMAGE_MAX_B64_CHARS:
+                raise DedicatedVisionUnavailable(
+                    "vision fallback image payload invalid"
+                )
+            mime = str((got or {}).get("image_mime") or "image/jpeg")
+            blocks: list[dict] = []
+            caption = context.text_of(row.get("content"))
+            if caption and caption != "[image]":
+                blocks.append({"type": "text", "text": caption})
+            blocks.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            })
+            out.append({**row, "content": blocks})
             continue
 
         got = fetched.get(message_id) if row.get("has_image") else None
@@ -11748,6 +12566,53 @@ def _inject_tail_files(tail: list[dict], *, user_id: str, read_files) -> list[di
         note = "\n（文件内容较长，已截断）" if got.get("truncated") else ""
         out.append({**row, "content": f"[file: {name}]\n{text}{note}"})
     return out
+
+
+def _emit_vision_fallback_completed(
+    deps: TurnDeps,
+    user_id: str,
+    state: VisionFallbackState,
+    *,
+    outcome: str,
+    error_class: str = "",
+) -> None:
+    """Emit the content-free terminal half of a selected main fallback."""
+    if (
+        state.selected_count <= 0
+        or state.completed_emitted
+        or deps.emit_debug_trace is None
+    ):
+        return
+    state.completed_emitted = True
+    started_at = state.selected_at
+    dur_ms = (
+        max(0.0, (time.monotonic() - started_at) * 1000.0)
+        if started_at is not None
+        else 0.0
+    )
+    try:
+        deps.emit_debug_trace(
+            user_id,
+            "vision.fallback.completed",
+            status="ok" if outcome == "success" else "error",
+            summary="vision_fallback_completed",
+            explain=(
+                "Records only fallback count, terminal class, and duration; "
+                "no message ids, image bytes, captions, observations, or replies."
+            ),
+            dur_ms=dur_ms,
+            detail={
+                "selected_count": int(state.selected_count),
+                "outcome": "success" if outcome == "success" else "error",
+                "error_class": str(error_class or "none")[:80],
+            },
+        )
+    except Exception as trace_exc:  # noqa: BLE001 — telemetry is best effort
+        log.warning(
+            "[v2.vision] fallback completion trace failed user=%s code=%s",
+            user_id,
+            type(trace_exc).__name__.lower(),
+        )
 
 
 async def _ensure_prompt_coverage_or_degrade(
@@ -11866,6 +12731,7 @@ async def process_job(
     mcp_offered_names: tuple[str, ...] = ()
     mcp_called_names: list[str] = []
     mcp_turn_outcome = "failed"
+    vision_fallback_state = VisionFallbackState()
     provider_roundtrip_trace = (
         _provider_tool_surface_callback(
             deps,
@@ -12054,6 +12920,7 @@ async def process_job(
                 claimed_by,
                 tm,
                 trajectory_recorder,
+                trace_id=str(job.get("trace_id") or ""),
             )
         if lane != "chat":
             # 真·未注册 lane 的兜底：maintenance/wake（heartbeat/scheduled/manual_wake）/
@@ -12411,6 +13278,7 @@ async def process_job(
                     for row in coalesced
                     if row.get("has_image") and row.get("id")
                 },
+                vision_fallback_state=vision_fallback_state,
                 tail_cap=_TAIL_HARD_CAP,
             )
             if ordered_chat_replies:
@@ -12421,35 +13289,11 @@ async def process_job(
         else:
             summary, tail = "", []
 
+        # Foreground World Book reads are model-visible and pull-only through
+        # worldbook_match. This avoids decrypting and injecting unrelated lore
+        # on every API-key chat/voice turn. The wake lane intentionally keeps
+        # its eager empty-message read above so alwaysOn entries still apply.
         worldbook_context = ""
-        if lane == "chat" and deps.read_worldbook_context is not None:
-            worldbook_match_messages = [
-                {
-                    "role": "user",
-                    "content": context.text_of(row.get("content")),
-                }
-                for row in coalesced
-                if context.text_of(row.get("content")).strip()
-            ]
-            if worldbook_match_messages:
-                try:
-                    async with enclave_sem:
-                        worldbook_result = await asyncio.to_thread(
-                            deps.read_worldbook_context,
-                            user_id,
-                            worldbook_match_messages,
-                            runtime_token=runtime_token,
-                        )
-                    if isinstance(worldbook_result, dict):
-                        worldbook_context = str(
-                            worldbook_result.get("block") or ""
-                        ).strip()
-                except Exception as exc:  # noqa: BLE001 — V1 parity: best effort
-                    log.warning(
-                        "[v2.worldbook] match unavailable user=%s code=%s",
-                        user_id,
-                        type(exc).__name__.lower(),
-                    )
 
         temporal_snapshot = await _capture_turn_temporal_snapshot(
             user_id=user_id,
@@ -12840,6 +13684,11 @@ async def process_job(
                                 # and only while the switch resolved ON for
                                 # this turn.
                                 history_tools_allowed=history_tools_offered,
+                                trace_context={
+                                    "trace_id": str(job.get("trace_id") or ""),
+                                    "job_id": str(job_id),
+                                    "lane": lane,
+                                },
                             )
                         scanned_rows = _history_rows_charged(result, lease)
                     finally:
@@ -12882,6 +13731,11 @@ async def process_job(
                         before_write=_before_write,
                         observe_photo=observe_photo,
                         read_parallelism=1,
+                        trace_context={
+                            "trace_id": str(job.get("trace_id") or ""),
+                            "job_id": str(job_id),
+                            "lane": lane,
+                        },
                     )
                 finally:
                     effect_reservations.mark_ready(tc)
@@ -12964,6 +13818,11 @@ async def process_job(
                         before_write=_before_write,
                         observe_photo=observe_photo,
                         read_parallelism=1,
+                        trace_context={
+                            "trace_id": str(job.get("trace_id") or ""),
+                            "job_id": str(job_id),
+                            "lane": lane,
+                        },
                     )
                 finally:
                     effect_reservations.mark_batch_ready(calls)
@@ -13176,8 +14035,6 @@ async def process_job(
         final_job_completed_atomically = False
         pending_file_replies: list[WorkspaceFileReply] = []
         pending_file_keys: set[tuple[str, int]] = set()
-        last_promotable_reply_text = ""
-
         async def _on_file_requirement_changed() -> None:
             pending_file_replies.clear()
             pending_file_keys.clear()
@@ -13217,7 +14074,6 @@ async def process_job(
             nonlocal language_correction_attempted
             nonlocal language_correction_pending, language_correction_outcome
             nonlocal thinking_language_correction_pending
-            nonlocal last_promotable_reply_text
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
             raw_reply_text = "" if file_reply is not None else str(text or "").strip()
             text = raw_reply_text
@@ -13249,7 +14105,7 @@ async def process_job(
             # text; which thinking to surface (self-authored vs native) and its
             # provenance are decided at seal time. Fail-closed on malformed <think>:
             # never leak a raw tag, never promote private thinking to the reply.
-            from core import self_thinking
+            from agent_protocol_core import self_thinking
 
             self_thinking_on = self_thinking.enabled()
             # 安全剥离与「要不要写/展示自写 thinking」必须解耦：FEEDLING_V2_SELF_THINKING
@@ -13377,7 +14233,7 @@ async def process_job(
                 # owns the attributed failure bubble.
                 raise TurnError("empty_reply")
             if not text and file_reply is None and not image_replies:
-                return  # empty intermediate reply{} call: no bubble, not an error
+                return  # empty non-text delivery: no bubble, not an error
             if file_reply is None:
                 text, removed_internal_reference = sanitize_downloadable_reply(
                     text,
@@ -13511,8 +14367,7 @@ async def process_job(
                     # are only non-sensitive routing metadata. The outbox
                     # validates them while holding the source job lock across
                     # sink dispatch.
-                    # Intermediate reply-tool bubbles deliberately carry no
-                    # fence and remain immediately visible mid-turn.
+                    # Final text replies carry the input frontier fence.
                     payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
                         "claimed_by": claimed_by,
                         "input_generation": int(observed_generation),
@@ -13770,8 +14625,6 @@ async def process_job(
                                 "text": spoken_reply,
                             }
                 if status == "applied" and not final:
-                    if file_reply is None and not image_replies:
-                        last_promotable_reply_text = str(text or "").strip()
                     return
                 if status == "applied":
                     source_status = await asyncio.to_thread(
@@ -13893,183 +14746,6 @@ async def process_job(
                     correction_outcome=language_correction_outcome,
                 )
 
-        async def _on_promote_last_intermediate() -> bool:
-            """Close this chat turn through its last durable reply-tool bubble."""
-            nonlocal final_job_completed_atomically
-            nonlocal thinking_trace_emitted, language_trace_emitted
-            nonlocal voice_reply_slot
-
-            if not seq_native or pending_file_replies:
-                return False
-            await _ensure_runtime_mode()
-            await _renew_lease()
-            receipt = await asyncio.to_thread(
-                v2_effect_outbox.last_promotable_intermediate_reply,
-                user_id=user_id,
-                job_id=job_id,
-            )
-            if receipt is None:
-                return False
-
-            source_effect_id = str(receipt["effect_id"])
-            payload = dict(receipt["payload"])
-            payload.pop(v2_effect_outbox.REPLY_SOURCE_FENCE_KEY, None)
-            payload["reply_through_seq"] = int(cursor_box["seq"])
-            payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
-                "claimed_by": claimed_by,
-                "input_generation": int(observed_generation),
-                "through_seq": int(cursor_box["seq"]),
-            }
-            if ordered_chat_replies:
-                payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY][
-                    "preserve_queued_input"
-                ] = True
-            payload[
-                v2_effect_outbox.PROMOTED_INTERMEDIATE_EFFECT_ID_KEY
-            ] = source_effect_id
-            if reply_parent_message_id:
-                payload["reply_to_message_id"] = reply_parent_message_id
-            if voice_call_context:
-                payload.update(voice_call_context)
-            try:
-                status_rows = await asyncio.to_thread(
-                    jobs_store.status_events_for_job, user_id, int(job_id)
-                )
-                payload.update(
-                    _activity_extra(
-                        core_chat_activity.project_tool_events(status_rows),
-                        turn_id=str(job.get("trace_id") or ""),
-                        job_id=int(job_id),
-                    )
-                )
-            except Exception as exc:  # noqa: BLE001 - reply stays authoritative
-                log.warning(
-                    "[v2.activity] promoted final projection failed "
-                    "user=%s job=%s code=%s",
-                    user_id,
-                    job_id,
-                    type(exc).__name__.lower(),
-                )
-
-            delivery_started_ns = time.monotonic_ns()
-            effect_id = await asyncio.to_thread(
-                v2_effect_outbox.enqueue_reply_promotion,
-                intermediate_effect_id=source_effect_id,
-                job_id=job_id,
-                user_id=user_id,
-                expected_generation=gen,
-                payload=payload,
-            )
-            if deps.apply_pending_effects is not None:
-                await asyncio.to_thread(deps.apply_pending_effects, user_id)
-            disposition = await asyncio.to_thread(
-                v2_effect_outbox.get_effect_disposition,
-                effect_id,
-                user_id=user_id,
-                job_id=job_id,
-                effect_type=v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE,
-            )
-            status = "missing" if disposition is None else disposition["status"]
-            last_error = "" if disposition is None else disposition["last_error"]
-            await _record_trajectory(
-                trajectory_recorder,
-                "reply_effect_disposition",
-                {
-                    "effect_id": effect_id,
-                    "effect_type": v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE,
-                    "final": True,
-                    "promoted_intermediate": True,
-                    "status": status,
-                    "last_error": last_error,
-                    "duration_ms": round(
-                        max(0, time.monotonic_ns() - delivery_started_ns)
-                        / 1_000_000.0,
-                        3,
-                    ),
-                },
-                best_effort=True,
-            )
-            if status == "applied":
-                source_status = await asyncio.to_thread(
-                    jobs_store.get_job_status,
-                    job_id,
-                    user_id=user_id,
-                    claimed_by=claimed_by,
-                )
-                if source_status != "completed":
-                    raise RuntimeError(
-                        "promoted final reply applied without completing source job"
-                    )
-                if not thinking_trace_emitted:
-                    thinking_trace_emitted = True
-                    await _emit_thinking_surfaced_trace(
-                        deps.emit_debug_trace,
-                        user_id,
-                        provider_config,
-                        lane="chat",
-                        branch="none",
-                        chars=0,
-                    )
-                if not language_trace_emitted:
-                    language_trace_emitted = True
-                    await _emit_reply_language_follow_trace(
-                        deps.emit_debug_trace,
-                        user_id,
-                        user_rows=language_user_rows,
-                        visible_reply=last_promotable_reply_text,
-                        lane="chat",
-                        correction_attempted=False,
-                        correction_outcome="skipped",
-                    )
-                if last_promotable_reply_text:
-                    voice_context = await asyncio.to_thread(
-                        _voice_context_for_seq,
-                        user_id,
-                        cursor_box["seq"],
-                    )
-                    if voice_context is not None:
-                        voice_reply_slot = {
-                            **voice_context,
-                            "message_id": str(payload["envelope"]["id"]),
-                            "text": last_promotable_reply_text,
-                        }
-                final_job_completed_atomically = True
-                return True
-            if (
-                status == "discarded"
-                and last_error == v2_effect_outbox.FINAL_REPLY_INPUT_ADVANCED
-            ):
-                raise v2_tool_loop.FinalReplySuperseded()
-            if (
-                status == "discarded"
-                and last_error == v2_effect_outbox.FINAL_REPLY_INVALID_FENCE
-            ):
-                raise RuntimeError("invalid promoted final reply fence")
-            if (
-                status == "discarded"
-                and last_error == v2_effect_outbox.FINAL_REPLY_SOURCE_JOB_INACTIVE
-            ):
-                raise LostJobLease(
-                    "source job became inactive before reply promotion"
-                )
-            if status == "discarded" and last_error in {
-                v2_effect_outbox.EFFECT_RUNTIME_STATE_CHANGED,
-                v2_effect_outbox.EFFECT_RUNTIME_GENERATION_CHANGED,
-            }:
-                code = (
-                    "runtime_mode_changed"
-                    if last_error
-                    == v2_effect_outbox.EFFECT_RUNTIME_STATE_CHANGED
-                    else "runtime_generation_changed"
-                )
-                await _fail_runtime_fence(
-                    code,
-                    "runtime ownership changed before reply promotion",
-                )
-            raise RuntimeError(
-                "promoted final reply effect not durably applied: " + status
-            )
-
         # `seq` is exclusively the consumed user|human frontier. The base prompt's
         # all-role snapshot bound is passed separately to the fold closure so an
         # assistant bubble remains visible in the tail without ever entering the
@@ -14114,34 +14790,14 @@ async def process_job(
                     model=str(getattr(provider_config, "model", "") or ""),
                     provider=str(getattr(provider_config, "provider", "") or ""),
                 )
-            try:
-                generated = await deps.generate_image(
-                    user_id,
-                    prompt,
-                    main_provider_config=provider_config,
-                    api_key=api_key,
-                    runtime_token=runtime_token,
-                )
-            except ImageGenerationUnavailable:
-                raise
-            except Exception as exc:  # noqa: BLE001 - stable chat failure below
-                classified = _turn_failure_error_class(exc)
-                code = {
-                    "auth_invalid": "image_generation_auth_invalid",
-                    "quota_insufficient": "image_generation_quota_insufficient",
-                    "model_not_found": "image_generation_model_not_found",
-                    "provider_incompatible": "image_generation_model_required",
-                    "rate_limited": "image_generation_rate_limited",
-                    "upstream_unavailable": "image_generation_unavailable",
-                    "turn_timeout": "image_generation_unavailable",
-                    "reply_parse_failed": "image_generation_invalid_output",
-                }.get(classified, "image_generation_failed")
-                raise ImageGenerationUnavailable(
-                    "image generation failed",
-                    error_code=code,
-                    model=str(getattr(provider_config, "model", "") or ""),
-                    provider=str(getattr(provider_config, "provider", "") or ""),
-                ) from exc
+            generated = await _call_image_generation_dependency(
+                deps.generate_image,
+                user_id=user_id,
+                prompt=prompt,
+                provider_config=provider_config,
+                api_key=api_key,
+                runtime_token=runtime_token,
+            )
             media = tuple(generated or ())
             if not media or any(not isinstance(item, ProviderMedia) for item in media):
                 raise ImageGenerationUnavailable(
@@ -14365,6 +15021,7 @@ async def process_job(
                         for row in coalesced
                         if row.get("has_image") and row.get("id")
                     },
+                    vision_fallback_state=vision_fallback_state,
                     tail_cap=_TAIL_HARD_CAP,
                 )
                 if ordered_chat_replies:
@@ -14405,7 +15062,7 @@ async def process_job(
         # which the seal surfaces cleanly (same as V1). Gated on the same kill switch;
         # when self-thinking is OFF this is False and the old include_reasoning path is
         # unchanged.
-        from core import self_thinking as _self_thinking_v2
+        from agent_protocol_core import self_thinking as _self_thinking_v2
 
         outcome = await v2_tool_loop.run_tool_loop(
             provider_config=provider_config,
@@ -14416,7 +15073,6 @@ async def process_job(
             build_messages=build_messages,
             dispatch_tools=_dispatch_tools,
             on_reply=_on_reply,
-            on_promote_last_intermediate=_on_promote_last_intermediate,
             on_file_reply=(
                 _on_file_reply if deps.load_workspace_file is not None else None
             ),
@@ -14445,6 +15101,11 @@ async def process_job(
                 exc,
             ),
             on_provider_tool_surface=provider_roundtrip_trace,
+            on_provider_call_event=(
+                provider_roundtrip_trace.record_model_call
+                if provider_roundtrip_trace is not None
+                else None
+            ),
             on_empty_provider_response=(
                 _empty_provider_response_debug_callback(
                     deps,
@@ -14460,6 +15121,8 @@ async def process_job(
                 deps=deps,
                 user_id=user_id,
                 lane=lane,
+                trace_id=str(job.get("trace_id") or ""),
+                job_id=str(job_id),
             ),
             extra_tool_specs=offered_mcp_tool_specs,
             refresh_extra_tool_specs=_current_offered_mcp_tool_specs,
@@ -14483,6 +15146,12 @@ async def process_job(
             initial_screen_pixels_blocked=(screen_frame_message is not None),
             tagged_image_message_key=v2_screen_chat.MESSAGE_TAG,
             on_tagged_images_rejected=_on_screen_images_rejected,
+            max_consecutive_tool_only_rounds=(
+                MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS
+            ),
+            max_terminal_tool_call_retries=(
+                MAX_TERMINAL_TOOL_CALL_RETRIES
+            ),
             max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
             max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
             tool_result_char_cap=TOOL_RESULT_CHAR_CAP,
@@ -14508,7 +15177,20 @@ async def process_job(
                     deps, user_id, lane
                 )
             ),
+            absolute_deadline=(
+                vision_fallback_state.absolute_deadline
+                if vision_fallback_state.selected_count > 0
+                else None
+            ),
         )
+        if vision_fallback_state.selected_count > 0:
+            await asyncio.to_thread(
+                _emit_vision_fallback_completed,
+                deps,
+                user_id,
+                vision_fallback_state,
+                outcome="success",
+            )
         if pushed_screen_frame_ids:
             await asyncio.to_thread(
                 jobs_store.upsert_wake_schedule,
@@ -14802,9 +15484,19 @@ async def process_job(
         log.info("[v2.worker] job %s stopped at rollout fence: %s", job_id, e)
         return "failed"
     except Exception as e:  # noqa: BLE001 - terminal outbox owns failure visibility
+        if vision_fallback_state.selected_count > 0:
+            await asyncio.to_thread(
+                _emit_vision_fallback_completed,
+                deps,
+                user_id,
+                vision_fallback_state,
+                outcome="error",
+                error_class=_turn_failure_error_class(e),
+            )
         failure_exc: BaseException = e
         if (
             not isinstance(e, DedicatedVisionUnavailable)
+            and vision_fallback_state.selected_count <= 0
             and any(bool(row.get("has_image")) for row in coalesced)
         ):
             classified = _turn_failure_error_class(e)
@@ -14828,6 +15520,12 @@ async def process_job(
                     error_code=vision_code,
                     model=str(getattr(provider_config, "model", "") or ""),
                     provider=str(getattr(provider_config, "provider", "") or ""),
+                    status_code=getattr(e, "status_code", None),
+                    upstream_detail=str(
+                        getattr(e, "upstream_detail", "")
+                        or getattr(e, "response_detail", "")
+                        or ""
+                    ),
                 )
         message = _safe_failure_code("turn_failed", failure_exc)
         await _record_trajectory(
@@ -14840,7 +15538,13 @@ async def process_job(
             },
             best_effort=True,
         )
-        log.warning("[v2.worker] job %s failed code=%s", job_id, message)
+        log.warning(
+            "[v2.worker] job %s failed code=%s status=%s upstream_detail=%r",
+            job_id,
+            message,
+            getattr(failure_exc, "status_code", None),
+            str(getattr(failure_exc, "upstream_detail", "") or "")[:240],
+        )
         owned = await asyncio.to_thread(
             jobs_store.mark_failed,
             job_id,
@@ -14958,17 +15662,26 @@ async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
 
     The signature is deliberately unchanged: many tests patch this seam.
     """
+    # Execution only; queue-inclusive elapsed time is terminal.ts - enqueued.ts.
+    started_ns = time.monotonic_ns()
     outcome = await _run_turn_body(job, deps, enclave_sem=enclave_sem)
     # Deliberately NOT a finally: a finally also runs for CancelledError and for
     # any unhandled BaseException, and would then emit outcome="failed" for a
     # turn that was merely drained -- inventing a failure that never happened.
     # Every terminal path inside the body returns an outcome, so returning is
     # the honest signal that a terminal state was reached.
-    await _emit_job_terminal_trace(deps, job, outcome)
+    dur_ms = max(0.0, (time.monotonic_ns() - started_ns) / 1_000_000)
+    await _emit_job_terminal_trace(deps, job, outcome, dur_ms=dur_ms)
     return outcome
 
 
-async def _emit_job_terminal_trace(deps: TurnDeps, job: dict, outcome: str) -> None:
+async def _emit_job_terminal_trace(
+    deps: TurnDeps,
+    job: dict,
+    outcome: str,
+    *,
+    dur_ms: float,
+) -> None:
     """Record the terminal half of the enqueue->terminal pair.
 
     Carries the job's own ``trace_id`` rather than minting one: a fresh id
@@ -15019,7 +15732,9 @@ async def _emit_job_terminal_trace(deps: TurnDeps, job: dict, outcome: str) -> N
         kwargs = {
             "status": status,
             "trace_id": str(job.get("trace_id") or ""),
+            "turn_id": str(job.get("trace_id") or ""),
             "job_id": str(job.get("id") or ""),
+            "dur_ms": max(0.0, float(dur_ms)),
             "detail": {"lane": lane, "outcome": outcome, "error_code": error_code},
         }
         # outcome_class has no success member, so it is only meaningful on an

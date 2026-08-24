@@ -1,79 +1,146 @@
-"""花园语言判定：几个英文桶不许把整个中文花园翻成英文。
+"""花园语言判定 —— 守的是「记忆不会自己换语言」。
 
-## 线上事故（2026-08-24）
+## 两次教训，都写在这里
 
-一个真实用户的中文花园（226 张卡，archive_language=zh-Hans-US），两天内新落的卡
-整个变成英文 —— 摘要是英文散文，桶是 Our relationship / Feelings & comfort。
+**第一次（2026-08-24 线上事故）**：判据看的是已有桶名里 CJK 与拉丁**字符**的个数。
+中英文桶名长度根本不对等（「工作」2 字符 vs「Our relationship」15 字符），一个英文
+桶顶七个中文桶。真实用户的中文花园两天内整个翻成英文。
 
-## 根因：拿字符数比大小，中英文不对等
+**第二次（同日，hx 指出）**：改成「按桶投票」只是提高了门槛，没解决根本问题 ——
 
-    中文桶平均 3.4 字符（「工作」）
-    英文桶平均 11.6 字符（「Our relationship」）
-    → 一个英文桶顶三个半中文桶
+    工作、健康、James、Sarah、Mike        ← 中文用户,给三个朋友各建了个桶
+    工作、James、OpenAI、GitHub、Figma    ← 中文用户,在记几个项目
 
-实测「6 个中文桶 + 3 个英文桶」就翻。而那几个英文桶是更早一个 bug 的残留
-（老提示词同时给中英两套让模型挑，约 1/3 的中文记忆被贴错），于是形成回路：
+人名、公司名、项目名全是拉丁字母，跟这个人说什么语言毫无关系。**怎么数都救不了 ——
+压根不该数它。**
 
-    旧残留 → 判成英文花园 → 新卡全用英文桶 → 英文桶更多 → 自我强化
-
-**用得越久越容易中招** —— 攒的英文桶越多。
-
-## 为什么之前的测试没抓到
-
-原来的用例只有「全中文」和「全英文」两个干净极端。而现实里只有混合态：
-干净的两极在生产中根本不存在。这个文件补的就是混合态。
+所以现在桶名完全不参与判定。这个文件的大半篇幅在守这一条。
 """
 from __future__ import annotations
 
-import pathlib
-import sys
-
 import pytest
 
-BACKEND = pathlib.Path(__file__).resolve().parent.parent / "backend"
-if str(BACKEND) not in sys.path:
-    sys.path.insert(0, str(BACKEND))
+from chat.reply_language import (
+    garden_language_decision,
+    infer_garden_language,
+    user_written_text,
+)
 
-from chat.reply_language import infer_garden_language  # noqa: E402
-
-
-@pytest.mark.parametrize("desc,buckets", [
-    ("事故现场：中英各半，英文桶名更长",
-     "我们的关系、工作、健康、Our relationship、Feelings & comfort、GitHub"),
-    ("6 个中文桶 + 3 个英文桶（实测的翻转下限）",
-     "工作、健康、宠物、家庭、朋友、爱好、Work、Health、Pets"),
-    ("压倒性中文 + 2 个英文",
-     "工作、健康、宠物、家庭、朋友、爱好、金钱、饮食、Our relationship、Feelings & comfort"),
-    ("一个超长英文桶 vs 三个短中文桶",
-     "工作、健康、宠物、Preferences & boundaries"),
-])
-def test_english_buckets_cannot_flip_a_chinese_garden(desc, buckets):
-    assert infer_garden_language({}, existing_buckets=buckets) == "zh-Hans", desc
+ZH_SAMPLE = "今天面试挂了，算法题第三次没做出来，感觉自己不太适合这行，有点想放弃了"
+EN_SAMPLE = (
+    "Bombed the interview again today, third time stuck on the same algorithm "
+    "problem. Starting to wonder whether this field is really for me."
+)
 
 
-def test_a_tie_stays_chinese():
-    """平票保持中文。
+# ---------------------------------------------------------------- 桶名不是证据
 
-    不对称是刻意的：把中文花园翻成英文，用户立刻看见自己的记忆换了语言；
-    保持中文最多是"没跟上"。两种错误代价差得远。
+@pytest.mark.parametrize(
+    "buckets,desc",
+    [
+        ("工作、健康、James、Sarah、Mike", "🔴 hx 的例子：给三个外国朋友各建一个桶"),
+        ("工作、James、OpenAI、GitHub、Figma", "🔴 公司名 / 项目名"),
+        ("我们的关系、工作、健康、Our relationship、Feelings & comfort、GitHub",
+         "🔴 2026-08-24 事故当天的真实桶构成"),
+        ("Work、Health、Pets、Family、Friends", "全英文桶，但这个人说中文"),
+    ],
+)
+def test_bucket_names_can_never_flip_a_chinese_speakers_garden(buckets: str, desc: str) -> None:
+    """一个说中文的人，桶名长什么样都不该让他的记忆变成英文。"""
+    got = infer_garden_language({}, written=ZH_SAMPLE, existing_buckets=buckets)
+    assert got == "zh-Hans", desc
+
+
+@pytest.mark.parametrize(
+    "buckets,desc",
+    [
+        ("工作、健康、宠物、家庭", "全中文桶，但这个人说英文"),
+        ("妈妈、房子、崽崽", "自定义中文桶"),
+    ],
+)
+def test_bucket_names_can_never_flip_an_english_speakers_garden(buckets: str, desc: str) -> None:
+    """反方向同样成立。只守一边的话，把判据写死成「永远中文」也能全绿。"""
+    got = infer_garden_language({}, written=EN_SAMPLE, existing_buckets=buckets)
+    assert got == "en", desc
+
+
+def test_buckets_do_not_appear_in_the_basis() -> None:
+    """依据名里不该再出现 existing_buckets —— 它已经不是一档证据了。
+
+    这条守的是「有人把桶名悄悄加回判据」：行为上可能一时看不出来（碰巧两边指向
+    同一种语言），但依据名会立刻暴露。
     """
-    assert infer_garden_language({}, existing_buckets="工作、健康、Work、Health") == "zh-Hans"
+    d = garden_language_decision({}, written=ZH_SAMPLE, existing_buckets="Work、Health、GitHub")
+    assert d["basis"] != "existing_buckets"
+    assert d["basis"] == "writing_language"
+    # 桶的计数仍然返回，但只作观测 —— 用来发现「判成中文却几乎全是拉丁桶」这类
+    # 归一化失效的情况。
+    assert d["bucket_en"] == 3
 
 
-@pytest.mark.parametrize("buckets", [
-    "Work / Health / Pets / Family",
-    "Work、Health、Pets、工作",
-])
-def test_a_genuinely_english_garden_still_reads_as_english(buckets):
-    """修复不能矫枉过正 —— 真的多数是英文，还得判英文。"""
-    assert infer_garden_language({}, existing_buckets=buckets) == "en"
+# ---------------------------------------------------------------- 证据的优先级
+
+def test_explicit_preference_beats_everything() -> None:
+    """用户明说要中文，就是中文 —— 哪怕他最近在写英文邮件、设备是英文的。
+
+    这是他自己的设置，不是我们可以推翻的推断。
+    """
+    got = infer_garden_language(
+        {"language_preference": "zh-Hans"},
+        written=EN_SAMPLE, locale="en", existing_buckets="Work、Health",
+    )
+    assert got == "zh-Hans"
 
 
-def test_custom_buckets_are_recognised_too():
-    """自造桶（不在通用集里）同样要认得出语言。"""
-    assert infer_garden_language({}, existing_buckets="妈妈、房子、崽崽") == "zh-Hans"
+def test_what_they_write_beats_device_locale() -> None:
+    """设备 locale 可能只是买了台水货手机。他实际在写什么才是真信号。"""
+    d = garden_language_decision({}, written=ZH_SAMPLE, locale="en")
+    assert d["locale"] == "zh-Hans"
+    assert d["basis"] == "writing_language"
 
 
-def test_no_buckets_falls_back_without_crashing():
-    """新花园还没有任何桶时，走后面的身份卡/locale 兜底，不能炸。"""
-    assert infer_garden_language({}, existing_buckets="") in ("zh-Hans", "en")
+def test_chinese_speaker_who_peppers_in_english_tech_words_stays_chinese() -> None:
+    """中文用户天天夹英文技术词。**按词计不按字符计** —— 一个英文词≈5 个字母，
+    比字符数中文永远吃亏，这跟桶名那次是同一个错。"""
+    written = (
+        "今天 review 了一天的 PR，眼睛快瞎了。那个 data pipeline 的重构改了 4000 多行，"
+        "team 里只有我碰过那块老代码，manager 说 sprint 排不下"
+    )
+    assert infer_garden_language({}, written=written) == "zh-Hans"
+
+
+def test_a_short_utterance_is_not_enough_to_move_a_garden() -> None:
+    """「ok thanks」不该把一个花园推向英文。证据不够就往下走。"""
+    d = garden_language_decision({}, written="ok thanks", locale="zh-Hans")
+    assert d["locale"] == "zh-Hans"
+    assert d["basis"] == "client_locale"
+
+
+def test_no_evidence_at_all_falls_back_and_says_so() -> None:
+    """什么都没有时落到默认，并且**说得出这是默认值** —— 好让宿主知道这个结论有多弱。"""
+    d = garden_language_decision(None)
+    assert d["basis"] == "default"
+
+
+# ---------------------------------------------------------------- 取证只取本人
+
+def test_only_the_persons_own_messages_count_as_evidence() -> None:
+    """AI 的回复不算证据。
+
+    AI 的回复本来就是用花园语言写的 —— 拿它当证据，就是「上一轮输出决定下一轮
+    输入」那个环，只是从桶名换成了消息体重演一遍。
+    """
+    messages = [
+        {"role": "user", "content": ZH_SAMPLE},
+        {"role": "assistant", "content": EN_SAMPLE * 3},
+        {"role": "user", "content": "而且最近睡不好，一到周二晚上就开始胃疼"},
+    ]
+    written = user_written_text(messages)
+    assert EN_SAMPLE[:20] not in written
+    assert infer_garden_language({}, written=written) == "zh-Hans"
+
+
+def test_lookalike_roles_do_not_count_as_the_person() -> None:
+    """role 判断要精确匹配 —— "user_proxy" 之类不是本人。"""
+    written = user_written_text([{"role": "user_proxy", "content": EN_SAMPLE}])
+    assert written == ""

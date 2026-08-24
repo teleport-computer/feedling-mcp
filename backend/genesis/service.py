@@ -29,6 +29,7 @@ from model_api_runtime.v2 import profile as v2_profile
 from model_api_runtime.v2 import profile_store as v2_profile_store
 from notices import catalog
 from notices import core as notices
+from memory.card_leak_signals import IO_LEAK_SIGNALS
 
 GENESIS_STATE_BLOB = "genesis_state"
 GENESIS_PERSONA_BLOB = "genesis_persona"
@@ -1967,8 +1968,8 @@ def render_genesis_profile_source(output: dict) -> tuple[str, int, bool]:
         summary = str(memory.get("summary") or "")
         content = memory_actions._memory_content_from_action(memory, summary)
         if memory_actions.card_guard.guard_enabled() and (
-            memory_actions.card_guard.hard_field_pollution_reason(summary)
-            or memory_actions.card_guard.hard_field_pollution_reason(content)
+            memory_actions.card_guard.hard_field_pollution_reason(summary, IO_LEAK_SIGNALS)
+            or memory_actions.card_guard.hard_field_pollution_reason(content, IO_LEAK_SIGNALS)
         ):
             continue
         if memory_actions._memory_tombstone_reason(summary, content):

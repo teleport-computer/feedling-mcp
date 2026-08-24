@@ -12,7 +12,7 @@ import httpx
 from core import envelope as core_envelope
 from enclave import readside as enclave_readside
 from memory import service as memory_service
-from memory_garden import timestamps as memory_timestamps
+from memgarden import timestamps as memory_timestamps
 
 
 MEMORY_READSIDE_DEFAULT_HARD_MAX = 1000

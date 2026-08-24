@@ -420,6 +420,9 @@ def _provider_config_from_plain(config: dict, api_key: str) -> provider_client.P
         base_url=base_url,
         context_window_tokens=config.get("context_window_tokens"),
         reasoning_effort=str(config.get("reasoning_effort") or ""),
+        hosted_route_id=str(config.get("id") or ""),
+        hosted_route_updated_at=str(config.get("updated_at") or ""),
+        hosted_vision_test_status=str(config.get("vision_test_status") or ""),
     )
 
 

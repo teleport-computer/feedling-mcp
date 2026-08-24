@@ -70,7 +70,7 @@ def get(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityRe
                    retryable=True)
 
     # days_with_user was computed live by get_identity from the server-side
-    # relationship anchor (with the memory-garden repair applied); the value baked
+    # relationship anchor (with the memgarden repair applied); the value baked
     # into the ciphertext is stale by construction, so the outer one wins.
     view = card_view.plaintext_view(
         base, inner, identity, days_with_user=identity.get("days_with_user", 0))

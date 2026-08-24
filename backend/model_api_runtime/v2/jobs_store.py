@@ -34,7 +34,7 @@ from psycopg.types.json import Jsonb
 
 import db
 from core import wake_bus
-from memory_garden import timestamps as memory_timestamps
+from memgarden import timestamps as memory_timestamps
 from model_api_runtime.v2 import usage_reporting
 from notices import catalog as notices_catalog
 from proactive import capture_daily
@@ -90,6 +90,9 @@ def _usage_report_admission():
     finally:
         _USAGE_REPORT_GATE.release()
 
+# Keep this producer export non-empty. The admin trace consumer uses that
+# invariant to distinguish a failed vocabulary load from a healthy reading;
+# making lanes optional/dynamic requires an explicit availability contract.
 LANES = {
     "chat",
     "manual_wake",
@@ -322,23 +325,120 @@ CONTROL_OUTCOME_CODES = frozenset({
     "manual_wake_disabled",
 })
 SILENT_BY_CHOICE_OUTCOME_CODE = "wake_failed:explicit_silence_suppressed"
+EMPTY_VISIBLE_REPLY_SUPPRESSED_REASON = "empty_visible_reply_suppressed"
 SAFETY_SUPPRESSION_CODES = frozenset({
     SILENT_BY_CHOICE_OUTCOME_CODE,
     "wake_failed:degenerate_reply_suppressed",
     "wake_failed:protocol_fragment_suppressed",
     "wake_failed:malformed_self_thinking_suppressed",
 })
+# Persisted V2 error-code keyspace.  Do not merge this with resident/V1
+# ``status_reason``.  The notices catalog owns the explicit Seven-approved
+# subset; this alias prevents the runtime and admin consumers copying it.
+USER_UNAVAILABLE_OUTCOME_CODES = (
+    notices_catalog.USER_UNAVAILABLE_V2_OUTCOME_CODES
+)
 TIMEOUT_OUTCOME_CODES = frozenset({
     "queue_timeout",
     "lease_timeout",
     "runtime_expired",
 })
+JOB_FAILURE_CODES = frozenset({
+    "foreground_chat_preempted",
+    "mcp_mutation_outcome_unknown",
+    "review_runner_failed",
+    "runtime_failed",
+    "runtime_state_not_v2",
+    "scheduled_lease_timeout_requeued",
+    "slot_watchdog_timeout",
+    "stale_runtime_generation",
+    "wake_replay_unsafe",
+    GENERAL_WATCHDOG_REQUEUE_EXHAUSTED,
+})
+
+# Closed vocabulary for the public enqueue trace. ``agent_jobs.reason`` remains
+# an internal persistence field and can carry migration/private coordination
+# values; the trace producer emits a reason only when it is registered here.
+# Admin consumes this export directly and therefore never has to infer that a
+# snake_case-looking string came from us. Keep the export non-empty: admin uses
+# that invariant to report a failed vocabulary load as unavailable rather than
+# as a healthy empty allowlist.
+ENQUEUE_REASON_CODES = frozenset({
+    # Foreground/recovery producers (chat itself is intentionally not traced by
+    # the generic enqueue hook, but keeping the complete queue vocabulary here
+    # prevents a second allowlist when that policy changes).
+    "chat_send",
+    "legacy_final_regeneration",
+    "mutation_recovery",
+    "ordered_followup",
+    "reconcile",
+    "runtime_cutover_recovery",
+    # Scheduled/manual/background lane producers.
+    "backlog_scan",
+    "cas_lost_retry",
+    "compaction",
+    "compaction_catchup",
+    "dream_refresh",
+    "force_dream",
+    "manual_tick",
+    "nightly_dream",
+    "operator_profile_backfill",
+    "post_turn_refresh",
+    "provider_config_changed",
+    "runtime_v2_cutover",
+    "scheduled_wake",
+    "screen_watch",
+    "slot_watchdog_timeout",
+    "user_requested",
+    # Capture and perception producers. Perception payload strings are
+    # normalized at this queue/trace boundary; an unregistered future trigger
+    # remains persisted internally but is omitted from the public trace.
+    "app_background",
+    "arrived_at_anchor",
+    "background_result",
+    "broadcast_closed",
+    "broadcast_opened",
+    "explicit_close",
+    "good_night",
+    "manual_force",
+    "perception_event",
+    "photo_added",
+    "quiet_timeout",
+    "quiet_window_migrate",
+    "scene_change",
+    "screen_lock",
+    "session_end",
+    "turn_backstop",
+    "unlock_after_absence",
+})
+
+
+def public_enqueue_reason(reason: object) -> str:
+    """Return a producer-registered public reason, or an empty redaction cue."""
+    candidate = str(reason or "").strip()
+    return candidate if candidate in ENQUEUE_REASON_CODES else ""
 
 
 # Wired by the assembly layer, never imported here: jobs_store sits below
 # debug_trace and must not reach upward for it.  Left None in contexts that do
 # not wire it (tests, tools), where enqueue must still work.
 on_job_enqueued = None
+
+
+def _trace_id_for_enqueue(lane: str, trace_id: object | None) -> str | None:
+    """Give every background job a join key without rewriting producer ids.
+
+    Chat trace ids are message/turn ids, not arbitrary correlation tokens.  A
+    few recovery/follow-up chat producers intentionally have no single source
+    message, so inventing an id there would lie to the activity projection.
+    Every other lane may safely use a generated correlation id when its
+    producer has none.  Keeping this decision at the queue boundary prevents a
+    newly added background producer from silently creating unjoinable traces.
+    """
+    if lane == "chat":
+        return None if trace_id is None else str(trace_id)
+    supplied = str(trace_id or "").strip()
+    return supplied or uuid.uuid4().hex
 
 
 def _notify_job_enqueued(
@@ -376,7 +476,7 @@ def _notify_job_enqueued(
 
 
 def terminal_outcome_class(error_code: str) -> str:
-    """Map a terminal error code to the shared four-value outcome taxonomy.
+    """Map a terminal error code to the shared outcome taxonomy.
 
     This lived inside the operations-dashboard query as two local frozensets, so
     the dashboard was the only thing that could tell a deliberate control
@@ -392,8 +492,8 @@ def terminal_outcome_class(error_code: str) -> str:
     code = str(error_code or "")
     if code in CONTROL_OUTCOME_CODES:
         return "control"
-    if code in SAFETY_SUPPRESSION_CODES:
-        return "safety_suppression"
+    if code in USER_UNAVAILABLE_OUTCOME_CODES:
+        return "user_unavailable"
     if code in TIMEOUT_OUTCOME_CODES:
         return "timeout"
     return "operational_failure"
@@ -1001,6 +1101,7 @@ def enqueue_job(
     """
     if lane not in LANES:
         raise ValueError(f"unknown lane: {lane!r}")
+    trace_id = _trace_id_for_enqueue(lane, trace_id)
     if priority is None:
         priority = LANE_PRIORITY.get(lane, 0)
 
@@ -1102,6 +1203,7 @@ def enqueue_job_with_context_log(
         raise ValueError(f"unknown lane: {lane!r}")
     if not str(context_stream).strip():
         raise ValueError("context_stream is required")
+    trace_id = _trace_id_for_enqueue(lane, trace_id)
     if priority is None:
         priority = LANE_PRIORITY.get(lane, 0)
 
@@ -4063,7 +4165,7 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         extra=extra,
     )
     if lane == "scheduled":
-        db.chat_append_strict(
+        seq = db.chat_append_strict(
             user_id,
             message_id,
             float(message["ts"]),
@@ -4077,7 +4179,8 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
             != str(job_id)
         ):
             raise RuntimeError("scheduled failure reply delivery was not adopted")
-        store.reload()
+        persisted["seq"] = int(seq)
+        store.apply_committed_chat_rows([persisted])
         store.notify_chat_waiters()
         try:
             wake_bus.notify("chat", user_id)
@@ -4095,7 +4198,8 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         require_cursor_advance=True,
     )
     if seq:
-        store.reload()
+        message["seq"] = int(seq)
+        store.apply_committed_chat_rows([message])
         store.notify_chat_waiters()
         try:
             wake_bus.notify("chat", user_id)
@@ -5925,7 +6029,8 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 "WITH recent AS ("
-                "  SELECT lane,status,last_error FROM agent_jobs "
+                "  SELECT lane,status,last_error,wake_result,wake_result_reason "
+                "  FROM agent_jobs "
                 "  WHERE status IN ('completed','failed','expired','superseded') "
                 "    AND finished_at >= now() - make_interval(hours => %s)"
                 ") SELECT lane,"
@@ -5937,8 +6042,11 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
                 "    AND last_error='queue_timeout')::int AS queue_expired,"
                 "  COUNT(*) FILTER (WHERE status='expired' "
                 "    AND last_error='lease_timeout')::int AS lease_expired "
+                ", COUNT(*) FILTER (WHERE status='completed' "
+                "    AND wake_result='sleep' AND wake_result_reason=%s)::int "
+                "    AS empty_reply_suppressions "
                 "FROM recent GROUP BY lane",
-                (safe_hours,),
+                (safe_hours, EMPTY_VISIBLE_REPLY_SUPPRESSED_REASON),
             )
             outcome_rows = cur.fetchall()
 
@@ -6065,14 +6173,21 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
         safety_suppressions = sum(
             int(item.get("count") or 0)
             for item in lane_failures
-            if item.get("outcome_class") == "safety_suppression"
+            if item.get("code") in SAFETY_SUPPRESSION_CODES
         )
-        # Expiries are always operational incidents.  Only the two allowlisted
-        # failed-job classes above are removed from the hard-failure numerator.
+        user_unavailable = sum(
+            int(item.get("count") or 0)
+            for item in lane_failures
+            if item.get("outcome_class") == "user_unavailable"
+        )
+        # Expiries/timeouts and safety suppressions are operational incidents.
+        # Only explicit control outcomes and Seven's exact user-unavailable
+        # codes leave our numerator. Unknown/new codes stay in it by default.
         operational_failures = max(
             0,
-            failed + expired - control_outcomes - safety_suppressions,
+            failed + expired - control_outcomes - user_unavailable,
         )
+        health_denominator = completed + operational_failures
         capture = capture_by_lane.get(lane)
         lanes.append({
             "lane": lane or "unknown",
@@ -6084,14 +6199,19 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
             "queue_expired": int((outcome or {}).get("queue_expired") or 0),
             "lease_expired": int((outcome or {}).get("lease_expired") or 0),
             "operational_failures": operational_failures,
+            "health_denominator": health_denominator,
             "control_outcomes": control_outcomes,
             "safety_suppressions": safety_suppressions,
+            "user_unavailable": user_unavailable,
+            "empty_reply_suppressions": int(
+                (outcome or {}).get("empty_reply_suppressions") or 0
+            ),
             "failure_rate": (
                 float(failed + expired) / float(resolved) if resolved else None
             ),
             "operational_failure_rate": (
-                float(operational_failures) / float(resolved)
-                if resolved else None
+                float(operational_failures) / float(health_denominator)
+                if health_denominator else None
             ),
             "p50_ok_ms": _optional_ms(latency_by_lane.get(lane), "p50_ms"),
             "p95_ok_ms": _optional_ms(latency_by_lane.get(lane), "p95_ms"),
@@ -6176,6 +6296,34 @@ def recent_chat_reliability(
                 (safe_hours,),
             )
             outcome = cur.fetchone() or {}
+
+            # T208 regression gauges use existing content-free signals only:
+            # reply_planned trajectory event kinds and the terminal empty-reply
+            # code.  Count logical trajectory events rather than physical rows;
+            # an oversized encrypted event may be split into several chunks.
+            cur.execute(
+                "WITH settled AS ("
+                " SELECT id,last_error FROM agent_jobs WHERE lane='chat' "
+                " AND status IN ('completed','failed','expired') "
+                " AND created_at >= now() - make_interval(hours => %s)"
+                "), planned AS ("
+                " SELECT event.job_id,"
+                "  count(DISTINCT regexp_replace(event.idempotency_key,"
+                "   '_p[0-9a-f]{6}_[0-9a-f]{8}$',''))::int AS reply_count "
+                " FROM v2_trajectory_events event JOIN settled "
+                "   ON settled.id=event.job_id "
+                " WHERE event.event_kind='reply_planned' GROUP BY event.job_id"
+                ") SELECT count(*)::int AS settled_turns,"
+                " count(*) FILTER (WHERE coalesce(planned.reply_count,0)>=2)::int "
+                "   AS multi_reply_turns,"
+                " count(*) FILTER (WHERE coalesce(planned.reply_count,0)>=1)::int "
+                "   AS reply_planned_observed_turns,"
+                " count(*) FILTER (WHERE settled.last_error="
+                "   'turn_failed:empty_reply')::int AS empty_reply_failures "
+                "FROM settled LEFT JOIN planned ON planned.job_id=settled.id",
+                (safe_hours,),
+            )
+            reply_quality = cur.fetchone() or {}
 
             cur.execute(
                 "WITH chat AS ("
@@ -6394,6 +6542,9 @@ def recent_chat_reliability(
     admitted = as_int(outcome, "admitted")
     settled = completed + failed + expired
     applied = as_int(effects, "final_applied_jobs")
+    multi_reply_turns = as_int(reply_quality, "multi_reply_turns")
+    empty_reply_failures = as_int(reply_quality, "empty_reply_failures")
+    reply_quality_settled = as_int(reply_quality, "settled_turns")
     return {
         "window_hours": safe_hours,
         "outcomes": {
@@ -6419,6 +6570,22 @@ def recent_chat_reliability(
                 "fallback_reply_pending", "error_status_delivered",
                 "runtime_error_delivered",
             )
+        },
+        "reply_quality": {
+            "settled_turns": reply_quality_settled,
+            "reply_planned_observed_turns": as_int(
+                reply_quality, "reply_planned_observed_turns"
+            ),
+            "multi_reply_turns": multi_reply_turns,
+            "multi_reply_turn_rate": (
+                float(multi_reply_turns) / float(reply_quality_settled)
+                if reply_quality_settled else None
+            ),
+            "empty_reply_failures": empty_reply_failures,
+            "empty_reply_failure_rate": (
+                float(empty_reply_failures) / float(reply_quality_settled)
+                if reply_quality_settled else None
+            ),
         },
         "settled_jobs": settled,
         "terminal_completion_rate": (

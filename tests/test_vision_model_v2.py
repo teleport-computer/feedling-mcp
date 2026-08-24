@@ -9,15 +9,33 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from accounts import onboarding as accounts_onboarding
-from hosted import setup_core, vision_routing
 from chat import consumer as chat_consumer
+from hosted import setup_core, vision_observer, vision_routing, visual_transport
 
 
 def _store(user_id="u1"):
     return SimpleNamespace(user_id=user_id)
 
 
-def _run_pixel_probe(monkeypatch, reply):
+def test_catalog_vision_remap_keeps_internal_upstream_detail():
+    original = vision_observer.VisionObserverError(
+        "vision_model_not_found",
+        status_code=404,
+        upstream_detail="UPSTREAM_MODEL_LOOKUP_DETAIL",
+    )
+
+    remapped = setup_core._classify_catalog_route_vision_error(
+        original,
+        catalog_model_found=True,
+    )
+
+    assert remapped.error_code == "vision_model_incompatible"
+    assert remapped.status_code == 404
+    assert remapped.upstream_detail == "UPSTREAM_MODEL_LOOKUP_DETAIL"
+    assert "UPSTREAM_MODEL_LOOKUP_DETAIL" not in remapped.detail
+
+
+def _run_pixel_probe(monkeypatch, reply, *, stop_reason=None):
     route = {
         "id": "r-thinking",
         "credential_id": "c1",
@@ -50,9 +68,13 @@ def _run_pixel_probe(monkeypatch, reply):
 
     def complete(_config, _messages, **kwargs):
         captured.update(kwargs)
-        return {"reply": reply}
+        return {"reply": reply, "stop_reason": stop_reason}
 
-    monkeypatch.setattr(setup_core.provider_client, "chat_completion", complete)
+    monkeypatch.setattr(
+        setup_core.provider_client,
+        "reliable_chat_completion_isolated",
+        complete,
+    )
     monkeypatch.setattr(
         setup_core.db,
         "model_api_route_mark_vision_test",
@@ -79,7 +101,7 @@ def test_thinking_probe_without_color_reply_is_retryable_failure(monkeypatch, re
         "status": "failed",
         "error": "vision_model_empty_response",
     }]
-    assert captured["max_tokens"] == 2000
+    assert captured["max_tokens"] == visual_transport.VISUAL_OUTPUT_MAX_TOKENS
     assert "warning" not in body
     assert "banner" not in body
 
@@ -95,6 +117,88 @@ def test_thinking_probe_nonempty_wrong_colors_are_unsupported(monkeypatch):
         "status": "unsupported",
         "error": "vision_model_incompatible",
     }]
+
+
+def test_setup_and_runtime_share_visual_transport_limits_and_preserve_png_mime(
+    monkeypatch,
+):
+    sentinel = 1777
+    monkeypatch.setattr(visual_transport, "VISUAL_OUTPUT_MAX_TOKENS", sentinel)
+    calls = []
+
+    def complete(_config, messages, **kwargs):
+        calls.append((messages, kwargs))
+        prompt = messages[0]["content"][0]["text"]
+        if "four solid vertical color stripes" in prompt:
+            return {"reply": "red,green,blue,yellow", "stop_reason": "stop"}
+        return {"reply": "A complete observation.", "stop_reason": "stop"}
+
+    monkeypatch.setattr(
+        setup_core.provider_client,
+        "reliable_chat_completion_isolated",
+        complete,
+    )
+    monkeypatch.setattr(
+        setup_core.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: b"provider-key",
+    )
+    monkeypatch.setattr(
+        setup_core.provider_client,
+        "list_provider_models",
+        lambda *_args: {"models": [{"id": "vision-model"}]},
+    )
+    monkeypatch.setattr(
+        setup_core,
+        "_vision_probe_image",
+        lambda: ("encoded-png", "red,green,blue,yellow"),
+    )
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_route_mark_vision_test",
+        lambda *_args, **_kwargs: True,
+    )
+    route = {
+        "id": "route-vision",
+        "credential_id": "cred-vision",
+        "provider": "openai_compatible",
+        "model": "vision-model",
+        "base_url": "https://relay.example/v1",
+        "api_key_envelope": {"body_ct": "ciphertext"},
+    }
+
+    assert setup_core._run_route_vision_test_or_error(
+        _store(), route, "caller"
+    ) is None
+    assert vision_observer.observe_image(
+        object(), image_mime="image/png", image_b64="runtime-png"
+    ) == "A complete observation."
+
+    assert [kwargs["max_tokens"] for _messages, kwargs in calls] == [
+        sentinel,
+        sentinel,
+    ]
+    assert calls[0][0][0]["content"][1]["image_url"]["url"] == (
+        "data:image/png;base64,encoded-png"
+    )
+    assert calls[1][0][0]["content"][1]["image_url"]["url"] == (
+        "data:image/png;base64,runtime-png"
+    )
+
+
+def test_setup_probe_rejects_nonempty_token_limited_reply(monkeypatch):
+    result, marked, _captured = _run_pixel_probe(
+        monkeypatch,
+        "red,green,blue,yellow",
+        stop_reason="length",
+    )
+
+    body, status = result
+    assert status == 400
+    assert body["error"] == "vision_model_failed"
+    assert body["reason"] == "output_truncated"
+    assert body["retryable"] is False
+    assert marked == [{"status": "failed", "error": "vision_model_failed"}]
 
 
 def test_setup_vision_probe_kick_is_daemonized_and_nonblocking(
@@ -673,7 +777,11 @@ def test_catalog_image_declaration_cannot_override_hard_pixel_rejection(monkeypa
         )
 
     events = []
-    monkeypatch.setattr(setup_core.provider_client, "chat_completion", complete)
+    monkeypatch.setattr(
+        setup_core.provider_client,
+        "reliable_chat_completion_isolated",
+        complete,
+    )
     monkeypatch.setattr(
         setup_core.debug_trace,
         "trace_event",
@@ -691,7 +799,9 @@ def test_catalog_image_declaration_cannot_override_hard_pixel_rejection(monkeypa
     assert status == 400
     assert body["error"] == "vision_model_incompatible"
     assert isinstance(captured["content"], list)
-    assert captured["kwargs"]["max_tokens"] == 2000
+    assert captured["kwargs"]["max_tokens"] == (
+        visual_transport.VISUAL_OUTPUT_MAX_TOKENS
+    )
     assert marked == [{
         "status": "unsupported",
         "error": "vision_model_incompatible",
@@ -740,7 +850,7 @@ def test_catalog_text_only_declaration_cannot_override_successful_pixel_probe(mo
     calls = []
     monkeypatch.setattr(
         setup_core.provider_client,
-        "chat_completion",
+        "reliable_chat_completion_isolated",
         lambda _config, messages, **kwargs: calls.append((messages, kwargs)) or {
             "reply": "red and yellow"
         },
@@ -794,7 +904,7 @@ def test_model_missing_from_catalog_still_uses_authoritative_pixel_probe(monkeyp
     calls = []
     monkeypatch.setattr(
         setup_core.provider_client,
-        "chat_completion",
+        "reliable_chat_completion_isolated",
         lambda _config, messages, **kwargs: calls.append((messages, kwargs)) or {
             "reply": "green,blue"
         },
@@ -846,7 +956,7 @@ def test_unknown_catalog_model_404_reports_incompatible_instead_of_missing(monke
 
     monkeypatch.setattr(
         setup_core.provider_client,
-        "chat_completion",
+        "reliable_chat_completion_isolated",
         endpoint_rejects,
     )
     monkeypatch.setattr(
@@ -899,7 +1009,11 @@ def test_missing_catalog_modalities_accepts_partial_image_recognition(monkeypatc
         captured["kwargs"] = _kwargs
         return {"reply": "I can see red and yellow."}
 
-    monkeypatch.setattr(setup_core.provider_client, "chat_completion", complete)
+    monkeypatch.setattr(
+        setup_core.provider_client,
+        "reliable_chat_completion_isolated",
+        complete,
+    )
     monkeypatch.setattr(
         setup_core.db,
         "model_api_route_mark_vision_test",
@@ -914,7 +1028,9 @@ def test_missing_catalog_modalities_accepts_partial_image_recognition(monkeypatc
     assert captured["content"][1]["image_url"]["url"].startswith(
         "data:image/png;base64,"
     )
-    assert captured["kwargs"]["max_tokens"] == 2000
+    assert captured["kwargs"]["max_tokens"] == (
+        visual_transport.VISUAL_OUTPUT_MAX_TOKENS
+    )
     assert marked == [{"status": "ok"}]
 
 
@@ -949,7 +1065,7 @@ def test_unavailable_catalog_endpoint_still_runs_real_image_probe(monkeypatch):
     probes = []
     monkeypatch.setattr(
         setup_core.provider_client,
-        "chat_completion",
+        "reliable_chat_completion_isolated",
         lambda _config, messages, **kwargs: probes.append((messages, kwargs)) or {
             "reply": "red,green,blue,yellow"
         },
@@ -966,7 +1082,9 @@ def test_unavailable_catalog_endpoint_still_runs_real_image_probe(monkeypatch):
     assert len(probes) == 1
     assert isinstance(probes[0][0][0]["content"], list)
     assert probes[0][0][0]["content"][1]["type"] == "image_url"
-    assert probes[0][1]["max_tokens"] == 2000
+    assert probes[0][1]["max_tokens"] == (
+        visual_transport.VISUAL_OUTPUT_MAX_TOKENS
+    )
 
 
 def test_resident_probe_side_channel_hides_expected_and_pending_beats_old_ok(monkeypatch):

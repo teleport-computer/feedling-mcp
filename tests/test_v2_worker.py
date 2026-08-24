@@ -6,6 +6,7 @@ stubbing enclave-bound reads, capability execution, and provider responses.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -18,7 +19,7 @@ import pytest
 import conftest
 import db
 import provider_client
-from provider_types import ToolExchange
+from provider_types import ToolCall, ToolExchange
 from capabilities import registry as cap_registry
 from core import store as core_store
 from model_api_runtime.v2 import compaction as v2_compaction
@@ -147,6 +148,64 @@ def test_v2_turn_failure_classification_uses_shared_notice_vocabulary(exc, expec
     assert worker._turn_failure_error_class(exc) == expected
 
 
+@pytest.mark.parametrize("status_code", [408, 500])
+def test_image_generation_wrapper_keeps_internal_http_diagnostics(status_code):
+    upstream_detail = f"IMAGE_WORKER_UPSTREAM_{status_code}_SECRET"
+    try:
+        provider_client._raise_for_provider_status(
+            provider_client.httpx.Response(status_code, text=upstream_detail)
+        )
+    except provider_client.ProviderError as exc:
+        failure = worker._image_generation_unavailable_from_exception(
+            exc,
+            _BYOK,
+        )
+    else:
+        raise AssertionError("expected injected provider failure")
+
+    assert failure.status_code == status_code
+    assert failure.upstream_detail == upstream_detail
+    assert upstream_detail not in str(failure)
+
+
+def test_image_generation_dependency_bug_is_system_owned():
+    async def broken_dependency(*_args, **_kwargs):
+        raise TypeError("internal provider-response adapter drift")
+
+    with pytest.raises(worker.ImageGenerationInternalError) as raised:
+        asyncio.run(
+            worker._call_image_generation_dependency(
+                broken_dependency,
+                user_id="usr_image_internal",
+                prompt="a small red robot",
+                provider_config=_BYOK,
+                api_key=None,
+                runtime_token="runtime-token",
+            )
+        )
+
+    failure = raised.value
+    assert failure.error_code == "image_generation_internal_error"
+    assert failure.provider == _BYOK.provider
+    assert failure.model == _BYOK.model
+    assert isinstance(failure.__cause__, TypeError)
+    assert "adapter drift" not in str(failure)
+
+
+def test_image_generation_internal_error_reaches_system_classification():
+    failure = worker.ImageGenerationInternalError(
+        model="gpt-image-test",
+        provider="openai",
+    )
+
+    assert worker._turn_failure_error_class(failure) == (
+        "image_generation_internal_error"
+    )
+    assert worker._safe_failure_code("turn_failed", failure) == (
+        "turn_failed:image_generation_internal_error"
+    )
+
+
 class _FakeCapResult:
     def __init__(self, data=None, ok=True):
         self._data = data or {}
@@ -211,6 +270,21 @@ def _text_round(text, *, prompt_tokens=1, completion_tokens=1):
     final reply")."""
     return {"reply": text, "tool_calls": [],
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
+
+
+def _stay_silent_round(*, prompt_tokens=1, completion_tokens=1):
+    return {
+        "reply": "",
+        "tool_calls": [{
+            "id": "stay-silent-test",
+            "name": "stay_silent",
+            "args": {"reason": "没有值得打扰用户的新信息"},
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+        },
+    }
 
 
 def _tool_round(*tool_calls, prompt_tokens=1, completion_tokens=1):
@@ -327,6 +401,92 @@ def test_process_job_end_to_end_writes_reply_and_completes(monkeypatch):
     state = jobs_store.get_runtime_state(uid)
     assert state.get("last_replied_ts") == 10.0
     assert "action_digest" in state  # non-sensitive digest only; no capability data leaked here
+
+
+def test_process_job_passes_selected_vision_deadline_to_tool_loop(monkeypatch):
+    """A raw-pixel fallback may use only the dedicated batch's remaining time."""
+    uid = "u_w_vision_deadline"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-vision-deadline")
+    deadline = worker.time.monotonic() + 60.0
+
+    async def read_prompt_context(*_args, vision_fallback_state, **_kwargs):
+        vision_fallback_state.absolute_deadline = deadline
+        vision_fallback_state.selected_count = 1
+        return "", [], [], False, 0, "", "", ""
+
+    async def coverage_is_current(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        worker,
+        "_read_seq_adaptive_prompt_context",
+        read_prompt_context,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_ensure_prompt_coverage_or_degrade",
+        coverage_is_current,
+    )
+    monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: 0)
+    monkeypatch.setattr(
+        worker.db,
+        "chat_recent_genuine_turn_boundary_seq",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "get_chat_tail_anchor",
+        lambda _uid: None,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_emit_vision_fallback_completed",
+        lambda *_args, **_kwargs: None,
+    )
+    captured = {}
+
+    async def run_loop(*, absolute_deadline, on_reply, **_kwargs):
+        captured["absolute_deadline"] = absolute_deadline
+        await on_reply("MODEL REPLY", final=True)
+        return worker.v2_tool_loop.LoopOutcome(
+            "MODEL REPLY",
+            1,
+            "completed",
+            False,
+        )
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", run_loop)
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda _store, _text: {"id": "r-vision-deadline"},
+    )
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [
+            {"id": "m1", "ts": 10.0, "role": "user", "content": "image"}
+        ],
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        read_summary_with_seq=lambda _uid: ("", 0.0, 0, 0),
+        read_tail_after_seq=lambda *_args, **_kwargs: [],
+        apply_pending_effects=_apply_effects,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert captured["absolute_deadline"] == deadline
 
 
 def test_chat_still_calls_provider_and_restores_unhealthy_state(monkeypatch):
@@ -1293,32 +1453,52 @@ def test_run_worker_loop_survives_transient_claim_error(monkeypatch):
 
 def test_slot_exception_path_backs_off_on_persistent_failure(monkeypatch):
     """Verify that when claim_next_job persistently fails (e.g., DB outage),
-    the exception handler waits poll_interval before retrying, rather than
-    hot-looping and flooding logs/connection pool."""
-    rec = {}
+    every failed claim crosses the poll wait seam before the next claim.  The
+    sequence assertion proves the causal ordering without using wall-clock
+    time; merely asserting that the shared wait helper was called would be too
+    weak because idle and kill-switch paths call the same helper.  Pinning this
+    helper rather than any sleep is intentional: it keeps backoff responsive to
+    both stop and wake events instead of making the slot uninterruptible."""
     stop = asyncio.Event()
     calls = {"n": 0}
+    events = []
 
     def _always_fail(worker_id, lanes=None):
         calls["n"] += 1
-        raise RuntimeError("persistent db outage")
+        if calls["n"] <= 3:
+            events.append(("failure", calls["n"]))
+            raise RuntimeError("persistent db outage")
+        # A broken exception path with no wait reaches this idle iteration.  It
+        # then exits through the fake wait below instead of hanging the test,
+        # leaving an event sequence that fails the exact assertion.
+        events.append(("empty", calls["n"]))
+        return None
+
+    async def _record_wait(stop_event_arg, wake_event, poll_interval):
+        assert stop_event_arg is stop
+        assert wake_event is None
+        assert poll_interval == 0.05
+        events.append(("wait", calls["n"]))
+        if calls["n"] >= 3:
+            stop_event_arg.set()
 
     monkeypatch.setattr(jobs_store, "claim_next_job", _always_fail)
+    monkeypatch.setattr(worker.kill_switch, "turns_halted", lambda: False)
+    monkeypatch.setattr(worker, "_wait_for_job_or_stop", _record_wait)
 
-    async def _driver():
-        task = asyncio.create_task(worker.run_worker_loop(
-            "w-backoff", max_workers=1, poll_interval=0.05, stop_event=stop, deps=_ok_deps(rec),
-        ))
-        # Let it run for ~0.1s (enough for 2-3 poll_interval cycles if backing off,
-        # but would be ~20+ attempts if hot-looping).
-        await asyncio.sleep(0.1)
-        stop.set()
-        await asyncio.wait_for(task, timeout=2.0)
+    asyncio.run(worker._slot_loop(
+        "w-backoff",
+        poll_interval=0.05,
+        stop_event=stop,
+        deps=_ok_deps({}),
+    ))
 
-    asyncio.run(_driver())
-    # With backoff: ~2-3 attempts in 0.1s (0.05s poll_interval + overhead).
-    # Without backoff: would be 20+ attempts.
-    assert calls["n"] <= 4, f"Too many attempts ({calls['n']}) suggests hot-loop without backoff"
+    assert calls["n"] == 3
+    assert events == [
+        ("failure", 1), ("wait", 1),
+        ("failure", 2), ("wait", 2),
+        ("failure", 3), ("wait", 3),
+    ]
 
 
 def test_slot_recovery_failure_does_not_kill_slot(monkeypatch):
@@ -1402,6 +1582,31 @@ def test_positive_worker_integer_settings_fail_closed(monkeypatch, raw):
 def test_positive_worker_integer_setting_accepts_value(monkeypatch):
     monkeypatch.setenv("TEST_V2_POSITIVE_INT", "3")
     assert worker._positive_int_env("TEST_V2_POSITIVE_INT", "1") == 3
+
+
+@pytest.mark.parametrize("raw", ["0", "-1"])
+def test_tail_image_limit_fails_worker_startup_when_nonpositive(raw):
+    backend = str(Path(__file__).parent.parent / "backend")
+    env = os.environ.copy()
+    env["FEEDLING_V2_TAIL_IMAGE_LIMIT"] = raw
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                f"import sys; sys.path.insert(0, {backend!r}); "
+                "from model_api_runtime.v2 import worker"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "FEEDLING_V2_TAIL_IMAGE_LIMIT must be a positive integer" in result.stderr
 
 
 # ------------------------------------------------------------------
@@ -1767,16 +1972,17 @@ def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
 
 
 def test_run_wake_weak_wake_still_records_whole_turn_metric_with_call_counted(monkeypatch):
-    """An empty terminal reply is a SUCCESSFUL weak-wake sleep, but it's still a
-    REAL, billed provider call — the metric row must count it, not silently
-    drop to model_calls=0 the way a pre-fix failed wake used to."""
+    """The empty round and forced explicit sleep are both billed model calls."""
     uid = "u_w_wake_turnmetric_weak"
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     job = jobs_store.claim_next_job("w")
 
-    _script_provider(monkeypatch, [_text_round("", prompt_tokens=9, completion_tokens=0)])
+    _script_provider(monkeypatch, [
+        _text_round("", prompt_tokens=9, completion_tokens=0),
+        _stay_silent_round(prompt_tokens=2, completion_tokens=1),
+    ])
     monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: 1)
     monkeypatch.setattr(worker.db, "chat_seqs_after_seq", lambda *_a, **_k: [1])
 
@@ -1801,8 +2007,8 @@ def test_run_wake_weak_wake_still_records_whole_turn_metric_with_call_counted(mo
             "SELECT prompt_tokens, model_calls, failed, status "
             "FROM v2_turn_metrics WHERE job_id=%s", (job_id,)).fetchone()
     assert row is not None
-    assert row[0] == 9
-    assert row[1] == 1
+    assert row[0] == 11
+    assert row[1] == 2
     assert row[2] is False
     assert row[3] == "ok"
 
@@ -1973,11 +2179,11 @@ def test_chat_turn_always_replies_even_when_model_only_calls_tools(monkeypatch):
     """BUG-4 structural successor (Task 7): in the old json_planner pipeline, a
     plan that never asked for `final_response` could silently swallow the turn
     (fixed back then by forcing `wants_reply=True` for the chat lane). In the
-    unified tool loop this can no longer happen BY CONSTRUCTION:
-    `tool_loop.run_tool_loop`'s last round keeps referenced schemas but sets
-    `tool_choice=none`, so a model that just keeps calling tools every round
-    still gets forced to a real reply at the `_TURN_MAX_LLM_CALLS`
-    budget — never a placeholder, never a silent swallow."""
+    unified tool loop this can no longer happen BY CONSTRUCTION. After the
+    independently configured consecutive tool-only threshold, the next round
+    keeps referenced schemas but sets `tool_choice=none`, so the model is forced
+    to a real reply before the hard `_TURN_MAX_LLM_CALLS` budget — never a
+    placeholder, never a silent swallow."""
     uid = "u_w_loop_bug4"
     conftest.seed_user(uid)
     _reset(uid)
@@ -1985,8 +2191,8 @@ def test_chat_turn_always_replies_even_when_model_only_calls_tools(monkeypatch):
     job = jobs_store.claim_next_job("w")
 
     monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
-    n = worker._TURN_MAX_LLM_CALLS
-    script = [_tool_round(_tc(f"c{i}", "memory_index")) for i in range(n - 1)]
+    n = worker.MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS
+    script = [_tool_round(_tc(f"c{i}", "memory_index")) for i in range(n)]
     script.append(_text_round("MODEL REPLY"))
     calls = _script_provider(monkeypatch, script)
 
@@ -1999,10 +2205,222 @@ def test_chat_turn_always_replies_even_when_model_only_calls_tools(monkeypatch):
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
-    assert len(calls) == n            # ran to the budget, no early silent stop
+    assert len(calls) == n + 1
+    assert len(calls) < worker._TURN_MAX_LLM_CALLS
     assert {spec.name for spec in calls[-1]["tools"]} == {"memory_index"}
     assert calls[-1]["tool_choice"] == "none"
-    assert written.get("text") == "MODEL REPLY"       # forced reply at the cap — no silent swallow
+    assert written.get("text") == "MODEL REPLY"  # early forced reply, no swallow
+
+
+def test_chat_terminal_tool_call_retries_stop_at_worker_configured_bound(
+    monkeypatch,
+):
+    """The production worker must pass its bounded terminal-retry setting.
+
+    One ordinary tool-only round enters the terminal phase. The model then
+    ignores every tool_choice=none request; the worker must stop after the
+    configured retry count plus the original terminal attempt, without
+    dispatching those terminal calls or writing a model bubble.
+    """
+    uid = "u_w_terminal_tool_retry_bound"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+    monkeypatch.setattr(worker, "MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS", 1)
+    retries = worker.MAX_TERMINAL_TOOL_CALL_RETRIES
+    terminal_rounds = retries + 1
+    script = [_tool_round(_tc("initial", "memory_index"))]
+    script.extend(
+        _tool_round(_tc(f"terminal-{index}", "memory_index"))
+        for index in range(terminal_rounds)
+    )
+    calls = _script_provider(monkeypatch, script)
+
+    deps = _deps(messages=[
+        {"id": "m1", "ts": 10.0, "role": "user", "content": "hello"},
+    ])
+    written = {}
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda store, text: written.update(text=text) or {"id": "r1"},
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "failed"
+    assert len(calls) == 1 + terminal_rounds
+    assert all(call["tool_choice"] == "none" for call in calls[1:])
+    assert written == {}
+    assert _job_status(job_id) == (
+        "failed",
+        "turn_failed:tool_budget_exhausted",
+    )
+
+
+def test_chat_terminal_tool_call_retries_honor_worker_override(monkeypatch):
+    """The chat worker must wire its retry override into the tool loop."""
+    uid = "u_w_terminal_tool_retry_override"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+    monkeypatch.setattr(worker, "MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS", 1)
+    library_default = (
+        worker.v2_tool_loop.DEFAULT_MAX_TERMINAL_TOOL_CALL_RETRIES
+    )
+    monkeypatch.setattr(
+        worker,
+        "MAX_TERMINAL_TOOL_CALL_RETRIES",
+        library_default + 1,
+    )
+    terminal_rounds = worker.MAX_TERMINAL_TOOL_CALL_RETRIES + 1
+    script = [_tool_round(_tc("initial", "memory_index"))]
+    script.extend(
+        _tool_round(_tc(f"terminal-{index}", "memory_index"))
+        for index in range(terminal_rounds)
+    )
+    calls = _script_provider(monkeypatch, script)
+
+    deps = _deps(messages=[
+        {"id": "m1", "ts": 10.0, "role": "user", "content": "hello"},
+    ])
+    written = {}
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda store, text: written.update(text=text) or {"id": "r1"},
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "failed"
+    assert len(calls) == 1 + terminal_rounds
+    assert all(call["tool_choice"] == "none" for call in calls[1:])
+    assert written == {}
+    assert _job_status(job_id) == (
+        "failed",
+        "turn_failed:tool_budget_exhausted",
+    )
+
+
+def test_wake_terminal_tool_call_retries_honor_worker_override(monkeypatch):
+    """The wake worker must wire its retry override into the tool loop."""
+    uid = "u_w_wake_terminal_tool_retry_override"
+    conftest.seed_user(uid)
+    _reset(uid)
+    _job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    job = jobs_store.claim_next_job("w")
+
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: _FakeCapResult({}),
+    )
+    monkeypatch.setattr(worker, "MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS", 1)
+    library_default = (
+        worker.v2_tool_loop.DEFAULT_MAX_TERMINAL_TOOL_CALL_RETRIES
+    )
+    monkeypatch.setattr(
+        worker,
+        "MAX_TERMINAL_TOOL_CALL_RETRIES",
+        library_default + 1,
+    )
+    terminal_rounds = worker.MAX_TERMINAL_TOOL_CALL_RETRIES + 1
+    script = [_tool_round(_tc("initial", "memory_index"))]
+    script.extend(
+        _tool_round(_tc(f"terminal-{index}", "memory_index"))
+        for index in range(terminal_rounds)
+    )
+    calls = _script_provider(monkeypatch, script)
+
+    deps = _deps(messages=[
+        {"id": "m1", "ts": 10.0, "role": "user", "content": "hello"},
+    ])
+    written = {}
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda store, text: written.update(text=text) or {"id": "r1"},
+    )
+    asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert len(calls) == 1 + terminal_rounds
+    assert all(call["tool_choice"] == "none" for call in calls[1:])
+    assert written == {}
+
+
+def test_task_dispatcher_terminal_tool_call_retries_honor_worker_override(
+    monkeypatch,
+):
+    """The task-child dispatcher must wire its retry override into the loop."""
+    uid = "u_w_task_terminal_tool_retry_override"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: _FakeCapResult({}),
+    )
+    monkeypatch.setattr(worker, "MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS", 1)
+    library_default = (
+        worker.v2_tool_loop.DEFAULT_MAX_TERMINAL_TOOL_CALL_RETRIES
+    )
+    monkeypatch.setattr(
+        worker,
+        "MAX_TERMINAL_TOOL_CALL_RETRIES",
+        library_default + 1,
+    )
+    terminal_rounds = worker.MAX_TERMINAL_TOOL_CALL_RETRIES + 1
+    expected_calls = 1 + terminal_rounds
+    call_cap = expected_calls + terminal_rounds
+    monkeypatch.setattr(
+        worker,
+        "_SUBAGENT_MAX_LLM_CALLS",
+        call_cap,
+    )
+
+    script = [_tool_round(_tc("initial", "memory_index"))]
+    script.extend(
+        _tool_round(_tc(f"terminal-{index}", "memory_index"))
+        for index in range(call_cap - 1)
+    )
+    calls = _script_provider(monkeypatch, script)
+    dispatcher = worker._make_task_batch_dispatcher(
+        provider_config=_BYOK,
+        store=core_store.get_store(uid),
+        api_key=None,
+        runtime_token="rt",
+        enclave_sem=asyncio.Semaphore(1),
+        trusted_system_blocks=(),
+        add_usage=lambda _usage: None,
+    )
+    task_call = ToolCall(
+        "parent-task",
+        worker.v2_subagents.TASK_TOOL,
+        {"prompt": "Inspect memory without changing it."},
+    )
+
+    (result,) = asyncio.run(dispatcher([task_call]))
+
+    assert json.loads(result.content) == {
+        "status": "error",
+        "error": "subagent_failed",
+    }
+    assert len(calls) == expected_calls
+    assert all(call["tool_choice"] == "none" for call in calls[1:])
 
 
 def test_second_round_receives_first_round_native_tool_exchange(monkeypatch):

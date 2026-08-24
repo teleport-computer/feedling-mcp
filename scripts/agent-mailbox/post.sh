@@ -23,6 +23,24 @@ clean_token() {
   esac
 }
 
+# Keep the address contract in one production source. config.env happens to
+# contain pane variables for the same agents, but it is local state and is not
+# available in every checkout or CI environment.
+VALID_RECIPIENTS=(
+  claude claude2 claude3 claude4
+  codex codex2 codex3 codex4
+  claudeclaude codexcodex
+)
+readonly VALID_RECIPIENTS
+
+valid_recipient() {
+  local candidate="$1" recipient
+  for recipient in "${VALID_RECIPIENTS[@]}"; do
+    [ "$candidate" = "$recipient" ] && return 0
+  done
+  return 1
+}
+
 clean_line() {
   printf '%s' "$1" | tr '\r\n' '  '
 }
@@ -56,6 +74,15 @@ to="$(clean_token "$to")" || usage
 msg_type="$(clean_token "$msg_type")" || usage
 [ -n "$subject" ] || usage
 
+# Reject unknown destinations before deriving or creating any mailbox path.
+# A typo must not produce a durable message or a poisoned inbox directory.
+if ! valid_recipient "$to"; then
+  printf "REFUSED: invalid --to recipient '%s'. Valid recipients:" "$to" >&2
+  printf ' %s' "${VALID_RECIPIENTS[@]}" >&2
+  printf '\n' >&2
+  exit 1
+fi
+
 # Identity guard (2026-07-22): --from must match the sender's own tmux session.
 # Stale shared memory repeatedly made agents claim the wrong identity (claude vs
 # claude2 incidents 07-19/21/22). The session name is ground truth. Deliberate
@@ -78,16 +105,19 @@ mailbox="${AGENT_MAILBOX_DIR:-$root/.agents/mailbox}"
 # 无人读取、**静默丢件**。当晚在 feedling-mcp-main 里发现 29 封被吞的信,
 # 其中 2 封是发给 Supervisor 的,它一直不知道。
 # 这是最坏的一种失败:没有报错、没有信号。所以宁可拒发,不许静默。
+# 显式 AGENT_MAILBOX_DIR 是调用者选择的投递根,也供隔离测试使用。
 _MAIN_TREE="/Users/xiaotingtan/Desktop/feedling-mcp-test"
-case "$(cd "$root" && pwd -P)" in
-  "$_MAIN_TREE") ;;
-  *)
-    echo "REFUSED: 你当前在 $root,不是主树。" >&2
-    echo "  mailbox 是每棵树独立的目录,在这里发信会投进本树的信箱,收件人永远读不到。" >&2
-    echo "  正确做法:cd $_MAIN_TREE 再发。" >&2
-    echo "  (确实要投到别处?设 AGENT_MAILBOX_DIR 显式指定。)" >&2
-    exit 1 ;;
-esac
+if [ -z "${AGENT_MAILBOX_DIR:-}" ]; then
+  case "$(cd "$root" && pwd -P)" in
+    "$_MAIN_TREE") ;;
+    *)
+      echo "REFUSED: 你当前在 $root,不是主树。" >&2
+      echo "  mailbox 是每棵树独立的目录,在这里发信会投进本树的信箱,收件人永远读不到。" >&2
+      echo "  正确做法:cd $_MAIN_TREE 再发。" >&2
+      echo "  (确实要投到别处?设 AGENT_MAILBOX_DIR 显式指定。)" >&2
+      exit 1 ;;
+  esac
+fi
 messages_dir="$mailbox/messages"
 inbox_dir="$mailbox/inbox/$to"
 outbox_dir="$mailbox/outbox/$from"

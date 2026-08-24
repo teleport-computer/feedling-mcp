@@ -5,7 +5,7 @@
     "这正是要测的:perception_trend 的用例里,另外三个 perception 就坐在旁边。",
     "",
     "excluded_tools 里的工具结构上无法用单轮用户话触发,硬编用例只会制造噪声:",
-    "  reply / stay_silent / mcp_tool_search  —— 协议与元工具,不由用户请求触发",
+    "  stay_silent / mcp_tool_search          —— 协议与元工具,不由用户请求触发",
     "  identity_nudge                         —— 描述明写是模型自己推断的微调",
     "  memory_fetch / history_fetch           —— 必须先由 index/search 给出 id",
     "native_image_cases 单列当前消息原生图片：生产会直接注入 image block，不应调用图库工具。",
@@ -13,7 +13,6 @@
     "它们的正确性由别处保证。mcp_tool_search 的恢复协议仍由生产 tool_loop 测试覆盖。"
   ],
   "excluded_tools": {
-    "reply": "protocol tool, not user-triggered",
     "stay_silent": "wake-lane only; filtered out of the evaluated chat catalog entirely",
     "mcp_tool_search": "recovery protocol requires a multi-round executor; covered elsewhere, NOT by this evaluator",
     "identity_nudge": "model-inferred adjustment, not a user request",
@@ -98,13 +97,17 @@
       "id": "id_dims_1",
       "family": "identity",
       "expect": "identity_dimensions_set",
-      "utterance": "把你的性格维度整个重写一遍:好奇 80、耐心 60,其他的都删掉"
+      "utterance": "把你的性格维度整个重写一遍:好奇 80、耐心 60,其他的都删掉",
+      "also_ok": ["identity_get"],
+      "_gold_note": "Seven 2026-08-21:『多调一次其实没事的,就是模型更严谨的先看再工作』。⇒ 先 identity_get 再改可接受;主指标改看 strict_ok,strict_exact 只作『是否一步到位』的次指标。"
     },
     {
       "id": "id_dims_2",
       "family": "identity",
       "expect": "identity_dimensions_set",
-      "utterance": "维度只保留好奇 80、耐心 60、幽默 70,其他全部删掉"
+      "utterance": "维度只保留好奇 80、耐心 60、幽默 70,其他全部删掉",
+      "also_ok": ["identity_get"],
+      "_gold_note": "同 id_dims_1(Seven 2026-08-21)。"
     },
     {
       "id": "ws_list_1",
@@ -254,14 +257,17 @@
     {
       "id": "hist_search_1",
       "family": "history",
-      "expect": "history_search",
-      "utterance": "我之前是不是跟你提过一家叫青柠的店?翻聊天记录找找"
+      "expect": "memory_search",
+      "utterance": "我之前是不是跟你提过一家叫青柠的店?翻聊天记录找找",
+      "_gold_note": "Seven 2026-08-21:memory_search 是默认路径,history_search 是备选;『一定是先 memory search 找不到才 history search』。用户嘴上说的『翻聊天记录』不改变这一点。"
     },
     {
       "id": "hist_search_2",
       "family": "history",
       "expect": "history_search",
-      "utterance": "去年我们聊过的那个搬家的事,原话是怎么说的"
+      "utterance": "去年我们聊过的那个搬家的事,原话是怎么说的",
+      "also_ok": ["memory_search"],
+      "_gold_note": "Seven 2026-08-21:『可以先 memory search,也可以直接 history search』(时间边界不机械化)。⇒ 主指标看 strict_ok;同批双调仍算过度选择——规则是串行升级。"
     },
     {
       "id": "mem_search_1",
@@ -274,6 +280,18 @@
       "family": "memory",
       "expect": "memory_search",
       "utterance": "你还记得我妈妈的名字吗"
+    },
+    {
+      "id": "worldbook_match_1",
+      "family": "worldbook",
+      "expect": "worldbook_match",
+      "utterance": "查一下我的世界书，Luna 在 Moon Court 是什么身份？"
+    },
+    {
+      "id": "worldbook_match_2",
+      "family": "worldbook",
+      "expect": "worldbook_match",
+      "utterance": "按我设定集里的规则，银月仪式要满足什么条件？"
     },
     {
       "id": "mem_index_1",
@@ -303,13 +321,17 @@
       "id": "mem_org_1",
       "family": "memory",
       "expect": "memory_organize",
-      "utterance": "你把记忆整个重新整理一遍吧"
+      "utterance": "你把记忆整个重新整理一遍吧",
+      "also_ok": ["memory_index"],
+      "_gold_note": "Seven 2026-08-21:先 memory_index 浏览再归整可接受。同上,主指标改 strict_ok。"
     },
     {
       "id": "mem_org_2",
       "family": "memory",
       "expect": "memory_organize",
-      "utterance": "现在就跑一次记忆归整,别等晚上了"
+      "utterance": "现在就跑一次记忆归整,别等晚上了",
+      "also_ok": ["memory_index"],
+      "_gold_note": "同 mem_org_1(Seven 2026-08-21)。"
     },
     {
       "id": "web_search_1",

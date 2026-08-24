@@ -1,4 +1,21 @@
-"""Agent protocol helpers for Proactive/Perception Runtime V2.
+"""T227 (audited 2026-08-22): not wired into production delivery.
+
+This long-standing model-facing Proactive/Perception V2 spine is not the active
+wake path; it was not disconnected by the T208 reply-tool removal.  Live
+scheduled-wake/store code reuses ``WakeEventV2`` from ``proactive/runtime_v2.py``,
+but scheduled delivery is handed directly to ``model_api_runtime/v2/jobs_store``
+and runs through ``model_api_runtime/v2/worker.py`` / ``tool_loop.py``.  No
+production assembly instantiates the island's runtime runner or tool executor.
+The two subsystems both use the name "V2": current ``model_api_runtime/v2`` has
+no call to this protocol, despite the easy-to-misread name overlap.
+
+Consequently, the fail-closed promise on
+``sanitize_visible_message_text_v2`` applies only inside this un-driven island;
+it does **not** protect the current proactive outlet.  That outlet uses
+``core/tool_markup_leak.py`` from ``model_api_runtime/v2/worker.py`` for markup
+stripping and T210 sentinel/degenerate suppression.  See T160, T210, and T227.
+
+Agent protocol helpers for Proactive/Perception Runtime V2.
 
 This module is intentionally pure. It parses the model-facing V2 turn protocol
 and builds the context payload without reaching into perception services.
@@ -14,7 +31,7 @@ import re
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from core import protocol_leak
+from agent_protocol_core import protocol_leak
 from core import tool_markup_leak
 
 
@@ -99,7 +116,7 @@ def sanitize_visible_message_text_v2(
     # send_message.text 原样发了出去）。这条 lane 我们甚至没在提示词里要求它写
     # think——它是从聊天历史里学来的，所以出口必须一律过闸，不能只在「要求它写
     # 的地方」设防。proactive 本来就是 fail-closed，剥不干净直接不发。
-    from core import self_thinking as _st
+    from agent_protocol_core import self_thinking as _st
 
     if _st.gate_enabled():
         _status, _thinking, _stripped = _st.strip_all_thinking(value)

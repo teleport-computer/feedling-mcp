@@ -1,7 +1,9 @@
 import sys
+from copy import deepcopy
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import provider_client as pc
+from capabilities.tool_schema import build_tool_specs
 from provider_types import ToolSpec, ToolResult
 
 TOOLS = [ToolSpec("web_search", "search", {"type": "object", "properties": {"q": {"type": "string"}}}),
@@ -13,6 +15,139 @@ def test_encode_tools_gemini():
     assert enc == [{"functionDeclarations": [
         {"name": "web_search", "description": "search", "parameters": TOOLS[0].parameters},
         {"name": "get_time", "description": "time", "parameters": TOOLS[1].parameters}]}]
+
+
+def test_encode_tools_gemini_removes_rejected_schema_keywords_recursively():
+    parameters = {
+        "type": "object",
+        "properties": {
+            # These are parameter names, not schema keywords, and must survive.
+            "additionalProperties": {"type": "string"},
+            "enum": {"type": "string"},
+            "actions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "threads": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "maxItems": 4,
+                            "enforceItemBounds": True,
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "additionalProperties": False,
+    }
+    original = deepcopy(parameters)
+
+    encoded = pc._encode_tools_gemini(
+        [ToolSpec("memory_write", "write", parameters)]
+    )[0]["functionDeclarations"][0]["parameters"]
+
+    assert parameters == original
+    assert "additionalProperties" not in encoded
+    assert set(encoded["properties"]) == {
+        "additionalProperties",
+        "enum",
+        "actions",
+    }
+    item_schema = encoded["properties"]["actions"]["items"]
+    assert "additionalProperties" not in item_schema
+    threads = item_schema["properties"]["threads"]
+    assert "enforceItemBounds" not in threads
+    assert threads["minItems"] == 1
+    assert threads["maxItems"] == 4
+
+
+def test_encode_tools_gemini_drops_only_non_string_enums():
+    parameters = {
+        "type": "object",
+        "properties": {
+            "include_image": {
+                "type": "boolean",
+                "enum": [True],
+                "default": True,
+            },
+            "limit": {"type": "integer", "enum": [1, 2]},
+            "mode": {"type": "string", "enum": ["fast", "full"]},
+            "mixed": {"type": "string", "enum": ["fast", 1]},
+        },
+    }
+
+    encoded = pc._encode_tools_gemini(
+        [ToolSpec("photo_read", "read", parameters)]
+    )[0]["functionDeclarations"][0]["parameters"]["properties"]
+
+    assert encoded["include_image"] == {"type": "boolean", "default": True}
+    assert encoded["limit"] == {"type": "integer"}
+    assert encoded["mode"]["enum"] == ["fast", "full"]
+    assert encoded["mixed"] == {"type": "string"}
+
+
+def test_encode_tools_gemini_preserves_accepted_constraints_and_opaque_defaults():
+    default = {"additionalProperties": "application data", "enum": [True]}
+    parameters = {
+        "type": "object",
+        "properties": {
+            "value": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 8,
+                "default": default,
+            },
+            "count": {"type": "number", "minimum": 0, "maximum": 10},
+            "items": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 3,
+            },
+        },
+    }
+
+    encoded = pc._encode_tools_gemini(
+        [ToolSpec("accepted", "accepted", parameters)]
+    )[0]["functionDeclarations"][0]["parameters"]
+
+    assert encoded == parameters
+    assert encoded["properties"]["value"]["default"] is not default
+
+
+def test_encode_tools_gemini_adapts_the_complete_builtin_catalog():
+    specs = build_tool_specs()
+    declarations = pc._encode_tools_gemini(specs)[0][
+        "functionDeclarations"
+    ]
+    by_name = {
+        declaration["name"]: declaration["parameters"]
+        for declaration in declarations
+    }
+
+    assert len(declarations) == len(specs)
+    assert set(by_name) == {spec.name for spec in specs}
+    assert all(
+        "additionalProperties" not in declaration["parameters"]
+        for declaration in declarations
+    )
+    memory_action = by_name["memory_write"]["properties"]["actions"]["items"]
+    threads = memory_action["properties"]["threads"]
+    assert "enforceItemBounds" not in threads
+    assert threads["minItems"] == 1
+    assert threads["maxItems"] == 4
+    assert memory_action["properties"]["op"]["enum"] == [
+        "add",
+        "update",
+        "delete",
+    ]
+    assert by_name["photo_read"]["properties"]["include_image"] == {
+        "type": "boolean",
+        "default": True,
+    }
 
 
 def test_decode_two_function_calls_gemini_synthesizes_ids():

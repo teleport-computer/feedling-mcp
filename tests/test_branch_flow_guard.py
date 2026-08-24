@@ -39,7 +39,12 @@ def test_branch_flow_guard_rejects_development_prs_to_main(head: str) -> None:
     result = _run("main", head)
 
     assert result.returncode != 0
-    assert "main only accepts pull requests from test or pre" in result.stderr
+    # 只断言「说清了 main 收哪几种来源」，不逐字锁死整句 —— 2026-08-24 开通
+    # hotfix 通道时文案从 "test or pre" 变成 "test, pre, or hotfix/*"，
+    # 逐字断言让这个测试红了，而闸门本身一直是对的（照样 returncode != 0）。
+    # 拒绝行为才是这条测试要守的东西，文案不是。
+    assert "main only accepts pull requests from" in result.stderr
+    assert head in result.stderr
 
 
 def test_branch_flow_guard_rejects_missing_branch_names() -> None:

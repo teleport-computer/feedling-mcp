@@ -26,6 +26,85 @@ import debug_trace
 import worldbook_readside_core
 
 
+_TRACE_LANES = {
+    "api", "chat", "heartbeat", "scheduled", "manual_wake", "screen_watch",
+}
+
+
+def _trace_write(
+    store, *, outcome: str, reason: str, status: str, trace_id: str = "",
+) -> None:
+    debug_trace.trace_event(
+        store,
+        subsystem="worldbook",
+        type="worldbook.entry.write.completed",
+        actor="backend",
+        status=status,
+        summary="",
+        explain="",
+        trace_id=str(trace_id or ""),
+        turn_id=str(trace_id or ""),
+        detail={
+            "operation": "upsert",
+            "outcome": outcome,
+            "reason": reason,
+            "counts": {"entries": 1},
+        },
+    )
+
+
+def _trace_match(
+    store,
+    *,
+    candidate_count: int,
+    matched_count: int,
+    rejected_count: int,
+    unavailable_count: int,
+    message_count: int,
+    block_chars: int,
+    outcome: str,
+    status: str = "ok",
+    reason: str = "",
+    trace_id: str = "",
+    job_id: str = "",
+    lane: str = "",
+    actor: str = "backend",
+) -> None:
+    normalized_lane = str(lane or "").strip().lower()
+    if normalized_lane not in _TRACE_LANES:
+        normalized_lane = "api"
+    debug_trace.trace_event(
+        store,
+        subsystem="worldbook",
+        type="worldbook.match.completed",
+        actor=(
+            "host_agent_runtime"
+            if actor == "host_agent_runtime"
+            else "backend"
+        ),
+        status=status,
+        summary="",
+        explain="",
+        trace_id=str(trace_id or ""),
+        turn_id=str(trace_id or ""),
+        job_id=str(job_id or ""),
+        detail={
+            "operation": "match",
+            "outcome": outcome,
+            "reason": reason,
+            "lane": normalized_lane,
+            "counts": {
+                "candidates": max(0, int(candidate_count)),
+                "matched": max(0, int(matched_count)),
+                "rejected": max(0, int(rejected_count)),
+                "unavailable": max(0, int(unavailable_count)),
+                "messages": max(0, int(message_count)),
+                "block_chars": max(0, int(block_chars)),
+            },
+        },
+    )
+
+
 def _request_envelope(payload: dict) -> tuple[dict | None, str | None]:
     if not isinstance(payload, dict):
         return None, "body must be a JSON object"
@@ -115,13 +194,22 @@ def list_envelopes(store) -> tuple[dict, int]:
 
 
 def upsert(
-    store, payload: dict, *, api_key: str | None, runtime_token: str | None
+    store, payload: dict, *, api_key: str | None, runtime_token: str | None,
+    trace_id: str = "",
 ) -> tuple[dict, int]:
     env, parse_error = _request_envelope(payload)
     if parse_error:
+        _trace_write(
+            store, outcome="rejected", reason="request_invalid",
+            status="warning", trace_id=trace_id,
+        )
         return {"error": parse_error}, 400
     validation_error = _validate_envelope(env or {}, store.user_id)
     if validation_error:
+        _trace_write(
+            store, outcome="rejected", reason="envelope_invalid",
+            status="warning", trace_id=trace_id,
+        )
         return {"error": validation_error}, 400
 
     record = {"id": str(env.get("id") or "").strip(), "updated_at": datetime.now().isoformat()}
@@ -130,13 +218,38 @@ def upsert(
         record, api_key=api_key, runtime_token=runtime_token)
     if cap_error:
         body, status = cap_error
+        reason = str(body.get("error") or "validation_failed")
+        if reason not in {
+            "content_too_long", "worldbook_validate_failed",
+            "worldbook_validate_unavailable",
+        }:
+            reason = "validation_failed"
+        _trace_write(
+            store,
+            outcome="failed" if status >= 500 else "rejected",
+            reason=reason,
+            status="error" if status >= 500 else "warning",
+            trace_id=trace_id,
+        )
         return body, status
-    saved = store.upsert_world_book(record)
+    try:
+        saved = store.upsert_world_book(record)
+    except Exception:  # noqa: BLE001 — public response must not expose DB details
+        _trace_write(
+            store, outcome="failed", reason="storage_error", status="error",
+            trace_id=trace_id,
+        )
+        return {"error": "worldbook_write_failed"}, 500
+    _trace_write(
+        store, outcome="stored", reason="committed", status="ok",
+        trace_id=trace_id,
+    )
     return {"id": saved["id"]}, 200
 
 
 def match(
-    store, payload: dict, *, api_key: str | None, runtime_token: str | None
+    store, payload: dict, *, api_key: str | None, runtime_token: str | None,
+    trace_id: str = "", job_id: str = "", lane: str = "", actor: str = "backend",
 ) -> tuple[dict, int]:
     messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
     current = str(payload.get("message") or "").strip()
@@ -145,6 +258,12 @@ def match(
     with store.world_books_lock:
         world_books = [dict(item) for item in store.world_books]
     if not world_books:
+        _trace_match(
+            store, candidate_count=0, matched_count=0, rejected_count=0,
+            unavailable_count=0, message_count=len(messages), block_chars=0,
+            outcome="no_entries", trace_id=trace_id, job_id=job_id,
+            lane=lane, actor=actor,
+        )
         return {"block": "", "matched_names": [], "rejected_over_cap": [], "unavailable_ids": []}, 200
     parts: list[dict] = []
     index = 0
@@ -202,6 +321,14 @@ def match(
                           "rejected_over_cap": [], "unavailable_ids": []}
                 )
             except RuntimeError as e:
+                _trace_match(
+                    store, candidate_count=len(world_books), matched_count=0,
+                    rejected_count=0, unavailable_count=0,
+                    message_count=len(messages), block_chars=0,
+                    outcome="unavailable", status="error",
+                    reason="readside_unavailable", trace_id=trace_id,
+                    job_id=job_id, lane=lane, actor=actor,
+                )
                 return {"error": "worldbook_match_unavailable", "detail": str(e)}, 503
             result["unavailable_ids"] = [
                 *unavailable_ids,
@@ -212,6 +339,31 @@ def match(
     result = worldbook_readside_core.merge_match_results(parts)
     block = str(result.get("block") or "")
     matched_names = result.get("matched_names") if isinstance(result.get("matched_names"), list) else []
+    rejected = result.get("rejected_over_cap") if isinstance(result.get("rejected_over_cap"), list) else []
+    unavailable = result.get("unavailable_ids") if isinstance(result.get("unavailable_ids"), list) else []
+    if block and (rejected or unavailable):
+        outcome, trace_status = "partial", "warning"
+    elif block:
+        outcome, trace_status = "matched", "ok"
+    elif rejected or unavailable:
+        outcome, trace_status = "unavailable", "warning"
+    else:
+        outcome, trace_status = "no_match", "ok"
+    _trace_match(
+        store,
+        candidate_count=len(world_books),
+        matched_count=len(matched_names),
+        rejected_count=len(rejected),
+        unavailable_count=len(unavailable),
+        message_count=len(messages),
+        block_chars=len(block),
+        outcome=outcome,
+        status=trace_status,
+        trace_id=trace_id,
+        job_id=job_id,
+        lane=lane,
+        actor=actor,
+    )
     if block:
         debug_trace.trace_event(
             store,
@@ -219,13 +371,16 @@ def match(
             type="worldbook_injected",
             actor="host_agent_runtime",
             summary=f"worldbook injected {len(matched_names)} entries",
-            detail={"names": matched_names},
+            trace_id=str(trace_id or ""),
+            turn_id=str(trace_id or ""),
+            job_id=str(job_id or ""),
+            detail={"counts": {"matched": len(matched_names)}},
         )
     return {
         "block": block,
         "matched_names": matched_names,
-        "rejected_over_cap": result.get("rejected_over_cap") if isinstance(result.get("rejected_over_cap"), list) else [],
-        "unavailable_ids": result.get("unavailable_ids") if isinstance(result.get("unavailable_ids"), list) else [],
+        "rejected_over_cap": rejected,
+        "unavailable_ids": unavailable,
     }, 200
 
 

@@ -15,8 +15,8 @@ Contract (from the task brief):
   chat_resident_consumer.py:6611), and hands only controlled frame counts to the
   loop's context under `_SCREEN_WATCH_SYSTEM_PROMPT`. The model can explicitly
   call screen tools to inspect content.
-- Silence is SUCCESS: an empty terminal reply completes the job with zero
-  bubbles (weak wake sleeps) — inherited from `_run_wake`, not a new path.
+- Silence is SUCCESS: the forced explicit `stay_silent` choice completes the
+  job with zero bubbles — inherited from `_run_wake`, not a new path.
 
 Style mirrors test_v2_wake_worker.py: real jobs_store/core_store (real DB
 claim/mark_*) + stubbed `worker._cap_data` (the enclave/DB capability
@@ -36,7 +36,7 @@ import pytest
 import conftest
 import db
 import provider_client
-from core import self_thinking
+from agent_protocol_core import self_thinking
 from core import store as core_store
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
@@ -197,8 +197,7 @@ def test_screen_watch_turn_passes_safe_screen_context_and_its_own_prompt(monkeyp
 # ------------------------------------------------------------------
 
 def test_screen_watch_silence_completes_without_a_bubble(monkeypatch):
-    """Most ticks produce nothing. An empty terminal reply is SUCCESS (weak
-    wake sleeps), never a chip and never a bubble."""
+    """Most ticks force an explicit sleep, never a chip or visible bubble."""
     uid = "u_sw_silence"
     conftest.seed_user(uid)
     _reset(uid)
@@ -208,7 +207,17 @@ def test_screen_watch_silence_completes_without_a_bubble(monkeypatch):
     _script_calls = []
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
-        _script_calls.append(messages)
+        _script_calls.append({"messages": messages, "tools": tools, **_kwargs})
+        if _kwargs.get("tool_choice") == "required":
+            return {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "screen-stay-silent",
+                    "name": "stay_silent",
+                    "args": {"reason": "屏幕没有值得打扰用户的新变化"},
+                }],
+                "usage": {},
+            }
         return _text_round("")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
@@ -232,6 +241,8 @@ def test_screen_watch_silence_completes_without_a_bubble(monkeypatch):
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
+    assert len(_script_calls) == 2
+    assert _script_calls[1]["tool_choice"] == "required"
     assert write_called["n"] == 0                     # no chat bubble
     assert surface_called["n"] == 0                   # no user-visible error chip
     assert _job_status(job_id)[0] == "completed"

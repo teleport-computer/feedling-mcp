@@ -19,6 +19,7 @@ def test_catalog_preserves_intentional_chat_and_folded_boundaries():
     folded = {t["function"]["name"]: t for t in evaluator.build_catalog("folded")}
 
     assert "stay_silent" not in full
+    assert "reply" not in full
     assert full.keys() == folded.keys()
     for name in evaluator.v2_tool_surface.RESIDENT_TOOL_NAMES:
         assert folded[name] == full[name]

@@ -1,0 +1,40 @@
+# actionlint gate contract stored beside the product workflows it describes.
+#
+# Scope is deliberately narrow and measured: historically only 9 of 165 (5.5%)
+# non-merge commits that changed .github/workflows carried a pair double-sign
+# trailer. This file does not claim to protect the other 156 paths.
+#
+# These four dimensions are the reproducibility contract. The gate reads them
+# from here; do not duplicate them in the script.
+@version 1.7.12
+@cwd .
+@flag -no-color
+@flag -shellcheck=
+@flag -pyflakes=
+@flag -oneline
+@target .github/workflows/*.yml
+@target .github/workflows/*.yaml
+
+# The equality between @max and the number of @allow entries is the one
+# load-bearing ratchet. Raising @max is an explicit review event. The companion
+# <= check only gives baseline-growth failures a more specific explanation.
+# If a known finding is fixed or its workflow is deleted, the next workflow or
+# baseline change is intentionally refused as stale. Remove that @allow and
+# decrement @max in the same product-repository change.
+@max 2
+
+# Why not fix: if: ${{ false }} is an intentional DEPRECATED deployment gate;
+# removing it would re-enable real Redis deployment.
+# Alternative guard: the job-level false condition is the guard, reinforced by
+# the workflow's Deprecated name.
+# Blind spot accepted: every future if-cond finding in this file shares this
+# file|rule key and is hidden by this exemption.
+@allow .github/workflows/redis-deploy.yml|if-cond
+
+# Why not fix: if: ${{ false }} intentionally suppresses alerts for stopped
+# Redis CVMs; removing it would re-enable expected-noise monitoring.
+# Alternative guard: the job-level false condition is the guard, reinforced by
+# the workflow's Deprecated name.
+# Blind spot accepted: every future if-cond finding in this file shares this
+# file|rule key and is hidden by this exemption.
+@allow .github/workflows/redis-monitor.yml|if-cond

@@ -64,7 +64,7 @@ def plaintext_view(base: dict, inner: dict, identity: dict, *, days_with_user: i
 
     ``days_with_user`` is passed in rather than computed here: the two callers
     derive it differently (the backend has a UserStore and can apply the
-    memory-garden anchor repair; the enclave only has the envelope's anchor), and
+    memgarden anchor repair; the enclave only has the envelope's anchor), and
     silently picking one of those behaviors for both would change a live counter.
 
     The profile fields are driven off ``card_policy``'s canonical list, not a

@@ -816,15 +816,24 @@ def _safe_detail(detail: dict[str, Any] | None) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for k, v in list(detail.items())[:_DETAIL_MAX_KEYS]:
         key = str(k)[:40]
-        if isinstance(v, (int, float, bool)):
+        if v is None:
+            out[key] = None
+        elif isinstance(v, (int, float, bool)):
             out[key] = v
         elif isinstance(v, str):
             out[key] = v[:_DETAIL_MAX_STR]
         elif isinstance(v, list):
-            out[key] = [str(x)[:_DETAIL_MAX_ITEM] for x in v[:_DETAIL_MAX_LIST]]
+            out[key] = [
+                None if x is None else str(x)[:_DETAIL_MAX_ITEM]
+                for x in v[:_DETAIL_MAX_LIST]
+            ]
         elif isinstance(v, dict):
             out[key] = {
-                str(kk)[:40]: (vv if isinstance(vv, (int, float, bool)) else str(vv)[:_DETAIL_MAX_ITEM])
+                str(kk)[:40]: (
+                    vv
+                    if vv is None or isinstance(vv, (int, float, bool))
+                    else str(vv)[:_DETAIL_MAX_ITEM]
+                )
                 for kk, vv in list(v.items())[:_DETAIL_MAX_KEYS]
             }
         else:

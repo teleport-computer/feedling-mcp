@@ -389,7 +389,7 @@ def test_pi_vision_rejection_rotates_session_before_showing_model_guidance(
     monkeypatch.setattr(
         crc, "_foreground_agent_message", lambda text, current_ts: text
     )
-    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text: "")
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text, **_kwargs: "")
     monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
     monkeypatch.setattr(
         crc,
@@ -456,10 +456,12 @@ def test_pi_text_only_turn_recovers_from_session_with_rejected_image(
         lambda: resident_chat_v2_profile,
     )
     monkeypatch.setattr(crc, "_prepend_io_cli_capability_catalog", lambda text: text)
-    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text: "")
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text, **_kwargs: "")
     monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
     monkeypatch.setattr(
-        crc, "_vision_observation", lambda *_args: "A blue chart is visible."
+        crc,
+        "_vision_observation",
+        lambda *_args, **_kwargs: "A blue chart is visible.",
     )
 
     def bridge_clean_session(text, *, current_ts):
@@ -512,7 +514,7 @@ def test_pi_text_only_turn_recovers_from_session_with_rejected_image(
     assert not replies[0][1].get("turn_failure_error_class")
 
 
-def test_dedicated_vision_observer_failure_never_calls_main_model(tmp_path):
+def test_dedicated_persistent_failure_never_sends_pixels_to_main(tmp_path):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
     msg = _make_image_msg(
@@ -528,8 +530,8 @@ def test_dedicated_vision_observer_failure_never_calls_main_model(tmp_path):
              crc,
              "_vision_observation",
              side_effect=crc.VisionObserverFailure(
-                 "vision_model_unavailable",
-                 status_code=502,
+                 "vision_model_auth_invalid",
+                 status_code=401,
                  detail="ProviderError",
                  model="vision/model-1",
                  provider="openrouter",
@@ -548,16 +550,162 @@ def test_dedicated_vision_observer_failure_never_calls_main_model(tmp_path):
     assert len(replies) == 2
     carrier_text, carrier_kwargs = replies[0]
     assert "视觉模型" in carrier_text or "vision model" in carrier_text.lower()
-    assert carrier_kwargs["turn_failure_error_class"] == "vision_model_unavailable"
-    assert carrier_kwargs["turn_failure_blame"] == "provider_transient"
+    assert carrier_kwargs["turn_failure_error_class"] == "vision_model_auth_invalid"
+    assert carrier_kwargs["turn_failure_blame"] == "user_provider"
     assert carrier_kwargs["reply_to_message_id"] == "img-observe-fail-01"
     assert carrier_kwargs["turn_failure_model"] == "vision/model-1"
     assert carrier_kwargs["turn_failure_provider"] == "openrouter"
     notice_text, notice_kwargs = replies[1]
-    assert "vision_model_unavailable" in notice_text
-    assert "HTTP 502" in notice_text
+    assert "vision_model_auth_invalid" in notice_text
+    assert "HTTP 401" in notice_text
     assert notice_kwargs["role"] == "system"
     assert notice_kwargs["notice_kind"] == "upstream_error"
+
+
+def test_dedicated_transient_failure_falls_back_to_exact_verified_main(tmp_path):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    msg = _make_image_msg(
+        ts=9410.0,
+        image_bytes=_JPEG_MAGIC,
+        msg_id="img-observe-fallback-01",
+        vision_route_id="vision-route-01",
+    )
+    calls = []
+    replies = []
+    traces = []
+
+    def fake_call(message, images=None, image_paths=None, **kwargs):
+        calls.append(
+            {
+                "message": message,
+                "images": images,
+                "image_paths": image_paths,
+                **kwargs,
+            }
+        )
+        return {"messages": ["The fallback main model inspected the image."]}
+
+    with patch.object(crc, "IMAGE_TEMP_DIR", tmp_path), \
+         patch.object(crc, "SCREEN_VISION_TEST_STATUS", "ok"), \
+         patch.object(crc, "_screen_runtime_unsupported", False), \
+         patch.object(
+             crc,
+             "_vision_observation",
+             side_effect=crc.VisionObserverFailure(
+                 "vision_model_unavailable",
+                 status_code=502,
+                 detail="ProviderError",
+                 model="vision/model-1",
+                 provider="openrouter",
+             ),
+         ), \
+         patch.object(crc, "_emit_debug_trace", side_effect=lambda *args, **kwargs: traces.append((args, kwargs))), \
+         patch.object(crc, "call_agent", side_effect=fake_call), \
+         patch.object(
+             crc,
+             "post_reply",
+             side_effect=lambda reply, **kwargs: replies.append((reply, kwargs)) or {"id": "reply-fallback-01"},
+         ):
+        result_ts = crc._process_messages([msg])
+
+    assert result_ts == pytest.approx(9410.0)
+    assert len(calls) == 1
+    assert calls[0]["images"][0]["data"].startswith("/9j/")
+    assert calls[0]["image_paths"]
+    assert calls[0]["absolute_deadline"] > 0
+    assert replies[0][0] == "The fallback main model inspected the image."
+    assert len(replies) == 1
+    event_types = [args[1] for args, _kwargs in traces if len(args) > 1]
+    assert "vision.fallback.evaluated" in event_types
+    assert "vision.fallback.completed" in event_types
+    serialized = str([
+        (args, kwargs)
+        for args, kwargs in traces
+        if len(args) > 1 and str(args[1]).startswith("vision.fallback.")
+    ])
+    assert "/9j/" not in serialized
+    assert "fallback main model inspected" not in serialized
+
+
+def test_resident_visual_budget_uses_shared_single_image_policy():
+    assert crc._RESIDENT_VISION_PRIMARY_BUDGET_SEC == pytest.approx(95.75)
+
+
+def test_dedicated_transient_failure_does_not_fallback_to_unverified_main(tmp_path):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    msg = _make_image_msg(
+        ts=9415.0,
+        image_bytes=_JPEG_MAGIC,
+        msg_id="img-observe-unverified-01",
+        vision_route_id="vision-route-01",
+    )
+    replies = []
+
+    with patch.object(crc, "IMAGE_TEMP_DIR", tmp_path), \
+         patch.object(crc, "SCREEN_VISION_TEST_STATUS", "untested"), \
+         patch.object(crc, "_screen_runtime_unsupported", False), \
+         patch.object(
+             crc,
+             "_vision_observation",
+             side_effect=crc.VisionObserverFailure(
+                 "vision_model_unavailable",
+                 status_code=502,
+             ),
+         ), \
+         patch.object(crc, "call_agent") as mock_call, \
+         patch.object(
+             crc,
+             "post_reply",
+             side_effect=lambda reply, **kwargs: replies.append((reply, kwargs)) or {"id": "reply-unverified-01"},
+         ):
+        result_ts = crc._process_messages([msg])
+
+    assert result_ts == pytest.approx(9415.0)
+    mock_call.assert_not_called()
+    assert replies[0][1]["turn_failure_error_class"] == "vision_model_unavailable"
+
+
+def test_dedicated_and_main_double_failure_keeps_native_main_error_class(tmp_path):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    msg = _make_image_msg(
+        ts=9420.0,
+        image_bytes=_JPEG_MAGIC,
+        msg_id="img-observe-double-fail-01",
+        vision_route_id="vision-route-01",
+    )
+    replies = []
+
+    with patch.object(crc, "IMAGE_TEMP_DIR", tmp_path), \
+         patch.object(crc, "SCREEN_VISION_TEST_STATUS", "ok"), \
+         patch.object(crc, "_screen_runtime_unsupported", False), \
+         patch.object(
+             crc,
+             "_vision_observation",
+             side_effect=crc.VisionObserverFailure(
+                 "vision_model_unavailable",
+                 status_code=502,
+             ),
+         ), \
+         patch.object(
+             crc,
+             "call_agent",
+             side_effect=RuntimeError("insufficient_quota: credit balance too low"),
+         ), \
+         patch.object(
+             crc,
+             "post_reply",
+             side_effect=lambda reply, **kwargs: replies.append((reply, kwargs)) or {"id": "reply-double-fail-01"},
+         ):
+        result_ts = crc._process_messages([msg])
+
+    assert result_ts == pytest.approx(9420.0)
+    carrier_kwargs = replies[0][1]
+    assert carrier_kwargs["turn_failure_error_class"] == "quota_insufficient"
+    assert carrier_kwargs["turn_failure_blame"] == "user_provider"
+    assert not carrier_kwargs["turn_failure_error_class"].startswith("vision_model_")
 
 
 # ---------------------------------------------------------------------------
@@ -581,6 +729,34 @@ class _FakeResp:
 
     def raise_for_status(self):
         return None
+
+
+def test_vision_observation_clamps_timeout_and_preserves_failure_reason():
+    seen = {}
+
+    def fake_post(*args, **kwargs):
+        seen["timeout"] = kwargs["timeout"]
+        return _FakeResp(
+            {
+                "error_class": "vision_model_failed",
+                "reason": "output_truncated",
+                "status_code": 502,
+            },
+            status=502,
+        )
+
+    with patch.object(crc.time, "monotonic", return_value=50.0), \
+         patch.object(crc._HTTP, "post", side_effect=fake_post):
+        with pytest.raises(crc.VisionObserverFailure) as raised:
+            crc._vision_observation(
+                "message-01",
+                "route-01",
+                absolute_deadline=50.4,
+            )
+
+    assert seen["timeout"] == pytest.approx(0.4)
+    assert raised.value.error_class == "vision_model_failed"
+    assert raised.value.reason == "output_truncated"
 
 
 def test_history_fetch_can_opt_out_of_image_bodies(monkeypatch):

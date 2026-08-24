@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import threading
 import time
 import uuid
 
@@ -1247,23 +1248,14 @@ def write_response(
         delivery = None
         if source == proactive_service.PROACTIVE_JOB_SOURCE:
             delivery = _proactive_delivery_decision_v2(store, payload)
-        if delivery is not None and not delivery.allow_visible_delivery:
-            delivery_fields.update({
-                "push_decision": "suppressed",
-                "push_reason": delivery.reason,
-                "alert_status": "suppressed",
-                "alert_reason": delivery.reason,
-                "live_activity_status": "suppressed",
-                "live_activity_reason": delivery.reason,
-            })
-        else:
-            delivery_fields.update(push_service._deliver_ai_message_push_if_background(
-                store,
-                body=visible_push_body,
-                title=payload.get("title", "") or "IO",
-                data=payload.get("data") if isinstance(payload.get("data"), dict) else {},
-                visual_state=payload.get("visualState") or payload.get("visual_state") or "reply",
-            ))
+        delivery_fields.update(push_service._deliver_ai_message_push_if_background(
+            store,
+            body=visible_push_body,
+            title=payload.get("title", "") or "IO",
+            data=payload.get("data") if isinstance(payload.get("data"), dict) else {},
+            visual_state=payload.get("visualState") or payload.get("visual_state") or "reply",
+            alert_delivery=delivery,
+        ))
     if delivery_fields:
         updated = store.update_chat_message_metadata(msg["id"], delivery_fields)
         if updated:
@@ -1336,13 +1328,17 @@ def _verify_reply_matches_ping(message: dict, *, ping_id: str, ping_ts: float) -
         return False
 
 
+def _wait_for_verify_wake(waiter: threading.Event, timeout_sec: float) -> bool:
+    """Test seam for the bounded event-first verify wait."""
+    return waiter.wait(timeout_sec)
+
+
 def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
     """Synthetic ping: insert a marker user message, wait up to ``timeout_sec``
     for an agent-role reply, return whether a reply pipeline is alive.
 
-    Blocking (``time.sleep`` poll loop) by design — the adapter runs it off the
-    event loop via the threadpool. See the original Flask docstring for the
-    marker/GC semantics.
+    Blocking (``threading.Event`` wait) by design — the adapter runs it off the
+    event loop via the threadpool. No database connection is held while waiting.
     """
     timeout_sec = min(int(payload.get("timeout_sec", 30)), 60)
 
@@ -1438,31 +1434,48 @@ def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
 
     print(f"[verify_loop:{store.user_id}] posted synthetic ping {ping_uuid} at ts={ping_ts}")
 
-    # Wait for the hidden reply tied to this exact ping. A concurrent ordinary
-    # agent reply is not evidence that the synthetic probe was handled.
-    deadline = time.time() + timeout_sec
+    # Register after the ping commit, then point-read immediately. The first
+    # read closes the commit/register race; later reads follow a targeted wake
+    # or the bounded two-second lost-NOTIFY fallback.
+    waiter = threading.Event()
+    with store.chat_waiters_lock:
+        store.chat_waiters.append(waiter)
+    deadline = time.monotonic() + timeout_sec
     response_time = None
     found_reply = False
-    while time.time() < deadline:
-        time.sleep(2)
-        # Cross-worker visibility: the resident consumer may POST its hidden
-        # verify ack through a DIFFERENT worker, which persists it to the DB and
-        # accepts it (routes_asgi._allow_verify_reply_with_fresh_pending_check
-        # reloads there before its negative decision too). This poll loop
-        # otherwise only reads THIS worker's cached store.chat_messages, so
-        # without a reload a valid ack stays invisible until a LISTEN/NOTIFY
-        # eviction that may never land inside the wait window — yielding
-        # loop_alive=false / response_time_sec=null despite the ack's 200.
-        store.reload()
-        with store.chat_lock:
-            chat_msgs = list(store.chat_messages)
-        for m in chat_msgs:
-            if _verify_reply_matches_ping(m, ping_id=ping_id, ping_ts=ping_ts):
-                response_time = float(m["ts"]) - ping_ts
+    found_reply_id = ""
+    try:
+        while True:
+            reply = db.chat_verify_reply_strict(store.user_id, ping_id, ping_ts)
+            if reply is not None:
+                response_time = float(reply["ts"]) - ping_ts
                 found_reply = True
+                found_reply_id = str(reply.get("id") or "")
                 break
-        if found_reply:
-            break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            _wait_for_verify_wake(waiter, min(2.0, remaining))
+            waiter.clear()
+    finally:
+        with store.chat_waiters_lock:
+            if waiter in store.chat_waiters:
+                store.chat_waiters.remove(waiter)
+        # Each concurrent verify owns only its exact ping and matched ack.
+        removed_ids = [
+            message_id for message_id in (found_reply_id, ping_id) if message_id
+        ]
+        for rid in removed_ids:
+            db.chat_delete(store.user_id, rid)
+        if hasattr(store, "remove_committed_chat_ids"):
+            store.remove_committed_chat_ids(removed_ids)
+        else:  # lightweight test doubles
+            removed_set = set(removed_ids)
+            with store.chat_lock:
+                store.chat_messages = [
+                    row for row in store.chat_messages
+                    if str(row.get("id") or "") not in removed_set
+                ]
 
     decrypt_health = None
     decrypt_policy = None
@@ -1483,26 +1496,6 @@ def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
     if passing:
         boot_gates._log_bootstrap_event(store, "chat_loop_verified", success=True)
         _maybe_enqueue_resident_introduction(store)
-
-    # Cleanup: remove the synthetic ping AND its ack from history regardless of
-    # outcome. The verify exchange is a private liveness test; it must not open
-    # Chat as the user's visible "First message."
-    #
-    # GC keys ONLY off source="verify_ping". Older code deleted "the first agent
-    # reply after the ping", so a concurrent REAL reply could be removed and
-    # leave its parent pointing at a missing reply row
-    # (DIAGNOSIS_hosted_reply_dangling_pointer_2026-07-20). The success matcher
-    # above is now stricter still (source + exact reply_to), while source remains
-    # the safe collection boundary for both the ping and its hidden ack.
-    with store.chat_lock:
-        removed_ids = _verify_synthetic_ids_to_gc(store.chat_messages)
-        removed_set = set(removed_ids)
-        store.chat_messages = [
-            m for m in store.chat_messages
-            if not (isinstance(m, dict) and str(m.get("id") or "") in removed_set)
-        ]
-        for rid in removed_ids:
-            db.chat_delete(store.user_id, rid)
 
     suggestions = []
     if not found_reply:

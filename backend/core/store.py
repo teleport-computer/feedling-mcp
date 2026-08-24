@@ -25,7 +25,20 @@ MAX_FRAMES = 200
 # is the immutable encrypted source transcript and is never trimmed by this
 # value. History pages and single-message body reads go directly to bounded DB
 # APIs, while resident polling/cache scans keep only this newest working set.
-MAX_CHAT_MESSAGES = 5000
+
+
+def _chat_hot_cache_limit() -> int:
+    raw = os.environ.get("FEEDLING_CHAT_HOT_CACHE_LIMIT", "5000").strip()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 5000
+    return max(64, min(5000, value))
+
+
+MAX_CHAT_MESSAGES = _chat_hot_cache_limit()
+_CHAT_SYNC_BATCH_MAX = 256
+_CHAT_VERSION_CHECK_INTERVAL_SEC = 1.0
 PUSH_COOLDOWN_SECONDS = int(os.environ.get("FEEDLING_PUSH_COOLDOWN_SEC", 300))
 LIVE_ACTIVITY_DEDUPE_SEC = int(os.environ.get("FEEDLING_LIVE_ACTIVITY_DEDUPE_SEC", 900))
 LIVE_ACTIVITY_START_COOLDOWN_SEC = int(os.environ.get("FEEDLING_LIVE_ACTIVITY_START_COOLDOWN_SEC", 1800))
@@ -151,6 +164,12 @@ class UserStore:
         # chat
         self.chat_messages: list[dict] = []
         self.chat_lock = threading.Lock()
+        self.chat_sync_lock = threading.Lock()
+        self.chat_hot_cache_limit = MAX_CHAT_MESSAGES
+        self.chat_version = 0
+        self.chat_max_seq = 0
+        self._chat_messages_by_id: dict[str, dict] = {}
+        self._chat_last_version_check_mono = 0.0
         self.chat_waiters: list[threading.Event] = []
         self.chat_waiters_lock = threading.Lock()
 
@@ -367,16 +386,297 @@ class UserStore:
 
     # ------- chat -------
     def _load_chat(self):
-        self.chat_messages = db.chat_load_recent(
-            self.user_id, MAX_CHAT_MESSAGES)
+        """Best-effort boot/legacy load; retain the last good cache on error."""
+        try:
+            self.reload_chat_hot_strict()
+        except Exception as e:
+            print(f"[{self.user_id}/chat] load failed: {e}")
+
+    def _ensure_chat_cache_state_locked(self) -> None:
+        """Lazily initialize indexes for old tests and lightweight stores."""
+        if not hasattr(self, "chat_hot_cache_limit"):
+            self.chat_hot_cache_limit = MAX_CHAT_MESSAGES
+        if not hasattr(self, "chat_version"):
+            self.chat_version = 0
+        if not hasattr(self, "chat_max_seq"):
+            self.chat_max_seq = 0
+        if not hasattr(self, "_chat_cache_generation"):
+            self._chat_cache_generation = 0
+        if not hasattr(self, "_chat_messages_by_id"):
+            self._chat_messages_by_id = {}
+        if (
+            len(self._chat_messages_by_id) != len(self.chat_messages)
+            or any(
+                self._chat_messages_by_id.get(str(row.get("id") or ""))
+                is not row
+                for row in self.chat_messages
+                if str(row.get("id") or "")
+            )
+        ):
+            self._chat_messages_by_id = {
+                str(row.get("id")): row
+                for row in self.chat_messages
+                if str(row.get("id") or "")
+            }
+            self.chat_max_seq = max(
+                (int(row.get("seq") or 0) for row in self.chat_messages),
+                default=0,
+            )
+
+    def _replace_chat_rows_locked(
+        self,
+        rows: list[dict],
+        *,
+        version: int,
+    ) -> None:
+        by_id: dict[str, dict] = {}
+        for raw in rows:
+            row = dict(raw)
+            msg_id = str(row.get("id") or "")
+            if msg_id:
+                by_id[msg_id] = row
+        ordered = sorted(
+            by_id.values(), key=lambda row: int(row.get("seq") or 0)
+        )
+        limit = min(
+            int(getattr(self, "chat_hot_cache_limit", MAX_CHAT_MESSAGES)),
+            int(MAX_CHAT_MESSAGES),
+        )
+        ordered = ordered[-max(1, limit):]
+        self.chat_messages = ordered
+        self._chat_messages_by_id = {
+            str(row["id"]): row for row in self.chat_messages
+        }
+        self.chat_version = int(version)
+        self.chat_max_seq = max(
+            (int(row.get("seq") or 0) for row in self.chat_messages),
+            default=0,
+        )
+        self._chat_cache_generation = (
+            int(getattr(self, "_chat_cache_generation", 0)) + 1
+        )
+
+    def _apply_committed_chat_rows_locked(
+        self,
+        rows: list[dict],
+        *,
+        version: int | None = None,
+    ) -> None:
+        UserStore._ensure_chat_cache_state_locked(self)
+        by_id = dict(self._chat_messages_by_id)
+        for raw in rows:
+            incoming = dict(raw)
+            msg_id = str(incoming.get("id") or "")
+            if not msg_id:
+                continue
+            existing = by_id.get(msg_id)
+            if existing is not None:
+                incoming = {**existing, **incoming}
+            by_id[msg_id] = incoming
+        next_version = self.chat_version if version is None else int(version)
+        UserStore._replace_chat_rows_locked(
+            self,
+            list(by_id.values()), version=max(self.chat_version, next_version)
+        )
+
+    def _update_cached_chat_row_locked(
+        self,
+        msg_id: str,
+        fields: dict,
+    ) -> dict | None:
+        UserStore._ensure_chat_cache_state_locked(self)
+        existing = self._chat_messages_by_id.get(str(msg_id))
+        if existing is None:
+            return None
+        existing.update(fields)
+        self._chat_cache_generation += 1
+        return existing
+
+    def apply_committed_chat_rows(
+        self,
+        rows: list[dict],
+        *,
+        version: int | None = None,
+    ) -> None:
+        """Atomically merge already-committed rows into the bounded hot cache."""
+        with self.chat_lock:
+            UserStore._apply_committed_chat_rows_locked(
+                self, rows, version=version
+            )
+
+    def remove_committed_chat_ids(self, message_ids: list[str]) -> None:
+        """Remove exact already-deleted rows from the local hot cache."""
+        removed = {
+            str(message_id) for message_id in message_ids if str(message_id)
+        }
+        if not removed:
+            return
+        with self.chat_lock:
+            self._ensure_chat_cache_state_locked()
+            if not any(
+                message_id in self._chat_messages_by_id
+                for message_id in removed
+            ):
+                return
+            remaining = [
+                row
+                for row in self.chat_messages
+                if str(row.get("id") or "") not in removed
+            ]
+            self._replace_chat_rows_locked(remaining, version=self.chat_version)
+
+    def reload_chat_hot_strict(self) -> list[dict]:
+        """Replace only chat state from one version-consistent hot snapshot."""
+        limit = min(
+            int(getattr(self, "chat_hot_cache_limit", MAX_CHAT_MESSAGES)),
+            int(MAX_CHAT_MESSAGES),
+        )
+        for _attempt in range(3):
+            with self.chat_lock:
+                self._ensure_chat_cache_state_locked()
+                generation = self._chat_cache_generation
+            version, rows = db.chat_load_hot_snapshot_strict(
+                self.user_id, limit
+            )
+            with self.chat_lock:
+                self._ensure_chat_cache_state_locked()
+                if self._chat_cache_generation != generation:
+                    continue
+                self._replace_chat_rows_locked(rows, version=version)
+                return list(self.chat_messages)
+        raise RuntimeError("chat cache changed during strict snapshot reload")
 
     def reload_chat_strict(self) -> list[dict]:
-        """Refresh chat state without converting a DB failure into emptiness."""
-        with self.chat_lock:
-            rows = db.chat_load_recent_strict(
-                self.user_id, MAX_CHAT_MESSAGES)
-            self.chat_messages = rows
-            return list(rows)
+        """Compatibility alias for the strict bounded chat-only refresh."""
+        return self.reload_chat_hot_strict()
+
+    def ensure_chat_fresh(
+        self,
+        *,
+        force: bool = False,
+        target_version: int | None = None,
+    ) -> bool:
+        """Apply durable chat events, falling back to a bounded snapshot.
+
+        Returns false on a database failure and leaves the last good cache
+        untouched. A forced wake bypasses the ordinary one-second version-read
+        coalescing window.
+        """
+        if not hasattr(self, "chat_sync_lock"):
+            self.chat_sync_lock = threading.Lock()
+        if not hasattr(self, "_chat_last_version_check_mono"):
+            self._chat_last_version_check_mono = 0.0
+        requested = int(target_version) if target_version is not None else None
+        if requested is not None and requested < 0:
+            return False
+
+        with self.chat_sync_lock:
+            with self.chat_lock:
+                self._ensure_chat_cache_state_locked()
+                base_version = self.chat_version
+                base_generation = self._chat_cache_generation
+            if requested is not None and requested <= base_version:
+                return True
+
+            now_mono = time.monotonic()
+            if (
+                not force
+                and requested is None
+                and now_mono - self._chat_last_version_check_mono
+                < _CHAT_VERSION_CHECK_INTERVAL_SEC
+            ):
+                return True
+            try:
+                current_version = (
+                    requested
+                    if requested is not None
+                    else db.chat_change_version(self.user_id)
+                )
+                self._chat_last_version_check_mono = now_mono
+                if current_version <= base_version:
+                    return True
+
+                changed = True
+                if current_version - base_version > _CHAT_SYNC_BATCH_MAX:
+                    self.reload_chat_hot_strict()
+                else:
+                    events = db.chat_change_events_after(
+                        self.user_id,
+                        base_version,
+                        _CHAT_SYNC_BATCH_MAX,
+                    )
+                    expected = base_version + 1
+                    continuous = True
+                    for event in events:
+                        if int(event.get("version") or -1) != expected:
+                            continuous = False
+                            break
+                        expected += 1
+                    if (
+                        not continuous
+                        or not events
+                        or int(events[-1].get("version") or 0)
+                        < current_version
+                        or any(event.get("operation") == "reset" for event in events)
+                    ):
+                        self.reload_chat_hot_strict()
+                    else:
+                        upsert_ids = list(dict.fromkeys(
+                            str(msg_id)
+                            for event in events
+                            if event.get("operation") == "upsert"
+                            for msg_id in event.get("message_ids", [])
+                            if str(msg_id)
+                        ))
+                        upsert_rows = db.chat_get_many_strict(
+                            self.user_id, upsert_ids
+                        ) if upsert_ids else []
+                        rows_by_id = {
+                            str(row.get("id") or ""): dict(row)
+                            for row in upsert_rows
+                        }
+                        if any(msg_id not in rows_by_id for msg_id in upsert_ids):
+                            self.reload_chat_hot_strict()
+                        else:
+                            cache_changed = False
+                            with self.chat_lock:
+                                self._ensure_chat_cache_state_locked()
+                                cache_changed = (
+                                    self._chat_cache_generation
+                                    != base_generation
+                                )
+                                if not cache_changed:
+                                    working = dict(self._chat_messages_by_id)
+                                    for event in events:
+                                        operation = str(
+                                            event.get("operation") or ""
+                                        )
+                                        message_ids = [
+                                            str(value)
+                                            for value in event.get(
+                                                "message_ids", []
+                                            )
+                                        ]
+                                        if operation == "upsert":
+                                            for msg_id in message_ids:
+                                                working[msg_id] = dict(
+                                                    rows_by_id[msg_id]
+                                                )
+                                        elif operation == "delete":
+                                            for msg_id in message_ids:
+                                                working.pop(msg_id, None)
+                                    self._replace_chat_rows_locked(
+                                        list(working.values()),
+                                        version=int(events[-1]["version"]),
+                                    )
+                            if cache_changed:
+                                self.reload_chat_hot_strict()
+                if changed:
+                    self.notify_chat_waiters()
+                return True
+            except Exception as e:
+                print(f"[{self.user_id}/chat] incremental sync failed: {e}")
+                return False
 
     def reload(self):
         """Re-read this store's cached state from PostgreSQL IN PLACE, keeping
@@ -393,9 +693,7 @@ class UserStore:
         _prev_guard = getattr(_reload_guard, "active", False)
         _reload_guard.active = True
         try:
-            with self.chat_lock:
-                self.chat_messages = db.chat_load_recent(
-                    self.user_id, MAX_CHAT_MESSAGES)
+            self._load_chat()
             with self.frames_lock:
                 self._load_frames_meta()
             with self.world_books_lock:
@@ -839,6 +1137,7 @@ class UserStore:
 
         persisted_new = True
         with self.chat_lock:
+            cache_seq: int | None = None
             # The legacy route is deliberately best-effort for compatibility.
             # V2 terminal replies opt into strict ordering: commit first, then
             # expose the row in the process cache.  A failed DB write therefore
@@ -893,6 +1192,7 @@ class UserStore:
                         "idempotency_window_sec"
                     ),
                 )
+                cache_seq = int(_seq)
                 if _job_id is None:
                     winner = db.chat_doc_for_seq(self.user_id, _seq)
                     if not isinstance(winner, dict):
@@ -902,25 +1202,29 @@ class UserStore:
                     msg = dict(winner)
                     persisted_new = False
             elif strict:
-                db.chat_append_strict(
+                seq = db.chat_append_strict(
                     self.user_id, msg_id, msg["ts"], msg, MAX_CHAT_MESSAGES)
-            persisted_msg_id = str(msg.get("id") or msg_id)
-            if not any(
-                str(existing.get("id") or "") == persisted_msg_id
-                for existing in self.chat_messages
-            ):
-                self.chat_messages.append(msg)
-            if len(self.chat_messages) > MAX_CHAT_MESSAGES:
-                self.chat_messages[:] = self.chat_messages[-MAX_CHAT_MESSAGES:]
+                if seq is not None:
+                    cache_seq = int(seq)
+            cached_msg = dict(msg)
+            if cache_seq is not None and "seq" not in cached_msg:
+                cached_msg["seq"] = cache_seq
+            UserStore._apply_committed_chat_rows_locked(self, [cached_msg])
             if resident_parent_doc is not None:
-                for existing in self.chat_messages:
-                    if str(existing.get("id") or "") == str(resident_reply_to):
-                        existing.update(resident_parent_doc)
-                        break
+                parent_id = str(resident_reply_to)
+                UserStore._update_cached_chat_row_locked(
+                    self, parent_id, resident_parent_doc
+                )
             if not strict:
                 if not resident_runtime_fenced:
-                    db.chat_append(
+                    seq = db.chat_append(
                         self.user_id, msg_id, msg["ts"], msg, MAX_CHAT_MESSAGES)
+                    if seq is not None:
+                        cached_msg = dict(msg)
+                        cached_msg["seq"] = int(seq)
+                        UserStore._apply_committed_chat_rows_locked(
+                            self, [cached_msg]
+                        )
         # Cross-worker wake: other workers' pollers for this user park on their
         # own threading.Events, which our notify_chat_waiters can't reach. The
         # local fast path (the caller's notify_chat_waiters) stays; this only
@@ -975,21 +1279,8 @@ class UserStore:
         """
         cached_reply = dict(reply_doc)
         with self.chat_lock:
-            for index, existing in enumerate(self.chat_messages):
-                if str(existing.get("id") or "") == parent_msg_id:
-                    self.chat_messages[index] = dict(parent_doc)
-                    break
-
-            replaced_reply = False
-            for index, existing in enumerate(self.chat_messages):
-                if str(existing.get("id") or "") == str(cached_reply.get("id") or ""):
-                    self.chat_messages[index] = cached_reply
-                    replaced_reply = True
-                    break
-            if not replaced_reply:
-                self.chat_messages.append(cached_reply)
-            if len(self.chat_messages) > MAX_CHAT_MESSAGES:
-                self.chat_messages[:] = self.chat_messages[-MAX_CHAT_MESSAGES:]
+            self._update_cached_chat_row_locked(parent_msg_id, parent_doc)
+            self._apply_committed_chat_rows_locked([cached_reply])
 
         wake_bus.notify("chat", self.user_id)
         try:
@@ -1056,19 +1347,8 @@ class UserStore:
 
         cached_docs = [dict(reply_doc) for reply_doc in reply_docs]
         with self.chat_lock:
-            for index, existing in enumerate(self.chat_messages):
-                if str(existing.get("id") or "") == parent_msg_id:
-                    self.chat_messages[index] = dict(parent_doc)
-                    break
-            for cached in cached_docs:
-                for index, existing in enumerate(self.chat_messages):
-                    if str(existing.get("id") or "") == str(cached.get("id") or ""):
-                        self.chat_messages[index] = cached
-                        break
-                else:
-                    self.chat_messages.append(cached)
-            if len(self.chat_messages) > MAX_CHAT_MESSAGES:
-                self.chat_messages[:] = self.chat_messages[-MAX_CHAT_MESSAGES:]
+            self._update_cached_chat_row_locked(parent_msg_id, parent_doc)
+            self._apply_committed_chat_rows_locked(cached_docs)
 
         wake_bus.notify("chat", self.user_id)
         try:
@@ -1115,16 +1395,7 @@ class UserStore:
         )
 
         with self.chat_lock:
-            replaced = False
-            for index, existing in enumerate(self.chat_messages):
-                if str(existing.get("id") or "") == str(winner.get("id") or ""):
-                    self.chat_messages[index] = dict(winner)
-                    replaced = True
-                    break
-            if not replaced:
-                self.chat_messages.append(dict(winner))
-            if len(self.chat_messages) > MAX_CHAT_MESSAGES:
-                self.chat_messages[:] = self.chat_messages[-MAX_CHAT_MESSAGES:]
+            self._apply_committed_chat_rows_locked([dict(winner)])
 
         if not inserted:
             return winner, False
@@ -1151,6 +1422,17 @@ class UserStore:
         stored.setdefault("owner_user_id", self.user_id)
         stored.setdefault("updated_at", datetime.now().isoformat())
         with self.world_books_lock:
+            # The database is authoritative.  Mutating the process-local cache
+            # before checking this bool used to make a failed write look saved
+            # until the next worker/restart reloaded the real row set.
+            wrote = db.world_book_upsert(
+                self.user_id,
+                entry_id,
+                str(stored.get("updated_at") or ""),
+                stored,
+            )
+            if not wrote:
+                raise RuntimeError("world_book_write_failed")
             replaced = False
             for i, existing in enumerate(self.world_books):
                 if str(existing.get("id") or "") == entry_id:
@@ -1159,7 +1441,6 @@ class UserStore:
                     break
             if not replaced:
                 self.world_books.append(stored)
-            db.world_book_upsert(self.user_id, entry_id, str(stored.get("updated_at") or ""), stored)
         return stored
 
     def delete_world_book(self, entry_id: str) -> bool:
@@ -1213,11 +1494,13 @@ class UserStore:
         if not clean:
             return None
         with self.chat_lock:
-            for msg in self.chat_messages:
-                if msg.get("id") == msg_id:
-                    msg.update(clean)
-                    db.chat_update_metadata(self.user_id, msg_id, clean)
-                    return msg
+            self._ensure_chat_cache_state_locked()
+            msg = self._chat_messages_by_id.get(str(msg_id))
+            if msg is not None:
+                msg.update(clean)
+                db.chat_update_metadata(self.user_id, msg_id, clean)
+                self._chat_cache_generation += 1
+                return msg
         return None
 
     def notify_chat_waiters(self):
@@ -1741,6 +2024,38 @@ def _evict_store(user_id: str) -> bool:
     store.reload()
     store.loaded_at = time.monotonic()
     _wake_store_waiters(store)
+    return True
+
+
+def _cached_store(user_id: str) -> UserStore | None:
+    """Return an existing worker-local store without creating or loading one."""
+    with _stores_lock:
+        return _stores.get(user_id)
+
+
+def _refresh_store_channel(user_id: str, channel: str) -> bool:
+    """Refresh or wake exactly one non-chat store component."""
+    store = _cached_store(user_id)
+    if store is None:
+        return False
+    previous_guard = getattr(_reload_guard, "active", False)
+    _reload_guard.active = True
+    try:
+        if channel == "frames":
+            with store.frames_lock:
+                store._load_frames_meta()
+        elif channel == "blob":
+            with store.world_books_lock:
+                store._load_world_books()
+            store._load_tokens()
+            store._load_live_activity_state()
+            store._load_push_state()
+        elif channel == "proactive":
+            store.notify_proactive_job_waiters()
+        else:
+            return False
+    finally:
+        _reload_guard.active = previous_guard
     return True
 
 

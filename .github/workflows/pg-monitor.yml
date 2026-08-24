@@ -14,6 +14,7 @@ jobs:
       matrix:
         environment: [prod, pre]
     steps:
+      - uses: actions/checkout@v4
       - name: Install psql 17 (direct TLS 需要 libpq>=17)
         run: |
           sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
@@ -36,12 +37,36 @@ jobs:
           fi
           test -n "$MON_DSN" || { echo "::error::${ENVIRONMENT} monitoring DSN is empty"; exit 1; }
           PSQL=/usr/lib/postgresql/17/bin/psql
-          AGE=$($PSQL "$MON_DSN" -tAc "SELECT COALESCE(EXTRACT(EPOCH FROM now()-last_archived_time)::int, 999999) FROM pg_stat_archiver;")
-          echo "archiver age: ${AGE}s"
-          test "$AGE" -lt 3600 || { echo "::error::archiver stale ${AGE}s (>1h) — 归档死了"; exit 1; }
-          WAL_MB=$($PSQL "$MON_DSN" -tAc "SELECT COALESCE(sum(size)/1024/1024,0)::int FROM pg_ls_waldir();")
-          echo "pg_wal size: ${WAL_MB}MB"
-          test "$WAL_MB" -lt 4096 || { echo "::error::WAL 堆积 ${WAL_MB}MB (>4GB) — 先修归档，绝不手删 pg_wal/"; exit 1; }
+          # last_archived_time 在闲置库上不会刷新，不能单独证明归档死亡。真正的
+          # fail-closed 信号是：最近失败尚无后续成功、.ready 文件持续堆积，或
+          # pg_wal 超限。R2 步骤再把 last_archived_wal 与对象存储逐字对账。
+          ROW=$($PSQL "$MON_DSN" -X -A -F '|' -t -c "
+            WITH archive_status AS (
+              SELECT
+                count(*) FILTER (WHERE name LIKE '%.ready')::int AS ready_count,
+                COALESCE(EXTRACT(EPOCH FROM now() - min(modification)
+                  FILTER (WHERE name LIKE '%.ready'))::int, 0) AS oldest_ready_age
+              FROM pg_ls_archive_statusdir()
+            ), wal_dir AS (
+              SELECT COALESCE(sum(size)/1024/1024, 0)::int AS wal_mb
+              FROM pg_ls_waldir()
+            )
+            SELECT COALESCE(a.last_archived_wal, ''),
+                   pg_walfile_name(pg_current_wal_lsn()),
+                   CASE WHEN a.last_failed_time IS NOT NULL
+                              AND (a.last_archived_time IS NULL
+                                   OR a.last_failed_time > a.last_archived_time)
+                        THEN 1 ELSE 0 END,
+                   s.ready_count, s.oldest_ready_age, w.wal_mb
+            FROM pg_stat_archiver a
+            CROSS JOIN archive_status s
+            CROSS JOIN wal_dir w;")
+          IFS='|' read -r LAST_ARCHIVED_WAL CURRENT_WAL \
+            UNRESOLVED_ARCHIVE_FAILURE READY_COUNT OLDEST_READY_AGE_SEC WAL_MB <<<"$ROW"
+          export LAST_ARCHIVED_WAL CURRENT_WAL UNRESOLVED_ARCHIVE_FAILURE \
+            READY_COUNT OLDEST_READY_AGE_SEC WAL_MB
+          bash deploy/postgres/check-backup-health.sh archiver
+          echo "LAST_ARCHIVED_WAL=$LAST_ARCHIVED_WAL" >> "$GITHUB_ENV"
       - name: R2 bucket freshness
         env:
           ENVIRONMENT: ${{ matrix.environment }}
@@ -70,21 +95,9 @@ jobs:
           test -n "$AWS_ACCESS_KEY_ID" && test -n "$AWS_SECRET_ACCESS_KEY" && test -n "$ENDPOINT" || {
             echo "::error::${ENVIRONMENT} R2 backup credentials are incomplete"; exit 1;
           }
-          # aws CLI 会自动分页：一个前缀 >1000 对象时，每页各输出一个「本页最新」
-          # 时间戳，newest() 于是吐出多行，下游 fromisoformat 直接炸（2026-07-14 prod
-          # 实测：wal_005/ 已 >1000 个 WAL 对象）。用 sort|tail 取跨页全局最新——对象
-          # key 按字典序≈时间序、ISO 时间戳字典序也=时间序，故排序末行即最新。空前缀
-          # aws 返回单行 "None"，经 sort|tail 仍是 "None"，check_age 照常当 EMPTY 处理。
-          # 注意：不能用 --no-paginate（只取第一页=最旧的 key → 反而误报 stale）。
-          #
-          # aws 的退出码必须自己接：老写法 `aws ... | sort | tail -n1` 的退出码取自
-          # tail，恒为 0。R2 在分页途中限流（ServiceUnavailable: Reduce your
-          # concurrent request rate）时，aws 中断退出但前几页已经打印出来，于是
-          # 函数照常返回一个「偏旧的最大值」，下游把它当成备份陈旧误报——2026-07-24
-          # 11:15 实测：吐出 09:54 报 "WAL stale 4950s"，而同一时刻库里
-          # pg_stat_archiver.last_archived_time 只有 1s 前、failed_count 自 07-13 未涨。
-          # 限流是瞬时的，故先退避重试；连续失败才报错，且措辞明确区分「R2 查不了」
-          # 与「备份真的陈旧」，避免下一个人照着假信号去查归档。
+          # aws CLI 会自动分页；每页可能各输出一个候选时间戳，所以排序后取全局
+          # 最新。显式保存 aws 的退出码，避免管道把 R2 限流/网络错误误装成成功。
+          # 瞬时错误退避重试三次，连续失败才判定“本次无法检查”。
           newest() {
             local prefix="$1" raw rc attempt
             for attempt in 1 2 3; do
@@ -99,24 +112,35 @@ jobs:
             echo "::error::ListObjectsV2 '${prefix}' 连续 3 次失败 — R2 侧问题，本次无法判定备份新鲜度（不等于备份陈旧）" >&2
             return 1
           }
-          WAL_TS=$(newest "${ENVIRONMENT}/wal-g/wal_005/")
           BASE_TS=$(newest "${ENVIRONMENT}/wal-g/basebackups_005/")
-          echo "newest wal: $WAL_TS | newest base sentinel: $BASE_TS"
+          echo "newest base sentinel: $BASE_TS"
 
-          check_age() {
-            # $1=label $2=timestamp $3=max_age_seconds $4=empty_error_message
-            local label="$1" ts="$2" max="$3" empty_msg="$4"
-            local age rc
+          age_seconds() {
+            local ts="$1" age rc
             # && rc=0 || rc=$? 防 GHA 默认 bash -e 在赋值失败时直接终止、吞掉下面的诊断分支
             age=$(python3 -c "import sys, datetime as dt; s = sys.argv[1].strip(); sys.exit(3) if (not s or s == 'None') else None; s = s[:-1] + '+00:00' if s.endswith('Z') else s; d = dt.datetime.fromisoformat(s); d = d.replace(tzinfo=dt.timezone.utc) if d.tzinfo is None else d; print(int((dt.datetime.now(dt.timezone.utc) - d).total_seconds()))" "$ts") && rc=0 || rc=$?
             case $rc in
-              3) echo "::error::${label} prefix EMPTY — ${empty_msg}"; exit 1 ;;
-              0) : ;;
-              *) echo "::error::${label} timestamp parse failed: '${ts}'"; exit 1 ;;
+              3) echo "::error::BASE prefix EMPTY — WAL 无 base backup 不可恢复" >&2; return 1 ;;
+              0) printf '%s\n' "$age" ;;
+              *) echo "::error::BASE timestamp parse failed: '${ts}'" >&2; return 1 ;;
             esac
-            echo "${label} age: ${age}s"
-            test "$age" -lt "$max" || { echo "::error::${label} stale ${age}s (>${max}s)"; exit 1; }
           }
 
-          check_age "WAL" "$WAL_TS" 3600 "wal_005 无最新 WAL — 归档未同步到 R2"
-          check_age "BASE" "$BASE_TS" 93600 "WAL 无 base backup 不可恢复"
+          # 不再要求 R2 每小时出现新 WAL；闲置库没有新 segment 是正常状态。
+          # 改为 HEAD 数据库明确报告的最后成功 WAL，对账比墙钟年龄更直接。
+          NEWEST_WAL_KEY="${ENVIRONMENT}/wal-g/wal_005/${LAST_ARCHIVED_WAL}.lz4"
+          for attempt in 1 2 3; do
+            if aws s3api head-object --endpoint-url "$ENDPOINT" \
+              --bucket io-in-enclave-db --key "$NEWEST_WAL_KEY" >/dev/null; then
+              wal_found=1; break
+            fi
+            echo "::warning::HeadObject WAL 第 ${attempt} 次失败，退避重试" >&2
+            sleep $((attempt * 10))
+          done
+          test "${wal_found:-0}" = 1 || {
+            echo "::error::R2 缺少数据库最后成功归档的 WAL"; exit 1;
+          }
+
+          BASE_AGE_SEC=$(age_seconds "$BASE_TS")
+          export NEWEST_WAL_KEY BASE_AGE_SEC
+          bash deploy/postgres/check-backup-health.sh r2

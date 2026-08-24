@@ -15,9 +15,9 @@ persisted + accepted (200). But verify_loop's wait loop polled
 cached list, so a cross-worker ack stayed invisible until a LISTEN/NOTIFY
 eviction that may never land inside the ≤60s window. The two paths must agree.
 
-This test pins the fix: verify_loop reloads inside its poll loop, so an ack a
-second store instance (a different worker) wrote straight to the DB — never
-touching this store's cache — is found before timeout.
+This test pins the optimized fix: verify_loop uses the exact durable ping/ack
+lookup, so an ack a second store instance wrote is found without reloading the
+worker's full resident state.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from __future__ import annotations
 import base64
 import itertools
 import sys
+import threading
 import uuid
 from pathlib import Path
 
@@ -39,6 +40,7 @@ from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
 from core.store import UserStore  # noqa: E402
 from accounts import registry  # noqa: E402
+
 
 
 def _b64(raw: bytes) -> str:
@@ -84,8 +86,7 @@ def _env(msg_id: str, user_id: str) -> dict:
 
 
 def test_verify_loop_finds_cross_worker_ack(client, monkeypatch):
-    """verify_loop's poll loop must reload, so an ack persisted by another
-    worker (a separate store instance, DB-only) is found within the timeout."""
+    """A DB-only cross-worker ack is found without a full store reload."""
     user_id, _api_key = _register(client)
     store = core_store.get_store(user_id)  # "worker A" (cached instance)
 
@@ -100,49 +101,50 @@ def test_verify_loop_finds_cross_worker_ack(client, monkeypatch):
         lambda *a, **k: {"blocks_verify": False},
     )
     # Deterministic: no real 2s waits, no wake-bus / introduction side effects.
-    monkeypatch.setattr(chat_core.time, "sleep", lambda *_a, **_k: None)
     monkeypatch.setattr(store, "notify_chat_waiters", lambda *a, **k: None)
     monkeypatch.setattr(
         chat_core, "_maybe_enqueue_resident_introduction", lambda *a, **k: None
     )
 
-    real_reload = store.reload
-    fired = {"acked": False}
+    real_verify_reply = chat_core.db.chat_verify_reply_strict
+    fired = {"acked": False, "started": False}
+    responder_lock = threading.Lock()
 
-    def reload_as_if_worker_b():
-        # First poll-loop reload: play "worker B" answering the probe. Persist
+    def point_read_as_if_worker_b(read_user_id, ping_id, ping_ts):
+        # First exact read: play "worker B" answering the probe. Persist
         # the hidden ack through a SEPARATE store instance, which writes the DB
         # but never touches worker A's cache — exactly the cross-worker split.
-        if not fired["acked"]:
-            ping = next(
-                (
-                    m for m in store.chat_messages
-                    if m.get("source") == "verify_ping" and m.get("role") == "user"
-                ),
-                None,
+        should_answer = False
+        with responder_lock:
+            ping = chat_core.db.chat_get_strict(read_user_id, ping_id)
+            if ping is not None and not fired["started"]:
+                fired["started"] = True
+                should_answer = True
+        if should_answer:
+            worker_b = UserStore(user_id)
+            # resident_reply_to is the real ack linkage: it persists via
+            # db.chat_append_resident_reply, sets reply_to_message_id, and
+            # CAS-marks the ping — exactly what /v1/chat/response does.
+            worker_b.append_chat(
+                "openclaw",
+                "verify_ping",
+                _env("wb_ack_" + uuid.uuid4().hex[:8], user_id),
+                resident_reply_to=ping["id"],
             )
-            if ping is not None:
-                worker_b = UserStore(user_id)
-                # resident_reply_to is the real ack linkage: it persists via
-                # db.chat_append_resident_reply, sets reply_to_message_id, and
-                # CAS-marks the ping — exactly what /v1/chat/response does.
-                worker_b.append_chat(
-                    "openclaw",
-                    "verify_ping",
-                    _env("wb_ack_" + uuid.uuid4().hex[:8], user_id),
-                    resident_reply_to=ping["id"],
-                )
-                fired["acked"] = True
-        real_reload()
+            fired["acked"] = True
+        return real_verify_reply(read_user_id, ping_id, ping_ts)
 
-    monkeypatch.setattr(store, "reload", reload_as_if_worker_b)
+    monkeypatch.setattr(
+        store,
+        "reload",
+        lambda: (_ for _ in ()).throw(AssertionError("full reload is forbidden")),
+    )
+    monkeypatch.setattr(chat_core.db, "chat_verify_reply_strict", point_read_as_if_worker_b)
 
     body, status = chat_core.verify_loop(store, {"timeout_sec": 10})
 
     assert status == 200, body
-    # If verify_loop never reloaded (the pre-fix behavior), worker B's ack was
-    # never injected and would be invisible anyway → passing would be false.
-    assert fired["acked"], "verify_loop did not reload inside its poll loop"
+    assert fired["acked"], "verify_loop did not perform the exact durable lookup"
     assert body["loop_alive"] is True, body
     assert body["passing"] is True, body
     assert body["response_time_sec"] is not None, body

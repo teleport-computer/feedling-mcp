@@ -41,7 +41,10 @@ async def worldbook_list(auth: AuthResult = Depends(require_auth)):
     return JSONResponse(body, status_code=status)
 
 
-@router.post("/v1/worldbook/upsert")
+@router.post(
+    "/v1/worldbook/upsert",
+    responses={500: {"description": "World Book storage failure"}},
+)
 async def worldbook_upsert(request: Request, auth: AuthResult = Depends(require_auth)):
     payload = (await asgi_http.read_json_silent(request)) or {}
     runtime_token = auth_core.extract_runtime_token(request.headers)
@@ -51,6 +54,7 @@ async def worldbook_upsert(request: Request, auth: AuthResult = Depends(require_
         payload,
         api_key=auth.api_key,
         runtime_token=runtime_token,
+        trace_id=str(request.headers.get("X-Feedling-Trace-Id") or ""),
     )
     return JSONResponse(body, status_code=status)
 
@@ -65,6 +69,8 @@ async def worldbook_match(request: Request, auth: AuthResult = Depends(require_a
         payload,
         api_key=auth.api_key,
         runtime_token=runtime_token,
+        trace_id=str(request.headers.get("X-Feedling-Trace-Id") or ""),
+        lane="api",
     )
     return JSONResponse(body, status_code=status)
 

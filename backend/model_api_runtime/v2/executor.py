@@ -7,6 +7,11 @@ inline. Synchronous capability work is moved off the event-loop thread and is
 bounded by the shared enclave semaphore.
 """
 from __future__ import annotations
+import logging
+import os
+import sys
+
+log = logging.getLogger("feedling.runtime_v2.executor")
 
 import asyncio
 import inspect
@@ -23,14 +28,23 @@ from model_api_runtime.v2 import provenance as _prov
 from provider_types import ToolResult
 from workspace.backends import WorkspaceError, model_writable_path
 
-async def _run_one(store, step, *, api_key, runtime_token, enclave_sem) -> tuple[str, dict]:
+async def _run_one(
+    store, step, *, api_key, runtime_token, enclave_sem, trace_context=None,
+) -> tuple[str, dict]:
     """Run one synchronous capability behind the shared enclave gate."""
     t = str(step.get("type") or "")
     params = step.get("payload") or {}
     async with enclave_sem:
+        kwargs = {
+            "api_key": api_key,
+            "runtime_token": runtime_token,
+            "params": params,
+        }
+        if t == "worldbook_match" and trace_context is not None:
+            kwargs["trace_context"] = trace_context
         result = await asyncio.to_thread(
             cap_registry.run_capability, t, store,
-            api_key=api_key, runtime_token=runtime_token, params=params,
+            **kwargs,
         )
     data = result.to_dict()
     return t, data
@@ -141,6 +155,9 @@ async def dispatch_tool_calls(
     # so with the switch OFF, or for any non-history tool, the gate branch
     # below never changes behavior.
     history_tools_allowed: bool = False,
+    # Content-free correlation metadata from the trusted worker, never from
+    # provider tool arguments. Only World Book consumes it today.
+    trace_context: dict | None = None,
 ) -> list[ToolResult]:
     """Dispatch provider tool_calls (spec C3). READ_ACTIONS run inline-parallel (their content
     feeds back to the model); WRITE_ACTIONS pass the provenance write_gate then are ENQUEUED as
@@ -202,6 +219,7 @@ async def dispatch_tool_calls(
             _t, data = await _run_one(
                 store, step, api_key=api_key, runtime_token=runtime_token,
                 enclave_sem=enclave_sem,
+                trace_context=trace_context,
             )
             if (
                 tc.name in {"photo_read", "screen_read"}
@@ -248,12 +266,48 @@ async def dispatch_tool_calls(
                 or activity_metadata.perception_result_metadata(tc.name, data)
                 or None
             )
-        except Exception:  # noqa: BLE001 — isolate one bad read; never expose its exception
+        except Exception:  # noqa: BLE001 — isolate one bad read; keep the wire vocabulary stable
             # Read calls are independent and side-effect-free.  A capability bug or
             # adapter failure must not discard successful sibling results or fail the
-            # whole turn.  Keep the error vocabulary stable and privacy-safe: exception
-            # text can contain decrypted data, URLs, or query terms.  Cancellation is a
-            # BaseException on supported Python versions and therefore still propagates.
+            # whole turn.  Cancellation is a BaseException on supported Python versions
+            # and therefore still propagates.
+            #
+            # 2026-08-23: the exception **class** and sanitized stack coordinates now go
+            # to the worker log so a failure is attributable — previously "contract error"
+            # (e.g. TypeError from an unexpected kwarg) and "runtime failure" (e.g. a
+            # DB timeout) produced the same four words and could not be told apart.
+            # T216's CI red was that shape; production has no CI to catch it.
+            #
+            # ⚠️ The exception **message** is deliberately NOT logged. This repo keeps
+            # detailed failure context in the *encrypted* trajectory and keeps flat log
+            # fields to a closed vocabulary (cf. provider_attempt_ledger's bounded
+            # ``error_class``). Worker logs are plaintext stdout — a different storage
+            # class with different access control. Capability reads process decrypted
+            # queries and card bodies, so their exception text can carry user content.
+            # Class + coordinates already separate "contract error" from "runtime
+            # failure", which is the whole point; the message would buy detail at the
+            # cost of moving user data across a documented boundary. Doing that needs an
+            # explicit architecture decision, not a side effect of one log line.
+            #
+            # ``content`` deliberately stays byte-identical.  It is NOT a debugging
+            # surface: it is fed back to the provider as a tool result and the model can
+            # repeat it to the user mid-conversation.  More importantly, worker.py:1950
+            # strips the ``error: `` prefix and tests the remainder for **exact**
+            # membership in cap_history.PRE_SCAN_ERROR_CODES — appending anything here
+            # silently flips that check to False and changes history pre-scan accounting
+            # with no error anywhere.
+            exc = sys.exc_info()[1]
+            tb = exc.__traceback__
+            frames = []
+            while tb is not None:          # 只留坐标:文件:行:函数,不带局部变量与实参
+                f = tb.tb_frame
+                frames.append(f"{os.path.basename(f.f_code.co_filename)}:{tb.tb_lineno}:{f.f_code.co_name}")
+                tb = tb.tb_next
+            log.error(
+                "[v2.executor] capability read failed; tool=%s call_id=%s error_class=%s at=%s",
+                getattr(tc, "name", "?"), getattr(tc, "id", "?"),
+                type(exc).__name__, " < ".join(frames[-6:]) or "?",
+            )
             content = "error: capability_failed"
         return tc.id, ToolResult(call_id=tc.id, content=content, metadata=metadata)
 

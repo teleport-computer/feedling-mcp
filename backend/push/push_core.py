@@ -22,8 +22,10 @@ from datetime import datetime
 
 from core import store as core_store
 from core.store import UserStore
+from proactive import controls_v2
 from push import apns
 from push import live_activity
+from push.sounds import NOTIFICATION_SOUND_NAME
 from push import tokens as push_tokens
 
 
@@ -32,6 +34,16 @@ def list_tokens(store: UserStore, *, active_only: bool) -> dict:
     if active_only:
         tokens = [t for t in tokens if push_tokens._entry_is_active(t)]
     return {"tokens": tokens}
+
+
+def _global_notification_suppression(store: UserStore) -> dict | None:
+    decision = controls_v2.evaluate_delivery_v2(
+        controls_v2.load_settings_v2_for_store(store),
+        source=controls_v2.USER_MESSAGE_SOURCE_V2,
+    )
+    if decision.allow_visible_delivery:
+        return None
+    return {"status": "suppressed", "reason": decision.reason}
 
 
 def register_token(store: UserStore, *, payload: dict) -> dict:
@@ -86,6 +98,8 @@ def register_token(store: UserStore, *, payload: dict) -> dict:
 
 
 def notification(store: UserStore, *, payload: dict) -> dict:
+    if suppression := _global_notification_suppression(store):
+        return suppression
     if not push_tokens._select_token(store, push_tokens._is_device_token, active_only=True):
         print(f"[notification:{store.user_id}] no device token — logged: {payload}")
         return {"status": "logged", "message_id": f"msg_{uuid.uuid4().hex[:8]}"}
@@ -93,7 +107,7 @@ def notification(store: UserStore, *, payload: dict) -> dict:
     apns_payload = {
         "aps": {
             "alert": {"title": payload.get("title", ""), "body": payload.get("body", "")},
-            "sound": "default",
+            "sound": NOTIFICATION_SOUND_NAME,
         }
     }
     result = apns._send_apns_to_active_tokens(
@@ -125,53 +139,17 @@ def ai_reply_push(store: UserStore, *, payload: dict) -> dict:
     V2 的 serve-worker 没有 APNs 私钥（只注入 backend），所以它把已落库回复的
     明文正文交到这里。正文只经过内存：不写库、不进日志正文。
 
-    ``is_wake`` 为真表示这是 agent 主动发起的消息，额外受用户的
-    ``reminders_delivery`` 开关管辖；用户发消息后的应答不受该开关影响。
+    ``reminders_delivery`` 是 iOS 普通 Push 消息的总开关。关闭后回复仍写入
+    聊天，但不发送通知横幅、声音或振动；Live Activity 使用独立开关。
     """
-    from proactive.controls_v2 import evaluate_delivery_v2, load_settings_v2_for_store
     from push import service as push_service
 
     msg_id = str(payload.get("msg_id") or "").strip()
     body = str(payload.get("body") or "").strip()
-    is_wake = bool(payload.get("is_wake"))
     if not msg_id:
         return {"status": "skipped", "reason": "missing_msg_id", "apns_alert_sent": False}
     if not body:
         return {"status": "skipped", "reason": "empty_body", "apns_alert_sent": False}
-
-    if is_wake:
-        # ``lane`` is the V2 lane name (heartbeat/scheduled/manual_wake/
-        # screen_watch) the serve-worker sent this wake reply's push under.
-        # Mirrors V1's ``_proactive_delivery_decision_v2`` (chat/chat_core.py),
-        # which derives ``source``/``manual`` from the wake job rather than
-        # hardcoding them -- manual==True routes through
-        # ``evaluate_delivery_v2``'s ``manual_bypass`` and is delivered even
-        # when the user has turned ``reminders_delivery`` off. Back-compat: a
-        # caller that predates this field (payload has no "lane" key at all)
-        # falls back to the pre-fix constants instead of erroring.
-        if "lane" in payload:
-            source = str(payload.get("lane") or "").strip() or "heartbeat"
-            manual = source == "manual_wake"
-        else:
-            source = "heartbeat"
-            manual = False
-        decision = evaluate_delivery_v2(
-            load_settings_v2_for_store(store), source=source, manual=manual)
-        if not decision.allow_visible_delivery:
-            fields = {
-                "push_decision": "suppressed",
-                "push_reason": decision.reason,
-                "alert_status": "suppressed",
-                "alert_reason": decision.reason,
-                "live_activity_status": "suppressed",
-                "live_activity_reason": decision.reason,
-            }
-            store.update_chat_message_metadata(msg_id, fields)
-            return {
-                "status": "suppressed",
-                "reason": decision.reason,
-                "apns_alert_sent": False,
-            }
 
     fields = push_service._deliver_ai_message_push_if_background(
         store, body=body[:240], title="IO", data={}, visual_state="reply")

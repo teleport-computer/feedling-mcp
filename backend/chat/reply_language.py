@@ -12,6 +12,12 @@ import re
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from memgarden.garden_language import (
+    count_bucket_languages,
+    decide_garden_language,
+    split_bucket_names,
+)
+
 
 @dataclass(frozen=True)
 class ReplyLanguagePolicy:
@@ -150,58 +156,131 @@ def infer_reply_language_policy(
     return _policy("zh-Hans", "default", confidence=0.0)
 
 
+#: 一条消息算「本人写的」要 role 是这个。别用 in / startswith 之类的模糊匹配 ——
+#: 助手侧的 role 也可能含 "user" 子串（"user_proxy"）。
+_USER_ROLE = "user"
+
+#: 取多少条。只要最近的：语言是会变的（有人换了工作开始用英文写），
+#: 拿三年前的历史投票会把当下的信号淹掉。
+USER_WRITING_SAMPLE_MESSAGES = 40
+
+
+def user_written_text(messages, *, limit: int = USER_WRITING_SAMPLE_MESSAGES) -> str:
+    """从消息列表里抽出**本人写的字**，拼成一段供语言判定用的样本。
+
+    为什么只取本人的：要判的是「这个人用什么语言」。把 AI 的回复也算进去，等于让
+    上一轮的输出参与决定下一轮 —— 那正是 2026-08-24 事故里桶名扮演的角色，
+    换个字段重演一遍而已。
+
+    为什么放在这里：**两条 runtime 共用一份实现。** 同一个文件里 ``user_naming``
+    的注释记着一次教训 —— 说话人标签各写了一份，V1 修了、V2 漏了半年。取证逻辑
+    同理，别再各写一份。
+    """
+    out = []
+    for m in list(messages or [])[-limit:]:
+        if not isinstance(m, dict):
+            continue
+        if str(m.get("role") or "").strip().lower() != _USER_ROLE:
+            continue
+        body = str(m.get("content") or m.get("text") or "").strip()
+        if body:
+            out.append(body)
+    return "\n".join(out)
+
+
 def infer_garden_language(
     identity: dict | None,
     *,
+    written: str = "",
     existing_buckets: str = "",
     locale: str = "",
     archive_language: str = "",
 ) -> str:
     """这个花园的分类语言（"zh-Hans" / "en"）—— 桶名、线索、卡片正文共用它。
 
-    为什么不直接用回复语言：**回复语言可以每轮变，花园语言不该变。** 这个人今天
-    用英文问一句，不该让他的花园里冒出一个 Work 桶，跟已有的「工作」并存 ——
-    桶是分类键，裂开等于同一类记忆被拆成两堆、检索时互相看不见。
+    为什么不直接用回复语言：**回复语言可以每轮变，花园语言不该变。** 一个人今天用
+    英文问一句，不该让他整个花园换语言。
 
-    所以证据里显式带上**已有的桶名**：花园现在是中文桶，判断就会继续给中文，
-    哪怕这一轮对话是英文的。第一次落卡（还没有任何桶）时才退回 identity /
-    locale / archive_language 那几级。
-
-    与 io 回复语言同源（``infer_reply_language_policy``），所以不会出现
-    「io 用英文跟你说话、却给你一个中文桶」这种自相矛盾。
+    ⚠️ ``existing_buckets`` **不参与判定**，只用来落一条观测。见
+    :func:`garden_language_decision` 里的理由。
     """
-    # 已有桶优先，且**不走 infer_reply_language_policy 的证据门槛**。
-    # 那个门槛（32 字符）是给散文调的；桶名天生就短 —— "Work / Health / Pets"
-    # 只有 14 个拉丁字母，喂进去会被判成证据不足、回落成中文，
-    # 于是一个英文花园会突然开始长中文桶。实测踩到过。
-    buckets = str(existing_buckets or "")
-    if buckets.strip():
-        # ⚠️ **按桶投票，绝不按字符数。**
-        #
-        # 2026-08-24 线上事故：原来比的是整串里 CJK 与拉丁**字符**的个数。中英文桶名
-        # 长度根本不对等 —— 中文桶平均 3.4 字符（「工作」），英文桶平均 11.6
-        # （「Our relationship」），**一个英文桶顶三个半中文桶**。实测「6 个中文桶 +
-        # 3 个英文桶」就会被判成英文花园。
-        #
-        # 而那几个英文桶是更早一个 bug 的残留（老提示词同时给中英两套让模型挑，约
-        # 1/3 的中文记忆被贴错桶）。两个 bug 单独看都不致命，叠起来是自我强化的回路：
-        #
-        #     旧残留 → 判成英文花园 → 新卡全用英文桶 → 英文桶更多 → …
-        #
-        # 真实后果：一个 226 张卡的中文花园两天内新落的卡整个变成英文。
-        #
-        # 一个桶一票，长度不参与。平票算中文 —— 这个不对称是刻意的：把中文花园翻成
-        # 英文是用户能立刻看见的破坏，保持中文最多是"没跟上"，代价小得多。
-        names = [b.strip() for b in re.split(r"[、,/\n]+", buckets) if b.strip()]
-        zh = sum(1 for n in names if _CJK_RE.search(n))
-        en = sum(1 for n in names if not _CJK_RE.search(n) and _LATIN_RE.search(n))
-        if zh or en:
-            return "zh-Hans" if zh >= en else "en"
+    return garden_language_decision(
+        identity,
+        written=written,
+        existing_buckets=existing_buckets,
+        locale=locale,
+        archive_language=archive_language,
+    )["locale"]
 
-    # 还没有任何桶（新花园的第一张卡）才看身份卡 / locale / 归档语言。
-    return infer_reply_language_policy(
-        identity or {}, [], locale=locale, archive_language=archive_language
-    ).language
+
+def garden_language_decision(
+    identity: dict | None,
+    *,
+    written: str = "",
+    existing_buckets: str = "",
+    locale: str = "",
+    archive_language: str = "",
+) -> dict:
+    """定这个花园的语言，并把**判定依据**一并返回，供落库观测。
+
+    ## 🔴 桶名不是证据
+
+    最容易想到的做法是「看这个花园现在的桶名是中文还是英文」。曾经就是这么做的，
+    **两次都出了事**：
+
+    2026-08-24 线上事故：更早一个 bug 让约 1/3 中文记忆贴上了英文公共桶，这些残留
+    被读成「这是英文花园」→ 新卡全用英文桶 → 英文桶更多。**桶是 AI 的输出，拿输出
+    当输入就是一个自我强化的环**，真实用户的中文花园两天内整个翻成英文。
+
+    当天的第一版修复只换了数票方式（按桶投票、不按字符），环还在。hx 随即指出更
+    致命的一点：**桶名里根本没有语言信息**。
+
+        工作、健康、James、Sarah、Mike        ← 中文用户,给三个朋友各建了个桶
+        工作、James、OpenAI、GitHub、Figma    ← 中文用户,在记几个项目
+
+    人名、公司名、项目名全是拉丁字母，跟这个人说什么语言毫无关系。怎么数都救不了 ——
+    问题不在怎么数，在于压根不该数它。
+
+    所以现在的证据只有三样，**桶名一样都不占**：
+
+        ① identity.language_preference   用户明说的,任何东西不该盖过它
+        ② 他实际在用什么语言写            身份卡正文 + 这轮对话里他自己说的话
+        ③ locale / archive_language      弱,只是设备设置
+
+    ## 那「别让 工作 和 Work 并存」谁来管
+
+    归一化 —— :func:`memgarden.prompts.buckets.normalize_bucket_language`。它只动
+    固定配对表里的通用桶（健康 ↔ Health），自定义桶原样放行。**语言跟着人走，
+    桶名跟着内容走**，两件事分开。
+
+    ## 返回值
+
+    全部**内容无关**：语言标签、依据名、证据词数。桶的计数也在里面，但它是
+    **观测量不是判据** —— 「判成中文但 9 个桶里 7 个是拉丁字母」值得记一笔
+    （可能归一化没生效），不值得据此改语言。
+    """
+    explicit = _language_from_hint(
+        (identity or {}).get("language_preference") if isinstance(identity, dict) else ""
+    )
+    # 「他写的字」= 这轮对话里他自己说的话 + 身份卡正文。前者是最新最真的信号，
+    # 后者在还没聊过时兜底。
+    sample = "\n".join(x for x in ([written] + _identity_texts(identity or {})) if x)
+
+    d = decide_garden_language(
+        explicit=explicit or None,
+        written=sample,
+        locale=_language_from_hint(locale) or _language_from_hint(archive_language) or None,
+    )
+    zh, en = count_bucket_languages(existing_buckets or "")
+    names = split_bucket_names(existing_buckets or "")
+    return {
+        **d,
+        # ↓ 观测用，**没有参与上面的判定**。留着是为了能发现「语言判成中文，
+        #   但桶几乎全是拉丁字母」这类归一化失效的情况。
+        "bucket_zh": zh,
+        "bucket_en": en,
+        "bucket_total": len(names),
+    }
 
 
 def reply_language_system_line(policy: ReplyLanguagePolicy, *, proactive: bool = False) -> str:

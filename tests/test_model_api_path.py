@@ -27,6 +27,7 @@ from hosted import chat_send_core  # noqa: E402
 from hosted import config_store as hosted_config_store  # noqa: E402
 from hosted import history_import  # noqa: E402
 from hosted import setup_core  # noqa: E402
+from hosted import visual_transport  # noqa: E402
 from identity import service as identity_service  # noqa: E402
 from model_api_runtime.v2 import jobs_store, prompt_frontier  # noqa: E402
 
@@ -295,15 +296,15 @@ def test_model_api_setup_auto_probe_is_nonblocking_and_updates_config(
     monkeypatch.setattr(provider_client, "list_provider_models", text_only_catalog)
     pixel_probes = []
 
-    def reject_pixel_probe(_config, messages, **kwargs):
-        pixel_probes.append((messages, kwargs))
+    def reject_pixel_probe(_config, **kwargs):
+        pixel_probes.append(kwargs)
         # A single color can never satisfy the randomized probe's requirement
         # for two correct colors, so the authoritative result is unsupported.
         return {"reply": "red"}
 
     monkeypatch.setattr(
-        provider_client,
-        "chat_completion",
+        visual_transport,
+        "request_visual_completion",
         reject_pixel_probe,
     )
     route_res = client.post(
@@ -341,7 +342,8 @@ def test_model_api_setup_auto_probe_is_nonblocking_and_updates_config(
 
     assert after["config"]["main_model"]["vision_test_status"] == "unsupported"
     assert len(pixel_probes) == 1
-    assert isinstance(pixel_probes[0][0][0]["content"], list)
+    assert pixel_probes[0]["image_mime"] == "image/png"
+    assert base64.b64decode(pixel_probes[0]["image_b64"])
 
 
 @pytest.mark.parametrize(

@@ -259,7 +259,7 @@ def _model_api_steps_with_genesis(
         ),
     }
     memory_step = {
-        "id": "memory_garden",
+        "id": "memgarden",
         "label": "Memory Garden",
         "passing": True,
         "blocking": False,
@@ -299,7 +299,7 @@ def _model_api_steps_with_genesis(
 
     replacements = {
         "history_import": history_step,
-        "memory_garden": memory_step,
+        "memgarden": memory_step,
         "identity_card": identity_step,
         "relationship_anchor": relationship_step,
         "hosted_chat": hosted_chat_step,
@@ -391,7 +391,7 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
         },
         {
             # A' (2026-06): Memory Garden is informational, not an onboarding gate.
-            "id": "memory_garden",
+            "id": "memgarden",
             "label": "Memory Garden",
             "passing": True,
             "blocking": False,
@@ -458,7 +458,7 @@ def _official_import_onboarding_validation_payload(store: UserStore) -> dict:
     steps = [
         {
             # A' (2026-06): Memory Garden is informational, not an onboarding gate.
-            "id": "memory_garden",
+            "id": "memgarden",
             "label": "Memory Garden",
             "passing": True,
             "blocking": False,
@@ -523,7 +523,7 @@ def _onboarding_validation_payload(store: UserStore) -> dict:
     steps = [
         {
             # A' (2026-06): Memory Garden is informational, not an onboarding gate.
-            "id": "memory_garden",
+            "id": "memgarden",
             "label": "Memory Garden",
             "passing": True,
             "blocking": False,

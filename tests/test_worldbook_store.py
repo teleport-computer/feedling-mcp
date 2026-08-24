@@ -4,7 +4,10 @@ import sys
 import uuid
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+from core import store as core_store  # noqa: E402
 from core.store import UserStore  # noqa: E402
 
 
@@ -61,3 +64,14 @@ def test_world_books_delete_returns_whether_row_existed_and_persists():
 
     reloaded = UserStore(uid)
     assert [item["id"] for item in reloaded.world_books] == ["wb2"]
+
+
+def test_world_book_failed_db_upsert_does_not_mutate_local_cache(monkeypatch):
+    store = UserStore(_uid())
+    before = [dict(item) for item in store.world_books]
+    monkeypatch.setattr(core_store.db, "world_book_upsert", lambda *_args: False)
+
+    with pytest.raises(RuntimeError, match="world_book_write_failed"):
+        store.upsert_world_book(_record("not-saved"))
+
+    assert store.world_books == before

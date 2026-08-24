@@ -51,7 +51,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -81,6 +81,7 @@ from hosted import config_store as hosted_config_store
 from hosted import mcp_core
 from hosted import mcp_status
 from hosted import mcp_tools
+from hosted import visual_transport
 from hosted import vision_observer
 from identity import card_policy
 from memory import memory_core
@@ -692,11 +693,8 @@ def _send_reply_push(
     compose 内网交过去（与 V1 consumer 走 HTTP 传 push_body 是同一个姿态）。
     完全 best-effort：任何异常都在这里吞掉并记日志，绝不冒到回合上。
 
-    ``lane`` 是本次唤醒的 V2 lane 名（chat lane 传空字符串），backend 用它推
-    manual（``lane == "manual_wake"``）与真实 wake source，对齐 V1
-    `_proactive_delivery_decision_v2` 从 job 推 manual 的做法 —— 缺这个字段会让
-    manual wake 被当成非 manual，关了 reminders_delivery 的用户收不到手动唤醒
-    推送（v2-push-parity 分支审查 Minor #1）。
+    ``lane`` 是本次唤醒的 V2 lane 名（chat lane 传空字符串），保留真实来源供
+    backend 做投递决策和诊断。系统通知关闭时所有 lane 都只写聊天，不发送推送。
     """
     api_url = os.environ.get("FEEDLING_API_URL", "").strip()
     if not api_url:
@@ -858,11 +856,22 @@ def _resolve_provider(user_id: str):
         b"feedling:v2:prompt-cache-route:v1\0" + scope_bytes,
         hashlib.sha256,
     ).hexdigest()
+    version = db.model_api_active_route_version(user_id)
+    exact_version = ""
+    if (
+        isinstance(version, dict)
+        and str(version.get("route_id") or "") == runtime.hosted_route_id
+        and str(version.get("provider") or "") == runtime.provider
+        and str(version.get("model") or "") == runtime.model
+        and str(version.get("base_url") or "") == runtime.base_url
+    ):
+        exact_version = str(version.get("updated_at_token") or "")
     return replace(
         runtime,
         prompt_cache_key=f"feedling-v2-{cache_key}",
         prompt_cache_route_fingerprint=f"feedling-v2-route-{route_fingerprint}",
         capture_attempt_trace=True,
+        hosted_route_updated_at=exact_version,
     ), {}
 
 
@@ -1132,34 +1141,20 @@ def _read_tail_window(
 
     Skip 规则与 `_read_messages` 一致：无 `body_ct` 或 `K_enclave is None` 的合成/
     本地-only 行跳过；`content_type == "image"` 走 "[image]" 简写，不经 enclave。"""
-    store = core_store.get_store(user_id)
-    reload_chat = getattr(store, "reload_chat_strict", None)
-    if callable(reload_chat):
-        rows = reload_chat()
-    else:  # lightweight test doubles retain the older reload seam
-        reload_store = getattr(store, "reload", None)
-        if callable(reload_store):
-            reload_store()
-        rows = list(getattr(store, "chat_messages", []) or [])
-    rows = sorted(rows, key=lambda m: m.get("ts") or 0.0)
     if limit <= 0:
         return []
-    candidates = [m for m in rows if m.get("ts") is not None and m.get("ts") > after_ts]
-    if exclude_synthetic_sources:
-        # Summary-coverage callers only: `verify_ping`/`resident_maintenance`
-        # rows are deleted once their probe completes, so folding one into an
-        # IMMUTABLE leaf freezes a coverage claim that the row itself will not
-        # honour — validate_canonical_frontier then fails every later turn.
-        # The seq-based reader already excludes them; this ts-based sibling
-        # kept the hole open for whichever caller still reaches it.
-        candidates = [
-            m for m in candidates
-            if str(m.get("source") or "")
-            not in ("verify_ping", "resident_maintenance")
-        ]
-    # Bound enclave work before decrypting, so every selected caption can be
-    # preserved without an independent cap that silently changes row content.
-    rows = candidates[:limit] if oldest_first else candidates[-limit:]
+    rows = db.chat_messages_after_seq(
+        user_id,
+        0,
+        limit=int(limit),
+        oldest_first=oldest_first,
+        exclude_synthetic_sources=exclude_synthetic_sources,
+    )
+    rows = [
+        row
+        for row in rows
+        if row.get("ts") is not None and float(row["ts"]) > float(after_ts)
+    ]
     return _decrypt_chat_rows(user_id, rows, user_only=False)
 
 
@@ -1179,7 +1174,7 @@ def _scrub_leaked_thinking_rows(rows: list[dict]) -> list[dict]:
     保留文字，格式没了、内容还在。行的 id/ts/seq 一律原样保留，compaction /
     capture 的水位连续性不受影响。
     """
-    from core import self_thinking as _st
+    from agent_protocol_core import self_thinking as _st
 
     if not _st.gate_enabled():
         return rows
@@ -2196,14 +2191,120 @@ def _observe_photo(
     )
 
 
+_VISION_BATCH_BUDGET_POLICY_VERSION = "derived-v2"
+
+
+def _vision_batch_candidate_budget_sec(image_count: int) -> float:
+    return visual_transport.visual_batch_budget_sec(image_count)
+
+
+def _emit_vision_batch_budget_evaluation(
+    user_id: str,
+    *,
+    actual_image_count: int,
+    started_at: float,
+    succeeded: bool,
+) -> None:
+    actual_dur_ms = max(0.0, (time.monotonic() - started_at) * 1000.0)
+    enforced_budget_ms = (
+        _vision_batch_candidate_budget_sec(actual_image_count) * 1000.0
+    )
+    deadline_reached = actual_dur_ms >= enforced_budget_ms
+    try:
+        _emit_v2_debug_trace_for_user(
+            user_id,
+            "vision.batch.budget.evaluated",
+            status="ok",
+            summary="enforced_deadline_evaluated",
+            detail={
+                "policy_version": _VISION_BATCH_BUDGET_POLICY_VERSION,
+                "actual_image_count": actual_image_count,
+                "configured_image_limit": v2_worker._TAIL_IMAGE_LIMIT,
+                "enforced_budget_ms": enforced_budget_ms,
+                "fixed_overhead_ms": (
+                    visual_transport.VISUAL_BATCH_FIXED_OVERHEAD_SEC * 1000.0
+                ),
+                "deadline_reached": deadline_reached,
+                "completed_successfully": succeeded,
+                "actual_dur_ms": actual_dur_ms,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — telemetry never changes behavior
+        log.warning(
+            "[v2.vision] batch budget trace failed user=%s error=%s",
+            str(user_id)[:8],
+            type(exc).__name__,
+        )
+
+
 def _read_vision_observations(
     user_id: str,
     targets: list[dict],
-) -> dict[str, str]:
-    """Send pinned V2 images to their observer and return text-only data.
+    *,
+    main_provider_config: provider_client.ProviderConfig | None = None,
+) -> v2_worker.VisionObservationBatch:
+    """Observe a batch under one absolute deadline and privacy fence."""
+    actual_image_count = sum(isinstance(item, dict) for item in targets)
+    started_at = time.monotonic()
+    absolute_deadline = started_at + _vision_batch_candidate_budget_sec(
+        actual_image_count
+    )
+    succeeded = False
+    try:
+        batch = _read_vision_observations_with_deadline(
+            user_id,
+            targets,
+            absolute_deadline=absolute_deadline,
+            main_provider_config=main_provider_config,
+        )
+        succeeded = all(
+            bool(outcome.observation) for outcome in batch.outcomes.values()
+        )
+        return batch
+    finally:
+        _emit_vision_batch_budget_evaluation(
+            user_id,
+            actual_image_count=actual_image_count,
+            started_at=started_at,
+            succeeded=succeeded,
+        )
+
+
+def _main_vision_route_is_verified(
+    user_id: str,
+    config: provider_client.ProviderConfig | None,
+) -> bool:
+    """Require a current ``ok`` verdict for this exact resolved main route."""
+    if config is None:
+        return False
+    route_id = str(getattr(config, "hosted_route_id", "") or "")
+    updated_at = str(getattr(config, "hosted_route_updated_at", "") or "")
+    configured_status = str(
+        getattr(config, "hosted_vision_test_status", "") or ""
+    ).strip().lower()
+    if not route_id or not updated_at or configured_status != "ok":
+        return False
+    verdict = db.model_api_active_route_vision_verdict(user_id)
+    return bool(
+        isinstance(verdict, dict)
+        and str(verdict.get("id") or "") == route_id
+        and str(verdict.get("updated_at") or "") == updated_at
+        and str(verdict.get("vision_test_status") or "").strip().lower() == "ok"
+    )
+
+
+def _read_vision_observations_with_deadline(
+    user_id: str,
+    targets: list[dict],
+    *,
+    absolute_deadline: float,
+    main_provider_config: provider_client.ProviderConfig | None,
+) -> v2_worker.VisionObservationBatch:
+    """Send pinned images to dedicated routes and retain per-target results.
 
     The route id was stored with the accepted chat row. Missing/deleted/stale
-    routes fail the turn; raw pixels never fall through to the main provider.
+    routes remain hard failures. Only the worker's explicit fallback policy may
+    authorize a second raw-pixel read for a provider failure.
     """
     normalized = [
         {
@@ -2221,7 +2322,7 @@ def _read_vision_observations(
     images = _read_images(user_id, [item["message_id"] for item in normalized])
     token = _mint_runtime_token(user_id)
     configs: dict[str, provider_client.ProviderConfig] = {}
-    observations: dict[str, str] = {}
+    outcomes: dict[str, v2_worker.VisionObservationOutcome] = {}
     for item in normalized:
         message_id = item["message_id"]
         route_id = item["route_id"]
@@ -2241,19 +2342,99 @@ def _read_vision_observations(
             configs[route_id] = config
 
         mime = str(image.get("image_mime") or "image/jpeg")
+        provider = str(config.provider or "")[:80]
+        model = str(config.model or "")[:96]
+        started_at = time.monotonic()
+
+        def emit_provider_trace(event_type: str, **kwargs) -> None:
+            try:
+                _emit_v2_debug_trace_for_user(
+                    user_id,
+                    event_type,
+                    trace_id=message_id,
+                    turn_id=message_id,
+                    **kwargs,
+                )
+            except Exception as trace_exc:  # noqa: BLE001 — diagnostics are best effort
+                log.warning(
+                    "[v2.vision] provider trace failed user=%s message=%s error=%s",
+                    str(user_id)[:8],
+                    message_id[:8],
+                    type(trace_exc).__name__,
+                )
+
+        emit_provider_trace(
+            "vision.provider.called",
+            status="started",
+            summary="provider_call",
+            detail={"provider": provider, "model": model},
+        )
         try:
-            observations[message_id] = vision_observer.observe_image(
+            observation = vision_observer.observe_image(
                 config,
                 image_mime=mime,
                 image_b64=image_b64,
+                absolute_deadline=absolute_deadline,
             )
-        except vision_observer.VisionObserverError as exc:
+        except vision_observer.VisionObserverError as failure:
             # Fixed route metadata, never inferred from model prose. The worker
             # can carry it to the terminal activity/fallback projection.
-            exc.model = str(config.model or "")[:96]
-            exc.provider = str(config.provider or "")[:80]
-            raise
-    return observations
+            failure.model = model
+            failure.provider = provider
+            emit_provider_trace(
+                "vision.provider.completed",
+                status="error",
+                summary=failure.error_code,
+                detail={
+                    "provider": provider,
+                    "model": model,
+                    "error_class": failure.error_code,
+                    "status_code": failure.status_code,
+                    "retryable": failure.retryable,
+                    **({"reason": failure.reason} if failure.reason else {}),
+                },
+                dur_ms=(time.monotonic() - started_at) * 1000,
+            )
+            log.warning(
+                "[v2.vision] provider call failed user=%s message=%s route=%s "
+                "provider=%s model=%s class=%s status=%s upstream_detail=%r",
+                str(user_id)[:8],
+                message_id[:8],
+                route_id[:8],
+                provider,
+                model,
+                failure.error_code,
+                failure.status_code,
+                failure.upstream_detail,
+            )
+            outcomes[message_id] = v2_worker.VisionObservationOutcome(
+                error_code=failure.error_code,
+                reason=failure.reason,
+                model=model,
+                provider=provider,
+                status_code=failure.status_code,
+                upstream_detail=failure.upstream_detail,
+            )
+            continue
+        emit_provider_trace(
+            "vision.provider.completed",
+            status="ok",
+            summary="provider_call_complete",
+            detail={"provider": provider, "model": model},
+            dur_ms=(time.monotonic() - started_at) * 1000,
+        )
+        outcomes[message_id] = v2_worker.VisionObservationOutcome(
+            observation=str(observation or "").strip(),
+            model=model,
+            provider=provider,
+        )
+    return v2_worker.VisionObservationBatch(
+        outcomes=outcomes,
+        absolute_deadline=float(absolute_deadline),
+        main_vision_verified=_main_vision_route_is_verified(
+            user_id, main_provider_config
+        ),
+    )
 
 
 def _read_files(user_id: str, message_ids: list[str]) -> dict[str, dict]:
@@ -2479,19 +2660,19 @@ async def _generate_image_for_chat(
         explain="开始生成图片（记录用的是哪条路由，不含提示词）。",
         detail=dict(_image_route_detail),
     )
-    try:
-        result = await provider_client.generate_image_async(config, prompt)
-        media = ProviderResponse.from_result(result).media
-        if not media:
-            raise provider_client.ProviderError("image_generation_invalid_output")
-        _emit_v2_debug_trace(
-            _image_store, "agent.image.generate.done", status="ok",
-            summary="image generation done",
-            explain="图片生成成功。",
-            detail={**_image_route_detail, "media_count": len(media)},
-        )
-    except Exception as exc:  # noqa: BLE001 - stable capability surface
+
+    async def raise_provider_failure(exc: BaseException) -> NoReturn:
+        """Classify and persist only failures raised by the provider seam."""
         classified = provider_client.classify_provider_error(exc)
+        raw_status_code = getattr(exc, "status_code", None)
+        status_code = (
+            raw_status_code if isinstance(raw_status_code, int) else None
+        )
+        upstream_detail = str(
+            getattr(exc, "upstream_detail", "")
+            or getattr(exc, "response_detail", "")
+            or ""
+        )[:240]
         incompatible = classified in {"provider_config", "provider_incompatible"} or (
             str(exc).strip().lower()
             in {"image_generation_model_unsupported", "image_generation_invalid_output"}
@@ -2532,7 +2713,19 @@ async def _generate_image_for_chat(
                 "error_code": code,
                 "classified": classified,
                 "incompatible": incompatible,
+                "status_code": status_code,
             },
+        )
+        log.warning(
+            "[v2.image] generation failed user=%s provider=%s model=%s "
+            "error=%s code=%s status=%s upstream_detail=%r",
+            str(user_id)[:8],
+            _image_route_detail["provider"],
+            _image_route_detail["model"],
+            type(exc).__name__,
+            code,
+            status_code,
+            upstream_detail,
         )
         if isinstance(route, dict) and route.get("id"):
             await asyncio.to_thread(
@@ -2557,7 +2750,26 @@ async def _generate_image_for_chat(
             error_code=code,
             model=str(getattr(config, "model", "") or ""),
             provider=str(getattr(config, "provider", "") or ""),
+            status_code=status_code,
+            upstream_detail=upstream_detail,
         ) from exc
+
+    try:
+        result = await provider_client.generate_image_async(config, prompt)
+    except Exception as exc:  # noqa: BLE001 - this try contains only provider I/O
+        await raise_provider_failure(exc)
+
+    media = ProviderResponse.from_result(result).media
+    if not media:
+        await raise_provider_failure(
+            provider_client.ProviderError("image_generation_invalid_output")
+        )
+    _emit_v2_debug_trace(
+        _image_store, "agent.image.generate.done", status="ok",
+        summary="image generation done",
+        explain="图片生成成功。",
+        detail={**_image_route_detail, "media_count": len(media)},
+    )
 
     target = route
     if target is None:
@@ -2752,6 +2964,11 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
         "cards": "",
         "card_items": [],
     }
+    if full_cards:
+        # Internal-only, content-free signal consumed by the Dream worker.  An
+        # empty successful index and a failed/degraded read must not both look
+        # like "the model chose to do nothing" in diagnostics.
+        ctx["_diagnostic_cards_outcome"] = "unavailable"
     try:
         body, status = memory_core.buckets(store, None, post_enclave=_post)
         if status == 200:
@@ -2825,6 +3042,11 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
                     rendered_chars += added_chars
                 ctx["card_items"] = selected
                 ctx["cards"] = "\n".join(lines)
+                ctx["_diagnostic_cards_outcome"] = (
+                    "ready" if len(selected) == len(ids) else "truncated"
+                )
+            elif full_cards:
+                ctx["_diagnostic_cards_outcome"] = "empty"
             elif not full_cards:
                 lines = [_render_card_line(item) for item in index_items]
                 ctx["cards"] = "\n".join(line for line in lines if line)
@@ -3221,10 +3443,15 @@ def _reply_message_fields(payload: dict) -> tuple[str, dict]:
     ):
         raise RuntimeError("invalid reply file mime")
     byte_count = raw.get("file_byte_count")
+    maximum_file_bytes = (
+        cap_tool_schema.SHARED_WORK_MAX_BYTES
+        if name.casefold().endswith(".io.html")
+        else v2_worker._WORKSPACE_FILE_MAX_BYTES
+    )
     if (
         type(byte_count) is not int
         or byte_count <= 0
-        or byte_count > v2_worker._WORKSPACE_FILE_MAX_BYTES
+        or byte_count > maximum_file_bytes
     ):
         raise RuntimeError("invalid reply file size")
     return "file", {
@@ -3442,14 +3669,9 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
                     user_id,
                     type(exc).__name__.lower(),
                 )
-        try:
-            store.reload_chat_strict()
-        except Exception as exc:  # noqa: BLE001 — cross-worker reload/poll is fallback
-            log.warning(
-                "[v2.reply] local chat cache refresh failed user=%s code=%s",
-                user_id,
-                type(exc).__name__.lower(),
-            )
+        store.apply_committed_chat_rows([
+            msg for msg, _inserted, _finish in records
+        ])
         if any(inserted for _msg, inserted, _finish in records):
             try:
                 # Runtime V2's runner-owned sweep is the sole capture producer.
@@ -4461,6 +4683,7 @@ def _read_worldbook_context(
     messages: list[dict],
     *,
     runtime_token: str,
+    trace_context: dict | None = None,
 ) -> dict:
     """Match this foreground turn against the user's encrypted World Book."""
     body, status = worldbook_core.match(
@@ -4468,6 +4691,16 @@ def _read_worldbook_context(
         {"messages": list(messages or [])},
         api_key=None,
         runtime_token=str(runtime_token or ""),
+        **(
+            {
+                "trace_id": str(trace_context.get("trace_id") or ""),
+                "job_id": str(trace_context.get("job_id") or ""),
+                "lane": str(trace_context.get("lane") or ""),
+                "actor": "host_agent_runtime",
+            }
+            if isinstance(trace_context, dict)
+            else {}
+        ),
     )
     if status != 200:
         raise RuntimeError("worldbook_match_failed")
@@ -4696,7 +4929,7 @@ async def _load_mcp_turn_observed(store, *, lane: str = "chat", **kwargs):
 def _emit_v2_debug_trace(store, event_type: str, *, status: str,
                          detail: dict, summary: str = "", explain: str = "",
                          dur_ms: float | None = None,
-                         trace_id: str = "", job_id: str = "",
+                         trace_id: str = "", turn_id: str = "", job_id: str = "",
                          outcome_class: str = "") -> None:
     from diagnostics import diagnostics_core
 
@@ -4709,6 +4942,8 @@ def _emit_v2_debug_trace(store, event_type: str, *, status: str,
         event["dur_ms"] = dur_ms
     # Added only when supplied, so the ~40 existing call sites keep emitting a
     # byte-identical payload.
+    if turn_id:
+        event["turn_id"] = str(turn_id)
     if job_id:
         event["job_id"] = str(job_id)
     if outcome_class:
@@ -5004,12 +5239,17 @@ def _emit_job_enqueued_trace(user_id: str, lane: str, *, reason: str, trace_id: 
     real indexed columns by insert_trace_events_strict, so putting them in
     detail is what populates them.
     """
+    detail = {"lane": lane, "enqueue_source": lane}
+    public_reason = jobs_store.public_enqueue_reason(reason)
+    if public_reason:
+        detail["reason"] = public_reason
     _emit_v2_debug_trace_for_user(
         user_id,
         "agent.job.enqueued",
         status="ok",
         trace_id=trace_id,
-        detail={"lane": lane, "reason": reason, "enqueue_source": lane},
+        turn_id=trace_id,
+        detail=detail,
     )
 
 
@@ -5423,6 +5663,39 @@ if _TURN_STALL_TIMEOUT_SEC < _MIN_TURN_STALL_TIMEOUT_SEC:
         "FEEDLING_V2_TURN_STALL_TIMEOUT_SEC (or legacy "
         "FEEDLING_V2_TURN_HARD_TIMEOUT_SEC) must be at least 210s"
     )
+
+
+def _validate_vision_batch_budget_below_stall(
+    *,
+    configured_image_limit: int,
+    turn_stall_timeout_sec: float,
+) -> float:
+    nominal_batch_sec = _vision_batch_candidate_budget_sec(configured_image_limit)
+    if nominal_batch_sec >= turn_stall_timeout_sec:
+        per_image_sec = provider_client.reliable_chat_nominal_envelope_sec(
+            request_inactivity_timeout_sec=(
+                visual_transport.VISUAL_REQUEST_INACTIVITY_TIMEOUT_SEC
+            ),
+            max_attempts=visual_transport.VISUAL_MAX_ATTEMPTS,
+            base_delay_sec=visual_transport.VISUAL_RETRY_BASE_DELAY_SEC,
+        )
+        raise RuntimeError(
+            "FEEDLING_V2_TAIL_IMAGE_LIMIT visual retry envelope must stay below "
+            "FEEDLING_V2_TURN_STALL_TIMEOUT_SEC "
+            f"(per_image={per_image_sec:.3f}s, "
+            f"image_limit={configured_image_limit}, "
+            "fixed_overhead="
+            f"{visual_transport.VISUAL_BATCH_FIXED_OVERHEAD_SEC:.3f}s, "
+            f"nominal={nominal_batch_sec:.3f}s, "
+            f"stall={turn_stall_timeout_sec:.3f}s)"
+        )
+    return nominal_batch_sec
+
+
+_VISION_BATCH_CONFIGURED_NOMINAL_SEC = _validate_vision_batch_budget_below_stall(
+    configured_image_limit=v2_worker._TAIL_IMAGE_LIMIT,
+    turn_stall_timeout_sec=_TURN_STALL_TIMEOUT_SEC,
+)
 
 
 # An MCP call only refreshes the per-turn stall clock after its bounded async
