@@ -279,12 +279,15 @@ def evaluate_delivery_v2(
 ) -> DeliveryDecisionV2:
     resolved = resolve_settings_v2(settings)
     normalized = str(source or "").strip()
+    # The iOS "System Notifications" control is the global visible-delivery
+    # switch. Manual wakes and replies to user-authored messages may still run
+    # and write chat records, but they must not bypass notification suppression.
+    if not resolved.reminders_delivery:
+        return DeliveryDecisionV2(True, False, "reminders_delivery_disabled", resolved)
     if manual:
         return DeliveryDecisionV2(True, True, "manual_bypass", resolved)
     if normalized == USER_MESSAGE_SOURCE_V2:
         return DeliveryDecisionV2(True, True, "user_message_bypass", resolved)
-    if not resolved.reminders_delivery:
-        return DeliveryDecisionV2(True, False, "reminders_delivery_disabled", resolved)
     return DeliveryDecisionV2(True, True, "allowed", resolved)
 
 

@@ -333,8 +333,8 @@ def ai_reply_push(store: UserStore, *, payload: dict) -> dict:
     V2 的 serve-worker 没有 APNs 私钥（只注入 backend），所以它把已落库回复的
     明文正文交到这里。正文只经过内存：不写库、不进日志正文。
 
-    ``is_wake`` 为真表示这是 agent 主动发起的消息，额外受用户的
-    ``reminders_delivery`` 开关管辖；用户发消息后的应答不受该开关影响。
+    ``reminders_delivery`` 后续升级为全局系统通知开关。无论消息来自 agent
+    主动唤醒还是用户消息后的应答，关闭时都只写聊天，不发送可见推送。
     """
     from proactive.controls_v2 import evaluate_delivery_v2, load_settings_v2_for_store
     from push import service as push_service
