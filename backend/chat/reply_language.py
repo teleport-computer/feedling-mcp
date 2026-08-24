@@ -170,71 +170,38 @@ def infer_garden_language(
     与 io 回复语言同源（``infer_reply_language_policy``），所以不会出现
     「io 用英文跟你说话、却给你一个中文桶」这种自相矛盾。
     """
-    return garden_language_decision(
-        identity,
-        existing_buckets=existing_buckets,
-        locale=locale,
-        archive_language=archive_language,
-    )["locale"]
-
-
-def garden_language_decision(
-    identity: dict | None,
-    *,
-    existing_buckets: str = "",
-    locale: str = "",
-    archive_language: str = "",
-) -> dict:
-    """同 :func:`infer_garden_language`，但把**判定依据**一并返回，供落库观测。
-
-    为什么需要它：落卡语言错了是**看得见症状、看不见原因**的一类问题 ——
-    用户只会说「怎么变英文了」，而我们查不到当时算出的是什么语言、凭什么算的。
-    2026-08-23 提示词英文化之后，这条路径的风险显著上升，必须能观测。
-
-    返回的字段全部**内容无关**：语言标签、依据名、以及桶名里的字符计数 ——
-    桶名本身是用户内容，绝不落库。
-    """
     # 已有桶优先，且**不走 infer_reply_language_policy 的证据门槛**。
     # 那个门槛（32 字符）是给散文调的；桶名天生就短 —— "Work / Health / Pets"
     # 只有 14 个拉丁字母，喂进去会被判成证据不足、回落成中文，
     # 于是一个英文花园会突然开始长中文桶。实测踩到过。
-    # ⚠️ **按桶投票，绝不按字符数。**
-    #
-    # 2026-08-24 线上事故：原实现比的是整串里 CJK 与拉丁**字符**的个数。中英文桶名
-    # 长度根本不对等 —— 中文桶「工作」两个字符，英文桶「Our relationship」十五个，
-    # **一个英文桶顶七个中文桶**。于是「8 个中文桶 + 2 个英文桶」会被判成英文花园。
-    #
-    # 而那几个英文桶本身是旧 bug 的残留（老提示词同时给中英两套让模型挑，约 1/3 的
-    # 中文记忆被贴上英文公共桶）。旧残留 → 被这里读成"这是英文花园" → 新卡全用英文桶
-    # → 英文桶更多，**自我强化**。真实用户的中文花园两天内整个翻成了英文。
-    #
-    # 一个桶一票，长度不参与。平票算中文（保守：翻成英文是用户能看见的破坏性变化，
-    # 保持中文最多是没跟上，代价小得多）。
-    names = [b.strip() for b in re.split(r"[、,/\n]+", str(existing_buckets or "")) if b.strip()]
-    if names:
+    buckets = str(existing_buckets or "")
+    if buckets.strip():
+        # ⚠️ **按桶投票，绝不按字符数。**
+        #
+        # 2026-08-24 线上事故：原来比的是整串里 CJK 与拉丁**字符**的个数。中英文桶名
+        # 长度根本不对等 —— 中文桶平均 3.4 字符（「工作」），英文桶平均 11.6
+        # （「Our relationship」），**一个英文桶顶三个半中文桶**。实测「6 个中文桶 +
+        # 3 个英文桶」就会被判成英文花园。
+        #
+        # 而那几个英文桶是更早一个 bug 的残留（老提示词同时给中英两套让模型挑，约
+        # 1/3 的中文记忆被贴错桶）。两个 bug 单独看都不致命，叠起来是自我强化的回路：
+        #
+        #     旧残留 → 判成英文花园 → 新卡全用英文桶 → 英文桶更多 → …
+        #
+        # 真实后果：一个 226 张卡的中文花园两天内新落的卡整个变成英文。
+        #
+        # 一个桶一票，长度不参与。平票算中文 —— 这个不对称是刻意的：把中文花园翻成
+        # 英文是用户能立刻看见的破坏，保持中文最多是"没跟上"，代价小得多。
+        names = [b.strip() for b in re.split(r"[、,/\n]+", buckets) if b.strip()]
         zh = sum(1 for n in names if _CJK_RE.search(n))
         en = sum(1 for n in names if not _CJK_RE.search(n) and _LATIN_RE.search(n))
         if zh or en:
-            return {
-                "locale": "zh-Hans" if zh >= en else "en",
-                "basis": "existing_buckets",
-                "bucket_zh": zh,
-                "bucket_en": en,
-                "bucket_total": len(names),
-            }
+            return "zh-Hans" if zh >= en else "en"
 
     # 还没有任何桶（新花园的第一张卡）才看身份卡 / locale / 归档语言。
-    policy = infer_reply_language_policy(
+    return infer_reply_language_policy(
         identity or {}, [], locale=locale, archive_language=archive_language
-    )
-    return {
-        "locale": policy.language,
-        "basis": f"reply_language:{policy.source}",
-        "bucket_zh": 0,
-        "bucket_en": 0,
-        "bucket_total": 0,
-        "confidence": round(float(policy.confidence or 0.0), 2),
-    }
+    ).language
 
 
 def reply_language_system_line(policy: ReplyLanguagePolicy, *, proactive: bool = False) -> str:
