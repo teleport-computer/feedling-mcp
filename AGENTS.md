@@ -1,5 +1,15 @@
 # Repository guidance for coding agents
 
+## Reading order on session start
+
+1. Read `AGENTS.md` for repository guardrails.
+2. Read `docs/CURRENT_STATE.md` for current runtime, deployment, data, and
+   diagnostic ownership. It takes precedence over historical summaries.
+3. Read `CONTRIBUTING.md` before backend code changes and
+   `docs/testing/README.md` before choosing verification.
+4. Use `docs/CHANGELOG.md` and historical plans only when prior decisions or
+   incident context are relevant.
+
 ## Branch and pull-request flow
 
 - Ordinary development branches, including `feature/*`, `fix/*`, `opt/*`,
