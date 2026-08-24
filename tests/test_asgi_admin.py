@@ -22,6 +22,7 @@ import itertools
 import json
 import re
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -223,6 +224,64 @@ def test_memory_truncation_real_action_is_queryable_through_admin_data_track(
         },
     }
     assert secret not in json.dumps(payload, ensure_ascii=False)
+
+
+def test_rds_primary_trace_write_recovers_and_debug_endpoint_returns_200(
+    env,
+    monkeypatch,
+):
+    """The production-selected RDS pool must carry both trace write and read."""
+    assert db.database_schema() == "rds"
+    user_id = "usr_t306_" + uuid.uuid4().hex[:16]
+    event = {
+        "ts": time.time(),
+        "subsystem": "agent",
+        "type": "agent.t306.rds",
+        "status": "ok",
+        "actor": "backend",
+        "trace_id": "trace-t306-rds",
+        "summary": "RDS trace migration regression",
+    }
+    health_names = (
+        "_write_failures_total",
+        "_write_consecutive_failures",
+        "_write_last_failure_at",
+        "_write_last_success_at",
+        "_write_last_error",
+        "_write_last_error_log_at",
+    )
+    with debug_trace._write_failure_lock:
+        health_before = {
+            name: getattr(debug_trace, name) for name in health_names
+        }
+        debug_trace._write_consecutive_failures = 3
+        debug_trace._write_last_error = "undefinedtable"
+
+    monkeypatch.setattr(debug_trace, "is_enabled", lambda _store: True)
+    monkeypatch.setattr(debug_trace, "_record_trace_stats", lambda *_a, **_kw: None)
+    try:
+        debug_trace._append_events(user_id, [event])
+        health = debug_trace.trace_storage_health()
+        assert health["healthy"] is True
+        assert health["consecutive_failures"] == 0
+        assert health["last_error"] == ""
+
+        status, payload = _asgi_json(
+            "GET",
+            "/v1/admin/data-track/debug?user_id=",
+            headers=_admin(),
+        )
+        assert status == 200
+        assert payload["summary"]["events_total"] >= 1
+        assert any(
+            row["trace_id"] == "trace-t306-rds"
+            for row in payload["events"]
+        )
+    finally:
+        db.delete_trace_events_for_user(user_id)
+        with debug_trace._write_failure_lock:
+            for name, value in health_before.items():
+                setattr(debug_trace, name, value)
 
 
 # --------------------------------------------------------------------------- #

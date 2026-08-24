@@ -26,7 +26,11 @@ def _database_url(base: str, database: str) -> str:
 
 def test_rds_pre_and_test_heads_converge():
     script = _scripts("alembic")
-    assert script.get_heads() == ["0101_chat_change_events"]
+    assert script.get_heads() == ["0102_trace_events"]
+    assert (
+        script.get_revision("0102_trace_events").down_revision
+        == "0101_chat_change_events"
+    )
     assert (
         script.get_revision("0101_chat_change_events").down_revision
         == "0100_lane_rollup_access_paths"
@@ -246,6 +250,10 @@ def test_tee_migrations_reuse_the_rds_contract_sql():
     assert (
         tee.get_revision("0036_lane_rollup_access_paths").module._UP
         == rds.get_revision("0100_lane_rollup_access_paths").module._UP
+    )
+    assert (
+        tee.get_revision("0033_trace_events").module._UP
+        == rds.get_revision("0102_trace_events").module._UP
     )
     tee_chat = tee.get_revision("0037_chat_poll_index").module
     rds_chat = rds.get_revision("0101_chat_change_events").module

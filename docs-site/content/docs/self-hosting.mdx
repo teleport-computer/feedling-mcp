@@ -396,6 +396,12 @@ operator will respond to a leaked client credential.
 - Back up the database and object storage before applying a new image.
 - Review Alembic migrations for forward and rollback implications; do not assume
   every data migration is automatically reversible.
+- With RDS selected as primary, the Gunicorn master runs `db.init_schema()` and
+  `alembic upgrade head` before it forks request-serving workers. Deploying a
+  new image therefore applies the initial RDS schema migration automatically
+  and fails startup if the configured database credential cannot migrate it;
+  the separate trace-partition workflow is for rolling maintenance after the
+  initial migration.
 - If the managed decrypted shadow is enabled, apply every new `alembic_tee`
   head to that target before, or in the same maintenance window as, the TEE
   primary. The exact-head gate deliberately stops replication on a mismatch,
@@ -421,8 +427,15 @@ operator will respond to a leaked client credential.
   Runtime V2 per-pool heartbeats, slot restarts, Enclave waits, queue age, disk
   use, backup age, and trace-partition health. Treat a non-empty
   `trace_events_default` partition as degraded even when writes still succeed;
-  run partition maintenance with the database owner credential, never the
-  application role.
+  the initial migration creates 29 past and 60 future Beijing-day partitions,
+  so schedule maintenance before that horizon expires. Run
+  `python -m admin.trace_events_partitions` outside the request-serving path
+  with a migration-capable credential in
+  `TRACE_EVENTS_MIGRATION_DATABASE_URL` (the existing TEE workflow may continue
+  to use `TEE_MIGRATION_DATABASE_URL`); never grant DDL to the application role
+  solely for partition repair. Repository operators can invoke the guarded
+  **RDS trace partition maintenance** workflow for `test`, `pre`, or `prod`;
+  production execution remains a separate, explicit operator action.
 - Keep unrelated tenant code and secrets out of a shared process runner.
 - Commission an isolation and abuse review before offering the deployment to
   untrusted public users.
