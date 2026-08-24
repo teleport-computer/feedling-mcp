@@ -1,6 +1,7 @@
 """Runtime 健康值班台：阈值判定与失败码清洗（纯函数，无需 PostgreSQL）。"""
 from __future__ import annotations
 
+import ast
 import os
 import sys
 from pathlib import Path
@@ -356,6 +357,81 @@ def test_runtime_failure_code_rejects_malformed_shapes():
     assert _dt._runtime_failure_code("Wake_Failed:TimeoutError") == "other"
     assert _dt._runtime_failure_code("wake failed: timeout") == "other"
     assert _dt._runtime_failure_code("wake_failed: 超时") == "other"
+
+
+def test_catalog_registry_failure_is_not_cached_as_normal_empty(monkeypatch):
+    import builtins
+    from notices import catalog
+
+    code = "catalog_only_test_code"
+    monkeypatch.setattr(_dt, "_known_failure_codes", lambda: frozenset())
+    monkeypatch.setattr(catalog, "ERROR_CLASSES", frozenset({code}))
+    monkeypatch.setattr(_dt, "_KNOWN_ERROR_CLASSES_CACHE", None)
+    assert _dt._runtime_failure_code(code) == code
+    assert _dt._runtime_failure_code("genuinely_unknown_test_code") == "other"
+
+    real_import = builtins.__import__
+
+    def fail_catalog_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "notices" and "catalog" in fromlist:
+            raise ImportError("injected catalog outage")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fail_catalog_import)
+    monkeypatch.setattr(_dt, "_KNOWN_ERROR_CLASSES_CACHE", None)
+    with pytest.raises(RuntimeError, match="error_class_registry_unavailable"):
+        _dt._runtime_failure_code(code)
+    assert _dt._KNOWN_ERROR_CLASSES_CACHE is None
+
+
+def test_catalog_registry_failure_visibility_does_not_depend_on_value(monkeypatch):
+    jobs_store_code = "jobs_store_only_test_code"
+    catalog_code = "catalog_only_test_code"
+    monkeypatch.setattr(
+        _dt, "_known_failure_codes", lambda: frozenset({jobs_store_code})
+    )
+    monkeypatch.setattr(
+        _dt, "_known_error_classes", lambda: frozenset({catalog_code})
+    )
+    assert _dt._is_registered_failure_code(jobs_store_code)
+    assert _dt._is_registered_failure_code(catalog_code)
+    assert not _dt._is_registered_failure_code("not_in_either_registry_test_code")
+
+    def unavailable_registry():
+        raise RuntimeError("error_class_registry_unavailable")
+
+    monkeypatch.setattr(_dt, "_known_error_classes", unavailable_registry)
+    for value in (jobs_store_code, "not_in_jobs_store_test_code"):
+        with pytest.raises(RuntimeError, match="error_class_registry_unavailable"):
+            _dt._is_registered_failure_code(value)
+
+
+def _known_error_class_fallback_violations(source: str) -> list[int]:
+    tree = ast.parse(source)
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_known_error_classes"
+    )
+    return [
+        node.lineno
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "frozenset"
+        and not node.args
+    ]
+
+
+def test_restoring_empty_catalog_fallback_turns_visibility_guard_red():
+    path = Path(_dt.__file__)
+    source = path.read_text()
+    assert _known_error_class_fallback_violations(source) == []
+    old = 'raise RuntimeError("error_class_registry_unavailable") from exc'
+    assert source.count(old) == 1
+    mutated = source.replace(
+        old, "_KNOWN_ERROR_CLASSES_CACHE = frozenset()"
+    )
+    assert _known_error_class_fallback_violations(mutated)
 
 
 # ---- 边界值测试：精确阈值 ----

@@ -71,6 +71,31 @@ def test_foreground_still_suppresses_both_regardless_of_flag():
     assert fields["alert_status"] == "suppressed"
 
 
+def test_system_notification_switch_suppresses_alert_but_not_live_activity():
+    store = _store("usr_notifications_off")
+    store.load_proactive_settings.return_value = {"reminders_delivery": False}
+    with patch("push.service.AI_MSG_LIVE_ACTIVITY", True), \
+         patch("push.service.registry._user_entry_snapshot", return_value={"user_id": store.user_id}), \
+         patch("push.service.db.user_exists", return_value=True), \
+         patch("push.service.load_settings_v2_for_store",
+               return_value={"reminders_delivery": False}), \
+         patch("push.service._ai_push_decision", return_value=dict(_BACKGROUND)) as presence, \
+         patch("push.service.live_activity.push_live_activity_hybrid_dict",
+               return_value={"status": "started", "reason": "", "activity_id": "a1", "mode": "start"}) as live_activity, \
+         patch("push.service._send_chat_alert") as alert:
+        fields = push_service._deliver_ai_message_push_if_background(
+            store, body="reply finished", title="IO"
+        )
+
+    presence.assert_called_once()
+    live_activity.assert_called_once()
+    alert.assert_not_called()
+    assert fields["push_decision"] == "suppress"
+    assert fields["push_reason"] == "reminders_delivery_disabled"
+    assert fields["live_activity_status"] == "started"
+    assert fields["alert_status"] == "suppressed"
+
+
 def test_env_flag_parsing():
     with patch.dict("os.environ", {"X_LA": "1"}):
         assert push_service._env_flag("X_LA", False) is True

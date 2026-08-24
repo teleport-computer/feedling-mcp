@@ -122,11 +122,13 @@ def test_quote_block_does_not_teach_v2_an_op_its_schema_rejects(monkeypatch):
 # 下面三条直接调生产 reader,把接线本身钉住。
 
 def _wire_raw_rows(monkeypatch, rows: list[dict]):
-    class _Store:
-        def reload_chat_strict(self):
-            return list(rows)
-
-    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda _uid: _Store())
+    monkeypatch.setattr(
+        serve_worker.db,
+        "chat_messages_after_seq",
+        lambda *_args, **_kwargs: [
+            {**row, "seq": index} for index, row in enumerate(rows, 1)
+        ],
+    )
 
 
 def test_ts_based_tail_reader_expands_quotes(monkeypatch):

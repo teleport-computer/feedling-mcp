@@ -187,13 +187,9 @@ def init_schema() -> None:
     assertion and must never run the RDS chain against that database.
     """
     if database_schema() == "tee":
-        from alembic.script import ScriptDirectory
-        from alembic.config import Config
+        import alembic_tee
 
-        here = Path(__file__).resolve().parent
-        cfg = Config(str(here / "alembic_tee" / "alembic.ini"))
-        cfg.set_main_option("script_location", str(here / "alembic_tee"))
-        expected_heads = set(ScriptDirectory.from_config(cfg).get_heads())
+        expected_heads = {alembic_tee.current_head()}
         with _schema_lock, psycopg.connect(_database_url(), autocommit=True) as conn:
             actual_heads = {
                 str(row[0])
@@ -4516,6 +4512,8 @@ def _lane_rollup_day_bounds(day: date, zone: ZoneInfo) -> tuple[datetime, dateti
 
 
 def _lane_rollup_freeze_day(conn, *, day: date, zone: ZoneInfo,
+                            access_path: str = "apikey_v2",
+                            mode_source: str = "explicit",
                             mirror_batch: list | None = None) -> int:
     """Insert route='model_api' cells for one closed Beijing day. Idempotent
     (ON CONFLICT DO NOTHING); returns how many cells were newly written.
@@ -4601,17 +4599,20 @@ def _lane_rollup_freeze_day(conn, *, day: date, zone: ZoneInfo,
     cell_sql = """
             INSERT INTO lane_daily_rollup
                 (user_id, day, route, lane, enqueue_source,
+                 access_path, mode_source,
                  completed, failed, expired, superseded, failure_codes,
                  spoke, spoke_completed, silent_declared, silent_undeclared)
-            SELECT u.user_id, %s, 'model_api', %s, %s, %s, %s, %s, %s, %s,
+            SELECT u.user_id, %s, 'model_api', %s, %s,
+                   %s, %s, %s, %s, %s, %s, %s,
                    %s, %s, %s, %s
             FROM users u WHERE u.user_id = %s FOR KEY SHARE OF u
-            ON CONFLICT (user_id, day, route, lane, enqueue_source) DO NOTHING
+            ON CONFLICT DO NOTHING
             RETURNING user_id
             """
     for (uid, lane, src, completed, failed, expired, superseded,
          spoke, spoke_completed, silent_declared, silent_undeclared) in counts:
-        params = (day_s, lane, src, completed, failed, expired, superseded,
+        params = (day_s, lane, src, access_path, mode_source,
+                  completed, failed, expired, superseded,
                   Jsonb(codes.get((str(uid), str(lane), str(src)), {})),
                   spoke, spoke_completed, silent_declared, silent_undeclared, uid)
         saved = conn.execute(cell_sql, params).fetchone()
@@ -4761,12 +4762,14 @@ def freeze_completed_lane_days(*, now_epoch: float | None = None,
         frozen: list[str] = []
         with get_pool().connection() as conn:
             row = conn.execute(
-                "SELECT backfill_from, through_day FROM lane_rollup_watermark "
+                "SELECT backfill_from, through_day, access_path_from "
+                "FROM lane_rollup_watermark "
                 "WHERE route = 'model_api'",
             ).fetchone()
             if row:
                 cursor = date.fromisoformat(row[1]) + timedelta(days=1)
                 backfill_from = row[0]
+                access_path_from = row[2]
             else:
                 oldest = conn.execute(
                     "SELECT MIN(finished_at) FROM agent_jobs WHERE status = ANY(%s)",
@@ -4776,18 +4779,31 @@ def freeze_completed_lane_days(*, now_epoch: float | None = None,
                     return []
                 cursor = oldest[0].astimezone(zone).date()
                 backfill_from = cursor.isoformat()
+                access_path_from = None
+            # No historical path backfill: current controls are a freeze-time
+            # snapshot, not evidence about an older event day. On the first
+            # T289 run only the latest closable day gains path semantics; older
+            # catch-up cells retain the unavailable sentinel.
+            path_effective_day = (
+                date.fromisoformat(access_path_from)
+                if access_path_from else last_completed
+            )
             steps = 0
             # voice_from 用 COALESCE 只认第一次：说话四列是 0093 之后才有的，它之前
             # 冻的格子在这四列上是结构性的 0（不是「量过、确实没说话」）。第一次带着
             # 说话数字冻的那天就是可信起点，之后不再移动。
             watermark_sql = """
                     INSERT INTO lane_rollup_watermark
-                        (route, backfill_from, through_day, voice_from)
-                    VALUES ('model_api', %s, %s, %s)
+                        (route, backfill_from, through_day, voice_from,
+                         access_path_from)
+                    VALUES ('model_api', %s, %s, %s, %s)
                     ON CONFLICT (route) DO UPDATE
                         SET through_day = EXCLUDED.through_day, frozen_at = now(),
                             voice_from = COALESCE(lane_rollup_watermark.voice_from,
-                                                  EXCLUDED.voice_from)
+                                                  EXCLUDED.voice_from),
+                            access_path_from = COALESCE(
+                                lane_rollup_watermark.access_path_from,
+                                EXCLUDED.access_path_from)
                     """
             from tee_shadow import mirror
             while cursor <= last_completed and steps < _LANE_ROLLUP_MAX_DAYS_PER_TICK:
@@ -4796,10 +4812,16 @@ def freeze_completed_lane_days(*, now_epoch: float | None = None,
                 # the TEE watermark claiming a day whose cells never arrived,
                 # which after cutover reads as "genuinely zero".
                 mirror_batch: list[tuple[str, tuple]] = []
-                _lane_rollup_freeze_day(conn, day=cursor, zone=zone,
-                                        mirror_batch=mirror_batch)
+                path_enabled = cursor >= path_effective_day
+                _lane_rollup_freeze_day(
+                    conn, day=cursor, zone=zone,
+                    access_path=("apikey_v2" if path_enabled else "unavailable"),
+                    mode_source=("explicit" if path_enabled else "unavailable"),
+                    mirror_batch=mirror_batch,
+                )
                 wm_params = (backfill_from, cursor.isoformat(),
-                             cursor.isoformat())
+                             cursor.isoformat(),
+                             cursor.isoformat() if path_enabled else None)
                 conn.execute(watermark_sql, wm_params)
                 mirror_batch.append((watermark_sql, wm_params))
                 mirror.execute_many(mirror_batch)
@@ -4812,15 +4834,13 @@ def freeze_completed_lane_days(*, now_epoch: float | None = None,
         return []
 
 
-# --- 期 2：V1/resident 源（user_logs → 格子） ------------------------------ #
-# 只冻 route='resident' 用户的 user_logs 流：hosted 用户的 user_logs 条目与
-# agent_jobs 是同一事件的第二份记录。⚠️ 注意它**不会**撞主键——PK 含 route 列，
-# 两条源写的 route 不同，插入会成功，于是 hosted 用户凭空多出一条 route='resident'
-# 的幽灵格子：跨 route 汇总时双计，且给 hosted 用户贴了错误的路线标签。
-# 静默多一行比撞键报错危险得多，所以这条过滤是本期最要害的一行。
-# hosted 的权威源是永不清理的 agent_jobs，环形缓冲滚掉的只是副本；resident 的
-# user_logs 是唯一记录（环 500 条/人正在滚动丢失），这正是本期止血的对象。
-# 口径抄 admin_events_overview（lane 推断/成败集合），使格子可与 events 页互核。
+# --- Runtime V1 源（user_logs → 格子） ------------------------------------ #
+# T289 前这里只收 onboarding_route='resident'，导致绝大多数托管 APIKey-V1
+# user_logs 被整体漏采。现在 ``route='resident'`` 仍只表示 Runtime V1 家族；独立
+# ``access_path`` 由冻结时的资格→接入×effective-runtime 分层产生。明确 Runtime V2
+# 控制下若仍出现 V1 源，则落 ``v2_control_v1_source`` 诊断路径而非静默丢弃；托管 V1、自建、
+# 无 route/binding 与接入未分类各自落可见路径。历史格不回填路径，水位前保留
+# unavailable sentinel。成败谓词仍与 admin_events_overview 同源。
 
 # 分桶时刻 = **终态时刻**（Seven 定 A：失败率只统计「有终态时刻的已终结尝试」，
 # 这条口径本身就预设了按终态时刻分桶）。
@@ -4928,9 +4948,127 @@ _LANE_ROLLUP_V1_IS_MEMORY = (
 )
 
 
+def _lane_rollup_v1_classification_snapshot(
+        conn, binding_classifier
+) -> tuple[
+    dict[str, tuple[str, str] | None],
+    dict[str, tuple[str, str] | None],
+]:
+    """Return one transaction-consistent V1 path snapshot for a catch-up run.
+
+    Qualification is deliberately hierarchical: an active, tested, supported
+    hosted route wins before resident-binding classification.  This makes the
+    hosted/self-hosted layers mutually exclusive even when a hosted account
+    also retains a connected resident binding. An explicitly Runtime-V2
+    account that nevertheless emits this V1 source receives a diagnostic path
+    instead of being silently discarded or mixed into APIKey-V2.
+
+    The callback is injected from the accounts layer; this persistence module
+    must never import or inspect registry process state.
+    """
+    if binding_classifier is None:
+        raise ValueError("resident lane freeze requires binding_classifier")
+    rows = conn.execute(
+        """
+        WITH eligible_hosted AS (
+            SELECT DISTINCT r.user_id
+            FROM model_api_routes r
+            JOIN model_api_credentials c ON c.id = r.credential_id
+            WHERE r.is_active
+              AND r.test_status = 'ok'
+              AND LOWER(c.provider) = ANY(%s)
+        )
+        SELECT u.user_id, u.doc,
+               lower(NULLIF(access.doc->>'route', '')) AS access_route,
+               NULLIF(runtime.doc->>'hosted_runtime_mode', '') AS raw_runtime_mode,
+               CASE
+                 WHEN runtime.doc->>'hosted_runtime_mode'
+                      IN ('resident_cli', 'db_action_v2')
+                 THEN runtime.doc->>'hosted_runtime_mode'
+                 ELSE 'resident_cli'
+               END AS effective_runtime_mode,
+               CASE
+                 WHEN runtime.doc->>'hosted_runtime_mode'
+                      IN ('resident_cli', 'db_action_v2')
+                 THEN 'explicit'
+                 ELSE 'default'
+               END AS mode_source,
+               (eligible.user_id IS NOT NULL) AS eligible_hosted
+        FROM users u
+        LEFT JOIN user_blobs access
+          ON access.user_id = u.user_id AND access.kind = 'onboarding_route'
+        LEFT JOIN user_blobs runtime
+          ON runtime.user_id = u.user_id AND runtime.kind = 'model_api_runtime'
+        LEFT JOIN eligible_hosted eligible ON eligible.user_id = u.user_id
+        ORDER BY u.user_id
+        """,
+        (list(HOSTED_RUNTIME_SUPPORTED_PROVIDERS),),
+    ).fetchall()
+    known_ids = {str(row[0]) for row in rows}
+    docs = []
+    for user_id, doc, *_rest in rows:
+        if not isinstance(doc, dict) or str(doc.get("user_id") or "") != str(user_id):
+            raise ValueError(
+                f"users document identity mismatch for V1 path snapshot: {user_id}"
+            )
+        docs.append(doc)
+    classified_raw = binding_classifier(docs)
+    if isinstance(classified_raw, (str, bytes)):
+        raise TypeError("binding_classifier must return user ids, not text")
+    connected_ids = {str(user_id) for user_id in classified_raw}
+    unknown_ids = connected_ids - known_ids
+    if unknown_ids:
+        raise ValueError(
+            "binding_classifier returned unknown user ids: "
+            + ",".join(sorted(unknown_ids)[:5])
+        )
+
+    snapshot: dict[str, tuple[str, str] | None] = {}
+    legacy_snapshot: dict[str, tuple[str, str] | None] = {}
+    for (user_id, _doc, access_route, raw_runtime_mode,
+         effective_runtime_mode, raw_mode_source, eligible_hosted) in rows:
+        uid = str(user_id)
+        # Before T289 the V1 freezer used exactly this access-axis filter and
+        # carried no path provenance. Keep it for historical catch-up cells;
+        # changing their population would itself be a forbidden backfill.
+        legacy_snapshot[uid] = (
+            ("unavailable", "unavailable")
+            if str(access_route or "") in {"", "resident"}
+            else None
+        )
+        if bool(eligible_hosted):
+            # Runtime axis: preserve whether production behavior came from an
+            # explicit control or the legacy resident_cli default. The SQL
+            # CASE above emits both values; raw remains independently present
+            # here so a missing control is never confused with an explicit one.
+            effective_mode = str(effective_runtime_mode)
+            mode_source = str(raw_mode_source)
+            if mode_source == "explicit" and not str(raw_runtime_mode or ""):
+                raise RuntimeError("explicit hosted runtime mode lost its raw value")
+            if effective_mode != "resident_cli":
+                snapshot[uid] = ("v2_control_v1_source", mode_source)
+                continue
+            # Access axis: this is onboarding access, not runtime family.
+            access = str(access_route or "")
+            if access == "model_api":
+                path = "apikey_v1"
+            elif access == "resident":
+                path = "resident_v1"
+            else:
+                path = "hosted_unclassified_v1"
+            snapshot[uid] = (path, mode_source)
+        else:
+            # Qualification layer already removed every hosted account, so a
+            # retained binding cannot overlap the hosted V1 paths.
+            path = "self_hosted" if uid in connected_ids else "unbound_no_route"
+            snapshot[uid] = (path, "not_applicable")
+    return snapshot, legacy_snapshot
+
+
 def _lane_rollup_freeze_resident_day(conn, *, day: date, zone: ZoneInfo,
+                                     classifications: dict[str, tuple[str, str] | None],
                                      mirror_batch: list | None = None) -> int:
-    """Insert route='resident' cells for one closed Beijing day from the
+    """Insert classified Runtime-V1 cells for one closed Beijing day from the
     ring-buffered user_logs streams. Same idempotency/mirroring/users-guard
     contract as the agent_jobs freezer."""
     start, end = _lane_rollup_day_bounds(day, zone)
@@ -4939,24 +5077,17 @@ def _lane_rollup_freeze_resident_day(conn, *, day: date, zone: ZoneInfo,
     voice_select = _LANE_ROLLUP_V1_VOICE_SELECT.format(ok=ok_pred)
     rows = conn.execute(
         f"""
-        WITH routes AS (
-            SELECT user_id,
-                   lower(COALESCE(NULLIF(doc->>'route',''),'resident')) AS route
-            FROM user_blobs WHERE kind = 'onboarding_route'
-        )
         SELECT l.user_id,
                {_LANE_ROLLUP_V1_LANE} AS lane,
                COUNT(*) FILTER (WHERE {ok_pred})::int AS completed,
                COUNT(*) FILTER (WHERE {fail_pred})::int AS failed,
                {voice_select}
         FROM user_logs l
-        LEFT JOIN routes r ON r.user_id = l.user_id
 {_LANE_ROLLUP_V1_SPOKE_JOIN},
         LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),
                                  NULLIF(l.doc->>'wake_kind',''),
                                  NULLIF(l.doc->>'trigger',''),'unknown') AS kind) k
         WHERE l.stream IN ('proactive_jobs','memory_capture_jobs')
-          AND COALESCE(r.route,'resident') = 'resident'
           AND {_LANE_ROLLUP_V1_TS} >= %s
           AND {_LANE_ROLLUP_V1_TS} < %s
         GROUP BY l.user_id, lane
@@ -4969,20 +5100,14 @@ def _lane_rollup_freeze_resident_day(conn, *, day: date, zone: ZoneInfo,
     outcomes: dict[tuple[str, str], dict[str, int]] = {}
     for uid, lane, status, reason, n in conn.execute(
         f"""
-        WITH routes AS (
-            SELECT user_id,
-                   lower(COALESCE(NULLIF(doc->>'route',''),'resident')) AS route
-            FROM user_blobs WHERE kind = 'onboarding_route'
-        )
         SELECT l.user_id, {_LANE_ROLLUP_V1_LANE} AS lane,
                l.doc->>'status', l.doc->>'status_reason', COUNT(*)::int
         FROM user_logs l
-        LEFT JOIN routes r ON r.user_id = l.user_id,
+        ,
         LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),
                                  NULLIF(l.doc->>'wake_kind',''),
                                  NULLIF(l.doc->>'trigger',''),'unknown') AS kind) k
         WHERE l.stream IN ('proactive_jobs','memory_capture_jobs')
-          AND COALESCE(r.route,'resident') = 'resident'
           AND {fail_pred}
           AND {_LANE_ROLLUP_V1_TS} >= %s
           AND {_LANE_ROLLUP_V1_TS} < %s
@@ -4990,6 +5115,12 @@ def _lane_rollup_freeze_resident_day(conn, *, day: date, zone: ZoneInfo,
         """,
         (start, end),
     ).fetchall():
+        if str(uid) not in classifications:
+            raise RuntimeError(
+                f"V1 source user missing from users snapshot: {uid}"
+            )
+        if classifications[str(uid)] is None:
+            continue
         key = (str(uid), str(lane))
         outcome_class = notices_catalog.v1_proactive_outcome_class(
             status, reason
@@ -5020,22 +5151,31 @@ def _lane_rollup_freeze_resident_day(conn, *, day: date, zone: ZoneInfo,
     cell_sql = """
             INSERT INTO lane_daily_rollup
                 (user_id, day, route, lane, enqueue_source,
+                 access_path, mode_source,
                  completed, failed, expired, superseded, failure_codes,
                  operational_failures, control_outcomes, user_unavailable,
                  spoke, spoke_completed, silent_declared, silent_undeclared)
-            SELECT u.user_id, %s, 'resident', %s, '', %s, %s, 0, 0, %s,
+            SELECT u.user_id, %s, 'resident', %s, '', %s, %s, %s, %s, 0, 0, %s,
                    %s, %s, %s,
                    %s, %s, %s, %s
             FROM users u WHERE u.user_id = %s FOR KEY SHARE OF u
-            ON CONFLICT (user_id, day, route, lane, enqueue_source) DO NOTHING
+            ON CONFLICT DO NOTHING
             RETURNING user_id
             """
     for (uid, lane, completed, failed,
          spoke, spoke_completed, silent_declared, silent_undeclared) in rows:
+        if str(uid) not in classifications:
+            raise RuntimeError(
+                f"V1 source user missing from users snapshot: {uid}"
+            )
+        classification = classifications[str(uid)]
+        if classification is None:
+            continue
         if not completed and not failed:
             continue  # 该组全是非终态,不落格子
+        access_path, mode_source = classification
         outcome_cell = outcomes.get((str(uid), str(lane)), {})
-        params = (day_s, lane, completed, failed,
+        params = (day_s, lane, access_path, mode_source, completed, failed,
                   Jsonb(codes.get((str(uid), str(lane)), {})),
                   outcome_cell.get("operational_failure", 0),
                   outcome_cell.get("control", 0),
@@ -5050,7 +5190,8 @@ def _lane_rollup_freeze_resident_day(conn, *, day: date, zone: ZoneInfo,
 
 
 def freeze_completed_resident_lane_days(*, now_epoch: float | None = None,
-                                        tz: str = "Asia/Shanghai") -> list[str]:
+                                        tz: str = "Asia/Shanghai",
+                                        binding_classifier=None) -> list[str]:
     """Freeze route='resident' cells with a 4h lag (a job created 23:58 that
     terminates 00:03 patches its user_logs doc after its creation day closed —
     the lag guarantees day D is only frozen once no D job can still be
@@ -5069,12 +5210,14 @@ def freeze_completed_resident_lane_days(*, now_epoch: float | None = None,
         frozen: list[str] = []
         with get_pool().connection() as conn:
             row = conn.execute(
-                "SELECT backfill_from, through_day FROM lane_rollup_watermark "
+                "SELECT backfill_from, through_day, access_path_from "
+                "FROM lane_rollup_watermark "
                 "WHERE route = 'resident'",
             ).fetchone()
             if row:
                 cursor = date.fromisoformat(row[1]) + timedelta(days=1)
                 backfill_from = row[0]
+                access_path_from = row[2]
             else:
                 oldest = conn.execute(
                     "SELECT MIN(ts) FROM user_logs "
@@ -5084,28 +5227,54 @@ def freeze_completed_resident_lane_days(*, now_epoch: float | None = None,
                     return []
                 cursor = datetime.fromtimestamp(float(oldest[0]), zone).date()
                 backfill_from = cursor.isoformat()
+                access_path_from = None
+            if cursor > last_completed:
+                return []
+            # One snapshot per multi-day catch-up run.  Every emitted record
+            # carries its path+mode_source, so this deliberate cross-day
+            # consistency choice is durable and inspectable rather than an
+            # implicit current-state join at read time.
+            classifications, legacy_classifications = (
+                _lane_rollup_v1_classification_snapshot(
+                    conn, binding_classifier
+                )
+            )
+            path_effective_day = (
+                date.fromisoformat(access_path_from)
+                if access_path_from else last_completed
+            )
             steps = 0
             # voice_from 语义同 model_api 路：只认第一次，见那边的说明。
             watermark_sql = """
                     INSERT INTO lane_rollup_watermark
                         (route, backfill_from, through_day, voice_from,
-                         outcomes_from)
-                    VALUES ('resident', %s, %s, %s, %s)
+                         outcomes_from, access_path_from)
+                    VALUES ('resident', %s, %s, %s, %s, %s)
                     ON CONFLICT (route) DO UPDATE
                         SET through_day = EXCLUDED.through_day, frozen_at = now(),
                             voice_from = COALESCE(lane_rollup_watermark.voice_from,
                                                   EXCLUDED.voice_from),
                             outcomes_from = COALESCE(
                                 lane_rollup_watermark.outcomes_from,
-                                EXCLUDED.outcomes_from)
+                                EXCLUDED.outcomes_from),
+                            access_path_from = COALESCE(
+                                lane_rollup_watermark.access_path_from,
+                                EXCLUDED.access_path_from)
                     """
             from tee_shadow import mirror
             while cursor <= last_completed and steps < _LANE_ROLLUP_MAX_DAYS_PER_TICK:
                 mirror_batch: list[tuple[str, tuple]] = []
+                path_enabled = cursor >= path_effective_day
                 _lane_rollup_freeze_resident_day(conn, day=cursor, zone=zone,
+                                                 classifications=(
+                                                     classifications
+                                                     if path_enabled
+                                                     else legacy_classifications
+                                                 ),
                                                  mirror_batch=mirror_batch)
                 wm_params = (backfill_from, cursor.isoformat(),
-                             cursor.isoformat(), cursor.isoformat())
+                             cursor.isoformat(), cursor.isoformat(),
+                             cursor.isoformat() if path_enabled else None)
                 conn.execute(watermark_sql, wm_params)
                 mirror_batch.append((watermark_sql, wm_params))
                 mirror.execute_many(mirror_batch)
@@ -5129,15 +5298,17 @@ _LANE_ROLLUP_DELETED_USER = "deleted"
 _LANE_ROLLUP_ANON_MERGE_SQL = """
 INSERT INTO lane_daily_rollup
     (user_id, day, route, lane, enqueue_source,
+     access_path, mode_source,
      completed, failed, expired, superseded, failure_codes,
      operational_failures, control_outcomes, user_unavailable,
      spoke, spoke_completed, silent_declared, silent_undeclared)
-SELECT %s, day, route, lane, enqueue_source,
+SELECT %s, day, route, lane, enqueue_source, access_path, mode_source,
        completed, failed, expired, superseded, failure_codes,
        operational_failures, control_outcomes, user_unavailable,
        spoke, spoke_completed, silent_declared, silent_undeclared
 FROM lane_daily_rollup WHERE user_id = %s
-ON CONFLICT (user_id, day, route, lane, enqueue_source) DO UPDATE SET
+ON CONFLICT (user_id, day, route, lane, enqueue_source,
+             access_path, mode_source) DO UPDATE SET
     completed = lane_daily_rollup.completed + EXCLUDED.completed,
     failed = lane_daily_rollup.failed + EXCLUDED.failed,
     expired = lane_daily_rollup.expired + EXCLUDED.expired,
@@ -5541,6 +5712,7 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
         rows = conn.execute(
             f"""
             SELECT user_id, day, route, lane, enqueue_source,
+                   access_path, mode_source,
                    completed, failed, expired, superseded, failure_codes,
                    operational_failures, control_outcomes, user_unavailable,
                    spoke, spoke_completed, silent_declared, silent_undeclared
@@ -5552,19 +5724,20 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
         ).fetchall()
         out_rows = [
             {"user_id": r[0], "day": r[1], "route": r[2], "lane": r[3],
-             "enqueue_source": r[4], "completed": r[5], "failed": r[6],
-             "expired": r[7], "superseded": r[8],
-             "failure_codes": dict(r[9] or {}), "frozen": True,
-             "operational_failures": r[10], "control_outcomes": r[11],
-             "user_unavailable": r[12],
-             "spoke": r[13], "spoke_completed": r[14],
-             "silent_declared": r[15], "silent_undeclared": r[16]}
+             "enqueue_source": r[4], "access_path": r[5],
+             "mode_source": r[6], "completed": r[7], "failed": r[8],
+             "expired": r[9], "superseded": r[10],
+             "failure_codes": dict(r[11] or {}), "frozen": True,
+             "operational_failures": r[12], "control_outcomes": r[13],
+             "user_unavailable": r[14],
+             "spoke": r[15], "spoke_completed": r[16],
+             "silent_declared": r[17], "silent_undeclared": r[18]}
             for r in rows
         ]
         coverage: dict[str, dict] = {}
         for r in conn.execute(
             "SELECT route, backfill_from, through_day, voice_from, "
-            "outcomes_from "
+            "outcomes_from, access_path_from "
             "FROM lane_rollup_watermark",
         ).fetchall():
             coverage[str(r[0])] = {
@@ -5576,6 +5749,9 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
                 "voice_from": r[3],
                 # V1 outcome 分类晚于原始格子上线；此前列默认 0 不是测量值。
                 "outcomes_from": r[4],
+                # Access-path columns are trustworthy only from this day.
+                # ``None`` means no measured path cell exists yet, never zero.
+                "access_path_from": r[5],
             }
         # Days after the watermark cannot be frozen yet — surface them live and
         # explicitly non-frozen, so a still-open day (or resident's 4h freeze
@@ -5693,6 +5869,8 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
                 today_rows.append(
                     {"user_id": r[1], "day": r[0], "route": live_route,
                      "lane": r[2], "enqueue_source": r[3],
+                     "access_path": "unavailable",
+                     "mode_source": "unavailable",
                      "completed": r[4], "failed": r[5], "expired": r[6],
                      "superseded": r[7], "failure_codes": {}, "frozen": False,
                      "operational_failures": None, "control_outcomes": None,
@@ -6023,12 +6201,184 @@ def admin_proactive_heartbeat_overspeed(*, since_epoch: float = 0.0, days: int =
 
 _ADMIN_EVENT_READ_TIMEOUT_MS = 5000
 
+LANE_ROLLUP_ACCESS_PATHS = (
+    "self_hosted",
+    "resident_v1",
+    "apikey_v1",
+    "apikey_v2",
+    "unbound_no_route",
+    "hosted_unclassified_v1",
+    "v2_control_v1_source",
+)
+_LANE_ROLLUP_V1_ACCESS_PATHS = frozenset(
+    path for path in LANE_ROLLUP_ACCESS_PATHS if path != "apikey_v2"
+)
+
 
 def _admin_event_read_failure(exc: Exception) -> tuple[str, str]:
     """Map DB read failure to a user-actionable display state."""
     if str(getattr(exc, "sqlstate", "") or "") == "57014":
         return "timeout", "取数超时（记了，但这里读不出来）"
     return "read_error", "取数失败（记了，但这里读不出来）"
+
+
+def _lane_rollup_path_window(*, path_rows, watermarks: dict,
+                             start_day: date, end_day: date,
+                             day_count: int) -> dict[str, dict]:
+    """Aggregate one closed-day window by the frozen access-path axis."""
+
+    def empty_counts() -> dict:
+        return {
+            "completed": 0, "failed": 0, "expired": 0, "superseded": 0,
+            "operational_failures": 0, "control_outcomes": 0,
+            "user_unavailable": 0, "failure_codes": {},
+        }
+
+    output: dict[str, dict] = {}
+    start_s, end_s = start_day.isoformat(), end_day.isoformat()
+    for path in LANE_ROLLUP_ACCESS_PATHS:
+        source_route = (
+            "resident" if path in _LANE_ROLLUP_V1_ACCESS_PATHS
+            else "model_api"
+        )
+        wm = watermarks.get(source_route)
+        effective_from = wm.get("access_path_from") if wm else None
+        covered_days = 0
+        if wm and effective_from:
+            covered_start = max(start_day, date.fromisoformat(effective_from))
+            covered_end = min(end_day, date.fromisoformat(wm["through_day"]))
+            if covered_end >= covered_start:
+                covered_days = (covered_end - covered_start).days + 1
+        coverage_level = (
+            "green" if covered_days == day_count
+            else "yellow" if covered_days
+            else "red"
+        )
+        outcome_covered_days = covered_days
+        outcome_level = coverage_level
+        if source_route == "resident":
+            outcome_covered_days = 0
+            outcomes_from = wm.get("outcomes_from") if wm else None
+            if outcomes_from and effective_from:
+                outcome_start = max(
+                    start_day,
+                    date.fromisoformat(outcomes_from),
+                    date.fromisoformat(effective_from),
+                )
+                outcome_end = min(
+                    end_day, date.fromisoformat(wm["through_day"])
+                )
+                if outcome_end >= outcome_start:
+                    outcome_covered_days = (
+                        outcome_end - outcome_start
+                    ).days + 1
+            outcome_level = (
+                "green" if outcome_covered_days == day_count
+                else "yellow" if outcome_covered_days
+                else "red"
+            )
+
+        selected = [
+            row for row in path_rows
+            if str(row[1]) == path and start_s <= str(row[0]) <= end_s
+        ]
+        active_users = {str(row[3]) for row in selected}
+        mode_users: dict[str, set[str]] = {}
+        mode_attempts: dict[str, int] = {}
+        lanes: dict[str, dict] = {}
+        lane_sources: dict[str, dict[str, dict]] = {}
+        per_user_lane: dict[tuple[str, str], dict[str, int]] = {}
+        for row in selected:
+            mode_source = str(row[2])
+            user_id = str(row[3])
+            lane = str(row[4])
+            enqueue_source = str(row[5] or "")
+            mode_users.setdefault(mode_source, set()).add(user_id)
+            mode_attempts[mode_source] = mode_attempts.get(mode_source, 0) + sum(
+                int(row[index] or 0) for index in (6, 7, 8, 9)
+            )
+            counts = {
+                "completed": int(row[6] or 0),
+                "failed": int(row[7] or 0),
+                "expired": int(row[8] or 0),
+                "superseded": int(row[9] or 0),
+                "failure_codes": {
+                    str(code): int(count or 0)
+                    for code, count in dict(row[10] or {}).items()
+                },
+                "operational_failures": int(row[11] or 0),
+                "control_outcomes": int(row[12] or 0),
+                "user_unavailable": int(row[13] or 0),
+            }
+            for bucket in (
+                lanes.setdefault(lane, empty_counts()),
+                lane_sources.setdefault(lane, {}).setdefault(
+                    enqueue_source, empty_counts()
+                ),
+            ):
+                for field in (
+                    "completed", "failed", "expired", "superseded",
+                    "operational_failures", "control_outcomes",
+                    "user_unavailable",
+                ):
+                    bucket[field] += counts[field]
+                for code, count in counts["failure_codes"].items():
+                    bucket["failure_codes"][code] = (
+                        bucket["failure_codes"].get(code, 0) + count
+                    )
+            per_user = per_user_lane.setdefault(
+                (lane, user_id), {"completed": 0, "failed": 0}
+            )
+            per_user["completed"] += counts["completed"]
+            per_user["failed"] += counts["failed"]
+
+        if coverage_level == "green":
+            for lane, bucket in lanes.items():
+                users = [
+                    counts for (raw_lane, _uid), counts in per_user_lane.items()
+                    if raw_lane == lane
+                ]
+                failed_total = sum(item["failed"] for item in users)
+                concentration = {
+                    "users_active": len(users),
+                    "users_zero_success": sum(
+                        item["completed"] == 0 and item["failed"] > 0
+                        for item in users
+                    ),
+                    "top_user_failure_share": (
+                        max((item["failed"] for item in users), default=0)
+                        / failed_total
+                        if failed_total else None
+                    ),
+                }
+                bucket["concentration"] = concentration
+                for source_bucket in lane_sources.get(lane, {}).values():
+                    source_bucket["concentration"] = concentration
+
+        output[path] = {
+            "source_route": source_route,
+            "active_users": len(active_users),
+            "mode_sources": {
+                source: {
+                    "active_users": len(users),
+                    "attempts": mode_attempts.get(source, 0),
+                }
+                for source, users in mode_users.items()
+            },
+            "coverage": {
+                "level": coverage_level,
+                "covered_days": covered_days,
+                "required_days": day_count,
+                "effective_from": effective_from,
+                "through_day": wm.get("through_day") if wm else None,
+                "outcomes_from": wm.get("outcomes_from") if wm else None,
+                "outcome_level": outcome_level,
+                "outcome_covered_days": outcome_covered_days,
+            },
+            "lanes": lanes,
+            "lane_sources": lane_sources,
+        }
+    return output
 
 
 def admin_event_path_rollup_windows(*, through_day: str = "",
@@ -6041,9 +6391,10 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
     than it is.  Watermarks are converted into an explicit per-window coverage
     level so a true zero remains distinguishable from an unmeasured cell.
 
-    ``model_api`` here is Runtime V2's ``agent_jobs`` freezer.  It must not be
-    relabelled as a generic API-key bucket; APIKey-V1 has no equivalent frozen
-    source and is declared unavailable by the presentation layer.
+    Runtime-family diagnostics still use ``route`` (``model_api`` = V2,
+    ``resident`` = V1). The separate ``paths`` result uses the freeze-time
+    ``access_path`` axis and its own effective-date watermark; it must not be
+    reconstructed by joining current account state at read time.
     """
     zone = ZoneInfo(tz)
     raw_end = str(through_day or "").strip()
@@ -6181,6 +6532,23 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                     end_day.isoformat(), end_day.isoformat(),
                 ),
             ).fetchall()
+            # Access-path rows remain separate from the runtime-family query
+            # above.  Only seven closed days are read, and retaining user_id +
+            # mode_source here lets Python compute honest distinct populations
+            # (including explicit/default) without summing daily distincts.
+            path_rows = conn.execute(
+                """
+                SELECT day, access_path, mode_source, user_id, lane,
+                       enqueue_source, completed, failed, expired, superseded,
+                       failure_codes, operational_failures, control_outcomes,
+                       user_unavailable
+                FROM lane_daily_rollup
+                WHERE day >= %s AND day <= %s
+                  AND access_path <> 'unavailable'
+                ORDER BY day, access_path, user_id, lane, enqueue_source
+                """,
+                (earliest.isoformat(), end_day.isoformat()),
+            ).fetchall()
             watermarks = {
                 str(row[0]): {
                     "backfill_from": str(row[1]),
@@ -6188,9 +6556,13 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                     "outcomes_from": (
                         str(row[3]) if row[3] is not None else None
                     ),
+                    "access_path_from": (
+                        str(row[4]) if row[4] is not None else None
+                    ),
                 }
                 for row in conn.execute(
-                    "SELECT route, backfill_from, through_day, outcomes_from "
+                    "SELECT route, backfill_from, through_day, outcomes_from, "
+                    "access_path_from "
                     "FROM lane_rollup_watermark "
                     "WHERE route IN ('resident', 'model_api')"
                 ).fetchall()
@@ -6219,6 +6591,18 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                             "lanes": {}, "lane_sources": {},
                         }
                         for route in ("resident", "model_api")
+                    },
+                    "paths": {
+                        path: {
+                            "coverage": {
+                                "level": level, "message": message,
+                                "covered_days": 0, "required_days": days,
+                                "effective_from": None, "through_day": None,
+                            },
+                            "active_users": None, "mode_sources": {},
+                            "lanes": {}, "lane_sources": {},
+                        }
+                        for path in LANE_ROLLUP_ACCESS_PATHS
                     },
                 }
                 for key, days in specs
@@ -6376,6 +6760,13 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
             "end_day": end_day.isoformat(),
             "day_count": day_count,
             "routes": routes,
+            "paths": _lane_rollup_path_window(
+                path_rows=path_rows,
+                watermarks=watermarks,
+                start_day=start_day,
+                end_day=end_day,
+                day_count=day_count,
+            ),
         })
     return {
         "timezone": tz,
@@ -7832,6 +8223,74 @@ def stop_trace_write_stats_writer(writer_id: str) -> None:
         conn.execute(_TRACE_WRITE_STATS_HEALTH_STOP_SQL, params)
     from tee_shadow import mirror
     mirror.execute(_TRACE_WRITE_STATS_HEALTH_STOP_SQL, params)
+
+
+# --- Public-contract rejection visibility (T239/T255) -------------------- #
+
+_CONTRACT_REJECTION_STATS_UPSERT_SQL = """
+INSERT INTO contract_rejection_stats (
+    contract_domain, boundary, fallback, release_sha, writer_id,
+    total, first_seen, last_seen
+) VALUES (%s,%s,%s,%s,%s,%s,to_timestamp(%s),to_timestamp(%s))
+ON CONFLICT (contract_domain, boundary, fallback, release_sha, writer_id)
+DO UPDATE SET
+    total = GREATEST(contract_rejection_stats.total, EXCLUDED.total),
+    first_seen = LEAST(contract_rejection_stats.first_seen, EXCLUDED.first_seen),
+    last_seen = GREATEST(contract_rejection_stats.last_seen, EXCLUDED.last_seen)
+"""
+
+
+def upsert_contract_rejection_stats(rows: list[tuple]) -> None:
+    """Absorb content-free per-writer absolute totals idempotently."""
+    if not rows:
+        return
+    normalized = [tuple(row) for row in rows]
+    with get_pool().connection() as conn:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.executemany(_CONTRACT_REJECTION_STATS_UPSERT_SQL, normalized)
+    from tee_shadow import mirror
+    mirror.execute_many([
+        (_CONTRACT_REJECTION_STATS_UPSERT_SQL, row) for row in normalized
+    ])
+
+
+def contract_rejection_stats_measurement(
+    *, release_sha: str = "", now_epoch: float | None = None,
+) -> dict:
+    """Return controlled dimensions for admin consumers; never rejected raw."""
+    now_value = float(now_epoch if now_epoch is not None else time.time())
+    params: list = [now_value - 86400]
+    release_clause = ""
+    if release_sha:
+        release_clause = " AND release_sha = %s"
+        params.append(str(release_sha)[:64])
+    sql = (
+        "SELECT contract_domain, boundary, fallback, release_sha, "
+        "SUM(total), extract(epoch FROM MIN(first_seen)), "
+        "extract(epoch FROM MAX(last_seen)) "
+        "FROM contract_rejection_stats "
+        "WHERE last_seen >= to_timestamp(%s)" + release_clause +
+        " GROUP BY contract_domain, boundary, fallback, release_sha "
+        "ORDER BY MAX(last_seen) DESC"
+    )
+    with get_pool().connection() as conn:
+        rows = conn.execute(sql, tuple(params)).fetchall()
+    return {
+        "window_seconds": 86400,
+        "release_sha": str(release_sha)[:64],
+        "rows": [
+            {
+                "contract_domain": str(row[0]),
+                "boundary": str(row[1]),
+                "fallback": str(row[2]),
+                "release_sha": str(row[3]),
+                "total": int(row[4]),
+                "first_seen": float(row[5]),
+                "last_seen": float(row[6]),
+            }
+            for row in rows
+        ],
+    }
 
 
 def trace_write_stats_measurement(
@@ -10032,6 +10491,192 @@ def chat_load_recent_strict(user_id: str, limit: int) -> list[dict]:
     return [r[0] for r in rows]
 
 
+_CHAT_BOUNDED_READ_MAX = 256
+_CHAT_HOT_SNAPSHOT_MAX = 5000
+_CHAT_HOT_SNAPSHOT_SQL = (
+    "SELECT seq,msg_id,ts,doc FROM ("
+    "  SELECT seq,msg_id,ts,doc FROM chat_messages "
+    "  WHERE user_id=%s ORDER BY seq DESC LIMIT %s"
+    ") hot ORDER BY seq ASC"
+)
+_CHAT_POINT_READ_SQL = (
+    "SELECT seq,msg_id,ts,doc FROM chat_messages "
+    "WHERE user_id=%s AND msg_id=%s"
+)
+_CHAT_MANY_READ_SQL = (
+    "SELECT seq,msg_id,ts,doc FROM chat_messages "
+    "WHERE user_id=%s AND msg_id=ANY(%s) ORDER BY seq ASC"
+)
+_CHAT_POLL_CANDIDATES_SQL = (
+    "SELECT seq,msg_id,ts,doc FROM chat_messages "
+    "WHERE user_id=%s AND doc->>'role'='user' "
+    "AND COALESCE(doc->>'voice_turn_status','')<>'superseded' "
+    "AND COALESCE(doc->>'reply_status','')<>'replied' "
+    "AND COALESCE(doc->>'reply_message_id','')='' "
+    "AND (ts>%s OR ts>%s) "
+    "ORDER BY seq ASC LIMIT %s"
+)
+
+
+def _chat_bounded_read_limit(limit: int) -> int:
+    return min(_CHAT_BOUNDED_READ_MAX, max(1, int(limit)))
+
+
+def _chat_hot_snapshot_limit(limit: int) -> int:
+    return min(_CHAT_HOT_SNAPSHOT_MAX, max(1, int(limit)))
+
+
+def _chat_project_row(row) -> dict:
+    """Overlay authoritative relational identity/order on a chat JSON doc."""
+    seq, msg_id, ts, doc = row
+    return {
+        **dict(doc or {}),
+        "id": str(msg_id),
+        "ts": float(ts),
+        "seq": int(seq),
+    }
+
+
+def chat_load_hot_snapshot_strict(
+    user_id: str,
+    limit: int,
+) -> tuple[int, list[dict]]:
+    """Read one version-consistent newest chat window, oldest first."""
+    bounded = _chat_hot_snapshot_limit(limit)
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            conn.execute(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+            )
+            version_row = conn.execute(
+                "SELECT version FROM chat_change_state WHERE user_id=%s",
+                (user_id,),
+            ).fetchone()
+            rows = conn.execute(
+                _CHAT_HOT_SNAPSHOT_SQL,
+                (user_id, bounded),
+            ).fetchall()
+    version = int(version_row[0]) if version_row is not None else 0
+    if version < 0:
+        raise ValueError("chat change version must be >= 0")
+    return version, [_chat_project_row(row) for row in rows]
+
+
+def chat_change_version(user_id: str) -> int:
+    """Return the user's durable chat version, or zero before first change."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT version FROM chat_change_state WHERE user_id=%s",
+            (user_id,),
+        ).fetchone()
+    version = int(row[0]) if row is not None else 0
+    if version < 0:
+        raise ValueError("chat change version must be >= 0")
+    return version
+
+
+def chat_change_events_after(
+    user_id: str,
+    after_version: int,
+    limit: int,
+) -> list[dict]:
+    """Return a bounded contiguous candidate window ordered by version."""
+    cursor = int(after_version)
+    if cursor < 0:
+        raise ValueError("after_version must be >= 0")
+    bounded = _chat_bounded_read_limit(limit)
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT version,operation,message_ids FROM chat_change_events "
+            "WHERE user_id=%s AND version>%s ORDER BY version ASC LIMIT %s",
+            (user_id, cursor, bounded),
+        ).fetchall()
+    return [
+        {
+            "version": int(version),
+            "operation": str(operation),
+            "message_ids": [str(message_id) for message_id in message_ids],
+        }
+        for version, operation, message_ids in rows
+    ]
+
+
+def chat_get_many_strict(user_id: str, message_ids: list[str]) -> list[dict]:
+    """Point-read at most 256 unique message IDs, returned in seq order."""
+    ids = list(dict.fromkeys(
+        str(message_id).strip() for message_id in message_ids
+        if str(message_id).strip()
+    ))[:_CHAT_BOUNDED_READ_MAX]
+    if not ids:
+        return []
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            _CHAT_MANY_READ_SQL,
+            (user_id, ids),
+        ).fetchall()
+    return [_chat_project_row(row) for row in rows]
+
+
+def chat_verify_reply_strict(
+    user_id: str,
+    ping_id: str,
+    ping_ts: float,
+) -> dict | None:
+    """Point-read the exact hidden ack referenced by one verify ping."""
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            conn.execute(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+            )
+            ping_row = conn.execute(
+                _CHAT_POINT_READ_SQL,
+                (user_id, ping_id),
+            ).fetchone()
+            if ping_row is None:
+                return None
+            ping = _chat_project_row(ping_row)
+            if (
+                ping.get("role") != "user"
+                or ping.get("source") != "verify_ping"
+            ):
+                return None
+            reply_id = str(ping.get("reply_message_id") or "").strip()
+            if not reply_id:
+                return None
+            reply_row = conn.execute(
+                _CHAT_POINT_READ_SQL,
+                (user_id, reply_id),
+            ).fetchone()
+    if reply_row is None:
+        return None
+    reply = _chat_project_row(reply_row)
+    if reply.get("role") not in ("agent", "openclaw"):
+        return None
+    if reply.get("source") != "verify_ping":
+        return None
+    if str(reply.get("reply_to_message_id") or "") != str(ping_id):
+        return None
+    if float(reply["ts"]) <= float(ping_ts):
+        return None
+    return reply
+
+
+def chat_poll_candidates_strict(
+    user_id: str,
+    since: float,
+    redelivery_floor: float,
+    limit: int,
+) -> list[dict]:
+    """Read bounded unanswered user rows from the durable poll window."""
+    bounded = _chat_bounded_read_limit(limit)
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            _CHAT_POLL_CANDIDATES_SQL,
+            (user_id, float(since), float(redelivery_floor), bounded),
+        ).fetchall()
+    return [_chat_project_row(row) for row in rows]
+
+
 def chat_load_recent(user_id: str, limit: int) -> list[dict]:
     """Legacy best-effort wrapper around :func:`chat_load_recent_strict`."""
     try:
@@ -12230,7 +12875,7 @@ def _chat_insert_on_cursor(
 def _chat_append_impl(
     user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int,
     *, coverage_gated: bool = False,
-) -> None:
+) -> int:
     """Insert one durable chat message. Idempotent on msg_id. Raises on the
     primary database write (``chat_append_strict`` relies on this so a DB failure
     cannot be mistaken for delivery); R2 offload stays best-effort.
@@ -12266,11 +12911,12 @@ def _chat_append_impl(
     # No retention cleanup follows an append. R2/TEE copies live for exactly as
     # long as the durable source row and are retired only by explicit user/account
     # deletion or replacement of that same row.
+    return int(_seq)
 
 
 def chat_append_strict(
     user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int,
-) -> None:
+) -> int:
     """Persist one chat message or raise on the primary database write.
 
     V2 uses this path for model replies so a database failure cannot be mistaken
@@ -12280,7 +12926,9 @@ def chat_append_strict(
     ``max_messages`` bounds only callers' hot caches; it never trims the durable
     source transcript.
     """
-    _chat_append_impl(user_id, msg_id, ts, doc, max_messages, coverage_gated=True)
+    return _chat_append_impl(
+        user_id, msg_id, ts, doc, max_messages, coverage_gated=True
+    )
 
 
 class ResidentReplyRejected(RuntimeError):
@@ -13279,7 +13927,13 @@ def chat_append_effect_with_cursor(
     return seq, inserted
 
 
-def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int) -> None:
+def chat_append(
+    user_id: str,
+    msg_id: str,
+    ts: float,
+    doc: dict,
+    max_messages: int,
+) -> int | None:
     """Best-effort legacy (pre-V2) durable chat write.
 
     ``max_messages`` is retained for API compatibility and only bounds the
@@ -13287,9 +13941,12 @@ def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: i
     deletion source-retention rule as V2.
     """
     try:
-        _chat_append_impl(user_id, msg_id, ts, doc, max_messages, coverage_gated=False)
+        return _chat_append_impl(
+            user_id, msg_id, ts, doc, max_messages, coverage_gated=False
+        )
     except Exception as e:
         log.error("[db] chat_append(%s,%s) failed: %s", user_id, msg_id, e)
+        return None
 
 
 class RuntimeControlChangedError(RuntimeError):

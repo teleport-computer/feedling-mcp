@@ -11,6 +11,9 @@ from typing import Callable, TypeVar
 import db
 from capabilities import vision_probe as vision_probe_capability
 from core.store import UserStore
+from notices import rejection_stats
+
+CONTRACT_REJECTION_HEADER = rejection_stats.HEADER_NAME
 
 
 _OFFICIAL_CONSUMER_NAME = "feedling-chat-resident"
@@ -198,6 +201,11 @@ def _consumer_headers_from_map(headers, remote_addr: str = "") -> dict:
         "remote_addr": remote_addr or "",
         "user_agent": headers.get("User-Agent", ""),
     }
+
+
+def record_contract_rejections(value: str) -> None:
+    """Absorb resident absolute counters without storing the header itself."""
+    rejection_stats.ingest_resident_header(value)
 
 
 def _record_consumer_event(store: UserStore, event_type: str, *, info: dict | None = None) -> None:

@@ -72,6 +72,18 @@ def _text_round(text):
             "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
 
 
+def _stay_silent_round():
+    return {
+        "reply": "",
+        "tool_calls": [{
+            "id": "stay-silent-test",
+            "name": "stay_silent",
+            "args": {"reason": "没有值得打扰用户的新信息"},
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+
+
 def _spy_provider(monkeypatch, seen):
     async def _fake(config, messages, *, tools=None, **_kwargs):
         seen["messages"] = messages
@@ -638,8 +650,12 @@ def test_repeated_completed_ordinary_heartbeat_marks_glance_unchanged(
         worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
     )
     prompts = []
+    forced_choices = []
 
     async def fake_provider(config, messages, *, tools=None, **kwargs):
+        if kwargs.get("tool_choice") == "required":
+            forced_choices.append(kwargs["tool_choice"])
+            return _stay_silent_round()
         prompts.append(messages)
         return _text_round("")
 
@@ -703,6 +719,7 @@ def test_repeated_completed_ordinary_heartbeat_marks_glance_unchanged(
         "runtime_data"
     ]
     assert second_status == "completed"
+    assert forced_choices == ["required", "required"]
     assert second_runtime_data["perception_glance"]["glance_changed"] is False
     assert (
         jobs_store.get_runtime_state(uid)[
@@ -882,8 +899,12 @@ def test_successful_heartbeat_without_context_reader_does_not_persist_fingerprin
     uid = "u_glance_missing_reader"
     conftest.seed_user(uid)
     _reset(uid)
+    provider_calls = []
 
     async def fake_provider(*args, **kwargs):
+        provider_calls.append(kwargs)
+        if kwargs.get("tool_choice") == "required":
+            return _stay_silent_round()
         return _text_round("")
 
     glance = {"weather": {"available": True, "notable_change": False}}
@@ -912,6 +933,8 @@ def test_successful_heartbeat_without_context_reader_does_not_persist_fingerprin
     )
 
     assert status == "completed"
+    assert len(provider_calls) == 2
+    assert provider_calls[1]["tool_choice"] == "required"
     assert (
         "last_completed_perception_glance_fingerprint"
         not in jobs_store.get_runtime_state(uid)

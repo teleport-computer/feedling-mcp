@@ -97,7 +97,14 @@ def test_every_prompt_builder_call_passes_a_locale():
     import ast
 
     BUILDERS = {"build_capture_prompt", "build_dream_prompt", "build_migrate_prompt"}
-    SKIP_DIRS = (".deps/", ".venv/", "docs-site/", "node_modules/")
+    SKIP_DIRS = (
+        ".claude/worktrees/",
+        ".deps/",
+        ".venv/",
+        ".worktrees/",
+        "docs-site/",
+        "node_modules/",
+    )
     repo = pathlib.Path(__file__).resolve().parents[1]
 
     offenders = []

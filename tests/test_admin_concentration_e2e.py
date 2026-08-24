@@ -53,6 +53,25 @@ def _frozen(*, concentration) -> dict:
                     "lanes": {}, "lane_sources": {},
                 },
             },
+            # T289 makes the access-path table consume its own frozen axis;
+            # route data remains only for the runtime-family diagnostic. Feed
+            # the same upstream lane shape into both axes so this test proves
+            # concentration survives each independent payload path.
+            "paths": {
+                "apikey_v2": {
+                    "active_users": 5,
+                    "mode_sources": {
+                        "explicit": {"active_users": 5, "attempts": 10},
+                    },
+                    "coverage": {
+                        "level": "green", "covered_days": 1,
+                        "required_days": 1,
+                        "effective_from": "2030-06-07",
+                    },
+                    "lanes": {"chat": lane},
+                    "lane_sources": {},
+                },
+            },
         }],
     }
 
@@ -88,8 +107,8 @@ def test_concentration_survives_payload_to_html():
 
     # ⚠️ 我在这条断言上连写错两版,都是**编码了碰巧的事实**而不是我在乎的性质:
     #   第一版「整页不出现未计算」→ 红。同页其它动作本就没有集中度,显示未计算是**正确的**。
-    #   第二版「恰好一格带该数字」→ 红。同一份 route 数据同时出现在
-    #             接入路径表与 runtime 辅助表里,两格都带,也是**正确的**。
+    #   第二版「恰好一格带该数字」→ 红。同一份冻结指标被显式喂进独立的
+    #             access-path 与 runtime-family 轴,两格都带,也是**正确的**。
     # 我真正在乎的性质只有一条:**凡是印出了数字的格子,都不许同时说「未计算」**。
     # 格数是多少不该由这条测试规定 —— 那是表结构的自由度。
     cells = [_text(c) for c in html_out.split("<td>") if "零成功 6/14 人" in c]

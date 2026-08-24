@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import ast
+import importlib
 from pathlib import Path
 
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-
 
 ROOT = Path(__file__).parent.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
@@ -13,6 +14,32 @@ TEST_COMPOSE = ROOT / "deploy" / "docker-compose.phala.test.yaml"
 TEST_RUNNER_COMPOSE = ROOT / "deploy" / "docker-compose.phala.runner.yaml"
 PROD_COMPOSE = ROOT / "deploy" / "docker-compose.phala.yaml"
 PROD_RUNNER_COMPOSE = ROOT / "deploy" / "docker-compose.phala.prod.runner.yaml"
+EXPECTED_TEE_HEAD = "0037_chat_poll_index"
+
+
+def _head_literal_lines(source: str) -> list[int]:
+    return [
+        node.lineno
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Constant) and node.value == EXPECTED_TEE_HEAD
+    ]
+
+
+def test_runtime_tee_head_consumers_have_no_literal_pin():
+    # Self-prove the AST guard before trusting its production scan. It remains
+    # insensitive to formatting and line wrapping because it inspects syntax,
+    # not source layout.
+    fixture = f"value = {EXPECTED_TEE_HEAD!r}\n"
+    assert _head_literal_lines(fixture) == [1]
+
+    for relative in (
+        "backend/alembic_tee/__init__.py",
+        "backend/admin/plaintext_shadow.py",
+        "backend/admin/phase4_cutover.py",
+        "backend/db.py",
+        "tests/test_plaintext_shadow_schema.py",
+    ):
+        assert _head_literal_lines((ROOT / relative).read_text()) == [], relative
 
 
 def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
@@ -20,10 +47,20 @@ def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
     cfg.set_main_option("script_location", str(ROOT / "backend" / "alembic_tee"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0034_v1_lane_outcome_counts"]
+    assert script.get_heads() == [EXPECTED_TEE_HEAD]
+    runtime_head = importlib.import_module("alembic_tee").current_head()
+    assert runtime_head == EXPECTED_TEE_HEAD
     assert (
-        script.get_revision("0034_v1_lane_outcome_counts").down_revision
-        == "0033_trace_events"
+        script.get_revision(EXPECTED_TEE_HEAD).down_revision
+        == "0036_lane_rollup_access_paths"
+    )
+    assert (
+        script.get_revision("0036_lane_rollup_access_paths").down_revision
+        == "0035_contract_rejection_stats"
+    )
+    assert (
+        script.get_revision("0035_contract_rejection_stats").down_revision
+        == "0034_v1_lane_outcome_counts"
     )
     assert (
         script.get_revision("0033_trace_events").down_revision

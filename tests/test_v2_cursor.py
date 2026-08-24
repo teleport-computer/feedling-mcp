@@ -172,6 +172,108 @@ def test_max_seq_zero_for_unknown_user(pg_clean):
     assert db.chat_messages_after_seq("u_cur_never_wrote", 0, limit=10) == []
 
 
+def test_poll_candidates_find_unanswered_row_older_than_hot_tail(pg_clean):
+    uid = "u_cur_poll_durable"
+    seed_user(uid)
+    db.chat_append(
+        uid, "unanswered", 1_500.0,
+        {"role": "user", "source": "chat"}, 5000,
+    )
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO chat_messages (user_id,msg_id,ts,doc) "
+            "SELECT %s, 'assistant-' || g::text, 1600 + g, "
+            "jsonb_build_object('role','assistant','source','chat') "
+            "FROM generate_series(1,300) AS g",
+            (uid,),
+        )
+
+    tail = db.chat_load_recent_strict(uid, 256)
+    assert all(row.get("id") != "unanswered" for row in tail)
+    rows = db.chat_poll_candidates_strict(
+        uid, since=2_000.0, redelivery_floor=1_000.0, limit=256,
+    )
+    assert [row["id"] for row in rows] == ["unanswered"]
+
+
+def test_poll_candidates_are_seq_ordered_and_capped(pg_clean):
+    uid = "u_cur_poll_bounded"
+    seed_user(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO chat_messages (user_id,msg_id,ts,doc) "
+            "SELECT %s, 'user-' || g::text, 5000 - g, "
+            "jsonb_build_object('role','user','source','chat') "
+            "FROM generate_series(1,300) AS g",
+            (uid,),
+        )
+
+    rows = db.chat_poll_candidates_strict(
+        uid, since=0.0, redelivery_floor=0.0, limit=999,
+    )
+    assert len(rows) == 256
+    assert [row["seq"] for row in rows] == sorted(row["seq"] for row in rows)
+    assert all(row["id"].startswith("user-") for row in rows)
+
+
+def test_hot_snapshot_can_exceed_incremental_batch_cap(pg_clean):
+    uid = "u_cur_hot_snapshot_limit"
+    seed_user(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO chat_messages (user_id,msg_id,ts,doc) "
+            "SELECT %s, 'hot-' || g::text, g, jsonb_build_object('role','user') "
+            "FROM generate_series(1,300) AS g",
+            (uid,),
+        )
+
+    version, rows = db.chat_load_hot_snapshot_strict(uid, 5000)
+    assert version == 1
+    assert len(rows) == 300
+    assert rows[0]["id"] == "hot-1"
+    assert rows[-1]["id"] == "hot-300"
+
+
+def test_bounded_chat_queries_do_not_seq_scan_large_chat_table(pg_clean):
+    uid = "u_cur_bounded_explain"
+    seed_user(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO chat_messages (user_id,msg_id,ts,doc) "
+            "SELECT %s, 'bulk-' || g::text, g, "
+            "jsonb_build_object('role','assistant','source','chat') "
+            "FROM generate_series(1,14000) AS g",
+            (uid,),
+        )
+        conn.execute("ANALYZE chat_messages")
+
+        def explain(query, params):
+            return "\n".join(
+                row[0]
+                for row in conn.execute(
+                    "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) " + query,
+                    params,
+                ).fetchall()
+            )
+
+        plans = {
+            "hot": explain(db._CHAT_HOT_SNAPSHOT_SQL, (uid, 256)),
+            "point": explain(db._CHAT_POINT_READ_SQL, (uid, "bulk-7000")),
+            "many": explain(
+                db._CHAT_MANY_READ_SQL,
+                (uid, ["bulk-1", "bulk-7000", "bulk-14000"]),
+            ),
+            "poll": explain(
+                db._CHAT_POLL_CANDIDATES_SQL,
+                (uid, 20_000.0, 19_000.0, 256),
+            ),
+        }
+
+    for name, plan in plans.items():
+        assert "Seq Scan on chat_messages" not in plan, f"{name}:\n{plan}"
+        assert "Index" in plan, f"{name}:\n{plan}"
+
+
 def test_cursor_advance_is_a_cursor_effect():
     eid, payload = cursor.advance_effect(job_id=7, ordinal=3, generation=2, new_seq=42)
     assert payload == {"new_seq": 42}

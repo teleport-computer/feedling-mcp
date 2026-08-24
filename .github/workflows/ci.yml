@@ -356,6 +356,7 @@ jobs:
           tests/test_multi_tenant_isolation.py
           tests/test_asgi_admin.py
           tests/test_asgi_cors.py
+          tests/test_notification_sound_payload.py
           tests/openapi/test_public_openapi.py
           tests/test_tee_table_registry.py
           tests/test_tee_registry_guard_enforced.py
@@ -753,6 +754,7 @@ jobs:
           python -m pytest \
             tests/test_ci_image_tag_width.py \
             tests/test_deploy_yaml_strict.py \
+            tests/test_agent_mailbox_post.py \
             tests/test_release_pin_cas.py \
             tests/test_frame_r2_deploy_config.py \
             tests/test_admin_runtime_mode.py \
@@ -808,6 +810,8 @@ jobs:
             tests/test_v2_first_chat_activation_backfill.py \
             tests/test_pre_runtime_preflight.py \
             tests/test_pre_test_migration_convergence.py \
+            tests/test_chat_change_events.py \
+            tests/test_chat_incremental_sync.py \
             tests/test_v2_jobs_migration.py \
             tests/test_lane_rollup.py \
             tests/test_data_track_snapshot_golden.py \
@@ -820,6 +824,7 @@ jobs:
             tests/test_v2_pool_fault_injection.py \
             tests/test_v2_pool_supervisor.py \
             tests/test_capture_prompt_v1.py \
+            tests/test_contract_rejection_stats.py \
             tests/test_data_track_runtime_view.py \
             tests/test_data_track_ops_views.py \
             tests/test_ops_dashboard_queries.py \
@@ -874,6 +879,7 @@ jobs:
             tests/test_admin_discarded_reason.py \
             tests/test_admin_concentration.py \
             tests/test_admin_concentration_e2e.py \
+            tests/test_admin_genesis_unavailable.py \
             -v
 
       - name: Upload execution evidence (report only)

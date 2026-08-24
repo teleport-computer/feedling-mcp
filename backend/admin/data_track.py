@@ -582,10 +582,17 @@ def _safe_genesis_job(job: dict | None) -> dict:
 def _genesis_stats(store: UserStore, *, include_jobs: bool = False) -> dict:
     state = db.get_blob(store.user_id, "genesis_state")
     state_doc = state if isinstance(state, dict) else {}
+    # ⚠️ 读失败与「这个用户确实没有 genesis 任务」**必须不同形**。
+    # 改这里之前,两者都产出 `jobs=[] / job_count=0` —— 而它们的下一步相反:
+    # 前者去修读取,后者就是正常。观测面把「量不到」显示成「量到了零」,
+    # 是本单(T245)要治的那个病本身,而这一处正在**我们用来看见故障的那个面上**。
+    # 状态词沿用本文件已有的 `ok`/`unavailable`,不另造词表。
+    jobs_source = "ok"
     try:
         jobs_raw = db.genesis_list_jobs(store.user_id, limit=5 if include_jobs else 1)
-    except Exception:
+    except Exception:  # noqa: BLE001 — 观测面降级展示,不 500
         jobs_raw = []
+        jobs_source = "unavailable"
     jobs = [_safe_genesis_job(j) for j in jobs_raw if isinstance(j, dict)]
     latest = jobs[0] if jobs else {}
     return {
@@ -601,6 +608,9 @@ def _genesis_stats(store: UserStore, *, include_jobs: bool = False) -> dict:
         "persona_ref_present": bool(str(state_doc.get("persona_ref") or "").strip() or latest.get("persona_ref_present")),
         "error": str(state_doc.get("error") or latest.get("error") or "")[:240],
         "job_count": len(jobs),
+        # `unavailable` 时上面那些由 latest_job 兜底的字段同样不可信 ——
+        # 读的人必须先看这一格,再决定要不要相信 job_count / job_status。
+        "jobs_source": jobs_source,
         "latest_job": latest,
         "jobs": jobs if include_jobs else [],
     }
@@ -2831,8 +2841,14 @@ def _known_error_classes() -> frozenset:
         try:
             from notices import catalog as _catalog
             _KNOWN_ERROR_CLASSES_CACHE = frozenset(_catalog.ERROR_CLASSES)
-        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
-            _KNOWN_ERROR_CLASSES_CACHE = frozenset()
+        except Exception as exc:  # noqa: BLE001 - unavailable is not empty
+            # This registry used to be a literal and therefore could not fail
+            # to load.  Returning an empty set after T255 made it producer-owned
+            # would turn a broken measuring instrument into a plausible partial
+            # result: jobs_store-only codes stayed visible while catalog-only
+            # codes silently became "other".  Fail this one new boundary loudly;
+            # T245 owns how the admin page will render the unavailable state.
+            raise RuntimeError("error_class_registry_unavailable") from exc
     return _KNOWN_ERROR_CLASSES_CACHE
 
 
@@ -2840,7 +2856,9 @@ _KNOWN_ERROR_CLASSES_CACHE = None
 
 
 def _is_registered_failure_code(value: str) -> bool:
-    return value in _known_failure_codes() or value in _known_error_classes()
+    known_failures = _known_failure_codes()
+    known_error_classes = _known_error_classes()
+    return value in known_failures or value in known_error_classes
 
 
 def _trace_public_fields(*, vocabulary=_TRACE_VOCABULARY_UNSET) -> dict:
@@ -3801,6 +3819,25 @@ def _render_funnel(funnel: dict | None, *, compact: bool) -> str:
             if isinstance(s, dict):
                 prev_by_id[str(s.get("id") or "")] = s
 
+    # ⚠️ 顶层已经把「builder 失败」坍缩成「暂不可用」,**但字段级没有** ——
+    # 改这里之前,`count` 缺失(合法:W1 窗口还没人走完)与 `count` 坏值(数据出问题)
+    # **都返回 None、都显示 `—`**,而它们的下一步相反。
+    # ⭐「顶层有 unavailable」不等于「字段级有 schema」:顶层没坏、字段坏了时,
+    #   页面会显示一个**结构完整但内容失真**的东西 —— 比整块不可用更难发现。
+    # ⚠️ 修法刻意最小侵入:`_count` **仍返回 None**,不改任何下游算术
+    # (下游有 7 处直接拿它做除法/减法,换成哨兵对象会全部炸)。
+    # 「读不出来」只在**显示那一处**用独立判据区分出来。
+    def _count_unreadable(stage: dict) -> bool:
+        """有值、但读不成整数 —— 与「本来就没有」(count 缺失)是两回事。"""
+        raw = stage.get("count")
+        if raw is None:
+            return False
+        try:
+            int(raw)
+        except (TypeError, ValueError):
+            return True
+        return False
+
     def _count(stage: dict):
         raw = stage.get("count")
         if raw is None:
@@ -3854,7 +3891,15 @@ def _render_funnel(funnel: dict | None, *, compact: bool) -> str:
             rows.append(f"<div class='hfunnel-conv'>{conv}</div>")
         if count is None:
             width_pct = 0.0
-            num = "<span class='muted' title='窗口尚未走完或查询失败，判不了'>—</span>"
+            # ⚠️ 这里原本一句「窗口尚未走完**或**查询失败,判不了」——
+            # 作者自己已经写下了这两件事被混在一起,只是没分开。它们的下一步相反:
+            # 前者什么都不用做,后者要去修数据/读取。
+            if _count_unreadable(stage):
+                num = ("<span class='warn' title='本阶段有 count 值,但读不成整数——"
+                       "数据有问题,不是「还没人走完」'>坏值</span>")
+            else:
+                num = ("<span class='muted' title='本阶段暂无 count(如窗口尚未走完)'>"
+                       "—</span>")
         elif base is None or base <= 0:
             width_pct = 0.0
             num = f"{count:,}"
@@ -6901,11 +6946,20 @@ def _home_human_summary(
     prev_wau = (pulse or {}).get("prev_wau")
     if wau is not None:
         head = f"近 7 天 <b>{int(wau)}</b> 人在用"
-        try:
-            diff = int(wau) - int(prev_wau)
-        except (TypeError, ValueError):
+        # ⚠️ 「本来就没有上一周」(首周)与「上一周的数读不出来」原本都让
+        # 对比从句静默消失 —— 读的人无从知道这里本该有句话。前者正常,后者要修数据。
+        prev_unreadable = False
+        if prev_wau is None:
             diff = None
-        if diff is not None and diff != 0:
+        else:
+            try:
+                diff = int(wau) - int(prev_wau)
+            except (TypeError, ValueError):
+                diff = None
+                prev_unreadable = True
+        if prev_unreadable:
+            head += "（上一周的数读不出来，比不了）"
+        elif diff is not None and diff != 0:
             head += f"（比上一周{'多' if diff > 0 else '少'} {abs(diff)} 个）"
         elif diff == 0:
             head += "（和上一周持平）"
@@ -6916,7 +6970,11 @@ def _home_human_summary(
             kept = int(round(float(d14["pct"])))
             clauses.append(f"新来 100 个能留住 <b>{kept}</b> 个")
         except (TypeError, ValueError):
-            pass
+            # ⚠️ 原本是 `pass` —— **整句话从页面上蒸发**,
+            # 而读的人**无从知道这里本该有一句**。
+            # 这是「省略型」:它既不返回 0 也不返回 None,它让一条陈述消失 ——
+            # 比显示一个坏值更难发现,因为**缺席不留痕迹**。
+            clauses.append("留存率读不出来")
     if queue is not None:
         rows = [r for r in (queue.get("rows") or []) if isinstance(r, dict)]
         if rows:
@@ -7194,7 +7252,14 @@ def _home_cost_section(cost: dict | None) -> str:
                 "<span class='muted'>usage 缺报较多，以上都是已知下限，不是全量。</span>"
             )
     except (TypeError, ValueError):
-        pass
+        # ⚠️ 这里原本是 `pass` —— 于是 coverage 坏值会让**低覆盖警告整句消失**,
+        # 页面反而显得比数据健康时更干净:**数据坏了,安全信号跟着一起没了**。
+        # 这比「显示一个错的数」更危险 —— 错的数还在提醒你这里有个量,
+        # 消失的警告让你以为这里没有问题。
+        coverage_note = (
+            "<span class='warn'>usage 覆盖率读不出来，"
+            "上面的成本数**无法判断是否为全量**。</span>"
+        )
     per_active = cost.get("per_active_user_day")
     try:
         # OverflowError：round(float('inf')) 会炸——契约上游今天只产有限值，
@@ -8375,7 +8440,7 @@ def _health_bj_this_monday() -> str:
     return (today - timedelta(days=today.weekday())).isoformat()
 
 
-def _health_t3_matured(cohort_week: str) -> bool:
+def _health_t3_matured(cohort_week: str) -> bool | None:
     """注册周的 t3 激活窗是否已全部走完（注册周 7 天 + 3 天 t3 窗）。
 
     coverage_complete 只说明漏斗行数对得上，不代表窗口走完；没成熟的周
@@ -8384,7 +8449,11 @@ def _health_t3_matured(cohort_week: str) -> bool:
     try:
         week = date.fromisoformat(str(cohort_week))
     except (TypeError, ValueError):
-        return False
+        # ⚠️ 读不出这是哪一周,与「这一周还没走完」**不是一回事**:
+        # 上面那句「注册 3 天内还没回复 ≠ 不会回复」是**关于时间的陈述**,
+        # 而这里我们连是哪一周都不知道 —— 前者等一等就好,后者要去修数据。
+        # 返回 None 让消费方各自决定怎么显示,而不是被静默并进「未成熟」。
+        return None
     today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
     return week + timedelta(days=10) <= today
 
@@ -8511,7 +8580,14 @@ def _health_activation_table(activation: dict | None) -> str:
             # 覆盖不完整的周渲染「未知」而不是 0%——缺证据 ≠ 没激活。
             rows.append(f"<tr><td>{week}</td><td>{n}</td>{unknown * 4}</tr>")
             continue
-        if not _health_t3_matured(c.get("cohort_week")):
+        matured = _health_t3_matured(c.get("cohort_week"))
+        if matured is None:
+            # ⚠️ 读不出这是哪一周 —— 与「窗口没走完」不同形:
+            # 后者等一等就好,前者要去修数据。并进「未成熟」会让它永远不被人发现。
+            bad = "<td><span class='warn' title='cohort_week 读不出来，不是「还没成熟」'>坏值</span></td>"
+            rows.append(f"<tr><td>{week}</td><td>{n}</td>{bad * 4}</tr>")
+            continue
+        if not matured:
             # 窗口没走完的周（本周/上周）渲染「未成熟」——注册 3 天内还没
             # 回复 ≠ 不会回复，确定性的 0% 是编出来的悲观。
             rows.append(f"<tr><td>{week}</td><td>{n}</td>{immature * 4}</tr>")
@@ -8708,7 +8784,9 @@ def _render_product_health_page(
         (
             c for c in (activation or {}).get("cohorts", [])
             if c.get("coverage_complete")
-            and _health_t3_matured(c.get("cohort_week"))
+            # None(读不出周)在这里与 False 同效:不选它当「最新完整周」——
+            # 这是**故意**的,一个读不出来的周不该被当成定论来源。
+            and _health_t3_matured(c.get("cohort_week")) is True
         ),
         None,
     )
@@ -9601,15 +9679,22 @@ _EVENT_CATEGORIES = [
 ]
 
 # T244's comparison table is intentionally independent from the older
-# VPS/API day drill below.  These are actions that can fail independently;
-# mappings exist only where the frozen source records that exact unit.  The
-# rollup's ``route`` is a runtime family, not an access mode: its V1 bucket
-# mixes Your Server users with hosted APIKey-V1 users.  A current access mode
-# join is not a lawful substitute for the missing event-time snapshot.
-_EVENT_MASTER_PATHS = (
-    ("resident", "resident"),
-    ("apikey_v1", "apikey_v1"),
-    ("apikey_v2", "apikey_v2"),
+# VPS/API day drill below. These are actions that can fail independently;
+# mappings exist only where the frozen source records that exact unit. ``route``
+# remains the runtime family. T289 adds a separate freeze-time ``access_path``
+# axis; it is deliberately unavailable before its own watermark.
+_EVENT_MASTER_PATH_LABELS = {
+    "self_hosted": "自建 Resident",
+    "resident_v1": "Resident-V1（托管）",
+    "apikey_v1": "APIKey-V1",
+    "apikey_v2": "APIKey-V2",
+    "unbound_no_route": "无托管资格且无 Resident binding",
+    "hosted_unclassified_v1": "托管 V1 · 接入方式未分类",
+    "v2_control_v1_source": "当前 V2 控制却出现 V1 源",
+}
+_EVENT_MASTER_PATHS = tuple(
+    (path, _EVENT_MASTER_PATH_LABELS[path])
+    for path in db.LANE_ROLLUP_ACCESS_PATHS
 )
 _EVENT_MASTER_ACTIONS = (
     {"key": "onboarding_job", "label": "入驻蒸馏 · 整单",
@@ -9668,14 +9753,7 @@ _EVENT_MASTER_ACTIONS = (
 
 
 def _event_path_master_payload(frozen: dict) -> dict:
-    """Build both the requested access-path table and a runtime-family aid.
-
-    Only Runtime V2 implies one access path (hosted API key).  Runtime V1 does
-    not: its frozen bucket mixes Your Server and hosted APIKey-V1 users, so the
-    two requested V1 access cells stay unavailable.  The raw V1 aggregate is
-    still useful and is exposed in a separate, differently shaped table where
-    nobody can mistake it for an access-path comparison.
-    """
+    """Build the frozen access-path table and runtime-family diagnostic."""
 
     def unavailable(*, coverage="red", detail=""):
         return {
@@ -9683,9 +9761,14 @@ def _event_path_master_payload(frozen: dict) -> dict:
             "message": "当前记不到这一级", "detail": detail,
         }
 
-    def metric_cell(raw_window: dict, runtime: str, mapping) -> dict:
+    def metric_cell(raw_window: dict, runtime: str, mapping,
+                    *, path: str | None = None) -> dict:
         source_route = "resident" if runtime == "runtime_v1" else "model_api"
-        route_data = (raw_window.get("routes") or {}).get(source_route, {})
+        route_data = (
+            (raw_window.get("paths") or {}).get(path, {})
+            if path is not None
+            else (raw_window.get("routes") or {}).get(source_route, {})
+        )
         coverage = route_data.get("coverage") or {}
         level = str(coverage.get("level") or "red")
         lane, enqueue_source = mapping
@@ -9710,6 +9793,7 @@ def _event_path_master_payload(frozen: dict) -> dict:
                 "message": "当前窗口不可计算",
                 "covered_days": int(coverage.get("covered_days") or 0),
                 "required_days": int(coverage.get("required_days") or 0),
+                "effective_from": coverage.get("effective_from"),
             }
         completed = int(counts.get("completed") or 0)
         failed = int(counts.get("failed") or 0)
@@ -9759,7 +9843,12 @@ def _event_path_master_payload(frozen: dict) -> dict:
                 "denominator": completed + operational,
                 "denominator_rule": (
                     "completed + operational failure；control、明确用户侧不可用、"
-                    "superseded 剔除；过去的日子没有回填"
+                    "superseded 剔除；过去的日子没有回填；"
+                    + (
+                        "成员按冻结时 route 资格→接入方式×effective runtime 分层"
+                        if path is not None
+                        else "本格仅是 Runtime V1 家族辅助汇总"
+                    )
                 ),
                 "concentration": counts.get("concentration"),
             }
@@ -9812,26 +9901,21 @@ def _event_path_master_payload(frozen: dict) -> dict:
                         "message": "N/A（产品当前不执行）",
                     }
                     continue
-                # Only Runtime V2 identifies an access path by itself.
-                runtime_mapping = (action.get("runtime_metrics") or {}).get("runtime_v2")
-                runtime_probe = (action.get("runtime_probe") or {}).get("runtime_v2")
-                if path == "apikey_v2" and runtime_mapping:
+                runtime = (
+                    "runtime_v2" if path == "apikey_v2" else "runtime_v1"
+                )
+                runtime_mapping = (action.get("runtime_metrics") or {}).get(runtime)
+                runtime_probe = (action.get("runtime_probe") or {}).get(runtime)
+                if runtime_mapping:
                     path_cells[path] = metric_cell(
-                        raw_window, "runtime_v2", runtime_mapping)
-                elif path == "apikey_v2" and runtime_probe:
+                        raw_window, runtime, runtime_mapping, path=path)
+                elif runtime_probe:
                     path_cells[path] = unavailable(
                         coverage=runtime_probe,
                         detail=(
-                            "有 V2 调用点，但尚无同源北京日冻结分母"
+                            f"有 {runtime} 调用点，但尚无同源北京日冻结分母"
                             if runtime_probe == "yellow"
-                            else "V2 在这一动作上零探针"
-                        ),
-                    )
-                elif path in {"resident", "apikey_v1"}:
-                    path_cells[path] = unavailable(
-                        detail=(
-                            "V1 冻结格混合 resident 与 APIKey-V1，"
-                            "没有事件发生时的 access_mode 快照"
+                            else f"{runtime} 在这一动作上零探针"
                         ),
                     )
                 else:
@@ -9874,7 +9958,24 @@ def _event_path_master_payload(frozen: dict) -> dict:
             "end_day": raw_window.get("end_day"),
             "day_count": raw_window.get("day_count"),
         }
-        path_windows.append({**window_meta, "rows": path_rows})
+        path_data = raw_window.get("paths") or {}
+        path_windows.append({
+            **window_meta,
+            "active_users": {
+                path: (path_data.get(path) or {}).get("active_users")
+                for path, _label in _EVENT_MASTER_PATHS
+            },
+            "mode_sources": {
+                path: (path_data.get(path) or {}).get("mode_sources") or {}
+                for path, _label in _EVENT_MASTER_PATHS
+            },
+            "effective_from": {
+                path: ((path_data.get(path) or {}).get("coverage") or {})
+                .get("effective_from")
+                for path, _label in _EVENT_MASTER_PATHS
+            },
+            "rows": path_rows,
+        })
         runtime_active_users = {}
         for runtime, route in (("runtime_v1", "resident"),
                                ("runtime_v2", "model_api")):
@@ -9904,10 +10005,10 @@ def _event_path_master_payload(frozen: dict) -> dict:
         ],
         "runtime_windows": runtime_windows,
         "access_gap": (
-            "V1 冻结格没有事件发生时的 access_mode；resident 与 APIKey-V1 "
-            "无法诚实拆开，不能用当前 access_mode 回填。"
+            "接入路径取冻结时快照，不是事件发生时快照；历史不回填。"
+            "每列只从页面标出的生效日起可读，之前不可用不等于 0。"
         ),
-        "self_deployed": "⬛ 结构性不可得，不在本表范围",
+        "self_deployed": "自建判据 = 无 active tested hosted route + connected resident binding",
     }
 
 # Plain-language: what each row actually is. Shown under every event label so the
@@ -10131,7 +10232,10 @@ def _render_event_master_cell(cell: dict, *, action: str, path: str,
         covered = int(cell.get("covered_days") or 0)
         required = int(cell.get("required_days") or 0)
         message = str(cell.get("message") or "当前窗口不可计算")
+        effective_from = str(cell.get("effective_from") or "")
         detail = f"冻结覆盖 {covered}/{required} 个北京日；拒绝用残缺窗口算率"
+        if effective_from:
+            detail += f"；此列自 {effective_from} 起有效，此前无数据不等于 0"
         return (f"<td>{mark} <b>{html.escape(message)}</b>"
                 f"<div class='evt-cell-scope'>{html.escape(scope)}<br>"
                 f"{html.escape(detail)}</div></td>")
@@ -10144,7 +10248,8 @@ def _render_event_master_cell(cell: dict, *, action: str, path: str,
 
 def _render_event_master_tables(master: dict) -> str:
     def render_windows(*, windows, columns, title, note,
-                       show_runtime_population=False):
+                       show_runtime_population=False,
+                       show_path_population=False):
         sections = []
         for window in windows or []:
             start = str(window.get("start_day") or "")
@@ -10176,10 +10281,9 @@ def _render_event_master_tables(master: dict) -> str:
                 )
             active_users = window.get("active_users")
             population = ""
-            # Route populations belong only to the runtime-family diagnostic.
-            # The access-path table cannot split the resident route into
-            # self-hosted vs APIKey-V1, so even an accidentally supplied map
-            # must never be rendered there.
+            # Runtime-family and access-path populations are distinct maps.
+            # Render each only in its matching table so neither denominator
+            # can leak into the other even when both are present in a window.
             if show_runtime_population and isinstance(active_users, dict):
                 parts = []
                 for col in columns:
@@ -10195,6 +10299,40 @@ def _render_event_master_tables(master: dict) -> str:
                 population = (
                     "<div class='evt-desc'>窗口内 runtime route 活跃用户"
                     "（冻结行按 user_id 去重）："
+                    + html.escape(" · ".join(parts)) + "</div>"
+                )
+            if show_path_population and isinstance(active_users, dict):
+                sources = window.get("mode_sources") or {}
+                effective = window.get("effective_from") or {}
+                parts = []
+                for col in columns:
+                    key = str(col.get("key") or "")
+                    label = str(col.get("label") or key)
+                    count = active_users.get(key)
+                    if count is None:
+                        value = "人数不可用"
+                    else:
+                        value = f"{int(count)} 人"
+                    source = sources.get(key) or {}
+                    if key in {"apikey_v1", "resident_v1",
+                               "hosted_unclassified_v1",
+                               "v2_control_v1_source"}:
+                        explicit = int(
+                            (source.get("explicit") or {}).get("active_users") or 0
+                        )
+                        default = int(
+                            (source.get("default") or {}).get("active_users") or 0
+                        )
+                        value += f"（显式 {explicit} / 默认 {default}）"
+                    from_day = effective.get(key)
+                    value += (
+                        f"；此列自 {from_day} 起有效"
+                        if from_day else "；此列尚未开始采集"
+                    )
+                    parts.append(f"{label} {value}")
+                population = (
+                    "<div class='evt-desc'>窗口内路径活跃用户"
+                    "（冻结行按 user_id 去重；默认=raw hosted_runtime_mode 缺失）："
                     + html.escape(" · ".join(parts)) + "</div>"
                 )
             sections.append(
@@ -10221,6 +10359,7 @@ def _render_event_master_tables(master: dict) -> str:
         render_windows(
             windows=master.get("windows"), columns=master.get("paths") or [],
             title="事件 × 接入路径成功/失败率（北京日冻结）", note=path_note,
+            show_path_population=True,
         )
         + render_windows(
             windows=master.get("runtime_windows"),
@@ -10838,6 +10977,14 @@ def _render_user_detail_page(user: dict) -> str:
     responder = user.get("responder") if isinstance(user.get("responder"), dict) else {}
     responder_name = str(responder.get("effective_responder") or "none")
     mismatch = bool(responder.get("mismatch"))
+    # ⚠️ 这张卡以前显示 `status or 'none'` —— **读库失败与「确实没有蒸馏」同形**。
+    # 两者的下一步相反(修读取 / 这就是正常),所以必须在页面上就分开,
+    # 而不是只在 JSON 里分开:大多数人看的是这张卡,不是 payload。
+    _genesis = user.get("genesis") if isinstance(user.get("genesis"), dict) else {}
+    if str(_genesis.get("jobs_source") or "ok") != "ok":
+        genesis_cell = "<span class='warn'>取不到（读取失败）</span>"
+    else:
+        genesis_cell = html.escape(str(_genesis.get("status") or "none"))
     mismatch_reasons = ", ".join(
         str(reason) for reason in responder.get("mismatch_reasons") or []
     )
@@ -10897,7 +11044,7 @@ def _render_user_detail_page(user: dict) -> str:
     <div class="card"><div class="value">{html.escape(_format_duration(user['onboarding']['stuck_for_sec']))}</div><div class="label">stuck for</div></div>
     <div class="card"><div class="value">{user['chat']['total']}</div><div class="label">chat messages</div></div>
     <div class="card"><div class="value">{user['memory']['total']}</div><div class="label">memories</div></div>
-    <div class="card"><div class="value">{html.escape(user.get('genesis', {}).get('status') or 'none')}</div><div class="label">genesis distill</div></div>
+    <div class="card"><div class="value">{genesis_cell}</div><div class="label">genesis distill</div></div>
     <div class="card"><div class="value">{user['proactive']['proactive_messages']}</div><div class="label">proactive writes</div></div>
     <div class="card"><div class="value">{html.escape(user.get('provider_state') or 'ok')}</div><div class="label">provider state</div></div>
     <div class="card"><div class="value">{html.escape(_bj_iso(user.get('last_provider_success_at')) or 'never')}</div><div class="label">last provider success</div></div>

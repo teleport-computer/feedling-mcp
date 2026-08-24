@@ -138,7 +138,7 @@ def _script_provider(monkeypatch, responses):
     calls = []
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
-        calls.append({"messages": messages, "tools": tools})
+        calls.append({"messages": messages, "tools": tools, **_kwargs})
         return next(it)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
@@ -148,6 +148,18 @@ def _script_provider(monkeypatch, responses):
 def _text_round(text, *, prompt_tokens=1, completion_tokens=1):
     return {"reply": text, "tool_calls": [],
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
+
+
+def _stay_silent_round(reason="没有值得打扰用户的新信息"):
+    return {
+        "reply": "",
+        "tool_calls": [{
+            "id": "stay-silent-test",
+            "name": cap_tool_schema.STAY_SILENT_TOOL,
+            "args": {"reason": reason},
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
 
 
 def _patch_user_decryptable_envelopes(monkeypatch, user_id: str) -> E2EClient:
@@ -200,7 +212,9 @@ def test_shadow_signals_never_reach_the_wake_provider_prompt(monkeypatch):
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "manual_wake")
     claimed_by = _claim(job_id)
-    calls = _script_provider(monkeypatch, [_text_round("")])
+    calls = _script_provider(
+        monkeypatch, [_text_round(""), _stay_silent_round()]
+    )
 
     status = asyncio.run(
         worker._run_wake(
@@ -215,8 +229,8 @@ def test_shadow_signals_never_reach_the_wake_provider_prompt(monkeypatch):
     )
 
     assert status == "completed"
-    assert len(calls) == 1
-    provider_wire = json.dumps(calls[0]["messages"], ensure_ascii=False)
+    assert len(calls) == 2
+    provider_wire = json.dumps(calls, ensure_ascii=False, default=str)
     assert "apns_alert_sent" not in provider_wire
     assert "local_hour" not in provider_wire
 
@@ -589,8 +603,7 @@ def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypat
     assert kw["body"] == reply_text[:240]
     assert kw["is_wake"] is True, "wake lane must push with is_wake=True"
     assert kw["lane"] == "manual_wake", (
-        "backend derives manual/source from this — a copy-paste bug here "
-        "silently breaks the reminders_delivery-off manual-wake bypass"
+        "backend must receive the real wake source for delivery metadata and diagnostics"
     )
     runtime_message = next(
         message
@@ -764,17 +777,14 @@ def test_wake_workspace_prompt_failure_is_silent_before_provider(
 
 
 def test_run_wake_weak_wake_sleeps_no_bubble_no_error(monkeypatch):
-    """Model declines to speak (empty terminal text) -> job completes cleanly,
-    zero bubbles, and the D3 no-filler-adjacent invariant: no error
-    status/callback. Unlike the chat lane, an empty terminal reply is NOT a
-    failure for wake — it's a legitimate silence."""
+    """An empty wake round is forced into explicit silence with zero bubbles."""
     uid = "u_wake_weak"
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
 
-    _script_provider(monkeypatch, [_text_round("")])
+    _script_provider(monkeypatch, [_text_round(""), _stay_silent_round()])
     write_called = {"n": 0}
     monkeypatch.setattr(
         worker, "_write_encrypted_reply",
@@ -808,7 +818,7 @@ def test_wake_shadow_write_failure_cannot_change_the_decision(monkeypatch):
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
-    _script_provider(monkeypatch, [_text_round("")])
+    _script_provider(monkeypatch, [_text_round(""), _stay_silent_round()])
     deps = _wake_deps(
         tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
     )
@@ -940,7 +950,11 @@ def test_wake_injects_attention_facts_as_non_user_application_data(monkeypatch):
 
     async def _provider(_config, messages, *, tools=None, **_kwargs):
         provider_calls.append(messages)
-        return _text_round("")
+        return (
+            _stay_silent_round()
+            if _kwargs.get("tool_choice") == "required"
+            else _text_round("")
+        )
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
     deps = _wake_deps(
@@ -976,7 +990,7 @@ def test_wake_injects_attention_facts_as_non_user_application_data(monkeypatch):
     )
 
     assert status == "completed"
-    assert len(provider_calls) == 1
+    assert len(provider_calls) == 2
     temporal_message = next(
         message
         for message in provider_calls[0]
@@ -1171,6 +1185,78 @@ def test_heartbeat_stay_silent_completes_with_auditable_reason(monkeypatch):
     assert "48 秒前刚主动联系过" not in json.dumps(
         silence, ensure_ascii=False
     )
+
+
+def test_heartbeat_empty_round_forces_stay_silent_and_persists_reason(monkeypatch):
+    uid = "u_wake_forced_stay_silent"
+    conftest.seed_user(uid)
+    _reset(uid)
+    trace_id = "trace-forced-silent-choice"
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat", trace_id=trace_id)
+    claimed_by = _claim(job_id)
+    calls = []
+
+    async def forced_choice_provider(config, messages, *, tools=None, **kwargs):
+        calls.append({"messages": messages, "tools": tools, **kwargs})
+        if len(calls) == 1:
+            return {"reply": "", "tool_calls": [], "usage": {}}
+        # Mutation proof: removing the forced tool_choice changes the model's
+        # simulated behavior to a visible reply, so the persisted sleep
+        # assertions below fail instead of passing on a scripted coincidence.
+        if kwargs.get("tool_choice") != "required":
+            return {"reply": "我还是说点什么吧", "tool_calls": [], "usage": {}}
+        return {
+            "reply": "",
+            "tool_calls": [{
+                "id": "forced-silent-1",
+                "name": cap_tool_schema.STAY_SILENT_TOOL,
+                "args": {"reason": "近期没有新的高价值信息"},
+            }],
+            "usage": {},
+        }
+
+    monkeypatch.setattr(
+        provider_client,
+        "chat_completion_async",
+        forced_choice_provider,
+    )
+    writes = []
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda *_args, **_kwargs: writes.append(True),
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "heartbeat",
+        deps,
+        _BYOK,
+        asyncio.Semaphore(4),
+        claimed_by,
+        trace_id=trace_id,
+    ))
+
+    assert status == "completed"
+    assert len(calls) == 2
+    assert "tool_choice" not in calls[0]
+    assert calls[1]["tool_choice"] == "required"
+    assert {spec.name for spec in calls[1]["tools"]} == {
+        "reply",
+        cap_tool_schema.STAY_SILENT_TOOL,
+    }
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT status,wake_result,wake_result_reason "
+            "FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+    assert row == ("completed", "sleep", "近期没有新的高价值信息")
+    assert writes == []
 
 
 def test_scheduled_thinking_only_remains_a_must_deliver_failure(monkeypatch):
@@ -1413,7 +1499,11 @@ def test_run_perception_wake_injects_trigger_as_untrusted_runtime_data(monkeypat
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
         seen["messages"] = messages
-        return _text_round("")
+        return (
+            _stay_silent_round()
+            if _kwargs.get("tool_choice") == "required"
+            else _text_round("")
+        )
 
     async def _empty_glance(*_args, **_kwargs):
         return None, None
@@ -1601,7 +1691,11 @@ def test_ordinary_heartbeat_gives_fingerprint_to_atomic_finish(monkeypatch):
     _reset(uid)
 
     async def fake_provider(*args, **kwargs):
-        return _text_round("")
+        return (
+            _stay_silent_round()
+            if kwargs.get("tool_choice") == "required"
+            else _text_round("")
+        )
 
     glance = {"weather": {"available": True, "notable_change": False}}
     fingerprint = worker.perception_glance_fingerprint(glance)
@@ -2668,7 +2762,11 @@ def test_wake_tells_the_provider_that_an_empty_reply_is_acceptable(monkeypatch):
             # What the real client does with a text-free 2xx body.
             raise provider_client.ProviderError(
                 "provider response had no usable reply text")
-        return _text_round("")
+        return (
+            _stay_silent_round()
+            if kwargs.get("tool_choice") == "required"
+            else _text_round("")
+        )
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _contract_faithful)
     write_called = {"n": 0}
@@ -2687,7 +2785,7 @@ def test_wake_tells_the_provider_that_an_empty_reply_is_acceptable(monkeypatch):
     # 用来推断 `_run_wake` 传了什么——那一跳由 `test_only_scheduled_wake_demands_
     # a_reply` 的 `_seen_lane_policy` 绑住。两者别混。
     assert seen.get("require_reply") is False, seen
-    # 沉默即成功：睡了，没失败，也没写气泡。
+    # 裸空成功由 tool_loop 强制收敛为显式 stay_silent，仍不写气泡。
     assert status == "completed"
     assert _job_status(job_id)[0] == "completed"
     assert write_called["n"] == 0
@@ -2696,9 +2794,8 @@ def test_wake_tells_the_provider_that_an_empty_reply_is_acceptable(monkeypatch):
 def _empty_round(*, stop_reason="end_turn"):
     """A structurally valid provider success with no usable output.
 
-    `stop_reason` 必须非空：`tool_loop._empty_response_shape` 旁边的 `semantic_empty`
-    判据要求 reasoning/stop_reason 至少有一个有值，否则纠正重试根本不会 arm
-    （直接判死）。造样本时漏了它，测的就不是恢复链而是快速失败路径。
+    `stop_reason` 非空，让诊断断言同时覆盖 provider 的终止原因归一化；wake 的
+    二阶段强制本身对有无 stop reason 使用同一判据。
     """
     round_ = _text_round("")
     round_["stop_reason"] = stop_reason
@@ -2715,7 +2812,7 @@ def test_weak_wake_semantic_empty_has_distinct_trace_and_no_message(monkeypatch)
     private_reasoning = "Q6_PRIVATE_REASONING_MUST_NOT_REACH_TRACE"
     response = _empty_round(stop_reason="end_turn")
     response["reasoning"] = private_reasoning
-    _script_provider(monkeypatch, [response])
+    _script_provider(monkeypatch, [response, _stay_silent_round()])
     writes = []
     monkeypatch.setattr(
         worker,
@@ -2768,9 +2865,9 @@ def test_weak_wake_semantic_empty_has_distinct_trace_and_no_message(monkeypatch)
         "completion_tokens": 1,
     }
     assert private_reasoning not in json.dumps(silence, ensure_ascii=False)
-    assert not [
+    assert len([
         trace for trace in traces if trace["type"] == "reply.silent_by_choice"
-    ]
+    ]) == 1
 
 
 def _seen_lane_policy(monkeypatch):

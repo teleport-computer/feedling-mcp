@@ -5,6 +5,12 @@ description: Understand Feedling's components, data flows, encryption boundaries
 
 import { ArchitectureDiagram } from '@/components/architecture-diagram';
 
+## Multi-worker chat consistency
+
+PostgreSQL is the durable source of truth for chat. Each backend worker keeps a bounded per-user hot projection and advances it with versioned change events delivered through PostgreSQL `LISTEN/NOTIFY`. Notifications are only wake hints: workers verify durable versions, apply contiguous events, and fall back to a bounded snapshot when events are missing, reset, or too far behind.
+
+Correctness-sensitive reads do not depend on cache freshness. Verify uses exact ping/reply lookups, resident poll selects bounded durable unanswered candidates before its atomic claim, and Runtime V2 freezes prompt membership by sequence. Chat envelopes remain opaque to this synchronization layer, and telemetry contains no message documents, ciphertext, keys, or connection strings.
+
 Feedling separates ciphertext persistence from authorized decryption and agent
 execution. Managed production uses a main confidential VM for the public API and
 trusted-decrypt service, separate confidential-VM capacity for hosted agents,
@@ -71,6 +77,19 @@ The model provider is an external plaintext recipient. Envelope encryption
 protects persisted content and the storage path; it does not hide the prompt
 from the model selected to process it. When visible push text is enabled, that
 notification text also passes through the external push provider.
+
+A selected dedicated image observer is normally the only model provider that
+receives an image's pixels; the main provider receives an untrusted text
+observation. If the observer is rate-limited, temporarily unavailable, empty, or
+explicitly truncated, Runtime V2 may disclose only those failed images to the
+exact current main route, and only while that route's exact image-control verdict
+is still `ok`. Authentication, quota, route, compatibility, image-read, and
+unknown failures do not cross that fallback boundary. Mixed batches retain text
+for successful observations and decrypt only failed image IDs again. The
+observer and every main recovery call share one absolute deadline, so recovery
+does not extend the turn's visual-processing budget. The official resident uses
+the same closed failure policy and only trusts the image verdict pinned into its
+currently spawned main-agent entry.
 
 Managed provider routes resolve every explicit HTTPS base URL on each
 validation, including the validation immediately before runtime calls, and
