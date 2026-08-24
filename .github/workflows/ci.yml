@@ -462,9 +462,10 @@ jobs:
             tests/test_perception_prompt_golden.py \
             -v
 
-      - name: Repository inventory unit tests
+      - name: Repository truth-map unit tests
         run: |
           python -m pytest \
+            tests/test_current_state_docs.py \
             tests/test_repository_inventory.py \
             -v
 
