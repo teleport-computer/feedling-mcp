@@ -9,9 +9,9 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 
 | Lifecycle | Classified documents |
 |---|---:|
-| `current` | 12 |
+| `current` | 14 |
 | `decision` | 1 |
-| `historical` | 4 |
+| `historical` | 7 |
 | `generated` | 1 |
 
 ## current
@@ -24,10 +24,12 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/PROJECT_OVERVIEW.md`
 - `docs/repository-cleanup/README.md`
 - `docs/repository-cleanup/agent-diagnostic-benchmark.md`
+- `docs/repository-cleanup/hosted-runtime-history.md`
 - `docs/superpowers/plans/2026-08-24-repository-cleanup.md`
 - `docs/superpowers/plans/2026-08-24-repository-cleanup.zh-CN.md`
 - `docs/testing/README.md`
 - `docs/testing/RUNTIME_MAP.md`
+- `scripts/loadtest/README.md`
 
 ## decision
 
@@ -36,8 +38,11 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 ## historical
 
 - `docs/CHANGELOG.md`
+- `docs/archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D0-rollout-infrastructure.md`
+- `docs/archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D4-loadtest-rollout-killresident.md`
+- `docs/archive/superpowers/specs/2026-07-09-hosted-runtime-v2-D0-rollout-infrastructure-design.md`
+- `docs/archive/superpowers/specs/2026-07-09-hosted-runtime-v2-D4-loadtest-rollout-killresident-design.md`
 - `docs/repository-cleanup/baseline.md`
-- `docs/superpowers/plans/2026-07-09-hosted-runtime-v2-D4-loadtest-rollout-killresident.md`
 - `docs/superpowers/plans/2026-08-01-branch-promotion-guard.md`
 
 ## generated

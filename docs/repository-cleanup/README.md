@@ -11,6 +11,7 @@ canonical_owner: self
 - [`baseline.md`](baseline.md)：清理开始时的 tracked 文件和已知矛盾快照。
 - [`agent-diagnostic-benchmark.md`](agent-diagnostic-benchmark.md)：固定排查题、判分规则和前后对比协议。
 - [`document-lifecycle-inventory.md`](document-lifecycle-inventory.md)：由生命周期工具生成的已分类文档清单。
+- [`hosted-runtime-history.md`](hosted-runtime-history.md)：hosted runtime 历史文档的分批证据、owner 与归档记录。
 - `candidates/`：候选项的生产消费者、兼容义务、验证证据和结论；只在出现强候选后创建记录。
 - [`tools/repository_inventory.py`](../../tools/repository_inventory.py)：确定性的 tracked 文件分类器。
 
