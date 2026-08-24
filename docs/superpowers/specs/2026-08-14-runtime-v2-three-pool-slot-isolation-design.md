@@ -6,7 +6,7 @@ canonical_owner: self
 
 ## 当前对照（2026-08-24）
 
-本决策是 Runtime V2 当前池拓扑的 canonical owner：
+本决策是已落地的 Runtime V2 当前池拓扑 canonical owner：
 `pool_config.py` 无条件构造 `foreground`、`wake`、`heavy` 三个逻辑池，
 `pool_supervisor.py`、`slot_protocol.py`、`child_supervisor.py` 与
 `turn_child.py` 让每个 `SlotSpec` 对应一个子进程，`serve_worker.py` 负责
@@ -14,6 +14,12 @@ canonical_owner: self
 `test_v2_pool_supervisor.py`、`test_v2_child_supervisor.py`、
 `test_v2_pool_fault_injection.py` 与 `test_v2_watchdog.py` 覆盖配置、单 slot
 隔离、故障恢复和 owner-fenced claim recovery。
+
+`serve_worker._fleet_heartbeat_loop` 和 `jobs_store.record_worker_heartbeat`
+已按 pool 发布 fleet 健康容量；Chat admission 读取 foreground 容量。Parent 的
+`EnclaveBroker` 已经通过 child/supervisor duplex IPC 在全实例范围内执行 reservation
+和 release。`pool_config.py` 当前 Heavy slot 的 stall 默认值是 120 秒（absolute 1200
+秒），不是下文历史 rollout 中的「先 240、后 120」阶段门槛。
 
 代码默认 slot 数是 `4/2/2`（foreground/wake/heavy），但部署数量由环境 compose
 显式变量决定；仓库默认值不证明任何 live 环境已采用该数量。本文的 2026-08-14 事故编号、
@@ -26,7 +32,7 @@ canonical_owner: self
 lease/write fence、outbox 幂等、kill switch 或历史完整性义务。
 
 - 日期：2026-08-14
-- 历史状态：设计方向已确认，书面规范待复核
+- 当前状态：已落地的 current decision；以下日期、目标分支、优先级和 rollout 文本均为历史 authoring metadata
 - 目标分支：`test`
 - 优先级：P0 Chat 抢占与即时 claim 回收；P1 三池/单 Slot 进程；P2 Profile 与容量优化
 - 取代范围：取代 `2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md`
@@ -34,6 +40,10 @@ lease/write fence、outbox 幂等、kill switch 或历史完整性义务。
   lease/write fence、outbox 幂等、kill switch 与历史完整性设计。
 
 ## 历史设计快照（2026-08-14）
+
+本节及其后的原始 numbered sections 记录当日事故、提案、实现顺序和 rollout 条件；其中的
+“当前”“新增”“改成”“先……再……”均是 2026-08-14 的设计时态，不能覆盖上方 current
+reconciliation 或 `CURRENT_STATE.md`。
 
 ### 1. 摘要
 
@@ -81,7 +91,7 @@ slot 进程即只杀一个 Job。Chat 入队时原子抢占同用户的非 Chat 
 3. kill 后 claim 回收慢于用户可接受等待；
 4. Profile 的阶段观测和资源边界不足。
 
-## 3. 目标与非目标
+## 3. 历史 proposal：目标与非目标
 
 ### 3.1 目标
 
@@ -104,7 +114,7 @@ slot 进程即只杀一个 Job。Chat 入队时原子抢占同用户的非 Chat 
 - 不以简单提高 `FEEDLING_V2_ENCLAVE_CONCURRENCY` 代替全局资源治理；
 - 不在本设计中横向增加 CVM；先完成单 CVM 的进程隔离与容量验证。
 
-## 4. 核心设计决策
+## 4. 历史 proposal：核心设计决策
 
 ### 4.1 Pool 是隔离类别，Slot 是容量单位
 
@@ -149,10 +159,10 @@ reaper、scheduler、heartbeat、watchdog、Genesis 和所有 slot supervisor。
 现有 `ORDER BY priority DESC, created_at` 继续作为同一 pool 内的 pending 排序。优先级不是抢占
 机制；运行中抢占由第 5 节定义。
 
-### 4.3 Pool 心跳与容量
+### 4.3 历史 pre-implementation baseline：Pool 心跳与容量
 
-当前 `v2_worker_heartbeats` 只表达一个 turn worker 的总容量，无法让 Chat 准入只读取
-Foreground 容量。设计为 heartbeat 增加显式 `pool` 维度，避免依赖 `worker_id` 字符串约定：
+当时的 `v2_worker_heartbeats` 只表达一个 turn worker 的总容量，无法让 Chat 准入只读取
+Foreground 容量。因此 proposal 为 heartbeat 增加显式 `pool` 维度，避免依赖 `worker_id` 字符串约定：
 
 ```text
 worker_id + pool + kind → capacity, beat_at, build identity
@@ -168,7 +178,7 @@ worker_id + pool + kind → capacity, beat_at, build identity
 Chat 准入只读取 Foreground pool 的活容量。Admin 同时展示各 pool 的配置容量、健康容量、busy、
 restarting 和 pending。
 
-## 5. Chat 抢占与同用户单飞
+## 5. 历史 proposal：Chat 抢占与同用户单飞
 
 ### 5.1 原则
 
@@ -225,7 +235,7 @@ content-free cancel 通知：`job_id + claimed_by + reason`。持有该 Job 的 
 - Parent 的短周期 active-job reconciliation 作为通知丢失兜底，发现 slot 正运行已终结 Job 时
   杀死该 slot。
 
-## 6. Per-Slot Watchdog 与即时回收
+## 6. 历史 proposal：Per-Slot Watchdog 与即时回收
 
 ### 6.1 监控单位
 
@@ -266,9 +276,9 @@ slot capacity → 0
 若数据库暂时不可用，仍先杀物理进程，随后 Parent 将精确回收请求留在有界重试队列；reaper 的
 lease timeout 是最终兜底，但不再是正常恢复路径。
 
-### 6.3 Lane 时间预算
+### 6.3 历史 proposal：Lane 时间预算
 
-首版保留现有安全下限，改为按 slot 当前 lane 选择预算：
+当时 proposal 先保留现有安全下限，再按 slot 当前 lane 选择预算：
 
 | Pool | Stall Budget | Absolute Budget | 备注 |
 | --- | ---: | ---: | --- |
@@ -282,7 +292,7 @@ Heavy 首先沿用 240 秒，避免在全量读卡尚未分批前引入新的误
 边界会及时刷新 stall clock。具体默认值在 test/pre 故障注入后可向上调整，但不能低于其最慢
 单步的合法 timeout。
 
-## 7. Foreground 准入与 TTL
+## 7. 历史 proposal：Foreground 准入与 TTL
 
 ### 7.1 Lane-aware Admission
 
@@ -313,7 +323,7 @@ Chat admission 的估算只使用：
 灰度期间需要过渡缓冲，可以配置为 180 秒，但不作为根因修复。Job claim 后使用独立 execution
 lease/watchdog budget。
 
-## 8. Profile 有界化
+## 8. 历史 proposal：Profile 有界化
 
 ### 8.1 频率
 
@@ -367,12 +377,11 @@ profile_write_started / profile_write_completed
 - Profile Job absolute budget 初始 1200 秒；
 - 超过预算按 Profile failure metadata/backoff 终结，不生成用户可见错误气泡。
 
-## 9. Enclave、数据库与 Provider 资源预算
+## 9. 历史 proposal：Enclave、数据库与 Provider 资源预算
 
 ### 9.1 Enclave
 
-当前 `ENCLAVE_SEMAPHORE` 是子进程内对象。改成 8 个 slot 进程后，若每个进程仍允许 2 并发，
-理论总并发会意外放大到 16。新设计要求 Parent 运行一个跨 slot 的实例级 admission broker，
+当时 `ENCLAVE_SEMAPHORE` 是子进程内对象。proposal 要求 Parent 运行一个跨 slot 的实例级 admission broker，
 slot child 通过独立双向 IPC 请求 `acquire(pool, slot_generation, request_id)` 和 `release`，初始
 总并发 4：
 
@@ -416,7 +425,7 @@ Enclave 硬上限，直到引入集中式 broker。
 本阶段不阻塞于 route 级调度；若真实数据表明共享 relay 成为瓶颈，再增加 route/credential
 admission。
 
-## 10. 用户失败语义
+## 10. 历史 proposal：用户失败语义
 
 失败提示按责任和可恢复性区分：
 
@@ -430,11 +439,11 @@ admission。
 只有存在 durable、幂等的服务端自动重试时，文案才能承诺“无需重发”。不能用话术掩盖一个已
 终局失败且不会自动恢复的 Job。
 
-## 11. 配置与恢复
+## 11. 历史 implementation / rollout configuration
 
-三池和单 Slot 进程隔离是 Runtime V2 的唯一拓扑，不保留 legacy 模式、共享多 Slot child，
-也不保留可拼成部分上线状态的独立开关。完整实现以一个 PR 合入 `test`，先在 test 环境验证。
-以下容量参数不是 Secret，直接写入 test 主 CVM compose 的 `serve-worker.environment`，不放入
+三池和单 Slot 进程隔离被 proposal 定义为 Runtime V2 的唯一拓扑，不保留 legacy 模式、共享多 Slot child，
+也不保留可拼成部分上线状态的独立开关。下列参数、test 环境和 rollout 描述是当时的 implementation evidence，
+不是当前部署指令；实际环境数量须依 `CURRENT_STATE.md`、exact deployed SHA 和对应 compose 核对。以下容量参数当时直接写入 test 主 CVM compose 的 `serve-worker.environment`，不放入
 GitHub Secret、GitHub Variable 或 Phala encrypted env。test/pre 机器本次不扩容，因此 test
 使用 `2/1/1 = 4` 验证完整三池；生产 8C16G 的目标仍为 `4/2/2 = 8`，prod/pre Compose
 本次不改：
@@ -463,7 +472,7 @@ FEEDLING_V2_ENCLAVE_INSTANCE_CONCURRENCY: "4"
 安装，不做降级；它与旧 image 向后兼容。恢复后重新核对 worker heartbeat、Foreground capacity、
 队列年龄和 exact-claim 回收，再决定是否继续测试。
 
-## 12. 可观测性
+## 12. 历史 implementation evidence：可观测性
 
 Admin 和指标至少新增：
 
@@ -482,7 +491,7 @@ Admin 和指标至少新增：
 所有标签必须 content-free，禁止 user_id、prompt、卡片正文等高基数或私密内容进入公共 metrics。
 按需调查时通过受控 Admin trace 使用 job_id。
 
-## 13. 测试与验收
+## 13. 历史 implementation evidence：测试与验收
 
 ### 13.1 P0 故障注入
 
@@ -528,7 +537,7 @@ Admin 和指标至少新增：
 “不可接受回退”和“显著增长”的数值阈值必须用 test 当前数据固定，不在没有基线的设计阶段
 伪造百分比。
 
-## 14. test 实施与扩容顺序
+## 14. 历史 test implementation / rollout sequence
 
 完整三池实现以一个 PR 合入 `test`，不拆成可独立启停的部分拓扑。顺序是：
 
@@ -543,7 +552,7 @@ test/pre 的故障注入、资源和用户链路证据。该改动改变部署�
 同步更新 `docs-site/content/docs/` 下的架构、工作流、自托管信任模型和 changelog；若公共 API
 错误契约变化，还要更新 OpenAPI、生成 `docs-site/openapi/public.json` 并运行文档合同测试。
 
-## 15. 风险与缓解
+## 15. 历史 proposal：风险与缓解
 
 | 风险 | 缓解 |
 | --- | --- |
@@ -557,7 +566,7 @@ test/pre 的故障注入、资源和用户链路证据。该改动改变部署�
 | 8-slot Provider 并发放大 | Enclave broker 保持实例上限 4；监控 route 429/timeout |
 | 新拓扑部署异常 | 重部署 previous known-good image/commit；保留兼容的加法迁移 `0085` |
 
-## 16. 完成定义
+## 16. 历史 completion definition
 
 设计实现完成必须同时满足：
 

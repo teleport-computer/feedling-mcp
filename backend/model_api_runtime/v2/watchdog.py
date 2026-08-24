@@ -176,14 +176,12 @@ async def _watchdog_loop(
     implementation (`jobs_store.pending_job_count() > 0`, wired in
     `serve_worker._serve`) is a blocking DB round trip.
 
-    On a kill decision: `jobs_store.record_worker_heartbeat(worker_id, capacity=0,
-    kind='turn')` is awaited FIRST (best-effort — a failed write is logged and does
-    NOT block the kill; the child is wedged regardless of whether the heartbeat row
-    could be updated), THEN `supervisor.kill_and_respawn()`. Every per-iteration
-    exception (poll_liveness/jobs_claimable_fn/the writes/the kill itself) is caught,
-    logged, and the loop continues — the watchdog must never crash the parent
-    process (crashing here would also silently stop the heartbeat/reaper/scheduler
-    loops it shares an `asyncio.gather` with in `serve_worker._serve`).
+    On a kill decision, the affected pool/slot heartbeat is first advertised with
+    `capacity=0` (best effort; DB trouble never blocks physical recovery). The
+    watchdog snapshots the active identity, confirms the physical kill, recovers
+    only that `job_id + claimed_by` claim, then starts the replacement slot. Every
+    per-iteration exception is caught and logged so a bad slot cannot crash the
+    parent fleet's heartbeat, reaper, scheduler, or other slot watchdogs.
     """
     if turn_stall_timeout_sec is None:
         turn_stall_timeout_sec = turn_hard_timeout_sec

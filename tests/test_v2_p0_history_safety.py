@@ -1,14 +1,11 @@
-"""P0 acceptance tests for Hosted Runtime V2 PR D, Half-B (history safety).
+"""P0 acceptance tests for the retained PR-D history-safety invariants.
 
-the retained PR-D history-safety decision:
-``docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md``.
-Builds on Tasks 6-10 (all already in this working tree):
-
-  - Task 6  (worker._run_compaction CAS-loss requeue)   — see test_v2_compaction_cas_requeue.py
-  - Task 7  (db.reconcile_unenqueued_v2_messages)        — see test_v2_reconcile_sweeper.py (not exercised here)
-  - Durable retention (append limits never delete source rows) — see test_v2_gc_coverage_gate.py
-  - Task 9  (v2_conversation_summary.watermark_seq, migration 0031)
-  - Task 10 (worker._ensure_prompt_coverage / _assert_prompt_covers prompt invariant) — see test_v2_prompt_invariant.py
+The canonical owner is
+``docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md``:
+D5 seq boundaries, D6 prompt coverage, D7 durable source retention, D8 CAS-loss
+requeue, and D9 parent reconciliation. Related focused tests are
+``test_v2_compaction_cas_requeue.py``, ``test_v2_reconcile_sweeper.py``,
+``test_v2_gc_coverage_gate.py``, and ``test_v2_prompt_invariant.py``.
 
 Each test below asserts a STRONG, non-vacuous property (documented per-test on
 why it can't pass by accident) rather than merely exercising the code path.

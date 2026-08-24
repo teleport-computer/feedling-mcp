@@ -10,9 +10,9 @@
 共用同一个进程和事件循环——任何一个 slot 里卡死的同步调用（未经 ``to_thread`` 桥出去的
 阻塞点、死锁、失控的 provider SDK）都会连带拖死整条事件循环，heartbeat/reaper 也跟着停,
 而 heartbeat 一旦停摆，jobs_store 反而看不出这个 worker 已经失能（心跳行还在，只是
-`capacity` 数字不会再更新）。把 turn slots 挪进一个独立进程后，父进程只要还能拿到
-SIGKILL 权限，就能在子进程卡死时无视它内部状态直接强杀重启——这是这个类存在的唯一
-理由，其余全是达成这个目的所需的管子。
+`capacity` 数字不会再更新）。当前 fleet 为每个 slot 建一个独立子进程和一个
+``ChildSupervisor``；父进程只要还能拿到 SIGKILL 权限，就能只强杀该 slot、按其
+``job_id + claimed_by`` 恢复 claim，再启动该 slot 的 replacement。
 
 **本文件刻意保持零 backend 依赖**（不 import ``db``/``worker``/``hosted``/
 ``agent_runtime`` 任何东西）：它只认识"一个可 pickle 的模块级 callable + 一根
@@ -23,18 +23,14 @@ kill/respawn 语义（见 `tests/test_v2_child_supervisor.py`），子进程目�
 纯 Python 的 fake。真正的生产目标（``turn_child.main``）由调用方（``serve_worker._serve``）
 显式传入，本类不内置默认值、不 import ``turn_child``。
 
-**progress pipe 协议**：子进程侧持有 Pipe 的写端（``start()`` 里作为 spawn target 的第
-一个位置参数传入），每隔一小段时间发送 ``("progress", slot_id, monotonic_ts,
-turn_start)``——``slot_id`` 是真实的 per-slot 下标（``worker._slot_loop`` 的
-``slot_id``，见 ``turn_child._make_progress_cb``）。父进程侧的后台线程把收到的每条消息
-落成两样东西：(1) 一个单调时钟时间戳 `_last_progress_at`——用本地 `time.monotonic()`
-（不是子进程发来的那个数值）记录"收到时刻"，避免依赖跨进程单调时钟是否严格同源这种
-细节；`poll_liveness()` 只是拿它跟当下的 `time.monotonic()` 作差，得到粗粒度的
-`last_progress_age_sec`（整个子进程"最新一次有任何 slot 活动"是多久之前）。(2) 一个
-per-slot 的 `_turn_starts` 字典——``turn_start is None``（slot 空闲）时清掉该 slot 的
-条目，否则记下子进程发来的那个 `turn_start` 原样（这个数值必须跟子进程自己后续用
-`time.monotonic()` 算出来的挂钟差保持同源，所以这里不能替换成父进程收到时刻——参见
-`poll_liveness()` 对它的用法）。
+**progress pipe 协议**：每个 child 持有自己的 duplex Pipe 写端（``start()`` 把它作为
+spawn target 的第一个位置参数传入）。它发送由 ``slot_protocol.encode_message`` 编码的
+``SlotProgress`` 和 ``LoopHeartbeat``，其中 progress 带 slot id、generation、stage、
+active owner identity、monotonic timestamp 与固定的 ``turn_start``。父进程 reader 只接收
+该 supervisor 的 slot/generation，使用本地 ``time.monotonic()`` 记录收到时刻，并保存最新
+active identity 与 ``turn_start``；空闲 progress 清空 active state。这样 parent 的时钟不
+依赖跨进程 monotonic clock 是否同源，同时 active turn 的 absolute age 仍使用 child 原始
+``turn_start`` 计算。
 
 **四只独立时钟**：`last_progress_age_sec`/`event_loop_heartbeat_age_sec` 只看 child event
 loop 是否还能调度；`last_slot_progress_age_sec` 看有没有 slot 穿过 claim/idle/turn 边界；
@@ -52,8 +48,8 @@ catch-up 不会再因为绝对年龄超过旧 180s 就被误杀，而 event-loop
     ...
     supervisor.stop()  # 优雅：SIGTERM + join，超时才 SIGKILL
 
-watchdog 循环会另外调 `poll_liveness()` + `kill_and_respawn()`；本类只负责把单 slot
-子进程立起来、能被父进程干净地 stop，不做自动踢杀。
+watchdog 循环会另外调 `poll_liveness()`、确认 kill、exact claim recovery 和 replacement
+start；本类只负责一个 slot 子进程的协议、liveness snapshot 与受控 stop/kill。
 """
 from __future__ import annotations
 

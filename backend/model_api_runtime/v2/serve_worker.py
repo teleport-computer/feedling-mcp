@@ -5334,7 +5334,7 @@ _HEARTBEAT_INTERVAL_SEC = _positive_float_env(
 
 # Capacity must reflect the turn-child's actual health, not
 # a configured aggregate — otherwise a heartbeat tick ~10s after the
-# watchdog (Task 3) writes capacity=0 on a kill would silently re-advertise full
+# watchdog writes capacity=0 on a kill would silently re-advertise full
 # capacity for a child that is mid-SIGKILL/respawn, letting admission race new turns
 # onto a pool slot that is not there yet. Independently env-configured (own var, own
 # default) rather than importing `_CHILD_LIVENESS_TIMEOUT_SEC` (defined further below,
@@ -6234,15 +6234,14 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     `docs/superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md`；
     progress、kill switch 与历史安全不变量见保留的
     `docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md`。
-    turn slot 不再是这里的 `asyncio.create_task`——它们跑在一个由
-    `child_supervisor.ChildSupervisor` spawn/监督的独立子进程里（`turn_child.main`）,
-    这样一个 slot 里卡死的同步调用不会拖死本进程的事件循环，本进程才能保住
-    SIGKILL 那个子进程的权力。`_reaper_loop`/`_heartbeat_loop`/`_scheduler_loop`/
-    Genesis 线程未改动，仍在本（父）进程里跑。
+    每个 `SlotSpec` 都由 `SlotFleet` 创建一个 `ChildSupervisor` 和一个独立
+    `turn_child.main` 进程；一个 slot 的同步卡死不会拖死 parent 或其他 slot。
+    Parent 运行 pool-aware fleet heartbeat、reaper、scheduler、exact-claim reconcile、
+    per-slot watchdog 与 Genesis 线程。
 
-    `_watchdog_loop` 读 `supervisor.poll_liveness()` 判定
-    卡死并调 `supervisor.kill_and_respawn()`——子进程崩溃/卡死不会让 `asyncio.gather(*tasks)`
-    跟着报错退出（父进程能在没有存活子进程的情况下继续跑并把它救回来）。
+    每个 `_watchdog_loop` 读对应 supervisor 的 liveness，先将该 pool/slot capacity
+    置零，再确认 kill、exact-recover 它的 active claim，并启动 replacement；一个 slot
+    崩溃/卡死不会让 `asyncio.gather(*tasks)` 或其他 slot 跟着退出。
     """
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -6282,7 +6281,7 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     # Synchronous: spawns the child process + starts the parent-side progress-pipe
     # reader thread. Not an asyncio task — the child runs in its own OS process, so
     # there is nothing here for `asyncio.gather` to await; its liveness is polled
-    # (Task 3) rather than joined.
+    # by its dedicated watchdog rather than joined.
     await asyncio.to_thread(fleet.start_all)
     for key in fleet.keys():
         _JOB_CANCEL_ROUTER.watch(fleet.supervisor(key))

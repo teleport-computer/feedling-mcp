@@ -70,12 +70,13 @@ log = logging.getLogger("feedling.runtime_v2.turn_child")
 def _make_progress_cb(conn: "Connection") -> "callable":
     """构造喂给 `worker.run_worker_loop(progress_cb=...)` 的回调：每次真实 slot 活动
     （claim 到 job / turn 跑完 / 空转 poll 醒来——见 `worker._slot_loop` 的三个调用点）
-    往 `conn`（progress pipe 写端）发一条 `("progress", slot_id, monotonic, turn_start)`。
+    往 `conn`（该 slot 的 progress pipe 写端）发送编码后的
+    `slot_protocol.SlotProgress`。
 
     `turn_start`（hard-timeout fix）：原样转发 `worker._slot_loop` 传来的第二个参数——
     这个 slot 当前正在跑的 turn 的开始时刻（claim 之后、`_run_turn` 之前），或者
     `None`（turn 跑完/空转，slot 当前空闲）。父进程侧的 `ChildSupervisor` 用它算
-    `current_turn_age_sec`（见该模块的 progress pipe 协议注释）——一个 slot 卡死在
+    `current_turn_age_sec`（见该模块的 slot protocol 注释）——一个 slot 卡死在
     `_run_turn` 内部永不返回时，它发出的最后一条消息里的 `turn_start` 就是父进程能拿到
     的最新数据，父进程用挂钟时间减去它，年龄跟着挂钟时间持续增长，不依赖这个 slot 之后
     还发不发消息。
@@ -108,8 +109,8 @@ async def _event_loop_heartbeat(
     it deliberately does not refresh any active turn's stall clock.  The two
     signals cover different failure modes:
 
-    * a synchronous event-loop block stops this heartbeat and trips the short
-      pool-wide liveness watchdog;
+    * a synchronous event-loop block stops this heartbeat and trips this slot's
+      liveness watchdog;
     * an ``await`` that never returns leaves the loop heartbeat healthy, but
       its slot stops crossing provider/tool/compaction boundaries and trips
       the per-turn stall watchdog.

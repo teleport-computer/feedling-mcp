@@ -1,9 +1,10 @@
-"""Hosted Runtime V2 PR D, Task 5 — Half-A P0 / acceptance tests
-(``docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md``).
+"""P0 acceptance tests for retained PR-D pool-safety invariants.
 
-This module re-asserts the STRONG acceptance properties Tasks 1-4 (kill_switch,
-child_supervisor.ChildSupervisor, watchdog.should_kill/_watchdog_loop, the
-health-derived _heartbeat_loop) are supposed to jointly guarantee, using fake
+The canonical owner is
+``docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md``:
+D1--D3 progress/watchdog/health capacity and D4 live kill-switch safety. This
+module re-asserts their joint behavior (kill switch, `ChildSupervisor`,
+`watchdog.should_kill`/`_watchdog_loop`, and health-derived heartbeat) using fake
 supervisors / monkeypatched jobs_store — no real turn work is ever spawned:
 
 1. P0 — all slots stuck: capacity=0 is recorded strictly BEFORE
