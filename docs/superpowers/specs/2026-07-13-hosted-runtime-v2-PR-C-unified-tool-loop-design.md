@@ -1,3 +1,7 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # Hosted Runtime V2 — PR C: Unified Provider-Native Tool Loop — Design
 
 **Status:** LANDED / CURRENT ARCHITECTURE RECORD

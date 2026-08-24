@@ -1,3 +1,9 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop-design.md
+historical_reason: superseded
+superseded_by: docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop-design.md
+---
 # Hosted Runtime V2 — Agent Loop 设计
 
 > **STATUS: HISTORICAL / SUPERSEDED.** This intermediate JSON-planner loop was

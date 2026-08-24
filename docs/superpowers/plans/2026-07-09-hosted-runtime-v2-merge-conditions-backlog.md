@@ -1,3 +1,9 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop-design.md
+historical_reason: superseded
+superseded_by: docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop-design.md
+---
 # Hosted Runtime V2 — Merge-Conditions Backlog
 
 > **RETIRED / DO NOT DEPLOY.** Historical snapshot; use the live Runtime V2
@@ -14,7 +20,7 @@
 
 ## 范围界定（重要）
 
-A+B+C 是按**当初的 A/B/C spec**（`docs/superpowers/specs/2026-07-08-hosted-runtime-v2-abc-design.md`，确定性 `planner→executor→responder`）实现并过审的。
+A+B+C 是按**当初的 A/B/C spec**（归档记录 [`2026-07-08-hosted-runtime-v2-abc-design.md`](../../archive/superpowers/specs/2026-07-08-hosted-runtime-v2-abc-design.md)，确定性 `planner→executor→responder`）实现并过审的。
 这份 walkthrough 是**更高的愿景稿**——它的 §4/§5 把架构抬到「原生 tool-calling agent loop + 完整对话压缩」，§9 又把这些提成 merge 前置。因此：
 
 - **A/B/C 对自身 spec = 完成。**

@@ -10,8 +10,8 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 | Lifecycle | Classified documents |
 |---|---:|
 | `current` | 14 |
-| `decision` | 1 |
-| `historical` | 7 |
+| `decision` | 2 |
+| `historical` | 13 |
 | `generated` | 1 |
 
 ## current
@@ -33,17 +33,24 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 
 ## decision
 
+- `docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop-design.md`
 - `docs/superpowers/specs/2026-07-21-dual-runtime-v1-v2-coexistence-design.md`
 
 ## historical
 
 - `docs/CHANGELOG.md`
+- `docs/archive/superpowers/plans/2026-07-08-hosted-runtime-v2-C-action-queue-planner.md`
 - `docs/archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D0-rollout-infrastructure.md`
 - `docs/archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D4-loadtest-rollout-killresident.md`
+- `docs/archive/superpowers/plans/2026-07-10-hosted-runtime-v2-agent-loop.md`
+- `docs/archive/superpowers/plans/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop.md`
+- `docs/archive/superpowers/specs/2026-07-08-hosted-runtime-v2-abc-design.md`
 - `docs/archive/superpowers/specs/2026-07-09-hosted-runtime-v2-D0-rollout-infrastructure-design.md`
 - `docs/archive/superpowers/specs/2026-07-09-hosted-runtime-v2-D4-loadtest-rollout-killresident-design.md`
 - `docs/repository-cleanup/baseline.md`
+- `docs/superpowers/plans/2026-07-09-hosted-runtime-v2-merge-conditions-backlog.md`
 - `docs/superpowers/plans/2026-08-01-branch-promotion-guard.md`
+- `docs/superpowers/specs/2026-07-10-hosted-runtime-v2-agent-loop-design.md`
 
 ## generated
 
