@@ -7,6 +7,7 @@ import db
 from accounts import registry
 from core.store import UserStore
 from proactive.controls_v2 import (
+    DeliveryDecisionV2,
     USER_MESSAGE_SOURCE_V2,
     evaluate_delivery_v2,
     load_settings_v2_for_store,
@@ -27,9 +28,8 @@ def _env_flag(name: str, default: bool) -> bool:
 
 # Received AI messages (chat replies + proactive) no longer expand the Dynamic
 # Island — they deliver only the system alert, which stacks in Notification
-# Center instead of flashing away. Explicit push and Live Activity routes remain
-# available for other/future uses, but the global System Notifications preference
-# gates their visible delivery too. Set
+# Center instead of flashing away. Live Activity remains an independent channel
+# controlled by its own client preference. Set
 # FEEDLING_AI_MSG_LIVE_ACTIVITY=1 to restore the old dual (Live Activity + alert)
 # behavior.
 AI_MSG_LIVE_ACTIVITY = _env_flag("FEEDLING_AI_MSG_LIVE_ACTIVITY", False)
@@ -171,6 +171,7 @@ def _deliver_ai_message_push_if_background(
     title: str = "",
     data: dict | None = None,
     visual_state: str = "reply",
+    alert_delivery: DeliveryDecisionV2 | None = None,
 ) -> dict:
     # Two-tier gate (see _send_chat_alert): free in-memory negative, then
     # authoritative DB check to close the stale-worker race after a cross-worker
@@ -191,30 +192,22 @@ def _deliver_ai_message_push_if_background(
             "alert_reason": "empty_body",
         }
 
-    delivery = evaluate_delivery_v2(
-        load_settings_v2_for_store(store),
-        source=USER_MESSAGE_SOURCE_V2,
-    )
-    if not delivery.allow_visible_delivery:
-        return {
-            "push_decision": "suppress",
-            "push_reason": delivery.reason,
-            "live_activity_status": "suppressed",
-            "live_activity_reason": delivery.reason,
-            "alert_status": "suppressed",
-            "alert_reason": delivery.reason,
-        }
-
+    delivery = alert_delivery or evaluate_delivery_v2(
+        load_settings_v2_for_store(store), source=USER_MESSAGE_SOURCE_V2)
     decision = _ai_push_decision(store)
+    should_push = bool(decision.get("should_push"))
     fields: dict = {
-        "push_decision": "send" if decision.get("should_push") else "suppress",
-        "push_reason": str(decision.get("reason") or "")[:120],
+        "push_decision": "send" if should_push and delivery.allow_visible_delivery else "suppress",
+        "push_reason": str(
+            decision.get("reason") if delivery.allow_visible_delivery else delivery.reason
+            or ""
+        )[:120],
         "app_presence_phase": str(decision.get("phase") or "")[:40],
     }
     if decision.get("age_sec") not in ("", None):
         fields["app_presence_age_sec"] = str(decision.get("age_sec"))[:20]
 
-    if not decision.get("should_push"):
+    if not should_push:
         reason = str(decision.get("reason") or "app_foreground")[:120]
         fields.update({
             "live_activity_status": "suppressed",
@@ -249,9 +242,13 @@ def _deliver_ai_message_push_if_background(
         fields["live_activity_activity_id"] = ""
         fields["live_activity_mode"] = "disabled"
 
-    alert_result = _send_chat_alert(store, visible_body, alert_title=title or "")
-    fields["alert_status"] = (alert_result or {}).get("status", "unknown")
-    fields["alert_reason"] = (alert_result or {}).get("reason", "")
+    if delivery.allow_visible_delivery:
+        alert_result = _send_chat_alert(store, visible_body, alert_title=title or "")
+        fields["alert_status"] = (alert_result or {}).get("status", "unknown")
+        fields["alert_reason"] = (alert_result or {}).get("reason", "")
+    else:
+        fields["alert_status"] = "suppressed"
+        fields["alert_reason"] = delivery.reason
     print(
         f"[ai-push:{store.user_id}] live={fields['live_activity_status']} "
         f"alert={fields['alert_status']} reason={fields.get('push_reason', '')}"

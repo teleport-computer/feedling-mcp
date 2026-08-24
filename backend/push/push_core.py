@@ -122,20 +122,14 @@ def notification(store: UserStore, *, payload: dict) -> dict:
 
 
 def dynamic_island(store: UserStore, *, payload: dict) -> dict:
-    if suppression := _global_notification_suppression(store):
-        return suppression
     return live_activity.push_live_activity_dict(store, payload)
 
 
 def live_activity_update(store: UserStore, *, payload: dict) -> dict:
-    if suppression := _global_notification_suppression(store):
-        return suppression
     return live_activity.push_live_activity_dict(store, payload)
 
 
 def live_start(store: UserStore, *, payload: dict) -> dict:
-    if suppression := _global_notification_suppression(store):
-        return suppression
     return live_activity.push_live_start_dict(store, payload)
 
 
@@ -145,56 +139,17 @@ def ai_reply_push(store: UserStore, *, payload: dict) -> dict:
     V2 的 serve-worker 没有 APNs 私钥（只注入 backend），所以它把已落库回复的
     明文正文交到这里。正文只经过内存：不写库、不进日志正文。
 
-    ``reminders_delivery`` 是 iOS 的全局系统通知开关。无论消息来自 agent
-    主动唤醒还是用户消息后的回复，关闭时都只写入聊天，不发送可见推送。
+    ``reminders_delivery`` 是 iOS 普通 Push 消息的总开关。关闭后回复仍写入
+    聊天，但不发送通知横幅、声音或振动；Live Activity 使用独立开关。
     """
     from push import service as push_service
 
     msg_id = str(payload.get("msg_id") or "").strip()
     body = str(payload.get("body") or "").strip()
-    is_wake = bool(payload.get("is_wake"))
     if not msg_id:
         return {"status": "skipped", "reason": "missing_msg_id", "apns_alert_sent": False}
     if not body:
         return {"status": "skipped", "reason": "empty_body", "apns_alert_sent": False}
-
-    if is_wake:
-        # ``lane`` is the V2 lane name (heartbeat/scheduled/manual_wake/
-        # screen_watch) the serve-worker sent this wake reply's push under.
-        # Mirrors V1's ``_proactive_delivery_decision_v2`` (chat/chat_core.py),
-        # which derives ``source``/``manual`` from the wake job rather than
-        # hardcoding them. The global notification gate now runs before that
-        # source-specific decision, so manual only describes the wake and never
-        # bypasses a disabled notification preference. Back-compat: a
-        # caller that predates this field (payload has no "lane" key at all)
-        # falls back to the pre-fix constants instead of erroring.
-        if "lane" in payload:
-            source = str(payload.get("lane") or "").strip() or "heartbeat"
-            manual = source == "manual_wake"
-        else:
-            source = "heartbeat"
-            manual = False
-    else:
-        source = controls_v2.USER_MESSAGE_SOURCE_V2
-        manual = False
-
-    decision = controls_v2.evaluate_delivery_v2(
-        controls_v2.load_settings_v2_for_store(store), source=source, manual=manual)
-    if not decision.allow_visible_delivery:
-        fields = {
-            "push_decision": "suppressed",
-            "push_reason": decision.reason,
-            "alert_status": "suppressed",
-            "alert_reason": decision.reason,
-            "live_activity_status": "suppressed",
-            "live_activity_reason": decision.reason,
-        }
-        store.update_chat_message_metadata(msg_id, fields)
-        return {
-            "status": "suppressed",
-            "reason": decision.reason,
-            "apns_alert_sent": False,
-        }
 
     fields = push_service._deliver_ai_message_push_if_background(
         store, body=body[:240], title="IO", data={}, visual_state="reply")

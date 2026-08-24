@@ -279,9 +279,9 @@ def evaluate_delivery_v2(
 ) -> DeliveryDecisionV2:
     resolved = resolve_settings_v2(settings)
     normalized = str(source or "").strip()
-    # The iOS "System Notifications" control is the global visible-delivery
-    # switch. Manual wakes and replies to user-authored messages may still run
-    # and write chat records, but they must not bypass notification suppression.
+    # The iOS "System Notifications" control gates ordinary APNs alert delivery.
+    # Manual wakes and replies still run and write chat records, but they must
+    # not bypass this Push preference. Live Activity has its own client switch.
     if not resolved.reminders_delivery:
         return DeliveryDecisionV2(True, False, "reminders_delivery_disabled", resolved)
     if manual:
