@@ -198,16 +198,29 @@ def garden_language_decision(
     # 那个门槛（32 字符）是给散文调的；桶名天生就短 —— "Work / Health / Pets"
     # 只有 14 个拉丁字母，喂进去会被判成证据不足、回落成中文，
     # 于是一个英文花园会突然开始长中文桶。实测踩到过。
-    buckets = str(existing_buckets or "")
-    if buckets.strip():
-        cjk = len(_CJK_RE.findall(buckets))
-        latin = len(_LATIN_RE.findall(buckets))
-        if cjk or latin:
+    # ⚠️ **按桶投票，绝不按字符数。**
+    #
+    # 2026-08-24 线上事故：原实现比的是整串里 CJK 与拉丁**字符**的个数。中英文桶名
+    # 长度根本不对等 —— 中文桶「工作」两个字符，英文桶「Our relationship」十五个，
+    # **一个英文桶顶七个中文桶**。于是「8 个中文桶 + 2 个英文桶」会被判成英文花园。
+    #
+    # 而那几个英文桶本身是旧 bug 的残留（老提示词同时给中英两套让模型挑，约 1/3 的
+    # 中文记忆被贴上英文公共桶）。旧残留 → 被这里读成"这是英文花园" → 新卡全用英文桶
+    # → 英文桶更多，**自我强化**。真实用户的中文花园两天内整个翻成了英文。
+    #
+    # 一个桶一票，长度不参与。平票算中文（保守：翻成英文是用户能看见的破坏性变化，
+    # 保持中文最多是没跟上，代价小得多）。
+    names = [b.strip() for b in re.split(r"[、,/\n]+", str(existing_buckets or "")) if b.strip()]
+    if names:
+        zh = sum(1 for n in names if _CJK_RE.search(n))
+        en = sum(1 for n in names if not _CJK_RE.search(n) and _LATIN_RE.search(n))
+        if zh or en:
             return {
-                "locale": "zh-Hans" if cjk >= latin else "en",
+                "locale": "zh-Hans" if zh >= en else "en",
                 "basis": "existing_buckets",
-                "bucket_cjk": cjk,
-                "bucket_latin": latin,
+                "bucket_zh": zh,
+                "bucket_en": en,
+                "bucket_total": len(names),
             }
 
     # 还没有任何桶（新花园的第一张卡）才看身份卡 / locale / 归档语言。
@@ -217,8 +230,9 @@ def garden_language_decision(
     return {
         "locale": policy.language,
         "basis": f"reply_language:{policy.source}",
-        "bucket_cjk": 0,
-        "bucket_latin": 0,
+        "bucket_zh": 0,
+        "bucket_en": 0,
+        "bucket_total": 0,
         "confidence": round(float(policy.confidence or 0.0), 2),
     }
 
