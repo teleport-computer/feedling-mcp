@@ -1731,6 +1731,120 @@ def test_followup_context_rebind_is_mirrored_to_tee(monkeypatch):
     assert row == (str(job_id), str(job_id))
 
 
+def test_rhythm_dual_entry_heartbeats_bounded_by_interval_clock():
+    """RH-1+BL-1+RH-4:排程+感知双入口混打 N 个 interval 的节奏不变量。
+
+    - 每个 interval 恰一个 heartbeat job,总数 == N+1(N 个 interval 含两端);
+    - 间隔中段的感知事件必输给钟(won=False),只 defer 不建 job;
+    - 准点 tick 不被上一班「放行即拨」的钟以 δ 之差挡住(RH-4 边界/共锚);
+    - 迟到与被节流的感知 context 无一丢失,最终都可从某个 job 读回;
+    - BL-1:job 创建数 == won=True 的准入次数(计费面=准入面)。
+
+    accepted tradeoff(督导 20260824T175529Z):放行即拨后 worker 挂掉 ⇒ 该格
+    心跳丢,fail-safe 朝「少跳」偏,不加补偿逻辑。interval 从被测模块派生。
+    """
+    from perception import store as perception_store
+
+    uid = "u_js_rhythm_dual_entry"
+    seed_user(uid)
+    _reset(uid)
+    stream = perception_store.V2_WAKE_CONTEXT_STREAM
+    interval = float(
+        core_store.normalize_proactive_wake_interval_sec(
+            core_store.PROACTIVE_WAKE_INTERVAL_MIN_SEC
+        )
+    )
+    assert interval > 0
+    t0 = 1_000_000.0
+    intervals = 3
+    injected: list[str] = []
+    wins = 0
+    job_ids: list[int] = []
+
+    def _perception_event(tp: float, wake_id: str, *, expect_defer: bool) -> None:
+        # 与 service._fire_wake_event_v2 同序:先试活跃 coalesce,
+        # 无活跃则问钟(CAS),败者 defer——storage 语义按生产顺序驱动。
+        doc = {
+            "wake_id": wake_id,
+            "trigger": "arrived_at_anchor",
+            "change_digest": wake_id,
+        }
+        injected.append(wake_id)
+        active = jobs_store.append_context_to_active_heartbeat(
+            uid, context_stream=stream, context_doc=doc, context_ts=tp
+        )
+        if not expect_defer:
+            assert active is not None
+            return
+        assert active is None
+        _value, won = core_store.consume_proactive_heartbeat_tick(
+            uid, now=tp, wake_interval_sec=interval
+        )
+        assert won is False, f"mid-interval perception at {tp} beat the clock"
+        result = jobs_store.defer_heartbeat_context(
+            uid, context_stream=stream, context_doc=doc, context_ts=tp
+        )
+        assert result["deferred"] is True
+
+    for k in range(intervals):
+        t = t0 + k * interval
+        # RH-4:准点 tick 必赢——判钟与拨钟共用同一 now 锚,无 δ 漂移自阻。
+        _value, won = core_store.consume_proactive_heartbeat_tick(
+            uid, now=t, wake_interval_sec=interval
+        )
+        assert won is True, f"beat {k} lost to its own previously-advanced clock"
+        wins += 1
+        job_id, coalesced = jobs_store.enqueue_scheduled_heartbeat(
+            uid, trace_id=f"rhythm-beat-{k}", context_stream=stream
+        )
+        assert coalesced is False
+        job_ids.append(job_id)
+        worker_id = f"w-rhythm-{k}"
+        job = jobs_store.claim_next_job(worker_id)
+        assert job is not None and job["id"] == job_id
+        assert jobs_store.mark_running(job_id, claimed_by=worker_id)
+        # 心跳运行中到达的感知:coalesce 进当前 job(历史行为不变)。
+        _perception_event(t + interval * 0.3, f"live-{k}", expect_defer=False)
+        completed, successor = jobs_store.finish_wake_job(
+            job_id,
+            claimed_by=worker_id,
+            observed_generation=0,
+            context_stream=stream,
+            consumed_context_seq=0,
+        )
+        assert completed is True and successor is None
+        # 无活跃 job 的间隔中段感知:输给钟,defer 不建 job。
+        _perception_event(t + interval * 0.6, f"throttled-{k}", expect_defer=True)
+
+    t_final = t0 + intervals * interval
+    _value, won = core_store.consume_proactive_heartbeat_tick(
+        uid, now=t_final, wake_interval_sec=interval
+    )
+    assert won is True, "final boundary beat lost (δ drift)"
+    wins += 1
+    final_id, coalesced = jobs_store.enqueue_scheduled_heartbeat(
+        uid, trace_id="rhythm-beat-final", context_stream=stream
+    )
+    assert coalesced is False
+    job_ids.append(final_id)
+
+    with db.get_pool().connection() as conn:
+        count = conn.execute(
+            "SELECT count(*) FROM agent_jobs WHERE user_id=%s AND lane='heartbeat'",
+            (uid,),
+        ).fetchone()[0]
+    assert count == intervals + 1  # RH-1:任何来源合计 ≤ N+1,且这里恰为 N+1
+    assert count == wins  # BL-1:每个 job 都对应一次钟准入,无旁路
+    seen: set[str] = set()
+    for jid in job_ids:
+        for item in perception_store.read_v2_wake_context(uid, jid):
+            seen.add(item["wake_id"])
+    assert seen == set(injected)  # LP:迟到/节流的 context 无一丢失
+    schedule = jobs_store.get_wake_schedule(uid)
+    assert schedule["pending_followup_source_job_id"] is None
+    assert schedule["pending_followup_generation"] is None
+
+
 def test_completed_wake_retry_cannot_overwrite_newer_glance_source():
     """An exact-source retry is idempotent and ordered by source job id."""
     uid = "u_js_glance_source_order"
