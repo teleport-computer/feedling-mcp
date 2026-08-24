@@ -1,9 +1,0 @@
-{"gid":"g01","desc":"纯中文花园","buckets":"工作、健康、宠物、家庭","expect":"zh-Hans","why":"基线"}
-{"gid":"g02","desc":"纯英文花园","buckets":"Work / Health / Pets / Family","expect":"en","why":"基线"}
-{"gid":"g03","desc":"中文花园混进 2 个英文桶","buckets":"工作、健康、宠物、家庭、朋友、爱好、金钱、饮食、Our relationship、Feelings & comfort","expect":"zh-Hans","why":"⚠️ 线上事故原型：8:2 被判成英文，整个花园翻转","incident":"2026-08-24 生产用户 226 张卡的中文花园两天内翻成英文"}
-{"gid":"g04","desc":"中英各半、英文桶名更长","buckets":"我们的关系、工作、健康、Our relationship、Feelings & comfort、GitHub","expect":"zh-Hans","why":"⚠️ 事故现场形状。按字符数比会判英文（9 vs 36）","incident":"同上"}
-{"gid":"g05","desc":"平票","buckets":"工作、健康、Work、Health","expect":"zh-Hans","why":"平票必须保持中文 —— 翻成英文是用户看得见的破坏，保持中文只是没跟上"}
-{"gid":"g06","desc":"英文占多数","buckets":"工作、Work、Health、Pets、Family","expect":"en","why":"修复不能矫枉过正：真的多数英文还得判英文"}
-{"gid":"g07","desc":"自造中文桶","buckets":"妈妈、房子、崽崽","expect":"zh-Hans","why":"自定义桶（不在通用集里）也要认得出语言"}
-{"gid":"g08","desc":"新花园无桶","buckets":"","expect":"zh-Hans","why":"没有证据时的默认"}
-{"gid":"g09","desc":"单个长英文桶 vs 多个短中文桶","buckets":"工作、健康、宠物、Preferences & boundaries","expect":"zh-Hans","why":"3:1，一个长英文桶不许掀翻"}
