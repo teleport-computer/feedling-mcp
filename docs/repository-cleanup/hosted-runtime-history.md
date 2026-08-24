@@ -165,8 +165,9 @@ partial-supersession 链接保持可解析。生成的 lifecycle inventory 由�
   in-flight scope 和 recent-`chat` mean 是当前估算输入；容量估算或其 DB 读取失败时必须
   fail open。此点不削弱 liveness、runtime-control、kill-switch 或 provider/configuration
   的 fail-closed 边界。
-- 本批次只变更 lifecycle Markdown 及生成的 inventory；不修改 runtime、数据库、schema、
-  compose、API/wire/security/public docs、`deploy/`、`docs-site/` 或
+- 本批次变更 lifecycle Markdown、生成的 inventory，并作一项文档层 API error-contract
+  修正：删除已失效的 live-overload `busy` / 503 行；不修改 runtime、数据库、schema、
+  compose、API/wire/security 行为、公开 `docs-site/`、`deploy/` 或
   `tools/chat_resident_consumer.py`。
 
 ### 批次 5 引用检查
