@@ -7,6 +7,7 @@ import db
 from accounts import registry
 from core.store import UserStore
 from push import apns, live_activity
+from push.sounds import NOTIFICATION_SOUND_NAME
 from push import tokens as push_tokens
 
 APP_FOREGROUND_FRESH_SEC = int(os.environ.get("FEEDLING_APP_FOREGROUND_FRESH_SEC", 90))
@@ -139,7 +140,7 @@ def _send_chat_alert(store: UserStore, alert_body: str, alert_title: str = ""):
     apns_payload = {
         "aps": {
             "alert": {"title": alert_title or "", "body": body},
-            "sound": "default",
+            "sound": NOTIFICATION_SOUND_NAME,
         },
         "feedling": {"type": "chat_reply"},
     }

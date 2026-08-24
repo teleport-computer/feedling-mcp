@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **iOS notification alerts now use a device-selected local sound.** APNs sends
+  one stable sound filename for regular notifications; the iOS app owns the
+  corresponding file in its local `Library/Sounds` directory. Older clients and
+  devices that keep System Default do not have that file, so iOS automatically
+  falls back to the system notification sound without a per-account backend
+  preference or uploaded audio.
+
 - **Hosted proactive wakes now make an explicit speak-or-sleep choice after an
   empty model round.** The first round still receives the full wake tool surface.
   If it ends without visible text or a tool call, including after earlier tool

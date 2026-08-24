@@ -24,6 +24,7 @@ from core import store as core_store
 from core.store import UserStore
 from push import apns
 from push import live_activity
+from push.sounds import NOTIFICATION_SOUND_NAME
 from push import tokens as push_tokens
 
 
@@ -93,7 +94,7 @@ def notification(store: UserStore, *, payload: dict) -> dict:
     apns_payload = {
         "aps": {
             "alert": {"title": payload.get("title", ""), "body": payload.get("body", "")},
-            "sound": "default",
+            "sound": NOTIFICATION_SOUND_NAME,
         }
     }
     result = apns._send_apns_to_active_tokens(
