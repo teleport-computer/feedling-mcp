@@ -462,6 +462,12 @@ jobs:
             tests/test_perception_prompt_golden.py \
             -v
 
+      - name: Repository inventory unit tests
+        run: |
+          python -m pytest \
+            tests/test_repository_inventory.py \
+            -v
+
       - name: Guard top-level pytest discovery coverage
         run: |
           export LC_ALL=C
