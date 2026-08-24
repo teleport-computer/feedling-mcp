@@ -17,6 +17,7 @@ import yaml
 
 LIFECYCLES = ("current", "decision", "historical", "generated")
 HISTORICAL_REASONS = ("implemented", "superseded", "rejected", "point-in-time")
+MARKDOWN_SUFFIXES = frozenset((".md", ".mdx"))
 
 
 def parse_metadata(text: str) -> tuple[dict[str, object], str | None]:
@@ -46,6 +47,30 @@ def parse_metadata(text: str) -> tuple[dict[str, object], str | None]:
 
 def _relative(path: Path, repo_root: Path) -> str:
     return path.resolve().relative_to(repo_root.resolve()).as_posix()
+
+
+def _resolve_repo_path(repo_root: Path, relative: str) -> Path | None:
+    """Resolve a repository-relative path, rejecting absolute paths and escapes."""
+
+    candidate = Path(relative)
+    if candidate.is_absolute():
+        return None
+    resolved = (repo_root / candidate).resolve()
+    try:
+        resolved.relative_to(repo_root.resolve())
+    except ValueError:
+        return None
+    return resolved
+
+
+def _lifecycle_of(path: Path) -> str:
+    if path.suffix.lower() not in MARKDOWN_SUFFIXES or not path.is_file():
+        return "unclassified"
+    metadata, error = parse_metadata(path.read_text(encoding="utf-8"))
+    if error is not None:
+        return "unclassified"
+    lifecycle = str(metadata.get("document_lifecycle") or "")
+    return lifecycle if lifecycle in LIFECYCLES else "unclassified"
 
 
 def validate_document(path: Path, repo_root: Path) -> list[str]:
@@ -85,8 +110,23 @@ def validate_document(path: Path, repo_root: Path) -> list[str]:
                 errors.append(
                     f"{relative}: historical_reason=superseded requires superseded_by"
                 )
-            elif not (repo_root / successor).exists():
-                errors.append(f"{relative}: superseded_by does not exist: {successor}")
+            else:
+                successor_path = _resolve_repo_path(repo_root, successor)
+                if successor_path is None:
+                    errors.append(
+                        f"{relative}: superseded_by escapes repository: {successor}"
+                    )
+                elif not successor_path.exists():
+                    errors.append(
+                        f"{relative}: superseded_by does not exist: {successor}"
+                    )
+                else:
+                    successor_lifecycle = _lifecycle_of(successor_path)
+                    if successor_lifecycle not in ("current", "decision"):
+                        errors.append(
+                            f"{relative}: superseded_by must be current or decision "
+                            f"Markdown: {successor} ({successor_lifecycle})"
+                        )
 
     if lifecycle == "generated" and not str(metadata.get("generator") or "").strip():
         errors.append(f"{relative}: generated documents require a generator command")
@@ -94,7 +134,10 @@ def validate_document(path: Path, repo_root: Path) -> list[str]:
     if not owner or owner == "self":
         return errors
 
-    owner_path = repo_root / owner
+    owner_path = _resolve_repo_path(repo_root, owner)
+    if owner_path is None:
+        errors.append(f"{relative}: canonical_owner escapes repository: {owner}")
+        return errors
     if not owner_path.exists():
         errors.append(f"{relative}: canonical_owner does not exist: {owner}")
         return errors
@@ -106,24 +149,27 @@ def validate_document(path: Path, repo_root: Path) -> list[str]:
                 f"{relative}: current canonical_owner cannot point into an archive: {owner}"
             )
             return errors
-        if owner_path.suffix.lower() == ".md":
-            owner_metadata, owner_error = parse_metadata(
-                owner_path.read_text(encoding="utf-8")
+        if owner_path.suffix.lower() not in MARKDOWN_SUFFIXES:
+            errors.append(
+                f"{relative}: current canonical_owner must be current or decision "
+                f"Markdown: {owner}"
             )
-            owner_lifecycle = str(owner_metadata.get("document_lifecycle") or "")
-            if owner_error is not None or owner_lifecycle not in LIFECYCLES:
-                errors.append(
-                    f"{relative}: current canonical_owner has no valid lifecycle "
-                    f"metadata: {owner}"
-                )
-            elif owner_lifecycle == "historical":
-                errors.append(
-                    f"{relative}: current canonical_owner is historical: {owner}"
-                )
-            elif owner_lifecycle == "generated":
-                errors.append(
-                    f"{relative}: current canonical_owner cannot be generated: {owner}"
-                )
+            return errors
+        owner_metadata, owner_error = parse_metadata(
+            owner_path.read_text(encoding="utf-8")
+        )
+        owner_lifecycle = str(owner_metadata.get("document_lifecycle") or "")
+        if owner_error is not None or owner_lifecycle not in LIFECYCLES:
+            errors.append(
+                f"{relative}: current canonical_owner has no valid lifecycle "
+                f"metadata: {owner}"
+            )
+        elif owner_lifecycle == "historical":
+            errors.append(f"{relative}: current canonical_owner is historical: {owner}")
+        elif owner_lifecycle == "generated":
+            errors.append(
+                f"{relative}: current canonical_owner cannot be generated: {owner}"
+            )
 
     return errors
 
@@ -141,7 +187,9 @@ def _git_paths(repo_root: Path, args: Sequence[str]) -> tuple[str, ...]:
 
 def _is_managed_markdown(path: str) -> bool:
     normalized = path.replace("\\", "/")
-    return normalized.lower().endswith(".md") and not normalized.startswith(
+    return Path(
+        normalized
+    ).suffix.lower() in MARKDOWN_SUFFIXES and not normalized.startswith(
         ("contracts/lib/", "vendor/")
     )
 
@@ -163,10 +211,13 @@ def changed_markdown_paths(repo_root: Path, changed_vs: str) -> tuple[str, ...]:
 
 def all_markdown_paths(repo_root: Path) -> tuple[str, ...]:
     paths = set(_git_paths(repo_root, ("ls-files", "-z")))
-    paths.update(
-        _git_paths(repo_root, ("ls-files", "--others", "--exclude-standard", "-z"))
+    existing = (
+        path
+        for path in paths
+        if (resolved := _resolve_repo_path(repo_root, path)) is not None
+        and resolved.is_file()
     )
-    return tuple(sorted(path for path in paths if _is_managed_markdown(path)))
+    return tuple(sorted(path for path in existing if _is_managed_markdown(path)))
 
 
 def classified_paths(

@@ -6,11 +6,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
 from tools.check_document_lifecycle import (  # noqa: E402
+    all_markdown_paths,
     changed_markdown_paths,
+    classified_paths,
     parse_metadata,
     render_report,
     validate_document,
@@ -134,6 +138,47 @@ def test_current_document_owner_must_itself_be_classified(tmp_path: Path) -> Non
     ]
 
 
+def test_current_document_owner_must_be_markdown_not_source(tmp_path: Path) -> None:
+    _write(tmp_path / "tools/owner.py", "OWNER = True\n")
+    current = _write(
+        tmp_path / "docs/current.md",
+        _document(lifecycle="current", canonical_owner="tools/owner.py"),
+    )
+
+    assert validate_document(current, tmp_path) == [
+        "docs/current.md: current canonical_owner must be current or decision Markdown: tools/owner.py"
+    ]
+
+
+def test_canonical_owner_cannot_escape_repository(tmp_path: Path) -> None:
+    outside = _write(tmp_path.parent / "outside-owner.md", "# Outside\n")
+    assert outside.exists()
+    current = _write(
+        tmp_path / "docs/current.md",
+        _document(lifecycle="current", canonical_owner="../outside-owner.md"),
+    )
+
+    assert validate_document(current, tmp_path) == [
+        "docs/current.md: canonical_owner escapes repository: ../outside-owner.md"
+    ]
+
+
+def test_mdx_can_be_a_current_canonical_owner(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "docs-site/content/docs/architecture.mdx",
+        _document(lifecycle="decision", canonical_owner="self"),
+    )
+    current = _write(
+        tmp_path / "docs/current.md",
+        _document(
+            lifecycle="current",
+            canonical_owner="docs-site/content/docs/architecture.mdx",
+        ),
+    )
+
+    assert validate_document(current, tmp_path) == []
+
+
 def test_lifecycle_specific_metadata_is_required(tmp_path: Path) -> None:
     historical = _write(
         tmp_path / "historical.md",
@@ -174,6 +219,49 @@ def test_superseded_document_requires_a_live_successor(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize("successor_lifecycle", ("historical", "generated"))
+def test_superseded_successor_must_be_current_or_decision(
+    tmp_path: Path,
+    successor_lifecycle: str,
+) -> None:
+    _write(
+        tmp_path / "docs/current.md",
+        _document(lifecycle="current", canonical_owner="self"),
+    )
+    successor_metadata = _document(
+        lifecycle=successor_lifecycle,
+        canonical_owner=(
+            "docs/current.md"
+            if successor_lifecycle == "historical"
+            else "tools/generate.py"
+        ),
+        historical_reason=(
+            "implemented" if successor_lifecycle == "historical" else None
+        ),
+        generator=(
+            "python3 tools/generate.py" if successor_lifecycle == "generated" else None
+        ),
+    )
+    _write(tmp_path / "docs/successor.md", successor_metadata)
+    if successor_lifecycle == "generated":
+        _write(tmp_path / "tools/generate.py", "print('generated')\n")
+    superseded = _write(
+        tmp_path / "docs/old.md",
+        "---\n"
+        "document_lifecycle: historical\n"
+        "canonical_owner: docs/current.md\n"
+        "historical_reason: superseded\n"
+        "superseded_by: docs/successor.md\n"
+        "---\n"
+        "# Old\n",
+    )
+
+    assert validate_document(superseded, tmp_path) == [
+        "docs/old.md: superseded_by must be current or decision Markdown: "
+        f"docs/successor.md ({successor_lifecycle})"
+    ]
+
+
 def test_changed_markdown_paths_uses_git_diff_and_untracked_files(
     tmp_path: Path,
 ) -> None:
@@ -188,9 +276,54 @@ def test_changed_markdown_paths_uses_git_diff_and_untracked_files(
 
     _write(tmp_path / "old.md", "# Changed\n")
     _write(tmp_path / "new.md", "# New\n")
+    _write(tmp_path / "docs-site/content/docs/public.mdx", "# Public\n")
     _write(tmp_path / "notes.txt", "not markdown\n")
 
-    assert changed_markdown_paths(tmp_path, base) == ("new.md", "old.md")
+    assert changed_markdown_paths(tmp_path, base) == (
+        "docs-site/content/docs/public.mdx",
+        "new.md",
+        "old.md",
+    )
+
+
+def test_all_report_uses_only_the_tracked_repository_corpus(tmp_path: Path) -> None:
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "tests@example.invalid")
+    _git(tmp_path, "config", "user.name", "Tests")
+    _write(
+        tmp_path / "tracked.md",
+        _document(lifecycle="current", canonical_owner="self"),
+    )
+    _git(tmp_path, "add", "tracked.md")
+    _git(tmp_path, "commit", "-q", "-m", "base")
+    _write(
+        tmp_path / "local-notes.md",
+        _document(lifecycle="current", canonical_owner="self"),
+    )
+
+    paths = all_markdown_paths(tmp_path)
+    report = render_report(classified_paths(tmp_path, paths))
+
+    assert paths == ("tracked.md",)
+    assert "tracked.md" in report
+    assert "local-notes.md" not in report
+
+
+def test_all_markdown_paths_ignores_tracked_files_missing_from_checkout(
+    tmp_path: Path,
+) -> None:
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "tests@example.invalid")
+    _git(tmp_path, "config", "user.name", "Tests")
+    removed = _write(
+        tmp_path / "removed.md",
+        _document(lifecycle="historical", canonical_owner="self"),
+    )
+    _git(tmp_path, "add", "removed.md")
+    _git(tmp_path, "commit", "-q", "-m", "base")
+    removed.unlink()
+
+    assert all_markdown_paths(tmp_path) == ()
 
 
 def test_render_report_is_deterministic_and_marks_itself_generated() -> None:
