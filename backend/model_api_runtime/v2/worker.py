@@ -77,6 +77,7 @@ from chat.reply_language import (
     infer_garden_language,
     infer_reply_language_policy,
     reply_language_system_line,
+    user_written_text,
 )
 from core import chat_activity as core_chat_activity
 from core import envelope as core_envelope
@@ -11485,9 +11486,12 @@ async def _run_extraction(
                 cards=ctx.get("cards", ""),
                 recent_conversations=window,
                 # 做梦整理的是同一个花园，语言判据必须跟 capture 同源，
-                # 否则夜里整理一遍会把桶换成另一种语言。
+                # 否则夜里整理一遍会把桶换成另一种语言 —— 也要喂同样的证据，
+                # 光同源不同证据一样会判出两个结果。
                 locale=infer_garden_language(
-                    None, existing_buckets=str(ctx.get("buckets") or "")
+                    ctx.get("identity") if isinstance(ctx.get("identity"), dict) else None,
+                    written=user_written_text(prompt_tail),
+                    existing_buckets=str(ctx.get("buckets") or ""),
                 ),
             )
             # parse_dream_consolidations 返回 (consolidations, questions, err)。
@@ -11537,11 +11541,21 @@ async def _run_extraction(
             items, reason = [], None
         else:
             if lane == "capture":
-                # 花园的分类语言。已有桶优先 —— 一个花园只用一种语言的桶，
-                # 不因为这轮对话换了语言就长出并存的第二套。
-                # 与 V1 consumer 走同一个 helper，两条 runtime 不许各判各的。
+                # 花园的分类语言 —— **看这个人用什么语言，不看桶名**。
+                #
+                # 2026-08-24 之前这里只传桶名（identity 传的是 None），于是桶名是
+                # V2 上唯一的信号。那次事故就是这么被放大的：旧 bug 留下的英文桶
+                # 被读成「这是英文花园」→ 新卡全用英文桶 → 英文桶更多。而且桶名里
+                # 大量是人名/公司名（James、GitHub），压根不携带语言信息。
+                # 详见 chat/reply_language.py:garden_language_decision 的说明。
+                #
+                # 现在喂真证据：身份卡 + 这轮对话里**他自己说的话**。
+                # 取证走共用 helper，两条 runtime 不许各写一份。
                 _lang = garden_language_decision(
-                    None, existing_buckets=str(ctx.get("buckets") or "")
+                    ctx.get("identity") if isinstance(ctx.get("identity"), dict) else None,
+                    written=user_written_text(prompt_tail),
+                    # ↓ 只落观测，不参与判定。
+                    existing_buckets=str(ctx.get("buckets") or ""),
                 )
                 capture_locale = _lang["locale"]
                 # 与 V1 同源、同样落库 —— 两条 runtime 的语言判定要能横向对比，

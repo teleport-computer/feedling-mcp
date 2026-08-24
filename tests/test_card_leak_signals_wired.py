@@ -227,15 +227,19 @@ def test_language_decision_is_observable_and_content_free():
     凭什么这么判。2026-08-23 把提示词换成英文指令之后，这条路径的风险显著上升。
 
     但记录本身不许带用户内容 —— **桶名是用户写的**。只落语言标签、依据名、
-    以及桶名里的字符计数。
+    以及桶名的计数。
     """
     import json
 
     from chat.reply_language import garden_language_decision
 
-    d = garden_language_decision({}, existing_buckets="崽崽、我们的关系、房贷")
+    d = garden_language_decision(
+        {}, written="今天面试挂了，算法题第三次没做出来，感觉自己不太适合这行",
+        existing_buckets="崽崽、我们的关系、房贷",
+    )
     assert d["locale"] == "zh-Hans"
-    assert d["basis"] == "existing_buckets"
+    # 桶名只作观测，不是依据 —— 依据来自这个人实际写的字。
+    assert d["basis"] == "writing_language"
 
     blob = json.dumps(d, ensure_ascii=False)
     for secret in ("崽崽", "我们的关系", "房贷"):
@@ -269,44 +273,48 @@ def test_the_event_is_registered_in_the_admin_board():
 # --------------------------------------------------------------------------- #
 
 
-def test_a_few_english_buckets_cannot_flip_a_chinese_garden():
-    """**线上事故（2026-08-24）。** 一个真实用户的中文花园两天内整个翻成了英文。
+def test_bucket_names_never_decide_the_garden_language():
+    """**两次教训叠起来的一条。**
 
-    根因：原实现比的是整串里 CJK 与拉丁**字符**的个数。中英文桶名长度不对等 ——
-    「工作」两个字符，「Our relationship」十五个，**一个英文桶顶七个中文桶**。
+    2026-08-24 线上事故：判据比的是桶名里 CJK 与拉丁**字符**的个数，中英文桶名长度
+    不对等（「工作」2 字符 vs「Our relationship」15 字符），一个英文桶顶七个中文桶，
+    真实用户的中文花园两天翻完。
 
-    而那几个英文桶本身是旧 bug 的残留（老提示词同时给中英两套让模型挑，约 1/3 的
-    中文记忆被贴上英文公共桶）。于是形成自我强化的回路：
+    同日 hx 指出更根本的一点：改成「按桶投票」只是抬高门槛，没解决问题 ——
 
-        旧残留的英文桶 → 判定成"英文花园" → 新卡全用英文桶 → 英文桶更多 → …
+        工作、健康、James、Sarah、Mike     ← 中文用户,给三个外国朋友各建了个桶
 
-    一个桶一票，长度不参与。
+    人名、公司名、项目名全是拉丁字母，跟这个人说什么语言毫无关系。**怎么数都救不了。**
+
+    所以桶名彻底退出判据；这条守的就是「别把它加回去」。
     """
     from chat.reply_language import garden_language_decision
 
-    # 事故现场的形状：中英各半，但英文桶名长得多
-    d = garden_language_decision(
-        {}, existing_buckets="我们的关系、工作、健康、Our relationship、Feelings & comfort、GitHub"
-    )
-    assert d["locale"] == "zh-Hans", f"中英各半的花园被判成了 {d['locale']}"
-
-    # 压倒性多数是中文，绝不能被两个英文桶掀翻
-    d = garden_language_decision(
-        {}, existing_buckets=(
-            "工作、健康、宠物、家庭、朋友、爱好、金钱、饮食、"
-            "Our relationship、Feelings & comfort"
-        )
-    )
-    assert d["locale"] == "zh-Hans"
-    assert d["bucket_zh"] == 8 and d["bucket_en"] == 2
+    zh = "今天面试挂了，算法题第三次没做出来，感觉自己不太适合这行，有点想放弃了"
+    for buckets in (
+        "我们的关系、工作、健康、Our relationship、Feelings & comfort、GitHub",
+        "工作、健康、James、Sarah、Mike",
+        "Work、Health、Pets、Family、Friends",
+    ):
+        d = garden_language_decision({}, written=zh, existing_buckets=buckets)
+        assert d["locale"] == "zh-Hans", f"桶名 {buckets!r} 把花园翻掉了"
+        assert d["basis"] == "writing_language", "依据不该来自桶名"
 
 
-def test_a_genuinely_english_garden_still_reads_as_english():
-    """修完不能矫枉过正 —— 真英文花园还得判成英文。"""
+def test_a_genuinely_english_speaker_still_reads_as_english():
+    """修完不能矫枉过正 —— 真英文用户还得判成英文，哪怕他的桶全是中文的。
+
+    只守「别翻成英文」一边的话，把判据写死成「永远中文」也能全绿。
+    """
     from chat.reply_language import garden_language_decision
 
-    d = garden_language_decision({}, existing_buckets="Work / Health / Pets / Family")
-    assert d["locale"] == "en" and d["bucket_en"] == 4
+    en = ("Bombed the interview again today, third time stuck on the same "
+          "algorithm problem. Starting to wonder whether this field is for me.")
+    d = garden_language_decision({}, written=en, existing_buckets="工作、健康、宠物、家庭")
+    assert d["locale"] == "en"
+    assert d["basis"] == "writing_language"
+    # 桶的计数照样返回，但它是观测量 —— 「判成英文却全是中文桶」正是归一化该管的事。
+    assert d["bucket_zh"] == 4
 
 
 def test_a_tie_stays_chinese():

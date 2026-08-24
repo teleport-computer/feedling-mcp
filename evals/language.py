@@ -41,22 +41,22 @@ from memgarden.contract import run_garden_language_contract  # noqa: E402
 from chat.reply_language import garden_language_decision  # noqa: E402
 
 
-def _decider(buckets, fallbacks):
-    """把内核语料的输入形状，翻译成 io 的取证入口。
+def _decider(evidence: dict) -> dict:
+    """把契约给的证据，翻译成 io 的取证入口。
 
-    语料给的 ``fallbacks`` 是"没有桶时按优先级看的其它信号"。io 这边第一级是
-    ``identity.language_preference``，第二级是客户端 locale，所以接在那两处。
+    ⚠️ 证据里**没有桶名**，这是契约的形状决定的 —— 桶名是 AI 的输出，且大量是
+    人名/公司名这类不携带语言信息的专有名词。io 这边照样把 existing_buckets 传下去，
+    但那只走观测字段，不参与判定；契约里那几条 James / 品牌名的用例就是在守这一点。
     """
-    rest = list(fallbacks)
-    identity = {"language_preference": rest[0]} if rest and rest[0] else {}
-    locale = next((f for f in rest[1:] if f), "")
-    d = garden_language_decision(identity, existing_buckets=buckets, locale=locale)
-    # io 的依据名更细（``reply_language:<source>``）。契约只严格比对
-    # ``existing_buckets`` 那一档（事故就出在那档）；兜底档只看"是不是走了兜底"。
-    basis = d["basis"]
-    if basis.startswith("reply_language:"):
-        basis = "default" if basis.endswith(":default") else "fallback"
-    return {"locale": d["locale"], "basis": basis}
+    identity = {"language_preference": evidence["explicit"]} if evidence.get("explicit") else {}
+    d = garden_language_decision(
+        identity,
+        written=evidence.get("written") or "",
+        locale=evidence.get("locale") or "",
+        # 故意塞一串英文桶名进去：判定**不该**因此改变。
+        existing_buckets="James、Sarah、OpenAI、GitHub",
+    )
+    return {"locale": d["locale"], "basis": d["basis"]}
 
 
 def main() -> int:

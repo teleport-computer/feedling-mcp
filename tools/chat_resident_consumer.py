@@ -196,6 +196,7 @@ from chat.reply_language import (
     infer_garden_language,
     infer_reply_language_policy,
     reply_language_system_line,
+    user_written_text,
 )
 from core.downloadable_reply import sanitize_downloadable_reply
 from model_api_runtime.v2 import context as downloadable_file_context
@@ -15632,10 +15633,19 @@ def _process_capture_jobs(jobs: list) -> float:
             )
             continue
         buckets_text, threads_text = _capture_memory_terms_context()
-        # 花园的分类语言。已有桶优先 —— 一个花园只用一种语言的桶，
-        # 不因为这轮对话换了语言就长出并存的第二套。
+        # 花园的分类语言 —— **看这个人用什么语言，不看桶名**。
+        #
+        # 桶名曾经是这里的首要判据，2026-08-24 因此出过线上事故（旧 bug 留下的英文
+        # 桶被读成「这是英文花园」→ 新卡全用英文桶 → 自我强化，中文花园两天翻完）。
+        # 更根本的问题是桶名里大量是人名/公司名（James、GitHub），压根不携带语言
+        # 信息。详见 chat/reply_language.py:garden_language_decision 的说明。
+        #
+        # 现在喂真证据：身份卡 + 这个窗口里**他自己说的话**。取证走共用 helper，
+        # 两条 runtime 不许各写一份。
         _lang = garden_language_decision(
             identity,
+            written=user_written_text(messages),
+            # ↓ 只落观测，不参与判定。
             existing_buckets=buckets_text,
             archive_language=str(_whoami_cache.get("archive_language") or "").strip(),
         )
@@ -16065,7 +16075,16 @@ def _dream_cards_context() -> tuple[str, dict[str, dict]]:
     return (text or "（暂无卡）")[:20000], by_id
 
 
-def _dream_recent_conversations_context(*, user_label: str = "TA", agent_label: str = "我") -> str:
+def _dream_recent_conversations_context(
+    *, user_label: str = "TA", agent_label: str = "我"
+) -> tuple[str, str]:
+    """返回 ``(渲染好的窗口, 这段里本人写的字)``。
+
+    第二项给语言判定用。**为什么不直接拿渲染好的窗口去判语言**：窗口里两个人的话
+    都在，AI 的回复本身就是用花园语言写的 —— 拿它当证据，又是「上一轮输出决定下一轮
+    输入」那个环，只是换了个字段重演。所以在同一次拉取里把本人那部分单独抽出来，
+    既不多解一次密，也不把 AI 的话算进去。
+    """
     try:
         # Text only — dream summarizes conversations, not images.
         history = get_decrypted_history(
@@ -16075,10 +16094,10 @@ def _dream_recent_conversations_context(*, user_label: str = "TA", agent_label: 
         )
     except Exception as e:
         log.warning("dream recent conversation fetch failed: %s", e)
-        return "（这几天没有可读对话）"
+        return "（这几天没有可读对话）", ""
     live = _capture_live_history(_conversation_rows(history or []))
     if not live:
-        return "（这几天没有新对话）"
+        return "（这几天没有新对话）", ""
     lines: list[str] = []
     for msg in live[-max(1, min(DREAM_RECENT_CHAT_LIMIT, 240)):]:
         ts = _message_ts_for_context(msg)
@@ -16088,7 +16107,8 @@ def _dream_recent_conversations_context(*, user_label: str = "TA", agent_label: 
             f"{msg.get('_capture_text') or _capture_message_text(msg)}"
         )
     text = "\n".join(lines).strip()
-    return text[-12000:] if len(text) > 12000 else text
+    written = user_written_text(live)
+    return (text[-12000:] if len(text) > 12000 else text), written
 
 
 def _dream_actions_from_consolidations(
@@ -16282,7 +16302,7 @@ def _process_dream_jobs(jobs: list) -> float:
             )
             continue
         _identity, ai_name, user_name, _identity_text = _capture_identity_context()
-        recent_text = _dream_recent_conversations_context(
+        recent_text, _dream_written = _dream_recent_conversations_context(
             user_label=user_name, agent_label=ai_name
         )
         _dream_buckets, _dream_threads = _capture_memory_terms_context()
@@ -16292,8 +16312,10 @@ def _process_dream_jobs(jobs: list) -> float:
             cards=cards_text,
             recent_conversations=recent_text,
             # 与 capture 同源：整理的是同一个花园，不能夜里换一种语言的桶。
+            # 证据也要同一套 —— 光同源不同证据，一样会判出两个结果。
             locale=infer_garden_language(
                 _identity,
+                written=_dream_written,
                 existing_buckets=_dream_buckets,
                 archive_language=str(_whoami_cache.get("archive_language") or "").strip(),
             ),
