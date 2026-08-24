@@ -20,6 +20,11 @@ canonical_owner: self
 的 liveness、runtime-control 变更、kill switch，以及 provider/configuration failures
 仍是彼此独立的 fail-closed gates；它们必须在消息入库前保持拒绝语义。
 
+兼容性说明：`isolation_events.admission_rejects.over_sla` 是 legacy-shaped 的
+zero/default metrics label，不是权威的 admission 结果。它不从
+`admission_over_sla` telemetry 取值，也不表示消息曾被拒绝；未来的改名或移除应作为
+单独的 wire-compatible cleanup 处理。
+
 ## 历史快照（2026-07-09 原始设计；不得作为当前执行指引）
 
 下方原文保留以解释当时的实现与测试边界。其 **Goal**、Architecture、503 `busy`

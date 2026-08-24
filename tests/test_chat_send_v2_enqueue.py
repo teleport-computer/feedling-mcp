@@ -575,9 +575,9 @@ def test_db_action_v2_over_sla_preempts_active_wake(monkeypatch):
 
 
 def test_db_action_v2_admission_check_fails_open_on_exception(monkeypatch):
-    """§6 admission ceiling must never itself become a failure source: if the
-    est-wait computation blows up (DB hiccup, unexpected None, etc.), send must
-    still proceed normally instead of the user silently losing their turn."""
+    """§6 queue-wait telemetry must never become a failure source: if its
+    est-wait classification blows up (DB hiccup, unexpected None, etc.), send
+    still proceeds normally instead of the user silently losing their turn."""
     _seed("u_send_v2_admission_failopen")
     store = core_store.get_store("u_send_v2_admission_failopen")
     hosted_config_store.set_hosted_runtime_mode(store, "db_action_v2")
@@ -624,8 +624,8 @@ def test_db_action_v2_admission_check_fails_open_on_exception(monkeypatch):
 
 
 def test_db_action_v2_admission_admits_under_sla(monkeypatch):
-    """Normal case: live worker pool with no queue backlog admits as usual —
-    the admission ceiling is a no-op when the estimated wait is under SLA."""
+    """A live pool with no queue backlog records an under-SLA queue-wait
+    classification and sends as usual."""
     _seed("u_send_v2_admission_ok")
     store = core_store.get_store("u_send_v2_admission_ok")
     hosted_config_store.set_hosted_runtime_mode(store, "db_action_v2")

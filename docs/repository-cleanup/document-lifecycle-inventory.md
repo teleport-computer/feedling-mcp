@@ -9,7 +9,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 
 | Lifecycle | Classified documents |
 |---|---:|
-| `current` | 15 |
+| `current` | 16 |
 | `decision` | 7 |
 | `historical` | 18 |
 | `generated` | 1 |
@@ -22,6 +22,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/API_ERRORS.md`
 - `docs/CURRENT_STATE.md`
 - `docs/DOCUMENT_LIFECYCLE.md`
+- `docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md`
 - `docs/PROJECT_OVERVIEW.md`
 - `docs/repository-cleanup/README.md`
 - `docs/repository-cleanup/agent-diagnostic-benchmark.md`

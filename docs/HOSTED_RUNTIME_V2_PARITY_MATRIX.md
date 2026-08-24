@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Hosted Runtime V2 — Current Parity and Completion Matrix
 
 > **CURRENT SOURCE OF TRUTH — 2026-07-27.** This page describes the current
@@ -32,7 +36,7 @@
 | One deployment topology | ✅ | Local, test, pre, and production hosted model-API deployments are `v2_only`. A bounded `serve-worker` pool runs in the runner CVM, separate from the main backend/enclave CVM; there is no hosted per-account runtime flip. |
 | Prompt caching and cache telemetry | ⚠️ | Provider-aware cache controls/affinity and per-turn read/write/miss telemetry are implemented for OpenAI-compatible, Anthropic/OpenRouter, Gemini, and Bedrock paths. The existing Pre canary proves a route-bound OpenRouter cache read; the trusted `/skills` prefix and native Bedrock path still need post-deploy live cache-hit proof. Editable `WORKING.md` is deliberately pull-only and is not part of the eager cache prefix. |
 | Durable profile field naming | ✅ | New profile distillation and encrypted storage use `MEMORY` for facts and `STYLE` for interaction style. The injection heading remains `HOW YOU TWO GET ALONG`; legacy stored `USER` fields are read-only compatibility input until each profile naturally redistills, and admin telemetry temporarily emits both `style_chars` and the `user_chars` compatibility alias. |
-| Tokens/turn and admission ceiling | ✅ | Whole-turn token/call/latency metrics and an admission ceiling are implemented. The offline token regression gate is live, and `/v1/admin/v2-metrics.turn_health` exposes bounded queue/lease expiry, failure/expiry rates, pending age, p95 latency, and trajectory completeness/gaps. |
+| Tokens/turn and queue-wait/capacity telemetry | ✅ | Whole-turn token/call/latency metrics and fail-open foreground queue-wait/capacity telemetry are implemented. An over-SLA estimate records telemetry only: it never returns 503 or rejects a message before atomic persistence/enqueue. The offline token regression gate is live, and `/v1/admin/v2-metrics.turn_health` exposes bounded queue/lease expiry, failure/expiry rates, pending age, p95 latency, and trajectory completeness/gaps. |
 | Concurrent CVM-class load proof | ⚠️ | The harness exists, but the authoritative concurrent run on the target CVM class remains an operational gate. |
 | Typing-signal pre-warm | ➖ | Removed from the release scope by product decision. Ordinary Send remains the only foreground trigger; V2 does not create speculative jobs or provider spend while the user types. |
 | Encrypted full trajectories and failure review | ✅ | Immutable encrypted per-job provider/tool/reply/fold/error capture is implemented. Oversized model-visible events use exact digest-verified encrypted chunks; every async provider HTTP attempt carries its effective request model, exact JSON body, result/error status and duration without an extra DB write. Tool timing/effect evidence and reply disposition are captured. There is no time-based trajectory GC; Chat Clear preserves historical evidence and account deletion is the complete-erasure boundary. Exact-job break-glass inspection is runner-local, decryptable, and durably audited. Provider-backed offline review remains explicit opt-in and side-effect-free; it is analysis, not deterministic replay. |

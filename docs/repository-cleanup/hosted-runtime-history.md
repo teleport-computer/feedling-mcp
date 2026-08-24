@@ -165,9 +165,13 @@ partial-supersession 链接保持可解析。生成的 lifecycle inventory 由�
   in-flight scope 和 recent-`chat` mean 是当前估算输入；容量估算或其 DB 读取失败时必须
   fail open。此点不削弱 liveness、runtime-control、kill-switch 或 provider/configuration
   的 fail-closed 边界。
-- 本批次变更 lifecycle Markdown、生成的 inventory，并作一项文档层 API error-contract
-  修正：删除已失效的 live-overload `busy` / 503 行；不修改 runtime、数据库、schema、
-  compose、API/wire/security 行为、公开 `docs-site/`、`deploy/` 或
+- `isolation_events.admission_rejects.over_sla` 是 legacy-shaped 的 zero/default metrics
+  label，不从 `admission_over_sla` telemetry 取值，且不表示消息被拒绝；任何改名或移除
+  都是单独的 wire-compatible cleanup，不属于本批次。
+- 本批次变更 lifecycle Markdown、生成的 inventory、active parity 表述，并作一项文档层
+  API error-contract 修正（删除已失效的 live-overload `busy` / 503 行）及指定 Python/test
+  注释或 docstring 的诊断用语规范；不修改 runtime、数据库、schema、compose、API/wire/
+  security 行为、公开 `docs-site/`、`deploy/` 或
   `tools/chat_resident_consumer.py`。
 
 ### 批次 5 引用检查
@@ -177,3 +181,5 @@ partial-supersession 链接保持可解析。生成的 lifecycle inventory 由�
 `docs-site/`，而是继续由 [Chat workflow](../../docs-site/content/docs/workflows/chat.mdx) 说明。
 审查复核同时移除了 [`API_ERRORS.md`](../API_ERRORS.md) 中已失效的 live-overload
 `busy` / 503 / `queue_over_sla` 行，避免将 telemetry 误发布为 HTTP error contract。
+当前 [`HOSTED_RUNTIME_V2_PARITY_MATRIX.md`](../HOSTED_RUNTIME_V2_PARITY_MATRIX.md) 也将
+该能力表述为 queue-wait/capacity telemetry，并明确 over-SLA 不会在持久化前返回 503 或拒绝。

@@ -4967,10 +4967,12 @@ def live_worker_count(*, within_sec: int = 30, pool: str | None = None) -> int:
 
 def live_genesis_worker_ids(*, within_sec: int = 30) -> list[str]:
     """worker_ids with a fresh ``kind='genesis'`` heartbeat. Sibling to
-    ``workers_alive``/``live_worker_count`` (which read ``kind='turn'`` only, to
-    gate chat admission): this reads the genesis heartbeats to gate the genesis
-    orphan reclaim — a ``processing`` job whose claiming worker id is absent here
-    was left behind by a dead/replaced worker."""
+    ``workers_alive`` (the turn-worker liveness gate) and ``live_worker_count``
+    (turn-process telemetry); both read ``kind='turn'`` only. Current Chat
+    queue/capacity telemetry uses ``live_worker_capacity``, not this helper.
+    This reads genesis heartbeats to gate genesis orphan reclaim: a
+    ``processing`` job whose claiming worker id is absent here was left behind
+    by a dead/replaced worker."""
     with _pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(

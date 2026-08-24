@@ -1668,8 +1668,8 @@ def test_completed_wake_retry_cannot_overwrite_newer_glance_source():
     }
 
 
-# --- §6 admission ceiling: 三个纯读查询 (live_worker_count / inflight_job_count /
-# recent_mean_service_sec) ---------------------------------------------------
+# --- §6 queue/capacity telemetry: 三个纯读查询 (live_worker_count /
+# inflight_job_count / recent_mean_service_sec) ------------------------------
 
 
 def test_live_worker_count_counts_only_recent():
@@ -2121,8 +2121,8 @@ def test_recent_mean_service_sec_averages_completed():
     assert 14.0 <= mean <= 16.0  # (10+20)/2 = 15
 
 
-# --- kind discriminator: genesis heartbeats must be invisible to the chat/send
-# admission gate (workers_alive / live_worker_count read only kind='turn') ---
+# --- kind discriminator: genesis heartbeats must be invisible to turn-worker
+# liveness and telemetry (workers_alive / live_worker_count read kind='turn') --
 
 
 def _clear_heartbeats():
@@ -2131,11 +2131,11 @@ def _clear_heartbeats():
 
 
 def test_genesis_heartbeat_does_not_inflate_turn_worker_liveness():
-    """A genesis heartbeat row must be invisible to the chat/send admission gate.
+    """A genesis heartbeat row must be invisible to turn-worker liveness/telemetry.
 
-    live_worker_count() feeds admission.estimate_wait_sec(workers=...); counting a
-    genesis row as a turn worker would halve the estimated queue wait for a
-    single-process pool and over-admit onto turn slots that do not exist.
+    Current Chat queue/capacity telemetry reads live_worker_capacity(), so a
+    genesis row must not appear as executable turn capacity. live_worker_count()
+    remains a turn-process metric and also excludes genesis rows.
     """
     _clear_heartbeats()
     jobs_store.record_worker_heartbeat("w1", pool="foreground")
