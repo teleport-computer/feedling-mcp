@@ -19,17 +19,25 @@ canonical_owner: self
 The core decision remains current: `backend/provider_client.py` exposes an
 additive normalized transport, retains dict compatibility for text callers,
 uses per-provider native tool codecs and native async paths, and supplies
-normalized usage to an idempotent per-job whole-turn metric. `backend/provider_types.py`
-retains the stable normalized types and native-turn transcript representation;
-`backend/model_api_runtime/v2/jobs_store.py` records the metric and
-`backend/alembic/versions/0029_v2_turn_metrics_whole_turn.py` establishes its
-per-job uniqueness. Evidence includes four-wire call-id round trips
-(`tests/test_provider_tools_acceptance.py`, `tests/test_provider_tool_transcript_wire.py`),
-native async without a thread bridge (`tests/test_provider_async_native.py`),
-malformed-tool and schema-fallback compatibility (`tests/test_provider_malformed_tool_fallback.py`),
-and idempotent success/failure telemetry (`tests/test_v2_whole_turn_metric.py`,
-`tests/test_v2_cache_retry_metrics.py`). PR-C's current unified loop consumes
-this transport, but does not supersede the provider/telemetry decision.
+normalized usage to an idempotent per-job whole-turn metric. The original
+2026-07-13 design baseline covered four wire families (OpenAI Chat/Responses,
+Anthropic, and Gemini). Bedrock is a later active extension and is the fifth
+native provider wire family: its tool codec is in the Bedrock helpers around
+`provider_client.py:1744`, and both sync and async routing include it around
+`:3990` and `:4826`. `backend/provider_types.py` retains the stable normalized
+types and native-turn transcript representation; `backend/model_api_runtime/v2/jobs_store.py`
+records the metric and `backend/alembic/versions/0029_v2_turn_metrics_whole_turn.py`
+establishes its per-job uniqueness. Evidence includes the original four-wire
+call-id/transcript tests (`tests/test_provider_tools_acceptance.py`,
+`tests/test_provider_tool_transcript_wire.py`), Bedrock's native tool,
+parallel-call, transcript, and sync/async coverage
+(`tests/test_provider_tools_bedrock.py`), native async without a thread bridge
+(`tests/test_provider_async_native.py`), malformed-tool and schema-fallback
+compatibility (`tests/test_provider_malformed_tool_fallback.py`), and idempotent
+success/failure telemetry (`tests/test_v2_whole_turn_metric.py`,
+`tests/test_v2_cache_retry_metrics.py`). Current compatibility obligations cover
+all five active native wire families; PR-C's current unified loop consumes this
+transport, but does not supersede the provider/telemetry decision.
 
 ---
 
