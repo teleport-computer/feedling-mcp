@@ -279,6 +279,10 @@ services:
       # election, core/wake_bus.py). Budget: test RDS max_connections=79, ~18
       # conns/worker → -w2≈36, safe.
       FEEDLING_BACKEND_WORKERS: "${FEEDLING_BACKEND_WORKERS:-1}"
+      # TEST cutover is attested in the compose hash: consume durable change
+      # events instead of reloading the full chat window on every sync.
+      FEEDLING_CHAT_SYNC_MODE: "incremental"
+      FEEDLING_CHAT_HOT_CACHE_LIMIT: "256"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
       # Public HTTPS origin returned by POST /v1/voice/sessions for the
       # ElevenLabs Custom LLM callback. Keep this literal aligned with ingress
@@ -433,6 +437,10 @@ services:
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
       DATABASE_URL: "${DATABASE_URL:-}"
       FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
+      # Keep the Runtime V2 worker on the same incremental chat view and
+      # bounded resident window as the HTTP backend.
+      FEEDLING_CHAT_SYNC_MODE: "incremental"
+      FEEDLING_CHAT_HOT_CACHE_LIMIT: "256"
       FEEDLING_PLAINTEXT_SHADOW_ENABLED: "0"
       # Keep Runtime V2 writes aligned with backend whoami/effective preference.
       FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "1"
