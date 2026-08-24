@@ -336,9 +336,18 @@ cd docs-site && npm run types:check && npm run lint && npm run build
 
 Expected: no new failures beyond the verified DB-backed baseline; all docs commands exit zero.
 
-- [ ] **Step 4: Run four-worker fault simulation**
+- [x] **Step 4: Run four-worker fault simulation**
 
 Replace the full gunicorn command array with `-w 4`. Verify append/finalize/delete/clear, listener outage, direct DB mutation, reconnect, worker recycle, and legacy/v2 payload mixing.
+
+Evidence (2026-08-24): an isolated local compose stack ran one gunicorn master
+plus four workers against an ephemeral PostgreSQL 16 database. Requests reached
+all four worker PIDs; append/finalize/delete/clear and repeated cross-connection
+history reads passed. A trigger-disabled direct insert remained visible through
+the durable read path; terminating all four LISTEN sessions recovered to four
+listeners within seven seconds; mixed legacy/v2 wakes produced no errors; and
+terminating one worker caused gunicorn to replace it while health and wake-bus
+checks remained healthy. The stack and volume were removed after the run.
 
 - [ ] **Step 5: Commit and deploy through test**
 
