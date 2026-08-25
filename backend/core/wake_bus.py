@@ -35,6 +35,10 @@ from typing import Any, Callable, Mapping
 import db
 
 log = logging.getLogger("feedling.wake_bus")
+# Backend startup intentionally does not raise the root logger to INFO because
+# many third-party loggers are noisy.  This module's fixed-enum, content-free
+# chat-sync records are rollout telemetry, so enable INFO only for this logger.
+log.setLevel(logging.INFO)
 
 # Single Postgres NOTIFY channel; the JSON payload carries the logical channel.
 PG_CHANNEL = "feedling_wake"
