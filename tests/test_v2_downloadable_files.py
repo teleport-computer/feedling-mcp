@@ -282,12 +282,12 @@ def test_canvas_send_file_delivers_model_authored_display_metadata(monkeypatch):
                             "revision": 2,
                             "title": "接星星",
                             "subtitle": "六十秒接住尽可能多的星星",
+                            "completion_message": "画布已经更新，可以直接打开了。",
                         },
                     }
                 ],
                 "usage": {},
             },
-            {"reply": "画布已经更新。", "tool_calls": [], "usage": {}},
         ],
         on_file_reply=on_file,
     )
@@ -300,7 +300,7 @@ def test_canvas_send_file_delivers_model_authored_display_metadata(monkeypatch):
             "六十秒接住尽可能多的星星",
         )
     ]
-    assert replies == [("画布已经更新。", True)]
+    assert replies == [("画布已经更新，可以直接打开了。", True)]
     assert outcome.replied_intermediate is True
 
 
@@ -518,12 +518,12 @@ def test_model_selected_shared_work_uses_compact_delivery_after_large_write(
                             "revision": 1,
                             "title": "记忆知识图谱",
                             "subtitle": "把重要记忆整理成可探索的关系图",
+                            "completion_message": "记忆知识图谱已经准备好了，可以直接打开。",
                         },
                     }
                 ],
                 "usage": {},
             },
-            {"reply": "Canvas 已经准备好了。", "tool_calls": [], "usage": {}},
         ],
         on_file_reply=on_file,
         dispatch=dispatch,
@@ -533,13 +533,16 @@ def test_model_selected_shared_work_uses_compact_delivery_after_large_write(
     )
 
     assert {"workspace_write", "send_file"}.issubset(calls[0])
-    assert calls[1:] == [("send_file",), ()]
+    assert calls[1:] == [("send_file",)]
     assert files == [("/workspace/记忆知识图谱.io.html", 1)]
-    assert replies == [("Canvas 已经准备好了。", True)]
+    assert replies == [("记忆知识图谱已经准备好了，可以直接打开。", True)]
     assert outcome.stop_reason == "final_text"
     assert len(str(messages_seen[1])) < 2_000
     assert "记忆知识图谱.io.html" in str(messages_seen[1])
-    assert len(str(messages_seen[2])) < 2_000
+    assert "completion_message" in str(messages_seen[1])
+    assert "do not default it to English or Chinese" in str(messages_seen[1])
+    assert "The work the user asked for was saved" not in str(messages_seen)
+    assert len(messages_seen) == 2
     assert all(
         kind != "required_file_missing" for kind, _payload in trajectory_events
     )
@@ -590,6 +593,8 @@ def test_canvas_update_compact_delivery_preserves_request_and_corrects_metadata(
                     "args": {
                         "path": "/workspace/小游戏.io.html",
                         "revision": 2,
+                        "title": "星光方块",
+                        "subtitle": "今晚一起玩",
                     },
                 }],
                 "usage": {},
@@ -604,11 +609,11 @@ def test_canvas_update_compact_delivery_preserves_request_and_corrects_metadata(
                         "revision": 2,
                         "title": "星光方块",
                         "subtitle": "今晚一起玩",
+                        "completion_message": "已经按你的要求更新好了。",
                     },
                 }],
                 "usage": {},
             },
-            {"reply": "已经按你的要求更新好了。", "tool_calls": [], "usage": {}},
         ],
         on_file_reply=on_file,
         dispatch=dispatch,
@@ -618,18 +623,21 @@ def test_canvas_update_compact_delivery_preserves_request_and_corrects_metadata(
         tool_events=tool_events,
     )
 
-    assert calls[1:] == [("send_file",), ("send_file",), ()]
+    assert calls[1:] == [("send_file",), ("send_file",)]
     assert files == [
         ("/workspace/小游戏.io.html", 2, "星光方块", "今晚一起玩")
     ]
     assert user_request in str(messages_seen[1])
-    assert "title and subtitle" in str(messages_seen[1])
+    assert "title, subtitle, and completion_message" in str(messages_seen[1])
     validation_exchange = messages_seen[2][-1]
     assert isinstance(validation_exchange, ToolExchange)
     assert [result.call_id for result in validation_exchange.results] == [
         "missing-metadata"
     ]
-    assert "requires title and subtitle" in validation_exchange.results[0].content
+    assert (
+        "requires title, subtitle, and completion_message"
+        in validation_exchange.results[0].content
+    )
     assert [event[2] for event in tool_events if event[0] == "missing-metadata"] == [
         "tool_call_started",
         "tool_call_result",
@@ -638,16 +646,7 @@ def test_canvas_update_compact_delivery_preserves_request_and_corrects_metadata(
         kind == "tool_batch_validation_failed"
         for kind, _payload in trajectory_events
     )
-    confirmation_messages = messages_seen[3]
-    assert confirmation_messages[0]["role"] == "system"
-    assert "same language as the user's current request" in confirmation_messages[0][
-        "content"
-    ]
-    assert user_request not in confirmation_messages[0]["content"]
-    assert confirmation_messages[1] == {
-        "role": "user",
-        "content": user_request,
-    }
+    assert len(messages_seen) == 3
     assert replies == [("已经按你的要求更新好了。", True)]
     assert outcome.stop_reason == "final_text"
 
@@ -818,6 +817,7 @@ def test_pending_canvas_delivery_rejects_wrong_target_then_delivers_exact_one(
                         "revision": 9,
                         "title": "面板",
                         "subtitle": "一个简洁的交互面板",
+                        "completion_message": "新版面板已经准备好了。",
                     },
                 }],
                 "usage": {},
@@ -832,11 +832,11 @@ def test_pending_canvas_delivery_rejects_wrong_target_then_delivers_exact_one(
                         "revision": 1,
                         "title": "面板",
                         "subtitle": "一个简洁的交互面板",
+                        "completion_message": "新版面板已经准备好了。",
                     },
                 }],
                 "usage": {},
             },
-            {"reply": "新版面板已发送。", "tool_calls": [], "usage": {}},
         ],
         on_file_reply=on_file,
         dispatch=dispatch,
@@ -846,7 +846,7 @@ def test_pending_canvas_delivery_rejects_wrong_target_then_delivers_exact_one(
     assert calls[1] == ("send_file",)
     assert calls[2] == ("send_file",)
     assert files == [("/workspace/panel.io.html", 1)]
-    assert replies == [("新版面板已发送。", True)]
+    assert replies == [("新版面板已经准备好了。", True)]
     assert outcome.stop_reason == "final_text"
 
 
@@ -892,11 +892,11 @@ def test_io_html_satisfies_generic_html_delivery_requirement(monkeypatch):
                         "revision": 1,
                         "title": "接星星小游戏",
                         "subtitle": "六十秒内接住尽可能多的星星",
+                        "completion_message": "小游戏已经发给你了，可以直接打开。",
                     },
                 }],
                 "usage": {},
             },
-            {"reply": "小游戏已经发给你了。", "tool_calls": [], "usage": {}},
         ],
         on_file_reply=on_file,
         dispatch=dispatch,
@@ -906,7 +906,7 @@ def test_io_html_satisfies_generic_html_delivery_requirement(monkeypatch):
 
     assert calls[1] == ("send_file",)
     assert files == [("/workspace/接星星小游戏.io.html", 1)]
-    assert replies == [("小游戏已经发给你了。", True)]
+    assert replies == [("小游戏已经发给你了，可以直接打开。", True)]
     assert outcome.stop_reason == "final_text"
 
 
@@ -959,11 +959,11 @@ def test_existing_canvas_read_can_be_delivered_without_rewriting_source(monkeypa
                         "revision": 7,
                         "title": "霓虹砖块",
                         "subtitle": "击碎所有砖块，刷新最高分",
+                        "completion_message": "标题和副标题已经更新好了。",
                     },
                 }],
                 "usage": {},
             },
-            {"reply": "标题和副标题已经更新。", "tool_calls": [], "usage": {}},
         ],
         on_file_reply=on_file,
         dispatch=dispatch,
@@ -981,7 +981,7 @@ def test_existing_canvas_read_can_be_delivered_without_rewriting_source(monkeypa
     assert files == [
         (path, 7, "霓虹砖块", "击碎所有砖块，刷新最高分")
     ]
-    assert replies == [("标题和副标题已经更新。", True)]
+    assert replies == [("标题和副标题已经更新好了。", True)]
     assert outcome.stop_reason == "final_text"
 
 
@@ -1050,11 +1050,11 @@ def test_existing_canvas_delivery_choice_can_still_rewrite_changed_source(
                         "revision": 8,
                         "title": "新版打砖块",
                         "subtitle": "加入新的关卡与计分规则",
+                        "completion_message": "新版已经发给你，可以直接打开。",
                     },
                 }],
                 "usage": {},
             },
-            {"reply": "新版已经发给你。", "tool_calls": [], "usage": {}},
         ],
         on_file_reply=on_file,
         dispatch=dispatch,
