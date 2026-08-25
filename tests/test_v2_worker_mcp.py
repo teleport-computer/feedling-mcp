@@ -55,7 +55,9 @@ def _reset(uid):
 
 
 @pytest.fixture(autouse=True)
-def _clean_agent_jobs_table():
+def _clean_agent_jobs_table(monkeypatch):
+    # MCP round-trip tests script plain replies and isolate tool contracts.
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs")
     yield
