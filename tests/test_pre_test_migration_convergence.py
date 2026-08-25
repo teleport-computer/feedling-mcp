@@ -26,7 +26,11 @@ def _database_url(base: str, database: str) -> str:
 
 def test_rds_pre_and_test_heads_converge():
     script = _scripts("alembic")
-    assert script.get_heads() == ["0102_trace_events"]
+    assert script.get_heads() == ["0103_v2_wake_followup_marker"]
+    assert (
+        script.get_revision("0103_v2_wake_followup_marker").down_revision
+        == "0102_trace_events"
+    )
     assert (
         script.get_revision("0102_trace_events").down_revision
         == "0101_chat_change_events"
@@ -95,7 +99,11 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0037_chat_poll_index"]
+    assert script.get_heads() == ["0038_v2_wake_followup_marker"]
+    assert (
+        script.get_revision("0038_v2_wake_followup_marker").down_revision
+        == "0037_chat_poll_index"
+    )
     assert (
         script.get_revision("0037_chat_poll_index").down_revision
         == "0036_lane_rollup_access_paths"
@@ -193,6 +201,10 @@ def test_tee_chain_carries_test_runtime_schema():
 def test_tee_migrations_reuse_the_rds_contract_sql():
     rds = _scripts("alembic")
     tee = _scripts("alembic_tee")
+    assert (
+        tee.get_revision("0038_v2_wake_followup_marker").module._UP
+        == rds.get_revision("0103_v2_wake_followup_marker").module._UP
+    )
     assert (
         tee.get_revision("0018_v2_wake_shadow_decisions").module._SCHEMA_UP
         == rds.get_revision("0085_v2_wake_shadow_decisions").module._SCHEMA_UP
