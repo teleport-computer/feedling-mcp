@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # trace_events 分区维护手册（RDS 主库）
 
 写给运维者（Seven）。回答三个问题：要做什么、什么时候做、忘了做会怎样。
