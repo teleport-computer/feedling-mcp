@@ -430,6 +430,14 @@ PARAMS: dict[str, dict] = {
             "revision": _INT,
             "title": {"type": "string", "maxLength": file_display.TITLE_MAX_CHARS},
             "subtitle": {"type": "string", "maxLength": file_display.SUBTITLE_MAX_CHARS},
+            "completion_message": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "The complete user-visible delivery message, written in the "
+                    "language of the user's current request and in your own voice."
+                ),
+            },
         },
         "required": ["path", "revision"],
     },
@@ -767,9 +775,12 @@ DESCRIPTIONS: dict[str, str] = {
         "user never needs to know /workspace or provide an internal path. Create "
         "or update the file with workspace_write first, wait for that tool result, "
         "then call send_file in a later round with the exact returned revision. "
-        "For every .io.html Canvas, title and subtitle are required. Generate both "
-        "in the user's current language; subtitle is one concise line describing "
-        "what the Canvas contains. When revising a Canvas, preserve its current "
+        "For every .io.html Canvas, title, subtitle, and completion_message are "
+        "required. Generate all three in the user's current language, following the "
+        "language used or explicitly requested in the current request; "
+        "subtitle is one concise line describing what the Canvas contains, and "
+        "completion_message is the complete visible chat bubble confirming delivery "
+        "in your own voice. When revising a Canvas, preserve its current "
         "title and subtitle unless the user asks to change them, and update either "
         "when the new content makes it useful. "
         "Do not call this merely because a conversational answer contains a list "
@@ -1028,9 +1039,13 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
         path = str(args.get("path") or "").strip()
         title = args.get("title")
         subtitle = args.get("subtitle")
+        completion_message = args.get("completion_message")
         if path.casefold().endswith(".io.html"):
-            if title is None or subtitle is None:
-                return "send_file for .io.html requires title and subtitle"
+            if title is None or subtitle is None or completion_message is None:
+                return (
+                    "send_file for .io.html requires title, subtitle, and "
+                    "completion_message"
+                )
             try:
                 file_display.normalize_text(
                     title,
@@ -1044,8 +1059,17 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
                 )
             except ValueError as exc:
                 return str(exc)
-        elif title is not None or subtitle is not None:
-            return "send_file title and subtitle are only valid for Canvas files"
+            if not isinstance(completion_message, str) or not completion_message.strip():
+                return "invalid completion_message"
+        elif (
+            title is not None
+            or subtitle is not None
+            or completion_message is not None
+        ):
+            return (
+                "send_file title, subtitle, and completion_message are only valid "
+                "for Canvas files"
+            )
     if name == IMAGE_REPLY_TOOL and not str(args.get("prompt") or "").strip():
         return "generate_image requires a non-empty prompt"
     if name == MCP_TOOL_SEARCH_TOOL:

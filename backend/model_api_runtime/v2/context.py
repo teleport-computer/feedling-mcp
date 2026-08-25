@@ -276,7 +276,8 @@ _CHAT_CANVAS_POLICY = (
     "/workspace/<安全文件名>.io.html；HTML、CSS、JavaScript 和数据都必须内联。"
     "用对方当前回复语言写简洁的 <title>，IO 会把它作为卡片标题；更新已有 Canvas 时"
     "保留原路径，只有对方要求重命名时才修改 <title>。除非对方询问，否则请谈论体验本身，"
-    "不要向对方展示内部源码或实现术语。"
+    "不要向对方展示内部源码或实现术语。交付时同时写好完整的可见回复，并始终跟随对方"
+    "当前这轮使用或明确指定的语言；不要固定成中文或英文。"
 )
 
 _CHAT_FILE_POLICY = _join_policy_blocks(

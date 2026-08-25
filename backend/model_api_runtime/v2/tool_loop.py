@@ -1444,8 +1444,11 @@ async def run_tool_loop(
             if target_path.casefold().endswith(".io.html"):
                 metadata_instruction = (
                     " This is a Canvas file, so send_file also requires a concise "
-                    "title and subtitle in the user's current reply language. "
-                    "Preserve or change both according to the current user request."
+                    "title, subtitle, and completion_message in the language of the "
+                    "user's current request. completion_message is the complete "
+                    "user-visible chat bubble in your own voice; do not default it "
+                    "to English or Chinese. Preserve or change the metadata according "
+                    "to the current user request."
                 )
             request_instruction = (
                 " Current user request: "
@@ -2883,9 +2886,11 @@ async def run_tool_loop(
             await _tool_event(tc, "tool_call_result", {"result": silent_result})
             return LoopOutcome("", attempts, "stay_silent", replied_intermediate)
 
+        canvas_completion_message = ""
         for tc in file_reply_calls:
             workspace_path = str(tc.args.get("path") or "").strip()
             workspace_revision = int(tc.args["revision"])
+            is_canvas_delivery = workspace_path.casefold().endswith(".io.html")
             await _tool_event(tc, "tool_call_started", {})
             await _trajectory(
                 "file_reply_planned",
@@ -2981,7 +2986,7 @@ async def run_tool_loop(
                 compact_delivery_mismatch_retry_used = True
                 continue
             try:
-                if workspace_path.casefold().endswith(".io.html"):
+                if is_canvas_delivery:
                     await on_file_reply(
                         workspace_path,
                         workspace_revision,
@@ -3003,12 +3008,16 @@ async def run_tool_loop(
             compact_delivery_validation_exchange = None
             compact_delivery_mismatch_retry_used = False
             compact_delivery_args_retry_used = False
+            if is_canvas_delivery:
+                canvas_completion_message = str(
+                    tc.args.get("completion_message") or ""
+                ).strip()
             requirement_now_met = (
                 bool(delivered_file_suffixes)
                 if not normalized_required_suffixes
                 else normalized_required_suffixes.issubset(delivered_file_suffixes)
             )
-            if requirement_now_met:
+            if requirement_now_met and not canvas_completion_message:
                 compact_delivery_confirmation_needed = True
             replied_intermediate = True
             file_result = ToolResult(
@@ -3019,6 +3028,76 @@ async def run_tool_loop(
             await _tool_event(
                 tc, "tool_call_result", {"result": file_result}
             )
+
+        if canvas_completion_message:
+            # Canvas metadata and the visible completion bubble are one model
+            # expression. Publishing the tool-authored bubble here keeps the
+            # staged attachment and its text in the same final effect, and avoids
+            # a second provider round seeded by runtime-authored English copy.
+            compact_delivery_confirmation_needed = False
+            await _trajectory(
+                "reply_planned",
+                {
+                    "round": attempts,
+                    "final": True,
+                    "text": canvas_completion_message,
+                    "reason": "canvas_tool_completion",
+                },
+            )
+            try:
+                reply_decision = await on_reply(
+                    canvas_completion_message,
+                    final=True,
+                    reasoning=_merged_reasoning(),
+                )
+            except FinalReplySuperseded:
+                reasoning_fragments.clear()
+                seen_reasoning_fragments.clear()
+                _progress("final_reply_superseded")
+                await _trajectory(
+                    "final_reply_superseded",
+                    {"round": attempts},
+                )
+                return LoopOutcome(
+                    "", attempts, "input_advanced", replied_intermediate
+                )
+            if isinstance(reply_decision, FinalReplyCorrectionRequest):
+                if (
+                    final_reply_correction_request is None
+                    and attempts < max_calls
+                    and str(reply_decision.instruction or "").strip()
+                ):
+                    final_reply_correction_request = reply_decision
+                    final_reply_correction_instruction = str(
+                        reply_decision.instruction
+                    ).strip()
+                    force_text_fallback = True
+                    force_text_fallback_reason = "final_reply_correction"
+                    reasoning_fragments.clear()
+                    seen_reasoning_fragments.clear()
+                    _progress("final_reply_correction_boundary")
+                else:
+                    final_reply_correction_request = reply_decision
+                    await _publish_final_correction_fallback("skipped")
+                    return LoopOutcome(
+                        reply_decision.original_text,
+                        attempts,
+                        "final_text",
+                        replied_intermediate,
+                    )
+            elif isinstance(reply_decision, FinalReplyCorrectionRejected):
+                raise RuntimeError(
+                    "final reply correction rejected without request"
+                )
+            elif reply_decision is not None:
+                raise RuntimeError("unsupported final reply decision")
+            else:
+                return LoopOutcome(
+                    canvas_completion_message,
+                    attempts,
+                    "final_text",
+                    replied_intermediate,
+                )
 
         image_final_superseded = False
         for tc in image_reply_calls:
