@@ -71,6 +71,78 @@ def _patch_blob_reads(monkeypatch, blobs: dict) -> None:
 
     monkeypatch.setattr(data_track.db, "query_trace_events", query_events)
 
+    def flat_page(
+        *, user_id="", trace_id_contains="", subsystem="", status="", q="",
+        since_epoch=0, limit=100, offset=0, candidate_limit, **_kwargs,
+    ):
+        candidate = query_events(
+            user_id=user_id,
+            trace_id_contains=trace_id_contains,
+            subsystem=subsystem,
+            q=q,
+            since_epoch=since_epoch,
+            limit=candidate_limit + 1,
+        )
+        truncated = len(candidate) > candidate_limit
+        candidate = candidate[:candidate_limit]
+        turns = data_track._debug_trace_group_turns(candidate)
+        if status:
+            turns = [turn for turn in turns if turn["terminal_status"] == status]
+            allowed = {(turn["user_id"], turn["trace_id"]) for turn in turns}
+            candidate = [
+                event for event in candidate
+                if (
+                    str(event.get("user_id") or ""),
+                    str(event.get("trace_id") or "ungrouped"),
+                ) in allowed
+            ]
+        user_rows = []
+        for uid in sorted({str(event.get("user_id") or "") for event in candidate}):
+            matching = [event for event in candidate if event.get("user_id") == uid]
+            user_rows.append({
+                "user_id": uid,
+                "events": len(matching),
+                "last_ts": max(float(event.get("ts") or 0) for event in matching),
+            })
+        return {
+            "events_total": len(candidate),
+            "turns_total": len(turns),
+            "stalled_turns": sum(turn["terminal_status"] == "stalled" for turn in turns),
+            "error_turns": sum(turn["terminal_status"] == "error" for turn in turns),
+            "scan_truncated": truncated,
+            "users": user_rows,
+            "subsystems": sorted({event.get("subsystem") for event in candidate}),
+            "statuses": sorted({event.get("status") for event in candidate}),
+            "rows": candidate[offset:offset + limit + 1],
+            "limit": limit,
+            "offset": offset,
+        }
+
+    def turn_rows(
+        *, turn_keys, user_id="", trace_id_contains="", subsystem="", q="",
+        since_epoch=0, candidate_limit, sibling_limit, **_kwargs,
+    ):
+        candidate = query_events(
+            user_id=user_id,
+            trace_id_contains=trace_id_contains,
+            subsystem=subsystem,
+            q=q,
+            since_epoch=since_epoch,
+            limit=candidate_limit,
+        )
+        allowed = set(turn_keys)
+        rows = [
+            event for event in candidate
+            if (
+                str(event.get("user_id") or ""),
+                str(event.get("trace_id") or "ungrouped"),
+            ) in allowed
+        ]
+        return rows[:sibling_limit], len(rows) > sibling_limit
+
+    monkeypatch.setattr(data_track.db, "query_trace_events_flat_page", flat_page)
+    monkeypatch.setattr(data_track.db, "query_trace_event_turn_rows", turn_rows)
+
 
 def test_provider_tool_surface_has_explicit_admin_step_label():
     assert data_track._debug_friendly_step({
@@ -452,7 +524,7 @@ def test_debug_payload_groups_multi_user_trace_and_marks_stalled(monkeypatch):
     assert turns["t-ok"]["total_dur_ms"] == 3000
 
 
-def test_debug_payload_treats_missing_trace_flag_as_enabled_by_default(monkeypatch):
+def test_blank_flat_payload_does_not_append_zero_event_live_users(monkeypatch):
     with registry._users_lock:
         registry._users[:] = [
             {"user_id": "user_a", "principal_id": "p_a", "created_at": "2026-07-04T00:00:00Z"},
@@ -467,17 +539,7 @@ def test_debug_payload_treats_missing_trace_flag_as_enabled_by_default(monkeypat
         payload = data_track._data_track_debug_payload()
 
     assert payload["observability"] == {"trace_vocabulary": "ok"}
-    assert payload["users"] == [
-        {
-            "user_id": "user_a",
-            "principal_id": "p_a",
-            "enabled": True,
-            "account_present": True,
-            "events": 0,
-            "last_ts": 0,
-            "last_at": "",
-        }
-    ]
+    assert payload["users"] == []
 
 
 def test_debug_payload_paginates_filtered_events(monkeypatch):
@@ -512,6 +574,69 @@ def test_debug_payload_paginates_filtered_events(monkeypatch):
     }
     assert payload["summary"]["events_total"] == 5
     assert payload["summary"]["events_returned"] == 2
+
+
+def test_flat_payload_fetches_page_lookahead_not_the_old_full_scan(monkeypatch):
+    """The old 50k-wide-row path must not quietly return behind green output tests."""
+    with registry._users_lock:
+        registry._users[:] = []
+    monkeypatch.setattr(
+        data_track.db,
+        "query_trace_events",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("flat payload returned to the legacy full-row query")
+        ),
+    )
+    calls = []
+    sibling_calls = []
+
+    def flat_page(**kwargs):
+        calls.append(kwargs)
+        rows = [
+            _event(105 - idx, "user_a", "agent.reply", trace_id=f"t-{idx}")
+            for idx in range(3)
+        ]
+        return {
+            "events_total": 5,
+            "turns_total": 5,
+            "stalled_turns": 0,
+            "error_turns": 0,
+            "scan_truncated": False,
+            "users": [{"user_id": "user_a", "events": 5, "last_ts": 105}],
+            "subsystems": ["agent"],
+            "statuses": ["ok"],
+            # A limit=2 DB page carries exactly one lookahead row.
+            "rows": rows,
+        }
+
+    monkeypatch.setattr(data_track.db, "query_trace_events_flat_page", flat_page)
+    def sibling_rows(**kwargs):
+        sibling_calls.append(kwargs)
+        return [], True
+
+    monkeypatch.setattr(data_track.db, "query_trace_event_turn_rows", sibling_rows)
+    monkeypatch.setattr(data_track.db, "get_blobs_for_users", lambda *_a: {})
+
+    with bind("view=debug&mode=flat&limit=2"):
+        payload = data_track._data_track_debug_payload()
+
+    assert len(calls) == 1
+    assert calls[0]["limit"] == 2
+    assert calls[0]["candidate_limit"] == data_track.DEBUG_TRACE_CANDIDATE_CAP
+    assert sibling_calls[0]["candidate_limit"] == data_track.DEBUG_TRACE_CANDIDATE_CAP
+    assert sibling_calls[0]["sibling_limit"] == data_track.DEBUG_TRACE_SIBLING_CAP
+    assert len(payload["events"]) == 2
+    assert payload["pagination"]["next_offset"] == 2
+    assert payload["summary"]["scan_truncated"] is True
+
+
+def test_debug_trace_query_limits_have_literal_policy_anchors():
+    # These independent literals intentionally survive mutations of the source
+    # constants; every query-shape test derives its runtime input from them.
+    assert data_track.DEBUG_TRACE_CANDIDATE_CAP == 5_000
+    assert data_track.DEBUG_TRACE_SIBLING_CAP == 5_000
+    assert data_track.DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS == 2_000
+    assert data_track.DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC == 1.0
 
 
 def test_debug_page_renders_nav_filters_and_redacts_plaintext_by_default(monkeypatch):

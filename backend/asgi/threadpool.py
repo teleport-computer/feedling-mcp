@@ -34,3 +34,17 @@ async def run_db(fn, *args, **kwargs):
         return fn(*args, **kwargs)
 
     return await anyio.to_thread.run_sync(_call)
+
+
+async def run_db_bounded(fn, *args, timeout_seconds: float, **kwargs):
+    """Run blocking DB work with an ASGI response deadline.
+
+    The DB callable must still enforce its own server-side statement timeout;
+    abandoning a worker thread makes the HTTP deadline honest but does not, by
+    itself, cancel a PostgreSQL statement already running in that thread.
+    """
+    def _call():
+        return fn(*args, **kwargs)
+
+    with anyio.fail_after(float(timeout_seconds)):
+        return await anyio.to_thread.run_sync(_call, abandon_on_cancel=True)

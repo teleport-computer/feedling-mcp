@@ -3181,6 +3181,184 @@ def _debug_filter_options(events: list[dict]) -> dict:
     }
 
 
+DEBUG_TRACE_CANDIDATE_CAP = 5_000
+DEBUG_TRACE_SIBLING_CAP = 5_000
+DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS = 2_000
+DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC = 1.0
+
+
+def _normalize_debug_event_durations(events: list[dict]) -> None:
+    for event in events:
+        if isinstance(event, dict) and "dur_ms" in event:
+            event["dur_ms"] = _finite_ms(event.get("dur_ms"))
+
+
+def _data_track_debug_flat_payload(
+    *,
+    trace_vocabulary,
+    filters: dict,
+    limit: int,
+    offset: int,
+    page: int,
+    user_filter: str,
+    subsystem_filter: str,
+    status_filter: str,
+    trace_filter: str,
+    reveal_key: str,
+    q: str,
+    since_epoch: float,
+    live_users: dict[str, dict],
+) -> dict:
+    """Build the flat firehose without materialising 50k wide rows in Python."""
+    offset = min(max(0, int(offset)), DEBUG_TRACE_CANDIDATE_CAP)
+    result = db.query_trace_events_flat_page(
+        user_id=user_filter,
+        trace_id_contains=trace_filter,
+        subsystem=subsystem_filter,
+        status=status_filter if status_filter != "all" else "",
+        q=q,
+        since_epoch=since_epoch,
+        limit=limit,
+        offset=offset,
+        candidate_limit=DEBUG_TRACE_CANDIDATE_CAP,
+        connection_timeout=DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC,
+        statement_timeout_ms=DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS,
+    )
+    # The extra row is a deterministic regression anchor: changing the DB call
+    # back to the old 50k fetch, or fetching exactly ``limit`` and guessing
+    # whether another row exists, must make the query-shape tests fail.
+    page_rows = list(result.get("rows") or [])
+    events_out = page_rows[:limit]
+    _normalize_debug_event_durations(events_out)
+    page_ids = list(dict.fromkeys(
+        (
+            str(event.get("user_id") or ""),
+            str(event.get("trace_id") or "ungrouped"),
+        )
+        for event in events_out
+    ))
+    sibling_rows, sibling_truncated = db.query_trace_event_turn_rows(
+        turn_keys=page_ids,
+        user_id=user_filter,
+        trace_id_contains=trace_filter,
+        subsystem=subsystem_filter,
+        q=q,
+        since_epoch=since_epoch,
+        candidate_limit=DEBUG_TRACE_CANDIDATE_CAP,
+        sibling_limit=DEBUG_TRACE_SIBLING_CAP,
+        connection_timeout=DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC,
+        statement_timeout_ms=DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS,
+    )
+    _normalize_debug_event_durations(sibling_rows)
+    turns_out = _debug_trace_group_turns(
+        sibling_rows,
+        known_job_lanes=(
+            trace_vocabulary[0] if trace_vocabulary is not None else None
+        ),
+    )
+    page_id_set = set(page_ids)
+    turns_out = [
+        turn for turn in turns_out
+        if (turn["user_id"], turn["trace_id"]) in page_id_set
+    ]
+
+    user_stats = {
+        str(row.get("user_id") or ""): row
+        for row in (result.get("users") or [])
+        if row.get("user_id")
+    }
+    # An exact-user flat drill-down still shows the trace switch even when the
+    # bounded query has no rows.  The blank firehose intentionally does not
+    # append every zero-event live account to a page-sized response.
+    if user_filter and user_filter in live_users:
+        user_stats.setdefault(
+            user_filter,
+            {"user_id": user_filter, "events": 0, "last_ts": 0},
+        )
+    user_ids = sorted(user_stats)
+    trace_flags = db.get_blobs_for_users(
+        user_ids, [debug_trace.DEBUG_TRACE_FLAG_BLOB]
+    )
+    user_rows = []
+    for uid in user_ids:
+        user = live_users.get(uid) or {}
+        stats = user_stats[uid]
+        latest = float(stats.get("last_ts") or 0)
+        user_rows.append({
+            "user_id": uid,
+            "principal_id": user.get("principal_id") or "",
+            "enabled": (
+                _debug_trace_enabled(
+                    trace_flags.get((uid, debug_trace.DEBUG_TRACE_FLAG_BLOB))
+                )
+                if uid in live_users else False
+            ),
+            "account_present": uid in live_users,
+            "events": int(stats.get("events") or 0),
+            "last_ts": latest,
+            "last_at": core_util._epoch_to_iso(latest),
+        })
+    user_rows.sort(key=lambda row: float(row.get("last_ts") or 0), reverse=True)
+
+    total = int(result.get("events_total") or 0)
+    turns_total = int(result.get("turns_total") or 0)
+    pagination = {
+        "limit": limit,
+        "offset": offset,
+        "total": total,
+        "returned": len(events_out),
+        "next_offset": offset + limit if offset + limit < total else None,
+        "prev_offset": max(0, offset - limit) if offset > 0 else None,
+        "current_page": (offset // limit) + 1 if limit else 1,
+        "total_pages": ((total + limit - 1) // limit) if limit else 1,
+    }
+    option_events = [
+        {"subsystem": value}
+        for value in (result.get("subsystems") or [])
+    ] + [
+        {"status": value}
+        for value in (result.get("statuses") or [])
+    ]
+    return {
+        "summary": {
+            "generated_at": datetime.now().isoformat(),
+            "users_scanned": len(user_ids),
+            "users_with_events": sum(
+                1 for row in user_rows if int(row.get("events") or 0) > 0
+            ),
+            "events_total": total,
+            "turns_total": turns_total,
+            "events_returned": len(events_out),
+            "turns_returned": len(turns_out),
+            "stalled_turns": int(result.get("stalled_turns") or 0),
+            "error_turns": int(result.get("error_turns") or 0),
+            "scan_truncated": bool(result.get("scan_truncated")) or sibling_truncated,
+        },
+        "filters": {
+            "since": filters.get("since", ""),
+            "q": q,
+            "user_id": user_filter,
+            "subsystem": subsystem_filter,
+            "status": status_filter,
+            "trace_id": trace_filter,
+            "mode": "flat",
+            "reveal": reveal_key,
+            "view": "debug",
+            "page": str(page or ""),
+        },
+        "options": _debug_filter_options(option_events),
+        "observability": {
+            "trace_vocabulary": (
+                "ok" if trace_vocabulary is not None else "unavailable"
+            ),
+        },
+        "pagination": pagination,
+        "users": user_rows,
+        "turns": turns_out,
+        "events": events_out,
+    }
+
+
 def _data_track_debug_payload() -> dict:
     trace_vocabulary = _trace_vocabulary()
     filters = _data_track_request_filters()
@@ -3220,10 +3398,27 @@ def _data_track_debug_payload() -> dict:
             )
         }
 
+    if mode == "flat":
+        return _data_track_debug_flat_payload(
+            trace_vocabulary=trace_vocabulary,
+            filters=filters,
+            limit=limit,
+            offset=offset,
+            page=page,
+            user_filter=user_filter,
+            subsystem_filter=subsystem_filter,
+            status_filter=status_filter,
+            trace_filter=trace_filter,
+            reveal_key=reveal_key,
+            q=q,
+            since_epoch=since_epoch,
+            live_users=live_users,
+        )
+
     # Direct table scan is bounded and filter-aware. Crucially, it begins from
     # trace rows rather than the live account registry, so an exact deleted uid
     # remains reachable for the 30-day incident window (T184 D7).
-    scan_limit = 50_000
+    scan_limit = DEBUG_TRACE_CANDIDATE_CAP
     all_events_raw = db.query_trace_events(
         user_id=user_filter,
         trace_id_contains=trace_filter,
@@ -3231,6 +3426,8 @@ def _data_track_debug_payload() -> dict:
         q=q,
         since_epoch=since_epoch,
         limit=scan_limit,
+        connection_timeout=DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC,
+        statement_timeout_ms=DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS,
     )
     # ⭐ 归一化放在**事件刚进来的这一刻**,而不是任何一个出口。
     #
@@ -3243,9 +3440,7 @@ def _data_track_debug_payload() -> dict:
     #
     # ⇒ 教训不是"再往下挪一层",是:**只要归一化放在出口,就得数清楚有几个出口 ——
     # 而我三次都数错了。放在入口就不用数。**
-    for _ev in all_events_raw:
-        if isinstance(_ev, dict) and "dur_ms" in _ev:
-            _ev["dur_ms"] = _finite_ms(_ev.get("dur_ms"))
+    _normalize_debug_event_durations(all_events_raw)
     event_user_ids = {
         str(event.get("user_id") or "")
         for event in all_events_raw

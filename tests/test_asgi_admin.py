@@ -28,6 +28,8 @@ from pathlib import Path
 
 import httpx
 import pytest
+from psycopg.errors import QueryCanceled
+from psycopg_pool import PoolTimeout
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
@@ -128,6 +130,51 @@ def _asgi_raw(method, path, headers=None, **kw):
 
 def _admin(token=ADMIN_TOKEN):
     return {"X-Admin-Token": token}
+
+
+def test_debug_query_timeout_and_pool_busy_have_distinct_503s(env, monkeypatch):
+    assert admin_asgi.DEBUG_TRACE_REQUEST_TIMEOUT_SEC == 3.0
+    calls = []
+
+    def query_cancelled(_query):
+        raise QueryCanceled("debug statement deadline")
+
+    monkeypatch.setattr(admin_asgi.admin_core, "debug_payload", query_cancelled)
+    started = time.monotonic()
+    status, payload = _asgi_json(
+        "GET", "/v1/admin/data-track/debug", headers=_admin()
+    )
+    assert time.monotonic() - started < admin_asgi.DEBUG_TRACE_REQUEST_TIMEOUT_SEC
+    assert (status, payload) == (503, {"error": "debug_query_timeout"})
+
+    def pool_busy(_query):
+        calls.append("busy")
+        raise PoolTimeout("debug pool acquire deadline")
+
+    monkeypatch.setattr(admin_asgi.admin_core, "debug_payload", pool_busy)
+    status, payload = _asgi_json(
+        "GET", "/v1/admin/data-track/debug", headers=_admin()
+    )
+    assert calls == ["busy"]
+    assert (status, payload) == (503, {"error": "service_busy"})
+
+
+def test_debug_route_deadline_abandons_a_slow_sync_worker(env, monkeypatch):
+    monkeypatch.setattr(admin_asgi, "DEBUG_TRACE_REQUEST_TIMEOUT_SEC", 0.05)
+
+    def slow_debug_payload(_query):
+        time.sleep(1.0)
+        return {"too_late": True}
+
+    monkeypatch.setattr(admin_asgi.admin_core, "debug_payload", slow_debug_payload)
+    started = time.monotonic()
+    status, payload = _asgi_json(
+        "GET", "/v1/admin/data-track/debug", headers=_admin()
+    )
+    elapsed = time.monotonic() - started
+
+    assert (status, payload) == (503, {"error": "debug_query_timeout"})
+    assert elapsed < 1.0
 
 
 # --------------------------------------------------------------------------- #
