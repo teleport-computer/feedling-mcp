@@ -1,3 +1,9 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop-design.md
+historical_reason: superseded
+superseded_by: docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop-design.md
+---
 # Hosted Runtime V2 — 子项目 C（action queue + short planner/executor/responder）Implementation Plan
 
 > **STATUS: HISTORICAL / SUPERSEDED.** The staged planner/responder pipeline in
@@ -26,7 +32,7 @@ Plan B 的 `0014` 迁移已建表）、`provider_client`（纯 Python，`reliabl
 
 ## Global Constraints
 
-以下逐字取自 spec `2026-07-08-hosted-runtime-v2-abc-design.md`，每个 Task 的要求隐含包含本节：
+以下逐字取自归档 spec [`2026-07-08-hosted-runtime-v2-abc-design.md`](../specs/2026-07-08-hosted-runtime-v2-abc-design.md)，每个 Task 的要求隐含包含本节：
 
 - **§7.3 BYOK-only 硬不变量（写进实现 + 测试断言）**：API-key 用户回合内**所有** LLM 调用（planner +
   responder + 任何需要模型的 digest 生成）**一律用该用户自己的 provider key**。**不存在平台级 LLM key

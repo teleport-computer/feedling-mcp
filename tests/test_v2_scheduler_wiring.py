@@ -1,9 +1,9 @@
-"""D3 Task 5：serve_worker._build_scheduler_deps —— 把纯模块
+"""Wake-lane scheduler wiring：serve_worker._build_scheduler_deps —— 把纯模块
 `model_api_runtime.v2.scheduler.run_scheduler_tick` 接到真实实现的装配层适配器。
 
 纯接线断言，不跑真的 scheduler 循环：monkeypatch jobs_store 上的
 enqueue_job/upsert_wake_schedule/due_heartbeat_users，断言 deps 的四个 callable
-把参数原样转发到正确的 lane/kwarg 上；wake_decision 断言就是 Task 3 的
+把参数原样转发到正确的 lane/kwarg 上；wake_decision 断言就是当前
 `_wake_decision_for_user` 适配器本体（不是重新实现一份）。
 """
 from __future__ import annotations
@@ -43,6 +43,56 @@ def test_advance_heartbeat_upserts_next_heartbeat_at(monkeypatch):
     deps.advance_heartbeat("u1", 123.0)
 
     assert calls == [("u1", {"next_heartbeat_at": 123.0})]
+
+
+def test_consume_heartbeat_tick_delegates_to_core_store(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        serve_worker.core_store,
+        "consume_proactive_heartbeat_tick",
+        lambda uid, **kw: calls.append((uid, kw)) or (456.0, True),
+    )
+
+    result = serve_worker._build_scheduler_deps().consume_heartbeat_tick(
+        "u1", now=123.0, wake_interval_sec=333
+    )
+
+    assert result == (456.0, True)
+    assert calls == [("u1", {"now": 123.0, "wake_interval_sec": 333})]
+
+
+def test_followup_marker_trace_has_source_successor_and_generation(monkeypatch):
+    traces = []
+    monkeypatch.setattr(
+        serve_worker,
+        "_emit_v2_debug_trace_for_user",
+        lambda uid, event, **kw: traces.append((uid, event, kw)),
+    )
+
+    serve_worker._emit_followup_marker_trace(
+        "u1",
+        "merged",
+        source_job_id=11,
+        generation=3,
+        successor_job_id=12,
+        moved_context_count=3,
+    )
+
+    assert traces == [(
+        "u1",
+        "agent.wake_followup.marker",
+        {
+            "status": "ok",
+            "job_id": "12",
+            "detail": {
+                "action": "merged",
+                "source_job_id": 11,
+                "generation": 3,
+                "moved_context_count": 3,
+                "successor_job_id": 12,
+            },
+        },
+    )]
 
 
 def test_due_users_delegates_to_due_heartbeat_users(monkeypatch):

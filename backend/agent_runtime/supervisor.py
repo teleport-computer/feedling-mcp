@@ -56,7 +56,6 @@ if str(_BACKEND_DIR) not in sys.path:
 
 import db
 from core import runtime_token
-from core import wake_bus
 from core.store import get_store
 from agent_runtime import leases, spawners
 from agent_runtime.heartbeat_policy import SUPERVISOR_HEARTBEAT_MAX_AGE_SEC
@@ -490,13 +489,12 @@ class Supervisor:
                         # next poll instead of waiting out CHAT_POLL_CLAIM_TTL_SEC
                         # (600s) for the lost-turn redelivery backstop. Best-effort:
                         # chat_expire_reply_claims already swallow-and-logs; the
-                        # notify is wrapped so a broadcast hiccup can't abort the
-                        # respawn (its real job is kill→spawn→swap).
+                        # committed UPDATE's DB trigger owns cross-worker wake;
+                        # the respawn's real job remains kill→spawn→swap.
                         try:
-                            if db.chat_expire_reply_claims(user_id):
-                                wake_bus.notify("chat", user_id)
+                            db.chat_expire_reply_claims(user_id)
                         except Exception:  # noqa: BLE001
-                            log.exception("claim release/notify failed for %s", user_id)
+                            log.exception("claim release failed for %s", user_id)
                         try:
                             pid = self.spawn_fn(entry, user_id, home)
                         except Exception as e:  # noqa: BLE001

@@ -423,6 +423,7 @@ def public_enqueue_reason(reason: object) -> str:
 # debug_trace and must not reach upward for it.  Left None in contexts that do
 # not wire it (tests, tools), where enqueue must still work.
 on_job_enqueued = None
+on_followup_marker = None
 
 
 def _trace_id_for_enqueue(lane: str, trace_id: object | None) -> str | None:
@@ -473,6 +474,30 @@ def _notify_job_enqueued(
         on_job_enqueued(user_id, lane, reason=reason, trace_id=trace_id)
     except Exception as exc:  # pragma: no cover - defensive
         log.warning("[jobs_store] enqueue trace hook failed: %s", exc)
+
+
+def _notify_followup_marker(
+    user_id: str,
+    *,
+    source_job_id: int,
+    generation: int,
+    successor_job_id: int,
+    moved_context_count: int,
+) -> None:
+    """Emit one completed marker merge through the assembly-layer hook."""
+    if on_followup_marker is None:
+        return
+    try:
+        on_followup_marker(
+            str(user_id),
+            "merged",
+            source_job_id=int(source_job_id),
+            generation=max(1, int(generation)),
+            successor_job_id=int(successor_job_id),
+            moved_context_count=max(0, int(moved_context_count)),
+        )
+    except Exception as exc:  # pragma: no cover - diagnostics are fail-open
+        log.warning("[jobs_store] follow-up marker trace hook failed: %s", exc)
 
 
 def terminal_outcome_class(error_code: str) -> str:
@@ -1180,6 +1205,135 @@ def enqueue_job(
     return result
 
 
+def _set_followup_marker_on_cursor(
+    cur,
+    *,
+    user_id: str,
+    source_job_id: int,
+    consumed_context_seq: int,
+    generation: int,
+) -> None:
+    """Bind one source's late-input generation under the per-user schedule lock."""
+    cur.execute(
+        "INSERT INTO v2_wake_schedule (user_id) VALUES (%s) "
+        "ON CONFLICT (user_id) DO NOTHING",
+        (str(user_id),),
+    )
+    cur.execute(
+        "SELECT pending_followup_generation,pending_followup_source_job_id,"
+        "pending_followup_consumed_context_seq FROM v2_wake_schedule "
+        "WHERE user_id=%s FOR UPDATE",
+        (str(user_id),),
+    )
+    marker = cur.fetchone()
+    if marker is None:
+        raise RuntimeError("follow-up schedule row missing")
+    existing_source = marker["pending_followup_source_job_id"]
+    if existing_source is not None and int(existing_source) != int(source_job_id):
+        raise RuntimeError("conflicting heartbeat follow-up marker source")
+    existing_cursor = marker["pending_followup_consumed_context_seq"]
+    if (
+        existing_cursor is not None
+        and int(existing_cursor) != max(0, int(consumed_context_seq))
+    ):
+        raise RuntimeError("conflicting heartbeat follow-up marker cursor")
+    cur.execute(
+        "UPDATE v2_wake_schedule SET pending_followup_generation=%s,"
+        "pending_followup_source_job_id=%s,"
+        "pending_followup_consumed_context_seq=%s,updated_at=now() "
+        "WHERE user_id=%s",
+        (
+            max(1, int(generation)),
+            int(source_job_id),
+            max(0, int(consumed_context_seq)),
+            str(user_id),
+        ),
+    )
+
+
+def _merge_followup_marker_on_cursor(
+    cur,
+    *,
+    user_id: str,
+    successor_job_id: int,
+    context_stream: str,
+) -> dict:
+    """Move every marked late row to one immediate successor and clear marker."""
+    cur.execute(
+        "SELECT pending_followup_generation,pending_followup_source_job_id,"
+        "pending_followup_consumed_context_seq FROM v2_wake_schedule "
+        "WHERE user_id=%s FOR UPDATE",
+        (str(user_id),),
+    )
+    marker = cur.fetchone()
+    if marker is None or marker["pending_followup_source_job_id"] is None:
+        raise RuntimeError("heartbeat follow-up marker missing during merge")
+    source_job_id = int(marker["pending_followup_source_job_id"])
+    consumed_context_seq = max(
+        0, int(marker["pending_followup_consumed_context_seq"] or 0)
+    )
+    generation = max(1, int(marker["pending_followup_generation"] or 1))
+    cur.execute(
+        "UPDATE user_logs SET item_key=%s,"
+        "doc=jsonb_set(doc,'{agent_job_id}',to_jsonb(%s::bigint),true) "
+        "WHERE user_id=%s AND stream=%s AND item_key=%s AND seq>%s",
+        (
+            str(int(successor_job_id)),
+            int(successor_job_id),
+            str(user_id),
+            str(context_stream),
+            str(source_job_id),
+            consumed_context_seq,
+        ),
+    )
+    moved_context_count = int(cur.rowcount)
+    if moved_context_count <= 0:
+        raise RuntimeError("heartbeat follow-up marker has no late context")
+    cur.execute(
+        "UPDATE agent_jobs SET input_generation=input_generation+%s WHERE id=%s",
+        (generation, int(successor_job_id)),
+    )
+    cur.execute(
+        "UPDATE v2_wake_schedule SET pending_followup_generation=NULL,"
+        "pending_followup_source_job_id=NULL,"
+        "pending_followup_consumed_context_seq=NULL,updated_at=now() "
+        "WHERE user_id=%s AND pending_followup_source_job_id=%s",
+        (str(user_id), source_job_id),
+    )
+    if int(cur.rowcount) != 1:
+        raise RuntimeError("heartbeat follow-up marker changed during merge")
+    return {
+        "source_job_id": source_job_id,
+        "consumed_context_seq": consumed_context_seq,
+        "generation": generation,
+        "moved_context_count": moved_context_count,
+    }
+
+
+def _mirror_followup_merge(
+    *,
+    user_id: str,
+    successor_job_id: int,
+    context_stream: str,
+    merge: dict,
+) -> None:
+    from tee_shadow import mirror
+
+    mirror.execute(
+        "UPDATE user_logs SET item_key=%s,"
+        "doc=jsonb_set(doc,'{agent_job_id}',to_jsonb(%s::bigint),true) "
+        "WHERE user_id=%s AND stream=%s AND item_key=%s AND seq>%s",
+        (
+            str(int(successor_job_id)),
+            int(successor_job_id),
+            str(user_id),
+            str(context_stream),
+            str(int(merge["source_job_id"])),
+            int(merge["consumed_context_seq"]),
+        ),
+    )
+
+
 def enqueue_job_with_context_log(
     user_id: str,
     lane: str,
@@ -1812,7 +1966,7 @@ def finish_wake_job(
         else None
     )
     successor_id: int | None = None
-    moved_context = False
+    followup_merge: dict | None = None
     user_id = ""
     with _pool().connection() as conn:
         with conn.transaction():
@@ -1885,6 +2039,29 @@ def finish_wake_job(
                 if clear_wake_backoff:
                     _clear_wake_backoff_on_cursor(cur, user_id)
                 if has_late_input:
+                    late_generation = (
+                        int(row["input_generation"] or 0)
+                        - int(observed_generation)
+                    )
+                    cur.execute(
+                        "SELECT COUNT(*) AS count FROM user_logs "
+                        "WHERE user_id=%s AND stream=%s AND item_key=%s AND seq>%s",
+                        (
+                            user_id,
+                            str(context_stream),
+                            str(int(job_id)),
+                            max(0, int(consumed_context_seq)),
+                        ),
+                    )
+                    late_context_count = int(cur.fetchone()["count"] or 0)
+                    if late_context_count > 0:
+                        _set_followup_marker_on_cursor(
+                            cur,
+                            user_id=user_id,
+                            source_job_id=int(job_id),
+                            consumed_context_seq=max(0, int(consumed_context_seq)),
+                            generation=late_generation,
+                        )
                     cur.execute(
                         "INSERT INTO agent_jobs "
                         "(user_id,lane,status,reason,priority,"
@@ -1898,38 +2075,27 @@ def finish_wake_job(
                         ),
                     )
                     successor_id = int(cur.fetchone()["id"])
-                    cur.execute(
-                        "UPDATE user_logs SET item_key=%s,"
-                        "doc=jsonb_set(doc,'{agent_job_id}',"
-                        "to_jsonb(%s::bigint),true) "
-                        "WHERE user_id=%s AND stream=%s AND item_key=%s "
-                        "AND seq>%s",
-                        (
-                            str(successor_id),
-                            successor_id,
-                            user_id,
-                            str(context_stream),
-                            str(int(job_id)),
-                            max(0, int(consumed_context_seq)),
-                        ),
-                    )
-                    moved_context = bool(cur.rowcount)
+                    if late_context_count > 0:
+                        followup_merge = _merge_followup_marker_on_cursor(
+                            cur,
+                            user_id=user_id,
+                            successor_job_id=successor_id,
+                            context_stream=str(context_stream),
+                        )
 
-    if successor_id is not None and moved_context:
-        from tee_shadow import mirror
-
-        mirror.execute(
-            "UPDATE user_logs SET item_key=%s,"
-            "doc=jsonb_set(doc,'{agent_job_id}',to_jsonb(%s::bigint),true) "
-            "WHERE user_id=%s AND stream=%s AND item_key=%s AND seq>%s",
-            (
-                str(successor_id),
-                successor_id,
-                user_id,
-                str(context_stream),
-                str(int(job_id)),
-                max(0, int(consumed_context_seq)),
-            ),
+    if successor_id is not None and followup_merge is not None:
+        _mirror_followup_merge(
+            user_id=user_id,
+            successor_job_id=successor_id,
+            context_stream=str(context_stream),
+            merge=followup_merge,
+        )
+        _notify_followup_marker(
+            user_id,
+            source_job_id=int(followup_merge["source_job_id"]),
+            generation=int(followup_merge["generation"]),
+            successor_job_id=successor_id,
+            moved_context_count=int(followup_merge["moved_context_count"]),
         )
     return True, successor_id
 
@@ -3910,7 +4076,7 @@ def _deliver_terminal_failure_status(
                 delivered = True
     if delivered:
         try:
-            wake_bus.notify("chat", user_id)
+            wake_bus.notify_chat_wake_only(user_id)
         except Exception:  # noqa: BLE001 — poll timeout remains the fallback
             pass
     return delivered
@@ -4128,6 +4294,7 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
             user_text
             if error_class
             in {
+                "canvas_file_delivery_incomplete",
                 "platform_queue_timeout",
                 "platform_execution_timeout",
                 "provider_timeout",
@@ -4182,10 +4349,6 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         persisted["seq"] = int(seq)
         store.apply_committed_chat_rows([persisted])
         store.notify_chat_waiters()
-        try:
-            wake_bus.notify("chat", user_id)
-        except Exception:  # noqa: BLE001 - poll timeout remains the fallback
-            pass
         return _ack_terminal_failure_reply(job_id)
 
     seq, inserted = db.chat_append_effect_with_cursor(
@@ -4201,10 +4364,6 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         message["seq"] = int(seq)
         store.apply_committed_chat_rows([message])
         store.notify_chat_waiters()
-        try:
-            wake_bus.notify("chat", user_id)
-        except Exception:  # noqa: BLE001 - poll timeout remains the fallback
-            pass
     if not inserted and seq:
         persisted = db.chat_get_strict(user_id, message_id)
         if (
@@ -4812,7 +4971,7 @@ def append_status_event(
                 )
                 event_id = int(cur.fetchone()["id"])
     try:
-        wake_bus.notify("chat", user_id)
+        wake_bus.notify_chat_wake_only(user_id)
     except Exception:  # noqa: BLE001 — best-effort; the INSERT already committed
         pass
     return event_id
@@ -4876,7 +5035,7 @@ def status_events_for_job(user_id: str, job_id: int) -> list[dict]:
 def list_status_events(user_id, *, after_id=0, limit=50) -> list[dict]:
     """按 id 升序返回 user 自 after_id 之后的 status 事件（游标读）。每行含
     id/job_id/user_id/kind/label/detail_json/seq/created_at(epoch float)。委托到
-    db.list_agent_status_events —— Plan C 的 chat/poll_core 长轮询走同一原语，
+    db.list_agent_status_events —— 当前 chat/status stream 的长轮询走同一原语，
     这里不重复写 SQL（单一读源）。"""
     return db.list_agent_status_events(user_id, after_id=after_id, limit=limit)
 
@@ -4946,8 +5105,10 @@ def workers_alive(*, within_sec: int = 30, pool: str | None = None) -> bool:
 
 
 def live_worker_count(*, within_sec: int = 30, pool: str | None = None) -> int:
-    """窗口内有心跳的 serve_worker TURN 进程数（workers_alive 的计数版，喂 admission
-    ceiling）。genesis 心跳不计入——它不占 turn 槽位。"""
+    """窗口内有心跳的 serve_worker TURN 进程数（queue telemetry 的计数版）。
+
+    genesis 心跳不计入——它不占 turn 槽位。
+    """
     with _pool().connection() as conn:
         with conn.cursor() as cur:
             query = (
@@ -4965,10 +5126,12 @@ def live_worker_count(*, within_sec: int = 30, pool: str | None = None) -> int:
 
 def live_genesis_worker_ids(*, within_sec: int = 30) -> list[str]:
     """worker_ids with a fresh ``kind='genesis'`` heartbeat. Sibling to
-    ``workers_alive``/``live_worker_count`` (which read ``kind='turn'`` only, to
-    gate chat admission): this reads the genesis heartbeats to gate the genesis
-    orphan reclaim — a ``processing`` job whose claiming worker id is absent here
-    was left behind by a dead/replaced worker."""
+    ``workers_alive`` (the turn-worker liveness gate) and ``live_worker_count``
+    (turn-process telemetry); both read ``kind='turn'`` only. Current Chat
+    queue/capacity telemetry uses ``live_worker_capacity``, not this helper.
+    This reads genesis heartbeats to gate genesis orphan reclaim: a
+    ``processing`` job whose claiming worker id is absent here was left behind
+    by a dead/replaced worker."""
     with _pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -5261,7 +5424,7 @@ def recent_watchdog_recovery_counts(*, within_hours: int = 24) -> dict[str, int]
 def inflight_job_count(*, lanes: set[str] | None = None) -> int:
     """Count pending/claimed/running Jobs, optionally within selected lanes.
 
-    Runtime admission must pass its pool's lane set.  The unfiltered form is
+    Runtime capacity telemetry must pass its pool's lane set. The unfiltered form is
     retained for aggregate Admin observability only.
     """
     with _pool().connection() as conn:
@@ -10510,7 +10673,7 @@ def get_summary_row(user_id) -> dict | None:
     {"summary_envelope": dict|None, "watermark_ts": float, "version": int,
     "watermark_seq": int}，无行返回 None（该用户从未压缩过）。
 
-    ``watermark_seq``（D5/Task 9，migration 0031）与 ``watermark_ts`` 同一行
+    ``watermark_seq``（migration 0031）与 ``watermark_ts`` 同一行
     并存：新压缩写入的行两者都是真值（见 ``upsert_summary_row_cas``）；但
     0031 之前就存在的行只有 ``watermark_ts``、``watermark_seq`` 落着迁移
     默认值 0。这里做一次性懒翻译——``watermark_seq==0`` 但
@@ -10518,7 +10681,7 @@ def get_summary_row(user_id) -> dict | None:
     strictly-less）现算一个替身返回，不回写库（下一次真正压缩发生时才会
     落一个精确值）。选在读侧做而不是把翻译推给每个调用方，是因为
     ``get_summary_row`` 只有一个实现、调用方（当前的 ``_read_summary``、
-    未来 Task 10 的 prompt-invariant 边界读取）都自动拿到一致语义，不用人人
+    当前 prompt-invariant 边界读取）都自动拿到一致语义，不用人人
     记得先查有没有 watermark_seq 再翻译一次。"""
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -10563,7 +10726,7 @@ def upsert_summary_row_cas(
     否则走 UPDATE ... WHERE version=expected_version（不匹配说明摘要在别处已被
     推进，本次写入是过期/丢失的 CAS，返回 False）。成功返回 True。
 
-    ``watermark_seq``（D5/Task 9）与 ``watermark_ts`` 在同一次 CAS 写入里
+    ``watermark_seq`` 与 ``watermark_ts`` 在同一次 CAS 写入里
     原子推进——同一行、同一个 UPDATE 语句，不是两次写。``None``（默认，
     向后兼容旧调用方/旧测试 fixture 未传这个参数的场景）在 UPDATE 分支用
     ``COALESCE`` 保留该行原有的 watermark_seq（不清零、不误伤未真正推进
@@ -12162,7 +12325,9 @@ def get_wake_schedule(user_id) -> dict | None:
                 "last_screen_watch_frame_id, last_screen_chat_frame_id, self_wake_streak, "
                 "self_wake_user_seq, self_wake_last_effect_id, "
                 "self_wake_last_effect_accepted, proactive_fail_streak, "
-                "proactive_fail_user_seq, updated_at "
+                "proactive_fail_user_seq, pending_followup_generation, "
+                "pending_followup_source_job_id, "
+                "pending_followup_consumed_context_seq, updated_at "
                 "FROM v2_wake_schedule WHERE user_id=%s",
                 (user_id,),
             )

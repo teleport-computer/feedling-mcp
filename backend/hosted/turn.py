@@ -10,6 +10,7 @@ from datetime import date, timedelta
 import db
 from core import enclave as core_enclave
 from core import envelope as core_envelope
+from chat import file_display
 from chat import service as chat_service
 from core.store import UserStore
 
@@ -573,6 +574,11 @@ def _model_api_file_payload(payload: dict) -> tuple[dict | None, tuple[dict, int
     mime = str(payload.get("file_mime") or "").strip().lower()
     ext = _file_ext(name)
 
+    try:
+        display_extra = file_display.metadata_from_payload(payload, filename=name)
+    except ValueError as exc:
+        return None, ({"error": "invalid_file", "detail": str(exc)}, 400)
+
     if mime.startswith("image/") or ext in _IMAGE_EXTS:
         img_mime = _normalize_image_mime(mime, ext)
         if img_mime is None:
@@ -587,10 +593,12 @@ def _model_api_file_payload(payload: dict) -> tuple[dict | None, tuple[dict, int
 
     if ext in _DOC_EXTS:
         return {"kind": "file", "bytes": data,
-                "mime": mime or _DEFAULT_DOC_MIME[ext], "name": name}, None
+                "mime": mime or _DEFAULT_DOC_MIME[ext], "name": name,
+                **display_extra}, None
 
     if _looks_like_text(data):
-        return {"kind": "file", "bytes": data, "mime": mime or "text/plain", "name": name}, None
+        return {"kind": "file", "bytes": data, "mime": mime or "text/plain", "name": name,
+                **display_extra}, None
 
     return None, ({"error": "unsupported_file_type",
                    "detail": f"file type not supported: {ext or mime or 'binary'}",

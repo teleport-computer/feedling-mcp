@@ -1336,6 +1336,48 @@ def test_unified_main_test_returns_model_identity_and_stable_status(monkeypatch)
     }
 
 
+def test_resident_main_vision_test_fires_typed_chat_wake(monkeypatch):
+    calls = []
+
+    class Store:
+        user_id = "resident-vision"
+
+        def notify_chat_waiters(self):
+            calls.append("local")
+
+    monkeypatch.setattr(
+        setup_core.vision_routing,
+        "runtime_capability",
+        lambda _store: {"runtime": "resident", "available": True},
+    )
+    monkeypatch.setattr(
+        setup_core.vision_routing.chat_consumer,
+        "begin_vision_probe",
+        lambda *_args, **_kwargs: (
+            {
+                "probe_id": "probe-1",
+                "expires_at_epoch": 1234,
+                "provider": "resident",
+                "model": "vision",
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        setup_core.wake_bus,
+        "notify_chat_wake_only",
+        lambda user_id: calls.append(("remote", user_id)),
+    )
+
+    body, status = setup_core.vision_main_test(
+        Store(), caller_api_key="caller"
+    )
+
+    assert status == 202
+    assert body["probe_id"] == "probe-1"
+    assert calls == ["local", ("remote", "resident-vision")]
+
+
 def test_dedicated_route_for_send_pins_ready_route(monkeypatch):
     route = {"id": "vision", "vision_test_status": "ok"}
     monkeypatch.setattr(vision_routing.db, "model_api_vision_route", lambda _uid: route)

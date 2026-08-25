@@ -523,6 +523,10 @@ class ProviderEmptyReply(RuntimeError):
     """A structurally valid provider success had no foreground-usable output."""
 
 
+class CanvasDeliveryIncomplete(RuntimeError):
+    """Canvas source was saved but its card still failed bounded delivery."""
+
+
 @dataclass(frozen=True)
 class FinalReplyCorrectionRequest:
     """Ask the loop for one text-only rewrite before publishing a final reply.
@@ -836,6 +840,20 @@ async def run_tool_loop(
         if isinstance(message, dict)
     ]
 
+    def _latest_user_delivery_request() -> str:
+        """Keep the model's final Canvas metadata grounded in the live request."""
+
+        for message in reversed(file_requirement_message_state):
+            if str(message.get("role") or "").strip().lower() != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return _truncate_result_content(
+                    content.strip(),
+                    DEFAULT_TOOL_RESULT_CHAR_CAP,
+                )
+        return ""
+
     def _normalize_file_requirement(value) -> tuple[bool, frozenset[str]]:
         suffixes = frozenset(
             str(suffix).strip().casefold() for suffix in (value or ())
@@ -867,8 +885,11 @@ async def run_tool_loop(
     file_delivery_recovery_needed = False
     workspace_write_applied = False
     workspace_delivery_target: tuple[str, int] | None = None
+    workspace_delivery_candidate: tuple[str, int] | None = None
+    existing_file_delivery_choice_required = False
     compact_delivery_validation_exchange: ToolExchange | None = None
     compact_delivery_mismatch_retry_used = False
+    compact_delivery_args_retry_used = False
     compact_delivery_confirmation_needed = False
     # Names keep required schemas visible and completed discovery calls valid in
     # native history. Exact call keys independently decide whether dispatch would
@@ -1084,12 +1105,12 @@ async def run_tool_loop(
                     {"round": attempts + 1, "messages": folded},
                 )
                 transcript.extend(folded)
+                file_requirement_message_state.extend(
+                    dict(message)
+                    for message in folded
+                    if isinstance(message, dict)
+                )
                 if resolve_required_file_suffixes is not None:
-                    file_requirement_message_state.extend(
-                        dict(message)
-                        for message in folded
-                        if isinstance(message, dict)
-                    )
                     (
                         next_file_delivery_required,
                         next_required_suffixes,
@@ -1113,8 +1134,11 @@ async def run_tool_loop(
                         file_delivery_fallback_reasoning = ""
                         workspace_write_applied = False
                         workspace_delivery_target = None
+                        workspace_delivery_candidate = None
+                        existing_file_delivery_choice_required = False
                         compact_delivery_validation_exchange = None
                         compact_delivery_mismatch_retry_used = False
+                        compact_delivery_args_retry_used = False
                         compact_delivery_confirmation_needed = False
                         if on_file_requirement_changed is not None:
                             await on_file_requirement_changed()
@@ -1303,6 +1327,7 @@ async def run_tool_loop(
             )
         )
         forced_delivery_tool = ""
+        file_delivery_choice_required = False
         if (
             not terminal_text_round
             and tools is not None
@@ -1335,8 +1360,24 @@ async def run_tool_loop(
             surface_reason = "file_delivery_forced"
             if workspace_write_applied:
                 forced_delivery_tool = tool_schema.FILE_REPLY_TOOL
+            elif (
+                existing_file_delivery_choice_required
+                and workspace_delivery_candidate is not None
+            ):
+                choice_names = {
+                    spec.name
+                    for spec in tools
+                    if spec.name in {"workspace_write", tool_schema.FILE_REPLY_TOOL}
+                }
+                tools = [spec for spec in tools if spec.name in choice_names]
+                if choice_names == {tool_schema.FILE_REPLY_TOOL}:
+                    forced_delivery_tool = tool_schema.FILE_REPLY_TOOL
+                elif choice_names:
+                    file_delivery_choice_required = True
             elif file_delivery_recovery_needed:
-                forced_delivery_tool = "workspace_write"
+                available_names = {spec.name for spec in tools}
+                if "workspace_write" in available_names:
+                    forced_delivery_tool = "workspace_write"
             if forced_delivery_tool:
                 tools = [
                     spec for spec in tools
@@ -1376,16 +1417,21 @@ async def run_tool_loop(
         compact_delivery_phase = ""
         if compact_delivery_confirmation_needed:
             compact_delivery_phase = "confirm"
+            current_user_request = _latest_user_delivery_request()
             messages = [
                 {
                     "role": "system",
                     "content": (
                         "The work the user asked for was saved and delivered "
-                        "successfully. Finish this turn in your own voice with that "
-                        "fact available; the user can open the work now."
+                        "successfully. Finish this turn in your own voice, using the "
+                        "same language as the user's current request below, with "
+                        "that fact available; the user can open the work now."
                     ),
                 },
-                {"role": "user", "content": "Finish your response to me."},
+                {
+                    "role": "user",
+                    "content": current_user_request or "Finish your response to me.",
+                },
             ]
         elif (
             forced_delivery_tool == tool_schema.FILE_REPLY_TOOL
@@ -1393,6 +1439,24 @@ async def run_tool_loop(
         ):
             compact_delivery_phase = "send_file"
             target_path, target_revision = workspace_delivery_target
+            current_user_request = _latest_user_delivery_request()
+            metadata_instruction = ""
+            if target_path.casefold().endswith(".io.html"):
+                metadata_instruction = (
+                    " This is a Canvas file, so send_file also requires a concise "
+                    "title, subtitle, and completion_message in the language of the "
+                    "user's current request. completion_message is the complete "
+                    "user-visible chat bubble in your own voice; do not default it "
+                    "to English or Chinese. Preserve or change the metadata according "
+                    "to the current user request."
+                )
+            request_instruction = (
+                " Current user request: "
+                + json.dumps(current_user_request, ensure_ascii=False)
+                + "."
+                if current_user_request
+                else ""
+            )
             messages = [
                 {
                     "role": "system",
@@ -1404,6 +1468,8 @@ async def run_tool_loop(
                             ensure_ascii=False,
                             separators=(",", ":"),
                         )
+                        + metadata_instruction
+                        + request_instruction
                     ),
                 },
                 {"role": "user", "content": "Complete the pending delivery now."},
@@ -1419,6 +1485,11 @@ async def run_tool_loop(
         if forced_delivery_tool:
             required_schema_names = set(required_schema_names) | {
                 forced_delivery_tool
+            }
+        if file_delivery_choice_required:
+            required_schema_names = set(required_schema_names) | {
+                "workspace_write",
+                tool_schema.FILE_REPLY_TOOL,
             }
         if wake_choice_required:
             required_schema_names = {
@@ -1608,6 +1679,7 @@ async def run_tool_loop(
                 "messages": messages,
                 "tools": tools,
                 "forced_tool": forced_delivery_tool,
+                "file_delivery_choice_required": file_delivery_choice_required,
                 "wake_choice_required": wake_choice_required,
                 "compact_delivery_phase": compact_delivery_phase,
                 "prompt_frontier": frontier_plan,
@@ -1634,6 +1706,8 @@ async def run_tool_loop(
             if terminal_schema_guard and tools is not None:
                 provider_kwargs["tool_choice"] = "none"
             if wake_choice_required:
+                provider_kwargs["tool_choice"] = "required"
+            if file_delivery_choice_required:
                 provider_kwargs["tool_choice"] = "required"
             if allow_image_output and not terminal_text_round:
                 provider_kwargs["allow_image_output"] = True
@@ -2347,13 +2421,36 @@ async def run_tool_loop(
                     )
                 if missing_suffixes:
                     target = ", ".join(missing_suffixes)
-                    delivery_retry_instruction = (
-                        "REQUIRED FILE DELIVERY: The user explicitly requested "
-                        f"downloadable output in {target}. Do not finish with "
-                        "plain text. Create editable source with workspace_write, "
-                        "then call send_file for every missing format before the "
-                        "terminal reply."
-                    )
+                    if workspace_delivery_candidate is not None:
+                        candidate_path, candidate_revision = (
+                            workspace_delivery_candidate
+                        )
+                        delivery_retry_instruction = (
+                            "REQUIRED FILE DELIVERY: The user explicitly requested "
+                            f"downloadable output in {target}. An existing exact "
+                            "workspace revision is available at "
+                            + json.dumps(
+                                {
+                                    "path": candidate_path,
+                                    "revision": candidate_revision,
+                                },
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                            + ". Do not finish with plain text or an internal link. "
+                            "Call workspace_write if the source bytes still need "
+                            "the user's requested change; otherwise call send_file "
+                            "for that exact existing revision."
+                        )
+                        existing_file_delivery_choice_required = True
+                    else:
+                        delivery_retry_instruction = (
+                            "REQUIRED FILE DELIVERY: The user explicitly requested "
+                            f"downloadable output in {target}. Do not finish with "
+                            "plain text. Create editable source with workspace_write, "
+                            "then call send_file for every missing format before the "
+                            "terminal reply."
+                        )
                 else:
                     delivery_retry_instruction = (
                         "REQUIRED FILE DELIVERY: The user explicitly requested a "
@@ -2563,10 +2660,6 @@ async def run_tool_loop(
                     and str(tc.args.get("url") or "").strip()
                     not in allowed_fetch_urls
                 )
-                or (
-                    tc.name not in mcp_names
-                    and tool_schema.validate_tool_args(tc.name, tc.args) is not None
-                )
                 for tc in pr.tool_calls
             )
         )
@@ -2630,6 +2723,113 @@ async def run_tool_loop(
             )
             continue
 
+        # Parsed calls with invalid domain arguments are not a broken provider
+        # protocol. During the compact Canvas delivery phase, return one native
+        # result per call and let the model correct the metadata once. This is
+        # deliberately separate from the target-mismatch retry: adding a title
+        # or subtitle must not consume the exact path/revision correction.
+        validation_errors = {
+            tc.id: validation_error
+            for tc in pr.tool_calls
+            if tc.name not in mcp_names
+            and (
+                validation_error := tool_schema.validate_tool_args(
+                    tc.name,
+                    tc.args,
+                    live_model_call=(compact_delivery_phase == "send_file"),
+                )
+            )
+            is not None
+        }
+        if compact_delivery_phase == "send_file" and len(pr.tool_calls) != 1:
+            validation_errors.update(
+                {
+                    tc.id: (
+                        "pending Canvas delivery requires exactly one "
+                        "send_file call"
+                    )
+                    for tc in pr.tool_calls
+                }
+            )
+        if validation_errors:
+            if compact_delivery_phase != "send_file":
+                if attempts >= max_calls:
+                    break
+                await _trajectory(
+                    "protocol_fallback",
+                    {
+                        "round": attempts,
+                        "reason": "invalid_or_over_budget_tool_exchange",
+                        "malformed": True,
+                        "mixed_reply_write": False,
+                        "over_tool_call_budget": False,
+                        "oversized_tool_exchange": False,
+                    },
+                )
+                force_text_fallback = True
+                force_text_fallback_reason = (
+                    "invalid_or_over_budget_tool_exchange"
+                )
+                continue
+            if compact_delivery_args_retry_used:
+                await _trajectory(
+                    "protocol_fallback",
+                    {
+                        "round": attempts,
+                        "reason": "repeated_invalid_canvas_delivery_args",
+                        "invalid_tool_names": sorted(
+                            {
+                                tc.name
+                                for tc in pr.tool_calls
+                                if tc.id in validation_errors
+                            }
+                        ),
+                    },
+                )
+                raise CanvasDeliveryIncomplete("invalid_canvas_delivery_args")
+
+            compact_delivery_args_retry_used = True
+            tool_calls_used += len(pr.tool_calls)
+            validation_results: list[ToolResult] = []
+            for tc in pr.tool_calls:
+                await _tool_event(tc, "tool_call_started", {})
+                validation_error = validation_errors.get(tc.id)
+                content = (
+                    f"error: invalid args for {tc.name}: {validation_error}. "
+                    "Nothing in this tool batch was executed. Correct the "
+                    "arguments and call the tool again."
+                    if validation_error is not None
+                    else (
+                        "error: tool batch not executed because another call had "
+                        "invalid arguments. Resubmit after correcting that call."
+                    )
+                )
+                result = ToolResult(call_id=tc.id, content=content)
+                validation_results.append(result)
+                await _tool_event(tc, "tool_call_result", {"result": result})
+            validation_results = _normalize_tool_results(
+                validation_results,
+                per_result_cap=tool_result_char_cap,
+                batch_cap=tool_batch_result_char_cap,
+            )
+            await _trajectory(
+                "tool_batch_validation_failed",
+                {
+                    "round": attempts,
+                    "calls": pr.tool_calls,
+                    "results": validation_results,
+                },
+            )
+            validation_exchange = ToolExchange(
+                calls=tuple(pr.tool_calls),
+                results=tuple(validation_results),
+                assistant_text=pr.text,
+                assistant_turn=pr.assistant_turn,
+            )
+            transcript.append(validation_exchange)
+            compact_delivery_validation_exchange = validation_exchange
+            continue
+
         tool_calls_used += len(pr.tool_calls)
 
         # text accompanying tool_calls = preamble/thinking, NOT a bubble.
@@ -2686,9 +2886,11 @@ async def run_tool_loop(
             await _tool_event(tc, "tool_call_result", {"result": silent_result})
             return LoopOutcome("", attempts, "stay_silent", replied_intermediate)
 
+        canvas_completion_message = ""
         for tc in file_reply_calls:
             workspace_path = str(tc.args.get("path") or "").strip()
             workspace_revision = int(tc.args["revision"])
+            is_canvas_delivery = workspace_path.casefold().endswith(".io.html")
             await _tool_event(tc, "tool_call_started", {})
             await _trajectory(
                 "file_reply_planned",
@@ -2747,18 +2949,52 @@ async def run_tool_loop(
                     tc, "tool_call_result", {"result": file_result}
                 )
                 if compact_delivery_mismatch_retry_used:
-                    force_text_fallback = True
-                    force_text_fallback_reason = "pending_delivery_target_mismatch"
-                    delivery_retry_instruction = (
-                        "The Canvas source was saved, but no file was delivered because "
-                        "send_file did not use the exact pending path and revision. Do "
-                        "not claim that the Canvas was delivered."
+                    raise CanvasDeliveryIncomplete(
+                        "pending_delivery_target_mismatch"
                     )
                 else:
                     compact_delivery_mismatch_retry_used = True
                 continue
+            if (
+                workspace_delivery_target is None
+                and existing_file_delivery_choice_required
+                and workspace_delivery_candidate is not None
+                and (workspace_path, workspace_revision)
+                != workspace_delivery_candidate
+            ):
+                target_path, target_revision = workspace_delivery_candidate
+                file_result = ToolResult(
+                    call_id=tc.id,
+                    content=(
+                        "error: existing_delivery_candidate_mismatch; no file was "
+                        "delivered. Call send_file with exactly "
+                        + json.dumps(
+                            {"path": target_path, "revision": target_revision},
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    ),
+                )
+                reply_results[tc.id] = file_result
+                await _tool_event(
+                    tc, "tool_call_result", {"result": file_result}
+                )
+                if compact_delivery_mismatch_retry_used:
+                    raise CanvasDeliveryIncomplete(
+                        "existing_delivery_candidate_mismatch"
+                    )
+                compact_delivery_mismatch_retry_used = True
+                continue
             try:
-                await on_file_reply(workspace_path, workspace_revision)
+                if is_canvas_delivery:
+                    await on_file_reply(
+                        workspace_path,
+                        workspace_revision,
+                        title=str(tc.args.get("title") or ""),
+                        subtitle=str(tc.args.get("subtitle") or ""),
+                    )
+                else:
+                    await on_file_reply(workspace_path, workspace_revision)
             except Exception as exc:
                 await _tool_event(
                     tc, "tool_call_error", {"error": type(exc).__name__}
@@ -2767,14 +3003,21 @@ async def run_tool_loop(
             delivered_file_suffixes.add(file_suffix)
             workspace_write_applied = False
             workspace_delivery_target = None
+            workspace_delivery_candidate = None
+            existing_file_delivery_choice_required = False
             compact_delivery_validation_exchange = None
             compact_delivery_mismatch_retry_used = False
+            compact_delivery_args_retry_used = False
+            if is_canvas_delivery:
+                canvas_completion_message = str(
+                    tc.args.get("completion_message") or ""
+                ).strip()
             requirement_now_met = (
                 bool(delivered_file_suffixes)
                 if not normalized_required_suffixes
                 else normalized_required_suffixes.issubset(delivered_file_suffixes)
             )
-            if requirement_now_met:
+            if requirement_now_met and not canvas_completion_message:
                 compact_delivery_confirmation_needed = True
             replied_intermediate = True
             file_result = ToolResult(
@@ -2785,6 +3028,76 @@ async def run_tool_loop(
             await _tool_event(
                 tc, "tool_call_result", {"result": file_result}
             )
+
+        if canvas_completion_message:
+            # Canvas metadata and the visible completion bubble are one model
+            # expression. Publishing the tool-authored bubble here keeps the
+            # staged attachment and its text in the same final effect, and avoids
+            # a second provider round seeded by runtime-authored English copy.
+            compact_delivery_confirmation_needed = False
+            await _trajectory(
+                "reply_planned",
+                {
+                    "round": attempts,
+                    "final": True,
+                    "text": canvas_completion_message,
+                    "reason": "canvas_tool_completion",
+                },
+            )
+            try:
+                reply_decision = await on_reply(
+                    canvas_completion_message,
+                    final=True,
+                    reasoning=_merged_reasoning(),
+                )
+            except FinalReplySuperseded:
+                reasoning_fragments.clear()
+                seen_reasoning_fragments.clear()
+                _progress("final_reply_superseded")
+                await _trajectory(
+                    "final_reply_superseded",
+                    {"round": attempts},
+                )
+                return LoopOutcome(
+                    "", attempts, "input_advanced", replied_intermediate
+                )
+            if isinstance(reply_decision, FinalReplyCorrectionRequest):
+                if (
+                    final_reply_correction_request is None
+                    and attempts < max_calls
+                    and str(reply_decision.instruction or "").strip()
+                ):
+                    final_reply_correction_request = reply_decision
+                    final_reply_correction_instruction = str(
+                        reply_decision.instruction
+                    ).strip()
+                    force_text_fallback = True
+                    force_text_fallback_reason = "final_reply_correction"
+                    reasoning_fragments.clear()
+                    seen_reasoning_fragments.clear()
+                    _progress("final_reply_correction_boundary")
+                else:
+                    final_reply_correction_request = reply_decision
+                    await _publish_final_correction_fallback("skipped")
+                    return LoopOutcome(
+                        reply_decision.original_text,
+                        attempts,
+                        "final_text",
+                        replied_intermediate,
+                    )
+            elif isinstance(reply_decision, FinalReplyCorrectionRejected):
+                raise RuntimeError(
+                    "final reply correction rejected without request"
+                )
+            elif reply_decision is not None:
+                raise RuntimeError("unsupported final reply decision")
+            else:
+                return LoopOutcome(
+                    canvas_completion_message,
+                    attempts,
+                    "final_text",
+                    replied_intermediate,
+                )
 
         image_final_superseded = False
         for tc in image_reply_calls:
@@ -2929,6 +3242,26 @@ async def run_tool_loop(
                 completed_memory_discovery_tools.add(tc.name)
                 completed_memory_discovery_calls.add(discovery_call_key)
         for tc in dispatch_calls:
+            if tc.name != "workspace_read":
+                continue
+            result = ordered_results_by_id[tc.id]
+            if str(result.content).strip().lower().startswith("error"):
+                continue
+            metadata = result.metadata or {}
+            path = metadata.get("workspace_read_path")
+            revision = metadata.get("workspace_revision")
+            if not isinstance(path, str) or type(revision) is not int:
+                continue
+            suffix = _file_suffix_for_requirement(
+                path, normalized_required_suffixes
+            )
+            matches_required_delivery = file_delivery_required and (
+                not normalized_required_suffixes
+                or suffix in normalized_required_suffixes
+            )
+            if matches_required_delivery and revision > 0:
+                workspace_delivery_candidate = (path, revision)
+        for tc in dispatch_calls:
             if tc.name != "workspace_write":
                 continue
             result = ordered_results_by_id[tc.id]
@@ -2951,6 +3284,9 @@ async def run_tool_loop(
                 revision = int(match.group(1)) if match else None
             if type(revision) is int and revision > 0:
                 workspace_delivery_target = (path, revision)
+                workspace_delivery_candidate = None
+                existing_file_delivery_choice_required = False
+                compact_delivery_args_retry_used = False
         if any(
             tc.name in provenance.EXTERNAL_READS or tc.name in mcp_names
             for tc in dispatch_calls

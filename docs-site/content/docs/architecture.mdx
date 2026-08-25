@@ -1,6 +1,8 @@
 ---
 title: Architecture and trust boundaries
 description: Understand Feedling's components, data flows, encryption boundaries, tenant isolation, and readiness model.
+document_lifecycle: current
+canonical_owner: self
 ---
 
 import { ArchitectureDiagram } from '@/components/architecture-diagram';
@@ -8,6 +10,16 @@ import { ArchitectureDiagram } from '@/components/architecture-diagram';
 ## Multi-worker chat consistency
 
 PostgreSQL is the durable source of truth for chat. Each backend worker keeps a bounded per-user hot projection and advances it with versioned change events delivered through PostgreSQL `LISTEN/NOTIFY`. Notifications are only wake hints: workers verify durable versions, apply contiguous events, and fall back to a bounded snapshot when events are missing, reset, or too far behind.
+
+Committed Chat-row mutations have one cross-worker producer: the PostgreSQL
+trigger that advances the durable per-user version. Application workers do not
+send a second generic Chat notification for the same mutation. State that can
+change a parked Chat poll without changing a Chat row—such as runtime progress,
+resident tool activity, MCP configuration, or a vision test—uses a separate
+wake-only payload. Current workers handle that payload without querying the Chat
+projection. During a rolling deployment, an older worker safely treats it as a
+generic bounded refresh, so mixed images preserve correctness while temporarily
+doing more work.
 
 Correctness-sensitive reads do not depend on cache freshness. Verify uses exact ping/reply lookups, resident poll selects bounded durable unanswered candidates before its atomic claim, and Runtime V2 freezes prompt membership by sequence. Chat envelopes remain opaque to this synchronization layer, and telemetry contains no message documents, ciphertext, keys, or connection strings.
 
@@ -442,21 +454,27 @@ lets an authorized administrator compare whether two searches used the same
 trimmed query during the trace-retention window, but it is not ciphertext and
 must not be exposed through a public debug route.
 
-In the managed TEE-primary topology, each trace event is an append-only row in
-the authoritative TEE PostgreSQL database. Daily partitions use Beijing-day
-boundaries and retain 30 days. A default partition preserves events if rolling
-partition maintenance is late, but any row in that partition is a degraded
-state that the backend reports independently of the owner-only repair command.
+In managed deployments, each trace event is an append-only row in the selected
+primary PostgreSQL database. The RDS and TEE migration chains carry the same
+table, index, and partition contract, but the service writes only the database
+selected as primary; it does not mirror or double-write trace rows. Daily
+partitions use Beijing-day boundaries and retain 30 days. A default partition
+preserves events if rolling partition maintenance is late, but any row in that
+partition is a degraded state that the backend reports independently of the
+owner-only repair command.
+
 Trace summaries, explanations, bounded structured detail, and explicitly
-captured content excerpts are plaintext operational data inside the TEE trust
-boundary; they are not end-to-end encrypted user envelopes. The table has no
-foreign key to the account row: deleting an account intentionally leaves its
-recent trace queryable by exact uid for incident diagnosis until retention or
-an explicit operator trace clear removes it. Each event also carries the same
-outcome classification used by Runtime job reporting: operational failure,
-timeout, control flow, or safety suppression. Keeping that vocabulary shared
-prevents trace investigation and the operational failure-rate dashboard from
-assigning the same terminal outcome to different buckets.
+captured content excerpts are plaintext operational data; they are not
+end-to-end encrypted user envelopes. Their trust boundary follows the selected
+database: RDS-primary deployments store them in RDS, while TEE-primary
+deployments store them in TEE PostgreSQL. The table has no foreign key to the
+account row: deleting an account intentionally leaves its recent trace
+queryable by exact uid for incident diagnosis until retention or an explicit
+operator trace clear removes it. Each event also carries the same outcome
+classification used by Runtime job reporting: operational failure, timeout,
+control flow, or safety suppression. Keeping that vocabulary shared prevents
+trace investigation and the operational failure-rate dashboard from assigning
+the same terminal outcome to different buckets.
 
 See the [Memory workflow](/docs/workflows/memory) for the complete envelope,
 selection, fetch, and action contracts.

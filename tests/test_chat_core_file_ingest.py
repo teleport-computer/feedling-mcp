@@ -57,6 +57,26 @@ def test_write_message_accepts_file(store):
     assert m["file_mime"] == "text/markdown"
 
 
+def test_write_message_preserves_optional_canvas_display_metadata(store):
+    payload = {
+        "envelope": _env(store.user_id, "env-canvas"),
+        "content_type": "file",
+        "file_name": "接星星.io.html",
+        "file_display_title": "  接星星  ",
+        "file_display_subtitle": "六十秒内  接住尽可能多的星星",
+        "file_mime": "text/html",
+    }
+
+    body, status = chat_core.write_message(store, payload)
+
+    assert status == 200, body
+    message = next(
+        item for item in store.chat_messages if item["id"] == "env-canvas"
+    )
+    assert message["file_display_title"] == "接星星"
+    assert message["file_display_subtitle"] == "六十秒内 接住尽可能多的星星"
+
+
 def test_write_message_accepts_binary_plaintext_file_when_effective_off(
     store, monkeypatch,
 ):

@@ -78,15 +78,21 @@ def test_close_pool_forgets_pool_before_stopping_threads(monkeypatch):
     closed = []
 
     class FakePool:
+        def __init__(self, attr):
+            self.attr = attr
+
         def close(self):
             assert db._pool is None
-            closed.append(True)
+            assert db._health_pool is None
+            closed.append(self.attr)
 
-    monkeypatch.setattr(db, "_pool", FakePool())
+    monkeypatch.setattr(db, "_pool", FakePool("_pool"))
+    monkeypatch.setattr(db, "_health_pool", FakePool("_health_pool"))
     db.close_pool()
 
     assert db._pool is None
-    assert closed == [True]
+    assert db._health_pool is None
+    assert closed == ["_pool", "_health_pool"]
 
 
 def test_worker_recycling_bounds_arena_growth():
@@ -163,3 +169,36 @@ def test_prod_compose_tee_pool_budget_fits_worker_count():
         f"TEE pool budget over: {workers} workers × {pool_max} pool_max "
         f"+ ~13 reserved >= 200 (TEE PG max_connections)"
     )
+
+
+def test_prod_compose_rds_pool_is_raised_with_safe_budget():
+    """Prod's ordinary pool must absorb bursts without exhausting the RDS.
+
+    Six workers at the code default of 16 saturated individual worker pools
+    while the shared RDS still had ample capacity.  The prod compose therefore
+    needs an explicit >=24 ceiling, including the health/LISTEN/election
+    connections in the worst-case budget against max_connections=402.
+    """
+    import pathlib
+    import re
+
+    import yaml
+
+    compose = yaml.safe_load(
+        (pathlib.Path(__file__).parent.parent / "deploy" / "docker-compose.phala.yaml").read_text()
+    )
+    env = compose["services"]["backend"]["environment"]
+
+    def _default(value, fallback):
+        match = re.search(r":-(\d+)", str(value or ""))
+        if match:
+            return int(match.group(1))
+        literal = str(value or "").strip('"')
+        return int(literal) if literal.isdigit() else fallback
+
+    workers = _default(env.get("FEEDLING_BACKEND_WORKERS"), 1)
+    ordinary_pool_max = _default(env.get("FEEDLING_DB_POOL_MAX_SIZE"), 16)
+    per_worker_peak = ordinary_pool_max + 2 + 1 + 1
+
+    assert ordinary_pool_max >= 24
+    assert workers * per_worker_peak + 3 < 402

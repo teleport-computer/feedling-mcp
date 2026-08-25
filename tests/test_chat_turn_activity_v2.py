@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import conftest  # noqa: E402
+from chat import activity_store  # noqa: E402
 from core import store as core_store  # noqa: E402
 from model_api_runtime.v2 import jobs_store, serve_worker  # noqa: E402
 
@@ -78,13 +79,21 @@ def test_turn_activity_route_rejects_invalid_turn_id(client, backend_env):
     assert response.json["error"] == "invalid_turn_id"
 
 
-def test_turn_activity_route_accepts_and_reads_v1_resident_events(client, backend_env):
+def test_turn_activity_route_accepts_and_reads_v1_resident_events(
+    client, backend_env, monkeypatch,
+):
     user_id = "usr_activity_v1"
     conftest.seed_user(user_id)
     key = conftest.seed_api_key(user_id)
     store = core_store.get_store(user_id)
     store.append_chat("user", "chat", _env(user_id, "turn-v1"))
     headers = {"Authorization": f"Bearer {key}"}
+    wakes = []
+    monkeypatch.setattr(
+        activity_store.wake_bus,
+        "notify_chat_wake_only",
+        lambda notified_user_id: wakes.append(notified_user_id),
+    )
 
     running = client.post(
         "/v1/chat/turn-activity/turn-v1/events",
@@ -128,6 +137,7 @@ def test_turn_activity_route_accepts_and_reads_v1_resident_events(client, backen
         {"key": "relationship", "count": 3},
         {"key": "family", "count": 1},
     ]
+    assert wakes == [user_id, user_id]
 
 
 def test_v1_activity_event_rejects_v2_owned_turn(client, backend_env):

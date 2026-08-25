@@ -31,6 +31,12 @@ _TEST_PROVIDER_CONFIG = provider_client.ProviderConfig(
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_self_thinking_correction(monkeypatch):
+    """Atomic reply/cursor tests exercise persistence races, not reply format."""
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
+
+
 def _envelope(item_id: str, *, body: str = "ciphertext") -> dict:
     return {
         "v": 1,

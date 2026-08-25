@@ -137,6 +137,10 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
                 entry["file_omitted"] = True
                 entry["file_mime"] = m.get("file_mime") or "application/octet-stream"
                 entry["file_name"] = m.get("file_name") or "file"
+                if m.get("file_display_title"):
+                    entry["file_display_title"] = m["file_display_title"]
+                if m.get("file_display_subtitle"):
+                    entry["file_display_subtitle"] = m["file_display_subtitle"]
             else:
                 entry["content"] = None
             qmids = m.get("quoted_memory_ids")
@@ -185,6 +189,10 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
                 entry["file_b64"] = base64.b64encode(plaintext).decode("ascii")
                 entry["file_mime"] = m.get("file_mime") or "application/octet-stream"
                 entry["file_name"] = m.get("file_name") or "file"
+                if m.get("file_display_title"):
+                    entry["file_display_title"] = m["file_display_title"]
+                if m.get("file_display_subtitle"):
+                    entry["file_display_subtitle"] = m["file_display_subtitle"]
             else:
                 entry["content"] = plaintext.decode("utf-8", errors="replace")
             _attach_chat_metadata(m, entry)

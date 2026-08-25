@@ -1,4 +1,4 @@
-"""Unified provider-native tool loop (spec C2, plan Task 5).
+"""Unified provider-native tool-loop contract (retained decision §C2).
 
 Locks the P0 loop-behavior contract with a fake `provider_client.chat_completion_async`
 (monkeypatched) plus recording injected callables — no real provider/DB/hosted access.

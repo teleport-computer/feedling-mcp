@@ -1,6 +1,6 @@
 """v2_worker_heartbeats: liveness table + jobs_store.record_worker_heartbeat /
 jobs_store.workers_alive. Backs the send-path guard that refuses chat/send in
-db_action_v2 mode when no serve_worker process has beaten recently (Task 2)."""
+db_action_v2 mode when no serve_worker process has beaten recently."""
 import sys
 from pathlib import Path
 

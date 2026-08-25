@@ -50,9 +50,13 @@ def test_runner_health_route_returns_200_for_exact_healthy_fleet(
     monkeypatch, runner_health_dependencies,
 ):
     monkeypatch.setenv("FEEDLING_EXPECTED_RUNNER_COUNT", "1")
-    monkeypatch.setattr(db, "list_supervisor_instance_heartbeats", lambda **_kwargs: [
-        {"ts": 995.0, "host_all": True, "owner": "private-owner"},
-    ])
+    monkeypatch.setattr(
+        db,
+        "list_supervisor_instance_heartbeats_for_health",
+        lambda **_kwargs: [
+            {"ts": 995.0, "host_all": True, "owner": "private-owner"},
+        ],
+    )
 
     status, body = _asgi_get("/healthz/runner")
 
@@ -73,7 +77,7 @@ def test_runner_health_route_returns_503_for_runner_count_mismatch(
 ):
     monkeypatch.setenv("FEEDLING_EXPECTED_RUNNER_COUNT", "1")
     monkeypatch.setattr(
-        db, "list_supervisor_instance_heartbeats", lambda **_kwargs: []
+        db, "list_supervisor_instance_heartbeats_for_health", lambda **_kwargs: []
     )
 
     status, body = _asgi_get("/healthz/runner")
@@ -121,7 +125,11 @@ def test_runner_health_route_returns_503_for_heartbeat_query_error(
     def raise_db_error(**_kwargs):
         raise RuntimeError("database unavailable")
 
-    monkeypatch.setattr(db, "list_supervisor_instance_heartbeats", raise_db_error)
+    monkeypatch.setattr(
+        db,
+        "list_supervisor_instance_heartbeats_for_health",
+        raise_db_error,
+    )
 
     status, body = _asgi_get("/healthz/runner")
 

@@ -1,4 +1,4 @@
-"""T184/A: additive TEE trace table, retention machinery, and read contract."""
+"""T184/T306 selected-primary trace storage and retention contracts."""
 
 from __future__ import annotations
 
@@ -115,6 +115,34 @@ def test_migration_has_beijing_bounds_no_fk_and_stable_indexes():
         / "backend/alembic_tee/versions/0033_trace_events.py"
     ).read_text()
     assert "AT TIME ZONE 'Asia/Shanghai'" in migration
+
+
+def test_partition_maintenance_has_an_explicit_rds_owner_channel(monkeypatch):
+    monkeypatch.setenv(
+        "TRACE_EVENTS_MIGRATION_DATABASE_URL",
+        "postgresql://rds-owner/trace",
+    )
+    monkeypatch.setenv(
+        "TEE_MIGRATION_DATABASE_URL",
+        "postgresql://tee-owner/trace",
+    )
+    assert partitions._migration_database_url() == "postgresql://rds-owner/trace"
+
+    monkeypatch.delenv("TRACE_EVENTS_MIGRATION_DATABASE_URL")
+    assert partitions._migration_database_url() == "postgresql://tee-owner/trace"
+
+    monkeypatch.delenv("TEE_MIGRATION_DATABASE_URL")
+    with pytest.raises(RuntimeError, match="TRACE_EVENTS_MIGRATION_DATABASE_URL"):
+        partitions._migration_database_url()
+
+    workflow = (
+        Path(__file__).parents[1]
+        / ".github/workflows/rds-trace-partitions.yml"
+    ).read_text()
+    assert "workflow_dispatch:" in workflow
+    assert "TRACE_EVENTS_MIGRATION_DATABASE_URL" in workflow
+    assert "python -m admin.trace_events_partitions" in workflow
+    assert "MAINTAIN-RDS-TRACE-PROD" in workflow
 
 
 def test_strict_insert_and_query_use_ts_id_order(tee_primary):
@@ -653,6 +681,138 @@ def test_trace_survives_account_delete_and_remains_queryable_by_uid(tee_primary)
         db.delete_trace_events_for_user(uid)
         with db.get_pool().connection() as conn:
             conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
+def test_flat_trace_query_uses_narrow_cap_and_page_plus_one(monkeypatch):
+    executions = []
+    connection_kwargs = []
+
+    class FakeTransaction:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeCursor:
+        def __init__(self):
+            self.current = ""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, params):
+            self.current = str(statement)
+            executions.append((self.current, list(params)))
+            return self
+
+        def fetchone(self):
+            return {
+                "events_total": 0,
+                "turns_total": 0,
+                "stalled_turns": 0,
+                "error_turns": 0,
+                "scan_truncated": False,
+                "users": [],
+                "subsystems": [],
+                "statuses": [],
+            }
+
+        def fetchall(self):
+            return []
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def transaction(self):
+            return FakeTransaction()
+
+        def execute(self, statement, params):
+            executions.append((str(statement), list(params)))
+
+        def cursor(self, **_kwargs):
+            return FakeCursor()
+
+    class FakePool:
+        def connection(self, **kwargs):
+            connection_kwargs.append(kwargs)
+            return FakeConnection()
+
+    monkeypatch.setattr(db, "get_pool", lambda: FakePool())
+    cap = data_track.DEBUG_TRACE_CANDIDATE_CAP
+    result = db.query_trace_events_flat_page(
+        user_id="user_a",
+        trace_id_contains="trace-part",
+        subsystem="agent",
+        status="stalled",
+        q="needle",
+        since_epoch=123.0,
+        limit=2,
+        offset=1,
+        candidate_limit=cap,
+        connection_timeout=data_track.DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC,
+        statement_timeout_ms=data_track.DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS,
+    )
+
+    assert result["rows"] == []
+    assert connection_kwargs == [{"timeout": 1.0}]
+    assert executions[0] == (
+        "SELECT set_config('statement_timeout', %s, true)",
+        ["2000ms"],
+    )
+    metadata_sql, metadata_params = executions[1]
+    page_sql, page_params = executions[2]
+    raw_candidate = metadata_sql.split("), candidate AS", 1)[0]
+    candidate_projection = raw_candidate.split("SELECT", 1)[1].split(
+        "FROM trace_events", 1
+    )[0]
+    assert "detail" not in candidate_projection
+    assert "content_excerpt" not in candidate_projection
+    for clause in (
+        "user_id=%s",
+        "trace_id ILIKE %s",
+        "subsystem=%s",
+        "ts>=to_timestamp(%s)",
+        "detail::text,content_excerpt::text) ILIKE %s",
+        "terminal_status=%s",
+    ):
+        assert clause in metadata_sql
+    assert metadata_params[-5:] == [cap + 1, cap, "stalled", "stalled", cap]
+    assert page_params[-6:] == [cap + 1, cap, "stalled", "stalled", 1, 3]
+    assert "JOIN trace_events e ON e.id=f.id AND e.ts=f.ts" in page_sql
+
+
+def test_flat_status_filter_matches_python_stall_semantics(tee_primary):
+    uid = _uid()
+    now = datetime.now(_ZONE).timestamp()
+    events = [
+        {**_event(ts=now - 3, trace_id="trace-stalled"), "type": "agent.call.start"},
+        {**_event(ts=now - 2, trace_id="trace-ok"), "type": "agent.call.start"},
+        {**_event(ts=now - 1, trace_id="trace-ok"), "type": "agent.call.done"},
+    ]
+    try:
+        db.insert_trace_events_strict(uid, events)
+        result = db.query_trace_events_flat_page(
+            user_id=uid,
+            status="stalled",
+            limit=10,
+            candidate_limit=data_track.DEBUG_TRACE_CANDIDATE_CAP,
+            connection_timeout=data_track.DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC,
+            statement_timeout_ms=data_track.DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS,
+        )
+        assert result["events_total"] == 1
+        assert result["turns_total"] == 1
+        assert result["stalled_turns"] == 1
+        assert [row["trace_id"] for row in result["rows"]] == ["trace-stalled"]
+    finally:
+        db.delete_trace_events_for_user(uid)
 
 
 def test_clear_tombstone_rejects_delayed_batch_and_preserves_toggle(tee_primary):

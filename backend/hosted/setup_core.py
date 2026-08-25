@@ -1484,7 +1484,7 @@ def vision_main_test(
             "config": _vision_config_payload(store),
         }, 409
     store.notify_chat_waiters()
-    wake_bus.notify("chat", store.user_id)
+    wake_bus.notify_chat_wake_only(store.user_id)
     return {
         "status": "testing",
         "source": "resident",

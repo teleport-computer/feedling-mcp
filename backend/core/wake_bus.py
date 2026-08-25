@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import hashlib
-import logging
 import os
 import threading
 import time
@@ -33,8 +32,12 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
 import db
+from core.telemetry_logging import stderr_info_logger
 
-log = logging.getLogger("feedling.wake_bus")
+log = stderr_info_logger("feedling.wake_bus")
+# Backend startup intentionally does not raise the root logger to INFO because
+# many third-party loggers are noisy.  This module's fixed-enum, content-free
+# chat-sync records are rollout telemetry, so emit them directly to stderr.
 
 # Single Postgres NOTIFY channel; the JSON payload carries the logical channel.
 PG_CHANNEL = "feedling_wake"
@@ -51,6 +54,7 @@ _CHAT_SYNC_RESULTS = frozenset({"applied", "skipped", "error", "mismatch"})
 _CHAT_SYNC_REASONS = frozenset({
     "legacy_payload", "legacy_mode", "already_fresh", "event_sync",
     "observe_sample", "observe_control", "sync_failed", "fingerprint_diff",
+    "wake_only",
 })
 
 # Extra per-channel handlers injected by the assembly layer for targets core may
@@ -134,20 +138,53 @@ def _reload_legacy_chat(store) -> None:
 def _dispatch_chat(data: dict, user_id: str) -> None:
     from core import store as core_store
 
+    is_wake_only = "w" in data
     is_v2 = "v" in data
     target_version = None
-    if is_v2:
+    if is_wake_only:
+        if (
+            set(data) != {"c", "u", "o", "w"}
+            or type(data.get("w")) is not int
+            or data.get("w") != 1
+        ):
+            return
+        origin = data.get("o")
+        if not isinstance(origin, str) or not origin or len(origin) > 128:
+            return
+    elif is_v2:
         if set(data) != {"v", "c", "u", "r"} or data.get("v") != 2:
             return
         raw_version = data.get("r")
         if type(raw_version) is not int or raw_version <= 0:
             return
         target_version = int(raw_version)
+    else:
+        if set(data) != {"u", "c", "o"}:
+            return
+        origin = data.get("o")
+        if not isinstance(origin, str) or not origin or len(origin) > 128:
+            return
 
     store = core_store._cached_store(user_id)
     if store is None:
         return
     mode = _chat_sync_mode()
+    if is_wake_only:
+        store.notify_chat_waiters()
+        _chat_sync_telemetry(
+            user_id=user_id, mode=mode, result="applied",
+            reason="wake_only", hot_rows=len(store.chat_messages),
+        )
+        return
+    if not is_v2 and mode == "incremental":
+        ok = store.ensure_chat_fresh(force=True)
+        store.notify_chat_waiters()
+        _chat_sync_telemetry(
+            user_id=user_id, mode=mode, result="applied" if ok else "error",
+            reason="legacy_payload" if ok else "sync_failed",
+            hot_rows=len(store.chat_messages),
+        )
+        return
     if not is_v2 or mode == "legacy":
         _reload_legacy_chat(store)
         _chat_sync_telemetry(
@@ -291,6 +328,17 @@ def notify(channel: str, user_id: str = "") -> None:
         return
     payload = json.dumps(
         {"u": user_id, "c": channel, "o": WORKER_ID}, separators=(",", ":")
+    )
+    db.pg_notify(PG_CHANNEL, payload)
+
+
+def notify_chat_wake_only(user_id: str) -> None:
+    """Wake remote chat pollers without claiming a chat-row mutation."""
+    if not _enabled():
+        return
+    payload = json.dumps(
+        {"c": "chat", "u": str(user_id), "o": WORKER_ID, "w": 1},
+        separators=(",", ":"),
     )
     db.pg_notify(PG_CHANNEL, payload)
 

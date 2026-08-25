@@ -30,6 +30,12 @@ HTTP mode:
   AGENT_HTTP_FIELD      JSON response field containing the reply (default: "response")
   AGENT_HTTP_CANCEL_URL Optional endpoint for cancelling an obsolete voice
                         request. Receives {"request_id": "..."}.
+  FEEDLING_AGENT_HTTP_LOCAL_IO_CLI
+                        Set true only when the HTTP agent runs on this machine,
+                        can execute local commands, and inherits FEEDLING_HOME.
+  FEEDLING_AGENT_HTTP_LOCAL_FILE_ROOTS
+                        os.pathsep-separated workspace roots whose generated
+                        files the opted-in local HTTP agent may send via io_cli.
 
 CLI mode:
   AGENT_CLI_CMD         Full command template; {message} is replaced with the
@@ -126,6 +132,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 import uuid
 import xml.etree.ElementTree as _ET
@@ -155,6 +162,7 @@ import generated_image
 import provider_client as _provider_client
 import vision_policy as _vision_policy
 from hosted import visual_transport as _visual_transport
+from chat import file_display
 
 # Shared torn-protocol-JSON leak detector (backend/core, pure). backend/ is on
 # sys.path via the insert above, so it imports as a top-level `core.*` name.
@@ -262,6 +270,9 @@ class StagedChatFile:
     name: str
     mime_type: str
     data: bytes
+    display_title: str = ""
+    display_subtitle: str = ""
+    cleanup_source: bool = True
 
 
 @dataclass(frozen=True)
@@ -328,9 +339,17 @@ AGENT_HTTP_CANCEL_URL = os.environ.get("AGENT_HTTP_CANCEL_URL", "").strip()
 AGENT_HTTP_REQUEST_ID_HEADER = os.environ.get(
     "AGENT_HTTP_REQUEST_ID_HEADER", "X-Feedling-Request-Id"
 ).strip()
+AGENT_HTTP_LOCAL_IO_CLI = _env_bool("FEEDLING_AGENT_HTTP_LOCAL_IO_CLI", False)
+AGENT_HTTP_LOCAL_FILE_ROOTS = tuple(
+    value.strip()
+    for value in os.environ.get(
+        "FEEDLING_AGENT_HTTP_LOCAL_FILE_ROOTS", ""
+    ).split(os.pathsep)
+    if value.strip()
+)
 
 AGENT_CLI_CMD = os.environ.get("AGENT_CLI_CMD", "")
-# Per-turn subprocess cap for the CLI agent. Default 300s: the managed
+# Per-turn cap for CLI subprocesses and HTTP agent requests. Default 300s: the managed
 # claude/codex/pi templates finish well inside it, while self-hosted stacks on
 # modest VPS hardware (official Claude Code cold starts, slow MCP, long-thinking
 # models) legitimately take 100-120s+ per turn — the old 120s default was
@@ -1757,6 +1776,32 @@ AUTO_UPDATE = os.environ.get("FEEDLING_AUTO_UPDATE", "1").strip().lower() not in
 # A runtime-token file is only written by the in-CVM supervisor — treat its
 # presence as "hosted" and never self-mutate there.
 _HOSTED = bool(FEEDLING_RUNTIME_TOKEN_FILE)
+
+
+def _agent_can_use_local_io_cli() -> bool:
+    if _HOSTED:
+        return False
+    if AGENT_MODE == "cli":
+        return True
+    return AGENT_MODE == "http" and AGENT_HTTP_LOCAL_IO_CLI
+
+
+def _agent_can_stage_outbound_attachments() -> bool:
+    """Whether this consumer can receive send-file/send-image over local IPC.
+
+    Hosted V1 CLI agents get their io_cli catalog and Bash allowlist from the
+    supervisor, so they must not use the self-hosted catalog gate above. They do
+    still run in this consumer's per-user home and need its private IPC listener
+    to turn an io_cli success into a durable chat attachment.
+    """
+    if _HOSTED:
+        return AGENT_MODE == "cli"
+    return _agent_can_use_local_io_cli()
+
+
+def _resident_ipc_listener_enabled() -> bool:
+    """Enable the private socket whenever the active agent can stage attachments."""
+    return _agent_can_stage_outbound_attachments()
 
 
 def _runtime_repo_files() -> set[str]:
@@ -3479,6 +3524,8 @@ def _land_file(msg_key: str, name: str, data: bytes) -> str:
 
 def _prepare_file_for_agent(msg: dict) -> "FilePrep":
     name = str(msg.get("file_name") or "file")
+    display_title = str(msg.get("file_display_title") or "").strip()
+    display_subtitle = str(msg.get("file_display_subtitle") or "").strip()
     mime = str(msg.get("file_mime") or "").lower()
     ftype = _friendly_file_type(name, mime)
     data = _decode_file_b64(msg.get("file_b64")) or b""
@@ -3534,17 +3581,26 @@ def _prepare_file_for_agent(msg: dict) -> "FilePrep":
         f"- 文件名：{name}\n"
         f"- 类型：{ftype}{extract_clause}\n"
         f"- 大小：{size}\n"
+        + (f"- Canvas 标题：{display_title}\n" if display_title else "")
+        + (f"- Canvas 副标题：{display_subtitle}\n" if display_subtitle else "")
         + (f"- 本地路径：{local_path}\n" if local_path else "")
         + "用 Read 工具读上面这个精确路径后再回复。读不到就直说，"
         "不要假装读过、不要编造文件内容。"
         + (f"\n{truncation_note}" if truncation_note else "")
     )
     if inline_text is not None:
+        canvas_metadata = ""
+        if display_title or display_subtitle:
+            canvas_metadata = (
+                f"Canvas 当前标题：{display_title or '（无）'}\n"
+                f"Canvas 当前副标题：{display_subtitle or '（无）'}\n"
+                "除非用户要求改变，否则修改后保留这两个展示字段。\n"
+            )
         http_block = (
             f"[用户发来文件「{name}」（{ftype}，{size}），以下是"
             f"{'抽取的纯文本内容，原始格式未保留' if extracted else '文件内容'}"
             f"{('，' + truncation_note) if truncation_note else ''}：]\n"
-            f"<<<\n{inline_text}\n>>>\n"
+            f"{canvas_metadata}<<<\n{inline_text}\n>>>\n"
             "[文件内容结束。请基于以上内容回复用户。]"
         )
     else:
@@ -7213,7 +7269,7 @@ def _call_agent_http_simple(
             payload=payload,
             headers=headers,
             timeout=_remaining_deadline_timeout(
-                absolute_deadline, cap_sec=60.0
+                absolute_deadline, cap_sec=float(AGENT_TURN_TIMEOUT_SEC)
             ),
         )
         if stream_update is not None
@@ -7222,7 +7278,7 @@ def _call_agent_http_simple(
             json=payload,
             headers=headers,
             timeout=_remaining_deadline_timeout(
-                absolute_deadline, cap_sec=60.0
+                absolute_deadline, cap_sec=float(AGENT_TURN_TIMEOUT_SEC)
             ),
         )
     )
@@ -7336,7 +7392,7 @@ def _call_agent_http_openai(
             payload=payload,
             headers=headers,
             timeout=_remaining_deadline_timeout(
-                absolute_deadline, cap_sec=120.0
+                absolute_deadline, cap_sec=float(AGENT_TURN_TIMEOUT_SEC)
             ),
         )
     else:
@@ -7345,7 +7401,7 @@ def _call_agent_http_openai(
             json=payload,
             headers=headers,
             timeout=_remaining_deadline_timeout(
-                absolute_deadline, cap_sec=120.0
+                absolute_deadline, cap_sec=float(AGENT_TURN_TIMEOUT_SEC)
             ),
         )
     if cancellation is not None:
@@ -7368,7 +7424,7 @@ def _call_agent_http_openai(
                     json=payload,
                     headers=headers,
                     timeout=_remaining_deadline_timeout(
-                        absolute_deadline, cap_sec=120.0
+                        absolute_deadline, cap_sec=float(AGENT_TURN_TIMEOUT_SEC)
                     ),
                 )
                 if cancellation is not None:
@@ -10929,6 +10985,7 @@ def _wake_think_permission_line() -> str:
 # ---------------------------------------------------------------------------
 
 _IO_CLI_PATH = str(_REPO / "tools" / "io_cli.py")
+_IO_CLI_COMMAND = f"{shlex.quote(sys.executable)} {shlex.quote(_IO_CLI_PATH)}"
 
 # None = "never built (yet, or last attempt failed)". A successful build is
 # cached for the life of the process — io_cli's verb/flag surface only changes
@@ -10966,20 +11023,37 @@ _io_cli_catalog_pending_session_id: str | None = None
 
 
 def _outbound_file_prompt_block() -> str:
+    source_instruction = (
+        "If the source already exists inside the configured local agent "
+        "workspace, do not copy or rewrite it into another directory; pass its "
+        "existing absolute path directly to send-file. Otherwise, write UTF-8 "
+        f"Markdown-like source under {OUTBOUND_FILE_DIR}."
+        if _agent_can_use_local_io_cli() and AGENT_HTTP_LOCAL_FILE_ROOTS
+        else f"Write UTF-8 Markdown-like source under {OUTBOUND_FILE_DIR}."
+    )
     return (
         "DOWNLOADABLE FILE DELIVERY: Interpret requests semantically. If the user "
-        "wants a reusable result to save/open/download/share, write UTF-8 "
-        f"Markdown-like source under {OUTBOUND_FILE_DIR}, then run `python "
-        f"{_IO_CLI_PATH} send-file --path <source_path> --name <download_name>`. "
+        "wants a reusable result to save/open/download/share, "
+        f"{source_instruction} Then run `"
+        f"{_IO_CLI_COMMAND} send-file --path <source_path> --name <download_name>`. "
         "Use the requested suffix exactly (Word=.docx, PDF=.pdf); never substitute "
         "Markdown, never ask for an internal path, and claim success only after "
         "send-file returns ok. Do at most one lightweight check that the output "
         "opens and has the requested format; do not repeatedly render, screenshot, "
         "or tune fonts unless the user explicitly asks for layout QA. Tutorial "
         "questions alone do not require a file. "
+        "IO CANVAS DELIVERY: A Canvas is one self-contained UTF-8 HTML file whose "
+        "name ends in .io.html, not ordinary .html. Keep CSS and JavaScript inline, "
+        "do not depend on remote assets or assume any native/JS bridge APIs, and "
+        "keep the complete file at or below 256000 bytes. Use the user's current "
+        "language for the file name, HTML title, and visible interface copy. For "
+        "every .io.html delivery, add `--title <short title> --subtitle <one-line "
+        "description>` to send-file. Generate both in the user's current language. "
+        "When revising a Canvas, preserve its current title and subtitle unless the "
+        "user asks to change them, and update either when the new content makes it useful. "
         "GENERATED IMAGE DELIVERY: When an image capability produces a PNG, "
         "JPEG, or WebP, save it under the same outbound directory and run "
-        f"`python {_IO_CLI_PATH} send-image --path <image_path> "
+        f"`{_IO_CLI_COMMAND} send-image --path <image_path> "
         "[--name <display_name>]`. It will appear directly as a chat image. "
         "Never expose a local path or claim delivery unless send-image returns ok."
     )
@@ -10988,10 +11062,10 @@ def _outbound_file_prompt_block() -> str:
 def _memory_read_prompt_block() -> str:
     return (
         "MEMORY READ PROTOCOL: When the user's current request asks you to "
-        "recall, use, inspect, or summarize their stored memories, run `python "
-        f"{_IO_CLI_PATH} memory-index --limit 20` first. If it returns items, "
-        "copy real values from items[].id and run `python "
-        f"{_IO_CLI_PATH} memory-fetch <real_id> [<real_id> ...]` before "
+        "recall, use, inspect, or summarize their stored memories, run `"
+        f"{_IO_CLI_COMMAND} memory-index --limit 20` first. If it returns items, "
+        "copy real values from items[].id and run `"
+        f"{_IO_CLI_COMMAND} memory-fetch <real_id> [<real_id> ...]` before "
         "answering or creating a file. Never pass placeholder words such as "
         "ids or memory_id. Never claim memories are unavailable based on an "
         "older turn or before the current turn's memory-index result."
@@ -10999,9 +11073,26 @@ def _memory_read_prompt_block() -> str:
 
 
 def _required_outbound_file_suffixes(text: str) -> tuple[str, ...] | None:
-    return downloadable_file_context.required_file_suffixes(
+    requirement = downloadable_file_context.required_file_suffixes(
         [{"role": "user", "content": str(text or "")}]
     )
+    if requirement is None:
+        return None
+    normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    canvas_named = ".io.html" in normalized or "canvas" in normalized or "画布" in normalized
+    if not canvas_named:
+        return requirement
+    if requirement == ():
+        return (".io.html",)
+    if ".html" not in requirement and ".io.html" not in normalized:
+        return requirement
+    return tuple(
+        dict.fromkeys(".io.html" if suffix == ".html" else suffix for suffix in requirement)
+    )
+
+
+def _outbound_name_matches_suffix(name: str, suffix: str) -> bool:
+    return str(name or "").casefold().endswith(str(suffix or "").casefold())
 
 
 def _missing_outbound_file_suffixes(
@@ -11010,8 +11101,11 @@ def _missing_outbound_file_suffixes(
 ) -> tuple[str, ...] | None:
     if not requirement:
         return None
-    delivered = {Path(item.name).suffix.lower() for item in staged}
-    missing = tuple(suffix for suffix in requirement if suffix not in delivered)
+    missing = tuple(
+        suffix
+        for suffix in requirement
+        if not any(_outbound_name_matches_suffix(item.name, suffix) for item in staged)
+    )
     return missing or None
 
 
@@ -11019,14 +11113,23 @@ def _outbound_file_retry_prompt(
     original_request: str, missing: tuple[str, ...]
 ) -> str:
     target = ", ".join(missing) if missing else "a suitable downloadable format"
+    source_instruction = (
+        "Use the existing source in your configured local agent workspace; do "
+        "not copy or rewrite it into another directory."
+        if _agent_can_use_local_io_cli() and AGENT_HTTP_LOCAL_FILE_ROOTS
+        else f"Create UTF-8 Markdown-like source under {OUTBOUND_FILE_DIR}."
+    )
     return (
         "The previous answer did not stage the file the user explicitly requested. "
         f"Original user request: {str(original_request or '')[:2000]}\n"
-        f"Missing output: {target}. Create UTF-8 Markdown-like source under "
-        f"{OUTBOUND_FILE_DIR}, then run `python {_IO_CLI_PATH} send-file --path "
+        f"Missing output: {target}. {source_instruction} Then run "
+        f"`{_IO_CLI_COMMAND} send-file --path "
         "<source_path> --name <download_name>`. Word must use .docx and PDF must "
-        "use .pdf. Do not substitute Markdown or claim success unless send-file "
-        "returns ok. Finish with one short user-facing reply after staging."
+        "use .pdf. An IO Canvas must use .io.html, remain self-contained, and "
+        "must not assume native bridge APIs. Do not substitute Markdown or claim success unless send-file "
+        "returns ok. For .io.html, send-file also requires `--title <short title> "
+        "--subtitle <one-line description>` in the user's current language. Finish "
+        "with one short user-facing reply after staging."
     )
 
 
@@ -11036,7 +11139,7 @@ def _image_claim_retry_prompt() -> str:
     return (
         "上一轮你说图已经生成/画好了,但这一轮没有任何图片真的被生成。"
         "请二选一,不要再声称已生成:"
-        f"(1) 你确实想给出这张图 —— 运行 `python {_IO_CLI_PATH} generate-image "
+        f"(1) 你确实想给出这张图 —— 运行 `{_IO_CLI_COMMAND} generate-image "
         "--prompt \"<完整的画面描述>\"`,再用 send-image 交付;"
         "(2) 你并不打算画 —— 照实说,不要用文字假装图已经存在。"
     )
@@ -11182,10 +11285,13 @@ def _prepend_io_cli_capability_catalog(
     sees the io_cli surface actually shipped in THIS checkout — never a stale
     hand-written list baked into a prompt.
 
-    Gate: VPS/self-hosted CLI only (``not _HOSTED and AGENT_MODE == "cli"``).
-    Hosted (image-baked, V2 registry-based tool calling — no io_cli.py to
-    shell out to) and http-backend agents (Hermes etc. — no io_cli, no local
-    subprocess) pass ``content`` through byte-identical.
+    Gate: VPS/self-hosted agents that can execute this checkout's local io_cli.
+    CLI mode has that capability by definition. HTTP mode requires the explicit
+    ``FEEDLING_AGENT_HTTP_LOCAL_IO_CLI`` opt-in because an arbitrary HTTP model
+    server cannot be assumed to have shell access or inherit this process's IPC.
+    Hosted agents (image-baked, V2 registry-based tool calling) and generic
+    HTTP backends without that explicit local-authority flag pass ``content``
+    through byte-identical.
 
     Injection point: called between ``_prepend_time_anchor_foreground`` and
     ``_foreground_agent_message`` in the foreground compose chain. It only
@@ -11212,7 +11318,7 @@ def _prepend_io_cli_capability_catalog(
     global _io_cli_catalog_cache, _io_cli_voice_catalog_cache
     global _io_cli_catalog_pending_session_id
     global _web_advertised_session_id, _web_off_notice_session_id
-    if _HOSTED or AGENT_MODE != "cli":
+    if not _agent_can_use_local_io_cli():
         return content
 
     cli_tokens = _cli_cmd_tokens()
@@ -13631,7 +13737,23 @@ def post_reply(
             plaintext_tier = _effective_encryption() == "off"
             visibility = "shared" if (plaintext_tier or seal_enc_pk) else "local_only"
 
-            def _text_envelope(value: str) -> dict[str, Any]:
+            delivery_id = ""
+            if (
+                not plaintext_tier
+                and source == "chat"
+                and role != "system"
+                and reply_to_message_id
+            ):
+                delivery_id = hashlib.sha256(
+                    (
+                        "feedling-resident-chat-reply-v1\0"
+                        f"{seal_user_id}\0{reply_to_message_id}"
+                    ).encode("utf-8")
+                ).hexdigest()[:32]
+
+            def _text_envelope(
+                value: str, *, item_id: str = ""
+            ) -> dict[str, Any]:
                 if plaintext_tier:
                     return {
                         "body": value,
@@ -13644,9 +13766,10 @@ def post_reply(
                     user_pk_bytes=seal_user_pk,
                     enclave_pk_bytes=seal_enc_pk,
                     visibility=visibility,
+                    item_id=(item_id or None),
                 )
 
-            envelope = _text_envelope(content)
+            envelope = _text_envelope(content, item_id=delivery_id)
             reply_file_followups = []
             for file_item in file_followups or []:
                 if plaintext_tier:
@@ -13670,6 +13793,14 @@ def post_reply(
                         "file_name": file_item.name,
                         "file_mime": file_item.mime_type,
                         "file_byte_count": len(file_item.data),
+                        **(
+                            {
+                                "file_display_title": file_item.display_title,
+                                "file_display_subtitle": file_item.display_subtitle,
+                            }
+                            if file_item.display_title and file_item.display_subtitle
+                            else {}
+                        ),
                     }
                 )
             reply_image_followups = []
@@ -13706,6 +13837,8 @@ def post_reply(
                 "source": source,
                 "alert_body": visible_body,
             }
+            if delivery_id:
+                body["resident_delivery_id"] = delivery_id
             if thinking_envelope:
                 body["thinking_envelope"] = thinking_envelope
                 kind = _sanitize_thinking_kind(thinking_kind)
@@ -13879,10 +14012,12 @@ def _post_reply_with_bootstrap_retry(send: Callable[[], Any]) -> Any:
 
 
 def _handle_post_reply_response(resp) -> dict:
-    """Inspect a /v1/chat/response response. Re-raises 4xx/5xx EXCEPT for
-    the structured `bootstrap_incomplete` 409, which we want to surface in
-    operator logs without crashing the daemon (a crash would put the
-    process into an restart-loop trying the same dead-end content forever).
+    """Inspect a /v1/chat/response response.
+
+    Re-raises 4xx/5xx except for terminal structured 409s. An
+    ``already_answered`` response means another attempt committed the parent
+    turn after our request left this process, so retrying the model cannot
+    produce another valid reply and must not hold the checkpoint forever.
     """
     if resp.status_code == 409:
         try:
@@ -13890,6 +14025,12 @@ def _handle_post_reply_response(resp) -> dict:
         except Exception:
             body = {}
         if body.get("error") == "voice_turn_superseded":
+            return body
+        if (
+            body.get("error") == "already_answered"
+            and body.get("reply_status") == "replied"
+        ):
+            log.info("chat_response already committed by another attempt")
             return body
         if body.get("error") == "bootstrap_incomplete":
             if body.get("retryable") is True:
@@ -18091,7 +18232,8 @@ def _process_messages(messages: list) -> float:
             else {}
         )
         outbound_file_turn_active = (
-            source in {"chat", "model_api"} and AGENT_MODE == "cli"
+            source in {"chat", "model_api"}
+            and _agent_can_stage_outbound_attachments()
         )
         outbound_file_requirement = (
             _required_outbound_file_suffixes(raw_user_content_for_lang)
@@ -18770,6 +18912,7 @@ def _process_messages(messages: list) -> float:
                 result = post_reply(reply, **post_kwargs)
                 if isinstance(result, dict) and result.get("error"):
                     if result.get("error") in {
+                        "already_answered",
                         "bootstrap_incomplete",
                         "voice_turn_superseded",
                     }:
@@ -18944,6 +19087,7 @@ _OUTBOUND_FILE_MAX_BYTES = 1_000_000
 _OUTBOUND_FILE_SUFFIXES = frozenset(
     {".docx", ".pdf", ".md", ".txt", ".csv", ".html", ".json", ".xml", ".yaml", ".yml", ".rtf"}
 )
+_OUTBOUND_CANVAS_MAX_BYTES = 256_000
 _OUTBOUND_FILE_MIMES = {
     ".csv": "text/csv",
     ".html": "text/html",
@@ -19015,6 +19159,8 @@ def _finish_outbound_attachment_turn(
         _active_outbound_file_turn_id = ""
         _active_outbound_file_suffixes = None
     for item in [*staged_files, *staged_images]:
+        if isinstance(item, StagedChatFile) and not item.cleanup_source:
+            continue
         try:
             Path(item.source_path).unlink(missing_ok=True)
         except OSError:
@@ -19083,14 +19229,38 @@ def _handle_stage_file_ipc(msg: dict) -> dict:
     source_path = Path(raw_path)
     if not source_path.is_absolute():
         source_path = OUTBOUND_FILE_DIR / source_path
+    cleanup_source = True
     try:
         resolved_dir = OUTBOUND_FILE_DIR.resolve()
         resolved_path = source_path.resolve(strict=True)
-        resolved_path.relative_to(resolved_dir)
+        try:
+            resolved_path.relative_to(resolved_dir)
+        except ValueError:
+            if not _agent_can_use_local_io_cli():
+                raise
+            trusted = False
+            for raw_root in AGENT_HTTP_LOCAL_FILE_ROOTS:
+                try:
+                    root = Path(raw_root).expanduser().resolve(strict=True)
+                    filesystem_root = Path(root.anchor).resolve()
+                    if (
+                        not root.is_dir()
+                        or root == filesystem_root
+                        or root == Path.home().resolve()
+                    ):
+                        continue
+                    resolved_path.relative_to(root)
+                except (OSError, ValueError):
+                    continue
+                trusted = True
+                cleanup_source = False
+                break
+            if not trusted:
+                raise
     except (OSError, ValueError):
         return {
             "ok": False,
-            "error": "path_outside_outbound_dir",
+            "error": "path_outside_allowed_file_roots",
             "request_id": request_id,
         }
 
@@ -19100,8 +19270,18 @@ def _handle_stage_file_ipc(msg: dict) -> dict:
         )
     except ValueError as exc:
         return {"ok": False, "error": str(exc), "request_id": request_id}
-    suffix = Path(name).suffix.lower()
-    if required_suffixes and suffix not in required_suffixes:
+    try:
+        display_extra = file_display.metadata_from_payload(
+            msg,
+            filename=name,
+            require_canvas_pair=True,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc), "request_id": request_id}
+    if required_suffixes and not any(
+        _outbound_name_matches_suffix(name, required)
+        for required in required_suffixes
+    ):
         return {
             "ok": False,
             "error": "wrong_file_suffix",
@@ -19113,6 +19293,11 @@ def _handle_stage_file_ipc(msg: dict) -> dict:
         source_bytes = resolved_path.read_bytes()
         if not source_bytes or len(source_bytes) > _OUTBOUND_FILE_MAX_BYTES:
             raise ValueError("file_source_empty_or_too_large")
+        if (
+            name.casefold().endswith(".io.html")
+            and len(source_bytes) > _OUTBOUND_CANVAS_MAX_BYTES
+        ):
+            raise ValueError("canvas_file_too_large")
         source = source_bytes.decode("utf-8")
         rendered = downloadable_document_render.render_download(name, source)
         data = rendered[0] if rendered is not None else source_bytes
@@ -19133,6 +19318,9 @@ def _handle_stage_file_ipc(msg: dict) -> dict:
         name=name,
         mime_type=mime_type,
         data=data,
+        display_title=display_extra.get("file_display_title", ""),
+        display_subtitle=display_extra.get("file_display_subtitle", ""),
+        cleanup_source=cleanup_source,
     )
     with _outbound_file_lock:
         if active_turn_id != _active_outbound_file_turn_id:
@@ -19159,6 +19347,11 @@ def _handle_stage_file_ipc(msg: dict) -> dict:
         "name": item.name,
         "mime": item.mime_type,
         "byte_count": len(item.data),
+        **(
+            {"title": item.display_title, "subtitle": item.display_subtitle}
+            if item.display_title and item.display_subtitle
+            else {}
+        ),
         "request_id": request_id,
     }
 
@@ -19420,11 +19613,13 @@ def _handle_redistill_ipc(msg: dict) -> dict:
 def _redistill_ipc_serve_forever(sock_path: Path) -> None:
     """Single-connection-at-a-time Unix-socket IPC listener for io_cli.
 
-    ``stage_file`` serves every CLI resident; ``redistill`` remains reachable
-    only to a self-hosted caller. One local caller at a time is the
-    whole use case, so a plain accept→handle→close loop (no thread pool) is
-    enough; the handler's network POST just makes the NEXT local caller wait
-    briefly in the OS accept backlog, which is fine for a one-shot command.
+    ``stage_file`` serves hosted V1 CLI agents and every local io_cli-capable
+    resident, including an explicitly opted-in same-machine HTTP agent;
+    ``redistill`` remains reachable only to a self-hosted caller. One local
+    caller at a time is the whole use case, so a plain accept→handle→close loop
+    (no thread pool) is enough; the handler's network POST just makes the NEXT
+    local caller wait briefly in the OS accept backlog, which is fine for a
+    one-shot command.
 
     Runs until ``_running`` flips False (same shutdown flag the main poll
     loop honors) — a final accept() may still be blocked when that happens,
@@ -20116,9 +20311,10 @@ def run() -> None:
 
     _warn_if_agent_entry_may_drift()
 
-    # Outbound-file staging is shared by hosted and self-hosted CLI residents.
-    # The redistill operation itself remains rejected for hosted callers.
-    if AGENT_MODE == "cli":
+    # Outbound-file staging is shared by hosted V1 CLI agents, self-hosted CLI
+    # residents, and explicitly opted-in same-machine HTTP agents. The redistill
+    # operation itself remains rejected for hosted callers.
+    if _resident_ipc_listener_enabled():
         threading.Thread(
             target=_redistill_ipc_serve_forever, args=(RESIDENT_IPC_SOCK,), daemon=True,
         ).start()

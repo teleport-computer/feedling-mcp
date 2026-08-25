@@ -160,6 +160,8 @@ def _row_payload(row: dict) -> dict:
                 out[key] = row[key]
         if ctype == "file":
             out["file_name"] = row.get("file_name")
+            out["file_display_title"] = row.get("file_display_title")
+            out["file_display_subtitle"] = row.get("file_display_subtitle")
         if row.get("caption_body") is not None:
             out["caption_body"] = row.get("caption_body")
     else:

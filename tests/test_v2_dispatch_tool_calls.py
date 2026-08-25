@@ -1,4 +1,4 @@
-"""C3 — `executor.dispatch_tool_calls`（spec 2026-07-13 PR-C Task 4）。
+"""Tool-call dispatcher contract (retained decision §C3).
 
 用假 capabilities.registry.run_capability（monkeypatch，返回罐装 CapabilityResult-shaped
 dict）+ 一个记录调用的 enqueue_write_effect 驱动，纯 asyncio，无 DB。断言：
@@ -94,6 +94,38 @@ def test_two_reads_dispatch_and_return_results_by_call_id(monkeypatch):
     assert "result-for-memory_index" in by_id["c1"].content
     assert "result-for-web_search" in by_id["c2"].content
     assert enqueued == []
+
+
+def test_workspace_read_exposes_exact_delivery_identity_in_metadata(monkeypatch):
+    def _run_capability(action_type, store, *, api_key, runtime_token, params):
+        assert action_type == "workspace_read"
+        return _FakeResult(
+            True,
+            {
+                "path": "/workspace/打砖块小游戏.io.html",
+                "revision": 7,
+                "content": "<html></html>",
+            },
+        )
+
+    results, enqueued = _run(
+        [
+            ToolCall(
+                id="read-canvas",
+                name="workspace_read",
+                args={"path": "/workspace/打砖块小游戏.io.html"},
+            )
+        ],
+        turn_authorization=False,
+        run_capability=_run_capability,
+        monkeypatch=monkeypatch,
+    )
+
+    assert enqueued == []
+    assert results[0].metadata == {
+        "workspace_read_path": "/workspace/打砖块小游戏.io.html",
+        "workspace_revision": 7,
+    }
 
 
 def test_one_read_exception_is_isolated_from_successful_sibling(monkeypatch):

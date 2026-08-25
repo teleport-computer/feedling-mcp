@@ -1,10 +1,43 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # Hosted Runtime V2 — PR B: Provider Transport / Telemetry — Design
 
-**Status:** LANDED / HISTORICAL DESIGN RECORD
+**Status:** LANDED / CURRENT DECISION RECORD
 **Depends on:** PR A (generation-fenced effect foundation, merged @ `d7e19a9`)
 **Directive:** @sxysun 4-PR next round (PR A control plane · **PR B transport/telemetry** · PR C unified native tool loop · PR D pool/history safety). Product hard decision: NO official/rule behavior tiering by provider/model — all models go through ONE provider-native tool loop (the loop itself is PR C; PR B ships the transport it needs).
 
 > **Not to be confused with** the `litellm-removal-pi-native-providers` spec/plan (`docs/superpowers/…2026-07-0{7,8}…`). That targets `backend/agent_runtime/` CVM driver selection + deleting a subprocess LiteLLM proxy; it is 0% implemented, disjoint from, and non-blocking for this PR. `backend/provider_client.py` already calls all four providers natively (no LiteLLM in its path).
+
+> **Lifecycle:** The detailed current-state and delivery-boundary paragraphs
+> below are 2026-07 design-time baselines. They explain the decision's origin,
+> rather than describing all current provider behavior or deployment status.
+
+## Landed/current reconciliation (2026-08-24)
+
+The core decision remains current: `backend/provider_client.py` exposes an
+additive normalized transport, retains dict compatibility for text callers,
+uses per-provider native tool codecs and native async paths, and supplies
+normalized usage to an idempotent per-job whole-turn metric. The original
+2026-07-13 design baseline covered four wire families (OpenAI Chat/Responses,
+Anthropic, and Gemini). Bedrock is a later active extension and is the fifth
+native provider wire family: its tool codec is in the Bedrock helpers around
+`provider_client.py:1744`, and both sync and async routing include it around
+`:3990` and `:4826`. `backend/provider_types.py` retains the stable normalized
+types and native-turn transcript representation; `backend/model_api_runtime/v2/jobs_store.py`
+records the metric and `backend/alembic/versions/0029_v2_turn_metrics_whole_turn.py`
+establishes its per-job uniqueness. Evidence includes the original four-wire
+call-id/transcript tests (`tests/test_provider_tools_acceptance.py`,
+`tests/test_provider_tool_transcript_wire.py`), Bedrock's native tool,
+parallel-call, transcript, and sync/async coverage
+(`tests/test_provider_tools_bedrock.py`), native async without a thread bridge
+(`tests/test_provider_async_native.py`), malformed-tool and schema-fallback
+compatibility (`tests/test_provider_malformed_tool_fallback.py`), and idempotent
+success/failure telemetry (`tests/test_v2_whole_turn_metric.py`,
+`tests/test_v2_cache_retry_metrics.py`). Current compatibility obligations cover
+all five active native wire families; PR-C's current unified loop consumes this
+transport, but does not supersede the provider/telemetry decision.
 
 ---
 
@@ -14,7 +47,7 @@ Turn `backend/provider_client.py` from a **text-only** transport into a **normal
 
 **Delivery boundary (mirrors PR A):** PR B ships the transport codecs + the whole-turn metric and proves them with codec round-trip tests. It wires **no live tool producer** into the turn loop, removes **no** `is_official`/`rule_plan` dispatch, and adds **no** real tool-execution loop — those are PR C. Acceptance is proven at the codec boundary, not end-to-end through a live loop.
 
-## Current state (grounding — verified)
+## Design-time state (historical grounding — verified in 2026-07)
 
 - **Single transport:** `backend/provider_client.py` (~1295 lines). Dispatch on `provider` at `chat_completion` (`:1015`) / `chat_completion_async` (`:1180`): `anthropic`→`_chat_completion_anthropic` (`:881`), `gemini`→`_chat_completion_gemini` (`:945`), `openai`+reasoning-id→`_chat_completion_openai_responses` (`:705`), else→`_chat_completion_openai_compatible` (`:834`). All four are **native httpx** calls to the real provider endpoint.
 - **No tool support anywhere:** none of the 4 wire builders accept `tools`; none of the 4 reply extractors read tool-call blocks (they pull text only). Confirmed by grep (zero `tool_calls`/`tools=`/`tool_result`/`function_call` in the module).

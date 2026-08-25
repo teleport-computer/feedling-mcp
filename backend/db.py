@@ -14,9 +14,10 @@ stored verbatim as JSONB and returned byte-for-byte, so the enclave's decrypt
 path is unaffected.
 
 Concurrency: ``-w N`` workers, ``--threads 32`` each in production compose. Each
-worker has its own ``psycopg_pool.ConnectionPool`` (default max_size=16,
-overridable with ``FEEDLING_DB_POOL_MAX_SIZE``) shared across its threads, plus
-one pool-external connection for the LISTEN wake bus (see
+worker has its own ordinary ``psycopg_pool.ConnectionPool`` (default max_size=16,
+overridable with ``FEEDLING_DB_POOL_MAX_SIZE``) shared across its threads, a
+health-only pool (min_size=1, max_size=2), plus one pool-external connection for
+the LISTEN wake bus (see
 ``listen_connection`` / ``pg_notify`` and ``core/wake_bus.py``) and at most one
 bounded pool-external config-lock connection. The long-poll
 endpoints block on in-memory ``threading.Event``s, NOT on a held DB connection,
@@ -65,8 +66,15 @@ FIRST_CHAT_OK_USER_SOURCES = frozenset({"chat", "model_api"})
 
 _pool: ConnectionPool | None = None
 _pool_lock = threading.Lock()
+_health_pool: ConnectionPool | None = None
+_health_pool_lock = threading.Lock()
 HEALTH_DB_ACQUIRE_TIMEOUT_SECONDS = 1.0
 HEALTH_DB_STATEMENT_TIMEOUT_MS = 1000
+# Public probes must remain observable when a request burst occupies all 16
+# ordinary slots. This lazy per-worker pool adds one steady / two peak RDS
+# connections, while keeping concurrent health requests bounded.
+HEALTH_DB_POOL_MIN_SIZE = 1
+HEALTH_DB_POOL_MAX_SIZE = 2
 
 
 def _database_url() -> str:
@@ -146,20 +154,44 @@ def get_pool() -> ConnectionPool:
     return _pool
 
 
+def get_health_pool() -> ConnectionPool:
+    """Return the small pool reserved for database-backed public health probes."""
+    global _health_pool
+    if _health_pool is not None:
+        return _health_pool
+    with _health_pool_lock:
+        if _health_pool is None:
+            _health_pool = ConnectionPool(
+                _database_url(),
+                min_size=HEALTH_DB_POOL_MIN_SIZE,
+                max_size=HEALTH_DB_POOL_MAX_SIZE,
+                timeout=HEALTH_DB_ACQUIRE_TIMEOUT_SECONDS,
+                max_idle=300,
+                kwargs={"autocommit": True},
+                open=True,
+            )
+    return _health_pool
+
+
 def close_pool() -> None:
-    """Close and forget this process's pool.
+    """Close and forget this process's ordinary and health pools.
 
     Gunicorn's master performs schema/policy startup work before forking. Any
     pool opened there must be fully stopped first: psycopg pool worker threads
     do not survive ``fork()``, and inheriting their connection objects into web
     workers can hang the first request. Each child lazily creates its own pool.
     """
-    global _pool
+    global _pool, _health_pool
     with _pool_lock:
         pool = _pool
         _pool = None
+    with _health_pool_lock:
+        health_pool = _health_pool
+        _health_pool = None
     if pool is not None:
         pool.close()
+    if health_pool is not None:
+        health_pool.close()
 
 
 # ---------------------------------------------------------------------------
@@ -469,17 +501,18 @@ def set_supervisor_instance_heartbeat(owner: str, payload: dict) -> None:
     mirror.execute(sql, params)
 
 
-def list_supervisor_instance_heartbeats(
+def _list_supervisor_instance_heartbeats_from_pool(
+    pool,
     *,
     timeout: float | None = None,
     statement_timeout_ms: int | None = None,
 ) -> list[dict]:
     """All runner heartbeat rows. Each dict carries the typed flags plus ``ts``
     (the row's ``updated_at`` as an epoch float) so the caller can age-filter in
-    pure code. Freshness/aggregation is the guard's job, not this query's. Raises
-    on a DB error so the caller can fall back to the legacy key."""
+    pure code. Freshness/aggregation is the caller's job. Raises on a DB error so
+    each caller can apply its own fail-open or fail-closed policy."""
     connection_kwargs = {"timeout": timeout} if timeout is not None else {}
-    with get_pool().connection(**connection_kwargs) as conn:
+    with pool.connection(**connection_kwargs) as conn:
         with _local_statement_timeout(conn, statement_timeout_ms):
             rows = conn.execute(
                 "SELECT owner, host, shard_index, shard_count, max_children, "
@@ -503,6 +536,32 @@ def list_supervisor_instance_heartbeats(
             "pi": bool(payload.get("pi")),
         })
     return out
+
+
+def list_supervisor_instance_heartbeats(
+    *,
+    timeout: float | None = None,
+    statement_timeout_ms: int | None = None,
+) -> list[dict]:
+    """Read runner heartbeats through the ordinary application pool."""
+    return _list_supervisor_instance_heartbeats_from_pool(
+        get_pool(),
+        timeout=timeout,
+        statement_timeout_ms=statement_timeout_ms,
+    )
+
+
+def list_supervisor_instance_heartbeats_for_health(
+    *,
+    timeout: float | None = None,
+    statement_timeout_ms: int | None = None,
+) -> list[dict]:
+    """Read runner heartbeats without competing for application pool slots."""
+    return _list_supervisor_instance_heartbeats_from_pool(
+        get_health_pool(),
+        timeout=timeout,
+        statement_timeout_ms=statement_timeout_ms,
+    )
 
 
 def prune_supervisor_instance_heartbeats(max_age_sec: float) -> None:
@@ -7755,7 +7814,7 @@ def _mirror_proactive_settings_current(user_id: str) -> None:
         )
 
 
-# --- Append-only TEE-primary debug trace (T184) --------------------------- #
+# --- Append-only selected-primary debug trace (T184/T306) ---------------- #
 
 _TRACE_EVENT_COLUMNS = (
     "id", "user_id", "ts", "subsystem", "type", "status", "outcome_class", "actor",
@@ -7781,10 +7840,9 @@ def insert_trace_events_strict(
 ) -> int:
     """Insert one immutable row per event; normalize unknown outcome classes.
 
-    This is intentionally not mirrored and not available in the RDS migration
-    chain: after TEE-primary promotion ``trace_events`` has exactly one writer
-    and one authoritative copy.  T184's traffic switch calls this helper in a
-    later batch; landing it with the additive schema keeps that cutover small.
+    This is intentionally not mirrored.  Both migration chains carry the same
+    table contract, but ``get_pool()`` selects exactly one primary, so a running
+    deployment still has one writer and one authoritative copy.
     """
     uid = str(user_id or "").strip()
     if not uid:
@@ -7863,6 +7921,8 @@ def query_trace_events(
     since_epoch: float = 0,
     limit: int = 200,
     offset: int = 0,
+    connection_timeout: float | None = None,
+    statement_timeout_ms: int | None = None,
 ) -> list[dict]:
     """Read trace rows directly, including rows for a deleted account uid."""
     from psycopg.rows import dict_row
@@ -7898,10 +7958,16 @@ def query_trace_events(
         "SELECT " + ",".join(_TRACE_EVENT_COLUMNS) + " FROM trace_events" +
         where + " ORDER BY ts DESC,id DESC LIMIT %s OFFSET %s"
     )
-    with get_pool().connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(statement, params)
-            rows = cur.fetchall()
+    connection_kwargs = (
+        {"timeout": float(connection_timeout)}
+        if connection_timeout is not None
+        else {}
+    )
+    with get_pool().connection(**connection_kwargs) as conn:
+        with _local_statement_timeout(conn, statement_timeout_ms):
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(statement, params)
+                rows = cur.fetchall()
     out: list[dict] = []
     for row in rows:
         item = dict(row)
@@ -7910,6 +7976,225 @@ def query_trace_events(
             item["ts"] = timestamp.timestamp()
         out.append(item)
     return out
+
+
+def _trace_event_candidate_query(
+    *,
+    user_id: str,
+    trace_id_contains: str,
+    subsystem: str,
+    q: str,
+    since_epoch: float,
+    status: str,
+    candidate_limit: int,
+) -> tuple[str, list]:
+    """Return the bounded, narrow CTE shared by flat-page trace queries.
+
+    The candidate carries no ``detail``/``content_excerpt`` values.  Those wide
+    columns are fetched only after SQL has selected the requested page (or the
+    explicitly capped sibling rows for that page's turns).
+    """
+    clauses: list[str] = []
+    params: list = []
+    if user_id:
+        clauses.append("user_id=%s")
+        params.append(str(user_id))
+    if trace_id_contains:
+        clauses.append("trace_id ILIKE %s")
+        params.append(f"%{str(trace_id_contains)}%")
+    if subsystem:
+        clauses.append("subsystem=%s")
+        params.append(str(subsystem))
+    if since_epoch:
+        clauses.append("ts>=to_timestamp(%s)")
+        params.append(float(since_epoch))
+    if q:
+        clauses.append(
+            "concat_ws(' ',user_id,trace_id,subsystem,type,status,outcome_class,summary,explain,"
+            "detail::text,content_excerpt::text) ILIKE %s"
+        )
+        params.append(f"%{str(q)}%")
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    cap = max(1, int(candidate_limit))
+    params.extend((cap + 1, cap))
+
+    # Stall parity with ``_debug_trace_detect_stall``: for each lifecycle stem,
+    # the last start/done/error in the bounded candidate decides whether that
+    # stem remains open.  The existing Python input is ts-desc/id-desc and its
+    # stable ascending-ts sort leaves the lower id last on equal timestamps;
+    # ``id ASC`` below preserves that tie behaviour.
+    ctes = (
+        "WITH raw_candidate AS MATERIALIZED ("
+        " SELECT id,ts,user_id,COALESCE(NULLIF(trace_id,''),'ungrouped') AS trace_key,"
+        " subsystem,type,status FROM trace_events" + where +
+        " ORDER BY ts DESC,id DESC LIMIT %s"
+        "), candidate AS MATERIALIZED ("
+        " SELECT * FROM raw_candidate ORDER BY ts DESC,id DESC LIMIT %s"
+        "), lifecycle_last AS ("
+        " SELECT DISTINCT ON (user_id,trace_key,regexp_replace(type,'[.](start|done|error)$',''))"
+        " user_id,trace_key,regexp_replace(type,'[.](start|done|error)$','') AS stem,"
+        " type LIKE '%%.start' AS is_open"
+        " FROM candidate WHERE type ~ '[.](start|done|error)$'"
+        " ORDER BY user_id,trace_key,regexp_replace(type,'[.](start|done|error)$',''),"
+        " ts DESC,id ASC"
+        "), turn_base AS ("
+        " SELECT user_id,trace_key,MAX(ts) AS last_ts,"
+        " bool_or(status IN ('error','failed')) AS any_error,"
+        " bool_or(status='blocked') AS any_blocked"
+        " FROM candidate GROUP BY user_id,trace_key"
+        "), turn_stall AS ("
+        " SELECT user_id,trace_key,bool_or(is_open) AS stalled"
+        " FROM lifecycle_last GROUP BY user_id,trace_key"
+        "), turn_status AS ("
+        " SELECT b.user_id,b.trace_key,b.last_ts,"
+        " CASE WHEN COALESCE(s.stalled,false) THEN 'stalled'"
+        " WHEN b.any_error THEN 'error' WHEN b.any_blocked THEN 'blocked' ELSE 'ok' END"
+        " AS terminal_status"
+        " FROM turn_base b LEFT JOIN turn_stall s USING (user_id,trace_key)"
+        "), selected_turns AS ("
+        " SELECT * FROM turn_status WHERE %s='' OR terminal_status=%s"
+        "), filtered AS MATERIALIZED ("
+        " SELECT c.* FROM candidate c JOIN selected_turns t USING (user_id,trace_key)"
+        ") "
+    )
+    normalized_status = str(status or "").strip().lower()
+    params.extend((normalized_status, normalized_status))
+    return ctes, params
+
+
+def query_trace_events_flat_page(
+    *,
+    user_id: str = "",
+    trace_id_contains: str = "",
+    subsystem: str = "",
+    status: str = "",
+    q: str = "",
+    since_epoch: float = 0,
+    limit: int = 100,
+    offset: int = 0,
+    candidate_limit: int,
+    connection_timeout: float,
+    statement_timeout_ms: int,
+) -> dict:
+    """Return one flat event page plus bounded SQL-side summary metadata."""
+    from psycopg.rows import dict_row
+
+    bounded_limit = max(1, min(int(limit or 100), 500))
+    bounded_offset = max(0, min(int(offset or 0), int(candidate_limit)))
+    ctes, cte_params = _trace_event_candidate_query(
+        user_id=user_id,
+        trace_id_contains=trace_id_contains,
+        subsystem=subsystem,
+        status=status,
+        q=q,
+        since_epoch=since_epoch,
+        candidate_limit=candidate_limit,
+    )
+    metadata_statement = ctes + (
+        "SELECT"
+        " (SELECT count(*) FROM filtered) AS events_total,"
+        " (SELECT count(*) FROM selected_turns) AS turns_total,"
+        " (SELECT count(*) FROM selected_turns WHERE terminal_status='stalled') AS stalled_turns,"
+        " (SELECT count(*) FROM selected_turns WHERE terminal_status='error') AS error_turns,"
+        " (SELECT count(*)>%s FROM raw_candidate) AS scan_truncated,"
+        " COALESCE((SELECT jsonb_agg(jsonb_build_object("
+        "   'user_id',u.user_id,'events',u.events,'last_ts',u.last_ts))"
+        "   FROM (SELECT user_id,count(*) AS events,extract(epoch FROM max(ts)) AS last_ts"
+        "         FROM filtered GROUP BY user_id ORDER BY max(ts) DESC) u),'[]'::jsonb) AS users,"
+        " COALESCE((SELECT array_agg(DISTINCT subsystem ORDER BY subsystem)"
+        "           FROM candidate WHERE subsystem<>''),ARRAY[]::text[]) AS subsystems,"
+        " COALESCE((SELECT array_agg(DISTINCT lower(status) ORDER BY lower(status))"
+        "           FROM candidate WHERE status<>''),ARRAY[]::text[]) AS statuses"
+    )
+    page_statement = ctes + (
+        "SELECT " + ",".join("e." + column for column in _TRACE_EVENT_COLUMNS) +
+        " FROM filtered f JOIN trace_events e ON e.id=f.id AND e.ts=f.ts"
+        " ORDER BY f.ts DESC,f.id DESC OFFSET %s LIMIT %s"
+    )
+    connection_kwargs = {"timeout": float(connection_timeout)}
+    with get_pool().connection(**connection_kwargs) as conn:
+        with _local_statement_timeout(conn, statement_timeout_ms):
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    metadata_statement,
+                    [*cte_params, int(candidate_limit)],
+                )
+                metadata = dict(cur.fetchone() or {})
+                cur.execute(
+                    page_statement,
+                    [*cte_params, bounded_offset, bounded_limit + 1],
+                )
+                rows = [dict(row) for row in cur.fetchall()]
+
+    for row in rows:
+        timestamp = row.get("ts")
+        if isinstance(timestamp, datetime):
+            row["ts"] = timestamp.timestamp()
+    return {
+        **metadata,
+        "rows": rows,
+        "limit": bounded_limit,
+        "offset": bounded_offset,
+    }
+
+
+def query_trace_event_turn_rows(
+    *,
+    turn_keys: list[tuple[str, str]],
+    user_id: str = "",
+    trace_id_contains: str = "",
+    subsystem: str = "",
+    q: str = "",
+    since_epoch: float = 0,
+    candidate_limit: int,
+    sibling_limit: int,
+    connection_timeout: float,
+    statement_timeout_ms: int,
+) -> tuple[list[dict], bool]:
+    """Fetch bounded candidate rows belonging to the flat page's turn keys."""
+    from psycopg.rows import dict_row
+
+    keys = list(dict.fromkeys(
+        (str(uid), str(trace_key or "ungrouped"))
+        for uid, trace_key in turn_keys
+    ))
+    if not keys:
+        return [], False
+    ctes, cte_params = _trace_event_candidate_query(
+        user_id=user_id,
+        trace_id_contains=trace_id_contains,
+        subsystem=subsystem,
+        status="",
+        q=q,
+        since_epoch=since_epoch,
+        candidate_limit=candidate_limit,
+    )
+    user_ids = [key[0] for key in keys]
+    trace_keys = [key[1] for key in keys]
+    bounded_sibling_limit = max(1, int(sibling_limit))
+    statement = ctes + (
+        ", page_turns AS (SELECT * FROM unnest(%s::text[],%s::text[])"
+        " AS wanted(user_id,trace_key))"
+        " SELECT " + ",".join("e." + column for column in _TRACE_EVENT_COLUMNS) +
+        " FROM candidate c JOIN page_turns p USING (user_id,trace_key)"
+        " JOIN trace_events e ON e.id=c.id AND e.ts=c.ts"
+        " ORDER BY c.ts DESC,c.id DESC LIMIT %s"
+    )
+    with get_pool().connection(timeout=float(connection_timeout)) as conn:
+        with _local_statement_timeout(conn, statement_timeout_ms):
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    statement,
+                    [*cte_params, user_ids, trace_keys, bounded_sibling_limit + 1],
+                )
+                rows = [dict(row) for row in cur.fetchall()]
+    truncated = len(rows) > bounded_sibling_limit
+    rows = rows[:bounded_sibling_limit]
+    for row in rows:
+        timestamp = row.get("ts")
+        if isinstance(timestamp, datetime):
+            row["ts"] = timestamp.timestamp()
+    return rows, truncated
 
 
 def delete_trace_events_for_user(user_id: str) -> int:

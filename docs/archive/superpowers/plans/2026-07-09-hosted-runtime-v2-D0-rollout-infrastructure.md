@@ -1,3 +1,9 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/superpowers/specs/2026-07-21-dual-runtime-v1-v2-coexistence-design.md
+historical_reason: superseded
+superseded_by: docs/superpowers/specs/2026-07-21-dual-runtime-v1-v2-coexistence-design.md
+---
 # D0 Rollout Infrastructure Implementation Plan
 
 > **RETIRED / DO NOT DEPLOY.** Historical cutover plan：单向 V2 互斥闸
@@ -9,7 +15,7 @@
 
 **Goal:** 让 V2 在 prod 能跑、安全、可控：部署 worker 池 + 互斥闸 + mode setter + per-turn 指标。
 
-**Architecture:** 见 spec `2026-07-09-hosted-runtime-v2-D0-rollout-infrastructure-design.md`。四块独立：compose 服务（ops）/ 发现互斥闸 / admin setter / 指标插桩。
+**Architecture:** 见归档 spec [`2026-07-09-hosted-runtime-v2-D0-rollout-infrastructure-design.md`](../specs/2026-07-09-hosted-runtime-v2-D0-rollout-infrastructure-design.md)。四块独立：compose 服务（ops）/ 发现互斥闸 / admin setter / 指标插桩。
 
 ## Global Constraints
 
