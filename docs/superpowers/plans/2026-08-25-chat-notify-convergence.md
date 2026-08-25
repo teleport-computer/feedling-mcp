@@ -444,7 +444,7 @@ Run:
 DATABASE_URL='postgresql://postgres:test@127.0.0.1:55432/postgres' \
 FEEDLING_TEST_PG='postgresql://postgres:test@127.0.0.1:55432/postgres' \
 /Users/zhengzhihao/Projects/teleport/feedling-mcp/.venv-test/bin/python \
-  -m pytest tests/test_openapi_contract.py -q
+  -m pytest tests/openapi -q
 cd docs-site
 npm run types:check
 npm run lint

@@ -9,6 +9,16 @@ import { ArchitectureDiagram } from '@/components/architecture-diagram';
 
 PostgreSQL is the durable source of truth for chat. Each backend worker keeps a bounded per-user hot projection and advances it with versioned change events delivered through PostgreSQL `LISTEN/NOTIFY`. Notifications are only wake hints: workers verify durable versions, apply contiguous events, and fall back to a bounded snapshot when events are missing, reset, or too far behind.
 
+Committed Chat-row mutations have one cross-worker producer: the PostgreSQL
+trigger that advances the durable per-user version. Application workers do not
+send a second generic Chat notification for the same mutation. State that can
+change a parked Chat poll without changing a Chat row—such as runtime progress,
+resident tool activity, MCP configuration, or a vision test—uses a separate
+wake-only payload. Current workers handle that payload without querying the Chat
+projection. During a rolling deployment, an older worker safely treats it as a
+generic bounded refresh, so mixed images preserve correctness while temporarily
+doing more work.
+
 Correctness-sensitive reads do not depend on cache freshness. Verify uses exact ping/reply lookups, resident poll selects bounded durable unanswered candidates before its atomic claim, and Runtime V2 freezes prompt membership by sequence. Chat envelopes remain opaque to this synchronization layer, and telemetry contains no message documents, ciphertext, keys, or connection strings.
 
 Feedling separates ciphertext persistence from authorized decryption and agent

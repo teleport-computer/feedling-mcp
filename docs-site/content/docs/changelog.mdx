@@ -36,7 +36,14 @@ change must not be interpreted as an API guarantee.
   primary only—there is no mirroring or double-write—and rolling partition
   maintenance uses an explicit migration credential outside the request path.
 
-- Reduced multi-worker chat database egress by synchronizing bounded per-user change events and using durable point/window queries for verify, resident poll, and Runtime V2 prompt reads. Public API schemas and end-to-end encryption behavior are unchanged; gap detection retains a bounded snapshot fallback.
+- Reduced multi-worker Chat database egress by synchronizing bounded per-user
+  change events and using durable point/window queries for verify, resident
+  poll, and Runtime V2 prompt reads. A committed Chat mutation now relies on its
+  single database-issued version notification instead of adding a second
+  application-issued hot-snapshot refresh. Runtime progress, MCP changes,
+  resident activity, and vision-test state retain immediate poll visibility
+  through a wake-only notification. Public API schemas and end-to-end encryption
+  behavior are unchanged; gap detection retains a bounded snapshot fallback.
 
 - **The iOS System Notifications switch now gates IO's ordinary message-style
   notifications.** Turning it off suppresses proactive alerts, manual-wake
