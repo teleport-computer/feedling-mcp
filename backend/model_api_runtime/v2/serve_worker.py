@@ -1873,6 +1873,9 @@ def _wake_decision_for_user(user_id: str, trigger: str = "heartbeat") -> dict:
     return {
         "should_wake": bool(d.get("should_wake_agent")),
         "wake_interval_sec": int(d.get("wake_interval_sec") or 7200),
+        "decision_at": (
+            float(d["ts"]) if d.get("ts") is not None else time.time()
+        ),
         "block_reason": str(d.get("reason") or ""),
     }
 
@@ -5114,11 +5117,9 @@ def _build_scheduler_deps():
     （包一层 proactive_gate 的只读适配器，本身不 enqueue）、enqueue_job("heartbeat")
     /upsert_wake_schedule(next_heartbeat_at=...)。
 
-    leader-election 有意跳过：`enqueue_job` 走
-    ux_agent_jobs_singleflight 分区唯一索引，多个 serve_worker 进程的 scheduler tick
-    并发对同一用户各自判定 should_wake 也只会各自 INSERT 一次、第二个撞唯一索引 coalesce
-    成同一行——重复调度天然无害。prod 只跑一个 serve-worker 容器，这条不变量目前甚至用
-    不上，但即使将来横向扩容也不需要另起一套选主。"""
+    多进程无需另做 leader election：settings blob 的单条 CAS 是每个周期
+    heartbeat slot 的放行权，只有 won=True 的调用方能入队；agent_jobs
+    single-flight 仍是队列层的第二道防线。感知事件不走这只时钟。"""
     return types.SimpleNamespace(
         eligible_users=lambda: admin_core.list_runtime_modes().get(
             hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, []
@@ -5130,6 +5131,9 @@ def _build_scheduler_deps():
         ),
         due_users=lambda: jobs_store.due_heartbeat_users(),
         wake_decision=_wake_decision_for_user,
+        consume_heartbeat_tick=lambda uid, **kwargs: (
+            core_store.consume_proactive_heartbeat_tick(uid, **kwargs)
+        ),
         enqueue_heartbeat=lambda uid: jobs_store.enqueue_job(
             uid, "heartbeat", trace_id=uuid.uuid4().hex
         ),
@@ -5255,6 +5259,7 @@ def wire_assembly() -> None:
     core_wake_bus.register_handler("v2_jobs", v2_worker.on_v2_job_notify)
     core_wake_bus.register_job_cancel_handler(_JOB_CANCEL_ROUTER.handle)
     jobs_store.on_job_enqueued = _emit_job_enqueued_trace
+    jobs_store.on_followup_marker = _emit_followup_marker_trace
     core_wake_bus.start_listener()
 
 
@@ -5276,6 +5281,32 @@ def _emit_job_enqueued_trace(user_id: str, lane: str, *, reason: str, trace_id: 
         status="ok",
         trace_id=trace_id,
         turn_id=trace_id,
+        detail=detail,
+    )
+
+
+def _emit_followup_marker_trace(
+    user_id: str,
+    action: str,
+    *,
+    source_job_id: int,
+    generation: int,
+    successor_job_id: int | None,
+    moved_context_count: int,
+) -> None:
+    detail = {
+        "action": str(action),
+        "source_job_id": int(source_job_id),
+        "generation": int(generation),
+        "moved_context_count": max(0, int(moved_context_count)),
+    }
+    if successor_job_id is not None:
+        detail["successor_job_id"] = int(successor_job_id)
+    _emit_v2_debug_trace_for_user(
+        user_id,
+        "agent.wake_followup.marker",
+        status="ok",
+        job_id=(str(successor_job_id) if successor_job_id is not None else ""),
         detail=detail,
     )
 

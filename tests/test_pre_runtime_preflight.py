@@ -14,7 +14,7 @@ TEST_COMPOSE = ROOT / "deploy" / "docker-compose.phala.test.yaml"
 TEST_RUNNER_COMPOSE = ROOT / "deploy" / "docker-compose.phala.runner.yaml"
 PROD_COMPOSE = ROOT / "deploy" / "docker-compose.phala.yaml"
 PROD_RUNNER_COMPOSE = ROOT / "deploy" / "docker-compose.phala.prod.runner.yaml"
-EXPECTED_TEE_HEAD = "0037_chat_poll_index"
+EXPECTED_TEE_HEAD = "0038_v2_wake_followup_marker"
 
 
 def _head_literal_lines(source: str) -> list[int]:
@@ -52,7 +52,7 @@ def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
     assert runtime_head == EXPECTED_TEE_HEAD
     assert (
         script.get_revision(EXPECTED_TEE_HEAD).down_revision
-        == "0036_lane_rollup_access_paths"
+        == "0037_chat_poll_index"
     )
     assert (
         script.get_revision("0036_lane_rollup_access_paths").down_revision

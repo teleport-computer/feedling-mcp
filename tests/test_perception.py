@@ -10,6 +10,7 @@ trigger is captured instead of enqueuing a real proactive job.
 Run:  python -m pytest tests/test_perception.py -q
 """
 import json
+import inspect
 import sys
 import time
 import types
@@ -29,6 +30,7 @@ from core import store as core_store
 from core import wake_bus as core_wake_bus
 from hosted import config_store as hosted_config_store
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import scheduler as v2_scheduler
 from proactive.runtime_v2 import WakeEventV2
 
 
@@ -233,6 +235,9 @@ def test_v2_perception_wake_uses_agent_jobs_instead_of_legacy_queue(monkeypatch)
     user_store = types.SimpleNamespace(
         proactive_activation_ready=lambda: True,
         append_proactive_job=lambda job: legacy_jobs.append(job),
+        load_proactive_settings=lambda: pytest.fail(
+            "perception wake consulted the periodic heartbeat clock"
+        ),
     )
     monkeypatch.setattr(core_store, "get_store", lambda _uid: user_store)
     monkeypatch.setattr(
@@ -254,6 +259,13 @@ def test_v2_perception_wake_uses_agent_jobs_instead_of_legacy_queue(monkeypatch)
         lambda channel, uid: notified.append((channel, uid)),
     )
     monkeypatch.setattr(service.store, "trim_v2_wake_context", lambda uid: None)
+    monkeypatch.setattr(
+        core_store,
+        "consume_proactive_heartbeat_tick",
+        lambda *_args, **_kwargs: pytest.fail(
+            "perception wake consumed the periodic heartbeat clock"
+        ),
+    )
     event = types.SimpleNamespace(
         user_id="u_v2_perception",
         wake_id="wake-perception-1",
@@ -290,6 +302,91 @@ def test_v2_perception_wake_uses_agent_jobs_instead_of_legacy_queue(monkeypatch)
     )]
     assert notified == [("v2_jobs", "u_v2_perception")]
     assert legacy_jobs == []
+
+
+def test_v2_perception_enqueue_source_has_no_periodic_clock_dependency():
+    source = inspect.getsource(service._fire_wake_event_v2)
+
+    assert "consume_proactive_heartbeat_tick" not in source
+    assert "defer_heartbeat_context" not in source
+
+
+@pytest.mark.parametrize(
+    ("job_kind", "expected_enqueues", "expected_clock_reads"),
+    [
+        ("perception", [("u_v2_clock_scope", "heartbeat")], []),
+        ("periodic", [], [("u_v2_clock_scope", 1000.0, 900)]),
+    ],
+)
+def test_v2_heartbeat_lane_clock_scope_is_trigger_specific(
+    monkeypatch,
+    job_kind,
+    expected_enqueues,
+    expected_clock_reads,
+):
+    """Same future tick: perception enters now; periodic heartbeat loses."""
+    uid = "u_v2_clock_scope"
+    enqueued = []
+    clock_reads = []
+    future_tick = 1900.0
+    user_store = types.SimpleNamespace(proactive_activation_ready=lambda: True)
+    monkeypatch.setattr(core_store, "get_store", lambda _uid: user_store)
+    monkeypatch.setattr(
+        hosted_config_store,
+        "get_hosted_runtime_mode_strict",
+        lambda _store: hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2,
+    )
+    monkeypatch.setattr(service.store, "trim_v2_wake_context", lambda _uid: None)
+    monkeypatch.setattr(core_wake_bus, "notify", lambda *_args: None)
+    monkeypatch.setattr(
+        jobs_store,
+        "enqueue_job_with_context_log",
+        lambda user_id, lane, **_kwargs: (
+            enqueued.append((user_id, lane)),
+            (123, False),
+        )[1],
+    )
+
+    def _consume(user_id, *, now, wake_interval_sec):
+        clock_reads.append((user_id, now, wake_interval_sec))
+        return future_tick, False
+
+    monkeypatch.setattr(
+        core_store, "consume_proactive_heartbeat_tick", _consume
+    )
+
+    if job_kind == "perception":
+        service._fire_wake_event_v2(types.SimpleNamespace(
+            user_id=uid,
+            wake_id="wake-clock-scope",
+            source="perception_event",
+            trigger="photo_added",
+            change_digest="photo changed",
+            origin_refs=("photo:1",),
+            presence_hints={},
+            payload={},
+            created_at=1000.0,
+            manual=False,
+        ))
+    else:
+        deps = types.SimpleNamespace(
+            due_users=lambda: [uid],
+            wake_decision=lambda _uid: {
+                "should_wake": True,
+                "wake_interval_sec": 900,
+                "decision_at": 1000.0,
+                "block_reason": "",
+            },
+            consume_heartbeat_tick=_consume,
+            enqueue_heartbeat=lambda user_id: enqueued.append(
+                (user_id, "heartbeat")
+            ),
+            advance_heartbeat=lambda _uid, _tick: None,
+        )
+        v2_scheduler.run_scheduler_tick(deps, now=1000.0)
+
+    assert enqueued == expected_enqueues
+    assert clock_reads == expected_clock_reads
 
 
 def test_v2_photo_wake_carries_id_scene_and_time_into_context(monkeypatch):

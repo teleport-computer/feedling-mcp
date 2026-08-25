@@ -423,6 +423,7 @@ def public_enqueue_reason(reason: object) -> str:
 # debug_trace and must not reach upward for it.  Left None in contexts that do
 # not wire it (tests, tools), where enqueue must still work.
 on_job_enqueued = None
+on_followup_marker = None
 
 
 def _trace_id_for_enqueue(lane: str, trace_id: object | None) -> str | None:
@@ -473,6 +474,30 @@ def _notify_job_enqueued(
         on_job_enqueued(user_id, lane, reason=reason, trace_id=trace_id)
     except Exception as exc:  # pragma: no cover - defensive
         log.warning("[jobs_store] enqueue trace hook failed: %s", exc)
+
+
+def _notify_followup_marker(
+    user_id: str,
+    *,
+    source_job_id: int,
+    generation: int,
+    successor_job_id: int,
+    moved_context_count: int,
+) -> None:
+    """Emit one completed marker merge through the assembly-layer hook."""
+    if on_followup_marker is None:
+        return
+    try:
+        on_followup_marker(
+            str(user_id),
+            "merged",
+            source_job_id=int(source_job_id),
+            generation=max(1, int(generation)),
+            successor_job_id=int(successor_job_id),
+            moved_context_count=max(0, int(moved_context_count)),
+        )
+    except Exception as exc:  # pragma: no cover - diagnostics are fail-open
+        log.warning("[jobs_store] follow-up marker trace hook failed: %s", exc)
 
 
 def terminal_outcome_class(error_code: str) -> str:
@@ -1180,6 +1205,135 @@ def enqueue_job(
     return result
 
 
+def _set_followup_marker_on_cursor(
+    cur,
+    *,
+    user_id: str,
+    source_job_id: int,
+    consumed_context_seq: int,
+    generation: int,
+) -> None:
+    """Bind one source's late-input generation under the per-user schedule lock."""
+    cur.execute(
+        "INSERT INTO v2_wake_schedule (user_id) VALUES (%s) "
+        "ON CONFLICT (user_id) DO NOTHING",
+        (str(user_id),),
+    )
+    cur.execute(
+        "SELECT pending_followup_generation,pending_followup_source_job_id,"
+        "pending_followup_consumed_context_seq FROM v2_wake_schedule "
+        "WHERE user_id=%s FOR UPDATE",
+        (str(user_id),),
+    )
+    marker = cur.fetchone()
+    if marker is None:
+        raise RuntimeError("follow-up schedule row missing")
+    existing_source = marker["pending_followup_source_job_id"]
+    if existing_source is not None and int(existing_source) != int(source_job_id):
+        raise RuntimeError("conflicting heartbeat follow-up marker source")
+    existing_cursor = marker["pending_followup_consumed_context_seq"]
+    if (
+        existing_cursor is not None
+        and int(existing_cursor) != max(0, int(consumed_context_seq))
+    ):
+        raise RuntimeError("conflicting heartbeat follow-up marker cursor")
+    cur.execute(
+        "UPDATE v2_wake_schedule SET pending_followup_generation=%s,"
+        "pending_followup_source_job_id=%s,"
+        "pending_followup_consumed_context_seq=%s,updated_at=now() "
+        "WHERE user_id=%s",
+        (
+            max(1, int(generation)),
+            int(source_job_id),
+            max(0, int(consumed_context_seq)),
+            str(user_id),
+        ),
+    )
+
+
+def _merge_followup_marker_on_cursor(
+    cur,
+    *,
+    user_id: str,
+    successor_job_id: int,
+    context_stream: str,
+) -> dict:
+    """Move every marked late row to one immediate successor and clear marker."""
+    cur.execute(
+        "SELECT pending_followup_generation,pending_followup_source_job_id,"
+        "pending_followup_consumed_context_seq FROM v2_wake_schedule "
+        "WHERE user_id=%s FOR UPDATE",
+        (str(user_id),),
+    )
+    marker = cur.fetchone()
+    if marker is None or marker["pending_followup_source_job_id"] is None:
+        raise RuntimeError("heartbeat follow-up marker missing during merge")
+    source_job_id = int(marker["pending_followup_source_job_id"])
+    consumed_context_seq = max(
+        0, int(marker["pending_followup_consumed_context_seq"] or 0)
+    )
+    generation = max(1, int(marker["pending_followup_generation"] or 1))
+    cur.execute(
+        "UPDATE user_logs SET item_key=%s,"
+        "doc=jsonb_set(doc,'{agent_job_id}',to_jsonb(%s::bigint),true) "
+        "WHERE user_id=%s AND stream=%s AND item_key=%s AND seq>%s",
+        (
+            str(int(successor_job_id)),
+            int(successor_job_id),
+            str(user_id),
+            str(context_stream),
+            str(source_job_id),
+            consumed_context_seq,
+        ),
+    )
+    moved_context_count = int(cur.rowcount)
+    if moved_context_count <= 0:
+        raise RuntimeError("heartbeat follow-up marker has no late context")
+    cur.execute(
+        "UPDATE agent_jobs SET input_generation=input_generation+%s WHERE id=%s",
+        (generation, int(successor_job_id)),
+    )
+    cur.execute(
+        "UPDATE v2_wake_schedule SET pending_followup_generation=NULL,"
+        "pending_followup_source_job_id=NULL,"
+        "pending_followup_consumed_context_seq=NULL,updated_at=now() "
+        "WHERE user_id=%s AND pending_followup_source_job_id=%s",
+        (str(user_id), source_job_id),
+    )
+    if int(cur.rowcount) != 1:
+        raise RuntimeError("heartbeat follow-up marker changed during merge")
+    return {
+        "source_job_id": source_job_id,
+        "consumed_context_seq": consumed_context_seq,
+        "generation": generation,
+        "moved_context_count": moved_context_count,
+    }
+
+
+def _mirror_followup_merge(
+    *,
+    user_id: str,
+    successor_job_id: int,
+    context_stream: str,
+    merge: dict,
+) -> None:
+    from tee_shadow import mirror
+
+    mirror.execute(
+        "UPDATE user_logs SET item_key=%s,"
+        "doc=jsonb_set(doc,'{agent_job_id}',to_jsonb(%s::bigint),true) "
+        "WHERE user_id=%s AND stream=%s AND item_key=%s AND seq>%s",
+        (
+            str(int(successor_job_id)),
+            int(successor_job_id),
+            str(user_id),
+            str(context_stream),
+            str(int(merge["source_job_id"])),
+            int(merge["consumed_context_seq"]),
+        ),
+    )
+
+
 def enqueue_job_with_context_log(
     user_id: str,
     lane: str,
@@ -1812,7 +1966,7 @@ def finish_wake_job(
         else None
     )
     successor_id: int | None = None
-    moved_context = False
+    followup_merge: dict | None = None
     user_id = ""
     with _pool().connection() as conn:
         with conn.transaction():
@@ -1885,6 +2039,29 @@ def finish_wake_job(
                 if clear_wake_backoff:
                     _clear_wake_backoff_on_cursor(cur, user_id)
                 if has_late_input:
+                    late_generation = (
+                        int(row["input_generation"] or 0)
+                        - int(observed_generation)
+                    )
+                    cur.execute(
+                        "SELECT COUNT(*) AS count FROM user_logs "
+                        "WHERE user_id=%s AND stream=%s AND item_key=%s AND seq>%s",
+                        (
+                            user_id,
+                            str(context_stream),
+                            str(int(job_id)),
+                            max(0, int(consumed_context_seq)),
+                        ),
+                    )
+                    late_context_count = int(cur.fetchone()["count"] or 0)
+                    if late_context_count > 0:
+                        _set_followup_marker_on_cursor(
+                            cur,
+                            user_id=user_id,
+                            source_job_id=int(job_id),
+                            consumed_context_seq=max(0, int(consumed_context_seq)),
+                            generation=late_generation,
+                        )
                     cur.execute(
                         "INSERT INTO agent_jobs "
                         "(user_id,lane,status,reason,priority,"
@@ -1898,38 +2075,27 @@ def finish_wake_job(
                         ),
                     )
                     successor_id = int(cur.fetchone()["id"])
-                    cur.execute(
-                        "UPDATE user_logs SET item_key=%s,"
-                        "doc=jsonb_set(doc,'{agent_job_id}',"
-                        "to_jsonb(%s::bigint),true) "
-                        "WHERE user_id=%s AND stream=%s AND item_key=%s "
-                        "AND seq>%s",
-                        (
-                            str(successor_id),
-                            successor_id,
-                            user_id,
-                            str(context_stream),
-                            str(int(job_id)),
-                            max(0, int(consumed_context_seq)),
-                        ),
-                    )
-                    moved_context = bool(cur.rowcount)
+                    if late_context_count > 0:
+                        followup_merge = _merge_followup_marker_on_cursor(
+                            cur,
+                            user_id=user_id,
+                            successor_job_id=successor_id,
+                            context_stream=str(context_stream),
+                        )
 
-    if successor_id is not None and moved_context:
-        from tee_shadow import mirror
-
-        mirror.execute(
-            "UPDATE user_logs SET item_key=%s,"
-            "doc=jsonb_set(doc,'{agent_job_id}',to_jsonb(%s::bigint),true) "
-            "WHERE user_id=%s AND stream=%s AND item_key=%s AND seq>%s",
-            (
-                str(successor_id),
-                successor_id,
-                user_id,
-                str(context_stream),
-                str(int(job_id)),
-                max(0, int(consumed_context_seq)),
-            ),
+    if successor_id is not None and followup_merge is not None:
+        _mirror_followup_merge(
+            user_id=user_id,
+            successor_job_id=successor_id,
+            context_stream=str(context_stream),
+            merge=followup_merge,
+        )
+        _notify_followup_marker(
+            user_id,
+            source_job_id=int(followup_merge["source_job_id"]),
+            generation=int(followup_merge["generation"]),
+            successor_job_id=successor_id,
+            moved_context_count=int(followup_merge["moved_context_count"]),
         )
     return True, successor_id
 
@@ -12159,7 +12325,9 @@ def get_wake_schedule(user_id) -> dict | None:
                 "last_screen_watch_frame_id, last_screen_chat_frame_id, self_wake_streak, "
                 "self_wake_user_seq, self_wake_last_effect_id, "
                 "self_wake_last_effect_accepted, proactive_fail_streak, "
-                "proactive_fail_user_seq, updated_at "
+                "proactive_fail_user_seq, pending_followup_generation, "
+                "pending_followup_source_job_id, "
+                "pending_followup_consumed_context_seq, updated_at "
                 "FROM v2_wake_schedule WHERE user_id=%s",
                 (user_id,),
             )

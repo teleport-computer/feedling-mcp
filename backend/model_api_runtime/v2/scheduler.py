@@ -22,13 +22,14 @@ def run_scheduler_tick(deps, *, now: float) -> dict:
     `deps` provides:
       - due_users() -> list[str]           # users whose heartbeat is due & not in payment cooldown
       - wake_decision(user_id) -> dict      # {"should_wake": bool, "wake_interval_sec": int, "block_reason": str}
+      - consume_heartbeat_tick(user_id, now, wake_interval_sec) -> (next_at, won)
       - enqueue_heartbeat(user_id) -> None  # enqueue a heartbeat agent_job (single-flight de-dupes)
       - advance_heartbeat(user_id, next_at_epoch: float) -> None  # persist next_heartbeat_at
 
-    For each due user: consult wake_decision. If should_wake -> enqueue_heartbeat
-    AND advance. If NOT should_wake (blocked/weak/unactivated) -> advance ONLY,
-    do NOT enqueue (zero-burn: no job, no model call). Always advance so a due
-    user isn't reconsidered every tick.
+    For each due user: consult wake_decision. If should_wake -> atomically claim
+    the periodic slot, enqueue only for the winner, then mirror that clock into
+    the wake schedule. If NOT should_wake (blocked/weak/unactivated) -> advance
+    ONLY, do NOT enqueue (zero-burn: no job, no model call).
 
     `now` is an injected epoch float (no wall-clock reads here -- keeps this
     deterministic and unit-testable).
@@ -61,14 +62,24 @@ def run_scheduler_tick(deps, *, now: float) -> dict:
                 skipped += 1
                 continue
             interval = int(decision.get("wake_interval_sec") or _DEFAULT_WAKE_INTERVAL_SEC)
-            next_at = now + interval
+            decision_at = float(decision.get("decision_at", now))
+            next_at = decision_at + interval
 
             if decision.get("should_wake"):
                 if not _still_v2(user_id):
                     skipped += 1
                     continue
-                deps.enqueue_heartbeat(user_id)
-                enqueued += 1
+                tick_at, won = deps.consume_heartbeat_tick(
+                    user_id,
+                    now=decision_at,
+                    wake_interval_sec=interval,
+                )
+                next_at = float(tick_at)
+                if won and _still_v2(user_id):
+                    deps.enqueue_heartbeat(user_id)
+                    enqueued += 1
+                else:
+                    skipped += 1
             else:
                 skipped += 1
 

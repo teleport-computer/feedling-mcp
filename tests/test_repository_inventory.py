@@ -29,7 +29,7 @@ from tools.repository_inventory import (  # noqa: E402
     ("path", "expected"),
     [
         ("backend/alembic/versions/0101_chat_change_events.py", "migration"),
-        ("backend/alembic_tee/versions/0037_chat_poll_index.py", "migration"),
+        ("backend/alembic_tee/versions/0038_v2_wake_followup_marker.py", "migration"),
         ("docs/superpowers/plans/2026-08-24-example.md", "historical-review"),
         ("docs/superpowers/specs/example.md", "historical-review"),
         ("docs-site/openapi/public.json", "generated"),

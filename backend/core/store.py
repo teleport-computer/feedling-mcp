@@ -115,10 +115,15 @@ def proactive_heartbeat_next_tick_at(settings: dict | None) -> float:
         return 0.0
 
 
+def _read_proactive_heartbeat_settings(user_id: str):
+    """Injectable read seam for deterministic CAS interleaving tests."""
+    return db.get_blob(user_id, "proactive_settings")
+
+
 def _cas_heartbeat_next_tick_at(user_id: str, transform) -> float:
     """CAS one scheduler field without clobbering concurrent settings writes."""
     for _attempt in range(_HEARTBEAT_NEXT_TICK_CAS_ATTEMPTS):
-        raw = db.get_blob(user_id, "proactive_settings")
+        raw = _read_proactive_heartbeat_settings(user_id)
         expected = dict(raw) if isinstance(raw, dict) else {}
         current = proactive_heartbeat_next_tick_at(expected)
         updated = max(0.0, float(transform(current)))
@@ -134,7 +139,9 @@ def _cas_heartbeat_next_tick_at(user_id: str, transform) -> float:
             insert_if_missing=not isinstance(raw, dict),
         ):
             return updated
-    return proactive_heartbeat_next_tick_at(db.get_blob(user_id, "proactive_settings"))
+    return proactive_heartbeat_next_tick_at(
+        _read_proactive_heartbeat_settings(user_id)
+    )
 
 
 def advance_proactive_heartbeat_tick(
@@ -145,6 +152,50 @@ def advance_proactive_heartbeat_tick(
 ) -> float:
     target = float(now) + normalize_proactive_wake_interval_sec(wake_interval_sec)
     return _cas_heartbeat_next_tick_at(user_id, lambda current: max(current, target))
+
+
+def consume_proactive_heartbeat_tick(
+    user_id: str,
+    *,
+    now: float,
+    wake_interval_sec,
+) -> tuple[float, bool]:
+    """Atomically claim one due periodic-heartbeat slot and advance its phase.
+
+    This clock belongs only to the scheduler's periodic heartbeat producer.
+    Perception events share the heartbeat lane but never consult or advance it.
+    When a tick runs late, advancement skips missed slots from the prior phase
+    instead of resetting the cadence to ``now + interval``.
+    """
+    timestamp = float(now)
+    interval = normalize_proactive_wake_interval_sec(wake_interval_sec)
+    for _attempt in range(_HEARTBEAT_NEXT_TICK_CAS_ATTEMPTS):
+        raw = _read_proactive_heartbeat_settings(user_id)
+        expected = dict(raw) if isinstance(raw, dict) else {}
+        current = proactive_heartbeat_next_tick_at(expected)
+        if current > timestamp:
+            return current, False
+        if current > 0.0:
+            missed = int(max(0.0, timestamp - current) // interval)
+            target = current + (missed + 1) * interval
+        else:
+            target = timestamp + interval
+        replacement = dict(expected)
+        replacement[HEARTBEAT_NEXT_TICK_AT_KEY] = target
+        if db.set_blob_if_unchanged(
+            user_id,
+            "proactive_settings",
+            expected,
+            replacement,
+            insert_if_missing=not isinstance(raw, dict),
+        ):
+            return target, True
+    return (
+        proactive_heartbeat_next_tick_at(
+            _read_proactive_heartbeat_settings(user_id)
+        ),
+        False,
+    )
 
 
 def shrink_proactive_heartbeat_tick(

@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db
 from model_api_runtime.v2 import jobs_store
+from tee_shadow import mirror as tee_mirror
 
 from conftest import seed_user
 from incident_guard_reference import legacy_consumer
@@ -44,6 +45,25 @@ def test_upsert_then_get_round_trips_heartbeat_time():
 def test_get_wake_schedule_returns_none_when_absent():
     seed_user("u_ws_absent")
     assert jobs_store.get_wake_schedule("u_ws_absent") is None
+
+
+def test_followup_marker_columns_exist_on_rds_and_tee_heads():
+    expected = {
+        "pending_followup_generation": ("bigint", "YES"),
+        "pending_followup_source_job_id": ("bigint", "YES"),
+        "pending_followup_consumed_context_seq": ("bigint", "YES"),
+    }
+
+    for pool in (db.get_pool(), tee_mirror.get_tee_pool()):
+        with pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT column_name,data_type,is_nullable "
+                "FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name='v2_wake_schedule' "
+                "AND column_name = ANY(%s)",
+                (list(expected),),
+            ).fetchall()
+        assert {name: (kind, nullable) for name, kind, nullable in rows} == expected
 
 
 def test_partial_upsert_leaves_other_columns_unchanged():

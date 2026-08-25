@@ -10,12 +10,14 @@ from model_api_runtime.v2 import scheduler
 
 
 class FakeDeps:
-    def __init__(self, users, decisions, *, raise_for=None):
+    def __init__(self, users, decisions, *, raise_for=None, consume_results=None):
         self._users = list(users)
         self._decisions = dict(decisions)
         self._raise_for = raise_for or set()
+        self._consume_results = dict(consume_results or {})
         self.enqueued = []
         self.advanced = []
+        self.consumed = []
 
     def due_users(self):
         return list(self._users)
@@ -27,6 +29,12 @@ class FakeDeps:
 
     def enqueue_heartbeat(self, user_id):
         self.enqueued.append(user_id)
+
+    def consume_heartbeat_tick(self, user_id, *, now, wake_interval_sec):
+        self.consumed.append((user_id, now, wake_interval_sec))
+        return self._consume_results.get(
+            user_id, (float(now) + int(wake_interval_sec), True)
+        )
 
     def advance_heartbeat(self, user_id, next_at_epoch):
         self.advanced.append((user_id, next_at_epoch))
@@ -41,6 +49,7 @@ def test_should_wake_true_enqueues_and_advances():
     result = scheduler.run_scheduler_tick(deps, now=now)
 
     assert deps.enqueued == ["u1"]
+    assert deps.consumed == [("u1", now, 900)]
     assert deps.advanced == [("u1", now + 900)]
     assert result == {"considered": 1, "enqueued": 1, "skipped": 0,
                       "scheduled_fired": 0, "extraction_enqueued": 0,
@@ -56,6 +65,7 @@ def test_zero_burn_blocked_does_not_enqueue_but_still_advances():
     result = scheduler.run_scheduler_tick(deps, now=now)
 
     assert deps.enqueued == []  # zero-burn: no job, no model call
+    assert deps.consumed == []
     assert deps.advanced == [("u2", now + 1800)]
     assert result == {"considered": 1, "enqueued": 0, "skipped": 1,
                       "scheduled_fired": 0, "extraction_enqueued": 0,
@@ -95,6 +105,44 @@ def test_final_runtime_mode_fence_blocks_enqueue_after_decision():
     assert deps.enqueued == []
     assert deps.advanced == []
     assert result["skipped"] == 1
+
+
+def test_losing_periodic_tick_cas_does_not_enqueue_and_uses_winner_clock():
+    deps = FakeDeps(
+        users=["raced"],
+        decisions={"raced": {
+            "should_wake": True,
+            "wake_interval_sec": 900,
+            "decision_at": 1000.25,
+            "block_reason": "",
+        }},
+        consume_results={"raced": (1900.0, False)},
+    )
+
+    result = scheduler.run_scheduler_tick(deps, now=9999.0)
+
+    assert deps.consumed == [("raced", 1000.25, 900)]
+    assert deps.enqueued == []
+    assert deps.advanced == [("raced", 1900.0)]
+    assert result["enqueued"] == 0
+    assert result["skipped"] == 1
+
+
+def test_decision_timestamp_drives_periodic_consumption_and_schedule():
+    deps = FakeDeps(
+        users=["u-decision-time"],
+        decisions={"u-decision-time": {
+            "should_wake": True,
+            "wake_interval_sec": 60,
+            "decision_at": 123.5,
+            "block_reason": "",
+        }},
+    )
+
+    scheduler.run_scheduler_tick(deps, now=9000.0)
+
+    assert deps.consumed == [("u-decision-time", 123.5, 60)]
+    assert deps.advanced == [("u-decision-time", 183.5)]
 
 
 def test_mixed_batch_two_wake_one_blocked():
@@ -247,6 +295,9 @@ def test_one_eligible_snapshot_filters_every_scheduler_lane():
         "should_wake": True, "wake_interval_sec": 60, "block_reason": "",
     }
     deps.enqueue_heartbeat = lambda uid: seen["heartbeat"].append(uid)
+    deps.consume_heartbeat_tick = lambda uid, **kw: (
+        float(kw["now"]) + int(kw["wake_interval_sec"]), True
+    )
     deps.advance_heartbeat = lambda uid, ts: None
     deps.extraction_users = lambda: ["resident", "v2"]
     deps.tick_extraction = lambda uid: seen["extract"].append(uid) or 1

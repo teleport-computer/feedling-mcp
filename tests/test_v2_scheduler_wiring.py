@@ -45,6 +45,56 @@ def test_advance_heartbeat_upserts_next_heartbeat_at(monkeypatch):
     assert calls == [("u1", {"next_heartbeat_at": 123.0})]
 
 
+def test_consume_heartbeat_tick_delegates_to_core_store(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        serve_worker.core_store,
+        "consume_proactive_heartbeat_tick",
+        lambda uid, **kw: calls.append((uid, kw)) or (456.0, True),
+    )
+
+    result = serve_worker._build_scheduler_deps().consume_heartbeat_tick(
+        "u1", now=123.0, wake_interval_sec=333
+    )
+
+    assert result == (456.0, True)
+    assert calls == [("u1", {"now": 123.0, "wake_interval_sec": 333})]
+
+
+def test_followup_marker_trace_has_source_successor_and_generation(monkeypatch):
+    traces = []
+    monkeypatch.setattr(
+        serve_worker,
+        "_emit_v2_debug_trace_for_user",
+        lambda uid, event, **kw: traces.append((uid, event, kw)),
+    )
+
+    serve_worker._emit_followup_marker_trace(
+        "u1",
+        "merged",
+        source_job_id=11,
+        generation=3,
+        successor_job_id=12,
+        moved_context_count=3,
+    )
+
+    assert traces == [(
+        "u1",
+        "agent.wake_followup.marker",
+        {
+            "status": "ok",
+            "job_id": "12",
+            "detail": {
+                "action": "merged",
+                "source_job_id": 11,
+                "generation": 3,
+                "moved_context_count": 3,
+                "successor_job_id": 12,
+            },
+        },
+    )]
+
+
 def test_due_users_delegates_to_due_heartbeat_users(monkeypatch):
     monkeypatch.setattr(jobs_store, "due_heartbeat_users", lambda: ["a", "b"])
 
