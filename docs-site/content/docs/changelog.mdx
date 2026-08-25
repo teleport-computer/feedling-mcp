@@ -161,6 +161,23 @@ change must not be interpreted as an API guarantee.
   tools, in addition to the identity writes already withheld. Reading memory,
   inspecting the screen, and replying are unchanged, as is foreground Chat with
   a shared screen, where the user's own message is present in the turn.
+- **Canvas cards now carry a model-authored title and subtitle.** Both resident
+  VPS delivery and Hosted Runtime V2 use the same bounded display metadata.
+  Every generated `.io.html` card includes both fields in the user's current
+  language; later revisions preserve them by default and may update them with
+  the Canvas content. The metadata commits atomically with the encrypted file,
+  while older cards without a subtitle remain readable.
+
+- **Local tool-capable resident HTTP agents can now deliver Canvas cards.** An
+  explicit `FEEDLING_AGENT_HTTP_LOCAL_IO_CLI=true` opt-in gives a same-machine
+  HTTP agent the existing `io_cli` file-delivery contract while generic HTTP
+  model servers remain unchanged. An explicit narrow workspace-root allowlist
+  lets `send-file` read the generated source without requiring the agent to
+  write outside its own workspace, and the original source is retained. Canvas output uses one self-contained
+  `.io.html` file capped at the iOS 256,000-byte limit, with no assumed native
+  bridge. Resident HTTP requests also honor `FEEDLING_AGENT_TURN_TIMEOUT_SEC`
+  instead of stopping at hard-coded 60- or 120-second limits.
+
 - **Independent resident screen turns now retain user-configured MCP tools in
   both foreground Chat and proactive lanes.** Under an explicit 2026-08-21
   trust-boundary decision, resident/CLI turns receiving pixels keep both

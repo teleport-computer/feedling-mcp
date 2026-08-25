@@ -1461,16 +1461,19 @@ def cmd_send_file(args):
     source_path = Path(raw_path)
     if not source_path.is_absolute():
         source_path = Path(_resident_ipc_home()) / "outbound-files" / source_path
-    reply = _resident_ipc_call(
-        "stage_file",
-        {"path": str(source_path), "name": str(args.name or "").strip()},
-    )
+    payload = {"path": str(source_path), "name": str(args.name or "").strip()}
+    if str(getattr(args, "title", "") or "").strip():
+        payload["file_display_title"] = str(args.title).strip()
+    if str(getattr(args, "subtitle", "") or "").strip():
+        payload["file_display_subtitle"] = str(args.subtitle).strip()
+    reply = _resident_ipc_call("stage_file", payload)
     if reply.get("ok"):
         _emit({"ok": True, **{key: value for key, value in reply.items() if key != "ok"}})
     exit_code = 2 if reply.get("error") in {
         "consumer_not_running",
         "no_active_chat_turn",
         "path_outside_outbound_dir",
+        "path_outside_allowed_file_roots",
     } else 1
     _emit({"ok": False, **{key: value for key, value in reply.items() if key != "ok"}}, exit_code)
 
@@ -2028,14 +2031,17 @@ def main():
         help="Stage a generated document for download in the current chat reply.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Write UTF-8 Markdown-like source under $FEEDLING_HOME/outbound-files, "
-            "then pass its path here. --name is the user-visible output name; "
+            "Pass UTF-8 Markdown-like source from $FEEDLING_HOME/outbound-files "
+            "or a local workspace explicitly trusted by the resident. --name is "
+            "the user-visible output name; "
             "Word (.docx) and PDF (.pdf) are rendered from the UTF-8 source.\n"
             f"{D3_SOURCING_RULE}"
         ),
     )
-    sf.add_argument("--path", required=True, help="UTF-8 source path inside the outbound-files directory")
+    sf.add_argument("--path", required=True, help="UTF-8 source path allowed by the resident")
     sf.add_argument("--name", required=True, help="download filename with the requested suffix")
+    sf.add_argument("--title", help="required short display title for .io.html Canvas files")
+    sf.add_argument("--subtitle", help="required one-line display subtitle for .io.html Canvas files")
     sf.set_defaults(func=cmd_send_file)
 
     si = sub.add_parser(

@@ -234,6 +234,24 @@ def test_file_message_with_caption(client, monkeypatch):
     assert m["content"] == "summarize this?"
 
 
+def test_canvas_file_exposes_display_metadata(client, monkeypatch):
+    _wire(monkeypatch, [
+        {"id": "canvas1", "role": "openclaw", "ts": 1.0, "v": 1,
+         "content_type": "file", "K_enclave": "x", "body_ct": "x",
+         "nonce": "x", "owner_user_id": "usr_a", "file_mime": "text/html",
+         "file_name": "接星星.io.html", "file_display_title": "接星星",
+         "file_display_subtitle": "六十秒接星星小游戏"},
+    ])
+    monkeypatch.setattr(envmod, "decrypt_envelope", lambda *_args: b"<html></html>")
+
+    message = client.get(
+        "/v1/chat/history", headers={"X-API-Key": "k"}
+    ).get_json()["messages"][0]
+
+    assert message["file_display_title"] == "接星星"
+    assert message["file_display_subtitle"] == "六十秒接星星小游戏"
+
+
 def test_file_message_without_caption(client, monkeypatch):
     _wire(monkeypatch, [
         {"id": "f2", "role": "user", "ts": 1.0, "v": 1, "content_type": "file",

@@ -72,6 +72,7 @@ from capabilities import history as cap_history
 from capabilities import registry as cap_registry
 from capabilities import result_budget as cap_result_budget
 from capabilities import tool_schema as cap_tool_schema
+from chat import file_display as chat_file_display
 from chat.reply_language import (
     garden_language_decision,
     infer_garden_language,
@@ -6497,6 +6498,8 @@ class WorkspaceFileReply:
     name: str
     mime_type: str
     data: bytes
+    display_title: str = ""
+    display_subtitle: str = ""
 
 
 @dataclass(frozen=True)
@@ -6557,7 +6560,12 @@ def _workspace_file_mime(name: str, declared: str = "") -> str:
     return known.get(suffix) or mimetypes.guess_type(name)[0] or "text/plain"
 
 
-def _workspace_file_reply_from_result(result: dict) -> WorkspaceFileReply:
+def _workspace_file_reply_from_result(
+    result: dict,
+    *,
+    title: str = "",
+    subtitle: str = "",
+) -> WorkspaceFileReply:
     """Validate assembly output before any model-selected file is published."""
     if not isinstance(result, dict):
         raise RuntimeError("workspace file loader returned invalid data")
@@ -6568,6 +6576,14 @@ def _workspace_file_reply_from_result(result: dict) -> WorkspaceFileReply:
     if not isinstance(content, str):
         raise ValueError("send_file requires UTF-8 workspace source content")
     name = _safe_download_name(path)
+    display_extra = chat_file_display.metadata_from_payload(
+        {
+            **({"file_display_title": title} if title else {}),
+            **({"file_display_subtitle": subtitle} if subtitle else {}),
+        },
+        filename=name,
+        require_canvas_pair=True,
+    )
     maximum_bytes = (
         cap_tool_schema.SHARED_WORK_MAX_BYTES
         if name.casefold().endswith(".io.html")
@@ -6591,6 +6607,8 @@ def _workspace_file_reply_from_result(result: dict) -> WorkspaceFileReply:
         name=name,
         mime_type=mime_type,
         data=data,
+        display_title=display_extra.get("file_display_title", ""),
+        display_subtitle=display_extra.get("file_display_subtitle", ""),
     )
 
 
@@ -7053,6 +7071,14 @@ def _build_encrypted_file_reply_effect_payload(
             "file_name": file_reply.name,
             "file_mime": file_reply.mime_type,
             "file_byte_count": len(file_reply.data),
+            **(
+                {
+                    "file_display_title": file_reply.display_title,
+                    "file_display_subtitle": file_reply.display_subtitle,
+                }
+                if file_reply.display_title and file_reply.display_subtitle
+                else {}
+            ),
         },
     }
 
@@ -14838,7 +14864,13 @@ async def process_job(
             "ts": float(cursor_ts),
         }
 
-        async def _on_file_reply(path: str, revision: int) -> None:
+        async def _on_file_reply(
+            path: str,
+            revision: int,
+            *,
+            title: str = "",
+            subtitle: str = "",
+        ) -> None:
             if deps.load_workspace_file is None:
                 raise RuntimeError("workspace file delivery is unavailable")
             loaded = await asyncio.to_thread(
@@ -14849,7 +14881,10 @@ async def process_job(
                 expected_revision=revision,
             )
             file_reply = await asyncio.to_thread(
-                _workspace_file_reply_from_result, loaded
+                _workspace_file_reply_from_result,
+                loaded,
+                title=title,
+                subtitle=subtitle,
             )
             if not seq_native:
                 await _on_reply(file_reply, final=False)

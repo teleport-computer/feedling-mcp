@@ -9941,6 +9941,16 @@
             "type": "string",
             "maxLength": 120
           },
+          "file_display_title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "file_display_subtitle": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160
+          },
           "file_mime": {
             "type": "string"
           }
@@ -10526,6 +10536,18 @@
           "file_name": {
             "type": "string"
           },
+          "file_display_title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120,
+            "description": "Optional Canvas card title. Valid only for .html/.io.html files."
+          },
+          "file_display_subtitle": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160,
+            "description": "Optional one-line Canvas card subtitle. Valid only for .html/.io.html files."
+          },
           "file_mime": {
             "type": "string"
           },
@@ -10564,6 +10586,18 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 120
+          },
+          "file_display_title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120,
+            "description": "Required together with file_display_subtitle for .io.html Canvas delivery."
+          },
+          "file_display_subtitle": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160,
+            "description": "Required together with file_display_title for .io.html Canvas delivery."
           },
           "file_mime": {
             "type": "string",

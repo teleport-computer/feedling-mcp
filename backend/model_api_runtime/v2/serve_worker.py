@@ -68,6 +68,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from accounts import registry as accounts_registry  # noqa: E402
+from chat import file_display as chat_file_display  # noqa: E402
 from admin import admin_core
 from capabilities import registry as cap_registry
 from capabilities import identity as cap_identity
@@ -567,6 +568,14 @@ def _file_row(m, *, mid, ts, role, token) -> dict:
         token=token,
         fallback=f"[file: {name}]",
     )
+    display_title = str(m.get("file_display_title") or "").strip()
+    display_subtitle = str(m.get("file_display_subtitle") or "").strip()
+    if display_title or display_subtitle:
+        text += (
+            "\n[Canvas display metadata — preserve unless the user asks to change it:"
+            f" title={json.dumps(display_title, ensure_ascii=False)},"
+            f" subtitle={json.dumps(display_subtitle, ensure_ascii=False)}]"
+        )
     return {
         "id": mid,
         "ts": ts,
@@ -574,6 +583,8 @@ def _file_row(m, *, mid, ts, role, token) -> dict:
         "content": text,
         "has_file": True,
         "file_name": name,
+        "file_display_title": m.get("file_display_title"),
+        "file_display_subtitle": m.get("file_display_subtitle"),
         "file_mime": m.get("file_mime") or "application/octet-stream",
     }
 
@@ -3423,12 +3434,18 @@ def _reply_message_fields(payload: dict) -> tuple[str, dict]:
             "image_mime": mime_type,
             "image_byte_count": byte_count,
         }
-    if content_type != "file" or set(raw) != {
+    required_file_fields = {
         "content_type",
         "file_name",
         "file_mime",
         "file_byte_count",
-    }:
+    }
+    optional_file_fields = {"file_display_title", "file_display_subtitle"}
+    if (
+        content_type != "file"
+        or not required_file_fields.issubset(raw)
+        or not set(raw).issubset(required_file_fields | optional_file_fields)
+    ):
         raise RuntimeError("unsupported reply content type")
     name = v2_worker._safe_download_name(
         "/workspace/" + str(raw.get("file_name") or "")
@@ -3454,10 +3471,19 @@ def _reply_message_fields(payload: dict) -> tuple[str, dict]:
         or byte_count > maximum_file_bytes
     ):
         raise RuntimeError("invalid reply file size")
+    try:
+        display_extra = chat_file_display.metadata_from_payload(
+            raw,
+            filename=name,
+            require_canvas_pair=True,
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
     return "file", {
         "file_name": name,
         "file_mime": mime_type,
         "file_byte_count": byte_count,
+        **display_extra,
     }
 
 

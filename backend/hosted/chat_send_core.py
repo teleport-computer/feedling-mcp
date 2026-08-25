@@ -309,6 +309,9 @@ def model_api_chat_send_core(
     if has_file:
         extra["file_name"] = file_parse["name"]
         extra["file_mime"] = file_parse["mime"]
+        for key in ("file_display_title", "file_display_subtitle"):
+            if file_parse.get(key):
+                extra[key] = file_parse[key]
         if message:
             cap_env, cap_err = core_envelope._build_shared_envelope_for_store(
                 store, message.encode("utf-8")
@@ -535,6 +538,9 @@ def _send_resident(
     if has_file:
         extra["file_name"] = file_parse["name"]
         extra["file_mime"] = file_parse["mime"]
+        for key in ("file_display_title", "file_display_subtitle"):
+            if file_parse.get(key):
+                extra[key] = file_parse[key]
         if message:
             cap_env, cap_err = core_envelope._build_shared_envelope_for_store(
                 store, message.encode("utf-8")
