@@ -1,4 +1,4 @@
-"""Bounded plaintext display metadata for Canvas file messages."""
+"""Bounded Canvas labels stored beside the encrypted attachment for clients."""
 
 from __future__ import annotations
 
