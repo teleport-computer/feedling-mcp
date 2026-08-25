@@ -32,6 +32,7 @@ from urllib.parse import parse_qs, quote, urlencode
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from psycopg.errors import QueryCanceled
 
 import db
 from admin import admin_core
@@ -39,10 +40,13 @@ from admin import memory_metadata
 from admin import tee_replication as admin_tee_replication
 from admin import plaintext_shadow as admin_plaintext_shadow
 from asgi import threadpool
+from asgi import responses
 from asgi.http import read_json_silent
 from model_api_runtime.v2 import jobs_store
 
 router = APIRouter()
+
+DEBUG_TRACE_REQUEST_TIMEOUT_SEC = 3.0
 
 _ADMIN_SESSION_COOKIE = "admin_session"
 _ADMIN_SESSION_MAX_AGE = 7 * 24 * 60 * 60
@@ -211,7 +215,14 @@ async def data_track_growth(request: Request):
 @router.get("/v1/admin/data-track/debug")
 async def data_track_debug(request: Request):
     _require_admin(request)
-    payload = await threadpool.run_db(admin_core.debug_payload, request.url.query)
+    try:
+        payload = await threadpool.run_db_bounded(
+            admin_core.debug_payload,
+            request.url.query,
+            timeout_seconds=DEBUG_TRACE_REQUEST_TIMEOUT_SEC,
+        )
+    except (TimeoutError, QueryCanceled):
+        return responses.json_error(503, {"error": "debug_query_timeout"})
     return JSONResponse(payload)
 
 
