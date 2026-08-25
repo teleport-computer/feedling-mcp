@@ -524,7 +524,7 @@ class ProviderEmptyReply(RuntimeError):
 
 
 class CanvasDeliveryIncomplete(RuntimeError):
-    """Canvas source was saved but its user-visible card was not delivered."""
+    """Canvas source was saved but its card still failed bounded delivery."""
 
 
 @dataclass(frozen=True)
