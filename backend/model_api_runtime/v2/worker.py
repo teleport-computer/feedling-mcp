@@ -594,7 +594,7 @@ def _new_direct_enclave_gate():
 
 
 def _reserved_lane_slots(max_workers: int, reserved: int | None = None) -> list:
-    """Per-slot lane allowlist（D3 Task 5：把 Task 2 的 claim lane-reservation 接进池编排）。
+    """Per-slot lane allowlist for the retained D3 wake-lane contract.
 
     前 `reserved` 个 slot 只允许抢 {"chat","manual_wake"}（一次 heartbeat/capture 唤醒风暴
     绝不会饿死聊天回复）；其余 slot 不设限（None＝任意 lane，含 heartbeat/capture/
@@ -908,7 +908,7 @@ _SUBAGENT_DISABLED_TOOLS = frozenset(
     if spec.name not in _SUBAGENT_ALLOWED_TOOLS
 )
 
-# D3 Task 6 (proactive/wake lanes): the scheduler (Task 4/9) enqueues jobs in
+# The retained D3 wake-lane contract: the scheduler enqueues jobs in
 # these three lanes when it decides the companion should reach out without the
 # user having spoken first. "capture" is intentionally NOT in this set — it's
 # a different capability shape (memory extraction, not a model-authored reply)
@@ -986,7 +986,7 @@ def _wake_system_prompt_for_lane(lane: str, base_prompt: str) -> str:
     return context._join_policy_blocks(*blocks)
 
 
-# D3 Task 7 (BYOK payment cooldown): a "provider_config" wake failure (402 out-of-credits,
+# Wake-lane BYOK payment cooldown: a "provider_config" failure (402 out-of-credits,
 # 401/403 bad key) means the user's BYOK key is dead/broke — retrying it every heartbeat
 # interval is a retry storm against a key that cannot succeed until the user fixes it
 # (mirrors the original resident runtime's 600s payment cooldown). We write
@@ -8254,7 +8254,7 @@ async def _run_wake(
     一体、自己的 try/except。heartbeat/manual_wake/screen_watch 是弱唤醒，失败继续静默；
     scheduled 是到点交付，最终失败通过 durable terminal outbox 写明确失败结果，不能无声消失。
 
-    D3 Task 8 (PR C spec C8)：跟 chat 分支（`process_job`，Task 7）一样跑同一个
+    Retained wake-lane accounting contract: 跟 chat 分支一样跑同一个
     `tool_loop.run_tool_loop`。`turn_authorization=True` 传给 `dispatch_tool_calls`（跟 chat
     传的值一样，语义是 wake_trigger 而不是 user——两者都在 `provenance.turn_has_write_
     authorization` 意义下"有资格授权写"）。跟 chat 分支的两点关键差异：
@@ -8267,7 +8267,7 @@ async def _run_wake(
 
     真 provider 错误（`chat_completion_async` 抛出的任何异常）：所有 lane 都
     `mark_failed`；只有 scheduled 同步排入用户可见失败 outbox。402/401/403 一类
-    "provider_config"错误（死/欠费 BYOK key）额外写一条 payment_cooldown（D3 Task 7），
+    "provider_config"错误（死/欠费 BYOK key）额外写一条 payment_cooldown，
     让 scheduler 的 `due_heartbeat_users` 停止对一把修不好的钥匙反复重试。
 
     prompt 组装：读 summary+tail（同 chat 路径的 D1 读法）；真实历史保留原 role，
@@ -12896,7 +12896,7 @@ async def process_job(
                 trajectory_recorder,
             )
         if lane in _WAKE_LANES:
-            # Self-contained wake path (D3 Task 6): proactive turn, not a reply to a
+            # Self-contained wake path: proactive turn, not a reply to a
             # just-sent user message. Own try/except inside `_run_wake` — never falls
             # into the chat-turn `except` below (that branch emits a user-visible
             # error status + record_terminal_error, which wake failures must not do).
@@ -16545,7 +16545,7 @@ async def run_worker_loop(
     wake_event（可选）由 serve_worker._serve 传入，桥 "v2_jobs" 即时唤醒（FIX 3）——
     未传（None）时所有 slot 退化为纯 poll，向后兼容既有调用方/测试。
 
-    lane 预留（D3 Task 5）：前几个 slot 只抢 {"chat","manual_wake"}（见 `_reserved_lane_slots`），
+    lane 预留：前几个 slot 只抢 {"chat","manual_wake"}（见 `_reserved_lane_slots`），
     保证 scheduler（Task 4）产出的 heartbeat 唤醒风暴抢不走全部 slot、饿死聊天回复，
     同时始终留一个 unrestricted slot，避免后台 lane 永久 pending。
     `FEEDLING_V2_CHAT_RESERVED_SLOTS` 显式设置时覆盖默认的 max(1, max_workers // 2)；

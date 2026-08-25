@@ -5107,13 +5107,13 @@ def build_production_deps() -> v2_worker.TurnDeps:
 
 
 def _build_scheduler_deps():
-    """装配 `model_api_runtime.v2.scheduler.run_scheduler_tick` 要的 deps（D3 Task 5）。
+    """装配 retained D3 wake-lane decision 的 scheduler deps。
     scheduler.py 是纯模块（不 import hosted/agent_runtime/proactive）——这里把它接到真实
     实现：due_heartbeat_users（Task 2 落的 v2_wake_schedule 表）、_wake_decision_for_user
     （Task 3 适配器，包一层 proactive_gate，读专用，本身不 enqueue）、enqueue_job("heartbeat")
     /upsert_wake_schedule(next_heartbeat_at=...)。
 
-    leader-election 有意跳过（见 D3 plan Task 5 说明）：`enqueue_job` 走
+    leader-election 有意跳过：`enqueue_job` 走
     ux_agent_jobs_singleflight 分区唯一索引，多个 serve_worker 进程的 scheduler tick
     并发对同一用户各自判定 should_wake 也只会各自 INSERT 一次、第二个撞唯一索引 coalesce
     成同一行——重复调度天然无害。prod 只跑一个 serve-worker 容器，这条不变量目前甚至用
@@ -5838,7 +5838,7 @@ async def _watchdog_loop(
 async def _scheduler_loop(
     stop_event: asyncio.Event, *, interval: float = _SCHEDULER_INTERVAL_SEC
 ) -> None:
-    """周期性跑一遍纯调度器（D3 Task 4 `scheduler.run_scheduler_tick`，Task 5 接线）：
+    """周期性运行 retained D3 wake-lane scheduler：
     对每个到期用户判定是否唤醒 heartbeat（经 `_wake_decision_for_user` 复用真实
     proactive gate），should_wake 就 enqueue_job("heartbeat")（single-flight 去重、
     走 Task 2 的 lane 优先级），无论如何都 advance_heartbeat 推进下次到期时间——

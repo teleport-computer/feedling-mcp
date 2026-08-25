@@ -1,7 +1,19 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # Runtime V2 单一确定性历史覆盖设计
 
+> **Current reconciliation (landed):** Commit `99d88b4a` removed the semantic
+> compaction path described as legacy below. `backend/model_api_runtime/v2/compaction.py`
+> now renders metadata-only count sentinels and never accepts plaintext or calls
+> a provider. Raw encrypted Chat rows remain the durable source ledger; exact
+> coverage/watermark/CAS provenance, the recent verbatim tail, and coverage-hole
+> safety remain current. Historical model-authored segments stay readable until
+> a metadata-only checkpoint supersedes them.
+
 **日期：** 2026-08-12  
-**状态：** 已获产品方向确认，待实施  
+**历史 authoring status：** 已获产品方向确认，待实施；现已按上方 reconciliation 落地。
 **范围：** Runtime V2 conversation compaction、部署配置、公开自托管文档
 
 ## 背景

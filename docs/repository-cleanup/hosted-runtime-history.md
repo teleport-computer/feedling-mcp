@@ -189,3 +189,42 @@ partial-supersession 链接保持可解析。生成的 lifecycle inventory 由�
 保留在原位的 [`HOSTED_RUNTIME_V2_PARITY_MATRIX.md`](../HOSTED_RUNTIME_V2_PARITY_MATRIX.md)
 现为 `historical` / `superseded`，其 owner/backlink 指向 `CURRENT_STATE.md`；它仍将该能力
 表述为 queue-wait/capacity telemetry，并明确 over-SLA 不会在持久化前返回 503 或拒绝。
+
+## 批次 6：D1 conversation context 与 D3 wake-lane 谱系
+
+审计日期：2026-08-25。结论：D1 的 design 与 implementation plan 都不再是当前
+semantic-history 契约；design 标为 `historical` / `superseded`，plan 标为
+`historical` / `implemented` 并移入 archive。2026-08-12 deterministic-only coverage
+设计已按 commit `99d88b4a` 落地，现为 retained `decision` / `canonical_owner: self`。
+D3 implementation plan 同样已实现并归档；D3 design 保留为 `decision`，但只保留
+V2-owned wake lane 的安全不变量，明确不再拥有 Resident 退役或共享 `N/R` slot 拓扑。
+
+| 原文档 | 状态与当前 owner | 实现 / 测试证据 | 兼容义务 | archive / retain 路径 |
+|---|---|---|---|---|
+| D1 full-conversation-context design | `historical` / `superseded`; deterministic-only coverage decision | `8166bbc4` 已为当前分支祖先；后续 `99d88b4a` 删除 semantic path；[`compaction.py`](../../backend/model_api_runtime/v2/compaction.py) 只渲染 metadata-only count sentinel；[`test_v2_deterministic_compaction.py`](../../tests/test_v2_deterministic_compaction.py)、[`test_v2_summary_frontier_unit.py`](../../tests/test_v2_summary_frontier_unit.py) 覆盖无 provider 的新写与 historical segment roll-up | 保留 raw encrypted Chat ledger、精确 seq/count coverage、watermark/CAS、recent verbatim tail 与 coverage-hole fail-safe；不得恢复 provider-authored conversation summary | retain as historical: [D1 design](../superpowers/specs/2026-07-09-hosted-runtime-v2-D1-full-conversation-context-design.md) |
+| D1 implementation plan | `historical` / `implemented`; deterministic-only coverage decision | `8166bbc4` 已实现其基础 context/summary path；其 append-and-merge provider instructions 已由 `99d88b4a` 取代 | 历史 checklist 不能授权读旧聊天正文或调用 provider 做 conversation compaction | [archive plan](../archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D1-full-conversation-context.md) |
+| deterministic-only coverage design | `decision`; self; landed | `2758001c` 记录 accepted design，`99d88b4a` 落地；[`worker.py`](../../backend/model_api_runtime/v2/worker.py) 的 maintenance/inline coverage 保留 CAS/requeue，且 [`compaction.py`](../../backend/model_api_runtime/v2/compaction.py) 无 plaintext/provider seam | 新 leaf/checkpoint 必须由 metadata 生成；历史 model-authored segment 可读但不会把语义正文带入新 checkpoint | retain: [decision](../superpowers/specs/2026-08-12-remove-v2-semantic-compaction-design.md) |
+| D3 proactive/wake-lanes design | `decision`; self; topology/coexistence 已委派 | `5fba0993` 已为当前分支祖先；[`scheduler.py`](../../backend/model_api_runtime/v2/scheduler.py) 保持 enqueue 前 gate，[`worker.py`](../../backend/model_api_runtime/v2/worker.py) 保持 wake 静默完成与 cooldown；[`test_v2_scheduler.py`](../../tests/test_v2_scheduler.py)、[`test_v2_wake_worker.py`](../../tests/test_v2_wake_worker.py) 覆盖 scheduler/wake contract | activation-before-enqueue、cooldown、no-filler、scheduled state machine 与 lane routing 保持；仅对 per-user fence 已切至 V2 的用户适用 | retain: [D3 decision](../superpowers/specs/2026-07-09-hosted-runtime-v2-D3-proactive-wake-lanes-design.md) |
+| D3 implementation plan | `historical` / `implemented`; D3 wake-lane decision | `5fba0993` 及现行 scheduler/wake tests 证明任务落地；运行时 docstrings 已改为指向 retained decision/直接契约 | 历史 shared reserved-slot instructions 不得恢复；pool routing 必须服从 three-pool decision，Resident/V2 共存必须服从 dual-runtime decision | [archive plan](../archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D3-proactive-wake-lanes.md) |
+
+### 批次 6 rationale transfer
+
+- D1 semantic compression 已由 deterministic-only coverage decision 接管并收窄：profile
+  MEMORY/USER 承担长期语义，conversation maintenance 只证明历史 coverage；任何新覆盖都不
+  解密或发送被覆盖的原始正文给 provider。
+- D3 的产品安全义务仍存在，但 current deployed contract 是 dual per-user runtime，不能将
+  V2 wake migration 当作关闭 `tools/chat_resident_consumer.py` 或 hosted Resident 的依据。
+  [`CURRENT_STATE.md`](../CURRENT_STATE.md) 仍是部署事实入口。
+- 原 D3 shared `N/R` reserved slots 已由
+  [three-pool decision](../superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md)
+  的 foreground/wake/heavy per-slot-process routing 接管；D3 不再作为 topology runbook。
+- 本批次只分类/移动 Markdown、更新 Markdown backlinks、生成 inventory，并迁移直接指向
+  archived plan 的 Python docstring/comment；未改变 runtime behavior、schema、compose、public
+  docs、test logic 或 `tools/chat_resident_consumer.py`。
+
+### 批次 6 引用检查
+
+原 D1/D3 plan 的精确路径和 basename 搜索只保留 archive records；D1 design 的
+`superseded_by` 与所有 historical canonical owners 都解析到 retained `decision`。生产 Python
+不再把 archived D3 implementation plan 当作任务依据：scheduler/wake 注释直接表达 retained
+decision 或当前契约。生成的 lifecycle inventory 由检查器重建，而非作为手工调用者。

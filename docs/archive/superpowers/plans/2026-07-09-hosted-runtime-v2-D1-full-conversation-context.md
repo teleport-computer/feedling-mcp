@@ -1,7 +1,21 @@
-# Hosted Runtime V2 — Full-Conversation Context (condition 2) Implementation Plan
+---
+document_lifecycle: historical
+historical_reason: implemented
+canonical_owner: docs/superpowers/specs/2026-08-12-remove-v2-semantic-compaction-design.md
+---
+# Hosted Runtime V2 — Full-Conversation Context Historical implementation record
+
+> **Historical record:** This plan's task steps landed. It is retained for
+> traceability only and is not operating documentation. The deterministic-only
+> coverage decision owns the current history contract; this plan's
+> provider-authored semantic-compaction instructions must not be executed.
+
+> **Historical authoring note:** The agentic-worker workflow and every checkbox
+> below are preserved evidence from the original execution period. Do not
+> execute them as a current plan.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development, **NO-COMMIT mode** (user commits at the end — never `git add`/`git commit`). Review each task via filesystem-snapshot diff. Steps use `- [ ]`.
-> **Spec:** `docs/superpowers/specs/2026-07-09-hosted-runtime-v2-D1-full-conversation-context-design.md`.
+> **Historical source spec:** [`D1 historical design`](../../../superpowers/specs/2026-07-09-hosted-runtime-v2-D1-full-conversation-context-design.md).
 
 **Goal:** The V2 chat turn shows the model the WHOLE conversation (encrypted itemized summary + verbatim recent tail), not just unreplied messages — so hosted 小克 stops forgetting — with a maintenance-lane compaction job keeping it bounded.
 

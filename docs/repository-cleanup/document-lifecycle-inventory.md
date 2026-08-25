@@ -10,8 +10,8 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 | Lifecycle | Classified documents |
 |---|---:|
 | `current` | 15 |
-| `decision` | 7 |
-| `historical` | 19 |
+| `decision` | 9 |
+| `historical` | 22 |
 | `generated` | 1 |
 
 ## current
@@ -35,11 +35,13 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 ## decision
 
 - `docs/superpowers/specs/2026-07-09-hosted-runtime-v2-D-admission-ceiling-design.md`
+- `docs/superpowers/specs/2026-07-09-hosted-runtime-v2-D3-proactive-wake-lanes-design.md`
 - `docs/superpowers/specs/2026-07-12-hosted-runtime-v2-PR-A-effect-foundation-design.md`
 - `docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-B-provider-transport-telemetry-design.md`
 - `docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop-design.md`
 - `docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md`
 - `docs/superpowers/specs/2026-07-21-dual-runtime-v1-v2-coexistence-design.md`
+- `docs/superpowers/specs/2026-08-12-remove-v2-semantic-compaction-design.md`
 - `docs/superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md`
 
 ## historical
@@ -49,6 +51,8 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/archive/superpowers/plans/2026-07-08-hosted-runtime-v2-C-action-queue-planner.md`
 - `docs/archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D-admission-ceiling.md`
 - `docs/archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D0-rollout-infrastructure.md`
+- `docs/archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D1-full-conversation-context.md`
+- `docs/archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D3-proactive-wake-lanes.md`
 - `docs/archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D4-loadtest-rollout-killresident.md`
 - `docs/archive/superpowers/plans/2026-07-10-hosted-runtime-v2-agent-loop.md`
 - `docs/archive/superpowers/plans/2026-07-12-hosted-runtime-v2-PR-A-effect-foundation.md`
@@ -62,6 +66,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/repository-cleanup/baseline.md`
 - `docs/superpowers/plans/2026-07-09-hosted-runtime-v2-merge-conditions-backlog.md`
 - `docs/superpowers/plans/2026-08-01-branch-promotion-guard.md`
+- `docs/superpowers/specs/2026-07-09-hosted-runtime-v2-D1-full-conversation-context-design.md`
 - `docs/superpowers/specs/2026-07-10-hosted-runtime-v2-agent-loop-design.md`
 
 ## generated

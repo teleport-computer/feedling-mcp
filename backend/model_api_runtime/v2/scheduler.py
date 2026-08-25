@@ -1,4 +1,4 @@
-"""V2 proactive scheduler tick (Task 4 of D3 proactive wake lanes plan).
+"""V2 proactive scheduler tick for the retained D3 wake-lane decision.
 
 Pure module: every side effect (which users are due, the wake decision,
 enqueueing a heartbeat job, advancing the schedule) is injected via a
