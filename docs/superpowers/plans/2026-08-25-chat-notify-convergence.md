@@ -254,7 +254,6 @@ git commit -m "refactor(chat): route non-chat state through wake-only"
 - Modify: `tests/test_model_api_path.py`
 - Modify: `tests/test_agent_runtime_supervisor.py`
 - Modify: `tests/test_chat_change_events.py`
-- Add: `tests/test_chat_notify_contract.py`
 
 ### Step 1: 写 DB v2 唯一 mutation 广播契约
 
@@ -266,24 +265,7 @@ assert payload == {
 }
 ```
 
-确认 rollback 不产生 committed effect。
-
-新建静态守卫 `tests/test_chat_notify_contract.py`：
-
-```python
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-
-def test_application_code_does_not_emit_legacy_chat_notifications():
-    offenders = []
-    for path in (ROOT / "backend").rglob("*.py"):
-        if path.name == "wake_bus.py":
-            continue
-        if 'wake_bus.notify("chat"' in path.read_text(encoding="utf-8"):
-            offenders.append(str(path.relative_to(ROOT)))
-    assert offenders == []
-```
+确认 rollback 不产生 committed effect。再通过真实 `UserStore.append_chat(strict=True)` 写入一行，并在同一 LISTEN 连接上收集通知：断言只有一条 DB v2 payload，且等待额外 200ms 后没有第二条 legacy payload。这个行为测试会在任一 mutation 路径重新加入应用层 `notify("chat")` 时捕获重复广播。
 
 ### Step 2: 更新业务测试预期
 
@@ -297,12 +279,12 @@ Run:
 DATABASE_URL='postgresql://postgres:test@127.0.0.1:55432/postgres' \
 FEEDLING_TEST_PG='postgresql://postgres:test@127.0.0.1:55432/postgres' \
 /Users/zhengzhihao/Projects/teleport/feedling-mcp/.venv-test/bin/python -m pytest \
-  tests/test_chat_notify_contract.py tests/test_chat_change_events.py \
+  tests/test_chat_change_events.py \
   tests/test_chat_idempotency_unit.py tests/test_chat_response_finalize_cas.py \
   tests/test_model_api_path.py tests/test_agent_runtime_supervisor.py -q
 ```
 
-Expected: 静态守卫列出 11 个旧调用；无 legacy notify 断言失败。
+Expected: high-level append 的 exact-one-notification 测试收到 v2 和 legacy 两条通知并失败；更新后的无 legacy notify 断言失败。
 
 ### Step 4: 删除精确 11 个调用
 
@@ -331,7 +313,7 @@ Run:
 DATABASE_URL='postgresql://postgres:test@127.0.0.1:55432/postgres' \
 FEEDLING_TEST_PG='postgresql://postgres:test@127.0.0.1:55432/postgres' \
 /Users/zhengzhihao/Projects/teleport/feedling-mcp/.venv-test/bin/python -m pytest \
-  tests/test_chat_notify_contract.py tests/test_chat_change_events.py \
+  tests/test_chat_change_events.py \
   tests/test_chat_idempotency_unit.py tests/test_chat_response_finalize_cas.py \
   tests/test_model_api_path.py tests/test_agent_runtime_supervisor.py \
   tests/test_voice_revision_latest_wins.py -q
@@ -496,7 +478,7 @@ FEEDLING_TEST_PG='postgresql://postgres:test@127.0.0.1:55432/postgres' \
 /Users/zhengzhihao/Projects/teleport/feedling-mcp/.venv-test/bin/python -m pytest \
   tests/test_wake_bus.py tests/test_chat_incremental_sync.py \
   tests/test_chat_poll_cross_worker_staleness.py tests/test_chat_change_events.py \
-  tests/test_chat_notify_contract.py tests/test_chat_turn_activity_v2.py \
+  tests/test_chat_turn_activity_v2.py \
   tests/test_user_mcp_core.py tests/test_vision_model_v2.py \
   tests/test_v2_jobs_store.py tests/test_chat_idempotency_unit.py \
   tests/test_chat_response_finalize_cas.py tests/test_model_api_path.py \
