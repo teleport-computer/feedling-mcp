@@ -521,7 +521,9 @@ def test_mark_expired_retained_helper_also_queues_chat_visibility():
     assert marker == ("queue_timeout",)
 
 
-def test_mark_failed_crash_window_has_durable_visibility_marker_and_replays_once():
+def test_mark_failed_crash_window_has_durable_visibility_marker_and_replays_once(
+    monkeypatch,
+):
     """Simulate death immediately after terminalization by doing no inline
     surfacing.  A later reconciler must find both obligations, and replaying it
     again must not duplicate either the status event or the idempotent callback.
@@ -547,6 +549,12 @@ def test_mark_failed_crash_window_has_durable_visibility_marker_and_replays_once
     assert marker == (uid, "turn_failed:runtimeerror", None, None)
 
     recorded = []
+    wakes = []
+    monkeypatch.setattr(
+        wake_bus,
+        "notify_chat_wake_only",
+        lambda user_id: wakes.append(user_id),
+    )
     first = jobs_store.reconcile_terminal_failure_outbox(
         record_terminal_error=lambda user_id, code: recorded.append((user_id, code)),
         job_id=job_id,
@@ -569,6 +577,7 @@ def test_mark_failed_crash_window_has_durable_visibility_marker_and_replays_once
         "reply_delivered": 0,
     }
     assert recorded == [(uid, "turn_failed:runtimeerror")]
+    assert wakes == [uid]
     errors = [
         event
         for event in jobs_store.list_status_events(uid, after_id=0)
@@ -1562,7 +1571,7 @@ def test_status_events_append_and_list_by_cursor():
     assert events[0]["id"] == id2
 
 
-def test_append_status_event_fires_cross_process_chat_wake(monkeypatch):
+def test_append_status_event_fires_typed_chat_wake(monkeypatch):
     """FIX 2 (§9): the V2 worker writes status events from a separate process than
     the web tier holding the parked chat long-poll. append_status_event must fire
     a cross-process wake on the "chat" channel after the INSERT commits, so the
@@ -1573,10 +1582,10 @@ def test_append_status_event_fires_cross_process_chat_wake(monkeypatch):
         conn.execute("DELETE FROM agent_status_events WHERE user_id='u_js_9d'")
     calls = []
     monkeypatch.setattr(
-        wake_bus, "notify", lambda channel, user_id="": calls.append((channel, user_id))
+        wake_bus, "notify_chat_wake_only", lambda user_id: calls.append(user_id)
     )
     event_id = jobs_store.append_status_event("u_js_9d", "processing", label="starting")
-    assert calls == [("chat", "u_js_9d")]
+    assert calls == ["u_js_9d"]
     # The notify is additive/best-effort — the status row itself must still land.
     events = jobs_store.list_status_events("u_js_9d", after_id=0)
     assert [e["id"] for e in events] == [event_id]

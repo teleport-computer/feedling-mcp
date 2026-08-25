@@ -3910,7 +3910,7 @@ def _deliver_terminal_failure_status(
                 delivered = True
     if delivered:
         try:
-            wake_bus.notify("chat", user_id)
+            wake_bus.notify_chat_wake_only(user_id)
         except Exception:  # noqa: BLE001 — poll timeout remains the fallback
             pass
     return delivered
@@ -4813,7 +4813,7 @@ def append_status_event(
                 )
                 event_id = int(cur.fetchone()["id"])
     try:
-        wake_bus.notify("chat", user_id)
+        wake_bus.notify_chat_wake_only(user_id)
     except Exception:  # noqa: BLE001 — best-effort; the INSERT already committed
         pass
     return event_id
