@@ -533,16 +533,12 @@ def test_recovery_turn_can_deliver_attached_existing_canvas_without_rewriting(
                         "revision": 7,
                         "title": "霓虹砖块",
                         "subtitle": "击碎砖块并刷新最高分",
+                        "completion_message": "标题和副标题已经更新。",
                     },
                 }],
                 "usage": {},
             }
-        assert tools is None
-        return {
-            "reply": "标题和副标题已经更新。",
-            "tool_calls": [],
-            "usage": {},
-        }
+        raise AssertionError("Canvas delivery must not require another provider call")
 
     monkeypatch.setattr(
         worker.core_envelope,
@@ -575,7 +571,7 @@ def test_recovery_turn_can_deliver_attached_existing_canvas_without_rewriting(
     ) == "completed"
 
     assert applied == [old_effect]
-    assert len(provider_calls) == 2
+    assert len(provider_calls) == 1
     with db.get_pool().connection() as conn:
         file_rows = conn.execute(
             "SELECT doc FROM chat_messages WHERE user_id=%s "
