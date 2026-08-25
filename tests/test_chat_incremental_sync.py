@@ -193,6 +193,74 @@ def test_strict_snapshot_retries_if_local_commit_lands_during_db_read(monkeypatc
     assert store.chat_version == 2
 
 
+def test_strict_snapshot_serializes_final_attempt_after_repeated_local_commits(
+    monkeypatch,
+):
+    store = _bare_store([_row("old", 1)], version=1)
+    calls = []
+
+    def snapshot(_uid, _limit):
+        calls.append(len(calls) + 1)
+        if len(calls) == 1:
+            assert store.chat_lock.locked() is False
+            store.apply_committed_chat_rows([_row("local-a", 2)])
+            return 1, [_row("old", 1)]
+        if len(calls) == 2:
+            assert store.chat_lock.locked() is False
+            store.apply_committed_chat_rows([_row("local-b", 3)])
+            return 2, [_row("old", 1), _row("local-a", 2)]
+        assert store.chat_lock.locked() is True
+        return 3, [
+            _row("old", 1),
+            _row("local-a", 2),
+            _row("local-b", 3),
+        ]
+
+    monkeypatch.setattr(
+        core_store.db, "chat_load_hot_snapshot_strict", snapshot
+    )
+
+    rows = store.reload_chat_hot_strict()
+
+    assert calls == [1, 2, 3]
+    assert [row["id"] for row in rows] == ["old", "local-a", "local-b"]
+    assert store.chat_version == 3
+    assert store.chat_max_seq == 3
+    assert set(store._chat_messages_by_id) == {"old", "local-a", "local-b"}
+
+
+def test_strict_snapshot_locked_fallback_failure_preserves_last_good_cache(
+    monkeypatch,
+):
+    store = _bare_store([_row("kept", 1)], version=1)
+    calls = []
+
+    def snapshot(_uid, _limit):
+        calls.append(len(calls) + 1)
+        if len(calls) <= 2:
+            store.apply_committed_chat_rows([
+                _row(f"local-{len(calls)}", len(calls) + 1)
+            ])
+            return 1, [_row("kept", 1)]
+        assert store.chat_lock.locked() is True
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(
+        core_store.db, "chat_load_hot_snapshot_strict", snapshot
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        store.reload_chat_hot_strict()
+
+    assert calls == [1, 2, 3]
+    assert [row["id"] for row in store.chat_messages] == [
+        "kept",
+        "local-1",
+        "local-2",
+    ]
+    assert store.chat_version == 1
+
+
 def test_failed_incremental_sync_does_not_wake_or_mutate(monkeypatch):
     store = _bare_store([_row("kept", 1)], version=1)
     wakes = []
