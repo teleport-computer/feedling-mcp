@@ -61,11 +61,12 @@ decision 或部署说明。
 | 2026-08-10 new Model API users default to Runtime V2 implementation plan | `historical` / `implemented`；[cohort design](../superpowers/specs/2026-08-10-new-model-api-users-default-v2-design.md) | 归档前精确路径和 basename 搜索仅命中本次未提交 batch plan 的归档步骤；没有生产代码、部署配置或 current runbook 消费该 plan | PR #177；`e67c3c68` 增加 cohort persistence primitives，`155d98cd` 增加 policy，`3acb27c8` 要求已测试 route，`5347ade4` 接入 Model API setup，`05223b8f` 持久化用户选择的 resident pin，`5b8fee70` 收紧 ownership race | 保持全局 fail-safe `resident` 默认；只在成功测试且 active 的 Model API route 后 admission；人工及用户路线 pin 高于自动 cohort；setup 与既有 fence/generation/reconciler 收敛；停止 admission 使用 cutoff，回滚仅处理自动 cohort 行 | [archive plan](../archive/superpowers/plans/2026-08-10-new-model-api-users-default-v2.md) |
 
 当前行为由 [`CURRENT_STATE.md`](../CURRENT_STATE.md)、[`HOSTED_RUNTIME_V2_ADDING_USERS.md`](../HOSTED_RUNTIME_V2_ADDING_USERS.md)、[`DEPLOYMENTS.md`](../../deploy/DEPLOYMENTS.md)、
-[`architecture.mdx`](../../docs-site/content/docs/architecture.mdx) 与
-[`changelog.mdx`](../../docs-site/content/docs/changelog.mdx)、主 compose 和实现代码共同拥有：
+[`architecture.mdx`](../../docs-site/content/docs/architecture.mdx)、
+[`workflows/chat.mdx`](../../docs-site/content/docs/workflows/chat.mdx)、主 compose 和实现代码共同拥有；
+[`changelog.mdx`](../../docs-site/content/docs/changelog.mdx) 保留交付历史：
 `FEEDLING_V2_NEW_USER_CUTOFF` 缺失、为空或非法时保持 resident；`updated_by !=
 'new-user-cohort'` 的人工或用户路线记录是更高优先级的显式 pin；自动 cohort 记录通过现有
-setup/fence 路径收敛。回滚时清空或前移 cutoff 以停止新增 admission，
+setup/fence 路径收敛。回滚时清空 cutoff 或将其移至未来以停止新增 admission，
 对已自动纳入的账号只将 `updated_by='new-user-cohort' AND desired='v2'` 改为
 `desired='resident'`，不影响人工 pin。
 
