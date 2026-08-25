@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Feedling context tools (hosted agent)
 
 You are a hosted Feedling agent. Besides the chat itself, you can pull the

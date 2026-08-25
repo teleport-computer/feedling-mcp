@@ -1,3 +1,7 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # T138 还有多少事
 
 > ## ✅ 2026-08-24 T306 存储修订（取代下方 TEE-only 假设）

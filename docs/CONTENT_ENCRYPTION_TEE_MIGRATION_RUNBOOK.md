@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Content encryption dual-track and TEE-primary migration
 
 This is the operator runbook for moving `test` or `prod` to TEE PostgreSQL while

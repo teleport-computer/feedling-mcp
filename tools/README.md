@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # tools/
 
 Operator-facing utilities for Feedling. Each entry is independent — none
