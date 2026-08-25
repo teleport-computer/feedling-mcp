@@ -8,6 +8,7 @@ Step-5 integration concern.
 Run:  python -m pytest tests/test_wake_bus.py -q
 """
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -19,6 +20,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from core import wake_bus
+
+
+def test_chat_sync_telemetry_is_info_enabled_in_backend_runtime():
+    assert wake_bus.log.isEnabledFor(logging.INFO)
 
 
 def _reset_handlers():

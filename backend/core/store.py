@@ -23,6 +23,9 @@ from core import envelope as core_envelope
 from core import wake_bus
 
 log = logging.getLogger("feedling.chat_sync")
+# Snapshot-fallback records are fixed-enum, content-free rollout telemetry.
+# Keep the global backend threshold unchanged and opt in only this logger.
+log.setLevel(logging.INFO)
 
 MAX_FRAMES = 200
 # Per-process hot chat window per user. The PostgreSQL ``chat_messages`` table

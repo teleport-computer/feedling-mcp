@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import sys
 import os
@@ -15,6 +16,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from core import store as core_store
 import db
 from conftest import seed_user
+
+
+def test_snapshot_fallback_telemetry_is_info_enabled_in_backend_runtime():
+    assert core_store.log.isEnabledFor(logging.INFO)
 
 
 def _row(msg_id: str, seq: int, **extra) -> dict:
