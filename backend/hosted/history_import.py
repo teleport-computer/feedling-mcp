@@ -3075,14 +3075,10 @@ def _append_model_api_onboarding_greeting(store: UserStore, text: str) -> dict:
         _sync_ring_with_greeting(store, winner)
         if inserted:
             # New-message side effects for the actual inserter only (parity
-            # with append_chat's chokepoint: local waiters, cross-worker wake,
-            # capture cadence). A loser adds no new content — sync only.
+            # with append_chat's chokepoint: local waiters and capture cadence.
+            # The committed INSERT's DB trigger owns cross-worker notification.
+            # A loser adds no new content — sync only.
             store.notify_chat_waiters()
-            try:
-                from core import wake_bus
-                wake_bus.notify("chat", store.user_id)
-            except Exception as e:  # noqa: BLE001
-                print(f"[history_import:{store.user_id}] greeting wake notify failed: {type(e).__name__}")
             try:
                 from proactive import capture_scheduler
                 capture_scheduler.record_chat_append(store, winner)

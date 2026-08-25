@@ -8,6 +8,8 @@ identity of ``_stores`` and ``UserStore`` instances matters: tests and the
 eviction path mutate them in place — never rebind them.
 """
 
+import hashlib
+import logging
 import os
 import threading
 import time
@@ -19,6 +21,8 @@ import db
 from core import config
 from core import envelope as core_envelope
 from core import wake_bus
+
+log = logging.getLogger("feedling.chat_sync")
 
 MAX_FRAMES = 200
 # Per-process hot chat window per user. The PostgreSQL ``chat_messages`` table
@@ -39,6 +43,13 @@ def _chat_hot_cache_limit() -> int:
 MAX_CHAT_MESSAGES = _chat_hot_cache_limit()
 _CHAT_SYNC_BATCH_MAX = 256
 _CHAT_VERSION_CHECK_INTERVAL_SEC = 1.0
+_CHAT_SNAPSHOT_FALLBACK_REASONS = frozenset({
+    "gap",
+    "reset",
+    "overflow",
+    "missing_row",
+    "generation_conflict",
+})
 PUSH_COOLDOWN_SECONDS = int(os.environ.get("FEEDLING_PUSH_COOLDOWN_SEC", 300))
 LIVE_ACTIVITY_DEDUPE_SEC = int(os.environ.get("FEEDLING_LIVE_ACTIVITY_DEDUPE_SEC", 900))
 LIVE_ACTIVITY_START_COOLDOWN_SEC = int(os.environ.get("FEEDLING_LIVE_ACTIVITY_START_COOLDOWN_SEC", 1800))
@@ -70,6 +81,21 @@ _HEARTBEAT_NEXT_TICK_CAS_ATTEMPTS = 4
 # outside a load) still broadcast. Thread-local so a load on one thread can't
 # mute a concurrent genuine write on another.
 _reload_guard = threading.local()
+
+
+def _chat_snapshot_fallback_telemetry(
+    *, user_id: str, reason: str, hot_rows: int
+) -> None:
+    """Emit content-free fixed-enum telemetry for incremental safety fallbacks."""
+    if reason not in _CHAT_SNAPSHOT_FALLBACK_REASONS:
+        raise ValueError("invalid chat snapshot fallback reason")
+    user_hash = hashlib.sha256(str(user_id).encode("utf-8")).hexdigest()[:16]
+    log.info(
+        "chat_sync_snapshot_fallback reason=%s user_hash=%s hot_rows=%d",
+        reason,
+        user_hash,
+        max(0, int(hot_rows)),
+    )
 
 
 def normalize_proactive_wake_interval_sec(value) -> int:
@@ -604,6 +630,11 @@ class UserStore:
 
                 changed = True
                 if current_version - base_version > _CHAT_SYNC_BATCH_MAX:
+                    _chat_snapshot_fallback_telemetry(
+                        user_id=self.user_id,
+                        reason="overflow",
+                        hot_rows=len(self.chat_messages),
+                    )
                     self.reload_chat_hot_strict()
                 else:
                     events = db.chat_change_events_after(
@@ -618,13 +649,21 @@ class UserStore:
                             continuous = False
                             break
                         expected += 1
+                    has_reset = any(
+                        event.get("operation") == "reset" for event in events
+                    )
                     if (
                         not continuous
                         or not events
                         or int(events[-1].get("version") or 0)
                         < current_version
-                        or any(event.get("operation") == "reset" for event in events)
+                        or has_reset
                     ):
+                        _chat_snapshot_fallback_telemetry(
+                            user_id=self.user_id,
+                            reason="reset" if has_reset else "gap",
+                            hot_rows=len(self.chat_messages),
+                        )
                         self.reload_chat_hot_strict()
                     else:
                         upsert_ids = list(dict.fromkeys(
@@ -642,6 +681,11 @@ class UserStore:
                             for row in upsert_rows
                         }
                         if any(msg_id not in rows_by_id for msg_id in upsert_ids):
+                            _chat_snapshot_fallback_telemetry(
+                                user_id=self.user_id,
+                                reason="missing_row",
+                                hot_rows=len(self.chat_messages),
+                            )
                             self.reload_chat_hot_strict()
                         else:
                             cache_changed = False
@@ -676,6 +720,11 @@ class UserStore:
                                         version=int(events[-1]["version"]),
                                     )
                             if cache_changed:
+                                _chat_snapshot_fallback_telemetry(
+                                    user_id=self.user_id,
+                                    reason="generation_conflict",
+                                    hot_rows=len(self.chat_messages),
+                                )
                                 self.reload_chat_hot_strict()
                 if changed:
                     self.notify_chat_waiters()
@@ -955,9 +1004,9 @@ class UserStore:
         values form the send-time ownership CAS. Optional ``client_msg_id`` and
         ``idempotency_window_sec`` preserve logical-send idempotency inside the
         same atomic transaction. `None` (the default) preserves
-        today's `chat_append_strict`/`chat_append` behavior byte-for-byte —
-        the in-memory cache append, trim, `wake_bus.notify`, and
-        Capture bookkeeping still runs after a genuine write. Exact Runtime V2
+        today's `chat_append_strict`/`chat_append` behavior for local cache,
+        trim, waiter, and Capture bookkeeping. Cross-worker notification comes
+        from the committed DB v2 trigger. Exact Runtime V2
         sends only refresh that state; their runner-owned scheduler is the sole
         capture producer and therefore never appends a legacy proactive job.
 
@@ -1250,7 +1299,6 @@ class UserStore:
                 replayed["_client_msg_replayed"] = True
                 return replayed
             return msg
-        wake_bus.notify("chat", self.user_id)
         try:
             from proactive import capture_scheduler
 
@@ -1292,7 +1340,6 @@ class UserStore:
             self._update_cached_chat_row_locked(parent_msg_id, parent_doc)
             self._apply_committed_chat_rows_locked([cached_reply])
 
-        wake_bus.notify("chat", self.user_id)
         try:
             from proactive import capture_scheduler
 
@@ -1360,7 +1407,6 @@ class UserStore:
             self._update_cached_chat_row_locked(parent_msg_id, parent_doc)
             self._apply_committed_chat_rows_locked(cached_docs)
 
-        wake_bus.notify("chat", self.user_id)
         try:
             from proactive import capture_scheduler
 
@@ -1410,7 +1456,6 @@ class UserStore:
         if not inserted:
             return winner, False
 
-        wake_bus.notify("chat", self.user_id)
         try:
             from proactive import capture_scheduler
 

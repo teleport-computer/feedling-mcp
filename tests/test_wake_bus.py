@@ -117,6 +117,38 @@ def test_notify_payload_shape(monkeypatch):
     assert captured["payload"] == {"u": "user-42", "c": "chat", "o": wake_bus.WORKER_ID}
 
 
+def test_notify_chat_wake_only_emits_exact_typed_payload(monkeypatch):
+    sent = []
+    monkeypatch.setenv("FEEDLING_WAKE_BUS_ENABLED", "1")
+    monkeypatch.setattr(wake_bus, "WORKER_ID", "worker-a")
+    monkeypatch.setattr(
+        wake_bus.db,
+        "pg_notify",
+        lambda channel, payload: sent.append((channel, payload)),
+    )
+
+    wake_bus.notify_chat_wake_only("u7")
+
+    assert sent == [(
+        wake_bus.PG_CHANNEL,
+        '{"c":"chat","u":"u7","o":"worker-a","w":1}',
+    )]
+
+
+def test_notify_chat_wake_only_disabled_is_noop(monkeypatch):
+    sent = []
+    monkeypatch.setenv("FEEDLING_WAKE_BUS_ENABLED", "0")
+    monkeypatch.setattr(
+        wake_bus.db,
+        "pg_notify",
+        lambda *args: sent.append(args),
+    )
+
+    wake_bus.notify_chat_wake_only("u7")
+
+    assert sent == []
+
+
 def test_forked_workers_get_distinct_identities():
     if not hasattr(os, "fork"):
         return
@@ -183,25 +215,143 @@ def test_dispatch_runs_injected_handler_for_other_worker(monkeypatch):
     _reset_handlers()
 
 
-def test_dispatch_legacy_chat_refreshes_only_chat(monkeypatch):
+def test_dispatch_wake_only_only_wakes_chat_waiters(monkeypatch):
     from core import store as core_store
 
     calls = []
 
     class Store:
+        chat_messages = []
+
+        def ensure_chat_fresh(self, **kwargs):
+            calls.append(("ensure", kwargs))
+            return True
+
         def reload_chat_hot_strict(self):
-            calls.append("chat")
+            calls.append("snapshot")
 
         def notify_chat_waiters(self):
             calls.append("chat_waiters")
 
     monkeypatch.setattr(core_store, "_stores", {"u7": Store()})
-    monkeypatch.setattr(core_store, "_evict_store", lambda _uid: calls.append("all"))
+    monkeypatch.setenv("FEEDLING_CHAT_SYNC_MODE", "incremental")
+
+    wake_bus._dispatch(json.dumps(
+        {"c": "chat", "u": "u7", "o": "OTHER", "w": 1}
+    ))
+
+    assert calls == ["chat_waiters"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"c": "chat", "u": "u7", "o": "OTHER", "w": True},
+        {"c": "chat", "u": "u7", "o": "OTHER", "w": 2},
+        {"c": "chat", "u": "u7", "o": "OTHER", "w": 1, "x": 1},
+        {"c": "chat", "u": "u7", "w": 1},
+    ],
+)
+def test_dispatch_rejects_malformed_wake_only_payload(monkeypatch, payload):
+    from core import store as core_store
+
+    calls = []
+
+    class Store:
+        chat_messages = []
+
+        def ensure_chat_fresh(self, **kwargs):
+            calls.append(("ensure", kwargs))
+            return True
+
+        def reload_chat_hot_strict(self):
+            calls.append("snapshot")
+
+        def notify_chat_waiters(self):
+            calls.append("chat_waiters")
+
+    monkeypatch.setattr(core_store, "_stores", {"u7": Store()})
+    monkeypatch.setenv("FEEDLING_CHAT_SYNC_MODE", "incremental")
+
+    wake_bus._dispatch(json.dumps(payload))
+
+    assert calls == []
+
+
+def test_dispatch_legacy_chat_in_incremental_mode_syncs_then_wakes(monkeypatch):
+    from core import store as core_store
+
+    calls = []
+
+    class Store:
+        chat_messages = []
+
+        def ensure_chat_fresh(self, **kwargs):
+            calls.append(("ensure", kwargs))
+            return True
+
+        def reload_chat_hot_strict(self):
+            calls.append("snapshot")
+
+        def notify_chat_waiters(self):
+            calls.append("chat_waiters")
+
+    monkeypatch.setattr(core_store, "_stores", {"u7": Store()})
     monkeypatch.setenv("FEEDLING_CHAT_SYNC_MODE", "incremental")
 
     wake_bus._dispatch(json.dumps({"u": "u7", "c": "chat", "o": "OTHER"}))
 
-    assert calls == ["chat", "chat_waiters"]
+    assert calls == [("ensure", {"force": True}), "chat_waiters"]
+
+
+def test_dispatch_legacy_chat_in_incremental_mode_wakes_when_sync_fails(
+    monkeypatch,
+):
+    from core import store as core_store
+
+    calls = []
+
+    class Store:
+        chat_messages = []
+
+        def ensure_chat_fresh(self, **kwargs):
+            calls.append(("ensure", kwargs))
+            return False
+
+        def reload_chat_hot_strict(self):
+            calls.append("snapshot")
+
+        def notify_chat_waiters(self):
+            calls.append("chat_waiters")
+
+    monkeypatch.setattr(core_store, "_stores", {"u7": Store()})
+    monkeypatch.setenv("FEEDLING_CHAT_SYNC_MODE", "incremental")
+
+    wake_bus._dispatch(json.dumps({"u": "u7", "c": "chat", "o": "OTHER"}))
+
+    assert calls == [("ensure", {"force": True}), "chat_waiters"]
+
+
+def test_dispatch_legacy_chat_in_legacy_mode_keeps_snapshot_behavior(monkeypatch):
+    from core import store as core_store
+
+    calls = []
+
+    class Store:
+        chat_messages = []
+
+        def reload_chat_hot_strict(self):
+            calls.append("snapshot")
+
+        def notify_chat_waiters(self):
+            calls.append("chat_waiters")
+
+    monkeypatch.setattr(core_store, "_stores", {"u7": Store()})
+    monkeypatch.setenv("FEEDLING_CHAT_SYNC_MODE", "legacy")
+
+    wake_bus._dispatch(json.dumps({"u": "u7", "c": "chat", "o": "OTHER"}))
+
+    assert calls == ["snapshot", "chat_waiters"]
 
 
 def test_dispatch_v2_chat_uses_target_version_without_origin(monkeypatch):
