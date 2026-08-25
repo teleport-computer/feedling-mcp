@@ -1396,16 +1396,21 @@ async def run_tool_loop(
         compact_delivery_phase = ""
         if compact_delivery_confirmation_needed:
             compact_delivery_phase = "confirm"
+            current_user_request = _latest_user_delivery_request()
             messages = [
                 {
                     "role": "system",
                     "content": (
                         "The work the user asked for was saved and delivered "
-                        "successfully. Finish this turn in your own voice with that "
-                        "fact available; the user can open the work now."
+                        "successfully. Finish this turn in your own voice, using the "
+                        "same language as the user's current request below, with "
+                        "that fact available; the user can open the work now."
                     ),
                 },
-                {"role": "user", "content": "Finish your response to me."},
+                {
+                    "role": "user",
+                    "content": current_user_request or "Finish your response to me.",
+                },
             ]
         elif (
             forced_delivery_tool == tool_schema.FILE_REPLY_TOOL

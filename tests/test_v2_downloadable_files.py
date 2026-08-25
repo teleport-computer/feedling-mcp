@@ -638,6 +638,16 @@ def test_canvas_update_compact_delivery_preserves_request_and_corrects_metadata(
         kind == "tool_batch_validation_failed"
         for kind, _payload in trajectory_events
     )
+    confirmation_messages = messages_seen[3]
+    assert confirmation_messages[0]["role"] == "system"
+    assert "same language as the user's current request" in confirmation_messages[0][
+        "content"
+    ]
+    assert user_request not in confirmation_messages[0]["content"]
+    assert confirmation_messages[1] == {
+        "role": "user",
+        "content": user_request,
+    }
     assert replies == [("已经按你的要求更新好了。", True)]
     assert outcome.stop_reason == "final_text"
 
