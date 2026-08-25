@@ -69,6 +69,29 @@ def test_rendered_prompt_documents_all_new_verbs():
         assert f"python {spawners._IO_CLI} {verb}" in prompt, f"{verb} missing from rendered prompt"
 
 
+def test_rendered_prompt_documents_canvas_delivery_contract():
+    files = spawners.agent_home_files("/h", driver="claude", provider="anthropic")
+    prompt = files["/h/agent-tools-prompt.md"]
+
+    assert ".io.html" in prompt
+    assert "--title <short title>" in prompt
+    assert "--subtitle <one-line description>" in prompt
+    assert "user's current language" in prompt
+    assert "256000 bytes" in prompt
+
+
+def test_fallback_send_file_documents_canvas_display_fields():
+    fallback = spawners._AGENT_PROMPT_FALLBACK_COMMANDS.format(
+        io_cli=spawners._IO_CLI
+    )
+    send_file_line = next(
+        line for line in fallback.splitlines() if " send-file " in line
+    )
+
+    assert "--title <title>" in send_file_line
+    assert "--subtitle <subtitle>" in send_file_line
+
+
 def test_build_catalog_none_falls_back_to_static_text_without_crashing(monkeypatch):
     monkeypatch.setattr(io_cli_catalog, "build_catalog", lambda *a, **kw: None)
 

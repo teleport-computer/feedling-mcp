@@ -802,7 +802,9 @@ def _patch_v1_foreground_file_turn(
     *,
     agent_mode="cli",
     http_local_io_cli=False,
+    hosted=False,
 ):
+    monkeypatch.setattr(resident, "_HOSTED", hosted)
     monkeypatch.setattr(resident, "AGENT_MODE", agent_mode)
     monkeypatch.setattr(
         resident, "AGENT_HTTP_LOCAL_IO_CLI", http_local_io_cli
@@ -901,6 +903,106 @@ def test_local_http_agent_retries_once_and_delivers_canvas_card(
     assert followups[0].display_subtitle == "六十秒接星星小游戏"
     assert (workspace / "接星星.io.html").exists()
     assert "/Users/" not in posted["reply"]
+
+
+def test_hosted_v1_cli_retries_once_and_delivers_canvas_subtitle(
+    tmp_path, monkeypatch
+):
+    _patch_v1_foreground_file_turn(monkeypatch, hosted=True)
+    outbox = tmp_path / "hosted-user" / "outbound-files"
+    source = outbox / "接星星小游戏.io.html"
+    monkeypatch.setattr(resident, "OUTBOUND_FILE_DIR", outbox)
+    calls = []
+    posted = {}
+
+    def fake_agent(message, **kwargs):
+        calls.append((message, kwargs))
+        if len(calls) == 1:
+            return {"messages": ["已经给入口加上副标题了。"]}
+        source.write_text(
+            "<!doctype html><html lang='zh-CN'><title>接星星小游戏</title></html>",
+            encoding="utf-8",
+        )
+        staged = resident._handle_stage_file_ipc(
+            {
+                "op": "stage_file",
+                "request_id": "request-hosted-canvas",
+                "path": str(source),
+                "name": "接星星小游戏.io.html",
+                "file_display_title": "接星星小游戏",
+                "file_display_subtitle": "左右移动篮子，六十秒挑战最高分",
+            }
+        )
+        assert staged["ok"] is True
+        return {"messages": ["已经修改并重新发给你了。"]}
+
+    def fake_post(reply, **kwargs):
+        posted["reply"] = reply
+        posted["kwargs"] = kwargs
+        return {"id": "reply-hosted-canvas"}
+
+    monkeypatch.setattr(resident, "call_agent", fake_agent)
+    monkeypatch.setattr(resident, "post_reply", fake_post)
+
+    result = resident._process_messages(
+        [
+            {
+                "id": "user-hosted-canvas",
+                "role": "user",
+                "source": "chat",
+                "content": (
+                    "继续修改接星星小游戏，给入口卡片增加副标题，"
+                    "完成后生成更新后的 HTML 画布文件并发给我。"
+                ),
+                "ts": 1234.625,
+            }
+        ]
+    )
+
+    assert result == pytest.approx(1234.625)
+    assert resident._agent_can_use_local_io_cli() is False
+    assert resident._agent_can_stage_outbound_attachments() is True
+    assert len(calls) == 2
+    assert "Missing output: .io.html" in calls[1][0]
+    assert posted["reply"] == "已经修改并重新发给你了。"
+    followups = posted["kwargs"]["file_followups"]
+    assert len(followups) == 1
+    assert followups[0].name == "接星星小游戏.io.html"
+    assert followups[0].display_title == "接星星小游戏"
+    assert followups[0].display_subtitle == "左右移动篮子，六十秒挑战最高分"
+    assert not source.exists()
+
+
+def test_hosted_v1_rejects_canvas_source_outside_private_outbox(
+    tmp_path, monkeypatch
+):
+    _patch_v1_foreground_file_turn(monkeypatch, hosted=True)
+    outbox = tmp_path / "hosted-user" / "outbound-files"
+    foreign_workspace = tmp_path / "foreign-workspace"
+    foreign_workspace.mkdir()
+    source = foreign_workspace / "接星星小游戏.io.html"
+    source.write_text("<html></html>", encoding="utf-8")
+    monkeypatch.setattr(resident, "OUTBOUND_FILE_DIR", outbox)
+    monkeypatch.setattr(
+        resident, "AGENT_HTTP_LOCAL_FILE_ROOTS", (str(foreign_workspace),)
+    )
+    resident._begin_outbound_file_turn("hosted-path-boundary", (".io.html",))
+
+    result = resident._handle_stage_file_ipc(
+        {
+            "op": "stage_file",
+            "request_id": "request-hosted-path-boundary",
+            "path": str(source),
+            "name": "接星星小游戏.io.html",
+            "file_display_title": "接星星小游戏",
+            "file_display_subtitle": "验证每用户文件边界",
+        }
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "path_outside_allowed_file_roots"
+    assert source.exists()
+    assert resident._finish_outbound_file_turn("hosted-path-boundary") == []
 
 
 def test_generic_http_agent_does_not_receive_local_file_retry(monkeypatch):
