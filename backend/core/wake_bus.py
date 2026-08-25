@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import hashlib
-import logging
 import os
 import threading
 import time
@@ -33,12 +32,12 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
 import db
+from core.telemetry_logging import stderr_info_logger
 
-log = logging.getLogger("feedling.wake_bus")
+log = stderr_info_logger("feedling.wake_bus")
 # Backend startup intentionally does not raise the root logger to INFO because
 # many third-party loggers are noisy.  This module's fixed-enum, content-free
-# chat-sync records are rollout telemetry, so enable INFO only for this logger.
-log.setLevel(logging.INFO)
+# chat-sync records are rollout telemetry, so emit them directly to stderr.
 
 # Single Postgres NOTIFY channel; the JSON payload carries the logical channel.
 PG_CHANNEL = "feedling_wake"

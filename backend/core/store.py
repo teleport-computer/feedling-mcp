@@ -9,7 +9,6 @@ eviction path mutate them in place — never rebind them.
 """
 
 import hashlib
-import logging
 import os
 import threading
 import time
@@ -21,11 +20,11 @@ import db
 from core import config
 from core import envelope as core_envelope
 from core import wake_bus
+from core.telemetry_logging import stderr_info_logger
 
-log = logging.getLogger("feedling.chat_sync")
+log = stderr_info_logger("feedling.chat_sync")
 # Snapshot-fallback records are fixed-enum, content-free rollout telemetry.
-# Keep the global backend threshold unchanged and opt in only this logger.
-log.setLevel(logging.INFO)
+# Keep the global backend threshold unchanged and emit directly to stderr.
 
 MAX_FRAMES = 200
 # Per-process hot chat window per user. The PostgreSQL ``chat_messages`` table
