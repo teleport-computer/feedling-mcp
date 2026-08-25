@@ -9,9 +9,9 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 
 | Lifecycle | Classified documents |
 |---|---:|
-| `current` | 17 |
-| `decision` | 10 |
-| `historical` | 25 |
+| `current` | 22 |
+| `decision` | 13 |
+| `historical` | 27 |
 | `generated` | 1 |
 
 ## current
@@ -19,23 +19,29 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `AGENTS.md`
 - `CLAUDE.md`
 - `README.md`
+- `docs-site/content/docs/architecture.mdx`
 - `docs-site/content/docs/changelog.mdx`
 - `docs/API_ERRORS.md`
 - `docs/CURRENT_STATE.md`
 - `docs/DOCUMENT_LIFECYCLE.md`
 - `docs/PROJECT_OVERVIEW.md`
+- `docs/RDS_TRACE_PARTITIONS_RUNBOOK.md`
+- `docs/ops/chat-incremental-sync-runbook.md`
 - `docs/repository-cleanup/README.md`
 - `docs/repository-cleanup/agent-diagnostic-benchmark.md`
 - `docs/repository-cleanup/hosted-runtime-history.md`
+- `docs/repository-cleanup/resident-runtime-history.md`
 - `docs/superpowers/plans/2026-08-24-io-marketing-website.md`
 - `docs/superpowers/plans/2026-08-24-repository-cleanup.md`
 - `docs/superpowers/plans/2026-08-24-repository-cleanup.zh-CN.md`
+- `docs/superpowers/plans/2026-08-26-resident-runtime-history-batch-1.md`
 - `docs/testing/README.md`
 - `docs/testing/RUNTIME_MAP.md`
 - `scripts/loadtest/README.md`
 
 ## decision
 
+- `docs/superpowers/plans/2026-08-25-chat-notify-convergence.md`
 - `docs/superpowers/specs/2026-07-09-hosted-runtime-v2-D-admission-ceiling-design.md`
 - `docs/superpowers/specs/2026-07-09-hosted-runtime-v2-D3-proactive-wake-lanes-design.md`
 - `docs/superpowers/specs/2026-07-12-hosted-runtime-v2-PR-A-effect-foundation-design.md`
@@ -43,9 +49,11 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop-design.md`
 - `docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md`
 - `docs/superpowers/specs/2026-07-21-dual-runtime-v1-v2-coexistence-design.md`
+- `docs/superpowers/specs/2026-08-10-new-model-api-users-default-v2-design.md`
 - `docs/superpowers/specs/2026-08-12-remove-v2-semantic-compaction-design.md`
 - `docs/superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md`
 - `docs/superpowers/specs/2026-08-24-io-marketing-website-design.md`
+- `docs/superpowers/specs/2026-08-25-chat-notify-convergence-design.md`
 
 ## historical
 
@@ -65,6 +73,8 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/archive/superpowers/plans/2026-07-13-hosted-runtime-v2-PR-B-provider-transport-telemetry.md`
 - `docs/archive/superpowers/plans/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop.md`
 - `docs/archive/superpowers/plans/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety.md`
+- `docs/archive/superpowers/plans/2026-07-21-dual-runtime-v1-v2-coexistence.md`
+- `docs/archive/superpowers/plans/2026-08-10-new-model-api-users-default-v2.md`
 - `docs/archive/superpowers/plans/2026-08-14-runtime-v2-three-pool-slot-isolation.md`
 - `docs/archive/superpowers/specs/2026-07-08-hosted-runtime-v2-abc-design.md`
 - `docs/archive/superpowers/specs/2026-07-09-hosted-runtime-v2-D0-rollout-infrastructure-design.md`
