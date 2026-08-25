@@ -286,6 +286,114 @@ def test_changed_markdown_paths_uses_git_diff_and_untracked_files(
     )
 
 
+def _force_rewritten_checkout(tmp_path: Path) -> tuple[Path, str]:
+    remote = tmp_path / "remote.git"
+    source = tmp_path / "source"
+    checkout = tmp_path / "checkout"
+    remote.mkdir()
+    source.mkdir()
+    _git(remote, "init", "--bare", "-q")
+    _git(source, "init", "-q")
+    _git(source, "config", "user.email", "tests@example.invalid")
+    _git(source, "config", "user.name", "Tests")
+    _write(source / "old.md", "# Existing but not classified yet\n")
+    _git(source, "add", "old.md")
+    _git(source, "commit", "-q", "-m", "old history")
+    old_head = _git(source, "rev-parse", "HEAD")
+    _git(source, "remote", "add", "origin", remote.as_uri())
+    _git(source, "push", "-q", "origin", "HEAD:refs/heads/test")
+
+    _git(source, "switch", "--orphan", "rewritten")
+    _write(
+        source / "new.md",
+        _document(lifecycle="current", canonical_owner="self"),
+    )
+    _git(source, "add", "new.md")
+    _git(source, "commit", "-q", "-m", "rewritten history")
+    _git(source, "push", "-q", "--force", "origin", "HEAD:refs/heads/test")
+
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "-q",
+            "--branch",
+            "test",
+            "--depth=1",
+            remote.as_uri(),
+            str(checkout),
+        ],
+        check=True,
+    )
+    missing = subprocess.run(
+        ["git", "-C", str(checkout), "cat-file", "-e", f"{old_head}^{{commit}}"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert missing.returncode != 0
+
+    return checkout, old_head
+
+
+def _run_changed_lifecycle_cli(
+    checkout: Path,
+    changed_vs: str,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "tools" / "check_document_lifecycle.py"),
+            "--repo-root",
+            str(checkout),
+            "--changed-vs",
+            changed_vs,
+            "--fetch-missing-base-from",
+            "origin",
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def test_cli_fetches_missing_full_sha_before_lifecycle_diff(tmp_path: Path) -> None:
+    """A force-rewritten push can leave event.before outside the checkout."""
+
+    checkout, old_head = _force_rewritten_checkout(tmp_path)
+
+    result = _run_changed_lifecycle_cli(checkout, old_head)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "document lifecycle: 1 Markdown file(s) valid\n"
+    assert _git(checkout, "cat-file", "-t", old_head) == "commit"
+
+
+def test_cli_fails_closed_when_full_sha_is_unavailable(tmp_path: Path) -> None:
+    checkout, _old_head = _force_rewritten_checkout(tmp_path)
+    unavailable_head = "f" * 40
+
+    result = _run_changed_lifecycle_cli(checkout, unavailable_head)
+
+    assert result.returncode != 0
+    assert "document lifecycle:" not in result.stdout
+    assert subprocess.run(
+        [
+            "git",
+            "-C",
+            str(checkout),
+            "cat-file",
+            "-e",
+            f"{unavailable_head}^{{commit}}",
+        ],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode != 0
+
+
 def test_all_report_uses_only_the_tracked_repository_corpus(tmp_path: Path) -> None:
     _git(tmp_path, "init", "-q")
     _git(tmp_path, "config", "user.email", "tests@example.invalid")

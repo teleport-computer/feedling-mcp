@@ -295,8 +295,9 @@ jobs:
             echo "::error::No authoritative lifecycle comparison SHA for $GITHUB_EVENT_NAME"
             exit 1
           fi
-          git cat-file -e "$base_sha^{commit}"
-          python tools/check_document_lifecycle.py --changed-vs "$base_sha"
+          python tools/check_document_lifecycle.py \
+            --changed-vs "$base_sha" \
+            --fetch-missing-base-from origin
 
       - name: Start backend
         env:

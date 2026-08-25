@@ -209,6 +209,45 @@ def changed_markdown_paths(repo_root: Path, changed_vs: str) -> tuple[str, ...]:
     return tuple(sorted(path for path in changed if _is_managed_markdown(path)))
 
 
+def ensure_changed_base(
+    repo_root: Path,
+    changed_vs: str,
+    fetch_missing_base_from: str | None,
+) -> None:
+    """Ensure the authoritative comparison commit exists locally."""
+
+    verify = [
+        "git",
+        "-C",
+        str(repo_root),
+        "cat-file",
+        "-e",
+        f"{changed_vs}^{{commit}}",
+    ]
+    if subprocess.run(
+        verify,
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0:
+        return
+    if fetch_missing_base_from is not None:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "fetch",
+                "--no-tags",
+                "--depth=1",
+                fetch_missing_base_from,
+                changed_vs,
+            ],
+            check=True,
+        )
+    subprocess.run(verify, check=True)
+
+
 def all_markdown_paths(repo_root: Path) -> tuple[str, ...]:
     paths = set(_git_paths(repo_root, ("ls-files", "-z")))
     existing = (
@@ -273,6 +312,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument("--changed-vs")
     selection.add_argument("--all", action="store_true")
+    parser.add_argument("--fetch-missing-base-from", metavar="REMOTE")
     parser.add_argument("--report", action="store_true")
     return parser.parse_args(argv)
 
@@ -280,6 +320,12 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     repo_root = args.repo_root.resolve()
+    if args.changed_vs:
+        ensure_changed_base(
+            repo_root,
+            args.changed_vs,
+            args.fetch_missing_base_from,
+        )
     paths = (
         all_markdown_paths(repo_root)
         if args.all

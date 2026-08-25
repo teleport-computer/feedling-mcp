@@ -1,3 +1,7 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # IO Marketing Website Design
 
 **Date:** 2026-08-24  
@@ -260,4 +264,3 @@ Before delivery:
 - No testimonials, pricing, roadmap, changelog, or press page
 - No dark mode in the first version
 - No framework or build system
-
