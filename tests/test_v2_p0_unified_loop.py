@@ -13,8 +13,9 @@ run_tool_loop` + `worker.process_job`/`executor.dispatch_tool_calls`), not a wea
                                    `deps.read_messages_since` DURING round-1's tool
                                    dispatch; round-2's `build_messages` sees A + B +
                                    round-1's tool_results, no `asyncio.sleep` (no
-                                   debounce), and the loop does not restart (round
-                                   counter monotonic, exactly 2 provider calls).
+                                   debounce), and the loop does not restart. With
+                                   self-thinking enabled, the bounded text-only
+                                   correction is round 3 on the same monotonic loop.
   4. malicious-page write refusal -> `turn_authorization=False` (a purely-external
                                    round) refuses every WRITE_ACTIONS tool_call
                                    deterministically: no effect row lands in
@@ -66,6 +67,12 @@ pytestmark = pytest.mark.skipif(
 
 _BYOK = provider_client.ProviderConfig(
     provider="anthropic", model="claude-sonnet-4-test", api_key="sk-user-byok", base_url="")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_self_thinking_correction(monkeypatch):
+    """P0 loop tests predate reply-format correction; one test opts in below."""
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +127,24 @@ def _patch_real_write(monkeypatch):
         envelope = {"v": 1, "body_ct": text, "nonce": "n", "K_user": "k_test"}
         return store.append_chat("openclaw", "model_api", envelope, strict=True)
 
+    def _build_envelope(store, plaintext, *, item_id=None):
+        return (
+            {
+                "v": 1,
+                "id": item_id or "thinking-envelope",
+                "body_ct": plaintext.decode("utf-8"),
+                "nonce": "n",
+                "K_user": "k_test",
+            },
+            None,
+        )
+
     monkeypatch.setattr(worker, "_write_encrypted_reply", _real_write)
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        _build_envelope,
+    )
 
 
 def _reply_effect_dispatch(user_id):
@@ -136,7 +160,7 @@ def _apply_effects(user_id):
     return v2_effect_outbox.apply_pending_effects(user_id, dispatch=_reply_effect_dispatch(user_id))
 
 
-def _script_provider(monkeypatch, responses):
+def _script_provider(monkeypatch, responses, *, allow_image_outputs=None):
     it = iter(responses)
     calls = []
 
@@ -148,7 +172,12 @@ def _script_provider(monkeypatch, responses):
         allow_image_output=False,
         **kwargs,
     ):
-        assert allow_image_output is True
+        expected_image_output = (
+            True
+            if allow_image_outputs is None
+            else allow_image_outputs[len(calls)]
+        )
+        assert allow_image_output is expected_image_output
         calls.append({
             "messages": messages,
             "tools": tools,
@@ -275,6 +304,7 @@ def test_p0_web_search_then_one_terminal_reply(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_p0_mid_turn_fold_no_restart_no_debounce(monkeypatch):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
     uid = "u_p0_midturn_fold"
     conftest.seed_user(uid)
     _reset(uid)
@@ -294,10 +324,17 @@ def test_p0_mid_turn_fold_no_restart_no_debounce(monkeypatch):
         return _FakeCapResult({"snippet": "search-result-unique"})
 
     monkeypatch.setattr(cap_registry, "run_capability", _run_capability)
-    calls = _script_provider(monkeypatch, [
-        _tool_round(_tc("m1", "memory_search", query="x")),
-        _text_round("done"),
-    ])
+    calls = _script_provider(
+        monkeypatch,
+        [
+            _tool_round(_tc("m1", "memory_search", query="x")),
+            _text_round("done"),
+            _text_round(
+                "<think>I want to answer with the result I just found</think>done"
+            ),
+        ],
+        allow_image_outputs=[True, True, False],
+    )
 
     # No asyncio.sleep anywhere in the unified loop (Global Constraints: "no
     # time-debounce; no loop restart") -- a real debounce regression would call it.
@@ -354,13 +391,20 @@ def test_p0_mid_turn_fold_no_restart_no_debounce(monkeypatch):
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
+    assert len(calls) == 3
     assert sleep_calls == []                     # STRONG: no debounce sleep occurred.
-    assert len(calls) == 2                        # STRONG: no restart -- a restart would
-                                                    # need a 3rd scripted provider call
-                                                    # (round 0 replayed), which would
-                                                    # StopIteration and fail the turn.
+    assert calls[2]["allow_image_output"] is False
+    assert calls[2]["tool_choice"] == "none"      # The third call is the bounded
+                                                    # text-only correction, not a restart.
+    correction_contract = (
+        worker._SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION.split("\n\n", 1)[1]
+    )
+    correction_system = str(calls[2]["messages"][0]["content"])
+    # Prompt-frontier clipping may remove the one-line retry prefix, but the
+    # correction's reused protocol contract remains as a second full copy.
+    assert correction_system.count(correction_contract) == 2
     outcome = captured["outcome"]
-    assert outcome.rounds == 2                     # STRONG: round counter monotonic, 2 not 3+.
+    assert outcome.rounds == 3                     # Monotonic tool, final, correction rounds.
     assert outcome.stop_reason == "final_text"
 
     round1_joined = " ".join(

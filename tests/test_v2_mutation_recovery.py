@@ -51,7 +51,9 @@ _MCP_READ = ToolSpec(
 
 
 @pytest.fixture(autouse=True)
-def _clean_jobs():
+def _clean_jobs(monkeypatch):
+    # These tests cover mutation recovery, not self-thinking correction.
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs")
     yield

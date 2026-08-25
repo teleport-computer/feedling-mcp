@@ -36,6 +36,12 @@ _PROVIDER = provider_client.ProviderConfig(
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_self_thinking_correction(monkeypatch):
+    """File-delivery tests exercise attachment contracts, not reply format."""
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
+
+
 def test_file_delivery_policy_is_semantic_and_hides_internal_paths():
     prompt = v2_context.CHAT_SYSTEM_PROMPT
     description = next(
