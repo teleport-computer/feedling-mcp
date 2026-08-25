@@ -6294,10 +6294,22 @@ def test_native_proactive_prompt_injects_digest_and_native_tool_catalog(monkeypa
         "_proactive_perception_digest",
         lambda: (
             {"place_label": "home", "motion_state": "still", "local_time": "2026-06-26T20:30:00+08:00"},
-            [{"signal": "steps", "field": "step_count", "current": 4200, "baseline_median": 3000, "delta": 1200}],
+            [{
+                "signal": "steps",
+                "field": "step_count",
+                "last_known": 4200,
+                "as_of": "2026-06-25 23:10",
+                "baseline_median": 3000,
+                "delta": 1200,
+            }],
             {
                 "media": {"now": {"artist": "Phoebe Bridgers"}, "novelty": "new_artist"},
-                "health": {"notable": [{"signal": "steps", "field": "step_count", "current": 4200}]},
+                "health": {"notable": [{
+                    "signal": "steps",
+                    "field": "step_count",
+                    "last_known": 4200,
+                    "as_of": "2026-06-25 23:10",
+                }]},
             },
         ),
     )
@@ -6330,6 +6342,8 @@ def test_native_proactive_prompt_injects_digest_and_native_tool_catalog(monkeypa
     assert "at most 2-3" in captured["message"]
     assert "perception_change_json" not in captured["message"]
     assert "\"signal\": \"steps\"" in captured["message"]
+    assert "\"last_known\": 4200" in captured["message"]
+    assert "2026-06-25 23:10" in captured["message"]
     assert "native_tool_access" in captured["message"]
     assert "perception" in captured["message"]
     assert "memory-index" in captured["message"]

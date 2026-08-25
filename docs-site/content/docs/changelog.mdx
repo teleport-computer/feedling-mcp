@@ -12,6 +12,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Perception digest trend entries now distinguish fresh readings from stale
+  daily rollups. Fresh entries retain `current`; stale entries retain the trend
+  as `last_known` with a user-local `as_of` time (or an explicitly labeled UTC
+  time when no valid timezone is available). Freshness uses each signal's
+  catalog TTL and applies identically to top-level `changes` and
+  `domains.health.notable`. Real-time perception snapshots are unchanged.
+
 - Runtime V2 Canvas updates now carry the current user request into the compact
   card-delivery step, make one bounded correction when title or subtitle metadata
   is invalid, and report an incomplete card delivery as a Canvas delivery issue
