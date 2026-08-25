@@ -59,6 +59,10 @@ _CHILD = textwrap.dedent(
     turn2 = cmd2[1:]
 
     print(json.dumps({
+        "hosted": m._HOSTED,
+        "local_catalog": m._agent_can_use_local_io_cli(),
+        "attachment_staging": m._agent_can_stage_outbound_attachments(),
+        "ipc_listener": m._resident_ipc_listener_enabled(),
         "agent_mode": m.AGENT_MODE,
         "agent_cli_cmd": m.AGENT_CLI_CMD,
         "checkpoint": str(m.CHECKPOINT_FILE),
@@ -93,6 +97,10 @@ def test_hosted_env_names_match_resident_and_are_per_user(tmp_path):
     home = str(tmp_path / "home")
     # The resident consumer read exactly the names spawners.consumer_env sets.
     assert out["agent_mode"] == "cli"
+    assert out["hosted"] is True
+    assert out["local_catalog"] is False
+    assert out["attachment_staging"] is True
+    assert out["ipc_listener"] is True
     assert out["checkpoint"] == f"{home}/checkpoint.json"
     assert out["session_template"] == f"{home}/agent-session.txt"
     assert out["image_dir"] == f"{home}/images"
@@ -106,6 +114,7 @@ def test_hosted_env_names_match_resident_and_are_per_user(tmp_path):
     assert "--allowed-tools" in cmd and "io_cli.py perception" in cmd
     assert "io_cli.py memory-index" in cmd
     assert "io_cli.py screen-read" in cmd
+    assert "io_cli.py send-file" in cmd
     assert f"--append-system-prompt-file {home}/agent-tools-prompt.md" in cmd
     assert cmd.endswith("-p {message}")
 

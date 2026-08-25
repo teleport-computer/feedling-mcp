@@ -167,6 +167,11 @@ change must not be interpreted as an API guarantee.
   language; later revisions preserve them by default and may update them with
   the Canvas content. The metadata commits atomically with the encrypted file,
   while older cards without a subtitle remain readable.
+- **Hosted Runtime V1 Canvas delivery now completes through its per-user staging
+  socket.** The hosted prompt, Bash allowlist, IPC listener, and one bounded
+  missing-file correction now expose the same `send-file` capability instead of
+  accepting a text-only success while no card was delivered. Hosted source files
+  remain restricted to that user's private `outbound-files` directory.
 
 - **Local tool-capable resident HTTP agents can now deliver Canvas cards.** An
   explicit `FEEDLING_AGENT_HTTP_LOCAL_IO_CLI=true` opt-in gives a same-machine
