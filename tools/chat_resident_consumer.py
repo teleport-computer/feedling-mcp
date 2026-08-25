@@ -1786,9 +1786,22 @@ def _agent_can_use_local_io_cli() -> bool:
     return AGENT_MODE == "http" and AGENT_HTTP_LOCAL_IO_CLI
 
 
-def _resident_ipc_listener_enabled() -> bool:
-    """Keep the prompt/catalog and the local IPC consumer on one capability gate."""
+def _agent_can_stage_outbound_attachments() -> bool:
+    """Whether this consumer can receive send-file/send-image over local IPC.
+
+    Hosted V1 CLI agents get their io_cli catalog and Bash allowlist from the
+    supervisor, so they must not use the self-hosted catalog gate above. They do
+    still run in this consumer's per-user home and need its private IPC listener
+    to turn an io_cli success into a durable chat attachment.
+    """
+    if _HOSTED:
+        return AGENT_MODE == "cli"
     return _agent_can_use_local_io_cli()
+
+
+def _resident_ipc_listener_enabled() -> bool:
+    """Enable the private socket whenever the active agent can stage attachments."""
+    return _agent_can_stage_outbound_attachments()
 
 
 def _runtime_repo_files() -> set[str]:
@@ -18219,7 +18232,8 @@ def _process_messages(messages: list) -> float:
             else {}
         )
         outbound_file_turn_active = (
-            source in {"chat", "model_api"} and _agent_can_use_local_io_cli()
+            source in {"chat", "model_api"}
+            and _agent_can_stage_outbound_attachments()
         )
         outbound_file_requirement = (
             _required_outbound_file_suffixes(raw_user_content_for_lang)
@@ -19599,12 +19613,13 @@ def _handle_redistill_ipc(msg: dict) -> dict:
 def _redistill_ipc_serve_forever(sock_path: Path) -> None:
     """Single-connection-at-a-time Unix-socket IPC listener for io_cli.
 
-    ``stage_file`` serves every local io_cli-capable resident, including an
-    explicitly opted-in same-machine HTTP agent; ``redistill`` remains reachable
-    only to a self-hosted caller. One local caller at a time is the
-    whole use case, so a plain accept→handle→close loop (no thread pool) is
-    enough; the handler's network POST just makes the NEXT local caller wait
-    briefly in the OS accept backlog, which is fine for a one-shot command.
+    ``stage_file`` serves hosted V1 CLI agents and every local io_cli-capable
+    resident, including an explicitly opted-in same-machine HTTP agent;
+    ``redistill`` remains reachable only to a self-hosted caller. One local
+    caller at a time is the whole use case, so a plain accept→handle→close loop
+    (no thread pool) is enough; the handler's network POST just makes the NEXT
+    local caller wait briefly in the OS accept backlog, which is fine for a
+    one-shot command.
 
     Runs until ``_running`` flips False (same shutdown flag the main poll
     loop honors) — a final accept() may still be blocked when that happens,
@@ -20296,9 +20311,9 @@ def run() -> None:
 
     _warn_if_agent_entry_may_drift()
 
-    # Outbound-file staging is shared by CLI residents and explicitly opted-in
-    # same-machine HTTP agents. The redistill operation itself remains rejected
-    # for hosted callers.
+    # Outbound-file staging is shared by hosted V1 CLI agents, self-hosted CLI
+    # residents, and explicitly opted-in same-machine HTTP agents. The redistill
+    # operation itself remains rejected for hosted callers.
     if _resident_ipc_listener_enabled():
         threading.Thread(
             target=_redistill_ipc_serve_forever, args=(RESIDENT_IPC_SOCK,), daemon=True,

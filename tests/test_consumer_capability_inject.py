@@ -149,6 +149,18 @@ def test_hosted_gate_returns_content_unchanged_and_never_builds(monkeypatch):
     assert calls == []
 
 
+def test_hosted_cli_stages_attachments_without_duplicate_catalog(monkeypatch):
+    monkeypatch.setattr(crc, "_HOSTED", True)
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    calls = _mock_build_catalog(monkeypatch, return_value="CATALOG")
+
+    assert crc._agent_can_use_local_io_cli() is False
+    assert crc._agent_can_stage_outbound_attachments() is True
+    assert crc._resident_ipc_listener_enabled() is True
+    assert crc._prepend_io_cli_capability_catalog("make a Canvas") == "make a Canvas"
+    assert calls == []
+
+
 def test_http_backend_gate_returns_content_unchanged_and_never_builds(monkeypatch):
     monkeypatch.setattr(crc, "_HOSTED", False)
     monkeypatch.setattr(crc, "AGENT_MODE", "http")
@@ -181,6 +193,7 @@ def test_local_http_io_cli_gate_also_enables_resident_ipc_listener(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_HTTP_LOCAL_IO_CLI", True)
 
     assert crc._agent_can_use_local_io_cli() is True
+    assert crc._agent_can_stage_outbound_attachments() is True
     assert crc._resident_ipc_listener_enabled() is True
 
 
@@ -190,6 +203,7 @@ def test_generic_http_keeps_resident_ipc_listener_disabled(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_HTTP_LOCAL_IO_CLI", False)
 
     assert crc._agent_can_use_local_io_cli() is False
+    assert crc._agent_can_stage_outbound_attachments() is False
     assert crc._resident_ipc_listener_enabled() is False
 
 
