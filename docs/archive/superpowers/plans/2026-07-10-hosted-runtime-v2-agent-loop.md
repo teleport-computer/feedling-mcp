@@ -1,3 +1,9 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop-design.md
+historical_reason: superseded
+superseded_by: docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop-design.md
+---
 # Hosted Runtime V2 — Agent Loop Implementation Plan
 
 > **STATUS: HISTORICAL / SUPERSEDED.** This plan produced an intermediate
@@ -12,7 +18,7 @@
 
 **Tech Stack:** Python 3.11, asyncio, pytest. Existing modules: `backend/model_api_runtime/v2/{planner,executor,responder,worker,invalidation,context}.py`, `scripts/loadtest/{mock_provider,compare_tokens}.py`.
 
-**Spec:** `docs/superpowers/specs/2026-07-10-hosted-runtime-v2-agent-loop-design.md` (§12 decisions, §13 BUG-4)
+**Spec:** [`2026-07-10-hosted-runtime-v2-agent-loop-design.md`](../../../superpowers/specs/2026-07-10-hosted-runtime-v2-agent-loop-design.md) (§12 decisions, §13 BUG-4)
 **Parity matrix:** `docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md` (§C turn shape, §E BUG-1/BUG-4)
 
 ## Global Constraints
@@ -738,7 +744,7 @@ Create `backend/model_api_runtime/v2/agent_loop.py`:
 ```python
 """V2 agent loop：`decide → act → observe → decide` 的**纯**状态机。
 
-设计见 docs/superpowers/specs/2026-07-10-hosted-runtime-v2-agent-loop-design.md。
+设计见 [`2026-07-10-hosted-runtime-v2-agent-loop-design.md`](../../../superpowers/specs/2026-07-10-hosted-runtime-v2-agent-loop-design.md)。
 
 为什么在这里而不在 executor 里：executor 是无状态批量调度器，不认识模型、不持有 BYOK
 key、不拼 wire。把循环塞进去等于把 V2 花力气拆开的「决定」与「执行」重新焊死。为什么不在

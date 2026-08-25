@@ -1,16 +1,18 @@
-"""``ChildSupervisor`` — 通用的「spawn 一个子进程 + 用 Pipe 侦测它是否还活着/还在动」
-工具类（Hosted Runtime V2 PR D，D1 结构拆分，见
-``docs/superpowers/plans/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety.md``
-Task 2）。
+"""``ChildSupervisor`` — 一个 slot 的子进程与 progress-pipe 监督工具。
+
+当前 per-slot 拓扑见
+``docs/superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md``；
+历史上形成的 progress、lease/write-fence 与恢复安全理由见
+``docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md``。
 
 **为什么是子进程而不是子协程**：拆分前，turn slot 是 ``serve_worker._serve`` 里
 ``asyncio.gather`` 的一个协程任务（``run_worker_loop``），跟 reaper/heartbeat/scheduler
 共用同一个进程和事件循环——任何一个 slot 里卡死的同步调用（未经 ``to_thread`` 桥出去的
 阻塞点、死锁、失控的 provider SDK）都会连带拖死整条事件循环，heartbeat/reaper 也跟着停,
 而 heartbeat 一旦停摆，jobs_store 反而看不出这个 worker 已经失能（心跳行还在，只是
-`capacity` 数字不会再更新）。把 turn slots 挪进一个独立进程后，父进程只要还能拿到
-SIGKILL 权限，就能在子进程卡死时无视它内部状态直接强杀重启——这是这个类存在的唯一
-理由，其余全是达成这个目的所需的管子。
+`capacity` 数字不会再更新）。当前 fleet 为每个 slot 建一个独立子进程和一个
+``ChildSupervisor``；父进程只要还能拿到 SIGKILL 权限，就能只强杀该 slot、按其
+``job_id + claimed_by`` 恢复 claim，再启动该 slot 的 replacement。
 
 **本文件刻意保持零 backend 依赖**（不 import ``db``/``worker``/``hosted``/
 ``agent_runtime`` 任何东西）：它只认识"一个可 pickle 的模块级 callable + 一根
@@ -21,37 +23,28 @@ kill/respawn 语义（见 `tests/test_v2_child_supervisor.py`），子进程目�
 纯 Python 的 fake。真正的生产目标（``turn_child.main``）由调用方（``serve_worker._serve``）
 显式传入，本类不内置默认值、不 import ``turn_child``。
 
-**progress pipe 协议**：子进程侧持有 Pipe 的写端（``start()`` 里作为 spawn target 的第
-一个位置参数传入），每隔一小段时间发送 ``("progress", slot_id, monotonic_ts,
-turn_start)``——``slot_id`` 是真实的 per-slot 下标（``worker._slot_loop`` 的
-``slot_id``，见 ``turn_child._make_progress_cb``）。父进程侧的后台线程把收到的每条消息
-落成两样东西：(1) 一个单调时钟时间戳 `_last_progress_at`——用本地 `time.monotonic()`
-（不是子进程发来的那个数值）记录"收到时刻"，避免依赖跨进程单调时钟是否严格同源这种
-细节；`poll_liveness()` 只是拿它跟当下的 `time.monotonic()` 作差，得到粗粒度的
-`last_progress_age_sec`（整个子进程"最新一次有任何 slot 活动"是多久之前）。(2) 一个
-per-slot 的 `_turn_starts` 字典——``turn_start is None``（slot 空闲）时清掉该 slot 的
-条目，否则记下子进程发来的那个 `turn_start` 原样（这个数值必须跟子进程自己后续用
-`time.monotonic()` 算出来的挂钟差保持同源，所以这里不能替换成父进程收到时刻——参见
-`poll_liveness()` 对它的用法）。
+**progress pipe 协议**：每个 child 持有自己的 duplex Pipe 写端（``start()`` 把它作为
+spawn target 的第一个位置参数传入）。它发送由 ``slot_protocol.encode_message`` 编码的
+``SlotProgress`` 和 ``LoopHeartbeat``，其中 progress 带 slot id、generation、stage、
+active owner identity、monotonic timestamp 与固定的 ``turn_start``。父进程 reader 只接收
+该 supervisor 的 slot/generation，使用本地 ``time.monotonic()`` 记录收到时刻，并保存最新
+active identity 与 ``turn_start``；空闲 progress 清空 active state。这样 parent 的时钟不
+依赖跨进程 monotonic clock 是否同源，同时 active turn 的 absolute age 仍使用 child 原始
+``turn_start`` 计算。
 
 **四只独立时钟**：`last_progress_age_sec`/`event_loop_heartbeat_age_sec` 只看 child event
-loop 是否还能调度；`last_slot_progress_age_sec` 看有没有 slot 穿过 claim/idle/turn 边界；
-active slot 另外有 `current_turn_stall_age_sec`（距本 turn 最近真实 provider/tool/compaction
+loop 是否还能调度；`last_slot_progress_age_sec` 看这个 child 的唯一 slot 有没有穿过
+claim/idle/turn 边界；active slot 另外有 `current_turn_stall_age_sec`（距本 turn 最近真实 provider/tool/compaction
 边界）和 `current_turn_age_sec`（距 turn 开始）。watchdog 用 stall age 抓永久卡住的 await，
 用更大的 absolute age 防止一个不断制造进度却永不终止的回合。这样合法的多轮/600s 历史
 catch-up 不会再因为绝对年龄超过旧 180s 就被误杀，而 event-loop heartbeat 也不会替某个
 卡住的 turn 刷新 stall clock。
 
-用法（`serve_worker._serve`）::
-
-    supervisor = ChildSupervisor(turn_child.main, liveness_timeout_sec=45.0,
-                                  spawn_args=(worker_id, poll_interval))
-    supervisor.start()
-    ...
-    supervisor.stop()  # 优雅：SIGTERM + join，超时才 SIGKILL
-
-D2（Task 3）的 watchdog 循环会另外调 `poll_liveness()` + `kill_and_respawn()`——本任务
-（D1/Task 2）只负责把子进程立起来、能被父进程干净地 stop，不做自动踢杀。
+生产构造由 `pool_supervisor.SlotFleet` 独占：它根据每个 `SlotSpec` 提供 pool、slot、lane、
+broker identity 与当前 `turn_child.main` target arguments，再创建本类。不要在调用方复制
+`ChildSupervisor` 的直接构造签名；见 `SlotFleet.__init__` 的实际装配。watchdog/parent
+随后完成 capacity=0、确认 kill、exact claim recovery 与 replacement start；本类只负责一个
+slot 子进程的协议、liveness snapshot 与受控 stop/kill。
 """
 from __future__ import annotations
 
@@ -196,8 +189,8 @@ class ChildSupervisor:
             self._last_progress_at = started_at
             self._last_slot_progress_at = started_at
             # Fresh generation of child == fresh turn-tracking state. A prior
-            # generation's slot_ids/turn_starts must never leak into this one
-            # (kill_and_respawn() calls start() again after killing the old proc).
+            # generation's slot identity/turn_start must never leak into this one
+            # (the legacy compatibility wrapper also starts after a successful kill).
             self._slot_generation = slot_generation
             self._snapshot = None
             self._turn_progress_at = None
@@ -215,20 +208,20 @@ class ChildSupervisor:
         `alive` 只反映"OS 进程还在不在"（`proc.is_alive()`），不代表它没卡死——一个
         在死锁里转不动的进程同样 `is_alive() == True`。`last_progress_age_sec`（兼容名）/
         `event_loop_heartbeat_age_sec` 是 event-loop 调度心跳年龄；
-        `last_slot_progress_age_sec` 才是任意 slot 最近真实活动的年龄。从未 start 时均为
+        `last_slot_progress_age_sec` 才是这个 child 唯一 slot 最近真实活动的年龄。从未 start 时均为
         `math.inf`，让 watchdog 的阈值比较自然成立。
 
-        `current_turn_age_sec`：当下挂钟时间减去 `_turn_starts` 里最老的那个 turn_start——也就是
-        "跑得最久、仍然没完成的那个 turn 已经跑了多久"。没有任何 slot 当前在跑 turn（
-        `_turn_starts` 为空）时是 `0.0`，不是 `inf`——一个空闲子进程不该被 clause (c)
+        `current_turn_age_sec`：当下挂钟时间减去最新 snapshot 的 `turn_start`——也就是
+        "这个 child 中仍然没完成的 turn 已经跑了多久"。没有 slot 当前在跑 turn（
+        snapshot 没有 `turn_start`）时是 `0.0`，不是 `inf`——一个空闲子进程不该被 clause (c)
         误判为"有个 turn 卡了 inf 秒"。这个字段跟 `last_progress_age_sec` 互补：一个
-        slot 卡死在 `_run_turn` 内部时，它最后一次发来的 turn_start 就定死在
-        `_turn_starts` 里不再更新，但这里每次都用**当前**挂钟时间去减它，所以即使这个
+        slot 卡死在 `_run_turn` 内部时，它最后一次发来的 turn_start 就定死在 snapshot 中
+        不再更新，但这里每次都用**当前**挂钟时间去减它，所以即使这个
         slot 从此不再发送任何消息，`current_turn_age_sec` 依然会随真实流逝的时间持续
         增长——不像 `last_progress_age_sec`，它不需要新消息到达就能反映"这个卡住的 turn
-        又多卡了几秒"。其它 slot 仍在正常工作时 `last_progress_age_sec` 整体依然新鲜，
-        只有这个字段能把这一个卡住的 turn 单独抓出来（见 clause (b) 的
-        `jobs_claimable` 闸门为什么抓不住这个场景：其它 slot 仍在正常抢/跑活）。
+        又多卡了几秒"。其他 slot 有各自独立 child/supervisor，不会刷新本 child 的
+        `last_progress_age_sec`；只有这个字段能把本 slot 的卡住 turn 单独抓出来（见
+        clause (b) 的 `jobs_claimable` 闸门为什么抓不住已开始执行的 turn）。
         """
         with self._lock:
             proc = self._proc
@@ -437,7 +430,8 @@ class ChildSupervisor:
     def stop(self, *, drain_timeout: float = 10.0, kill_timeout: float = 2.0) -> None:
         """优雅停止：SIGTERM（子进程的信号处理器据此 drain 手上的回合再退出）+ 限时
         join；超时仍活着才升级成 SIGKILL。父进程 `_serve` 的 finally/stop_event 路径调
-        这个，不是 `kill_and_respawn`——那个是 watchdog 专用的"不管三七二十一先杀死"。
+        这个。当前 watchdog recovery 则通过 `kill_for_recovery()` 取得确认的 kill outcome，
+        由 parent 完成 exact claim recovery 后再启动 replacement。
         """
         with self._lifecycle_lock:
             self._stop_locked(

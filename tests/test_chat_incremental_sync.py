@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import io
+import logging
 import threading
 import sys
 import os
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -15,6 +18,21 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from core import store as core_store
 import db
 from conftest import seed_user
+
+
+@contextmanager
+def _capture_logger(logger):
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    logger.addHandler(handler)
+    try:
+        yield stream
+    finally:
+        logger.removeHandler(handler)
+
+
+def test_snapshot_fallback_telemetry_is_info_enabled_in_backend_runtime():
+    assert core_store.log.isEnabledFor(logging.INFO)
 
 
 def _row(msg_id: str, seq: int, **extra) -> dict:
@@ -82,17 +100,17 @@ def test_continuous_events_apply_upsert_update_delete_and_wake_once(monkeypatch)
 
 
 @pytest.mark.parametrize(
-    ("current", "events"),
+    ("current", "events", "expected_reason"),
     [
-        (3, [{"version": 3, "operation": "upsert", "message_ids": ["c"]}]),
-        (2, [{"version": 2, "operation": "reset", "message_ids": []}]),
-        (300, []),
-        (2, []),
+        (3, [{"version": 3, "operation": "upsert", "message_ids": ["c"]}], "gap"),
+        (2, [{"version": 2, "operation": "reset", "message_ids": []}], "reset"),
+        (300, [], "overflow"),
+        (2, [], "gap"),
     ],
     ids=["gap", "reset", "overflow", "expired-history"],
 )
 def test_gap_reset_overflow_and_expired_history_reload_snapshot(
-    monkeypatch, current, events,
+    monkeypatch, current, events, expected_reason,
 ):
     store = _bare_store([_row("a", 1)], version=1)
     reloads = []
@@ -113,11 +131,70 @@ def test_gap_reset_overflow_and_expired_history_reload_snapshot(
 
     monkeypatch.setattr(store, "reload_chat_hot_strict", reload_hot)
     monkeypatch.setattr(store, "notify_chat_waiters", lambda: None)
-
-    assert store.ensure_chat_fresh(force=True) is True
+    with _capture_logger(core_store.log) as stream:
+        assert store.ensure_chat_fresh(force=True) is True
     assert reloads == [True]
     assert store.chat_version == current
     assert [row["id"] for row in store.chat_messages] == ["snapshot"]
+    text = stream.getvalue()
+    assert f"reason={expected_reason}" in text
+    assert "user_hash=" in text
+    assert store.user_id not in text
+    assert "message_ids" not in text
+
+
+def test_missing_upsert_row_logs_snapshot_fallback_reason(monkeypatch):
+    store = _bare_store([_row("a", 1)], version=1)
+    monkeypatch.setattr(core_store.db, "chat_change_version", lambda _uid: 2)
+    monkeypatch.setattr(
+        core_store.db,
+        "chat_change_events_after",
+        lambda *_args: [
+            {"version": 2, "operation": "upsert", "message_ids": ["missing"]}
+        ],
+    )
+    monkeypatch.setattr(core_store.db, "chat_get_many_strict", lambda *_args: [])
+    monkeypatch.setattr(store, "reload_chat_hot_strict", lambda: [])
+    monkeypatch.setattr(store, "notify_chat_waiters", lambda: None)
+    with _capture_logger(core_store.log) as stream:
+        assert store.ensure_chat_fresh(force=True) is True
+
+    text = stream.getvalue()
+    assert "reason=missing_row" in text
+    assert store.user_id not in text
+
+
+def test_generation_conflict_logs_snapshot_fallback_reason(monkeypatch):
+    store = _bare_store([_row("a", 1)], version=1)
+    monkeypatch.setattr(core_store.db, "chat_change_version", lambda _uid: 2)
+    monkeypatch.setattr(
+        core_store.db,
+        "chat_change_events_after",
+        lambda *_args: [
+            {"version": 2, "operation": "upsert", "message_ids": ["b"]}
+        ],
+    )
+
+    def get_many(*_args):
+        store.apply_committed_chat_rows([_row("local", 3)])
+        return [_row("b", 2)]
+
+    monkeypatch.setattr(core_store.db, "chat_get_many_strict", get_many)
+    monkeypatch.setattr(store, "reload_chat_hot_strict", lambda: [])
+    monkeypatch.setattr(store, "notify_chat_waiters", lambda: None)
+    with _capture_logger(core_store.log) as stream:
+        assert store.ensure_chat_fresh(force=True) is True
+
+    text = stream.getvalue()
+    assert "reason=generation_conflict" in text
+    assert store.user_id not in text
+
+
+def test_snapshot_fallback_telemetry_rejects_unknown_reason():
+    with pytest.raises(ValueError, match="fallback reason"):
+        core_store._chat_snapshot_fallback_telemetry(
+            user_id="private-user", reason="unknown", hot_rows=1
+        )
 
 
 def test_duplicate_target_and_coalesced_check_do_no_work(monkeypatch):
@@ -191,6 +268,74 @@ def test_strict_snapshot_retries_if_local_commit_lands_during_db_read(monkeypatc
     assert len(calls) == 2
     assert [row["id"] for row in rows] == ["old", "local"]
     assert store.chat_version == 2
+
+
+def test_strict_snapshot_serializes_final_attempt_after_repeated_local_commits(
+    monkeypatch,
+):
+    store = _bare_store([_row("old", 1)], version=1)
+    calls = []
+
+    def snapshot(_uid, _limit):
+        calls.append(len(calls) + 1)
+        if len(calls) == 1:
+            assert store.chat_lock.locked() is False
+            store.apply_committed_chat_rows([_row("local-a", 2)])
+            return 1, [_row("old", 1)]
+        if len(calls) == 2:
+            assert store.chat_lock.locked() is False
+            store.apply_committed_chat_rows([_row("local-b", 3)])
+            return 2, [_row("old", 1), _row("local-a", 2)]
+        assert store.chat_lock.locked() is True
+        return 3, [
+            _row("old", 1),
+            _row("local-a", 2),
+            _row("local-b", 3),
+        ]
+
+    monkeypatch.setattr(
+        core_store.db, "chat_load_hot_snapshot_strict", snapshot
+    )
+
+    rows = store.reload_chat_hot_strict()
+
+    assert calls == [1, 2, 3]
+    assert [row["id"] for row in rows] == ["old", "local-a", "local-b"]
+    assert store.chat_version == 3
+    assert store.chat_max_seq == 3
+    assert set(store._chat_messages_by_id) == {"old", "local-a", "local-b"}
+
+
+def test_strict_snapshot_locked_fallback_failure_preserves_last_good_cache(
+    monkeypatch,
+):
+    store = _bare_store([_row("kept", 1)], version=1)
+    calls = []
+
+    def snapshot(_uid, _limit):
+        calls.append(len(calls) + 1)
+        if len(calls) <= 2:
+            store.apply_committed_chat_rows([
+                _row(f"local-{len(calls)}", len(calls) + 1)
+            ])
+            return 1, [_row("kept", 1)]
+        assert store.chat_lock.locked() is True
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(
+        core_store.db, "chat_load_hot_snapshot_strict", snapshot
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        store.reload_chat_hot_strict()
+
+    assert calls == [1, 2, 3]
+    assert [row["id"] for row in store.chat_messages] == [
+        "kept",
+        "local-1",
+        "local-2",
+    ]
+    assert store.chat_version == 1
 
 
 def test_failed_incremental_sync_does_not_wake_or_mutate(monkeypatch):

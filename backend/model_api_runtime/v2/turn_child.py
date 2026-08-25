@@ -1,4 +1,9 @@
-"""Turn-child 子进程入口（Hosted Runtime V2 PR D，D1 结构拆分，Task 2）。
+"""Runtime V2 单 slot 子进程入口。
+
+当前三池/单 slot 拓扑见
+``docs/superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md``；
+progress、watchdog 与历史安全不变量见保留的
+``docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md``。
 
 `serve_worker._serve`（父进程）不再直接 `asyncio.create_task(v2_worker.run_worker_loop
 (...))`——那样 turn slot 跟 reaper/heartbeat/scheduler/Genesis 共用一个事件循环，一个
@@ -65,12 +70,13 @@ log = logging.getLogger("feedling.runtime_v2.turn_child")
 def _make_progress_cb(conn: "Connection") -> "callable":
     """构造喂给 `worker.run_worker_loop(progress_cb=...)` 的回调：每次真实 slot 活动
     （claim 到 job / turn 跑完 / 空转 poll 醒来——见 `worker._slot_loop` 的三个调用点）
-    往 `conn`（progress pipe 写端）发一条 `("progress", slot_id, monotonic, turn_start)`。
+    往 `conn`（该 slot 的 progress pipe 写端）发送编码后的
+    `slot_protocol.SlotProgress`。
 
     `turn_start`（hard-timeout fix）：原样转发 `worker._slot_loop` 传来的第二个参数——
     这个 slot 当前正在跑的 turn 的开始时刻（claim 之后、`_run_turn` 之前），或者
     `None`（turn 跑完/空转，slot 当前空闲）。父进程侧的 `ChildSupervisor` 用它算
-    `current_turn_age_sec`（见该模块的 progress pipe 协议注释）——一个 slot 卡死在
+    `current_turn_age_sec`（见该模块的 slot protocol 注释）——一个 slot 卡死在
     `_run_turn` 内部永不返回时，它发出的最后一条消息里的 `turn_start` 就是父进程能拿到
     的最新数据，父进程用挂钟时间减去它，年龄跟着挂钟时间持续增长，不依赖这个 slot 之后
     还发不发消息。
@@ -103,15 +109,15 @@ async def _event_loop_heartbeat(
     it deliberately does not refresh any active turn's stall clock.  The two
     signals cover different failure modes:
 
-    * a synchronous event-loop block stops this heartbeat and trips the short
-      pool-wide liveness watchdog;
+    * a synchronous event-loop block stops this heartbeat and trips this slot's
+      liveness watchdog;
     * an ``await`` that never returns leaves the loop heartbeat healthy, but
       its slot stops crossing provider/tool/compaction boundaries and trips
       the per-turn stall watchdog.
 
     Keeping them separate also prevents a normal 60-second async provider wait
-    from looking like a dead 45-second child merely because all slots happen to
-    be busy while another job is queued.
+    in this child’s one slot from looking like a dead 45-second child merely
+    because another job is queued.
     """
     while not stop_event.is_set():
         try:
@@ -149,7 +155,8 @@ async def _run(
         except (NotImplementedError, RuntimeError):
             # 极少数平台/事件循环组合不支持 add_signal_handler——退化为"收不到干净 drain
             # 信号"，但进程仍然会被裸 SIGTERM 杀掉（只是跳过 drain），父进程的 SIGKILL
-            # 路径（watchdog kill_and_respawn）完全不受影响，那条本来就是不可 catch 的。
+            # 路径完全不受影响：parent fleet/serve_worker 负责确认 kill、按精确
+            # job_id + claimed_by 恢复 claim 并启动 replacement；SIGKILL 本来不可 catch。
             log.warning("[v2.turn_child] add_signal_handler unsupported for %s", sig)
 
     deps = serve_worker.build_production_deps()

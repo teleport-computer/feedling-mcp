@@ -42,6 +42,10 @@ def _clean_agent_jobs_table(monkeypatch):
     # Exact successor/enqueue assertions predate the independent profile lane.
     monkeypatch.setenv("FEEDLING_V2_PROFILE_ENABLED", "0")
     monkeypatch.setattr(worker, "_PROFILE_ENABLED", False)
+    # These integration cases predate default-on self-thinking and mostly
+    # script plain terminal replies. Keep their historical contract isolated;
+    # self-thinking behavior is covered explicitly in test_v2_worker_tool_loop.
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs")
     yield
@@ -611,7 +615,7 @@ def test_process_job_acquires_enclave_semaphore_for_read_messages_and_prefetch(m
     the shared gate. Uses a real (counting) Semaphore, not a mock, so the
     assertion exercises actual async acquire/release semantics.
 
-    Task 7: the old planner-lane memory_index/perception_snapshot prefetches
+    Historical planner-lane memory_index/perception_snapshot prefetches
     are gone (the unified tool loop only fetches what the model actually asks
     for), so this now drives a 2-round script — an explicitly enabled
     `web_search` tool call, then a terminal reply — to exercise a THIRD
@@ -1610,8 +1614,8 @@ def test_tail_image_limit_fails_worker_startup_when_nonpositive(raw):
 
 
 # ------------------------------------------------------------------
-# D3 Task 5: lane reservation wiring — _reserved_lane_slots() picks the
-# per-slot lane allowlist that run_worker_loop hands to each _slot_loop.
+# Legacy direct-worker lane-assignment compatibility — _reserved_lane_slots()
+# picks the per-slot allowlist that run_worker_loop hands to each _slot_loop.
 # ------------------------------------------------------------------
 
 def test_reserved_lane_slots_explicit_reserved_count():
@@ -2565,7 +2569,7 @@ def test_chat_still_works_and_takes_the_chat_path(monkeypatch):
 
 
 # ------------------------------------------------------------------
-# Hosted Runtime V2 PR D Task 2: slot-driven progress_cb. Replaces the old
+# Slot-driven progress callback. Replaces the old
 # free-running progress ticker (turn_child._progress_ticker) with a signal
 # tied to REAL slot activity — claim, turn completion, and idle-poll wake —
 # so the Task 3 watchdog can tell "event loop healthy, nothing to claim"
@@ -2645,7 +2649,7 @@ def test_slot_loop_progress_cb_exception_does_not_crash_loop(monkeypatch):
 def test_run_worker_loop_threads_progress_cb_with_slot_index(monkeypatch):
     """run_worker_loop must hand each _slot_loop its own index (slot_id) plus
     the same progress_cb — this is the wiring the turn_child progress pipe
-    (and the eventual Task 3 watchdog) relies on to attribute a heartbeat to a
+    (and the watchdog) relies on to attribute a heartbeat to a
     specific slot."""
     stop = asyncio.Event()
 

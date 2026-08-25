@@ -101,7 +101,7 @@ def _save(store: UserStore, servers: list[dict]) -> dict:
     # from the run_db threadpool because the registry hops back to the loop via
     # loop.call_soon_threadsafe.
     store.notify_chat_waiters()
-    wake_bus.notify("chat", store.user_id)
+    wake_bus.notify_chat_wake_only(store.user_id)
     return data
 
 
@@ -529,7 +529,7 @@ def test_server(store: UserStore, name: str, caller_api_key: str | None) -> tupl
             # changed, mirroring _save's intent without a spurious wake.
             if new_doc["fingerprint"] != original.get("fingerprint"):
                 store.notify_chat_waiters()
-                wake_bus.notify("chat", store.user_id)
+                wake_bus.notify_chat_wake_only(store.user_id)
     return out, 200
 
 

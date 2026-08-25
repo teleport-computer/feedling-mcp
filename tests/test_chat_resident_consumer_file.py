@@ -120,6 +120,27 @@ def test_prepare_text_file_lands_and_names_original(tmp_path, monkeypatch):
     assert "笔记.md" in prep.cli_instruction
 
 
+def test_prepare_canvas_file_exposes_current_title_and_subtitle(tmp_path, monkeypatch):
+    from tools import chat_resident_consumer as c
+    monkeypatch.setattr(c, "FILE_TEMP_DIR", tmp_path)
+    import base64
+    msg = {
+        "id": "canvas-file",
+        "content_type": "file",
+        "file_name": "接星星.io.html",
+        "file_display_title": "接星星",
+        "file_display_subtitle": "六十秒接星星小游戏",
+        "file_mime": "text/html",
+        "file_b64": base64.b64encode(b"<html></html>").decode(),
+    }
+
+    prep = c._prepare_file_for_agent(msg)
+
+    assert "Canvas 标题：接星星" in prep.cli_instruction
+    assert "Canvas 副标题：六十秒接星星小游戏" in prep.cli_instruction
+    assert "除非用户要求改变" in prep.http_block
+
+
 def test_prepare_docx_declares_extraction(tmp_path, monkeypatch):
     from tools import chat_resident_consumer as c
     monkeypatch.setattr(c, "FILE_TEMP_DIR", tmp_path)

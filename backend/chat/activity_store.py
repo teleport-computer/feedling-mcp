@@ -84,7 +84,7 @@ def append_resident_tool_event(
                     event_id = int(cur.fetchone()["id"])
     if inserted is not None:
         try:
-            wake_bus.notify("chat", str(user_id))
+            wake_bus.notify_chat_wake_only(str(user_id))
         except Exception:  # observability must never affect the tool
             pass
     return event_id, inserted is not None

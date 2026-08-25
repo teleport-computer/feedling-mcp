@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import sys
 from pathlib import Path
 
@@ -223,3 +224,62 @@ def test_heartbeat_deadline_cas_retries_without_clobbering_peer_write(monkeypatc
     assert attempts[1][0]["peer_field"] == "concurrent"
     assert attempts[1][1]["peer_field"] == "concurrent"
     assert attempts[1][1][core_store.HEARTBEAT_NEXT_TICK_AT_KEY] == 1900.0
+
+
+def test_periodic_tick_consume_preserves_existing_phase():
+    uid = "usr_heartbeat_consume_phase"
+    seed_user(uid)
+    db.set_blob(
+        uid,
+        "proactive_settings",
+        {
+            core_store.HEARTBEAT_NEXT_TICK_AT_KEY: 1900.0,
+            "peer_field": "preserve",
+        },
+    )
+
+    tick_at, won = core_store.consume_proactive_heartbeat_tick(
+        uid, now=1900.25, wake_interval_sec=900
+    )
+
+    assert won is True
+    assert tick_at == 2800.0
+    persisted = db.get_blob(uid, "proactive_settings")
+    assert persisted[core_store.HEARTBEAT_NEXT_TICK_AT_KEY] == 2800.0
+    assert persisted["peer_field"] == "preserve"
+
+
+def test_periodic_tick_consume_has_exactly_one_concurrent_winner():
+    uid = "usr_heartbeat_consume_race"
+    seed_user(uid)
+    db.set_blob(
+        uid,
+        "proactive_settings",
+        {core_store.HEARTBEAT_NEXT_TICK_AT_KEY: 1000.0},
+    )
+
+    def _consume(_index):
+        return core_store.consume_proactive_heartbeat_tick(
+            uid, now=1000.0, wake_interval_sec=900
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(_consume, range(8)))
+
+    assert sum(won for _tick, won in results) == 1
+    assert {tick for tick, _won in results} == {1900.0}
+
+
+def test_periodic_tick_consume_cas_exhaustion_never_invents_a_win(monkeypatch):
+    monkeypatch.setattr(
+        core_store,
+        "_read_proactive_heartbeat_settings",
+        lambda _uid: {core_store.HEARTBEAT_NEXT_TICK_AT_KEY: 1000.0},
+    )
+    monkeypatch.setattr(db, "set_blob_if_unchanged", lambda *_a, **_k: False)
+
+    tick_at, won = core_store.consume_proactive_heartbeat_tick(
+        "usr_heartbeat_consume_loser", now=1000.0, wake_interval_sec=900
+    )
+
+    assert (tick_at, won) == (1000.0, False)

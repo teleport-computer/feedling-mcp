@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: AGENTS.md
+---
 # CLAUDE.md — repo-level guidance
 
 ## Design System
@@ -14,22 +18,26 @@ tokens defined at the bottom of `DESIGN.md`.
 
 ## Reading order on session start
 
-1. `docs/CHANGELOG.md` — landmark diffs from recent sessions; this is
-   the source of truth for "what shipped, when, why."
-2. `CONTRIBUTING.md` — backend code-organization rules (where new code
+1. `AGENTS.md` — repository guardrails and branch/documentation rules.
+2. `docs/CURRENT_STATE.md` — current runtime, deployment, data/trust, and
+   diagnostic ownership. This is the current-state entry point.
+3. `CONTRIBUTING.md` — backend code-organization rules (where new code
    goes, dependency direction, asgi_app.py is assembly-only). Read before
    writing ANY backend code; PRs are reviewed against it.
-3. `DESIGN.md` — if doing any UI work.
-4. `deploy/DEPLOYMENTS.md` — if doing any enclave/CVM/on-chain work.
-5. `docs/testing/TESTING.md` — the general test standard: a "changed X → run
+4. `DESIGN.md` — if doing any UI work.
+5. `deploy/DEPLOYMENTS.md` — if doing any enclave/CVM/on-chain work.
+6. `docs/testing/README.md` and `docs/testing/TESTING.md` — the test entry point
+   and general standard: a "changed X → run
    which tests" decision matrix (§2) covering every change class
    (backend logic, routes, encryption/account link, gateway/driver,
    consumer, schema, compose, CVM, iOS, docs, contracts). Consult it
    before declaring ANY change done — it defines the Definition of Done.
+7. `docs/CHANGELOG.md` — historical timeline and decision context when needed;
+   it does not override current deployment/code evidence.
 
 There is no longer a separate HANDOFF.md — it was a session-relay doc
-from the v0→v1 strip era and was deleted 2026-05-12. Recent state lives
-in the CHANGELOG and in git log.
+from the v0→v1 strip era and was deleted 2026-05-12. Current state lives in
+`docs/CURRENT_STATE.md`; history remains in the changelog and git log.
 
 ## Agent mailbox
 

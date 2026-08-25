@@ -1,4 +1,24 @@
-# Hosted Runtime V2 — Full-Conversation Context (condition 2) Design
+---
+document_lifecycle: historical
+historical_reason: superseded
+superseded_by: docs/superpowers/specs/2026-08-12-remove-v2-semantic-compaction-design.md
+canonical_owner: docs/superpowers/specs/2026-08-12-remove-v2-semantic-compaction-design.md
+---
+# Hosted Runtime V2 — Full-Conversation Context (condition 2) Historical design
+
+> **Historical record:** This design and its implementation landed, but its
+> provider-authored, append-and-merge conversation summary is superseded. The
+> current Runtime V2 history contract is the landed
+> [`deterministic-only coverage decision`](2026-08-12-remove-v2-semantic-compaction-design.md):
+> raw encrypted Chat rows remain the durable ledger; exact seq/count provenance,
+> watermark/CAS, the bounded recent verbatim tail, and coverage-hole safety
+> remain required; newly written coverage is metadata-only and never sends
+> conversation plaintext to a provider. `v2_agent_profile` MEMORY/USER owns
+> long-lived semantic context.
+
+> **Historical authoring note:** The status, task references, budgets, and
+> execution instructions below describe the 2026-07-09 design baseline. They
+> are retained as implementation evidence, not as a current runbook.
 
 > **Status:** design, uncommitted, on `feat/hosted-runtime-v2` worktree.
 > **Scope:** this is **Step 2 = walkthrough §9 condition 2 ONLY** (full conversation + compaction). Conditions 3 (native agent loop) and §6 (admission ceiling) are **explicitly out** — deferred to later subproject-D work or dropped. See `2026-07-09-hosted-runtime-v2-merge-conditions-backlog.md`.

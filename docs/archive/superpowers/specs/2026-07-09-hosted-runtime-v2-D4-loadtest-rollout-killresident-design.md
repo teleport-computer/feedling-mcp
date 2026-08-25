@@ -1,7 +1,14 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/superpowers/specs/2026-07-21-dual-runtime-v1-v2-coexistence-design.md
+historical_reason: superseded
+superseded_by: docs/superpowers/specs/2026-07-21-dual-runtime-v1-v2-coexistence-design.md
+---
 # Hosted Runtime V2 — D4 Load Test + Gated Rollout + Kill Resident 设计
 
-> **RETIRED / DO NOT DEPLOY.** Historical cutover design; resident rollback and
-> supervisor scale-down are complete and cannot be used operationally.
+> **RETIRED / DO NOT DEPLOY.** 这是“全量切 V2 后关闭 Resident”的历史设计。
+> 当前托管环境仍采用 dual-runtime，Resident supervisor 和反向切换是受保护的
+> 生产路径；不要执行本文的 kill-resident 步骤。
 
 > 子项目 D 的收官，**真正兑现省钱/并发的那一步**。来源：walkthrough §8 gate 6-7 + §9 条件6 + 现状调查（2026-07-09）。**依赖 D0（池在跑+互斥闸+setter+指标）+ D3（proactive 迁走）。** 半代码（压测脚手架）半 ops（灰度/关 resident runbook）。
 

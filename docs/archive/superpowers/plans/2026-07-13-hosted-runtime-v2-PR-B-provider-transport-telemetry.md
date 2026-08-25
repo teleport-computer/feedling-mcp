@@ -1,6 +1,14 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-B-provider-transport-telemetry-design.md
+historical_reason: implemented
+---
 # Hosted Runtime V2 — PR B: Provider Transport / Telemetry — Implementation Plan
 
 > **STATUS: LANDED / HISTORICAL IMPLEMENTATION RECORD.**
+
+> Current owner: [the retained PR-B provider transport/telemetry decision](../../../superpowers/specs/2026-07-13-hosted-runtime-v2-PR-B-provider-transport-telemetry-design.md).
+> This plan's tasks and no-commit instructions are historical, not operating documentation.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

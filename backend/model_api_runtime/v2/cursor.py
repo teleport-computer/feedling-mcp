@@ -9,7 +9,8 @@ message. ``seq`` is a real monotonic identity-column counter (see
 Advancing the cursor is itself an outbox ``cursor`` effect (see
 ``effect_outbox.py``) so it is generation-fenced and idempotent exactly like
 every other V2 side effect: the actual durable WRITE of the new cursor value
-happens in the ``cursor`` effect's dispatch sink (Task 6 / spec A6), not here.
+happens in the ``cursor`` effect's dispatch sink (retained effect-dispatch
+contract §A6), not here.
 This module only derives the effect's id/payload and reads the last durably
 committed value back off the user's ``model_api_runtime`` profile blob.
 """

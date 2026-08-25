@@ -1,6 +1,12 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop-design.md
+historical_reason: implemented
+---
 # Hosted Runtime V2 — PR C: Unified Provider-Native Tool Loop — Implementation Plan
 
-> **STATUS: LANDED / CURRENT ARCHITECTURE IMPLEMENTATION RECORD.**
+> **STATUS: LANDED / HISTORICAL IMPLEMENTATION RECORD.** The current
+> architecture decision is [`2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop-design.md`](../../../superpowers/specs/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop-design.md).
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

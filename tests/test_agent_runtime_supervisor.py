@@ -661,11 +661,9 @@ def test_respawn_releases_inflight_claim_after_kill_before_spawn(monkeypatch):
 
     def _fake_release(user_id):
         events.append("release")
-        return 1  # non-zero → notify should fire
+        return 1  # DB trigger owns the cross-worker v2 notification.
 
     monkeypatch.setattr(supervisor_mod.db, "chat_expire_reply_claims", _fake_release)
-    monkeypatch.setattr(supervisor_mod.wake_bus, "notify",
-                        lambda channel, uid="": events.append(f"notify:{channel}"))
 
     _roster("u_1")  # seed the users row so acquire's FK is satisfied
     procs = OrderedProcs()
@@ -678,7 +676,7 @@ def test_respawn_releases_inflight_claim_after_kill_before_spawn(monkeypatch):
 
     assert "release" in events, events
     assert events.index("kill") < events.index("release") < events.index("spawn"), events
-    assert events.index("release") < events.index("notify:chat"), events
+    assert "notify:chat" not in events
 
 
 def test_tick_provider_key_rotation_respawns_consumer():

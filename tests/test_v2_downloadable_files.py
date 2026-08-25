@@ -36,6 +36,12 @@ _PROVIDER = provider_client.ProviderConfig(
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_self_thinking_correction(monkeypatch):
+    """File-delivery tests exercise attachment contracts, not reply format."""
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
+
+
 def test_file_delivery_policy_is_semantic_and_hides_internal_paths():
     prompt = v2_context.CHAT_SYSTEM_PROMPT
     description = next(
@@ -256,6 +262,48 @@ def test_send_file_is_chat_only_and_invokes_explicit_callback(monkeypatch):
     ]
 
 
+def test_canvas_send_file_delivers_model_authored_display_metadata(monkeypatch):
+    files = []
+
+    async def on_file(path, revision, *, title, subtitle):
+        files.append((path, revision, title, subtitle))
+
+    outcome, _, replies, _ = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "canvas-1",
+                        "name": "send_file",
+                        "args": {
+                            "path": "/workspace/接星星.io.html",
+                            "revision": 2,
+                            "title": "接星星",
+                            "subtitle": "六十秒接住尽可能多的星星",
+                            "completion_message": "画布已经更新，可以直接打开了。",
+                        },
+                    }
+                ],
+                "usage": {},
+            },
+        ],
+        on_file_reply=on_file,
+    )
+
+    assert files == [
+        (
+            "/workspace/接星星.io.html",
+            2,
+            "接星星",
+            "六十秒接住尽可能多的星星",
+        )
+    ]
+    assert replies == [("画布已经更新，可以直接打开了。", True)]
+    assert outcome.replied_intermediate is True
+
+
 def test_required_file_turn_offers_only_delivery_pipeline_tools(monkeypatch):
     files = []
 
@@ -411,7 +459,7 @@ def test_model_selected_shared_work_uses_compact_delivery_after_large_write(
     files = []
     trajectory_events = []
 
-    async def on_file(path, revision):
+    async def on_file(path, revision, *, title="", subtitle=""):
         files.append((path, revision))
 
     async def dispatch(tool_calls):
@@ -468,12 +516,14 @@ def test_model_selected_shared_work_uses_compact_delivery_after_large_write(
                         "args": {
                             "path": "/workspace/记忆知识图谱.io.html",
                             "revision": 1,
+                            "title": "记忆知识图谱",
+                            "subtitle": "把重要记忆整理成可探索的关系图",
+                            "completion_message": "记忆知识图谱已经准备好了，可以直接打开。",
                         },
                     }
                 ],
                 "usage": {},
             },
-            {"reply": "Canvas 已经准备好了。", "tool_calls": [], "usage": {}},
         ],
         on_file_reply=on_file,
         dispatch=dispatch,
@@ -483,16 +533,197 @@ def test_model_selected_shared_work_uses_compact_delivery_after_large_write(
     )
 
     assert {"workspace_write", "send_file"}.issubset(calls[0])
-    assert calls[1:] == [("send_file",), ()]
+    assert calls[1:] == [("send_file",)]
     assert files == [("/workspace/记忆知识图谱.io.html", 1)]
-    assert replies == [("Canvas 已经准备好了。", True)]
+    assert replies == [("记忆知识图谱已经准备好了，可以直接打开。", True)]
     assert outcome.stop_reason == "final_text"
     assert len(str(messages_seen[1])) < 2_000
     assert "记忆知识图谱.io.html" in str(messages_seen[1])
-    assert len(str(messages_seen[2])) < 2_000
+    assert "completion_message" in str(messages_seen[1])
+    assert "do not default it to English or Chinese" in str(messages_seen[1])
+    assert "The work the user asked for was saved" not in str(messages_seen)
+    assert len(messages_seen) == 2
     assert all(
         kind != "required_file_missing" for kind, _payload in trajectory_events
     )
+
+
+def test_canvas_update_compact_delivery_preserves_request_and_corrects_metadata(
+    monkeypatch,
+):
+    files = []
+    trajectory_events = []
+    tool_events = []
+    user_request = "把标题改成「星光方块」，副标题改成「今晚一起玩」。"
+
+    async def on_file(path, revision, *, title="", subtitle=""):
+        files.append((path, revision, title, subtitle))
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content="ok: workspace_write applied at revision 2",
+                metadata={"workspace_revision": 2},
+            )
+            for call in tool_calls
+        ]
+
+    outcome, calls, replies, messages_seen = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "write-update",
+                    "name": "workspace_write",
+                    "args": {
+                        "path": "/workspace/小游戏.io.html",
+                        "content": "<title>星光方块</title><main>game</main>",
+                        "expected_revision": 1,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "missing-metadata",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/小游戏.io.html",
+                        "revision": 2,
+                        "title": "星光方块",
+                        "subtitle": "今晚一起玩",
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "corrected-delivery",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/小游戏.io.html",
+                        "revision": 2,
+                        "title": "星光方块",
+                        "subtitle": "今晚一起玩",
+                        "completion_message": "已经按你的要求更新好了。",
+                    },
+                }],
+                "usage": {},
+            },
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        file_requirement_messages=[{"role": "user", "content": user_request}],
+        max_calls=4,
+        trajectory_events=trajectory_events,
+        tool_events=tool_events,
+    )
+
+    assert calls[1:] == [("send_file",), ("send_file",)]
+    assert files == [
+        ("/workspace/小游戏.io.html", 2, "星光方块", "今晚一起玩")
+    ]
+    assert user_request in str(messages_seen[1])
+    assert "title, subtitle, and completion_message" in str(messages_seen[1])
+    validation_exchange = messages_seen[2][-1]
+    assert isinstance(validation_exchange, ToolExchange)
+    assert [result.call_id for result in validation_exchange.results] == [
+        "missing-metadata"
+    ]
+    assert (
+        "requires title, subtitle, and completion_message"
+        in validation_exchange.results[0].content
+    )
+    assert [event[2] for event in tool_events if event[0] == "missing-metadata"] == [
+        "tool_call_started",
+        "tool_call_result",
+    ]
+    assert any(
+        kind == "tool_batch_validation_failed"
+        for kind, _payload in trajectory_events
+    )
+    assert len(messages_seen) == 3
+    assert replies == [("已经按你的要求更新好了。", True)]
+    assert outcome.stop_reason == "final_text"
+
+
+def test_canvas_update_repeated_invalid_metadata_fails_as_delivery_not_connection(
+    monkeypatch,
+):
+    files = []
+
+    async def on_file(path, revision, *, title="", subtitle=""):
+        files.append((path, revision, title, subtitle))
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content="ok: workspace_write applied at revision 2",
+                metadata={"workspace_revision": 2},
+            )
+            for call in tool_calls
+        ]
+
+    with pytest.raises(
+        tool_loop.CanvasDeliveryIncomplete,
+        match="invalid_canvas_delivery_args",
+    ):
+        _run_loop(
+            monkeypatch,
+            [
+                {
+                    "reply": "",
+                    "tool_calls": [{
+                        "id": "write-update",
+                        "name": "workspace_write",
+                        "args": {
+                            "path": "/workspace/小游戏.io.html",
+                            "content": "<title>小游戏</title>",
+                            "expected_revision": 1,
+                        },
+                    }],
+                    "usage": {},
+                },
+                {
+                    "reply": "",
+                    "tool_calls": [{
+                        "id": "missing-metadata-1",
+                        "name": "send_file",
+                        "args": {
+                            "path": "/workspace/小游戏.io.html",
+                            "revision": 2,
+                        },
+                    }],
+                    "usage": {},
+                },
+                {
+                    "reply": "",
+                    "tool_calls": [{
+                        "id": "missing-metadata-2",
+                        "name": "send_file",
+                        "args": {
+                            "path": "/workspace/小游戏.io.html",
+                            "revision": 2,
+                        },
+                    }],
+                    "usage": {},
+                },
+            ],
+            on_file_reply=on_file,
+            dispatch=dispatch,
+            file_requirement_messages=[{
+                "role": "user",
+                "content": "修改标题和副标题",
+            }],
+            max_calls=4,
+        )
+
+    assert files == []
 
 
 def test_ordinary_workspace_write_remains_a_draft_without_auto_delivery(monkeypatch):
@@ -547,7 +778,7 @@ def test_pending_canvas_delivery_rejects_wrong_target_then_delivers_exact_one(
 ):
     files = []
 
-    async def on_file(path, revision):
+    async def on_file(path, revision, *, title="", subtitle=""):
         files.append((path, revision))
 
     async def dispatch(tool_calls):
@@ -584,6 +815,9 @@ def test_pending_canvas_delivery_rejects_wrong_target_then_delivers_exact_one(
                     "args": {
                         "path": "/workspace/other.io.html",
                         "revision": 9,
+                        "title": "面板",
+                        "subtitle": "一个简洁的交互面板",
+                        "completion_message": "新版面板已经准备好了。",
                     },
                 }],
                 "usage": {},
@@ -596,11 +830,13 @@ def test_pending_canvas_delivery_rejects_wrong_target_then_delivers_exact_one(
                     "args": {
                         "path": "/workspace/panel.io.html",
                         "revision": 1,
+                        "title": "面板",
+                        "subtitle": "一个简洁的交互面板",
+                        "completion_message": "新版面板已经准备好了。",
                     },
                 }],
                 "usage": {},
             },
-            {"reply": "新版面板已发送。", "tool_calls": [], "usage": {}},
         ],
         on_file_reply=on_file,
         dispatch=dispatch,
@@ -610,14 +846,14 @@ def test_pending_canvas_delivery_rejects_wrong_target_then_delivers_exact_one(
     assert calls[1] == ("send_file",)
     assert calls[2] == ("send_file",)
     assert files == [("/workspace/panel.io.html", 1)]
-    assert replies == [("新版面板已发送。", True)]
+    assert replies == [("新版面板已经准备好了。", True)]
     assert outcome.stop_reason == "final_text"
 
 
 def test_io_html_satisfies_generic_html_delivery_requirement(monkeypatch):
     files = []
 
-    async def on_file(path, revision):
+    async def on_file(path, revision, *, title="", subtitle=""):
         files.append((path, revision))
 
     async def dispatch(tool_calls):
@@ -654,11 +890,13 @@ def test_io_html_satisfies_generic_html_delivery_requirement(monkeypatch):
                     "args": {
                         "path": "/workspace/接星星小游戏.io.html",
                         "revision": 1,
+                        "title": "接星星小游戏",
+                        "subtitle": "六十秒内接住尽可能多的星星",
+                        "completion_message": "小游戏已经发给你了，可以直接打开。",
                     },
                 }],
                 "usage": {},
             },
-            {"reply": "小游戏已经发给你了。", "tool_calls": [], "usage": {}},
         ],
         on_file_reply=on_file,
         dispatch=dispatch,
@@ -668,7 +906,167 @@ def test_io_html_satisfies_generic_html_delivery_requirement(monkeypatch):
 
     assert calls[1] == ("send_file",)
     assert files == [("/workspace/接星星小游戏.io.html", 1)]
-    assert replies == [("小游戏已经发给你了。", True)]
+    assert replies == [("小游戏已经发给你了，可以直接打开。", True)]
+    assert outcome.stop_reason == "final_text"
+
+
+def test_existing_canvas_read_can_be_delivered_without_rewriting_source(monkeypatch):
+    files = []
+    dispatched = []
+    path = "/workspace/打砖块小游戏.io.html"
+
+    async def on_file(file_path, revision, *, title="", subtitle=""):
+        files.append((file_path, revision, title, subtitle))
+
+    async def dispatch(tool_calls):
+        dispatched.extend(call.name for call in tool_calls)
+        return [
+            ToolResult(
+                call_id=call.id,
+                content='{"path":"/workspace/打砖块小游戏.io.html","revision":7}',
+                metadata={
+                    "workspace_read_path": path,
+                    "workspace_revision": 7,
+                },
+            )
+            for call in tool_calls
+        ]
+
+    outcome, calls, replies, messages_seen = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "read-existing",
+                    "name": "workspace_read",
+                    "args": {"path": path},
+                }],
+                "usage": {},
+            },
+            {
+                "reply": f"已经更新，打开 private://workspace{path}",
+                "tool_calls": [],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "send-existing",
+                    "name": "send_file",
+                    "args": {
+                        "path": path,
+                        "revision": 7,
+                        "title": "霓虹砖块",
+                        "subtitle": "击碎所有砖块，刷新最高分",
+                        "completion_message": "标题和副标题已经更新好了。",
+                    },
+                }],
+                "usage": {},
+            },
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        required_file_suffixes=(".html",),
+        file_requirement_messages=[{
+            "role": "user",
+            "content": "把这个 Canvas 的标题和副标题重新改一下，发给我。",
+        }],
+        max_calls=4,
+    )
+
+    assert dispatched == ["workspace_read"]
+    assert set(calls[2]) == {"workspace_write", "send_file"}
+    assert "existing exact workspace revision" in messages_seen[2][0]["content"]
+    assert files == [
+        (path, 7, "霓虹砖块", "击碎所有砖块，刷新最高分")
+    ]
+    assert replies == [("标题和副标题已经更新好了。", True)]
+    assert outcome.stop_reason == "final_text"
+
+
+def test_existing_canvas_delivery_choice_can_still_rewrite_changed_source(
+    monkeypatch,
+):
+    files = []
+    path = "/workspace/打砖块小游戏.io.html"
+
+    async def on_file(file_path, revision, *, title="", subtitle=""):
+        files.append((file_path, revision, title, subtitle))
+
+    async def dispatch(tool_calls):
+        results = []
+        for call in tool_calls:
+            if call.name == "workspace_read":
+                results.append(ToolResult(
+                    call_id=call.id,
+                    content='{"path":"/workspace/打砖块小游戏.io.html","revision":7}',
+                    metadata={
+                        "workspace_read_path": path,
+                        "workspace_revision": 7,
+                    },
+                ))
+            else:
+                results.append(ToolResult(
+                    call_id=call.id,
+                    content="ok: workspace_write applied at revision 8",
+                    metadata={"workspace_revision": 8},
+                ))
+        return results
+
+    outcome, calls, _, _ = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "read-existing",
+                    "name": "workspace_read",
+                    "args": {"path": path},
+                }],
+                "usage": {},
+            },
+            {"reply": "修改完成。", "tool_calls": [], "usage": {}},
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "write-update",
+                    "name": "workspace_write",
+                    "args": {
+                        "path": path,
+                        "content": "<html>updated game</html>",
+                        "expected_revision": 7,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "send-update",
+                    "name": "send_file",
+                    "args": {
+                        "path": path,
+                        "revision": 8,
+                        "title": "新版打砖块",
+                        "subtitle": "加入新的关卡与计分规则",
+                        "completion_message": "新版已经发给你，可以直接打开。",
+                    },
+                }],
+                "usage": {},
+            },
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        required_file_suffixes=(".html",),
+        max_calls=5,
+    )
+
+    assert set(calls[2]) == {"workspace_write", "send_file"}
+    assert calls[3] == ("send_file",)
+    assert files == [
+        (path, 8, "新版打砖块", "加入新的关卡与计分规则")
+    ]
     assert outcome.stop_reason == "final_text"
 
 
@@ -1126,7 +1524,9 @@ def test_workspace_file_result_bounds_content_and_sanitizes_name():
             "path": "/workspace/knowledge.io.html",
             "content": "<!doctype html><title>Knowledge</title>",
             "mime_type": "text/markdown",
-        }
+        },
+        title="Knowledge",
+        subtitle="Interactive knowledge Canvas",
     )
     assert shared_work.mime_type == "text/html"
     with pytest.raises(ValueError):
@@ -1134,6 +1534,16 @@ def test_workspace_file_result_bounds_content_and_sanitizes_name():
             {
                 "path": "/workspace/too-large.io.html",
                 "content": "x" * (tool_schema.SHARED_WORK_MAX_BYTES + 1),
+            },
+            title="Too large",
+            subtitle="Oversized Canvas",
+        )
+
+    with pytest.raises(ValueError):
+        worker._workspace_file_reply_from_result(
+            {
+                "path": "/workspace/large.md",
+                "content": "x" * (worker._WORKSPACE_FILE_MAX_BYTES + 1),
             }
         )
 
@@ -1148,12 +1558,39 @@ def test_workspace_write_rejects_oversized_shared_work_source():
         },
     )
     assert error == "Canvas source exceeds the 256 KB UTF-8 limit"
-    with pytest.raises(ValueError):
+
+
+def test_workspace_canvas_file_result_preserves_display_metadata(monkeypatch):
+    result = worker._workspace_file_reply_from_result(
+        {
+            "path": "/workspace/接星星.io.html",
+            "content": "<html><title>接星星</title></html>",
+            "mime_type": "text/html",
+        },
+        title="  接星星  ",
+        subtitle="六十秒内   接住尽可能多的星星",
+    )
+
+    assert result.display_title == "接星星"
+    assert result.display_subtitle == "六十秒内 接住尽可能多的星星"
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda *_args, **_kwargs: ({"id": "a" * 32}, None),
+    )
+    effect = worker._build_encrypted_file_reply_effect_payload(
+        object(), result, effect_id="effect-canvas"
+    )
+    assert effect["message_extra"]["file_display_title"] == "接星星"
+    assert effect["message_extra"]["file_display_subtitle"] == "六十秒内 接住尽可能多的星星"
+
+    with pytest.raises(ValueError, match="title and subtitle"):
         worker._workspace_file_reply_from_result(
             {
-                "path": "/workspace/large.md",
-                "content": "x" * (worker._WORKSPACE_FILE_MAX_BYTES + 1),
-            }
+                "path": "/workspace/接星星.io.html",
+                "content": "<html></html>",
+            },
+            title="接星星",
         )
 
 
@@ -1286,8 +1723,10 @@ def test_transactional_reply_sink_preserves_file_metadata(monkeypatch):
         "envelope": {"id": "a" * 32},
         "message_extra": {
             "content_type": "file",
-            "file_name": "report.md",
-            "file_mime": "text/markdown",
+            "file_name": "接星星.io.html",
+            "file_display_title": "接星星",
+            "file_display_subtitle": "六十秒接星星小游戏",
+            "file_mime": "text/html",
             "file_byte_count": 9,
         },
     }
@@ -1297,8 +1736,10 @@ def test_transactional_reply_sink_preserves_file_metadata(monkeypatch):
     assert callable(post_commit)
     assert captured["content_type"] == "file"
     assert captured["extra"] == {
-        "file_name": "report.md",
-        "file_mime": "text/markdown",
+        "file_name": "接星星.io.html",
+        "file_display_title": "接星星",
+        "file_display_subtitle": "六十秒接星星小游戏",
+        "file_mime": "text/html",
         "file_byte_count": 9,
     }
 
@@ -1312,6 +1753,18 @@ def test_reply_metadata_rejects_unbounded_or_forged_values():
                     "file_name": "x.md",
                     "file_mime": "text/markdown",
                     "file_byte_count": worker._WORKSPACE_FILE_MAX_BYTES + 1,
+                }
+            }
+        )
+    with pytest.raises(RuntimeError, match="title and subtitle"):
+        serve_worker._reply_message_fields(
+            {
+                "message_extra": {
+                    "content_type": "file",
+                    "file_name": "接星星.io.html",
+                    "file_display_title": "接星星",
+                    "file_mime": "text/html",
+                    "file_byte_count": 100,
                 }
             }
         )

@@ -230,7 +230,7 @@ def test_chat_core_two_workers_one_reply_and_winner_only_side_effects(
     ]
     assert cached_parent["reply_message_id"] == winner_id
     assert [msg["id"] for msg in cached_replies] == [winner_id]
-    assert len(wakes) == 1
+    assert wakes == []
     assert len(captures) == 1
     assert len(first_chat_marks) == 1
     assert len(pushes) == 1

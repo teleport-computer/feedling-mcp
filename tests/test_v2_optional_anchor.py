@@ -28,6 +28,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_self_thinking_correction(monkeypatch):
+    """Anchor tests exercise prompt-window replay, not final reply format."""
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
+
+
 def _append(uid, role, text, *, source=None):
     """插入一条真实 chat 行并返回真实 seq。
 

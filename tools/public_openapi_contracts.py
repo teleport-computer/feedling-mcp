@@ -1108,13 +1108,15 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "include_reasoning": {
                 "type": "boolean",
                 "default": False,
-                "description": "Request the assistant's per-turn thinking for this Hosted Runtime V2 turn. With the self-authored thinking chain enabled (the default), the returned thinking is io's own first-person summary rather than the provider's raw chain-of-thought, falling back to native reasoning when no self-authored block was produced. Omitted values preserve the historical disabled behavior; resident runtimes ignore this field.",
+                "description": "Request the assistant's per-turn thinking for this Hosted Runtime V2 turn. With the self-authored thinking chain enabled (the default), the returned thinking is io's own first-person summary rather than the provider's raw chain-of-thought. If the initial final reply omits that block, Runtime V2 may spend one separately metered, text-only provider round from the existing turn budget to restate the same format contract. If that bounded correction is unavailable or still unusable, the original reply is delivered without a thinking attachment or native-reasoning fallback. Omitted values preserve the historical disabled behavior; resident runtimes ignore this field.",
             },
             "image_b64": {"type": "string", "contentEncoding": "base64", "description": "Image data; decoded size must not exceed 2,000,000 bytes."},
             "image_base64": {"type": "string", "contentEncoding": "base64", "deprecated": True},
             "image_mime": {"type": "string", "enum": ["image/jpeg", "image/png", "image/webp", "image/gif"]},
             "file_b64": {"type": "string", "contentEncoding": "base64", "description": "File data; decoded size must not exceed 26,214,400 bytes."},
             "file_name": {"type": "string", "maxLength": 120},
+            "file_display_title": {"type": "string", "minLength": 1, "maxLength": 120},
+            "file_display_subtitle": {"type": "string", "minLength": 1, "maxLength": 160},
             "file_mime": {"type": "string"},
         },
         "anyOf": [
@@ -1397,6 +1399,18 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "content_type": {"type": "string", "enum": ["text", "image", "file"], "default": "text"},
             "file_name": {"type": "string"},
+            "file_display_title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120,
+                "description": "Optional Canvas card title. Valid only for .html/.io.html files.",
+            },
+            "file_display_subtitle": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160,
+                "description": "Optional one-line Canvas card subtitle. Valid only for .html/.io.html files.",
+            },
             "file_mime": {"type": "string"},
             "caption_envelope": {
                 "allOf": [{"$ref": "#/components/schemas/EncryptedEnvelope"}],
@@ -1417,6 +1431,18 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "properties": {
             "envelope": {"$ref": "#/components/schemas/EncryptedEnvelope"},
             "file_name": {"type": "string", "minLength": 1, "maxLength": 120},
+            "file_display_title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120,
+                "description": "Required together with file_display_subtitle for .io.html Canvas delivery.",
+            },
+            "file_display_subtitle": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160,
+                "description": "Required together with file_display_title for .io.html Canvas delivery.",
+            },
             "file_mime": {"type": "string", "minLength": 1, "maxLength": 120},
             "file_byte_count": {
                 "type": "integer",

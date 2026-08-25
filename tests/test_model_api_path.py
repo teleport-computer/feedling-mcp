@@ -1711,11 +1711,10 @@ def test_onboarding_greeting_lookup_failure_propagates(client, monkeypatch):
     assert store.introduction_done() is False
 
 
-def test_onboarding_greeting_wake_notify_fires_for_inserter_only(client, monkeypatch):
-    # The cross-worker wake must actually fire for the inserter (a broken
-    # import here was once swallowed silently — other workers' long-polls
-    # never woke), and must NOT fire for a loser/idempotent re-call that adds
-    # no new content.
+def test_onboarding_greeting_does_not_emit_legacy_chat_notify(client, monkeypatch):
+    # The committed chat_messages INSERT is broadcast by the DB v2 trigger.
+    # The application path must not add a second legacy notification, and an
+    # idempotent loser must remain side-effect free.
     from core import wake_bus as core_wake_bus
 
     user_id, _api_key = _register(client)
@@ -1725,10 +1724,10 @@ def test_onboarding_greeting_wake_notify_fires_for_inserter_only(client, monkeyp
                         lambda kind, *args: notified.append((kind,) + args))
 
     history_import._append_model_api_onboarding_greeting(store, "hello")
-    assert notified == [("chat", user_id)]
+    assert notified == []
 
     history_import._append_model_api_onboarding_greeting(store, "retry")
-    assert notified == [("chat", user_id)]
+    assert notified == []
 
 
 def test_onboarding_greeting_insert_failure_does_not_mark(client, monkeypatch):

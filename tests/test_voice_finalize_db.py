@@ -507,8 +507,6 @@ def _run_finalize(monkeypatch, uid: str, call_id: str):
         return payload
 
     monkeypatch.setattr(routes_asgi.asgi_http, "read_json_silent", _read_json)
-    monkeypatch.setattr(routes_asgi.wake_bus, "notify", lambda *_a, **_k: None)
-
     from voice import transcript_store
 
     monkeypatch.setattr(

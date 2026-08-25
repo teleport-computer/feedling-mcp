@@ -235,6 +235,18 @@ def test_dead_v2_pool_fails_before_append_on_both_adapters(env):
         (
             {
                 "content_type": "file",
+                "file_name": "接星星.io.html",
+                "file_display_title": "接星星",
+                "file_display_subtitle": "六十秒接星星小游戏",
+                "file_mime": "text/html",
+                "file_b64": _b64(b"<html></html>"),
+                "message": "继续修改",
+            },
+            "file",
+        ),
+        (
+            {
+                "content_type": "file",
                 "file_name": "pic.png",
                 "file_mime": "image/png",
                 "file_b64": _b64(b"\x89PNG\r\n\x1a\n"),
@@ -254,6 +266,9 @@ def test_asgi_file_turns_enter_v2(env, payload, content_type):
     store = core_store.get_store(user_id)
     user_rows = [row for row in store.chat_messages if row.get("role") == "user"]
     assert user_rows[-1]["content_type"] == content_type
+    if payload.get("file_display_title"):
+        assert user_rows[-1]["file_display_title"] == "接星星"
+        assert user_rows[-1]["file_display_subtitle"] == "六十秒接星星小游戏"
 
 
 @pytest.mark.parametrize(

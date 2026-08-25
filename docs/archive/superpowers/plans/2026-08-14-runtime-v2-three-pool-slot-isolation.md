@@ -1,6 +1,18 @@
-# Runtime V2 Three-Pool Slot Isolation Implementation Plan
+---
+document_lifecycle: historical
+historical_reason: implemented
+canonical_owner: docs/superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md
+---
+# Runtime V2 Three-Pool Slot Isolation Historical implementation record
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Use `superpowers:test-driven-development` for every behavior change and `superpowers:verification-before-completion` before claiming a task complete.
+> **Historical record:** This plan's task steps landed. It preserves point-in-time
+> rollout and deployment evidence, but is not an operating runbook. The retained
+> three-pool decision owns the current topology; deployed counts remain
+> environment-specific facts.
+
+> **Historical authoring note:** The agentic-worker workflow and every checkbox
+> below are preserved evidence from the original execution period. Do not execute
+> them as a current plan.
 
 **Goal:** From the current `test` branch, replace Runtime V2's shared multi-slot worker with the complete three-pool runtime, then validate a resource-bounded 2-foreground/1-wake/1-heavy deployment on the existing test machine. The production target remains 4/2/2 in a later promotion.
 

@@ -18,6 +18,7 @@ from alembic.config import Config
 from psycopg.types.json import Jsonb
 
 import db
+from core import store as core_store
 
 
 ROOT = Path(__file__).parent.parent
@@ -170,6 +171,49 @@ def test_chat_change_rolls_back_event_and_notify_with_business_write():
             conn.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
 
 
+def test_store_append_emits_only_one_durable_v2_notification():
+    user_id = _uid("store_append")
+    listener = psycopg.connect(os.environ["DATABASE_URL"], autocommit=True)
+    listener.execute("LISTEN feedling_wake")
+    try:
+        with db.get_pool().connection() as conn:
+            _seed_user(conn, user_id)
+
+        store = core_store.get_store(user_id)
+        store.append_chat(
+            "user",
+            "chat",
+            {
+                "v": 1,
+                "id": "only-once",
+                "body_ct": "ciphertext",
+                "nonce": "nonce",
+                "K_user": "wrapped-key",
+                "visibility": "shared",
+                "owner_user_id": user_id,
+            },
+            strict=True,
+        )
+
+        notices = list(listener.notifies(timeout=0.5, stop_after=3))
+        payloads = [
+            json.loads(notice.payload)
+            for notice in notices
+            if json.loads(notice.payload).get("u") == user_id
+        ]
+        assert payloads == [{
+            "v": 2,
+            "c": "chat",
+            "u": user_id,
+            "r": 1,
+        }]
+    finally:
+        listener.close()
+        core_store._stores.pop(user_id, None)
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
+
+
 def test_account_delete_cascade_does_not_recreate_chat_change_rows():
     user_id = _uid("account_delete")
     with db.get_pool().connection() as conn:
@@ -213,7 +257,7 @@ def test_0098_downgrade_and_upgrade_are_repeatable():
         with db.get_pool().connection() as conn:
             assert conn.execute(
                 "SELECT version_num FROM alembic_version"
-            ).fetchall() == [("0102_trace_events",)]
+            ).fetchall() == [("0103_v2_wake_followup_marker",)]
             assert conn.execute(
                 "SELECT to_regclass('chat_change_state'), "
                 "to_regclass('chat_change_events'), "

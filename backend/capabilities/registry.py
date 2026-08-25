@@ -1,4 +1,4 @@
-"""Action-type → capability dispatch table for the V2 executor (Plan C)."""
+"""Action-type → capability dispatch table for the V2 tool dispatcher."""
 from __future__ import annotations
 
 from typing import Callable

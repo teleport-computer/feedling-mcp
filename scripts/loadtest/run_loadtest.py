@@ -19,8 +19,8 @@ future level-A run would assemble a real ``TurnDeps``/pool and pass IT as the
 change.
 
 The real, large (~100-user) load test is a MANUAL, LOCAL exercise run by a
-human near cutover (see docs/superpowers/plans/2026-07-09-hosted-runtime-v2-
-D4-loadtest-rollout-killresident.md, Task 5). It is NOT run in CI. Any RSS
+human under the limits in ``scripts/loadtest/README.md``. It is NOT run in CI.
+Any RSS
 figure this script reports when run standalone is indicative of a dev box,
 not CVM-authoritative — the real capacity number must come from an actual CVM
 run. CI only exercises a <=5-user smoke test (see

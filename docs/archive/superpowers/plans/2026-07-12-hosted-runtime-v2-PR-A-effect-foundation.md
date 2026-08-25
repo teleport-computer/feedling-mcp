@@ -1,4 +1,14 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/superpowers/specs/2026-07-12-hosted-runtime-v2-PR-A-effect-foundation-design.md
+historical_reason: implemented
+---
 # Hosted Runtime V2 — PR A: Effect Foundation Implementation Plan
+
+> **Historical implementation record:** this plan landed. Its retained current
+> decision owner is [the PR-A effect-foundation design](../../../superpowers/specs/2026-07-12-hosted-runtime-v2-PR-A-effect-foundation-design.md);
+> do not use these task steps or their no-commit/worktree instructions as current
+> operating documentation.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

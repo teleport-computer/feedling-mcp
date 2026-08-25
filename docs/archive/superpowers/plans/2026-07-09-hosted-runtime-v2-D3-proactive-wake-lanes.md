@@ -1,4 +1,18 @@
-# D3 Proactive/Wake Lanes Implementation Plan
+---
+document_lifecycle: historical
+historical_reason: implemented
+canonical_owner: docs/superpowers/specs/2026-07-09-hosted-runtime-v2-D3-proactive-wake-lanes-design.md
+---
+# D3 Proactive/Wake Lanes Historical implementation record
+
+> **Historical record:** This plan's task steps landed. It is retained for
+> traceability only and is not operating documentation. The retained D3
+> decision owns live wake-lane invariants; the three-pool decision owns current
+> pool topology and the dual-runtime decision owns Resident/V2 coexistence.
+
+> **Historical authoring note:** The agentic-worker workflow and every checkbox
+> below are preserved evidence from the original execution period. Do not
+> execute them as a current plan.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development. Steps use checkbox (`- [ ]`)。这是大迁移；port-类 task 的逐行代码在执行该 task 时读源 `file:line` 展开，本 plan 给 task 边界+接口+测试用例+不变量+port 指令。
 

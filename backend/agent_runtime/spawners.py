@@ -166,7 +166,7 @@ _AGENT_PROMPT_FALLBACK_COMMANDS = (
     "python {io_cli} photo-recent [--limit <n>]\n"
     "python {io_cli} photo-read --id <photo_id> [--include-image]\n"
     "python {io_cli} chat-image --id <message_id>\n"
-    "python {io_cli} send-file --path <source_path> --name <download_name>\n"
+    "python {io_cli} send-file --path <source_path> --name <download_name> [--title <title>] [--subtitle <subtitle>]\n"
     "python {io_cli} generate-image --prompt <complete visual description>\n"
     "python {io_cli} send-image --path <image_path> [--name <display_name>]\n"
     "python {io_cli} schedule-wake --at <time> [--reason <text>] [--tz <tz>]\n"
