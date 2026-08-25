@@ -22,6 +22,7 @@ from copy import deepcopy
 
 from provider_types import ToolSpec
 from capabilities import registry
+from chat import file_display
 from identity import card_policy
 # Card-writing rules live with the memory package (single source of truth shared
 # with the V1 guidance block); only the op names above are V2-specific.
@@ -424,7 +425,12 @@ PARAMS: dict[str, dict] = {
     # accepts a host filesystem path.
     FILE_REPLY_TOOL: {
         "type": "object",
-        "properties": {"path": _STR, "revision": _INT},
+        "properties": {
+            "path": _STR,
+            "revision": _INT,
+            "title": {"type": "string", "maxLength": file_display.TITLE_MAX_CHARS},
+            "subtitle": {"type": "string", "maxLength": file_display.SUBTITLE_MAX_CHARS},
+        },
         "required": ["path", "revision"],
     },
     IMAGE_REPLY_TOOL: {
@@ -761,6 +767,11 @@ DESCRIPTIONS: dict[str, str] = {
         "user never needs to know /workspace or provide an internal path. Create "
         "or update the file with workspace_write first, wait for that tool result, "
         "then call send_file in a later round with the exact returned revision. "
+        "For every .io.html Canvas, title and subtitle are required. Generate both "
+        "in the user's current language; subtitle is one concise line describing "
+        "what the Canvas contains. When revising a Canvas, preserve its current "
+        "title and subtitle unless the user asks to change them, and update either "
+        "when the new content makes it useful. "
         "Do not call this merely because a conversational answer contains a list "
         "or structured text. Host filesystem paths and /artifacts, /skills, or "
         "/memory entries are not accepted."
@@ -1013,6 +1024,28 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
         type(args.get("revision")) is not int or args["revision"] <= 0
     ):
         return "send_file revision must be a positive integer"
+    if name == FILE_REPLY_TOOL:
+        path = str(args.get("path") or "").strip()
+        title = args.get("title")
+        subtitle = args.get("subtitle")
+        if path.casefold().endswith(".io.html"):
+            if title is None or subtitle is None:
+                return "send_file for .io.html requires title and subtitle"
+            try:
+                file_display.normalize_text(
+                    title,
+                    field="title",
+                    max_chars=file_display.TITLE_MAX_CHARS,
+                )
+                file_display.normalize_text(
+                    subtitle,
+                    field="subtitle",
+                    max_chars=file_display.SUBTITLE_MAX_CHARS,
+                )
+            except ValueError as exc:
+                return str(exc)
+        elif title is not None or subtitle is not None:
+            return "send_file title and subtitle are only valid for Canvas files"
     if name == IMAGE_REPLY_TOOL and not str(args.get("prompt") or "").strip():
         return "generate_image requires a non-empty prompt"
     if name == MCP_TOOL_SEARCH_TOOL:

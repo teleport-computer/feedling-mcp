@@ -1115,6 +1115,8 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "image_mime": {"type": "string", "enum": ["image/jpeg", "image/png", "image/webp", "image/gif"]},
             "file_b64": {"type": "string", "contentEncoding": "base64", "description": "File data; decoded size must not exceed 26,214,400 bytes."},
             "file_name": {"type": "string", "maxLength": 120},
+            "file_display_title": {"type": "string", "minLength": 1, "maxLength": 120},
+            "file_display_subtitle": {"type": "string", "minLength": 1, "maxLength": 160},
             "file_mime": {"type": "string"},
         },
         "anyOf": [
@@ -1397,6 +1399,18 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "content_type": {"type": "string", "enum": ["text", "image", "file"], "default": "text"},
             "file_name": {"type": "string"},
+            "file_display_title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120,
+                "description": "Optional Canvas card title. Valid only for .html/.io.html files.",
+            },
+            "file_display_subtitle": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160,
+                "description": "Optional one-line Canvas card subtitle. Valid only for .html/.io.html files.",
+            },
             "file_mime": {"type": "string"},
             "caption_envelope": {
                 "allOf": [{"$ref": "#/components/schemas/EncryptedEnvelope"}],
@@ -1417,6 +1431,18 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "properties": {
             "envelope": {"$ref": "#/components/schemas/EncryptedEnvelope"},
             "file_name": {"type": "string", "minLength": 1, "maxLength": 120},
+            "file_display_title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120,
+                "description": "Required together with file_display_subtitle for .io.html Canvas delivery.",
+            },
+            "file_display_subtitle": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160,
+                "description": "Required together with file_display_title for .io.html Canvas delivery.",
+            },
             "file_mime": {"type": "string", "minLength": 1, "maxLength": 120},
             "file_byte_count": {
                 "type": "integer",

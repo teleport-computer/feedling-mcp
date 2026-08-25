@@ -262,6 +262,48 @@ def test_send_file_is_chat_only_and_invokes_explicit_callback(monkeypatch):
     ]
 
 
+def test_canvas_send_file_delivers_model_authored_display_metadata(monkeypatch):
+    files = []
+
+    async def on_file(path, revision, *, title, subtitle):
+        files.append((path, revision, title, subtitle))
+
+    outcome, _, replies, _ = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "canvas-1",
+                        "name": "send_file",
+                        "args": {
+                            "path": "/workspace/接星星.io.html",
+                            "revision": 2,
+                            "title": "接星星",
+                            "subtitle": "六十秒接住尽可能多的星星",
+                        },
+                    }
+                ],
+                "usage": {},
+            },
+            {"reply": "画布已经更新。", "tool_calls": [], "usage": {}},
+        ],
+        on_file_reply=on_file,
+    )
+
+    assert files == [
+        (
+            "/workspace/接星星.io.html",
+            2,
+            "接星星",
+            "六十秒接住尽可能多的星星",
+        )
+    ]
+    assert replies == [("画布已经更新。", True)]
+    assert outcome.replied_intermediate is True
+
+
 def test_required_file_turn_offers_only_delivery_pipeline_tools(monkeypatch):
     files = []
 
@@ -417,7 +459,7 @@ def test_model_selected_shared_work_uses_compact_delivery_after_large_write(
     files = []
     trajectory_events = []
 
-    async def on_file(path, revision):
+    async def on_file(path, revision, *, title="", subtitle=""):
         files.append((path, revision))
 
     async def dispatch(tool_calls):
@@ -474,6 +516,8 @@ def test_model_selected_shared_work_uses_compact_delivery_after_large_write(
                         "args": {
                             "path": "/workspace/记忆知识图谱.io.html",
                             "revision": 1,
+                            "title": "记忆知识图谱",
+                            "subtitle": "把重要记忆整理成可探索的关系图",
                         },
                     }
                 ],
@@ -553,7 +597,7 @@ def test_pending_canvas_delivery_rejects_wrong_target_then_delivers_exact_one(
 ):
     files = []
 
-    async def on_file(path, revision):
+    async def on_file(path, revision, *, title="", subtitle=""):
         files.append((path, revision))
 
     async def dispatch(tool_calls):
@@ -590,6 +634,8 @@ def test_pending_canvas_delivery_rejects_wrong_target_then_delivers_exact_one(
                     "args": {
                         "path": "/workspace/other.io.html",
                         "revision": 9,
+                        "title": "面板",
+                        "subtitle": "一个简洁的交互面板",
                     },
                 }],
                 "usage": {},
@@ -602,6 +648,8 @@ def test_pending_canvas_delivery_rejects_wrong_target_then_delivers_exact_one(
                     "args": {
                         "path": "/workspace/panel.io.html",
                         "revision": 1,
+                        "title": "面板",
+                        "subtitle": "一个简洁的交互面板",
                     },
                 }],
                 "usage": {},
@@ -623,7 +671,7 @@ def test_pending_canvas_delivery_rejects_wrong_target_then_delivers_exact_one(
 def test_io_html_satisfies_generic_html_delivery_requirement(monkeypatch):
     files = []
 
-    async def on_file(path, revision):
+    async def on_file(path, revision, *, title="", subtitle=""):
         files.append((path, revision))
 
     async def dispatch(tool_calls):
@@ -660,6 +708,8 @@ def test_io_html_satisfies_generic_html_delivery_requirement(monkeypatch):
                     "args": {
                         "path": "/workspace/接星星小游戏.io.html",
                         "revision": 1,
+                        "title": "接星星小游戏",
+                        "subtitle": "六十秒内接住尽可能多的星星",
                     },
                 }],
                 "usage": {},
@@ -1132,7 +1182,9 @@ def test_workspace_file_result_bounds_content_and_sanitizes_name():
             "path": "/workspace/knowledge.io.html",
             "content": "<!doctype html><title>Knowledge</title>",
             "mime_type": "text/markdown",
-        }
+        },
+        title="Knowledge",
+        subtitle="Interactive knowledge Canvas",
     )
     assert shared_work.mime_type == "text/html"
     with pytest.raises(ValueError):
@@ -1140,6 +1192,16 @@ def test_workspace_file_result_bounds_content_and_sanitizes_name():
             {
                 "path": "/workspace/too-large.io.html",
                 "content": "x" * (tool_schema.SHARED_WORK_MAX_BYTES + 1),
+            },
+            title="Too large",
+            subtitle="Oversized Canvas",
+        )
+
+    with pytest.raises(ValueError):
+        worker._workspace_file_reply_from_result(
+            {
+                "path": "/workspace/large.md",
+                "content": "x" * (worker._WORKSPACE_FILE_MAX_BYTES + 1),
             }
         )
 
@@ -1154,12 +1216,39 @@ def test_workspace_write_rejects_oversized_shared_work_source():
         },
     )
     assert error == "Canvas source exceeds the 256 KB UTF-8 limit"
-    with pytest.raises(ValueError):
+
+
+def test_workspace_canvas_file_result_preserves_display_metadata(monkeypatch):
+    result = worker._workspace_file_reply_from_result(
+        {
+            "path": "/workspace/接星星.io.html",
+            "content": "<html><title>接星星</title></html>",
+            "mime_type": "text/html",
+        },
+        title="  接星星  ",
+        subtitle="六十秒内   接住尽可能多的星星",
+    )
+
+    assert result.display_title == "接星星"
+    assert result.display_subtitle == "六十秒内 接住尽可能多的星星"
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda *_args, **_kwargs: ({"id": "a" * 32}, None),
+    )
+    effect = worker._build_encrypted_file_reply_effect_payload(
+        object(), result, effect_id="effect-canvas"
+    )
+    assert effect["message_extra"]["file_display_title"] == "接星星"
+    assert effect["message_extra"]["file_display_subtitle"] == "六十秒内 接住尽可能多的星星"
+
+    with pytest.raises(ValueError, match="title and subtitle"):
         worker._workspace_file_reply_from_result(
             {
-                "path": "/workspace/large.md",
-                "content": "x" * (worker._WORKSPACE_FILE_MAX_BYTES + 1),
-            }
+                "path": "/workspace/接星星.io.html",
+                "content": "<html></html>",
+            },
+            title="接星星",
         )
 
 
@@ -1292,8 +1381,10 @@ def test_transactional_reply_sink_preserves_file_metadata(monkeypatch):
         "envelope": {"id": "a" * 32},
         "message_extra": {
             "content_type": "file",
-            "file_name": "report.md",
-            "file_mime": "text/markdown",
+            "file_name": "接星星.io.html",
+            "file_display_title": "接星星",
+            "file_display_subtitle": "六十秒接星星小游戏",
+            "file_mime": "text/html",
             "file_byte_count": 9,
         },
     }
@@ -1303,8 +1394,10 @@ def test_transactional_reply_sink_preserves_file_metadata(monkeypatch):
     assert callable(post_commit)
     assert captured["content_type"] == "file"
     assert captured["extra"] == {
-        "file_name": "report.md",
-        "file_mime": "text/markdown",
+        "file_name": "接星星.io.html",
+        "file_display_title": "接星星",
+        "file_display_subtitle": "六十秒接星星小游戏",
+        "file_mime": "text/html",
         "file_byte_count": 9,
     }
 
@@ -1318,6 +1411,18 @@ def test_reply_metadata_rejects_unbounded_or_forged_values():
                     "file_name": "x.md",
                     "file_mime": "text/markdown",
                     "file_byte_count": worker._WORKSPACE_FILE_MAX_BYTES + 1,
+                }
+            }
+        )
+    with pytest.raises(RuntimeError, match="title and subtitle"):
+        serve_worker._reply_message_fields(
+            {
+                "message_extra": {
+                    "content_type": "file",
+                    "file_name": "接星星.io.html",
+                    "file_display_title": "接星星",
+                    "file_mime": "text/html",
+                    "file_byte_count": 100,
                 }
             }
         )

@@ -611,6 +611,9 @@ def test_bootstrap_instructions_drop_memory_floor_gate(backend):
     # A' deeper conflict (Codex): identity must NOT be presented as hard-derived
     # from the Memory Garden — a 0-memory user has no receipts to derive from.
     assert "必须来自 Memory Garden receipts" not in instructions
+    assert "FEEDLING_AGENT_HTTP_LOCAL_IO_CLI=true" in instructions
+    assert "FEEDLING_AGENT_HTTP_LOCAL_FILE_ROOTS" in instructions
+    assert "普通或远程 HTTP 模型服务必须保持 false" in instructions
 
 
 # ---------------------------------------------------------------------------

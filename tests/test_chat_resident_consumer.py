@@ -642,6 +642,50 @@ def test_post_reply_uses_cached_whoami_keys_when_refresh_fails(monkeypatch):
     assert captured["json"]["envelope"]["visibility"] == "shared"
 
 
+def test_post_reply_uses_stable_delivery_id_for_parent_retry(monkeypatch):
+    payloads = []
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"id": "accepted", "ts": 2.0}
+
+    def _build(**kwargs):
+        return {"id": kwargs.get("item_id") or "random", "body_ct": "sealed"}
+
+    def _post(url, json=None, headers=None, timeout=None):
+        payloads.append(json)
+        return _Resp()
+
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {
+            "user_id": "usr_retry",
+            "user_pk": b"u" * 32,
+            "enclave_pk": b"e" * 32,
+            "content_encryption_effective": "on",
+        },
+    )
+    monkeypatch.setattr(crc, "_build_envelope", _build)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
+
+    crc.post_reply("first wording", reply_to_message_id="parent-1")
+    crc.post_reply("retry wording", reply_to_message_id="parent-1")
+
+    first_id = payloads[0]["resident_delivery_id"]
+    assert len(first_id) == 32
+    assert payloads[0]["envelope"]["id"] == first_id
+    assert payloads[1]["resident_delivery_id"] == first_id
+    assert payloads[1]["envelope"]["id"] == first_id
+
+
 def test_post_reply_uses_plaintext_envelopes_when_effective_off(monkeypatch):
     captured = {}
 
@@ -1795,12 +1839,28 @@ def test_no_error_notice_when_fallback_rejected_already_answered(monkeypatch):
 
     with patch.object(crc, "call_agent", side_effect=RuntimeError("agent down")), \
          patch.object(crc, "post_reply", side_effect=fake_post):
-        crc._process_messages([
+        result_ts = crc._process_messages([
             {"id": "agent-failure-409-1", "role": "user", "content": "msg1", "ts": 100.0}
         ])
 
     # 兜底尝试发出但被拒；system 通知绝不能跟着发出去。
     assert [kw.get("role") for _, kw in calls] == [None]
+    assert result_ts == pytest.approx(100.0)
+
+
+def test_handle_post_reply_treats_committed_parent_as_terminal():
+    response = MagicMock()
+    response.status_code = 409
+    response.json.return_value = {
+        "error": "already_answered",
+        "reply_status": "replied",
+    }
+
+    assert crc._handle_post_reply_response(response) == {
+        "error": "already_answered",
+        "reply_status": "replied",
+    }
+    response.raise_for_status.assert_not_called()
 
 
 def test_agent_failure_reported_even_with_fallback_disabled(monkeypatch):
@@ -6699,6 +6759,41 @@ def test_call_agent_http_openai_raw_text_returns_bare_cards_body(monkeypatch):
 
     out = crc._call_agent_http_openai("capture prompt", raw_text=True)
     assert json.loads(out) == {"cards": []}
+
+
+@pytest.mark.parametrize(
+    ("protocol", "call"),
+    [
+        ("simple", crc._call_agent_http_simple),
+        ("openai", crc._call_agent_http_openai),
+    ],
+)
+def test_http_agent_calls_honor_configured_turn_timeout(monkeypatch, protocol, call):
+    class _Resp:
+        headers = {}
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            if protocol == "openai":
+                return {"choices": [{"message": {"content": "ok"}}]}
+            return {"response": "ok"}
+
+    seen = {}
+
+    def post(*args, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        return _Resp()
+
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://127.0.0.1:8768/chat")
+    monkeypatch.setattr(crc, "AGENT_TURN_TIMEOUT_SEC", 600)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_agent_session_key", lambda: "")
+    monkeypatch.setattr(crc._HTTP, "post", post)
+
+    assert call("make a canvas") == "ok"
+    assert seen["timeout"] == 600
 
 
 def test_agent_turn_extracts_native_thinking_from_content_block_and_messages_from_text_block():

@@ -38,6 +38,7 @@ import generated_image
 from accounts import onboarding as accounts_onboarding
 from bootstrap import gates as boot_gates
 from chat import consumer as chat_consumer
+from chat import file_display
 from chat import idempotency as chat_idempotency
 from chat import service as chat_service
 from chat import activity_store as chat_activity_store
@@ -700,6 +701,12 @@ def write_message(store: UserStore, payload: dict) -> tuple[dict, int]:
             file_extra["file_name"] = fname[:120]
         if fmime:
             file_extra["file_mime"] = fmime[:120]
+        try:
+            file_extra.update(
+                file_display.metadata_from_payload(payload, filename=fname)
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}, 400
     # User text sent alongside an image/file rides a separate client-built
     # caption envelope. Persist it via the shared caption_* schema so the enclave
     # decrypts it into `content` and the agent sees the text. Without this the
@@ -897,6 +904,14 @@ def write_response(
                 or file_byte_count > 1_000_000
             ):
                 return {"error": "invalid file_followup size"}, 400
+            try:
+                display_extra = file_display.metadata_from_payload(
+                    raw_followup,
+                    filename=file_name,
+                    require_canvas_pair=True,
+                )
+            except ValueError as exc:
+                return {"error": str(exc)}, 400
             file_followups.append(
                 (
                     followup_envelope,
@@ -904,6 +919,7 @@ def write_response(
                         "file_name": file_name,
                         "file_mime": file_mime,
                         "file_byte_count": file_byte_count,
+                        **display_extra,
                     },
                 )
             )

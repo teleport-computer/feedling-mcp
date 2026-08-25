@@ -2758,7 +2758,15 @@ async def run_tool_loop(
                     compact_delivery_mismatch_retry_used = True
                 continue
             try:
-                await on_file_reply(workspace_path, workspace_revision)
+                if workspace_path.casefold().endswith(".io.html"):
+                    await on_file_reply(
+                        workspace_path,
+                        workspace_revision,
+                        title=str(tc.args.get("title") or ""),
+                        subtitle=str(tc.args.get("subtitle") or ""),
+                    )
+                else:
+                    await on_file_reply(workspace_path, workspace_revision)
             except Exception as exc:
                 await _tool_event(
                     tc, "tool_call_error", {"error": type(exc).__name__}
