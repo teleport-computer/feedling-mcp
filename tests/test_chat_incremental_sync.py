@@ -164,8 +164,90 @@ def test_missing_upsert_row_logs_snapshot_fallback_reason(monkeypatch):
     assert store.user_id not in text
 
 
-def test_generation_conflict_logs_snapshot_fallback_reason(monkeypatch):
+def test_generation_conflict_retries_incrementally_without_snapshot(monkeypatch):
     store = _bare_store([_row("a", 1)], version=1)
+    event_reads = []
+    row_reads = []
+    reloads = []
+    monkeypatch.setattr(core_store.db, "chat_change_version", lambda _uid: 2)
+
+    def events_after(_uid, after, _limit):
+        event_reads.append(after)
+        return [
+            {"version": 2, "operation": "upsert", "message_ids": ["b"]}
+        ]
+
+    monkeypatch.setattr(core_store.db, "chat_change_events_after", events_after)
+
+    def get_many(*_args):
+        row_reads.append(True)
+        if len(row_reads) == 1:
+            store.apply_committed_chat_rows([_row("local", 3)])
+        return [_row("b", 2)]
+
+    monkeypatch.setattr(core_store.db, "chat_get_many_strict", get_many)
+    monkeypatch.setattr(
+        store,
+        "reload_chat_hot_strict",
+        lambda: reloads.append(True) or [],
+    )
+    monkeypatch.setattr(store, "notify_chat_waiters", lambda: None)
+    with _capture_logger(core_store.log) as stream:
+        assert store.ensure_chat_fresh(force=True) is True
+
+    text = stream.getvalue()
+    assert event_reads == [1, 1]
+    assert len(row_reads) == 2
+    assert reloads == []
+    assert [row["id"] for row in store.chat_messages] == ["a", "b", "local"]
+    assert store.chat_version == 2
+    assert "reason=generation_conflict" not in text
+
+
+def test_generation_conflict_stops_when_local_write_reaches_target(monkeypatch):
+    store = _bare_store([_row("a", 1)], version=1)
+    event_reads = []
+    row_reads = []
+    reloads = []
+    wakes = []
+    monkeypatch.setattr(
+        core_store.db,
+        "chat_change_events_after",
+        lambda _uid, after, _limit: event_reads.append(after) or [
+            {"version": 2, "operation": "upsert", "message_ids": ["b"]}
+        ],
+    )
+
+    def get_many(*_args):
+        row_reads.append(True)
+        store.apply_committed_chat_rows([_row("b", 2)], version=2)
+        return [_row("b", 2)]
+
+    monkeypatch.setattr(core_store.db, "chat_get_many_strict", get_many)
+    monkeypatch.setattr(
+        store,
+        "reload_chat_hot_strict",
+        lambda: reloads.append(True) or [],
+    )
+    monkeypatch.setattr(
+        store, "notify_chat_waiters", lambda: wakes.append(True)
+    )
+    with _capture_logger(core_store.log) as stream:
+        assert store.ensure_chat_fresh(force=True, target_version=2) is True
+
+    assert event_reads == [1]
+    assert row_reads == [True]
+    assert reloads == []
+    assert wakes == [True]
+    assert [row["id"] for row in store.chat_messages] == ["a", "b"]
+    assert store.chat_version == 2
+    assert "reason=generation_conflict" not in stream.getvalue()
+
+
+def test_repeated_generation_conflict_falls_back_after_two_retries(monkeypatch):
+    store = _bare_store([_row("a", 1)], version=1)
+    row_reads = []
+    reloads = []
     monkeypatch.setattr(core_store.db, "chat_change_version", lambda _uid: 2)
     monkeypatch.setattr(
         core_store.db,
@@ -176,17 +258,31 @@ def test_generation_conflict_logs_snapshot_fallback_reason(monkeypatch):
     )
 
     def get_many(*_args):
-        store.apply_committed_chat_rows([_row("local", 3)])
+        row_reads.append(True)
+        with store.chat_lock:
+            store._update_cached_chat_row_locked(
+                "a", {"touch": len(row_reads)}
+            )
         return [_row("b", 2)]
 
+    def reload_hot():
+        reloads.append(True)
+        with store.chat_lock:
+            store._replace_chat_rows_locked([_row("snapshot", 2)], version=2)
+        return list(store.chat_messages)
+
     monkeypatch.setattr(core_store.db, "chat_get_many_strict", get_many)
-    monkeypatch.setattr(store, "reload_chat_hot_strict", lambda: [])
+    monkeypatch.setattr(store, "reload_chat_hot_strict", reload_hot)
     monkeypatch.setattr(store, "notify_chat_waiters", lambda: None)
     with _capture_logger(core_store.log) as stream:
         assert store.ensure_chat_fresh(force=True) is True
 
     text = stream.getvalue()
-    assert "reason=generation_conflict" in text
+    assert len(row_reads) == 3
+    assert reloads == [True]
+    assert [row["id"] for row in store.chat_messages] == ["snapshot"]
+    assert store.chat_version == 2
+    assert text.count("reason=generation_conflict") == 1
     assert store.user_id not in text
 
 

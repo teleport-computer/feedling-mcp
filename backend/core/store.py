@@ -44,6 +44,7 @@ def _chat_hot_cache_limit() -> int:
 
 MAX_CHAT_MESSAGES = _chat_hot_cache_limit()
 _CHAT_SYNC_BATCH_MAX = 256
+_CHAT_GENERATION_RETRY_MAX = 2
 _CHAT_VERSION_CHECK_INTERVAL_SEC = 1.0
 _CHAT_SNAPSHOT_FALLBACK_REASONS = frozenset({
     "gap",
@@ -656,135 +657,151 @@ class UserStore:
             return False
 
         with self.chat_sync_lock:
-            with self.chat_lock:
-                self._ensure_chat_cache_state_locked()
-                base_version = self.chat_version
-                base_generation = self._chat_cache_generation
-            if requested is not None and requested <= base_version:
-                return True
-
-            now_mono = time.monotonic()
-            if (
-                not force
-                and requested is None
-                and now_mono - self._chat_last_version_check_mono
-                < _CHAT_VERSION_CHECK_INTERVAL_SEC
-            ):
-                return True
-            try:
-                current_version = (
-                    requested
-                    if requested is not None
-                    else db.chat_change_version(self.user_id)
-                )
-                self._chat_last_version_check_mono = now_mono
-                if current_version <= base_version:
+            generation_retries = 0
+            while True:
+                with self.chat_lock:
+                    self._ensure_chat_cache_state_locked()
+                    base_version = self.chat_version
+                    base_generation = self._chat_cache_generation
+                if requested is not None and requested <= base_version:
+                    if generation_retries:
+                        self.notify_chat_waiters()
                     return True
 
-                changed = True
-                if current_version - base_version > _CHAT_SYNC_BATCH_MAX:
-                    _chat_snapshot_fallback_telemetry(
-                        user_id=self.user_id,
-                        reason="overflow",
-                        hot_rows=len(self.chat_messages),
+                now_mono = time.monotonic()
+                if (
+                    generation_retries == 0
+                    and not force
+                    and requested is None
+                    and now_mono - self._chat_last_version_check_mono
+                    < _CHAT_VERSION_CHECK_INTERVAL_SEC
+                ):
+                    return True
+                try:
+                    current_version = (
+                        requested
+                        if requested is not None
+                        else db.chat_change_version(self.user_id)
                     )
-                    self.reload_chat_hot_strict()
-                else:
-                    events = db.chat_change_events_after(
-                        self.user_id,
-                        base_version,
-                        _CHAT_SYNC_BATCH_MAX,
-                    )
-                    expected = base_version + 1
-                    continuous = True
-                    for event in events:
-                        if int(event.get("version") or -1) != expected:
-                            continuous = False
-                            break
-                        expected += 1
-                    has_reset = any(
-                        event.get("operation") == "reset" for event in events
-                    )
-                    if (
-                        not continuous
-                        or not events
-                        or int(events[-1].get("version") or 0)
-                        < current_version
-                        or has_reset
-                    ):
+                    self._chat_last_version_check_mono = now_mono
+                    if current_version <= base_version:
+                        if generation_retries:
+                            self.notify_chat_waiters()
+                        return True
+
+                    if current_version - base_version > _CHAT_SYNC_BATCH_MAX:
                         _chat_snapshot_fallback_telemetry(
                             user_id=self.user_id,
-                            reason="reset" if has_reset else "gap",
+                            reason="overflow",
                             hot_rows=len(self.chat_messages),
                         )
                         self.reload_chat_hot_strict()
                     else:
-                        upsert_ids = list(dict.fromkeys(
-                            str(msg_id)
-                            for event in events
-                            if event.get("operation") == "upsert"
-                            for msg_id in event.get("message_ids", [])
-                            if str(msg_id)
-                        ))
-                        upsert_rows = db.chat_get_many_strict(
-                            self.user_id, upsert_ids
-                        ) if upsert_ids else []
-                        rows_by_id = {
-                            str(row.get("id") or ""): dict(row)
-                            for row in upsert_rows
-                        }
-                        if any(msg_id not in rows_by_id for msg_id in upsert_ids):
+                        events = db.chat_change_events_after(
+                            self.user_id,
+                            base_version,
+                            _CHAT_SYNC_BATCH_MAX,
+                        )
+                        expected = base_version + 1
+                        continuous = True
+                        for event in events:
+                            if int(event.get("version") or -1) != expected:
+                                continuous = False
+                                break
+                            expected += 1
+                        has_reset = any(
+                            event.get("operation") == "reset" for event in events
+                        )
+                        if (
+                            not continuous
+                            or not events
+                            or int(events[-1].get("version") or 0)
+                            < current_version
+                            or has_reset
+                        ):
                             _chat_snapshot_fallback_telemetry(
                                 user_id=self.user_id,
-                                reason="missing_row",
+                                reason="reset" if has_reset else "gap",
                                 hot_rows=len(self.chat_messages),
                             )
                             self.reload_chat_hot_strict()
                         else:
-                            cache_changed = False
-                            with self.chat_lock:
-                                self._ensure_chat_cache_state_locked()
-                                cache_changed = (
-                                    self._chat_cache_generation
-                                    != base_generation
-                                )
-                                if not cache_changed:
-                                    working = dict(self._chat_messages_by_id)
-                                    for event in events:
-                                        operation = str(
-                                            event.get("operation") or ""
-                                        )
-                                        message_ids = [
-                                            str(value)
-                                            for value in event.get(
-                                                "message_ids", []
-                                            )
-                                        ]
-                                        if operation == "upsert":
-                                            for msg_id in message_ids:
-                                                working[msg_id] = dict(
-                                                    rows_by_id[msg_id]
-                                                )
-                                        elif operation == "delete":
-                                            for msg_id in message_ids:
-                                                working.pop(msg_id, None)
-                                    self._replace_chat_rows_locked(
-                                        list(working.values()),
-                                        version=int(events[-1]["version"]),
-                                    )
-                            if cache_changed:
+                            upsert_ids = list(dict.fromkeys(
+                                str(msg_id)
+                                for event in events
+                                if event.get("operation") == "upsert"
+                                for msg_id in event.get("message_ids", [])
+                                if str(msg_id)
+                            ))
+                            upsert_rows = db.chat_get_many_strict(
+                                self.user_id, upsert_ids
+                            ) if upsert_ids else []
+                            rows_by_id = {
+                                str(row.get("id") or ""): dict(row)
+                                for row in upsert_rows
+                            }
+                            if any(
+                                msg_id not in rows_by_id
+                                for msg_id in upsert_ids
+                            ):
                                 _chat_snapshot_fallback_telemetry(
                                     user_id=self.user_id,
-                                    reason="generation_conflict",
+                                    reason="missing_row",
                                     hot_rows=len(self.chat_messages),
                                 )
                                 self.reload_chat_hot_strict()
-                if changed:
+                            else:
+                                cache_changed = False
+                                with self.chat_lock:
+                                    self._ensure_chat_cache_state_locked()
+                                    cache_changed = (
+                                        self._chat_cache_generation
+                                        != base_generation
+                                    )
+                                    if not cache_changed:
+                                        working = dict(
+                                            self._chat_messages_by_id
+                                        )
+                                        for event in events:
+                                            operation = str(
+                                                event.get("operation") or ""
+                                            )
+                                            message_ids = [
+                                                str(value)
+                                                for value in event.get(
+                                                    "message_ids", []
+                                                )
+                                            ]
+                                            if operation == "upsert":
+                                                for msg_id in message_ids:
+                                                    working[msg_id] = dict(
+                                                        rows_by_id[msg_id]
+                                                    )
+                                            elif operation == "delete":
+                                                for msg_id in message_ids:
+                                                    working.pop(msg_id, None)
+                                        self._replace_chat_rows_locked(
+                                            list(working.values()),
+                                            version=int(events[-1]["version"]),
+                                        )
+                                if cache_changed:
+                                    if (
+                                        generation_retries
+                                        < _CHAT_GENERATION_RETRY_MAX
+                                    ):
+                                        generation_retries += 1
+                                        continue
+                                    _chat_snapshot_fallback_telemetry(
+                                        user_id=self.user_id,
+                                        reason="generation_conflict",
+                                        hot_rows=len(self.chat_messages),
+                                    )
+                                    self.reload_chat_hot_strict()
                     self.notify_chat_waiters()
-                return True
-            except Exception as e:
-                print(f"[{self.user_id}/chat] incremental sync failed: {e}")
-                return False
+                    return True
+                except Exception as e:
+                    print(f"[{self.user_id}/chat] incremental sync failed: {e}")
+                    return False
 
     def reload(self):
         """Re-read this store's cached state from PostgreSQL IN PLACE, keeping
