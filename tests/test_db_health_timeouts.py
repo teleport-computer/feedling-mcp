@@ -58,6 +58,38 @@ class _Pool:
         return _Context(self.conn)
 
 
+def test_health_pool_is_lazy_bounded_and_separate(monkeypatch):
+    created = []
+    ordinary_pool = object()
+
+    class FakeConnectionPool:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+            created.append(self)
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://health-test")
+    monkeypatch.setattr(db, "ConnectionPool", FakeConnectionPool)
+    monkeypatch.setattr(db, "_pool", ordinary_pool)
+    monkeypatch.setattr(db, "_health_pool", None)
+
+    first = db.get_health_pool()
+    second = db.get_health_pool()
+
+    assert first is second
+    assert first is not ordinary_pool
+    assert created == [first]
+    assert first.args == ("postgresql://health-test",)
+    assert first.kwargs == {
+        "min_size": 1,
+        "max_size": 2,
+        "timeout": 1.0,
+        "max_idle": 300,
+        "kwargs": {"autocommit": True},
+        "open": True,
+    }
+
+
 def test_health_probe_bounds_acquire_and_statement_timeout(monkeypatch):
     conn = _Connection()
     pool = _Pool(conn)
@@ -79,9 +111,9 @@ def test_runner_heartbeat_health_path_uses_same_bounds(monkeypatch):
     row = ("runner-a", "host", 0, 1, 0, 0, True, False, "v", 995.0, {})
     conn = _Connection([row])
     pool = _Pool(conn)
-    monkeypatch.setattr(db, "get_pool", lambda: pool)
+    monkeypatch.setattr(db, "get_health_pool", lambda: pool)
 
-    rows = db.list_supervisor_instance_heartbeats(
+    rows = db.list_supervisor_instance_heartbeats_for_health(
         timeout=1.0,
         statement_timeout_ms=1000,
     )

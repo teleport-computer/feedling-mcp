@@ -237,8 +237,9 @@ services:
     # core/wake_bus.py). To enable: set FEEDLING_BACKEND_WORKERS=N via the
     # encrypted env channel IN A DEPLOY whose image contains the leader-election
     # patch (a pre-patch image binds :9998 at import → N>1 would double-bind; the
-    # default 1 stays safe on any image). Sizing: ~18 DB conns/worker (pool 16 +
-    # 1 listener + 1 election); test RDS t4g-micro max_connections=79 → N=2 safe.
+    # default 1 stays safe on any image). Sizing: ~20 DB conns/worker (ordinary
+    # pool 16 + health pool up to 2 + 1 listener + 1 election); test RDS
+    # t4g-micro max_connections=79 → N=2 safe.
     command: ["gunicorn", "--chdir", "backend", "--config", "backend/gunicorn_conf.py", "-k", "asgi.worker.FeedlingUvicornWorker", "--timeout", "120", "-b", "0.0.0.0:5001", "asgi_app:app"]
     restart: unless-stopped
     # One fd per live client connection. Now that keep-alive connections survive
@@ -276,8 +277,8 @@ services:
       # var TEST_FEEDLING_BACKEND_WORKERS, =2 since 2026-07-01) was silently
       # dropped and test ran -w1 regardless. Wiring it makes the var take effect.
       # -w N is code-supported (LISTEN/NOTIFY wake bus + advisory-lock leader
-      # election, core/wake_bus.py). Budget: test RDS max_connections=79, ~18
-      # conns/worker → -w2≈36, safe.
+      # election, core/wake_bus.py). Budget: test RDS max_connections=79, ~20
+      # conns/worker → -w2≈40, safe.
       FEEDLING_BACKEND_WORKERS: "${FEEDLING_BACKEND_WORKERS:-1}"
       # TEST cutover is attested in the compose hash: consume durable change
       # events instead of reloading the full chat window on every sync.

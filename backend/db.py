@@ -14,9 +14,10 @@ stored verbatim as JSONB and returned byte-for-byte, so the enclave's decrypt
 path is unaffected.
 
 Concurrency: ``-w N`` workers, ``--threads 32`` each in production compose. Each
-worker has its own ``psycopg_pool.ConnectionPool`` (default max_size=16,
-overridable with ``FEEDLING_DB_POOL_MAX_SIZE``) shared across its threads, plus
-one pool-external connection for the LISTEN wake bus (see
+worker has its own ordinary ``psycopg_pool.ConnectionPool`` (default max_size=16,
+overridable with ``FEEDLING_DB_POOL_MAX_SIZE``) shared across its threads, a
+health-only pool (min_size=1, max_size=2), plus one pool-external connection for
+the LISTEN wake bus (see
 ``listen_connection`` / ``pg_notify`` and ``core/wake_bus.py``) and at most one
 bounded pool-external config-lock connection. The long-poll
 endpoints block on in-memory ``threading.Event``s, NOT on a held DB connection,
@@ -65,8 +66,15 @@ FIRST_CHAT_OK_USER_SOURCES = frozenset({"chat", "model_api"})
 
 _pool: ConnectionPool | None = None
 _pool_lock = threading.Lock()
+_health_pool: ConnectionPool | None = None
+_health_pool_lock = threading.Lock()
 HEALTH_DB_ACQUIRE_TIMEOUT_SECONDS = 1.0
 HEALTH_DB_STATEMENT_TIMEOUT_MS = 1000
+# Public probes must remain observable when a request burst occupies all 16
+# ordinary slots. This lazy per-worker pool adds one steady / two peak RDS
+# connections, while keeping concurrent health requests bounded.
+HEALTH_DB_POOL_MIN_SIZE = 1
+HEALTH_DB_POOL_MAX_SIZE = 2
 
 
 def _database_url() -> str:
@@ -146,20 +154,44 @@ def get_pool() -> ConnectionPool:
     return _pool
 
 
+def get_health_pool() -> ConnectionPool:
+    """Return the small pool reserved for database-backed public health probes."""
+    global _health_pool
+    if _health_pool is not None:
+        return _health_pool
+    with _health_pool_lock:
+        if _health_pool is None:
+            _health_pool = ConnectionPool(
+                _database_url(),
+                min_size=HEALTH_DB_POOL_MIN_SIZE,
+                max_size=HEALTH_DB_POOL_MAX_SIZE,
+                timeout=HEALTH_DB_ACQUIRE_TIMEOUT_SECONDS,
+                max_idle=300,
+                kwargs={"autocommit": True},
+                open=True,
+            )
+    return _health_pool
+
+
 def close_pool() -> None:
-    """Close and forget this process's pool.
+    """Close and forget this process's ordinary and health pools.
 
     Gunicorn's master performs schema/policy startup work before forking. Any
     pool opened there must be fully stopped first: psycopg pool worker threads
     do not survive ``fork()``, and inheriting their connection objects into web
     workers can hang the first request. Each child lazily creates its own pool.
     """
-    global _pool
+    global _pool, _health_pool
     with _pool_lock:
         pool = _pool
         _pool = None
+    with _health_pool_lock:
+        health_pool = _health_pool
+        _health_pool = None
     if pool is not None:
         pool.close()
+    if health_pool is not None:
+        health_pool.close()
 
 
 # ---------------------------------------------------------------------------
@@ -469,17 +501,18 @@ def set_supervisor_instance_heartbeat(owner: str, payload: dict) -> None:
     mirror.execute(sql, params)
 
 
-def list_supervisor_instance_heartbeats(
+def _list_supervisor_instance_heartbeats_from_pool(
+    pool,
     *,
     timeout: float | None = None,
     statement_timeout_ms: int | None = None,
 ) -> list[dict]:
     """All runner heartbeat rows. Each dict carries the typed flags plus ``ts``
     (the row's ``updated_at`` as an epoch float) so the caller can age-filter in
-    pure code. Freshness/aggregation is the guard's job, not this query's. Raises
-    on a DB error so the caller can fall back to the legacy key."""
+    pure code. Freshness/aggregation is the caller's job. Raises on a DB error so
+    each caller can apply its own fail-open or fail-closed policy."""
     connection_kwargs = {"timeout": timeout} if timeout is not None else {}
-    with get_pool().connection(**connection_kwargs) as conn:
+    with pool.connection(**connection_kwargs) as conn:
         with _local_statement_timeout(conn, statement_timeout_ms):
             rows = conn.execute(
                 "SELECT owner, host, shard_index, shard_count, max_children, "
@@ -503,6 +536,32 @@ def list_supervisor_instance_heartbeats(
             "pi": bool(payload.get("pi")),
         })
     return out
+
+
+def list_supervisor_instance_heartbeats(
+    *,
+    timeout: float | None = None,
+    statement_timeout_ms: int | None = None,
+) -> list[dict]:
+    """Read runner heartbeats through the ordinary application pool."""
+    return _list_supervisor_instance_heartbeats_from_pool(
+        get_pool(),
+        timeout=timeout,
+        statement_timeout_ms=statement_timeout_ms,
+    )
+
+
+def list_supervisor_instance_heartbeats_for_health(
+    *,
+    timeout: float | None = None,
+    statement_timeout_ms: int | None = None,
+) -> list[dict]:
+    """Read runner heartbeats without competing for application pool slots."""
+    return _list_supervisor_instance_heartbeats_from_pool(
+        get_health_pool(),
+        timeout=timeout,
+        statement_timeout_ms=statement_timeout_ms,
+    )
 
 
 def prune_supervisor_instance_heartbeats(max_age_sec: float) -> None:

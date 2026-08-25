@@ -78,15 +78,21 @@ def test_close_pool_forgets_pool_before_stopping_threads(monkeypatch):
     closed = []
 
     class FakePool:
+        def __init__(self, attr):
+            self.attr = attr
+
         def close(self):
             assert db._pool is None
-            closed.append(True)
+            assert db._health_pool is None
+            closed.append(self.attr)
 
-    monkeypatch.setattr(db, "_pool", FakePool())
+    monkeypatch.setattr(db, "_pool", FakePool("_pool"))
+    monkeypatch.setattr(db, "_health_pool", FakePool("_health_pool"))
     db.close_pool()
 
     assert db._pool is None
-    assert closed == [True]
+    assert db._health_pool is None
+    assert closed == ["_pool", "_health_pool"]
 
 
 def test_worker_recycling_bounds_arena_growth():
