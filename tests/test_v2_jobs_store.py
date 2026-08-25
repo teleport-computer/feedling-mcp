@@ -624,6 +624,50 @@ def test_terminal_failure_reply_is_encrypted_linked_classified_and_idempotent(
     assert v2_cursor.load_seq(core_store.get_store(uid)) == parent_seq
 
 
+def test_canvas_delivery_failure_reply_does_not_claim_a_connection_problem(
+    monkeypatch,
+):
+    uid = "u_js_canvas_delivery_failure"
+    seed_user(uid)
+    _reset(uid)
+    _append_user_message(uid)
+    encrypted_plaintexts = []
+
+    def capture_failure_envelope(store, plaintext, *, item_id=None):
+        encrypted_plaintexts.append(plaintext.decode("utf-8"))
+        return _fake_failure_envelope(store, plaintext, item_id=item_id)
+
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        capture_failure_envelope,
+    )
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    jobs_store.claim_next_job("w")
+    assert jobs_store.mark_failed(
+        job_id,
+        "turn_failed:canvas_file_delivery_incomplete",
+        claimed_by="w",
+        error_class="canvas_file_delivery_incomplete",
+    )
+
+    result = jobs_store.reconcile_terminal_failure_outbox(job_id=job_id)
+
+    assert result["reply_delivered"] == 1
+    assert encrypted_plaintexts == [
+        "画布内容已经保存，但卡片更新没有完成。请稍后再试。"
+    ]
+    failure = next(
+        row
+        for row in db.chat_load_strict(uid)
+        if str(row.get("terminal_failure_job_id") or "") == str(job_id)
+    )
+    assert failure["turn_failure_error_class"] == (
+        "canvas_file_delivery_incomplete"
+    )
+    assert failure["turn_failure_blame"] == "system"
+
+
 def test_scheduled_failure_reply_is_standalone_visible_and_idempotent(monkeypatch):
     uid = "u_js_scheduled_terminal_reply"
     seed_user(uid)

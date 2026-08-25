@@ -545,6 +545,178 @@ def test_model_selected_shared_work_uses_compact_delivery_after_large_write(
     )
 
 
+def test_canvas_update_compact_delivery_preserves_request_and_corrects_metadata(
+    monkeypatch,
+):
+    files = []
+    trajectory_events = []
+    tool_events = []
+    user_request = "把标题改成「星光方块」，副标题改成「今晚一起玩」。"
+
+    async def on_file(path, revision, *, title="", subtitle=""):
+        files.append((path, revision, title, subtitle))
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content="ok: workspace_write applied at revision 2",
+                metadata={"workspace_revision": 2},
+            )
+            for call in tool_calls
+        ]
+
+    outcome, calls, replies, messages_seen = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "write-update",
+                    "name": "workspace_write",
+                    "args": {
+                        "path": "/workspace/小游戏.io.html",
+                        "content": "<title>星光方块</title><main>game</main>",
+                        "expected_revision": 1,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "missing-metadata",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/小游戏.io.html",
+                        "revision": 2,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "corrected-delivery",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/小游戏.io.html",
+                        "revision": 2,
+                        "title": "星光方块",
+                        "subtitle": "今晚一起玩",
+                    },
+                }],
+                "usage": {},
+            },
+            {"reply": "已经按你的要求更新好了。", "tool_calls": [], "usage": {}},
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        file_requirement_messages=[{"role": "user", "content": user_request}],
+        max_calls=4,
+        trajectory_events=trajectory_events,
+        tool_events=tool_events,
+    )
+
+    assert calls[1:] == [("send_file",), ("send_file",), ()]
+    assert files == [
+        ("/workspace/小游戏.io.html", 2, "星光方块", "今晚一起玩")
+    ]
+    assert user_request in str(messages_seen[1])
+    assert "title and subtitle" in str(messages_seen[1])
+    validation_exchange = messages_seen[2][-1]
+    assert isinstance(validation_exchange, ToolExchange)
+    assert [result.call_id for result in validation_exchange.results] == [
+        "missing-metadata"
+    ]
+    assert "requires title and subtitle" in validation_exchange.results[0].content
+    assert [event[2] for event in tool_events if event[0] == "missing-metadata"] == [
+        "tool_call_started",
+        "tool_call_result",
+    ]
+    assert any(
+        kind == "tool_batch_validation_failed"
+        for kind, _payload in trajectory_events
+    )
+    assert replies == [("已经按你的要求更新好了。", True)]
+    assert outcome.stop_reason == "final_text"
+
+
+def test_canvas_update_repeated_invalid_metadata_fails_as_delivery_not_connection(
+    monkeypatch,
+):
+    files = []
+
+    async def on_file(path, revision, *, title="", subtitle=""):
+        files.append((path, revision, title, subtitle))
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content="ok: workspace_write applied at revision 2",
+                metadata={"workspace_revision": 2},
+            )
+            for call in tool_calls
+        ]
+
+    with pytest.raises(
+        tool_loop.CanvasDeliveryIncomplete,
+        match="invalid_canvas_delivery_args",
+    ):
+        _run_loop(
+            monkeypatch,
+            [
+                {
+                    "reply": "",
+                    "tool_calls": [{
+                        "id": "write-update",
+                        "name": "workspace_write",
+                        "args": {
+                            "path": "/workspace/小游戏.io.html",
+                            "content": "<title>小游戏</title>",
+                            "expected_revision": 1,
+                        },
+                    }],
+                    "usage": {},
+                },
+                {
+                    "reply": "",
+                    "tool_calls": [{
+                        "id": "missing-metadata-1",
+                        "name": "send_file",
+                        "args": {
+                            "path": "/workspace/小游戏.io.html",
+                            "revision": 2,
+                        },
+                    }],
+                    "usage": {},
+                },
+                {
+                    "reply": "",
+                    "tool_calls": [{
+                        "id": "missing-metadata-2",
+                        "name": "send_file",
+                        "args": {
+                            "path": "/workspace/小游戏.io.html",
+                            "revision": 2,
+                        },
+                    }],
+                    "usage": {},
+                },
+            ],
+            on_file_reply=on_file,
+            dispatch=dispatch,
+            file_requirement_messages=[{
+                "role": "user",
+                "content": "修改标题和副标题",
+            }],
+            max_calls=4,
+        )
+
+    assert files == []
+
+
 def test_ordinary_workspace_write_remains_a_draft_without_auto_delivery(monkeypatch):
     files = []
 
