@@ -65,6 +65,21 @@ def test_safe_failure_codes_are_members_of_the_producer_export():
         assert "private" not in code
 
 
+def test_canvas_delivery_failure_is_not_classified_as_provider_connection():
+    exc = tool_loop.CanvasDeliveryIncomplete("invalid_canvas_delivery_args")
+
+    assert worker._safe_failure_code("turn_failed", exc) == (
+        "turn_failed:canvas_file_delivery_incomplete"
+    )
+    assert worker._turn_failure_error_class(exc) == (
+        "canvas_file_delivery_incomplete"
+    )
+    assert notices_catalog.user_text_for(
+        "canvas_file_delivery_incomplete",
+        language="zh-CN",
+    ) == "画布内容已经保存，但卡片更新没有完成。请稍后再试。"
+
+
 def test_unknown_exception_class_and_scope_collapse_to_registered_buckets():
     class SecretToken(RuntimeError):
         pass

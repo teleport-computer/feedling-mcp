@@ -10,6 +10,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Runtime V2 Canvas updates now carry the current user request into the compact
+  card-delivery step, make one bounded correction when title or subtitle metadata
+  is invalid, and report an incomplete card delivery as a Canvas delivery issue
+  instead of a model connection failure.
+
 - **Hosted Runtime V2 Chat now makes one bounded correction attempt when a
   final reply omits its self-authored thinking block.** The correction is
   text-only, reuses the existing `<think>` contract without asking the model to

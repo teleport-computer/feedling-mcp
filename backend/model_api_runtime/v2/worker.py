@@ -1271,6 +1271,8 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
         kind = candidate if candidate in notices_catalog.ERROR_CLASSES else "error"
     elif isinstance(exc, v2_tool_loop.ProviderEmptyReply):
         kind = "empty_reply"
+    elif isinstance(exc, v2_tool_loop.CanvasDeliveryIncomplete):
+        kind = "canvas_file_delivery_incomplete"
     elif isinstance(exc, TurnError):
         raw = str(exc)
         if raw in {
@@ -1395,6 +1397,8 @@ def _turn_failure_error_class(exc: BaseException) -> str:
     """Classify V2 foreground failures through the shared notice catalog."""
     if isinstance(exc, (DedicatedVisionUnavailable, ImageGenerationUnavailable)):
         return exc.error_code
+    if isinstance(exc, v2_tool_loop.CanvasDeliveryIncomplete):
+        return "canvas_file_delivery_incomplete"
     if isinstance(exc, v2_prompt_frontier.PromptFrontierExhausted):
         # An unaudited default is our conservative local ceiling, not the
         # provider's model limit. Never blame the user or tell them to shorten
