@@ -133,7 +133,7 @@ def _wake_deps(*, summary="", tail=None, has_genuine_user_history=None):
 def _script_provider(monkeypatch, responses):
     """Monkeypatch `provider_client.chat_completion_async` — what
     `tool_loop.run_tool_loop` calls once per round (the wake lane's LLM wire
-    boundary since Task 8)."""
+    boundary)."""
     it = iter(responses)
     calls = []
 

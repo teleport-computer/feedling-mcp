@@ -1,10 +1,10 @@
-"""Hosted Runtime V2 PR D, Task 4 (D3 capacity reflects health).
+"""Hosted Runtime V2 current capacity-health contract.
 
 `serve_worker._heartbeat_loop` must derive the `capacity` it writes to the
 `kind='turn'` heartbeat row from the turn-child's ACTUAL health
 (`child_supervisor.ChildSupervisor.poll_liveness()`), otherwise a heartbeat
 tick ~10s after the watchdog
-(Task 3) writes capacity=0 on a kill decision would silently re-advertise full
+writes capacity=0 on a kill decision would silently re-advertise full
 capacity for a child that is mid-SIGKILL/respawn.
 
 Mirrors the `_reaper_loop`/`_watchdog_loop` driver pattern in

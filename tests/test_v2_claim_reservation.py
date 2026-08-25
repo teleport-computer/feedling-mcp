@@ -1,7 +1,12 @@
-"""Legacy direct-worker lane reservation compatibility coverage.
+"""Current SlotSpec lane-allowlist claim filtering and priority coverage.
 
-预留槽位场景：一个 worker slot 只被允许抢 {"chat","manual_wake"}，即使有大量
-heartbeat/capture 在排队，也绝不会去抢它们——保证聊天回复不被后台唤醒风暴饿死。
+The production three-pool topology passes every SlotSpec's current lane
+allowlist through ``turn_child`` to ``worker._slot_loop`` and then to
+``claim_next_job(lanes=...)``. A foreground slot therefore does not claim a
+wake/heavy job, while an unrestricted claim follows current lane priority.
+Only ``worker._reserved_lane_slots`` automatic N/R assignment and the
+multi-slot ``run_worker_loop`` arrangement are legacy direct-worker/test
+compatibility.
 """
 from __future__ import annotations
 
@@ -45,7 +50,7 @@ def test_reserved_slot_skips_background_lanes_until_chat_arrives():
     jobs_store.enqueue_job("u_res_1", "heartbeat")
     jobs_store.enqueue_job("u_res_2", "capture")
 
-    # Reserved slot only allowed to pull chat/manual_wake — nothing claimable yet.
+    # A foreground-style allowlist only claims chat/manual_wake; nothing is claimable yet.
     claimed = jobs_store.claim_next_job("w1", lanes={"chat", "manual_wake"})
     assert claimed is None
 

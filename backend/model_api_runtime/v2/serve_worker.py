@@ -1,10 +1,11 @@
-"""V2 worker 进程入口 + 生产依赖装配（子项目 B，Task 8 扩到全流程）。
+"""V2 worker process entrypoint and production dependency assembly.
 
-部署目标（已钉死，见 spec §2.1）：这是 backend 代码的 worker 镜像入口，运行在独立
-runner CVM 的唯一 `serve-worker` service；hosted resident supervisor 已退役。
-Genesis 已在 2026-07-10 rehome 到本进程的 dedicated thread。
-它**不是**独立 repo，也**不**贴着主 app CVM 的 FastAPI backend 跑。HTTP 化会把
-backend→enclave→backend 的 reentrant 502 根因请回来；贴主 app 跑则与 backend 争 CPU/内存。
+Current deployment facts belong to ``docs/CURRENT_STATE.md``. This backend-image
+entrypoint runs the pooled Runtime V2 worker on the main CVM; hosted Resident
+continues separately on its agent-runner CVM under the dual-runtime decision.
+Genesis runs on this process's dedicated thread. This is not a separate repo;
+the worker reaches the enclave through the configured runtime path rather than
+introducing an extra HTTP service boundary.
 
 装配层：这里（且只有这里）可同时 import hosted/core/model_api_runtime，把
 需要上层的实现注入进 worker.TurnDeps，令 worker.py 保持不逆依赖（CONTRIBUTING §2）。
@@ -3296,7 +3297,7 @@ def _last_user_msg_ts(user_id: str) -> float | None:
 
 
 def _tick_screen_watch_for_user(user_id: str) -> int:
-    """屏幕监看生产者（D-screen_watch Task 4）：替掉 resident 的 per-user 120s 循环。
+    """Screen-watch producer replacing the Resident per-user 120s loop.
 
     每 scheduler tick 对一个到期用户跑一遍**纯** gate `screen_watch.should_watch`，命中才
     再问只读 proactive oracle `_wake_decision_for_user`（未激活/Ambient-off/免打扰闸 + 零
@@ -5369,7 +5370,7 @@ async def _heartbeat_loop(
     interval: float = _HEARTBEAT_INTERVAL_SEC,
     capacity_stale_sec: float = _CAPACITY_STALE_SEC,
 ) -> None:
-    """UPSERT this process's liveness row every ~interval seconds (Task 2: the
+    """UPSERT this process's liveness row every ~interval seconds (the
     db_action_v2 chat/send guard needs something to check — without this, a
     pool where every serve_worker process has died would queue jobs forever
     with no error). Reuses the same ``worker_id`` this process passes to

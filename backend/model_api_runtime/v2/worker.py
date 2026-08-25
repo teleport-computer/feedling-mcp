@@ -1608,7 +1608,7 @@ class TurnDeps:
     read_summary_with_seq: Callable[[str], tuple[str, float, int, int]] | None = None
     # (user_id, summary, watermark_ts, expected_version[, watermark_seq]) -> True if CAS
     # landed：本地加密（core_envelope，非 enclave 往返）+ CAS 写回 v2_conversation_summary
-    # （Task 2 storage）。expected_version 不匹配（别的回合已推进过摘要）时返回 False，
+    # （summary storage）。expected_version 不匹配（别的回合已推进过摘要）时返回 False，
     # 调用方按丢弃本次压缩处理，不重试、不报错——下一回合会用新版本重新压缩。默认 None：同上。
     # watermark_seq 是可选的第 5 个位置参数——_run_compaction 只有在能拿到折叠
     # 批次最后一行的精确 seq 时才会传它（生产路径总是能拿到；某些窄签名的测试 fake 只接 4
@@ -1651,7 +1651,7 @@ class TurnDeps:
     # 历史读取。默认 None：
     # worker.py 不 import hosted/capabilities，生产装配见 serve_worker。
     read_files: Callable[[str, list[str]], dict[str, dict]] | None = None
-    # —— capture/dream 记忆抽取 lane 的三个注入回调（Task 3）——
+    # —— capture/dream 记忆抽取 lane 的三个注入回调 ——
     # 全部默认 None：worker.py 不 import `hosted`/`memory_core`/`core.envelope`-for-memory
     # （否则违反 CONTRIBUTING §2 的依赖方向），所以记忆上下文读取、信封加密、落库都作为
     # 可调用对象由 serve_worker.build_production_deps 注入；测试注入假实现直接跑。
@@ -1719,7 +1719,7 @@ class TurnDeps:
     cancel_capture_job: Callable[..., bool] | None = None
     capture_enabled: Callable[[str], bool] | None = None
     dream_enabled: Callable[[str], bool] | None = None
-    # user_id -> {"applied": int, "discarded": int}（Task 6 / spec A6）：run the
+    # user_id -> {"applied": int, "discarded": int}（spec A6）：run the
     # generation-fenced effect-outbox applier (`effect_outbox.apply_pending_effects`)
     # with this turn's real dispatch sinks at end-of-turn. worker.py itself never
     # imports `model_api_runtime.v2.effect_outbox`'s dispatch-side wiring (the 8
@@ -3517,7 +3517,7 @@ async def _dispatch_mixed_tool_calls(
         started_ns = time.monotonic_ns()
         if dispatch_provider_usage is None:
             # wake/subagent lanes bind no callable — this tool is never
-            # offered there (Task 5 catalog scoping); a call reaching here
+            # offered there by catalog scoping; a call reaching here
             # anyway (forged/legacy caller) is refused, not silently routed.
             results = [
                 ToolResult(call_id=tc.id, content="error: tool_not_allowed")
@@ -5853,7 +5853,7 @@ def _make_provider_usage_dispatcher(
     *, provider_config
 ) -> Callable[[list], Awaitable[list[ToolResult]]]:
     """Bind the turn's already-decrypted provider_config for provider_usage
-    calls (Task 6). Mirrors ``_make_task_batch_dispatcher``'s closure shape:
+    calls. Mirrors ``_make_task_batch_dispatcher``'s closure shape:
     capture once at turn setup, never re-resolve per call — a second
     resolution would mean a second decrypt.
 
@@ -8704,7 +8704,7 @@ async def _run_wake(
             _flatten_turns(optional_tail_turns) + wake_tail
         )
 
-        # screen_watch lane grounds on recent shared-screen availability (Task 3).
+        # screen_watch lane grounds on recent shared-screen availability.
         # Fetch ONLY screen_recent — no perception_glance or perception_snapshot: the
         # resident explicitly sets perception_digest=None for screen-watch jobs.
         # B1 aligns its separate screen recipe with V1: at most four frames carry
@@ -9075,10 +9075,10 @@ async def _run_wake(
             search_halted=wake_search_halted,
             fetch_halted=wake_fetch_halted,
         )
-        # provider_usage is chat-lane only (Task 5 design decision): the
+        # provider_usage is chat-lane only: the
         # proactive companion never has a user-asked-a-question moment to
         # answer, so it must never be offered here — unconditionally, not
-        # gated by the kill switch (that gate is chat-lane's Task 6 concern).
+        # gated by the kill switch (a chat-lane concern).
         # `mcp_tool_search` 不在这里 —— 它是折叠 schema 的唯一取回口。禁掉它
         # 等于让唤醒道在压力下永久丢失工具参数(T154 之前正是如此)。
         wake_disabled_tool_names = wake_disabled_web_tool_names | {
@@ -12918,7 +12918,7 @@ async def process_job(
                 trace_id=str(job.get("trace_id") or ""),
             )
         if lane in _EXTRACTION_LANES:
-            # 自成一体的记忆抽取路径（capture/dream，Task 3）：build prompt → BYOK 抽取 →
+            # 自成一体的记忆抽取路径（capture/dream）：build prompt → BYOK 抽取 →
             # parse → memory actions。同 _run_compaction/_run_wake 一样有自己的 try/except，
             # 绝不落进下面 chat-turn 的 except（那条会 emit 用户可见 error status +
             # record_terminal_error）——后台 job 永不写气泡、永不弹 error chip。
@@ -13354,7 +13354,7 @@ async def process_job(
 
         async def _enqueue_write_effect(tc) -> str:
             """WRITE tool_call -> PR A effect (spec C6). Mapping lives in the shared
-            `_write_tool_effect_payload` (also used by `_run_wake` — Task 8)."""
+            `_write_tool_effect_payload` (also used by `_run_wake`)."""
             prepared = effect_reservations.get(tc)
             encrypted_payload = await asyncio.to_thread(
                 _build_encrypted_tool_effect_payload,
@@ -13653,7 +13653,7 @@ async def process_job(
             observe_photo=observe_photo,
             trajectory_recorder=trajectory_recorder,
         )
-        # Chat-lane only (Task 6): closes over THIS turn's already-decrypted
+        # Chat-lane only: closes over THIS turn's already-decrypted
         # provider_config, never re-resolved per call.
         dispatch_provider_usage = _make_provider_usage_dispatcher(
             provider_config=provider_config
@@ -15553,7 +15553,7 @@ async def process_job(
                     successor_id,
                     type(exc).__name__,
                 )
-        # End-of-turn effect-outbox drain (Task 6 / spec A6): apply any pending
+        # End-of-turn effect-outbox drain (spec A6): apply any pending
         # generation-fenced effects for this user with the real dispatch sinks.
         # Best-effort — the turn's own reply/runtime-state/job transition above
         # are already durable by this point, so a failure here must not turn a
@@ -16374,8 +16374,9 @@ async def _slot_loop(
     跑完手上的即退出（优雅 drain）。
 
     lanes（可选）：转给 `jobs_store.claim_next_job` 的 lane 白名单。None＝不限制
-    （行为与改动前完全一致）；非 None 时这个 slot 只抢白名单里的 lane——`run_worker_loop`
-    用它给部分 slot 划专用车道（见 `_reserved_lane_slots`）。
+    （行为与改动前完全一致）；非 None 时这个 slot 只抢白名单里的 lane。生产
+    `turn_child` 把每个 SlotSpec 的 current allowlist 传到这里；`run_worker_loop`
+    仅在 compatibility 路径中使用 `_reserved_lane_slots` 的旧自动分配。
 
     progress_cb（可选，per-slot progress / hard-timeout safety）：`progress_cb(slot_id, turn_start)`
     在真实 slot 活动的天然边界调用——claim 到一个 job 之后（即将进入 `_run_turn`）、
