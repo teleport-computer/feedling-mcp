@@ -654,6 +654,15 @@ def test_self_thinking_language_mismatch_is_closed_and_content_free():
     ) is None
 
 
+def test_self_thinking_absent_correction_reuses_shared_contract_without_downshift():
+    instruction = worker._SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION
+
+    assert instruction.endswith(self_thinking.INSTRUCTION.strip())
+    assert "<think>…</think>" in instruction
+    for forbidden in ("简短点", "别想太多", "be concise", "think less"):
+        assert forbidden not in instruction
+
+
 def test_thinking_surface_trace_contains_metadata_only():
     captured = {}
 
@@ -669,6 +678,7 @@ def test_thinking_surface_trace_contains_metadata_only():
             lane="chat",
             branch="self",
             chars=17,
+            retried=worker.MAX_SELF_THINKING_ABSENT_RETRIES,
         )
     )
 
@@ -678,8 +688,15 @@ def test_thinking_surface_trace_contains_metadata_only():
         "chars": 17,
         "model": "model-safe-name",
         "lane": "chat",
+        "retried": worker.MAX_SELF_THINKING_ABSENT_RETRIES,
     }
-    assert set(captured["detail"]) == {"branch", "chars", "model", "lane"}
+    assert set(captured["detail"]) == {
+        "branch",
+        "chars",
+        "model",
+        "lane",
+        "retried",
+    }
 
 
 def test_thinking_surface_trace_bounds_user_configured_model_name():

@@ -346,6 +346,7 @@ def test_wake_self_thinking_on_drops_native_reasoning_fallback(monkeypatch):
         "chars": 0,
         "model": _BYOK.model,
         "lane": "wake",
+        "retried": 0,
     }]
     language_traces = [
         trace for trace in traces
