@@ -82,17 +82,17 @@ def test_continuous_events_apply_upsert_update_delete_and_wake_once(monkeypatch)
 
 
 @pytest.mark.parametrize(
-    ("current", "events"),
+    ("current", "events", "expected_reason"),
     [
-        (3, [{"version": 3, "operation": "upsert", "message_ids": ["c"]}]),
-        (2, [{"version": 2, "operation": "reset", "message_ids": []}]),
-        (300, []),
-        (2, []),
+        (3, [{"version": 3, "operation": "upsert", "message_ids": ["c"]}], "gap"),
+        (2, [{"version": 2, "operation": "reset", "message_ids": []}], "reset"),
+        (300, [], "overflow"),
+        (2, [], "gap"),
     ],
     ids=["gap", "reset", "overflow", "expired-history"],
 )
 def test_gap_reset_overflow_and_expired_history_reload_snapshot(
-    monkeypatch, current, events,
+    monkeypatch, caplog, current, events, expected_reason,
 ):
     store = _bare_store([_row("a", 1)], version=1)
     reloads = []
@@ -113,11 +113,70 @@ def test_gap_reset_overflow_and_expired_history_reload_snapshot(
 
     monkeypatch.setattr(store, "reload_chat_hot_strict", reload_hot)
     monkeypatch.setattr(store, "notify_chat_waiters", lambda: None)
+    caplog.set_level("INFO", logger="feedling.chat_sync")
 
     assert store.ensure_chat_fresh(force=True) is True
     assert reloads == [True]
     assert store.chat_version == current
     assert [row["id"] for row in store.chat_messages] == ["snapshot"]
+    assert f"reason={expected_reason}" in caplog.text
+    assert "user_hash=" in caplog.text
+    assert store.user_id not in caplog.text
+    assert "message_ids" not in caplog.text
+
+
+def test_missing_upsert_row_logs_snapshot_fallback_reason(monkeypatch, caplog):
+    store = _bare_store([_row("a", 1)], version=1)
+    monkeypatch.setattr(core_store.db, "chat_change_version", lambda _uid: 2)
+    monkeypatch.setattr(
+        core_store.db,
+        "chat_change_events_after",
+        lambda *_args: [
+            {"version": 2, "operation": "upsert", "message_ids": ["missing"]}
+        ],
+    )
+    monkeypatch.setattr(core_store.db, "chat_get_many_strict", lambda *_args: [])
+    monkeypatch.setattr(store, "reload_chat_hot_strict", lambda: [])
+    monkeypatch.setattr(store, "notify_chat_waiters", lambda: None)
+    caplog.set_level("INFO", logger="feedling.chat_sync")
+
+    assert store.ensure_chat_fresh(force=True) is True
+
+    assert "reason=missing_row" in caplog.text
+    assert store.user_id not in caplog.text
+
+
+def test_generation_conflict_logs_snapshot_fallback_reason(monkeypatch, caplog):
+    store = _bare_store([_row("a", 1)], version=1)
+    monkeypatch.setattr(core_store.db, "chat_change_version", lambda _uid: 2)
+    monkeypatch.setattr(
+        core_store.db,
+        "chat_change_events_after",
+        lambda *_args: [
+            {"version": 2, "operation": "upsert", "message_ids": ["b"]}
+        ],
+    )
+
+    def get_many(*_args):
+        store.apply_committed_chat_rows([_row("local", 3)])
+        return [_row("b", 2)]
+
+    monkeypatch.setattr(core_store.db, "chat_get_many_strict", get_many)
+    monkeypatch.setattr(store, "reload_chat_hot_strict", lambda: [])
+    monkeypatch.setattr(store, "notify_chat_waiters", lambda: None)
+    caplog.set_level("INFO", logger="feedling.chat_sync")
+
+    assert store.ensure_chat_fresh(force=True) is True
+
+    assert "reason=generation_conflict" in caplog.text
+    assert store.user_id not in caplog.text
+
+
+def test_snapshot_fallback_telemetry_rejects_unknown_reason():
+    with pytest.raises(ValueError, match="fallback reason"):
+        core_store._chat_snapshot_fallback_telemetry(
+            user_id="private-user", reason="unknown", hot_rows=1
+        )
 
 
 def test_duplicate_target_and_coalesced_check_do_no_work(monkeypatch):
