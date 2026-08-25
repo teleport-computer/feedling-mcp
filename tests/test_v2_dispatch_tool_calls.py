@@ -96,6 +96,38 @@ def test_two_reads_dispatch_and_return_results_by_call_id(monkeypatch):
     assert enqueued == []
 
 
+def test_workspace_read_exposes_exact_delivery_identity_in_metadata(monkeypatch):
+    def _run_capability(action_type, store, *, api_key, runtime_token, params):
+        assert action_type == "workspace_read"
+        return _FakeResult(
+            True,
+            {
+                "path": "/workspace/打砖块小游戏.io.html",
+                "revision": 7,
+                "content": "<html></html>",
+            },
+        )
+
+    results, enqueued = _run(
+        [
+            ToolCall(
+                id="read-canvas",
+                name="workspace_read",
+                args={"path": "/workspace/打砖块小游戏.io.html"},
+            )
+        ],
+        turn_authorization=False,
+        run_capability=_run_capability,
+        monkeypatch=monkeypatch,
+    )
+
+    assert enqueued == []
+    assert results[0].metadata == {
+        "workspace_read_path": "/workspace/打砖块小游戏.io.html",
+        "workspace_revision": 7,
+    }
+
+
 def test_one_read_exception_is_isolated_from_successful_sibling(monkeypatch):
     ran = []
 

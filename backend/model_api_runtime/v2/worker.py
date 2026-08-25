@@ -4962,6 +4962,30 @@ def _adaptive_replay_parts(
     )
 
 
+def _attached_file_matches_requirement(
+    messages: list[dict], requirement: tuple[str, ...] | None
+) -> bool:
+    """Whether a recovery turn carries a file of the requested format."""
+
+    if requirement is None:
+        return False
+    names = [
+        str(message.get("file_name") or "").strip().casefold()
+        for message in messages
+        if message.get("has_file") is True
+    ]
+    names = [name for name in names if name]
+    if not names:
+        return False
+    if not requirement:
+        return True
+    return any(
+        name.endswith(str(suffix).casefold())
+        for name in names
+        for suffix in requirement
+    )
+
+
 async def _coalesce_inputs(
     deps: TurnDeps, user_id: str, since_seq: int, *, enclave_sem=None
 ) -> tuple[list[dict], int, float]:
@@ -13128,17 +13152,37 @@ async def process_job(
                     "voice_call_id": call_id,
                     "voice_turn_id": turn_id,
                 }
-        # A recovery turn is deliberately mutation-free. Keeping the hard file
-        # completion guard active here creates an impossible state: the guard
-        # demands workspace_write while the recovery barrier withholds it, so
-        # the same oldest unanswered message retries until empty_reply forever.
-        # Settle that message honestly as text; the next ordinary job can create
-        # a file after the reply cursor has cleared the old mutation frontier.
-        required_file_suffixes = (
+        detected_file_requirement = (
             context.required_file_suffixes(coalesced)
-            if lane == "chat" and mutation_recovery_barrier is None
+            if lane == "chat"
             else None
         )
+        recovery_existing_file_delivery = bool(
+            mutation_recovery_barrier is not None
+            and _attached_file_matches_requirement(
+                coalesced, detected_file_requirement
+            )
+        )
+        # A recovery turn remains mutation-free, but attaching an existing file
+        # and explicitly asking for that format can be completed by sending an
+        # already-stored exact workspace revision. That does not repeat the old
+        # mutation; it only repairs the missing user-visible attachment.
+        required_file_suffixes = (
+            detected_file_requirement
+            if mutation_recovery_barrier is None
+            or recovery_existing_file_delivery
+            else None
+        )
+
+        def _resolve_turn_file_requirement(messages):
+            resolved = context.required_file_suffixes(messages)
+            if mutation_recovery_barrier is None:
+                return resolved
+            return (
+                resolved
+                if _attached_file_matches_requirement(messages, resolved)
+                else None
+            )
         if not coalesced and lane == "chat":
             # 无未回复消息（已被别的回合吃掉，或是竞态下的重复 claim）——干净收尾，不落 filler。
             completed, successor_id = await asyncio.to_thread(
@@ -13542,9 +13586,13 @@ async def process_job(
                 set(cap_registry.WRITE_ACTIONS)
                 | set(mcp_mutating_names)
                 | {
-                    cap_tool_schema.FILE_REPLY_TOOL,
                     cap_tool_schema.MEMORY_ORGANIZE_TOOL,
                 }
+                | (
+                    set()
+                    if recovery_existing_file_delivery
+                    else {cap_tool_schema.FILE_REPLY_TOOL}
+                )
             )
         # Web gate. UNION with the mutation set, never assignment — overwriting
         # would re-expose the writes that mutation recovery just withheld.
@@ -15206,11 +15254,15 @@ async def process_job(
             on_tool_event=chat_tool_activity_callback,
             required_file_suffixes=required_file_suffixes,
             file_requirement_messages=(
-                coalesced if mutation_recovery_barrier is None else ()
+                coalesced
+                if mutation_recovery_barrier is None
+                or recovery_existing_file_delivery
+                else ()
             ),
             resolve_required_file_suffixes=(
-                context.required_file_suffixes
+                _resolve_turn_file_requirement
                 if mutation_recovery_barrier is None
+                or recovery_existing_file_delivery
                 else None
             ),
             on_file_requirement_changed=_on_file_requirement_changed,
