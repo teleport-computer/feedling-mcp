@@ -531,7 +531,7 @@ class UserStore:
             int(getattr(self, "chat_hot_cache_limit", MAX_CHAT_MESSAGES)),
             int(MAX_CHAT_MESSAGES),
         )
-        for _attempt in range(3):
+        for _attempt in range(2):
             with self.chat_lock:
                 self._ensure_chat_cache_state_locked()
                 generation = self._chat_cache_generation
@@ -544,7 +544,13 @@ class UserStore:
                     continue
                 self._replace_chat_rows_locked(rows, version=version)
                 return list(self.chat_messages)
-        raise RuntimeError("chat cache changed during strict snapshot reload")
+        with self.chat_lock:
+            self._ensure_chat_cache_state_locked()
+            version, rows = db.chat_load_hot_snapshot_strict(
+                self.user_id, limit
+            )
+            self._replace_chat_rows_locked(rows, version=version)
+            return list(self.chat_messages)
 
     def reload_chat_strict(self) -> list[dict]:
         """Compatibility alias for the strict bounded chat-only refresh."""
