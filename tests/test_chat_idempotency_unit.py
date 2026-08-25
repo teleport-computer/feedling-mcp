@@ -10,7 +10,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from chat import idempotency  # noqa: E402
 from core import store as core_store  # noqa: E402
-from core import wake_bus  # noqa: E402
 from proactive import capture_scheduler  # noqa: E402
 
 
@@ -57,7 +56,7 @@ def test_parse_client_msg_id_absent_invalid_and_canonical():
 def test_store_duplicate_reconciles_cache_without_second_side_effect(monkeypatch):
     store = _bare_store()
     winner: dict = {}
-    calls = {"db": 0, "wake": 0, "capture": 0}
+    calls = {"db": 0, "capture": 0}
 
     def _append(_uid, _msg_id, _ts, doc, _max, **_kwargs):
         calls["db"] += 1
@@ -67,9 +66,6 @@ def test_store_duplicate_reconciles_cache_without_second_side_effect(monkeypatch
         return dict(winner), False
 
     monkeypatch.setattr(core_store.db, "chat_append_idempotent", _append)
-    monkeypatch.setattr(
-        wake_bus, "notify", lambda *_args, **_kwargs: calls.__setitem__("wake", calls["wake"] + 1)
-    )
     monkeypatch.setattr(
         capture_scheduler,
         "record_chat_append",
@@ -95,4 +91,4 @@ def test_store_duplicate_reconciles_cache_without_second_side_effect(monkeypatch
     assert retry_inserted is False
     assert retry == first
     assert [row["id"] for row in store.chat_messages] == ["first-envelope"]
-    assert calls == {"db": 2, "wake": 1, "capture": 1}
+    assert calls == {"db": 2, "capture": 1}

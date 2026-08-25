@@ -18,7 +18,7 @@ BACKEND = pathlib.Path(__file__).resolve().parent.parent / "backend"
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
-from memory_garden.selection import (  # noqa: E402
+from memgarden.selection import (  # noqa: E402
     Chain, Pick, RecentStage, RelevanceStage, RoleStage, SelectionPolicy, SelectionResult,
 )
 

@@ -657,7 +657,10 @@ def test_provider_failure_leaves_a_partial_request_error_trajectory(monkeypatch)
         "provider_request",
         "provider_error",
     ]
-    assert events[0][1]["messages"][0]["content"] == "private prompt"
+    assert events[0][1]["messages"][-1] == {
+        "role": "user",
+        "content": "private prompt",
+    }
     assert events[1][1]["provider_attempt_trace"]["attempts"][0]["status"] == 503
 
 

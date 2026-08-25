@@ -1,9 +1,15 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/CURRENT_STATE.md
+historical_reason: point-in-time
+---
 # Feedling MCP — Changelog
 
-> Landmark diffs over time. Two months from now, this is how we remember
-> when a decision was made and why.
+> This is the historical timeline of landmark diffs: it records when a decision
+> was made and why. Current runtime and deployment ownership live in
+> [`CURRENT_STATE.md`](CURRENT_STATE.md); exact deployed evidence and current
+> code take precedence over older entries here.
 >
-> Source-of-truth for "where we are now" is this changelog plus `git log`.
 > `PROJECT_BRIEF.md` and `ROADMAP.md` were retired 2026-04-20 — historical
 > references to them below are preserved verbatim.
 
@@ -12,8 +18,10 @@
 ## 给 Claude Code 的说明
 
 **每次开新对话时**，请按顺序读：
-1. `CHANGELOG.md`（最近的变化——尤其是最上面 3-5 条）
-2. `CLAUDE.md`（当前 repo-level guardrails；`HANDOFF.md` 已删除）
+1. `AGENTS.md`（当前 repo-level guardrails）
+2. `CURRENT_STATE.md`（当前 runtime、部署和排查 owner）
+3. `CLAUDE.md`（补充约定；`HANDOFF.md` 已删除）
+4. 只有需要历史原因时再查本 changelog 和 git log
 
 **每次完成一个 task 或做出决策时**，在文档顶部追加一条记录。格式见下面。
 
@@ -46,6 +54,57 @@
 ---
 
 ## 记录正文（最新的在上面）
+
+## 2026-08-24 — V1 冻结按接入路径拆分并补齐托管人群
+
+**[DONE] 事件健康表不再把 Runtime V1 家族误当成一种接入方式。**
+
+- V1 冻结先按 active-tested hosted route 分层，再按接入方式与 effective runtime
+  拆出 APIKey-V1、托管 Resident-V1、自建 Resident、无 route/binding 和接入未分类；
+  原先被 onboarding route 过滤掉的托管 APIKey-V1 作业从生效日起进入冻结格。
+- 每格保存 `access_path` 与 `mode_source`；缺失的 raw runtime control 仍按生产默认
+  执行 V1，但明确标为 `default`，与 `explicit` 分开显示。connected resident binding
+  从冻结事务内的用户文档经 accounts 纯分类器注入，不读取进程缓存。
+- 新增 `access_path_from` 水位。历史不回填，管理页逐列显示“此列自某日起有效”；
+  生效日前的 `unavailable` 不等于零。RDS/TEE 双迁移、镜像扶正主键和匿名归并同步。
+
+## 2026-08-23 — V1 冻结格保留 operational outcome 分类
+
+**[DONE] Runtime family 辅助表不再把 V1 `skipped` 控制结果算成系统失败。**
+
+- V1 `status + status_reason` 分类器下沉到 `notices/catalog.py`，管理端实时视图与
+  每日冻结器共用同一纯函数；`skipped`、明确用户侧不可用和 operational failure
+  分别落入冻结格，失败分母只保留 `completed + operational failure`。
+- 新增独立 `outcomes_from` 水位。迁移前的冻结格不会回填，列默认 0 也不代表历史
+  测得零失败；只有新分类完整覆盖整个窗口时才发布百分比，其余窗口继续明确显示
+  不可计算。
+- RDS 与 TEE 迁移同步新增三类计数和水位约束；删号后的匿名聚合也逐类相加，保持
+  冻结历史的分类守恒。
+## 2026-08-24 — Canvas 卡片增加可生成和修改的副标题
+
+**[UI] VPS 与 API Key 两条生成链路使用同一份标题、副标题元数据。**
+
+- `.io.html` 交付现在必须同时带短标题与单行副标题，模型使用用户当前语言生成，
+  后续修改时默认保留，也可以随内容一起更新。
+- 标题和副标题作为有界的文件消息展示元数据，与加密 HTML 附件原子落库，旧消息
+  没有副标题时继续兼容显示。
+- iOS 的画布列表、聊天卡片、搜索和继续修改附件读取同一字段，不从 HTML 正文猜测。
+- Hosted Runtime V1 同步开启每用户隔离的文件 staging socket 和缺文件纠正，避免
+  模型看到 `send-file`、实际交付通道却未启动而只返回文字。源文件仍只允许位于
+  当前用户私有的 `outbound-files` 目录。
+
+## 2026-08-24 — Resident HTTP Canvas 交付不再提前断线
+
+**[DONE] 同机 HTTP agent 可显式接入 `io_cli`，Canvas 以 `.io.html` 卡片交付。**
+
+- HTTP agent 请求统一使用 `FEEDLING_AGENT_TURN_TIMEOUT_SEC`，不再被写死的
+  60/120 秒提前断开。
+- 仅当 `FEEDLING_AGENT_HTTP_LOCAL_IO_CLI=true` 时，HTTP agent 才获得本地
+  `io_cli` 目录和文件完成守卫，普通远程 HTTP 模型服务保持原行为。
+- 配合精确的 `FEEDLING_AGENT_HTTP_LOCAL_FILE_ROOTS` 工作区白名单，`send-file`
+  可直接读取 Agent 已生成的文件，不要求跨工作区复制，也不会删除原始文件。
+- Canvas 固定为单个自包含 `.io.html`，不假定 JS Bridge，按 iOS 上限限制为
+  256,000 bytes，并要求文件名、标题和界面文案跟随用户当前语言。
 
 ## 2026-08-20 — TEE Redis 暂停并标记废弃
 
@@ -4093,7 +4152,7 @@ the one prod user actually do to migrate to E2E?".
   garden after a successful flip.
 - Chat is intentionally skipped — many items, transient; the
   "hide from agent" affordance matters more on persistent
-  memory-garden entries.
+  memgarden entries.
 
 **Inline migration progress**
 - `FeedlingAPI` gains `@Published migrationProgress: (done, total)?`.

@@ -9,13 +9,15 @@ evicted the oldest events.  One row per event makes a write an O(1) INSERT, so
 nothing is ever "pushed out"; retention becomes a number of days instead of a
 number of events.
 
-Seven's decisions (2026-08-20), recorded because they are not derivable
-from the code:
+Seven's storage decisions, recorded because they are not derivable from the
+table shape:
 
-* **TEE only.**  "prod 之后也会变成 tee 的, rds 都不用了" — so this migration
-  exists solely in the TEE chain.  There is deliberately no RDS twin, which is
-  why this file has no byte-identical-literal convergence test (0030 needed one
-  because it had an RDS counterpart at 0081).
+* **Both selectable primaries.**  The 2026-08-24 production decision keeps RDS
+  as the primary while the TEE database transport is reworked, superseding the
+  2026-08-20 TEE-only rollout assumption.  RDS revision 0102 therefore carries
+  the same ``_UP`` literal, guarded byte-for-byte by the migration convergence
+  test.  Only the database selected by ``FEEDLING_DATABASE_SCHEMA`` is written;
+  this is schema parity, not dual-write or mirroring.
 * **No account-deletion cascade.**  "用户把账号消除时, 他的 trace 根本不需要删除
   ...删掉并没有什么意义" — traces exist to debug problems after the fact, and a
   deleted account is exactly when you want to know what happened.  Hence

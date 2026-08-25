@@ -148,7 +148,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: &enclave-image ghcr.io/teleport-computer/feedling:3cde1e9
+    image: &enclave-image ghcr.io/teleport-computer/feedling:c5b1c37
     command: &enclave-command ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -231,7 +231,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:3cde1e9
+    image: ghcr.io/teleport-computer/feedling:c5b1c37
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -240,8 +240,9 @@ services:
     # core/wake_bus.py). To enable: set FEEDLING_BACKEND_WORKERS=N via the
     # encrypted env channel IN A DEPLOY whose image contains the leader-election
     # patch (a pre-patch image binds :9998 at import → N>1 would double-bind; the
-    # default 1 stays safe on any image). Sizing: ~18 DB conns/worker (pool 16 +
-    # 1 listener + 1 election), so N×18 must stay under the RDS max_connections.
+    # default 1 stays safe on any image). Prod sizing: ~28 DB conns/worker
+    # (ordinary pool 24 + health pool up to 2 + 1 listener + 1 election), so N×28 must stay
+    # under the RDS max_connections.
     command: ["gunicorn", "--chdir", "backend", "--config", "backend/gunicorn_conf.py", "-k", "asgi.worker.FeedlingUvicornWorker", "--timeout", "120", "-b", "0.0.0.0:5001", "asgi_app:app"]
     restart: unless-stopped
     # One fd per live client connection. Now that keep-alive connections survive
@@ -288,6 +289,11 @@ services:
       # still fails fast at startup (db.py) if it ends up empty at runtime.
       DATABASE_URL: "${DATABASE_URL:-}"
       FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
+      # Consume durable per-user change events and keep only the newest 256
+      # rows resident. Literals make the production cutover attestable in the
+      # compose hash instead of relying on mutable deploy-time configuration.
+      FEEDLING_CHAT_SYNC_MODE: "incremental"
+      FEEDLING_CHAT_HOT_CACHE_LIMIT: "256"
       # TEE 明文影子库（feedling-io-db-prod，独立 pg CVM）。best-effort 双写：
       # db.py 写主库后镜像到这里，tee_shadow.mirror 永不 raise、失败只计数，绝不
       # 拖垮主路径。两个都为空 = 双写 OFF（mirror.enabled() 需 FEEDLING_TEE_DUAL_WRITE=1
@@ -406,16 +412,21 @@ services:
       # (core/leader.py run_singleton, in the deployed image) + Postgres
       # LISTEN/NOTIFY wake bus (core/wake_bus.py). Needed because each hosted
       # clients can park /v1/chat/poll threads for up to 30s. Sizing:
-      # ~18 DB conns/worker; prod RDS max_connections=402 so 4 workers (~72) is
-      # safe. Encrypted env, not baked into compose_hash — flip via var without
-      # on-chain re-auth. Default 4 here since the deployed image has the leader
-      # patch; set to 1 if ever deploying a pre-leader-election image.
+      # ~28 DB conns/worker at the prod ordinary-pool default below; prod RDS
+      # max_connections=402 so 6 workers peak at ~168, plus 3 reserved leaves
+      # ~231 connections for other roles/services. Encrypted env, not baked into
+      # compose_hash — flip via var without on-chain re-auth.
       # 2026-07-15 4→6：实测容量支持（prod RDS max_connections=402、当前仅用 ~82，
-      # +2 worker ≈ +36 连接仍宽裕；CVM 8 核、available ~12GB，worker 峰值 RSS 被
+      # +2 worker 按当前预算 ≈ +56 连接仍宽裕；CVM 8 核、available ~12GB，worker 峰值 RSS 被
       # max_requests 回收 + MALLOC_ARENA_MAX 封在 ~1GB，6×1GB 预算内）。收益：长轮询
       # 并发摊薄 + 单 worker 回收时容量只降 1/6。注意 wake-bus fan-out 随 worker 数
       # 线性放大（每条 chat NOTIFY 多 2 个 worker 的 store 刷新），当前消息速率下可忽略。
       FEEDLING_BACKEND_WORKERS: "${FEEDLING_BACKEND_WORKERS:-6}"
+      # Ordinary RDS pool ceiling per Gunicorn worker. Raised 16→24 after the
+      # 2026-08-25 per-worker saturation incident; the shared RDS was only ~32%
+      # occupied, so this uses existing headroom without changing the pool's
+      # steady min_size=2. Keep the budget guard in test_gunicorn_conf.py green.
+      FEEDLING_DB_POOL_MAX_SIZE: "${FEEDLING_DB_POOL_MAX_SIZE:-24}"
       # TEE 影子库 per-worker 连接池预算（tee_shadow/mirror.py，代码默认 max=32
       # 是按 4 worker 算的：4×32=128 < 200）。worker 提到 6 后必须显式下调：
       # 6×24=144 + 非 app 角色 ~10 + superuser 保留 3 ≈ 157 < TEE PG
@@ -452,7 +463,7 @@ services:
   # separate agent-runner CVM(s) (deploy/docker-compose.phala.prod.runner.yaml),
   # which this compose change does NOT touch (§7b: "runner CVM: 不动").
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:3cde1e9
+    image: ghcr.io/teleport-computer/feedling:c5b1c37
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
@@ -464,6 +475,9 @@ services:
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
       DATABASE_URL: "${DATABASE_URL:-}"
       FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
+      # Match the HTTP backend's incremental view and bounded resident window.
+      FEEDLING_CHAT_SYNC_MODE: "incremental"
+      FEEDLING_CHAT_HOT_CACHE_LIMIT: "256"
       # Only the backend owns the elected decrypted-shadow drain.
       FEEDLING_PLAINTEXT_SHADOW_ENABLED: "0"
       # Must match the backend; CI admits 1 only with TEE-primary wiring.
@@ -564,7 +578,7 @@ services:
       retries: 3
 
   cpu-recorder:
-    image: ghcr.io/teleport-computer/feedling:3cde1e9
+    image: ghcr.io/teleport-computer/feedling:c5b1c37
     container_name: cpu-recorder
     command: ["python", "-u", "ops/cpu_recorder.py"]
     restart: unless-stopped

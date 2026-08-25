@@ -230,7 +230,7 @@ def test_chat_core_two_workers_one_reply_and_winner_only_side_effects(
     ]
     assert cached_parent["reply_message_id"] == winner_id
     assert [msg["id"] for msg in cached_replies] == [winner_id]
-    assert len(wakes) == 1
+    assert wakes == []
     assert len(captures) == 1
     assert len(first_chat_marks) == 1
     assert len(pushes) == 1
@@ -683,6 +683,10 @@ def test_finalize_reply_once_explain_uses_parent_primary_key(store):
             "FROM generate_series(1, 500) AS n",
             (store.user_id,),
         )
+        # The full suite shares one database and several earlier tests truncate
+        # this table. Refresh statistics after the local 500-row seed so this
+        # planner assertion measures the data shape it just constructed.
+        conn.execute("ANALYZE chat_messages")
         plan_rows = conn.execute(
             "EXPLAIN (FORMAT TEXT) " + db._CHAT_FINALIZE_REPLY_ONCE_SQL,
             (

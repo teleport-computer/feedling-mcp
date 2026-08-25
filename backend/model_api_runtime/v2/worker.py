@@ -49,7 +49,7 @@ import time
 import uuid
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable
 
@@ -58,8 +58,10 @@ import generated_image
 import provider_attempt_ledger
 import provider_client
 import provider_health
+import vision_policy
 from voice import transcript_store as voice_transcript_store
 from notices import catalog as notices_catalog
+from notices import error_contract, rejection_stats
 from provider_types import (
     MCP_TRANSPORT_FAILURE_ERROR,
     ProviderMedia,
@@ -70,22 +72,25 @@ from capabilities import history as cap_history
 from capabilities import registry as cap_registry
 from capabilities import result_budget as cap_result_budget
 from capabilities import tool_schema as cap_tool_schema
+from chat import file_display as chat_file_display
 from chat.reply_language import (
+    garden_language_decision,
     infer_garden_language,
     infer_reply_language_policy,
     reply_language_system_line,
+    user_written_text,
 )
 from core import chat_activity as core_chat_activity
 from core import envelope as core_envelope
-from core import protocol_leak
+from agent_protocol_core import protocol_leak
 from core import tool_markup_leak
 from core import util as core_util
 from core import provider_usage
-from core import self_thinking
+from agent_protocol_core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
-from memory_garden import dream_trace as memory_dream_trace
-from memory_garden import timestamps as memory_timestamps
+from memory import dream_trace as memory_dream_trace
+from memgarden import timestamps as memory_timestamps
 from core.downloadable_reply import sanitize_downloadable_reply
 from perception.glance import (
     perception_glance_fingerprint,
@@ -95,6 +100,7 @@ from perception.agent_fields import (
     AGENT_PERCEPTION_SIGNALS,
     FAST_AGENT_PERCEPTION_SIGNALS,
 )
+from perception_kernel import prompts as perception_prompts
 from screen import screen_read_core
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
@@ -134,20 +140,21 @@ from memory.capture_prompt_v1 import (
     parse_capture_cards,
 )
 from identity.user_naming import transcript_speaker_label
-from memory_garden.text.card_text import (
+from memgarden.text.card_text import (
     build_truncation_retry_prompt,
     card_text_rejection,
     count_user_token_residuals,
     is_retryable_parse_error,
     sanitize_card_labels,
 )
-from memory_garden.text import card_guard
-from memory_garden.guards import dream_gates as memory_dream_gates
+from memgarden.text import card_guard
+from memgarden.guards import dream_gates as memory_dream_gates
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
     build_dream_retry_prompt,
     parse_dream_consolidations,
 )
+from memory.card_leak_signals import IO_LEAK_SIGNALS
 
 log = logging.getLogger("feedling.runtime_v2.worker")
 
@@ -444,6 +451,21 @@ MAX_TOOL_CALLS_PER_ROUND = _positive_int_env(
     "FEEDLING_V2_MAX_TOOL_CALLS_PER_ROUND", "8"
 )
 MAX_TOOL_CALLS_PER_TURN = _positive_int_env("FEEDLING_V2_MAX_TOOL_CALLS_PER_TURN", "24")
+MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS = _positive_int_env(
+    "FEEDLING_V2_MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS", "3"
+)
+MAX_TERMINAL_TOOL_CALL_RETRIES = _positive_int_env(
+    "FEEDLING_V2_MAX_TERMINAL_TOOL_CALL_RETRIES", "2"
+)
+# Foreground self-thinking format correction shares the tool loop's existing
+# final-reply rewrite path.  Keep this as a named hard bound instead of growing
+# a second provider-call budget beside ``max_calls``.
+MAX_SELF_THINKING_ABSENT_RETRIES = 1
+_SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION = (
+    "上一轮最终回复缺少规定的 <think>…</think> 结构。"
+    "请重新输出最终回复，严格遵守以下既有契约：\n\n"
+    + self_thinking.INSTRUCTION.strip()
+)
 TOOL_RESULT_CHAR_CAP = _positive_int_env("FEEDLING_V2_TOOL_RESULT_CHAR_CAP", "2000")
 TOOL_BATCH_RESULT_CHAR_CAP = _positive_int_env(
     "FEEDLING_V2_TOOL_BATCH_RESULT_CHAR_CAP", "8000"
@@ -572,14 +594,18 @@ def _new_direct_enclave_gate():
 
 
 def _reserved_lane_slots(max_workers: int, reserved: int | None = None) -> list:
-    """Per-slot lane allowlist（D3 Task 5：把 Task 2 的 claim lane-reservation 接进池编排）。
+    """Legacy direct-worker/test compatibility lane assignments.
 
-    前 `reserved` 个 slot 只允许抢 {"chat","manual_wake"}（一次 heartbeat/capture 唤醒风暴
-    绝不会饿死聊天回复）；其余 slot 不设限（None＝任意 lane，含 heartbeat/capture/
-    maintenance）。reserved 未显式传时默认 max(1, max_workers // 2)，但始终至少保留
-    一个 unrestricted slot；单-worker 部署因此不能做 lane reservation。否则 scheduled/
-    maintenance/capture 等非 chat job 会在一个健康进程里永久 pending。reserved 会被夹到
-    [0, max_workers - 1] 区间内，防御越界配置。"""
+    This helper preserves the old multi-slot direct-worker behavior for tests
+    and compatibility callers. It is not the production topology: production
+    lane routing is defined by ``pool_config.RuntimePoolConfig`` and runs one
+    ``turn_child`` process for each SlotSpec under the three-pool decision.
+
+    前 `reserved` 个 compatibility slot 只允许抢 {"chat","manual_wake"}；其余 slot
+    不设限（None＝任意 lane，含 heartbeat/capture/maintenance）。reserved 未显式传时默认
+    max(1, max_workers // 2)，但始终至少保留一个 unrestricted slot；单-worker 调用因此
+    不做 lane reservation。否则 scheduled/maintenance/capture 等非 chat job 会在一个健康
+    进程里永久 pending。reserved 会被夹到 [0, max_workers - 1] 区间内，防御越界配置。"""
     n = max(1, int(max_workers))
     r = reserved if reserved is not None else max(1, n // 2)
     r = max(0, min(r, n - 1))
@@ -682,7 +708,7 @@ if not math.isfinite(_PROMPT_CATCHUP_DEADLINE_SEC) or _PROMPT_CATCHUP_DEADLINE_S
 
 # 每回合最多注入最近 N 张图。enclave 容量有限（每张图一次往返），且无 prompt caching ——
 # tail 里的图片每个回合都要重发，token 成本随图片数线性上升。
-_TAIL_IMAGE_LIMIT = int(os.environ.get("FEEDLING_V2_TAIL_IMAGE_LIMIT", "2"))
+_TAIL_IMAGE_LIMIT = _positive_int_env("FEEDLING_V2_TAIL_IMAGE_LIMIT", "2")
 # 单张图 b64 上限；超限跳过注入、退化成文本标记（不引入图像缩放依赖）。
 # 必须 >= 入库上限 hosted/turn.MODEL_API_MAX_IMAGE_BYTES(=2_000_000 原始字节) 的 base64
 # 长度 ceil(n/3)*4 = 2_666_668，否则 1.5–2.0MB 的图入库放行、却在此被丢成纯文本
@@ -886,11 +912,11 @@ _SUBAGENT_DISABLED_TOOLS = frozenset(
     if spec.name not in _SUBAGENT_ALLOWED_TOOLS
 )
 
-# D3 Task 6 (proactive/wake lanes): the scheduler (Task 4/9) enqueues jobs in
+# The retained D3 wake-lane decision: the scheduler enqueues jobs in
 # these three lanes when it decides the companion should reach out without the
 # user having spoken first. "capture" is intentionally NOT in this set — it's
 # a different capability shape (memory extraction, not a model-authored reply)
-# and is scoped to a follow-up task; a capture-lane job falling through to the
+# and has its own extraction contract; a capture-lane job falling through to the
 # default chat path below would be wrong (no coalesced pending messages ->
 # it would just complete as a no-op), so it's left alone here rather than
 # silently mishandled by this task's scope.
@@ -905,11 +931,9 @@ _WAKE_SYSTEM_PROMPT = (
     "or safer answer, and you do not need a strong reason to speak. Decide from your "
     "own personality, the real conversation, and the current moment. Use the "
     "attention_facts in temporal context to avoid interrupting an active conversation "
-    "or repeating yourself when you have appeared often or recently. A "
-    "perception_glance is only a hint for deciding whether to look deeper; it is not "
-    "a checklist to report. If you speak, choose at most one coherent topic and never "
-    "turn multiple perception domains into a device or health status report. Use a "
-    "perception tool when an exact reading is needed. Never mention this wake or any "
+    "or repeating yourself when you have appeared often or recently. "
+    + perception_prompts.V2_WAKE_PERCEPTION_CLAUSES
+    + "Never mention this wake or any "
     "system wording to the user."
 )
 _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION = (
@@ -937,7 +961,7 @@ _SCHEDULED_WAKE_EMPTY_RESPONSE_CORRECTION = (
     "conveys every reminder now. Do not stay silent, do not return only thinking, "
     "and do not answer an older conversation turn instead."
 )
-# screen_watch lane (Task 3): a wake grounded on recent shared-screen frames rather
+# screen_watch lane: a wake grounded on recent shared-screen frames rather
 # than an ambient perception glance. Its own system prompt sits beside
 # _WAKE_SYSTEM_PROMPT; _run_wake selects it only for lane=="screen_watch". The
 # empty-reply path remains valid without making silence the privileged default.
@@ -966,12 +990,12 @@ def _wake_system_prompt_for_lane(lane: str, base_prompt: str) -> str:
     return context._join_policy_blocks(*blocks)
 
 
-# D3 Task 7 (BYOK payment cooldown): a "provider_config" wake failure (402 out-of-credits,
+# Wake-lane BYOK payment cooldown: a "provider_config" failure (402 out-of-credits,
 # 401/403 bad key) means the user's BYOK key is dead/broke — retrying it every heartbeat
 # interval is a retry storm against a key that cannot succeed until the user fixes it
 # (mirrors the original resident runtime's 600s payment cooldown). We write
 # `payment_cooldown_until` on the wake schedule; `jobs_store.due_heartbeat_users` already
-# excludes cooled-down users (Task 1), so no further wakes fire until it lapses.
+# excludes cooled-down users, so no further wakes fire until it lapses.
 _WAKE_COOLDOWN_SEC = float(os.environ.get("FEEDLING_V2_WAKE_COOLDOWN_SEC", "600"))
 _WAKE_FAIL_BACKOFF_BASE_SEC = float(
     os.environ.get("PROACTIVE_FAIL_BACKOFF_BASE_SEC", "60")
@@ -1139,15 +1163,63 @@ class DedicatedVisionUnavailable(RuntimeError):
         provider: str = "",
         status_code: int | None = None,
         upstream_detail: str = "",
+        reason: str = "",
     ):
         super().__init__(message)
-        self.error_code = error_code
+        self.error_code = error_contract.resolve_untrusted(
+            error_code,
+            domain="vision",
+            boundary="v2_dedicated_vision",
+            reporter=rejection_stats.record_hosted,
+        ).code
         self.model = str(model or "")[:96]
         self.provider = str(provider or "")[:80]
         self.status_code = status_code if isinstance(status_code, int) else None
+        self.reason = str(reason or "")[:80]
         # Internal-only carrier. Never add this value to terminal status events,
         # trajectories, debug traces, or user-facing exception messages.
         self.upstream_detail = str(upstream_detail or "")[:240]
+
+
+@dataclass(frozen=True)
+class VisionObservationOutcome:
+    """One dedicated route result without carrying raw image bytes."""
+
+    observation: str = ""
+    error_code: str = ""
+    reason: str = ""
+    model: str = ""
+    provider: str = ""
+    status_code: int | None = None
+    upstream_detail: str = ""
+
+
+@dataclass(frozen=True)
+class VisionObservationBatch:
+    """Per-target dedicated results plus the shared privacy/deadline fence."""
+
+    outcomes: dict[str, VisionObservationOutcome]
+    absolute_deadline: float
+    main_vision_verified: bool
+
+
+@dataclass
+class VisionFallbackState:
+    """Turn-local state threaded from image injection into the main provider."""
+
+    absolute_deadline: float | None = None
+    selected_count: int = 0
+    selected_at: float | None = None
+    completed_emitted: bool = False
+    # Prompt-frontier recovery may rebuild the same tail before the first main
+    # provider call. Reuse dedicated results so a rebuild cannot mint a fresh
+    # visual deadline or repeat a paid observer request.
+    batch_cache: dict[
+        tuple[tuple[str, str], ...], VisionObservationBatch
+    ] = field(default_factory=dict)
+    selected_batch_keys: set[tuple[tuple[str, str], ...]] = field(
+        default_factory=set
+    )
 
 
 class ImageGenerationUnavailable(RuntimeError):
@@ -1164,7 +1236,12 @@ class ImageGenerationUnavailable(RuntimeError):
         upstream_detail: str = "",
     ):
         super().__init__(message)
-        self.error_code = str(error_code or "image_generation_failed")[:64]
+        self.error_code = error_contract.resolve_untrusted(
+            error_code,
+            domain="image_generation",
+            boundary="v2_image_generation",
+            reporter=rejection_stats.record_hosted,
+        ).code
         self.model = str(model or "")[:96]
         self.provider = str(provider or "")[:80]
         self.status_code = status_code if isinstance(status_code, int) else None
@@ -1194,6 +1271,8 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
         kind = candidate if candidate in notices_catalog.ERROR_CLASSES else "error"
     elif isinstance(exc, v2_tool_loop.ProviderEmptyReply):
         kind = "empty_reply"
+    elif isinstance(exc, v2_tool_loop.CanvasDeliveryIncomplete):
+        kind = "canvas_file_delivery_incomplete"
     elif isinstance(exc, TurnError):
         raw = str(exc)
         if raw in {
@@ -1318,6 +1397,8 @@ def _turn_failure_error_class(exc: BaseException) -> str:
     """Classify V2 foreground failures through the shared notice catalog."""
     if isinstance(exc, (DedicatedVisionUnavailable, ImageGenerationUnavailable)):
         return exc.error_code
+    if isinstance(exc, v2_tool_loop.CanvasDeliveryIncomplete):
+        return "canvas_file_delivery_incomplete"
     if isinstance(exc, v2_prompt_frontier.PromptFrontierExhausted):
         # An unaudited default is our conservative local ceiling, not the
         # provider's model limit. Never blame the user or tell them to shorten
@@ -1531,9 +1612,9 @@ class TurnDeps:
     read_summary_with_seq: Callable[[str], tuple[str, float, int, int]] | None = None
     # (user_id, summary, watermark_ts, expected_version[, watermark_seq]) -> True if CAS
     # landed：本地加密（core_envelope，非 enclave 往返）+ CAS 写回 v2_conversation_summary
-    # （Task 2 storage）。expected_version 不匹配（别的回合已推进过摘要）时返回 False，
+    # （summary storage）。expected_version 不匹配（别的回合已推进过摘要）时返回 False，
     # 调用方按丢弃本次压缩处理，不重试、不报错——下一回合会用新版本重新压缩。默认 None：同上。
-    # watermark_seq（D5/Task 9）是可选的第 5 个位置参数——_run_compaction 只有在能拿到折叠
+    # watermark_seq 是可选的第 5 个位置参数——_run_compaction 只有在能拿到折叠
     # 批次最后一行的精确 seq 时才会传它（生产路径总是能拿到；某些窄签名的测试 fake 只接 4
     # 个参数，_run_compaction 会退化成旧的 4 参调用，两边都不破）。
     # Segmented production path. Leaf summaries and higher-level checkpoints
@@ -1574,7 +1655,7 @@ class TurnDeps:
     # 历史读取。默认 None：
     # worker.py 不 import hosted/capabilities，生产装配见 serve_worker。
     read_files: Callable[[str, list[str]], dict[str, dict]] | None = None
-    # —— capture/dream 记忆抽取 lane 的三个注入回调（Task 3）——
+    # —— capture/dream 记忆抽取 lane 的三个注入回调 ——
     # 全部默认 None：worker.py 不 import `hosted`/`memory_core`/`core.envelope`-for-memory
     # （否则违反 CONTRIBUTING §2 的依赖方向），所以记忆上下文读取、信封加密、落库都作为
     # 可调用对象由 serve_worker.build_production_deps 注入；测试注入假实现直接跑。
@@ -1642,7 +1723,7 @@ class TurnDeps:
     cancel_capture_job: Callable[..., bool] | None = None
     capture_enabled: Callable[[str], bool] | None = None
     dream_enabled: Callable[[str], bool] | None = None
-    # user_id -> {"applied": int, "discarded": int}（Task 6 / spec A6）：run the
+    # user_id -> {"applied": int, "discarded": int}（spec A6）：run the
     # generation-fenced effect-outbox applier (`effect_outbox.apply_pending_effects`)
     # with this turn's real dispatch sinks at end-of-turn. worker.py itself never
     # imports `model_api_runtime.v2.effect_outbox`'s dispatch-side wiring (the 8
@@ -1659,10 +1740,8 @@ class TurnDeps:
     # 有）。best-effort：实现方吞掉自身异常，调用点也再兜一层 —— 推送失败绝不能
     # 把一个已经成功发布回复的回合打成 failed。None（所有不接线的测试/legacy
     # 调用方）= 特性关闭，行为与补齐推送之前完全一致。``lane`` 是本次唤醒的 lane
-    # 名（chat lane 传空字符串）：backend 端用它推 manual（lane == "manual_wake"）与
-    # 真实 wake source，对齐 V1 `_proactive_delivery_decision_v2` 从 job 推 manual
-    # 的做法 —— 之前这里硬编码 source="heartbeat"/manual=False，导致关了
-    # reminders_delivery 的用户在 V2 手动唤醒收不到推送（V1 会走 manual_bypass）。
+    # 名（chat lane 传空字符串），backend 端据此保留真实 wake source。系统通知
+    # 关闭时 manual wake 仍可运行并写入聊天，但不再绕过可见通知总开关。
     # 返回 True 只表示 APNs 接受了 alert（设备专注/静音/通知设置不可见，是实际响铃的
     # 上界）；任何关闭、前台压制、无 token、出网失败都返回 False。chat lane 忽略该
     # 返回值；wake lane 只把它写入决策后的影子观测，绝不回灌判据。
@@ -3442,7 +3521,7 @@ async def _dispatch_mixed_tool_calls(
         started_ns = time.monotonic_ns()
         if dispatch_provider_usage is None:
             # wake/subagent lanes bind no callable — this tool is never
-            # offered there (Task 5 catalog scoping); a call reaching here
+            # offered there by catalog scoping; a call reaching here
             # anyway (forged/legacy caller) is refused, not silently routed.
             results = [
                 ToolResult(call_id=tc.id, content="error: tool_not_allowed")
@@ -4883,6 +4962,30 @@ def _adaptive_replay_parts(
     )
 
 
+def _attached_file_matches_requirement(
+    messages: list[dict], requirement: tuple[str, ...] | None
+) -> bool:
+    """Whether a recovery turn carries a file of the requested format."""
+
+    if requirement is None:
+        return False
+    names = [
+        str(message.get("file_name") or "").strip().casefold()
+        for message in messages
+        if message.get("has_file") is True
+    ]
+    names = [name for name in names if name]
+    if not names:
+        return False
+    if not requirement:
+        return True
+    return any(
+        name.endswith(str(suffix).casefold())
+        for name in names
+        for suffix in requirement
+    )
+
+
 async def _coalesce_inputs(
     deps: TurnDeps, user_id: str, since_seq: int, *, enclave_sem=None
 ) -> tuple[list[dict], int, float]:
@@ -5697,6 +5800,12 @@ def _make_task_batch_dispatcher(
                 ),
                 outbound_blocking_read_tool_names=(_PRIVATE_READ_TOOLS),
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
+                max_consecutive_tool_only_rounds=(
+                    MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS
+                ),
+                max_terminal_tool_call_retries=(
+                    MAX_TERMINAL_TOOL_CALL_RETRIES
+                ),
                 max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
                 max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
                 tool_result_char_cap=TOOL_RESULT_CHAR_CAP,
@@ -5772,7 +5881,7 @@ def _make_provider_usage_dispatcher(
     *, provider_config
 ) -> Callable[[list], Awaitable[list[ToolResult]]]:
     """Bind the turn's already-decrypted provider_config for provider_usage
-    calls (Task 6). Mirrors ``_make_task_batch_dispatcher``'s closure shape:
+    calls. Mirrors ``_make_task_batch_dispatcher``'s closure shape:
     capture once at turn setup, never re-resolve per call — a second
     resolution would mean a second decrypt.
 
@@ -5995,6 +6104,7 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             summary=summary,
             content=content or summary,
             guard=guard_on,
+            signals=IO_LEAK_SIGNALS,
         )
         if rejection:
             raise ValueError(f"memory_card_rejected:{rejection}")
@@ -6003,6 +6113,7 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             threads=list(inner.get("threads") or []),
             guard=guard_on,
             lang_text=f"{summary}\n{content}",
+            signals=IO_LEAK_SIGNALS,
         )
         if bucket:
             inner["bucket"] = bucket
@@ -6060,7 +6171,7 @@ def _frozen_relationship_anchor(patch) -> str | None:
 def _write_tool_effect_payload(tc) -> tuple[str, dict]:
     """Map a WRITE_ACTIONS tool_call to its PR A `(effect_type, payload)` (spec C6). ONE
     definition shared by every lane's `enqueue_write_effect` closure (`process_job`'s chat
-    branch — Task 7 — and `_run_wake` — Task 8) so the write-tool -> effect_type mapping never
+    branch and `_run_wake`) so the write-tool -> effect_type mapping never
     drifts between lanes. `cap_registry.WRITE_ACTIONS` is the closed set
     `executor.dispatch_tool_calls` ever routes here — a new write capability shipping without a
     mapping below must fail loudly, not silently drop the write."""
@@ -6419,6 +6530,8 @@ class WorkspaceFileReply:
     name: str
     mime_type: str
     data: bytes
+    display_title: str = ""
+    display_subtitle: str = ""
 
 
 @dataclass(frozen=True)
@@ -6479,7 +6592,12 @@ def _workspace_file_mime(name: str, declared: str = "") -> str:
     return known.get(suffix) or mimetypes.guess_type(name)[0] or "text/plain"
 
 
-def _workspace_file_reply_from_result(result: dict) -> WorkspaceFileReply:
+def _workspace_file_reply_from_result(
+    result: dict,
+    *,
+    title: str = "",
+    subtitle: str = "",
+) -> WorkspaceFileReply:
     """Validate assembly output before any model-selected file is published."""
     if not isinstance(result, dict):
         raise RuntimeError("workspace file loader returned invalid data")
@@ -6490,6 +6608,14 @@ def _workspace_file_reply_from_result(result: dict) -> WorkspaceFileReply:
     if not isinstance(content, str):
         raise ValueError("send_file requires UTF-8 workspace source content")
     name = _safe_download_name(path)
+    display_extra = chat_file_display.metadata_from_payload(
+        {
+            **({"file_display_title": title} if title else {}),
+            **({"file_display_subtitle": subtitle} if subtitle else {}),
+        },
+        filename=name,
+        require_canvas_pair=True,
+    )
     maximum_bytes = (
         cap_tool_schema.SHARED_WORK_MAX_BYTES
         if name.casefold().endswith(".io.html")
@@ -6513,6 +6639,8 @@ def _workspace_file_reply_from_result(result: dict) -> WorkspaceFileReply:
         name=name,
         mime_type=mime_type,
         data=data,
+        display_title=display_extra.get("file_display_title", ""),
+        display_subtitle=display_extra.get("file_display_subtitle", ""),
     )
 
 
@@ -6637,6 +6765,7 @@ async def _emit_thinking_surfaced_trace(
     lane: str,
     branch: str,
     chars: int,
+    retried: int = 0,
 ) -> None:
     """Emit one content-free terminal thinking decision, best-effort."""
     if emit_debug_trace is None:
@@ -6648,6 +6777,7 @@ async def _emit_thinking_surfaced_trace(
     )
     safe_lane = "wake" if lane == "wake" else "chat"
     safe_chars = max(0, int(chars))
+    safe_retried = max(0, min(int(retried), MAX_SELF_THINKING_ABSENT_RETRIES))
     # ``model`` is user-configurable for compatible relays.  Match the existing
     # plaintext thinking metadata bound instead of letting an arbitrary string
     # expand the server-visible trace payload.
@@ -6660,14 +6790,15 @@ async def _emit_thinking_surfaced_trace(
             status="ok",
             summary=f"V2 thinking {safe_branch} ({safe_chars} chars)",
             explain=(
-                "Records only the selected branch, character count, model, and "
-                "lane; no thinking text or fragment is included."
+                "Records only the selected branch, character count, retry count, "
+                "model, and lane; no thinking text or fragment is included."
             ),
             detail={
                 "branch": safe_branch,
                 "chars": safe_chars,
                 "model": model,
                 "lane": safe_lane,
+                "retried": safe_retried,
             },
         )
     except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a reply
@@ -6972,6 +7103,14 @@ def _build_encrypted_file_reply_effect_payload(
             "file_name": file_reply.name,
             "file_mime": file_reply.mime_type,
             "file_byte_count": len(file_reply.data),
+            **(
+                {
+                    "file_display_title": file_reply.display_title,
+                    "file_display_subtitle": file_reply.display_subtitle,
+                }
+                if file_reply.display_title and file_reply.display_subtitle
+                else {}
+            ),
         },
     }
 
@@ -7454,6 +7593,7 @@ async def _read_seq_adaptive_prompt_context(
     add_usage: Callable[[dict | None], None] | None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
     active_image_ids: set[str] | None = None,
+    vision_fallback_state: VisionFallbackState | None = None,
     tail_cap: int | None = None,
 ) -> tuple[str, list[dict], list[list[dict]], bool, int, str, str, str]:
     """Read one exact core plus summary-covered complete-turn replay.
@@ -7535,6 +7675,9 @@ async def _read_seq_adaptive_prompt_context(
             read_images=deps.read_images,
             active_image_ids=active_image_ids,
             read_vision_observations=deps.read_vision_observations,
+            main_provider_config=provider_config,
+            vision_fallback_state=vision_fallback_state,
+            emit_debug_trace=deps.emit_debug_trace,
         )
         tail = await asyncio.to_thread(
             _inject_tail_files,
@@ -7550,6 +7693,9 @@ async def _read_seq_adaptive_prompt_context(
                 read_images=deps.read_images,
                 active_image_ids=active_image_ids,
                 read_vision_observations=deps.read_vision_observations,
+                main_provider_config=provider_config,
+                vision_fallback_state=vision_fallback_state,
+                emit_debug_trace=deps.emit_debug_trace,
             )
             optional_rows = await asyncio.to_thread(
                 _inject_tail_files,
@@ -7871,7 +8017,7 @@ async def _assert_prompt_covers_seq(
 
 
 async def _assert_prompt_covers(user_id: str, tail_limit: int) -> None:
-    """Post-assembly hard assertion (D6/Task 10): every message with
+    """Post-assembly prompt-coverage assertion: every message with
     ``seq > watermark_seq`` must be inside the tail window this turn is about
     to hand the model. Re-derives ``watermark_seq`` fresh from the DB
     (``jobs_store.get_summary_row``) rather than reusing
@@ -8140,7 +8286,7 @@ async def _run_wake(
     一体、自己的 try/except。heartbeat/manual_wake/screen_watch 是弱唤醒，失败继续静默；
     scheduled 是到点交付，最终失败通过 durable terminal outbox 写明确失败结果，不能无声消失。
 
-    D3 Task 8 (PR C spec C8)：跟 chat 分支（`process_job`，Task 7）一样跑同一个
+    Retained wake-lane accounting contract: 跟 chat 分支一样跑同一个
     `tool_loop.run_tool_loop`。`turn_authorization=True` 传给 `dispatch_tool_calls`（跟 chat
     传的值一样，语义是 wake_trigger 而不是 user——两者都在 `provenance.turn_has_write_
     authorization` 意义下"有资格授权写"）。跟 chat 分支的两点关键差异：
@@ -8153,7 +8299,7 @@ async def _run_wake(
 
     真 provider 错误（`chat_completion_async` 抛出的任何异常）：所有 lane 都
     `mark_failed`；只有 scheduled 同步排入用户可见失败 outbox。402/401/403 一类
-    "provider_config"错误（死/欠费 BYOK key）额外写一条 payment_cooldown（D3 Task 7），
+    "provider_config"错误（死/欠费 BYOK key）额外写一条 payment_cooldown，
     让 scheduler 的 `due_heartbeat_users` 停止对一把修不好的钥匙反复重试。
 
     prompt 组装：读 summary+tail（同 chat 路径的 D1 读法）；真实历史保留原 role，
@@ -8315,7 +8461,7 @@ async def _run_wake(
             ):
                 raise RuntimeModeChanged(f"user rolled back before {effect}")
 
-        # D6/Task 10: close a compaction backlog gap BEFORE reading the actual
+        # Close a compaction backlog gap before reading the actual
         # prompt content — see `_ensure_prompt_coverage`'s docstring. Only run
         # when both seq-native readers are wired; a
         # coverage check is meaningless without a real tail reader to bound.
@@ -8586,7 +8732,7 @@ async def _run_wake(
             _flatten_turns(optional_tail_turns) + wake_tail
         )
 
-        # screen_watch lane grounds on recent shared-screen availability (Task 3).
+        # screen_watch lane grounds on recent shared-screen availability.
         # Fetch ONLY screen_recent — no perception_glance or perception_snapshot: the
         # resident explicitly sets perception_digest=None for screen-watch jobs.
         # B1 aligns its separate screen recipe with V1: at most four frames carry
@@ -8957,10 +9103,10 @@ async def _run_wake(
             search_halted=wake_search_halted,
             fetch_halted=wake_fetch_halted,
         )
-        # provider_usage is chat-lane only (Task 5 design decision): the
+        # provider_usage is chat-lane only: the
         # proactive companion never has a user-asked-a-question moment to
         # answer, so it must never be offered here — unconditionally, not
-        # gated by the kill switch (that gate is chat-lane's Task 6 concern).
+        # gated by the kill switch (a chat-lane concern).
         # `mcp_tool_search` 不在这里 —— 它是折叠 schema 的唯一取回口。禁掉它
         # 等于让唤醒道在压力下永久丢失工具参数(T154 之前正是如此)。
         wake_disabled_tool_names = wake_disabled_web_tool_names | {
@@ -9318,7 +9464,7 @@ async def _run_wake(
             # the real reply, and surface the block in the thinking channel instead of
             # native reasoning. Same kill switch. Fail-closed: a malformed block →
             # silence (a legitimate wake outcome), never a leaked tag.
-            from core import self_thinking as _st_wake
+            from agent_protocol_core import self_thinking as _st_wake
 
             _wake_self_thinking_on = _st_wake.enabled()
             # 与聊天出口同样解耦：关掉 self-thinking 不能顺带关掉安全剥离
@@ -9985,7 +10131,7 @@ async def _run_wake(
                     raise
 
         await _fence_wake_effect("wake turn")
-        from core import self_thinking as _st_wake_loop
+        from agent_protocol_core import self_thinking as _st_wake_loop
 
         async def _on_wake_screen_images_rejected(
             _exc: BaseException,
@@ -10040,11 +10186,11 @@ async def _run_wake(
                 add_usage=_add_usage,
                 max_calls=_TURN_MAX_LLM_CALLS,
                 # "Weak wake sleeps": staying silent is this lane's documented
-                # success case (`_on_reply` no-ops on empty text), so a
-                # text-free provider reply must come back as "" rather than
-                # raising. Without this the lane failed 100% of the time on
-                # test with `wake_failed:providererror` while the provider
-                # answered 200 OK — the model simply had nothing to say.
+                # success case. Keep the provider parser permissive so the
+                # tool loop can recognize a structurally valid empty 200 and
+                # spend one bounded follow-up on the forced reply/stay_silent
+                # choice. Explicit stay_silent remains success; an empty forced
+                # choice fails closed through the existing empty_reply path.
                 #
                 # `scheduled` 是唯一的例外，必须留在 require_reply=True 上。
                 # opened/closed 屏幕共享边沿都只是普通 wake 事实，由模型结合
@@ -10105,6 +10251,12 @@ async def _run_wake(
                 ),
                 outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
+                max_consecutive_tool_only_rounds=(
+                    MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS
+                ),
+                max_terminal_tool_call_retries=(
+                    MAX_TERMINAL_TOOL_CALL_RETRIES
+                ),
                 max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
                 max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
                 tool_result_char_cap=TOOL_RESULT_CHAR_CAP,
@@ -10153,7 +10305,7 @@ async def _run_wake(
             if provider_client.classify_provider_error(e) == "provider_config":
                 # Dead/broke BYOK key (402 out-of-credits, 401/403 bad key) — back off
                 # BEFORE mark_failed below, so the scheduler stops hammering
-                # this key every heartbeat interval (Task 1's due_heartbeat_users query
+                # this key every heartbeat interval (due_heartbeat_users
                 # already excludes users still in cooldown).
                 await _fence_wake_effect("payment cooldown")
                 await asyncio.to_thread(
@@ -11403,6 +11555,14 @@ async def _run_extraction(
                 user_name=ctx.get("user_name", ""),
                 cards=ctx.get("cards", ""),
                 recent_conversations=window,
+                # 做梦整理的是同一个花园，语言判据必须跟 capture 同源，
+                # 否则夜里整理一遍会把桶换成另一种语言 —— 也要喂同样的证据，
+                # 光同源不同证据一样会判出两个结果。
+                locale=infer_garden_language(
+                    ctx.get("identity") if isinstance(ctx.get("identity"), dict) else None,
+                    written=user_written_text(prompt_tail),
+                    existing_buckets=str(ctx.get("buckets") or ""),
+                ),
             )
             # parse_dream_consolidations 返回 (consolidations, questions, err)。
             # questions 属于「主动提问」= wake 语义，本轮明确丢弃（spec §5.3）。
@@ -11451,12 +11611,41 @@ async def _run_extraction(
             items, reason = [], None
         else:
             if lane == "capture":
-                # 花园的分类语言。已有桶优先 —— 一个花园只用一种语言的桶，
-                # 不因为这轮对话换了语言就长出并存的第二套。
-                # 与 V1 consumer 走同一个 helper，两条 runtime 不许各判各的。
-                capture_locale = infer_garden_language(
-                    None, existing_buckets=str(ctx.get("buckets") or "")
+                # 花园的分类语言 —— **看这个人用什么语言，不看桶名**。
+                #
+                # 2026-08-24 之前这里只传桶名（identity 传的是 None），于是桶名是
+                # V2 上唯一的信号。那次事故就是这么被放大的：旧 bug 留下的英文桶
+                # 被读成「这是英文花园」→ 新卡全用英文桶 → 英文桶更多。而且桶名里
+                # 大量是人名/公司名（James、GitHub），压根不携带语言信息。
+                # 详见 chat/reply_language.py:garden_language_decision 的说明。
+                #
+                # 现在喂真证据：身份卡 + 这轮对话里**他自己说的话**。
+                # 取证走共用 helper，两条 runtime 不许各写一份。
+                _lang = garden_language_decision(
+                    ctx.get("identity") if isinstance(ctx.get("identity"), dict) else None,
+                    written=user_written_text(prompt_tail),
+                    # ↓ 只落观测，不参与判定。
+                    existing_buckets=str(ctx.get("buckets") or ""),
                 )
+                capture_locale = _lang["locale"]
+                # 与 V1 同源、同样落库 —— 两条 runtime 的语言判定要能横向对比，
+                # 否则「只有 V2 用户变英文了」这种问题查不出来。
+                if deps.emit_debug_trace is not None:
+                    try:
+                        await asyncio.to_thread(
+                            deps.emit_debug_trace,
+                            user_id,
+                            "memory.capture.language",
+                            status="ok",
+                            summary=f"落卡语言 {_lang['locale']}（依据 {_lang['basis']}）",
+                            explain="这轮落卡用哪种语言写卡，以及凭什么这么判。桶名本身不落库。",
+                            trace_id=str(trace_id or job_id),
+                            turn_id=str(trace_id or job_id),
+                            job_id=str(job_id),
+                            detail=dict(_lang),
+                        )
+                    except Exception:  # noqa: BLE001 — 观测失败绝不影响落卡
+                        pass
                 prompt = build_capture_prompt(
                     ai_name=ctx.get("ai_name", ""),
                     user_name=ctx.get("user_name", ""),
@@ -12128,6 +12317,9 @@ def _inject_tail_images(
     read_images,
     active_image_ids: set[str] | None = None,
     read_vision_observations=None,
+    main_provider_config: Any = None,
+    vision_fallback_state: VisionFallbackState | None = None,
+    emit_debug_trace: Callable[..., None] | None = None,
 ) -> list[dict]:
     """Materialize V2 image rows without crossing the selected privacy route.
 
@@ -12152,30 +12344,177 @@ def _inject_tail_images(
         and str(row["id"]) in active_ids
     ]
     observations: dict[str, str] = {}
+    fallback_fetched: dict[str, dict] = {}
     if dedicated_targets:
         if read_vision_observations is None:
             raise DedicatedVisionUnavailable("vision observer is not wired")
-        try:
-            observations = read_vision_observations(user_id, dedicated_targets) or {}
-        except Exception as exc:  # noqa: BLE001 — stable V2 failure surface below
-            safe_code = str(
-                getattr(exc, "error_code", "") or "vision_model_failed"
-            )[:64]
-            raise DedicatedVisionUnavailable(
-                "vision observer failed",
-                error_code=safe_code,
-                model=str(getattr(exc, "model", "") or ""),
-                provider=str(getattr(exc, "provider", "") or ""),
-                status_code=getattr(exc, "status_code", None),
-                upstream_detail=str(
-                    getattr(exc, "upstream_detail", "") or ""
-                ),
-            ) from exc
-        if any(
-            not str(observations.get(item["message_id"]) or "").strip()
+        batch_key = tuple(
+            (item["message_id"], item["route_id"])
             for item in dedicated_targets
-        ):
-            raise DedicatedVisionUnavailable("vision observation missing")
+        )
+        batch = (
+            vision_fallback_state.batch_cache.get(batch_key)
+            if vision_fallback_state is not None
+            else None
+        )
+        batch_was_cached = batch is not None
+        if batch is None:
+            try:
+                batch = read_vision_observations(
+                    user_id,
+                    dedicated_targets,
+                    main_provider_config=main_provider_config,
+                )
+            except Exception as exc:  # noqa: BLE001 — stable V2 failure surface below
+                safe_code = str(
+                    getattr(exc, "error_code", "") or "vision_model_failed"
+                )[:64]
+                raise DedicatedVisionUnavailable(
+                    "vision observer failed",
+                    error_code=safe_code,
+                    model=str(getattr(exc, "model", "") or ""),
+                    provider=str(getattr(exc, "provider", "") or ""),
+                    status_code=getattr(exc, "status_code", None),
+                    upstream_detail=str(
+                        getattr(exc, "upstream_detail", "") or ""
+                    ),
+                    reason=str(getattr(exc, "reason", "") or ""),
+                ) from exc
+
+        if isinstance(batch, VisionObservationBatch):
+            outcomes = batch.outcomes
+        elif isinstance(batch, dict):
+            # Compatibility seam for non-production callers that still return
+            # the pre-A2 success-only shape. It cannot authorize fallback.
+            outcomes = {
+                str(message_id): VisionObservationOutcome(
+                    observation=str(observation or "").strip()
+                )
+                for message_id, observation in batch.items()
+            }
+            batch = VisionObservationBatch(
+                outcomes=outcomes,
+                absolute_deadline=time.monotonic(),
+                main_vision_verified=False,
+            )
+        else:
+            raise DedicatedVisionUnavailable("vision observation batch invalid")
+        if vision_fallback_state is not None and not batch_was_cached:
+            vision_fallback_state.batch_cache[batch_key] = batch
+
+        failures: list[tuple[str, VisionObservationOutcome]] = []
+        for item in dedicated_targets:
+            message_id = item["message_id"]
+            outcome = outcomes.get(message_id)
+            if outcome is None:
+                failures.append(
+                    (message_id, VisionObservationOutcome(
+                        error_code="vision_model_failed"
+                    ))
+                )
+                continue
+            observation = str(outcome.observation or "").strip()
+            if observation:
+                observations[message_id] = observation
+            else:
+                failures.append((message_id, outcome))
+
+        if failures:
+            first_failure = failures[0][1]
+
+            def raise_dedicated(message: str) -> None:
+                raise DedicatedVisionUnavailable(
+                    message,
+                    error_code=(
+                        first_failure.error_code or "vision_model_failed"
+                    ),
+                    model=first_failure.model,
+                    provider=first_failure.provider,
+                    status_code=first_failure.status_code,
+                    upstream_detail=first_failure.upstream_detail,
+                    reason=first_failure.reason,
+                )
+
+            all_eligible = all(
+                vision_policy.is_main_fallback_eligible(
+                    outcome.error_code, outcome.reason
+                )
+                for _message_id, outcome in failures
+            )
+            remaining = float(batch.absolute_deadline) - time.monotonic()
+            selected_count = (
+                len(failures)
+                if all_eligible and batch.main_vision_verified and remaining > 0
+                else 0
+            )
+            skipped_reason = "none"
+            if not all_eligible:
+                skipped_reason = "ineligible_failure"
+            elif not batch.main_vision_verified:
+                skipped_reason = "main_route_unverified"
+            elif remaining <= 0:
+                skipped_reason = "deadline_exhausted"
+            if emit_debug_trace is not None and not batch_was_cached:
+                try:
+                    emit_debug_trace(
+                        user_id,
+                        "vision.fallback.evaluated",
+                        status="ok" if selected_count else "gated",
+                        summary="vision_fallback_evaluated",
+                        explain=(
+                            "Records only closed-set routing and deadline state; "
+                            "no message ids, image bytes, captions, or observations."
+                        ),
+                        detail={
+                            "eligible_failure_count": (
+                                len(failures) if all_eligible else 0
+                            ),
+                            "main_vision_verified": bool(
+                                batch.main_vision_verified
+                            ),
+                            "remaining_budget": (
+                                "positive" if remaining > 0 else "expired"
+                            ),
+                            "selected_count": selected_count,
+                            "skipped_reason": skipped_reason,
+                        },
+                    )
+                except Exception as trace_exc:  # noqa: BLE001 — best effort
+                    log.warning(
+                        "[v2.vision] fallback evaluation trace failed "
+                        "user=%s code=%s",
+                        user_id,
+                        type(trace_exc).__name__.lower(),
+                    )
+            if selected_count <= 0:
+                raise_dedicated("vision fallback was not authorized")
+            if read_images is None:
+                raise_dedicated("vision fallback image reader is not wired")
+            selected_ids = [message_id for message_id, _outcome in failures]
+            try:
+                # Deliberate second read: this is the auditable disclosure gate.
+                # Successful dedicated targets are absent from this exact list.
+                fallback_fetched = read_images(user_id, selected_ids) or {}
+            except Exception as exc:  # noqa: BLE001 — preserve dedicated identity
+                raise_dedicated("vision fallback image read failed")
+            if any(
+                not str(
+                    (fallback_fetched.get(message_id) or {}).get("image_b64") or ""
+                )
+                for message_id in selected_ids
+            ):
+                raise_dedicated("vision fallback image payload missing")
+            if (
+                vision_fallback_state is not None
+                and batch_key not in vision_fallback_state.selected_batch_keys
+            ):
+                vision_fallback_state.absolute_deadline = float(
+                    batch.absolute_deadline
+                )
+                vision_fallback_state.selected_count += selected_count
+                vision_fallback_state.selected_batch_keys.add(batch_key)
+                if vision_fallback_state.selected_at is None:
+                    vision_fallback_state.selected_at = time.monotonic()
 
     wanted = [
         str(row["id"])
@@ -12195,6 +12534,9 @@ def _inject_tail_images(
         message_id = str(row.get("id") or "")
         route_id = str(row.get("vision_route_id") or "")
         if row.get("has_image") and route_id:
+            if message_id not in active_ids:
+                out.append(row)
+                continue
             observation = str(observations.get(message_id) or "").strip()
             if observation:
                 caption = context.text_of(row.get("content"))
@@ -12211,8 +12553,23 @@ def _inject_tail_images(
                     + observation_block
                 )
                 out.append({**row, "content": content})
-            else:
-                out.append(row)
+                continue
+            got = fallback_fetched.get(message_id)
+            b64 = str((got or {}).get("image_b64") or "")
+            if not b64 or len(b64) > _IMAGE_MAX_B64_CHARS:
+                raise DedicatedVisionUnavailable(
+                    "vision fallback image payload invalid"
+                )
+            mime = str((got or {}).get("image_mime") or "image/jpeg")
+            blocks: list[dict] = []
+            caption = context.text_of(row.get("content"))
+            if caption and caption != "[image]":
+                blocks.append({"type": "text", "text": caption})
+            blocks.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            })
+            out.append({**row, "content": blocks})
             continue
 
         got = fetched.get(message_id) if row.get("has_image") else None
@@ -12279,6 +12636,53 @@ def _inject_tail_files(tail: list[dict], *, user_id: str, read_files) -> list[di
         note = "\n（文件内容较长，已截断）" if got.get("truncated") else ""
         out.append({**row, "content": f"[file: {name}]\n{text}{note}"})
     return out
+
+
+def _emit_vision_fallback_completed(
+    deps: TurnDeps,
+    user_id: str,
+    state: VisionFallbackState,
+    *,
+    outcome: str,
+    error_class: str = "",
+) -> None:
+    """Emit the content-free terminal half of a selected main fallback."""
+    if (
+        state.selected_count <= 0
+        or state.completed_emitted
+        or deps.emit_debug_trace is None
+    ):
+        return
+    state.completed_emitted = True
+    started_at = state.selected_at
+    dur_ms = (
+        max(0.0, (time.monotonic() - started_at) * 1000.0)
+        if started_at is not None
+        else 0.0
+    )
+    try:
+        deps.emit_debug_trace(
+            user_id,
+            "vision.fallback.completed",
+            status="ok" if outcome == "success" else "error",
+            summary="vision_fallback_completed",
+            explain=(
+                "Records only fallback count, terminal class, and duration; "
+                "no message ids, image bytes, captions, observations, or replies."
+            ),
+            dur_ms=dur_ms,
+            detail={
+                "selected_count": int(state.selected_count),
+                "outcome": "success" if outcome == "success" else "error",
+                "error_class": str(error_class or "none")[:80],
+            },
+        )
+    except Exception as trace_exc:  # noqa: BLE001 — telemetry is best effort
+        log.warning(
+            "[v2.vision] fallback completion trace failed user=%s code=%s",
+            user_id,
+            type(trace_exc).__name__.lower(),
+        )
 
 
 async def _ensure_prompt_coverage_or_degrade(
@@ -12397,6 +12801,7 @@ async def process_job(
     mcp_offered_names: tuple[str, ...] = ()
     mcp_called_names: list[str] = []
     mcp_turn_outcome = "failed"
+    vision_fallback_state = VisionFallbackState()
     provider_roundtrip_trace = (
         _provider_tool_surface_callback(
             deps,
@@ -12523,7 +12928,7 @@ async def process_job(
                 trajectory_recorder,
             )
         if lane in _WAKE_LANES:
-            # Self-contained wake path (D3 Task 6): proactive turn, not a reply to a
+            # Self-contained wake path: proactive turn, not a reply to a
             # just-sent user message. Own try/except inside `_run_wake` — never falls
             # into the chat-turn `except` below (that branch emits a user-visible
             # error status + record_terminal_error, which wake failures must not do).
@@ -12541,7 +12946,7 @@ async def process_job(
                 trace_id=str(job.get("trace_id") or ""),
             )
         if lane in _EXTRACTION_LANES:
-            # 自成一体的记忆抽取路径（capture/dream，Task 3）：build prompt → BYOK 抽取 →
+            # 自成一体的记忆抽取路径（capture/dream）：build prompt → BYOK 抽取 →
             # parse → memory actions。同 _run_compaction/_run_wake 一样有自己的 try/except，
             # 绝不落进下面 chat-turn 的 except（那条会 emit 用户可见 error status +
             # record_terminal_error）——后台 job 永不写气泡、永不弹 error chip。
@@ -12747,17 +13152,37 @@ async def process_job(
                     "voice_call_id": call_id,
                     "voice_turn_id": turn_id,
                 }
-        # A recovery turn is deliberately mutation-free. Keeping the hard file
-        # completion guard active here creates an impossible state: the guard
-        # demands workspace_write while the recovery barrier withholds it, so
-        # the same oldest unanswered message retries until empty_reply forever.
-        # Settle that message honestly as text; the next ordinary job can create
-        # a file after the reply cursor has cleared the old mutation frontier.
-        required_file_suffixes = (
+        detected_file_requirement = (
             context.required_file_suffixes(coalesced)
-            if lane == "chat" and mutation_recovery_barrier is None
+            if lane == "chat"
             else None
         )
+        recovery_existing_file_delivery = bool(
+            mutation_recovery_barrier is not None
+            and _attached_file_matches_requirement(
+                coalesced, detected_file_requirement
+            )
+        )
+        # A recovery turn remains mutation-free, but attaching an existing file
+        # and explicitly asking for that format can be completed by sending an
+        # already-stored exact workspace revision. That does not repeat the old
+        # mutation; it only repairs the missing user-visible attachment.
+        required_file_suffixes = (
+            detected_file_requirement
+            if mutation_recovery_barrier is None
+            or recovery_existing_file_delivery
+            else None
+        )
+
+        def _resolve_turn_file_requirement(messages):
+            resolved = context.required_file_suffixes(messages)
+            if mutation_recovery_barrier is None:
+                return resolved
+            return (
+                resolved
+                if _attached_file_matches_requirement(messages, resolved)
+                else None
+            )
         if not coalesced and lane == "chat":
             # 无未回复消息（已被别的回合吃掉，或是竞态下的重复 claim）——干净收尾，不落 filler。
             completed, successor_id = await asyncio.to_thread(
@@ -12893,7 +13318,7 @@ async def process_job(
                 )
                 optional_anchor_seq = None
         if seq_context:
-            # D6/Task 10: close a compaction backlog gap BEFORE reading the
+            # Close a compaction backlog gap before reading the
             # actual prompt content — see `_ensure_prompt_coverage`'s
             # docstring. Common case (no gap) costs two cheap indexed reads
             # and returns immediately without touching the enclave/LLM.
@@ -12943,6 +13368,7 @@ async def process_job(
                     for row in coalesced
                     if row.get("has_image") and row.get("id")
                 },
+                vision_fallback_state=vision_fallback_state,
                 tail_cap=_TAIL_HARD_CAP,
             )
             if ordered_chat_replies:
@@ -12976,7 +13402,7 @@ async def process_job(
 
         async def _enqueue_write_effect(tc) -> str:
             """WRITE tool_call -> PR A effect (spec C6). Mapping lives in the shared
-            `_write_tool_effect_payload` (also used by `_run_wake` — Task 8)."""
+            `_write_tool_effect_payload` (also used by `_run_wake`)."""
             prepared = effect_reservations.get(tc)
             encrypted_payload = await asyncio.to_thread(
                 _build_encrypted_tool_effect_payload,
@@ -13160,9 +13586,13 @@ async def process_job(
                 set(cap_registry.WRITE_ACTIONS)
                 | set(mcp_mutating_names)
                 | {
-                    cap_tool_schema.FILE_REPLY_TOOL,
                     cap_tool_schema.MEMORY_ORGANIZE_TOOL,
                 }
+                | (
+                    set()
+                    if recovery_existing_file_delivery
+                    else {cap_tool_schema.FILE_REPLY_TOOL}
+                )
             )
         # Web gate. UNION with the mutation set, never assignment — overwriting
         # would re-expose the writes that mutation recovery just withheld.
@@ -13185,8 +13615,8 @@ async def process_job(
             fetch_halted=web_fetch_halted,
         )
         # provider_usage kill switch, offer-time half. This is the chat lane's
-        # own gate (Task 6) — the wake lane withholds the tool unconditionally
-        # (Task 5), never reaching this check. Fail-closed: a broken read
+        # own gate — the wake lane withholds the tool unconditionally, never
+        # reaching this check. Fail-closed: a broken read
         # withholds the tool rather than exposing it.
         try:
             provider_usage_halted = await asyncio.to_thread(
@@ -13275,7 +13705,7 @@ async def process_job(
             observe_photo=observe_photo,
             trajectory_recorder=trajectory_recorder,
         )
-        # Chat-lane only (Task 6): closes over THIS turn's already-decrypted
+        # Chat-lane only: closes over THIS turn's already-decrypted
         # provider_config, never re-resolved per call.
         dispatch_provider_usage = _make_provider_usage_dispatcher(
             provider_config=provider_config
@@ -13710,6 +14140,10 @@ async def process_job(
         language_correction_pending = False
         language_correction_outcome = "skipped"
         thinking_language_correction_pending = False
+        self_thinking_absent_retry_requests = 0
+        self_thinking_absent_retried = 0
+        self_thinking_absent_retry_pending = False
+        self_thinking_absent_retry_response_seen = False
 
         def _cancel_language_correction() -> None:
             nonlocal language_correction_attempted
@@ -13719,6 +14153,16 @@ async def process_job(
             language_correction_pending = False
             language_correction_outcome = "skipped"
             thinking_language_correction_pending = False
+
+        def _cancel_self_thinking_absent_retry() -> None:
+            nonlocal self_thinking_absent_retry_requests
+            nonlocal self_thinking_absent_retried
+            nonlocal self_thinking_absent_retry_pending
+            nonlocal self_thinking_absent_retry_response_seen
+            self_thinking_absent_retry_requests = 0
+            self_thinking_absent_retried = 0
+            self_thinking_absent_retry_pending = False
+            self_thinking_absent_retry_response_seen = False
 
         async def _on_reply(
             text: str | WorkspaceFileReply,
@@ -13738,6 +14182,10 @@ async def process_job(
             nonlocal language_correction_attempted
             nonlocal language_correction_pending, language_correction_outcome
             nonlocal thinking_language_correction_pending
+            nonlocal self_thinking_absent_retry_requests
+            nonlocal self_thinking_absent_retried
+            nonlocal self_thinking_absent_retry_pending
+            nonlocal self_thinking_absent_retry_response_seen
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
             raw_reply_text = "" if file_reply is not None else str(text or "").strip()
             text = raw_reply_text
@@ -13769,7 +14217,7 @@ async def process_job(
             # text; which thinking to surface (self-authored vs native) and its
             # provenance are decided at seal time. Fail-closed on malformed <think>:
             # never leak a raw tag, never promote private thinking to the reply.
-            from core import self_thinking
+            from agent_protocol_core import self_thinking
 
             self_thinking_on = self_thinking.enabled()
             # 安全剥离与「要不要写/展示自写 thinking」必须解耦：FEEDLING_V2_SELF_THINKING
@@ -13781,6 +14229,7 @@ async def process_job(
             _st_gate_on = self_thinking.gate_enabled()
             self_thinking_text = ""
             self_thinking_failed = False
+            self_thinking_status = None
             if (_st_gate_on or self_thinking_on) and file_reply is None and text:
                 _st_split = (
                     self_thinking.strip_all_thinking
@@ -13788,6 +14237,7 @@ async def process_job(
                     else self_thinking.split_thinking
                 )
                 _st_status, _st_thinking, _st_reply = _st_split(text)
+                self_thinking_status = _st_status
                 if _st_status == self_thinking.COMPLETE:
                     text = _st_reply
                     self_thinking_text = _st_thinking
@@ -13914,26 +14364,74 @@ async def process_job(
                     if not pending_file_replies:
                         raise TurnError("internal_file_reference_without_attachment")
             if correction_outcome:
-                safe_outcomes = {
-                    "corrected",
-                    "kept_original_still_mismatch",
-                    "retry_error",
-                    "retry_empty",
-                    "skipped",
-                }
-                language_correction_outcome = (
-                    correction_outcome
-                    if correction_outcome in safe_outcomes
-                    else "skipped"
-                )
-                language_correction_attempted = (
-                    language_correction_outcome != "skipped"
-                )
-                language_correction_pending = False
-                thinking_language_correction_pending = False
+                if self_thinking_absent_retry_pending:
+                    # The loop republishes the first usable reply when the bounded
+                    # correction errors, is empty, is rejected, or has no call
+                    # budget. Count only a provider call that actually happened.
+                    if (
+                        correction_outcome != "skipped"
+                        and not self_thinking_absent_retry_response_seen
+                    ):
+                        self_thinking_absent_retried += 1
+                    self_thinking_absent_retry_pending = False
+                    self_thinking_absent_retry_response_seen = False
+                else:
+                    safe_outcomes = {
+                        "corrected",
+                        "kept_original_still_mismatch",
+                        "retry_error",
+                        "retry_empty",
+                        "skipped",
+                    }
+                    language_correction_outcome = (
+                        correction_outcome
+                        if correction_outcome in safe_outcomes
+                        else "skipped"
+                    )
+                    language_correction_attempted = (
+                        language_correction_outcome != "skipped"
+                    )
+                    language_correction_pending = False
+                    thinking_language_correction_pending = False
             elif final and file_reply is None and not image_replies and text:
+                retry_completed = False
+                if self_thinking_absent_retry_pending:
+                    self_thinking_absent_retried += 1
+                    self_thinking_absent_retry_response_seen = True
+                    if (
+                        self_thinking_status == self_thinking.COMPLETE
+                        and not self_thinking_failed
+                    ):
+                        self_thinking_absent_retry_pending = False
+                        self_thinking_absent_retry_response_seen = False
+                        retry_completed = True
+                    else:
+                        # A correction may improve the saved candidate only by
+                        # satisfying the existing COMPLETE contract. ABSENT,
+                        # SILENT, FAILED, and internal-term failures all preserve
+                        # the first usable reply without surfacing a new marker.
+                        return v2_tool_loop.FinalReplyCorrectionRejected()
+                elif (
+                    self_thinking_on
+                    and self_thinking_status == self_thinking.ABSENT
+                    and self_thinking_absent_retry_requests
+                    < MAX_SELF_THINKING_ABSENT_RETRIES
+                ):
+                    self_thinking_absent_retry_requests += 1
+                    self_thinking_absent_retry_pending = True
+                    return v2_tool_loop.FinalReplyCorrectionRequest(
+                        instruction=_SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION,
+                        original_text=raw_reply_text,
+                        original_reasoning=reasoning,
+                        on_cancel=_cancel_self_thinking_absent_retry,
+                    )
+                # One correction round is already consumed after an ABSENT retry.
+                # Publish a valid COMPLETE result directly instead of asking the
+                # generic one-rewrite loop for a second language rewrite (which
+                # would otherwise fail open to the original ABSENT candidate).
                 if (
-                    self_thinking_text
+                    not retry_completed
+                    and self_thinking_text
                     and not thinking_language_correction_pending
                     and not correction_outcome
                 ):
@@ -13967,7 +14465,8 @@ async def process_job(
                         # rewrite.
                         return v2_tool_loop.FinalReplyCorrectionRejected()
                 elif (
-                    follow_outcome == "mismatch"
+                    not retry_completed
+                    and follow_outcome == "mismatch"
                     and user_script not in {"indeterminate", "mixed"}
                     and reply_script not in {"indeterminate", "mixed"}
                 ):
@@ -14310,6 +14809,7 @@ async def process_job(
                             lane="chat",
                             branch=_thinking_branch,
                             chars=_thinking_chars,
+                            retried=self_thinking_absent_retried,
                         )
                     if final and not language_trace_emitted:
                         language_trace_emitted = True
@@ -14397,6 +14897,7 @@ async def process_job(
                     lane="chat",
                     branch=_thinking_branch,
                     chars=_thinking_chars,
+                    retried=self_thinking_absent_retried,
                 )
             if final and not language_trace_emitted:
                 language_trace_emitted = True
@@ -14419,7 +14920,13 @@ async def process_job(
             "ts": float(cursor_ts),
         }
 
-        async def _on_file_reply(path: str, revision: int) -> None:
+        async def _on_file_reply(
+            path: str,
+            revision: int,
+            *,
+            title: str = "",
+            subtitle: str = "",
+        ) -> None:
             if deps.load_workspace_file is None:
                 raise RuntimeError("workspace file delivery is unavailable")
             loaded = await asyncio.to_thread(
@@ -14430,7 +14937,10 @@ async def process_job(
                 expected_revision=revision,
             )
             file_reply = await asyncio.to_thread(
-                _workspace_file_reply_from_result, loaded
+                _workspace_file_reply_from_result,
+                loaded,
+                title=title,
+                subtitle=subtitle,
             )
             if not seq_native:
                 await _on_reply(file_reply, final=False)
@@ -14685,6 +15195,7 @@ async def process_job(
                         for row in coalesced
                         if row.get("has_image") and row.get("id")
                     },
+                    vision_fallback_state=vision_fallback_state,
                     tail_cap=_TAIL_HARD_CAP,
                 )
                 if ordered_chat_replies:
@@ -14725,7 +15236,7 @@ async def process_job(
         # which the seal surfaces cleanly (same as V1). Gated on the same kill switch;
         # when self-thinking is OFF this is False and the old include_reasoning path is
         # unchanged.
-        from core import self_thinking as _self_thinking_v2
+        from agent_protocol_core import self_thinking as _self_thinking_v2
 
         outcome = await v2_tool_loop.run_tool_loop(
             provider_config=provider_config,
@@ -14743,11 +15254,15 @@ async def process_job(
             on_tool_event=chat_tool_activity_callback,
             required_file_suffixes=required_file_suffixes,
             file_requirement_messages=(
-                coalesced if mutation_recovery_barrier is None else ()
+                coalesced
+                if mutation_recovery_barrier is None
+                or recovery_existing_file_delivery
+                else ()
             ),
             resolve_required_file_suffixes=(
-                context.required_file_suffixes
+                _resolve_turn_file_requirement
                 if mutation_recovery_barrier is None
+                or recovery_existing_file_delivery
                 else None
             ),
             on_file_requirement_changed=_on_file_requirement_changed,
@@ -14809,6 +15324,12 @@ async def process_job(
             initial_screen_pixels_blocked=(screen_frame_message is not None),
             tagged_image_message_key=v2_screen_chat.MESSAGE_TAG,
             on_tagged_images_rejected=_on_screen_images_rejected,
+            max_consecutive_tool_only_rounds=(
+                MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS
+            ),
+            max_terminal_tool_call_retries=(
+                MAX_TERMINAL_TOOL_CALL_RETRIES
+            ),
             max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
             max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
             tool_result_char_cap=TOOL_RESULT_CHAR_CAP,
@@ -14834,7 +15355,20 @@ async def process_job(
                     deps, user_id, lane
                 )
             ),
+            absolute_deadline=(
+                vision_fallback_state.absolute_deadline
+                if vision_fallback_state.selected_count > 0
+                else None
+            ),
         )
+        if vision_fallback_state.selected_count > 0:
+            await asyncio.to_thread(
+                _emit_vision_fallback_completed,
+                deps,
+                user_id,
+                vision_fallback_state,
+                outcome="success",
+            )
         if pushed_screen_frame_ids:
             await asyncio.to_thread(
                 jobs_store.upsert_wake_schedule,
@@ -15075,7 +15609,7 @@ async def process_job(
                     successor_id,
                     type(exc).__name__,
                 )
-        # End-of-turn effect-outbox drain (Task 6 / spec A6): apply any pending
+        # End-of-turn effect-outbox drain (spec A6): apply any pending
         # generation-fenced effects for this user with the real dispatch sinks.
         # Best-effort — the turn's own reply/runtime-state/job transition above
         # are already durable by this point, so a failure here must not turn a
@@ -15128,9 +15662,19 @@ async def process_job(
         log.info("[v2.worker] job %s stopped at rollout fence: %s", job_id, e)
         return "failed"
     except Exception as e:  # noqa: BLE001 - terminal outbox owns failure visibility
+        if vision_fallback_state.selected_count > 0:
+            await asyncio.to_thread(
+                _emit_vision_fallback_completed,
+                deps,
+                user_id,
+                vision_fallback_state,
+                outcome="error",
+                error_class=_turn_failure_error_class(e),
+            )
         failure_exc: BaseException = e
         if (
             not isinstance(e, DedicatedVisionUnavailable)
+            and vision_fallback_state.selected_count <= 0
             and any(bool(row.get("has_image")) for row in coalesced)
         ):
             classified = _turn_failure_error_class(e)
@@ -15885,11 +16429,12 @@ async def _slot_loop(
     wake_event 命中时立刻醒——见 `_wait_for_job_or_stop`）。stop_event 置位后不再抢新活，
     跑完手上的即退出（优雅 drain）。
 
-    lanes（可选）：转给 `jobs_store.claim_next_job` 的 lane 白名单（Task 2）。None＝不限制
-    （行为与改动前完全一致）；非 None 时这个 slot 只抢白名单里的 lane——`run_worker_loop`
-    用它给部分 slot 划专用车道（见 `_reserved_lane_slots`）。
+    lanes（可选）：转给 `jobs_store.claim_next_job` 的 lane 白名单。None＝不限制
+    （行为与改动前完全一致）；非 None 时这个 slot 只抢白名单里的 lane。生产
+    `turn_child` 把每个 SlotSpec 的 current allowlist 传到这里；`run_worker_loop`
+    仅在 compatibility 路径中使用 `_reserved_lane_slots` 的旧自动分配。
 
-    progress_cb（可选，PR D Task 2 + hard-timeout fix）：`progress_cb(slot_id, turn_start)`
+    progress_cb（可选，per-slot progress / hard-timeout safety）：`progress_cb(slot_id, turn_start)`
     在真实 slot 活动的天然边界调用——claim 到一个 job 之后（即将进入 `_run_turn`）、
     `_run_turn` 跑完、每次空转 poll 醒来，以及 task-local `_report_turn_progress` 转发的
     provider round / reliable retry / tool batch / compaction batch 边界。这样一个合法长回合会
@@ -16056,18 +16601,26 @@ async def run_worker_loop(
     slot_generation: str = "g0",
     slot_ids: "list[str] | None" = None,
 ) -> None:
-    """起 max_workers 个 job-slot 协程共抢同一张 agent_jobs（SKIP LOCKED 无争用）。
+    """Run direct-worker slots for compatibility callers and unit tests.
+
+    Production does not use this multi-slot arrangement: ``serve_worker``
+    builds the three-pool ``RuntimePoolConfig`` and starts one ``turn_child``
+    process for every SlotSpec. Each child invokes ``_slot_loop`` directly with
+    that pool's lane allowlist. This function remains the direct-worker/test
+    compatibility path and still preserves its historical lane assignments.
+
+    起 max_workers 个 job-slot 协程共抢同一张 agent_jobs（SKIP LOCKED 无争用）。
     stop_event 置位 → 所有 slot 跑完手上 job 后退出（SIGTERM 优雅 drain 的落点）。
     wake_event（可选）由 serve_worker._serve 传入，桥 "v2_jobs" 即时唤醒（FIX 3）——
     未传（None）时所有 slot 退化为纯 poll，向后兼容既有调用方/测试。
 
-    lane 预留（D3 Task 5）：前几个 slot 只抢 {"chat","manual_wake"}（见 `_reserved_lane_slots`），
-    保证 scheduler（Task 4）产出的 heartbeat 唤醒风暴抢不走全部 slot、饿死聊天回复，
-    同时始终留一个 unrestricted slot，避免后台 lane 永久 pending。
+    compatibility lane assignments：前几个 slot 只抢 {"chat","manual_wake"}
+    （见 `_reserved_lane_slots`），同时始终留一个 unrestricted slot，避免后台 lane
+    永久 pending。
     `FEEDLING_V2_CHAT_RESERVED_SLOTS` 显式设置时覆盖默认的 max(1, max_workers // 2)；
     留空/未设置时用默认值。
 
-    progress_cb（可选，PR D Task 2）：原样转给每个 `_slot_loop`，附带该 slot 在
+    progress_cb（可选）：原样转给每个 `_slot_loop`，附带该 slot 在
     `assignments` 里的下标作为 `slot_id`——见 `_slot_loop` 自己的 docstring。默认 None：
     向后兼容既有调用方/测试。
 

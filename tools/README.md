@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # tools/
 
 Operator-facing utilities for Feedling. Each entry is independent — none
@@ -228,6 +232,25 @@ runtimes the consumer closes the response stream and, when
 endpoint should be idempotent and return after the runtime accepts the
 cancellation. The obsolete request is never posted as a reply; the newer turn
 is processed normally by the resident loop.
+
+An HTTP endpoint does not receive local file authority by default. If the HTTP
+agent runs on the same machine, can execute commands in this checkout, and
+inherits the resident's `FEEDLING_HOME`, enable the existing `io_cli` delivery
+surface explicitly:
+
+```
+FEEDLING_AGENT_HTTP_LOCAL_IO_CLI=true
+FEEDLING_AGENT_HTTP_LOCAL_FILE_ROOTS=/absolute/path/to/the/agent/workspace
+```
+
+This lets the agent stage downloadable files and self-contained Canvas files
+ending in `.io.html`. `send-file` may read a generated source from the explicit
+workspace root and the resident leaves that original intact. Canvas delivery
+also passes `--title` and `--subtitle`; both use the user's current language and
+may be preserved or updated when the Canvas is revised. Keep the root as
+narrow as the agent's workspace; never configure a home directory or filesystem
+root. Leave both settings off for ordinary model servers, Ollama, vLLM, and
+remote APIs that cannot execute `tools/io_cli.py` locally.
 
 For Hermes' API server, use the OpenAI-compatible protocol instead of the
 simple JSON shape:

@@ -107,7 +107,7 @@ def _clean_agent_jobs_table(monkeypatch):
     Truncate the whole table before each test so claim tests only ever see
     the row(s) they set up themselves.
 
-    Also clears `v2_runtime_state` (Task 2's per-user cutover generation row):
+    Also clears `v2_runtime_state` (the per-user cutover generation row):
     generation tests advance a user's generation via `db.advance_runtime_state`,
     and a leftover row from an earlier test would let a later test's
     `db.get_runtime_generation("u_...")` lazy-init see a stale generation
@@ -521,7 +521,9 @@ def test_mark_expired_retained_helper_also_queues_chat_visibility():
     assert marker == ("queue_timeout",)
 
 
-def test_mark_failed_crash_window_has_durable_visibility_marker_and_replays_once():
+def test_mark_failed_crash_window_has_durable_visibility_marker_and_replays_once(
+    monkeypatch,
+):
     """Simulate death immediately after terminalization by doing no inline
     surfacing.  A later reconciler must find both obligations, and replaying it
     again must not duplicate either the status event or the idempotent callback.
@@ -547,6 +549,12 @@ def test_mark_failed_crash_window_has_durable_visibility_marker_and_replays_once
     assert marker == (uid, "turn_failed:runtimeerror", None, None)
 
     recorded = []
+    wakes = []
+    monkeypatch.setattr(
+        wake_bus,
+        "notify_chat_wake_only",
+        lambda user_id: wakes.append(user_id),
+    )
     first = jobs_store.reconcile_terminal_failure_outbox(
         record_terminal_error=lambda user_id, code: recorded.append((user_id, code)),
         job_id=job_id,
@@ -569,6 +577,7 @@ def test_mark_failed_crash_window_has_durable_visibility_marker_and_replays_once
         "reply_delivered": 0,
     }
     assert recorded == [(uid, "turn_failed:runtimeerror")]
+    assert wakes == [uid]
     errors = [
         event
         for event in jobs_store.list_status_events(uid, after_id=0)
@@ -622,6 +631,50 @@ def test_terminal_failure_reply_is_encrypted_linked_classified_and_idempotent(
     assert parent["reply_message_id"] == failure["id"]
     assert parent["reply_error_class"] == "quota_insufficient"
     assert v2_cursor.load_seq(core_store.get_store(uid)) == parent_seq
+
+
+def test_canvas_delivery_failure_reply_does_not_claim_a_connection_problem(
+    monkeypatch,
+):
+    uid = "u_js_canvas_delivery_failure"
+    seed_user(uid)
+    _reset(uid)
+    _append_user_message(uid)
+    encrypted_plaintexts = []
+
+    def capture_failure_envelope(store, plaintext, *, item_id=None):
+        encrypted_plaintexts.append(plaintext.decode("utf-8"))
+        return _fake_failure_envelope(store, plaintext, item_id=item_id)
+
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        capture_failure_envelope,
+    )
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    jobs_store.claim_next_job("w")
+    assert jobs_store.mark_failed(
+        job_id,
+        "turn_failed:canvas_file_delivery_incomplete",
+        claimed_by="w",
+        error_class="canvas_file_delivery_incomplete",
+    )
+
+    result = jobs_store.reconcile_terminal_failure_outbox(job_id=job_id)
+
+    assert result["reply_delivered"] == 1
+    assert encrypted_plaintexts == [
+        "画布内容已经保存，但卡片更新没有完成。请稍后再试。"
+    ]
+    failure = next(
+        row
+        for row in db.chat_load_strict(uid)
+        if str(row.get("terminal_failure_job_id") or "") == str(job_id)
+    )
+    assert failure["turn_failure_error_class"] == (
+        "canvas_file_delivery_incomplete"
+    )
+    assert failure["turn_failure_blame"] == "system"
 
 
 def test_scheduled_failure_reply_is_standalone_visible_and_idempotent(monkeypatch):
@@ -1518,7 +1571,7 @@ def test_status_events_append_and_list_by_cursor():
     assert events[0]["id"] == id2
 
 
-def test_append_status_event_fires_cross_process_chat_wake(monkeypatch):
+def test_append_status_event_fires_typed_chat_wake(monkeypatch):
     """FIX 2 (§9): the V2 worker writes status events from a separate process than
     the web tier holding the parked chat long-poll. append_status_event must fire
     a cross-process wake on the "chat" channel after the INSERT commits, so the
@@ -1529,10 +1582,10 @@ def test_append_status_event_fires_cross_process_chat_wake(monkeypatch):
         conn.execute("DELETE FROM agent_status_events WHERE user_id='u_js_9d'")
     calls = []
     monkeypatch.setattr(
-        wake_bus, "notify", lambda channel, user_id="": calls.append((channel, user_id))
+        wake_bus, "notify_chat_wake_only", lambda user_id: calls.append(user_id)
     )
     event_id = jobs_store.append_status_event("u_js_9d", "processing", label="starting")
-    assert calls == [("chat", "u_js_9d")]
+    assert calls == ["u_js_9d"]
     # The notify is additive/best-effort — the status row itself must still land.
     events = jobs_store.list_status_events("u_js_9d", after_id=0)
     assert [e["id"] for e in events] == [event_id]
@@ -1540,8 +1593,8 @@ def test_append_status_event_fires_cross_process_chat_wake(monkeypatch):
 
 
 def test_list_status_events_delegates_to_db_primitive(monkeypatch):
-    """Cross-plan amendment: jobs_store.list_status_events must not run its own SQL —
-    it delegates to db.list_agent_status_events so Plan C's long-poll reads the same
+    """The status-stream read path must not run its own SQL —
+    it delegates to db.list_agent_status_events so all long-poll reads share the same
     single source of truth."""
     seed_user("u_js_9b")
     calls = []
@@ -1617,9 +1670,222 @@ def test_finish_wake_job_persists_glance_before_successor_handoff():
         "last_completed_perception_glance_source_job_id": job_id,
     }
     with db.get_pool().connection() as conn:
-        assert conn.execute(
-            "SELECT status FROM agent_jobs WHERE id=%s", (successor_id,)
-        ).fetchone()[0] == "pending"
+        successor = conn.execute(
+            "SELECT status,input_generation FROM agent_jobs WHERE id=%s",
+            (successor_id,),
+        ).fetchone()
+    assert successor == ("pending", 0)
+    marker = jobs_store.get_wake_schedule(uid)
+    assert marker is None or (
+        marker["pending_followup_source_job_id"] is None
+        and marker["pending_followup_consumed_context_seq"] is None
+        and marker["pending_followup_generation"] is None
+    )
+
+
+def test_late_perception_burst_creates_one_immediate_followup(monkeypatch):
+    """N late contexts merge once, without waiting for a scheduler pass."""
+    from perception import store as perception_store
+    from tee_shadow import mirror
+
+    uid = "u_js_late_perception_burst"
+    seed_user(uid)
+    _reset(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM v2_wake_schedule WHERE user_id=%s", (uid,))
+        conn.execute(
+            "DELETE FROM user_logs WHERE user_id=%s AND stream=%s",
+            (uid, perception_store.V2_WAKE_CONTEXT_STREAM),
+        )
+
+    job_id, coalesced = jobs_store.enqueue_job_with_context_log(
+        uid,
+        "heartbeat",
+        reason="arrived_at_anchor",
+        trace_id="wake-initial",
+        context_stream=perception_store.V2_WAKE_CONTEXT_STREAM,
+        context_doc={"wake_id": "wake-initial", "trigger": "arrived_at_anchor"},
+        context_ts=100.0,
+    )
+    assert coalesced is False
+    initial_context = perception_store.read_v2_wake_context(uid, job_id)
+    assert len(initial_context) == 1
+    consumed_context_seq = initial_context[0]["_context_seq"]
+    claimed = jobs_store.claim_next_job("w-late-burst")
+    assert claimed is not None and int(claimed["id"]) == job_id
+    assert jobs_store.mark_running(job_id, claimed_by="w-late-burst")
+
+    late_count = 5
+    for index in range(late_count):
+        same_id, late_coalesced = jobs_store.enqueue_job_with_context_log(
+            uid,
+            "heartbeat",
+            reason="photo_added",
+            trace_id=f"wake-late-{index}",
+            context_stream=perception_store.V2_WAKE_CONTEXT_STREAM,
+            context_doc={
+                "wake_id": f"wake-late-{index}",
+                "trigger": "photo_added",
+            },
+            context_ts=101.0 + index,
+        )
+        assert (same_id, late_coalesced) == (job_id, True)
+
+    marker_events = []
+    monkeypatch.setattr(
+        jobs_store,
+        "on_followup_marker",
+        lambda uid, action, **detail: marker_events.append((uid, action, detail)),
+    )
+    mirror_calls = []
+    monkeypatch.setattr(
+        mirror,
+        "execute",
+        lambda sql, params=(): mirror_calls.append((sql, tuple(params))),
+    )
+
+    completed, successor_id = jobs_store.finish_wake_job(
+        job_id,
+        claimed_by="w-late-burst",
+        observed_generation=0,
+        context_stream=perception_store.V2_WAKE_CONTEXT_STREAM,
+        consumed_context_seq=consumed_context_seq,
+    )
+
+    assert completed is True
+    assert successor_id is not None
+    with db.get_pool().connection() as conn:
+        jobs = conn.execute(
+            "SELECT id,status,reason,input_generation FROM agent_jobs "
+            "WHERE user_id=%s AND lane='heartbeat' ORDER BY id",
+            (uid,),
+        ).fetchall()
+    assert jobs == [
+        (job_id, "completed", "arrived_at_anchor", late_count),
+        (
+            successor_id,
+            "pending",
+            "coalesced_perception_followup",
+            late_count,
+        ),
+    ]
+    assert [
+        item["wake_id"]
+        for item in perception_store.read_v2_wake_context(uid, successor_id)
+    ] == [f"wake-late-{index}" for index in range(late_count)]
+    assert [
+        item["wake_id"]
+        for item in perception_store.read_v2_wake_context(uid, job_id)
+    ] == ["wake-initial"]
+
+    marker = jobs_store.get_wake_schedule(uid)
+    assert marker["pending_followup_source_job_id"] is None
+    assert marker["pending_followup_consumed_context_seq"] is None
+    assert marker["pending_followup_generation"] is None
+    assert marker_events == [(
+        uid,
+        "merged",
+        {
+            "source_job_id": job_id,
+            "generation": late_count,
+            "successor_job_id": successor_id,
+            "moved_context_count": late_count,
+        },
+    )]
+    assert any(
+        "UPDATE user_logs SET item_key" in sql
+        and params[0] == str(successor_id)
+        and params[4] == str(job_id)
+        and params[5] == consumed_context_seq
+        for sql, params in mirror_calls
+    )
+
+    # Completion retry is idempotent and trimming cannot resurrect/stick the
+    # already-consumed marker.
+    assert jobs_store.finish_wake_job(
+        job_id,
+        claimed_by="w-late-burst",
+        observed_generation=0,
+        context_stream=perception_store.V2_WAKE_CONTEXT_STREAM,
+        consumed_context_seq=consumed_context_seq,
+    ) == (True, None)
+    perception_store.trim_v2_wake_context(uid)
+    marker = jobs_store.get_wake_schedule(uid)
+    assert marker["pending_followup_source_job_id"] is None
+    assert len(perception_store.read_v2_wake_context(uid, successor_id)) == late_count
+
+    # No scheduler call is involved: the same durable successor is claimable
+    # immediately after the completion transaction commits.
+    successor = jobs_store.claim_next_job("w-followup-immediate")
+    assert successor is not None and int(successor["id"]) == successor_id
+
+
+def test_immediate_followup_context_rebind_reaches_tee(monkeypatch):
+    from perception import store as perception_store
+    from tee_shadow import mirror
+
+    monkeypatch.setenv("FEEDLING_TEE_DUAL_WRITE", "1")
+    uid = "u_js_immediate_followup_tee"
+    seed_user(uid)
+    _reset(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM user_logs WHERE user_id=%s AND stream=%s",
+            (uid, perception_store.V2_WAKE_CONTEXT_STREAM),
+        )
+    with mirror.get_tee_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM user_logs WHERE user_id=%s AND stream=%s",
+            (uid, perception_store.V2_WAKE_CONTEXT_STREAM),
+        )
+
+    job_id, _ = jobs_store.enqueue_job_with_context_log(
+        uid,
+        "heartbeat",
+        reason="photo_added",
+        trace_id="wake-tee-initial",
+        context_stream=perception_store.V2_WAKE_CONTEXT_STREAM,
+        context_doc={"wake_id": "wake-tee-initial", "trigger": "photo_added"},
+        context_ts=100.0,
+    )
+    initial = perception_store.read_v2_wake_context(uid, job_id)
+    owner = "w-followup-tee"
+    claimed = jobs_store.claim_next_job(owner)
+    assert claimed is not None and int(claimed["id"]) == job_id
+    assert jobs_store.mark_running(job_id, claimed_by=owner)
+    same_id, coalesced = jobs_store.enqueue_job_with_context_log(
+        uid,
+        "heartbeat",
+        reason="unlock_after_absence",
+        trace_id="wake-tee-late",
+        context_stream=perception_store.V2_WAKE_CONTEXT_STREAM,
+        context_doc={
+            "wake_id": "wake-tee-late",
+            "trigger": "unlock_after_absence",
+        },
+        context_ts=101.0,
+    )
+    assert (same_id, coalesced) == (job_id, True)
+
+    completed, successor_id = jobs_store.finish_wake_job(
+        job_id,
+        claimed_by=owner,
+        observed_generation=0,
+        context_stream=perception_store.V2_WAKE_CONTEXT_STREAM,
+        consumed_context_seq=initial[0]["_context_seq"],
+    )
+
+    assert completed is True and successor_id is not None
+    with mirror.get_tee_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT item_key,doc->>'wake_id',doc->>'agent_job_id' "
+            "FROM user_logs WHERE user_id=%s AND stream=%s ORDER BY seq",
+            (uid, perception_store.V2_WAKE_CONTEXT_STREAM),
+        ).fetchall()
+    assert rows == [
+        (str(job_id), "wake-tee-initial", str(job_id)),
+        (str(successor_id), "wake-tee-late", str(successor_id)),
+    ]
 
 
 def test_completed_wake_retry_cannot_overwrite_newer_glance_source():
@@ -1668,8 +1934,8 @@ def test_completed_wake_retry_cannot_overwrite_newer_glance_source():
     }
 
 
-# --- §6 admission ceiling: 三个纯读查询 (live_worker_count / inflight_job_count /
-# recent_mean_service_sec) ---------------------------------------------------
+# --- §6 queue/capacity telemetry: 三个纯读查询 (live_worker_count /
+# inflight_job_count / recent_mean_service_sec) ------------------------------
 
 
 def test_live_worker_count_counts_only_recent():
@@ -2121,8 +2387,8 @@ def test_recent_mean_service_sec_averages_completed():
     assert 14.0 <= mean <= 16.0  # (10+20)/2 = 15
 
 
-# --- kind discriminator: genesis heartbeats must be invisible to the chat/send
-# admission gate (workers_alive / live_worker_count read only kind='turn') ---
+# --- kind discriminator: genesis heartbeats must be invisible to turn-worker
+# liveness and telemetry (workers_alive / live_worker_count read kind='turn') --
 
 
 def _clear_heartbeats():
@@ -2131,11 +2397,11 @@ def _clear_heartbeats():
 
 
 def test_genesis_heartbeat_does_not_inflate_turn_worker_liveness():
-    """A genesis heartbeat row must be invisible to the chat/send admission gate.
+    """A genesis heartbeat row must be invisible to turn-worker liveness/telemetry.
 
-    live_worker_count() feeds admission.estimate_wait_sec(workers=...); counting a
-    genesis row as a turn worker would halve the estimated queue wait for a
-    single-process pool and over-admit onto turn slots that do not exist.
+    Current Chat queue/capacity telemetry reads live_worker_capacity(), so a
+    genesis row must not appear as executable turn capacity. live_worker_count()
+    remains a turn-process metric and also excludes genesis rows.
     """
     _clear_heartbeats()
     jobs_store.record_worker_heartbeat("w1", pool="foreground")

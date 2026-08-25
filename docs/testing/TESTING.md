@@ -187,7 +187,7 @@ V2 的 bug 表面很杂,底下集中在**五段共用代码**上(上下文组装
 | **D. 加密 / 信封 / 账号链路** | `content_encryption.py` `model_api` setup·send、`enclave_app.py`、`/v1/envelope/*` | ✅ | ✅ **必跑** | ⚠️ 建议 | `tools/e2e_encryption_test.py` / `v1_envelope_roundtrip_test.py`；确认"服务端永不见明文" |
 | **E. Provider / driver（含思维链）** | `provider_client.py`、V2 的 provider 调用层、resident consumer 的 driver 侧 | ✅（`test_hosted_agent_runtime_driver.py` 等） | ✅ 各 provider | ✅ **必跑** | 部署 CVM 后读 trace：`thinking_present` / `reasoning_output_tokens` / `AGENT_CLI_CMD`；**按模型家族分层验**（Anthropic/OpenAI/Gemini/中转 wire 各不同） |
 | **F. 消费端 consumer / proactive** | `tools/chat_resident_consumer.py` `backend/proactive/*` | ✅（sanitize 等单元断言） | — | ✅ **必跑** | **改完必 `systemctl --user restart feedling-chat-resident`**（否则跑旧内存态）；发消息验不泄漏协议碎片；**并发写自查**（"两个同时到会怎样？"）+ 确定性并发测试（Event gate 模式，禁 sleep 碰运气，样板 `test_debug_trace.py::test_flush_pending_waits_for_worker_in_flight_batch`）；**开关独立性矩阵**（Seven 2026-07-26 定：心跳/照片/到达/解锁/定时/屏幕共享**相互无连带**）——动了 `proactive/controls_v2.py::evaluate_wake_control_v2` 或任一唤醒源，必须逐个关单个开关、断言**只有它那条路被拦、其余全通**（实测 44 活跃用户里 6 个是"心跳关+屏幕共享开"，任何连带都会当场砍掉他们的功能）；consumer 耦合测试集一次跑齐：`grep -l -E 'chat_resident_consumer' tests/test_*.py`（34 个文件，基线 1100 passed / 1 skipped）；**动了定时唤醒（`scheduled_wake_v2` / `schedule_wake` 工具面）必跑 `NO_PROXY='*' python3 -m tools.e2e.repeat_wake_probe`** —— 重复提醒的验收标准是「明天真的响、说停真的停」，那句话跨调度器+存储+上下文注入三层，单测证明不了；探针四格里最要紧的是**用已 fired 的旧 id 能整串取消**（否则用户关不掉一个每天响的提醒） |
-| **F2. 记忆写入判据（capture / dream 解析）** | `backend/memory_garden/text/card_text.py` `*_prompt_v1.py` 的 parse/prompt、`v2/extraction.py`、consumer 的 capture/dream handler | ✅（`test_card_text_gate.py` `test_capture_prompt_v1.py` `test_dream_prompt_v1.py` `test_v2_extraction*.py` `test_dream_gates.py`） | — | ✅ **必跑** | **主风险是误拦不是漏拦**：判严一格 = 用户本该有的卡凭空消失且无声。部署后必跑 `NO_PROXY='*' python3 tools/e2e/card_gate_probe.py`（至少两个模型档：一强一弱），断言真卡落地且**过它自己那把尺子**；改 Unicode/长度判据必须补非拉丁非 CJK 语种（阿拉伯/西里尔/希伯来/重音拉丁）回归——字符区间白名单曾整语种误杀；`strict=False` 的「全脏」分支必须报 `*_after_retry` 让 job 失败，**报成 noop 会推进 capture frontier 把窗口永久丢掉**。**2026-08-05 起 dream 出口只拦「明显不对」**（占位符/协议泄漏/卡id泄漏/墓碑短语/爆炸半径保险丝），**内容质量判断一律不进闸**（15% 增量栅栏与逐提案语义审查员已拆，别再加回来）；改 dream 判据必须跑 `test_dream_gates.py` 的 **V1/V2 跨 lane 一致性锁**——两条 lane 的结构判据是同一套，只改一边 = 行为漂移。**改内容闸必须先列「写入路清单」再定落点**（usr_a40e 2026-08-06）：记忆写入至少有四条路——capture/dream 结构化 parse、**明文 `/v1/memory/actions`（io_cli memory-write/patch，agent 徒手路）**、genesis/history_import 蒸馏、migrate——闸只落 parse 层时徒手路整个绕过（墓碑卡三晚全走明文路，parse 层的新闸一张没拦到）；判据的**单一事实源**放 `card_text.py`/`dream_gates.py`，各路各自接入，绝不复制判据本体。**新闸必须显式决定挂不挂 kill switch，且补 switch-off 回归**：`FEEDLING_MEMORY_CARD_GUARD` 的契约只管协议残片检测，墓碑/占位符闸无条件跑（`test_tombstone_gate_survives_guard_kill_switch`）——挂错伞 = 止血关协议闸时顺手重开事故路 |
+| **F2. 记忆写入判据（capture / dream 解析）** | `memgarden/text/card_text.py`（外部包） `*_prompt_v1.py` 的 parse/prompt、`v2/extraction.py`、consumer 的 capture/dream handler | ✅（`test_card_text_gate.py` `test_capture_prompt_v1.py` `test_dream_prompt_v1.py` `test_v2_extraction*.py` `test_dream_gates.py`） | — | ✅ **必跑** | **主风险是误拦不是漏拦**：判严一格 = 用户本该有的卡凭空消失且无声。部署后必跑 `NO_PROXY='*' python3 tools/e2e/card_gate_probe.py`（至少两个模型档：一强一弱），断言真卡落地且**过它自己那把尺子**；改 Unicode/长度判据必须补非拉丁非 CJK 语种（阿拉伯/西里尔/希伯来/重音拉丁）回归——字符区间白名单曾整语种误杀；`strict=False` 的「全脏」分支必须报 `*_after_retry` 让 job 失败，**报成 noop 会推进 capture frontier 把窗口永久丢掉**。**2026-08-05 起 dream 出口只拦「明显不对」**（占位符/协议泄漏/卡id泄漏/墓碑短语/爆炸半径保险丝），**内容质量判断一律不进闸**（15% 增量栅栏与逐提案语义审查员已拆，别再加回来）；改 dream 判据必须跑 `test_dream_gates.py` 的 **V1/V2 跨 lane 一致性锁**——两条 lane 的结构判据是同一套，只改一边 = 行为漂移。**改内容闸必须先列「写入路清单」再定落点**（usr_a40e 2026-08-06）：记忆写入至少有四条路——capture/dream 结构化 parse、**明文 `/v1/memory/actions`（io_cli memory-write/patch，agent 徒手路）**、genesis/history_import 蒸馏、migrate——闸只落 parse 层时徒手路整个绕过（墓碑卡三晚全走明文路，parse 层的新闸一张没拦到）；判据的**单一事实源**放 `card_text.py`/`dream_gates.py`，各路各自接入，绝不复制判据本体。**新闸必须显式决定挂不挂 kill switch，且补 switch-off 回归**：`FEEDLING_MEMORY_CARD_GUARD` 的契约只管协议残片检测，墓碑/占位符闸无条件跑（`test_tombstone_gate_survives_guard_kill_switch`）——挂错伞 = 止血关协议闸时顺手重开事故路 |
 | **F3. 错误分类 / 归因（blame）** | `tools/chat_resident_consumer.py::_ERROR_CLASS_RULES`、`backend/notices/catalog.py::_UPSTREAM_RULES` | ✅（`test_catalog_consumer_parity.py` 逐字锁两份规则） | — | ✅（`tools/e2e/turn_failure_smoke.py`） | **规则表是开集，不是穷举**：每接一家 provider/中转就可能冒出新措辞，而**漏判不报错**——只是静默降级成 `FALLBACK_REPLY`（"我这会儿有点慢…你稍后再发一次"），用户永远等不到"你的模型名写错了"。所以：① 新增措辞必须附**真实错误串出处**（admin ledger / 用户截图），不许凭空想 regex；② 两份规则**必须同改**（parity test 会拦，但别等它拦）；③ 改完自问"哪些错误现在还落进 system 兜底？"。案例 usr_a40e（`deepseek-chat` 用户反复收到"没接上"，真因是模型名不可用——失败相关性干净地只命中这一个模型） |
 | **F4. 卡里怎么称呼本人（称谓 / 转写标签）** | `backend/identity/user_naming.py`、三条写入路各自的 prompt（capture / dream / `hosted/history_import.py`）、resident consumer 与 V2 worker 的转写标签（两侧都在跑，改一边就分叉） | ✅（`test_card_user_referent.py`：三条路都带规则 + 转写标签绝不写 "User"） | — | ✅ **必跑** | **改规则必须三条路一起改**（蒸馏 / 落卡 / 做梦），只改一条 = 另两条继续泄漏；**根因通常在转写标签不在 prompt**（V2 曾漏传 `user_name`，把本人标成 `user:`，模型照抄进卡）。live 验：`/v1/history_import/upload`（托管蒸馏，**必传 `relationship_started_at` 或 `fresh_start=true`**，否则 job 直接 failed）用**不设名字**的账号跑——有名字时泄漏率本来就 0，测不出东西；素材里要混真产品词（「用户留存」）确认**没被误杀**。**确定性改写器不可上写入路**（`rewrite_user_reference`：锚点是开集，产品散文近 100% 被改坏，2026-07-26 已撤，`test_deterministic_rewriter_is_not_wired_into_the_daily_card_path` 锁死）。⚠️ 已知缺口：V2 的 dream 没有 force 旁路（夜间窗+新卡数+最小间隔三闸），做梦这条路目前**只有单测、无 live 覆盖** |
 | **F5. CLI driver 会话 / argv 准备** | `tools/chat_resident_consumer.py` 的 `_prepare_cli_command` / `call_agent_cli`、`--resume`/`--session-id`/`isolated_session` 相关 | ✅（驱动矩阵） | — | ⚠️ 真实二进制 smoke | **测试必须断言「交给驱动的最终 argv」（产物），不能只断言意图 flag**——2026-08-05 前 isolated_session 的两个测试都 mock 掉 call_agent、只断言 `isolated_session=True` 传到了，于是一条根本跑不起来的 claude 命令绿着上线六天（claude 的 `--print --resume` 只认它**自己生成的 UUID** / 已存在 session title，consumer 自造的 bounded 标签首轮必炸；vision probe 与 dream 语义 review 在 claude-driver 家庭因此**全部静默失败**，探针 verdict 被 CLI 错误污染成 `vision_model_failed`）。四个驱动的会话语义各不相同，改会话逻辑必须逐驱动过矩阵：**claude** 最严（session id 只认自产 UUID；隔离 = **不给任何会话旗标**，裸 `claude --print` 即全新会话）、**pi** `--session-id` 是 create-if-missing、收任意串、**hermes** `--resume` 收任意串、**codex** 无 resume 天然每轮全新。验收两件套：①单测钉 argv（样板 `test_prepare_claude_cli_isolated_session_*`，含「隔离轮不得读写共享会话存储」的反断言）；②对**真实 claude 二进制**先跑**负向对照**（手工构造修复前的失败形状、确认报错逐字复现——证明 E2E 踩的是真路径，不是假绿），再跑正向 smoke：隔离首轮成功 + 共享 `--resume` 跨轮召回 + 隔离轮看不到聊天上下文 + 共享 sid 不被搅动（修复参照 1965546c）。**驱动语义有分歧时优先拿 claude 做负向对照**——它反复是最特殊的那个（另见 F 行 claude 工具面泄漏） |
@@ -260,6 +260,26 @@ V2 的 bug 表面很杂,底下集中在**五段共用代码**上(上下文组装
   `sys.path.insert(backend)`，否则从"静默忽略"变成"收集期 ModuleNotFoundError"。
 - **验口径一秒钟**：`pytest tests/ -q --collect-only | tail -1`。
   无 PG 约 1.7k，接上 PG 约 8.9k——报"全量通过"前先看这个数对不对得上。
+
+**⚠️ 上面那条验的是"能不能收集"，验不了"CI 会不会跑"。** 2026-08-22 我本地 96 passed、
+推上去被 `Guard top-level pytest discovery coverage` 打红——**规则就写在上面那张表里，
+我照样踩了**。所以缺的不是规则，是**一个推之前就能跑的检查**：
+
+```bash
+# 那道守卫是纯 shell、零网络，可以原样在本地跑（约 2 秒）
+export LC_ALL=C
+find tests -maxdepth 1 -type f -name 'test_*.py' | sort > /tmp/g-all.txt
+grep -oE 'tests/test_[A-Za-z0-9_]+\.py' .github/workflows/ci.yml | sort -u > /tmp/g-named.txt
+grep -l -E 'chat_resident_consumer' tests/test_*.py | sort > /tmp/g-cons.txt
+sort -u /tmp/g-named.txt /tmp/g-cons.txt > /tmp/g-cov.txt
+comm -23 /tmp/g-all.txt /tmp/g-cov.txt | grep -F "<你的新文件名>"
+# 有输出 = CI 不会跑它；空 = 已覆盖。
+```
+
+⭐ 判据升一层：**"CI 会告诉我"不是一道防线，是一次延迟通知**——它在推之后好几分钟才响，
+而 git 传输挂着时（2026-08-22 实测持续一整段）**它根本不会响**。
+凡是"只有远端才会告诉你"的检查，都该问一句：**它的本地版能不能现在就跑？**
+这一道的答案是能，而且是 shell 三行。
 
 ---
 
@@ -467,6 +487,38 @@ V2 的 bug 表面很杂,底下集中在**五段共用代码**上(上下文组装
 
 同族判据：同一个函数里若已有一条为某 lane / 某场景**破了例**的路径，而另一条同语义
 路径没破例，基本就是漏改，不是设计。
+
+### 6.3 在中间注入的测试，只证明"我构造到的那条路对了"
+
+**2026-08-22 有一次干净的对照，值得当模板记住。** 一个管理端字段要从冻结数据一路
+活到页面上，中间经过「产生格子」和「渲染格子」两段。我写了 4 条测试，全部**直接构造
+最终的格子**再断言渲染 —— 4 条全绿。而产生格子的那一段**根本没把该字段放进返回值**，
+页面恒显示"未计算"。
+
+把那一行透传删掉，再跑两组：
+
+| 测试写法 | 删掉透传后 |
+|---|---|
+| 从**最上游**的 payload 喂入，断言到最终 HTML | 🔴 **红** |
+| 直接构造**最终对象**再断言渲染（我原来那 4 条） | ✅ **全绿** |
+
+⇒ **注入点在哪，覆盖就从哪开始。** 在中间注入，等于把上游那一段整个划到测试之外，
+而它失效时**没有任何东西会红**。
+
+**判据（下笔写测试前问一句）**：
+- 我的输入是从**真实产生方**来的，还是我手搓的？手搓 ⇒ 产生方那段没被覆盖。
+- 这条测试能红，是因为**被测行为坏了**，还是因为**我恰好构造到了那条路**？
+- 想验的东西跨了几段？跨段的性质必须**至少有一条端到端的断言**压着。
+
+⚠️ 配套的两个坑（同一晚踩的）：
+- **断言不要编码"碰巧的事实"。** 同一条端到端断言我连写错两版：
+  "整页不出现 X"（同页别的格子出现 X 是**正确行为**）、"恰好一格带该数字"
+  （同一份数据同时出现在两张表里，**两格都带也是正确的**）。
+  最终只断言性质：**凡印出数字的格子，都不许同时说"未计算"**——有几格是表结构的自由度。
+- **突变打空和护栏不承重，在输出上分不开。** 同一晚我两次把突变注入到了
+  被测代码根本不读的地方（一次是构造函数的**输入** dict，而返回值是显式构造的），
+  得到全绿，差点报"护栏不承重"。⇒ **每枪先 `assert 锚点计数 == 1`**，
+  且锚点要取自**真实源码文本**，不要凭记忆拼。
 
 ## 7. "完成"的定义（Definition of Done）
 

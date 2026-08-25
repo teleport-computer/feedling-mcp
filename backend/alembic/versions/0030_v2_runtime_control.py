@@ -1,5 +1,5 @@
 """0030 v2 runtime control: single-row `v2_runtime_control` table backing the
-live turn kill switch (PR D Task 1 / D4). `turns_halted=true` fail-closes new
+live turn kill switch. `turns_halted=true` fail-closes new
 V2 chat admission (503), stops `_slot_loop` from claiming new jobs, and fences
 active write effects — all without a redeploy. Genesis is untouched: it reads
 a separate `genesis_import_jobs` table + heartbeat and never consults this one.

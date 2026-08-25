@@ -1,6 +1,6 @@
 # Memory Garden 内核提取 · 测试方案
 
-> 配套分支 `feat/memory-garden-kernel`（15 个提交）。
+> 配套分支 `feat/memgarden-kernel`（15 个提交）。
 > 本文回答：这次改动的风险面在哪、已经验了什么、**还缺什么**、上线前必须过哪些关。
 > 初稿由 Claude 起草，待 Codex 评审补充。
 
@@ -10,7 +10,7 @@
 
 | 改动 | 风险 | 最坏后果 |
 |---|---|---|
-| 9 个模块搬进 `memory_garden/`，10 个转发壳删除 | 漏改某处 import | 启动即崩（已被全量收集覆盖） |
+| 9 个模块搬进 `memgarden/`，10 个转发壳删除 | 漏改某处 import | 启动即崩（已被全量收集覆盖） |
 | 39 个文件的调用方切到内核 | 拿到不同的函数版本 | 行为静默漂移 |
 | prompt 三件套的 identity 依赖改为传参 | 称呼装配错位 | 卡里出现「用户」这类系统称谓 |
 | 三个策略档位收拢 | 尺子被用错档 | 用户整理的 100 条只落 2 张卡 |
@@ -288,7 +288,7 @@ conftest 自己从维护库里开一个一次性数据库并导出 `DATABASE_URL
 
 **怎么证明走的是内核**：产出的 selector trace 里 `reason=phrase_match`，
 而 `phrase_match` 这个字符串在 `backend/` 下**只存在于**
-`memory_garden/scoring/relevance.py`。服务端跑的确实是内核代码，不是残留副本。
+`memgarden/scoring/relevance.py`。服务端跑的确实是内核代码，不是残留副本。
 
 ### 缺口 2：genesis 完整导入 ✅（并因此抓到一个真回归）
 
@@ -340,8 +340,8 @@ enclave，发一条**真实加密**的用户消息：
 桶是中文单词、没有斜杠双语对；称呼用真名「阿哲」而不是「用户」。
 
 这条路径经过本批改动的全部 7 处 import（`core.protocol_leak` /
-`self_thinking`、`memory_garden.text.card_guard` / `card_text`、
-`memory_garden.guards.dream_gates`、`memory_garden.prompts.buckets` /
+`self_thinking`、`memgarden.text.card_guard` / `card_text`、
+`memgarden.guards.dream_gates`、`memgarden.prompts.buckets` /
 `migrate`）—— 任何一处解析失败，进程根本起不来。
 
 ### 附带闭掉：dream 签名在**真实数据**上对拍 ✅

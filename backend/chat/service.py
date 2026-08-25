@@ -547,124 +547,94 @@ def _pending_chat_messages_for_poll(
             return []
     with store.chat_lock:
         redelivery_floor = _redelivery_floor(store, now)
-        for msg_index, msg in enumerate(store.chat_messages):
-            ts = _float_meta(msg.get("ts"), 0.0)
-            if ts <= since:
-                if (
-                    claim
-                    and msg.get("role") == "user"
-                    and msg.get("reply_status") != "replied"
-                    and not str(msg.get("reply_message_id") or "").strip()
-                ):
-                    legacy_reply = _legacy_adjacent_reply_candidate(
-                        store.chat_messages, msg_index
+        cached_rows = list(store.chat_messages)
+    cached_index = {
+        str(row.get("id") or ""): index
+        for index, row in enumerate(cached_rows)
+    }
+    candidates = db.chat_poll_candidates_strict(
+        store.user_id,
+        since,
+        _redelivery_window_floor(now),
+        256,
+    )
+    for msg in candidates:
+        ts = _float_meta(msg.get("ts"), 0.0)
+        if ts <= since:
+            msg_index = cached_index.get(str(msg.get("id") or ""))
+            if claim and msg_index is not None:
+                legacy_reply = _legacy_adjacent_reply_candidate(
+                    cached_rows, msg_index
+                )
+                if legacy_reply is not None:
+                    _reply_index, reply = legacy_reply
+                    reconciled = db.chat_reconcile_legacy_adjacent_reply(
+                        store.user_id,
+                        str(msg.get("id") or ""),
+                        str(reply.get("id") or ""),
                     )
-                    if legacy_reply is not None:
-                        reply_index, reply = legacy_reply
-                        reconciled = db.chat_reconcile_legacy_adjacent_reply(
-                            store.user_id,
-                            str(msg.get("id") or ""),
-                            str(reply.get("id") or ""),
+                    if reconciled is not None:
+                        store.apply_committed_chat_rows(list(reconciled))
+                        print(
+                            f"[chat/poll:{store.user_id}] "
+                            f"legacy_adjacent_reply_reconciled "
+                            f"parent={msg.get('id')} reply={reply.get('id')}"
                         )
-                        if reconciled is not None:
-                            parent_doc, reply_doc = reconciled
-                            msg.update(parent_doc)
-                            store.chat_messages[reply_index].update(reply_doc)
-                            print(
-                                f"[chat/poll:{store.user_id}] "
-                                f"legacy_adjacent_reply_reconciled "
-                                f"parent={msg.get('id')} reply={reply.get('id')}"
-                            )
-                            continue
-                if redelivered >= CHAT_REDELIVERY_BATCH_MAX:
-                    continue  # budget spent — leftovers roll into the next poll unclaimed
-                # Redelivery backstop: an unanswered turn the cursor already
-                # passed is still deliverable while it's inside the window and
-                # on the unanswered tail (see _redelivery_floor). verify_ping
-                # probes are excluded — verify_loop GC'd theirs long ago and a
-                # late reply would only 409. Unlike the fresh path below, a
-                # LIVE claim blocks redelivery even to its own consumer:
-                # re-handing the message to its claimer on every poll while
-                # the turn is still running would double-burn; retry waits for
-                # TTL expiry instead.
-                # Supersession is a statement about the CONVERSATION moving on:
-                # the user re-asked and got an answer, so a late reply to the
-                # old turn would land out of order. It does not describe a turn
-                # the system took and dropped — that message was never answered
-                # and its content may be unrelated to whatever came after. Such
-                # a message stays redeliverable inside the window; without this
-                # it disappears permanently and silently the moment any later
-                # turn is answered (prod 2026-07-22: 40 rows / 9h / 16 users).
-                # The age bound still applies, so a permanently unreadable
-                # message retries a bounded number of times and then stops.
-                floor = (
-                    _redelivery_window_floor(now)
-                    if _claim_abandoned(msg, now)
-                    else redelivery_floor
-                )
-                if ts <= floor:
-                    continue
-                if str(msg.get("source") or "") in NON_CONVERSATION_USER_SOURCES:
-                    continue
-                claimed_by = str(msg.get("reply_claimed_by") or "").strip()
-                expires_at = _float_meta(msg.get("reply_claim_expires_at"), 0.0)
-                if claimed_by and expires_at > now:
-                    continue
-            # Gate on role / already-replied / claimable from cache (these don't
-            # race the way the claim itself does). For a claiming poll the
-            # cache's claimed_by read is only an early filter — the authoritative
-            # decision is the DB CAS below.
-            if not _chat_message_claimable(msg, consumer_id, now):
+                        continue
+            if redelivered >= CHAT_REDELIVERY_BATCH_MAX:
                 continue
-            if not claim:
-                # read-only peek — hydrate an R2-offloaded file body so the
-                # delivered message carries its ciphertext (claim path below gets
-                # this via chat_try_claim_reply).
-                claimed.append(_strip_body_storage_fields(
-                    db.hydrate_chat_file_body(store.user_id, dict(msg))
-                ))
-                if ts <= since:
-                    redelivered += 1
-                continue
-            # The claim must be atomic in the DB, not decided from this worker's
-            # cache — otherwise two workers polling the same reply would each read
-            # "unclaimed" and both deliver it. chat_try_claim_reply is a
-            # conditional UPDATE; only the winner gets the merged doc back.
-            msg_id = str(msg.get("id") or "")
-            if not msg_id:
-                continue
-            # Read BEFORE the claim overwrites the fields it is derived from.
-            was_abandoned = _claim_abandoned(msg, now)
-            prev_claimed_by = str(msg.get("reply_claimed_by") or "")
-            fields = {
-                "reply_claimed_by": consumer_id,
-                "reply_claimed_at": f"{now:.3f}",
-                "reply_claim_expires_at": f"{now + max(10, CHAT_POLL_CLAIM_TTL_SEC):.3f}",
-            }
-            # Backstop (ts <= since) claims are strict: the cache-side checks
-            # above (live claim, _redelivery_floor) may be stale on this
-            # worker, so the CAS itself re-decides both authoritatively — see
-            # chat_try_claim_reply's redelivery mode.
-            merged = db.chat_try_claim_reply(
-                store.user_id, msg_id, consumer_id, now, fields,
-                redelivery=ts <= since,
+            floor = (
+                _redelivery_window_floor(now)
+                if _claim_abandoned(msg, now)
+                else redelivery_floor
             )
-            if merged is None:
-                continue  # lost the claim to another consumer/worker — skip
-            if was_abandoned:
-                # A message the system took and dropped is being handed back.
-                # Loud on purpose: this is the only server-side evidence that
-                # the wedge-skip path fired at all. Before this line the whole
-                # chain was silent — prod 2026-07-22's 40 lost messages were
-                # found by reconciling reply_message_id IS NULL, not by an
-                # alert. Greppable, carries user + message id, countable.
-                print(
-                    f"[chat/poll:{store.user_id}] abandoned_claim_recovered "
-                    f"id={msg_id} ts={ts:.3f} age_sec={now - ts:.0f} "
-                    f"prev_claim={prev_claimed_by} consumer={consumer_id}"
-                )
-            msg.update(fields)  # keep this worker's cache copy consistent
-            claimed.append(_strip_body_storage_fields(merged))
+            if ts <= floor:
+                continue
+            if str(msg.get("source") or "") in NON_CONVERSATION_USER_SOURCES:
+                continue
+            claimed_by = str(msg.get("reply_claimed_by") or "").strip()
+            expires_at = _float_meta(msg.get("reply_claim_expires_at"), 0.0)
+            if claimed_by and expires_at > now:
+                continue
+        if not _chat_message_claimable(msg, consumer_id, now):
+            continue
+        if not claim:
+            claimed.append(_strip_body_storage_fields(
+                db.hydrate_chat_file_body(store.user_id, dict(msg))
+            ))
             if ts <= since:
                 redelivered += 1
+            continue
+        msg_id = str(msg.get("id") or "")
+        if not msg_id:
+            continue
+        was_abandoned = _claim_abandoned(msg, now)
+        prev_claimed_by = str(msg.get("reply_claimed_by") or "")
+        fields = {
+            "reply_claimed_by": consumer_id,
+            "reply_claimed_at": f"{now:.3f}",
+            "reply_claim_expires_at": (
+                f"{now + max(10, CHAT_POLL_CLAIM_TTL_SEC):.3f}"
+            ),
+        }
+        merged = db.chat_try_claim_reply(
+            store.user_id,
+            msg_id,
+            consumer_id,
+            now,
+            fields,
+            redelivery=ts <= since,
+        )
+        if merged is None:
+            continue
+        if was_abandoned:
+            print(
+                f"[chat/poll:{store.user_id}] abandoned_claim_recovered "
+                f"id={msg_id} ts={ts:.3f} age_sec={now - ts:.0f} "
+                f"prev_claim={prev_claimed_by} consumer={consumer_id}"
+            )
+        store.apply_committed_chat_rows([merged])
+        claimed.append(_strip_body_storage_fields(merged))
+        if ts <= since:
+            redelivered += 1
     return claimed

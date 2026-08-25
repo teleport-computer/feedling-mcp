@@ -288,7 +288,7 @@ Identity 和 Memory Garden 等插件只能返回结构化的“上下文贡献�
 ```text
 core.chat
 plugin.identity
-plugin.memory-garden
+plugin.memgarden
 plugin.ios-perception
 plugin.inner-thought
 ```

@@ -1,13 +1,11 @@
-"""P0 acceptance tests for Hosted Runtime V2 PR D, Half-B (history safety).
+"""P0 acceptance tests for the retained PR-D history-safety invariants.
 
-Task 11 of docs/superpowers/plans/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety.md.
-Builds on Tasks 6-10 (all already in this working tree):
-
-  - Task 6  (worker._run_compaction CAS-loss requeue)   — see test_v2_compaction_cas_requeue.py
-  - Task 7  (db.reconcile_unenqueued_v2_messages)        — see test_v2_reconcile_sweeper.py (not exercised here)
-  - Durable retention (append limits never delete source rows) — see test_v2_gc_coverage_gate.py
-  - Task 9  (v2_conversation_summary.watermark_seq, migration 0031)
-  - Task 10 (worker._ensure_prompt_coverage / _assert_prompt_covers prompt invariant) — see test_v2_prompt_invariant.py
+The canonical owner is
+``docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md``:
+D5 seq boundaries, D6 prompt coverage, D7 durable source retention, D8 CAS-loss
+requeue, and D9 parent reconciliation. Related focused tests are
+``test_v2_compaction_cas_requeue.py``, ``test_v2_reconcile_sweeper.py``,
+``test_v2_gc_coverage_gate.py``, and ``test_v2_prompt_invariant.py``.
 
 Each test below asserts a STRONG, non-vacuous property (documented per-test on
 why it can't pass by accident) rather than merely exercising the code path.
@@ -99,7 +97,7 @@ def test_5000_identical_ts_and_summary_watermark_preserve_every_source_row():
     summary_row = jobs_store.get_summary_row(uid)
     assert summary_row is not None
     watermark_seq = summary_row["watermark_seq"]
-    # Sanity: the lazy ts->seq back-compat translation (Task 9) placed the
+    # Sanity: the D5--D6 seq-boundary compatibility translation placed the
     # watermark exactly at the last old message, not beyond it.
     old_last_seq = db.chat_seq_for_msg_id(uid, f"old{n_old - 1:02d}")
     assert watermark_seq == old_last_seq
@@ -161,8 +159,8 @@ def test_5000_identical_ts_and_summary_watermark_preserve_every_source_row():
 
 
 # ---------------------------------------------------------------------------
-# P0 #2 — prompt coverage after catch-up (Task 10's synchronous catch-up
-# compaction closes the "silently dropped between watermark and tail" hole).
+# P0 #2 — D6 prompt coverage after synchronous catch-up compaction closes the
+# "silently dropped between watermark and tail" hole.
 # ---------------------------------------------------------------------------
 
 
@@ -325,7 +323,7 @@ def test_prompt_coverage_no_false_gap_under_multiuser_seq_interleaving(monkeypat
 
 # ---------------------------------------------------------------------------
 # P0 #3 — compaction CAS-loss requeues, never permanently abandons a
-# still-over-budget tail (Task 6).
+# still-over-budget tail (D8 CAS-loss requeue).
 # ---------------------------------------------------------------------------
 
 

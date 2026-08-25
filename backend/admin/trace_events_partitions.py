@@ -1,10 +1,12 @@
-"""Owner-only maintenance for the TEE-primary ``trace_events`` partitions.
+"""Owner-only maintenance for the selected primary's trace partitions.
 
 The application role deliberately has no DDL path.  This command runs with
-``TEE_MIGRATION_DATABASE_URL`` after an Alembic TEE migration (and may be run
-again manually).  The DEFAULT partition preserves writes when maintenance is
-late; seeing any row there is still a degraded-state signal and is reported by
-the independent application monitor before this command repairs it.
+``TRACE_EVENTS_MIGRATION_DATABASE_URL`` after an RDS or TEE migration (and may
+be run again manually).  ``TEE_MIGRATION_DATABASE_URL`` remains a compatibility
+fallback for the existing TEE workflow.  The DEFAULT partition preserves writes
+when maintenance is late; seeing any row there is still a degraded-state signal
+and is reported by the independent application monitor before this command
+repairs it.
 """
 
 from __future__ import annotations
@@ -21,6 +23,20 @@ from psycopg import sql
 
 _ZONE = ZoneInfo("Asia/Shanghai")
 _PARTITION_RE = re.compile(r"^trace_events_p(\d{8})$")
+
+
+def _migration_database_url() -> str:
+    """Return the explicit owner/migration DSN for the selected primary."""
+    dsn = (
+        os.environ.get("TRACE_EVENTS_MIGRATION_DATABASE_URL", "").strip()
+        or os.environ.get("TEE_MIGRATION_DATABASE_URL", "").strip()
+    )
+    if not dsn:
+        raise RuntimeError(
+            "TRACE_EVENTS_MIGRATION_DATABASE_URL is required "
+            "(TEE_MIGRATION_DATABASE_URL is accepted for the TEE workflow)"
+        )
+    return dsn
 
 
 def _beijing_today(now: datetime | None = None) -> date:
@@ -177,9 +193,7 @@ def main() -> int:
     parser.add_argument("--retention-days", type=int, default=30)
     parser.add_argument("--future-days", type=int, default=60)
     args = parser.parse_args()
-    dsn = os.environ.get("TEE_MIGRATION_DATABASE_URL", "").strip()
-    if not dsn:
-        raise RuntimeError("TEE_MIGRATION_DATABASE_URL is required")
+    dsn = _migration_database_url()
     with psycopg.connect(dsn) as conn:
         report = maintain(
             conn,

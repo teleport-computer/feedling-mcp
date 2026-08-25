@@ -117,8 +117,29 @@ _IO_CLI_VERBS = (
 # relationship. Host-only — set via consumer_env(); VPS keeps the default.
 _HOST_SESSION_MAX_TURNS = "24"
 
+
+def _read_markdown_prompt(path: Path) -> str:
+    """Read a runtime prompt without repository-only YAML front matter."""
+
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return text
+    try:
+        closing_index = next(
+            index
+            for index, line in enumerate(lines[1:], start=1)
+            if line.strip() == "---"
+        )
+    except StopIteration:
+        raise ValueError(f"unterminated YAML front matter: {path}") from None
+    return "".join(lines[closing_index + 1:]).lstrip("\r\n")
+
+
 # The how-to prompt shipped beside this module (into the image via COPY backend/).
-_AGENT_PROMPT_TEXT = (Path(__file__).resolve().parent / "agent_tools_prompt.md").read_text()
+_AGENT_PROMPT_TEXT = _read_markdown_prompt(
+    Path(__file__).resolve().parent / "agent_tools_prompt.md"
+)
 _AGENT_PROMPT_BASENAME = "agent-tools-prompt.md"
 
 # T13: the "How to call it" command block in agent_tools_prompt.md is now the
@@ -166,7 +187,7 @@ _AGENT_PROMPT_FALLBACK_COMMANDS = (
     "python {io_cli} photo-recent [--limit <n>]\n"
     "python {io_cli} photo-read --id <photo_id> [--include-image]\n"
     "python {io_cli} chat-image --id <message_id>\n"
-    "python {io_cli} send-file --path <source_path> --name <download_name>\n"
+    "python {io_cli} send-file --path <source_path> --name <download_name> [--title <title>] [--subtitle <subtitle>]\n"
     "python {io_cli} generate-image --prompt <complete visual description>\n"
     "python {io_cli} send-image --path <image_path> [--name <display_name>]\n"
     "python {io_cli} schedule-wake --at <time> [--reason <text>] [--tz <tz>]\n"

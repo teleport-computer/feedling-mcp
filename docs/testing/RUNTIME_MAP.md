@@ -1,7 +1,13 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # 概念 → 各运行时坐标对照表
 
 > **做跨运行时对照之前先查这张表,不要直接 grep 符号名。**
 > 一条 grep 返回 0,第一个问题是「这个符号在那一侧叫这个名字吗」,不是「那一侧没有这个功能」。
+>
+> runtime 是否启用、由谁部署以 [`../CURRENT_STATE.md`](../CURRENT_STATE.md) 为准；本表只映射实现概念和符号。
 
 2026-08-14 建。快照提交 `6a7bf491`(origin/test)。
 
@@ -16,8 +22,8 @@
   它证明不了任何事。resident 侧对应的是 `memory-index` / `memory-fetch`。
 - 有人把 `occurred_at = now` 归因到 Runtime V2,实际先命中的是 resident consumer。
 - 有人把 `tools/chat_resident_consumer.py` 直接叫「V1」——
-  `docs/testing/README.md` 明写现在只剩两条路径:**Runtime V2** 和 **Resident / VPS**,
-  「V1 托管已不再维护」。
+  更准确的区分是两种执行实现：**Runtime V2** 和 **Resident consumer**；后者既可
+  由用户 VPS 运行，也可由 hosted agent-runner 托管。
 
 ## 术语(先对齐,否则整张表都会读错)
 
@@ -101,16 +107,16 @@ resident 侧才是 HTTP 客户端,POST `/v1/memory/*`。
 
 | prompt | 唯一实现 | 谁在用 |
 |---|---|---|
-| capture | `backend/memory_garden/prompts/capture.py` | V2 + resident(都经 `memory/capture_prompt_v1.py` 适配壳) |
-| dream | `backend/memory_garden/prompts/dream.py` | V2 + resident(都经 `memory/dream_prompt_v1.py` 适配壳) |
-| migrate | `backend/memory_garden/prompts/migrate.py` | **只有 resident**;V2 侧无调用方,老壳 `memory/migrate_prompt_v1.py` 已在 `5e50e79e` 删除 |
+| capture | `memgarden/prompts/capture.py`（外部包） | V2 + resident(都经 `memory/capture_prompt_v1.py` 适配壳) |
+| dream | `memgarden/prompts/dream.py`（外部包） | V2 + resident(都经 `memory/dream_prompt_v1.py` 适配壳) |
+| migrate | `memgarden/prompts/migrate.py`（外部包） | **只有 resident**;V2 侧无调用方,老壳 `memory/migrate_prompt_v1.py` 已在 `5e50e79e` 删除 |
 
 `memory/*_prompt_v1.py` 现在**不是纯 re-export**:它们是适配层,补齐称呼规则后转调内核
 (所以壳与内核签名不同,别用 `is` 判定两者等同)。
 
 **改动影响面**:动 capture / dream 的模板 = **同时改变托管用户与自建服务器用户的行为**。
-逐字节 golden 见 `tests/test_memory_garden_capture_golden.py` 与
-`tests/test_memory_garden_dream_migrate_golden.py` —— 有意改动要更新基线并在提交里说明。
+逐字节 golden 见 `tests/test_memgarden_capture_golden.py` 与
+`tests/test_memgarden_dream_migrate_golden.py` —— 有意改动要更新基线并在提交里说明。
 
 ### `occurred_at` 谁在写(这是被错误归因过的字段)
 

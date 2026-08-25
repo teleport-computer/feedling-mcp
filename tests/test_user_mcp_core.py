@@ -433,11 +433,13 @@ def test_probe_detected_transport_persisted(store, monkeypatch):
         lambda url, headers, ca_pem=None, transport_hint="": {
             "ok": True, "tool_count": 1, "tool_names": ["geocode"],
             "transport": "sse"})
+    calls = _spy_wakes(store, monkeypatch)
 
     out, status = mcp_core.test_server(store, "sneaky", caller_api_key="k")
     assert status == 200 and out["ok"] is True
     body, _ = mcp_core.list_servers(store)
     assert body["servers"][0]["transport"] == "sse"   # corrected + persisted
+    assert calls == {"waiters": 1, "wake_bus": 1}
 
 
 def test_probe_persist_does_not_clobber_concurrent_write(store, monkeypatch):
@@ -517,8 +519,8 @@ def _spy_wakes(store, monkeypatch):
         store, "notify_chat_waiters",
         lambda: calls.__setitem__("waiters", calls["waiters"] + 1))
     monkeypatch.setattr(
-        mcp_core.wake_bus, "notify",
-        lambda channel, uid: calls.__setitem__("wake_bus", calls["wake_bus"] + 1))
+        mcp_core.wake_bus, "notify_chat_wake_only",
+        lambda uid: calls.__setitem__("wake_bus", calls["wake_bus"] + 1))
     return calls
 
 

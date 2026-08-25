@@ -166,12 +166,14 @@ def test_dream_context_budget_rejects_oversized_first_card_from_final_prompt(
         user_name=ctx["user_name"],
         cards=ctx["cards"],
         recent_conversations="",
+        locale="zh-Hans",
     )
     empty_prompt = build_dream_prompt(
         ai_name=ctx["ai_name"],
         user_name=ctx["user_name"],
         cards="",
         recent_conversations="",
+        locale="zh-Hans",
     )
 
     assert ctx["card_items"] == []

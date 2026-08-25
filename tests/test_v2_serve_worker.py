@@ -2,6 +2,8 @@
 不起真 worker/真 enclave。"""
 import asyncio
 import json
+import os
+import subprocess
 import sys
 import time
 import types
@@ -456,6 +458,87 @@ def test_mcp_call_timeout_must_leave_watchdog_stall_margin():
                 mcp_call_timeout_sec=unsafe_timeout,
                 turn_stall_timeout_sec=240.0,
             )
+
+
+def test_visual_batch_nominal_retry_envelope_fits_stall_budget():
+    configured_limit = worker._TAIL_IMAGE_LIMIT
+    expected = serve_worker.visual_transport.visual_batch_budget_sec(
+        configured_limit
+    )
+    assert serve_worker._validate_vision_batch_budget_below_stall(
+        configured_image_limit=configured_limit,
+        turn_stall_timeout_sec=240.0,
+    ) == pytest.approx(expected)
+    assert serve_worker._VISION_BATCH_CONFIGURED_NOMINAL_SEC == pytest.approx(
+        expected
+    )
+
+    overhead = serve_worker.visual_transport.VISUAL_BATCH_FIXED_OVERHEAD_SEC
+    with pytest.raises(
+        RuntimeError,
+        match=rf"fixed_overhead={overhead:.3f}s",
+    ):
+        serve_worker._validate_vision_batch_budget_below_stall(
+            configured_image_limit=configured_limit + 1,
+            turn_stall_timeout_sec=240.0,
+        )
+
+
+def test_visual_batch_startup_budget_tracks_nondefault_image_limit():
+    backend = str(Path(__file__).parent.parent / "backend")
+    configured_limit = 1
+    env = os.environ.copy()
+    env["FEEDLING_V2_TAIL_IMAGE_LIMIT"] = str(configured_limit)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                f"import sys; sys.path.insert(0, {backend!r}); "
+                "from model_api_runtime.v2 import serve_worker; "
+                "print(serve_worker._VISION_BATCH_CONFIGURED_NOMINAL_SEC)"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    expected = serve_worker.visual_transport.visual_batch_budget_sec(
+        configured_limit
+    )
+    assert float(result.stdout.strip()) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("raw", ["0", "-1"])
+def test_tail_image_limit_fails_serve_worker_startup_when_nonpositive(raw):
+    backend = str(Path(__file__).parent.parent / "backend")
+    env = os.environ.copy()
+    env["FEEDLING_V2_TAIL_IMAGE_LIMIT"] = raw
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                f"import sys; sys.path.insert(0, {backend!r}); "
+                "from model_api_runtime.v2 import serve_worker"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert (
+        "FEEDLING_V2_TAIL_IMAGE_LIMIT must be a positive integer"
+        in result.stderr
+    )
 
 
 def test_chat_absolute_budget_includes_bounded_mcp_turn_allowance():
@@ -1134,24 +1217,40 @@ def test_read_messages_propagates_strict_database_read_failure(monkeypatch):
 
 
 def test_tail_reader_selects_window_before_enclave_decrypt(monkeypatch):
-    class _Store:
-        chat_messages = [
-            {"id": f"m{i}", "ts": float(i), "role": "user", "body_ct": "x", "K_enclave": "k"}
-            for i in range(1, 501)
-        ]
-
     calls = []
-    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda uid: _Store())
+    selected = [
+        {"id": f"m{i}", "seq": i, "ts": float(i), "role": "user",
+         "body_ct": "x", "K_enclave": "k"}
+        for i in (499, 500)
+    ]
+    monkeypatch.setattr(
+        serve_worker.db,
+        "chat_messages_after_seq",
+        lambda uid, after_seq, *, limit, oldest_first, **kwargs: (
+            calls.append((uid, after_seq, limit, oldest_first)) or selected
+        ),
+    )
+    monkeypatch.setattr(
+        serve_worker.core_store,
+        "get_store",
+        lambda _uid: (_ for _ in ()).throw(
+            AssertionError("tail reader must not load or reload UserStore")
+        ),
+    )
     monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
+    decrypted = []
     monkeypatch.setattr(
         serve_worker.core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda row, *args, **kwargs: calls.append(row["id"]) or row["id"].encode(),
+        lambda row, *args, **kwargs: (
+            decrypted.append(row["id"]) or row["id"].encode()
+        ),
     )
 
     out = serve_worker._read_tail("u", 0.0, 2)
     assert [row["id"] for row in out] == ["m499", "m500"]
-    assert calls == ["m499", "m500"]
+    assert calls == [("u", 0, 2, False)]
+    assert decrypted == ["m499", "m500"]
 
 
 def test_seq_catchup_reader_uses_strict_db_order_and_preserves_seq(monkeypatch):
@@ -1454,7 +1553,7 @@ def test_r2_cleanup_loop_is_a_separate_driver(monkeypatch):
 
 
 class _HealthySupervisor:
-    """D3 (Task 4): `_heartbeat_loop` now derives capacity from
+    """Current pool-health contract: `_heartbeat_loop` derives capacity from
     `supervisor.poll_liveness()` — a fresh/alive child advertises full capacity."""
 
     def poll_liveness(self) -> dict:
@@ -1630,14 +1729,9 @@ def test_on_v2_job_notify_is_a_noop_without_context():
 
 
 # ------------------------------------------------------------------
-# Task 3 (D1): _read_tail — both-roles windowed read (mirrors _read_messages
+# Current context contract: _read_tail is a both-roles windowed read (mirrors _read_messages
 # but doesn't slice at last-assistant and doesn't skip non-user rows).
 # ------------------------------------------------------------------
-
-class _FakeStore:
-    def __init__(self, chat_messages):
-        self.chat_messages = chat_messages
-
 
 def _fake_decrypt(envelope, key, *, purpose, runtime_token=""):
     return f"plain-{envelope['id']}".encode()
@@ -1654,12 +1748,19 @@ def _interleaved_rows():
     ]
 
 
+def _mock_tail_rows(monkeypatch, rows):
+    durable = [{**row, "seq": index} for index, row in enumerate(rows, 1)]
+
+    def read(_uid, _after_seq, *, limit, oldest_first, **_kwargs):
+        return durable[:limit] if oldest_first else durable[-limit:]
+
+    monkeypatch.setattr(serve_worker.db, "chat_messages_after_seq", read)
+
+
 def test_read_tail_returns_both_roles_in_order(monkeypatch):
     from core import enclave as core_enclave
-    from core import store as core_store
 
-    fake_store = _FakeStore(_interleaved_rows())
-    monkeypatch.setattr(core_store, "get_store", lambda uid: fake_store)
+    _mock_tail_rows(monkeypatch, _interleaved_rows())
     monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _fake_decrypt)
 
     out = serve_worker._read_tail("u_tail_test", 0.0, 10)
@@ -1671,10 +1772,8 @@ def test_read_tail_returns_both_roles_in_order(monkeypatch):
 
 def test_read_tail_filters_after_ts(monkeypatch):
     from core import enclave as core_enclave
-    from core import store as core_store
 
-    fake_store = _FakeStore(_interleaved_rows())
-    monkeypatch.setattr(core_store, "get_store", lambda uid: fake_store)
+    _mock_tail_rows(monkeypatch, _interleaved_rows())
     monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _fake_decrypt)
 
     out = serve_worker._read_tail("u_tail_test", 1.5, 10)
@@ -1684,15 +1783,13 @@ def test_read_tail_filters_after_ts(monkeypatch):
 
 def test_read_tail_caps_to_limit(monkeypatch):
     from core import enclave as core_enclave
-    from core import store as core_store
 
     rows = [
         {"id": f"m{i}", "ts": float(i), "role": "user", "content_type": "text",
          "body_ct": f"ct{i}", "K_enclave": f"k{i}"}
         for i in range(1, 6)
     ]
-    fake_store = _FakeStore(rows)
-    monkeypatch.setattr(core_store, "get_store", lambda uid: fake_store)
+    _mock_tail_rows(monkeypatch, rows)
     monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _fake_decrypt)
 
     out = serve_worker._read_tail("u_tail_test", 0.0, 2)

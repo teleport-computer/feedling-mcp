@@ -92,7 +92,7 @@ async def runner_healthz():
 
     try:
         instances = await health_executor.run(
-            db.list_supervisor_instance_heartbeats,
+            db.list_supervisor_instance_heartbeats_for_health,
             timeout=db.HEALTH_DB_ACQUIRE_TIMEOUT_SECONDS,
             statement_timeout_ms=db.HEALTH_DB_STATEMENT_TIMEOUT_MS,
         )

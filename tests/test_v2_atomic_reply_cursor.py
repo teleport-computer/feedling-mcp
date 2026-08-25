@@ -21,12 +21,20 @@ from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import worker
 from provider_types import ToolExchange
 
+from conftest import BACKGROUND_EVENT_TIMEOUT
+
 
 _TEST_PROVIDER_CONFIG = provider_client.ProviderConfig(
     provider="anthropic",
     model="claude-sonnet-4-test",
     api_key="test-key",
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_self_thinking_correction(monkeypatch):
+    """Atomic reply/cursor tests exercise persistence races, not reply format."""
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
 
 
 def _envelope(item_id: str, *, body: str = "ciphertext") -> dict:
@@ -645,7 +653,7 @@ def test_reordered_runtime_blob_mirrors_cannot_restore_an_older_cursor(
         doc = params[2].obj if len(params) >= 3 and hasattr(params[2], "obj") else {}
         if doc.get(cursor.CURSOR_KEY) == 10:
             old_mirror_started.set()
-            assert release_old_mirror.wait(timeout=3)
+            assert release_old_mirror.wait(timeout=BACKGROUND_EVENT_TIMEOUT)
         return original_execute(sql, params)
 
     monkeypatch.setattr(mirror, "execute", delayed_execute)
@@ -658,7 +666,7 @@ def test_reordered_runtime_blob_mirrors_cannot_restore_an_older_cursor(
             cursor.CURSOR_KEY,
             10,
         )
-        assert old_mirror_started.wait(timeout=3)
+        assert old_mirror_started.wait(timeout=BACKGROUND_EVENT_TIMEOUT)
         new = pool.submit(
             db.advance_blob_int_strict,
             uid,

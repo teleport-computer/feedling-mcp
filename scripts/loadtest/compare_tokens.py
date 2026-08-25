@@ -2,8 +2,10 @@
 
 The V1 (resident) runtime drives the LLM via subprocess CLIs (codex/claude),
 which cannot be cleanly pointed at an HTTP mock provider, so a true live A/B
-of V2 vs resident is a MANUAL near-cutover activity (see the D4 plan, Task 5
-runbook). What THIS module provides instead:
+of V2 vs resident is a MANUAL near-cutover activity. The current token
+comparison flow and its scope are documented in ``scripts/loadtest/README.md``
+and ``docs/HOSTED_RUNTIME_V2_TOKEN_BASELINE.md``. What THIS module provides
+instead:
 
   1. ``compare_tokens_per_turn`` — pure comparison math against a supplied
      resident baseline number (produced out-of-band, e.g. from a manual

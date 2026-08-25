@@ -1,5 +1,25 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # T138 还有多少事
 
+> ## ✅ 2026-08-24 T306 存储修订（取代下方 TEE-only 假设）
+>
+> 生产继续以 RDS 为 primary；`trace_events` 因此在 RDS 迁移链 0102 与
+> TEE 迁移链 0033 保持逐字相同的表、分区及索引 DDL。运行时仍只通过
+> `get_pool()` 写当前所选 primary，不做 union read、double-write 或镜像。
+> 北京日分区、30 天保留、默认分区降级报警、无用户外键、销号后按 uid
+> 排障、旧 blob 不回填等合同不变。滚动维护可显式使用
+> `TRACE_EVENTS_MIGRATION_DATABASE_URL`；现有 TEE 工作流继续兼容
+> `TEE_MIGRATION_DATABASE_URL`。生产 RDS 迁移由外部部署触发 Gunicorn master
+> 的 `db.init_schema()`，在 worker fork 前自动执行 `alembic upgrade head`；
+> 无需另跑 0102 专用迁移命令，但合 main、部署与启动后校验仍是本任务之外的
+> external 步骤，不由本任务直接操作。
+>
+> 下方 2026-08-20 决议中的「只落 TEE」「RDS 无双链」仅是当时的上线
+> 假设，已被本修订取代；其他未冲突的安全、保留与清理决议继续有效。
+>
 > ## ✅ 2026-08-20 T184 实施决议（优先于本文历史方案）
 >
 > Seven 已定案：`trace_events` 只落 TEE，保留 30 天，不迁移旧 blob，

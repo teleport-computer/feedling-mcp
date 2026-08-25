@@ -9,6 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import provider_client as pc  # noqa: E402
+from conftest import capture_sleeps  # noqa: E402
 from provider_types import ToolSpec  # noqa: E402
 
 
@@ -20,6 +21,145 @@ class FakeResponse:
 
     def json(self) -> dict:
         return self._body
+
+
+@pytest.mark.parametrize(
+    ("raw", "normalized"),
+    [
+        ("length", "length"),
+        ("MAX_TOKENS", "max_tokens"),
+        ("max-output-tokens", "max_output_tokens"),
+    ],
+)
+def test_token_limit_stop_reason_normalization(raw, normalized):
+    assert pc.normalize_stop_reason(raw) == normalized
+    assert pc.is_token_limit_stop_reason(raw) is True
+
+
+@pytest.mark.parametrize("raw", [None, "", "stop", "content_filter", "max_time"])
+def test_non_token_stop_reason_is_not_rejected(raw):
+    assert pc.is_token_limit_stop_reason(raw) is False
+
+
+def test_reliable_nominal_envelope_uses_live_retry_delay_ceiling():
+    assert pc.reliable_chat_nominal_envelope_sec(
+        request_inactivity_timeout_sec=45.0,
+        max_attempts=2,
+        base_delay_sec=0.5,
+    ) == pytest.approx(90.75)
+
+
+def test_reliable_retry_wrapper_uses_shared_delay_algorithm(monkeypatch):
+    calls = []
+    sleeps = []
+
+    def complete(*_args, **_kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            raise pc.ProviderError("temporary", status_code=502)
+        return {"reply": "ok"}
+
+    monkeypatch.setattr(pc, "chat_completion", complete)
+    monkeypatch.setattr(
+        pc,
+        "_reliable_retry_delay_sec",
+        lambda attempt, **kwargs: sleeps.append((attempt, kwargs)) or 0.125,
+    )
+    capture_sleeps(monkeypatch, pc, sleeps)
+
+    assert pc.reliable_chat_completion(object(), [], max_attempts=2)["reply"] == "ok"
+    assert sleeps[-1] == 0.125
+    assert sleeps[0][0] == 1
+
+
+def test_async_reliable_deadline_cancels_inflight_attempt_without_zombie(
+    monkeypatch,
+):
+    import asyncio
+    import time
+
+    cancelled = []
+    calls = []
+
+    async def slow_call(*_args, **_kwargs):
+        calls.append(True)
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    monkeypatch.setattr(pc, "chat_completion_async", slow_call)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        asyncio.run(
+            pc.reliable_chat_completion_async(
+                object(),
+                [],
+                max_attempts=2,
+                absolute_deadline=time.monotonic() + 0.03,
+                timeout=45.0,
+            )
+        )
+
+    assert calls == [True]
+    assert cancelled == [True]
+    assert time.monotonic() - started < 0.5
+
+
+def test_async_reliable_deadline_clamps_retry_backoff(monkeypatch):
+    import asyncio
+    import time
+
+    calls = []
+
+    async def fail(*_args, **_kwargs):
+        calls.append(True)
+        raise pc.ProviderError("temporary", status_code=502)
+
+    monkeypatch.setattr(pc, "chat_completion_async", fail)
+    monkeypatch.setattr(pc, "_reliable_retry_delay_sec", lambda *_args, **_kwargs: 30.0)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError) as caught:
+        asyncio.run(
+            pc.reliable_chat_completion_async(
+                object(),
+                [],
+                max_attempts=2,
+                absolute_deadline=time.monotonic() + 0.2,
+            )
+        )
+
+    assert calls == [True]
+    assert getattr(caught.value, "feedling_error_class", "") == (
+        "transient_exhausted"
+    )
+    assert time.monotonic() - started < 0.7
+
+
+def test_async_reliable_deadline_clamps_per_attempt_timeout(monkeypatch):
+    import asyncio
+    import time
+
+    timeouts = []
+
+    async def complete(*_args, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        return {"reply": "ok"}
+
+    monkeypatch.setattr(pc, "chat_completion_async", complete)
+    result = asyncio.run(
+        pc.reliable_chat_completion_async(
+            object(),
+            [],
+            max_attempts=1,
+            absolute_deadline=time.monotonic() + 0.5,
+            timeout=45.0,
+        )
+    )
+
+    assert result == {"reply": "ok"}
+    assert 0 < timeouts[0] <= 0.5
 
 
 @pytest.mark.parametrize("status_code", [408, 500])
@@ -446,6 +586,43 @@ def test_provider_specific_named_tool_choice_wire_shapes():
         messages=[{"role": "user", "content": [{"text": "write"}]}], max_tokens=700,
         temperature=None, response_format=None, tools=[tool], tool_choice=choice)
     assert bedrock["toolConfig"]["toolChoice"] == {"tool": {"name": "workspace_write"}}
+
+
+def test_provider_specific_required_tool_choice_wire_shapes():
+    tool = ToolSpec("reply", "reply once", {"type": "object", "properties": {}})
+    messages = [{"role": "user", "content": "choose now"}]
+
+    openai_chat = pc._build_openai_compat_payload(
+        provider="openai", model="gpt-4.1", messages=messages,
+        temperature=None, max_tokens=700, response_format=None,
+        extra_body=None, include_reasoning=False, tools=[tool],
+        tool_choice="required")
+    assert openai_chat["tool_choice"] == "required"
+
+    openai_responses, _url, _headers = pc._build_openai_responses_payload(
+        model="gpt-5", base_url="https://api.openai.com/v1", key="k",
+        messages=messages, max_tokens=700, response_format=None,
+        tools=[tool], tool_choice="required")
+    assert openai_responses["tool_choice"] == "required"
+
+    anthropic, _url, _headers = pc._build_anthropic_payload(
+        model="claude-opus-4-8", base_url="https://api.anthropic.com/v1", key="k",
+        messages=messages, max_tokens=700, temperature=None,
+        response_format=None, tools=[tool], tool_choice="required")
+    assert anthropic["tool_choice"] == {"type": "any"}
+
+    gemini, _url, _headers = pc._build_gemini_payload(
+        model="gemini-2.5-pro",
+        base_url="https://generativelanguage.googleapis.com/v1beta", key="k",
+        messages=messages, max_tokens=700, temperature=None,
+        response_format=None, tools=[tool], tool_choice="required")
+    assert gemini["toolConfig"]["functionCallingConfig"] == {"mode": "ANY"}
+
+    bedrock, _url, _headers = pc._build_bedrock_payload(
+        model="anthropic.claude-3", base_url="https://bedrock.example", key="k",
+        messages=messages, max_tokens=700, temperature=None,
+        response_format=None, tools=[tool], tool_choice="required")
+    assert bedrock["toolConfig"]["toolChoice"] == {"any": {}}
 
 
 def test_parse_openai_compat_body_result_shape():

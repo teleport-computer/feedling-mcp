@@ -55,7 +55,9 @@ def _reset(uid):
 
 
 @pytest.fixture(autouse=True)
-def _clean_agent_jobs_table():
+def _clean_agent_jobs_table(monkeypatch):
+    # MCP round-trip tests script plain replies and isolate tool contracts.
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs")
     yield
@@ -503,6 +505,15 @@ def test_provider_roundtrip_trace_records_cap_closure_without_user_content(monke
     jobs_store.enqueue_job(uid, "chat", trace_id=turn_trace_id)
     job = jobs_store.claim_next_job("w")
     _patch_real_write(monkeypatch)
+    # This test owns the independent hard-max telemetry path. Keep the newer
+    # consecutive tool-only stall threshold from pre-empting round 15; its
+    # default early-closure behavior is covered by
+    # test_chat_turn_always_replies_even_when_model_only_calls_tools.
+    monkeypatch.setattr(
+        worker,
+        "MAX_CONSECUTIVE_TOOL_ONLY_ROUNDS",
+        worker._TURN_MAX_LLM_CALLS,
+    )
 
     dispatched = []
     turn = _FakeMcpTurn(

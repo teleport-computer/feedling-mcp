@@ -22,16 +22,20 @@ import itertools
 import json
 import re
 import sys
+import time
 import uuid
 from pathlib import Path
 
 import httpx
 import pytest
+from psycopg.errors import QueryCanceled
+from psycopg_pool import PoolTimeout
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
 import debug_trace  # noqa: E402
 from accounts import registry  # noqa: E402
+from admin import data_track  # noqa: E402
 from admin import routes_asgi as admin_asgi  # noqa: E402
 from admin import memory_metadata  # noqa: E402
 from asgi import middleware  # noqa: E402
@@ -128,6 +132,51 @@ def _admin(token=ADMIN_TOKEN):
     return {"X-Admin-Token": token}
 
 
+def test_debug_query_timeout_and_pool_busy_have_distinct_503s(env, monkeypatch):
+    assert admin_asgi.DEBUG_TRACE_REQUEST_TIMEOUT_SEC == 3.0
+    calls = []
+
+    def query_cancelled(_query):
+        raise QueryCanceled("debug statement deadline")
+
+    monkeypatch.setattr(admin_asgi.admin_core, "debug_payload", query_cancelled)
+    started = time.monotonic()
+    status, payload = _asgi_json(
+        "GET", "/v1/admin/data-track/debug", headers=_admin()
+    )
+    assert time.monotonic() - started < admin_asgi.DEBUG_TRACE_REQUEST_TIMEOUT_SEC
+    assert (status, payload) == (503, {"error": "debug_query_timeout"})
+
+    def pool_busy(_query):
+        calls.append("busy")
+        raise PoolTimeout("debug pool acquire deadline")
+
+    monkeypatch.setattr(admin_asgi.admin_core, "debug_payload", pool_busy)
+    status, payload = _asgi_json(
+        "GET", "/v1/admin/data-track/debug", headers=_admin()
+    )
+    assert calls == ["busy"]
+    assert (status, payload) == (503, {"error": "service_busy"})
+
+
+def test_debug_route_deadline_abandons_a_slow_sync_worker(env, monkeypatch):
+    monkeypatch.setattr(admin_asgi, "DEBUG_TRACE_REQUEST_TIMEOUT_SEC", 0.05)
+
+    def slow_debug_payload(_query):
+        time.sleep(1.0)
+        return {"too_late": True}
+
+    monkeypatch.setattr(admin_asgi.admin_core, "debug_payload", slow_debug_payload)
+    started = time.monotonic()
+    status, payload = _asgi_json(
+        "GET", "/v1/admin/data-track/debug", headers=_admin()
+    )
+    elapsed = time.monotonic() - started
+
+    assert (status, payload) == (503, {"error": "debug_query_timeout"})
+    assert elapsed < 1.0
+
+
 # --------------------------------------------------------------------------- #
 # normalisers for volatile fields
 # --------------------------------------------------------------------------- #
@@ -222,6 +271,64 @@ def test_memory_truncation_real_action_is_queryable_through_admin_data_track(
         },
     }
     assert secret not in json.dumps(payload, ensure_ascii=False)
+
+
+def test_rds_primary_trace_write_recovers_and_debug_endpoint_returns_200(
+    env,
+    monkeypatch,
+):
+    """The production-selected RDS pool must carry both trace write and read."""
+    assert db.database_schema() == "rds"
+    user_id = "usr_t306_" + uuid.uuid4().hex[:16]
+    event = {
+        "ts": time.time(),
+        "subsystem": "agent",
+        "type": "agent.t306.rds",
+        "status": "ok",
+        "actor": "backend",
+        "trace_id": "trace-t306-rds",
+        "summary": "RDS trace migration regression",
+    }
+    health_names = (
+        "_write_failures_total",
+        "_write_consecutive_failures",
+        "_write_last_failure_at",
+        "_write_last_success_at",
+        "_write_last_error",
+        "_write_last_error_log_at",
+    )
+    with debug_trace._write_failure_lock:
+        health_before = {
+            name: getattr(debug_trace, name) for name in health_names
+        }
+        debug_trace._write_consecutive_failures = 3
+        debug_trace._write_last_error = "undefinedtable"
+
+    monkeypatch.setattr(debug_trace, "is_enabled", lambda _store: True)
+    monkeypatch.setattr(debug_trace, "_record_trace_stats", lambda *_a, **_kw: None)
+    try:
+        debug_trace._append_events(user_id, [event])
+        health = debug_trace.trace_storage_health()
+        assert health["healthy"] is True
+        assert health["consecutive_failures"] == 0
+        assert health["last_error"] == ""
+
+        status, payload = _asgi_json(
+            "GET",
+            "/v1/admin/data-track/debug?user_id=",
+            headers=_admin(),
+        )
+        assert status == 200
+        assert payload["summary"]["events_total"] >= 1
+        assert any(
+            row["trace_id"] == "trace-t306-rds"
+            for row in payload["events"]
+        )
+    finally:
+        db.delete_trace_events_for_user(user_id)
+        with debug_trace._write_failure_lock:
+            for name, value in health_before.items():
+                setattr(debug_trace, name, value)
 
 
 # --------------------------------------------------------------------------- #
@@ -364,9 +471,22 @@ def test_events_day_selector_shape_and_invalid_day(env, monkeypatch):
         return raw
 
     monkeypatch.setattr(db, "admin_events_overview", fake_overview)
+    frozen = {
+        "timezone": "Asia/Shanghai", "closed_through_day": "2035-05-05",
+        "windows": [],
+    }
+    import_overall = {
+        "calculated_at": "2035-05-06T00:00:00+00:00",
+        "coverage": "red", "reason": "test", "windows": [],
+    }
+    monkeypatch.setattr(db, "admin_event_path_rollup_windows", lambda **_kw: frozen)
+    monkeypatch.setattr(db, "admin_history_import_job_rolling_windows",
+                        lambda: import_overall)
     path = "/v1/admin/data-track/events?day=2035-05-06"
     expected = {
         "filters": {"day": "2035-05-06", "timezone": "Asia/Shanghai"},
+        "event_path_master": data_track._event_path_master_payload(frozen),
+        "history_import_overall": import_overall,
         **raw,
     }
     assert _flask_get_json(path, headers=_admin()) == (200, expected)

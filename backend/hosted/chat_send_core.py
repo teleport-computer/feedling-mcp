@@ -309,6 +309,9 @@ def model_api_chat_send_core(
     if has_file:
         extra["file_name"] = file_parse["name"]
         extra["file_mime"] = file_parse["mime"]
+        for key in ("file_display_title", "file_display_subtitle"):
+            if file_parse.get(key):
+                extra[key] = file_parse[key]
         if message:
             cap_env, cap_err = core_envelope._build_shared_envelope_for_store(
                 store, message.encode("utf-8")
@@ -379,9 +382,8 @@ def model_api_chat_send_core(
         )
     else:
         # The assistant reply may have been posted through another worker since
-        # this store's last wake refresh. Reload before the existing response
-        # builder checks for it; this does not notify or re-run the turn.
-        store.reload()
+        # this store's last wake refresh. Apply only its durable change events.
+        store.ensure_chat_fresh(force=True)
     if inserted:
         core_wake_bus.notify("v2_jobs", store.user_id)
     body, status = agent_runtime_cutover.build_processing_response(user_row, driver=driver)
@@ -536,6 +538,9 @@ def _send_resident(
     if has_file:
         extra["file_name"] = file_parse["name"]
         extra["file_mime"] = file_parse["mime"]
+        for key in ("file_display_title", "file_display_subtitle"):
+            if file_parse.get(key):
+                extra[key] = file_parse[key]
         if message:
             cap_env, cap_err = core_envelope._build_shared_envelope_for_store(
                 store, message.encode("utf-8")
@@ -588,8 +593,8 @@ def _send_resident(
         )
     else:
         # The assistant reply may have been posted through another worker since
-        # this store's last wake refresh. Reload before handle_send checks for it.
-        store.reload()
+        # this store's last wake refresh. Apply only its durable change events.
+        store.ensure_chat_fresh(force=True)
 
     body, status = agent_runtime_cutover.handle_send(store, user_row, driver)
     return body, status

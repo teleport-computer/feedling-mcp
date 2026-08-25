@@ -69,3 +69,52 @@ async def test_lifespan_loads_registry_before_wake_bus(monkeypatch):
     )
     assert calls.count("trace_stats") == 1
     assert calls.count("trace_stats_stop") == 1
+
+
+@pytest.mark.asyncio
+async def test_lifespan_starts_trace_monitor_for_rds_primary(monkeypatch):
+    """RDS must not silently lose the selected-primary storage alarm."""
+    calls: list[str] = []
+    monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "rds")
+    monkeypatch.setattr(
+        lifespan_mod,
+        "settings",
+        SimpleNamespace(
+            start_background=True,
+            db_threads=1,
+            http_max_connections=1,
+            http_max_keepalive=1,
+            poller_max_active=1,
+        ),
+    )
+    monkeypatch.setattr(accounts_registry, "load_users", lambda: None)
+    monkeypatch.setattr(threadpool, "configure_thread_limiter", lambda: None)
+    monkeypatch.setattr(core_store, "set_async_wake_hook", lambda _fn: None)
+    monkeypatch.setattr(debug_trace, "start_trace_stats_writer", lambda: None)
+    monkeypatch.setattr(debug_trace, "stop_trace_stats_writer", lambda: None)
+    monkeypatch.setattr(lifespan_mod, "_start_wake_bus", lambda: None)
+    monkeypatch.setattr(lifespan_mod, "_start_ws_leader", lambda: None)
+    monkeypatch.setattr(lifespan_mod, "_start_dau_snapshot_leader", lambda: None)
+    monkeypatch.setattr(
+        lifespan_mod, "_start_runtime_reconciler_leader", lambda: None
+    )
+    monkeypatch.setattr(lifespan_mod, "_start_lane_rollup_leader", lambda: None)
+    monkeypatch.setattr(
+        lifespan_mod,
+        "_start_trace_events_monitor_leader",
+        lambda: calls.append("trace-events-monitor"),
+    )
+
+    from plaintext_shadow import config as plaintext_shadow_config
+    from admin import plaintext_shadow_scheduler
+    from tee_shadow import mirror as tee_mirror
+
+    monkeypatch.setattr(plaintext_shadow_config, "validate_live_startup", lambda: None)
+    monkeypatch.setattr(plaintext_shadow_scheduler, "should_start", lambda: False)
+    monkeypatch.setattr(tee_mirror, "enabled", lambda: False)
+
+    app = SimpleNamespace(state=SimpleNamespace())
+    async with lifespan_mod.lifespan(app):
+        pass
+
+    assert calls == ["trace-events-monitor"]

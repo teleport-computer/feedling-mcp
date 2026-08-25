@@ -628,11 +628,13 @@ def test_replayed_cancel_route_remains_idempotent_and_cleans(monkeypatch):
 
     class Store:
         def __init__(self):
-            self.reloaded = False
+            self.refreshed = False
             self.notified = False
 
-        def reload(self):
-            self.reloaded = True
+        def ensure_chat_fresh(self, *, force=False):
+            assert force is True
+            self.refreshed = True
+            return True
 
         def notify_chat_waiters(self):
             self.notified = True
@@ -663,8 +665,6 @@ def test_replayed_cancel_route_remains_idempotent_and_cleans(monkeypatch):
     monkeypatch.setattr(voice_cleanup, "persist_transcript_card",
                         lambda *a, **k: True)
     monkeypatch.setattr(core_store, "get_store", lambda *_args: store)
-    monkeypatch.setattr(routes_asgi.wake_bus, "notify", lambda *_args: None)
-
     from voice import transcript_store as _ts
 
     monkeypatch.setattr(_ts, "exists", lambda *_args: False)
@@ -687,7 +687,7 @@ def test_replayed_cancel_route_remains_idempotent_and_cleans(monkeypatch):
 
     body = json.loads(response.body)
     assert response.status_code == 200
-    assert store.reloaded is True
+    assert store.refreshed is True
     assert store.notified is True
     # 一句内容都没有的通话也要留下痕迹 —— Seven 2026-08-10 定稿:绝不允许遗漏
     assert archived.get("text"), "空通话没有被归档,这通电话对用户就消失了"
@@ -1193,8 +1193,9 @@ def test_cancel_archives_the_content_the_server_has_instead_of_deleting_it(
                 "duration_sec": 42}
 
     class Store:
-        def reload(self):
-            pass
+        def ensure_chat_fresh(self, *, force=False):
+            assert force is True
+            return True
 
         def notify_chat_waiters(self):
             pass
@@ -1212,7 +1213,6 @@ def test_cancel_archives_the_content_the_server_has_instead_of_deleting_it(
     monkeypatch.setattr(results, "delete_call_state",
                         lambda *_args: {"results_deleted": 0, "streams_deleted": 0})
     monkeypatch.setattr(core_store, "get_store", lambda *_args: Store())
-    monkeypatch.setattr(routes_asgi.wake_bus, "notify", lambda *_args: None)
     # 服务端**有**真实内容,尽管客户端以为这通是空的
     monkeypatch.setattr(
         voice_cleanup, "transcript_turns_from_rows",

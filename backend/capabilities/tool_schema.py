@@ -1,14 +1,14 @@
-"""Tool-schema catalog (Plan C, Task 3 / C1).
+"""Provider-native tool-schema catalog.
 
 Derives one `ToolSpec` per model-facing capability in
 `capabilities.registry.CAPABILITIES` (everything except the internal-only
 `chat_image_read`, `chat_file_read`, and `perception_glance`, which have no
 model-facing schema) plus the runtime-native `task` and `provider_usage` tools.
 The unified tool loop handles these specially instead of dispatching them
-through the capability executor. `provider_usage` is
+through the capability dispatcher. `provider_usage` is
 chat-lane only — it is deliberately absent from `worker._SUBAGENT_ALLOWED_TOOLS`
 (so subagents never see it) and is always withheld from the wake/screen_watch/
-manual_wake lane (see `worker._run_wake`); see Task 5's brief for why it is not
+manual_wake lane (see `worker._run_wake`); it is not
 in `provenance.EXTERNAL_READS` but is in `worker._PRIVATE_READ_TOOLS`.
 
 Each entry in `PARAMS` mirrors exactly the `params` fields each capability module reads —
@@ -22,16 +22,18 @@ from copy import deepcopy
 
 from provider_types import ToolSpec
 from capabilities import registry
+from chat import file_display
 from identity import card_policy
 # Card-writing rules live with the memory package (single source of truth shared
 # with the V1 guidance block); only the op names above are V2-specific.
-from memory_garden.prompts import buckets as prompts_v1
+from memgarden.prompts import buckets as prompts_v1
 from memory.source_policy import MAX_MEMORY_SUPERSEDE_TARGETS
 from perception.agent_fields import (
     AGENT_PERCEPTION_SIGNALS,
     AGENT_SIGNAL_FIELDS,
     FAST_AGENT_PERCEPTION_SIGNALS,
 )
+from perception_kernel import prompts as perception_prompts
 
 STAY_SILENT_TOOL = "stay_silent"
 FILE_REPLY_TOOL = "send_file"
@@ -65,7 +67,7 @@ _IDENTITY_DIMENSION = {
 }
 
 # Keep the provider-visible vocabulary tied to the same projection catalog the
-# capability executor consumes.  A copied enum silently drifts and turns an
+# capability dispatcher consumes.  A copied enum silently drifts and turns an
 # otherwise healthy perception read into ``unknown_signals`` at runtime.
 _PERCEPTION_SIGNAL_ENUM = list(AGENT_PERCEPTION_SIGNALS)
 _PERCEPTION_FIELD_ENUM = sorted({
@@ -423,7 +425,20 @@ PARAMS: dict[str, dict] = {
     # accepts a host filesystem path.
     FILE_REPLY_TOOL: {
         "type": "object",
-        "properties": {"path": _STR, "revision": _INT},
+        "properties": {
+            "path": _STR,
+            "revision": _INT,
+            "title": {"type": "string", "maxLength": file_display.TITLE_MAX_CHARS},
+            "subtitle": {"type": "string", "maxLength": file_display.SUBTITLE_MAX_CHARS},
+            "completion_message": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "The complete user-visible delivery message, written in the "
+                    "language of the user's current request and in your own voice."
+                ),
+            },
+        },
         "required": ["path", "revision"],
     },
     IMAGE_REPLY_TOOL: {
@@ -653,22 +668,21 @@ DESCRIPTIONS: dict[str, str] = {
                             "If signals is omitted, ONLY the fast defaults are returned: "
                             + _PERCEPTION_DEFAULTS + ". Health and activity signals are "
                             "never included by default; request them explicitly by name. "
-                            "The app field is only the latest open/close event observed "
-                            "within 15 minutes; never claim it is the app currently in use. "
+                            + perception_prompts.PERCEPTION_TOOL_NOTES["perception_snapshot"]
+                            + " "
                             "Use perception_recent_apps for an activity trajectory."),
     "perception_recent_apps": (_PERCEPTION_USAGE_GATE
                                + "Read the merged app open/close trajectory, newest first, "
                                "with event, minutes_ago, and category. Use hours to bound "
                                "the time window and check minutes_ago before saying 'just "
-                               "now'. apps=[] means no data; disabled=true means access is "
-                               "off, not that no apps were used."),
+                               "now'. "
+                               + perception_prompts.PERCEPTION_TOOL_NOTES["perception_recent_apps"]),
     "perception_trend": (_PERCEPTION_USAGE_GATE
                          + "Read a numeric-field trend over recent days for one named signal "
                          "from " + _PERCEPTION_DOMAINS + ". Snapshot defaults do not apply: "
                          "always name the signal, and name the field when the signal has "
                          "multiple numeric fields. "
-                         "Interpret the rolling baseline as the usual level and delta as "
-                         "the current change from that baseline; do not conflate them."),
+                         + perception_prompts.PERCEPTION_TOOL_NOTES["perception_trend"]),
     "perception_history": (_PERCEPTION_USAGE_GATE
                            + "Read raw daily historical values over recent days for one named "
                            "signal from " + _PERCEPTION_DOMAINS + ". Snapshot defaults do "
@@ -761,6 +775,14 @@ DESCRIPTIONS: dict[str, str] = {
         "user never needs to know /workspace or provide an internal path. Create "
         "or update the file with workspace_write first, wait for that tool result, "
         "then call send_file in a later round with the exact returned revision. "
+        "For every .io.html Canvas, title, subtitle, and completion_message are "
+        "required. Generate all three in the user's current language, following the "
+        "language used or explicitly requested in the current request; "
+        "subtitle is one concise line describing what the Canvas contains, and "
+        "completion_message is the complete visible chat bubble confirming delivery "
+        "in your own voice. When revising a Canvas, preserve its current "
+        "title and subtitle unless the user asks to change them, and update either "
+        "when the new content makes it useful. "
         "Do not call this merely because a conversational answer contains a list "
         "or structured text. Host filesystem paths and /artifacts, /skills, or "
         "/memory entries are not accepted."
@@ -1013,6 +1035,41 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
         type(args.get("revision")) is not int or args["revision"] <= 0
     ):
         return "send_file revision must be a positive integer"
+    if name == FILE_REPLY_TOOL:
+        path = str(args.get("path") or "").strip()
+        title = args.get("title")
+        subtitle = args.get("subtitle")
+        completion_message = args.get("completion_message")
+        if path.casefold().endswith(".io.html"):
+            if title is None or subtitle is None or completion_message is None:
+                return (
+                    "send_file for .io.html requires title, subtitle, and "
+                    "completion_message"
+                )
+            try:
+                file_display.normalize_text(
+                    title,
+                    field="title",
+                    max_chars=file_display.TITLE_MAX_CHARS,
+                )
+                file_display.normalize_text(
+                    subtitle,
+                    field="subtitle",
+                    max_chars=file_display.SUBTITLE_MAX_CHARS,
+                )
+            except ValueError as exc:
+                return str(exc)
+            if not isinstance(completion_message, str) or not completion_message.strip():
+                return "invalid completion_message"
+        elif (
+            title is not None
+            or subtitle is not None
+            or completion_message is not None
+        ):
+            return (
+                "send_file title, subtitle, and completion_message are only valid "
+                "for Canvas files"
+            )
     if name == IMAGE_REPLY_TOOL and not str(args.get("prompt") or "").strip():
         return "generate_image requires a non-empty prompt"
     if name == MCP_TOOL_SEARCH_TOOL:

@@ -5,8 +5,10 @@
 tee_shadow.reconciler.TABLES。三处互不校验，谁都不是全集，所以 Runtime V2 的
 19 张新表可以一张都没登记而无人发现（2026-07-27 实测 RDS 61 张 / TEE 20 张）。
 
-本模块是那个"全集"。规则：**每一张 RDS 表必须有且只有一条登记**，由
-tests/test_tee_table_registry.py 强制。加了 RDS 表却没登记 lane 的改动合不进去。
+本模块是那个"全集"。规则：**每一张独立 RDS 表必须有且只有一条登记**，由
+tests/test_tee_table_registry.py 强制。声明式分区的物理子表没有独立的数据流语义，
+因此由守卫从 pg_inherits 验证并继承已登记根表的 lane；它们不按日期逐张写进这里。
+加了 RDS 表却没登记 lane、或分区子表找不到已登记根表的改动都合不进去。
 
 lane 语义见下面常量的注释。注册表是纯数据 + 查询 helper，不做任何 I/O——它被
 scheduler、verify、snapshot 三处消费，必须能在任何上下文里安全 import。
@@ -141,6 +143,12 @@ REGISTRY: dict[str, Entry] = {
         "watchdog exact recovery 的低频明文不可变事件（RDS 0097/TEE 0030）；"
         "主库与 agent_jobs 状态转移同事务追加，提交后热镜像，漏镜像由 reconciler "
         "按 job_id+job_attempt_count 扶正；滚动窗口不能由 agent_jobs 当前态反推",
+    ),
+    "contract_rejection_stats": Entry(
+        MIRROR,
+        "error_class 契约拒绝的 content-free 绝对计数（RDS 0098/TEE 0034）；"
+        "每进程×受控三元组单调更新，主写后热镜像，漏镜像由 reconciler 按五列"
+        "复合主键扶正；writer 随发布永久增长，不能进 20 万行硬阀的 SNAPSHOT",
     ),
 
     # ---------------------------------------------------------------- #
@@ -280,6 +288,27 @@ REGISTRY: dict[str, Entry] = {
     # ---------------------------------------------------------------- #
     "alembic_version": Entry(
         SKIP, "RDS 迁移链自己的版本表；TEE 有独立的 alembic_tee_version，两条链互不感知"),
+    "chat_change_state": Entry(
+        SKIP,
+        "当前 primary 的 per-user chat cache 版本控制面；版本只对应本库写序列，"
+        "跨库复制会制造无意义的版本缺口。TEE-primary 后由本库 statement trigger "
+        "实时产生，不搬 RDS 历史",
+        required_in_tee=True,
+    ),
+    "chat_change_events": Entry(
+        SKIP,
+        "当前 primary 的短期 chat cache replay 控制面，只含 message id、不含正文；"
+        "与 chat_change_state 同属本库写序列，TEE-primary 后由本库 trigger 产生，"
+        "不复制 RDS 历史",
+        required_in_tee=True,
+    ),
+    "trace_events": Entry(
+        SKIP,
+        "selected primary 的本地诊断事件；RDS-primary 与 TEE-primary 各自只写本库，"
+        "跨库复制会混合两个主库时期的观测权威并制造重复事件。切主后由新主库本地产生，"
+        "不搬旧主库历史；DEFAULT 与每日物理分区继承本条 lane",
+        required_in_tee=True,
+    ),
     "genesis_import_chunks": Entry(
         SKIP,
         "入住导入的 staging 数据，冻结窗口内处理完即弃，非用户资产；不搬 RDS 历史，"
@@ -350,13 +379,19 @@ _PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "genesis_import_outputs": ("user_id", "job_id", "output_type"),
     "notify_relay_configs": ("auth_token",),
     "notify_relay_logs": ("id",),
-    "lane_daily_rollup": ("user_id", "day", "route", "lane", "enqueue_source"),
+    "lane_daily_rollup": (
+        "user_id", "day", "route", "lane", "enqueue_source",
+        "access_path", "mode_source",
+    ),
     "lane_rollup_watermark": ("route",),
     "chat_daily_rollup": ("user_id", "day"),
     "chat_rollup_watermark": ("scope",),
     "trace_write_stats": ("day", "writer_id", "subsystem", "event_type", "lane"),
     "trace_write_stats_health": ("writer_id",),
     "v2_job_recovery_events": ("job_id", "job_attempt_count"),
+    "contract_rejection_stats": (
+        "contract_domain", "boundary", "fallback", "release_sha", "writer_id"
+    ),
     "chat_messages": ("user_id", "msg_id"),
     "memory_moments": ("user_id", "moment_id"),
     "world_book_entries": ("user_id", "entry_id"),

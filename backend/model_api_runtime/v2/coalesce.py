@@ -146,6 +146,8 @@ def coalesce_pending(
             "vision_route_id",
             "has_file",
             "file_name",
+            "file_display_title",
+            "file_display_subtitle",
             "file_mime",
         ):
             if key in m:

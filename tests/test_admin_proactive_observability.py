@@ -55,15 +55,21 @@ def test_v1_failure_classifier_is_fail_closed_and_keeps_keyspace_separate():
     })
     assert notices_catalog.USER_UNAVAILABLE_V1_REASONS == expected
     for reason in expected:
-        assert dt._v1_proactive_outcome_class("failed", reason) == "user_unavailable"
+        assert notices_catalog.v1_proactive_outcome_class(
+            "failed", reason
+        ) == "user_unavailable"
 
-    assert dt._v1_proactive_outcome_class("failed", "unknown") == "operational_failure"
-    assert dt._v1_proactive_outcome_class("failed", "rate_limited") == "operational_failure"
-    assert dt._v1_proactive_outcome_class(
+    assert notices_catalog.v1_proactive_outcome_class(
+        "failed", "unknown"
+    ) == "operational_failure"
+    assert notices_catalog.v1_proactive_outcome_class(
+        "failed", "rate_limited"
+    ) == "operational_failure"
+    assert notices_catalog.v1_proactive_outcome_class(
         "skipped", "heartbeat_throttled"
     ) == "control"
     # A V2 scoped code is not inferred into the V1 exemption by suffix/shape.
-    assert dt._v1_proactive_outcome_class(
+    assert notices_catalog.v1_proactive_outcome_class(
         "failed", "turn_failed:quota_insufficient"
     ) == "operational_failure"
 

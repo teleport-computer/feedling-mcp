@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
 import object_storage  # noqa: E402
 
-from conftest import seed_user  # noqa: E402
+from conftest import seed_user, capture_sleeps  # noqa: E402
 
 
 class _Streaming:
@@ -153,7 +153,7 @@ def test_get_retries_one_transient_r2_failure(monkeypatch):
         return real_get(user_id, frame_id)
 
     monkeypatch.setattr(object_storage, "get_frame_body_strict", flaky_get)
-    monkeypatch.setattr(db.time, "sleep", lambda _seconds: None)
+    capture_sleeps(monkeypatch, db)
 
     assert db.frame_get(uid, "f1") == env
     assert calls["count"] == 2
@@ -172,7 +172,7 @@ def test_get_can_distinguish_exhausted_r2_failure_from_missing(monkeypatch):
             _ClientError("InternalError")
         ),
     )
-    monkeypatch.setattr(db.time, "sleep", lambda _seconds: None)
+    capture_sleeps(monkeypatch, db)
 
     assert db.frame_get(uid, "f1") is None
     with pytest.raises(db.FrameReadUnavailable):

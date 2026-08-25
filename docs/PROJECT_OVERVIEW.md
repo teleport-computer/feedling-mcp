@@ -1,8 +1,15 @@
+---
+document_lifecycle: current
+canonical_owner: docs/CURRENT_STATE.md
+---
 # Feedling 项目总览（功能 · 架构 · 信任链）
 
 > 面向第一次接触本项目的工程师 / 审计者 / 合作者的导读文档。
 > 首次撰写 2026-06-10，现行运行时状态更新至 2026-07-18。部署相关的具体数值（镜像 tag、compose_hash、CVM ID）
 > 会随发布变化，以 `deploy/DEPLOYMENTS.md` 为准。
+>
+> **当前状态入口**：运行时 policy、默认路径和部署 owner 以
+> [`CURRENT_STATE.md`](CURRENT_STATE.md) 为准。本文保留产品与架构导读，不再复制易漂移的 current policy。
 
 ---
 
@@ -75,7 +82,7 @@ feedling-mcp/
 | 路由 | 谁是大脑 | 形态 |
 |------|---------|------|
 | **Resident Consumer（自建服务器）** | 用户自己的 agent 运行时（VPS / Hermes / Claude Code 等） | 跑 `tools/chat_resident_consumer.py` 长轮询聊天、调用 agent、回写加密回复 |
-| **Model API（托管 Runtime V2）** | 用户提供的模型 API key（OpenAI / Anthropic / Gemini 等） | 后端加密保存 key；独立 runner CVM 上的有界 `serve-worker` 池从 PostgreSQL 领取任务，所有模型共用同一套原生 tool-calling loop。现行状态见 `docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md`。 |
+| **Model API（托管 dual runtime）** | 用户提供的模型 API key（OpenAI / Anthropic / Gemini 等） | 后端加密保存 key；per-user runtime fence 选择 pooled Runtime V2 或 hosted Resident。现行 policy 和 owner 见 `CURRENT_STATE.md`。 |
 | **官方 App 导入** | — | 历史数据迁移入口 |
 
 > **已移除（2026-06-12）**：MCP 直连（Claude.ai / Claude Desktop 经
@@ -102,17 +109,19 @@ git 历史）。
 - 感知信号先过 `PerceptionDifferV2`。连续信号只能 pull；离散事件才可能 wake。
 - 新控制面是 Ambient / Scheduled / Delivery 三层 gate。旧
   `enabled/dnd/user_state/ai_state` 只属于过渡兼容语义，不能继续扩展新 runtime。
-- Hosted Model API 只走 Runtime V2 的统一 tool catalog、wake contract 和
-  differ 语义。用户自行运行的 `/v1/chat/*` resident consumer 是另一个产品
-  接入面，不能被 hosted 账号选择，也不是故障回退。
+- Hosted Model API 的执行体由 per-user runtime fence 选择；Runtime V2 与
+  hosted Resident 的工具和 wake 机制并不相同，坐标见
+  `docs/testing/RUNTIME_MAP.md`。用户自行运行的 `/v1/chat/*` consumer 与 hosted
+  Resident 共用实现，但属于独立接入和部署形态，不能当作 hosted 故障回退。
 
-当前 hosted backend manifest 固定为 `v2_only`；不存在 per-user runtime
-flip、resident supervisor 或 hosted resident rollback。旧 proactive API 如仍
-存在，只能作为兼容输入/投影，不能成为另一套 hosted agent 执行体。
+当前 hosted backend 使用 per-user fence 在 Runtime V2 与 hosted Resident
+之间选择；三套主 compose 的缺省 policy/default 见 `CURRENT_STATE.md`。
+旧 proactive API 如仍存在，只能作为兼容输入/投影，不能自行成为第三套 hosted
+agent 执行体。
 
 ## 4. 系统架构
 
-### 4.1 服务拓扑（main CVM + Runtime V2 runner CVM）
+### 4.1 服务拓扑（main CVM + hosted Resident runner CVM）
 
 ```
             iOS App                Claude.ai / Claude Desktop
@@ -130,21 +139,26 @@ flip、resident supervisor 或 hosted resident rollback。旧 proactive API 如�
    │ :5001 + :9998(WS)  │
    │ ~139 条 /v1/* 路由  │
    │ 唯一数据出入口      │
-   └──────┬──────────┬──┘
-          │          │ 解密请求（可选）
-          ▼          ▼
+   └──────┬──────────┼───────────────┐
+          │          │ 解密请求       │ durable V2 jobs
+          ▼          ▼               ▼
    ┌────────────┐ ┌──────────────────────────┐
    │ PostgreSQL │ │ enclave (enclave_app.py)  │
    │ (外部，存   │ │ :5003 自有 TLS（KMS 派生） │
    │  密文信封)  │ │ /attestation + 解密代理    │
    └────────────┘ └──────────────────────────┘
-                    ▲ iOS 经 dstack-gateway "-5003s." 直连做证书 pin
+          ▲          ▲              ┌──────────────────────┐
+          └──────────┼──────────────│ serve-worker（V2 池） │
+                     │              │ main CVM 内           │
+                     │              └──────────────────────┘
+                     │
+                     ▲ iOS 经 dstack-gateway "-5003s." 直连做证书 pin
 
-        独立 runner CVM（一个或多个）
+        独立 hosted Resident runner CVM（一个或多个）
         ┌──────────────────────────────┐
-        │ serve-worker（有界 V2 池）   │
-        │ PostgreSQL durable jobs      │
-        │ 无 per-user resident 进程    │
+        │ agent-runner supervisor      │
+        │ per-user resident consumer   │
+        │ Postgres lease + 本地 checkpoint │
         └──────────────────────────────┘
 ```
 
@@ -194,8 +208,8 @@ flip、resident supervisor 或 hosted resident rollback。旧 proactive API 如�
 | `provider_client.py` | 模型 API 路由的 LLM provider 客户端（key 校验、chat completion） |
 | `hosted_runtime.py` | 旧接口兼容辅助；不是 hosted 执行路径，也不能启动 resident runtime |
 | `model_api_runtime/v2/` | 托管 Runtime V2：durable queue、统一 provider/tool loop、summary+tail、outbox、prompt-cache telemetry、加密 trajectory、workspace、bounded subagents 与 background lanes |
-| `agent_runtime/` | 仅保留与独立 agent 接入有关的非 supervisor 辅助；旧 hosted per-user CLI supervisor/spawner 已删除 |
-| `memory_garden/scoring/relevance.py` | 记忆检索与相关性打分，组上下文窗口 |
+| `agent_runtime/` | active hosted Resident supervisor/spawner；在独立 runner CVM 中托管 `tools/chat_resident_consumer.py` |
+| `memgarden/scoring/relevance.py` | 记忆检索与相关性打分，组上下文窗口 |
 | `perception/` | 扩展感知：信号目录、权限、快照、wake 触发 |
 | `dstack_tls.py` | dstack-KMS 密钥派生 + 确定性 TLS 证书生成 |
 
@@ -312,28 +326,25 @@ agent 对身体的主动操作（推送、写记忆/身份）走 HTTP API 的
    保存 provider 配置（key 本身也封成 v1 信封存储）。
 2. 可选 `POST /v1/history_import/upload` 导入旧聊天记录，后端用该 provider
    提取记忆、初始化身份卡。
-3. 之后聊天走 `POST /v1/model_api/chat/send`：请求先通过 Runtime V2 的
-   policy、worker 心跳、kill switch 和 admission 检查，再把用户消息加密落库，
-   并与 durable job 原子入队。独立 runner CVM 中的 pooled `serve-worker`
-   （`backend/model_api_runtime/v2/`）通过 `SKIP LOCKED` 领取 job，经 enclave
-   解密本轮所需内容和 BYOK，组装 summary + verbatim tail、相关记忆与工具，
-   进入统一的原生 provider/tool loop；回复、轨迹和 working-memory 内容在持久化
-   前重新加密。终态、deadline、重试和 `last_runtime_error` 均由 durable job
-   状态管理。
+3. 之后聊天走 `POST /v1/model_api/chat/send`：请求读取严格的 per-user runtime
+   control。V2 tuple 经 worker 心跳、kill switch 和 admission 检查后，把用户消息
+   与 durable job 原子入队，由主 CVM 的 pooled `serve-worker` 处理；Resident tuple
+   则检查 supervisor heartbeat，交给独立 runner CVM 托管的 resident consumer。
+   两条路径都 fail closed，不在故障时静默切换执行体。
 
-托管 Model API 路径没有 inline fallback、resident supervisor、per-user CLI
-agent 进程或按用户切换旧 runtime 的机制。`hosted_runtime.py` 只是旧接口兼容
-辅助，`backend/agent_runtime/` 也不是 hosted consumer。用户不需要部署 agent；
-入站消息在 TDX 内的 ASGI handler 封装信封前、enclave 解密时、受信任的
-Runtime V2 worker 组 prompt 时，以及用户授权的模型 provider 处理本轮时会短暂
-成为明文；PostgreSQL 与 backend 持久层只保存密文内容及必要的明文路由元数据。
+托管 Model API 路径由严格的 per-user `(mode, state)` tuple 选择：V2 tuple
+进入 pooled `serve-worker`，Resident tuple 进入独立 runner CVM 的
+`backend/agent_runtime/` supervisor，并托管 per-user consumer。切换中或非法 tuple
+会 fail closed，不做隐式 fallback。用户不需要自行部署 agent；两条 hosted 路径的
+现行接线和信任边界见 `CURRENT_STATE.md`。
 
 ### 5.8 隐私梯度
 
-**A/B 路由明文只出现在 enclave 和用户自己的 agent 侧；C 路由为了零部署，
-由 TDX main CVM 的入站 handler/enclave 与独立 TDX runner CVM 中的 Runtime V2
-worker 短暂处理明文，并把授权后的 prompt 发送给用户选择的模型 provider。
-backend/数据库不持久化对话、summary、轨迹或 workspace 的明文内容。**
+**自建 Resident 的明文出现在 enclave 和用户自己的 agent 侧；托管 Model API
+则按 runtime fence 由 TDX 内的 Runtime V2 worker 或 hosted Resident runner 处理，
+并把授权后的 prompt 发送给用户选择的模型 provider。具体内容 shape 还受环境的
+plaintext-write/TEE gate 影响，不能把单一环境的状态写成全局不变量；现行信任边界
+见 `CURRENT_STATE.md`。**
 
 ## 6. 加密设计（v1 信封）
 
@@ -387,8 +398,9 @@ Alembic 出现之前就已建表的生产 RDS 上。
 ### 7.2 表清单（核心表，来自 `0001_baseline` + `0002_perception_items`）
 
 > 后续 revision 还增加了 perception、Genesis、Runtime V2 durable jobs、
-> summary/metrics/outbox、workspace/sandbox usage 等表。旧 resident supervisor
-> 表只作为迁移兼容数据存在，不代表当前 hosted topology。下表只列核心表。
+> summary/metrics/outbox、workspace/sandbox usage，以及 hosted Resident
+> supervisor/lease 等表。迁移历史本身不证明一条 runtime 活跃或退役；当前 hosted
+> topology 以 `CURRENT_STATE.md` 与部署/进程证据为准。下表只列核心表。
 
 | 表 | 主键 / 索引 | 存什么 |
 |----|------------|--------|
@@ -480,7 +492,7 @@ tab 概念，`below_floor` 的三个 per-tab key 仅为响应形状兼容保留�
 所有变更写入 `user_logs` 的 `memory_changes` 流；批量捕获（聊天历史蒸馏
 成记忆卡）走 `memory_capture_jobs` 流跟踪进度。
 
-**检索（喂给 agent 的上下文怎么选）**：`backend/memory_garden/scoring/relevance.py`，
+**检索（喂给 agent 的上下文怎么选）**：`memgarden/scoring/relevance.py`（外部包），
 纯函数、不依赖向量库——
 
 - resident 路径（宽松）：最多 3 张转折卡（标题前缀 `转折｜`，最新

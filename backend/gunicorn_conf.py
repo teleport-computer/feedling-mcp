@@ -22,9 +22,10 @@ def _worker_count() -> int:
     long-poll waiters in the others, and advisory-lock leader election
     (``core.leader.run_singleton``) so only ONE worker binds the :9998 WS server.
     So raising this is a pure config change. Sizing is bounded by Postgres
-    max_connections: each worker holds ~16 pool + 1 LISTEN + 1 election ≈ 18
-    connections, so -w2 ≈ 36, -w3 ≈ 54 — check the RDS instance's max_connections
-    before raising (test t4g-micro = 79 → -w2 safe / -w3 edge)."""
+    max_connections: each worker holds ~16 ordinary pool + up to 2 health pool +
+    1 LISTEN + 1 election ≈ 20 connections, so -w2 ≈ 40, -w3 ≈ 60 — check the
+    RDS instance's max_connections before raising (test t4g-micro = 79 → -w2
+    safe / -w3 edge)."""
     # `or "1"` guards the empty string: CI passes `-e FEEDLING_BACKEND_WORKERS=$VAR`
     # and an unset GitHub var expands to "", so the key is SET-but-empty — int("")
     # would crash gunicorn config load and the backend would fail to boot.

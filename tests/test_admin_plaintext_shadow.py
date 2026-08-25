@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from psycopg.types.json import Jsonb
 
+import alembic_tee
 import db
 from admin import plaintext_shadow
 from plaintext_shadow.config import TargetPolicy
@@ -75,6 +76,22 @@ def test_preflight_red_report_returns_nonzero(monkeypatch):
         lambda: {"ok": False, "failure_slugs": ["target_tls_required"]},
     )
     assert plaintext_shadow.main(["preflight"]) == 2
+
+
+@pytest.mark.parametrize("heads", [(), ("0035_a", "0036_b")])
+def test_preflight_reports_invalid_application_migration_chain(
+    monkeypatch, capsys, heads
+):
+    monkeypatch.setattr(alembic_tee, "current_heads", lambda: heads)
+
+    rc = plaintext_shadow.main(["preflight"])
+
+    assert rc == 2
+    assert json.loads(capsys.readouterr().out) == {
+        "failure_slugs": ["application_migration_chain_invalid"],
+        "ok": False,
+        "schema_head": None,
+    }
 
 
 def test_install_and_remove_trigger_commands_dispatch(monkeypatch):
@@ -277,7 +294,7 @@ def test_restore_claims_normalize_malformed_timestamps_to_runtime_error(bad_time
         "expires_at": "2026-08-21T00:00:00Z",
         "ha_verified": True,
         "restored_at": bad_time,
-        "schema_head": plaintext_shadow._SCHEMA_HEAD,
+        "schema_head": alembic_tee.current_head(),
         "source_backup_at": "2026-08-19T00:00:00Z",
         "target_capacity_bytes": 1,
         "target_connection_limit": 1,
@@ -318,7 +335,7 @@ def _signed_restore_claims(monkeypatch):
         "expires_at": (now + timedelta(hours=1)).isoformat(),
         "ha_verified": True,
         "restored_at": (now - timedelta(minutes=1)).isoformat(),
-        "schema_head": plaintext_shadow._SCHEMA_HEAD,
+        "schema_head": alembic_tee.current_head(),
         "source_backup_at": (now - timedelta(minutes=2)).isoformat(),
         "target_capacity_bytes": 1_000_000_000,
         "target_connection_limit": connection_limit,

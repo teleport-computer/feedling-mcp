@@ -101,3 +101,17 @@ Pillow>=11,<13
 # 4.5–6.x 稳定的 async API（redis.asyncio.Redis 的 ssl_ca_certs/max_connections
 # 等 + aclose/close 兜底），故 range 放宽。
 redis>=5,<7
+
+# 记忆的编辑判断内核 —— 从本仓库提取出去的独立库（Apache-2.0，公开仓库）。
+#
+# 为什么走 GitHub Release 的 wheel URL 而不是 PyPI：
+#   1. PyPI 上 memory-garden 已被一个同领域的项目占用，我们叫 memgarden；
+#      发 PyPI 是后续的事，Release 先跑通接入。
+#   2. 本镜像用 `pip install --require-hashes`，每个依赖都必须有 sha256。
+#      git+ 依赖给不出稳定 wheel 哈希，Release 上的固定 wheel 可以 —— 这也是
+#      compose 哈希上链所要求的「构建可复现」。
+#
+# 升级 = 换 URL 里的版本号 + 重新 `uv pip compile --generate-hashes`。
+# 别写成 @main 或分支名：那样构建就不可复现了，整条证明链失效。
+memgarden @ https://github.com/teleport-computer/memgarden/releases/download/v0.2.0/memgarden-0.2.0-py3-none-any.whl
+agent-protocol-core @ https://github.com/teleport-computer/memgarden/releases/download/v0.2.0/agent_protocol_core-0.2.0-py3-none-any.whl

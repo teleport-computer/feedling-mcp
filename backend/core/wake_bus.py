@@ -23,7 +23,7 @@ wake/reload path.
 from __future__ import annotations
 
 import json
-import logging
+import hashlib
 import os
 import threading
 import time
@@ -32,8 +32,12 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
 import db
+from core.telemetry_logging import stderr_info_logger
 
-log = logging.getLogger("feedling.wake_bus")
+log = stderr_info_logger("feedling.wake_bus")
+# Backend startup intentionally does not raise the root logger to INFO because
+# many third-party loggers are noisy.  This module's fixed-enum, content-free
+# chat-sync records are rollout telemetry, so emit them directly to stderr.
 
 # Single Postgres NOTIFY channel; the JSON payload carries the logical channel.
 PG_CHANNEL = "feedling_wake"
@@ -44,7 +48,14 @@ WORKER_ID = uuid.uuid4().hex
 
 # Logical channels whose target is a per-user cached store: a cross-worker
 # notify refreshes that store in place (which also wakes its long-poll waiters).
-_STORE_CHANNELS = frozenset({"chat", "proactive", "frames", "blob"})
+_TARGETED_STORE_CHANNELS = frozenset({"proactive", "frames", "blob"})
+_CHAT_SYNC_MODES = frozenset({"legacy", "observe", "incremental"})
+_CHAT_SYNC_RESULTS = frozenset({"applied", "skipped", "error", "mismatch"})
+_CHAT_SYNC_REASONS = frozenset({
+    "legacy_payload", "legacy_mode", "already_fresh", "event_sync",
+    "observe_sample", "observe_control", "sync_failed", "fingerprint_diff",
+    "wake_only",
+})
 
 # Extra per-channel handlers injected by the assembly layer for targets core may
 # not import upward (channel -> [fn(user_id)]). E.g. asgi/lifespan.py wires the
@@ -76,6 +87,156 @@ if hasattr(os, "register_at_fork"):
 
 def _enabled() -> bool:
     return os.environ.get("FEEDLING_WAKE_BUS_ENABLED", "1") == "1"
+
+
+def _chat_sync_mode() -> str:
+    mode = os.environ.get("FEEDLING_CHAT_SYNC_MODE", "legacy").strip().lower()
+    if mode not in _CHAT_SYNC_MODES:
+        raise RuntimeError(
+            "FEEDLING_CHAT_SYNC_MODE must be legacy, observe, or incremental"
+        )
+    return mode
+
+
+def _observe_chat_user(user_id: str) -> bool:
+    digest = hashlib.sha256(str(user_id).encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big") % 100 == 0
+
+
+def _chat_sync_telemetry(
+    *, user_id: str, mode: str, result: str, reason: str, hot_rows: int
+) -> None:
+    """Emit content-free fixed-enum sync telemetry."""
+    if mode not in _CHAT_SYNC_MODES:
+        raise ValueError("invalid chat sync telemetry mode")
+    if result not in _CHAT_SYNC_RESULTS:
+        raise ValueError("invalid chat sync telemetry result")
+    if reason not in _CHAT_SYNC_REASONS:
+        raise ValueError("invalid chat sync telemetry reason")
+    user_hash = hashlib.sha256(str(user_id).encode("utf-8")).hexdigest()[:16]
+    log.info(
+        "chat_sync mode=%s result=%s reason=%s user_hash=%s hot_rows=%d",
+        mode, result, reason, user_hash, max(0, int(hot_rows)),
+    )
+
+
+def _chat_cache_fingerprint(store) -> str:
+    with store.chat_lock:
+        identity = [
+            (str(row.get("id") or ""), int(row.get("seq") or 0))
+            for row in store.chat_messages
+        ]
+    encoded = json.dumps(identity, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _reload_legacy_chat(store) -> None:
+    store.reload_chat_hot_strict()
+    store.notify_chat_waiters()
+
+
+def _dispatch_chat(data: dict, user_id: str) -> None:
+    from core import store as core_store
+
+    is_wake_only = "w" in data
+    is_v2 = "v" in data
+    target_version = None
+    if is_wake_only:
+        if (
+            set(data) != {"c", "u", "o", "w"}
+            or type(data.get("w")) is not int
+            or data.get("w") != 1
+        ):
+            return
+        origin = data.get("o")
+        if not isinstance(origin, str) or not origin or len(origin) > 128:
+            return
+    elif is_v2:
+        if set(data) != {"v", "c", "u", "r"} or data.get("v") != 2:
+            return
+        raw_version = data.get("r")
+        if type(raw_version) is not int or raw_version <= 0:
+            return
+        target_version = int(raw_version)
+    else:
+        if set(data) != {"u", "c", "o"}:
+            return
+        origin = data.get("o")
+        if not isinstance(origin, str) or not origin or len(origin) > 128:
+            return
+
+    store = core_store._cached_store(user_id)
+    if store is None:
+        return
+    mode = _chat_sync_mode()
+    if is_wake_only:
+        store.notify_chat_waiters()
+        _chat_sync_telemetry(
+            user_id=user_id, mode=mode, result="applied",
+            reason="wake_only", hot_rows=len(store.chat_messages),
+        )
+        return
+    if not is_v2 and mode == "incremental":
+        ok = store.ensure_chat_fresh(force=True)
+        store.notify_chat_waiters()
+        _chat_sync_telemetry(
+            user_id=user_id, mode=mode, result="applied" if ok else "error",
+            reason="legacy_payload" if ok else "sync_failed",
+            hot_rows=len(store.chat_messages),
+        )
+        return
+    if not is_v2 or mode == "legacy":
+        _reload_legacy_chat(store)
+        _chat_sync_telemetry(
+            user_id=user_id, mode=mode, result="applied",
+            reason="legacy_payload" if not is_v2 else "legacy_mode",
+            hot_rows=len(store.chat_messages),
+        )
+        return
+    if mode == "incremental":
+        if int(getattr(store, "chat_version", 0)) >= target_version:
+            _chat_sync_telemetry(
+                user_id=user_id, mode=mode, result="skipped",
+                reason="already_fresh", hot_rows=len(store.chat_messages),
+            )
+            return
+        ok = store.ensure_chat_fresh(force=True, target_version=target_version)
+        _chat_sync_telemetry(
+            user_id=user_id, mode=mode, result="applied" if ok else "error",
+            reason="event_sync" if ok else "sync_failed",
+            hot_rows=len(store.chat_messages),
+        )
+        return
+
+    # observe: production behavior stays legacy. For a deterministic 1% sample,
+    # apply incremental first, hash only id+seq, then replace with the legacy
+    # snapshot and compare. Fixed slugs avoid leaking user or message metadata.
+    incremental_hash = None
+    if _observe_chat_user(user_id):
+        if store.ensure_chat_fresh(force=True, target_version=target_version):
+            incremental_hash = _chat_cache_fingerprint(store)
+        else:
+            log.warning("chat_sync_observe_incremental_error")
+            _chat_sync_telemetry(
+                user_id=user_id, mode=mode, result="error",
+                reason="sync_failed", hot_rows=len(store.chat_messages),
+            )
+    _reload_legacy_chat(store)
+    if (
+        incremental_hash is not None
+        and incremental_hash != _chat_cache_fingerprint(store)
+    ):
+        log.warning("chat_sync_observe_mismatch")
+        _chat_sync_telemetry(
+            user_id=user_id, mode=mode, result="mismatch",
+            reason="fingerprint_diff", hot_rows=len(store.chat_messages),
+        )
+    else:
+        _chat_sync_telemetry(
+            user_id=user_id, mode=mode, result="applied",
+            reason=("observe_sample" if incremental_hash else "observe_control"),
+            hot_rows=len(store.chat_messages),
+        )
 
 
 def register_handler(channel: str, fn: Callable[[str], None]) -> None:
@@ -171,6 +332,17 @@ def notify(channel: str, user_id: str = "") -> None:
     db.pg_notify(PG_CHANNEL, payload)
 
 
+def notify_chat_wake_only(user_id: str) -> None:
+    """Wake remote chat pollers without claiming a chat-row mutation."""
+    if not _enabled():
+        return
+    payload = json.dumps(
+        {"c": "chat", "u": str(user_id), "o": WORKER_ID, "w": 1},
+        separators=(",", ":"),
+    )
+    db.pg_notify(PG_CHANNEL, payload)
+
+
 def _dispatch(payload: str) -> None:
     try:
         data = json.loads(payload)
@@ -202,7 +374,12 @@ def _dispatch(payload: str) -> None:
                 )
         return
     user_id = data.get("u") or ""
-    if channel in _STORE_CHANNELS and user_id:
+    if channel == "chat" and user_id:
+        try:
+            _dispatch_chat(data, user_id)
+        except Exception:
+            log.exception("[wake_bus] chat dispatch failed")
+    elif channel in _TARGETED_STORE_CHANNELS and user_id:
         # Lazy import breaks the core.store <-> core.wake_bus cycle (store
         # imports wake_bus at module load to emit notifies). _evict_store
         # reloads the cached store in place and wakes its local waiters, so a
@@ -210,7 +387,7 @@ def _dispatch(payload: str) -> None:
         from core import store as core_store
 
         try:
-            core_store._evict_store(user_id)
+            core_store._refresh_store_channel(user_id, channel)
         except Exception:
             log.exception("[wake_bus] evict failed for user=%s", user_id)
     for fn in _extra_handlers.get(channel, ()):  # injected upward targets
@@ -277,6 +454,7 @@ def start_listener() -> None:
     Idempotent. Called from asgi/lifespan.py at startup (which also wires
     screen_ws.start via the WS leader election)."""
     global _listener_started
+    _chat_sync_mode()
     if not _enabled():
         return
     with _listener_lock:

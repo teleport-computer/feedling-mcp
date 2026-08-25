@@ -1,10 +1,11 @@
-"""V2 worker 进程入口 + 生产依赖装配（子项目 B，Task 8 扩到全流程）。
+"""V2 worker process entrypoint and production dependency assembly.
 
-部署目标（已钉死，见 spec §2.1）：这是 backend 代码的 worker 镜像入口，运行在独立
-runner CVM 的唯一 `serve-worker` service；hosted resident supervisor 已退役。
-Genesis 已在 2026-07-10 rehome 到本进程的 dedicated thread。
-它**不是**独立 repo，也**不**贴着主 app CVM 的 FastAPI backend 跑。HTTP 化会把
-backend→enclave→backend 的 reentrant 502 根因请回来；贴主 app 跑则与 backend 争 CPU/内存。
+Current deployment facts belong to ``docs/CURRENT_STATE.md``. This backend-image
+entrypoint runs the pooled Runtime V2 worker on the main CVM; hosted Resident
+continues separately on its agent-runner CVM under the dual-runtime decision.
+Genesis runs on this process's dedicated thread. This is not a separate repo;
+the worker reaches the enclave through the configured runtime path rather than
+introducing an extra HTTP service boundary.
 
 装配层：这里（且只有这里）可同时 import hosted/core/model_api_runtime，把
 需要上层的实现注入进 worker.TurnDeps，令 worker.py 保持不逆依赖（CONTRIBUTING §2）。
@@ -68,6 +69,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from accounts import registry as accounts_registry  # noqa: E402
+from chat import file_display as chat_file_display  # noqa: E402
 from admin import admin_core
 from capabilities import registry as cap_registry
 from capabilities import identity as cap_identity
@@ -81,6 +83,7 @@ from hosted import config_store as hosted_config_store
 from hosted import mcp_core
 from hosted import mcp_status
 from hosted import mcp_tools
+from hosted import visual_transport
 from hosted import vision_observer
 from identity import card_policy
 from memory import memory_core
@@ -566,6 +569,14 @@ def _file_row(m, *, mid, ts, role, token) -> dict:
         token=token,
         fallback=f"[file: {name}]",
     )
+    display_title = str(m.get("file_display_title") or "").strip()
+    display_subtitle = str(m.get("file_display_subtitle") or "").strip()
+    if display_title or display_subtitle:
+        text += (
+            "\n[Canvas display metadata — preserve unless the user asks to change it:"
+            f" title={json.dumps(display_title, ensure_ascii=False)},"
+            f" subtitle={json.dumps(display_subtitle, ensure_ascii=False)}]"
+        )
     return {
         "id": mid,
         "ts": ts,
@@ -573,6 +584,8 @@ def _file_row(m, *, mid, ts, role, token) -> dict:
         "content": text,
         "has_file": True,
         "file_name": name,
+        "file_display_title": m.get("file_display_title"),
+        "file_display_subtitle": m.get("file_display_subtitle"),
         "file_mime": m.get("file_mime") or "application/octet-stream",
     }
 
@@ -692,11 +705,8 @@ def _send_reply_push(
     compose 内网交过去（与 V1 consumer 走 HTTP 传 push_body 是同一个姿态）。
     完全 best-effort：任何异常都在这里吞掉并记日志，绝不冒到回合上。
 
-    ``lane`` 是本次唤醒的 V2 lane 名（chat lane 传空字符串），backend 用它推
-    manual（``lane == "manual_wake"``）与真实 wake source，对齐 V1
-    `_proactive_delivery_decision_v2` 从 job 推 manual 的做法 —— 缺这个字段会让
-    manual wake 被当成非 manual，关了 reminders_delivery 的用户收不到手动唤醒
-    推送（v2-push-parity 分支审查 Minor #1）。
+    ``lane`` 是本次唤醒的 V2 lane 名（chat lane 传空字符串），保留真实来源供
+    backend 做投递决策和诊断。系统通知关闭时所有 lane 都只写聊天，不发送推送。
     """
     api_url = os.environ.get("FEEDLING_API_URL", "").strip()
     if not api_url:
@@ -858,11 +868,22 @@ def _resolve_provider(user_id: str):
         b"feedling:v2:prompt-cache-route:v1\0" + scope_bytes,
         hashlib.sha256,
     ).hexdigest()
+    version = db.model_api_active_route_version(user_id)
+    exact_version = ""
+    if (
+        isinstance(version, dict)
+        and str(version.get("route_id") or "") == runtime.hosted_route_id
+        and str(version.get("provider") or "") == runtime.provider
+        and str(version.get("model") or "") == runtime.model
+        and str(version.get("base_url") or "") == runtime.base_url
+    ):
+        exact_version = str(version.get("updated_at_token") or "")
     return replace(
         runtime,
         prompt_cache_key=f"feedling-v2-{cache_key}",
         prompt_cache_route_fingerprint=f"feedling-v2-route-{route_fingerprint}",
         capture_attempt_trace=True,
+        hosted_route_updated_at=exact_version,
     ), {}
 
 
@@ -1132,34 +1153,20 @@ def _read_tail_window(
 
     Skip 规则与 `_read_messages` 一致：无 `body_ct` 或 `K_enclave is None` 的合成/
     本地-only 行跳过；`content_type == "image"` 走 "[image]" 简写，不经 enclave。"""
-    store = core_store.get_store(user_id)
-    reload_chat = getattr(store, "reload_chat_strict", None)
-    if callable(reload_chat):
-        rows = reload_chat()
-    else:  # lightweight test doubles retain the older reload seam
-        reload_store = getattr(store, "reload", None)
-        if callable(reload_store):
-            reload_store()
-        rows = list(getattr(store, "chat_messages", []) or [])
-    rows = sorted(rows, key=lambda m: m.get("ts") or 0.0)
     if limit <= 0:
         return []
-    candidates = [m for m in rows if m.get("ts") is not None and m.get("ts") > after_ts]
-    if exclude_synthetic_sources:
-        # Summary-coverage callers only: `verify_ping`/`resident_maintenance`
-        # rows are deleted once their probe completes, so folding one into an
-        # IMMUTABLE leaf freezes a coverage claim that the row itself will not
-        # honour — validate_canonical_frontier then fails every later turn.
-        # The seq-based reader already excludes them; this ts-based sibling
-        # kept the hole open for whichever caller still reaches it.
-        candidates = [
-            m for m in candidates
-            if str(m.get("source") or "")
-            not in ("verify_ping", "resident_maintenance")
-        ]
-    # Bound enclave work before decrypting, so every selected caption can be
-    # preserved without an independent cap that silently changes row content.
-    rows = candidates[:limit] if oldest_first else candidates[-limit:]
+    rows = db.chat_messages_after_seq(
+        user_id,
+        0,
+        limit=int(limit),
+        oldest_first=oldest_first,
+        exclude_synthetic_sources=exclude_synthetic_sources,
+    )
+    rows = [
+        row
+        for row in rows
+        if row.get("ts") is not None and float(row["ts"]) > float(after_ts)
+    ]
     return _decrypt_chat_rows(user_id, rows, user_only=False)
 
 
@@ -1179,7 +1186,7 @@ def _scrub_leaked_thinking_rows(rows: list[dict]) -> list[dict]:
     保留文字，格式没了、内容还在。行的 id/ts/seq 一律原样保留，compaction /
     capture 的水位连续性不受影响。
     """
-    from core import self_thinking as _st
+    from agent_protocol_core import self_thinking as _st
 
     if not _st.gate_enabled():
         return rows
@@ -1866,6 +1873,9 @@ def _wake_decision_for_user(user_id: str, trigger: str = "heartbeat") -> dict:
     return {
         "should_wake": bool(d.get("should_wake_agent")),
         "wake_interval_sec": int(d.get("wake_interval_sec") or 7200),
+        "decision_at": (
+            float(d["ts"]) if d.get("ts") is not None else time.time()
+        ),
         "block_reason": str(d.get("reason") or ""),
     }
 
@@ -2196,14 +2206,120 @@ def _observe_photo(
     )
 
 
+_VISION_BATCH_BUDGET_POLICY_VERSION = "derived-v2"
+
+
+def _vision_batch_candidate_budget_sec(image_count: int) -> float:
+    return visual_transport.visual_batch_budget_sec(image_count)
+
+
+def _emit_vision_batch_budget_evaluation(
+    user_id: str,
+    *,
+    actual_image_count: int,
+    started_at: float,
+    succeeded: bool,
+) -> None:
+    actual_dur_ms = max(0.0, (time.monotonic() - started_at) * 1000.0)
+    enforced_budget_ms = (
+        _vision_batch_candidate_budget_sec(actual_image_count) * 1000.0
+    )
+    deadline_reached = actual_dur_ms >= enforced_budget_ms
+    try:
+        _emit_v2_debug_trace_for_user(
+            user_id,
+            "vision.batch.budget.evaluated",
+            status="ok",
+            summary="enforced_deadline_evaluated",
+            detail={
+                "policy_version": _VISION_BATCH_BUDGET_POLICY_VERSION,
+                "actual_image_count": actual_image_count,
+                "configured_image_limit": v2_worker._TAIL_IMAGE_LIMIT,
+                "enforced_budget_ms": enforced_budget_ms,
+                "fixed_overhead_ms": (
+                    visual_transport.VISUAL_BATCH_FIXED_OVERHEAD_SEC * 1000.0
+                ),
+                "deadline_reached": deadline_reached,
+                "completed_successfully": succeeded,
+                "actual_dur_ms": actual_dur_ms,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — telemetry never changes behavior
+        log.warning(
+            "[v2.vision] batch budget trace failed user=%s error=%s",
+            str(user_id)[:8],
+            type(exc).__name__,
+        )
+
+
 def _read_vision_observations(
     user_id: str,
     targets: list[dict],
-) -> dict[str, str]:
-    """Send pinned V2 images to their observer and return text-only data.
+    *,
+    main_provider_config: provider_client.ProviderConfig | None = None,
+) -> v2_worker.VisionObservationBatch:
+    """Observe a batch under one absolute deadline and privacy fence."""
+    actual_image_count = sum(isinstance(item, dict) for item in targets)
+    started_at = time.monotonic()
+    absolute_deadline = started_at + _vision_batch_candidate_budget_sec(
+        actual_image_count
+    )
+    succeeded = False
+    try:
+        batch = _read_vision_observations_with_deadline(
+            user_id,
+            targets,
+            absolute_deadline=absolute_deadline,
+            main_provider_config=main_provider_config,
+        )
+        succeeded = all(
+            bool(outcome.observation) for outcome in batch.outcomes.values()
+        )
+        return batch
+    finally:
+        _emit_vision_batch_budget_evaluation(
+            user_id,
+            actual_image_count=actual_image_count,
+            started_at=started_at,
+            succeeded=succeeded,
+        )
+
+
+def _main_vision_route_is_verified(
+    user_id: str,
+    config: provider_client.ProviderConfig | None,
+) -> bool:
+    """Require a current ``ok`` verdict for this exact resolved main route."""
+    if config is None:
+        return False
+    route_id = str(getattr(config, "hosted_route_id", "") or "")
+    updated_at = str(getattr(config, "hosted_route_updated_at", "") or "")
+    configured_status = str(
+        getattr(config, "hosted_vision_test_status", "") or ""
+    ).strip().lower()
+    if not route_id or not updated_at or configured_status != "ok":
+        return False
+    verdict = db.model_api_active_route_vision_verdict(user_id)
+    return bool(
+        isinstance(verdict, dict)
+        and str(verdict.get("id") or "") == route_id
+        and str(verdict.get("updated_at") or "") == updated_at
+        and str(verdict.get("vision_test_status") or "").strip().lower() == "ok"
+    )
+
+
+def _read_vision_observations_with_deadline(
+    user_id: str,
+    targets: list[dict],
+    *,
+    absolute_deadline: float,
+    main_provider_config: provider_client.ProviderConfig | None,
+) -> v2_worker.VisionObservationBatch:
+    """Send pinned images to dedicated routes and retain per-target results.
 
     The route id was stored with the accepted chat row. Missing/deleted/stale
-    routes fail the turn; raw pixels never fall through to the main provider.
+    routes remain hard failures. Only the worker's explicit fallback policy may
+    authorize a second raw-pixel read for a provider failure.
     """
     normalized = [
         {
@@ -2221,7 +2337,7 @@ def _read_vision_observations(
     images = _read_images(user_id, [item["message_id"] for item in normalized])
     token = _mint_runtime_token(user_id)
     configs: dict[str, provider_client.ProviderConfig] = {}
-    observations: dict[str, str] = {}
+    outcomes: dict[str, v2_worker.VisionObservationOutcome] = {}
     for item in normalized:
         message_id = item["message_id"]
         route_id = item["route_id"]
@@ -2269,10 +2385,11 @@ def _read_vision_observations(
             detail={"provider": provider, "model": model},
         )
         try:
-            observations[message_id] = vision_observer.observe_image(
+            observation = vision_observer.observe_image(
                 config,
                 image_mime=mime,
                 image_b64=image_b64,
+                absolute_deadline=absolute_deadline,
             )
         except vision_observer.VisionObserverError as failure:
             # Fixed route metadata, never inferred from model prose. The worker
@@ -2289,6 +2406,7 @@ def _read_vision_observations(
                     "error_class": failure.error_code,
                     "status_code": failure.status_code,
                     "retryable": failure.retryable,
+                    **({"reason": failure.reason} if failure.reason else {}),
                 },
                 dur_ms=(time.monotonic() - started_at) * 1000,
             )
@@ -2304,7 +2422,15 @@ def _read_vision_observations(
                 failure.status_code,
                 failure.upstream_detail,
             )
-            raise
+            outcomes[message_id] = v2_worker.VisionObservationOutcome(
+                error_code=failure.error_code,
+                reason=failure.reason,
+                model=model,
+                provider=provider,
+                status_code=failure.status_code,
+                upstream_detail=failure.upstream_detail,
+            )
+            continue
         emit_provider_trace(
             "vision.provider.completed",
             status="ok",
@@ -2312,7 +2438,18 @@ def _read_vision_observations(
             detail={"provider": provider, "model": model},
             dur_ms=(time.monotonic() - started_at) * 1000,
         )
-    return observations
+        outcomes[message_id] = v2_worker.VisionObservationOutcome(
+            observation=str(observation or "").strip(),
+            model=model,
+            provider=provider,
+        )
+    return v2_worker.VisionObservationBatch(
+        outcomes=outcomes,
+        absolute_deadline=float(absolute_deadline),
+        main_vision_verified=_main_vision_route_is_verified(
+            user_id, main_provider_config
+        ),
+    )
 
 
 def _read_files(user_id: str, message_ids: list[str]) -> dict[str, dict]:
@@ -3163,7 +3300,7 @@ def _last_user_msg_ts(user_id: str) -> float | None:
 
 
 def _tick_screen_watch_for_user(user_id: str) -> int:
-    """屏幕监看生产者（D-screen_watch Task 4）：替掉 resident 的 per-user 120s 循环。
+    """Screen-watch producer replacing the Resident per-user 120s loop.
 
     每 scheduler tick 对一个到期用户跑一遍**纯** gate `screen_watch.should_watch`，命中才
     再问只读 proactive oracle `_wake_decision_for_user`（未激活/Ambient-off/免打扰闸 + 零
@@ -3301,12 +3438,18 @@ def _reply_message_fields(payload: dict) -> tuple[str, dict]:
             "image_mime": mime_type,
             "image_byte_count": byte_count,
         }
-    if content_type != "file" or set(raw) != {
+    required_file_fields = {
         "content_type",
         "file_name",
         "file_mime",
         "file_byte_count",
-    }:
+    }
+    optional_file_fields = {"file_display_title", "file_display_subtitle"}
+    if (
+        content_type != "file"
+        or not required_file_fields.issubset(raw)
+        or not set(raw).issubset(required_file_fields | optional_file_fields)
+    ):
         raise RuntimeError("unsupported reply content type")
     name = v2_worker._safe_download_name(
         "/workspace/" + str(raw.get("file_name") or "")
@@ -3332,10 +3475,19 @@ def _reply_message_fields(payload: dict) -> tuple[str, dict]:
         or byte_count > maximum_file_bytes
     ):
         raise RuntimeError("invalid reply file size")
+    try:
+        display_extra = chat_file_display.metadata_from_payload(
+            raw,
+            filename=name,
+            require_canvas_pair=True,
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
     return "file", {
         "file_name": name,
         "file_mime": mime_type,
         "file_byte_count": byte_count,
+        **display_extra,
     }
 
 
@@ -3547,14 +3699,9 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
                     user_id,
                     type(exc).__name__.lower(),
                 )
-        try:
-            store.reload_chat_strict()
-        except Exception as exc:  # noqa: BLE001 — cross-worker reload/poll is fallback
-            log.warning(
-                "[v2.reply] local chat cache refresh failed user=%s code=%s",
-                user_id,
-                type(exc).__name__.lower(),
-            )
+        store.apply_committed_chat_rows([
+            msg for msg, _inserted, _finish in records
+        ])
         if any(inserted for _msg, inserted, _finish in records):
             try:
                 # Runtime V2's runner-owned sweep is the sole capture producer.
@@ -4964,17 +5111,15 @@ def build_production_deps() -> v2_worker.TurnDeps:
 
 
 def _build_scheduler_deps():
-    """装配 `model_api_runtime.v2.scheduler.run_scheduler_tick` 要的 deps（D3 Task 5）。
+    """装配 retained D3 wake-lane decision 的 scheduler deps。
     scheduler.py 是纯模块（不 import hosted/agent_runtime/proactive）——这里把它接到真实
-    实现：due_heartbeat_users（Task 2 落的 v2_wake_schedule 表）、_wake_decision_for_user
-    （Task 3 适配器，包一层 proactive_gate，读专用，本身不 enqueue）、enqueue_job("heartbeat")
+    实现：due_heartbeat_users（v2_wake_schedule）、_wake_decision_for_user
+    （包一层 proactive_gate 的只读适配器，本身不 enqueue）、enqueue_job("heartbeat")
     /upsert_wake_schedule(next_heartbeat_at=...)。
 
-    leader-election 有意跳过（见 D3 plan Task 5 说明）：`enqueue_job` 走
-    ux_agent_jobs_singleflight 分区唯一索引，多个 serve_worker 进程的 scheduler tick
-    并发对同一用户各自判定 should_wake 也只会各自 INSERT 一次、第二个撞唯一索引 coalesce
-    成同一行——重复调度天然无害。prod 只跑一个 serve-worker 容器，这条不变量目前甚至用
-    不上，但即使将来横向扩容也不需要另起一套选主。"""
+    多进程无需另做 leader election：settings blob 的单条 CAS 是每个周期
+    heartbeat slot 的放行权，只有 won=True 的调用方能入队；agent_jobs
+    single-flight 仍是队列层的第二道防线。感知事件不走这只时钟。"""
     return types.SimpleNamespace(
         eligible_users=lambda: admin_core.list_runtime_modes().get(
             hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, []
@@ -4986,18 +5131,21 @@ def _build_scheduler_deps():
         ),
         due_users=lambda: jobs_store.due_heartbeat_users(),
         wake_decision=_wake_decision_for_user,
+        consume_heartbeat_tick=lambda uid, **kwargs: (
+            core_store.consume_proactive_heartbeat_tick(uid, **kwargs)
+        ),
         enqueue_heartbeat=lambda uid: jobs_store.enqueue_job(
             uid, "heartbeat", trace_id=uuid.uuid4().hex
         ),
         advance_heartbeat=lambda uid, next_at: jobs_store.upsert_wake_schedule(
             uid, next_heartbeat_at=next_at
         ),
-        # scheduled lane 生产者（BUG-3）：due_scheduled_users（Task 2）列出到期 self-wake
+        # scheduled lane producer：due_scheduled_users 列出到期 self-wake
         # timer 的用户，_fire_scheduled_for_user 逐用户走 fire_due_timers 把每个到期 timer
         # 转成一个 `scheduled` lane 的 agent_job。scheduler.py 用 getattr 探测这两个属性。
         due_scheduled_users=lambda: jobs_store.due_scheduled_users(),
         fire_scheduled=_fire_scheduled_for_user,
-        # capture/dream 抽取 lane 生产者（Task 4）：extraction_users 列出当前处于 db_action_v2
+        # capture/dream extraction-lane producer：extraction_users 列出当前处于 db_action_v2
         # 模式的用户（admin_core.list_runtime_modes 已按模式分组，取 db_action_v2 那组即
         # 与 hosted eligibility 同源，无需另起一条查询）；_tick_extraction_for_user
         # 逐用户跑 capture+dream 触发闸，各自命中安静窗口/夜间阈值时 enqueue 一个抽取 job。
@@ -5010,8 +5158,8 @@ def _build_scheduler_deps():
             else []
         ),
         tick_extraction=_tick_extraction_for_user,
-        # screen_watch lane 生产者（D-screen_watch Task 4）：screen_watch_users 列出
-        # next_screen_watch_at 已到期的用户（Task 2 的 due_screen_watch_users，与
+        # screen_watch lane producer：screen_watch_users 列出
+        # next_screen_watch_at 已到期的用户（due_screen_watch_users，与
         # heartbeat/scheduled 同套 payment-cooldown 排除）；_tick_screen_watch_for_user
         # 逐用户跑纯 gate + 只读 oracle，命中才 enqueue 一个 screen_watch job。
         # scheduler.py 同样用 getattr 探测这两个属性（缺一即整段跳过，既有 FakeDeps 零改动）。
@@ -5111,6 +5259,7 @@ def wire_assembly() -> None:
     core_wake_bus.register_handler("v2_jobs", v2_worker.on_v2_job_notify)
     core_wake_bus.register_job_cancel_handler(_JOB_CANCEL_ROUTER.handle)
     jobs_store.on_job_enqueued = _emit_job_enqueued_trace
+    jobs_store.on_followup_marker = _emit_followup_marker_trace
     core_wake_bus.start_listener()
 
 
@@ -5132,6 +5281,32 @@ def _emit_job_enqueued_trace(user_id: str, lane: str, *, reason: str, trace_id: 
         status="ok",
         trace_id=trace_id,
         turn_id=trace_id,
+        detail=detail,
+    )
+
+
+def _emit_followup_marker_trace(
+    user_id: str,
+    action: str,
+    *,
+    source_job_id: int,
+    generation: int,
+    successor_job_id: int | None,
+    moved_context_count: int,
+) -> None:
+    detail = {
+        "action": str(action),
+        "source_job_id": int(source_job_id),
+        "generation": int(generation),
+        "moved_context_count": max(0, int(moved_context_count)),
+    }
+    if successor_job_id is not None:
+        detail["successor_job_id"] = int(successor_job_id)
+    _emit_v2_debug_trace_for_user(
+        user_id,
+        "agent.wake_followup.marker",
+        status="ok",
+        job_id=(str(successor_job_id) if successor_job_id is not None else ""),
         detail=detail,
     )
 
@@ -5189,9 +5364,9 @@ _HEARTBEAT_INTERVAL_SEC = _positive_float_env(
     "FEEDLING_V2_HEARTBEAT_INTERVAL_SEC", "10"
 )
 
-# D3 (Task 4, PR-D plan): capacity must reflect the turn-child's ACTUAL health, not
+# Capacity must reflect the turn-child's actual health, not
 # a configured aggregate — otherwise a heartbeat tick ~10s after the
-# watchdog (Task 3) writes capacity=0 on a kill would silently re-advertise full
+# watchdog writes capacity=0 on a kill would silently re-advertise full
 # capacity for a child that is mid-SIGKILL/respawn, letting admission race new turns
 # onto a pool slot that is not there yet. Independently env-configured (own var, own
 # default) rather than importing `_CHILD_LIVENESS_TIMEOUT_SEC` (defined further below,
@@ -5226,20 +5401,20 @@ async def _heartbeat_loop(
     interval: float = _HEARTBEAT_INTERVAL_SEC,
     capacity_stale_sec: float = _CAPACITY_STALE_SEC,
 ) -> None:
-    """UPSERT this process's liveness row every ~interval seconds (Task 2: the
+    """UPSERT this process's liveness row every ~interval seconds (the
     db_action_v2 chat/send guard needs something to check — without this, a
     pool where every serve_worker process has died would queue jobs forever
     with no error). Reuses the same ``worker_id`` this process passes to
     ``claim_next_job``/``run_worker_loop`` — one row per live process.
 
-    D3 (Task 4): ``capacity`` is DERIVED from ``supervisor.poll_liveness()`` each
+    ``capacity`` is derived from ``supervisor.poll_liveness()`` each
     tick — 0 if the turn-child is dead or its progress is older than
     ``capacity_stale_sec``, else one. This
     is deliberately the same shape as (and agrees with) the watchdog's own kill
     threshold: whichever of the two loops ticks next while the child is down keeps
     writing capacity=0, so they reinforce rather than race each other back to a
-    stale "full capacity" row (see the watchdog module docstring's "capacity=0 must
-    be written before kill_and_respawn" note for the other half of this contract).
+    stale "full capacity" row (see the watchdog module docstring's capacity-zero
+    before confirmed-kill/exact-recovery sequence for the other half of this contract).
 
     Emits one heartbeat immediately on startup (before the first sleep) so a
     just-started pool is visible right away rather than only after the first
@@ -5492,7 +5667,7 @@ _SCHEDULER_INTERVAL_SEC = _positive_float_env(
     "FEEDLING_V2_SCHEDULER_INTERVAL_SEC", "30"
 )
 
-# D2 (Task 3, watchdog.py) is the module that actually ACTS on this — comparing it
+# The watchdog module acts on this value — comparing it
 # against `child_supervisor.ChildSupervisor.poll_liveness()["last_progress_age_sec"]`
 # to decide `should_kill`. It's defined here (not in watchdog.py) because the
 # ChildSupervisor this constant configures is constructed in `_serve`, and this same
@@ -5546,6 +5721,39 @@ if _TURN_STALL_TIMEOUT_SEC < _MIN_TURN_STALL_TIMEOUT_SEC:
         "FEEDLING_V2_TURN_STALL_TIMEOUT_SEC (or legacy "
         "FEEDLING_V2_TURN_HARD_TIMEOUT_SEC) must be at least 210s"
     )
+
+
+def _validate_vision_batch_budget_below_stall(
+    *,
+    configured_image_limit: int,
+    turn_stall_timeout_sec: float,
+) -> float:
+    nominal_batch_sec = _vision_batch_candidate_budget_sec(configured_image_limit)
+    if nominal_batch_sec >= turn_stall_timeout_sec:
+        per_image_sec = provider_client.reliable_chat_nominal_envelope_sec(
+            request_inactivity_timeout_sec=(
+                visual_transport.VISUAL_REQUEST_INACTIVITY_TIMEOUT_SEC
+            ),
+            max_attempts=visual_transport.VISUAL_MAX_ATTEMPTS,
+            base_delay_sec=visual_transport.VISUAL_RETRY_BASE_DELAY_SEC,
+        )
+        raise RuntimeError(
+            "FEEDLING_V2_TAIL_IMAGE_LIMIT visual retry envelope must stay below "
+            "FEEDLING_V2_TURN_STALL_TIMEOUT_SEC "
+            f"(per_image={per_image_sec:.3f}s, "
+            f"image_limit={configured_image_limit}, "
+            "fixed_overhead="
+            f"{visual_transport.VISUAL_BATCH_FIXED_OVERHEAD_SEC:.3f}s, "
+            f"nominal={nominal_batch_sec:.3f}s, "
+            f"stall={turn_stall_timeout_sec:.3f}s)"
+        )
+    return nominal_batch_sec
+
+
+_VISION_BATCH_CONFIGURED_NOMINAL_SEC = _validate_vision_batch_budget_below_stall(
+    configured_image_limit=v2_worker._TAIL_IMAGE_LIMIT,
+    turn_stall_timeout_sec=_TURN_STALL_TIMEOUT_SEC,
+)
 
 
 # An MCP call only refreshes the per-turn stall clock after its bounded async
@@ -5617,7 +5825,7 @@ def _jobs_claimable() -> bool:
     `jobs_claimable` guard) — `pending_job_count()` counts only rows still
     `status='pending'` whose durable `available_at` fence is due (queued and
     ready, not yet claimed by ANY worker slot), which is
-    exactly "all slots stuck while work waits": a wedged child claims nothing, so
+    exactly "this slot is stuck while work waits": a wedged child claims nothing, so
     genuinely queued work sits at `pending` instead of draining into `claimed`/
     `running`. Deliberately NOT `inflight_job_count()` (pending+claimed+running) —
     that would stay truthy even while a healthy child is mid-turn on already-claimed
@@ -5662,10 +5870,10 @@ async def _watchdog_loop(
 async def _scheduler_loop(
     stop_event: asyncio.Event, *, interval: float = _SCHEDULER_INTERVAL_SEC
 ) -> None:
-    """周期性跑一遍纯调度器（D3 Task 4 `scheduler.run_scheduler_tick`，Task 5 接线）：
+    """周期性运行 retained D3 wake-lane scheduler：
     对每个到期用户判定是否唤醒 heartbeat（经 `_wake_decision_for_user` 复用真实
     proactive gate），should_wake 就 enqueue_job("heartbeat")（single-flight 去重、
-    走 Task 2 的 lane 优先级），无论如何都 advance_heartbeat 推进下次到期时间——
+    使用当前 lane priority），无论如何都 advance_heartbeat 推进下次到期时间——
     不会同一批用户每个 tick 都重新判一遍。
 
     镜像 `_reaper_loop`/`_heartbeat_loop` 的结构：interruptible 的
@@ -5864,9 +6072,9 @@ async def _reconcile_loop(
 ) -> None:
     """Periodic orphan-message and durable-effect reconciliation.
 
-    D9 (Task 7, PR-D plan): periodic wiring for `db.reconcile_unenqueued_v2_messages`
+    Periodic wiring for `db.reconcile_unenqueued_v2_messages`
     — the A7 orphan-message sweeper that was built but never invoked anywhere (its own
-    docstring deferred the periodic call to "PR D's sweeper"). Without this loop, a
+    docstring deferred the periodic call to a parent-owned sweeper). Without this loop, a
     `db_action_v2` user whose newest chat message never got a matching `agent_jobs`
     row (a bug, a manual data fix, or a message written before A7 existed) stays
     silently unanswered forever — nothing else in the pool re-derives "has an
@@ -6052,18 +6260,20 @@ def _start_genesis_thread(worker_id: str):
 
 
 async def _serve(worker_id: str, *, poll_interval: float) -> None:
-    """PARENT process loop (D1 结构拆分后，见
-    `docs/superpowers/plans/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety.md`
-    Task 2). turn slot 不再是这里的 `asyncio.create_task`——它们跑在一个由
-    `child_supervisor.ChildSupervisor` spawn/监督的独立子进程里（`turn_child.main`）,
-    这样一个 slot 里卡死的同步调用不会拖死本进程的事件循环，本进程才能保住
-    SIGKILL 那个子进程的权力。`_reaper_loop`/`_heartbeat_loop`/`_scheduler_loop`/
-    Genesis 线程未改动，仍在本（父）进程里跑。
+    """PARENT process loop.
 
-    D2（Task 3）在 `tasks` 里加了 `_watchdog_loop`，读 `supervisor.poll_liveness()` 判定
-    卡死并调 `supervisor.kill_and_respawn()`——子进程崩溃/卡死不会让 `asyncio.gather(*tasks)`
-    跟着报错退出（父进程能在没有存活子进程的情况下继续跑并把它救回来，这正是 Task 2 要求的
-    "子进程崩溃不能带崩父进程"，Task 3 在此基础上补上"卡死了要主动救"）。
+    当前三池/单 slot 进程拓扑见
+    `docs/superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md`；
+    progress、kill switch 与历史安全不变量见保留的
+    `docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md`。
+    每个 `SlotSpec` 都由 `SlotFleet` 创建一个 `ChildSupervisor` 和一个独立
+    `turn_child.main` 进程；一个 slot 的同步卡死不会拖死 parent 或其他 slot。
+    Parent 运行 pool-aware fleet heartbeat、reaper、scheduler、exact-claim reconcile、
+    per-slot watchdog 与 Genesis 线程。
+
+    每个 `_watchdog_loop` 读对应 supervisor 的 liveness，先将该 pool/slot capacity
+    置零，再确认 kill、exact-recover 它的 active claim，并启动 replacement；一个 slot
+    崩溃/卡死不会让 `asyncio.gather(*tasks)` 或其他 slot 跟着退出。
     """
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -6103,7 +6313,7 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     # Synchronous: spawns the child process + starts the parent-side progress-pipe
     # reader thread. Not an asyncio task — the child runs in its own OS process, so
     # there is nothing here for `asyncio.gather` to await; its liveness is polled
-    # (Task 3) rather than joined.
+    # by its dedicated watchdog rather than joined.
     await asyncio.to_thread(fleet.start_all)
     for key in fleet.keys():
         _JOB_CANCEL_ROUTER.watch(fleet.supervisor(key))

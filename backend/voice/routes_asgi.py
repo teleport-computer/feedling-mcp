@@ -25,7 +25,6 @@ from asgi.deps import require_auth, require_scope
 from chat import idempotency as chat_idempotency
 from core import envelope as core_envelope
 from core import voice_token
-from core import wake_bus
 from hosted import chat_send_core
 from hosted import config_store as hosted_config_store
 from notices import catalog as notices_catalog
@@ -644,12 +643,10 @@ async def cancel_voice_call(
         handoff = results.delete_call_state(user_id, call_id)
         cleanup = voice_cleanup.delete_call_messages(user_id, call_id)
         store = core_store.get_store(user_id)
-        # Reload from the authoritative rows: older assistant messages may be
-        # discoverable only through reply_to_message_id and carry no call id in
-        # this worker's stale cache.
-        store.reload()
+        # Apply the authoritative delete events; older assistant messages may
+        # be discoverable only through reply_to_message_id in durable storage.
+        store.ensure_chat_fresh(force=True)
         store.notify_chat_waiters()
-        wake_bus.notify("chat", user_id)
         if cleanup["remaining"] > 0:
             return {
                 "error": "voice_cleanup_incomplete",
@@ -799,7 +796,6 @@ async def finalize_voice_call(
                 or str(m.get("id") or "") == mid
             ]
         store.notify_chat_waiters()
-        wake_bus.notify("chat", user_id)
         # Memory: one ordinary Capture round over the window that now contains
         # this call's card. The capture handler swaps that card for the archived
         # FULL transcript, so memory sees everything that was said — same

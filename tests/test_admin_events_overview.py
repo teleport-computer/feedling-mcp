@@ -22,6 +22,7 @@ if not os.environ.get("DATABASE_URL"):
     pytest.skip("DATABASE_URL not set - needs a real Postgres", allow_module_level=True)
 
 import db  # noqa: E402
+from admin import data_track as data_track_module  # noqa: E402
 from conftest import seed_user  # noqa: E402
 
 db.init_schema()
@@ -266,3 +267,435 @@ def test_events_overview_without_a_day_still_returns_all_time():
     """不传 day 时维持旧行为（全量），供不关心日期的调用方使用。"""
     payload = db.admin_events_overview()
     assert set(payload) == {"proactive", "capture", "genesis", "reply"}
+
+
+def test_history_import_rolling_rate_counts_every_attempt_not_latest_per_user():
+    """A retry success must not erase the same user's earlier failed attempt."""
+    uid = _uid("events_import_attempts")
+    _seed_test_user(uid)
+    now = datetime.now(timezone.utc)
+    before = db.admin_history_import_job_rolling_windows()
+    db.set_blob(uid, "history_import_job:failed_attempt", {
+        "job_id": "failed_attempt",
+        "status": "failed",
+        "created_at": (now - timedelta(hours=3)).isoformat(),
+        "failed_at": (now - timedelta(hours=2)).isoformat(),
+    })
+    db.set_blob(uid, "history_import_job:successful_retry", {
+        "job_id": "successful_retry",
+        "status": "completed",
+        "created_at": (now - timedelta(hours=2)).isoformat(),
+        "completed_at": (now - timedelta(hours=1)).isoformat(),
+    })
+
+    payload = db.admin_history_import_job_rolling_windows()
+    one_day = next(row for row in payload["windows"]
+                   if row["key"] == "rolling_1d")
+    before_day = next(row for row in before["windows"]
+                      if row["key"] == "rolling_1d")
+    assert one_day["completed"] - before_day["completed"] == 1
+    assert one_day["failed"] - before_day["failed"] == 1
+    assert one_day["denominator"] - before_day["denominator"] == 2
+
+
+def _master_frozen(*, v1="green", v2="green") -> dict:
+    v1_coverage = {
+        "level": v1,
+        "covered_days": 1 if v1 == "green" else 0,
+        "required_days": 1,
+        "effective_from": "2030-06-07",
+        "outcomes_from": "2030-06-07",
+        "outcome_level": v1,
+        "outcome_covered_days": 1 if v1 == "green" else 0,
+    }
+    v2_coverage = {
+        "level": v2,
+        "covered_days": 1 if v2 == "green" else 0,
+        "required_days": 1,
+        "effective_from": "2030-06-07",
+    }
+    heartbeat = {
+        "completed": 9, "failed": 2,
+        "expired": 0, "superseded": 0,
+        "operational_failures": 1,
+        "control_outcomes": 1,
+        "user_unavailable": 0,
+        "failure_codes": {
+            "heartbeat_throttled": 1,
+            "wake_failed:providererror": 1,
+        },
+    }
+    chat = {
+        "completed": 6, "failed": 4,
+        "expired": 0, "superseded": 2,
+        "failure_codes": {
+            "extraction_failed:quota_insufficient": 1,
+            "extraction_failed:upstream_unavailable": 3,
+        },
+    }
+
+    return {
+        "timezone": "Asia/Shanghai",
+        "closed_through_day": "2030-06-07",
+        "windows": [{
+            "key": "24h", "start_day": "2030-06-07",
+            "end_day": "2030-06-07", "day_count": 1,
+            "routes": {
+                "resident": {
+                    "active_users": 17,
+                    "coverage": dict(v1_coverage),
+                    "lanes": {"heartbeat": dict(heartbeat)},
+                    "lane_sources": {},
+                },
+                "model_api": {
+                    "active_users": 5,
+                    "coverage": dict(v2_coverage),
+                    "lanes": {"chat": dict(chat)},
+                    "lane_sources": {},
+                },
+            },
+            "paths": {
+                "self_hosted": {
+                    "active_users": 11,
+                    "mode_sources": {
+                        "not_applicable": {"active_users": 11, "attempts": 11},
+                    },
+                    "coverage": dict(v1_coverage),
+                    "lanes": {"heartbeat": dict(heartbeat)},
+                    "lane_sources": {},
+                },
+                "resident_v1": {
+                    "active_users": 3,
+                    "mode_sources": {
+                        "explicit": {"active_users": 2, "attempts": 8},
+                        "default": {"active_users": 1, "attempts": 3},
+                    },
+                    "coverage": dict(v1_coverage),
+                    "lanes": {"heartbeat": {
+                        **heartbeat, "completed": 7, "failed": 1,
+                        "operational_failures": 1, "control_outcomes": 0,
+                        "failure_codes": {"wake_failed:providererror": 1},
+                    }},
+                    "lane_sources": {},
+                },
+                "apikey_v1": {
+                    "active_users": 3,
+                    "mode_sources": {
+                        "explicit": {"active_users": 2, "attempts": 6},
+                        "default": {"active_users": 1, "attempts": 2},
+                    },
+                    "coverage": dict(v1_coverage),
+                    "lanes": {"heartbeat": {
+                        **heartbeat, "completed": 6, "failed": 2,
+                    }},
+                    "lane_sources": {},
+                },
+                "apikey_v2": {
+                    "active_users": 5,
+                    "mode_sources": {
+                        "explicit": {"active_users": 4, "attempts": 10},
+                        "default": {"active_users": 1, "attempts": 2},
+                    },
+                    "coverage": dict(v2_coverage),
+                    "lanes": {"chat": dict(chat)},
+                    "lane_sources": {},
+                },
+                **{
+                    path: {
+                        "active_users": 0,
+                        "mode_sources": {},
+                        "coverage": dict(v1_coverage),
+                        "lanes": {},
+                        "lane_sources": {},
+                    }
+                    for path in (
+                        "unbound_no_route",
+                        "hosted_unclassified_v1",
+                        "v2_control_v1_source",
+                    )
+                },
+            },
+        }],
+    }
+
+
+def _master_row(payload: dict, key: str, *, runtime=False) -> dict:
+    windows = payload["runtime_windows"] if runtime else payload["windows"]
+    return next(row for row in windows[0]["rows"] if row["key"] == key)
+
+
+def test_master_declares_distinct_v1_access_path_collection_mechanisms():
+    payload = data_track_module._event_path_master_payload(_master_frozen())
+    heartbeat = _master_row(payload, "heartbeat")
+    self_hosted = heartbeat["cells"]["self_hosted"]
+    resident_v1 = heartbeat["cells"]["resident_v1"]
+    apikey_v1 = heartbeat["cells"]["apikey_v1"]
+    assert self_hosted["state"] == "metric"
+    assert resident_v1["state"] == "metric"
+    assert apikey_v1["state"] == "metric"
+    assert self_hosted["success"] == 9
+    assert resident_v1["success"] == 7
+    assert apikey_v1["success"] == 6
+    assert "资格→接入方式×effective runtime 分层" in apikey_v1[
+        "denominator_rule"
+    ]
+    assert heartbeat["cells"]["apikey_v2"]["state"] == "metric"
+
+    runtime_heartbeat = _master_row(payload, "heartbeat", runtime=True)
+    assert runtime_heartbeat["cells"]["runtime_v1"]["state"] == "metric"
+    assert runtime_heartbeat["cells"]["runtime_v1"]["failure"] == 1
+    assert runtime_heartbeat["cells"]["runtime_v1"]["control_outcomes"] == 1
+    assert runtime_heartbeat["cells"]["runtime_v1"]["denominator"] == 10
+    assert "本格仅是 Runtime V1 家族辅助汇总" in runtime_heartbeat[
+        "cells"
+    ]["runtime_v1"]["denominator_rule"]
+    assert "resident_cli 234 vs V2 32" not in str(payload)
+    assert "25,207" not in str(payload)
+    assert payload["runtime_windows"][0]["active_users"] == {
+        "runtime_v1": 17,
+        "runtime_v2": 5,
+    }
+    page = data_track_module._render_event_master_tables(payload)
+    assert "冻结行按 user_id 去重" in page
+    assert "V1 runtime（混合接入方式） 17 人" in page
+    assert "V2 runtime（APIKey） 5 人" in page
+    assert "混合接入方式" in payload["runtime_paths"][0]["label"]
+
+
+def test_complete_zero_and_missing_probe_render_differently():
+    metric = data_track_module._render_event_master_cell({
+        "state": "metric", "coverage": "green", "success": 0,
+        "failure": 0, "denominator": 0, "superseded": 0,
+        "denominator_rule": "completed + failed",
+    }, action="Capture", path="APIKey-V2", window="最近 1 个已关闭北京日")
+    missing = data_track_module._render_event_master_cell({
+        "state": "unavailable", "coverage": "red",
+        "message": "当前记不到这一级", "detail": "零探针",
+    }, action="Capture", path="APIKey-V1", window="最近 1 个已关闭北京日")
+    assert "🟢" in metric and "0 次终态作业" in metric
+    assert "🔴" in missing and "当前记不到这一级" in missing
+    assert metric != missing
+
+
+def test_runtime_population_does_not_turn_missing_or_partial_into_zero():
+    frozen = _master_frozen(v2="yellow")
+    del frozen["windows"][0]["routes"]["resident"]["active_users"]
+    payload = data_track_module._event_path_master_payload(frozen)
+    assert payload["runtime_windows"][0]["active_users"] == {
+        "runtime_v1": None,
+        "runtime_v2": None,
+    }
+    page = data_track_module._render_event_master_tables(payload)
+    assert page.count("人数不报（冻结覆盖不完整或来源未提供）") == 2
+    assert "V1 runtime（混合接入方式） 0 人" not in page
+    assert "V2 runtime（APIKey） 0 人" not in page
+
+
+def test_v1_rate_is_withheld_when_raw_or_outcome_coverage_is_not_green():
+    raw_partial = data_track_module._event_path_master_payload(
+        _master_frozen(v1="yellow")
+    )
+    raw_cell = _master_row(
+        raw_partial, "heartbeat", runtime=True
+    )["cells"]["runtime_v1"]
+    assert raw_cell["state"] == "coverage_gap"
+    assert "denominator" not in raw_cell
+
+    outcome_partial_source = _master_frozen()
+    coverage = outcome_partial_source["windows"][0]["routes"]["resident"][
+        "coverage"
+    ]
+    coverage.update({
+        "outcomes_from": "2030-06-08",
+        "outcome_level": "red",
+        "outcome_covered_days": 0,
+    })
+    outcome_partial = data_track_module._event_path_master_payload(
+        outcome_partial_source
+    )
+    outcome_cell = _master_row(
+        outcome_partial, "heartbeat", runtime=True
+    )["cells"]["runtime_v1"]
+    assert outcome_cell["state"] == "unavailable"
+    assert outcome_cell["coverage"] == "red"
+    assert "过去的日子没有回填" in outcome_cell["detail"]
+    assert "denominator" not in outcome_cell
+
+
+def test_route_population_is_never_rendered_as_an_access_path_population():
+    payload = data_track_module._event_path_master_payload(_master_frozen())
+
+    runtime_window = {
+        **payload["runtime_windows"][0],
+        "active_users": {
+            "runtime_v1": 9, "runtime_v2": 8,
+            "self_hosted": 71, "apikey_v1": 72,
+        },
+    }
+    runtime_page = data_track_module._render_event_master_tables({
+        **payload,
+        "windows": [],
+        "runtime_windows": [runtime_window],
+    })
+    # First prove the probe is wired correctly: this exact field is visible on
+    # the runtime table before we rely on its absence from the path table.
+    assert "窗口内 runtime route 活跃用户" in runtime_page
+    assert "V1 runtime（混合接入方式） 9 人" in runtime_page
+    assert "V2 runtime（APIKey） 8 人" in runtime_page
+    assert "自建 Resident 71 人" not in runtime_page
+    assert "APIKey-V1 72 人" not in runtime_page
+
+    path_window = {
+        **payload["windows"][0],
+        "active_users": {
+            **payload["windows"][0]["active_users"],
+            "runtime_v1": 81,
+            "runtime_v2": 82,
+        },
+    }
+    path_page = data_track_module._render_event_master_tables({
+        **payload,
+        "windows": [path_window],
+        "runtime_windows": [],
+    })
+    assert "窗口内 runtime route 活跃用户" not in path_page
+    assert "窗口内路径活跃用户" in path_page
+    assert "自建 Resident 11 人" in path_page
+    assert "APIKey-V1 3 人" in path_page
+    assert "APIKey-V2 5 人" in path_page
+    assert "V1 runtime（混合接入方式） 81 人" not in path_page
+    assert "V2 runtime（APIKey） 82 人" not in path_page
+
+
+def test_model_call_probe_coverage_mutation_changes_cell_shape(monkeypatch):
+    action = {
+        "key": "model_call", "label": "正常聊天 · 单次模型调用",
+        "desc": "probe mutation",
+        "runtime_probe": {"runtime_v1": "yellow", "runtime_v2": "red"},
+    }
+    monkeypatch.setattr(data_track_module, "_EVENT_MASTER_ACTIONS", (action,))
+    red_payload = data_track_module._event_path_master_payload(_master_frozen())
+    red_html = data_track_module._render_event_master_tables(red_payload)
+
+    action["runtime_probe"]["runtime_v2"] = "yellow"
+    yellow_payload = data_track_module._event_path_master_payload(_master_frozen())
+    yellow_html = data_track_module._render_event_master_tables(yellow_payload)
+
+    assert "🔴" in red_html
+    assert "🟡" in yellow_html
+    red_runtime = _master_row(
+        red_payload, "model_call", runtime=True
+    )["cells"]["runtime_v2"]
+    yellow_runtime = _master_row(
+        yellow_payload, "model_call", runtime=True
+    )["cells"]["runtime_v2"]
+    assert red_runtime["coverage"] == "red"
+    assert red_runtime["detail"] == "这一动作×runtime family 零探针"
+    assert yellow_runtime["coverage"] == "yellow"
+    assert yellow_runtime["detail"] == "有调用点但尚无同源北京日冻结分母"
+    assert red_html != yellow_html
+
+
+def test_metric_cell_states_action_path_window_and_denominator():
+    payload = data_track_module._event_path_master_payload(_master_frozen())
+    raw_chat = _master_frozen()["windows"][0]["routes"]["model_api"]["lanes"]["chat"]
+    assert raw_chat["failed"] == 4
+    assert raw_chat["failure_codes"]["extraction_failed:quota_insufficient"] == 1
+    chat = _master_row(payload, "chat_job")
+    assert chat["cells"]["apikey_v2"]["failure"] == 3
+    assert chat["cells"]["apikey_v2"]["user_unavailable"] == 1
+    page = data_track_module._render_event_master_tables(payload)
+    assert "动作=正常聊天 · 整个回复任务" in page
+    assert "路径=APIKey-V2" in page
+    assert "窗口=最近 1 个已关闭北京日（2030-06-07 至 2030-06-07）" in page
+    assert "分母=9（成功 6 + 失败 3" in page
+    assert "用户侧不可用 1（剔除）" in page
+    assert "superseded 2（剔除）" in page
+
+
+def test_v2_operational_failure_rate_excludes_control_but_keeps_unknown():
+    frozen = _master_frozen()
+    chat = frozen["windows"][0]["routes"]["model_api"]["lanes"]["chat"]
+    updated = {
+        "completed": 5, "failed": 3, "expired": 0, "superseded": 0,
+        "failure_codes": {
+            "runtime_mode_changed": 1,
+            "extraction_failed:quota_insufficient": 1,
+            "future_unknown_code": 1,
+        },
+    }
+    chat.update(updated)
+    frozen["windows"][0]["paths"]["apikey_v2"]["lanes"]["chat"].update(
+        updated
+    )
+    payload = data_track_module._event_path_master_payload(frozen)
+    cell = _master_row(payload, "chat_job")["cells"]["apikey_v2"]
+    assert cell["raw_non_success"] == 3
+    assert cell["control_outcomes"] == 1
+    assert cell["user_unavailable"] == 1
+    assert cell["failure"] == 1
+    assert cell["denominator"] == 6
+
+
+def test_history_import_overall_quality_labels_are_load_bearing():
+    page = data_track_module._render_history_import_overall({
+        "calculated_at": "2030-06-08T00:00:00+00:00",
+        "coverage": "red",
+        "reason": "无路径快照、未物理冻结；T247 补",
+        "windows": [{
+            "key": "rolling_1d", "label": "过去 1 个滚动日",
+            "completed": 3, "failed": 1, "denominator": 4,
+        }],
+    })
+    assert "全路径合计（滚动窗口 · 即时重算 · 未冻结）" in page
+    assert "🔴 覆盖" in page
+    assert "无路径快照、未物理冻结；T247 补" in page
+    assert "计算时刻（北京）" in page
+    assert "75.0% 成功 · 25.0% 失败" in page
+    assert "分母=4 个全部路径 terminal job" in page
+
+
+def test_product_na_and_observability_gap_use_different_words():
+    payload = data_track_module._event_path_master_payload(_master_frozen())
+    history = _master_row(payload, "onboarding_history")
+    identity = _master_row(payload, "onboarding_identity")
+    assert history["cells"]["apikey_v2"]["message"] == "N/A（产品当前不执行）"
+    assert history["cells"]["apikey_v2"]["coverage"] == "black"
+    assert identity["cells"]["apikey_v2"]["message"] == "当前记不到这一级"
+    assert identity["cells"]["apikey_v2"]["coverage"] == "red"
+
+
+def test_rollup_read_timeout_is_not_rendered_as_zero_or_missing_probe(monkeypatch):
+    class ReadTimeout(Exception):
+        sqlstate = "57014"
+
+    class TimeoutPool:
+        def connection(self, **_kwargs):
+            raise ReadTimeout("canceling statement due to statement timeout")
+
+    monkeypatch.setattr(db, "get_pool", lambda: TimeoutPool())
+    frozen = db.admin_event_path_rollup_windows(through_day="2030-06-07")
+    assert frozen["read_status"] == {
+        "level": "timeout",
+        "message": "取数超时（记了，但这里读不出来）",
+    }
+    payload = data_track_module._event_path_master_payload(frozen)
+    chat = _master_row(payload, "chat_job")
+    cell = chat["cells"]["apikey_v2"]
+    assert cell["state"] == "timeout"
+    page = data_track_module._render_event_master_tables(payload)
+    assert "⏱️" in page
+    assert "取数超时（记了，但这里读不出来）" in page
+    assert "下一步是修读取路径，不是补埋点" in page
+
+
+def test_history_import_read_timeout_has_its_own_marker():
+    page = data_track_module._render_history_import_overall({
+        "calculated_at": "2030-06-08T00:00:00+00:00",
+        "coverage": "timeout",
+        "reason": "取数超时（记了，但这里读不出来）；无路径快照、未物理冻结；T247 补",
+        "windows": [],
+    })
+    assert "⏱️ 覆盖" in page
+    assert "取数超时（记了，但这里读不出来）" in page
+    assert "🔴 覆盖" not in page

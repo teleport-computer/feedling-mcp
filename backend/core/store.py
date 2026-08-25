@@ -8,6 +8,7 @@ identity of ``_stores`` and ``UserStore`` instances matters: tests and the
 eviction path mutate them in place — never rebind them.
 """
 
+import hashlib
 import os
 import threading
 import time
@@ -19,13 +20,39 @@ import db
 from core import config
 from core import envelope as core_envelope
 from core import wake_bus
+from core.telemetry_logging import stderr_info_logger
+
+log = stderr_info_logger("feedling.chat_sync")
+# Snapshot-fallback records are fixed-enum, content-free rollout telemetry.
+# Keep the global backend threshold unchanged and emit directly to stderr.
 
 MAX_FRAMES = 200
 # Per-process hot chat window per user. The PostgreSQL ``chat_messages`` table
 # is the immutable encrypted source transcript and is never trimmed by this
 # value. History pages and single-message body reads go directly to bounded DB
 # APIs, while resident polling/cache scans keep only this newest working set.
-MAX_CHAT_MESSAGES = 5000
+
+
+def _chat_hot_cache_limit() -> int:
+    raw = os.environ.get("FEEDLING_CHAT_HOT_CACHE_LIMIT", "5000").strip()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 5000
+    return max(64, min(5000, value))
+
+
+MAX_CHAT_MESSAGES = _chat_hot_cache_limit()
+_CHAT_SYNC_BATCH_MAX = 256
+_CHAT_GENERATION_RETRY_MAX = 2
+_CHAT_VERSION_CHECK_INTERVAL_SEC = 1.0
+_CHAT_SNAPSHOT_FALLBACK_REASONS = frozenset({
+    "gap",
+    "reset",
+    "overflow",
+    "missing_row",
+    "generation_conflict",
+})
 PUSH_COOLDOWN_SECONDS = int(os.environ.get("FEEDLING_PUSH_COOLDOWN_SEC", 300))
 LIVE_ACTIVITY_DEDUPE_SEC = int(os.environ.get("FEEDLING_LIVE_ACTIVITY_DEDUPE_SEC", 900))
 LIVE_ACTIVITY_START_COOLDOWN_SEC = int(os.environ.get("FEEDLING_LIVE_ACTIVITY_START_COOLDOWN_SEC", 1800))
@@ -59,6 +86,21 @@ _HEARTBEAT_NEXT_TICK_CAS_ATTEMPTS = 4
 _reload_guard = threading.local()
 
 
+def _chat_snapshot_fallback_telemetry(
+    *, user_id: str, reason: str, hot_rows: int
+) -> None:
+    """Emit content-free fixed-enum telemetry for incremental safety fallbacks."""
+    if reason not in _CHAT_SNAPSHOT_FALLBACK_REASONS:
+        raise ValueError("invalid chat snapshot fallback reason")
+    user_hash = hashlib.sha256(str(user_id).encode("utf-8")).hexdigest()[:16]
+    log.info(
+        "chat_sync_snapshot_fallback reason=%s user_hash=%s hot_rows=%d",
+        reason,
+        user_hash,
+        max(0, int(hot_rows)),
+    )
+
+
 def normalize_proactive_wake_interval_sec(value) -> int:
     try:
         interval = int(value)
@@ -74,10 +116,15 @@ def proactive_heartbeat_next_tick_at(settings: dict | None) -> float:
         return 0.0
 
 
+def _read_proactive_heartbeat_settings(user_id: str):
+    """Injectable read seam for deterministic CAS interleaving tests."""
+    return db.get_blob(user_id, "proactive_settings")
+
+
 def _cas_heartbeat_next_tick_at(user_id: str, transform) -> float:
     """CAS one scheduler field without clobbering concurrent settings writes."""
     for _attempt in range(_HEARTBEAT_NEXT_TICK_CAS_ATTEMPTS):
-        raw = db.get_blob(user_id, "proactive_settings")
+        raw = _read_proactive_heartbeat_settings(user_id)
         expected = dict(raw) if isinstance(raw, dict) else {}
         current = proactive_heartbeat_next_tick_at(expected)
         updated = max(0.0, float(transform(current)))
@@ -93,7 +140,9 @@ def _cas_heartbeat_next_tick_at(user_id: str, transform) -> float:
             insert_if_missing=not isinstance(raw, dict),
         ):
             return updated
-    return proactive_heartbeat_next_tick_at(db.get_blob(user_id, "proactive_settings"))
+    return proactive_heartbeat_next_tick_at(
+        _read_proactive_heartbeat_settings(user_id)
+    )
 
 
 def advance_proactive_heartbeat_tick(
@@ -104,6 +153,50 @@ def advance_proactive_heartbeat_tick(
 ) -> float:
     target = float(now) + normalize_proactive_wake_interval_sec(wake_interval_sec)
     return _cas_heartbeat_next_tick_at(user_id, lambda current: max(current, target))
+
+
+def consume_proactive_heartbeat_tick(
+    user_id: str,
+    *,
+    now: float,
+    wake_interval_sec,
+) -> tuple[float, bool]:
+    """Atomically claim one due periodic-heartbeat slot and advance its phase.
+
+    This clock belongs only to the scheduler's periodic heartbeat producer.
+    Perception events share the heartbeat lane but never consult or advance it.
+    When a tick runs late, advancement skips missed slots from the prior phase
+    instead of resetting the cadence to ``now + interval``.
+    """
+    timestamp = float(now)
+    interval = normalize_proactive_wake_interval_sec(wake_interval_sec)
+    for _attempt in range(_HEARTBEAT_NEXT_TICK_CAS_ATTEMPTS):
+        raw = _read_proactive_heartbeat_settings(user_id)
+        expected = dict(raw) if isinstance(raw, dict) else {}
+        current = proactive_heartbeat_next_tick_at(expected)
+        if current > timestamp:
+            return current, False
+        if current > 0.0:
+            missed = int(max(0.0, timestamp - current) // interval)
+            target = current + (missed + 1) * interval
+        else:
+            target = timestamp + interval
+        replacement = dict(expected)
+        replacement[HEARTBEAT_NEXT_TICK_AT_KEY] = target
+        if db.set_blob_if_unchanged(
+            user_id,
+            "proactive_settings",
+            expected,
+            replacement,
+            insert_if_missing=not isinstance(raw, dict),
+        ):
+            return target, True
+    return (
+        proactive_heartbeat_next_tick_at(
+            _read_proactive_heartbeat_settings(user_id)
+        ),
+        False,
+    )
 
 
 def shrink_proactive_heartbeat_tick(
@@ -151,6 +244,12 @@ class UserStore:
         # chat
         self.chat_messages: list[dict] = []
         self.chat_lock = threading.Lock()
+        self.chat_sync_lock = threading.Lock()
+        self.chat_hot_cache_limit = MAX_CHAT_MESSAGES
+        self.chat_version = 0
+        self.chat_max_seq = 0
+        self._chat_messages_by_id: dict[str, dict] = {}
+        self._chat_last_version_check_mono = 0.0
         self.chat_waiters: list[threading.Event] = []
         self.chat_waiters_lock = threading.Lock()
 
@@ -367,16 +466,342 @@ class UserStore:
 
     # ------- chat -------
     def _load_chat(self):
-        self.chat_messages = db.chat_load_recent(
-            self.user_id, MAX_CHAT_MESSAGES)
+        """Best-effort boot/legacy load; retain the last good cache on error."""
+        try:
+            self.reload_chat_hot_strict()
+        except Exception as e:
+            print(f"[{self.user_id}/chat] load failed: {e}")
+
+    def _ensure_chat_cache_state_locked(self) -> None:
+        """Lazily initialize indexes for old tests and lightweight stores."""
+        if not hasattr(self, "chat_hot_cache_limit"):
+            self.chat_hot_cache_limit = MAX_CHAT_MESSAGES
+        if not hasattr(self, "chat_version"):
+            self.chat_version = 0
+        if not hasattr(self, "chat_max_seq"):
+            self.chat_max_seq = 0
+        if not hasattr(self, "_chat_cache_generation"):
+            self._chat_cache_generation = 0
+        if not hasattr(self, "_chat_messages_by_id"):
+            self._chat_messages_by_id = {}
+        if (
+            len(self._chat_messages_by_id) != len(self.chat_messages)
+            or any(
+                self._chat_messages_by_id.get(str(row.get("id") or ""))
+                is not row
+                for row in self.chat_messages
+                if str(row.get("id") or "")
+            )
+        ):
+            self._chat_messages_by_id = {
+                str(row.get("id")): row
+                for row in self.chat_messages
+                if str(row.get("id") or "")
+            }
+            self.chat_max_seq = max(
+                (int(row.get("seq") or 0) for row in self.chat_messages),
+                default=0,
+            )
+
+    def _replace_chat_rows_locked(
+        self,
+        rows: list[dict],
+        *,
+        version: int,
+    ) -> None:
+        by_id: dict[str, dict] = {}
+        for raw in rows:
+            row = dict(raw)
+            msg_id = str(row.get("id") or "")
+            if msg_id:
+                by_id[msg_id] = row
+        ordered = sorted(
+            by_id.values(), key=lambda row: int(row.get("seq") or 0)
+        )
+        limit = min(
+            int(getattr(self, "chat_hot_cache_limit", MAX_CHAT_MESSAGES)),
+            int(MAX_CHAT_MESSAGES),
+        )
+        ordered = ordered[-max(1, limit):]
+        self.chat_messages = ordered
+        self._chat_messages_by_id = {
+            str(row["id"]): row for row in self.chat_messages
+        }
+        self.chat_version = int(version)
+        self.chat_max_seq = max(
+            (int(row.get("seq") or 0) for row in self.chat_messages),
+            default=0,
+        )
+        self._chat_cache_generation = (
+            int(getattr(self, "_chat_cache_generation", 0)) + 1
+        )
+
+    def _apply_committed_chat_rows_locked(
+        self,
+        rows: list[dict],
+        *,
+        version: int | None = None,
+    ) -> None:
+        UserStore._ensure_chat_cache_state_locked(self)
+        by_id = dict(self._chat_messages_by_id)
+        for raw in rows:
+            incoming = dict(raw)
+            msg_id = str(incoming.get("id") or "")
+            if not msg_id:
+                continue
+            existing = by_id.get(msg_id)
+            if existing is not None:
+                incoming = {**existing, **incoming}
+            by_id[msg_id] = incoming
+        next_version = self.chat_version if version is None else int(version)
+        UserStore._replace_chat_rows_locked(
+            self,
+            list(by_id.values()), version=max(self.chat_version, next_version)
+        )
+
+    def _update_cached_chat_row_locked(
+        self,
+        msg_id: str,
+        fields: dict,
+    ) -> dict | None:
+        UserStore._ensure_chat_cache_state_locked(self)
+        existing = self._chat_messages_by_id.get(str(msg_id))
+        if existing is None:
+            return None
+        existing.update(fields)
+        self._chat_cache_generation += 1
+        return existing
+
+    def apply_committed_chat_rows(
+        self,
+        rows: list[dict],
+        *,
+        version: int | None = None,
+    ) -> None:
+        """Atomically merge already-committed rows into the bounded hot cache."""
+        with self.chat_lock:
+            UserStore._apply_committed_chat_rows_locked(
+                self, rows, version=version
+            )
+
+    def remove_committed_chat_ids(self, message_ids: list[str]) -> None:
+        """Remove exact already-deleted rows from the local hot cache."""
+        removed = {
+            str(message_id) for message_id in message_ids if str(message_id)
+        }
+        if not removed:
+            return
+        with self.chat_lock:
+            self._ensure_chat_cache_state_locked()
+            if not any(
+                message_id in self._chat_messages_by_id
+                for message_id in removed
+            ):
+                return
+            remaining = [
+                row
+                for row in self.chat_messages
+                if str(row.get("id") or "") not in removed
+            ]
+            self._replace_chat_rows_locked(remaining, version=self.chat_version)
+
+    def reload_chat_hot_strict(self) -> list[dict]:
+        """Replace only chat state from one version-consistent hot snapshot."""
+        limit = min(
+            int(getattr(self, "chat_hot_cache_limit", MAX_CHAT_MESSAGES)),
+            int(MAX_CHAT_MESSAGES),
+        )
+        for _attempt in range(2):
+            with self.chat_lock:
+                self._ensure_chat_cache_state_locked()
+                generation = self._chat_cache_generation
+            version, rows = db.chat_load_hot_snapshot_strict(
+                self.user_id, limit
+            )
+            with self.chat_lock:
+                self._ensure_chat_cache_state_locked()
+                if self._chat_cache_generation != generation:
+                    continue
+                self._replace_chat_rows_locked(rows, version=version)
+                return list(self.chat_messages)
+        with self.chat_lock:
+            self._ensure_chat_cache_state_locked()
+            version, rows = db.chat_load_hot_snapshot_strict(
+                self.user_id, limit
+            )
+            self._replace_chat_rows_locked(rows, version=version)
+            return list(self.chat_messages)
 
     def reload_chat_strict(self) -> list[dict]:
-        """Refresh chat state without converting a DB failure into emptiness."""
-        with self.chat_lock:
-            rows = db.chat_load_recent_strict(
-                self.user_id, MAX_CHAT_MESSAGES)
-            self.chat_messages = rows
-            return list(rows)
+        """Compatibility alias for the strict bounded chat-only refresh."""
+        return self.reload_chat_hot_strict()
+
+    def ensure_chat_fresh(
+        self,
+        *,
+        force: bool = False,
+        target_version: int | None = None,
+    ) -> bool:
+        """Apply durable chat events, falling back to a bounded snapshot.
+
+        Returns false on a database failure and leaves the last good cache
+        untouched. A forced wake bypasses the ordinary one-second version-read
+        coalescing window.
+        """
+        if not hasattr(self, "chat_sync_lock"):
+            self.chat_sync_lock = threading.Lock()
+        if not hasattr(self, "_chat_last_version_check_mono"):
+            self._chat_last_version_check_mono = 0.0
+        requested = int(target_version) if target_version is not None else None
+        if requested is not None and requested < 0:
+            return False
+
+        with self.chat_sync_lock:
+            generation_retries = 0
+            while True:
+                with self.chat_lock:
+                    self._ensure_chat_cache_state_locked()
+                    base_version = self.chat_version
+                    base_generation = self._chat_cache_generation
+                if requested is not None and requested <= base_version:
+                    if generation_retries:
+                        self.notify_chat_waiters()
+                    return True
+
+                now_mono = time.monotonic()
+                if (
+                    generation_retries == 0
+                    and not force
+                    and requested is None
+                    and now_mono - self._chat_last_version_check_mono
+                    < _CHAT_VERSION_CHECK_INTERVAL_SEC
+                ):
+                    return True
+                try:
+                    current_version = (
+                        requested
+                        if requested is not None
+                        else db.chat_change_version(self.user_id)
+                    )
+                    self._chat_last_version_check_mono = now_mono
+                    if current_version <= base_version:
+                        if generation_retries:
+                            self.notify_chat_waiters()
+                        return True
+
+                    if current_version - base_version > _CHAT_SYNC_BATCH_MAX:
+                        _chat_snapshot_fallback_telemetry(
+                            user_id=self.user_id,
+                            reason="overflow",
+                            hot_rows=len(self.chat_messages),
+                        )
+                        self.reload_chat_hot_strict()
+                    else:
+                        events = db.chat_change_events_after(
+                            self.user_id,
+                            base_version,
+                            _CHAT_SYNC_BATCH_MAX,
+                        )
+                        expected = base_version + 1
+                        continuous = True
+                        for event in events:
+                            if int(event.get("version") or -1) != expected:
+                                continuous = False
+                                break
+                            expected += 1
+                        has_reset = any(
+                            event.get("operation") == "reset" for event in events
+                        )
+                        if (
+                            not continuous
+                            or not events
+                            or int(events[-1].get("version") or 0)
+                            < current_version
+                            or has_reset
+                        ):
+                            _chat_snapshot_fallback_telemetry(
+                                user_id=self.user_id,
+                                reason="reset" if has_reset else "gap",
+                                hot_rows=len(self.chat_messages),
+                            )
+                            self.reload_chat_hot_strict()
+                        else:
+                            upsert_ids = list(dict.fromkeys(
+                                str(msg_id)
+                                for event in events
+                                if event.get("operation") == "upsert"
+                                for msg_id in event.get("message_ids", [])
+                                if str(msg_id)
+                            ))
+                            upsert_rows = db.chat_get_many_strict(
+                                self.user_id, upsert_ids
+                            ) if upsert_ids else []
+                            rows_by_id = {
+                                str(row.get("id") or ""): dict(row)
+                                for row in upsert_rows
+                            }
+                            if any(
+                                msg_id not in rows_by_id
+                                for msg_id in upsert_ids
+                            ):
+                                _chat_snapshot_fallback_telemetry(
+                                    user_id=self.user_id,
+                                    reason="missing_row",
+                                    hot_rows=len(self.chat_messages),
+                                )
+                                self.reload_chat_hot_strict()
+                            else:
+                                cache_changed = False
+                                with self.chat_lock:
+                                    self._ensure_chat_cache_state_locked()
+                                    cache_changed = (
+                                        self._chat_cache_generation
+                                        != base_generation
+                                    )
+                                    if not cache_changed:
+                                        working = dict(
+                                            self._chat_messages_by_id
+                                        )
+                                        for event in events:
+                                            operation = str(
+                                                event.get("operation") or ""
+                                            )
+                                            message_ids = [
+                                                str(value)
+                                                for value in event.get(
+                                                    "message_ids", []
+                                                )
+                                            ]
+                                            if operation == "upsert":
+                                                for msg_id in message_ids:
+                                                    working[msg_id] = dict(
+                                                        rows_by_id[msg_id]
+                                                    )
+                                            elif operation == "delete":
+                                                for msg_id in message_ids:
+                                                    working.pop(msg_id, None)
+                                        self._replace_chat_rows_locked(
+                                            list(working.values()),
+                                            version=int(events[-1]["version"]),
+                                        )
+                                if cache_changed:
+                                    if (
+                                        generation_retries
+                                        < _CHAT_GENERATION_RETRY_MAX
+                                    ):
+                                        generation_retries += 1
+                                        continue
+                                    _chat_snapshot_fallback_telemetry(
+                                        user_id=self.user_id,
+                                        reason="generation_conflict",
+                                        hot_rows=len(self.chat_messages),
+                                    )
+                                    self.reload_chat_hot_strict()
+                    self.notify_chat_waiters()
+                    return True
+                except Exception as e:
+                    print(f"[{self.user_id}/chat] incremental sync failed: {e}")
+                    return False
 
     def reload(self):
         """Re-read this store's cached state from PostgreSQL IN PLACE, keeping
@@ -393,9 +818,7 @@ class UserStore:
         _prev_guard = getattr(_reload_guard, "active", False)
         _reload_guard.active = True
         try:
-            with self.chat_lock:
-                self.chat_messages = db.chat_load_recent(
-                    self.user_id, MAX_CHAT_MESSAGES)
+            self._load_chat()
             with self.frames_lock:
                 self._load_frames_meta()
             with self.world_books_lock:
@@ -517,6 +940,8 @@ class UserStore:
                 "vision_main_route_id",
                 "vision_main_route_updated_at",
                 "file_name",
+                "file_display_title",
+                "file_display_subtitle",
                 "file_mime",
                 "file_byte_count",
                 # Optional client operation UUID. Plaintext routing metadata
@@ -649,9 +1074,9 @@ class UserStore:
         values form the send-time ownership CAS. Optional ``client_msg_id`` and
         ``idempotency_window_sec`` preserve logical-send idempotency inside the
         same atomic transaction. `None` (the default) preserves
-        today's `chat_append_strict`/`chat_append` behavior byte-for-byte —
-        the in-memory cache append, trim, `wake_bus.notify`, and
-        Capture bookkeeping still runs after a genuine write. Exact Runtime V2
+        today's `chat_append_strict`/`chat_append` behavior for local cache,
+        trim, waiter, and Capture bookkeeping. Cross-worker notification comes
+        from the committed DB v2 trigger. Exact Runtime V2
         sends only refresh that state; their runner-owned scheduler is the sole
         capture producer and therefore never appends a legacy proactive job.
 
@@ -745,6 +1170,8 @@ class UserStore:
                 "vision_main_route_id",
                 "vision_main_route_updated_at",
                 "file_name",
+                "file_display_title",
+                "file_display_subtitle",
                 "file_mime",
                 "file_byte_count",
                 # Optional client operation UUID. Plaintext routing metadata
@@ -839,6 +1266,7 @@ class UserStore:
 
         persisted_new = True
         with self.chat_lock:
+            cache_seq: int | None = None
             # The legacy route is deliberately best-effort for compatibility.
             # V2 terminal replies opt into strict ordering: commit first, then
             # expose the row in the process cache.  A failed DB write therefore
@@ -893,6 +1321,7 @@ class UserStore:
                         "idempotency_window_sec"
                     ),
                 )
+                cache_seq = int(_seq)
                 if _job_id is None:
                     winner = db.chat_doc_for_seq(self.user_id, _seq)
                     if not isinstance(winner, dict):
@@ -902,25 +1331,29 @@ class UserStore:
                     msg = dict(winner)
                     persisted_new = False
             elif strict:
-                db.chat_append_strict(
+                seq = db.chat_append_strict(
                     self.user_id, msg_id, msg["ts"], msg, MAX_CHAT_MESSAGES)
-            persisted_msg_id = str(msg.get("id") or msg_id)
-            if not any(
-                str(existing.get("id") or "") == persisted_msg_id
-                for existing in self.chat_messages
-            ):
-                self.chat_messages.append(msg)
-            if len(self.chat_messages) > MAX_CHAT_MESSAGES:
-                self.chat_messages[:] = self.chat_messages[-MAX_CHAT_MESSAGES:]
+                if seq is not None:
+                    cache_seq = int(seq)
+            cached_msg = dict(msg)
+            if cache_seq is not None and "seq" not in cached_msg:
+                cached_msg["seq"] = cache_seq
+            UserStore._apply_committed_chat_rows_locked(self, [cached_msg])
             if resident_parent_doc is not None:
-                for existing in self.chat_messages:
-                    if str(existing.get("id") or "") == str(resident_reply_to):
-                        existing.update(resident_parent_doc)
-                        break
+                parent_id = str(resident_reply_to)
+                UserStore._update_cached_chat_row_locked(
+                    self, parent_id, resident_parent_doc
+                )
             if not strict:
                 if not resident_runtime_fenced:
-                    db.chat_append(
+                    seq = db.chat_append(
                         self.user_id, msg_id, msg["ts"], msg, MAX_CHAT_MESSAGES)
+                    if seq is not None:
+                        cached_msg = dict(msg)
+                        cached_msg["seq"] = int(seq)
+                        UserStore._apply_committed_chat_rows_locked(
+                            self, [cached_msg]
+                        )
         # Cross-worker wake: other workers' pollers for this user park on their
         # own threading.Events, which our notify_chat_waiters can't reach. The
         # local fast path (the caller's notify_chat_waiters) stays; this only
@@ -936,7 +1369,6 @@ class UserStore:
                 replayed["_client_msg_replayed"] = True
                 return replayed
             return msg
-        wake_bus.notify("chat", self.user_id)
         try:
             from proactive import capture_scheduler
 
@@ -975,23 +1407,9 @@ class UserStore:
         """
         cached_reply = dict(reply_doc)
         with self.chat_lock:
-            for index, existing in enumerate(self.chat_messages):
-                if str(existing.get("id") or "") == parent_msg_id:
-                    self.chat_messages[index] = dict(parent_doc)
-                    break
+            self._update_cached_chat_row_locked(parent_msg_id, parent_doc)
+            self._apply_committed_chat_rows_locked([cached_reply])
 
-            replaced_reply = False
-            for index, existing in enumerate(self.chat_messages):
-                if str(existing.get("id") or "") == str(cached_reply.get("id") or ""):
-                    self.chat_messages[index] = cached_reply
-                    replaced_reply = True
-                    break
-            if not replaced_reply:
-                self.chat_messages.append(cached_reply)
-            if len(self.chat_messages) > MAX_CHAT_MESSAGES:
-                self.chat_messages[:] = self.chat_messages[-MAX_CHAT_MESSAGES:]
-
-        wake_bus.notify("chat", self.user_id)
         try:
             from proactive import capture_scheduler
 
@@ -1056,21 +1474,9 @@ class UserStore:
 
         cached_docs = [dict(reply_doc) for reply_doc in reply_docs]
         with self.chat_lock:
-            for index, existing in enumerate(self.chat_messages):
-                if str(existing.get("id") or "") == parent_msg_id:
-                    self.chat_messages[index] = dict(parent_doc)
-                    break
-            for cached in cached_docs:
-                for index, existing in enumerate(self.chat_messages):
-                    if str(existing.get("id") or "") == str(cached.get("id") or ""):
-                        self.chat_messages[index] = cached
-                        break
-                else:
-                    self.chat_messages.append(cached)
-            if len(self.chat_messages) > MAX_CHAT_MESSAGES:
-                self.chat_messages[:] = self.chat_messages[-MAX_CHAT_MESSAGES:]
+            self._update_cached_chat_row_locked(parent_msg_id, parent_doc)
+            self._apply_committed_chat_rows_locked(cached_docs)
 
-        wake_bus.notify("chat", self.user_id)
         try:
             from proactive import capture_scheduler
 
@@ -1115,21 +1521,11 @@ class UserStore:
         )
 
         with self.chat_lock:
-            replaced = False
-            for index, existing in enumerate(self.chat_messages):
-                if str(existing.get("id") or "") == str(winner.get("id") or ""):
-                    self.chat_messages[index] = dict(winner)
-                    replaced = True
-                    break
-            if not replaced:
-                self.chat_messages.append(dict(winner))
-            if len(self.chat_messages) > MAX_CHAT_MESSAGES:
-                self.chat_messages[:] = self.chat_messages[-MAX_CHAT_MESSAGES:]
+            self._apply_committed_chat_rows_locked([dict(winner)])
 
         if not inserted:
             return winner, False
 
-        wake_bus.notify("chat", self.user_id)
         try:
             from proactive import capture_scheduler
 
@@ -1223,11 +1619,13 @@ class UserStore:
         if not clean:
             return None
         with self.chat_lock:
-            for msg in self.chat_messages:
-                if msg.get("id") == msg_id:
-                    msg.update(clean)
-                    db.chat_update_metadata(self.user_id, msg_id, clean)
-                    return msg
+            self._ensure_chat_cache_state_locked()
+            msg = self._chat_messages_by_id.get(str(msg_id))
+            if msg is not None:
+                msg.update(clean)
+                db.chat_update_metadata(self.user_id, msg_id, clean)
+                self._chat_cache_generation += 1
+                return msg
         return None
 
     def notify_chat_waiters(self):
@@ -1751,6 +2149,38 @@ def _evict_store(user_id: str) -> bool:
     store.reload()
     store.loaded_at = time.monotonic()
     _wake_store_waiters(store)
+    return True
+
+
+def _cached_store(user_id: str) -> UserStore | None:
+    """Return an existing worker-local store without creating or loading one."""
+    with _stores_lock:
+        return _stores.get(user_id)
+
+
+def _refresh_store_channel(user_id: str, channel: str) -> bool:
+    """Refresh or wake exactly one non-chat store component."""
+    store = _cached_store(user_id)
+    if store is None:
+        return False
+    previous_guard = getattr(_reload_guard, "active", False)
+    _reload_guard.active = True
+    try:
+        if channel == "frames":
+            with store.frames_lock:
+                store._load_frames_meta()
+        elif channel == "blob":
+            with store.world_books_lock:
+                store._load_world_books()
+            store._load_tokens()
+            store._load_live_activity_state()
+            store._load_push_state()
+        elif channel == "proactive":
+            store.notify_proactive_job_waiters()
+        else:
+            return False
+    finally:
+        _reload_guard.active = previous_guard
     return True
 
 

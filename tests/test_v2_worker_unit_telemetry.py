@@ -11,7 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from core import self_thinking  # noqa: E402
+from agent_protocol_core import self_thinking  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
 from model_api_runtime.v2 import tool_loop  # noqa: E402
 from model_api_runtime.v2 import worker  # noqa: E402
@@ -63,6 +63,21 @@ def test_safe_failure_codes_are_members_of_the_producer_export():
         code = worker._safe_failure_code(scope, exc)
         assert code in worker.PUBLIC_FAILURE_CODES
         assert "private" not in code
+
+
+def test_canvas_delivery_failure_is_not_classified_as_provider_connection():
+    exc = tool_loop.CanvasDeliveryIncomplete("invalid_canvas_delivery_args")
+
+    assert worker._safe_failure_code("turn_failed", exc) == (
+        "turn_failed:canvas_file_delivery_incomplete"
+    )
+    assert worker._turn_failure_error_class(exc) == (
+        "canvas_file_delivery_incomplete"
+    )
+    assert notices_catalog.user_text_for(
+        "canvas_file_delivery_incomplete",
+        language="zh-CN",
+    ) == "画布内容已经保存，但卡片更新没有完成。请稍后再试。"
 
 
 def test_unknown_exception_class_and_scope_collapse_to_registered_buckets():
@@ -654,6 +669,15 @@ def test_self_thinking_language_mismatch_is_closed_and_content_free():
     ) is None
 
 
+def test_self_thinking_absent_correction_reuses_shared_contract_without_downshift():
+    instruction = worker._SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION
+
+    assert instruction.endswith(self_thinking.INSTRUCTION.strip())
+    assert "<think>…</think>" in instruction
+    for forbidden in ("简短点", "别想太多", "be concise", "think less"):
+        assert forbidden not in instruction
+
+
 def test_thinking_surface_trace_contains_metadata_only():
     captured = {}
 
@@ -669,6 +693,7 @@ def test_thinking_surface_trace_contains_metadata_only():
             lane="chat",
             branch="self",
             chars=17,
+            retried=worker.MAX_SELF_THINKING_ABSENT_RETRIES,
         )
     )
 
@@ -678,8 +703,15 @@ def test_thinking_surface_trace_contains_metadata_only():
         "chars": 17,
         "model": "model-safe-name",
         "lane": "chat",
+        "retried": worker.MAX_SELF_THINKING_ABSENT_RETRIES,
     }
-    assert set(captured["detail"]) == {"branch", "chars", "model", "lane"}
+    assert set(captured["detail"]) == {
+        "branch",
+        "chars",
+        "model",
+        "lane",
+        "retried",
+    }
 
 
 def test_thinking_surface_trace_bounds_user_configured_model_name():
@@ -1248,7 +1280,7 @@ def test_checkpoint_degradation_never_logs_arbitrary_detail_or_code(
 
 
 # ── B4-5 (#3):思考气泡的内部【字段名】黑名单 ─────────────────────────
-# 词表共享(core.self_thinking),**宽度按道分开**:
+# 词表共享(agent_protocol_core.self_thinking),**宽度按道分开**:
 #   V1 逐行丢弃 → 宽匹配;V2 整段替换成 marker → 窄匹配(只认泄漏形状)。
 
 

@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: docs/CURRENT_STATE.md
+---
 # feedling-mcp-v1
 
 Feedling gives your Personal Agent a body on iOS — Dynamic Island, Live
@@ -7,6 +11,9 @@ authorized on-chain and verified live from the app.
 
 Agent 是大脑，Feedling 是身体。
 
+> 当前 runtime、部署与排查入口以 [`docs/CURRENT_STATE.md`](docs/CURRENT_STATE.md)
+> 为准；README 中的历史里程碑不能覆盖 exact deployed commit、compose 和代码证据。
+
 ## What this repo is
 
 > **Note (2026-06-12)**: the MCP user line (FastMCP server, `mcp.feedling.app`,
@@ -14,10 +21,13 @@ Agent 是大脑，Feedling 是身体。
 > only where they describe past milestones.
 
 1. **HTTP backend** (FastAPI/ASGI, `backend/asgi_app.py`) — iOS, resident-consumer, and proactive APIs
-2. **Hosted Runtime V2 workers** (`backend/model_api_runtime/v2/`) — a bounded,
-   PostgreSQL-backed native agent/tool loop deployed as pooled `serve-worker`
-   processes; hosted resident supervisors and per-user CLI processes are retired
-3. **Production CVM stack** (`deploy/docker-compose.phala.yaml`) — dstack-ingress + backend + enclave services running inside one Phala TDX CVM
+2. **Dual hosted runtimes** — pooled Runtime V2 workers
+   (`backend/model_api_runtime/v2/`) and active hosted Resident supervisors
+   (`backend/agent_runtime/`) coexist under a per-user fence; the latter hosts
+   the same single-file resident consumer used on user VPS machines
+3. **Production CVM topology** — main CVM runs dstack-ingress + backend +
+   enclave + pooled `serve-worker`; separate runner CVM(s) run hosted Resident
+   `agent-runner` processes (see `docs/CURRENT_STATE.md`)
 4. **Enclave app** (`backend/enclave_app.py`) — owns the content private key, serves `/attestation` on its own pinnable TLS port, and runs the decrypt proxy
 5. **iOS app** — now lives in the companion repo <https://github.com/teleport-computer/feedling-mcp-ios>. It owns Chat · Identity · Garden · Settings, Live Activity / Dynamic Island, Broadcast Extension for screen capture, and the live audit card.
 6. **Skill** — the agent's bootstrap + behavior spec. Lives in a separate public repo so it can be hot-updated without an iOS rebuild: <https://github.com/teleport-computer/io-onboarding>. Current onboarding splits users into three routes: own server / resident consumer, model API key, and official app import.

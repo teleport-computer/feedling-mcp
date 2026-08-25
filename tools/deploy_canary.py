@@ -87,13 +87,28 @@ def _http(method: str, url: str, *, body: dict | None = None, api_key: str | Non
         return 0, {"error": f"transport: {getattr(e, 'reason', e)}"}
 
 
-def _http_retry(method: str, url: str, **kw) -> tuple[int, dict]:
+def _http_retry(
+    method: str,
+    url: str,
+    *,
+    accept_unauthorized_after_transport: bool = False,
+    **kw,
+) -> tuple[int, dict]:
     """_http with exponential backoff on transient statuses (_RETRYABLE). Sleeps
     2,4,8,16,32s between the default 5 tries (~62s total) — sized to outlast the
     ~60s backend wedge after a CVM restart. A status that persists through every
     try is returned to the caller as a real finding."""
+    saw_transport_failure = False
     for attempt in range(1, HTTP_TRIES + 1):
         st, body = _http(method, url, **kw)
+        if accept_unauthorized_after_transport and saw_transport_failure and st == 401:
+            print(
+                f"[canary] {method} {url} -> 401 after an outcome-unknown "
+                "transport failure; API key invalidation proves cleanup ✓"
+            )
+            return 200, {"deleted": True, "inferred_from": "401_after_transport"}
+        if st == 0:
+            saw_transport_failure = True
         if st not in _RETRYABLE or attempt == HTTP_TRIES:
             return st, body
         print(f"[canary] {method} {url} -> {st}: {body.get('error')} "
@@ -213,7 +228,8 @@ def main() -> None:
     finally:
         # 6. always delete the canary account — must never accumulate
         reset_status, _ = _http_retry("POST", f"{API_URL}/v1/account/reset",
-                                      body={"confirm": "delete-all-data"}, api_key=api_key)
+                                      body={"confirm": "delete-all-data"}, api_key=api_key,
+                                      accept_unauthorized_after_transport=True)
         print(f"[canary] account reset -> {reset_status}")
 
     # Only reached on the SUCCESS path: a _fail() inside the try raises SystemExit

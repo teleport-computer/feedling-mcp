@@ -51,7 +51,9 @@ _MCP_READ = ToolSpec(
 
 
 @pytest.fixture(autouse=True)
-def _clean_jobs():
+def _clean_jobs(monkeypatch):
+    # These tests cover mutation recovery, not self-thinking correction.
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs")
     yield
@@ -432,6 +434,153 @@ def test_new_user_send_after_crashed_mutation_runs_one_text_only_recovery_turn(
     assert jobs_store.get_chat_mutation_recovery_barrier(
         uid, after_seq=v2_cursor.load_seq(core_store.get_store(uid))
     ) is None
+
+
+def test_recovery_turn_can_deliver_attached_existing_canvas_without_rewriting(
+    monkeypatch,
+):
+    uid = "u_mutation_barrier_canvas_delivery"
+    conftest.seed_user(uid)
+    _reset(uid)
+    first_seq, old_job_id = db.chat_append_and_enqueue(
+        uid,
+        "old-input",
+        1.0,
+        _user_doc("old-input", "update the canvas"),
+        5000,
+        "chat",
+    )
+    old_job = jobs_store.claim_next_job("crashed-canvas-owner")
+    assert old_job is not None and old_job["id"] == old_job_id
+    assert jobs_store.mark_running(old_job_id, claimed_by="crashed-canvas-owner")
+    old_effect = effect_outbox.enqueue_effect(
+        job_id=old_job_id,
+        user_id=uid,
+        effect_type=worker.ENCRYPTED_TOOL_EFFECT_TYPES["memory"],
+        ordinal=0,
+        expected_generation=db.get_runtime_generation(uid),
+        payload={"effect_envelope": {"ciphertext": "opaque"}},
+        input_frontier_seq=first_seq,
+    )
+    assert jobs_store.mark_failed(
+        old_job_id, "simulated_child_crash", claimed_by="crashed-canvas-owner"
+    )
+
+    second_seq, recovery_job_id = db.chat_append_and_enqueue(
+        uid,
+        "canvas-followup",
+        2.0,
+        _user_doc(
+            "canvas-followup",
+            "完成后生成更新后的 HTML 画布文件并发给我。",
+        ),
+        5000,
+        "chat",
+    )
+    recovery_job = jobs_store.claim_next_job("canvas-recovery-owner")
+    assert recovery_job is not None and recovery_job["id"] == recovery_job_id
+
+    def read_after(_uid, after_seq):
+        if after_seq >= second_seq:
+            return []
+        return [{
+            "id": "canvas-followup",
+            "seq": second_seq,
+            "ts": 2.0,
+            "role": "user",
+            "content": "完成后生成更新后的 HTML 画布文件并发给我。",
+            "has_file": True,
+            "file_name": "打砖块小游戏.io.html",
+            "file_mime": "text/html",
+        }]
+
+    applied = []
+
+    def apply_pending(user_id: str):
+        def dispatch(effect_type: str, payload: dict) -> None:
+            if effect_type == worker.ENCRYPTED_TOOL_EFFECT_TYPES["memory"]:
+                applied.append(str(payload["effect_id"]))
+                return
+            raise AssertionError(f"unexpected ordinary dispatch: {effect_type}")
+
+        return effect_outbox.apply_pending_effects(
+            user_id,
+            dispatch=dispatch,
+            dispatch_reply_in_transaction=(
+                lambda _effect_type, payload, connection:
+                serve_worker._sink_reply_in_transaction(
+                    user_id, payload, connection
+                )
+            ),
+        )
+
+    provider_calls = []
+    path = "/workspace/打砖块小游戏.io.html"
+
+    async def provider(_config, _messages, *, tools=None, **_kwargs):
+        names = {spec.name for spec in (tools or [])}
+        provider_calls.append(names)
+        if len(provider_calls) == 1:
+            assert "workspace_write" not in names
+            assert cap_tool_schema.FILE_REPLY_TOOL in names
+            return {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "send-existing-canvas",
+                    "name": cap_tool_schema.FILE_REPLY_TOOL,
+                    "args": {
+                        "path": path,
+                        "revision": 7,
+                        "title": "霓虹砖块",
+                        "subtitle": "击碎砖块并刷新最高分",
+                        "completion_message": "标题和副标题已经更新。",
+                    },
+                }],
+                "usage": {},
+            }
+        raise AssertionError("Canvas delivery must not require another provider call")
+
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        _fake_envelope,
+    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: read_after(_uid, 0),
+        read_messages_after_seq=read_after,
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        apply_pending_effects=apply_pending,
+        load_workspace_file=lambda *_args, **_kwargs: {
+            "path": path,
+            "content": "<html><body>game</body></html>",
+            "mime_type": "text/html",
+            "revision": 7,
+        },
+    )
+
+    assert asyncio.run(
+        worker.process_job(
+            recovery_job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    ) == "completed"
+
+    assert applied == [old_effect]
+    assert len(provider_calls) == 1
+    with db.get_pool().connection() as conn:
+        file_rows = conn.execute(
+            "SELECT doc FROM chat_messages WHERE user_id=%s "
+            "AND doc->>'content_type'='file' ORDER BY seq",
+            (uid,),
+        ).fetchall()
+    assert len(file_rows) == 1
+    assert file_rows[0][0]["file_display_title"] == "霓虹砖块"
+    assert file_rows[0][0]["file_display_subtitle"] == "击碎砖块并刷新最高分"
 
 
 def test_reconciler_uses_cursor_after_intermediate_reply_and_mutation_crash():

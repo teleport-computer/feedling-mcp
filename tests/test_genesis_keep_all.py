@@ -39,7 +39,7 @@ def test_fact_write_keep_all_on_appends_directive():
     on = prompts.fact_write_messages([], keep_all=True)[0]["content"]
     assert prompts.FACT_WRITE_KEEP_ALL_SUFFIX in on
     assert on.startswith(prompts.FACT_WRITE_PROMPT)
-    assert "date 或 occurred_at" in on
+    assert "`date` or `occurred_at`" in on
     assert "tags" in on
     assert "threads" in on
 

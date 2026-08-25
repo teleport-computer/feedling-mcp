@@ -6,15 +6,15 @@ PR A built (but never wired) a stable seq cursor (``cursor.py``:
 ``chat_messages.seq`` — a real monotonic identity-column counter, unlike
 wall-clock ``ts`` (two messages appended in the same instant can share an
 identical ``ts``, which makes a ts-only boundary ambiguous under ties).
-This migration is the first step of wiring that into production (PR D
-Task 9 / D5): it gives the compaction watermark a seq column so later
+This migration is the first step of wiring that into production: it gives the
+compaction watermark a seq column so later
 consumers (the prompt-invariant catch-up check, the GC coverage gate) can
 bound "what the summary covers" by seq instead of ts.
 
 Scope note: this migration ONLY adds the column. The full reply-cursor /
 turn-read-boundary seq migration (``since = last_replied_ts`` -> seq,
 ``v2_reply_cursor_seq`` outbox wiring) is deliberately deferred to a later
-task — see the D5 task write-up. Existing rows default to 0; ``worker.py``'s
+follow-up work. Existing rows default to 0; ``worker.py``'s
 compaction now writes a real ``watermark_seq`` on every subsequent write, and
 ``db.seq_for_watermark_ts`` gives a conservative (strictly-less) one-time
 ts->seq translation for rows that still carry the migration default.

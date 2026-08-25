@@ -1,4 +1,4 @@
-"""jobs_store.wake_success_stats — V2 唤醒成功率的 lane 级独立计量（D3 Task 8）。
+"""jobs_store.wake_success_stats — V2 唤醒成功率的 lane 级独立计量。
 
 地雷1（同 legacy daily-report 曾踩的坑）：wake job 的 `completed` 终态本身就是
 成功——即使这一轮判断"这次不用发消息"（silence 是合法结果），也要计入成功，不能

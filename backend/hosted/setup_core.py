@@ -46,6 +46,7 @@ from hosted import new_user_v2_cohort
 from hosted import turn as hosted_turn
 from hosted import vision_routing
 from hosted import vision_observer
+from hosted import visual_transport
 from model_api_runtime.v2 import prompt_frontier
 
 
@@ -606,14 +607,13 @@ def _run_route_vision_test_or_error(
 
     # The real one-image call is always authoritative, matching real chat turns.
     encoded, expected = _vision_probe_image()
-    probe_image = f"data:image/png;base64,{encoded}"
     prompt = (
         "This is a private capability check. Inspect this image. It has four "
         "solid vertical color stripes. Reply using only four lowercase color "
         "names from left to right, separated by commas."
     )
     try:
-        result = provider_client.chat_completion(
+        result = visual_transport.request_visual_completion(
             provider_client.ProviderConfig(
                 route["provider"],
                 route["model"],
@@ -621,22 +621,11 @@ def _run_route_vision_test_or_error(
                 route["base_url"],
                 context_window_tokens=route.get("context_window_tokens"),
             ),
-            [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": probe_image},
-                    },
-                ],
-            }],
-            max_tokens=2000,
-            temperature=None,
-            timeout=45.0,
-            include_reasoning=False,
+            prompt=prompt,
+            image_mime="image/png",
+            image_b64=encoded,
         )
-    except provider_client.ProviderError as exc:
+    except (provider_client.ProviderError, visual_transport.VisualOutputTruncated) as exc:
         stable = _classify_catalog_route_vision_error(
             exc,
             catalog_model_found=exact is not None,
@@ -666,6 +655,7 @@ def _run_route_vision_test_or_error(
             "detail": stable.detail,
             "status_code": stable.status_code,
             "retryable": stable.retryable,
+            **({"reason": stable.reason} if stable.reason else {}),
         }, 400
 
     reply = str(result.get("reply") or "").strip().lower()
@@ -1494,7 +1484,7 @@ def vision_main_test(
             "config": _vision_config_payload(store),
         }, 409
     store.notify_chat_waiters()
-    wake_bus.notify("chat", store.user_id)
+    wake_bus.notify_chat_wake_only(store.user_id)
     return {
         "status": "testing",
         "source": "resident",
