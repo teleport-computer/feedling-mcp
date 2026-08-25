@@ -4183,10 +4183,6 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         persisted["seq"] = int(seq)
         store.apply_committed_chat_rows([persisted])
         store.notify_chat_waiters()
-        try:
-            wake_bus.notify("chat", user_id)
-        except Exception:  # noqa: BLE001 - poll timeout remains the fallback
-            pass
         return _ack_terminal_failure_reply(job_id)
 
     seq, inserted = db.chat_append_effect_with_cursor(
@@ -4202,10 +4198,6 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         message["seq"] = int(seq)
         store.apply_committed_chat_rows([message])
         store.notify_chat_waiters()
-        try:
-            wake_bus.notify("chat", user_id)
-        except Exception:  # noqa: BLE001 - poll timeout remains the fallback
-            pass
     if not inserted and seq:
         persisted = db.chat_get_strict(user_id, message_id)
         if (

@@ -955,9 +955,9 @@ class UserStore:
         values form the send-time ownership CAS. Optional ``client_msg_id`` and
         ``idempotency_window_sec`` preserve logical-send idempotency inside the
         same atomic transaction. `None` (the default) preserves
-        today's `chat_append_strict`/`chat_append` behavior byte-for-byte —
-        the in-memory cache append, trim, `wake_bus.notify`, and
-        Capture bookkeeping still runs after a genuine write. Exact Runtime V2
+        today's `chat_append_strict`/`chat_append` behavior for local cache,
+        trim, waiter, and Capture bookkeeping. Cross-worker notification comes
+        from the committed DB v2 trigger. Exact Runtime V2
         sends only refresh that state; their runner-owned scheduler is the sole
         capture producer and therefore never appends a legacy proactive job.
 
@@ -1250,7 +1250,6 @@ class UserStore:
                 replayed["_client_msg_replayed"] = True
                 return replayed
             return msg
-        wake_bus.notify("chat", self.user_id)
         try:
             from proactive import capture_scheduler
 
@@ -1292,7 +1291,6 @@ class UserStore:
             self._update_cached_chat_row_locked(parent_msg_id, parent_doc)
             self._apply_committed_chat_rows_locked([cached_reply])
 
-        wake_bus.notify("chat", self.user_id)
         try:
             from proactive import capture_scheduler
 
@@ -1360,7 +1358,6 @@ class UserStore:
             self._update_cached_chat_row_locked(parent_msg_id, parent_doc)
             self._apply_committed_chat_rows_locked(cached_docs)
 
-        wake_bus.notify("chat", self.user_id)
         try:
             from proactive import capture_scheduler
 
@@ -1410,7 +1407,6 @@ class UserStore:
         if not inserted:
             return winner, False
 
-        wake_bus.notify("chat", self.user_id)
         try:
             from proactive import capture_scheduler
 

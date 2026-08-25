@@ -3,8 +3,9 @@
 The message / response / history / history-clear / message-body / verify-loop
 logic for the resident chat line, lifted out of the Flask routes so the FastAPI
 async routes reuse **identical** semantics — same envelope validation, same
-append / claim, the SAME wake calls (``store.notify_chat_waiters`` /
-``wake_bus.notify``) fired at the SAME points, the same ``debug_trace`` events.
+append / claim, the SAME local waiter wakes fired at the SAME points, and the
+same ``debug_trace`` events. Committed chat mutations are broadcast by the DB
+v2 trigger rather than a second application notification.
 Only the ``/poll`` wait primitive stays framework-specific (see ``poll_core`` /
 ``routes_asgi``).
 
@@ -15,13 +16,12 @@ module, so the Flask adapter (``routes.py``) and the ASGI adapter
 (``routes_asgi.py``) both delegate here and the wakes fire identically on every
 write path.
 
-Wake calls preserved (byte-for-byte with the old Flask routes):
+Local wake calls preserved (byte-for-byte with the old Flask routes):
 - ``write_message``  → ``store.notify_chat_waiters()`` after the append.
-- ``clear_history``  → ``store.notify_chat_waiters()`` + ``wake_bus.notify``.
+- ``clear_history``  → ``store.notify_chat_waiters()`` after the delete.
 - ``verify_loop``    → ``store.notify_chat_waiters()`` after the synthetic ping.
 - ``write_response`` → NO explicit notify (matches Flask; the resident consumer
-  reply is picked up via /history, and ``append_chat`` still fires its own
-  cross-worker ``wake_bus.notify`` internally, exactly as before).
+  reply is picked up via /history; DB v2 notifications refresh remote caches).
 """
 
 from __future__ import annotations
@@ -44,7 +44,6 @@ from chat import service as chat_service
 from chat import activity_store as chat_activity_store
 from core import chat_activity as chat_activity_projection
 from core import envelope as core_envelope
-from core import wake_bus
 from core.store import UserStore
 from notices import catalog as notices_catalog
 from notices import core as notices_core
@@ -590,10 +589,7 @@ def clear_history(store: UserStore, payload: dict) -> tuple[dict, int]:
         store.chat_messages = []
 
     store.notify_chat_waiters()
-    # Cross-worker: other workers still hold the now-cleared messages in cache —
-    # refresh them (a delete isn't a new-message append, so it won't route
-    # through append_chat's notify).
-    wake_bus.notify("chat", store.user_id)
+    # Cross-worker refresh is emitted by the committed chat delete trigger.
     print(f"[chat/clear:{store.user_id}] deleted={deleted}")
     return {
         "cleared": True,
