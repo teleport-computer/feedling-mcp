@@ -5109,8 +5109,8 @@ def build_production_deps() -> v2_worker.TurnDeps:
 def _build_scheduler_deps():
     """装配 retained D3 wake-lane decision 的 scheduler deps。
     scheduler.py 是纯模块（不 import hosted/agent_runtime/proactive）——这里把它接到真实
-    实现：due_heartbeat_users（Task 2 落的 v2_wake_schedule 表）、_wake_decision_for_user
-    （Task 3 适配器，包一层 proactive_gate，读专用，本身不 enqueue）、enqueue_job("heartbeat")
+    实现：due_heartbeat_users（v2_wake_schedule）、_wake_decision_for_user
+    （包一层 proactive_gate 的只读适配器，本身不 enqueue）、enqueue_job("heartbeat")
     /upsert_wake_schedule(next_heartbeat_at=...)。
 
     leader-election 有意跳过：`enqueue_job` 走
@@ -5135,12 +5135,12 @@ def _build_scheduler_deps():
         advance_heartbeat=lambda uid, next_at: jobs_store.upsert_wake_schedule(
             uid, next_heartbeat_at=next_at
         ),
-        # scheduled lane 生产者（BUG-3）：due_scheduled_users（Task 2）列出到期 self-wake
+        # scheduled lane producer：due_scheduled_users 列出到期 self-wake
         # timer 的用户，_fire_scheduled_for_user 逐用户走 fire_due_timers 把每个到期 timer
         # 转成一个 `scheduled` lane 的 agent_job。scheduler.py 用 getattr 探测这两个属性。
         due_scheduled_users=lambda: jobs_store.due_scheduled_users(),
         fire_scheduled=_fire_scheduled_for_user,
-        # capture/dream 抽取 lane 生产者（Task 4）：extraction_users 列出当前处于 db_action_v2
+        # capture/dream extraction-lane producer：extraction_users 列出当前处于 db_action_v2
         # 模式的用户（admin_core.list_runtime_modes 已按模式分组，取 db_action_v2 那组即
         # 与 hosted eligibility 同源，无需另起一条查询）；_tick_extraction_for_user
         # 逐用户跑 capture+dream 触发闸，各自命中安静窗口/夜间阈值时 enqueue 一个抽取 job。
@@ -5153,8 +5153,8 @@ def _build_scheduler_deps():
             else []
         ),
         tick_extraction=_tick_extraction_for_user,
-        # screen_watch lane 生产者（D-screen_watch Task 4）：screen_watch_users 列出
-        # next_screen_watch_at 已到期的用户（Task 2 的 due_screen_watch_users，与
+        # screen_watch lane producer：screen_watch_users 列出
+        # next_screen_watch_at 已到期的用户（due_screen_watch_users，与
         # heartbeat/scheduled 同套 payment-cooldown 排除）；_tick_screen_watch_for_user
         # 逐用户跑纯 gate + 只读 oracle，命中才 enqueue 一个 screen_watch job。
         # scheduler.py 同样用 getattr 探测这两个属性（缺一即整段跳过，既有 FakeDeps 零改动）。
@@ -5841,7 +5841,7 @@ async def _scheduler_loop(
     """周期性运行 retained D3 wake-lane scheduler：
     对每个到期用户判定是否唤醒 heartbeat（经 `_wake_decision_for_user` 复用真实
     proactive gate），should_wake 就 enqueue_job("heartbeat")（single-flight 去重、
-    走 Task 2 的 lane 优先级），无论如何都 advance_heartbeat 推进下次到期时间——
+    使用当前 lane priority），无论如何都 advance_heartbeat 推进下次到期时间——
     不会同一批用户每个 tick 都重新判一遍。
 
     镜像 `_reaper_loop`/`_heartbeat_loop` 的结构：interruptible 的

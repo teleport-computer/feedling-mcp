@@ -594,14 +594,18 @@ def _new_direct_enclave_gate():
 
 
 def _reserved_lane_slots(max_workers: int, reserved: int | None = None) -> list:
-    """Per-slot lane allowlist for the retained D3 wake-lane contract.
+    """Legacy direct-worker/test compatibility lane assignments.
 
-    前 `reserved` 个 slot 只允许抢 {"chat","manual_wake"}（一次 heartbeat/capture 唤醒风暴
-    绝不会饿死聊天回复）；其余 slot 不设限（None＝任意 lane，含 heartbeat/capture/
-    maintenance）。reserved 未显式传时默认 max(1, max_workers // 2)，但始终至少保留
-    一个 unrestricted slot；单-worker 部署因此不能做 lane reservation。否则 scheduled/
-    maintenance/capture 等非 chat job 会在一个健康进程里永久 pending。reserved 会被夹到
-    [0, max_workers - 1] 区间内，防御越界配置。"""
+    This helper preserves the old multi-slot direct-worker behavior for tests
+    and compatibility callers. It is not the production topology: production
+    lane routing is defined by ``pool_config.RuntimePoolConfig`` and runs one
+    ``turn_child`` process for each SlotSpec under the three-pool decision.
+
+    前 `reserved` 个 compatibility slot 只允许抢 {"chat","manual_wake"}；其余 slot
+    不设限（None＝任意 lane，含 heartbeat/capture/maintenance）。reserved 未显式传时默认
+    max(1, max_workers // 2)，但始终至少保留一个 unrestricted slot；单-worker 调用因此
+    不做 lane reservation。否则 scheduled/maintenance/capture 等非 chat job 会在一个健康
+    进程里永久 pending。reserved 会被夹到 [0, max_workers - 1] 区间内，防御越界配置。"""
     n = max(1, int(max_workers))
     r = reserved if reserved is not None else max(1, n // 2)
     r = max(0, min(r, n - 1))
@@ -908,11 +912,11 @@ _SUBAGENT_DISABLED_TOOLS = frozenset(
     if spec.name not in _SUBAGENT_ALLOWED_TOOLS
 )
 
-# The retained D3 wake-lane contract: the scheduler enqueues jobs in
+# The retained D3 wake-lane decision: the scheduler enqueues jobs in
 # these three lanes when it decides the companion should reach out without the
 # user having spoken first. "capture" is intentionally NOT in this set — it's
 # a different capability shape (memory extraction, not a model-authored reply)
-# and is scoped to a follow-up task; a capture-lane job falling through to the
+# and has its own extraction contract; a capture-lane job falling through to the
 # default chat path below would be wrong (no coalesced pending messages ->
 # it would just complete as a no-op), so it's left alone here rather than
 # silently mishandled by this task's scope.
@@ -957,7 +961,7 @@ _SCHEDULED_WAKE_EMPTY_RESPONSE_CORRECTION = (
     "conveys every reminder now. Do not stay silent, do not return only thinking, "
     "and do not answer an older conversation turn instead."
 )
-# screen_watch lane (Task 3): a wake grounded on recent shared-screen frames rather
+# screen_watch lane: a wake grounded on recent shared-screen frames rather
 # than an ambient perception glance. Its own system prompt sits beside
 # _WAKE_SYSTEM_PROMPT; _run_wake selects it only for lane=="screen_watch". The
 # empty-reply path remains valid without making silence the privileged default.
@@ -991,7 +995,7 @@ def _wake_system_prompt_for_lane(lane: str, base_prompt: str) -> str:
 # interval is a retry storm against a key that cannot succeed until the user fixes it
 # (mirrors the original resident runtime's 600s payment cooldown). We write
 # `payment_cooldown_until` on the wake schedule; `jobs_store.due_heartbeat_users` already
-# excludes cooled-down users (Task 1), so no further wakes fire until it lapses.
+# excludes cooled-down users, so no further wakes fire until it lapses.
 _WAKE_COOLDOWN_SEC = float(os.environ.get("FEEDLING_V2_WAKE_COOLDOWN_SEC", "600"))
 _WAKE_FAIL_BACKOFF_BASE_SEC = float(
     os.environ.get("PROACTIVE_FAIL_BACKOFF_BASE_SEC", "60")
@@ -6139,7 +6143,7 @@ def _frozen_relationship_anchor(patch) -> str | None:
 def _write_tool_effect_payload(tc) -> tuple[str, dict]:
     """Map a WRITE_ACTIONS tool_call to its PR A `(effect_type, payload)` (spec C6). ONE
     definition shared by every lane's `enqueue_write_effect` closure (`process_job`'s chat
-    branch — Task 7 — and `_run_wake` — Task 8) so the write-tool -> effect_type mapping never
+    branch and `_run_wake`) so the write-tool -> effect_type mapping never
     drifts between lanes. `cap_registry.WRITE_ACTIONS` is the closed set
     `executor.dispatch_tool_calls` ever routes here — a new write capability shipping without a
     mapping below must fail loudly, not silently drop the write."""
@@ -10273,7 +10277,7 @@ async def _run_wake(
             if provider_client.classify_provider_error(e) == "provider_config":
                 # Dead/broke BYOK key (402 out-of-credits, 401/403 bad key) — back off
                 # BEFORE mark_failed below, so the scheduler stops hammering
-                # this key every heartbeat interval (Task 1's due_heartbeat_users query
+                # this key every heartbeat interval (due_heartbeat_users
                 # already excludes users still in cooldown).
                 await _fence_wake_effect("payment cooldown")
                 await asyncio.to_thread(
@@ -13559,8 +13563,8 @@ async def process_job(
             fetch_halted=web_fetch_halted,
         )
         # provider_usage kill switch, offer-time half. This is the chat lane's
-        # own gate (Task 6) — the wake lane withholds the tool unconditionally
-        # (Task 5), never reaching this check. Fail-closed: a broken read
+        # own gate — the wake lane withholds the tool unconditionally, never
+        # reaching this check. Fail-closed: a broken read
         # withholds the tool rather than exposing it.
         try:
             provider_usage_halted = await asyncio.to_thread(
@@ -16369,7 +16373,7 @@ async def _slot_loop(
     wake_event 命中时立刻醒——见 `_wait_for_job_or_stop`）。stop_event 置位后不再抢新活，
     跑完手上的即退出（优雅 drain）。
 
-    lanes（可选）：转给 `jobs_store.claim_next_job` 的 lane 白名单（Task 2）。None＝不限制
+    lanes（可选）：转给 `jobs_store.claim_next_job` 的 lane 白名单。None＝不限制
     （行为与改动前完全一致）；非 None 时这个 slot 只抢白名单里的 lane——`run_worker_loop`
     用它给部分 slot 划专用车道（见 `_reserved_lane_slots`）。
 
@@ -16540,14 +16544,22 @@ async def run_worker_loop(
     slot_generation: str = "g0",
     slot_ids: "list[str] | None" = None,
 ) -> None:
-    """起 max_workers 个 job-slot 协程共抢同一张 agent_jobs（SKIP LOCKED 无争用）。
+    """Run direct-worker slots for compatibility callers and unit tests.
+
+    Production does not use this multi-slot arrangement: ``serve_worker``
+    builds the three-pool ``RuntimePoolConfig`` and starts one ``turn_child``
+    process for every SlotSpec. Each child invokes ``_slot_loop`` directly with
+    that pool's lane allowlist. This function remains the direct-worker/test
+    compatibility path and still preserves its historical lane assignments.
+
+    起 max_workers 个 job-slot 协程共抢同一张 agent_jobs（SKIP LOCKED 无争用）。
     stop_event 置位 → 所有 slot 跑完手上 job 后退出（SIGTERM 优雅 drain 的落点）。
     wake_event（可选）由 serve_worker._serve 传入，桥 "v2_jobs" 即时唤醒（FIX 3）——
     未传（None）时所有 slot 退化为纯 poll，向后兼容既有调用方/测试。
 
-    lane 预留：前几个 slot 只抢 {"chat","manual_wake"}（见 `_reserved_lane_slots`），
-    保证 scheduler（Task 4）产出的 heartbeat 唤醒风暴抢不走全部 slot、饿死聊天回复，
-    同时始终留一个 unrestricted slot，避免后台 lane 永久 pending。
+    compatibility lane assignments：前几个 slot 只抢 {"chat","manual_wake"}
+    （见 `_reserved_lane_slots`），同时始终留一个 unrestricted slot，避免后台 lane
+    永久 pending。
     `FEEDLING_V2_CHAT_RESERVED_SLOTS` 显式设置时覆盖默认的 max(1, max_workers // 2)；
     留空/未设置时用默认值。
 

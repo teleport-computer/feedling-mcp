@@ -1614,8 +1614,8 @@ def test_tail_image_limit_fails_worker_startup_when_nonpositive(raw):
 
 
 # ------------------------------------------------------------------
-# D3 Task 5: lane reservation wiring — _reserved_lane_slots() picks the
-# per-slot lane allowlist that run_worker_loop hands to each _slot_loop.
+# Legacy direct-worker lane-assignment compatibility — _reserved_lane_slots()
+# picks the per-slot allowlist that run_worker_loop hands to each _slot_loop.
 # ------------------------------------------------------------------
 
 def test_reserved_lane_slots_explicit_reserved_count():

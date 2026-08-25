@@ -1,4 +1,4 @@
-"""D3 Task 2：lane 优先级 + claim 的可选 lane-allowlist（预留槽位）。
+"""Legacy direct-worker lane reservation compatibility coverage.
 
 预留槽位场景：一个 worker slot 只被允许抢 {"chat","manual_wake"}，即使有大量
 heartbeat/capture 在排队，也绝不会去抢它们——保证聊天回复不被后台唤醒风暴饿死。

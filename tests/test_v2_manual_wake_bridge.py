@@ -1,4 +1,4 @@
-"""proactive_tick 在 db_action_v2 模式下的 MANUAL wake 桥接（D3 Task 9）。
+"""proactive_tick 在 db_action_v2 模式下的 MANUAL wake 桥接。
 
 db_action_v2 用户没有常驻 consumer（D0 排他性 guard 已把他们从发现名单里摘掉），
 所以 MANUAL wake（"talk to me now"）不能再走常驻 proactive_job（永远不会被认领）；

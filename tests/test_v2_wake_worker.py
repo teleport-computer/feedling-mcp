@@ -2519,9 +2519,9 @@ def test_run_wake_tolerates_missing_read_summary_read_tail(monkeypatch):
 
 
 # ------------------------------------------------------------------
-# D3 Task 7: a "provider_config"-kind failure (dead/broke BYOK key: 402/401/403
-# — classified via provider_client.classify_provider_error, Task 8's
-# replacement for the old ResponderError.kind mechanism) must write a
+# A "provider_config"-kind failure (dead/broke BYOK key: 402/401/403
+# — classified via provider_client.classify_provider_error, replacing the old
+# ResponderError.kind mechanism) must write a
 # payment_cooldown_until on the wake schedule BEFORE the silent mark_failed,
 # so the scheduler's due_heartbeat_users stops re-firing wakes at a key that
 # cannot succeed until the user fixes it. A "transient"-kind error must NOT

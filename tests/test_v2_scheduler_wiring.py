@@ -1,4 +1,4 @@
-"""D3 Task 5：serve_worker._build_scheduler_deps —— 把纯模块
+"""Wake-lane scheduler wiring：serve_worker._build_scheduler_deps —— 把纯模块
 `model_api_runtime.v2.scheduler.run_scheduler_tick` 接到真实实现的装配层适配器。
 
 纯接线断言，不跑真的 scheduler 循环：monkeypatch jobs_store 上的
