@@ -177,6 +177,9 @@ scans it and incorrectly changes the `generated` count.
 
 ```bash
 python3 tools/check_document_lifecycle.py --changed-vs origin/test
+NO_PROXY='*' no_proxy='*' \
+DATABASE_URL='postgresql://postgres:test@127.0.0.1:55432/postgres' \
+FEEDLING_TEST_PG='postgresql://postgres:test@127.0.0.1:55432/postgres' \
 /Users/zhengzhihao/Projects/teleport/feedling-mcp/.venv-test/bin/python -m pytest \
   tests/test_document_lifecycle.py tests/test_current_state_docs.py \
   tests/test_repository_inventory.py tests/test_dual_runtime_coexistence.py \
