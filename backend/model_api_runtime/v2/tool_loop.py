@@ -885,6 +885,8 @@ async def run_tool_loop(
     file_delivery_recovery_needed = False
     workspace_write_applied = False
     workspace_delivery_target: tuple[str, int] | None = None
+    workspace_delivery_candidate: tuple[str, int] | None = None
+    existing_file_delivery_choice_required = False
     compact_delivery_validation_exchange: ToolExchange | None = None
     compact_delivery_mismatch_retry_used = False
     compact_delivery_args_retry_used = False
@@ -1132,6 +1134,8 @@ async def run_tool_loop(
                         file_delivery_fallback_reasoning = ""
                         workspace_write_applied = False
                         workspace_delivery_target = None
+                        workspace_delivery_candidate = None
+                        existing_file_delivery_choice_required = False
                         compact_delivery_validation_exchange = None
                         compact_delivery_mismatch_retry_used = False
                         compact_delivery_args_retry_used = False
@@ -1323,6 +1327,7 @@ async def run_tool_loop(
             )
         )
         forced_delivery_tool = ""
+        file_delivery_choice_required = False
         if (
             not terminal_text_round
             and tools is not None
@@ -1355,8 +1360,24 @@ async def run_tool_loop(
             surface_reason = "file_delivery_forced"
             if workspace_write_applied:
                 forced_delivery_tool = tool_schema.FILE_REPLY_TOOL
+            elif (
+                existing_file_delivery_choice_required
+                and workspace_delivery_candidate is not None
+            ):
+                choice_names = {
+                    spec.name
+                    for spec in tools
+                    if spec.name in {"workspace_write", tool_schema.FILE_REPLY_TOOL}
+                }
+                tools = [spec for spec in tools if spec.name in choice_names]
+                if choice_names == {tool_schema.FILE_REPLY_TOOL}:
+                    forced_delivery_tool = tool_schema.FILE_REPLY_TOOL
+                elif choice_names:
+                    file_delivery_choice_required = True
             elif file_delivery_recovery_needed:
-                forced_delivery_tool = "workspace_write"
+                available_names = {spec.name for spec in tools}
+                if "workspace_write" in available_names:
+                    forced_delivery_tool = "workspace_write"
             if forced_delivery_tool:
                 tools = [
                     spec for spec in tools
@@ -1456,6 +1477,11 @@ async def run_tool_loop(
         if forced_delivery_tool:
             required_schema_names = set(required_schema_names) | {
                 forced_delivery_tool
+            }
+        if file_delivery_choice_required:
+            required_schema_names = set(required_schema_names) | {
+                "workspace_write",
+                tool_schema.FILE_REPLY_TOOL,
             }
         if wake_choice_required:
             required_schema_names = {
@@ -1645,6 +1671,7 @@ async def run_tool_loop(
                 "messages": messages,
                 "tools": tools,
                 "forced_tool": forced_delivery_tool,
+                "file_delivery_choice_required": file_delivery_choice_required,
                 "wake_choice_required": wake_choice_required,
                 "compact_delivery_phase": compact_delivery_phase,
                 "prompt_frontier": frontier_plan,
@@ -1671,6 +1698,8 @@ async def run_tool_loop(
             if terminal_schema_guard and tools is not None:
                 provider_kwargs["tool_choice"] = "none"
             if wake_choice_required:
+                provider_kwargs["tool_choice"] = "required"
+            if file_delivery_choice_required:
                 provider_kwargs["tool_choice"] = "required"
             if allow_image_output and not terminal_text_round:
                 provider_kwargs["allow_image_output"] = True
@@ -2384,13 +2413,36 @@ async def run_tool_loop(
                     )
                 if missing_suffixes:
                     target = ", ".join(missing_suffixes)
-                    delivery_retry_instruction = (
-                        "REQUIRED FILE DELIVERY: The user explicitly requested "
-                        f"downloadable output in {target}. Do not finish with "
-                        "plain text. Create editable source with workspace_write, "
-                        "then call send_file for every missing format before the "
-                        "terminal reply."
-                    )
+                    if workspace_delivery_candidate is not None:
+                        candidate_path, candidate_revision = (
+                            workspace_delivery_candidate
+                        )
+                        delivery_retry_instruction = (
+                            "REQUIRED FILE DELIVERY: The user explicitly requested "
+                            f"downloadable output in {target}. An existing exact "
+                            "workspace revision is available at "
+                            + json.dumps(
+                                {
+                                    "path": candidate_path,
+                                    "revision": candidate_revision,
+                                },
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                            + ". Do not finish with plain text or an internal link. "
+                            "Call workspace_write if the source bytes still need "
+                            "the user's requested change; otherwise call send_file "
+                            "for that exact existing revision."
+                        )
+                        existing_file_delivery_choice_required = True
+                    else:
+                        delivery_retry_instruction = (
+                            "REQUIRED FILE DELIVERY: The user explicitly requested "
+                            f"downloadable output in {target}. Do not finish with "
+                            "plain text. Create editable source with workspace_write, "
+                            "then call send_file for every missing format before the "
+                            "terminal reply."
+                        )
                 else:
                     delivery_retry_instruction = (
                         "REQUIRED FILE DELIVERY: The user explicitly requested a "
@@ -2893,6 +2945,36 @@ async def run_tool_loop(
                 else:
                     compact_delivery_mismatch_retry_used = True
                 continue
+            if (
+                workspace_delivery_target is None
+                and existing_file_delivery_choice_required
+                and workspace_delivery_candidate is not None
+                and (workspace_path, workspace_revision)
+                != workspace_delivery_candidate
+            ):
+                target_path, target_revision = workspace_delivery_candidate
+                file_result = ToolResult(
+                    call_id=tc.id,
+                    content=(
+                        "error: existing_delivery_candidate_mismatch; no file was "
+                        "delivered. Call send_file with exactly "
+                        + json.dumps(
+                            {"path": target_path, "revision": target_revision},
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    ),
+                )
+                reply_results[tc.id] = file_result
+                await _tool_event(
+                    tc, "tool_call_result", {"result": file_result}
+                )
+                if compact_delivery_mismatch_retry_used:
+                    raise CanvasDeliveryIncomplete(
+                        "existing_delivery_candidate_mismatch"
+                    )
+                compact_delivery_mismatch_retry_used = True
+                continue
             try:
                 if workspace_path.casefold().endswith(".io.html"):
                     await on_file_reply(
@@ -2911,6 +2993,8 @@ async def run_tool_loop(
             delivered_file_suffixes.add(file_suffix)
             workspace_write_applied = False
             workspace_delivery_target = None
+            workspace_delivery_candidate = None
+            existing_file_delivery_choice_required = False
             compact_delivery_validation_exchange = None
             compact_delivery_mismatch_retry_used = False
             compact_delivery_args_retry_used = False
@@ -3074,6 +3158,26 @@ async def run_tool_loop(
                 completed_memory_discovery_tools.add(tc.name)
                 completed_memory_discovery_calls.add(discovery_call_key)
         for tc in dispatch_calls:
+            if tc.name != "workspace_read":
+                continue
+            result = ordered_results_by_id[tc.id]
+            if str(result.content).strip().lower().startswith("error"):
+                continue
+            metadata = result.metadata or {}
+            path = metadata.get("workspace_read_path")
+            revision = metadata.get("workspace_revision")
+            if not isinstance(path, str) or type(revision) is not int:
+                continue
+            suffix = _file_suffix_for_requirement(
+                path, normalized_required_suffixes
+            )
+            matches_required_delivery = file_delivery_required and (
+                not normalized_required_suffixes
+                or suffix in normalized_required_suffixes
+            )
+            if matches_required_delivery and revision > 0:
+                workspace_delivery_candidate = (path, revision)
+        for tc in dispatch_calls:
             if tc.name != "workspace_write":
                 continue
             result = ordered_results_by_id[tc.id]
@@ -3096,6 +3200,8 @@ async def run_tool_loop(
                 revision = int(match.group(1)) if match else None
             if type(revision) is int and revision > 0:
                 workspace_delivery_target = (path, revision)
+                workspace_delivery_candidate = None
+                existing_file_delivery_choice_required = False
                 compact_delivery_args_retry_used = False
         if any(
             tc.name in provenance.EXTERNAL_READS or tc.name in mcp_names

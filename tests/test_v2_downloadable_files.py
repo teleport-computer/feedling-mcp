@@ -900,6 +900,166 @@ def test_io_html_satisfies_generic_html_delivery_requirement(monkeypatch):
     assert outcome.stop_reason == "final_text"
 
 
+def test_existing_canvas_read_can_be_delivered_without_rewriting_source(monkeypatch):
+    files = []
+    dispatched = []
+    path = "/workspace/打砖块小游戏.io.html"
+
+    async def on_file(file_path, revision, *, title="", subtitle=""):
+        files.append((file_path, revision, title, subtitle))
+
+    async def dispatch(tool_calls):
+        dispatched.extend(call.name for call in tool_calls)
+        return [
+            ToolResult(
+                call_id=call.id,
+                content='{"path":"/workspace/打砖块小游戏.io.html","revision":7}',
+                metadata={
+                    "workspace_read_path": path,
+                    "workspace_revision": 7,
+                },
+            )
+            for call in tool_calls
+        ]
+
+    outcome, calls, replies, messages_seen = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "read-existing",
+                    "name": "workspace_read",
+                    "args": {"path": path},
+                }],
+                "usage": {},
+            },
+            {
+                "reply": f"已经更新，打开 private://workspace{path}",
+                "tool_calls": [],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "send-existing",
+                    "name": "send_file",
+                    "args": {
+                        "path": path,
+                        "revision": 7,
+                        "title": "霓虹砖块",
+                        "subtitle": "击碎所有砖块，刷新最高分",
+                    },
+                }],
+                "usage": {},
+            },
+            {"reply": "标题和副标题已经更新。", "tool_calls": [], "usage": {}},
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        required_file_suffixes=(".html",),
+        file_requirement_messages=[{
+            "role": "user",
+            "content": "把这个 Canvas 的标题和副标题重新改一下，发给我。",
+        }],
+        max_calls=4,
+    )
+
+    assert dispatched == ["workspace_read"]
+    assert set(calls[2]) == {"workspace_write", "send_file"}
+    assert "existing exact workspace revision" in messages_seen[2][0]["content"]
+    assert files == [
+        (path, 7, "霓虹砖块", "击碎所有砖块，刷新最高分")
+    ]
+    assert replies == [("标题和副标题已经更新。", True)]
+    assert outcome.stop_reason == "final_text"
+
+
+def test_existing_canvas_delivery_choice_can_still_rewrite_changed_source(
+    monkeypatch,
+):
+    files = []
+    path = "/workspace/打砖块小游戏.io.html"
+
+    async def on_file(file_path, revision, *, title="", subtitle=""):
+        files.append((file_path, revision, title, subtitle))
+
+    async def dispatch(tool_calls):
+        results = []
+        for call in tool_calls:
+            if call.name == "workspace_read":
+                results.append(ToolResult(
+                    call_id=call.id,
+                    content='{"path":"/workspace/打砖块小游戏.io.html","revision":7}',
+                    metadata={
+                        "workspace_read_path": path,
+                        "workspace_revision": 7,
+                    },
+                ))
+            else:
+                results.append(ToolResult(
+                    call_id=call.id,
+                    content="ok: workspace_write applied at revision 8",
+                    metadata={"workspace_revision": 8},
+                ))
+        return results
+
+    outcome, calls, _, _ = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "read-existing",
+                    "name": "workspace_read",
+                    "args": {"path": path},
+                }],
+                "usage": {},
+            },
+            {"reply": "修改完成。", "tool_calls": [], "usage": {}},
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "write-update",
+                    "name": "workspace_write",
+                    "args": {
+                        "path": path,
+                        "content": "<html>updated game</html>",
+                        "expected_revision": 7,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "send-update",
+                    "name": "send_file",
+                    "args": {
+                        "path": path,
+                        "revision": 8,
+                        "title": "新版打砖块",
+                        "subtitle": "加入新的关卡与计分规则",
+                    },
+                }],
+                "usage": {},
+            },
+            {"reply": "新版已经发给你。", "tool_calls": [], "usage": {}},
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        required_file_suffixes=(".html",),
+        max_calls=5,
+    )
+
+    assert set(calls[2]) == {"workspace_write", "send_file"}
+    assert calls[3] == ("send_file",)
+    assert files == [
+        (path, 8, "新版打砖块", "加入新的关卡与计分规则")
+    ]
+    assert outcome.stop_reason == "final_text"
+
+
 @pytest.mark.parametrize("required_suffix", [".pdf", ".docx", ".json"])
 def test_io_html_does_not_satisfy_non_html_requirement(required_suffix):
     assert tool_loop._file_suffix_for_requirement(

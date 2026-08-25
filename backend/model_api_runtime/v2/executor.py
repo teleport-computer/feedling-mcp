@@ -266,6 +266,23 @@ async def dispatch_tool_calls(
                 or activity_metadata.perception_result_metadata(tc.name, data)
                 or None
             )
+            if tc.name == "workspace_read" and data.get("ok"):
+                payload = data.get("data") or {}
+                path = payload.get("path") if isinstance(payload, dict) else None
+                revision = (
+                    payload.get("revision") if isinstance(payload, dict) else None
+                )
+                if (
+                    isinstance(path, str)
+                    and path.startswith("/")
+                    and type(revision) is int
+                    and revision > 0
+                ):
+                    metadata = {
+                        **(metadata or {}),
+                        "workspace_read_path": path,
+                        "workspace_revision": revision,
+                    }
         except Exception:  # noqa: BLE001 — isolate one bad read; keep the wire vocabulary stable
             # Read calls are independent and side-effect-free.  A capability bug or
             # adapter failure must not discard successful sibling results or fail the
