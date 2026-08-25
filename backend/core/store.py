@@ -815,6 +815,8 @@ class UserStore:
                 "vision_main_route_id",
                 "vision_main_route_updated_at",
                 "file_name",
+                "file_display_title",
+                "file_display_subtitle",
                 "file_mime",
                 "file_byte_count",
                 # Optional client operation UUID. Plaintext routing metadata
@@ -1043,6 +1045,8 @@ class UserStore:
                 "vision_main_route_id",
                 "vision_main_route_updated_at",
                 "file_name",
+                "file_display_title",
+                "file_display_subtitle",
                 "file_mime",
                 "file_byte_count",
                 # Optional client operation UUID. Plaintext routing metadata

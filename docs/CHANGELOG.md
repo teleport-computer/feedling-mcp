@@ -72,6 +72,28 @@
   不可计算。
 - RDS 与 TEE 迁移同步新增三类计数和水位约束；删号后的匿名聚合也逐类相加，保持
   冻结历史的分类守恒。
+## 2026-08-24 — Canvas 卡片增加可生成和修改的副标题
+
+**[UI] VPS 与 API Key 两条生成链路使用同一份标题、副标题元数据。**
+
+- `.io.html` 交付现在必须同时带短标题与单行副标题，模型使用用户当前语言生成，
+  后续修改时默认保留，也可以随内容一起更新。
+- 标题和副标题作为有界的文件消息展示元数据，与加密 HTML 附件原子落库，旧消息
+  没有副标题时继续兼容显示。
+- iOS 的画布列表、聊天卡片、搜索和继续修改附件读取同一字段，不从 HTML 正文猜测。
+
+## 2026-08-24 — Resident HTTP Canvas 交付不再提前断线
+
+**[DONE] 同机 HTTP agent 可显式接入 `io_cli`，Canvas 以 `.io.html` 卡片交付。**
+
+- HTTP agent 请求统一使用 `FEEDLING_AGENT_TURN_TIMEOUT_SEC`，不再被写死的
+  60/120 秒提前断开。
+- 仅当 `FEEDLING_AGENT_HTTP_LOCAL_IO_CLI=true` 时，HTTP agent 才获得本地
+  `io_cli` 目录和文件完成守卫，普通远程 HTTP 模型服务保持原行为。
+- 配合精确的 `FEEDLING_AGENT_HTTP_LOCAL_FILE_ROOTS` 工作区白名单，`send-file`
+  可直接读取 Agent 已生成的文件，不要求跨工作区复制，也不会删除原始文件。
+- Canvas 固定为单个自包含 `.io.html`，不假定 JS Bridge，按 iOS 上限限制为
+  256,000 bytes，并要求文件名、标题和界面文案跟随用户当前语言。
 
 ## 2026-08-20 — TEE Redis 暂停并标记废弃
 

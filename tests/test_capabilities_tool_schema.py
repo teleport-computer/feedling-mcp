@@ -26,6 +26,34 @@ def test_catalog_covers_capabilities_plus_synthetic_tools_minus_internal_actions
     assert all(isinstance(s, ToolSpec) for s in specs)
 
 
+def test_canvas_send_file_requires_bounded_title_and_subtitle():
+    send_file = next(
+        spec for spec in tool_schema.build_tool_specs()
+        if spec.name == tool_schema.FILE_REPLY_TOOL
+    )
+    assert send_file.parameters["properties"]["title"]["maxLength"] == 120
+    assert send_file.parameters["properties"]["subtitle"]["maxLength"] == 160
+    assert "user's current language" in send_file.description
+
+    base = {"path": "/workspace/接星星.io.html", "revision": 2}
+    assert "requires title and subtitle" in tool_schema.validate_tool_args(
+        "send_file", base
+    )
+    assert tool_schema.validate_tool_args(
+        "send_file",
+        {**base, "title": "接星星", "subtitle": "六十秒接星星小游戏"},
+    ) is None
+    assert "only valid for Canvas" in tool_schema.validate_tool_args(
+        "send_file",
+        {
+            "path": "/workspace/计划.pdf",
+            "revision": 1,
+            "title": "计划",
+            "subtitle": "明日安排",
+        },
+    )
+
+
 def test_t101_perception_and_screen_gates_reach_final_tool_descriptions():
     descriptions = {
         spec.name: spec.description for spec in tool_schema.build_tool_specs()

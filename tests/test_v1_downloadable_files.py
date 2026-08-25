@@ -128,6 +128,42 @@ def test_v1_text_and_file_followup_commit_as_one_ordered_reply(
     assert float(card["ts"]) > float(primary["ts"])
 
 
+def test_v1_canvas_followup_persists_title_and_subtitle(store, monkeypatch):
+    _quiet_response_side_effects(monkeypatch)
+    parent = store.append_chat(
+        "user", "chat", _envelope(store.user_id, "v1_canvas_parent")
+    )
+
+    body, status = chat_core.write_response(
+        store,
+        {
+            "envelope": _envelope(store.user_id, "v1_canvas_primary"),
+            "reply_to_message_id": parent["id"],
+            "file_followups": [
+                {
+                    "envelope": _envelope(store.user_id, "v1_canvas_card"),
+                    "file_name": "接星星.io.html",
+                    "file_display_title": "接星星",
+                    "file_display_subtitle": "六十秒接星星小游戏",
+                    "file_mime": "text/html",
+                    "file_byte_count": 1234,
+                }
+            ],
+        },
+        consumer_id="resident-v1",
+        consumer_info={},
+        allow_verify_reply=False,
+    )
+
+    assert status == 200, body
+    card = next(
+        row for row in db.chat_load(store.user_id)
+        if row["id"] == "v1_canvas_card"
+    )
+    assert card["file_display_title"] == "接星星"
+    assert card["file_display_subtitle"] == "六十秒接星星小游戏"
+
+
 def test_v1_text_and_images_commit_as_one_ordered_reply(store, monkeypatch):
     _quiet_response_side_effects(monkeypatch)
     parent = store.append_chat(
@@ -426,6 +462,183 @@ def test_resident_stages_and_renders_real_pdf(tmp_path, monkeypatch):
     assert not source.exists()
 
 
+def test_resident_stages_io_canvas_with_exact_multi_suffix(tmp_path, monkeypatch):
+    outbox = tmp_path / "outbound-files"
+    monkeypatch.setattr(resident, "OUTBOUND_FILE_DIR", outbox)
+    resident._begin_outbound_file_turn("turn-canvas", (".io.html",))
+    source = outbox / "source.html"
+    source.write_text(
+        "<!doctype html><html lang='zh-CN'><title>接星星</title></html>",
+        encoding="utf-8",
+    )
+
+    reply = resident._handle_stage_file_ipc(
+        {
+            "op": "stage_file",
+            "request_id": "request-canvas",
+            "path": str(source),
+            "name": "接星星.io.html",
+            "file_display_title": "接星星",
+            "file_display_subtitle": "接住从夜空落下的小星星",
+        }
+    )
+
+    assert reply["ok"] is True
+    staged = resident._finish_outbound_file_turn("turn-canvas")
+    assert len(staged) == 1
+    assert staged[0].name == "接星星.io.html"
+    assert staged[0].mime_type == "text/html"
+    assert staged[0].display_title == "接星星"
+    assert staged[0].display_subtitle == "接住从夜空落下的小星星"
+
+
+def test_resident_requires_canvas_title_and_subtitle(tmp_path, monkeypatch):
+    outbox = tmp_path / "outbound-files"
+    monkeypatch.setattr(resident, "OUTBOUND_FILE_DIR", outbox)
+    resident._begin_outbound_file_turn("turn-canvas-metadata", (".io.html",))
+    source = outbox / "source.html"
+    source.write_text("<html></html>", encoding="utf-8")
+
+    reply = resident._handle_stage_file_ipc(
+        {
+            "op": "stage_file",
+            "request_id": "request-canvas-metadata",
+            "path": str(source),
+            "name": "接星星.io.html",
+            "file_display_title": "接星星",
+        }
+    )
+
+    assert reply == {
+        "ok": False,
+        "error": "Canvas delivery requires title and subtitle",
+        "request_id": "request-canvas-metadata",
+    }
+    assert resident._finish_outbound_file_turn("turn-canvas-metadata") == []
+
+
+def test_local_http_resident_stages_canvas_from_trusted_workspace_without_deleting_source(
+    tmp_path, monkeypatch
+):
+    outbox = tmp_path / "outbound-files"
+    workspace = tmp_path / "agent-workspace"
+    workspace.mkdir()
+    source = workspace / "接星星小游戏.io.html"
+    source.write_text(
+        "<!doctype html><html lang='zh-CN'><title>接星星小游戏</title></html>",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(resident, "OUTBOUND_FILE_DIR", outbox)
+    monkeypatch.setattr(resident, "AGENT_MODE", "http")
+    monkeypatch.setattr(resident, "AGENT_HTTP_LOCAL_IO_CLI", True)
+    monkeypatch.setattr(
+        resident, "AGENT_HTTP_LOCAL_FILE_ROOTS", (str(workspace),)
+    )
+    resident._begin_outbound_file_turn("turn-workspace-canvas", (".io.html",))
+
+    reply = resident._handle_stage_file_ipc(
+        {
+            "op": "stage_file",
+            "request_id": "request-workspace-canvas",
+            "path": str(source),
+            "name": "接星星小游戏.io.html",
+            "file_display_title": "接星星小游戏",
+            "file_display_subtitle": "六十秒内接住尽可能多的星星",
+        }
+    )
+
+    assert reply["ok"] is True
+    staged = resident._finish_outbound_file_turn("turn-workspace-canvas")
+    assert len(staged) == 1
+    assert staged[0].data == source.read_bytes()
+    assert staged[0].cleanup_source is False
+    assert source.exists()
+
+
+def test_local_http_resident_rejects_file_outside_explicit_workspace(
+    tmp_path, monkeypatch
+):
+    outbox = tmp_path / "outbound-files"
+    workspace = tmp_path / "agent-workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.io.html"
+    outside.write_text("<html></html>", encoding="utf-8")
+    monkeypatch.setattr(resident, "OUTBOUND_FILE_DIR", outbox)
+    monkeypatch.setattr(resident, "AGENT_MODE", "http")
+    monkeypatch.setattr(resident, "AGENT_HTTP_LOCAL_IO_CLI", True)
+    monkeypatch.setattr(
+        resident, "AGENT_HTTP_LOCAL_FILE_ROOTS", (str(workspace),)
+    )
+    resident._begin_outbound_file_turn("turn-workspace-escape", (".io.html",))
+
+    reply = resident._handle_stage_file_ipc(
+        {
+            "op": "stage_file",
+            "request_id": "request-workspace-escape",
+            "path": str(outside),
+            "name": "outside.io.html",
+        }
+    )
+
+    assert reply["ok"] is False
+    assert reply["error"] == "path_outside_allowed_file_roots"
+    assert resident._finish_outbound_file_turn("turn-workspace-escape") == []
+
+
+def test_local_http_resident_rejects_broad_home_root(tmp_path, monkeypatch):
+    outbox = tmp_path / "outbound-files"
+    source = tmp_path / "private.io.html"
+    source.write_text("<html></html>", encoding="utf-8")
+    monkeypatch.setattr(resident, "OUTBOUND_FILE_DIR", outbox)
+    monkeypatch.setattr(resident, "AGENT_MODE", "http")
+    monkeypatch.setattr(resident, "AGENT_HTTP_LOCAL_IO_CLI", True)
+    monkeypatch.setattr(resident.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(
+        resident, "AGENT_HTTP_LOCAL_FILE_ROOTS", (str(tmp_path),)
+    )
+    resident._begin_outbound_file_turn("turn-broad-home", (".io.html",))
+
+    reply = resident._handle_stage_file_ipc(
+        {
+            "op": "stage_file",
+            "request_id": "request-broad-home",
+            "path": str(source),
+            "name": "private.io.html",
+        }
+    )
+
+    assert reply["ok"] is False
+    assert reply["error"] == "path_outside_allowed_file_roots"
+    assert resident._finish_outbound_file_turn("turn-broad-home") == []
+
+
+def test_resident_rejects_canvas_larger_than_ios_limit(tmp_path, monkeypatch):
+    outbox = tmp_path / "outbound-files"
+    monkeypatch.setattr(resident, "OUTBOUND_FILE_DIR", outbox)
+    resident._begin_outbound_file_turn("turn-large-canvas", (".io.html",))
+    source = outbox / "large.html"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(
+        "<html>" + ("x" * resident._OUTBOUND_CANVAS_MAX_BYTES) + "</html>",
+        encoding="utf-8",
+    )
+
+    reply = resident._handle_stage_file_ipc(
+        {
+            "op": "stage_file",
+            "request_id": "request-large-canvas",
+            "path": str(source),
+            "name": "太大的画布.io.html",
+            "file_display_title": "太大的画布",
+            "file_display_subtitle": "用于验证画布大小限制",
+        }
+    )
+
+    assert reply["ok"] is False
+    assert reply["error"] == "canvas_file_too_large"
+    assert resident._finish_outbound_file_turn("turn-large-canvas") == []
+
+
 @pytest.mark.parametrize("source", ["chat", "model_api"])
 def test_file_only_cli_result_is_success_not_parse_failure(
     tmp_path, monkeypatch, source
@@ -536,6 +749,43 @@ def test_v1_completion_guard_matches_natural_word_request():
 @pytest.mark.parametrize(
     "text",
     [
+        "帮我生成一个 HTML 画布文件并发给我。",
+        "Create a Canvas HTML file for me.",
+        "请生成 star-catcher.io.html 并发送。",
+    ],
+)
+def test_v1_completion_guard_maps_canvas_html_to_io_html(text):
+    requirement = resident._required_outbound_file_suffixes(text)
+
+    assert requirement == (".io.html",)
+    staged = [
+        resident.StagedChatFile(
+            source_path="/private/tmp/star-catcher.html",
+            name="star-catcher.html",
+            mime_type="text/html",
+            data=b"<html></html>",
+        )
+    ]
+    assert resident._missing_outbound_file_suffixes(requirement, staged) == (
+        ".io.html",
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("帮我生成一个普通 HTML 文件。", (".html",)),
+        ("把这个 Canvas 导出成 PDF 发给我。", (".pdf",)),
+        ("请解释一下 Canvas 是什么。", None),
+    ],
+)
+def test_v1_canvas_suffix_mapping_does_not_expand_other_requests(text, expected):
+    assert resident._required_outbound_file_suffixes(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
         "给我一份下周的工作清单",
         "can you make a plan for my week?",
         "give me a report on how I slept",
@@ -547,8 +797,17 @@ def test_v1_completion_guard_ignores_conversational_requests(text):
     assert resident._required_outbound_file_suffixes(text) is None
 
 
-def _patch_v1_foreground_file_turn(monkeypatch):
-    monkeypatch.setattr(resident, "AGENT_MODE", "cli")
+def _patch_v1_foreground_file_turn(
+    monkeypatch,
+    *,
+    agent_mode="cli",
+    http_local_io_cli=False,
+):
+    monkeypatch.setattr(resident, "AGENT_MODE", agent_mode)
+    monkeypatch.setattr(
+        resident, "AGENT_HTTP_LOCAL_IO_CLI", http_local_io_cli
+    )
+    monkeypatch.setattr(resident, "AGENT_HTTP_LOCAL_FILE_ROOTS", ())
     monkeypatch.setattr(resident, "_resident_chat_runtime_v2_enabled", lambda: False)
     monkeypatch.setattr(
         resident, "_prepend_io_cli_capability_catalog", lambda content: content
@@ -564,6 +823,122 @@ def _patch_v1_foreground_file_turn(monkeypatch):
     monkeypatch.setattr(resident, "_worldbook_context_for_foreground", lambda _text, **_kwargs: "")
     resident._seen_ids.clear()
     resident._seen_ids_order.clear()
+
+
+def test_local_http_agent_retries_once_and_delivers_canvas_card(
+    tmp_path, monkeypatch
+):
+    _patch_v1_foreground_file_turn(
+        monkeypatch,
+        agent_mode="http",
+        http_local_io_cli=True,
+    )
+    outbox = tmp_path / "outbound-files"
+    workspace = tmp_path / "agent-workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(resident, "OUTBOUND_FILE_DIR", outbox)
+    monkeypatch.setattr(
+        resident, "AGENT_HTTP_LOCAL_FILE_ROOTS", (str(workspace),)
+    )
+    calls = []
+    posted = {}
+
+    def fake_agent(message, **kwargs):
+        calls.append((message, kwargs))
+        if len(calls) == 1:
+            return {
+                "messages": [
+                    "完成了：[打开游戏](/Users/example/workspace/star-catcher.html)"
+                ]
+            }
+        source = workspace / "接星星.io.html"
+        source.write_text(
+            "<!doctype html><html lang='zh-CN'><title>接星星</title></html>",
+            encoding="utf-8",
+        )
+        staged = resident._handle_stage_file_ipc(
+            {
+                "op": "stage_file",
+                "request_id": "request-http-canvas",
+                "path": str(source),
+                "name": "接星星.io.html",
+                "file_display_title": "接星星",
+                "file_display_subtitle": "六十秒接星星小游戏",
+            }
+        )
+        assert staged["ok"] is True
+        return {"messages": ["已经做好并发给你了。"]}
+
+    def fake_post(reply, **kwargs):
+        posted["reply"] = reply
+        posted["kwargs"] = kwargs
+        return {"id": "reply-http-canvas"}
+
+    monkeypatch.setattr(resident, "call_agent", fake_agent)
+    monkeypatch.setattr(resident, "post_reply", fake_post)
+
+    result = resident._process_messages(
+        [
+            {
+                "id": "user-http-canvas",
+                "role": "user",
+                "source": "chat",
+                "content": "帮我做一个接星星小游戏，生成 HTML 画布文件并发给我。",
+                "ts": 1234.5,
+            }
+        ]
+    )
+
+    assert result == pytest.approx(1234.5)
+    assert len(calls) == 2
+    assert "Missing output: .io.html" in calls[1][0]
+    assert posted["reply"] == "已经做好并发给你了。"
+    followups = posted["kwargs"]["file_followups"]
+    assert len(followups) == 1
+    assert followups[0].name == "接星星.io.html"
+    assert followups[0].mime_type == "text/html"
+    assert followups[0].display_title == "接星星"
+    assert followups[0].display_subtitle == "六十秒接星星小游戏"
+    assert (workspace / "接星星.io.html").exists()
+    assert "/Users/" not in posted["reply"]
+
+
+def test_generic_http_agent_does_not_receive_local_file_retry(monkeypatch):
+    _patch_v1_foreground_file_turn(
+        monkeypatch,
+        agent_mode="http",
+        http_local_io_cli=False,
+    )
+    calls = []
+    posted = {}
+
+    def fake_agent(message, **kwargs):
+        calls.append((message, kwargs))
+        return {"messages": ["我可以先说明玩法。"]}
+
+    def fake_post(reply, **kwargs):
+        posted["reply"] = reply
+        posted["kwargs"] = kwargs
+        return {"id": "reply-generic-http"}
+
+    monkeypatch.setattr(resident, "call_agent", fake_agent)
+    monkeypatch.setattr(resident, "post_reply", fake_post)
+
+    resident._process_messages(
+        [
+            {
+                "id": "user-generic-http",
+                "role": "user",
+                "source": "chat",
+                "content": "生成 HTML 画布文件并发给我。",
+                "ts": 1234.75,
+            }
+        ]
+    )
+
+    assert len(calls) == 1
+    assert posted["reply"] == "我可以先说明玩法。"
+    assert posted["kwargs"].get("file_followups") in (None, [])
 
 
 def test_v1_conversational_request_does_not_spend_file_retry(monkeypatch):
@@ -734,6 +1109,28 @@ def test_v1_outbound_prompt_limits_expensive_document_qa():
 
     assert "at most one lightweight check" in prompt
     assert "do not repeatedly render" in prompt
+    assert ".io.html" in prompt
+    assert "native/JS bridge" in prompt
+    assert "256000 bytes" in prompt
+    assert "user's current language" in prompt
+    assert "--title <short title> --subtitle <one-line description>" in prompt
+
+
+def test_local_http_outbound_prompt_uses_existing_trusted_workspace_source(
+    monkeypatch
+):
+    monkeypatch.setattr(resident, "AGENT_MODE", "http")
+    monkeypatch.setattr(resident, "AGENT_HTTP_LOCAL_IO_CLI", True)
+    monkeypatch.setattr(
+        resident, "AGENT_HTTP_LOCAL_FILE_ROOTS", ("/narrow/agent-workspace",)
+    )
+
+    prompt = resident._outbound_file_prompt_block()
+    retry = resident._outbound_file_retry_prompt("生成 Canvas", (".io.html",))
+
+    assert "do not copy or rewrite it into another directory" in prompt
+    assert "existing absolute path directly to send-file" in prompt
+    assert "do not copy or rewrite it into another directory" in retry
 
 
 def test_v1_memory_read_prompt_requires_index_then_fetch():
@@ -742,8 +1139,8 @@ def test_v1_memory_read_prompt_requires_index_then_fetch():
     assert "memory-index" in prompt
     assert "items[].id" in prompt
     assert "memory-fetch" in prompt
-    assert f"python {resident._IO_CLI_PATH} memory-index" in prompt
-    assert f"python {resident._IO_CLI_PATH} memory-fetch" in prompt
+    assert f"{resident._IO_CLI_COMMAND} memory-index" in prompt
+    assert f"{resident._IO_CLI_COMMAND} memory-fetch" in prompt
     assert "Never claim memories are unavailable" in prompt
 
 

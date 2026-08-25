@@ -6,7 +6,8 @@ Pure-function + monkeypatched coverage for
 ``_prepend_io_cli_capability_catalog`` (tools/chat_resident_consumer.py):
 
   - hosted gate: byte-identical passthrough, build_catalog never called
-  - http-backend gate: same passthrough (AGENT_MODE != "cli")
+  - generic http-backend gate: same passthrough unless the operator explicitly
+    declares that the local HTTP agent can execute io_cli
   - cli mode, resume-capable driver (claude/pi/hermes): injects on the first
     turn of a session, skips on a later turn of the SAME session — ONLY once
     the turn is confirmed committed (pending -> commit, Codex review I10)
@@ -86,6 +87,7 @@ def _reset_capability_catalog_state(monkeypatch):
     — individual tests override what they need."""
     monkeypatch.setattr(crc, "_HOSTED", False)
     monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(crc, "AGENT_HTTP_LOCAL_IO_CLI", False)
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", "claude -p {message}")
     crc._io_cli_catalog_cache = None
     crc._io_cli_voice_catalog_cache = None
@@ -134,7 +136,7 @@ def _with_download_delivery_prompt(prefix: str, content: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Gate: hosted / http-backend — byte-identical passthrough
+# Gate: hosted / generic http-backend — byte-identical passthrough
 # ---------------------------------------------------------------------------
 
 def test_hosted_gate_returns_content_unchanged_and_never_builds(monkeypatch):
@@ -156,6 +158,39 @@ def test_http_backend_gate_returns_content_unchanged_and_never_builds(monkeypatc
 
     assert result == "hello there"
     assert calls == []
+
+
+def test_local_tool_capable_http_backend_receives_catalog(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    monkeypatch.setattr(crc, "AGENT_HTTP_LOCAL_IO_CLI", True)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "http-session-1")
+    calls = _mock_build_catalog(monkeypatch, return_value="CATALOG")
+
+    result = crc._prepend_io_cli_capability_catalog("make a Canvas")
+
+    assert result == _with_download_delivery_prompt("CATALOG", "make a Canvas")
+    assert "send-file" in result
+    assert ".io.html" in result
+    assert len(calls) == 1
+    assert crc._io_cli_catalog_pending_session_id == "http-session-1"
+
+
+def test_local_http_io_cli_gate_also_enables_resident_ipc_listener(monkeypatch):
+    monkeypatch.setattr(crc, "_HOSTED", False)
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    monkeypatch.setattr(crc, "AGENT_HTTP_LOCAL_IO_CLI", True)
+
+    assert crc._agent_can_use_local_io_cli() is True
+    assert crc._resident_ipc_listener_enabled() is True
+
+
+def test_generic_http_keeps_resident_ipc_listener_disabled(monkeypatch):
+    monkeypatch.setattr(crc, "_HOSTED", False)
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    monkeypatch.setattr(crc, "AGENT_HTTP_LOCAL_IO_CLI", False)
+
+    assert crc._agent_can_use_local_io_cli() is False
+    assert crc._resident_ipc_listener_enabled() is False
 
 
 # ---------------------------------------------------------------------------
