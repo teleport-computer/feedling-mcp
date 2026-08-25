@@ -1,3 +1,7 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # Chat 严格快照收敛与 RDS Trace 修复设计
 
 **日期：** 2026-08-25

@@ -746,6 +746,28 @@ def test_agent_home_files_blank_persona_is_tools_only():
     assert append.startswith("# Feedling context tools")  # tools how-to header, no prefix
 
 
+def test_read_markdown_prompt_strips_repository_front_matter(tmp_path):
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text(
+        "---\n"
+        "document_lifecycle: current\n"
+        "canonical_owner: self\n"
+        "---\n"
+        "# Runtime prompt\n"
+        "Body\n",
+    )
+
+    assert spawners._read_markdown_prompt(prompt) == "# Runtime prompt\nBody\n"
+
+
+def test_read_markdown_prompt_rejects_unterminated_front_matter(tmp_path):
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("---\ndocument_lifecycle: current\n# Runtime prompt\n")
+
+    with pytest.raises(ValueError, match="unterminated YAML front matter"):
+        spawners._read_markdown_prompt(prompt)
+
+
 def test_agent_home_files_codex_seeds_web_search_disabled_config_toml():
     # LiteLLM gateway retired: codex talks straight to OpenAI. The ONLY thing its
     # config.toml carries is the top-level `web_search = "disabled"` key, so codex's
