@@ -1,3 +1,7 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # Chat 通知收敛与纯唤醒协议设计
 
 **日期：** 2026-08-25

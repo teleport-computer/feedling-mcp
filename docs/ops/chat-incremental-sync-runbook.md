@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Chat incremental sync rollout
 
 This runbook moves cross-worker chat consistency from full resident-store reloads to durable per-user change events and bounded point/window queries. Public API responses and E2EE boundaries do not change.

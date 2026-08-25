@@ -1,3 +1,7 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # Chat Notification Convergence Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan.
