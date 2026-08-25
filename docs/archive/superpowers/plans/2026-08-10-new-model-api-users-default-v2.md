@@ -1,3 +1,8 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/superpowers/specs/2026-08-10-new-model-api-users-default-v2-design.md
+historical_reason: implemented
+---
 # New Model API Users Default to Runtime V2 Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
