@@ -137,6 +137,7 @@ def test_reconciled_human_message_is_replied_and_advances_seq_cursor(monkeypatch
     fenced reply outbox, and transactional reply+cursor sink. Only enclave and
     provider boundaries are faked, as they are external to this test process.
     """
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
     uid = "u_reconcile_human"
     seed_user(uid)
     _mark_db_action_v2(uid)

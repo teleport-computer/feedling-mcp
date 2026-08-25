@@ -44,7 +44,10 @@ _BYOK = provider_client.ProviderConfig(
     provider="anthropic", model="claude-sonnet-4-test", api_key="sk-user-byok", base_url="")
 
 @pytest.fixture(autouse=True)
-def _clean_agent_jobs_table():
+def _clean_agent_jobs_table(monkeypatch):
+    # Perception tests script plain replies and exercise grounding boundaries,
+    # not the default-on self-thinking correction contract.
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs")
     yield

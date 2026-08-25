@@ -42,6 +42,10 @@ def _clean_agent_jobs_table(monkeypatch):
     # Exact successor/enqueue assertions predate the independent profile lane.
     monkeypatch.setenv("FEEDLING_V2_PROFILE_ENABLED", "0")
     monkeypatch.setattr(worker, "_PROFILE_ENABLED", False)
+    # These integration cases predate default-on self-thinking and mostly
+    # script plain terminal replies. Keep their historical contract isolated;
+    # self-thinking behavior is covered explicitly in test_v2_worker_tool_loop.
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs")
     yield
