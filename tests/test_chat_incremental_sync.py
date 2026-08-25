@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import threading
 import sys
 import os
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -16,6 +18,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from core import store as core_store
 import db
 from conftest import seed_user
+
+
+@contextmanager
+def _capture_logger(logger):
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    logger.addHandler(handler)
+    try:
+        yield stream
+    finally:
+        logger.removeHandler(handler)
 
 
 def test_snapshot_fallback_telemetry_is_info_enabled_in_backend_runtime():
@@ -97,7 +110,7 @@ def test_continuous_events_apply_upsert_update_delete_and_wake_once(monkeypatch)
     ids=["gap", "reset", "overflow", "expired-history"],
 )
 def test_gap_reset_overflow_and_expired_history_reload_snapshot(
-    monkeypatch, caplog, current, events, expected_reason,
+    monkeypatch, current, events, expected_reason,
 ):
     store = _bare_store([_row("a", 1)], version=1)
     reloads = []
@@ -118,19 +131,19 @@ def test_gap_reset_overflow_and_expired_history_reload_snapshot(
 
     monkeypatch.setattr(store, "reload_chat_hot_strict", reload_hot)
     monkeypatch.setattr(store, "notify_chat_waiters", lambda: None)
-    caplog.set_level("INFO", logger="feedling.chat_sync")
-
-    assert store.ensure_chat_fresh(force=True) is True
+    with _capture_logger(core_store.log) as stream:
+        assert store.ensure_chat_fresh(force=True) is True
     assert reloads == [True]
     assert store.chat_version == current
     assert [row["id"] for row in store.chat_messages] == ["snapshot"]
-    assert f"reason={expected_reason}" in caplog.text
-    assert "user_hash=" in caplog.text
-    assert store.user_id not in caplog.text
-    assert "message_ids" not in caplog.text
+    text = stream.getvalue()
+    assert f"reason={expected_reason}" in text
+    assert "user_hash=" in text
+    assert store.user_id not in text
+    assert "message_ids" not in text
 
 
-def test_missing_upsert_row_logs_snapshot_fallback_reason(monkeypatch, caplog):
+def test_missing_upsert_row_logs_snapshot_fallback_reason(monkeypatch):
     store = _bare_store([_row("a", 1)], version=1)
     monkeypatch.setattr(core_store.db, "chat_change_version", lambda _uid: 2)
     monkeypatch.setattr(
@@ -143,15 +156,15 @@ def test_missing_upsert_row_logs_snapshot_fallback_reason(monkeypatch, caplog):
     monkeypatch.setattr(core_store.db, "chat_get_many_strict", lambda *_args: [])
     monkeypatch.setattr(store, "reload_chat_hot_strict", lambda: [])
     monkeypatch.setattr(store, "notify_chat_waiters", lambda: None)
-    caplog.set_level("INFO", logger="feedling.chat_sync")
+    with _capture_logger(core_store.log) as stream:
+        assert store.ensure_chat_fresh(force=True) is True
 
-    assert store.ensure_chat_fresh(force=True) is True
+    text = stream.getvalue()
+    assert "reason=missing_row" in text
+    assert store.user_id not in text
 
-    assert "reason=missing_row" in caplog.text
-    assert store.user_id not in caplog.text
 
-
-def test_generation_conflict_logs_snapshot_fallback_reason(monkeypatch, caplog):
+def test_generation_conflict_logs_snapshot_fallback_reason(monkeypatch):
     store = _bare_store([_row("a", 1)], version=1)
     monkeypatch.setattr(core_store.db, "chat_change_version", lambda _uid: 2)
     monkeypatch.setattr(
@@ -169,12 +182,12 @@ def test_generation_conflict_logs_snapshot_fallback_reason(monkeypatch, caplog):
     monkeypatch.setattr(core_store.db, "chat_get_many_strict", get_many)
     monkeypatch.setattr(store, "reload_chat_hot_strict", lambda: [])
     monkeypatch.setattr(store, "notify_chat_waiters", lambda: None)
-    caplog.set_level("INFO", logger="feedling.chat_sync")
+    with _capture_logger(core_store.log) as stream:
+        assert store.ensure_chat_fresh(force=True) is True
 
-    assert store.ensure_chat_fresh(force=True) is True
-
-    assert "reason=generation_conflict" in caplog.text
-    assert store.user_id not in caplog.text
+    text = stream.getvalue()
+    assert "reason=generation_conflict" in text
+    assert store.user_id not in text
 
 
 def test_snapshot_fallback_telemetry_rejects_unknown_reason():
