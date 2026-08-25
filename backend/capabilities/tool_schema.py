@@ -1,14 +1,14 @@
-"""Tool-schema catalog (Plan C, Task 3 / C1).
+"""Provider-native tool-schema catalog.
 
 Derives one `ToolSpec` per model-facing capability in
 `capabilities.registry.CAPABILITIES` (everything except the internal-only
 `chat_image_read`, `chat_file_read`, and `perception_glance`, which have no
 model-facing schema) plus the runtime-native `task` and `provider_usage` tools.
 The unified tool loop handles these specially instead of dispatching them
-through the capability executor. `provider_usage` is
+through the capability dispatcher. `provider_usage` is
 chat-lane only — it is deliberately absent from `worker._SUBAGENT_ALLOWED_TOOLS`
 (so subagents never see it) and is always withheld from the wake/screen_watch/
-manual_wake lane (see `worker._run_wake`); see Task 5's brief for why it is not
+manual_wake lane (see `worker._run_wake`); it is not
 in `provenance.EXTERNAL_READS` but is in `worker._PRIVATE_READ_TOOLS`.
 
 Each entry in `PARAMS` mirrors exactly the `params` fields each capability module reads —
@@ -67,7 +67,7 @@ _IDENTITY_DIMENSION = {
 }
 
 # Keep the provider-visible vocabulary tied to the same projection catalog the
-# capability executor consumes.  A copied enum silently drifts and turns an
+# capability dispatcher consumes.  A copied enum silently drifts and turns an
 # otherwise healthy perception read into ``unknown_signals`` at runtime.
 _PERCEPTION_SIGNAL_ENUM = list(AGENT_PERCEPTION_SIGNALS)
 _PERCEPTION_FIELD_ENUM = sorted({

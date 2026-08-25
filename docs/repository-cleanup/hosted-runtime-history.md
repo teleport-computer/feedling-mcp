@@ -228,3 +228,42 @@ V2-owned wake lane 的安全不变量，明确不再拥有 Resident 退役或共
 `superseded_by` 与所有 historical canonical owners 都解析到 retained `decision`。生产 Python
 不再把 archived D3 implementation plan 当作任务依据：scheduler/wake 注释直接表达 retained
 decision 或当前契约。生成的 lifecycle inventory 由检查器重建，而非作为手工调用者。
+
+## 批次 7：A/B 与 Step 1 implementation lineage
+
+审计日期：2026-08-25。结论：三个计划都是已实现的历史交付记录，均移入 archive 并标为
+`historical` / `implemented`。Plan A 的仍有效 capability-result、registry、redaction 和
+向下依赖理由由 retained PR-C provider-native tool-loop decision 接管；Plan B 的 durable queue
+基础、注入边界、BYOK/no-filler、single-flight 和 recovery 是现行代码/测试义务，但其 staged
+`agent_action_queue` planner API 及旧进程/部署快照不再是运行手册。Step 1 的每项 safeguard
+分别由当前 loop、worker/queue、error-surface 和 dual-runtime/topology evidence 约束；它的
+runner-CVM/Resident 退役叙述只保留为历史快照。
+
+| 原文档 | 状态与当前 owner | 实现 / 测试证据 | 兼容义务 | archive / retain 路径 |
+|---|---|---|---|---|
+| Plan A capability facade | `historical` / `implemented`; PR-C unified-loop decision | [`types.py`](../../backend/capabilities/types.py)、[`registry.py`](../../backend/capabilities/registry.py)、[`tool_schema.py`](../../backend/capabilities/tool_schema.py)、[`web.py`](../../backend/capabilities/web.py) 保留统一结果、registry、schema、redaction 和 provenance 边界；[`tool_loop.py`](../../backend/model_api_runtime/v2/tool_loop.py)、[`executor.py`](../../backend/model_api_runtime/v2/executor.py)、[`test_capabilities_registry.py`](../../tests/test_capabilities_registry.py)、[`test_capabilities_tool_schema.py`](../../tests/test_capabilities_tool_schema.py)、[`test_v2_dispatch_tool_calls.py`](../../tests/test_v2_dispatch_tool_calls.py) 证明当前 catalog/dispatcher | 不得恢复 JSON staged planner；继续保持 CapabilityResult 归一化、无 platform key、no-filler、输出 caps/redaction 和 downward-only dependency direction | [archive plan](../archive/superpowers/plans/2026-07-08-hosted-runtime-v2-A-capability-layer.md); retain: [PR-C decision](../superpowers/specs/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop-design.md) |
+| Plan B DB jobs + bounded worker | `historical` / `implemented`; [`CURRENT_STATE.md`](../CURRENT_STATE.md) | [`0014_hosted_runtime_v2.py`](../../backend/alembic/versions/0014_hosted_runtime_v2.py) 和 [`test_v2_jobs_migration.py`](../../tests/test_v2_jobs_migration.py) 保留四张持久化表（包括 `agent_action_queue`）；[`jobs_store.py`](../../backend/model_api_runtime/v2/jobs_store.py)、[`worker.py`](../../backend/model_api_runtime/v2/worker.py)、[`test_v2_jobs_store.py`](../../tests/test_v2_jobs_store.py)、[`test_v2_worker.py`](../../tests/test_v2_worker.py)、[`test_v2_dependency_direction.py`](../../tests/test_v2_dependency_direction.py) 覆盖 durable claim、single-flight、恢复与注入方向 | 不得删除/迁移 `agent_action_queue` 或削弱 schema compatibility；继续保持 BYOK/no-filler、worker core 不向上 import、per-user single-flight、claim/reaper/recovery。旧 staged planner CRUD/control-flow 和单一 worker process/deployment snapshot 不授权当前操作 | [archive plan](../archive/superpowers/plans/2026-07-08-hosted-runtime-v2-B-db-jobs-worker.md); current deployment: [`CURRENT_STATE.md`](../CURRENT_STATE.md); safety/topology: [PR-D decision](../superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md), [three-pool decision](../superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md) |
+| Step 1 mechanical merge-condition fixes | `historical` / `implemented`; [`CURRENT_STATE.md`](../CURRENT_STATE.md) | async provider/retry: [`provider_client.py`](../../backend/provider_client.py) + [`test_provider_client_async_reliable.py`](../../tests/test_provider_client_async_reliable.py); liveness: [`jobs_store.py`](../../backend/model_api_runtime/v2/jobs_store.py) + [`test_v2_worker_heartbeat.py`](../../tests/test_v2_worker_heartbeat.py); terminal errors: [`status_stream.py`](../../backend/model_api_runtime/v2/status_stream.py) + [`test_v2_status_stream.py`](../../tests/test_v2_status_stream.py); capability vocabulary/web: the Plan A evidence above | 保留 each live safeguard under its present contract; do not treat old planner vocabulary as a current capability consumer. The old runner-CVM/Resident-retirement statement is not current: pooled V2 `serve-worker` is in the primary CVM while hosted Resident remains in a separate runner CVM, subject to per-user dual-runtime control | [archive plan](../archive/superpowers/plans/2026-07-09-hosted-runtime-v2-step1-mechanical-fixes.md); retain: [PR-C decision](../superpowers/specs/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop-design.md), [dual-runtime decision](../superpowers/specs/2026-07-21-dual-runtime-v1-v2-coexistence-design.md), [current state](../CURRENT_STATE.md) |
+
+### 批次 7 rationale transfer
+
+- Plan A 的 facade 不变量仍是现行基础，但 `tool_schema` 和 `tool_loop` 已取代其“由 Plan C
+  executor 消费”的 staged 叙述：所有模型使用 provider-native catalog，dispatcher 按当前
+  tool-call contract 处理 reads/writes/provenance。
+- Plan B 保留 durable Postgres job/queue、依赖注入、BYOK/no-filler、single-flight 和恢复的
+  理由；`agent_action_queue` 是持久化兼容面，不因其 planner consumer 退休而成为删除目标。
+  拓扑、安全 recovery 和 live environment 分别继续服从 PR-D、three-pool 与 CURRENT_STATE。
+- Step 1 的 async/retry、liveness、terminal-error 和 capability safeguards 已成为独立的现行
+  code/test contracts。其 runner-CVM 与 Resident 退役部署语言不得覆盖 current dual-runtime
+  deployment；环境事实仍须以 exact deployed SHA、对应 compose 和 CURRENT_STATE 核对。
+- 本批次只移动/分类 Markdown、更新审计/backlinks，并将直接把历史 staged planner 当作当前
+  consumer 的 Python/test 注释或 docstring 改为当前 contract。没有修改 runtime behavior、测试
+  logic、schema/Alembic、`deploy/`、`docs-site/` 或 `tools/chat_resident_consumer.py`。
+
+### 批次 7 引用检查
+
+三个原始精确 plan 路径在 rename history 之外均不存在；外部 backlinks 改为 archive 路径，三个
+historical `canonical_owner` 都解析到已分类的 live Markdown owner。已经归档文档中的 Plan A/B/C
+语义词仅作为历史考据保留；生产/test 注释改为 provider-native dispatcher、status-stream 或现行
+liveness contract，避免把 retired staged planner 当作当前 capability consumer。lifecycle inventory
+由 checker 连续生成两次并比较字节，作为分类清单的确定性证据。

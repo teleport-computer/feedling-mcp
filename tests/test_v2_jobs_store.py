@@ -107,7 +107,7 @@ def _clean_agent_jobs_table(monkeypatch):
     Truncate the whole table before each test so claim tests only ever see
     the row(s) they set up themselves.
 
-    Also clears `v2_runtime_state` (Task 2's per-user cutover generation row):
+    Also clears `v2_runtime_state` (the per-user cutover generation row):
     generation tests advance a user's generation via `db.advance_runtime_state`,
     and a leftover row from an earlier test would let a later test's
     `db.get_runtime_generation("u_...")` lazy-init see a stale generation
@@ -1540,8 +1540,8 @@ def test_append_status_event_fires_cross_process_chat_wake(monkeypatch):
 
 
 def test_list_status_events_delegates_to_db_primitive(monkeypatch):
-    """Cross-plan amendment: jobs_store.list_status_events must not run its own SQL —
-    it delegates to db.list_agent_status_events so Plan C's long-poll reads the same
+    """The status-stream read path must not run its own SQL —
+    it delegates to db.list_agent_status_events so all long-poll reads share the same
     single source of truth."""
     seed_user("u_js_9b")
     calls = []

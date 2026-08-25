@@ -4876,7 +4876,7 @@ def status_events_for_job(user_id: str, job_id: int) -> list[dict]:
 def list_status_events(user_id, *, after_id=0, limit=50) -> list[dict]:
     """按 id 升序返回 user 自 after_id 之后的 status 事件（游标读）。每行含
     id/job_id/user_id/kind/label/detail_json/seq/created_at(epoch float)。委托到
-    db.list_agent_status_events —— Plan C 的 chat/poll_core 长轮询走同一原语，
+    db.list_agent_status_events —— 当前 chat/status stream 的长轮询走同一原语，
     这里不重复写 SQL（单一读源）。"""
     return db.list_agent_status_events(user_id, after_id=after_id, limit=limit)
 

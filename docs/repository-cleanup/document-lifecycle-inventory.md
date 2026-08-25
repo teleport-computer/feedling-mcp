@@ -11,7 +11,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 |---|---:|
 | `current` | 15 |
 | `decision` | 9 |
-| `historical` | 22 |
+| `historical` | 25 |
 | `generated` | 1 |
 
 ## current
@@ -48,12 +48,15 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 
 - `docs/CHANGELOG.md`
 - `docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md`
+- `docs/archive/superpowers/plans/2026-07-08-hosted-runtime-v2-A-capability-layer.md`
+- `docs/archive/superpowers/plans/2026-07-08-hosted-runtime-v2-B-db-jobs-worker.md`
 - `docs/archive/superpowers/plans/2026-07-08-hosted-runtime-v2-C-action-queue-planner.md`
 - `docs/archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D-admission-ceiling.md`
 - `docs/archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D0-rollout-infrastructure.md`
 - `docs/archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D1-full-conversation-context.md`
 - `docs/archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D3-proactive-wake-lanes.md`
 - `docs/archive/superpowers/plans/2026-07-09-hosted-runtime-v2-D4-loadtest-rollout-killresident.md`
+- `docs/archive/superpowers/plans/2026-07-09-hosted-runtime-v2-step1-mechanical-fixes.md`
 - `docs/archive/superpowers/plans/2026-07-10-hosted-runtime-v2-agent-loop.md`
 - `docs/archive/superpowers/plans/2026-07-12-hosted-runtime-v2-PR-A-effect-foundation.md`
 - `docs/archive/superpowers/plans/2026-07-13-hosted-runtime-v2-PR-B-provider-transport-telemetry.md`
