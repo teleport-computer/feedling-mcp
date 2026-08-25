@@ -1,6 +1,6 @@
 """worker._run_wake on the unified provider-native tool loop.
 
-Style mirrors tests/test_v2_worker_tool_loop.py (Task 7's chat-lane sibling):
+Style mirrors tests/test_v2_worker_tool_loop.py (the chat-lane sibling):
 real jobs_store (real DB claim/mark_*), real core_store (real DB chat/reload),
 real model_api_runtime.v2.coalesce/executor/effect_outbox/tool_loop; the only
 boundary stubbed is `provider_client.chat_completion_async` (the LLM wire
@@ -786,7 +786,7 @@ def test_wake_provider_error_silent_mark_failed(monkeypatch):
 
 # ------------------------------------------------------------------
 # provider_config-kind failures (dead/broke BYOK key) still set payment
-# cooldown BEFORE the silent mark_failed (D3 Task 7 behavior preserved).
+# cooldown BEFORE the silent mark_failed (wake-lane contract).
 # ------------------------------------------------------------------
 
 def test_wake_provider_config_error_still_sets_payment_cooldown(monkeypatch):

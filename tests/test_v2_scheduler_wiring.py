@@ -1,9 +1,9 @@
-"""D3 Task 5：serve_worker._build_scheduler_deps —— 把纯模块
+"""Wake-lane scheduler wiring：serve_worker._build_scheduler_deps —— 把纯模块
 `model_api_runtime.v2.scheduler.run_scheduler_tick` 接到真实实现的装配层适配器。
 
 纯接线断言，不跑真的 scheduler 循环：monkeypatch jobs_store 上的
 enqueue_job/upsert_wake_schedule/due_heartbeat_users，断言 deps 的四个 callable
-把参数原样转发到正确的 lane/kwarg 上；wake_decision 断言就是 Task 3 的
+把参数原样转发到正确的 lane/kwarg 上；wake_decision 断言就是当前
 `_wake_decision_for_user` 适配器本体（不是重新实现一份）。
 """
 from __future__ import annotations

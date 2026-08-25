@@ -107,7 +107,7 @@ def _clean_agent_jobs_table(monkeypatch):
     Truncate the whole table before each test so claim tests only ever see
     the row(s) they set up themselves.
 
-    Also clears `v2_runtime_state` (Task 2's per-user cutover generation row):
+    Also clears `v2_runtime_state` (the per-user cutover generation row):
     generation tests advance a user's generation via `db.advance_runtime_state`,
     and a leftover row from an earlier test would let a later test's
     `db.get_runtime_generation("u_...")` lazy-init see a stale generation
@@ -1540,8 +1540,8 @@ def test_append_status_event_fires_cross_process_chat_wake(monkeypatch):
 
 
 def test_list_status_events_delegates_to_db_primitive(monkeypatch):
-    """Cross-plan amendment: jobs_store.list_status_events must not run its own SQL —
-    it delegates to db.list_agent_status_events so Plan C's long-poll reads the same
+    """The status-stream read path must not run its own SQL —
+    it delegates to db.list_agent_status_events so all long-poll reads share the same
     single source of truth."""
     seed_user("u_js_9b")
     calls = []
@@ -1668,8 +1668,8 @@ def test_completed_wake_retry_cannot_overwrite_newer_glance_source():
     }
 
 
-# --- §6 admission ceiling: 三个纯读查询 (live_worker_count / inflight_job_count /
-# recent_mean_service_sec) ---------------------------------------------------
+# --- §6 queue/capacity telemetry: 三个纯读查询 (live_worker_count /
+# inflight_job_count / recent_mean_service_sec) ------------------------------
 
 
 def test_live_worker_count_counts_only_recent():
@@ -2121,8 +2121,8 @@ def test_recent_mean_service_sec_averages_completed():
     assert 14.0 <= mean <= 16.0  # (10+20)/2 = 15
 
 
-# --- kind discriminator: genesis heartbeats must be invisible to the chat/send
-# admission gate (workers_alive / live_worker_count read only kind='turn') ---
+# --- kind discriminator: genesis heartbeats must be invisible to turn-worker
+# liveness and telemetry (workers_alive / live_worker_count read kind='turn') --
 
 
 def _clear_heartbeats():
@@ -2131,11 +2131,11 @@ def _clear_heartbeats():
 
 
 def test_genesis_heartbeat_does_not_inflate_turn_worker_liveness():
-    """A genesis heartbeat row must be invisible to the chat/send admission gate.
+    """A genesis heartbeat row must be invisible to turn-worker liveness/telemetry.
 
-    live_worker_count() feeds admission.estimate_wait_sec(workers=...); counting a
-    genesis row as a turn worker would halve the estimated queue wait for a
-    single-process pool and over-admit onto turn slots that do not exist.
+    Current Chat queue/capacity telemetry reads live_worker_capacity(), so a
+    genesis row must not appear as executable turn capacity. live_worker_count()
+    remains a turn-process metric and also excludes genesis rows.
     """
     _clear_heartbeats()
     jobs_store.record_worker_heartbeat("w1", pool="foreground")

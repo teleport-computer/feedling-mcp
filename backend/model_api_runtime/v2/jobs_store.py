@@ -4876,7 +4876,7 @@ def status_events_for_job(user_id: str, job_id: int) -> list[dict]:
 def list_status_events(user_id, *, after_id=0, limit=50) -> list[dict]:
     """按 id 升序返回 user 自 after_id 之后的 status 事件（游标读）。每行含
     id/job_id/user_id/kind/label/detail_json/seq/created_at(epoch float)。委托到
-    db.list_agent_status_events —— Plan C 的 chat/poll_core 长轮询走同一原语，
+    db.list_agent_status_events —— 当前 chat/status stream 的长轮询走同一原语，
     这里不重复写 SQL（单一读源）。"""
     return db.list_agent_status_events(user_id, after_id=after_id, limit=limit)
 
@@ -4946,8 +4946,10 @@ def workers_alive(*, within_sec: int = 30, pool: str | None = None) -> bool:
 
 
 def live_worker_count(*, within_sec: int = 30, pool: str | None = None) -> int:
-    """窗口内有心跳的 serve_worker TURN 进程数（workers_alive 的计数版，喂 admission
-    ceiling）。genesis 心跳不计入——它不占 turn 槽位。"""
+    """窗口内有心跳的 serve_worker TURN 进程数（queue telemetry 的计数版）。
+
+    genesis 心跳不计入——它不占 turn 槽位。
+    """
     with _pool().connection() as conn:
         with conn.cursor() as cur:
             query = (
@@ -4965,10 +4967,12 @@ def live_worker_count(*, within_sec: int = 30, pool: str | None = None) -> int:
 
 def live_genesis_worker_ids(*, within_sec: int = 30) -> list[str]:
     """worker_ids with a fresh ``kind='genesis'`` heartbeat. Sibling to
-    ``workers_alive``/``live_worker_count`` (which read ``kind='turn'`` only, to
-    gate chat admission): this reads the genesis heartbeats to gate the genesis
-    orphan reclaim — a ``processing`` job whose claiming worker id is absent here
-    was left behind by a dead/replaced worker."""
+    ``workers_alive`` (the turn-worker liveness gate) and ``live_worker_count``
+    (turn-process telemetry); both read ``kind='turn'`` only. Current Chat
+    queue/capacity telemetry uses ``live_worker_capacity``, not this helper.
+    This reads genesis heartbeats to gate genesis orphan reclaim: a
+    ``processing`` job whose claiming worker id is absent here was left behind
+    by a dead/replaced worker."""
     with _pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -5261,7 +5265,7 @@ def recent_watchdog_recovery_counts(*, within_hours: int = 24) -> dict[str, int]
 def inflight_job_count(*, lanes: set[str] | None = None) -> int:
     """Count pending/claimed/running Jobs, optionally within selected lanes.
 
-    Runtime admission must pass its pool's lane set.  The unfiltered form is
+    Runtime capacity telemetry must pass its pool's lane set. The unfiltered form is
     retained for aggregate Admin observability only.
     """
     with _pool().connection() as conn:
@@ -10510,7 +10514,7 @@ def get_summary_row(user_id) -> dict | None:
     {"summary_envelope": dict|None, "watermark_ts": float, "version": int,
     "watermark_seq": int}，无行返回 None（该用户从未压缩过）。
 
-    ``watermark_seq``（D5/Task 9，migration 0031）与 ``watermark_ts`` 同一行
+    ``watermark_seq``（migration 0031）与 ``watermark_ts`` 同一行
     并存：新压缩写入的行两者都是真值（见 ``upsert_summary_row_cas``）；但
     0031 之前就存在的行只有 ``watermark_ts``、``watermark_seq`` 落着迁移
     默认值 0。这里做一次性懒翻译——``watermark_seq==0`` 但
@@ -10518,7 +10522,7 @@ def get_summary_row(user_id) -> dict | None:
     strictly-less）现算一个替身返回，不回写库（下一次真正压缩发生时才会
     落一个精确值）。选在读侧做而不是把翻译推给每个调用方，是因为
     ``get_summary_row`` 只有一个实现、调用方（当前的 ``_read_summary``、
-    未来 Task 10 的 prompt-invariant 边界读取）都自动拿到一致语义，不用人人
+    当前 prompt-invariant 边界读取）都自动拿到一致语义，不用人人
     记得先查有没有 watermark_seq 再翻译一次。"""
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -10563,7 +10567,7 @@ def upsert_summary_row_cas(
     否则走 UPDATE ... WHERE version=expected_version（不匹配说明摘要在别处已被
     推进，本次写入是过期/丢失的 CAS，返回 False）。成功返回 True。
 
-    ``watermark_seq``（D5/Task 9）与 ``watermark_ts`` 在同一次 CAS 写入里
+    ``watermark_seq`` 与 ``watermark_ts`` 在同一次 CAS 写入里
     原子推进——同一行、同一个 UPDATE 语句，不是两次写。``None``（默认，
     向后兼容旧调用方/旧测试 fixture 未传这个参数的场景）在 UPDATE 分支用
     ``COALESCE`` 保留该行原有的 watermark_seq（不清零、不误伤未真正推进

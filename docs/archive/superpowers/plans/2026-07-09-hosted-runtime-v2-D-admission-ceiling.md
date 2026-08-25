@@ -1,6 +1,19 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/superpowers/specs/2026-07-09-hosted-runtime-v2-D-admission-ceiling-design.md
+historical_reason: implemented
+---
 # §6 Admission Ceiling Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **STATUS: LANDED / HISTORICAL IMPLEMENTATION RECORD — DO NOT EXECUTE.** Every
+> task checkbox, code sample, response shape, path, line number, rollout fact,
+> and instruction below records the 2026-07 implementation snapshot. It is not
+> operating guidance: live overload is now fail-open telemetry and accepted
+> messages are atomically persisted/enqueued. Current behavior is owned by the
+> [retained admission-ceiling decision](../../../superpowers/specs/2026-07-09-hosted-runtime-v2-D-admission-ceiling-design.md).
+
+> **Historical task format:** The following agentic-worker requirement and checkbox
+> steps are preserved evidence only; they are not instructions for current work.
 
 **Goal:** send 路径在持久化前估算排队等待时长，超 SLA 则返回独立 busy 响应且不落库。
 

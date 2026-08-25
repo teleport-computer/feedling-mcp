@@ -1,4 +1,4 @@
-"""C3 — `executor.dispatch_tool_calls`（spec 2026-07-13 PR-C Task 4）。
+"""Tool-call dispatcher contract (retained decision §C3).
 
 用假 capabilities.registry.run_capability（monkeypatch，返回罐装 CapabilityResult-shaped
 dict）+ 一个记录调用的 enqueue_write_effect 驱动，纯 asyncio，无 DB。断言：

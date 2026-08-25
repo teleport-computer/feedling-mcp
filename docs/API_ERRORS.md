@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # API 错误 slug 契约表
 
 > `{"error": "<slug>"}` 的 slug 是稳定 API 面：一经写入本表即冻结，废弃走
@@ -134,7 +138,6 @@
 | `runtime_policy_not_ready` | 503 | system | 账号的 runtime control 尚未处于 `db_action_v2` + `v2`，消息不会落库或入队 | |
 | `workers_unavailable` | 503 | system | 没有 live Runtime V2 turn-worker 心跳；发送前拒绝，绝不退回 resident | |
 | `turns_halted` | 503 | system | 运维 kill switch 已暂停新 turn；Genesis 使用独立控制面 | |
-| `busy` | 503 | system | live worker pool 的预计排队时间超过 admission SLA；`reason=queue_over_sla` | |
 | `runtime_control_changed` | 503 | system | 加密消息写入前后 runtime generation/control 发生变化，事务回滚且不留下孤儿 job | |
 | `client_msg_id_invalid` | 400 | — | `client_msg_id` 给了但不是合法 UUID 字符串 | |
 

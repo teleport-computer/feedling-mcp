@@ -1,11 +1,17 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # 测试怎么做 — 从这里开始
 
 > 2026-08-14 重整。**这个目录以前有 6 份文档、没有主次,不知道该从哪进。**
 > 现在只有一个入口:就是这份。按「你现在要干什么」往下找,照抄命令即可。
 >
-> **只剩两条路径需要测**(V1 托管已不再维护;V1 文档作对照组保留,见 CHAT_ACTIVITY_V2_MANUAL.md 头注):
-> 1. **Runtime V2** —— 托管用户,我们的 worker 池跑模型
-> 2. **Resident / VPS** —— 用户自己服务器上跑 consumer
+> 当前 runtime policy 与部署 owner 先看 [`../CURRENT_STATE.md`](../CURRENT_STATE.md)。
+> 现在有两种执行实现、三种需要覆盖的部署形态：
+> 1. **Runtime V2** —— 托管用户,pooled worker 跑模型
+> 2. **Hosted Resident** —— 独立 agent-runner 托管 resident consumer
+> 3. **Resident / VPS** —— 用户自己服务器上跑同一份 consumer
 >
 > **同一件事在这两条路径里往往叫不同名字、在不同文件。**
 > 做跨运行时对照之前先查 **[`RUNTIME_MAP.md`](RUNTIME_MAP.md)**(概念 → 各运行时坐标),
@@ -109,6 +115,11 @@ python3 -m pytest -q tests/test_chat_resident_consumer*.py tests/test_consumer_*
 | `memory_thinking_leak_probe.py` | 思维链泄漏进记忆 |
 | `worldbook_probe.py` | 世界书 |
 | `proactive_probe.py` | 主动唤醒 |
+
+Hosted Resident 还要覆盖 supervisor→consumer 接线与 self-update 契约：至少运行
+`tests/test_agent_runtime_resident_contract.py`、`tests/test_chat_resident_self_update.py`
+和受影响的 `tests/test_agent_runtime_*.py`。它与 VPS 共用 consumer 实现，不代表两种
+部署形态可以只测一边。
 
 ---
 

@@ -1553,7 +1553,7 @@ def test_r2_cleanup_loop_is_a_separate_driver(monkeypatch):
 
 
 class _HealthySupervisor:
-    """D3 (Task 4): `_heartbeat_loop` now derives capacity from
+    """Current pool-health contract: `_heartbeat_loop` derives capacity from
     `supervisor.poll_liveness()` — a fresh/alive child advertises full capacity."""
 
     def poll_liveness(self) -> dict:
@@ -1729,7 +1729,7 @@ def test_on_v2_job_notify_is_a_noop_without_context():
 
 
 # ------------------------------------------------------------------
-# Task 3 (D1): _read_tail — both-roles windowed read (mirrors _read_messages
+# Current context contract: _read_tail is a both-roles windowed read (mirrors _read_messages
 # but doesn't slice at last-assistant and doesn't skip non-user rows).
 # ------------------------------------------------------------------
 

@@ -265,6 +265,8 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Bind execution evidence to exact checkout
         continue-on-error: true
@@ -283,13 +285,26 @@ jobs:
           pip install --require-hashes -r backend/requirements.lock
           pip install requests  # test-only
 
+      - name: Validate changed document lifecycle
+        if: ${{ github.event_name != 'workflow_dispatch' }}
+        env:
+          LIFECYCLE_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          base_sha="$LIFECYCLE_BASE_SHA"
+          if [ -z "$base_sha" ] || [ "$base_sha" = "0000000000000000000000000000000000000000" ]; then
+            echo "::error::No authoritative lifecycle comparison SHA for $GITHUB_EVENT_NAME"
+            exit 1
+          fi
+          git cat-file -e "$base_sha^{commit}"
+          python tools/check_document_lifecycle.py --changed-vs "$base_sha"
+
       - name: Start backend
         env:
           FEEDLING_DATA_DIR: /tmp/feedling-data-ci
           FEEDLING_WS_PORT: "19998"
           DATABASE_URL: "postgresql://postgres:postgres@127.0.0.1:5432/feedling_ci"
-          # Hosted Runtime V2 needs the shared token secret; there is no
-          # supervisor/host-all prerequisite after resident retirement.
+          # Runtime V2 needs the shared token secret. This unit-test backend job
+          # does not start the separately deployed hosted Resident agent-runner.
           FEEDLING_RUNTIME_TOKEN_SECRET: "ci-smoke-secret"
         run: |
           mkdir -p "$FEEDLING_DATA_DIR"
@@ -462,6 +477,14 @@ jobs:
             tests/test_perception_kernel_purity.py \
             tests/test_perception_kernel_wake.py \
             tests/test_perception_prompt_golden.py \
+            -v
+
+      - name: Repository truth-map unit tests
+        run: |
+          python -m pytest \
+            tests/test_current_state_docs.py \
+            tests/test_document_lifecycle.py \
+            tests/test_repository_inventory.py \
             -v
 
       - name: Guard top-level pytest discovery coverage

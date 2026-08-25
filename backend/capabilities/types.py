@@ -1,8 +1,8 @@
 """Uniform result shape for the capability facade (Hosted Runtime V2).
 
 Domain `*_core` functions return heterogeneous shapes — `(body, status)`
-tuples, `ScreenResult` dataclasses, or raise `AgentRouteError`. The V2 worker's
-planner/executor need ONE shape; `CapabilityResult` is it.
+tuples, `ScreenResult` dataclasses, or raise `AgentRouteError`. The V2
+provider-native tool dispatcher needs ONE shape; `CapabilityResult` is it.
 """
 from __future__ import annotations
 

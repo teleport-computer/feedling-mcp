@@ -1,4 +1,4 @@
-"""proactive_tick 在 db_action_v2 模式下的 MANUAL wake 桥接（D3 Task 9）。
+"""proactive_tick 在 db_action_v2 模式下的 MANUAL wake 桥接。
 
 db_action_v2 用户没有常驻 consumer（D0 排他性 guard 已把他们从发现名单里摘掉），
 所以 MANUAL wake（"talk to me now"）不能再走常驻 proactive_job（永远不会被认领）；
@@ -131,7 +131,7 @@ def test_db_action_v2_non_manual_tick_creates_no_job(monkeypatch):
 def test_resident_cli_manual_tick_still_uses_resident_path(monkeypatch):
     """Regression: a hosted user with no hosted_runtime_mode set (default
     resident_cli) must hit the exact same resident gate-decision path as
-    before Task 9 — the v2 bridge must be a no-op for them."""
+    before the V2 manual-wake bridge — the bridge must be a no-op for them."""
     seed_user("u_manual_resident")
     store = core_store.get_store("u_manual_resident")
     assert hosted_config_store.get_hosted_runtime_mode(store) == "resident_cli"

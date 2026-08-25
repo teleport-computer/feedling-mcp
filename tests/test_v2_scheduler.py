@@ -1,4 +1,4 @@
-"""Pure unit tests for the V2 proactive scheduler tick (Task 4).
+"""Pure unit tests for the current V2 proactive scheduler contract.
 
 All IO is injected via a fake `deps` object — no DB, no wall clock reads
 inside the module under test. Zero-burn invariant: a blocked/weak wake

@@ -594,14 +594,18 @@ def _new_direct_enclave_gate():
 
 
 def _reserved_lane_slots(max_workers: int, reserved: int | None = None) -> list:
-    """Per-slot lane allowlist（D3 Task 5：把 Task 2 的 claim lane-reservation 接进池编排）。
+    """Legacy direct-worker/test compatibility lane assignments.
 
-    前 `reserved` 个 slot 只允许抢 {"chat","manual_wake"}（一次 heartbeat/capture 唤醒风暴
-    绝不会饿死聊天回复）；其余 slot 不设限（None＝任意 lane，含 heartbeat/capture/
-    maintenance）。reserved 未显式传时默认 max(1, max_workers // 2)，但始终至少保留
-    一个 unrestricted slot；单-worker 部署因此不能做 lane reservation。否则 scheduled/
-    maintenance/capture 等非 chat job 会在一个健康进程里永久 pending。reserved 会被夹到
-    [0, max_workers - 1] 区间内，防御越界配置。"""
+    This helper preserves the old multi-slot direct-worker behavior for tests
+    and compatibility callers. It is not the production topology: production
+    lane routing is defined by ``pool_config.RuntimePoolConfig`` and runs one
+    ``turn_child`` process for each SlotSpec under the three-pool decision.
+
+    前 `reserved` 个 compatibility slot 只允许抢 {"chat","manual_wake"}；其余 slot
+    不设限（None＝任意 lane，含 heartbeat/capture/maintenance）。reserved 未显式传时默认
+    max(1, max_workers // 2)，但始终至少保留一个 unrestricted slot；单-worker 调用因此
+    不做 lane reservation。否则 scheduled/maintenance/capture 等非 chat job 会在一个健康
+    进程里永久 pending。reserved 会被夹到 [0, max_workers - 1] 区间内，防御越界配置。"""
     n = max(1, int(max_workers))
     r = reserved if reserved is not None else max(1, n // 2)
     r = max(0, min(r, n - 1))
@@ -908,11 +912,11 @@ _SUBAGENT_DISABLED_TOOLS = frozenset(
     if spec.name not in _SUBAGENT_ALLOWED_TOOLS
 )
 
-# D3 Task 6 (proactive/wake lanes): the scheduler (Task 4/9) enqueues jobs in
+# The retained D3 wake-lane decision: the scheduler enqueues jobs in
 # these three lanes when it decides the companion should reach out without the
 # user having spoken first. "capture" is intentionally NOT in this set — it's
 # a different capability shape (memory extraction, not a model-authored reply)
-# and is scoped to a follow-up task; a capture-lane job falling through to the
+# and has its own extraction contract; a capture-lane job falling through to the
 # default chat path below would be wrong (no coalesced pending messages ->
 # it would just complete as a no-op), so it's left alone here rather than
 # silently mishandled by this task's scope.
@@ -957,7 +961,7 @@ _SCHEDULED_WAKE_EMPTY_RESPONSE_CORRECTION = (
     "conveys every reminder now. Do not stay silent, do not return only thinking, "
     "and do not answer an older conversation turn instead."
 )
-# screen_watch lane (Task 3): a wake grounded on recent shared-screen frames rather
+# screen_watch lane: a wake grounded on recent shared-screen frames rather
 # than an ambient perception glance. Its own system prompt sits beside
 # _WAKE_SYSTEM_PROMPT; _run_wake selects it only for lane=="screen_watch". The
 # empty-reply path remains valid without making silence the privileged default.
@@ -986,12 +990,12 @@ def _wake_system_prompt_for_lane(lane: str, base_prompt: str) -> str:
     return context._join_policy_blocks(*blocks)
 
 
-# D3 Task 7 (BYOK payment cooldown): a "provider_config" wake failure (402 out-of-credits,
+# Wake-lane BYOK payment cooldown: a "provider_config" failure (402 out-of-credits,
 # 401/403 bad key) means the user's BYOK key is dead/broke — retrying it every heartbeat
 # interval is a retry storm against a key that cannot succeed until the user fixes it
 # (mirrors the original resident runtime's 600s payment cooldown). We write
 # `payment_cooldown_until` on the wake schedule; `jobs_store.due_heartbeat_users` already
-# excludes cooled-down users (Task 1), so no further wakes fire until it lapses.
+# excludes cooled-down users, so no further wakes fire until it lapses.
 _WAKE_COOLDOWN_SEC = float(os.environ.get("FEEDLING_V2_WAKE_COOLDOWN_SEC", "600"))
 _WAKE_FAIL_BACKOFF_BASE_SEC = float(
     os.environ.get("PROACTIVE_FAIL_BACKOFF_BASE_SEC", "60")
@@ -1604,9 +1608,9 @@ class TurnDeps:
     read_summary_with_seq: Callable[[str], tuple[str, float, int, int]] | None = None
     # (user_id, summary, watermark_ts, expected_version[, watermark_seq]) -> True if CAS
     # landed：本地加密（core_envelope，非 enclave 往返）+ CAS 写回 v2_conversation_summary
-    # （Task 2 storage）。expected_version 不匹配（别的回合已推进过摘要）时返回 False，
+    # （summary storage）。expected_version 不匹配（别的回合已推进过摘要）时返回 False，
     # 调用方按丢弃本次压缩处理，不重试、不报错——下一回合会用新版本重新压缩。默认 None：同上。
-    # watermark_seq（D5/Task 9）是可选的第 5 个位置参数——_run_compaction 只有在能拿到折叠
+    # watermark_seq 是可选的第 5 个位置参数——_run_compaction 只有在能拿到折叠
     # 批次最后一行的精确 seq 时才会传它（生产路径总是能拿到；某些窄签名的测试 fake 只接 4
     # 个参数，_run_compaction 会退化成旧的 4 参调用，两边都不破）。
     # Segmented production path. Leaf summaries and higher-level checkpoints
@@ -1647,7 +1651,7 @@ class TurnDeps:
     # 历史读取。默认 None：
     # worker.py 不 import hosted/capabilities，生产装配见 serve_worker。
     read_files: Callable[[str, list[str]], dict[str, dict]] | None = None
-    # —— capture/dream 记忆抽取 lane 的三个注入回调（Task 3）——
+    # —— capture/dream 记忆抽取 lane 的三个注入回调 ——
     # 全部默认 None：worker.py 不 import `hosted`/`memory_core`/`core.envelope`-for-memory
     # （否则违反 CONTRIBUTING §2 的依赖方向），所以记忆上下文读取、信封加密、落库都作为
     # 可调用对象由 serve_worker.build_production_deps 注入；测试注入假实现直接跑。
@@ -1715,7 +1719,7 @@ class TurnDeps:
     cancel_capture_job: Callable[..., bool] | None = None
     capture_enabled: Callable[[str], bool] | None = None
     dream_enabled: Callable[[str], bool] | None = None
-    # user_id -> {"applied": int, "discarded": int}（Task 6 / spec A6）：run the
+    # user_id -> {"applied": int, "discarded": int}（spec A6）：run the
     # generation-fenced effect-outbox applier (`effect_outbox.apply_pending_effects`)
     # with this turn's real dispatch sinks at end-of-turn. worker.py itself never
     # imports `model_api_runtime.v2.effect_outbox`'s dispatch-side wiring (the 8
@@ -3513,7 +3517,7 @@ async def _dispatch_mixed_tool_calls(
         started_ns = time.monotonic_ns()
         if dispatch_provider_usage is None:
             # wake/subagent lanes bind no callable — this tool is never
-            # offered there (Task 5 catalog scoping); a call reaching here
+            # offered there by catalog scoping; a call reaching here
             # anyway (forged/legacy caller) is refused, not silently routed.
             results = [
                 ToolResult(call_id=tc.id, content="error: tool_not_allowed")
@@ -5849,7 +5853,7 @@ def _make_provider_usage_dispatcher(
     *, provider_config
 ) -> Callable[[list], Awaitable[list[ToolResult]]]:
     """Bind the turn's already-decrypted provider_config for provider_usage
-    calls (Task 6). Mirrors ``_make_task_batch_dispatcher``'s closure shape:
+    calls. Mirrors ``_make_task_batch_dispatcher``'s closure shape:
     capture once at turn setup, never re-resolve per call — a second
     resolution would mean a second decrypt.
 
@@ -6139,7 +6143,7 @@ def _frozen_relationship_anchor(patch) -> str | None:
 def _write_tool_effect_payload(tc) -> tuple[str, dict]:
     """Map a WRITE_ACTIONS tool_call to its PR A `(effect_type, payload)` (spec C6). ONE
     definition shared by every lane's `enqueue_write_effect` closure (`process_job`'s chat
-    branch — Task 7 — and `_run_wake` — Task 8) so the write-tool -> effect_type mapping never
+    branch and `_run_wake`) so the write-tool -> effect_type mapping never
     drifts between lanes. `cap_registry.WRITE_ACTIONS` is the closed set
     `executor.dispatch_tool_calls` ever routes here — a new write capability shipping without a
     mapping below must fail loudly, not silently drop the write."""
@@ -7985,7 +7989,7 @@ async def _assert_prompt_covers_seq(
 
 
 async def _assert_prompt_covers(user_id: str, tail_limit: int) -> None:
-    """Post-assembly hard assertion (D6/Task 10): every message with
+    """Post-assembly prompt-coverage assertion: every message with
     ``seq > watermark_seq`` must be inside the tail window this turn is about
     to hand the model. Re-derives ``watermark_seq`` fresh from the DB
     (``jobs_store.get_summary_row``) rather than reusing
@@ -8254,7 +8258,7 @@ async def _run_wake(
     一体、自己的 try/except。heartbeat/manual_wake/screen_watch 是弱唤醒，失败继续静默；
     scheduled 是到点交付，最终失败通过 durable terminal outbox 写明确失败结果，不能无声消失。
 
-    D3 Task 8 (PR C spec C8)：跟 chat 分支（`process_job`，Task 7）一样跑同一个
+    Retained wake-lane accounting contract: 跟 chat 分支一样跑同一个
     `tool_loop.run_tool_loop`。`turn_authorization=True` 传给 `dispatch_tool_calls`（跟 chat
     传的值一样，语义是 wake_trigger 而不是 user——两者都在 `provenance.turn_has_write_
     authorization` 意义下"有资格授权写"）。跟 chat 分支的两点关键差异：
@@ -8267,7 +8271,7 @@ async def _run_wake(
 
     真 provider 错误（`chat_completion_async` 抛出的任何异常）：所有 lane 都
     `mark_failed`；只有 scheduled 同步排入用户可见失败 outbox。402/401/403 一类
-    "provider_config"错误（死/欠费 BYOK key）额外写一条 payment_cooldown（D3 Task 7），
+    "provider_config"错误（死/欠费 BYOK key）额外写一条 payment_cooldown，
     让 scheduler 的 `due_heartbeat_users` 停止对一把修不好的钥匙反复重试。
 
     prompt 组装：读 summary+tail（同 chat 路径的 D1 读法）；真实历史保留原 role，
@@ -8429,7 +8433,7 @@ async def _run_wake(
             ):
                 raise RuntimeModeChanged(f"user rolled back before {effect}")
 
-        # D6/Task 10: close a compaction backlog gap BEFORE reading the actual
+        # Close a compaction backlog gap before reading the actual
         # prompt content — see `_ensure_prompt_coverage`'s docstring. Only run
         # when both seq-native readers are wired; a
         # coverage check is meaningless without a real tail reader to bound.
@@ -8700,7 +8704,7 @@ async def _run_wake(
             _flatten_turns(optional_tail_turns) + wake_tail
         )
 
-        # screen_watch lane grounds on recent shared-screen availability (Task 3).
+        # screen_watch lane grounds on recent shared-screen availability.
         # Fetch ONLY screen_recent — no perception_glance or perception_snapshot: the
         # resident explicitly sets perception_digest=None for screen-watch jobs.
         # B1 aligns its separate screen recipe with V1: at most four frames carry
@@ -9071,10 +9075,10 @@ async def _run_wake(
             search_halted=wake_search_halted,
             fetch_halted=wake_fetch_halted,
         )
-        # provider_usage is chat-lane only (Task 5 design decision): the
+        # provider_usage is chat-lane only: the
         # proactive companion never has a user-asked-a-question moment to
         # answer, so it must never be offered here — unconditionally, not
-        # gated by the kill switch (that gate is chat-lane's Task 6 concern).
+        # gated by the kill switch (a chat-lane concern).
         # `mcp_tool_search` 不在这里 —— 它是折叠 schema 的唯一取回口。禁掉它
         # 等于让唤醒道在压力下永久丢失工具参数(T154 之前正是如此)。
         wake_disabled_tool_names = wake_disabled_web_tool_names | {
@@ -10273,7 +10277,7 @@ async def _run_wake(
             if provider_client.classify_provider_error(e) == "provider_config":
                 # Dead/broke BYOK key (402 out-of-credits, 401/403 bad key) — back off
                 # BEFORE mark_failed below, so the scheduler stops hammering
-                # this key every heartbeat interval (Task 1's due_heartbeat_users query
+                # this key every heartbeat interval (due_heartbeat_users
                 # already excludes users still in cooldown).
                 await _fence_wake_effect("payment cooldown")
                 await asyncio.to_thread(
@@ -12896,7 +12900,7 @@ async def process_job(
                 trajectory_recorder,
             )
         if lane in _WAKE_LANES:
-            # Self-contained wake path (D3 Task 6): proactive turn, not a reply to a
+            # Self-contained wake path: proactive turn, not a reply to a
             # just-sent user message. Own try/except inside `_run_wake` — never falls
             # into the chat-turn `except` below (that branch emits a user-visible
             # error status + record_terminal_error, which wake failures must not do).
@@ -12914,7 +12918,7 @@ async def process_job(
                 trace_id=str(job.get("trace_id") or ""),
             )
         if lane in _EXTRACTION_LANES:
-            # 自成一体的记忆抽取路径（capture/dream，Task 3）：build prompt → BYOK 抽取 →
+            # 自成一体的记忆抽取路径（capture/dream）：build prompt → BYOK 抽取 →
             # parse → memory actions。同 _run_compaction/_run_wake 一样有自己的 try/except，
             # 绝不落进下面 chat-turn 的 except（那条会 emit 用户可见 error status +
             # record_terminal_error）——后台 job 永不写气泡、永不弹 error chip。
@@ -13266,7 +13270,7 @@ async def process_job(
                 )
                 optional_anchor_seq = None
         if seq_context:
-            # D6/Task 10: close a compaction backlog gap BEFORE reading the
+            # Close a compaction backlog gap before reading the
             # actual prompt content — see `_ensure_prompt_coverage`'s
             # docstring. Common case (no gap) costs two cheap indexed reads
             # and returns immediately without touching the enclave/LLM.
@@ -13350,7 +13354,7 @@ async def process_job(
 
         async def _enqueue_write_effect(tc) -> str:
             """WRITE tool_call -> PR A effect (spec C6). Mapping lives in the shared
-            `_write_tool_effect_payload` (also used by `_run_wake` — Task 8)."""
+            `_write_tool_effect_payload` (also used by `_run_wake`)."""
             prepared = effect_reservations.get(tc)
             encrypted_payload = await asyncio.to_thread(
                 _build_encrypted_tool_effect_payload,
@@ -13559,8 +13563,8 @@ async def process_job(
             fetch_halted=web_fetch_halted,
         )
         # provider_usage kill switch, offer-time half. This is the chat lane's
-        # own gate (Task 6) — the wake lane withholds the tool unconditionally
-        # (Task 5), never reaching this check. Fail-closed: a broken read
+        # own gate — the wake lane withholds the tool unconditionally, never
+        # reaching this check. Fail-closed: a broken read
         # withholds the tool rather than exposing it.
         try:
             provider_usage_halted = await asyncio.to_thread(
@@ -13649,7 +13653,7 @@ async def process_job(
             observe_photo=observe_photo,
             trajectory_recorder=trajectory_recorder,
         )
-        # Chat-lane only (Task 6): closes over THIS turn's already-decrypted
+        # Chat-lane only: closes over THIS turn's already-decrypted
         # provider_config, never re-resolved per call.
         dispatch_provider_usage = _make_provider_usage_dispatcher(
             provider_config=provider_config
@@ -15549,7 +15553,7 @@ async def process_job(
                     successor_id,
                     type(exc).__name__,
                 )
-        # End-of-turn effect-outbox drain (Task 6 / spec A6): apply any pending
+        # End-of-turn effect-outbox drain (spec A6): apply any pending
         # generation-fenced effects for this user with the real dispatch sinks.
         # Best-effort — the turn's own reply/runtime-state/job transition above
         # are already durable by this point, so a failure here must not turn a
@@ -16369,11 +16373,12 @@ async def _slot_loop(
     wake_event 命中时立刻醒——见 `_wait_for_job_or_stop`）。stop_event 置位后不再抢新活，
     跑完手上的即退出（优雅 drain）。
 
-    lanes（可选）：转给 `jobs_store.claim_next_job` 的 lane 白名单（Task 2）。None＝不限制
-    （行为与改动前完全一致）；非 None 时这个 slot 只抢白名单里的 lane——`run_worker_loop`
-    用它给部分 slot 划专用车道（见 `_reserved_lane_slots`）。
+    lanes（可选）：转给 `jobs_store.claim_next_job` 的 lane 白名单。None＝不限制
+    （行为与改动前完全一致）；非 None 时这个 slot 只抢白名单里的 lane。生产
+    `turn_child` 把每个 SlotSpec 的 current allowlist 传到这里；`run_worker_loop`
+    仅在 compatibility 路径中使用 `_reserved_lane_slots` 的旧自动分配。
 
-    progress_cb（可选，PR D Task 2 + hard-timeout fix）：`progress_cb(slot_id, turn_start)`
+    progress_cb（可选，per-slot progress / hard-timeout safety）：`progress_cb(slot_id, turn_start)`
     在真实 slot 活动的天然边界调用——claim 到一个 job 之后（即将进入 `_run_turn`）、
     `_run_turn` 跑完、每次空转 poll 醒来，以及 task-local `_report_turn_progress` 转发的
     provider round / reliable retry / tool batch / compaction batch 边界。这样一个合法长回合会
@@ -16540,18 +16545,26 @@ async def run_worker_loop(
     slot_generation: str = "g0",
     slot_ids: "list[str] | None" = None,
 ) -> None:
-    """起 max_workers 个 job-slot 协程共抢同一张 agent_jobs（SKIP LOCKED 无争用）。
+    """Run direct-worker slots for compatibility callers and unit tests.
+
+    Production does not use this multi-slot arrangement: ``serve_worker``
+    builds the three-pool ``RuntimePoolConfig`` and starts one ``turn_child``
+    process for every SlotSpec. Each child invokes ``_slot_loop`` directly with
+    that pool's lane allowlist. This function remains the direct-worker/test
+    compatibility path and still preserves its historical lane assignments.
+
+    起 max_workers 个 job-slot 协程共抢同一张 agent_jobs（SKIP LOCKED 无争用）。
     stop_event 置位 → 所有 slot 跑完手上 job 后退出（SIGTERM 优雅 drain 的落点）。
     wake_event（可选）由 serve_worker._serve 传入，桥 "v2_jobs" 即时唤醒（FIX 3）——
     未传（None）时所有 slot 退化为纯 poll，向后兼容既有调用方/测试。
 
-    lane 预留（D3 Task 5）：前几个 slot 只抢 {"chat","manual_wake"}（见 `_reserved_lane_slots`），
-    保证 scheduler（Task 4）产出的 heartbeat 唤醒风暴抢不走全部 slot、饿死聊天回复，
-    同时始终留一个 unrestricted slot，避免后台 lane 永久 pending。
+    compatibility lane assignments：前几个 slot 只抢 {"chat","manual_wake"}
+    （见 `_reserved_lane_slots`），同时始终留一个 unrestricted slot，避免后台 lane
+    永久 pending。
     `FEEDLING_V2_CHAT_RESERVED_SLOTS` 显式设置时覆盖默认的 max(1, max_workers // 2)；
     留空/未设置时用默认值。
 
-    progress_cb（可选，PR D Task 2）：原样转给每个 `_slot_loop`，附带该 slot 在
+    progress_cb（可选）：原样转给每个 `_slot_loop`，附带该 slot 在
     `assignments` 里的下标作为 `slot_id`——见 `_slot_loop` 自己的 docstring。默认 None：
     向后兼容既有调用方/测试。
 

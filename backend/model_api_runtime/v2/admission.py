@@ -1,7 +1,7 @@
-"""§6 admission ceiling —— 纯函数：估算 send 排队等待、判定是否放行。
+"""§6 queue-wait telemetry 的纯函数。
 
 无 DB、无 hosted import（守依赖方向）。DB 读由 jobs_store 提供、chat_send_core 注入。
-当前 prod 用户量极小，此闸是安全阀、几乎不触发；刻意保持最小近似（不按 priority 加权）。
+live overload 的估算只用于 telemetry；它不在持久化前拒绝用户消息。
 """
 from __future__ import annotations
 
@@ -35,9 +35,9 @@ def estimate_wait_sec(
     mean_service_sec: float | None,
     default_service_sec: float,
 ) -> float:
-    """est-wait = ceil(inflight / workers) × 服务时长。
+    """返回 est-wait = ceil(inflight / workers) × 服务时长。
 
-    workers<=0 → 0（防除零；供给死交给上游存活闸，不在这里拦）。
+    workers<=0 → 0（防除零；供给死交给独立的上游 liveness gate）。
     inflight<=0 → 0。mean_service_sec None → 用 default_service_sec。
     """
     if workers <= 0 or inflight <= 0:
@@ -48,5 +48,8 @@ def estimate_wait_sec(
 
 
 def should_admit(est_wait_sec: float, *, sla_sec: float) -> bool:
-    """est_wait ≤ sla → 放行（边界相等放行）。"""
+    """分类 est_wait 是否未超过 SLA（边界相等为 true）。
+
+    Hosted Chat 仅把该分类写成 telemetry；它不代表 pre-persistence 拒绝。
+    """
     return est_wait_sec <= sla_sec

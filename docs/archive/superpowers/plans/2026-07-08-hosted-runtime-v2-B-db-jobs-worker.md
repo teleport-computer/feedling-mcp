@@ -1,12 +1,21 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/CURRENT_STATE.md
+historical_reason: implemented
+---
 # Hosted Runtime V2 — 子项目 B（DB job + 有界 worker 骨架）Implementation Plan
 
-> **RETIRED / DO NOT DEPLOY.** Historical implementation record; use the live
-> Runtime V2 rollout and parity documents for current operations.
+> **HISTORICAL IMPLEMENTATION RECORD — DO NOT EXECUTE OR DEPLOY THIS PLAN.**
+> Use [`CURRENT_STATE.md`](../../../CURRENT_STATE.md), the retained runtime
+> decisions, current code, and focused tests for live behavior and deployment.
 
 > **STATUS: HISTORICAL IMPLEMENTATION RECORD.** The durable job/worker
-> foundation remains current, but the `agent_action_queue` planner pipeline and
-> its Python CRUD surface were superseded by provider-native tool calls plus the
-> generation-fenced effect outbox. Do not treat every API shown below as live.
+> foundation remains current, including injection/dependency direction, BYOK and
+> no-filler boundaries, per-user single-flight, and recovery rationale. The
+> staged `agent_action_queue` planner pipeline and its Python CRUD surface are
+> historical; provider-native tool calls and the generation-fenced effect outbox
+> now own that control flow. Persisted `agent_action_queue` schema compatibility
+> remains required and is not a deletion instruction.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

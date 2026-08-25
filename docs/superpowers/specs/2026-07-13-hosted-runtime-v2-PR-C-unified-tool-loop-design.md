@@ -1,3 +1,7 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # Hosted Runtime V2 — PR C: Unified Provider-Native Tool Loop — Design
 
 **Status:** LANDED / CURRENT ARCHITECTURE RECORD
@@ -22,7 +26,7 @@ Replace the staged `is_official → rule_plan/official_plan → executor → for
 - broken tool args, or relay tools returning 400/422: exactly one same-turn fallback, no persisted tier.
 - web/tool observations carry provenance and can NEVER self-authorize a durable write.
 
-## Current state (grounding — verified, file:line)
+## Pre-PR-C baseline (historical grounding — file:line at design time)
 
 - **Turn loop:** `worker.process_job` chat branch (`worker.py:933-1074`) is a two-layer loop: outer `while True` with `replan_count`/`llm_calls` (cap `_TURN_MAX_LLM_CALLS=6`, `:126`) wrapping `v2_agent_loop.run_turn(decide=_decide, run_tools=_run_tools, …)` (`:997`). `_decide` (`:948`) calls `v2_planner.plan` (`:959`); `_run_tools` (`:975`) calls `v2_executor.execute_plan` (`:992`). After the loop, `v2_responder.respond` (`:1059`) is FORCE-called for chat (`wants_reply` hard-wired True, `:1024`). End-of-turn `deps.apply_pending_effects(user_id)` drain already wired (`:1106-1110`) — but no producer feeds it.
 - **`v2_agent_loop`** (`agent_loop.py`): a bounded state-machine skeleton (`Decision{actions,wants_reply,final_text}`, `LoopResult`, stop reasons), NOT a real tool loop. `final_text` is a dead seam reserved for a native tool-calling backend.
@@ -33,6 +37,18 @@ Replace the staged `is_official → rule_plan/official_plan → executor → for
 - **PR A outbox (producer side unwired):** `db.effect_enqueue(effect_id,user_id,job_id,effect_type,expected_generation,payload)` (`db.py:3426`), `effect_id.derive(*,job_id,effect_type,ordinal)` (`effect_id.py:11`), `derive_control` (`:16`). No `effect_outbox.enqueue_effect` wrapper yet. Consumer `apply_pending_effects` + `serve_worker.build_production_effect_dispatch` + 7 sinks already built/wired. Effect types: `{reply,status,cursor,job,memory,identity,schedule}`. A producer needs `expected_generation` = the turn's pinned runtime generation (ABA-safety).
 - **PR B transport:** `provider_client.chat_completion_async(config, messages, *, tools: list[ToolSpec]|None=None) -> dict` with `result["tool_calls"]` = `[{id,name,args,args_raw,args_ok}]`; `provider_types.ProviderResponse.from_result`; `TurnMetrics.add_call(usage)`.
 - **Message fold:** `_coalesce_inputs` (`worker.py:377`) → `v2_coalesce.coalesce_pending` (ts-cursor). Today a new-message fold path RESTARTS the outer loop via `v2_inval.evaluate`→REPLAN→`continue`. PR C's per-round fold replaces this for chat/wake. PR A `cursor.py` provides the seq-based cursor (`load_seq`, `advance_effect`) preferred over the ts-cursor (ts collisions under concurrent workers).
+
+### Landed/current reconciliation (2026-08-24)
+
+The preceding bullets are the retired baseline that motivated PR-C, not current
+production grounding. Current V2 turns use the provider-native
+`backend/model_api_runtime/v2/tool_loop.py::run_tool_loop`; `worker.process_job`
+calls it for chat, `_run_wake` calls it for wake, and the child path calls the
+same loop. The staged `agent_loop.py → planner.py → responder.py` control flow
+and its unwired-effect description no longer define production behavior.
+Current code plus `tests/test_v2_p0_unified_loop.py`, `tests/test_v2_tool_loop.py`,
+`tests/test_v2_worker_tool_loop.py`, and `tests/test_v2_wake_tool_loop.py` are
+the implementation evidence for this decision.
 
 ---
 

@@ -1,7 +1,15 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/superpowers/specs/2026-07-21-dual-runtime-v1-v2-coexistence-design.md
+historical_reason: superseded
+superseded_by: docs/superpowers/specs/2026-07-21-dual-runtime-v1-v2-coexistence-design.md
+---
 # Hosted Runtime V2 — D0 Rollout Infrastructure 设计
 
-> **RETIRED / DO NOT DEPLOY.** Historical cutover design; per-user resident
-> rollback, roster, and selector paths have been removed.
+> **RETIRED / DO NOT DEPLOY.** 这是单向迁往 V2 的历史设计。2026-07-21
+> 接受的 dual-runtime 决策恢复并保护了 per-user Resident/V2 双向切换；当前
+> topology、selector 和回滚事实以 `docs/CURRENT_STATE.md`、实际 compose 与
+> `2026-07-21-dual-runtime-v1-v2-coexistence-design.md` 为准。
 
 > 子项目 D 的前置基建。来源：walkthrough §8 gate 7 + 两份现状调查（2026-07-09）。**这是 D3/D4 的共同前提**：没有它，V2 worker 池在 prod 一次都没跑过，且被翻到 db_action_v2 的用户会被 resident + V2 双跑。
 

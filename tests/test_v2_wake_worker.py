@@ -133,7 +133,7 @@ def _wake_deps(*, summary="", tail=None, has_genuine_user_history=None):
 def _script_provider(monkeypatch, responses):
     """Monkeypatch `provider_client.chat_completion_async` — what
     `tool_loop.run_tool_loop` calls once per round (the wake lane's LLM wire
-    boundary since Task 8)."""
+    boundary)."""
     it = iter(responses)
     calls = []
 
@@ -2519,9 +2519,9 @@ def test_run_wake_tolerates_missing_read_summary_read_tail(monkeypatch):
 
 
 # ------------------------------------------------------------------
-# D3 Task 7: a "provider_config"-kind failure (dead/broke BYOK key: 402/401/403
-# — classified via provider_client.classify_provider_error, Task 8's
-# replacement for the old ResponderError.kind mechanism) must write a
+# A "provider_config"-kind failure (dead/broke BYOK key: 402/401/403
+# — classified via provider_client.classify_provider_error, replacing the old
+# ResponderError.kind mechanism) must write a
 # payment_cooldown_until on the wake schedule BEFORE the silent mark_failed,
 # so the scheduler's due_heartbeat_users stops re-firing wakes at a key that
 # cannot succeed until the user fixes it. A "transient"-kind error must NOT

@@ -1,4 +1,4 @@
-"""V2 proactive scheduler tick (Task 4 of D3 proactive wake lanes plan).
+"""V2 proactive scheduler tick for the retained D3 wake-lane decision.
 
 Pure module: every side effect (which users are due, the wake decision,
 enqueueing a heartbeat job, advancing the schedule) is injected via a
@@ -91,7 +91,7 @@ def run_scheduler_tick(deps, *, now: float) -> dict:
             except Exception:  # noqa: BLE001 — 单用户失败不能中断整轮扫描
                 logger.exception("scheduler: fire_scheduled failed for user %s", user_id)
 
-    # capture/dream 抽取扫描（Task 4）—— 与上面的 scheduled 扫描同构：两个新 dep 同样
+    # capture/dream extraction scan——与上面的 scheduled 扫描同构：两个新 dep 同样
     # getattr 探测（既有 FakeDeps 没有这两个属性，直接取会 AttributeError），缺一即整段跳过；
     # 每用户 try/except（logger.exception），单用户失败绝不中断整轮扫描（与 heartbeat/
     # scheduled 的隔离口径一致）。
@@ -105,7 +105,7 @@ def run_scheduler_tick(deps, *, now: float) -> dict:
             except Exception:  # noqa: BLE001 — 单用户失败不能中断整轮扫描
                 logger.exception("scheduler: tick_extraction failed for user %s", user_id)
 
-    # screen_watch 扫描（D-screen_watch Task 4）—— 与上面 scheduled/extraction 扫描同构：
+    # screen_watch scan——与上面 scheduled/extraction 扫描同构：
     # 两个新 dep 同样 getattr 探测（既有 FakeDeps 没有这两个属性，直接取会 AttributeError），
     # 缺一即整段跳过；每用户 try/except（logger.exception），单用户失败绝不中断整轮扫描
     # （与 heartbeat/scheduled/extraction 的隔离口径一致）。

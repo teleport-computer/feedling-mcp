@@ -1,4 +1,23 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # Hosted Runtime V2 — D3 Proactive/Wake Lanes 设计
+
+> **Current reconciliation:** This decision governs the live V2-owned wake
+> lanes: activation-before-enqueue, payment cooldown, no-filler completion,
+> scheduled-wake state-machine preservation, and lane-aware wake routing remain
+> required. Under the accepted
+> [`dual-runtime coexistence decision`](2026-07-21-dual-runtime-v1-v2-coexistence-design.md),
+> those guarantees apply only to users currently fenced to V2; Resident remains
+> a current hosted runtime and must not be unconditionally shut down.
+>
+> The original shared `N/R` reserved-slot arrangement is historical. Current
+> pool routing and per-slot process isolation are owned by the
+> [`three-pool slot-isolation decision`](2026-08-14-runtime-v2-three-pool-slot-isolation-design.md).
+> Its foreground/wake/heavy allowlists replace this document's shared-slot
+> topology. The historical sections below remain useful as rationale and
+> implementation evidence, not as topology or deployment instructions.
 
 > 子项目 D 的大迁移。来源：walkthrough §6（lane 模型）+ §8 gate 5 + 现状调查（2026-07-09）。**依赖 D0 池在跑。** 把 proactive/wake/capture 从 resident 常驻计时器搬到 `agent_jobs` lane，兑现"关 resident"的前置（proactive 不迁走，resident 就停不掉）。
 

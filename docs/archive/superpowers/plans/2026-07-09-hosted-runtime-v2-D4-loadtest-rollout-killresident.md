@@ -1,13 +1,20 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/superpowers/specs/2026-07-21-dual-runtime-v1-v2-coexistence-design.md
+historical_reason: superseded
+superseded_by: docs/superpowers/specs/2026-07-21-dual-runtime-v1-v2-coexistence-design.md
+---
 # D4 Load Test + Gated Rollout + Kill Resident Implementation Plan
 
-> **RETIRED / DO NOT DEPLOY.** Historical cutover plan; resident rollback and
-> per-user rollout selectors no longer exist.
+> **SUPERSEDED / DO NOT DEPLOY.** Historical V2-only cutover plan. The accepted
+> dual-runtime decision restored per-user selection and hosted Resident; use
+> `docs/CURRENT_STATE.md` for current operation.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development（仅 T1-T4 压测脚手架）。T5 灰度/关 resident 是 **ops runbook 非 TDD**，由用户/ops 手动执行。Steps 用 checkbox。
 
 **Goal:** 证明 V2 对等且不更贵（tokens/turn 不回归）→ 据证据灰度翻用户 → 停 resident，兑现省钱/并发。
 
-**Architecture:** 见 spec `…-D4-loadtest-rollout-killresident-design.md`。**依赖 D0（指标/setter/互斥闸）+ D3（proactive 迁走）。**
+**Architecture:** 见归档 spec [`2026-07-09-hosted-runtime-v2-D4-loadtest-rollout-killresident-design.md`](../specs/2026-07-09-hosted-runtime-v2-D4-loadtest-rollout-killresident-design.md)。**依赖 D0（指标/setter/互斥闸）+ D3（proactive 迁走）。**
 
 ## Global Constraints
 

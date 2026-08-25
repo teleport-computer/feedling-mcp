@@ -1,10 +1,20 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop-design.md
+historical_reason: implemented
+---
 # Hosted Runtime V2 — Plan A: Capability Facade Implementation Plan
+
+> **HISTORICAL IMPLEMENTATION RECORD — DO NOT EXECUTE OR DEPLOY THIS PLAN.**
+> The uniform `CapabilityResult`, downward-only facade boundary, registry, caps,
+> and redaction rationale landed. The retained provider-native tool-loop decision
+> now owns the model-facing catalog and dispatcher contract.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build `backend/capabilities/` — a thin uniform facade over the existing domain `*_core` functions — giving the V2 worker one `CapabilityResult` shape and an action-type dispatch table, with output caps + redaction.
 
-**Architecture:** The framework-neutral capability implementations already exist as `memory_core` / `perception_core` / `screen_read_core` / `perception_read_core` / `identity_core`. This plan does NOT reimplement them and does NOT touch the HTTP routes or `io_cli`. Each `capabilities/<verb>.py` module imports its core via `from pkg import module`, calls it, and normalizes the heterogeneous return (`(body, status)` tuple / `ScreenResult` / raised `AgentRouteError`) into `CapabilityResult`. `registry.py` maps action-type strings to these functions for the executor (Plan C).
+**Architecture:** The framework-neutral capability implementations already exist as `memory_core` / `perception_core` / `screen_read_core` / `perception_read_core` / `identity_core`. This plan did not reimplement them or change HTTP routes or `io_cli`. Each `capabilities/<verb>.py` module imports its core via `from pkg import module`, calls it, and normalizes the heterogeneous return (`(body, status)` tuple / `ScreenResult` / raised `AgentRouteError`) into `CapabilityResult`. The registry remains the uniform capability boundary; its current model-facing catalog and dispatch use are governed by the retained provider-native tool-loop decision.
 
 **Tech Stack:** Python 3.11, pytest, existing backend package layout (FastAPI app assembled in `asgi_app.py`, but this plan adds no routes).
 
@@ -44,7 +54,7 @@ tests/
 docs/superpowers/specs/runtime-v2-parity-matrix.md   (Phase 0 deliverable)
 ```
 
-## Interfaces produced (consumed by Plan C's executor)
+## Historical interfaces produced
 
 ```python
 # capabilities/types.py
@@ -1097,9 +1107,9 @@ git commit -m "feat(capabilities): action-type dispatch registry"
 
 ---
 
-## Plan A done — hand-off to Plan B / C
+## Historical hand-off
 
-- Plan C's executor imports **`capabilities.registry.run_capability`** and drives it by `action_type`, threading `store`, `api_key`, `runtime_token`, `params`.
+- The former staged planner/executor consumed **`capabilities.registry.run_capability`** by `action_type`. Current consumers are the provider-native tool loop and its dispatcher, governed by the retained owner above.
 - Every `data` is already capped/redacted, safe to log in status events and feed the responder.
 - Enclave-bound verbs (`memory_index/fetch`, `screen_read`, `photo_read` with image, `chat_image_read`) still hit the enclave inside the core — Plan B/C must wrap those calls in the shared `ENCLAVE_SEMAPHORE` (spec §11 R3).
 

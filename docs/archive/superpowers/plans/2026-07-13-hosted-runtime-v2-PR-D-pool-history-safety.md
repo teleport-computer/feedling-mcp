@@ -1,11 +1,23 @@
-# Hosted Runtime V2 — PR D: Pool / History Safety — Implementation Plan
+---
+document_lifecycle: historical
+historical_reason: implemented
+canonical_owner: docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md
+---
+# Hosted Runtime V2 — PR D: Pool / History Safety — Historical implementation record
+
+> **Historical record:** This plan's task steps landed. It is retained for
+> traceability only and is not operating documentation. The retained PR-D
+> decision owns the safety invariants; the three-pool decision owns the current
+> one-process-per-slot topology.
 
 > **Historical retention note (2026-07-18):** the D7 coverage-gated trim in
 > this execution plan is no longer current. Durable raw chat and attachment
 > bodies are retained; 5,000 bounds only the process hot window, while summary
 > watermarks affect model context only.
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Historical authoring note:** The agentic-worker workflow and every checkbox
+> below are preserved evidence from the original execution period. Do not execute
+> them as a current plan.
 
 **Goal:** Make the V2 turn pool a killable/restartable child-process crash domain with a split stall/absolute-budget watchdog + health-reflecting capacity + a live kill switch (turns halt, Genesis unaffected), and close the history-integrity gaps (seq cursor, prompt-coverage invariant via synchronous catch-up compaction, durable source retention independent of compaction, compaction CAS-loss requeue, reconcile sweeper).
 

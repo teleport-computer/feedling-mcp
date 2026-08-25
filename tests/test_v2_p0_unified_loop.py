@@ -1,5 +1,5 @@
-"""Hosted Runtime V2 PR C — Task 10: the P0 / @sxysun-gates-deploy acceptance subset
-for the unified provider-native tool loop (spec 2026-07-13 PR-C plan, "### Task 10").
+"""P0 acceptance contract for the unified provider-native tool loop
+(retained decision §§C2–C3).
 
 Each test below asserts a STRONG live-behavior property of the real loop (`tool_loop.
 run_tool_loop` + `worker.process_job`/`executor.dispatch_tool_calls`), not a weak proxy:
@@ -31,8 +31,8 @@ run_tool_loop` + `worker.process_job`/`executor.dispatch_tool_calls`), not a wea
                                    for the RIGHT call_id (no cross-wire id/content
                                    mixups).
 
-Style mirrors tests/test_v2_worker_tool_loop.py (Task 7) / tests/test_v2_wake_tool_loop.py
-(Task 8): real jobs_store/core_store/effect_outbox against Postgres; the only boundaries
+Style mirrors tests/test_v2_worker_tool_loop.py / tests/test_v2_wake_tool_loop.py:
+real jobs_store/core_store/effect_outbox against Postgres; the only boundaries
 stubbed are `capabilities.registry.run_capability` (capability correctness has its own
 test files) and `provider_client.chat_completion_async` (the LLM wire boundary the loop
 calls once per round — scripted here to drive specific round shapes).

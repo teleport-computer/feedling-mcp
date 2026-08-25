@@ -4,7 +4,7 @@ Legacy runtime web access is a keyless DuckDuckGo HTML scrape (no provider,
 no API key) already implemented in model_api_runtime/tools.py
 (`web_search_duckduckgo`, `sanitize_web_query`, `query_has_sensitive_data`,
 `_strip_html_text`). This facade exposes it as V2 capabilities so the
-planner/executor gain web access parity with the legacy runtime
+provider-native tool loop gains web access parity with the legacy runtime
 (merge-review condition 4b) — no reimplementation, just the uniform
 CapabilityResult shape + input guards + redaction/size caps for untrusted
 external content.
@@ -40,7 +40,7 @@ _FETCH_TIMEOUT_SEC = 8.0
 #
 # It is deliberately NOT the bound that protects the prompt. Two later stages do
 # that, and they are the real limit on what reaches the model:
-# executor._RESULT_CHAR_CAP and tool_loop's tool_result_char_cap, both 2000.
+# tool dispatcher result caps and tool_loop's tool_result_char_cap, both 2000.
 # Raising a limit here without raising those would only look like it worked.
 _FETCH_MAX_BODY_BYTES = 300_000
 
@@ -323,7 +323,7 @@ def fetch(store, *, api_key=None, runtime_token=None, params=None) -> Capability
     # tail was silently dropped would read "not on this page" into a fact that
     # simply was not in the part it got.
     # Key order matters and is load-bearing. Downstream this dict is json-dumped
-    # and hard-cut at executor._RESULT_CHAR_CAP (2000), so anything placed after
+    # and hard-cut by the tool dispatcher result cap (2000), so anything placed after
     # `text` is simply not delivered — a `truncated` flag at the end reached the
     # model exactly never. The flag is what stops "absent from the part I read"
     # from being reported as "absent from the page", so it goes first.

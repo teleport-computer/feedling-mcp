@@ -1,10 +1,18 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/CURRENT_STATE.md
+historical_reason: implemented
+---
 # Hosted Runtime V2 — Step 1: Mechanical Merge-Condition Fixes
 
-> **STATUS: HISTORICAL / LANDED.** This plan records the first mechanical
-> hardening pass. Use the current rollout runbook and production code for live
-> behavior and remaining gates.
+> **HISTORICAL IMPLEMENTATION RECORD — DO NOT EXECUTE OR DEPLOY THIS PLAN.**
+> This plan records the first mechanical hardening pass. Use
+> [`CURRENT_STATE.md`](../../../CURRENT_STATE.md), retained decisions, current
+> production code, and focused tests for live behavior and remaining gates.
 
-> **For agentic workers:** execute via superpowers:subagent-driven-development, **NO-COMMIT mode** (user commits themselves — never `git add`/`git commit`). Review each task via filesystem-snapshot diff.
+> **Historical process note (non-executable):** the original implementation used
+> a no-commit working agreement and filesystem-snapshot review. That instruction
+> does not govern current work.
 > **Source:** `2026-07-09-hosted-runtime-v2-merge-conditions-backlog.md` — this plan implements the "机械项 (A-C 补丁)" rows only. Conditions 2, 3, §6-admission-ceiling are deferred to subproject D (step 2).
 
 **Goal:** Close the mechanical §9 merge-conditions on `feat/hosted-runtime-v2`: 1a worker liveness guard, 1c error surface, 1e async provider, 4a vocab reconcile, 4b web capability, 4c memory_search, 5 deployment docs.
@@ -13,7 +21,8 @@
 
 ## Global Constraints (copy into every reviewer prompt)
 
-- **NO commits, NO `git add`.** User commits at the very end.
+- **Historical process note:** the original author reserved the commit step; this
+  is not an instruction for current work.
 - **Dependency direction (hard, AST-guarded by `tests/test_v2_dependency_direction.py`):** modules under `backend/model_api_runtime/v2/` and `backend/capabilities/` MUST NOT import `hosted` or `agent_runtime`. Only `serve_worker.py` (injection layer) wires hosted deps in via `TurnDeps`. `provider_client` (at `backend/provider_client.py`) IS allowed.
 - **BYOK-only invariant:** every LLM call uses the user's own JIT-decrypted key. No platform LLM key anywhere. Don't regress.
 - **No-filler:** only model-authored `final_response` writes a chat bubble. Status/error events are runtime-authored, never assistant text.
@@ -161,6 +170,12 @@
 ---
 
 ## Task 7 (cond 5): pin deployment target in docs
+
+> **Historical deployment snapshot.** The runner-CVM/Resident statement below
+> was a point-in-time rollout proposal, not a current topology claim. Current
+> deployment is dual: pooled `serve-worker` runs in the primary CVM, while the
+> active hosted Resident remains in a separate runner CVM; verify an environment
+> with its exact deployed SHA and [`CURRENT_STATE.md`](../../../CURRENT_STATE.md).
 
 **Files:**
 - Modify: `backend/model_api_runtime/v2/serve_worker.py` (docstring @ ~245-247: remove the hedge "may run in a separate process/CVM/pod"; state definitively: runs as a sibling entrypoint inside the **runner CVM supervisor**, same image, alongside resident consumers + genesis worker)

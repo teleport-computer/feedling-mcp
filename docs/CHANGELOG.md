@@ -1,9 +1,15 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/CURRENT_STATE.md
+historical_reason: point-in-time
+---
 # Feedling MCP — Changelog
 
-> Landmark diffs over time. Two months from now, this is how we remember
-> when a decision was made and why.
+> This is the historical timeline of landmark diffs: it records when a decision
+> was made and why. Current runtime and deployment ownership live in
+> [`CURRENT_STATE.md`](CURRENT_STATE.md); exact deployed evidence and current
+> code take precedence over older entries here.
 >
-> Source-of-truth for "where we are now" is this changelog plus `git log`.
 > `PROJECT_BRIEF.md` and `ROADMAP.md` were retired 2026-04-20 — historical
 > references to them below are preserved verbatim.
 
@@ -12,8 +18,10 @@
 ## 给 Claude Code 的说明
 
 **每次开新对话时**，请按顺序读：
-1. `CHANGELOG.md`（最近的变化——尤其是最上面 3-5 条）
-2. `CLAUDE.md`（当前 repo-level guardrails；`HANDOFF.md` 已删除）
+1. `AGENTS.md`（当前 repo-level guardrails）
+2. `CURRENT_STATE.md`（当前 runtime、部署和排查 owner）
+3. `CLAUDE.md`（补充约定；`HANDOFF.md` 已删除）
+4. 只有需要历史原因时再查本 changelog 和 git log
 
 **每次完成一个 task 或做出决策时**，在文档顶部追加一条记录。格式见下面。
 
