@@ -9,8 +9,8 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 
 | Lifecycle | Classified documents |
 |---|---:|
-| `current` | 15 |
-| `decision` | 9 |
+| `current` | 17 |
+| `decision` | 10 |
 | `historical` | 25 |
 | `generated` | 1 |
 
@@ -19,6 +19,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `AGENTS.md`
 - `CLAUDE.md`
 - `README.md`
+- `docs-site/content/docs/changelog.mdx`
 - `docs/API_ERRORS.md`
 - `docs/CURRENT_STATE.md`
 - `docs/DOCUMENT_LIFECYCLE.md`
@@ -26,6 +27,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/repository-cleanup/README.md`
 - `docs/repository-cleanup/agent-diagnostic-benchmark.md`
 - `docs/repository-cleanup/hosted-runtime-history.md`
+- `docs/superpowers/plans/2026-08-24-io-marketing-website.md`
 - `docs/superpowers/plans/2026-08-24-repository-cleanup.md`
 - `docs/superpowers/plans/2026-08-24-repository-cleanup.zh-CN.md`
 - `docs/testing/README.md`
@@ -43,6 +45,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/superpowers/specs/2026-07-21-dual-runtime-v1-v2-coexistence-design.md`
 - `docs/superpowers/specs/2026-08-12-remove-v2-semantic-compaction-design.md`
 - `docs/superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md`
+- `docs/superpowers/specs/2026-08-24-io-marketing-website-design.md`
 
 ## historical
 
