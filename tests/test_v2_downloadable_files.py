@@ -14,6 +14,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import provider_client
+from agent_protocol_core import self_thinking
 import conftest
 import db
 from provider_types import ProviderMedia, ToolExchange, ToolResult
@@ -101,6 +102,7 @@ def _run_loop(
     trajectory_events=None,
     tool_events=None,
     build_messages=None,
+    suppress_native_reasoning=False,
 ):
     calls = []
     replies = []
@@ -153,6 +155,7 @@ def _run_loop(
             fold_new_messages=no_fold,
             add_usage=lambda usage: None,
             max_calls=max_calls,
+            suppress_native_reasoning=suppress_native_reasoning,
             on_trajectory_event=(
                 record_trajectory if trajectory_events is not None else None
             ),
@@ -261,6 +264,83 @@ def test_send_file_is_chat_only_and_invokes_explicit_callback(monkeypatch):
         ("f1", "send_file", "tool_call_started"),
         ("f1", "send_file", "tool_call_result"),
     ]
+
+
+def test_chinese_file_delivery_uses_chinese_compact_control_messages(monkeypatch):
+    files = []
+    request = (
+        "请生成并发送一个中文纯文本文件，文件名为中文附件，"
+        "正文写这是中文测试，请发送真实附件。"
+    )
+
+    async def on_file(path, revision):
+        files.append((path, revision))
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content=(
+                    "ok: workspace_write applied at revision 1; use the same "
+                    "path and revision 1 with send_file"
+                ),
+                metadata={"workspace_revision": 1},
+            )
+            for call in tool_calls
+        ]
+
+    outcome, calls, replies, messages_seen = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "write-cn",
+                    "name": "workspace_write",
+                    "args": {
+                        "path": "/workspace/中文附件.txt",
+                        "content": "这是中文测试。",
+                        "expected_revision": 0,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "send-cn",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/中文附件.txt",
+                        "revision": 1,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "中文附件已经生成，可以下载了。",
+                "tool_calls": [],
+                "usage": {},
+            },
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        required_file_suffixes=(".txt",),
+        file_requirement_messages=[{"role": "user", "content": request}],
+        max_calls=4,
+        suppress_native_reasoning=True,
+    )
+
+    assert calls[1] == ("send_file",)
+    assert files == [("/workspace/中文附件.txt", 1)]
+    assert replies == [("中文附件已经生成，可以下载了。", True)]
+    assert outcome.stop_reason == "final_text"
+    assert "现在调用 send_file" in messages_seen[1][0]["content"]
+    assert request in messages_seen[1][0]["content"]
+    assert "使用与下方当前请求相同的语言" in messages_seen[2][0]["content"]
+    assert self_thinking.INSTRUCTION.strip() in messages_seen[1][0]["content"]
+    assert self_thinking.INSTRUCTION.strip() in messages_seen[2][0]["content"]
+    assert messages_seen[2][1] == {"role": "user", "content": request}
 
 
 def test_canvas_send_file_delivers_model_authored_display_metadata(monkeypatch):
@@ -865,7 +945,7 @@ def test_canvas_update_compact_delivery_preserves_request_and_corrects_metadata(
         ("/workspace/小游戏.io.html", 2, "星光方块", "今晚一起玩")
     ]
     assert user_request in str(messages_seen[1])
-    assert "title, subtitle, and completion_message" in str(messages_seen[1])
+    assert "title、subtitle 和 completion_message" in str(messages_seen[1])
     validation_exchange = messages_seen[2][-1]
     assert isinstance(validation_exchange, ToolExchange)
     assert [result.call_id for result in validation_exchange.results] == [
@@ -1932,6 +2012,35 @@ def test_workspace_canvas_file_result_preserves_display_metadata(monkeypatch):
             },
             title="接星星",
         )
+
+
+def test_workspace_file_effect_seals_rendered_bytes_as_binary(monkeypatch):
+    captured = {}
+
+    def build_envelope(_store, plaintext, **kwargs):
+        captured["plaintext"] = plaintext
+        captured.update(kwargs)
+        return {"id": "b" * 32}, ""
+
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        build_envelope,
+    )
+    reply = worker.WorkspaceFileReply(
+        path="/workspace/中文附件.docx",
+        name="中文附件.docx",
+        mime_type=document_render.DOCX_MIME,
+        data=b"PK\x03\x04\xff\x00",
+    )
+
+    effect = worker._build_encrypted_file_reply_effect_payload(
+        object(), reply, effect_id="effect-docx"
+    )
+
+    assert captured["plaintext"] == reply.data
+    assert captured["content_kind"] == "binary"
+    assert effect["message_extra"]["file_name"] == "中文附件.docx"
 
 
 def test_workspace_file_result_renders_real_word_and_pdf_documents():

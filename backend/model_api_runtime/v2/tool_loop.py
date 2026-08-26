@@ -13,7 +13,8 @@ from provider_types import ProviderResponse, ToolExchange, ToolResult, ToolSpec
 from capabilities import registry as cap_registry
 from capabilities import result_budget
 from capabilities import tool_schema
-from agent_protocol_core import protocol_leak
+from agent_protocol_core import protocol_leak, self_thinking
+from model_api_runtime.v2 import language_follow
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import provenance
 from model_api_runtime.v2 import tool_surface
@@ -869,6 +870,22 @@ async def run_tool_loop(
                 )
         return ""
 
+    def _delivery_control_uses_han(request: str) -> bool:
+        """Keep compact delivery prompts aligned with the visible request."""
+
+        writing_system = language_follow.classify_writing_system(request)
+        return writing_system == "han" or (
+            writing_system == "indeterminate"
+            and re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", request) is not None
+        )
+
+    def _compact_delivery_system_prompt(instruction: str) -> str:
+        """Preserve the normal final-reply contract in compact delivery rounds."""
+
+        if not suppress_native_reasoning:
+            return instruction
+        return instruction.rstrip() + "\n\n" + self_thinking.INSTRUCTION.strip()
+
     def _normalize_file_requirement(value) -> tuple[bool, frozenset[str]]:
         suffixes = frozenset(
             str(suffix).strip().casefold() for suffix in (value or ())
@@ -1433,21 +1450,39 @@ async def run_tool_loop(
         if compact_delivery_confirmation_needed:
             compact_delivery_phase = "confirm"
             current_user_request = _latest_user_delivery_request()
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "The work the user asked for was saved and delivered "
-                        "successfully. Finish this turn in your own voice, using the "
-                        "same language as the user's current request below, with "
-                        "that fact available; the user can open the work now."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": current_user_request or "Finish your response to me.",
-                },
-            ]
+            if _delivery_control_uses_han(current_user_request):
+                messages = [
+                    {
+                        "role": "system",
+                        "content": _compact_delivery_system_prompt(
+                            "对方要求的内容已经成功保存并发送。请用你自己的口吻结束本轮，"
+                            "使用与下方当前请求相同的语言，把这件事实自然地告诉对方；"
+                            "文件现在已经可以打开或下载。"
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": current_user_request or "请完成对我的回复。",
+                    },
+                ]
+            else:
+                messages = [
+                    {
+                        "role": "system",
+                        "content": _compact_delivery_system_prompt(
+                            "The work the user asked for was saved and delivered "
+                            "successfully. Finish this turn in your own voice, using the "
+                            "same language as the user's current request below, with "
+                            "that fact available; the user can open the work now."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            current_user_request or "Finish your response to me."
+                        ),
+                    },
+                ]
         elif (
             forced_delivery_tool == tool_schema.FILE_REPLY_TOOL
             and workspace_delivery_target is not None
@@ -1455,29 +1490,49 @@ async def run_tool_loop(
             compact_delivery_phase = "send_file"
             target_path, target_revision = workspace_delivery_target
             current_user_request = _latest_user_delivery_request()
+            use_han_control = _delivery_control_uses_han(current_user_request)
             metadata_instruction = ""
             if target_path.casefold().endswith(".io.html"):
                 metadata_instruction = (
-                    " This is a Canvas file, so send_file also requires a concise "
-                    "title, subtitle, and completion_message in the language of the "
-                    "user's current request. completion_message is the complete "
-                    "user-visible chat bubble in your own voice; do not default it "
-                    "to English or Chinese. Preserve or change the metadata according "
-                    "to the current user request."
+                    (
+                        " 这是 Canvas 文件，所以 send_file 还必须提供简洁的 title、"
+                        "subtitle 和 completion_message，并使用对方当前请求的语言。"
+                        "completion_message 是完整的可见聊天气泡，要用你自己的口吻；"
+                        "不要默认使用英文或中文。按照当前请求保留或修改这些元数据。"
+                    )
+                    if use_han_control
+                    else (
+                        " This is a Canvas file, so send_file also requires a concise "
+                        "title, subtitle, and completion_message in the language of the "
+                        "user's current request. completion_message is the complete "
+                        "user-visible chat bubble in your own voice; do not default it "
+                        "to English or Chinese. Preserve or change the metadata according "
+                        "to the current user request."
+                    )
                 )
-            request_instruction = (
-                " Current user request: "
-                + json.dumps(current_user_request, ensure_ascii=False)
-                + "."
-                if current_user_request
-                else ""
+            request_instruction = ""
+            if current_user_request:
+                request_instruction = (
+                    (" 对方当前请求：" if use_han_control else " Current user request: ")
+                    + json.dumps(current_user_request, ensure_ascii=False)
+                    + "。"
+                )
+            delivery_instruction = (
+                (
+                    "作品源文件已经保存。现在调用 send_file 一次完成发送，"
+                    "目标必须完全一致："
+                )
+                if use_han_control
+                else (
+                    "The work's source is already saved. Complete the delivery "
+                    "now by calling send_file once with this exact target: "
+                )
             )
             messages = [
                 {
                     "role": "system",
-                    "content": (
-                        "The work's source is already saved. Complete the delivery "
-                        "now by calling send_file once with this exact target: "
+                    "content": _compact_delivery_system_prompt(
+                        delivery_instruction
                         + json.dumps(
                             {"path": target_path, "revision": target_revision},
                             ensure_ascii=False,
@@ -1487,7 +1542,14 @@ async def run_tool_loop(
                         + request_instruction
                     ),
                 },
-                {"role": "user", "content": "Complete the pending delivery now."},
+                {
+                    "role": "user",
+                    "content": (
+                        "现在完成待发送的文件。"
+                        if use_han_control
+                        else "Complete the pending delivery now."
+                    ),
+                },
             ]
             if compact_delivery_validation_exchange is not None:
                 messages.append(compact_delivery_validation_exchange)

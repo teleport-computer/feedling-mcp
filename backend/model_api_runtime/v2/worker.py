@@ -7100,6 +7100,7 @@ def _build_encrypted_file_reply_effect_payload(
         store,
         bytes(file_reply.data),
         item_id=item_id,
+        content_kind="binary",
     )
     if envelope is None:
         raise RuntimeError(error or "file reply envelope build failed")
