@@ -1,3 +1,8 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/TEE_POSTGRES_SHADOW_PROVISIONING.md
+historical_reason: implemented
+---
 # TEE Postgres Phase 0–1（spike + pg CVM 基建）Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
