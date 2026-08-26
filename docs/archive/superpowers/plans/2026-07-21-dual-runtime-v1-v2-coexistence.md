@@ -1,3 +1,8 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/superpowers/specs/2026-07-21-dual-runtime-v1-v2-coexistence-design.md
+historical_reason: implemented
+---
 # 双运行时共存（V1 + V2 + allowlist 切换）Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
