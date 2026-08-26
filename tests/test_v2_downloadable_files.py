@@ -27,6 +27,7 @@ from model_api_runtime.v2 import tool_loop
 from model_api_runtime.v2 import worker
 from model_api_runtime.v2 import context as v2_context
 from capabilities import tool_schema
+from core.downloadable_reply import sanitize_downloadable_reply
 
 
 _PROVIDER = provider_client.ProviderConfig(
@@ -417,6 +418,7 @@ def test_send_file_cannot_share_a_batch_with_workspace_write(monkeypatch):
         ("help me make a checklist for packing", None),
         ("给我一个报告", None),
         ("请根据你对我们的记忆，整理一份 Markdown文档，并提供下载。", (".md",)),
+        ("将我们的记忆总结一下，生成一份Md 文档发给我", (".md",)),
         ("把 Markdown 文件转换成 Word 文档", (".docx",)),
         ("把Markdown文件转成Word文档", (".docx",)),
         ("Word 和 PDF 有什么区别？", None),
@@ -437,6 +439,139 @@ def test_required_file_suffixes_detects_clear_file_intent(text, expected):
     assert v2_context.required_file_suffixes(
         [{"role": "user", "content": text}]
     ) == expected
+
+
+def test_file_marker_without_staged_attachment_is_not_a_download_link():
+    cleaned, removed = sanitize_downloadable_reply(
+        "文件已经生成：[file: 小林与小凛的记忆总结.md]",
+        attachment_staged=False,
+    )
+
+    assert removed is True
+    assert "[file:" not in cleaned
+
+
+def test_file_marker_with_staged_attachment_becomes_plain_confirmation():
+    cleaned, removed = sanitize_downloadable_reply(
+        "文件已经生成：[file: 小林与小凛的记忆总结.md]",
+        attachment_staged=True,
+    )
+
+    assert removed is True
+    assert cleaned == "文件已生成，可在下方下载。"
+
+
+def test_required_file_recovery_resets_tool_only_stall_before_delivery(
+    monkeypatch,
+):
+    files = []
+    trajectory_events = []
+
+    async def on_file(path, revision):
+        files.append((path, revision))
+
+    async def dispatch(tool_calls):
+        results = []
+        for call in tool_calls:
+            if call.name == "workspace_write":
+                results.append(ToolResult(
+                    call_id=call.id,
+                    content=(
+                        "ok: workspace_write applied at revision 1; use the same "
+                        "path and revision 1 with send_file"
+                    ),
+                    metadata={"workspace_revision": 1},
+                ))
+            else:
+                results.append(ToolResult(call_id=call.id, content="ok"))
+        return results
+
+    outcome, calls, replies, _ = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "index-1",
+                    "name": "memory_index",
+                    "args": {"limit": 1},
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "index-2",
+                    "name": "memory_index",
+                    "args": {"limit": 20},
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "fetch-1",
+                    "name": "memory_fetch",
+                    "args": {"ids": ["memory-1"]},
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "这是记忆总结，但附件还没有生成。",
+                "tool_calls": [],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "write-1",
+                    "name": "workspace_write",
+                    "args": {
+                        "path": "/workspace/小林与小凛的记忆总结.md",
+                        "content": "# 小林与小凛的记忆总结",
+                        "expected_revision": 0,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "send-1",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/小林与小凛的记忆总结.md",
+                        "revision": 1,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "Markdown 文档已经发给你了。",
+                "tool_calls": [],
+                "usage": {},
+            },
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        required_file_suffixes=(".md",),
+        file_requirement_messages=[{
+            "role": "user",
+            "content": "将我们的记忆总结一下，生成一份Md 文档发给我",
+        }],
+        max_calls=8,
+        trajectory_events=trajectory_events,
+    )
+
+    assert "workspace_write" not in calls[3]
+    assert calls[4] == ("workspace_write",)
+    assert calls[5] == ("send_file",)
+    assert files == [("/workspace/小林与小凛的记忆总结.md", 1)]
+    assert replies == [("Markdown 文档已经发给你了。", True)]
+    assert outcome.stop_reason == "final_text"
+    assert all(
+        kind != "required_file_missing" for kind, _payload in trajectory_events
+    )
 
 
 @pytest.mark.parametrize(

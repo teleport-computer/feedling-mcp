@@ -2467,6 +2467,9 @@ async def run_tool_loop(
                 file_delivery_recovery_needed = True
                 if not file_delivery_retry_used and attempts < max_calls - 1:
                     file_delivery_retry_used = True
+                    # Reset stale stall history so required write/send recovery
+                    # is not preempted immediately after workspace_write.
+                    consecutive_tool_only_rounds = 0
                     _progress("required_file_retry_boundary")
                     continue
                 await _record_required_file_missing(attempts)
