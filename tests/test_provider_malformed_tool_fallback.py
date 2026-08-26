@@ -219,6 +219,7 @@ def test_tool_schema_400_still_falls_back_to_text(monkeypatch):
 
 def test_web_observation_revokes_durable_writes_for_later_rounds(monkeypatch):
     provider_tools = []
+    provider_tool_choices = []
     responses = iter([
         {
             "reply": "",
@@ -243,6 +244,7 @@ def test_web_observation_revokes_durable_writes_for_later_rounds(monkeypatch):
 
     async def _provider(_config, _messages, *, tools=None, **kwargs):
         provider_tools.append(tools)
+        provider_tool_choices.append(kwargs.get("tool_choice"))
         return next(responses)
 
     dispatched = []
@@ -275,7 +277,11 @@ def test_web_observation_revokes_durable_writes_for_later_rounds(monkeypatch):
     assert cap_registry.WRITE_ACTIONS <= first_names
     assert cap_registry.WRITE_ACTIONS.isdisjoint(second_names)
     assert tool_loop.provenance.EXTERNAL_READS.isdisjoint(second_names)
-    assert {spec.name for spec in provider_tools[2]} == {"web_fetch"}
+    assert {spec.name for spec in provider_tools[2]} == {
+        "identity_patch",
+        "web_fetch",
+    }
+    assert provider_tool_choices[2] == "none"
     assert [tc.name for tc in dispatched] == ["web_fetch"]
     assert replies == [("safe final", True)]
     assert outcome.final_text == "safe final"
@@ -410,6 +416,7 @@ def test_web_search_result_cannot_redirect_model_to_fresh_fetch_url(monkeypatch)
 
 def test_removed_reply_tool_and_durable_write_same_batch_fail_closed(monkeypatch):
     provider_tools = []
+    provider_tool_choices = []
     responses = iter([
         {
             "reply": "",
@@ -427,6 +434,7 @@ def test_removed_reply_tool_and_durable_write_same_batch_fail_closed(monkeypatch
 
     async def _provider(_config, _messages, *, tools=None, **kwargs):
         provider_tools.append(tools)
+        provider_tool_choices.append(kwargs.get("tool_choice"))
         return next(responses)
 
     async def _dispatch(_calls):
@@ -452,6 +460,7 @@ def test_removed_reply_tool_and_durable_write_same_batch_fail_closed(monkeypatch
     ))
 
     assert provider_tools[0] is not None
-    assert provider_tools[1] is None
+    assert {spec.name for spec in provider_tools[1]} == {"identity_patch"}
+    assert provider_tool_choices[1] == "none"
     assert replies == [("I couldn't safely apply that change.", True)]
     assert outcome.final_text == "I couldn't safely apply that change."
