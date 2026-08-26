@@ -467,15 +467,11 @@ jobs:
             tests/test_memgarden_dreaming.py \
             -v
 
-      - name: Perception kernel unit tests
+      - name: Perception prompt golden test
         env:
           PYTHONPATH: backend
         run: |
           python -m pytest \
-            tests/test_perception_kernel_catalog.py \
-            tests/test_perception_kernel_projection.py \
-            tests/test_perception_kernel_purity.py \
-            tests/test_perception_kernel_wake.py \
             tests/test_perception_prompt_golden.py \
             -v
 

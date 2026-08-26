@@ -433,22 +433,13 @@ if not _provisioned:
         "test_pytest_coverage_ratchet.py",
         # Phase A CI 执行证据量具：临时文件 + 子进程 pytest，不碰 DB/网络。
         "test_ci_execution_evidence.py",
-        # 感知内核纯度守卫(2026-08-19, 感知内核提取 Task 1)。纯:AST walk + 文件系统扫描,
-        # 零 DB/零网络。自带 sys.path 引导(backend/ 枚举)。
-        "test_perception_kernel_purity.py",
+        # 2026-08-26：test_perception_kernel_{purity,catalog,projection,wake}.py
+        # 已删（内核成了外部包 sensegate，这几条纯度/等价性守卫搬进了包自己的仓库）。
         # 感知 prompt 基线快照(2026-08-19, 感知内核提取 Task 0)。纯:比对
         # V2 模块级常量字符串 + 调用 chat_resident_consumer 的一个纯函数,
-        # 不碰 DB/网络。自带 sys.path 引导(backend/ + tools/)。
+        # 不碰 DB/网络。自带 sys.path 引导(backend/ + tools/)。这条留下——它测的是
+        # 本仓库怎么拼 prompt，不是内核本身。
         "test_perception_prompt_golden.py",
-        # 感知能力表等价性(2026-08-19, 感知内核提取 Task 2)。纯:import 两个
-        # 声明模块比对对象同一性 + 字典遍历,零 DB/零网络。
-        "test_perception_kernel_catalog.py",
-        # 字段投影/权限判据/一瞥等价性(2026-08-19, 感知内核提取 Task 3)。纯:import
-        # 两侧模块比对对象同一性 + 纯函数调用,零 DB/零网络。自带 sys.path 引导。
-        "test_perception_kernel_projection.py",
-        # 叫醒判据(2026-08-19, 感知内核提取 Task 7)。纯:只 import
-        # perception_kernel.wake 调纯函数,零 DB/零网络/零时钟(时间由测试传入)。
-        "test_perception_kernel_wake.py",
     }
     collect_ignore = sorted(
         f

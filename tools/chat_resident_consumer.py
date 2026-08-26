@@ -156,7 +156,7 @@ try:
 except ImportError:
     _ENCRYPTION_AVAILABLE = False
 
-from perception_kernel import prompts as perception_prompts
+from sensegate import prompts as perception_prompts
 
 import generated_image
 import provider_client as _provider_client

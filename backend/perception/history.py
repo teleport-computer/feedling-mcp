@@ -1,7 +1,7 @@
-"""io 侧兼容壳 —— 已搬进 ``perception_kernel.history``。"""
+"""io 侧兼容壳 —— 已搬进 ``sensegate.history``。"""
 from __future__ import annotations
 
-from perception_kernel.history import (  # noqa: F401
+from sensegate.history import (  # noqa: F401
     CUMULATIVE,
     DURATION_BY_STATE,
     EVENT_LIST,

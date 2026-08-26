@@ -13,7 +13,7 @@ import os
 from typing import Any, Literal
 
 import db
-from perception_kernel import wake as wake_kernel
+from sensegate import wake as wake_kernel
 
 
 log = logging.getLogger("perception.signal_state_v2")

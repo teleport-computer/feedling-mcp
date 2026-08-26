@@ -27,7 +27,7 @@ from agent_protocol_core import self_thinking
 import worldbook_match
 from voice.message_filter import VOICE_CALL_RECORD_ROLE, conversation_rows
 from identity import card_policy
-from perception_kernel import prompts as perception_prompts
+from sensegate import prompts as perception_prompts
 
 
 def _join_policy_blocks(*blocks: str) -> str:

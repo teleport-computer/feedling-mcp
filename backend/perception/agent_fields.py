@@ -1,7 +1,7 @@
-"""io 侧兼容壳 —— 已搬进 ``perception_kernel.fields``。"""
+"""io 侧兼容壳 —— 已搬进 ``sensegate.fields``。"""
 from __future__ import annotations
 
-from perception_kernel.fields import (  # noqa: F401
+from sensegate.fields import (  # noqa: F401
     AGENT_PERCEPTION_SIGNALS,
     AGENT_SIGNAL_FIELDS,
     FAST_AGENT_PERCEPTION_SIGNALS,

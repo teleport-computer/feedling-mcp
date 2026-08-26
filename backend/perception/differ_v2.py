@@ -11,7 +11,7 @@ import time
 from typing import Any, Callable, Mapping
 
 from perception import signal_state_v2
-from perception_kernel import wake as wake_kernel
+from sensegate import wake as wake_kernel
 from proactive.observability_v2 import METRIC_PHASH_FRAME, MetricsSinkV2, record_metric_v2
 
 
@@ -173,7 +173,7 @@ class PerceptionDifferV2:
     ) -> tuple[DifferEventV2, ...]:
         if not changed:
             return ()
-        # 「变了算不算一件事」这半个判据搬进了内核（perception_kernel.wake）。
+        # 「变了算不算一件事」这半个判据搬进了内核（sensegate.wake）。
         # `changed` 本身仍由 signal_state_v2 在 FOR UPDATE 行锁里比对 HMAC 指纹
         # 定夺——那是机制，不动；这里只问「这个信号值不值得发叫醒事件」。
         if not wake_kernel.is_wake_worthy_signal(signal):
