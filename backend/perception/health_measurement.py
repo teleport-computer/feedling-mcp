@@ -64,7 +64,7 @@ class MeasurementGroup(NamedTuple):
 # health_activity / health_cycle / health_mood are intentionally NOT covered
 # here yet — the brief's worked examples are body measurements, sleep, workout
 # and blood pressure. Extending coverage is adding one more dict entry here
-# once their wire fields are confirmed; see docs/NOTES-batch2-wiring.md.
+# once their wire fields are confirmed; see docs/NOTES-measured-at-ingest.md.
 MEASUREMENT_GROUPS: dict[str, tuple[MeasurementGroup, ...]] = {
     "health_body": (
         MeasurementGroup("weight_kg", ("weight_kg",), INSTANT),
@@ -220,7 +220,7 @@ def apply_group_update(
 
     Cutover: a day-doc not yet tagged ``_ts_kind == "measured"`` is REPLACED
     outright (not folded onto) the moment a measurement-time-aware report
-    lands on it. This is deliberate — see docs/NOTES-batch2-wiring.md
+    lands on it. This is deliberate — see docs/NOTES-measured-at-ingest.md
     "the cutover": we never compare an old arrival-tagged aggregate (which may
     already be inflated by repeated same-sample re-uploads) against new,
     correctly-deduped data. The old row is simply superseded.

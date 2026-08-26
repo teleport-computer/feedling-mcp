@@ -645,7 +645,7 @@ def _apply(user_id: str, pairs: list, client_ts=None, *, emit_legacy_wakes: bool
                     # null observation (hist_null_keys only) is intentionally
                     # skipped here: NO_OBSERVATION/UNAVAILABLE bookkeeping is
                     # scoped to measurement-aware signals for now (see
-                    # docs/NOTES-batch2-wiring.md, "known limitations").
+                    # docs/NOTES-measured-at-ingest.md, "known limitations").
                     if obs is None:
                         continue
                     store.merge_perception_daily(
