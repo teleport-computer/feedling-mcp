@@ -1530,8 +1530,9 @@ prod9 node 18 配好）、`docker build --platform linux/amd64`、GHCR 包必须
   补 RETIRED（整篇 V2-only/杀 resident 命题被 07-21 dual 反转、原先无任何
   标注，最严重一份）；`2026-07-09-…-D0-rollout-infrastructure.md` plan 补
   RETIRED（其 spec 早已 RETIRED、plan 漏标）；
-  `2026-07-04-tee-postgres-migration-design.md` 补部分退役说明
-  （Phase 0–1 现役、Phase 2–3 随 supervisor 拓扑作废）。
+  `docs/archive/superpowers/specs/2026-07-04-tee-postgres-migration-design.md`
+  补部分退役说明（Phase 0–1 现役、Phase 2–3 随 supervisor 拓扑作废；该设计
+  随后已整体归档）。
 - **目录型资产全干净**：copytext（DB 服务非静态目录）、notices catalog
   24 类全有发射方、conftest 仅 2 个高频 fixture、model_api_runtime 无外部
   prompt 资产、loadtest/provider_probe 无断裂引用——零死项。

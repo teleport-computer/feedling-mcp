@@ -1,4 +1,17 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md
+historical_reason: superseded
+superseded_by: docs/CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md
+---
 # TEE 内明文 Postgres 迁移设计（feedling-mcp）
+
+> **SUPERSEDED / DO NOT IMPLEMENT.** 本文是 2026-07 的迁移设计记录；其“取消
+> local_only、强更旧客户端、最终删除整个信封层”等终态未被采用。当前 mixed
+> encrypted/plaintext 行形、客户端兼容、扶正/回滚和 plaintext shadow 以
+> `docs/CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md` 为准；PG CVM、TLS、角色、备份与
+> 恢复操作以 `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md` 为准；环境现状必须核对 live
+> 配置与 exact deployed release。
 
 > **部分退役说明（2026-07-25 补注）.** 本设计 Phase 0–1（pg CVM 基建）已
 > 落地现役；Phase 2–3（向 hosted supervisor 表 shadow/dual-write）随
