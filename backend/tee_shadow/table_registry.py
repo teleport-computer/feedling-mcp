@@ -97,6 +97,18 @@ REGISTRY: dict[str, Entry] = {
         "resident_* 四列当前既不热路径双写也不扶正（T150 待设计决定）",
     ),
     "genesis_import_outputs": Entry(MIRROR, "入住导入产物，明文；reconciler.TABLES 已覆盖"),
+    "distillation_artifact_attempts": Entry(
+        MIRROR,
+        "蒸馏 artifact 逐次账本；无内容、追加 start 后原地闭合 terminal outcome",
+    ),
+    "distillation_artifact_daily_rollup": Entry(
+        MIRROR,
+        "蒸馏 artifact 北京日冻结格；只覆盖新账本生效后，历史明确不回填",
+    ),
+    "distillation_rollup_watermark": Entry(
+        MIRROR,
+        "蒸馏冻结格独立生效/完成水位；防止生效日前缺失被读成 0",
+    ),
     "notify_relay_configs": Entry(MIRROR, "自部署推送中继配置；alembic_tee 0002 已建表"),
     "notify_relay_logs": Entry(MIRROR, "推送中继日志；id 是 IDENTITY 列"),
     "lane_daily_rollup": Entry(
@@ -377,6 +389,12 @@ _PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "copytext_meta": ("id",),
     "genesis_import_jobs": ("user_id", "job_id"),
     "genesis_import_outputs": ("user_id", "job_id", "output_type"),
+    "distillation_artifact_attempts": ("attempt_id",),
+    "distillation_artifact_daily_rollup": (
+        "day", "access_path", "distill_kind", "artifact", "outcome",
+        "terminal_result",
+    ),
+    "distillation_rollup_watermark": ("scope",),
     "notify_relay_configs": ("auth_token",),
     "notify_relay_logs": ("id",),
     "lane_daily_rollup": (

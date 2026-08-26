@@ -5394,6 +5394,218 @@ def freeze_completed_resident_lane_days(*, now_epoch: float | None = None,
         return []
 
 
+# --- Distillation artifact attempts -> immutable Beijing-day cells ---------
+
+_DISTILLATION_ROLLUP_MAX_DAYS_PER_TICK = 45
+
+
+def _distillation_freeze_day(
+    conn, *, day: date, zone: ZoneInfo, mirror_batch: list | None = None,
+) -> int:
+    start, end = _lane_rollup_day_bounds(day, zone)
+    rows = conn.execute(
+        """
+        SELECT access_path, distill_kind, artifact, outcome, terminal_result,
+               COUNT(*)::bigint
+        FROM distillation_artifact_attempts
+        WHERE finished_at >= %s AND finished_at < %s
+        GROUP BY access_path, distill_kind, artifact, outcome, terminal_result
+        ORDER BY access_path, distill_kind, artifact, outcome, terminal_result
+        """,
+        (start, end),
+    ).fetchall()
+    sql = """
+        INSERT INTO distillation_artifact_daily_rollup
+            (day, access_path, distill_kind, artifact, outcome,
+             terminal_result, attempts)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT DO NOTHING
+    """
+    day_s = day.isoformat()
+    for access_path, kind, artifact, outcome, terminal_result, attempts in rows:
+        params = (
+            day_s, access_path, kind, artifact, outcome, terminal_result,
+            int(attempts),
+        )
+        conn.execute(sql, params)
+        if mirror_batch is not None:
+            mirror_batch.append((sql, params))
+    return len(rows)
+
+
+def freeze_completed_distillation_days(
+    *, now_epoch: float | None = None, tz: str = "Asia/Shanghai",
+) -> list[str]:
+    """Freeze only post-deployment attempts; historical jobs are not backfilled.
+
+    The first tick records today's Beijing date as ``effective_from`` and an
+    empty through-day immediately before it.  That explicit waterline lets the
+    reader distinguish pre-ledger history from a measured zero.
+    """
+    try:
+        zone = ZoneInfo(tz)
+        now = (
+            datetime.fromtimestamp(float(now_epoch), zone)
+            if now_epoch is not None else datetime.now(zone)
+        )
+        last_completed = (now - timedelta(hours=4)).date() - timedelta(days=1)
+        frozen: list[str] = []
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT effective_from, through_day "
+                "FROM distillation_rollup_watermark "
+                "WHERE scope = 'artifact_attempts'"
+            ).fetchone()
+            if row is None:
+                effective = now.date()
+                through = effective - timedelta(days=1)
+                sql = """
+                    INSERT INTO distillation_rollup_watermark
+                        (scope, effective_from, through_day)
+                    VALUES ('artifact_attempts', %s, %s)
+                    ON CONFLICT (scope) DO NOTHING
+                """
+                params = (effective.isoformat(), through.isoformat())
+                conn.execute(sql, params)
+                from tee_shadow import mirror
+                mirror.execute(sql, params)
+                return []
+            effective = date.fromisoformat(str(row[0]))
+            cursor = max(
+                effective,
+                date.fromisoformat(str(row[1])) + timedelta(days=1),
+            )
+            watermark_sql = """
+                UPDATE distillation_rollup_watermark
+                SET through_day = %s, frozen_at = now()
+                WHERE scope = 'artifact_attempts'
+            """
+            from tee_shadow import mirror
+            steps = 0
+            while (
+                cursor <= last_completed
+                and steps < _DISTILLATION_ROLLUP_MAX_DAYS_PER_TICK
+            ):
+                mirror_batch: list[tuple[str, tuple]] = []
+                _distillation_freeze_day(
+                    conn, day=cursor, zone=zone, mirror_batch=mirror_batch
+                )
+                params = (cursor.isoformat(),)
+                conn.execute(watermark_sql, params)
+                mirror_batch.append((watermark_sql, params))
+                mirror.execute_many(mirror_batch)
+                frozen.append(cursor.isoformat())
+                cursor += timedelta(days=1)
+                steps += 1
+        return frozen
+    except Exception as exc:  # noqa: BLE001 -- scheduler failure domain
+        log.error("[db] freeze_completed_distillation_days failed: %s", exc)
+        return []
+
+
+def admin_distillation_artifact_rollup_windows(
+    *, through_day: str = "", tz: str = "Asia/Shanghai",
+) -> dict:
+    """Read 1/7 closed Beijing-day artifact-attempt windows.
+
+    Counts are returned only with their coverage. Consumers must reject a
+    partial window instead of treating the missing pre-ledger days as zero.
+    """
+    zone = ZoneInfo(tz)
+    raw_end = str(through_day or "").strip()
+    if raw_end:
+        try:
+            end_day = date.fromisoformat(raw_end)
+        except ValueError as exc:
+            raise ValueError(
+                f"admin_distillation_artifact_rollup_windows: bad day {raw_end!r}"
+            ) from exc
+    else:
+        end_day = datetime.now(zone).date() - timedelta(days=1)
+    try:
+        with _admin_data_track_connection() as conn:
+            wm = conn.execute(
+                "SELECT effective_from, through_day, frozen_at "
+                "FROM distillation_rollup_watermark "
+                "WHERE scope = 'artifact_attempts'"
+            ).fetchone()
+            rows = conn.execute(
+                """
+                SELECT day, access_path, distill_kind, artifact, outcome,
+                       terminal_result, attempts
+                FROM distillation_artifact_daily_rollup
+                WHERE day >= %s AND day <= %s
+                ORDER BY day, access_path, distill_kind, artifact, outcome
+                """,
+                ((end_day - timedelta(days=6)).isoformat(), end_day.isoformat()),
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        level, message = _admin_event_read_failure(exc)
+        return {
+            "read_status": {"level": level, "message": message},
+            "history_backfill": "unavailable",
+            "windows": [],
+        }
+
+    effective = date.fromisoformat(str(wm[0])) if wm else None
+    frozen_through = date.fromisoformat(str(wm[1])) if wm else None
+
+    def window(day_count: int) -> dict:
+        start_day = end_day - timedelta(days=day_count - 1)
+        covered_start = max(start_day, effective) if effective else None
+        covered_end = min(end_day, frozen_through) if frozen_through else None
+        covered_days = (
+            (covered_end - covered_start).days + 1
+            if covered_start and covered_end and covered_end >= covered_start
+            else 0
+        )
+        level = (
+            "green" if covered_days == day_count
+            else "yellow" if covered_days
+            else "red"
+        )
+        cells: dict[str, dict] = {}
+        for raw in rows:
+            raw_day = date.fromisoformat(str(raw[0]))
+            if not start_day <= raw_day <= end_day:
+                continue
+            path, kind, artifact = str(raw[1]), str(raw[2]), str(raw[3])
+            outcome, terminal = str(raw[4]), str(raw[5])
+            count = int(raw[6] or 0)
+            cell = (
+                cells.setdefault(kind, {})
+                .setdefault(artifact, {})
+                .setdefault(path, {
+                    "succeeded": 0, "failed": 0, "no_write": 0,
+                    "outcomes": {},
+                })
+            )
+            cell[terminal] += count
+            cell["outcomes"][outcome] = cell["outcomes"].get(outcome, 0) + count
+        return {
+            "day_count": day_count,
+            "start_day": start_day.isoformat(),
+            "end_day": end_day.isoformat(),
+            "coverage": level,
+            "covered_days": covered_days,
+            "effective_from": effective.isoformat() if effective else None,
+            "through_day": frozen_through.isoformat() if frozen_through else None,
+            "cells": cells,
+        }
+
+    return {
+        "read_status": {"level": "ok", "message": ""},
+        "history_backfill": "unavailable",
+        "history_note": (
+            "artifact attempt 账本只覆盖生效日之后；历史 job 无 attempt 边界，"
+            "不可回填，生效日前无数据不等于 0"
+        ),
+        "effective_from": effective.isoformat() if effective else None,
+        "through_day": frozen_through.isoformat() if frozen_through else None,
+        "windows": [window(1), window(7)],
+    }
+
+
 # 删号后的格子处置（Seven 2026-08-18 拍板）：匿名化归并——既非级联删除（会让
 # 冻结的历史聚合数字事后变动），也非带 id 永久保留（0021 先例是匿名 cohort，
 # 与逐用户行不等价，codex2 审出）。归并目标行 user_id='deleted'。
@@ -7115,7 +7327,10 @@ def admin_history_import_job_rolling_windows() -> dict:
         return {
             "calculated_at": calculated_at.isoformat(),
             "coverage": level,
-            "reason": f"{message}；无路径快照、未物理冻结；T247 补",
+            "reason": (
+                f"{message}；整单 history job 无事件时路径快照且未物理冻结；"
+                "artifact 分步账本是另一口径，仅覆盖生效后"
+            ),
             "windows": [],
         }
 
@@ -7139,7 +7354,10 @@ def admin_history_import_job_rolling_windows() -> dict:
     return {
         "calculated_at": calculated_at.isoformat(),
         "coverage": "red",
-        "reason": "无路径快照、未物理冻结；T247 补",
+        "reason": (
+            "整单 history job 无事件时路径快照且未物理冻结；"
+            "artifact 分步账本是另一口径，仅覆盖生效后"
+        ),
         "windows": windows,
     }
 
@@ -9937,8 +10155,9 @@ def recent_genesis_import_health(
     ``artifact_verified``.  The former is a reducer lifecycle fact; the latter
     is conservative evidence from the durable ledger that the job produced the
     artifact its mode called for.  This avoids turning a terminal row into a
-    false-green import result while we still lack a dedicated per-attempt
-    artifact-verification ledger.
+    false-green import result. This legacy final-snapshot classifier remains
+    separate from the post-rollout per-attempt artifact ledger: it can describe
+    older jobs conservatively, but must not be relabeled as attempt evidence.
 
     The returned failure code is derived in SQL from at most the first two
     snake-case error segments.  Free-form exception text is neither returned
@@ -10065,6 +10284,7 @@ def recent_genesis_import_health(
                   has_source_material,
                   memory_action_count,
                   identity_status,
+                  failed_phase,
                   created_at, updated_at, completed_at,
                   CASE
                     WHEN status='failed' AND
@@ -10227,6 +10447,9 @@ def genesis_reclaim_orphaned_processing_jobs(
     safe_limit = max(1, min(int(limit or 1), 200))
     live = list(dict.fromkeys(str(w) for w in (live_worker_ids or []) if str(w)))
     _UPDATE_SET = (
+        "failed_phase = CASE WHEN {j}.received_chunks > 0 THEN {j}.failed_phase "
+        "ELSE COALESCE(NULLIF({j}.output->>'stage', ''), "
+        "NULLIF({j}.status, 'failed'), NULLIF({j}.failed_phase, '')) END, "
         "status = CASE WHEN {j}.received_chunks > 0 THEN 'uploaded' ELSE 'failed' END, "
         "error = CASE WHEN {j}.received_chunks > 0 THEN '' ELSE %s END, "
         "worker_claimed_by = CASE WHEN {j}.received_chunks > 0 THEN '' ELSE {j}.worker_claimed_by END, "
@@ -10365,6 +10588,9 @@ def genesis_reap_stale_processing_jobs(older_than_sec: int, *, error: str, limit
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE genesis_import_jobs AS j SET
+                failed_phase = COALESCE(NULLIF(j.output->>'stage', ''),
+                                        NULLIF(j.status, 'failed'),
+                                        NULLIF(j.failed_phase, '')),
                 status = 'failed',
                 error = %s,
                 updated_at = now()
@@ -10388,7 +10614,10 @@ def genesis_reap_stale_processing_jobs(older_than_sec: int, *, error: str, limit
         # exact rows the primary reaped rather than re-picking independently.
         placeholders = ", ".join(["(%s, %s)"] * len(out))
         mirror_sql = (
-            "UPDATE genesis_import_jobs SET status = 'failed', error = %s, updated_at = now() "
+            "UPDATE genesis_import_jobs SET "
+            "failed_phase = COALESCE(NULLIF(output->>'stage', ''), "
+            "NULLIF(status, 'failed'), NULLIF(failed_phase, '')), "
+            "status = 'failed', error = %s, updated_at = now() "
             f"WHERE (user_id, job_id) IN ({placeholders})"
         )
         mirror_params = (error[:1000],) + tuple(
@@ -10419,6 +10648,9 @@ def genesis_fail_stale_plaintext_job(
     safe_sec = max(60, int(older_than_sec or 0))
     sql = """
         UPDATE genesis_import_jobs SET
+            failed_phase = COALESCE(NULLIF(output->>'stage', ''),
+                                    NULLIF(status, 'failed'),
+                                    NULLIF(failed_phase, '')),
             status = 'failed',
             error = %s,
             updated_at = now()
@@ -10443,7 +10675,10 @@ def genesis_fail_stale_plaintext_job(
     if result is not None:
         from tee_shadow import mirror
         mirror.execute(
-            "UPDATE genesis_import_jobs SET status='failed', error=%s, updated_at=now() "
+            "UPDATE genesis_import_jobs SET "
+            "failed_phase=COALESCE(NULLIF(output->>'stage',''), "
+            "NULLIF(status,'failed'), NULLIF(failed_phase,'')), "
+            "status='failed', error=%s, updated_at=now() "
             "WHERE user_id=%s AND job_id=%s AND status='processing' "
             "AND COALESCE(metadata->>'ingest', '')='plaintext' "
             "AND COALESCE(metadata->>'plaintext_worker_instance', '')=%s",
@@ -10500,6 +10735,10 @@ def genesis_reap_stale_resident_jobs(
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE genesis_import_jobs AS j SET
+                failed_phase = CASE WHEN j.resident_attempts < %s THEN j.failed_phase
+                    ELSE COALESCE(NULLIF(j.output->>'stage', ''),
+                                  NULLIF(j.status, 'failed'),
+                                  NULLIF(j.failed_phase, '')) END,
                 status = CASE WHEN j.resident_attempts < %s THEN 'awaiting_resident' ELSE 'failed' END,
                 error = CASE WHEN j.resident_attempts < %s THEN '' ELSE %s END,
                 resident_consumer_id = '',
@@ -10510,7 +10749,7 @@ def genesis_reap_stale_resident_jobs(
             WHERE j.user_id = picked.user_id AND j.job_id = picked.job_id
             RETURNING j.*
             """,
-            (safe_sec, safe_limit, safe_max, safe_max, error[:1000]),
+            (safe_sec, safe_limit, safe_max, safe_max, safe_max, error[:1000]),
         )
         rows = cur.fetchall()
         cols = [d[0] for d in cur.description]
@@ -10555,6 +10794,9 @@ def genesis_reap_stale_unclaimed_jobs(
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE genesis_import_jobs AS j SET
+                failed_phase = COALESCE(NULLIF(j.output->>'stage', ''),
+                                        NULLIF(j.status, 'failed'),
+                                        NULLIF(j.failed_phase, '')),
                 status = 'failed',
                 error = %s,
                 updated_at = now()
@@ -10750,6 +10992,7 @@ def genesis_mark_finalized(user_id: str, job_id: str) -> dict | None:
         """
         UPDATE genesis_import_jobs SET
             status = 'uploaded',
+            failed_phase = '',
             finalized_at = COALESCE(finalized_at, now()),
             updated_at = now()
         WHERE user_id = %s AND job_id = %s
@@ -10778,6 +11021,11 @@ def genesis_set_job_status(
     sql = (
         """
         UPDATE genesis_import_jobs SET
+            failed_phase = CASE WHEN %s = 'failed'
+                THEN COALESCE(NULLIF(output->>'stage', ''),
+                              NULLIF(status, 'failed'),
+                              NULLIF(failed_phase, ''))
+                ELSE failed_phase END,
             status = %s,
             error = %s,
             output = COALESCE(%s::jsonb, output),
@@ -10788,6 +11036,7 @@ def genesis_set_job_status(
         """
     )
     params = (
+        status,
         status,
         error[:1000],
         Jsonb(output) if output is not None else None,
@@ -10812,12 +11061,62 @@ def genesis_set_job_status(
     from tee_shadow import mirror
     mirror.execute(sql, (
         status,
+        status,
         error[:1000],
         Jsonb(output) if output is not None else None,
         processed_chunks,
         user_id,
         job_id,
     ))
+    return result
+
+
+def distillation_start_artifact_attempt(
+    *, attempt_id: str, user_id: str, job_id: str, flow: str,
+    distill_kind: str, artifact: str, access_path: str,
+) -> dict | None:
+    """Append the start boundary for one real artifact write attempt.
+
+    There is intentionally no uniqueness constraint on ``job_id + artifact``:
+    foreground/background passes and retries are separate attempts, and a later
+    success must never overwrite an earlier failure.
+    """
+    sql = """
+        INSERT INTO distillation_artifact_attempts
+            (attempt_id, user_id, job_id, flow, distill_kind, artifact,
+             access_path)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (attempt_id) DO NOTHING
+        RETURNING *
+    """
+    params = (
+        str(attempt_id), str(user_id), str(job_id), str(flow),
+        str(distill_kind), str(artifact), str(access_path),
+    )
+    with get_pool().connection() as conn:
+        cur = conn.execute(sql, params)
+        result = _genesis_row(cur, cur.fetchone())
+    from tee_shadow import mirror
+    mirror.execute(sql, params)
+    return result
+
+
+def distillation_finish_artifact_attempt(
+    attempt_id: str, *, outcome: str, terminal_result: str,
+) -> dict | None:
+    """Close exactly one attempt; a second close cannot rewrite its evidence."""
+    sql = """
+        UPDATE distillation_artifact_attempts SET
+            outcome = %s, terminal_result = %s, finished_at = now()
+        WHERE attempt_id = %s AND finished_at IS NULL
+        RETURNING *
+    """
+    params = (str(outcome), str(terminal_result), str(attempt_id))
+    with get_pool().connection() as conn:
+        cur = conn.execute(sql, params)
+        result = _genesis_row(cur, cur.fetchone())
+    from tee_shadow import mirror
+    mirror.execute(sql, params)
     return result
 
 
@@ -17638,6 +17937,7 @@ def delete_user_data(user_id: str) -> None:
         "perception_items",
         "perception_daily",
         "perception_signal_state_v2",
+        "distillation_artifact_attempts",
         "genesis_import_chunks",
         "genesis_import_outputs",
         "genesis_import_jobs",

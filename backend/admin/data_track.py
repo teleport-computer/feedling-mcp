@@ -533,6 +533,7 @@ def _history_import_stats(store: UserStore) -> dict:
         "job_id": latest.get("job_id", ""),
         "status": latest.get("status", ""),
         "phase": latest.get("phase", ""),
+        "failed_phase": latest.get("failed_phase", ""),
         "phase_label": latest.get("phase_label", ""),
         "progress": latest.get("progress", 0),
         "created_at": latest.get("created_at", ""),
@@ -1176,6 +1177,7 @@ def _data_track_history_import_from_snapshot(snap: dict) -> dict:
         "job_id": latest.get("job_id", ""),
         "status": latest.get("status", ""),
         "phase": latest.get("phase", ""),
+        "failed_phase": latest.get("failed_phase", ""),
         "phase_label": latest.get("phase_label", ""),
         "progress": latest.get("progress", 0),
         "created_at": latest.get("created_at", ""),
@@ -6395,6 +6397,7 @@ def _render_imports_page(report: dict | None, *, within_hours: int) -> str:
             f"<td class='{evidence_cls}'>{evidence_text}</td>"
             f"<td>{_fmt_count(row.get('memory_action_count'))} / {'有' if row.get('has_identity_evidence') else '无'}</td>"
             f"{_failure_code_cell(row.get('error_code'), missing='—')}"
+            f"<td><code>{html.escape(str(row.get('failed_phase') or '—'))}</code></td>"
             f"<td>{html.escape(_ops_time(row.get('created_at')))}</td>"
             f"<td>{html.escape(_ops_time(row.get('updated_at')))}</td>"
             "</tr>"
@@ -6421,10 +6424,10 @@ def _render_imports_page(report: dict | None, *, within_hours: int) -> str:
       {_render_metric('完成 p50', _fmt_duration_sec(report.get('p50_complete_sec')))}
       {_render_metric('完成 p95', _fmt_duration_sec(report.get('p95_complete_sec')))}
     </section>
-    <div class="note-box"><b>两种成功不能混：</b>Terminal done 只表示 reducer 把 job 置为完成；Artifact 证据通过则按任务模式检查 durable ledger 中的 identity / memory 写入证据。当前仍不是独立的 artifact-attempt 账本：合法的 nameless / fresh-start 完成可能被保守标为“证据不足”，不会假绿。页面不读取导入正文、模型输出或任意 exception 尾部。</div>
+    <div class="note-box"><b>两种成功不能混：</b>Terminal done 只表示 reducer 把 job 置为完成；这里的 Artifact 证据通过仍是兼容旧 job 的最终快照分类，合法的 nameless / fresh-start 完成可能被保守标为“证据不足”。新的逐 attempt 账本在事件路径表按北京日展示，只覆盖生效后，不能回填旧 job。页面不读取导入正文、模型输出或任意 exception 尾部。</div>
     <h2>最近任务</h2>
-    <div class="table-wrap"><table><thead><tr><th>User</th><th>Job</th><th>模式</th><th>状态</th><th>Artifact 证据</th><th>Memory / Identity</th><th>安全失败码</th><th>创建 UTC</th><th>更新 UTC</th></tr></thead>
-    <tbody>{''.join(recent_rows) if recent_rows else "<tr><td colspan='9' class='muted'>窗口内无任务。</td></tr>"}</tbody></table></div>
+    <div class="table-wrap"><table><thead><tr><th>User</th><th>Job</th><th>模式</th><th>状态</th><th>Artifact 证据</th><th>Memory / Identity</th><th>安全失败码</th><th>失败阶段</th><th>创建 UTC</th><th>更新 UTC</th></tr></thead>
+    <tbody>{''.join(recent_rows) if recent_rows else "<tr><td colspan='10' class='muted'>窗口内无任务。</td></tr>"}</tbody></table></div>
     <h2>失败原因 Top</h2>
     <div class="table-wrap"><table><thead><tr><th>安全失败码</th><th>次数</th></tr></thead><tbody>{failure_rows or "<tr><td colspan='2' class='muted'>窗口内无失败。</td></tr>"}</tbody></table></div>
     """
@@ -10452,21 +10455,44 @@ _EVENT_MASTER_PATHS = tuple(
 )
 _EVENT_MASTER_ACTIONS = (
     {"key": "onboarding_job", "label": "入驻蒸馏 · 整单",
-     "desc": "一次 history import job 的整体终态；身份卡/记忆/问候不是独立 attempt。"},
+     "desc": "一次 history import job 的整体终态；不可替代下方各 artifact attempt。"},
     {"key": "onboarding_identity", "label": "入驻蒸馏 · 身份卡写入",
-     "desc": "当前 job 只保留最终汇总，无法把这一件 artifact 单独作为分母。"},
+     "desc": "逐次记录真实身份卡写入 attempt；生效日前历史不可回填。",
+     "distillation_kind": "onboarding", "distillation_artifact": "identity"},
     {"key": "onboarding_memory", "label": "入驻蒸馏 · 长期记忆写入",
-     "desc": "当前 job 只保留最终汇总，无法把这一件 artifact 单独作为分母。"},
+     "desc": "逐次记录真实长期记忆写入 attempt；前台/后台写入各算一次。",
+     "distillation_kind": "onboarding", "distillation_artifact": "memory"},
     {"key": "onboarding_history", "label": "入驻蒸馏 · 历史聊天落库",
      "desc": "历史聊天当前仅作为蒸馏输入，不写入 chat_messages。", "na": True},
     {"key": "onboarding_greeting", "label": "入驻蒸馏 · 首次问候写入",
-     "desc": "问候与整单共用一个终态，没有独立失败账本。"},
+     "desc": "逐次记录首次问候的真实落库边界。",
+     "distillation_kind": "onboarding", "distillation_artifact": "greeting"},
+    {"key": "onboarding_persona", "label": "入驻蒸馏 · Persona 写入",
+     "desc": "逐次记录 persona artifact；高优先级旧值保留单列 outcome。",
+     "distillation_kind": "onboarding", "distillation_artifact": "persona"},
+    {"key": "onboarding_voice", "label": "入驻蒸馏 · Voice 写入",
+     "desc": "逐次记录 voice artifact 的真实写入边界。",
+     "distillation_kind": "onboarding", "distillation_artifact": "voice"},
+    {"key": "onboarding_profile", "label": "入驻蒸馏 · Profile 写入",
+     "desc": "逐次记录 profile CAS 的产生方 outcome。",
+     "distillation_kind": "onboarding", "distillation_artifact": "profile"},
     {"key": "redistill_identity", "label": "二次蒸馏 · 身份卡写入",
-     "desc": "终态会覆盖原 phase，当前不能定位到这一级。"},
+     "desc": "逐次记录身份卡更新，并保留 locked/no-write 等产生方 outcome。",
+     "distillation_kind": "redistill", "distillation_artifact": "identity"},
     {"key": "redistill_memory", "label": "二次蒸馏 · 长期记忆写入",
-     "desc": "终态会覆盖原 phase，当前不能定位到这一级。"},
+     "desc": "逐次记录长期记忆追加，不用整单终态反推。",
+     "distillation_kind": "redistill", "distillation_artifact": "memory"},
     {"key": "redistill_history", "label": "二次蒸馏 · 历史聊天落库",
      "desc": "二次蒸馏不执行历史聊天落库。", "na": True},
+    {"key": "redistill_persona", "label": "二次蒸馏 · Persona 写入",
+     "desc": "逐次记录 persona artifact，不从整单事件估算。",
+     "distillation_kind": "redistill", "distillation_artifact": "persona"},
+    {"key": "redistill_voice", "label": "二次蒸馏 · Voice 写入",
+     "desc": "逐次记录 voice artifact，不从整单事件估算。",
+     "distillation_kind": "redistill", "distillation_artifact": "voice"},
+    {"key": "redistill_profile", "label": "二次蒸馏 · Profile 写入",
+     "desc": "逐次记录 profile CAS 的产生方 outcome。",
+     "distillation_kind": "redistill", "distillation_artifact": "profile"},
     {"key": "chat_job", "label": "正常聊天 · 整个回复任务",
      "desc": "V2 以 chat job 终态计；resident 回复和 V1 没有同源冻结格。",
      "runtime_metrics": {"runtime_v2": ("chat", None)}},
@@ -10506,7 +10532,9 @@ _EVENT_MASTER_ACTIONS = (
 )
 
 
-def _event_path_master_payload(frozen: dict) -> dict:
+def _event_path_master_payload(
+    frozen: dict, distillation: dict | None = None,
+) -> dict:
     """Build the frozen access-path table and runtime-family diagnostic."""
 
     def unavailable(*, coverage="red", detail=""):
@@ -10640,6 +10668,63 @@ def _event_path_master_payload(frozen: dict) -> dict:
             "concentration": counts.get("concentration"),
         }
 
+    distillation_report = distillation if isinstance(distillation, dict) else {}
+    distillation_windows = {
+        int(window.get("day_count") or 0): window
+        for window in distillation_report.get("windows") or []
+        if isinstance(window, dict)
+    }
+
+    def distillation_cell(action: dict, raw_window: dict, *, paths: list[str]) -> dict:
+        read_status = distillation_report.get("read_status") or {}
+        read_level = str(read_status.get("level") or "ok")
+        if read_level != "ok":
+            return {
+                "state": read_level, "coverage": read_level,
+                "message": str(read_status.get("message") or "取数失败（记了，但这里读不出来）"),
+                "detail": "artifact attempt 账本读取失败；不是 0 次",
+            }
+        day_count = int(raw_window.get("day_count") or 0)
+        window = distillation_windows.get(day_count)
+        if not window:
+            return unavailable(
+                detail="artifact attempt 冻结器尚未建立生效水位；不是 0 次"
+            )
+        coverage = str(window.get("coverage") or "red")
+        if coverage != "green":
+            return {
+                "state": "coverage_gap", "coverage": coverage,
+                "message": "当前窗口不可计算",
+                "covered_days": int(window.get("covered_days") or 0),
+                "required_days": day_count,
+                "effective_from": window.get("effective_from"),
+            }
+        kind = str(action.get("distillation_kind") or "")
+        artifact = str(action.get("distillation_artifact") or "")
+        artifact_cells = (
+            ((window.get("cells") or {}).get(kind) or {}).get(artifact) or {}
+        )
+        succeeded = failed = no_write = 0
+        outcomes: dict[str, int] = {}
+        for path in paths:
+            raw = artifact_cells.get(path) or {}
+            succeeded += int(raw.get("succeeded") or 0)
+            failed += int(raw.get("failed") or 0)
+            no_write += int(raw.get("no_write") or 0)
+            for outcome, count in (raw.get("outcomes") or {}).items():
+                outcomes[str(outcome)] = outcomes.get(str(outcome), 0) + int(count or 0)
+        return {
+            "state": "metric", "coverage": "green",
+            "success": succeeded, "failure": failed,
+            "denominator": succeeded + failed,
+            "no_write": no_write,
+            "outcomes": outcomes,
+            "denominator_rule": (
+                "artifact terminal succeeded + failed；not-provided / preserved / "
+                "locked / skipped 等 no-write 单列剔除；每次真实写入调用各算一次"
+            ),
+        }
+
     path_windows = []
     runtime_windows = []
     for raw_window in frozen.get("windows", []):
@@ -10654,6 +10739,11 @@ def _event_path_master_payload(frozen: dict) -> dict:
                         "state": "not_applicable", "coverage": "black",
                         "message": "N/A（产品当前不执行）",
                     }
+                    continue
+                if action.get("distillation_artifact"):
+                    path_cells[path] = distillation_cell(
+                        action, raw_window, paths=[path]
+                    )
                     continue
                 runtime = (
                     "runtime_v2" if path == "apikey_v2" else "runtime_v1"
@@ -10682,6 +10772,19 @@ def _event_path_master_payload(frozen: dict) -> dict:
                         "state": "not_applicable", "coverage": "black",
                         "message": "N/A（产品当前不执行）",
                     }
+                    continue
+                if action.get("distillation_artifact"):
+                    runtime_paths = (
+                        ["apikey_v2"]
+                        if runtime == "runtime_v2"
+                        else [
+                            path for path, _label in _EVENT_MASTER_PATHS
+                            if path != "apikey_v2"
+                        ]
+                    )
+                    runtime_cells[runtime] = distillation_cell(
+                        action, raw_window, paths=runtime_paths
+                    )
                     continue
                 mapping = (action.get("runtime_metrics") or {}).get(runtime)
                 probe_level = (action.get("runtime_probe") or {}).get(runtime)
@@ -10761,6 +10864,7 @@ def _event_path_master_payload(frozen: dict) -> dict:
         "access_gap": (
             "接入路径取冻结时快照，不是事件发生时快照；历史不回填。"
             "每列只从页面标出的生效日起可读，之前不可用不等于 0。"
+            + (" " + str(distillation_report.get("history_note") or "")).rstrip()
         ),
         "self_deployed": "自建判据 = 无 active tested hosted route + connected resident binding",
     }
@@ -10792,7 +10896,8 @@ def _data_track_events_payload() -> dict:
     day = _validated_dau_day(raw_day) if raw_day else _events_today()
     raw = db.admin_events_overview(day=day)
     frozen_master = _event_path_master_payload(
-        db.admin_event_path_rollup_windows(tz="Asia/Shanghai")
+        db.admin_event_path_rollup_windows(tz="Asia/Shanghai"),
+        db.admin_distillation_artifact_rollup_windows(tz="Asia/Shanghai"),
     )
     import_overall = db.admin_history_import_job_rolling_windows()
 
@@ -10955,6 +11060,7 @@ def _render_event_master_cell(cell: dict, *, action: str, path: str,
         denominator = int(cell.get("denominator") or 0)
         success = int(cell.get("success") or 0)
         failure = int(cell.get("failure") or 0)
+        no_write = int(cell.get("no_write") or 0)
         rule = str(cell.get("denominator_rule") or "")
         if denominator:
             success_rate = success / denominator * 100
@@ -10962,6 +11068,11 @@ def _render_event_master_cell(cell: dict, *, action: str, path: str,
             headline = (
                 f"{mark} <b>{success_rate:.1f}% 成功</b> · "
                 f"<b>{failure_rate:.1f}% 失败</b>"
+            )
+        elif no_write:
+            headline = (
+                f"{mark} <b>0 次进入成败分母</b> · "
+                f"no-write {no_write} 次单列"
             )
         else:
             headline = f"{mark} <b>0 次终态作业</b> · 成功/失败率 —"
@@ -10975,9 +11086,18 @@ def _render_event_master_cell(cell: dict, *, action: str, path: str,
             )
         if int(cell.get("control_outcomes") or 0):
             excluded += f" · control {int(cell['control_outcomes'])}（剔除）"
+        if no_write:
+            excluded += f" · no-write {no_write}（单列剔除）"
+        outcomes = cell.get("outcomes") if isinstance(cell.get("outcomes"), dict) else {}
+        outcome_detail = ""
+        if outcomes:
+            outcome_detail = " · outcome " + ", ".join(
+                f"{key}={int(value or 0)}"
+                for key, value in sorted(outcomes.items())
+            )
         detail = (
             f"分母={denominator}（成功 {success} + 失败 {failure}；"
-            f"{rule}）{excluded}{controls}"
+            f"{rule}）{excluded}{controls}{outcome_detail}"
             f"{_concentration_line(cell.get('concentration'))}"
         )
         return (f"<td>{headline}<div class='evt-cell-scope'>"
@@ -11128,8 +11248,10 @@ def _render_history_import_overall(report: dict) -> str:
     calculated_at = _bj_iso(report.get("calculated_at"))
     level = str(report.get("coverage") or "red")
     mark = _EVENT_COVERAGE_MARK.get(level, "🔴")
-    reason = str(report.get("reason") or
-                 "无路径快照、未物理冻结；T247 补")
+    reason = str(report.get("reason") or (
+        "整单 history job 无事件时路径快照且未物理冻结；"
+        "artifact 分步账本是另一口径，仅覆盖生效后"
+    ))
     rows = []
     for window in report.get("windows") or []:
         completed = int(window.get("completed") or 0)

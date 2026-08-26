@@ -26,7 +26,11 @@ def _database_url(base: str, database: str) -> str:
 
 def test_rds_pre_and_test_heads_converge():
     script = _scripts("alembic")
-    assert script.get_heads() == ["0103_v2_wake_followup_marker"]
+    assert script.get_heads() == ["0104_distill_artifact_ledger"]
+    assert (
+        script.get_revision("0104_distill_artifact_ledger").down_revision
+        == "0103_v2_wake_followup_marker"
+    )
     assert (
         script.get_revision("0103_v2_wake_followup_marker").down_revision
         == "0102_trace_events"
@@ -99,7 +103,11 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0038_v2_wake_followup_marker"]
+    assert script.get_heads() == ["0039_distill_artifact_ledger"]
+    assert (
+        script.get_revision("0039_distill_artifact_ledger").down_revision
+        == "0038_v2_wake_followup_marker"
+    )
     assert (
         script.get_revision("0038_v2_wake_followup_marker").down_revision
         == "0037_chat_poll_index"
@@ -201,6 +209,10 @@ def test_tee_chain_carries_test_runtime_schema():
 def test_tee_migrations_reuse_the_rds_contract_sql():
     rds = _scripts("alembic")
     tee = _scripts("alembic_tee")
+    assert (
+        tee.get_revision("0039_distill_artifact_ledger").module._UP
+        == rds.get_revision("0104_distill_artifact_ledger").module._UP
+    )
     assert (
         tee.get_revision("0038_v2_wake_followup_marker").module._UP
         == rds.get_revision("0103_v2_wake_followup_marker").module._UP
