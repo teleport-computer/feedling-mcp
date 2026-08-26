@@ -1011,6 +1011,34 @@ async def run_tool_loop(
             and re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", request) is not None
         )
 
+    def _delivery_completion_matches_request(
+        request: str, completion_message: str
+    ) -> bool:
+        """Validate the model-authored delivery bubble against the live request."""
+
+        expected = language_follow.classify_writing_system(request)
+        actual = language_follow.classify_writing_system(completion_message)
+        if expected == "mixed":
+            return True
+        if expected == "indeterminate":
+            if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", request) is not None:
+                expected = "han"
+            elif re.search(r"[A-Za-z]", request) is not None:
+                expected = "latin"
+            else:
+                return True
+        if actual == expected or actual == "mixed":
+            return True
+        if actual != "indeterminate":
+            return False
+        if expected == "han":
+            return re.search(
+                r"[\u3400-\u4dbf\u4e00-\u9fff]", completion_message
+            ) is not None
+        if expected == "latin":
+            return re.search(r"[A-Za-z]", completion_message) is not None
+        return False
+
     def _compact_delivery_system_prompt(instruction: str) -> str:
         """Preserve the normal final-reply contract in compact delivery rounds."""
 
@@ -1632,22 +1660,28 @@ async def run_tool_loop(
             target_path, target_revision = workspace_delivery_target
             current_user_request = _latest_user_delivery_request()
             use_han_control = _delivery_control_uses_han(current_user_request)
-            metadata_instruction = ""
+            metadata_instruction = (
+                (
+                    " send_file 必须同时提供 completion_message，作为发送附件后的"
+                    "完整可见聊天气泡；必须使用中文并保持你自己的口吻。"
+                )
+                if use_han_control
+                else (
+                    " send_file must also provide completion_message as the complete "
+                    "visible chat bubble after delivery; write it in English and in "
+                    "your own voice."
+                )
+            )
             if target_path.casefold().endswith(".io.html"):
-                metadata_instruction = (
+                metadata_instruction += (
                     (
-                        " 这是 Canvas 文件，所以 send_file 还必须提供简洁的 title、"
-                        "subtitle 和 completion_message，并使用对方当前请求的语言。"
-                        "completion_message 是完整的可见聊天气泡，要用你自己的口吻；"
-                        "不要默认使用英文或中文。按照当前请求保留或修改这些元数据。"
+                        " 这是 Canvas 文件，所以还必须提供简洁的 title 和 subtitle；"
+                        "按照当前请求保留或修改这些元数据。"
                     )
                     if use_han_control
                     else (
                         " This is a Canvas file, so send_file also requires a concise "
-                        "title, subtitle, and completion_message in the language of the "
-                        "user's current request. completion_message is the complete "
-                        "user-visible chat bubble in your own voice; do not default it "
-                        "to English or Chinese. Preserve or change the metadata according "
+                        "title and subtitle. Preserve or change that metadata according "
                         "to the current user request."
                     )
                 )
@@ -3059,6 +3093,19 @@ async def run_tool_loop(
             )
             is not None
         }
+        if compact_delivery_phase == "send_file" and _latest_user_delivery_request():
+            for tc in pr.tool_calls:
+                if (
+                    tc.name == tool_schema.FILE_REPLY_TOOL
+                    and tc.id not in validation_errors
+                    and not str(
+                    tc.args.get("completion_message") or ""
+                    ).strip()
+                ):
+                    validation_errors[tc.id] = (
+                        "send_file requires completion_message for the visible "
+                        "delivery bubble"
+                    )
         if compact_delivery_phase == "send_file" and len(pr.tool_calls) != 1:
             validation_errors.update(
                 {
@@ -3241,7 +3288,7 @@ async def run_tool_loop(
             await _tool_event(tc, "tool_call_result", {"result": silent_result})
             return LoopOutcome("", attempts, "stay_silent", replied_intermediate)
 
-        canvas_completion_message = ""
+        file_completion_message = ""
         for tc in file_reply_calls:
             workspace_path = str(tc.args.get("path") or "").strip()
             workspace_revision = int(tc.args["revision"])
@@ -3340,6 +3387,54 @@ async def run_tool_loop(
                     )
                 compact_delivery_mismatch_retry_used = True
                 continue
+            completion_message = str(
+                tc.args.get("completion_message") or ""
+            ).strip()
+            current_user_request = _latest_user_delivery_request()
+            if current_user_request and not _delivery_completion_matches_request(
+                current_user_request, completion_message
+            ):
+                if compact_delivery_args_retry_used:
+                    await _trajectory(
+                        "file_completion_language_follow",
+                        {
+                            "round": attempts,
+                            "expected": language_follow.classify_writing_system(
+                                current_user_request
+                            ),
+                            "actual": language_follow.classify_writing_system(
+                                completion_message
+                            ),
+                            "outcome": "kept_after_bounded_correction",
+                        },
+                    )
+                else:
+                    required_script = language_follow.classify_writing_system(
+                        current_user_request
+                    )
+                    file_result = ToolResult(
+                        call_id=tc.id,
+                        content=(
+                            "error: completion_message language mismatch; no file was "
+                            f"delivered. Rewrite completion_message using {required_script} "
+                            "and call send_file again with the same path and revision. "
+                            "If the current request explicitly requires another language, "
+                            "resubmit the same completion_message unchanged to confirm "
+                            "that choice."
+                        ),
+                    )
+                    reply_results[tc.id] = file_result
+                    compact_delivery_validation_exchange = ToolExchange(
+                        calls=(tc,),
+                        results=(file_result,),
+                        assistant_text=pr.text,
+                        assistant_turn=pr.assistant_turn,
+                    )
+                    await _tool_event(
+                        tc, "tool_call_result", {"result": file_result}
+                    )
+                    compact_delivery_args_retry_used = True
+                    continue
             try:
                 if is_canvas_delivery:
                     await on_file_reply(
@@ -3363,16 +3458,17 @@ async def run_tool_loop(
             compact_delivery_validation_exchange = None
             compact_delivery_mismatch_retry_used = False
             compact_delivery_args_retry_used = False
-            if is_canvas_delivery:
-                canvas_completion_message = str(
-                    tc.args.get("completion_message") or ""
-                ).strip()
+            file_completion_message = (
+                completion_message
+                if is_canvas_delivery or current_user_request
+                else ""
+            )
             requirement_now_met = (
                 bool(delivered_file_suffixes)
                 if not normalized_required_suffixes
                 else normalized_required_suffixes.issubset(delivered_file_suffixes)
             )
-            if requirement_now_met and not canvas_completion_message:
+            if requirement_now_met and not file_completion_message:
                 compact_delivery_confirmation_needed = True
             replied_intermediate = True
             file_result = ToolResult(
@@ -3384,8 +3480,8 @@ async def run_tool_loop(
                 tc, "tool_call_result", {"result": file_result}
             )
 
-        if canvas_completion_message:
-            # Canvas metadata and the visible completion bubble are one model
+        if file_completion_message:
+            # Attachment metadata and the visible completion bubble are one model
             # expression. Publishing the tool-authored bubble here keeps the
             # staged attachment and its text in the same final effect, and avoids
             # a second provider round seeded by runtime-authored English copy.
@@ -3395,13 +3491,13 @@ async def run_tool_loop(
                 {
                     "round": attempts,
                     "final": True,
-                    "text": canvas_completion_message,
-                    "reason": "canvas_tool_completion",
+                    "text": file_completion_message,
+                    "reason": "file_tool_completion",
                 },
             )
             try:
                 reply_decision = await on_reply(
-                    canvas_completion_message,
+                    file_completion_message,
                     final=True,
                     reasoning=_merged_reasoning(),
                 )
@@ -3448,7 +3544,7 @@ async def run_tool_loop(
                 raise RuntimeError("unsupported final reply decision")
             else:
                 return LoopOutcome(
-                    canvas_completion_message,
+                    file_completion_message,
                     attempts,
                     "final_text",
                     replied_intermediate,

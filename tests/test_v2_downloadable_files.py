@@ -313,13 +313,9 @@ def test_chinese_file_delivery_uses_chinese_compact_control_messages(monkeypatch
                     "args": {
                         "path": "/workspace/中文附件.txt",
                         "revision": 1,
+                        "completion_message": "中文附件已经生成，可以下载了。",
                     },
                 }],
-                "usage": {},
-            },
-            {
-                "reply": "中文附件已经生成，可以下载了。",
-                "tool_calls": [],
                 "usage": {},
             },
         ],
@@ -337,10 +333,10 @@ def test_chinese_file_delivery_uses_chinese_compact_control_messages(monkeypatch
     assert outcome.stop_reason == "final_text"
     assert "现在调用 send_file" in messages_seen[1][0]["content"]
     assert request in messages_seen[1][0]["content"]
-    assert "使用与下方当前请求相同的语言" in messages_seen[2][0]["content"]
+    assert "completion_message" in messages_seen[1][0]["content"]
+    assert "必须使用中文" in messages_seen[1][0]["content"]
     assert self_thinking.INSTRUCTION.strip() in messages_seen[1][0]["content"]
-    assert self_thinking.INSTRUCTION.strip() in messages_seen[2][0]["content"]
-    assert messages_seen[2][1] == {"role": "user", "content": request}
+    assert len(messages_seen) == 2
 
 
 def test_canvas_send_file_delivers_model_authored_display_metadata(monkeypatch):
@@ -724,13 +720,9 @@ def test_required_file_recovery_resets_tool_only_stall_before_delivery(
                     "args": {
                         "path": "/workspace/小林与小凛的记忆总结.md",
                         "revision": 1,
+                        "completion_message": "Markdown 文档已经发给你了。",
                     },
                 }],
-                "usage": {},
-            },
-            {
-                "reply": "Markdown 文档已经发给你了。",
-                "tool_calls": [],
                 "usage": {},
             },
         ],
@@ -857,7 +849,7 @@ def test_model_selected_shared_work_uses_compact_delivery_after_large_write(
     assert len(str(messages_seen[1])) < 2_000
     assert "记忆知识图谱.io.html" in str(messages_seen[1])
     assert "completion_message" in str(messages_seen[1])
-    assert "do not default it to English or Chinese" in str(messages_seen[1])
+    assert "write it in English" in str(messages_seen[1])
     assert "The work the user asked for was saved" not in str(messages_seen)
     assert len(messages_seen) == 2
     assert all(
@@ -939,7 +931,8 @@ def test_chinese_canvas_compact_delivery_preserves_requested_card_metadata(
     assert outcome.stop_reason == "final_text"
     compact_prompt = messages_seen[1][0]["content"]
     assert request in compact_prompt
-    assert "title、subtitle 和 completion_message" in compact_prompt
+    assert "completion_message" in compact_prompt
+    assert "title 和 subtitle" in compact_prompt
     assert self_thinking.INSTRUCTION.strip() in compact_prompt
 
 
@@ -1023,7 +1016,8 @@ def test_canvas_update_compact_delivery_preserves_request_and_corrects_metadata(
         ("/workspace/小游戏.io.html", 2, "星光方块", "今晚一起玩")
     ]
     assert user_request in str(messages_seen[1])
-    assert "title、subtitle 和 completion_message" in str(messages_seen[1])
+    assert "completion_message" in str(messages_seen[1])
+    assert "title 和 subtitle" in str(messages_seen[1])
     validation_exchange = messages_seen[2][-1]
     assert isinstance(validation_exchange, ToolExchange)
     assert [result.call_id for result in validation_exchange.results] == [
@@ -1669,12 +1663,15 @@ def test_late_folded_word_request_enables_file_completion_guard(monkeypatch):
                     {
                         "id": "f1",
                         "name": "send_file",
-                        "args": {"path": "/workspace/计划.docx", "revision": 1},
+                        "args": {
+                            "path": "/workspace/计划.docx",
+                            "revision": 1,
+                            "completion_message": "Word 文档已发给你。",
+                        },
                     }
                 ],
                 "usage": {},
             },
-            {"reply": "Word 文档已发给你。", "tool_calls": [], "usage": {}},
         ],
         on_file_reply=on_file,
         file_requirement_messages=initial_messages,

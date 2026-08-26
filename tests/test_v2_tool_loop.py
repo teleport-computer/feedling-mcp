@@ -24,7 +24,6 @@ from capabilities import registry as cap_registry
 from capabilities import tool_schema as cap_tool_schema
 from provider_types import ProviderMedia, ToolExchange, ToolResult
 from model_api_runtime.v2 import executor as v2_executor
-from model_api_runtime.v2 import language_follow
 from model_api_runtime.v2 import tool_loop
 
 
@@ -2172,8 +2171,43 @@ def test_file_recovery_tool_choice_dispatches_by_provider_capability(
     assert all(item["dropped_tool_count"] > 0 for item in surfaces[:3])
 
 
-def test_compact_file_confirmation_keeps_language_correction_instruction(
-    monkeypatch,
+@pytest.mark.parametrize(
+    ("user_request", "wrong_message", "corrected_message"),
+    [
+        pytest.param(
+            "请直接生成并发送一个真实的 Markdown 文件，完成后用中文简短回复。",
+            "Your work is saved and ready to open now.",
+            "文件已经生成并发送，可以直接下载了。",
+            id="han-corrected",
+        ),
+        pytest.param(
+            "Create and attach a real Markdown file, then reply briefly in English.",
+            "文件已经生成并发送，可以直接下载了。",
+            "Your work is saved and ready to open now.",
+            id="latin-corrected",
+        ),
+        pytest.param(
+            "生成文件",
+            "Your work is saved and ready to open now.",
+            "文件已经生成，可以下载了。",
+            id="short-han-corrected",
+        ),
+        pytest.param(
+            "Make PDF.",
+            "文件已经生成并发送，可以直接下载了。",
+            "Your PDF is ready to download.",
+            id="short-latin-corrected",
+        ),
+        pytest.param(
+            "请生成一份 Markdown 文件，完成以后请用英文告诉我结果。",
+            "Your work is saved and ready to open now.",
+            "Your work is saved and ready to open now.",
+            id="explicit-language-confirmed",
+        ),
+    ],
+)
+def test_compact_file_delivery_corrects_or_confirms_language_before_delivery(
+    monkeypatch, user_request, wrong_message, corrected_message,
 ):
     provider = _ScriptedProvider([
         {
@@ -2194,18 +2228,25 @@ def test_compact_file_confirmation_keeps_language_correction_instruction(
             "tool_calls": [{
                 "id": "deliver",
                 "name": "send_file",
-                "args": {"path": "/workspace/final.md", "revision": 1},
+                "args": {
+                    "path": "/workspace/final.md",
+                    "revision": 1,
+                    "completion_message": wrong_message,
+                },
             }],
             "usage": {},
         },
         {
-            "reply": "Your work is saved and ready to open now.",
-            "tool_calls": [],
-            "usage": {},
-        },
-        {
-            "reply": "文件已经生成并发送，可以直接下载了。",
-            "tool_calls": [],
+            "reply": "",
+            "tool_calls": [{
+                "id": "deliver-corrected",
+                "name": "send_file",
+                "args": {
+                    "path": "/workspace/final.md",
+                    "revision": 1,
+                    "completion_message": corrected_message,
+                },
+            }],
             "usage": {},
         },
     ])
@@ -2228,29 +2269,8 @@ def test_compact_file_confirmation_keeps_language_correction_instruction(
     async def on_file(path, revision):
         delivered.append((path, revision))
 
-    class CorrectingReply:
-        def __init__(self):
-            self.calls = []
-
-        async def __call__(
-            self, text, *, final, reasoning="", correction_outcome=""
-        ):
-            self.calls.append((text, final, correction_outcome))
-            if text.startswith("Your work") and not correction_outcome:
-                return tool_loop.FinalReplyCorrectionRequest(
-                    instruction=language_follow.CORRECTION_INSTRUCTION,
-                    original_text=text,
-                    original_reasoning=reasoning,
-                )
-            return None
-
-    replies = CorrectingReply()
-    user_message = {
-        "role": "user",
-        "content": (
-            "请直接生成并发送一个真实的 Markdown 文件，完成后用中文简短回复。"
-        ),
-    }
+    replies = _RecordingReply()
+    user_message = {"role": "user", "content": user_request}
     outcome = asyncio.run(tool_loop.run_tool_loop(
         provider_config=_TEST_PROVIDER_CONFIG,
         build_messages=_RecordingBuildMessages(),
@@ -2264,16 +2284,15 @@ def test_compact_file_confirmation_keeps_language_correction_instruction(
         max_calls=4,
     ))
 
-    correction_messages = json.dumps(
-        provider.calls[3]["messages"], ensure_ascii=False
-    )
-    assert language_follow.CORRECTION_INSTRUCTION in correction_messages
+    correction_exchange = provider.calls[2]["messages"][-1]
+    assert isinstance(correction_exchange, ToolExchange)
+    assert len(correction_exchange.results) == 1
+    correction_result = correction_exchange.results[0].content
+    assert "completion_message language mismatch" in correction_result
+    assert "same path and revision" in correction_result
     assert delivered == [("/workspace/final.md", 1)]
-    assert replies.calls == [
-        ("Your work is saved and ready to open now.", True, ""),
-        ("文件已经生成并发送，可以直接下载了。", True, ""),
-    ]
-    assert outcome.final_text == "文件已经生成并发送，可以直接下载了。"
+    assert replies.calls == [(corrected_message, True)]
+    assert outcome.final_text == corrected_message
 
 
 def test_invalid_artifact_write_is_model_visible_and_retries_in_workspace(
