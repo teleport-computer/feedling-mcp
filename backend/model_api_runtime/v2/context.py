@@ -345,18 +345,18 @@ _FILE_CREATE_RE = re.compile(
 )
 _FILE_DESIRE_RE = re.compile(
     r"(?:我(?:想要|要|需要)(?:一个|一份|这份|这个)?\s*(?:"
-    r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)|"
+    r"(?:word|pdf|markdown|md|docx|txt|csv|tsv|html|json|xml|yaml|yml|rtf|svg)|"
     r"[^。！？\n]{0,32}?(?:文档|文件|附件|报告|计划书|清单|表格|简历))|"
     r"\b(?:i want|i need|i would like|i'd like)\s+(?:a\s+|an\s+)?"
-    r"(?:(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)\b|"
+    r"(?:(?:word|pdf|markdown|md|docx|txt|csv|tsv|html|json|xml|yaml|yml|rtf|svg)\b|"
     r"[^.!?\n]{0,48}?\b(?:document|file|attachment|report|plan|checklist|"
     r"spreadsheet|resume)\b))"
 )
 _FILE_EXPLICIT_REQUEST_RE = re.compile(
     r"(?:(?:帮我|替我|为我)(?:生成|创建|制作|导出|保存|转换|转成|整理|写成|做成)|"
-    r"给我\s*(?:一个|一份)?\s*(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)|"
+    r"给我\s*(?:一个|一份)?\s*(?:word|pdf|markdown|md|docx|txt|csv|tsv|html|json|xml|yaml|yml|rtf|svg)|"
     r"我(?:想要|要|需要)(?:一个|一份|这份|这个)?\s*"
-    r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)|"
+    r"(?:word|pdf|markdown|md|docx|txt|csv|tsv|html|json|xml|yaml|yml|rtf|svg)|"
     r"\b(?:create|generate|make|produce|export|save|convert)\b.{0,40}\bfor me\b|"
     r"\b(?:send|give|provide) me\b)"
 )
@@ -380,12 +380,12 @@ _FILE_CANCEL_RE = re.compile(
 _FILE_NEGATED_FORMAT_RE = re.compile(
     r"(?:(?:不要|不用|无需|不需要|别)(?:替我|帮我|为我)?\s*"
     r"(?:生成|创建|制作|导出|发送|发|提供)?\s*"
-    r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)"
+    r"(?:word|pdf|markdown|md|docx|txt|csv|tsv|html|json|xml|yaml|yml|rtf|svg)"
     r"\s*(?:格式|文档|文件)?|"
     r"\b(?:do not|don't|no need to)\s+"
     r"(?:(?:create|generate|make|export|send|provide)\s+)?"
     r"(?:(?:a|an|any|the)\s+)?"
-    r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)"
+    r"(?:word|pdf|markdown|md|docx|txt|csv|tsv|html|json|xml|yaml|yml|rtf|svg)"
     r"(?:\s+(?:format|document|file))?\b)"
 )
 _FILE_ADDITIVE_RE = re.compile(
@@ -413,11 +413,13 @@ _FILE_FORMAT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (".md", re.compile(r"(?:\.md\b|\bmarkdown\b|markdown\s*文档|md\s*文档)")),
     (".txt", re.compile(r"(?:\.txt\b|\btxt\b|纯文本(?:文档|文件)?)")),
     (".csv", re.compile(r"(?:\.csv\b|\bcsv\b)")),
+    (".tsv", re.compile(r"(?:\.tsv\b|\btsv\b)")),
     (".html", re.compile(r"(?:\.html?\b|\bhtml\b)")),
     (".json", re.compile(r"(?:\.json\b|\bjson\b)")),
     (".xml", re.compile(r"(?:\.xml\b|\bxml\b)")),
-    (".yaml", re.compile(r"(?:\.ya?ml\b|\byaml\b)")),
+    (".yaml", re.compile(r"(?:\.ya?ml\b|\bya?ml\b)")),
     (".rtf", re.compile(r"(?:\.rtf\b|\brtf\b)")),
+    (".svg", re.compile(r"(?:\.svg\b|\bsvg\b)")),
 )
 
 # Conservative completion guard for explicit image-creation requests. The model

@@ -49,7 +49,7 @@ def test_canvas_send_file_requires_metadata_and_model_authored_completion():
             "completion_message": "接星星小游戏已经做好，可以直接打开玩了。",
         },
     ) is None
-    assert "only valid for Canvas" in tool_schema.validate_tool_args(
+    assert tool_schema.validate_tool_args(
         "send_file",
         {
             "path": "/workspace/计划.pdf",
@@ -58,7 +58,7 @@ def test_canvas_send_file_requires_metadata_and_model_authored_completion():
             "subtitle": "明日安排",
             "completion_message": "计划已经做好。",
         },
-    )
+    ) is None
 
 
 def test_t101_perception_and_screen_gates_reach_final_tool_descriptions():

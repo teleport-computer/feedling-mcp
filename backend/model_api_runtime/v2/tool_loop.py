@@ -338,7 +338,12 @@ def _file_suffix_for_requirement(
         return max(matches, key=len)
     if normalized.endswith(".io.html"):
         return ".io.html"
-    return posixpath.splitext(normalized)[1]
+    suffix = posixpath.splitext(normalized)[1]
+    return {
+        ".htm": ".html",
+        ".markdown": ".md",
+        ".yml": ".yaml",
+    }.get(suffix, suffix)
 
 
 def _serialized_chars(value) -> int | None:
@@ -523,8 +528,18 @@ class ProviderEmptyReply(RuntimeError):
     """A structurally valid provider success had no foreground-usable output."""
 
 
-class CanvasDeliveryIncomplete(RuntimeError):
+class FileDeliveryIncomplete(RuntimeError):
+    """A requested attachment was saved but still failed bounded delivery."""
+
+
+class CanvasDeliveryIncomplete(FileDeliveryIncomplete):
     """Canvas source was saved but its card still failed bounded delivery."""
+
+
+def _delivery_incomplete(path: str, reason: str) -> FileDeliveryIncomplete:
+    if str(path or "").strip().casefold().endswith(".io.html"):
+        return CanvasDeliveryIncomplete(reason)
+    return FileDeliveryIncomplete(reason)
 
 
 @dataclass(frozen=True)
@@ -2467,6 +2482,9 @@ async def run_tool_loop(
                 file_delivery_recovery_needed = True
                 if not file_delivery_retry_used and attempts < max_calls - 1:
                     file_delivery_retry_used = True
+                    # Reset stale stall history so required write/send recovery
+                    # is not preempted immediately after workspace_write.
+                    consecutive_tool_only_rounds = 0
                     _progress("required_file_retry_boundary")
                     continue
                 await _record_required_file_missing(attempts)
@@ -2772,11 +2790,25 @@ async def run_tool_loop(
                 )
                 continue
             if compact_delivery_args_retry_used:
+                delivery_path = (
+                    workspace_delivery_target[0]
+                    if workspace_delivery_target is not None
+                    else workspace_delivery_candidate[0]
+                    if workspace_delivery_candidate is not None
+                    else str(pr.tool_calls[0].args.get("path") or "")
+                    if pr.tool_calls
+                    else ""
+                )
+                canvas_delivery = delivery_path.casefold().endswith(".io.html")
                 await _trajectory(
                     "protocol_fallback",
                     {
                         "round": attempts,
-                        "reason": "repeated_invalid_canvas_delivery_args",
+                        "reason": (
+                            "repeated_invalid_canvas_delivery_args"
+                            if canvas_delivery
+                            else "repeated_invalid_file_delivery_args"
+                        ),
                         "invalid_tool_names": sorted(
                             {
                                 tc.name
@@ -2786,7 +2818,14 @@ async def run_tool_loop(
                         ),
                     },
                 )
-                raise CanvasDeliveryIncomplete("invalid_canvas_delivery_args")
+                raise _delivery_incomplete(
+                    delivery_path,
+                    (
+                        "invalid_canvas_delivery_args"
+                        if canvas_delivery
+                        else "invalid_file_delivery_args"
+                    ),
+                )
 
             compact_delivery_args_retry_used = True
             tool_calls_used += len(pr.tool_calls)
@@ -2949,8 +2988,8 @@ async def run_tool_loop(
                     tc, "tool_call_result", {"result": file_result}
                 )
                 if compact_delivery_mismatch_retry_used:
-                    raise CanvasDeliveryIncomplete(
-                        "pending_delivery_target_mismatch"
+                    raise _delivery_incomplete(
+                        target_path, "pending_delivery_target_mismatch"
                     )
                 else:
                     compact_delivery_mismatch_retry_used = True
@@ -2980,8 +3019,8 @@ async def run_tool_loop(
                     tc, "tool_call_result", {"result": file_result}
                 )
                 if compact_delivery_mismatch_retry_used:
-                    raise CanvasDeliveryIncomplete(
-                        "existing_delivery_candidate_mismatch"
+                    raise _delivery_incomplete(
+                        target_path, "existing_delivery_candidate_mismatch"
                     )
                 compact_delivery_mismatch_retry_used = True
                 continue

@@ -80,6 +80,19 @@ def test_canvas_delivery_failure_is_not_classified_as_provider_connection():
     ) == "画布内容已经保存，但卡片更新没有完成。请稍后再试。"
 
 
+def test_file_delivery_failure_is_not_classified_as_canvas_or_connection():
+    exc = tool_loop.FileDeliveryIncomplete("pending_delivery_target_mismatch")
+
+    assert worker._safe_failure_code("turn_failed", exc) == (
+        "turn_failed:file_delivery_incomplete"
+    )
+    assert worker._turn_failure_error_class(exc) == "file_delivery_incomplete"
+    assert notices_catalog.user_text_for(
+        "file_delivery_incomplete",
+        language="zh-CN",
+    ) == "文件内容已经保存，但附件发送没有完成。请稍后再试。"
+
+
 def test_unknown_exception_class_and_scope_collapse_to_registered_buckets():
     class SecretToken(RuntimeError):
         pass

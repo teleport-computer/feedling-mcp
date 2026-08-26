@@ -1061,15 +1061,8 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
                 return str(exc)
             if not isinstance(completion_message, str) or not completion_message.strip():
                 return "invalid completion_message"
-        elif (
-            title is not None
-            or subtitle is not None
-            or completion_message is not None
-        ):
-            return (
-                "send_file title, subtitle, and completion_message are only valid "
-                "for Canvas files"
-            )
+        # Providers may populate optional schema fields even when they are not
+        # relevant. Non-Canvas delivery safely ignores Canvas presentation data.
     if name == IMAGE_REPLY_TOOL and not str(args.get("prompt") or "").strip():
         return "generate_image requires a non-empty prompt"
     if name == MCP_TOOL_SEARCH_TOOL:

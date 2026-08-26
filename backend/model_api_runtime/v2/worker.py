@@ -1273,6 +1273,8 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
         kind = "empty_reply"
     elif isinstance(exc, v2_tool_loop.CanvasDeliveryIncomplete):
         kind = "canvas_file_delivery_incomplete"
+    elif isinstance(exc, v2_tool_loop.FileDeliveryIncomplete):
+        kind = "file_delivery_incomplete"
     elif isinstance(exc, TurnError):
         raw = str(exc)
         if raw in {
@@ -1399,6 +1401,8 @@ def _turn_failure_error_class(exc: BaseException) -> str:
         return exc.error_code
     if isinstance(exc, v2_tool_loop.CanvasDeliveryIncomplete):
         return "canvas_file_delivery_incomplete"
+    if isinstance(exc, v2_tool_loop.FileDeliveryIncomplete):
+        return "file_delivery_incomplete"
     if isinstance(exc, v2_prompt_frontier.PromptFrontierExhausted):
         # An unaudited default is our conservative local ceiling, not the
         # provider's model limit. Never blame the user or tell them to shorten
@@ -6567,13 +6571,6 @@ def _workspace_file_mime(name: str, declared: str = "") -> str:
     """Choose a safe MIME for generated workspace files sent without rendering."""
     if str(name or "").casefold().endswith(".io.html"):
         return "text/html"
-    explicit = str(declared or "").strip().lower()
-    if explicit.startswith("text/") or explicit in {
-        "application/json",
-        "application/xml",
-        "application/yaml",
-    }:
-        return explicit[:120]
     suffix = posixpath.splitext(name)[1].lower()
     known = {
         ".csv": "text/csv",
@@ -6585,11 +6582,21 @@ def _workspace_file_mime(name: str, declared: str = "") -> str:
         ".rtf": "text/rtf",
         ".svg": "image/svg+xml",
         ".tsv": "text/tab-separated-values",
+        ".txt": "text/plain",
         ".xml": "application/xml",
         ".yaml": "application/yaml",
         ".yml": "application/yaml",
     }
-    return known.get(suffix) or mimetypes.guess_type(name)[0] or "text/plain"
+    if suffix in known:
+        return known[suffix]
+    explicit = str(declared or "").strip().lower()
+    if explicit.startswith("text/") or explicit in {
+        "application/json",
+        "application/xml",
+        "application/yaml",
+    }:
+        return explicit[:120]
+    return mimetypes.guess_type(name)[0] or "text/plain"
 
 
 def _workspace_file_reply_from_result(
