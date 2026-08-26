@@ -39,6 +39,7 @@ def _run(
     refresh_extra_tool_specs=None,
     initial_screen_pixels_blocked=False,
     initial_untrusted_screen_only=False,
+    provider_tool_choices=None,
 ):
     if extra_mutating_tool_names is None:
         extra_mutating_tool_names = {
@@ -46,6 +47,8 @@ def _run(
 
     async def _provider(_config, _messages, *, tools=None, **kwargs):
         provider_tools.append(tools)
+        if provider_tool_choices is not None:
+            provider_tool_choices.append(kwargs.get("tool_choice"))
         return next(responses)
 
     replies = []
@@ -190,15 +193,19 @@ def test_removed_reply_plus_mutating_mcp_is_rejected_before_any_side_effect():
         raise AssertionError("reply+mutation batch must execute nothing")
 
     provider_tools = []
+    provider_tool_choices = []
     outcome, replies = _run(
         responses,
         _dispatch,
         extra_tool_specs=[MCP_WRITE_SPEC],
         extra_mutating_tool_names={MCP_WRITE_SPEC.name},
         provider_tools=provider_tools,
+        provider_tool_choices=provider_tool_choices,
     )
 
-    assert [tools is None for tools in provider_tools] == [False, True]
+    assert [tools is None for tools in provider_tools] == [False, False]
+    assert {spec.name for spec in provider_tools[1]} == {MCP_WRITE_SPEC.name}
+    assert provider_tool_choices[1] == "none"
     assert replies == [("safe fallback", True)]
     assert outcome.final_text == "safe fallback"
 
@@ -216,14 +223,18 @@ def test_removed_reply_plus_server_claimed_read_only_mcp_is_still_rejected():
         raise AssertionError("reply+MCP batch must execute nothing")
 
     provider_tools = []
+    provider_tool_choices = []
     outcome, replies = _run(
         responses,
         _dispatch,
         extra_tool_specs=[MCP_SPEC],
         provider_tools=provider_tools,
+        provider_tool_choices=provider_tool_choices,
     )
 
-    assert [tools is None for tools in provider_tools] == [False, True]
+    assert [tools is None for tools in provider_tools] == [False, False]
+    assert {spec.name for spec in provider_tools[1]} == {MCP_SPEC.name}
+    assert provider_tool_choices[1] == "none"
     assert replies == [("safe fallback", True)]
     assert outcome.final_text == "safe fallback"
 
