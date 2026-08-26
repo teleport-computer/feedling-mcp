@@ -1295,6 +1295,73 @@ def test_event_path_windows_use_closed_days_and_declare_partial_coverage(
     }
 
 
+def test_background_user_reader_is_bounded_and_uses_operational_denominator(
+        clean_rollup):
+    """Per-user cells answer who is failing without reopening full history."""
+    yesterday = (_beijing_today() - timedelta(days=1)).isoformat()
+    u1 = "usr_t133_background_a"
+    u2 = "usr_t133_background_b"
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO lane_daily_rollup
+              (user_id, day, route, lane, completed, failed, expired,
+               superseded, operational_failures, control_outcomes,
+               user_unavailable, failure_codes)
+            VALUES
+              (%s, %s, 'resident', 'heartbeat', 2, 5, 0, 0, 1, 2, 2,
+               '{"wake_failed:providererror":1}'::jsonb),
+              (%s, %s, 'resident', 'capture', 0, 2, 0, 0, 2, 0, 0,
+               '{"extraction_failed:pooltimeout":2}'::jsonb),
+              (%s, %s, 'resident', 'heartbeat', 4, 0, 0, 0, 0, 0, 0,
+               '{}'::jsonb)
+            """,
+            (u1, yesterday, u1, yesterday, u2, yesterday),
+        )
+        conn.execute(
+            """
+            INSERT INTO lane_rollup_watermark
+              (route, backfill_from, through_day, outcomes_from)
+            VALUES ('resident', %s, %s, %s)
+            ON CONFLICT (route) DO UPDATE SET
+              backfill_from=EXCLUDED.backfill_from,
+              through_day=EXCLUDED.through_day,
+              outcomes_from=EXCLUDED.outcomes_from
+            """,
+            (yesterday, yesterday, yesterday),
+        )
+
+    report = db.admin_background_lane_users([u1, u2], days=1)
+    assert report["window"]["start_day"] == yesterday
+    assert report["window"]["end_day"] == yesterday
+    assert report["window"]["open_day_excluded"] is True
+    assert report["coverage_by_route"]["resident"]["level"] == "green"
+
+    heartbeat = report["users"][u1]["lanes"]["heartbeat"]
+    assert heartbeat["failed"] == 5, "raw failed remains visible"
+    assert heartbeat["operational_failures"] == 1
+    assert heartbeat["control_outcomes"] == 2
+    assert heartbeat["user_unavailable"] == 2
+    assert heartbeat["terminal_attempts"] == 3
+    assert heartbeat["failure_rate"] == pytest.approx(1 / 3)
+    assert heartbeat["failure_codes"] == {"wake_failed:providererror": 1}
+
+    capture = report["users"][u1]["lanes"]["capture"]
+    assert capture["terminal_attempts"] == 2
+    assert capture["failure_rate"] == 1.0
+    assert capture["failure_codes"] == {"extraction_failed:pooltimeout": 2}
+    assert report["users"][u2]["lanes"]["heartbeat"]["failure_rate"] == 0.0
+
+
+def test_background_user_zero_keeps_missing_coverage_distinct(clean_rollup):
+    report = db.admin_background_lane_users(
+        ["usr_t133_unmeasured"], days=1
+    )
+    assert report["users"] == {}
+    assert report["coverage_by_route"]["resident"]["level"] == "unavailable"
+    assert report["coverage_by_route"]["model_api"]["level"] == "unavailable"
+
+
 def test_v1_rate_requires_full_outcome_watermark_and_excludes_control(
         clean_rollup):
     """New classified cells produce a rate; old defaults remain unavailable."""

@@ -836,6 +836,9 @@ def _data_track_memory_from_snapshot(snap: dict) -> dict:
     memory = dict(snap.get("memory") or {})
     extra = dict(snap.get("memory_extra") or {})
     log_counts = dict(snap.get("log_counts") or {})
+    legacy_status = str(
+        snap.get("legacy_background_breakdowns_status") or "available"
+    )
     invalid_fields: list[str] = []
     by_type = {typ: 0 for typ in memory_service.MEMORY_TYPES}
     by_type.update(_data_track_count_dict(
@@ -863,6 +866,7 @@ def _data_track_memory_from_snapshot(snap: dict) -> dict:
             log_counts.get("changes_by_capture_mode"), invalid_fields=invalid_fields,
             field_prefix="memory.changes_by_capture_mode",
         ),
+        "changes_breakdowns_status": legacy_status,
         "capture_jobs": int(extra.get("capture_jobs") or 0),
         "capture_jobs_by_status": _data_track_count_dict(
             log_counts.get("capture_jobs_by_status"), invalid_fields=invalid_fields,
@@ -873,6 +877,7 @@ def _data_track_memory_from_snapshot(snap: dict) -> dict:
             field_prefix="memory.capture_jobs_by_mode",
         ),
         "capture_actions_written": int(extra.get("capture_actions_written") or 0),
+        "capture_breakdowns_status": legacy_status,
         "last_capture_at": _data_track_iso(extra.get("last_capture_ts")),
         "first_created_at": _data_track_iso(memory.get("first_created_at")),
         "last_created_at": _data_track_iso(memory.get("last_created_at")),
@@ -1028,6 +1033,9 @@ def _connection_health(route: str, access_modes: list, chat: dict) -> dict:
 def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
     logs = dict(snap.get("logs") or {})
     extra = dict(snap.get("proactive_extra") or {})
+    legacy_status = str(
+        snap.get("legacy_background_breakdowns_status") or "available"
+    )
     invalid_fields: list[str] = []
 
     def counts(value, name: str) -> dict:
@@ -1105,6 +1113,7 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
             extra.get("jobs_user_unavailable_by_reason"),
             "proactive.jobs_user_unavailable_by_reason",
         ),
+        "breakdowns_status": legacy_status,
         "proactive_messages": int(chat.get("proactive_messages") or 0),
         "delivery_signals": delivered,
         "live_activity_status": live_status_counts,
@@ -1128,6 +1137,9 @@ def _data_track_tracking_from_snapshot(snap: dict) -> dict:
             field_prefix="tracking.by_type",
         ),
         "last_at": _data_track_iso(tracking.get("last_ts")),
+        "breakdowns_status": str(
+            snap.get("legacy_background_breakdowns_status") or "available"
+        ),
     }
     result["counts_status"] = "invalid" if invalid_fields else "ok"
     result["invalid_count_fields"] = sorted(set(invalid_fields))
@@ -1146,6 +1158,9 @@ def _data_track_bootstrap_from_snapshot(snap: dict) -> dict:
             field_prefix="bootstrap.by_type",
         ),
         "last_at": _data_track_iso(bootstrap.get("last_ts")),
+        "breakdowns_status": str(
+            snap.get("legacy_background_breakdowns_status") or "available"
+        ),
     }
     result["counts_status"] = "invalid" if invalid_fields else "ok"
     result["invalid_count_fields"] = sorted(set(invalid_fields))
@@ -2231,6 +2246,11 @@ def _data_track_request_filters() -> dict:
     raw_runtime_state = (request.args.get("runtime_state") or "").strip().lower()
     if raw_runtime_state not in {"", "v2", "draining", "resident"}:
         raw_runtime_state = ""
+    raw_human_activity = (
+        request.args.get("human_activity") or "all"
+    ).strip().lower()
+    if raw_human_activity not in {"all", "active", "inactive"}:
+        raw_human_activity = "all"
 
     def read_int(name: str, default: int, minimum: int, maximum: int) -> int:
         try:
@@ -2250,6 +2270,14 @@ def _data_track_request_filters() -> dict:
         "view": raw_view,
         "runtime_state": raw_runtime_state,
         "days": read_int("days", 30, 1, 1000),
+        # Query-time cohort control: the product question is whether failures
+        # are concentrated in abandoned accounts.  The activity definition is
+        # never welded into the rollup itself; callers choose a window and the
+        # only signal is chat.last_user_at (not last_activity_at, which includes
+        # the very background work being diagnosed).
+        "human_activity": raw_human_activity,
+        "human_days": read_int("human_days", 7, 1, 3650),
+        "lane_days": read_int("lane_days", 7, 1, 90),
     }
 
 
@@ -2293,6 +2321,101 @@ def _data_track_apply_runtime_filter(rows: list[dict], runtime_state: str) -> li
         if str((row.get("responder") or {}).get("runtime_state") or "resident")
         .strip().lower() == selected
     ]
+
+
+def _data_track_apply_human_filter(rows: list[dict], selected: str) -> list[dict]:
+    cohort = str(selected or "all").strip().lower()
+    if cohort not in {"active", "inactive"}:
+        return rows
+    return [
+        row for row in rows
+        if str((row.get("human_activity") or {}).get("state") or "inactive")
+        == cohort
+    ]
+
+
+def _background_lane_empty() -> dict:
+    return {
+        "completed": 0,
+        "failed": 0,
+        "expired": 0,
+        "superseded": 0,
+        "operational_failures": 0,
+        "control_outcomes": 0,
+        "user_unavailable": 0,
+        "terminal_attempts": 0,
+        "failure_rate": None,
+        "failure_codes": {},
+    }
+
+
+def _background_lanes_for_user(
+    report: dict, *, user_id: str, route: str
+) -> dict:
+    raw_users = report.get("users") if isinstance(report, dict) else {}
+    raw = (
+        raw_users.get(user_id)
+        if isinstance(raw_users, dict) and isinstance(raw_users.get(user_id), dict)
+        else {}
+    )
+    lanes = raw.get("lanes") if isinstance(raw.get("lanes"), dict) else {}
+    coverage_by_route = (
+        report.get("coverage_by_route")
+        if isinstance(report.get("coverage_by_route"), dict) else {}
+    )
+    raw_routes = raw.get("routes") if isinstance(raw.get("routes"), dict) else {}
+    # The primary lane totals combine every execution family observed for the
+    # user in this window, so their coverage must do the same. Always union the
+    # current runtime family: after a resident -> V2 switch, old resident cells
+    # cannot make an as-yet-unmeasured model_api path look healthy.
+    coverage_routes = sorted(
+        {str(value) for value in raw_routes} | {str(route)}
+    )
+    route_coverage = {
+        value: dict(coverage_by_route.get(value) or {
+            "level": "unavailable",
+            "message": f"{value} 无覆盖证据",
+        })
+        for value in coverage_routes
+    }
+    rank = {
+        "green": 0,
+        "partial": 1,
+        "unavailable": 2,
+        "timeout": 3,
+        "read_error": 4,
+    }
+    coverage_level = max(
+        (str(value.get("level") or "unavailable")
+         for value in route_coverage.values()),
+        key=lambda value: rank.get(value, rank["unavailable"]),
+    )
+    if len(route_coverage) == 1:
+        coverage = dict(next(iter(route_coverage.values())))
+    else:
+        coverage = {
+            "level": coverage_level,
+            "message": "；".join(
+                f"{value}={details.get('level') or 'unavailable'}"
+                for value, details in route_coverage.items()
+            ),
+        }
+    return {
+        "window": dict(report.get("window") or {}),
+        "read_status": dict(report.get("read_status") or {}),
+        "coverage_route": route,
+        "coverage_routes": coverage_routes,
+        "coverage_by_route": route_coverage,
+        "coverage": dict(coverage),
+        "lanes": {
+            lane: dict(lanes.get(lane) or _background_lane_empty())
+            for lane in ("heartbeat", "capture")
+        },
+        # A user can cross routes during the selected window. Preserve the
+        # route split for investigation while keeping the two primary cells
+        # above easy to sort/render.
+        "routes": dict(raw.get("routes") or {}),
+    }
 
 
 def _data_track_sort_rows(rows: list[dict], sort_key: str, direction: str) -> None:
@@ -2352,7 +2475,21 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     with registry._users_lock:
         users = [dict(u) for u in registry._users if u.get("user_id")]
     users = _data_track_filter_users(users, filters)
-    snapshot = db.admin_data_track_snapshot([str(u.get("user_id") or "") for u in users])
+    user_ids = [str(u.get("user_id") or "") for u in users]
+    snapshot = db.admin_data_track_snapshot(
+        user_ids,
+        # Fleet-wide users *and* summary paths must stay bounded. One-user
+        # detail bypasses this payload and keeps the legacy breakdowns through
+        # admin_data_track_snapshot's default True.
+        include_legacy_background=False,
+    )
+    background_report = (
+        db.admin_background_lane_users(
+            user_ids, days=int(filters.get("lane_days") or 7)
+        )
+        if include_users else {}
+    )
+    human_cutoff = time.time() - int(filters.get("human_days") or 7) * 86400
     rows = []
     for u in users:
         uid = str(u.get("user_id") or "")
@@ -2363,6 +2500,12 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         health = dict(snapshot.get(uid, {}).get("provider_health") or {})
         row.update(
             {
+                "snapshot_read_status": dict(
+                    snapshot.get(uid, {}).get("snapshot_read_status") or {
+                        "level": "unavailable",
+                        "message": "取数状态缺失",
+                    }
+                ),
                 "provider_state": str(
                     health.get("provider_state") or "ok"
                 ),
@@ -2377,11 +2520,45 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
                 ),
             }
         )
+        if include_users:
+            last_user_epoch = core_util._to_epoch(
+                (row.get("chat") or {}).get("last_user_at")
+            )
+            row["human_activity"] = {
+                "state": (
+                    "active"
+                    if last_user_epoch and last_user_epoch >= human_cutoff
+                    else "inactive"
+                ),
+                "basis": "chat.last_user_at",
+                "days": int(filters.get("human_days") or 7),
+                "last_user_at": str(
+                    (row.get("chat") or {}).get("last_user_at") or ""
+                ),
+            }
+            runtime_state = str(
+                (row.get("responder") or {}).get("runtime_state") or "resident"
+            ).strip().lower()
+            # lane_daily_rollup.route is the execution family, not the account's
+            # onboarding selection. Hosted V2/draining work freezes into
+            # model_api; resident and hosted-V1 work freezes into resident.
+            coverage_route = (
+                "model_api" if runtime_state in {"v2", "draining"}
+                else "resident"
+            )
+            row["background_lanes"] = _background_lanes_for_user(
+                background_report,
+                user_id=uid,
+                route=coverage_route,
+            )
         rows.append(row)
     rows = _data_track_apply_runtime_filter(
         rows, str(filters.get("runtime_state") or "")
     )
     rows = _data_track_apply_text_filter(rows, str(filters.get("q") or ""))
+    rows = _data_track_apply_human_filter(
+        rows, str(filters.get("human_activity") or "all")
+    )
     _data_track_sort_rows(rows, str(filters.get("sort") or ""), str(filters.get("dir") or "desc"))
     completed = sum(1 for r in rows if r["onboarding"]["passing"])
     incomplete = max(0, len(rows) - completed)
@@ -2394,6 +2571,9 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     proactive_jobs = 0
     proactive_messages = 0
     proactive_failed = 0
+    # This fleet-wide payload deliberately omits the legacy JSON breakdowns;
+    # one-user detail is the only path where that all-history contract remains.
+    proactive_breakdowns_available = False
     # Ground-truth activation funnel — derived from REAL behaviour (memory
     # written / messages sent / replies received / recency), independent of the
     # onboarding-stage label. This is the trustworthy usage view: a user who has
@@ -2431,7 +2611,10 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         memory_total += row["memory"]["total"]
         proactive_jobs += row["proactive"]["jobs"]
         proactive_messages += row["proactive"]["proactive_messages"]
-        proactive_failed += row["proactive"]["failed_jobs"]
+        if row["proactive"].get("breakdowns_status") == "available":
+            proactive_failed += row["proactive"]["failed_jobs"]
+        else:
+            proactive_breakdowns_available = False
         if row.get("provider_state") == "needs_user_action":
             provider_needs_user_action += 1
         if int(row["memory"].get("total") or 0) > 0:
@@ -2527,7 +2710,12 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         "memory_avg_per_user": (memory_total / len(rows)) if rows else 0,
         "proactive_jobs_total": proactive_jobs,
         "proactive_messages_total": proactive_messages,
-        "proactive_failed_total": proactive_failed,
+        "proactive_failed_total": (
+            proactive_failed if proactive_breakdowns_available else None
+        ),
+        "proactive_breakdowns_status": (
+            "available" if proactive_breakdowns_available else "omitted"
+        ),
         "provider_needs_user_action": provider_needs_user_action,
         "app_usage": {
             "foreground_sec_total": au_fg_total,
@@ -2546,8 +2734,24 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
             "sort": filters.get("sort", ""),
             "dir": filters.get("dir", "desc"),
             "runtime_state": filters.get("runtime_state", ""),
+            "human_activity": filters.get("human_activity", "all"),
+            "human_days": int(filters.get("human_days") or 7),
+            "lane_days": int(filters.get("lane_days") or 7),
         },
     }
+    if include_users:
+        payload["background_lane_window"] = {
+            "window": dict(background_report.get("window") or {}),
+            "read_status": dict(background_report.get("read_status") or {}),
+            "coverage_by_route": dict(
+                background_report.get("coverage_by_route") or {}
+            ),
+            "denominator": "completed + operational_failures",
+            "excluded": (
+                "control_outcomes, user_unavailable, superseded, expired; "
+                "nonterminal jobs are reported by the separate stuck metric"
+            ),
+        }
     if include_users:
         offset = int(filters.get("offset") or 0)
         limit = int(filters.get("limit") or 100)
@@ -8106,6 +8310,29 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
         if pager_links:
             pager = f"<div class='pager'>{''.join(pager_links)}</div>"
     rows_html = []
+
+    def background_cell(row: dict, lane: str, label: str) -> str:
+        block = row.get("background_lanes") or {}
+        read_status = block.get("read_status") or {}
+        coverage = block.get("coverage") or {}
+        counts = (block.get("lanes") or {}).get(lane) or {}
+        if str(read_status.get("level") or "ok") != "ok":
+            return f"{label} 取数失败"
+        terminal = int(counts.get("terminal_attempts") or 0)
+        failures = int(counts.get("operational_failures") or 0)
+        completed = int(counts.get("completed") or 0)
+        rate = counts.get("failure_rate")
+        rate_text = f"{float(rate) * 100:.0f}%" if rate is not None else "—"
+        coverage_mark = (
+            ""
+            if coverage.get("level") == "green"
+            else f" · 覆盖{html.escape(str(coverage.get('level') or 'unknown'))}"
+        )
+        return (
+            f"{label} {rate_text}"
+            f"（成{completed}/故{failures}/分母{terminal}）{coverage_mark}"
+        )
+
     for row in users:
         onboarding = row["onboarding"]
         stage = onboarding["stage"]
@@ -8116,7 +8343,7 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
         principal = str(access.get("principal_id") or row.get("principal_id") or "")
         principal_short = f"{principal[:12]}…" if len(principal) > 12 else principal
         onb_mem, live_mem = _memory_source_split(row["memory"].get("by_source"))
-        pro = row["proactive"]
+        human = row.get("human_activity") or {}
         conn = row.get("connection") or {}
         conn_status = conn.get("status", "")
         conn_cls = "warn" if conn_status in ("offline", "stalled") else ("ok" if conn_status == "ok" else "muted")
@@ -8151,16 +8378,11 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
             f"<td>{row['chat']['total']} <span class='muted'>u{row['chat']['user_messages']} / a{row['chat']['agent_messages']}</span></td>"
             f"<td>{row['memory']['total']} <span class='muted'>cards</span>"
             f"<br><span class='muted'>onb {onb_mem} / live {live_mem}</span></td>"
-            f"<td>{pro['proactive_messages']} <span class='muted'>sent</span>"
-            f"<br><span class='muted'>心跳 总{pro.get('heartbeat_jobs', 0)} "
-            f"/ 失败{pro.get('heartbeat_failed', 0)} "
-            f"/ 控制{pro.get('heartbeat_control', 0)} "
-            f"/ 用户侧{pro.get('heartbeat_user_unavailable', 0)}; "
-            f"屏幕 总{pro.get('screen_jobs', 0)} "
-            f"/ 失败{pro.get('screen_failed', 0)} "
-            f"/ 控制{pro.get('screen_control', 0)} "
-            f"/ 用户侧{pro.get('screen_user_unavailable', 0)}</span></td>"
-            f"<td>{html.escape(_bj_iso(row.get('last_activity_at')))}</td>"
+            f"<td>{background_cell(row, 'heartbeat', '心跳')}"
+            f"<br><span class='muted'>{background_cell(row, 'capture', 'capture')}</span></td>"
+            f"<td>{html.escape(_bj_iso(human.get('last_user_at')) or '从未')}"
+            f"<br><span class='muted'>{html.escape(str(human.get('state') or 'inactive'))}"
+            f" · {int(human.get('days') or 0)}d · chat.last_user_at</span></td>"
             "</tr>"
         )
     fn = summary.get("activation_funnel", {})
@@ -8262,6 +8484,27 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
         "“已激活”仍按有记忆或发过消息的行为口径。Token 与模型用量已移到独立页面，避免把只统计 chat lane 的旧 rollup 误称为全站用量。"
         f" <a href='{html.escape(_usage_page_href(), quote=True)}'>打开 Token 与模型</a>。</div>"
     )
+    human_filter_links = []
+    selected_human = str(filters.get("human_activity") or "all")
+    for cohort, label in (
+        ("all", "全部真人活跃状态"),
+        ("active", "窗口内发过消息"),
+        ("inactive", "窗口内未发消息 / 从未发过"),
+    ):
+        cls = "sort-button active" if selected_human == cohort else "sort-button"
+        href = _data_track_page_href(
+            view="users", human_activity=cohort, offset=0
+        )
+        human_filter_links.append(
+            f"<a class='{cls}' href='{html.escape(href, quote=True)}'>{html.escape(label)}</a>"
+        )
+    human_filter_section = (
+        "<h2>真人活跃筛选</h2>"
+        f"<div class='sortbar'>{''.join(human_filter_links)}</div>"
+        f"<div class='muted'>窗口={int(filters.get('human_days') or 7)} 天；"
+        "只看 <code>chat.last_user_at</code>。后台心跳、capture、memory 写入不会把废号变成活跃号。"
+        "可用 <code>human_days</code> 改窗口，不把判活阈值焊死进冻结定义。</div>"
+    )
     # App 使用时长(iOS app_session_end 事件聚合 · summary['app_usage'] 由 db 层填充)。
     au = summary.get("app_usage") or {}
     if au.get("sessions_total"):
@@ -8333,6 +8576,7 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
 	  {_render_funnel(funnel, compact=False)}
 	  {accounting_details}
 		  {runtime_population_section}
+		  {human_filter_section}
 		  {app_usage_section}
 	  <h2>Beta users</h2>
 	  <form class="toolbar" method="get" action="/admin/data-track/users">
@@ -8343,16 +8587,15 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
 	  </form>
 	  <div class="toolbar"><input id="q" placeholder="筛选 UID、route、runtime state、stage"></div>
 	  {_render_chat_coverage_note(summary.get("chat_coverage"))}
-	  <div class="note-box"><b>Proactive 失败口径（Resident / V1）</b><br>
-	  总数=该 lane 的全史 <code>proactive_jobs</code> 全状态记录，不是失败率分母；
-	  失败=<code>status=failed</code> 且不属于明确用户侧七码，未知/未登记原因仍算我方失败；
-	  控制=<code>status=skipped</code>（含 <code>heartbeat_throttled</code>），不算失败；
-	  用户侧=明确额度、Key 或模型不存在；<code>expired</code> 沿用 V1 既有口径不计。
-	  本列不含 Runtime V2 用户，V2 请看 Runtime 值班台；两边表、窗口、总体与键空间不同，不可横向对数。</div>
+	  <div class="note-box"><b>后台道按用户失败率</b><br>
+	  数据来自冻结 <code>lane_daily_rollup</code>，默认最近 {int(filters.get('lane_days') or 7)} 个完整北京日；
+	  分母=<code>completed + operational_failures</code>。控制切流、明确用户侧、superseded 不进分母；
+	  pending/claimed/running 不塞进失败率，另由 stuck 指标负责。覆盖不完整时格子明确标 partial，
+	  不会把未量到的 0 冒充健康。可用 <code>lane_days</code> 改窗口。</div>
 	  <div class="sortbar">{sort_controls}</div>
 	  {pager}
 	  <div class="table-wrap"><table id="users">
-    <thead><tr><th>User</th><th>Onboarding route</th><th>实际 Runtime</th><th>连接</th><th>Onboarding</th><th>Steps</th><th>Chat 累计发生</th><th>Memory</th><th>Proactive 心跳/屏幕（全史四分法）</th><th>Last activity</th></tr></thead>
+    <thead><tr><th>User</th><th>Onboarding route</th><th>实际 Runtime</th><th>连接</th><th>Onboarding</th><th>Steps</th><th>Chat 累计发生</th><th>Memory</th><th>后台道失败率（按用户）</th><th>Last human message</th></tr></thead>
     <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='10' class='muted'>No users yet.</td></tr>"}</tbody>
   </table></div>
 </main>

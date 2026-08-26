@@ -200,7 +200,15 @@ def test_admin_data_track_aggregates_counts_without_content(client):
     assert row["memory"]["by_tab"]["story"] == 1
     assert row["memory"]["by_tab"]["about_me"] == 1
     assert row["proactive"]["proactive_messages"] == 1
-    assert row["proactive"]["job_failed_reasons"] == {"model_timeout": 1, "unknown": 1}
+    # The users index intentionally skips the whole-history background
+    # breakdown; that legacy evidence remains available on the one-user detail.
+    detail = client.get(
+        f"/v1/admin/data-track/users/{user_id}", headers=_admin_headers()
+    ).get_json()["user"]
+    assert detail["proactive"]["job_failed_reasons"] == {
+        "model_timeout": 1,
+        "unknown": 1,
+    }
     dumped = json.dumps(body)
     assert "ciphertext-that-must-not-leak" not in dumped
     assert "private alert preview" not in dumped
@@ -239,9 +247,11 @@ def test_users_surface_separates_v1_failure_control_and_user_unavailable(client)
     ):
         store.append_proactive_job(job)
 
-    response = client.get("/v1/admin/data-track/users", headers=_admin_headers())
+    response = client.get(
+        f"/v1/admin/data-track/users/{user_id}", headers=_admin_headers()
+    )
     assert response.status_code == 200
-    proactive = response.get_json()["users"][0]["proactive"]
+    proactive = response.get_json()["user"]["proactive"]
     assert proactive["lens"] == "v1_proactive_jobs_log"
     assert proactive["failure_definition"]["window"] == "all_history"
     assert proactive["heartbeat_jobs"] == 4
@@ -257,10 +267,242 @@ def test_users_surface_separates_v1_failure_control_and_user_unavailable(client)
     page = client.get("/admin/data-track?view=users", headers=_admin_headers())
     assert page.status_code == 200
     body = page.get_data(as_text=True)
-    assert "心跳 总4 / 失败1 / 控制1 / 用户侧1" in body
-    assert "Proactive 失败口径（Resident / V1）" in body
-    assert "未知/未登记原因仍算我方失败" in body
-    assert "本列不含 Runtime V2 用户" in body
+    assert "后台道失败率（按用户）" in body
+    assert "冻结" in body
+    assert "chat.last_user_at" in body
+
+
+def test_users_background_lanes_filter_by_last_user_message_and_skip_full_history(
+        client, monkeypatch):
+    active_user, _ = _register(client)
+    inactive_user, _ = _register(client)
+    active_store = core_store.get_store(active_user)
+    active_store.append_chat(
+        "user", "chat", _env("human-active-now", active_user)
+    )
+    active_store.append_proactive_job({
+        "job_id": "legacy-breakdown-must-not-be-read",
+        "status": "failed",
+        "status_reason": "legacy_provider_timeout",
+        "job_kind": "heartbeat",
+    })
+    active_store.append_gate_decision({
+        "decision_id": "legacy-gate-json-must-not-be-read",
+        "should_reach_out": True,
+    })
+    active_store.append_tracking_event(tracking_core._make_tracking_event(
+        active_store,
+        "legacy-tracking-json-must-not-be-read",
+        {"payload": {}},
+    ))
+    yesterday = (
+        datetime.now(ZoneInfo("Asia/Shanghai")).date() - timedelta(days=1)
+    ).isoformat()
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO lane_daily_rollup
+              (user_id, day, route, lane, completed, failed,
+               operational_failures, control_outcomes, user_unavailable,
+               failure_codes)
+            VALUES
+              (%s, %s, 'resident', 'heartbeat', 3, 4, 1, 2, 1,
+               '{"wake_failed:providererror":1}'::jsonb),
+              (%s, %s, 'resident', 'capture', 0, 2, 2, 0, 0,
+               '{"extraction_failed:pooltimeout":2}'::jsonb),
+              (%s, %s, 'resident', 'heartbeat', 0, 5, 5, 0, 0,
+               '{"wake_failed:providererror":5}'::jsonb)
+            """,
+            (
+                active_user, yesterday,
+                active_user, yesterday,
+                inactive_user, yesterday,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO lane_rollup_watermark
+              (route, backfill_from, through_day, outcomes_from)
+            VALUES ('resident', %s, %s, %s)
+            ON CONFLICT (route) DO UPDATE SET
+              backfill_from=EXCLUDED.backfill_from,
+              through_day=EXCLUDED.through_day,
+              outcomes_from=EXCLUDED.outcomes_from
+            """,
+            (yesterday, yesterday, yesterday),
+        )
+
+    real_snapshot = db.admin_data_track_snapshot
+    snapshot_modes = []
+
+    def observed_snapshot(user_ids, **kwargs):
+        snapshot_modes.append(kwargs.get("include_legacy_background"))
+        return real_snapshot(user_ids, **kwargs)
+
+    monkeypatch.setattr(db, "admin_data_track_snapshot", observed_snapshot)
+    active = client.get(
+        "/v1/admin/data-track/users?human_activity=active&human_days=7&lane_days=1",
+        headers=_admin_headers(),
+    )
+    assert active.status_code == 200, active.get_data(as_text=True)
+    active_body = active.get_json()
+    assert [row["user_id"] for row in active_body["users"]] == [active_user]
+    assert active_body["filters"]["human_activity"] == "active"
+    assert active_body["filters"]["human_days"] == 7
+    assert active_body["filters"]["lane_days"] == 1
+    assert snapshot_modes[-1] is False, (
+        "users index must not reopen the legacy whole-history background scans"
+    )
+
+    row = active_body["users"][0]
+    assert row["human_activity"] == {
+        "state": "active",
+        "basis": "chat.last_user_at",
+        "days": 7,
+        "last_user_at": row["chat"]["last_user_at"],
+    }
+    heartbeat = row["background_lanes"]["lanes"]["heartbeat"]
+    capture = row["background_lanes"]["lanes"]["capture"]
+    assert row["proactive"]["breakdowns_status"] == "omitted"
+    assert row["proactive"]["job_failed_reasons"] == {}
+    assert row["proactive"]["decisions"] == 1
+    assert row["proactive"]["decision_true"] == 0
+    assert row["memory"]["capture_breakdowns_status"] == "omitted"
+    assert row["tracking"]["events"] == 1
+    assert row["tracking"]["by_type"] == {}
+    assert row["tracking"]["breakdowns_status"] == "omitted"
+    assert row["background_lanes"]["coverage_route"] == "resident"
+    assert row["background_lanes"]["coverage_routes"] == ["resident"]
+    assert row["background_lanes"]["coverage"]["level"] == "green"
+    assert heartbeat["terminal_attempts"] == 4
+    assert heartbeat["failure_rate"] == pytest.approx(0.25)
+    assert capture["terminal_attempts"] == 2
+    assert capture["failure_rate"] == 1.0
+
+    inactive = client.get(
+        "/v1/admin/data-track/users?human_activity=inactive&human_days=7&lane_days=1",
+        headers=_admin_headers(),
+    ).get_json()
+    assert [row["user_id"] for row in inactive["users"]] == [inactive_user]
+    assert inactive["users"][0]["human_activity"]["state"] == "inactive"
+    assert inactive["users"][0]["background_lanes"]["lanes"]["heartbeat"][
+        "failure_rate"
+    ] == 1.0
+
+    page = client.get(
+        "/admin/data-track?view=users&human_activity=active&human_days=7&lane_days=1",
+        headers=_admin_headers(),
+    )
+    rendered = page.get_data(as_text=True)
+    assert page.status_code == 200, rendered
+    assert "后台道失败率（按用户）" in rendered
+    assert "chat.last_user_at" in rendered
+    assert "心跳 25%（成3/故1/分母4）" in rendered
+    assert "capture 100%（成0/故2/分母2）" in rendered
+    assert inactive_user not in rendered
+
+    summary = client.get(
+        "/v1/admin/data-track/summary", headers=_admin_headers()
+    )
+    assert summary.status_code == 200, summary.get_data(as_text=True)
+    summary_body = summary.get_json()["summary"]
+    assert snapshot_modes[-1] is False, (
+        "fleet-wide summary must not reopen legacy JSON breakdown scans"
+    )
+    assert summary_body["proactive_breakdowns_status"] == "omitted"
+    assert summary_body["proactive_failed_total"] is None
+
+
+def test_background_lane_coverage_uses_weakest_observed_and_current_route():
+    from admin import data_track
+
+    report = {
+        "window": {"days": 7},
+        "read_status": {"level": "ok", "message": ""},
+        "coverage_by_route": {
+            "resident": {"level": "green", "message": ""},
+            "model_api": {"level": "partial", "message": "late backfill"},
+        },
+        "users": {
+            "usr_switching": {
+                "lanes": {
+                    "heartbeat": {
+                        **data_track._background_lane_empty(),
+                        "completed": 3,
+                        "terminal_attempts": 3,
+                        "failure_rate": 0.0,
+                    },
+                },
+                "routes": {
+                    "resident": {"heartbeat": {"completed": 2}},
+                    "model_api": {"heartbeat": {"completed": 1}},
+                },
+            },
+            "usr_just_switched": {
+                "lanes": {
+                    "heartbeat": {
+                        **data_track._background_lane_empty(),
+                        "completed": 2,
+                        "terminal_attempts": 2,
+                        "failure_rate": 0.0,
+                    },
+                },
+                "routes": {"resident": {"heartbeat": {"completed": 2}}},
+            },
+        },
+    }
+
+    mixed = data_track._background_lanes_for_user(
+        report, user_id="usr_switching", route="model_api"
+    )
+    assert mixed["coverage_routes"] == ["model_api", "resident"]
+    assert mixed["coverage"]["level"] == "partial"
+    assert "model_api=partial" in mixed["coverage"]["message"]
+    assert "resident=green" in mixed["coverage"]["message"]
+
+    report["coverage_by_route"]["model_api"] = {
+        "level": "unavailable", "message": "no watermark"
+    }
+    switched = data_track._background_lanes_for_user(
+        report, user_id="usr_just_switched", route="model_api"
+    )
+    assert switched["coverage_routes"] == ["model_api", "resident"]
+    assert switched["coverage"]["level"] == "unavailable"
+    assert "model_api=unavailable" in switched["coverage"]["message"]
+
+
+def test_data_track_admin_connection_sets_session_timeout_and_resets(
+        monkeypatch):
+    executed = []
+
+    class FakeConnection:
+        def execute(self, sql):
+            executed.append(sql)
+
+    class FakeLease:
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        def __enter__(self):
+            return self.connection
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakePool:
+        def connection(self, *, timeout):
+            assert timeout == 5
+            return FakeLease()
+
+    monkeypatch.setattr(db, "get_pool", lambda: FakePool())
+    with pytest.raises(RuntimeError, match="probe"):
+        with db._admin_data_track_connection():
+            raise RuntimeError("probe")
+
+    assert executed == [
+        "SET statement_timeout = '5000ms'",
+        "RESET statement_timeout",
+    ]
 
 
 def test_admin_data_track_reports_screen_frame_storage_and_freshness(client):
