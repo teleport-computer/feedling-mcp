@@ -1,3 +1,8 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
+
 # tools/e2e — 发版 P0 冒烟（一键）
 
 `docs/testing/RELEASE_TESTING_PROTOCOL.md` §3 的可执行实现。**只打 test 环境**
