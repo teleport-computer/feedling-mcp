@@ -17,6 +17,7 @@ on:
           - check-test-transport
           - diagnose-test-photo
           - restart-test-cvm
+          - deploy-test-preview
 
 # Pull-request validation is replaceable, but branch pushes may already be
 # between the main-CVM and runner-CVM mutations. Never cancel a release unit.
@@ -1251,7 +1252,11 @@ jobs:
 
   detect-cvm-changes-test:
     name: detect CVM changes (test)
-    if: github.ref == 'refs/heads/test' && github.event_name == 'push'
+    if: >-
+      (github.ref == 'refs/heads/test' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' &&
+       inputs.operation == 'deploy-test-preview' &&
+       startsWith(github.ref, 'refs/heads/codex/'))
     runs-on: ubuntu-24.04
     outputs:
       cvm: ${{ steps.filter.outputs.cvm }}
@@ -1284,8 +1289,10 @@ jobs:
     name: validate test Runtime V2 deploy prerequisites
     needs: [detect-cvm-changes-test]
     if: |
-      github.ref == 'refs/heads/test' &&
-      github.event_name == 'push' &&
+      ((github.ref == 'refs/heads/test' && github.event_name == 'push') ||
+       (github.event_name == 'workflow_dispatch' &&
+        inputs.operation == 'deploy-test-preview' &&
+        startsWith(github.ref, 'refs/heads/codex/'))) &&
       needs.detect-cvm-changes-test.outputs.cvm == 'true'
     runs-on: ubuntu-24.04
     permissions:
@@ -2496,17 +2503,17 @@ jobs:
       # deploy isn't done until the runner CVM(s) redeploy. It lives in the
       # notify-lark-prod-deploy job (needs: deploy-cvm + deploy-prod-runner-cvm).
 
-  # 手动重部署 test（代码没变、只想重新走一遍部署）：workflow_dispatch 不行——
-  # 下面的 if 要求 event_name == 'push'，且 detect-cvm-changes-test 的 paths-filter
-  # 必须命中。空 commit 同样无效。办法是对 filter 白名单里的文件（backend/**、
-  # deploy/docker-compose.phala.test.yaml、本文件……）做一处无害改动后 push 到 test，
-  # 且 commit message 不要带 [skip ci]。
+  # 手动重部署 test（代码没变、只想重新走一遍部署）仍应通过 test 分支 push。
+  # deploy-test-preview 仅允许显式 dispatch 一个 codex/* 分支，用于 PR 合并前的
+  # 共享 test 环境验收；它继续经过完整 prerequisite、attestation 和 canary gate。
   deploy-test-cvm:
     name: deploy CVM (test)
     needs: [forge-test, python-tests, docker-build, docker-build-worker-deps, lint, dcap-python, detect-cvm-changes-test, validate-test-runtime-prerequisites]
     if: |
-      github.ref == 'refs/heads/test' &&
-      github.event_name == 'push' &&
+      ((github.ref == 'refs/heads/test' && github.event_name == 'push') ||
+       (github.event_name == 'workflow_dispatch' &&
+        inputs.operation == 'deploy-test-preview' &&
+        startsWith(github.ref, 'refs/heads/codex/'))) &&
       needs.detect-cvm-changes-test.outputs.cvm == 'true'
     runs-on: ubuntu-24.04
     permissions:
@@ -2760,8 +2767,10 @@ jobs:
     name: deploy runner CVM (test)
     needs: [deploy-test-cvm, detect-cvm-changes-test]
     if: |
-      github.ref == 'refs/heads/test' &&
-      github.event_name == 'push' &&
+      ((github.ref == 'refs/heads/test' && github.event_name == 'push') ||
+       (github.event_name == 'workflow_dispatch' &&
+        inputs.operation == 'deploy-test-preview' &&
+        startsWith(github.ref, 'refs/heads/codex/'))) &&
       needs.detect-cvm-changes-test.outputs.cvm == 'true'
     runs-on: ubuntu-24.04
     permissions:
