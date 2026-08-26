@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
+from core.store_sections import StoreSection  # noqa: E402
 from accounts import registry as accounts_registry  # noqa: E402
 import db  # noqa: E402
 
@@ -167,8 +168,10 @@ def test_history_and_single_body_read_past_hot_window(user, monkeypatch):
         _append_db_only(user_id, f"new-{index}", oldest_ts + index)
 
     monkeypatch.setattr(core_store, "MAX_CHAT_MESSAGES", 3)
+    hot_store = core_store.get_store(
+        user_id, require={StoreSection.CHAT}
+    )
     core_store._evict_store(user_id)
-    hot_store = core_store.get_store(user_id)
     assert [row["id"] for row in hot_store.chat_messages] == [
         "new-3", "new-4", "new-5",
     ]

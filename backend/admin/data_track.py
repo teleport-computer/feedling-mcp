@@ -33,6 +33,7 @@ from proactive import service as proactive_service
 from screen import screen_read_core
 from bootstrap import gates as boot_gates
 from core import store as core_store
+from core.store_sections import StoreSection
 from core import util as core_util
 from identity import service as identity_service
 from memory import dream_trace as memory_dream_trace
@@ -1810,7 +1811,14 @@ def _v2_profile_detail(user_id: str) -> dict:
 
 def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) -> dict:
     user_id = str(user_entry.get("user_id") or "")
-    store = core_store.get_store(user_id)
+    store = core_store.get_store(
+        user_id,
+        require={
+            StoreSection.CHAT,
+            StoreSection.TOKENS,
+            StoreSection.WORLD_BOOKS,
+        },
+    )
     route_data = db.get_blob(store.user_id, "onboarding_route") or {}
     route = onboarding._load_onboarding_route(store)
     access_modes = registry._public_access_mode_state(dict(user_entry), route)

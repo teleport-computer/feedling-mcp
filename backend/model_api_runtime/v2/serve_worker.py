@@ -77,6 +77,7 @@ from capabilities import tool_schema as cap_tool_schema
 from core import envelope as core_envelope
 from core import runtime_token
 from core import store as core_store
+from core.store_sections import StoreSection
 from core import wake_bus as core_wake_bus
 from genesis import daemon as genesis_daemon
 from hosted import config_store as hosted_config_store
@@ -3288,7 +3289,7 @@ def _last_user_msg_ts(user_id: str) -> float | None:
     """该用户最后一条 `role in {"user", "human"}` 消息的 ts —— 直接读 `store.chat_messages` 的明文
     `role`/`ts` 列（**绝不 enclave**：只有 `body_ct` 是密文，role/ts 是明文）。没有任何
     user 行时返回 None（gate 视作「未在对话」，不触发 chatting 让路）。"""
-    store = core_store.get_store(user_id)
+    store = core_store.get_store(user_id, require={StoreSection.CHAT})
     rows = getattr(store, "chat_messages", []) or []
     last_ts: float | None = None
     for m in rows:
@@ -4717,7 +4718,9 @@ def _read_worldbook_context(
 ) -> dict:
     """Match this foreground turn against the user's encrypted World Book."""
     body, status = worldbook_core.match(
-        core_store.get_store(str(user_id)),
+        core_store.get_store(
+            str(user_id), require={StoreSection.WORLD_BOOKS}
+        ),
         {"messages": list(messages or [])},
         api_key=None,
         runtime_token=str(runtime_token or ""),

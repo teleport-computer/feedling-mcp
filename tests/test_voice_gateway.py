@@ -664,7 +664,9 @@ def test_replayed_cancel_route_remains_idempotent_and_cleans(monkeypatch):
                         lambda *a, **k: [])
     monkeypatch.setattr(voice_cleanup, "persist_transcript_card",
                         lambda *a, **k: True)
-    monkeypatch.setattr(core_store, "get_store", lambda *_args: store)
+    monkeypatch.setattr(
+        core_store, "get_store", lambda *_args, **_kwargs: store
+    )
     from voice import transcript_store as _ts
 
     monkeypatch.setattr(_ts, "exists", lambda *_args: False)
@@ -1212,7 +1214,9 @@ def test_cancel_archives_the_content_the_server_has_instead_of_deleting_it(
                         lambda *_args: "rt")
     monkeypatch.setattr(results, "delete_call_state",
                         lambda *_args: {"results_deleted": 0, "streams_deleted": 0})
-    monkeypatch.setattr(core_store, "get_store", lambda *_args: Store())
+    monkeypatch.setattr(
+        core_store, "get_store", lambda *_args, **_kwargs: Store()
+    )
     # 服务端**有**真实内容,尽管客户端以为这通是空的
     monkeypatch.setattr(
         voice_cleanup, "transcript_turns_from_rows",

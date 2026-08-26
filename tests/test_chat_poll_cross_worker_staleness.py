@@ -35,6 +35,7 @@ from accounts import registry as accounts_registry  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
+from core.store_sections import StoreSection  # noqa: E402
 from core import wake_bus  # noqa: E402
 
 
@@ -144,7 +145,7 @@ def test_poll_redelivers_unanswered_row_older_than_hot_cache(user):
 
 def test_v2_wake_incrementally_refreshes_cached_worker(user, monkeypatch):
     uid, _api_key = user
-    store = core_store.get_store(uid)
+    store = core_store.get_store(uid, require={StoreSection.CHAT})
     _write_user_message_bypassing_cache(uid, "m_v2_wake", time.time())
     target_version = db.chat_change_version(uid)
     assert all(row.get("id") != "m_v2_wake" for row in store.chat_messages)
