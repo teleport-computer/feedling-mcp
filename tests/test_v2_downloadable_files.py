@@ -865,6 +865,84 @@ def test_model_selected_shared_work_uses_compact_delivery_after_large_write(
     )
 
 
+def test_chinese_canvas_compact_delivery_preserves_requested_card_metadata(
+    monkeypatch,
+):
+    files = []
+    request = (
+        "请生成并发送一个 Canvas，文件名为修前基线-中文.io.html。"
+        "附件卡标题使用中文 Canvas 基线，副标题使用交互测试，并用中文回复。"
+    )
+
+    async def on_file(path, revision, *, title="", subtitle=""):
+        files.append((path, revision, title, subtitle))
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content="ok: workspace_write applied at revision 1",
+                metadata={"workspace_revision": 1},
+            )
+            for call in tool_calls
+        ]
+
+    outcome, calls, replies, messages_seen = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "write-cn-canvas",
+                    "name": "workspace_write",
+                    "args": {
+                        "path": "/workspace/修前基线-中文.io.html",
+                        "content": "<main>中文 Canvas 基线</main>",
+                        "expected_revision": 0,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "send-cn-canvas",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/修前基线-中文.io.html",
+                        "revision": 1,
+                        "title": "中文 Canvas 基线",
+                        "subtitle": "交互测试",
+                        "completion_message": "中文 Canvas 已经生成，可以直接打开。",
+                    },
+                }],
+                "usage": {},
+            },
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        file_requirement_messages=[{"role": "user", "content": request}],
+        max_calls=3,
+        suppress_native_reasoning=True,
+    )
+
+    assert calls[1] == ("send_file",)
+    assert files == [
+        (
+            "/workspace/修前基线-中文.io.html",
+            1,
+            "中文 Canvas 基线",
+            "交互测试",
+        )
+    ]
+    assert replies == [("中文 Canvas 已经生成，可以直接打开。", True)]
+    assert outcome.stop_reason == "final_text"
+    compact_prompt = messages_seen[1][0]["content"]
+    assert request in compact_prompt
+    assert "title、subtitle 和 completion_message" in compact_prompt
+    assert self_thinking.INSTRUCTION.strip() in compact_prompt
+
+
 def test_canvas_update_compact_delivery_preserves_request_and_corrects_metadata(
     monkeypatch,
 ):
@@ -2014,7 +2092,25 @@ def test_workspace_canvas_file_result_preserves_display_metadata(monkeypatch):
         )
 
 
-def test_workspace_file_effect_seals_rendered_bytes_as_binary(monkeypatch):
+@pytest.mark.parametrize(
+    ("name", "mime_type", "data"),
+    [
+        ("修前基线-中文.md", "text/markdown", b"# baseline\n"),
+        ("修前基线-中文.docx", document_render.DOCX_MIME, b"PK\x03\x04\xff\x00"),
+        ("修前基线-中文.pdf", document_render.PDF_MIME, b"%PDF-1.7\n\xff"),
+        (
+            "修前基线-中文.io.html",
+            "text/html",
+            b"<html><body>Canvas baseline</body></html>",
+        ),
+    ],
+)
+def test_workspace_file_effect_seals_all_attachment_formats_as_binary(
+    monkeypatch,
+    name,
+    mime_type,
+    data,
+):
     captured = {}
 
     def build_envelope(_store, plaintext, **kwargs):
@@ -2028,19 +2124,19 @@ def test_workspace_file_effect_seals_rendered_bytes_as_binary(monkeypatch):
         build_envelope,
     )
     reply = worker.WorkspaceFileReply(
-        path="/workspace/中文附件.docx",
-        name="中文附件.docx",
-        mime_type=document_render.DOCX_MIME,
-        data=b"PK\x03\x04\xff\x00",
+        path=f"/workspace/{name}",
+        name=name,
+        mime_type=mime_type,
+        data=data,
     )
 
     effect = worker._build_encrypted_file_reply_effect_payload(
-        object(), reply, effect_id="effect-docx"
+        object(), reply, effect_id=f"effect-{name}"
     )
 
     assert captured["plaintext"] == reply.data
     assert captured["content_kind"] == "binary"
-    assert effect["message_extra"]["file_name"] == "中文附件.docx"
+    assert effect["message_extra"]["file_name"] == name
 
 
 def test_workspace_file_result_renders_real_word_and_pdf_documents():
