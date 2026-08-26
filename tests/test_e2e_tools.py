@@ -525,6 +525,150 @@ def test_cleanup_orphans_semantics(monkeypatch, tmp_path) -> None:
     assert not any("api.feedling.app/v1" in u and "test-api" not in u for u in posted)
 
 
+def test_cleanup_orphans_preserves_failure_site_within_retention(
+    monkeypatch, tmp_path,
+) -> None:
+    import json as _json
+    from datetime import datetime, timedelta, timezone
+
+    import httpx
+    import tools.e2e.client as client_mod
+
+    orphans = tmp_path / "orphans"
+    failures = tmp_path / "failures"
+    orphans.mkdir()
+    site = failures / "usr_recent_failure"
+    site.mkdir(parents=True)
+    (orphans / "usr_recent_failure.json").write_text(_json.dumps({
+        "api_url": TEST_API,
+        "user_id": "usr_recent_failure",
+        "api_key": "key-recent-failure",
+    }))
+    (site / "evidence.json").write_text(_json.dumps({
+        "created_at": (
+            datetime.now(timezone.utc)
+            - timedelta(days=p0.FAILURE_RETENTION_DAYS / 2)
+        ).isoformat(),
+        "retention_days": p0.FAILURE_RETENTION_DAYS,
+        "user_id": "usr_recent_failure",
+    }))
+    monkeypatch.setattr(client_mod, "_ORPHANS_DIR", orphans)
+    monkeypatch.setattr(client_mod, "_FAILURES_DIR", failures)
+    monkeypatch.setattr(p0, "_ADMIN_TOKEN_FILE", tmp_path / "missing-admin-token")
+
+    posts: list[str] = []
+    monkeypatch.setattr(httpx, "post", lambda url, **_kw: posts.append(url))
+
+    assert p0._cleanup_orphans() == 1
+    assert posts == []
+    assert (orphans / "usr_recent_failure.json").exists()
+    assert site.exists()
+
+
+@pytest.mark.parametrize(
+    "invalid_evidence",
+    ["unreadable", "negative_retention", "user_id_mismatch"],
+)
+def test_cleanup_orphans_fails_closed_on_invalid_failure_evidence(
+    monkeypatch, tmp_path, invalid_evidence,
+) -> None:
+    import json as _json
+    from datetime import datetime, timedelta, timezone
+
+    import httpx
+    import tools.e2e.client as client_mod
+
+    orphans = tmp_path / "orphans"
+    failures = tmp_path / "failures"
+    orphans.mkdir()
+    site = failures / "usr_unreadable_failure"
+    site.mkdir(parents=True)
+    orphan = orphans / "usr_unreadable_failure.json"
+    orphan.write_text(_json.dumps({
+        "api_url": TEST_API,
+        "user_id": "usr_unreadable_failure",
+        "api_key": "key-unreadable-failure",
+    }))
+    evidence = {
+        "created_at": (
+            datetime.now(timezone.utc)
+            - timedelta(days=p0.FAILURE_RETENTION_DAYS + 1)
+        ).isoformat(),
+        "retention_days": p0.FAILURE_RETENTION_DAYS,
+        "user_id": "usr_unreadable_failure",
+    }
+    if invalid_evidence == "unreadable":
+        (site / "evidence.json").write_text("{not json")
+    else:
+        if invalid_evidence == "negative_retention":
+            evidence["retention_days"] = -1
+        else:
+            evidence["user_id"] = "usr_different_failure"
+        (site / "evidence.json").write_text(_json.dumps(evidence))
+    monkeypatch.setattr(client_mod, "_ORPHANS_DIR", orphans)
+    monkeypatch.setattr(client_mod, "_FAILURES_DIR", failures)
+    monkeypatch.setattr(p0, "_ADMIN_TOKEN_FILE", tmp_path / "missing-admin-token")
+
+    posts: list[str] = []
+
+    def fake_post(url, **_kw):
+        posts.append(url)
+        return FakeResponse(200, {"deleted": True})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    assert p0._cleanup_orphans() == 1
+    assert posts == []
+    assert orphan.exists()
+    assert site.exists()
+
+
+def test_cleanup_orphans_fails_closed_on_orphan_user_id_mismatch(
+    monkeypatch, tmp_path,
+) -> None:
+    import json as _json
+    from datetime import datetime, timedelta, timezone
+
+    import httpx
+    import tools.e2e.client as client_mod
+
+    orphans = tmp_path / "orphans"
+    failures = tmp_path / "failures"
+    orphans.mkdir()
+    site = failures / "usr_manifest_name"
+    site.mkdir(parents=True)
+    orphan = orphans / "usr_manifest_name.json"
+    orphan.write_text(_json.dumps({
+        "api_url": TEST_API,
+        "user_id": "usr_manifest_body",
+        "api_key": "key-mismatched-orphan",
+    }))
+    (site / "evidence.json").write_text(_json.dumps({
+        "created_at": (
+            datetime.now(timezone.utc)
+            - timedelta(days=p0.FAILURE_RETENTION_DAYS / 2)
+        ).isoformat(),
+        "retention_days": p0.FAILURE_RETENTION_DAYS,
+        "user_id": "usr_manifest_name",
+    }))
+    monkeypatch.setattr(client_mod, "_ORPHANS_DIR", orphans)
+    monkeypatch.setattr(client_mod, "_FAILURES_DIR", failures)
+    monkeypatch.setattr(p0, "_ADMIN_TOKEN_FILE", tmp_path / "missing-admin-token")
+
+    posts: list[str] = []
+
+    def fake_post(url, **_kw):
+        posts.append(url)
+        return FakeResponse(200, {"deleted": True})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    assert p0._cleanup_orphans() == 1
+    assert posts == []
+    assert orphan.exists()
+    assert site.exists()
+
+
 def test_expired_failure_cleanup_requires_admin_404_then_removes_site(
     monkeypatch, tmp_path,
 ) -> None:
@@ -543,8 +687,11 @@ def test_expired_failure_cleanup_requires_admin_404_then_removes_site(
         "api_url": TEST_API, "user_id": "usr_expired", "api_key": "key-expired",
     }))
     (site / "evidence.json").write_text(_json.dumps({
-        "created_at": (datetime.now(timezone.utc) - timedelta(days=8)).isoformat(),
-        "retention_days": 7,
+        "created_at": (
+            datetime.now(timezone.utc)
+            - timedelta(days=p0.FAILURE_RETENTION_DAYS + 1)
+        ).isoformat(),
+        "retention_days": p0.FAILURE_RETENTION_DAYS,
         "user_id": "usr_expired",
     }))
     token_file = tmp_path / "admin-token"
