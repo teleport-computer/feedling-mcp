@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Agent Mailbox
 
 Codex and Claude Code can coordinate through a local repo mailbox plus tmux
