@@ -145,16 +145,7 @@ def _within_night_window(store, *, now: float) -> bool:
 
 
 def _live_user_turn_count(store) -> int:
-    chat_messages = getattr(store, "chat_messages", None)
-    if not isinstance(chat_messages, list):
-        return 0
-    chat_lock = getattr(store, "chat_lock", None)
-    if chat_lock is not None:
-        with chat_lock:
-            messages = [dict(msg) for msg in chat_messages if isinstance(msg, Mapping)]
-    else:
-        messages = [dict(msg) for msg in chat_messages if isinstance(msg, Mapping)]
-    return sum(1 for msg in messages if str(msg.get("role") or "").strip() == "user")
+    return db.chat_user_turn_count_strict(store.user_id)
 
 
 def _dream_snapshot(store) -> dict[str, Any]:

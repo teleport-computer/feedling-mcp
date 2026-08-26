@@ -31,6 +31,11 @@ class _FakeStore:
         self.frames_lock = threading.Lock()
         self.chat_messages = []
         self.frames_meta = []
+        self.section_requests = []
+
+    def ensure_sections(self, sections, **kwargs):
+        self.section_requests.append((frozenset(sections), dict(kwargs)))
+        return True
 
     def list_gate_decisions(self, limit=1000):
         return [{
@@ -116,7 +121,16 @@ def test_dashboard_reads_v2_turn_action_tool_records_and_round3_labels(monkeypat
         lambda _user_id, stream, limit=100, since_epoch=0.0: list(streams.get(stream, []))[-limit:],
     )
 
-    snapshot = dashboard._proactive_debug_snapshot(_FakeStore())
+    store = _FakeStore()
+    snapshot = dashboard._proactive_debug_snapshot(store)
+    assert store.section_requests == [
+        (
+            frozenset(
+                {dashboard.StoreSection.CHAT, dashboard.StoreSection.FRAMES}
+            ),
+            {"reason": "first_use", "strict": True},
+        )
+    ]
     assert snapshot["counts"]["v2_turns"] == 1
     assert snapshot["counts"]["v2_turn_actions"] == 1
     assert snapshot["counts"]["v2_tool_traces"] == 1
