@@ -296,6 +296,11 @@ class UserStore:
         self.chat_version = 0
         self.chat_max_seq = 0
         self._chat_messages_by_id: dict[str, dict] = {}
+        # False until a bounded, version-consistent DB snapshot has been
+        # installed.  Committed writes must not turn a metadata-only shell
+        # into a partial cache containing only the rows written locally.
+        self._chat_has_complete_snapshot = False
+        self._chat_cache_generation = 0
         self._chat_last_version_check_mono = 0.0
         self.chat_waiters: list[threading.Event] = []
         self.chat_waiters_lock = threading.Lock()
@@ -624,6 +629,12 @@ class UserStore:
             self.chat_max_seq = 0
         if not hasattr(self, "_chat_cache_generation"):
             self._chat_cache_generation = 0
+        if not hasattr(self, "_chat_has_complete_snapshot"):
+            # Lightweight stores built with ``__new__`` predate section slots
+            # and represent an already-populated legacy cache in tests/callers.
+            self._chat_has_complete_snapshot = not hasattr(
+                self, "_section_slots"
+            )
         if not hasattr(self, "_chat_messages_by_id"):
             self._chat_messages_by_id = {}
         if (
@@ -644,6 +655,21 @@ class UserStore:
                 (int(row.get("seq") or 0) for row in self.chat_messages),
                 default=0,
             )
+
+    def chat_cache_loaded(self) -> bool:
+        """Return whether chat rows came from a complete bounded snapshot."""
+        return bool(getattr(self, "_chat_has_complete_snapshot", False))
+
+    def _mark_chat_cache_dirty_locked(
+        self,
+        *,
+        version: int | None = None,
+    ) -> None:
+        """Fence in-flight loads without materializing a cold chat cache."""
+        self._chat_cache_generation += 1
+        slots = getattr(self, "_section_slots", None)
+        if slots is not None:
+            slots[StoreSection.CHAT].mark_stale(dirty_version=version)
 
     def _replace_chat_rows_locked(
         self,
@@ -674,6 +700,7 @@ class UserStore:
             (int(row.get("seq") or 0) for row in self.chat_messages),
             default=0,
         )
+        self._chat_has_complete_snapshot = True
         self._chat_cache_generation = (
             int(getattr(self, "_chat_cache_generation", 0)) + 1
         )
@@ -685,6 +712,9 @@ class UserStore:
         version: int | None = None,
     ) -> None:
         UserStore._ensure_chat_cache_state_locked(self)
+        if not UserStore.chat_cache_loaded(self):
+            UserStore._mark_chat_cache_dirty_locked(self, version=version)
+            return
         by_id = dict(self._chat_messages_by_id)
         for raw in rows:
             incoming = dict(raw)
@@ -707,6 +737,9 @@ class UserStore:
         fields: dict,
     ) -> dict | None:
         UserStore._ensure_chat_cache_state_locked(self)
+        if not UserStore.chat_cache_loaded(self):
+            UserStore._mark_chat_cache_dirty_locked(self)
+            return None
         existing = self._chat_messages_by_id.get(str(msg_id))
         if existing is None:
             return None
@@ -735,6 +768,9 @@ class UserStore:
             return
         with self.chat_lock:
             self._ensure_chat_cache_state_locked()
+            if not self.chat_cache_loaded():
+                self._mark_chat_cache_dirty_locked()
+                return
             if not any(
                 message_id in self._chat_messages_by_id
                 for message_id in removed
@@ -746,6 +782,15 @@ class UserStore:
                 if str(row.get("id") or "") not in removed
             ]
             self._replace_chat_rows_locked(remaining, version=self.chat_version)
+
+    def apply_committed_chat_clear(self) -> None:
+        """Apply an authoritative clear and fence any snapshot already read."""
+        with self.chat_lock:
+            self._ensure_chat_cache_state_locked()
+            self.chat_messages = []
+            self._chat_messages_by_id = {}
+            self.chat_max_seq = 0
+            self._chat_cache_generation += 1
 
     def reload_chat_hot_strict(self) -> list[dict]:
         """Replace only chat state from one version-consistent hot snapshot."""

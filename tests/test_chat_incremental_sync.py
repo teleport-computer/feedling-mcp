@@ -8,6 +8,7 @@ import threading
 import sys
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -16,8 +17,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from core import store as core_store
+from core.store_sections import SectionStatus, StoreSection
 import db
 from conftest import seed_user
+from chat import chat_core
+from proactive import capture_scheduler
 
 
 @contextmanager
@@ -68,6 +72,101 @@ def test_chat_hot_cache_limit_defaults_and_clamps(monkeypatch):
     assert core_store._chat_hot_cache_limit() == 5000
     monkeypatch.setenv("FEEDLING_CHAT_HOT_CACHE_LIMIT", "broken")
     assert core_store._chat_hot_cache_limit() == 5000
+
+
+def test_cold_committed_rows_do_not_create_partial_chat_cache(monkeypatch):
+    monkeypatch.setenv("FEEDLING_STORE_LOAD_MODE", "lazy")
+    store = core_store.UserStore("u-cold-commit")
+
+    store.apply_committed_chat_rows([_row("new", 1)], version=1)
+
+    assert store.chat_messages == []
+    assert store.chat_version == 0
+    assert store._section_slots[StoreSection.CHAT].status is SectionStatus.UNLOADED
+    assert store._section_slots[StoreSection.CHAT].dirty_version == 1
+
+
+def test_cold_strict_append_persists_without_populating_chat_cache(monkeypatch):
+    monkeypatch.setenv("FEEDLING_STORE_LOAD_MODE", "lazy")
+    store = core_store.UserStore("u-cold-append")
+    persisted = []
+    monkeypatch.setattr(
+        core_store.db,
+        "chat_append_strict",
+        lambda user_id, msg_id, ts, doc, max_messages: (
+            persisted.append((user_id, msg_id, doc)) or 17
+        ),
+    )
+    monkeypatch.setattr(
+        core_store.db,
+        "chat_load_hot_snapshot_strict",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("cold append loaded a hot snapshot")
+        ),
+    )
+    monkeypatch.setattr(
+        capture_scheduler,
+        "record_chat_append",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = store.append_chat(
+        "user",
+        "chat",
+        {
+            "id": "m-cold",
+            "v": 1,
+            "body_ct": "ciphertext",
+            "nonce": "nonce",
+            "K_user": "wrapped-key",
+            "owner_user_id": store.user_id,
+        },
+        strict=True,
+    )
+
+    assert result["id"] == "m-cold"
+    assert persisted and persisted[0][:2] == (store.user_id, "m-cold")
+    assert store.chat_messages == []
+    assert store._section_slots[StoreSection.CHAT].status is SectionStatus.UNLOADED
+
+
+def test_clear_during_first_load_cannot_resurrect_rows(monkeypatch):
+    monkeypatch.setenv("FEEDLING_STORE_LOAD_MODE", "lazy")
+    store = core_store.UserStore("u-clear-load-race")
+    snapshot_read = threading.Event()
+    release_snapshot = threading.Event()
+    calls = []
+
+    def snapshot(_user_id, _limit):
+        calls.append(len(calls) + 1)
+        if len(calls) == 1:
+            snapshot_read.set()
+            assert release_snapshot.wait(2)
+            return 1, [_row("old", 1)]
+        return 2, []
+
+    monkeypatch.setattr(core_store.db, "chat_load_hot_snapshot_strict", snapshot)
+    monkeypatch.setattr(chat_core.db, "chat_clear", lambda _user_id: 1)
+    monkeypatch.setattr(store, "notify_chat_waiters", lambda: None)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        loading = pool.submit(
+            store.ensure_sections,
+            {StoreSection.CHAT},
+            reason="first_use",
+            strict=True,
+        )
+        assert snapshot_read.wait(2)
+        body, status = chat_core.clear_history(
+            store, {"confirm": "clear-chat-history"}
+        )
+        assert status == 200 and body["cleared"] is True
+        release_snapshot.set()
+        assert loading.result(timeout=2) is True
+
+    assert calls == [1, 2]
+    assert store.chat_messages == []
+    assert store._section_slots[StoreSection.CHAT].status is SectionStatus.FRESH
 
 
 def test_continuous_events_apply_upsert_update_delete_and_wake_once(monkeypatch):
