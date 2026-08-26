@@ -615,6 +615,72 @@ def test_language_follow_emits_once_for_terminal_visible_body_after_thinking(
     assert private_thinking not in json.dumps(language_traces, ensure_ascii=False)
 
 
+def test_chat_thinking_and_visible_language_mismatch_share_one_correction(
+    monkeypatch,
+):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_thinking_visible_language_correction"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-thinking-visible-language-correction")
+    _stub_envelope_build(monkeypatch)
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: _FakeCapResult({"snippet": "result"}),
+    )
+    calls = _script_provider(monkeypatch, [
+        _tool_round(_tc("s1", "web_search", query="first")),
+        _tool_round(_tc("s2", "web_search", query="second")),
+        _text_round(
+            "<think>The file is ready and I will finish in English.</think>"
+            "Your work is saved and delivered successfully. You can open it now."
+        ),
+        _text_round(
+            "<think>文件已经准备好，我会用中文完成回复。</think>"
+            "文件已经生成并发送，可以直接下载了。"
+        ),
+    ])
+    traces = []
+    deps = _deps(messages=[{
+        "id": "m-thinking-visible-language-correction",
+        "ts": 10.0,
+        "role": "user",
+        "content": "请处理这件事情，完成以后用中文给我一句简短回复。",
+    }])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    assert len(calls) == 4
+    correction_prompt = str(calls[3]["messages"])
+    assert language_follow.CORRECTION_INSTRUCTION in correction_prompt
+    assert "思考段和可见回复都与用户语言一致" in correction_prompt
+    assert [row["body_ct"] for row in _bubbles(uid)] == [
+        "文件已经生成并发送，可以直接下载了。"
+    ]
+    assert _bubbles(uid)[0]["thinking_body_ct"] == (
+        "文件已经准备好，我会用中文完成回复。"
+    )
+    language_trace = next(
+        trace for trace in traces if trace["type"] == "reply.language_follow"
+    )
+    assert language_trace["detail"] == {
+        "user_script": "han",
+        "reply_script": "han",
+        "outcome": "match",
+        "lane": "chat",
+        "correction_attempted": True,
+        "correction_outcome": "corrected",
+    }
+
+
 def test_chat_language_mismatch_rewrites_once_and_publishes_matching_reply(
     monkeypatch,
 ):
