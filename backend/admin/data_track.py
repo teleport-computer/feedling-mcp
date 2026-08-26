@@ -216,12 +216,17 @@ def _memory_stats(store: UserStore) -> dict:
         if isinstance(j, dict)
     ]
     actions_written = 0
+    invalid_actions_written = 0
     for job in capture_jobs:
         if not isinstance(job, dict):
             continue
         try:
-            actions_written += int(job.get("actions_written") or 0)
-        except (TypeError, ValueError):
+            parsed_actions = int(job.get("actions_written") or 0)
+            if parsed_actions < 0:
+                raise ValueError("negative_actions_written")
+            actions_written += parsed_actions
+        except (TypeError, ValueError, OverflowError):
+            invalid_actions_written += 1
             continue
     return {
         "total": counts["total"],
@@ -235,6 +240,10 @@ def _memory_stats(store: UserStore) -> dict:
         "capture_jobs_by_status": _count_rows(capture_jobs, "status"),
         "capture_jobs_by_mode": _count_rows(capture_jobs, "mode"),
         "capture_actions_written": actions_written,
+        "capture_actions_written_status": (
+            "invalid" if invalid_actions_written else "ok"
+        ),
+        "capture_actions_written_invalid_rows": invalid_actions_written,
         "last_capture_at": core_util._epoch_to_iso(max(capture_epochs, default=0)),
         "first_created_at": core_util._epoch_to_iso(min([e for e in created_epochs if e], default=0)),
         "last_created_at": core_util._epoch_to_iso(max(created_epochs, default=0)),
@@ -282,22 +291,31 @@ def _memory_capture_validation_detail(store: UserStore, *, limit: int = 50) -> d
     )
     skipped: dict[str, int] = {}
     applied = {"added": 0, "superseded": 0}
+    invalid_count_fields: list[str] = []
     rows: list[dict] = []
     for job in jobs:
         result = job.get("capture_result") or {}
         for reason, count in (result.get("skipped") or {}).items():
             try:
-                skipped[str(reason)] = skipped.get(str(reason), 0) + max(
-                    0, int(count or 0)
+                parsed_count = int(count or 0)
+                if parsed_count < 0:
+                    raise ValueError("negative_skipped_count")
+                skipped[str(reason)] = (
+                    skipped.get(str(reason), 0) + parsed_count
                 )
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                invalid_count_fields.append(f"skipped.{str(reason)[:80]}")
                 continue
         for action in applied:
             try:
-                applied[action] += max(
-                    0, int((result.get("applied") or {}).get(action) or 0)
+                parsed_count = int(
+                    (result.get("applied") or {}).get(action) or 0
                 )
-            except (TypeError, ValueError):
+                if parsed_count < 0:
+                    raise ValueError("negative_applied_count")
+                applied[action] += parsed_count
+            except (TypeError, ValueError, OverflowError):
+                invalid_count_fields.append(f"applied.{action}")
                 continue
         if len(rows) < limit:
             rows.append({
@@ -319,6 +337,8 @@ def _memory_capture_validation_detail(store: UserStore, *, limit: int = 50) -> d
         "jobs_total": len(jobs),
         "applied": applied,
         "skipped": skipped,
+        "counts_status": "invalid" if invalid_count_fields else "ok",
+        "invalid_count_fields": sorted(set(invalid_count_fields)),
         "jobs": rows,
     }
 
@@ -622,13 +642,25 @@ def _data_track_iso(value) -> str:
     return str(value or "")
 
 
-def _data_track_count_dict(raw: dict | None) -> dict:
+def _data_track_count_dict(
+    raw: dict | None,
+    *,
+    invalid_fields: list[str] | None = None,
+    field_prefix: str = "",
+) -> dict:
     out: dict[str, int] = {}
     for key, value in (raw or {}).items():
         try:
-            out[str(key or "unknown")] = int(value or 0)
+            parsed = int(value or 0)
+            if parsed < 0:
+                raise ValueError("negative_count")
+            out[str(key or "unknown")] = parsed
         except Exception:
             out[str(key or "unknown")] = 0
+            if invalid_fields is not None:
+                invalid_fields.append(
+                    f"{field_prefix}.{str(key or 'unknown')}".strip(".")
+                )
     return out
 
 
@@ -653,20 +685,27 @@ def _validated_dau_day(value: str) -> str:
     return raw
 
 
-def _default_usage_histogram_day(rows: list[dict]) -> str:
+def _default_usage_histogram_day(
+    rows: list[dict], *, invalid_days: list[str] | None = None,
+) -> str:
     """Latest completed Beijing day present in the DAU table, or yesterday."""
     today = datetime.now(_SHANGHAI_TZ).date()
+    selected = ""
     for row in rows:
         raw = str(row.get("day") or "").strip()
         if not _DAU_DAY_RE.fullmatch(raw):
+            if raw and invalid_days is not None:
+                invalid_days.append(raw[:40])
             continue
         try:
             candidate = date.fromisoformat(raw)
         except ValueError:
+            if invalid_days is not None:
+                invalid_days.append(raw[:40])
             continue
-        if candidate < today:
-            return candidate.isoformat()
-    return (today - timedelta(days=1)).isoformat()
+        if candidate < today and not selected:
+            selected = candidate.isoformat()
+    return selected or (today - timedelta(days=1)).isoformat()
 
 
 def _bj_iso(value) -> str:
@@ -718,15 +757,42 @@ def _data_track_app_usage_from_snapshot(snap: dict) -> dict:
     aggregation). ``last_at`` is a server ingest epoch; keep it raw for the
     Shanghai-day DAU roll-up and also expose an ISO string for display."""
     au = dict(snap.get("app_usage") or {})
+    invalid_fields: list[str] = []
     try:
         last_epoch = float(au.get("last_at") or 0) or 0.0
     except (TypeError, ValueError):
         last_epoch = 0.0
+        invalid_fields.append("last_at")
+    if last_epoch and (
+        not math.isfinite(last_epoch) or last_epoch < 0
+    ):
+        last_epoch = 0.0
+        invalid_fields.append("last_at")
+    if last_epoch:
+        try:
+            datetime.fromtimestamp(last_epoch, _SHANGHAI_TZ)
+        except (ValueError, OverflowError, OSError):
+            last_epoch = 0.0
+            invalid_fields.append("last_at")
+
+    def _count(name: str) -> int:
+        raw = au.get(name)
+        try:
+            parsed = int(raw or 0)
+            if parsed < 0:
+                raise ValueError("negative_count")
+            return parsed
+        except (TypeError, ValueError, OverflowError):
+            invalid_fields.append(name)
+            return 0
+
     return {
-        "foreground_sec": int(au.get("foreground_sec") or 0),
-        "sessions": int(au.get("sessions") or 0),
+        "foreground_sec": _count("foreground_sec"),
+        "sessions": _count("sessions"),
         "last_at_epoch": last_epoch,
         "last_at": _data_track_iso(last_epoch) if last_epoch else "",
+        "fields_status": "invalid" if invalid_fields else "ok",
+        "invalid_fields": sorted(set(invalid_fields)),
     }
 
 
@@ -770,8 +836,12 @@ def _data_track_memory_from_snapshot(snap: dict) -> dict:
     memory = dict(snap.get("memory") or {})
     extra = dict(snap.get("memory_extra") or {})
     log_counts = dict(snap.get("log_counts") or {})
+    invalid_fields: list[str] = []
     by_type = {typ: 0 for typ in memory_service.MEMORY_TYPES}
-    by_type.update(_data_track_count_dict(memory.get("by_type")))
+    by_type.update(_data_track_count_dict(
+        memory.get("by_type"), invalid_fields=invalid_fields,
+        field_prefix="memory.by_type",
+    ))
     by_tab = {"story": 0, "about_me": 0, "ta_thinking": 0}
     for mem_type, count in by_type.items():
         tab = memory_service.TAB_FOR_TYPE.get(mem_type, "unknown")
@@ -780,27 +850,54 @@ def _data_track_memory_from_snapshot(snap: dict) -> dict:
         "total": int(memory.get("total") or 0),
         "by_tab": by_tab,
         "by_type": by_type,
-        "by_source": _data_track_count_dict(memory.get("by_source")),
+        "by_source": _data_track_count_dict(
+            memory.get("by_source"), invalid_fields=invalid_fields,
+            field_prefix="memory.by_source",
+        ),
         "changes": int((snap.get("logs") or {}).get("memory_changes", {}).get("count") or 0),
-        "changes_by_action": _data_track_count_dict(log_counts.get("changes_by_action")),
-        "changes_by_capture_mode": _data_track_count_dict(log_counts.get("changes_by_capture_mode")),
+        "changes_by_action": _data_track_count_dict(
+            log_counts.get("changes_by_action"), invalid_fields=invalid_fields,
+            field_prefix="memory.changes_by_action",
+        ),
+        "changes_by_capture_mode": _data_track_count_dict(
+            log_counts.get("changes_by_capture_mode"), invalid_fields=invalid_fields,
+            field_prefix="memory.changes_by_capture_mode",
+        ),
         "capture_jobs": int(extra.get("capture_jobs") or 0),
-        "capture_jobs_by_status": _data_track_count_dict(log_counts.get("capture_jobs_by_status")),
-        "capture_jobs_by_mode": _data_track_count_dict(log_counts.get("capture_jobs_by_mode")),
+        "capture_jobs_by_status": _data_track_count_dict(
+            log_counts.get("capture_jobs_by_status"), invalid_fields=invalid_fields,
+            field_prefix="memory.capture_jobs_by_status",
+        ),
+        "capture_jobs_by_mode": _data_track_count_dict(
+            log_counts.get("capture_jobs_by_mode"), invalid_fields=invalid_fields,
+            field_prefix="memory.capture_jobs_by_mode",
+        ),
         "capture_actions_written": int(extra.get("capture_actions_written") or 0),
         "last_capture_at": _data_track_iso(extra.get("last_capture_ts")),
         "first_created_at": _data_track_iso(memory.get("first_created_at")),
         "last_created_at": _data_track_iso(memory.get("last_created_at")),
         "earliest_occurred_at": _data_track_iso(memory.get("earliest_occurred_at")),
         "latest_occurred_at": _data_track_iso(memory.get("latest_occurred_at")),
+        "counts_status": "invalid" if invalid_fields else "ok",
+        "invalid_count_fields": sorted(set(invalid_fields)),
     }
 
 
 def _data_track_chat_from_snapshot(snap: dict) -> dict:
     chat = dict(snap.get("chat") or {})
-    by_role = _data_track_count_dict(chat.get("by_role"))
-    by_source = _data_track_count_dict(chat.get("by_source"))
-    by_content_type = _data_track_count_dict(chat.get("by_content_type"))
+    invalid_fields: list[str] = []
+    by_role = _data_track_count_dict(
+        chat.get("by_role"), invalid_fields=invalid_fields,
+        field_prefix="chat.by_role",
+    )
+    by_source = _data_track_count_dict(
+        chat.get("by_source"), invalid_fields=invalid_fields,
+        field_prefix="chat.by_source",
+    )
+    by_content_type = _data_track_count_dict(
+        chat.get("by_content_type"), invalid_fields=invalid_fields,
+        field_prefix="chat.by_content_type",
+    )
     user_messages = int(chat.get("user_messages") or by_role.get("user", 0))
     agent_messages = int(
         chat.get("agent_messages")
@@ -824,6 +921,8 @@ def _data_track_chat_from_snapshot(snap: dict) -> dict:
         "last_user_at": _data_track_iso(chat.get("last_user_ts")),
         "last_agent_at": _data_track_iso(chat.get("last_agent_ts")),
         "proactive_last_at": _data_track_iso(chat.get("proactive_last_ts")),
+        "counts_status": "invalid" if invalid_fields else "ok",
+        "invalid_count_fields": sorted(set(invalid_fields)),
     }
 
 
@@ -929,18 +1028,35 @@ def _connection_health(route: str, access_modes: list, chat: dict) -> dict:
 def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
     logs = dict(snap.get("logs") or {})
     extra = dict(snap.get("proactive_extra") or {})
-    status_counts = _data_track_count_dict(extra.get("jobs_by_status"))
-    kind_lanes = _bucket_proactive_kinds(_data_track_count_dict(extra.get("jobs_by_kind")))
-    raw_fail_kinds = _data_track_count_dict(extra.get("jobs_failed_by_kind"))
+    invalid_fields: list[str] = []
+
+    def counts(value, name: str) -> dict:
+        return _data_track_count_dict(
+            value, invalid_fields=invalid_fields, field_prefix=name,
+        )
+    status_counts = counts(extra.get("jobs_by_status"), "proactive.jobs_by_status")
+    kind_lanes = _bucket_proactive_kinds(
+        counts(extra.get("jobs_by_kind"), "proactive.jobs_by_kind")
+    )
+    raw_fail_kinds = counts(
+        extra.get("jobs_failed_by_kind"), "proactive.jobs_failed_by_kind"
+    )
     fail_lanes = _bucket_proactive_kinds(raw_fail_kinds)
     control_lanes = _bucket_proactive_kinds(
-        _data_track_count_dict(extra.get("jobs_control_by_kind"))
+        counts(extra.get("jobs_control_by_kind"), "proactive.jobs_control_by_kind")
     )
     user_unavailable_lanes = _bucket_proactive_kinds(
-        _data_track_count_dict(extra.get("jobs_user_unavailable_by_kind"))
+        counts(
+            extra.get("jobs_user_unavailable_by_kind"),
+            "proactive.jobs_user_unavailable_by_kind",
+        )
     )
-    live_status_counts = _data_track_count_dict(extra.get("live_activity_status"))
-    alert_status_counts = _data_track_count_dict(extra.get("alert_status"))
+    live_status_counts = counts(
+        extra.get("live_activity_status"), "proactive.live_activity_status"
+    )
+    alert_status_counts = counts(
+        extra.get("alert_status"), "proactive.alert_status"
+    )
     decisions = int(extra.get("decisions") or logs.get("gate_decisions", {}).get("count") or 0)
     decision_true = int(extra.get("decision_true") or 0)
     delivered = (
@@ -948,7 +1064,9 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
         + alert_status_counts.get("delivered", 0)
         + alert_status_counts.get("logged_only", 0)
     )
-    failed_reasons = _data_track_count_dict(extra.get("jobs_failed_by_reason"))
+    failed_reasons = counts(
+        extra.get("jobs_failed_by_reason"), "proactive.jobs_failed_by_reason"
+    )
     failed = (
         sum(fail_lanes.values())
         if raw_fail_kinds
@@ -980,9 +1098,12 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
         "posted_jobs": status_counts.get("posted", 0) + status_counts.get("delivered", 0),
         "failed_jobs": failed,
         "job_failed_reasons": failed_reasons,
-        "job_control_reasons": _data_track_count_dict(extra.get("jobs_control_by_reason")),
-        "job_user_unavailable_reasons": _data_track_count_dict(
-            extra.get("jobs_user_unavailable_by_reason")
+        "job_control_reasons": counts(
+            extra.get("jobs_control_by_reason"), "proactive.jobs_control_by_reason"
+        ),
+        "job_user_unavailable_reasons": counts(
+            extra.get("jobs_user_unavailable_by_reason"),
+            "proactive.jobs_user_unavailable_by_reason",
         ),
         "proactive_messages": int(chat.get("proactive_messages") or 0),
         "delivery_signals": delivered,
@@ -990,6 +1111,8 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
         "alert_status": alert_status_counts,
         "device_events": int(logs.get("device_events", {}).get("count") or 0),
         "last_at": core_util._epoch_to_iso(last_at),
+        "counts_status": "invalid" if invalid_fields else "ok",
+        "invalid_count_fields": sorted(set(invalid_fields)),
     }
 
 
@@ -997,22 +1120,36 @@ def _data_track_tracking_from_snapshot(snap: dict) -> dict:
     logs = dict(snap.get("logs") or {})
     counts = dict(snap.get("log_counts") or {})
     tracking = logs.get("tracking_events", {}) or {}
-    return {
+    invalid_fields: list[str] = []
+    result = {
         "events": int(tracking.get("count") or 0),
-        "by_type": _data_track_count_dict(counts.get("tracking_by_type")),
+        "by_type": _data_track_count_dict(
+            counts.get("tracking_by_type"), invalid_fields=invalid_fields,
+            field_prefix="tracking.by_type",
+        ),
         "last_at": _data_track_iso(tracking.get("last_ts")),
     }
+    result["counts_status"] = "invalid" if invalid_fields else "ok"
+    result["invalid_count_fields"] = sorted(set(invalid_fields))
+    return result
 
 
 def _data_track_bootstrap_from_snapshot(snap: dict) -> dict:
     logs = dict(snap.get("logs") or {})
     counts = dict(snap.get("log_counts") or {})
     bootstrap = logs.get("bootstrap_events", {}) or {}
-    return {
+    invalid_fields: list[str] = []
+    result = {
         "events": int(bootstrap.get("count") or 0),
-        "by_type": _data_track_count_dict(counts.get("bootstrap_by_type")),
+        "by_type": _data_track_count_dict(
+            counts.get("bootstrap_by_type"), invalid_fields=invalid_fields,
+            field_prefix="bootstrap.by_type",
+        ),
         "last_at": _data_track_iso(bootstrap.get("last_ts")),
     }
+    result["counts_status"] = "invalid" if invalid_fields else "ok"
+    result["invalid_count_fields"] = sorted(set(invalid_fields))
+    return result
 
 
 def _data_track_history_import_from_snapshot(snap: dict) -> dict:
@@ -1066,6 +1203,7 @@ def _data_track_fast_validation(
     memory_total = int(memory.get("total") or 0)
     has_memories = memory_total > 0
     identity_written = identity is not None
+    consumer_poll_status = "not_applicable"
 
     if route == "model_api":
         # Hosted: "connection" = the backend actually produced a hosted reply.
@@ -1085,10 +1223,20 @@ def _data_track_fast_validation(
         norm_route = "official_import"
     else:  # resident / self-host
         consumer = consumer_state or {}
-        try:
-            age_sec = time.time() - float(consumer.get("last_poll_epoch") or 0)
-        except Exception:
+        raw_poll_epoch = consumer.get("last_poll_epoch")
+        if raw_poll_epoch in (None, "", 0):
             age_sec = None
+            consumer_poll_status = "missing"
+        else:
+            try:
+                parsed_poll_epoch = float(raw_poll_epoch)
+                if not math.isfinite(parsed_poll_epoch) or parsed_poll_epoch < 0:
+                    raise ValueError("invalid_poll_epoch")
+                age_sec = time.time() - parsed_poll_epoch
+                consumer_poll_status = "ok"
+            except (TypeError, ValueError, OverflowError):
+                age_sec = None
+                consumer_poll_status = "invalid"
         consumer_ok = (
             bool(consumer.get("official"))
             and age_sec is not None
@@ -1115,6 +1263,7 @@ def _data_track_fast_validation(
         "route": norm_route,
         "next_action": "" if next_step is None else next_step["required"],
         "steps": steps,
+        "consumer_poll_status": consumer_poll_status,
     }
 
 
@@ -1145,6 +1294,9 @@ def _effective_responder(
 
     raw_pollers = state.get("poll_consumers")
     pollers = raw_pollers if isinstance(raw_pollers, dict) else {}
+    invalid_poll_identities: list[str] = []
+    if raw_pollers is not None and not isinstance(raw_pollers, dict):
+        invalid_poll_identities.append("poll_consumers")
     # Backward compatibility for states written before poll_consumers existed.
     if not pollers and state.get("last_poll_epoch"):
         consumer_id = str(state.get("consumer_id") or "")
@@ -1168,11 +1320,22 @@ def _effective_responder(
     poll_observations = []
     for identity, value in pollers.items():
         if not isinstance(value, dict):
+            invalid_poll_identities.append(str(identity))
             continue
-        try:
-            last_epoch = float(value.get("last_poll_epoch") or 0)
-        except (TypeError, ValueError):
+        raw_last_epoch = value.get("last_poll_epoch")
+        last_poll_status = "missing"
+        if raw_last_epoch in (None, "", 0):
             last_epoch = 0.0
+        else:
+            try:
+                last_epoch = float(raw_last_epoch)
+                if not math.isfinite(last_epoch) or last_epoch < 0:
+                    raise ValueError("invalid_poll_epoch")
+                last_poll_status = "ok"
+            except (TypeError, ValueError, OverflowError):
+                last_epoch = 0.0
+                last_poll_status = "invalid"
+                invalid_poll_identities.append(str(identity))
         age_sec = max(0.0, now - last_epoch) if last_epoch > 0 else None
         responder = str(value.get("responder") or "")
         if responder not in {"hosted_v1", "hosted_v2", "resident"}:
@@ -1190,6 +1353,7 @@ def _effective_responder(
                 "responder": responder,
                 "last_poll_at": str(value.get("last_poll_at") or ""),
                 "last_poll_epoch": last_epoch,
+                "last_poll_status": last_poll_status,
                 "age_sec": int(age_sec) if age_sec is not None else None,
                 "recent": bool(
                     age_sec is not None
@@ -1248,6 +1412,15 @@ def _effective_responder(
         "current_control_plane": sorted(current),
         "poll_observations": poll_observations,
         "recent_poll_observations": recent_polls,
+        "poll_evidence_status": (
+            "invalid" if invalid_poll_identities
+            else "ok" if any(
+                item.get("last_poll_status") == "ok"
+                for item in poll_observations
+            )
+            else "missing"
+        ),
+        "invalid_poll_identities": sorted(set(invalid_poll_identities)),
         "criteria": (
             "current: live agent_runtime_instances lease => hosted_v1; "
             "v2_runtime_state v2/draining => hosted_v2. "
@@ -1335,6 +1508,9 @@ def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
             "next_action": validation.get("next_action", ""),
             "steps": [],
             "stuck_for_sec": stuck_for_sec,
+            "consumer_poll_status": validation.get(
+                "consumer_poll_status", "not_applicable"
+            ),
         },
         "last_activity_at": core_util._epoch_to_iso(latest_epoch),
         "chat": chat,
@@ -1420,11 +1596,16 @@ def _model_api_route_summaries(user_id: str) -> list[dict]:
 
 def _notice_summaries(user_id: str, *, limit: int = _NOTICE_SUMMARY_LIMIT) -> list[dict]:
     """Return recent notice metadata using an explicit content-free allowlist."""
-    def _count(value) -> int:
+    def _count(value) -> tuple[int, str]:
+        if value in (None, ""):
+            return 0, "missing"
         try:
-            return max(0, int(value or 0))
-        except (TypeError, ValueError):
-            return 0
+            parsed = int(value)
+            if parsed < 0:
+                raise ValueError("negative_occurrences")
+            return parsed, "ok"
+        except (TypeError, ValueError, OverflowError):
+            return 0, "invalid"
 
     def _last_ts(row: dict) -> float:
         return float(core_util._to_epoch(row.get("last_ts")) or 0)
@@ -1435,16 +1616,18 @@ def _notice_summaries(user_id: str, *, limit: int = _NOTICE_SUMMARY_LIMIT) -> li
         key=_last_ts,
         reverse=True,
     )[: max(0, int(limit))]
-    return [
-        {
+    out = []
+    for row in rows:
+        occurrences, occurrences_status = _count(row.get("occurrences"))
+        out.append({
             "error_class": str(row.get("error_class") or "")[:160],
             "blame": str(row.get("blame") or "")[:80],
             "severity": str(row.get("severity") or "")[:40],
-            "occurrences": _count(row.get("occurrences")),
+            "occurrences": occurrences,
+            "occurrences_status": occurrences_status,
             "last_ts": _last_ts(row),
-        }
-        for row in rows
-    ]
+        })
+    return out
 
 
 def _bootstrap_event_stats(store: UserStore, *, include_events: bool = False) -> dict:
@@ -1479,11 +1662,18 @@ def _runtime_summary(store: UserStore) -> dict:
            "driver": "", "driver_lens": _DRIVER_LENS, "codex_transport": "",
            "cli_cmd_custom": False, "reasoning_effort": "",
            "context_window_configured": 0, "context_window_tokens": 0,
-           "context_window_source": ""}
+           "context_window_source": "", "config_status": "ok",
+           "driver_status": "not_applicable"}
     try:
         from hosted import config_store as _cfg_store
-        cfg = _cfg_store._load_model_api_config(store) or {}
+        cfg = _cfg_store._load_model_api_config(store)
     except Exception:
+        out["config_status"] = "unavailable"
+        return out
+    if cfg is None:
+        cfg = {}
+    if not isinstance(cfg, Mapping):
+        out["config_status"] = "invalid"
         return out
     provider = str(cfg.get("provider") or "")
     out.update({
@@ -1501,7 +1691,9 @@ def _runtime_summary(store: UserStore) -> dict:
             out["driver"] = _cutover.driver_for_provider(provider)
             out["codex_transport"] = _cutover.codex_transport(provider)
         except Exception:
-            pass
+            out["driver_status"] = "unavailable"
+        else:
+            out["driver_status"] = "ok"
         # Only a configured route has a budget. Resolving one for an empty
         # provider/model still returns the deployment default, which would
         # print a concrete window for a user who has no model route at all —
@@ -1695,18 +1887,39 @@ def _v2_wake_schedule_detail(user_id: str, settings: dict | None) -> dict:
             "blocked_by": ["no_schedule_row"],
             "note": "该用户尚未被 V2 调度器接管过（无 v2_wake_schedule 行）",
         }
+    if not isinstance(row, dict):
+        return {
+            "present": True,
+            "fields_status": "invalid",
+            "field_status": {"schedule_row": "invalid"},
+            "error": "schedule_row_invalid",
+        }
+    if not isinstance(diagnosis, dict):
+        diagnosis = {}
+
+    field_status: dict[str, str] = {}
 
     def _epoch(key: str) -> float:
-        try:
-            return float(row.get(key) or 0.0)
-        except (TypeError, ValueError):
+        raw = row.get(key)
+        if raw in (None, ""):
+            field_status[key] = "missing"
             return 0.0
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            field_status[key] = "invalid"
+            return 0.0
+        if not math.isfinite(parsed) or parsed < 0:
+            field_status[key] = "invalid"
+            return 0.0
+        field_status[key] = "ok"
+        return parsed
 
     def _iso(key: str) -> str:
         value = _epoch(key)
         return _data_track_iso(value) if value else ""
 
-    return {
+    out = {
         "present": True,
         "now": _data_track_iso(time.time()),
         # ⚠️ 只列 `v2_wake_schedule` **真实存在**的列。我第一版凭印象写了
@@ -1727,15 +1940,20 @@ def _v2_wake_schedule_detail(user_id: str, settings: dict | None) -> dict:
         # 空列表 = 现在就该到期。非空 = 这些条件挡着,判据与调度器同源。
         "blocked_by": list(diagnosis.get("blocked_by") or []),
     }
+    out["field_status"] = field_status
+    out["fields_status"] = (
+        "invalid" if "invalid" in field_status.values() else "ok"
+    )
+    return out
 
 
 def _v2_profile_detail(user_id: str) -> dict:
     """Return the Runtime V2 profile's content-free support metadata only.
 
-    The encrypted ``memory`` / ``user`` envelope bodies are deliberately not
-    copied, validated, or decrypted here.  Keep this as an explicit allowlist:
-    a future field added to the stored profile must not automatically become
-    visible through the admin detail endpoint.
+    The producer validates the stored document shape.  Encrypted ``memory`` /
+    ``style`` envelope bodies are still never copied or decrypted here.  Keep
+    the returned projection as an explicit allowlist: a future producer field
+    must not automatically become visible through the admin detail endpoint.
     """
     try:
         from model_api_runtime.v2 import profile_store as _v2_profile_store
@@ -1745,31 +1963,23 @@ def _v2_profile_detail(user_id: str) -> dict:
             _v2_profile_store.PROFILE_BLOB_KIND,
         )
     except Exception:  # noqa: BLE001 — observability must never 500 the page
-        return {"state": "read_error"}
+        return {"state": "read_error", "document_status": "unavailable"}
 
     if document is None:
-        return {"state": "missing"}
-    if not isinstance(document, dict):
-        return {"state": "read_error"}
+        return {"state": "missing", "document_status": "missing"}
+    try:
+        document = _v2_profile_store.validate_profile_document(document)
+    except _v2_profile_store.ProfileStorageError as exc:
+        # The producer already owns the full storage schema.  Reusing it here
+        # prevents admin from maintaining a weaker copy where malformed counts
+        # quietly become zero.  Its errors are content-free stable codes.
+        return {
+            "state": "read_error",
+            "document_status": "invalid",
+            "invalid_reason": str(exc)[:160],
+        }
 
     state = str(document.get("state") or "")
-    if state not in {"ok", "pending", "degraded", "empty"}:
-        return {"state": "read_error"}
-
-    def _count(value) -> int:
-        if isinstance(value, bool):
-            return 0
-        try:
-            return max(0, int(value or 0))
-        except (TypeError, ValueError, OverflowError):
-            return 0
-
-    def _retry_at(value) -> float:
-        try:
-            parsed = float(value or 0)
-        except (TypeError, ValueError, OverflowError):
-            return 0.0
-        return parsed if math.isfinite(parsed) and parsed >= 0 else 0.0
 
     source = document.get("source")
     if not isinstance(source, dict):
@@ -1786,23 +1996,26 @@ def _v2_profile_detail(user_id: str) -> dict:
         style = document.get("user")
     if not isinstance(style, dict):
         style = {}
-    style_chars = _count(style.get("chars"))
+    style_chars = int(style.get("chars") or 0)
 
     return {
         "state": state,
-        "memory_chars": _count(memory.get("chars")),
+        "document_status": "ok",
+        "memory_chars": int(memory.get("chars") or 0),
         "style_chars": style_chars,
         # One-version compatibility alias for external admin consumers.
         "user_chars": style_chars,
         "source": {
-            "card_count": _count(source.get("card_count")),
+            "card_count": int(source.get("card_count") or 0),
             "max_updated_at": str(source.get("max_updated_at") or ""),
             "generated_at": str(source.get("generated_at") or ""),
         },
         "last_attempt": {
             "reject_code": str(last_attempt.get("reject_code") or "")[:160],
-            "attempts": _count(last_attempt.get("attempts")),
-            "retry_not_before": _retry_at(last_attempt.get("retry_not_before")),
+            "attempts": int(last_attempt.get("attempts") or 0),
+            "retry_not_before": float(
+                last_attempt.get("retry_not_before") or 0.0
+            ),
         },
         "disabled": document.get("disabled") is True,
     }
@@ -2797,31 +3010,91 @@ _TRACE_PUBLIC_FAILURE_CODE = object()  # 值必须命中产生方显式导出
 # `wake_failed:providererror` 等真实码因此可见,未知后缀仍保持遮蔽。
 
 
+def _load_jobs_store_failure_codes() -> set[str]:
+    from model_api_runtime.v2 import jobs_store as jobs_store
+
+    return set().union(
+        jobs_store.CONTROL_OUTCOME_CODES,
+        jobs_store.JOB_FAILURE_CODES,
+        jobs_store.SAFETY_SUPPRESSION_CODES,
+        jobs_store.TIMEOUT_OUTCOME_CODES,
+    )
+
+
+def _load_worker_failure_codes() -> set[str]:
+    from model_api_runtime.v2 import worker
+
+    return set(worker.PUBLIC_FAILURE_CODES)
+
+
+def _load_voice_failure_codes() -> set[str]:
+    from voice import error_codes
+
+    return set(error_codes.VOICE_GATEWAY_ERROR_CODES)
+
+
+_FAILURE_VOCABULARY_LOADERS = (
+    ("jobs_store", _load_jobs_store_failure_codes),
+    ("worker", _load_worker_failure_codes),
+    ("voice", _load_voice_failure_codes),
+)
+
+
+def _failure_vocabulary() -> tuple[frozenset[str], frozenset[str]]:
+    """Return codes plus producer sources that could not be loaded.
+
+    Only a complete read is cached.  A partial import is a legitimate degraded
+    admin response (some deployments may omit an optional producer), but it is
+    never promoted to the process-wide complete vocabulary: refresh/retry can
+    recover without restarting the process and every consumer can expose which
+    source was unavailable.
+    """
+    global _KNOWN_FAILURE_CODES_CACHE
+    if _KNOWN_FAILURE_CODES_CACHE is not None:
+        return _KNOWN_FAILURE_CODES_CACHE, frozenset()
+
+    codes: set[str] = set()
+    unavailable_sources: set[str] = set()
+    for source, loader in _FAILURE_VOCABULARY_LOADERS:
+        try:
+            loaded = loader()
+            codes.update(str(code) for code in loaded)
+        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
+            unavailable_sources.add(source)
+            continue
+
+    result = frozenset(codes)
+    if not unavailable_sources:
+        _KNOWN_FAILURE_CODES_CACHE = result
+    return result, frozenset(unavailable_sources)
+
+
 def _known_failure_codes() -> frozenset:
     """产生方**显式导出**的失败码集合,从模块读,管理端不抄也不推断。"""
-    global _KNOWN_FAILURE_CODES_CACHE
-    if _KNOWN_FAILURE_CODES_CACHE is None:
-        codes: set[str] = set()
-        try:
-            from model_api_runtime.v2 import jobs_store as _js
-            codes |= set(_js.CONTROL_OUTCOME_CODES)
-            codes |= set(_js.JOB_FAILURE_CODES)
-            codes |= set(_js.SAFETY_SUPPRESSION_CODES)
-            codes |= set(_js.TIMEOUT_OUTCOME_CODES)
-        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
-            pass
-        try:
-            from model_api_runtime.v2 import worker as _worker
-            codes |= set(_worker.PUBLIC_FAILURE_CODES)
-        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
-            pass
-        try:
-            from voice import error_codes as _voice_error_codes
-            codes |= set(_voice_error_codes.VOICE_GATEWAY_ERROR_CODES)
-        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
-            pass
-        _KNOWN_FAILURE_CODES_CACHE = frozenset(codes)
-    return _KNOWN_FAILURE_CODES_CACHE
+    codes, _unavailable_sources = _failure_vocabulary()
+    return codes
+
+
+def _failure_vocabulary_observability() -> dict:
+    _codes, unavailable_sources = _failure_vocabulary()
+    return {
+        "status": "partial" if unavailable_sources else "ok",
+        "unavailable_sources": sorted(unavailable_sources),
+    }
+
+
+def _render_failure_vocabulary_warning(observability: dict) -> str:
+    """Render a partial producer vocabulary as an instrument failure."""
+    if observability.get("status") == "ok":
+        return ""
+    missing = ", ".join(
+        str(value) for value in observability.get("unavailable_sources", [])
+    ) or "unknown"
+    return (
+        "<div class='note-box bad'><b>失败码词表仅部分可用。</b>"
+        f"未加载来源：{html.escape(missing)}；other 可能是量具缺口，"
+        "不能读成真实未分类。</div>"
+    )
 
 
 _KNOWN_FAILURE_CODES_CACHE = None
@@ -3196,6 +3469,7 @@ def _normalize_debug_event_durations(events: list[dict]) -> None:
 def _data_track_debug_flat_payload(
     *,
     trace_vocabulary,
+    failure_vocabulary: dict,
     filters: dict,
     limit: int,
     offset: int,
@@ -3351,6 +3625,7 @@ def _data_track_debug_flat_payload(
             "trace_vocabulary": (
                 "ok" if trace_vocabulary is not None else "unavailable"
             ),
+            "failure_vocabulary": failure_vocabulary,
         },
         "pagination": pagination,
         "users": user_rows,
@@ -3361,6 +3636,7 @@ def _data_track_debug_flat_payload(
 
 def _data_track_debug_payload() -> dict:
     trace_vocabulary = _trace_vocabulary()
+    failure_vocabulary = _failure_vocabulary_observability()
     filters = _data_track_request_filters()
     limit = int(filters.get("limit") or 100)
     offset = int(filters.get("offset") or 0)
@@ -3401,6 +3677,7 @@ def _data_track_debug_payload() -> dict:
     if mode == "flat":
         return _data_track_debug_flat_payload(
             trace_vocabulary=trace_vocabulary,
+            failure_vocabulary=failure_vocabulary,
             filters=filters,
             limit=limit,
             offset=offset,
@@ -3550,6 +3827,7 @@ def _data_track_debug_payload() -> dict:
             "trace_vocabulary": (
                 "ok" if trace_vocabulary is not None else "unavailable"
             ),
+            "failure_vocabulary": failure_vocabulary,
         },
         "pagination": pagination,
         "users": users_out,
@@ -3569,7 +3847,11 @@ def _data_track_dau_payload() -> dict:
         days=days,
         tz="Asia/Shanghai",
     )
-    histogram_day = requested_day or _default_usage_histogram_day(rows)
+    invalid_days: list[str] = []
+    default_histogram_day = _default_usage_histogram_day(
+        rows, invalid_days=invalid_days,
+    )
+    histogram_day = requested_day or default_histogram_day
     usage_histogram = db.admin_data_track_usage_histogram(
         day=histogram_day,
         tz="Asia/Shanghai",
@@ -3611,6 +3893,10 @@ def _data_track_dau_payload() -> dict:
             for row in rows
         ],
         "usage_histogram": usage_histogram,
+        "observability": {
+            "day_values": "invalid" if invalid_days else "ok",
+            "invalid_day_rows": len(invalid_days),
+        },
         "definition": {
             "dau": "DAU = 使用 DAU: distinct users with an app_session_end (foreground app open) on the Beijing day. Chat DAU / Tracking DAU are looser breakdowns.",
             "excluded": "Agent/openclaw messages, proactive writes, and verify_ping synthetic messages are excluded.",
@@ -5030,6 +5316,10 @@ def _render_runtime_health_page(
     是 None（各自独立的失败域，见 admin_core）：取不到时对应区块显「暂不可用」，
     不得把 None 渲染成 0——0 是"确认过是零"。
     """
+    failure_vocabulary = _failure_vocabulary_observability()
+    failure_vocabulary_warning = _render_failure_vocabulary_warning(
+        failure_vocabulary
+    )
     service_level, service_reasons = _runtime_service_level(payload, delivery)
     if delivery is None and service_level == "ok":
         service_level = "warn"
@@ -5385,6 +5675,7 @@ def _render_runtime_health_page(
   <h1>Runtime 健康</h1>
   <div class="muted">Generated {html.escape(_bj_iso(payload.get("generated_at")))}. Metadata only; encrypted content is not read or rendered.</div>
   {_render_data_track_view_nav("runtime")}
+  {failure_vocabulary_warning}
   <div class="sortbar">{window_links}</div>
   <h2>状态拆分</h2>
   {split_health}
@@ -8089,6 +8380,14 @@ def _render_data_track_dau_page(payload: dict) -> str:
     histogram_buckets = list(histogram.get("buckets") or [])
     histogram_total = int(histogram.get("total_users") or 0)
     definition = payload.get("definition", {})
+    observability = payload.get("observability") or {}
+    day_warning = (
+        "<div style='background:#fff8e8;border:1px solid #e3bd7a;"
+        "border-radius:8px;padding:10px 12px;margin:12px 0;color:#8a4a00'>"
+        "DAU 行里有 day 值读不出来；所选分布日可能是回退值，不代表坏行不存在。"
+        "</div>"
+        if observability.get("day_values") == "invalid" else ""
+    )
     api_qs = _data_track_qs(
         view=None,
         q=None,
@@ -8251,6 +8550,7 @@ def _render_data_track_dau_page(payload: dict) -> str:
   <div class="muted">Generated {html.escape(_bj_iso(summary["generated_at"]))}. DAU timezone: {html.escape(summary["timezone"])}.</div>
   <div class="muted">Showing {html.escape(str(summary["days_returned"]))} active days. Since {html.escape(str(filters.get("since") or "all time"))}; days limit {html.escape(str(filters.get("days") or 30))}.</div>
   {_render_data_track_view_nav("dau")}
+  {day_warning}
   <section class="metrics">{metrics}</section>
   <h2>使用时长分布 · {html.escape(histogram_day or "n/a")}</h2>
   <div class="toolbar">{''.join(histogram_days)}</div>
@@ -9449,6 +9749,9 @@ def _render_data_track_debug_page(payload: dict) -> str:
     trace_vocabulary_status = str(
         (payload.get("observability") or {}).get("trace_vocabulary") or "unavailable"
     )
+    failure_vocabulary = (
+        (payload.get("observability") or {}).get("failure_vocabulary") or {}
+    )
     trace_public_fields = _trace_public_fields(
         vocabulary=(
             _TRACE_VOCABULARY_UNSET
@@ -9656,12 +9959,25 @@ def _render_data_track_debug_page(payload: dict) -> str:
         _render_metric("turns", summary["turns_total"]),
         _render_metric("stalled / error", f"{summary['stalled_turns']} / {summary['error_turns']}"),
     ])
-    vocabulary_warning = (
-        "<div class='observability-warning'>Trace 词表暂不可用；"
-        "后台任务 lane / enqueue reason 闭集字段未展示，"
-        "不能读成“事件没有这些字段”。</div>"
-        if trace_vocabulary_status != "ok"
-        else ""
+    vocabulary_warnings = []
+    if trace_vocabulary_status != "ok":
+        vocabulary_warnings.append(
+            "Trace 词表暂不可用；后台任务 lane / enqueue reason 闭集字段未展示，"
+            "不能读成“事件没有这些字段”。"
+        )
+    if str(failure_vocabulary.get("status") or "partial") != "ok":
+        missing = ", ".join(
+            str(value) for value in failure_vocabulary.get(
+                "unavailable_sources", []
+            )
+        ) or "unknown"
+        vocabulary_warnings.append(
+            "失败码词表仅部分可用；未加载来源："
+            f"{missing}。相关失败码可能被归入 other，不能读成“没有该类失败”。"
+        )
+    vocabulary_warning = "".join(
+        f"<div class='observability-warning'>{html.escape(message)}</div>"
+        for message in vocabulary_warnings
     )
     refresh_meta = "" if reveal_key else '<meta http-equiv="refresh" content="30">'
 
@@ -11165,6 +11481,86 @@ def _render_user_recent_jobs(user: dict) -> str:
     )
 
 
+def _render_data_quality_warnings(user: dict) -> str:
+    """Render only explicit parse/read failures; legitimate missing stays quiet."""
+    warnings: list[str] = []
+
+    memory = user.get("memory") if isinstance(user.get("memory"), dict) else {}
+    if memory.get("capture_actions_written_status") == "invalid":
+        warnings.append("memory capture 的 actions_written 有坏值，合计只是已读下限。")
+    if memory.get("counts_status") == "invalid":
+        warnings.append("memory snapshot 的计数字段有坏值，0 不代表真实为零。")
+    capture = (
+        user.get("memory_capture_validation")
+        if isinstance(user.get("memory_capture_validation"), dict) else {}
+    )
+    if capture.get("counts_status") == "invalid":
+        warnings.append("memory capture validation 有坏计数，applied/skipped 只是已读下限。")
+
+    for key, label in (
+        ("chat", "chat snapshot"),
+        ("proactive", "proactive snapshot"),
+        ("tracking", "tracking snapshot"),
+        ("bootstrap_events", "bootstrap snapshot"),
+    ):
+        block = user.get(key) if isinstance(user.get(key), dict) else {}
+        if block.get("counts_status") == "invalid":
+            warnings.append(f"{label} 有坏计数，页面中的 0 不是可信测量。")
+
+    app_usage = (
+        user.get("app_usage") if isinstance(user.get("app_usage"), dict) else {}
+    )
+    if app_usage.get("fields_status") == "invalid":
+        warnings.append("App usage 有字段读不出来，0/空时间不是“没有使用”。")
+
+    onboarding = (
+        user.get("onboarding") if isinstance(user.get("onboarding"), dict) else {}
+    )
+    if onboarding.get("consumer_poll_status") == "invalid":
+        warnings.append("resident consumer 的 last_poll_epoch 读不出来，不能判为未轮询。")
+    responder = (
+        user.get("responder") if isinstance(user.get("responder"), dict) else {}
+    )
+    if responder.get("poll_evidence_status") == "invalid":
+        warnings.append("responder poll 证据有坏时间，recent/none 结论不完整。")
+
+    notices = user.get("notice_summaries") or []
+    if any(
+        isinstance(row, dict) and row.get("occurrences_status") == "invalid"
+        for row in notices
+    ):
+        warnings.append("notice occurrences 有坏值，显示的 0 不是“没有发生”。")
+
+    runtime = user.get("runtime") if isinstance(user.get("runtime"), dict) else {}
+    if runtime.get("config_status") == "unavailable":
+        warnings.append("runtime config 暂不可读，空 provider/model 不代表未配置。")
+    elif runtime.get("config_status") == "invalid":
+        warnings.append("runtime config 形状无效，空 provider/model 不代表未配置。")
+    if runtime.get("driver_status") == "unavailable":
+        warnings.append("runtime driver/transport 推导失败，空值不代表 legacy。")
+
+    wake = (
+        user.get("v2_wake_schedule")
+        if isinstance(user.get("v2_wake_schedule"), dict) else {}
+    )
+    if wake.get("fields_status") == "invalid":
+        warnings.append("V2 wake schedule 有坏时间，空时钟不代表未设置。")
+
+    profile = (
+        user.get("v2_profile") if isinstance(user.get("v2_profile"), dict) else {}
+    )
+    if profile.get("document_status") == "invalid":
+        warnings.append("V2 profile 文档未通过 producer schema，0 chars/count 不可信。")
+    elif profile.get("document_status") == "unavailable":
+        warnings.append("V2 profile 暂不可读，不能当成缺失或空 profile。")
+
+    return "".join(
+        "<div class='data-quality-warning'><strong>观测数据异常</strong>："
+        f"{html.escape(message)}</div>"
+        for message in warnings
+    )
+
+
 def _render_user_detail_page(user: dict) -> str:
     qs = _data_track_qs()
     back = f"/admin/data-track?{qs}" if qs else "/admin/data-track"
@@ -11189,6 +11585,7 @@ def _render_user_detail_page(user: dict) -> str:
         if mismatch
         else ""
     )
+    data_quality_warnings = _render_data_quality_warnings(user)
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -11227,6 +11624,7 @@ def _render_user_detail_page(user: dict) -> str:
     .runtime-user-jobs th,.runtime-user-jobs td {{ padding:9px 10px; border-bottom:1px solid var(--line); text-align:left; white-space:nowrap; }}
     .runtime-user-jobs th {{ color:var(--muted); font-size:12px; }}
     .responder-alert {{ margin:10px 0; padding:11px 13px; color:#8f1711; background:#fff0ee; border:2px solid #c62f25; border-radius:8px; }}
+    .data-quality-warning {{ margin:10px 0; padding:11px 13px; color:#8a4a00; background:#fff8e8; border:1px solid #e3bd7a; border-radius:8px; }}
   </style>
 </head>
 <body>
@@ -11246,6 +11644,7 @@ def _render_user_detail_page(user: dict) -> str:
     <div class="card"><div class="value">{html.escape(user.get('last_provider_error_class') or 'none')}</div><div class="label">latest provider error</div></div>
     <div class="card"><div class="value">{html.escape(responder_name)}</div><div class="label">effective responder</div></div>
   </section>
+  {data_quality_warnings}
   {responder_notice}
   <div class="muted">Responder 判据：{html.escape(str(responder.get('criteria') or 'unavailable'))}</div>
   {_render_screen_frames(user)}

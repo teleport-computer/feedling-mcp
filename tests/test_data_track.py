@@ -1183,7 +1183,9 @@ def test_admin_data_track_app_usage_rollup(client):
         for r in client.get("/v1/admin/data-track/users", headers=_admin_headers()).get_json()["users"]
     }
     assert rows2[u_none]["app_usage"] == {
-        "foreground_sec": 0, "sessions": 0, "last_at_epoch": 0.0, "last_at": "",
+        "foreground_sec": 0, "sessions": 0,
+        "last_at_epoch": 0.0, "last_at": "",
+        "fields_status": "ok", "invalid_fields": [],
     }
 
 
@@ -1471,6 +1473,7 @@ def test_admin_route_and_notice_summary_helpers_are_explicit_allowlists(monkeypa
         "blame": "provider_transient",
         "severity": "warning",
         "occurrences": 3,
+        "occurrences_status": "ok",
         "last_ts": 2.0,
     }]
     serialized = json.dumps({"routes": routes, "notices": notices})
@@ -1562,10 +1565,12 @@ def test_detail_payload_exposes_content_free_route_errors_and_notice_summaries(c
         "blame": "provider_transient",
         "severity": "warning",
         "occurrences": 22,
+        "occurrences_status": "ok",
         "last_ts": 22.0,
     }
     assert all(set(item) == {
-        "error_class", "blame", "severity", "occurrences", "last_ts"
+        "error_class", "blame", "severity", "occurrences",
+        "occurrences_status", "last_ts"
     } for item in row["notice_summaries"])
     serialized = json.dumps(row)
     assert "private-relay.example" not in serialized
@@ -1583,7 +1588,10 @@ def test_detail_payload_exposes_content_free_v2_profile_status_true_pg(client):
 
     missing = client.get(endpoint, headers=_admin_headers())
     assert missing.status_code == 200
-    assert missing.get_json()["user"]["v2_profile"] == {"state": "missing"}
+    assert missing.get_json()["user"]["v2_profile"] == {
+        "state": "missing",
+        "document_status": "missing",
+    }
 
     pending_doc = profile_store.build_profile_document(
         user_id,
@@ -1607,6 +1615,7 @@ def test_detail_payload_exposes_content_free_v2_profile_status_true_pg(client):
     assert pending.status_code == 200
     assert pending.get_json()["user"]["v2_profile"] == {
         "state": "pending",
+        "document_status": "ok",
         "memory_chars": 0,
         "style_chars": 0,
         "user_chars": 0,
@@ -1653,6 +1662,7 @@ def test_detail_payload_exposes_content_free_v2_profile_status_true_pg(client):
     profile = user_detail["v2_profile"]
     assert profile == {
         "state": "ok",
+        "document_status": "ok",
         "memory_chars": len("private memory profile"),
         "style_chars": len("private style profile"),
         "user_chars": len("private style profile"),
@@ -1674,13 +1684,14 @@ def test_detail_payload_exposes_content_free_v2_profile_status_true_pg(client):
     assert "private" not in serialized
 
 
-def test_v2_profile_detail_is_allowlisted_truncated_and_read_safe(monkeypatch):
+def test_v2_profile_detail_is_allowlisted_and_read_safe(monkeypatch):
     from admin import data_track as data_track
 
     monkeypatch.setattr(
         data_track.db,
         "get_blob_strict",
         lambda *_args: {
+            "v": 1,
             "state": "degraded",
             "memory": {"chars": 4, "envelope": {"body_ct": "secret"}},
             "user": {"chars": 5, "envelope": {"body_ct": "secret"}},
@@ -1691,8 +1702,12 @@ def test_v2_profile_detail_is_allowlisted_truncated_and_read_safe(monkeypatch):
                 "private_source": "secret",
             },
             "last_attempt": {
-                "reject_code": "r" * 200,
+                "at": "2026-08-01T10:01:00Z",
+                "reject_code": "provider_retry",
                 "attempts": 7,
+                "retry_disposition": "scheduled",
+                "retry_family": "transient",
+                "retry_attempts": 1,
                 "retry_not_before": 8,
                 "private_error": "secret",
             },
@@ -1702,10 +1717,10 @@ def test_v2_profile_detail_is_allowlisted_truncated_and_read_safe(monkeypatch):
     )
 
     detail = data_track._v2_profile_detail("usr_test")
-    assert detail["last_attempt"]["reject_code"] == "r" * 160
+    assert detail["last_attempt"]["reject_code"] == "provider_retry"
     assert set(detail) == {
-        "state", "memory_chars", "style_chars", "user_chars", "source",
-        "last_attempt", "disabled"
+        "state", "document_status", "memory_chars", "style_chars",
+        "user_chars", "source", "last_attempt", "disabled"
     }
     assert set(detail["source"]) == {
         "card_count", "max_updated_at", "generated_at"
@@ -1719,7 +1734,10 @@ def test_v2_profile_detail_is_allowlisted_truncated_and_read_safe(monkeypatch):
         raise RuntimeError("database unavailable")
 
     monkeypatch.setattr(data_track.db, "get_blob_strict", _fail)
-    assert data_track._v2_profile_detail("usr_test") == {"state": "read_error"}
+    assert data_track._v2_profile_detail("usr_test") == {
+        "state": "read_error",
+        "document_status": "unavailable",
+    }
 
 
 def test_detail_payload_exposes_capture_validation_decisions(client):
