@@ -217,7 +217,7 @@ def _patch_capture_state(
                     )
                     row = cur.fetchone()
                 persisted = _state_doc(row[0] if row is not None else {})
-                if wrote and source_id:
+                if wrote and (source_id or require_existing):
                     # Keep the shared Chat Clear fence until the mirror lands.
                     # Clear's primary delete + mirror delete therefore order
                     # after every successful pre-clear refresh; a delayed
