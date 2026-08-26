@@ -394,6 +394,8 @@ jobs:
             tests/test_perception_ingress_v2.py \
             tests/test_ios_perception_contract_v2.py \
             tests/test_perception.py \
+            tests/test_health_measurement.py \
+            tests/test_perception_health_measurement_wiring.py \
             tests/test_proactive_jobs.py \
             tests/test_proactive_gate_eval.py \
             tests/test_screen_caption_backend.py \

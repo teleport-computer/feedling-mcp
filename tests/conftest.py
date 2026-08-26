@@ -316,6 +316,10 @@ if not _provisioned:
         "test_perception_recent_apps_flow.py",
         "test_ios_perception_contract_v2.py",
         "test_perception_ingress_v2.py",
+        # sensegate batch-2 wiring (2026-08-26): both pure (health_measurement.py
+        # has zero I/O; the wiring test uses an in-memory FakeStore, no Postgres).
+        "test_health_measurement.py",
+        "test_perception_health_measurement_wiring.py",
         "test_provider_client.py",
         "test_provider_tools_gemini.py",
         "test_provider_catalog_unit.py",

@@ -600,8 +600,8 @@ mdurl==0.1.2 \
 memgarden @ https://github.com/teleport-computer/memgarden/releases/download/v0.2.0/memgarden-0.2.0-py3-none-any.whl \
     --hash=sha256:55f3b88d7313a8262de108a9859a7b2413062c5b1cee152d8cce0c650e3caa0d
     # via -r backend/requirements.txt
-sensegate @ https://github.com/teleport-computer/sensegate/releases/download/v0.1.0/sensegate-0.1.0-py3-none-any.whl \
-    --hash=sha256:7d2227b40a77446148e2e15e3d93c6c0644f859bcbd7a9ef23fc9aa4c9345885
+perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.1.0/perceptkit-0.1.0-py3-none-any.whl \
+    --hash=sha256:5167d3d0ab3de7b8521b0eab25355ba6f0e92ca1911d592907d8e7bd40062a24
     # via -r backend/requirements.txt
 packaging==26.1 \
     --hash=sha256:5d9c0669c6285e491e0ced2eee587eaf67b670d94a19e94e3984a481aba6802f \

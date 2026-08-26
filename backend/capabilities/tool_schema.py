@@ -33,7 +33,7 @@ from perception.agent_fields import (
     AGENT_SIGNAL_FIELDS,
     FAST_AGENT_PERCEPTION_SIGNALS,
 )
-from sensegate import prompts as perception_prompts
+from perceptkit import prompts as perception_prompts
 
 STAY_SILENT_TOOL = "stay_silent"
 FILE_REPLY_TOOL = "send_file"

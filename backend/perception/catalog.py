@@ -1,11 +1,11 @@
-"""io 侧兼容壳 —— 能力表已搬进 ``sensegate.catalog``。
+"""io 侧兼容壳 —— 能力表已搬进 ``perceptkit.catalog``。
 
 保留这个模块是为了不动 service / routes / ingress 里几十处
 ``from perception.catalog import ...``。新代码请直接 import 内核。
 """
 from __future__ import annotations
 
-from sensegate.catalog import (  # noqa: F401
+from perceptkit.catalog import (  # noqa: F401
     CAPABILITIES,
     COMPOSITE_KEYS,
     Capability,

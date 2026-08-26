@@ -116,7 +116,7 @@ redis>=5,<7
 memgarden @ https://github.com/teleport-computer/memgarden/releases/download/v0.2.0/memgarden-0.2.0-py3-none-any.whl
 agent-protocol-core @ https://github.com/teleport-computer/memgarden/releases/download/v0.2.0/agent_protocol_core-0.2.0-py3-none-any.whl
 
-# 感知内核 —— 同样从本仓库提取出去的独立库（sensegate），走法与上面的
+# 感知内核 —— 同样从本仓库提取出去的独立库（perceptkit），走法与上面的
 # memgarden 一致：GitHub Release 的 wheel URL，理由同上（--require-hashes +
 # compose 哈希上链要求构建可复现）。
-sensegate @ https://github.com/teleport-computer/sensegate/releases/download/v0.1.0/sensegate-0.1.0-py3-none-any.whl
+perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.1.0/perceptkit-0.1.0-py3-none-any.whl

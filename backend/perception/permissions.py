@@ -1,7 +1,7 @@
-"""io 侧兼容壳 —— 已搬进 ``sensegate.fields``。"""
+"""io 侧兼容壳 —— 已搬进 ``perceptkit.fields``。"""
 from __future__ import annotations
 
-from sensegate.fields import (  # noqa: F401
+from perceptkit.fields import (  # noqa: F401
     ALLOW_VALUES,
     DENIED_VALUES,
     OFF_VALUES,

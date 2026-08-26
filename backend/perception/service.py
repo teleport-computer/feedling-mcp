@@ -30,7 +30,7 @@ from core import enclave as core_enclave  # noqa: F401 — 读侧已改走 core_
 # 这行保留是因为测试 monkeypatch `<module>.core_enclave` 上的
 # _decrypt_envelope_via_enclave（patch 的是共享模块对象，仍然生效）。
 
-from . import catalog, history, permissions, resolve, store
+from . import catalog, health_measurement, history, permissions, resolve, store
 from .ingress_v2 import device_event_observations_v2, operation_observations_v2, observe_signal_v2
 from .ios_contract_v2 import (
     ENCRYPTED_SIGNAL_KEYS_V2,
@@ -183,6 +183,31 @@ def _record_decrypt_failure_v2(user_id: str, key: str, reason: str, ts: float) -
         }, ts)
     except Exception as e:  # observability must never break ingest
         log.warning("perception decrypt-failure audit write failed for %s: %s", user_id, e)
+
+
+def _record_unavailable_observation_v2(user_id: str, key: str, ts: float) -> None:
+    """Record UNAVAILABLE observation state (task 4 — distinct from "queried,
+    no sample") for every measurement group of a health signal whose envelope
+    just failed to decrypt. Best-effort/non-fatal, same rationale as
+    ``_record_decrypt_failure_v2``: this is Tier 2 bookkeeping, it must never
+    take down ingest.
+
+    Uses today's fallback date (there is no measurement time available on a
+    failed decrypt) and deliberately does NOT force the `_ts_kind` cutover —
+    see ``health_measurement.apply_unavailable``."""
+    groups = health_measurement.MEASUREMENT_GROUPS.get(key)
+    if not groups or not hasattr(store, "merge_perception_daily"):
+        return
+    try:
+        date = _local_date(ts, stable_context_timezone(user_id))
+        for group in groups:
+            store.merge_perception_daily(
+                user_id, date, key,
+                lambda prev, _g=group: health_measurement.apply_unavailable(prev, group=_g),
+                ts,
+            )
+    except Exception as e:
+        log.warning("perception_daily unavailable-state rollup failed for %s key=%s: %s", user_id, key, e)
 
 
 def _decrypted_location_anchor_id_v2(plaintext: Any) -> str:
@@ -410,6 +435,7 @@ def _ingest_snapshot_v2_inner(
                         location_anchor_observations.append((key, values))
                 else:
                     _record_decrypt_failure_v2(user_id, key, err, now)
+                    _record_unavailable_observation_v2(user_id, key, now)
             else:
                 storage_items.append(item)
             continue
@@ -500,6 +526,10 @@ def _apply(user_id: str, pairs: list, client_ts=None, *, emit_legacy_wakes: bool
     input_fields: dict[str, list] = {}   # input_name -> output fields it proposed
     wake_pending: list[tuple] = []       # (cap_key, debounce, field, old, new)
     hist_obs: dict[str, dict] = {}       # catalog signal key -> resolved values (for Tier 2)
+    hist_raw: dict[str, Any] = {}        # catalog signal key -> RAW reported mapping (pre-resolver;
+                                          # carries the optional measurement-metadata fields that
+                                          # resolvers/output-filtering would otherwise drop)
+    hist_null_keys: set[str] = set()     # historized signals reported as null this pass
     tz_seen: str | None = None
 
     for input_name, value, msg in pairs:
@@ -526,6 +556,8 @@ def _apply(user_id: str, pairs: list, client_ts=None, *, emit_legacy_wakes: bool
             for fname in sig.outputs:
                 patch[fname] = _cell(None, now, msg)
                 fields.append(fname)
+            if history.is_historized(key):
+                hist_null_keys.add(key)
         else:
             # Resolve raw -> label (raw discarded) or store as-is.
             if sig.resolver:
@@ -566,6 +598,8 @@ def _apply(user_id: str, pairs: list, client_ts=None, *, emit_legacy_wakes: bool
                 tz_seen = resolved.get("timezone") or tz_seen
             if history.is_historized(key) and isinstance(resolved, dict):
                 hist_obs[key] = dict(resolved)
+                if key in health_measurement.MEASUREMENT_GROUPS and isinstance(value, Mapping):
+                    hist_raw[key] = value
         input_fields[input_name] = fields
 
     # Atomic ts-guarded write under a row lock: a field is persisted only if its
@@ -590,18 +624,56 @@ def _apply(user_id: str, pairs: list, client_ts=None, *, emit_legacy_wakes: bool
     # Only for signals that actually wrote a field this report (skips stale/older).
     # Best-effort: history is Tier 2 and must NEVER break Tier 1 state ingest, so
     # the whole block is guarded (also tolerates stores without the daily helper).
-    if hist_obs and hasattr(store, "merge_perception_daily"):
+    if (hist_obs or hist_null_keys) and hasattr(store, "merge_perception_daily"):
         try:
-            local_date = _local_date(now, tz_seen or (prev_state.get("timezone") or {}).get("v"))
-            for sig_key, obs in hist_obs.items():
+            fallback_date = _local_date(now, tz_seen or (prev_state.get("timezone") or {}).get("v"))
+            for sig_key in (set(hist_obs) | hist_null_keys):
                 outs = catalog.SIGNALS[sig_key].outputs if sig_key in catalog.SIGNALS else ()
                 if not any(f in written for f in outs):
                     continue
-                store.merge_perception_daily(
-                    user_id, local_date, sig_key,
-                    lambda prev, _o=obs, _k=sig_key: history.record_daily(prev, _k, _o, ts=now),
-                    now,
+                obs = hist_obs.get(sig_key)
+                groups = health_measurement.MEASUREMENT_GROUPS.get(sig_key)
+                raw = hist_raw.get(sig_key)
+                metas = (
+                    health_measurement.extract_group_metadata(sig_key, raw)
+                    if (groups and raw is not None) else []
                 )
+                measurement_aware = any(m.is_measurement_aware for m in metas)
+
+                if not groups or not measurement_aware:
+                    # Legacy path — byte-identical to pre-batch2 behavior. A
+                    # null observation (hist_null_keys only) is intentionally
+                    # skipped here: NO_OBSERVATION/UNAVAILABLE bookkeeping is
+                    # scoped to measurement-aware signals for now (see
+                    # docs/NOTES-batch2-wiring.md, "known limitations").
+                    if obs is None:
+                        continue
+                    store.merge_perception_daily(
+                        user_id, fallback_date, sig_key,
+                        lambda prev, _o=obs, _k=sig_key: history.record_daily(prev, _k, _o, ts=now),
+                        now,
+                    )
+                    continue
+
+                # Measurement-aware: per-group date attribution + dedup +
+                # observed-state, one merge_perception_daily call per distinct
+                # attributed date (a report can legitimately span more than
+                # one day's rollup, e.g. one group backfilled, one live).
+                meta_by_group = {m.group.name: m for m in metas}
+                for group in groups:
+                    meta = meta_by_group.get(group.name) or health_measurement.GroupMeta(group)
+                    target_date = health_measurement.attributed_date(meta, fallback=fallback_date)
+                    field_values = {f: (obs or {}).get(f) for f in group.fields}
+                    key_for_group = health_measurement.identity_key(sig_key, meta)
+                    store.merge_perception_daily(
+                        user_id, target_date, sig_key,
+                        lambda prev, _s=sig_key, _g=group, _fv=field_values, _k=key_for_group, _t=now:
+                            health_measurement.apply_group_update(
+                                prev, signal=_s, group=_g, field_values=_fv,
+                                identity_key=_k, ts=_t,
+                            ),
+                        now,
+                    )
         except Exception as e:
             log.warning("perception_daily history rollup failed (non-fatal): %s", e)
 
