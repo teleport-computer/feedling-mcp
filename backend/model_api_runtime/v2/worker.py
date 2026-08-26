@@ -922,6 +922,25 @@ _SUBAGENT_DISABLED_TOOLS = frozenset(
 # silently mishandled by this task's scope.
 _WAKE_LANES = frozenset({"heartbeat", "scheduled", "manual_wake", "screen_watch"})
 
+# A proactive reply rejected by the post-time chat-collision gate never reached
+# the user, but without a bounded breadcrumb the next wake sees the same prompt
+# frontier and can regenerate it verbatim. Keep two encrypted rows for
+# observability, while only the newest one is injected into the next weak wake.
+WAKE_DISCARDED_DRAFT_STREAM = "v2_wake_discarded_draft"
+WAKE_DISCARDED_DRAFT_TEXT_CAP = 2000
+WAKE_DISCARDED_DRAFT_PROMPT_CAP = 2600
+WAKE_DISCARDED_DRAFT_STREAM_MAX = 2
+_WAKE_DISCARDED_DRAFT_LANES = frozenset(
+    {"heartbeat", "manual_wake", "screen_watch"}
+)
+_WAKE_DISCARDED_DRAFT_DELIVERY_NOTE = (
+    "这段话未送达，用户没有看到过。"
+)
+_WAKE_DISCARDED_DRAFT_GUIDANCE = (
+    "若它仍然相关，请自然融入这一次的新回复；若已被其间对话覆盖或已经过时，"
+    "请放下。不要逐字重发。"
+)
+
 # 记忆抽取 lane（capture=一窗对话→记忆卡，dream=现有卡片→合并）。同形：
 # build prompt → BYOK 抽取 → parse → memory actions。永不写气泡、永不弹 error chip。
 _EXTRACTION_LANES = frozenset({"capture", "dream"})
@@ -988,6 +1007,235 @@ def _wake_system_prompt_for_lane(lane: str, base_prompt: str) -> str:
     if lane != "scheduled":
         blocks.append(_OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION)
     return context._join_policy_blocks(*blocks)
+
+
+def _store_wake_discarded_draft(
+    store,
+    text: str,
+    *,
+    wake_kind: str,
+    source_job_id: str,
+    collision_seq_hint: int,
+) -> dict | None:
+    """Seal and retain one collision-discarded weak-wake draft.
+
+    The plaintext exists only in this worker call. ``user_logs`` receives the
+    same at-rest envelope shape used by chat replies, never a ghost chat row.
+    Persistence is intentionally best-effort: a crash/failure in the small gap
+    after discard degrades to the pre-T310 behavior and must not resurrect or
+    fail an otherwise safely suppressed reply.
+    """
+    bounded = str(text or "").strip()[:WAKE_DISCARDED_DRAFT_TEXT_CAP]
+    if not bounded or wake_kind not in _WAKE_DISCARDED_DRAFT_LANES:
+        return None
+    created_at = time.time()
+    item_id = hashlib.sha256(
+        (
+            f"v2-wake-discarded:{store.user_id}:{source_job_id}:"
+            f"{collision_seq_hint}:{created_at:.9f}"
+        ).encode("utf-8")
+    ).hexdigest()[:32]
+    envelope, error = core_envelope._build_shared_envelope_for_store(
+        store,
+        bounded.encode("utf-8"),
+        item_id=item_id,
+    )
+    if envelope is None:
+        log.warning(
+            "[v2.worker] wake discarded-draft envelope failed user=%s job=%s "
+            "lane=%s error=%s",
+            store.user_id,
+            source_job_id,
+            wake_kind,
+            error or "unknown",
+        )
+        return None
+    doc = {
+        "sealed_text": envelope,
+        "created_at": created_at,
+        "wake_kind": wake_kind,
+        "source_job_id": str(source_job_id),
+        "collision_seq_hint": max(0, int(collision_seq_hint)),
+    }
+    persisted = db.log_append(
+        str(store.user_id),
+        WAKE_DISCARDED_DRAFT_STREAM,
+        doc,
+        ts=created_at,
+        item_key=str(source_job_id),
+    )
+    # ``None`` remains accepted for narrow legacy/test fakes that predate the
+    # return value; production returns an exact bool and must not emit a stored
+    # trace after a swallowed primary failure.
+    if persisted is False:
+        return None
+    db.log_trim(
+        str(store.user_id),
+        WAKE_DISCARDED_DRAFT_STREAM,
+        WAKE_DISCARDED_DRAFT_STREAM_MAX,
+    )
+    return {
+        "source_job_id": str(source_job_id),
+        "chars": len(bounded),
+        "created_at": created_at,
+    }
+
+
+def _read_latest_wake_discarded_draft(
+    user_id: str,
+    *,
+    runtime_token: str,
+) -> dict | None:
+    """Open only the newest retained draft for one subsequent weak wake."""
+    rows = db.log_read(user_id, WAKE_DISCARDED_DRAFT_STREAM, limit=1)
+    if not rows:
+        return None
+    row = rows[-1]
+    if not isinstance(row, dict) or not isinstance(row.get("sealed_text"), dict):
+        return None
+    raw = core_envelope.read_envelope_body(
+        row["sealed_text"],
+        None,
+        purpose="v2_wake_discarded_draft",
+        runtime_token=runtime_token,
+    )
+    text = raw.decode("utf-8").strip()[:WAKE_DISCARDED_DRAFT_TEXT_CAP]
+    if not text:
+        return None
+    try:
+        created_at = float(row.get("created_at") or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        created_at = 0.0
+    return {
+        "text": text,
+        "created_at": created_at,
+        "wake_kind": str(row.get("wake_kind") or ""),
+        "source_job_id": str(row.get("source_job_id") or ""),
+        "collision_seq_hint": max(0, int(row.get("collision_seq_hint") or 0)),
+    }
+
+
+def _wake_discarded_draft_prompt_data(draft: dict) -> dict:
+    """Build an untrusted prompt segment capped in serialized JSON space."""
+    metadata = {
+        "created_at": draft.get("created_at", 0.0),
+        "delivery_note": _WAKE_DISCARDED_DRAFT_DELIVERY_NOTE,
+        "guidance": _WAKE_DISCARDED_DRAFT_GUIDANCE,
+        "source_job_id": str(draft.get("source_job_id") or ""),
+        "wake_kind": str(draft.get("wake_kind") or ""),
+    }
+    wrapper = {"wake_discarded_draft": {**metadata, "text": ""}}
+    raw_text = str(draft.get("text") or "")[:WAKE_DISCARDED_DRAFT_TEXT_CAP]
+    # Cap what the provider receives: escaping can expand newlines, quotes and
+    # backslashes, so truncate in rendered JSON space rather than raw chars.
+    best = ""
+    low = 0
+    high = len(raw_text)
+    while low <= high:
+        midpoint = (low + high) // 2
+        wrapper["wake_discarded_draft"]["text"] = raw_text[:midpoint]
+        rendered = json.dumps(
+            wrapper,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(rendered) <= WAKE_DISCARDED_DRAFT_PROMPT_CAP:
+            best = raw_text[:midpoint]
+            low = midpoint + 1
+        else:
+            high = midpoint - 1
+    wrapper["wake_discarded_draft"]["text"] = best
+    return wrapper
+
+
+def _wake_action_context_str(
+    grounding_results: dict | None,
+    discarded_draft: dict | None,
+) -> str:
+    """Render ordinary grounding plus one latest undelivered draft.
+
+    With no draft this delegates byte-for-byte to the existing renderer. When
+    a draft exists it is retained first under the global action-context cap;
+    ordinary grounding observations are then added whole while they fit.
+    """
+    if discarded_draft is None:
+        return context.action_context_str(grounding_results)
+    try:
+        draft_payload = _wake_discarded_draft_prompt_data(discarded_draft)
+        folded = context.fold_action_results(grounding_results)
+        combined = {**folded, **draft_payload}
+        rendered = json.dumps(
+            combined,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(rendered) <= context.ACTION_CONTEXT_CHAR_CAP:
+            return rendered
+        bounded = {"_truncated": True, **draft_payload}
+        for action_type, value in folded.items():
+            if action_type in {"_truncated", "wake_discarded_draft"}:
+                continue
+            candidate = {**bounded, action_type: value}
+            candidate_rendered = json.dumps(
+                candidate,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if len(candidate_rendered) <= context.ACTION_CONTEXT_CHAR_CAP:
+                bounded[action_type] = value
+        return json.dumps(
+            bounded,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except Exception as exc:  # noqa: BLE001 — stale context must not kill wake
+        log.warning(
+            "[v2.worker] wake discarded-draft prompt omitted code=%s",
+            type(exc).__name__.lower(),
+        )
+        return context.action_context_str(grounding_results)
+
+
+async def _emit_wake_discarded_draft_trace(
+    emit_debug_trace: Callable[..., None] | None,
+    user_id: str,
+    event: str,
+    *,
+    source_job_id: str,
+    chars: int,
+    current_job_id: str,
+    lane: str,
+) -> None:
+    """Emit content-free draft lifecycle telemetry without affecting a turn."""
+    if emit_debug_trace is None:
+        return
+    try:
+        await asyncio.to_thread(
+            emit_debug_trace,
+            user_id,
+            event,
+            status="ok",
+            summary="V2 撞车丢弃草稿生命周期",
+            explain="仅记录来源任务、字符数和 wake lane；不记录草稿正文。",
+            detail={
+                "source_job_id": str(source_job_id),
+                "current_job_id": str(current_job_id),
+                "chars": max(0, int(chars)),
+                "lane": str(lane),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — diagnostics never affect delivery
+        log.warning(
+            "[v2.worker] wake discarded-draft trace failed user=%s event=%s "
+            "code=%s",
+            user_id,
+            event,
+            type(exc).__name__.lower(),
+        )
 
 
 # Wake-lane BYOK payment cooldown: a "provider_config" failure (402 out-of-credits,
@@ -8322,6 +8570,8 @@ async def _run_wake(
     push_slot: dict | None = None
     shadow_decision_allowed: bool | None = None
     stay_silent_reason: str | None = None
+    discarded_draft: dict | None = None
+    discarded_draft_cleared = False
     language_user_rows: list[dict] = []
     # Same content-free MCP usage counters chat keeps, declared before the try so
     # the finally can emit `mcp.turn.usage` for wake lanes too. Without a wake
@@ -8433,6 +8683,36 @@ async def _run_wake(
         # wake turn. Load before any prompt-coverage provider call so a broken
         # workspace never produces an under-authorized proactive response.
         token = deps.mint_enclave_token(user_id)
+        if lane in _WAKE_DISCARDED_DRAFT_LANES:
+            try:
+                async with enclave_sem:
+                    discarded_draft = await asyncio.to_thread(
+                        _read_latest_wake_discarded_draft,
+                        user_id,
+                        runtime_token=token,
+                    )
+            except Exception as exc:  # noqa: BLE001 — optional stale context
+                log.warning(
+                    "[v2.worker] wake discarded-draft read failed user=%s "
+                    "job=%s lane=%s code=%s",
+                    user_id,
+                    job_id,
+                    lane,
+                    type(exc).__name__.lower(),
+                )
+                discarded_draft = None
+            if discarded_draft is not None:
+                await _emit_wake_discarded_draft_trace(
+                    deps.emit_debug_trace,
+                    user_id,
+                    "wake.discarded_draft.consumed",
+                    source_job_id=str(
+                        discarded_draft.get("source_job_id") or ""
+                    ),
+                    chars=len(str(discarded_draft.get("text") or "")),
+                    current_job_id=str(job_id),
+                    lane=lane,
+                )
         observe_photo = _make_photo_observer(
             deps,
             user_id=user_id,
@@ -9464,6 +9744,7 @@ async def _run_wake(
             nonlocal thinking_trace_emitted, language_trace_emitted
             nonlocal shadow_decision_allowed
             nonlocal wake_self_thinking_failed
+            nonlocal discarded_draft_cleared
             text = str(text or "").strip()
             wake_self_thinking_failed = False
             # Self-authored thinking (same mechanism as the chat lane): peel a leading
@@ -9805,6 +10086,41 @@ async def _run_wake(
                 )
                 if status == "applied":
                     shadow_decision_allowed = True
+                    if (
+                        discarded_draft is not None
+                        and not discarded_draft_cleared
+                    ):
+                        try:
+                            cleared = await asyncio.to_thread(
+                                db.log_clear,
+                                user_id,
+                                WAKE_DISCARDED_DRAFT_STREAM,
+                            )
+                        except Exception as exc:  # noqa: BLE001 — reply applied
+                            cleared = False
+                            log.warning(
+                                "[v2.worker] wake discarded-draft clear failed "
+                                "user=%s job=%s lane=%s code=%s",
+                                user_id,
+                                job_id,
+                                lane,
+                                type(exc).__name__.lower(),
+                            )
+                        if cleared:
+                            discarded_draft_cleared = True
+                            await _emit_wake_discarded_draft_trace(
+                                deps.emit_debug_trace,
+                                user_id,
+                                "wake.discarded_draft.cleared",
+                                source_job_id=str(
+                                    discarded_draft.get("source_job_id") or ""
+                                ),
+                                chars=len(
+                                    str(discarded_draft.get("text") or "")
+                                ),
+                                current_job_id=str(job_id),
+                                lane=lane,
+                            )
                     # 覆盖式：一个回合可能吐多条气泡，只有最后一条会成为推送。构建槽位
                     # 本身也是 best-effort：payload 缺 "envelope"（例如未来出现的非
                     # seq_native / 测试注入变体）不该把一个已经成功落库的回合打成
@@ -9862,7 +10178,46 @@ async def _run_wake(
                 ):
                     # Post-time collision is an intentional sleep, not stale
                     # input to fold into another provider call. The wake job
-                    # finishes normally without publishing or pushing.
+                    # finishes normally without publishing or pushing. Preserve
+                    # a bounded encrypted draft so the next weak wake knows this
+                    # wording was never shown. Persistence is best-effort and
+                    # cannot retry or publish this discarded reply.
+                    try:
+                        collision_seq_hint = await asyncio.to_thread(
+                            db.chat_max_seq,
+                            user_id,
+                        )
+                    except Exception:  # noqa: BLE001 — diagnostic hint only
+                        collision_seq_hint = wake_snapshot_seq
+                    try:
+                        stored_draft = await asyncio.to_thread(
+                            _store_wake_discarded_draft,
+                            store,
+                            text,
+                            wake_kind=lane,
+                            source_job_id=str(job_id),
+                            collision_seq_hint=int(collision_seq_hint or 0),
+                        )
+                    except Exception as exc:  # noqa: BLE001 — fail-open observe
+                        stored_draft = None
+                        log.warning(
+                            "[v2.worker] wake discarded-draft write failed "
+                            "user=%s job=%s lane=%s code=%s",
+                            user_id,
+                            job_id,
+                            lane,
+                            type(exc).__name__.lower(),
+                        )
+                    if stored_draft is not None:
+                        await _emit_wake_discarded_draft_trace(
+                            deps.emit_debug_trace,
+                            user_id,
+                            "wake.discarded_draft.stored",
+                            source_job_id=str(job_id),
+                            chars=int(stored_draft.get("chars") or 0),
+                            current_job_id=str(job_id),
+                            lane=lane,
+                        )
                     return
                 if (
                     status == "discarded"
@@ -10040,10 +10395,9 @@ async def _run_wake(
                 system_prompt=_wake_sys,
                 summary=summary,
                 tail=wake_tail,
-                extra_context=(
-                    context.action_context_str(grounding_results)
-                    if grounding_results
-                    else ""
+                extra_context=_wake_action_context_str(
+                    grounding_results,
+                    discarded_draft,
                 ),
                 identity_card_or_persona=identity_card_or_persona,
                 trusted_system_blocks=trusted_system_blocks,
