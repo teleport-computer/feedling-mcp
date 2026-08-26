@@ -6,6 +6,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from psycopg_pool import PoolTimeout
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
@@ -844,3 +845,40 @@ def test_lost_lease_never_advances_capture_frontier(monkeypatch):
 
     assert result == "failed"
     assert statuses == [True]
+
+
+def test_capture_database_pool_timeout_records_distinct_terminal_code():
+    terminal = []
+
+    def _pool_timeout(_user_id):
+        raise PoolTimeout("private database acquisition detail")
+
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        resolve_provider=lambda _uid: (object(), {}),
+        mint_enclave_token=lambda _uid: "rt",
+        read_capture_state=_pool_timeout,
+        fail_capture_job=lambda **kwargs: terminal.append(kwargs) or True,
+    )
+
+    result = asyncio.run(
+        worker._run_extraction(
+            "job-db-pool",
+            "u-v2-capture",
+            "capture",
+            deps,
+            object(),
+            asyncio.Semaphore(1),
+            claimed_by="owner",
+        )
+    )
+
+    assert result == "failed"
+    assert terminal == [
+        {
+            "job_id": "job-db-pool",
+            "user_id": "u-v2-capture",
+            "claimed_by": "owner",
+            "error": "extraction_failed:database_pool_timeout",
+        }
+    ]

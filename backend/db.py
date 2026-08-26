@@ -1348,7 +1348,33 @@ def _chat_proactive_status_into(conn, ids: list[str], out: dict, ensure) -> None
                 extra_block[key] = buckets
 
 
-def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
+_ADMIN_DATA_TRACK_READ_TIMEOUT_MS = 5000
+
+
+@contextmanager
+def _admin_data_track_connection():
+    """Lease one bounded admin connection without poisoning the shared pool."""
+    with get_pool().connection(
+        timeout=_ADMIN_DATA_TRACK_READ_TIMEOUT_MS / 1000
+    ) as conn:
+        # Pool connections are autocommit, so SET LOCAL/set_config(..., true)
+        # would expire at the end of that one statement. Use a session setting
+        # for this lease and always reset it before returning the connection.
+        conn.execute(
+            f"SET statement_timeout = '{_ADMIN_DATA_TRACK_READ_TIMEOUT_MS}ms'"
+        )
+        try:
+            yield conn
+        finally:
+            try:
+                conn.execute("RESET statement_timeout")
+            except Exception:  # noqa: BLE001 — pool discards broken sessions
+                pass
+
+
+def admin_data_track_snapshot(
+    user_ids: list[str], *, include_legacy_background: bool = True
+) -> dict[str, dict]:
     """Return metadata-only aggregate stats for a set of users.
 
     This is deliberately SQL-aggregate based: admin dashboards must not pull
@@ -1364,11 +1390,14 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
         return out.setdefault(uid, {})
 
     out: dict[str, dict] = {
-        uid: {"app_usage": {"foreground_sec": 0, "sessions": 0, "last_at": None}}
+        uid: {
+            "app_usage": {"foreground_sec": 0, "sessions": 0, "last_at": None},
+            "snapshot_read_status": {"level": "ok", "message": ""},
+        }
         for uid in ids
     }
     try:
-        with get_pool().connection() as conn:
+        with _admin_data_track_connection() as conn:
             _chat_rollup_into(conn, ids, out, ensure)
 
             rows = conn.execute(
@@ -1503,116 +1532,121 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                     "last_at": last_at,
                 }
 
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       COUNT(*)::int AS decisions,
-                       COUNT(*) FILTER (
-                         WHERE LOWER(COALESCE(doc->>'should_reach_out', '')) IN ('true', '1', 'yes')
-                       )::int AS decision_true
-                FROM user_logs
-                WHERE user_id = ANY(%s) AND stream = 'gate_decisions'
-                GROUP BY user_id
-                """,
-                (ids,),
-            ).fetchall()
-            for uid, decisions, decision_true in rows:
-                ensure(out, uid).setdefault("proactive_extra", {}).update({
-                    "decisions": decisions,
-                    "decision_true": decision_true,
-                })
+            if include_legacy_background:
+                rows = conn.execute(
+                    """
+                    SELECT user_id,
+                           COUNT(*)::int AS decisions,
+                           COUNT(*) FILTER (
+                             WHERE LOWER(COALESCE(doc->>'should_reach_out', '')) IN ('true', '1', 'yes')
+                           )::int AS decision_true
+                    FROM user_logs
+                    WHERE user_id = ANY(%s) AND stream = 'gate_decisions'
+                    GROUP BY user_id
+                    """,
+                    (ids,),
+                ).fetchall()
+                for uid, decisions, decision_true in rows:
+                    ensure(out, uid).setdefault("proactive_extra", {}).update({
+                        "decisions": decisions,
+                        "decision_true": decision_true,
+                    })
 
-            rows = conn.execute(
-                """
-                SELECT user_id, COALESCE(NULLIF(doc->>'status', ''), 'unknown') AS status,
-                       COUNT(*)::int
-                FROM user_logs
-                WHERE user_id = ANY(%s) AND stream = 'proactive_jobs'
-                GROUP BY user_id, status
-                """,
-                (ids,),
-            ).fetchall()
-            for uid, status, count in rows:
-                ensure(out, uid).setdefault("proactive_extra", {}).setdefault("jobs_by_status", {})[status] = count
+                rows = conn.execute(
+                    """
+                    SELECT user_id, COALESCE(NULLIF(doc->>'status', ''), 'unknown') AS status,
+                           COUNT(*)::int
+                    FROM user_logs
+                    WHERE user_id = ANY(%s) AND stream = 'proactive_jobs'
+                    GROUP BY user_id, status
+                    """,
+                    (ids,),
+                ).fetchall()
+                for uid, status, count in rows:
+                    ensure(out, uid).setdefault("proactive_extra", {}).setdefault("jobs_by_status", {})[status] = count
 
-            # Seven 2026-08-21: V1 has its own status_reason keyspace.  Read
-            # the exact producer-owned exemption set so db.py does not copy
-            # seven strings or merge them with V2 last_error codes.
-            v1_user_unavailable = list(
-                notices_catalog.USER_UNAVAILABLE_V1_REASONS
-            )
+                # Seven 2026-08-21: V1 has its own status_reason keyspace.  Read
+                # the exact producer-owned exemption set so db.py does not copy
+                # seven strings or merge them with V2 last_error codes.
+                v1_user_unavailable = list(
+                    notices_catalog.USER_UNAVAILABLE_V1_REASONS
+                )
 
-            # Split proactive jobs by lane (heartbeat vs screen-share vs other).
-            # The persisted job doc carries job_kind / wake_kind / trigger; group
-            # by the first non-empty of those and let the caller bucket the raw
-            # kind strings (data_track._classify_proactive_kind).
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       COALESCE(
-                         NULLIF(doc->>'job_kind', ''),
-                         NULLIF(doc->>'wake_kind', ''),
-                         NULLIF(doc->>'trigger', ''),
-                         'unknown'
-                       ) AS kind,
-                       COUNT(*)::int AS total,
-                       (COUNT(*) FILTER (
-                          WHERE doc->>'status' = 'failed'
-                            AND COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''),
-                                         'unknown') <> ALL(%s::text[])))::int
-                         AS operational_failed,
-                       (COUNT(*) FILTER (
-                          WHERE doc->>'status' = 'skipped'))::int AS control,
-                       (COUNT(*) FILTER (
-                          WHERE doc->>'status' = 'failed'
-                            AND COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''),
-                                         'unknown') = ANY(%s::text[])))::int
-                         AS user_unavailable
-                FROM user_logs
-                WHERE user_id = ANY(%s) AND stream = 'proactive_jobs'
-                GROUP BY user_id, kind
-                """,
-                (v1_user_unavailable, v1_user_unavailable, ids),
-            ).fetchall()
-            for uid, kind, total, failed, control, user_unavailable in rows:
-                pex = ensure(out, uid).setdefault("proactive_extra", {})
-                pex.setdefault("jobs_by_kind", {})[kind] = total
-                pex.setdefault("jobs_failed_by_kind", {})[kind] = failed
-                pex.setdefault("jobs_control_by_kind", {})[kind] = control
-                pex.setdefault("jobs_user_unavailable_by_kind", {})[
-                    kind
-                ] = user_unavailable
+                # These three GROUP BY queries are intentionally detail-only.
+                # The users index used to run them over every retained V1 log on
+                # every request; at production cardinality that path reached the
+                # 240s server boundary.  The index now reads bounded immutable
+                # lane cells via admin_background_lane_users instead.
+                rows = conn.execute(
+                    """
+                    SELECT user_id,
+                           COALESCE(
+                             NULLIF(doc->>'job_kind', ''),
+                             NULLIF(doc->>'wake_kind', ''),
+                             NULLIF(doc->>'trigger', ''),
+                             'unknown'
+                           ) AS kind,
+                           COUNT(*)::int AS total,
+                           (COUNT(*) FILTER (
+                              WHERE doc->>'status' = 'failed'
+                                AND COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''),
+                                             'unknown') <> ALL(%s::text[])))::int
+                             AS operational_failed,
+                           (COUNT(*) FILTER (
+                              WHERE doc->>'status' = 'skipped'))::int AS control,
+                           (COUNT(*) FILTER (
+                              WHERE doc->>'status' = 'failed'
+                                AND COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''),
+                                             'unknown') = ANY(%s::text[])))::int
+                             AS user_unavailable
+                    FROM user_logs
+                    WHERE user_id = ANY(%s) AND stream = 'proactive_jobs'
+                    GROUP BY user_id, kind
+                    """,
+                    (v1_user_unavailable, v1_user_unavailable, ids),
+                ).fetchall()
+                for uid, kind, total, failed, control, user_unavailable in rows:
+                    pex = ensure(out, uid).setdefault("proactive_extra", {})
+                    pex.setdefault("jobs_by_kind", {})[kind] = total
+                    pex.setdefault("jobs_failed_by_kind", {})[kind] = failed
+                    pex.setdefault("jobs_control_by_kind", {})[kind] = control
+                    pex.setdefault("jobs_user_unavailable_by_kind", {})[
+                        kind
+                    ] = user_unavailable
 
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       CASE
-                         WHEN doc->>'status' = 'skipped' THEN 'control'
-                         WHEN COALESCE(
-                           NULLIF(BTRIM(doc->>'status_reason'), ''), 'unknown'
-                         ) = ANY(%s::text[]) THEN 'user_unavailable'
-                         ELSE 'operational_failure'
-                       END AS outcome_class,
-                       COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''), 'unknown') AS reason,
-                       COUNT(*)::int
-                FROM user_logs
-                WHERE user_id = ANY(%s)
-                  AND stream = 'proactive_jobs'
-                  AND doc->>'status' IN ('failed', 'skipped')
-                GROUP BY user_id, outcome_class, reason
-                """,
-                (v1_user_unavailable, ids),
-            ).fetchall()
-            reason_fields = {
-                "operational_failure": "jobs_failed_by_reason",
-                "control": "jobs_control_by_reason",
-                "user_unavailable": "jobs_user_unavailable_by_reason",
-            }
-            for uid, outcome_class, reason, count in rows:
-                field = reason_fields[str(outcome_class)]
-                ensure(out, uid).setdefault("proactive_extra", {}).setdefault(
-                    field, {}
-                )[reason] = count
+                rows = conn.execute(
+                    """
+                    SELECT user_id,
+                           CASE
+                             WHEN doc->>'status' = 'skipped' THEN 'control'
+                             WHEN COALESCE(
+                               NULLIF(BTRIM(doc->>'status_reason'), ''), 'unknown'
+                             ) = ANY(%s::text[]) THEN 'user_unavailable'
+                             ELSE 'operational_failure'
+                           END AS outcome_class,
+                           COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''), 'unknown') AS reason,
+                           COUNT(*)::int
+                    FROM user_logs
+                    WHERE user_id = ANY(%s)
+                      AND stream = 'proactive_jobs'
+                      AND doc->>'status' IN ('failed', 'skipped')
+                    GROUP BY user_id, outcome_class, reason
+                    """,
+                    (v1_user_unavailable, ids),
+                ).fetchall()
+                reason_fields = {
+                    "operational_failure": "jobs_failed_by_reason",
+                    "control": "jobs_control_by_reason",
+                    "user_unavailable": "jobs_user_unavailable_by_reason",
+                }
+                for uid, outcome_class, reason, count in rows:
+                    field = reason_fields[str(outcome_class)]
+                    ensure(out, uid).setdefault("proactive_extra", {}).setdefault(
+                        field, {}
+                    )[reason] = count
+            else:
+                for uid in ids:
+                    ensure(out, uid)["legacy_background_breakdowns_status"] = "omitted"
 
             # ⚠️ 这两个维度**必须**走格子，不能留原来的全史 GROUP BY。
             # 把它们冻进格子却仍从 chat_messages 现算，等于新增列只写不读、
@@ -1620,33 +1654,41 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
             # 逮到我就是这么写的：写侧改了、读侧一行没动）。
             _chat_proactive_status_into(conn, ids, out, ensure)
 
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       COUNT(*)::int AS capture_jobs,
-                       COALESCE(SUM(NULLIF(doc->>'actions_written', '')::int), 0)::int AS actions_written,
-                       MAX(ts) AS last_capture_ts
-                FROM user_logs
-                WHERE user_id = ANY(%s) AND stream = 'memory_capture_jobs'
-                GROUP BY user_id
-                """,
-                (ids,),
-            ).fetchall()
-            for uid, capture_jobs, actions_written, last_ts in rows:
-                ensure(out, uid).setdefault("memory_extra", {}).update({
-                    "capture_jobs": capture_jobs,
-                    "capture_actions_written": actions_written,
-                    "last_capture_ts": last_ts,
-                })
+            if include_legacy_background:
+                rows = conn.execute(
+                    """
+                    SELECT user_id,
+                           COUNT(*)::int AS capture_jobs,
+                           COALESCE(SUM(NULLIF(doc->>'actions_written', '')::int), 0)::int AS actions_written,
+                           MAX(ts) AS last_capture_ts
+                    FROM user_logs
+                    WHERE user_id = ANY(%s) AND stream = 'memory_capture_jobs'
+                    GROUP BY user_id
+                    """,
+                    (ids,),
+                ).fetchall()
+                for uid, capture_jobs, actions_written, last_ts in rows:
+                    ensure(out, uid).setdefault("memory_extra", {}).update({
+                        "capture_jobs": capture_jobs,
+                        "capture_actions_written": actions_written,
+                        "last_capture_ts": last_ts,
+                    })
 
-            for stream, field, out_key in (
-                ("memory_changes", "action", "changes_by_action"),
-                ("memory_changes", "capture_mode", "changes_by_capture_mode"),
-                ("memory_capture_jobs", "status", "capture_jobs_by_status"),
-                ("memory_capture_jobs", "mode", "capture_jobs_by_mode"),
-                ("tracking_events", "type", "tracking_by_type"),
-                ("bootstrap_events", "event_type", "bootstrap_by_type"),
-            ):
+            detail_breakdowns = ()
+            if include_legacy_background:
+                # Every entry below groups an unbounded retained stream by a
+                # JSON field. They are useful on one-user detail, but none is
+                # rendered by the users/summary surfaces. Keep all of them out
+                # of the fleet-wide path rather than merely hiding the result.
+                detail_breakdowns = (
+                    ("memory_changes", "action", "changes_by_action"),
+                    ("memory_changes", "capture_mode", "changes_by_capture_mode"),
+                    ("memory_capture_jobs", "status", "capture_jobs_by_status"),
+                    ("memory_capture_jobs", "mode", "capture_jobs_by_mode"),
+                    ("tracking_events", "type", "tracking_by_type"),
+                    ("bootstrap_events", "event_type", "bootstrap_by_type"),
+                )
+            for stream, field, out_key in detail_breakdowns:
                 rows = conn.execute(
                     """
                     SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
@@ -1825,6 +1867,12 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                 ensure(out, uid)["history_import"] = doc
     except Exception as e:
         log.error("[db] admin_data_track_snapshot failed: %s", e)
+        level, message = _admin_event_read_failure(e)
+        for uid in ids:
+            ensure(out, uid)["snapshot_read_status"] = {
+                "level": level,
+                "message": message,
+            }
     return out
 
 
@@ -6279,6 +6327,196 @@ def _admin_event_read_failure(exc: Exception) -> tuple[str, str]:
     if str(getattr(exc, "sqlstate", "") or "") == "57014":
         return "timeout", "取数超时（记了，但这里读不出来）"
     return "read_error", "取数失败（记了，但这里读不出来）"
+
+
+def admin_background_lane_users(
+    user_ids: list[str], *, days: int = 7, tz: str = "Asia/Shanghai"
+) -> dict:
+    """Bounded per-user heartbeat/capture outcomes from immutable day cells.
+
+    The old users index issued several whole-history GROUP BY queries over
+    ``user_logs`` for every page load and reached the production server's 240s
+    boundary.  This reader scans only completed Beijing-day cells.  Counts and
+    coverage stay separate so an unmeasured zero cannot look healthy.
+    """
+    ids = list(dict.fromkeys(str(uid) for uid in user_ids if str(uid)))
+    day_count = max(1, min(int(days or 7), 90))
+    zone = ZoneInfo(tz)
+    end_day = datetime.now(zone).date() - timedelta(days=1)
+    start_day = end_day - timedelta(days=day_count - 1)
+
+    def empty_coverage(level: str, message: str = "") -> dict[str, dict]:
+        return {
+            route: {
+                "level": level,
+                "message": message,
+                "backfill_from": None,
+                "through_day": None,
+                "outcomes_from": None,
+                "required_start_day": start_day.isoformat(),
+                "required_end_day": end_day.isoformat(),
+            }
+            for route in ("resident", "model_api")
+        }
+
+    base = {
+        "window": {
+            "timezone": tz,
+            "days": day_count,
+            "start_day": start_day.isoformat(),
+            "end_day": end_day.isoformat(),
+            "open_day_excluded": True,
+        },
+        "coverage_by_route": empty_coverage("unavailable"),
+        "users": {},
+        "read_status": {"level": "ok", "message": ""},
+    }
+    if not ids:
+        return base
+
+    try:
+        with _admin_data_track_connection() as conn:
+            rows = conn.execute(
+                """
+                WITH selected AS (
+                  SELECT user_id, route, lane, completed, failed, expired,
+                         superseded, operational_failures, control_outcomes,
+                         user_unavailable, failure_codes
+                  FROM lane_daily_rollup
+                  WHERE user_id = ANY(%s)
+                    AND day >= %s AND day <= %s
+                    AND lane IN ('heartbeat', 'capture')
+                ), totals AS (
+                  SELECT user_id, route, lane,
+                         coalesce(sum(completed), 0)::bigint AS completed,
+                         coalesce(sum(failed), 0)::bigint AS failed,
+                         coalesce(sum(expired), 0)::bigint AS expired,
+                         coalesce(sum(superseded), 0)::bigint AS superseded,
+                         coalesce(sum(operational_failures), 0)::bigint
+                           AS operational_failures,
+                         coalesce(sum(control_outcomes), 0)::bigint
+                           AS control_outcomes,
+                         coalesce(sum(user_unavailable), 0)::bigint
+                           AS user_unavailable
+                  FROM selected
+                  GROUP BY user_id, route, lane
+                ), code_counts AS (
+                  SELECT s.user_id, s.route, s.lane, code.key AS code,
+                         coalesce(sum(
+                           CASE WHEN code.value ~ '^[0-9]+$'
+                                THEN code.value::bigint ELSE 0 END
+                         ), 0)::bigint AS count
+                  FROM selected s
+                  CROSS JOIN LATERAL jsonb_each_text(s.failure_codes) AS code
+                  GROUP BY s.user_id, s.route, s.lane, code.key
+                ), codes AS (
+                  SELECT user_id, route, lane,
+                         jsonb_object_agg(code, count) AS failure_codes
+                  FROM code_counts
+                  GROUP BY user_id, route, lane
+                )
+                SELECT t.user_id, t.route, t.lane, t.completed, t.failed,
+                       t.expired, t.superseded, t.operational_failures,
+                       t.control_outcomes, t.user_unavailable,
+                       coalesce(c.failure_codes, '{}'::jsonb)
+                FROM totals t
+                LEFT JOIN codes c USING (user_id, route, lane)
+                ORDER BY t.user_id, t.route, t.lane
+                """,
+                (ids, start_day.isoformat(), end_day.isoformat()),
+            ).fetchall()
+            watermarks = {
+                str(row[0]): {
+                    "backfill_from": str(row[1]) if row[1] is not None else None,
+                    "through_day": str(row[2]) if row[2] is not None else None,
+                    "outcomes_from": str(row[3]) if row[3] is not None else None,
+                }
+                for row in conn.execute(
+                    "SELECT route, backfill_from, through_day, outcomes_from "
+                    "FROM lane_rollup_watermark "
+                    "WHERE route IN ('resident','model_api')"
+                ).fetchall()
+            }
+    except Exception as exc:  # noqa: BLE001 — admin evidence degrades closed
+        level, message = _admin_event_read_failure(exc)
+        log.error("[db] admin_background_lane_users failed: %s", exc)
+        base["read_status"] = {"level": level, "message": message}
+        base["coverage_by_route"] = empty_coverage(level, message)
+        return base
+
+    coverage: dict[str, dict] = {}
+    for route in ("resident", "model_api"):
+        wm = watermarks.get(route)
+        if wm is None:
+            coverage[route] = empty_coverage("unavailable")[route]
+            continue
+        complete = (
+            bool(wm.get("backfill_from"))
+            and bool(wm.get("through_day"))
+            and bool(wm.get("outcomes_from"))
+            and str(wm["backfill_from"]) <= start_day.isoformat()
+            and str(wm["outcomes_from"]) <= start_day.isoformat()
+            and str(wm["through_day"]) >= end_day.isoformat()
+        )
+        coverage[route] = {
+            "level": "green" if complete else "partial",
+            "message": "" if complete else "窗口仅部分落入冻结/分类覆盖范围",
+            **wm,
+            "required_start_day": start_day.isoformat(),
+            "required_end_day": end_day.isoformat(),
+        }
+
+    users: dict[str, dict] = {}
+    for row in rows:
+        uid, route, lane = str(row[0]), str(row[1]), str(row[2])
+        completed = int(row[3] or 0)
+        operational = int(row[7] or 0)
+        denominator = completed + operational
+        lane_row = {
+            "completed": completed,
+            "failed": int(row[4] or 0),
+            "expired": int(row[5] or 0),
+            "superseded": int(row[6] or 0),
+            "operational_failures": operational,
+            "control_outcomes": int(row[8] or 0),
+            "user_unavailable": int(row[9] or 0),
+            "terminal_attempts": denominator,
+            "failure_rate": operational / denominator if denominator else None,
+            "failure_codes": {
+                str(code): int(count or 0)
+                for code, count in dict(row[10] or {}).items()
+            },
+        }
+        user = users.setdefault(uid, {"routes": {}, "lanes": {}})
+        user["routes"].setdefault(route, {})[lane] = dict(lane_row)
+        combined = user["lanes"].setdefault(
+            lane,
+            {
+                "completed": 0, "failed": 0, "expired": 0,
+                "superseded": 0, "operational_failures": 0,
+                "control_outcomes": 0, "user_unavailable": 0,
+                "terminal_attempts": 0, "failure_rate": None,
+                "failure_codes": {},
+            },
+        )
+        for field in (
+            "completed", "failed", "expired", "superseded",
+            "operational_failures", "control_outcomes", "user_unavailable",
+            "terminal_attempts",
+        ):
+            combined[field] += lane_row[field]
+        for code, count in lane_row["failure_codes"].items():
+            combined["failure_codes"][code] = (
+                combined["failure_codes"].get(code, 0) + count
+            )
+        combined["failure_rate"] = (
+            combined["operational_failures"] / combined["terminal_attempts"]
+            if combined["terminal_attempts"] else None
+        )
+
+    base["coverage_by_route"] = coverage
+    base["users"] = users
+    return base
 
 
 def _lane_rollup_path_window(*, path_rows, watermarks: dict,
