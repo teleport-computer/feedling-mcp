@@ -1,4 +1,14 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/MEMORY_GARDEN_EXTRACTION_DESIGN.zh.md
+historical_reason: implemented
+---
 # Memory Garden 内核提取 实施计划
+
+> **CORE EXTRACTION IMPLEMENTED / DO NOT RE-RUN**：本计划的判断力提取、调用方切换和
+> Garden/IO 边界已实施；内核随后重命名为 `memgarden` 并改为外部 wheel。正文中的
+> storage adapter 切流与 CLI/MCP 壳没有实施，继续作为 current decision 的明确 deferred
+> scope，而不是本归档计划的已交付能力。其余路径、分支和命令仅作实施期证据。
 
 **Goal:** 把 Memory Garden 的判断力（什么值得记 / 怎么归桶 / 挑哪几张 / 要不要整理 / 怎么整理）
 从 io 后端提取成独立包 `backend/memgarden/`，让 V1 consumer、V2 worker、genesis 三条线
