@@ -1,6 +1,7 @@
 ---
-document_lifecycle: current
+document_lifecycle: historical
 canonical_owner: docs/superpowers/plans/2026-08-24-repository-cleanup.zh-CN.md
+historical_reason: implemented
 ---
 # Storage/TEE History Batch 1 Implementation Plan
 

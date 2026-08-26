@@ -13,7 +13,7 @@ historical_reason: implemented
 
 **Tech Stack:** postgres:17（digest pin）、WAL-G（v3.0.8 起步，须核验 PG17）、Phala dstack（prod9, `phala@1.1.19`）、Cloudflare R2、GitHub Actions（手动 deploy + cron 监控）。
 
-**Spec:** `docs/superpowers/specs/2026-07-04-tee-postgres-migration-design.md`（以下简称 spec）。hivemind 源文件在 `~/Projects/teleport/hivemind-core/deploy/postgres/`，**以 spec 和本 plan 为准，源文件里 fail-open 的分支一律不抄**。
+**Spec:** `docs/archive/superpowers/specs/2026-07-04-tee-postgres-migration-design.md`（历史设计，以下简称 spec）。hivemind 源文件在 `~/Projects/teleport/hivemind-core/deploy/postgres/`，**以当时的 spec 和本 plan 为准，源文件里 fail-open 的分支一律不抄**。
 
 ## Global Constraints
 
