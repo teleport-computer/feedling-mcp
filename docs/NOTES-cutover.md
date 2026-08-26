@@ -189,3 +189,28 @@ purely the read-side pooling across day-docs, closed by this batch.
   `MEASUREMENT_GROUPS` (unchanged, per the prior batch's notes) — the read
   filter is a no-op for them exactly as it is for any other signal that never
   gets `_ts_kind`.
+
+## Full suite result
+
+```
+$ python3 -m pytest tests/ -q -p no:randomly --ignore=tests/test_api.py --ignore=tests/test_redis_pool.py --ignore=tests/test_image_generation_model.py
+...
+FAILED tests/test_e2b_template_contract.py::test_tracked_template_tag_matches_extractor_and_pinned_contract
+FAILED tests/test_file_text.py::test_pdf_extracts_text_via_pypdf
+FAILED tests/test_plaintext_shadow_config.py::test_live_identity_rejects_hostname_aliases_to_same_database
+FAILED tests/test_plaintext_shadow_config.py::test_live_identity_accepts_different_databases_on_same_server
+FAILED tests/test_provider_client.py::test_dedicated_url_answer_is_fetched_and_must_decode
+FAILED tests/test_provider_client.py::test_a_link_inside_a_chat_reply_is_never_fetched
+FAILED tests/test_provider_client.py::test_links_are_capped_and_share_one_byte_budget
+FAILED tests/test_provider_client.py::test_official_providers_also_fetch_a_url_answer
+FAILED tests/test_provider_client.py::test_links_share_one_wall_clock_budget
+FAILED tests/test_v2_downloadable_files.py::test_workspace_file_result_renders_real_word_and_pdf_documents
+FAILED tests/test_v2_downloadable_files.py::test_process_job_commits_single_generated_image_without_empty_followups
+11 failed, 11556 passed, 8 skipped, 9 xfailed, 68 warnings, 3 subtests passed in 405.66s
+```
+
+11 failed, matching the stated pre-existing baseline of 11 exactly by count.
+None are perception-related (e2b template pinning, PDF text extraction,
+plaintext-shadow hostname/database identity config, provider-client URL
+fetching, v2 downloadable-file rendering/job-commit) — unrelated to this
+change and to `perception_daily`/health measurement.
