@@ -11,6 +11,23 @@ main_compose="${2:?main compose path is required}"
 runner_compose="${3:?runner compose path is required}"
 trigger_sha="${GITHUB_SHA:?GITHUB_SHA is required}"
 owner="${GITHUB_REPOSITORY_OWNER:?GITHUB_REPOSITORY_OWNER is required}"
+test_preview="${FEEDLING_TEST_PREVIEW_DEPLOY:-0}"
+
+case "$test_preview" in
+  0) ;;
+  1)
+    if [ "$branch" != "test" ] \
+      || [ "${GITHUB_EVENT_NAME:-}" != "workflow_dispatch" ] \
+      || [[ "${GITHUB_REF:-}" != refs/heads/codex/* ]]; then
+      echo "::error::test preview deploy requires workflow_dispatch from a codex/* branch"
+      exit 1
+    fi
+    ;;
+  *)
+    echo "::error::FEEDLING_TEST_PREVIEW_DEPLOY must be exactly 0 or 1"
+    exit 1
+    ;;
+esac
 
 if [ "$(git rev-parse HEAD)" != "$trigger_sha" ]; then
   echo "::error::release checkout is not the triggering commit $trigger_sha"
@@ -37,9 +54,11 @@ if ! grep -Eq 'FEEDLING_PLAINTEXT_SHADOW_ENABLED:[[:space:]]*"0"' "$runner_compo
   exit 1
 fi
 
-git fetch origin "$branch"
-remote_sha=$(git rev-parse "origin/$branch")
-if [ "$remote_sha" != "$trigger_sha" ]; then
+if [ "$test_preview" = "0" ]; then
+  git fetch origin "$branch"
+  remote_sha=$(git rev-parse "origin/$branch")
+fi
+if [ "$test_preview" = "0" ] && [ "$remote_sha" != "$trigger_sha" ]; then
   # A retry of this same workflow may find the exact pin commit created by
   # its first attempt. Accept only that direct child, with the exact subject
   # and the two expected compose files as its complete diff. Any other branch
@@ -109,7 +128,9 @@ if ! grep -Eq "ghcr\\.io/${image_owner}/feedling-agent-runner:${short_sha}([[:sp
   exit 1
 fi
 
-if git diff --quiet -- "$main_compose" "$runner_compose"; then
+if [ "$test_preview" = "1" ]; then
+  echo "test preview images pinned locally to :$short_sha"
+elif git diff --quiet -- "$main_compose" "$runner_compose"; then
   echo "release images already pinned to :$short_sha"
 else
   git config user.name 'feedling-ci'
