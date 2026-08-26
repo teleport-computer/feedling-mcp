@@ -53,6 +53,8 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable
 
+from psycopg_pool import PoolTimeout as PsycopgPoolTimeout
+
 import db
 import generated_image
 import provider_attempt_ledger
@@ -1600,6 +1602,7 @@ _EXTRACTION_FAILURE_KINDS = frozenset(
     set(_EXTRACTION_FAILURE_REASONS)
     | set(v2_extraction.PUBLIC_PROVIDER_FAILURE_CODES)
     | {
+        "database_pool_timeout",
         "invalid_card_content",
         "invalid_card_content_after_retry",
         "json_decode_error",
@@ -1626,6 +1629,16 @@ PUBLIC_FAILURE_CODES = frozenset(
 
 def _extraction_failure_code(exc: BaseException) -> str:
     """Preserve expected extraction causes without persisting raw messages."""
+    # Historical workers persisted this exception by its bare class name as
+    # ``extraction_failed:pooltimeout``.  That lost the defining provenance:
+    # psycopg_pool and HTTP clients both expose a ``PoolTimeout`` class.  The
+    # provider seam catches and normalizes its own transport exceptions before
+    # they reach this boundary, while psycopg acquisition errors can arise from
+    # Capture state, fence, journal, or commit reads.  Match the concrete DB
+    # exception before the generic closed vocabulary so operators can tell a
+    # database-capacity failure from a model failure without exposing details.
+    if isinstance(exc, PsycopgPoolTimeout):
+        return "extraction_failed:database_pool_timeout"
     raw = str(exc or "").strip()
     provider_code = v2_extraction.provider_failure_code_from_reason(raw)
     if provider_code is not None:
