@@ -444,6 +444,10 @@ if not _provisioned:
         # 不碰 DB/网络。自带 sys.path 引导(backend/ + tools/)。这条留下——它测的是
         # 本仓库怎么拼 prompt，不是内核本身。
         "test_perception_prompt_golden.py",
+        # 趋势模型分发(2026-08-26)。纯:list_perception_daily 整个 monkeypatch 掉,
+        # 只调 perception_core.perception_trend_payload + perceptkit.trend_models,
+        # 不碰 DB。
+        "test_perception_trend_dispatch.py",
     }
     collect_ignore = sorted(
         f

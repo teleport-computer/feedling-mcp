@@ -477,6 +477,14 @@ jobs:
             tests/test_perception_prompt_golden.py \
             -v
 
+      - name: Perception trend model dispatch unit tests
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m pytest \
+            tests/test_perception_trend_dispatch.py \
+            -v
+
       - name: Repository truth-map unit tests
         run: |
           python -m pytest \
