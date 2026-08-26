@@ -59,6 +59,19 @@ def _tick(*, now_epoch: float | None = None) -> list[str]:
             log.info("[lane-rollup] froze chat Beijing days: %s", ",".join(chat))
     except Exception as e:  # noqa: BLE001
         log.warning("[lane-rollup] chat tick failed: %s", e)
+    # Distillation artifact attempts have their own no-backfill watermark.
+    # Keep this in an independent failure domain: a ledger migration/runtime
+    # defect must not stop lane or chat cells from advancing.
+    try:
+        distillation = db.freeze_completed_distillation_days(
+            now_epoch=now_epoch, tz="Asia/Shanghai")
+        if distillation:
+            log.info(
+                "[lane-rollup] froze distillation Beijing days: %s",
+                ",".join(distillation),
+            )
+    except Exception as e:  # noqa: BLE001
+        log.warning("[lane-rollup] distillation tick failed: %s", e)
     return frozen
 
 

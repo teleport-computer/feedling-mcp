@@ -42,6 +42,7 @@ def test_reap_requeues_under_cap():
     j = db.genesis_get_job(uid, jid)
     assert j["status"] == "awaiting_resident"          # re-queued (1 < 3)
     assert j["resident_consumer_id"] == ""             # consumer cleared → re-claimable
+    assert j["failed_phase"] == ""
 
 
 def test_reap_fails_at_cap():
@@ -52,6 +53,7 @@ def test_reap_fails_at_cap():
     j = db.genesis_get_job(uid, jid)
     assert j["status"] == "failed"
     assert j["error"] == "consumer_died"
+    assert j["failed_phase"] == "resident_claimed"
 
 
 def test_worker_reaper_ignores_resident_owned_processing():

@@ -3,9 +3,12 @@ import importlib
 import sys
 from pathlib import Path
 
+import httpx
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import pytest
+from psycopg_pool import PoolTimeout as PsycopgPoolTimeout
 
 from memory.capture_prompt_v1 import (
     build_capture_retry_prompt,
@@ -97,6 +100,28 @@ def test_extract_returns_reason_on_provider_error(monkeypatch):
     assert parsed is None
     assert err.startswith("provider_call_failed:")
     assert seen == [None]
+
+
+def test_extract_normalizes_http_pool_timeout_at_provider_boundary(monkeypatch):
+    async def _pool_timeout(_cfg, _messages, **_kwargs):
+        raise httpx.PoolTimeout("private HTTP pool detail")
+
+    monkeypatch.setattr(
+        extraction.provider_client,
+        "reliable_chat_completion_async",
+        _pool_timeout,
+    )
+
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=lambda raw: ([raw], None),
+        )
+    )
+
+    assert parsed is None
+    assert err == "provider_call_failed:upstream_unavailable"
 
 
 @pytest.mark.parametrize(
@@ -674,6 +699,23 @@ def test_extraction_failure_codes_are_allowlisted_and_drop_raw_details():
     assert worker._extraction_failure_code(
         RuntimeError("output_truncated")
     ) == "extraction_failed:output_truncated"
+
+
+def test_extraction_database_pool_timeout_keeps_provenance_without_details():
+    failure = PsycopgPoolTimeout("private database acquisition detail")
+
+    assert worker._extraction_failure_code(failure) == (
+        "extraction_failed:database_pool_timeout"
+    )
+    assert "extraction_failed:database_pool_timeout" in worker.PUBLIC_FAILURE_CODES
+
+    # Do not regress to matching the ambiguous class name: another library may
+    # define its own PoolTimeout, and model transport errors have a separate
+    # provider_call_failed normalization boundary.
+    OtherPoolTimeout = type("PoolTimeout", (RuntimeError,), {})
+    assert worker._extraction_failure_code(OtherPoolTimeout("private")) == (
+        "extraction_failed:error"
+    )
 
 
 def test_extract_provider_reason_records_failure_not_false_success(monkeypatch):

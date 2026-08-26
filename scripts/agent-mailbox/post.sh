@@ -106,7 +106,7 @@ mailbox="${AGENT_MAILBOX_DIR:-$root/.agents/mailbox}"
 # 其中 2 封是发给 Supervisor 的,它一直不知道。
 # 这是最坏的一种失败:没有报错、没有信号。所以宁可拒发,不许静默。
 # 显式 AGENT_MAILBOX_DIR 是调用者选择的投递根,也供隔离测试使用。
-_MAIN_TREE="/Users/xiaotingtan/Desktop/feedling-mcp-test"
+_MAIN_TREE="/Users/xiaotingtan/workspace/io/feedling-mcp-test"
 if [ -z "${AGENT_MAILBOX_DIR:-}" ]; then
   case "$(cd "$root" && pwd -P)" in
     "$_MAIN_TREE") ;;

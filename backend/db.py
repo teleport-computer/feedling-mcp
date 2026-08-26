@@ -1348,7 +1348,33 @@ def _chat_proactive_status_into(conn, ids: list[str], out: dict, ensure) -> None
                 extra_block[key] = buckets
 
 
-def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
+_ADMIN_DATA_TRACK_READ_TIMEOUT_MS = 5000
+
+
+@contextmanager
+def _admin_data_track_connection():
+    """Lease one bounded admin connection without poisoning the shared pool."""
+    with get_pool().connection(
+        timeout=_ADMIN_DATA_TRACK_READ_TIMEOUT_MS / 1000
+    ) as conn:
+        # Pool connections are autocommit, so SET LOCAL/set_config(..., true)
+        # would expire at the end of that one statement. Use a session setting
+        # for this lease and always reset it before returning the connection.
+        conn.execute(
+            f"SET statement_timeout = '{_ADMIN_DATA_TRACK_READ_TIMEOUT_MS}ms'"
+        )
+        try:
+            yield conn
+        finally:
+            try:
+                conn.execute("RESET statement_timeout")
+            except Exception:  # noqa: BLE001 — pool discards broken sessions
+                pass
+
+
+def admin_data_track_snapshot(
+    user_ids: list[str], *, include_legacy_background: bool = True
+) -> dict[str, dict]:
     """Return metadata-only aggregate stats for a set of users.
 
     This is deliberately SQL-aggregate based: admin dashboards must not pull
@@ -1364,11 +1390,14 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
         return out.setdefault(uid, {})
 
     out: dict[str, dict] = {
-        uid: {"app_usage": {"foreground_sec": 0, "sessions": 0, "last_at": None}}
+        uid: {
+            "app_usage": {"foreground_sec": 0, "sessions": 0, "last_at": None},
+            "snapshot_read_status": {"level": "ok", "message": ""},
+        }
         for uid in ids
     }
     try:
-        with get_pool().connection() as conn:
+        with _admin_data_track_connection() as conn:
             _chat_rollup_into(conn, ids, out, ensure)
 
             rows = conn.execute(
@@ -1503,116 +1532,121 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                     "last_at": last_at,
                 }
 
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       COUNT(*)::int AS decisions,
-                       COUNT(*) FILTER (
-                         WHERE LOWER(COALESCE(doc->>'should_reach_out', '')) IN ('true', '1', 'yes')
-                       )::int AS decision_true
-                FROM user_logs
-                WHERE user_id = ANY(%s) AND stream = 'gate_decisions'
-                GROUP BY user_id
-                """,
-                (ids,),
-            ).fetchall()
-            for uid, decisions, decision_true in rows:
-                ensure(out, uid).setdefault("proactive_extra", {}).update({
-                    "decisions": decisions,
-                    "decision_true": decision_true,
-                })
+            if include_legacy_background:
+                rows = conn.execute(
+                    """
+                    SELECT user_id,
+                           COUNT(*)::int AS decisions,
+                           COUNT(*) FILTER (
+                             WHERE LOWER(COALESCE(doc->>'should_reach_out', '')) IN ('true', '1', 'yes')
+                           )::int AS decision_true
+                    FROM user_logs
+                    WHERE user_id = ANY(%s) AND stream = 'gate_decisions'
+                    GROUP BY user_id
+                    """,
+                    (ids,),
+                ).fetchall()
+                for uid, decisions, decision_true in rows:
+                    ensure(out, uid).setdefault("proactive_extra", {}).update({
+                        "decisions": decisions,
+                        "decision_true": decision_true,
+                    })
 
-            rows = conn.execute(
-                """
-                SELECT user_id, COALESCE(NULLIF(doc->>'status', ''), 'unknown') AS status,
-                       COUNT(*)::int
-                FROM user_logs
-                WHERE user_id = ANY(%s) AND stream = 'proactive_jobs'
-                GROUP BY user_id, status
-                """,
-                (ids,),
-            ).fetchall()
-            for uid, status, count in rows:
-                ensure(out, uid).setdefault("proactive_extra", {}).setdefault("jobs_by_status", {})[status] = count
+                rows = conn.execute(
+                    """
+                    SELECT user_id, COALESCE(NULLIF(doc->>'status', ''), 'unknown') AS status,
+                           COUNT(*)::int
+                    FROM user_logs
+                    WHERE user_id = ANY(%s) AND stream = 'proactive_jobs'
+                    GROUP BY user_id, status
+                    """,
+                    (ids,),
+                ).fetchall()
+                for uid, status, count in rows:
+                    ensure(out, uid).setdefault("proactive_extra", {}).setdefault("jobs_by_status", {})[status] = count
 
-            # Seven 2026-08-21: V1 has its own status_reason keyspace.  Read
-            # the exact producer-owned exemption set so db.py does not copy
-            # seven strings or merge them with V2 last_error codes.
-            v1_user_unavailable = list(
-                notices_catalog.USER_UNAVAILABLE_V1_REASONS
-            )
+                # Seven 2026-08-21: V1 has its own status_reason keyspace.  Read
+                # the exact producer-owned exemption set so db.py does not copy
+                # seven strings or merge them with V2 last_error codes.
+                v1_user_unavailable = list(
+                    notices_catalog.USER_UNAVAILABLE_V1_REASONS
+                )
 
-            # Split proactive jobs by lane (heartbeat vs screen-share vs other).
-            # The persisted job doc carries job_kind / wake_kind / trigger; group
-            # by the first non-empty of those and let the caller bucket the raw
-            # kind strings (data_track._classify_proactive_kind).
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       COALESCE(
-                         NULLIF(doc->>'job_kind', ''),
-                         NULLIF(doc->>'wake_kind', ''),
-                         NULLIF(doc->>'trigger', ''),
-                         'unknown'
-                       ) AS kind,
-                       COUNT(*)::int AS total,
-                       (COUNT(*) FILTER (
-                          WHERE doc->>'status' = 'failed'
-                            AND COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''),
-                                         'unknown') <> ALL(%s::text[])))::int
-                         AS operational_failed,
-                       (COUNT(*) FILTER (
-                          WHERE doc->>'status' = 'skipped'))::int AS control,
-                       (COUNT(*) FILTER (
-                          WHERE doc->>'status' = 'failed'
-                            AND COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''),
-                                         'unknown') = ANY(%s::text[])))::int
-                         AS user_unavailable
-                FROM user_logs
-                WHERE user_id = ANY(%s) AND stream = 'proactive_jobs'
-                GROUP BY user_id, kind
-                """,
-                (v1_user_unavailable, v1_user_unavailable, ids),
-            ).fetchall()
-            for uid, kind, total, failed, control, user_unavailable in rows:
-                pex = ensure(out, uid).setdefault("proactive_extra", {})
-                pex.setdefault("jobs_by_kind", {})[kind] = total
-                pex.setdefault("jobs_failed_by_kind", {})[kind] = failed
-                pex.setdefault("jobs_control_by_kind", {})[kind] = control
-                pex.setdefault("jobs_user_unavailable_by_kind", {})[
-                    kind
-                ] = user_unavailable
+                # These three GROUP BY queries are intentionally detail-only.
+                # The users index used to run them over every retained V1 log on
+                # every request; at production cardinality that path reached the
+                # 240s server boundary.  The index now reads bounded immutable
+                # lane cells via admin_background_lane_users instead.
+                rows = conn.execute(
+                    """
+                    SELECT user_id,
+                           COALESCE(
+                             NULLIF(doc->>'job_kind', ''),
+                             NULLIF(doc->>'wake_kind', ''),
+                             NULLIF(doc->>'trigger', ''),
+                             'unknown'
+                           ) AS kind,
+                           COUNT(*)::int AS total,
+                           (COUNT(*) FILTER (
+                              WHERE doc->>'status' = 'failed'
+                                AND COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''),
+                                             'unknown') <> ALL(%s::text[])))::int
+                             AS operational_failed,
+                           (COUNT(*) FILTER (
+                              WHERE doc->>'status' = 'skipped'))::int AS control,
+                           (COUNT(*) FILTER (
+                              WHERE doc->>'status' = 'failed'
+                                AND COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''),
+                                             'unknown') = ANY(%s::text[])))::int
+                             AS user_unavailable
+                    FROM user_logs
+                    WHERE user_id = ANY(%s) AND stream = 'proactive_jobs'
+                    GROUP BY user_id, kind
+                    """,
+                    (v1_user_unavailable, v1_user_unavailable, ids),
+                ).fetchall()
+                for uid, kind, total, failed, control, user_unavailable in rows:
+                    pex = ensure(out, uid).setdefault("proactive_extra", {})
+                    pex.setdefault("jobs_by_kind", {})[kind] = total
+                    pex.setdefault("jobs_failed_by_kind", {})[kind] = failed
+                    pex.setdefault("jobs_control_by_kind", {})[kind] = control
+                    pex.setdefault("jobs_user_unavailable_by_kind", {})[
+                        kind
+                    ] = user_unavailable
 
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       CASE
-                         WHEN doc->>'status' = 'skipped' THEN 'control'
-                         WHEN COALESCE(
-                           NULLIF(BTRIM(doc->>'status_reason'), ''), 'unknown'
-                         ) = ANY(%s::text[]) THEN 'user_unavailable'
-                         ELSE 'operational_failure'
-                       END AS outcome_class,
-                       COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''), 'unknown') AS reason,
-                       COUNT(*)::int
-                FROM user_logs
-                WHERE user_id = ANY(%s)
-                  AND stream = 'proactive_jobs'
-                  AND doc->>'status' IN ('failed', 'skipped')
-                GROUP BY user_id, outcome_class, reason
-                """,
-                (v1_user_unavailable, ids),
-            ).fetchall()
-            reason_fields = {
-                "operational_failure": "jobs_failed_by_reason",
-                "control": "jobs_control_by_reason",
-                "user_unavailable": "jobs_user_unavailable_by_reason",
-            }
-            for uid, outcome_class, reason, count in rows:
-                field = reason_fields[str(outcome_class)]
-                ensure(out, uid).setdefault("proactive_extra", {}).setdefault(
-                    field, {}
-                )[reason] = count
+                rows = conn.execute(
+                    """
+                    SELECT user_id,
+                           CASE
+                             WHEN doc->>'status' = 'skipped' THEN 'control'
+                             WHEN COALESCE(
+                               NULLIF(BTRIM(doc->>'status_reason'), ''), 'unknown'
+                             ) = ANY(%s::text[]) THEN 'user_unavailable'
+                             ELSE 'operational_failure'
+                           END AS outcome_class,
+                           COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''), 'unknown') AS reason,
+                           COUNT(*)::int
+                    FROM user_logs
+                    WHERE user_id = ANY(%s)
+                      AND stream = 'proactive_jobs'
+                      AND doc->>'status' IN ('failed', 'skipped')
+                    GROUP BY user_id, outcome_class, reason
+                    """,
+                    (v1_user_unavailable, ids),
+                ).fetchall()
+                reason_fields = {
+                    "operational_failure": "jobs_failed_by_reason",
+                    "control": "jobs_control_by_reason",
+                    "user_unavailable": "jobs_user_unavailable_by_reason",
+                }
+                for uid, outcome_class, reason, count in rows:
+                    field = reason_fields[str(outcome_class)]
+                    ensure(out, uid).setdefault("proactive_extra", {}).setdefault(
+                        field, {}
+                    )[reason] = count
+            else:
+                for uid in ids:
+                    ensure(out, uid)["legacy_background_breakdowns_status"] = "omitted"
 
             # ⚠️ 这两个维度**必须**走格子，不能留原来的全史 GROUP BY。
             # 把它们冻进格子却仍从 chat_messages 现算，等于新增列只写不读、
@@ -1620,33 +1654,41 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
             # 逮到我就是这么写的：写侧改了、读侧一行没动）。
             _chat_proactive_status_into(conn, ids, out, ensure)
 
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       COUNT(*)::int AS capture_jobs,
-                       COALESCE(SUM(NULLIF(doc->>'actions_written', '')::int), 0)::int AS actions_written,
-                       MAX(ts) AS last_capture_ts
-                FROM user_logs
-                WHERE user_id = ANY(%s) AND stream = 'memory_capture_jobs'
-                GROUP BY user_id
-                """,
-                (ids,),
-            ).fetchall()
-            for uid, capture_jobs, actions_written, last_ts in rows:
-                ensure(out, uid).setdefault("memory_extra", {}).update({
-                    "capture_jobs": capture_jobs,
-                    "capture_actions_written": actions_written,
-                    "last_capture_ts": last_ts,
-                })
+            if include_legacy_background:
+                rows = conn.execute(
+                    """
+                    SELECT user_id,
+                           COUNT(*)::int AS capture_jobs,
+                           COALESCE(SUM(NULLIF(doc->>'actions_written', '')::int), 0)::int AS actions_written,
+                           MAX(ts) AS last_capture_ts
+                    FROM user_logs
+                    WHERE user_id = ANY(%s) AND stream = 'memory_capture_jobs'
+                    GROUP BY user_id
+                    """,
+                    (ids,),
+                ).fetchall()
+                for uid, capture_jobs, actions_written, last_ts in rows:
+                    ensure(out, uid).setdefault("memory_extra", {}).update({
+                        "capture_jobs": capture_jobs,
+                        "capture_actions_written": actions_written,
+                        "last_capture_ts": last_ts,
+                    })
 
-            for stream, field, out_key in (
-                ("memory_changes", "action", "changes_by_action"),
-                ("memory_changes", "capture_mode", "changes_by_capture_mode"),
-                ("memory_capture_jobs", "status", "capture_jobs_by_status"),
-                ("memory_capture_jobs", "mode", "capture_jobs_by_mode"),
-                ("tracking_events", "type", "tracking_by_type"),
-                ("bootstrap_events", "event_type", "bootstrap_by_type"),
-            ):
+            detail_breakdowns = ()
+            if include_legacy_background:
+                # Every entry below groups an unbounded retained stream by a
+                # JSON field. They are useful on one-user detail, but none is
+                # rendered by the users/summary surfaces. Keep all of them out
+                # of the fleet-wide path rather than merely hiding the result.
+                detail_breakdowns = (
+                    ("memory_changes", "action", "changes_by_action"),
+                    ("memory_changes", "capture_mode", "changes_by_capture_mode"),
+                    ("memory_capture_jobs", "status", "capture_jobs_by_status"),
+                    ("memory_capture_jobs", "mode", "capture_jobs_by_mode"),
+                    ("tracking_events", "type", "tracking_by_type"),
+                    ("bootstrap_events", "event_type", "bootstrap_by_type"),
+                )
+            for stream, field, out_key in detail_breakdowns:
                 rows = conn.execute(
                     """
                     SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
@@ -1825,6 +1867,12 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                 ensure(out, uid)["history_import"] = doc
     except Exception as e:
         log.error("[db] admin_data_track_snapshot failed: %s", e)
+        level, message = _admin_event_read_failure(e)
+        for uid in ids:
+            ensure(out, uid)["snapshot_read_status"] = {
+                "level": level,
+                "message": message,
+            }
     return out
 
 
@@ -5346,6 +5394,218 @@ def freeze_completed_resident_lane_days(*, now_epoch: float | None = None,
         return []
 
 
+# --- Distillation artifact attempts -> immutable Beijing-day cells ---------
+
+_DISTILLATION_ROLLUP_MAX_DAYS_PER_TICK = 45
+
+
+def _distillation_freeze_day(
+    conn, *, day: date, zone: ZoneInfo, mirror_batch: list | None = None,
+) -> int:
+    start, end = _lane_rollup_day_bounds(day, zone)
+    rows = conn.execute(
+        """
+        SELECT access_path, distill_kind, artifact, outcome, terminal_result,
+               COUNT(*)::bigint
+        FROM distillation_artifact_attempts
+        WHERE finished_at >= %s AND finished_at < %s
+        GROUP BY access_path, distill_kind, artifact, outcome, terminal_result
+        ORDER BY access_path, distill_kind, artifact, outcome, terminal_result
+        """,
+        (start, end),
+    ).fetchall()
+    sql = """
+        INSERT INTO distillation_artifact_daily_rollup
+            (day, access_path, distill_kind, artifact, outcome,
+             terminal_result, attempts)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT DO NOTHING
+    """
+    day_s = day.isoformat()
+    for access_path, kind, artifact, outcome, terminal_result, attempts in rows:
+        params = (
+            day_s, access_path, kind, artifact, outcome, terminal_result,
+            int(attempts),
+        )
+        conn.execute(sql, params)
+        if mirror_batch is not None:
+            mirror_batch.append((sql, params))
+    return len(rows)
+
+
+def freeze_completed_distillation_days(
+    *, now_epoch: float | None = None, tz: str = "Asia/Shanghai",
+) -> list[str]:
+    """Freeze only post-deployment attempts; historical jobs are not backfilled.
+
+    The first tick records today's Beijing date as ``effective_from`` and an
+    empty through-day immediately before it.  That explicit waterline lets the
+    reader distinguish pre-ledger history from a measured zero.
+    """
+    try:
+        zone = ZoneInfo(tz)
+        now = (
+            datetime.fromtimestamp(float(now_epoch), zone)
+            if now_epoch is not None else datetime.now(zone)
+        )
+        last_completed = (now - timedelta(hours=4)).date() - timedelta(days=1)
+        frozen: list[str] = []
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT effective_from, through_day "
+                "FROM distillation_rollup_watermark "
+                "WHERE scope = 'artifact_attempts'"
+            ).fetchone()
+            if row is None:
+                effective = now.date()
+                through = effective - timedelta(days=1)
+                sql = """
+                    INSERT INTO distillation_rollup_watermark
+                        (scope, effective_from, through_day)
+                    VALUES ('artifact_attempts', %s, %s)
+                    ON CONFLICT (scope) DO NOTHING
+                """
+                params = (effective.isoformat(), through.isoformat())
+                conn.execute(sql, params)
+                from tee_shadow import mirror
+                mirror.execute(sql, params)
+                return []
+            effective = date.fromisoformat(str(row[0]))
+            cursor = max(
+                effective,
+                date.fromisoformat(str(row[1])) + timedelta(days=1),
+            )
+            watermark_sql = """
+                UPDATE distillation_rollup_watermark
+                SET through_day = %s, frozen_at = now()
+                WHERE scope = 'artifact_attempts'
+            """
+            from tee_shadow import mirror
+            steps = 0
+            while (
+                cursor <= last_completed
+                and steps < _DISTILLATION_ROLLUP_MAX_DAYS_PER_TICK
+            ):
+                mirror_batch: list[tuple[str, tuple]] = []
+                _distillation_freeze_day(
+                    conn, day=cursor, zone=zone, mirror_batch=mirror_batch
+                )
+                params = (cursor.isoformat(),)
+                conn.execute(watermark_sql, params)
+                mirror_batch.append((watermark_sql, params))
+                mirror.execute_many(mirror_batch)
+                frozen.append(cursor.isoformat())
+                cursor += timedelta(days=1)
+                steps += 1
+        return frozen
+    except Exception as exc:  # noqa: BLE001 -- scheduler failure domain
+        log.error("[db] freeze_completed_distillation_days failed: %s", exc)
+        return []
+
+
+def admin_distillation_artifact_rollup_windows(
+    *, through_day: str = "", tz: str = "Asia/Shanghai",
+) -> dict:
+    """Read 1/7 closed Beijing-day artifact-attempt windows.
+
+    Counts are returned only with their coverage. Consumers must reject a
+    partial window instead of treating the missing pre-ledger days as zero.
+    """
+    zone = ZoneInfo(tz)
+    raw_end = str(through_day or "").strip()
+    if raw_end:
+        try:
+            end_day = date.fromisoformat(raw_end)
+        except ValueError as exc:
+            raise ValueError(
+                f"admin_distillation_artifact_rollup_windows: bad day {raw_end!r}"
+            ) from exc
+    else:
+        end_day = datetime.now(zone).date() - timedelta(days=1)
+    try:
+        with _admin_data_track_connection() as conn:
+            wm = conn.execute(
+                "SELECT effective_from, through_day, frozen_at "
+                "FROM distillation_rollup_watermark "
+                "WHERE scope = 'artifact_attempts'"
+            ).fetchone()
+            rows = conn.execute(
+                """
+                SELECT day, access_path, distill_kind, artifact, outcome,
+                       terminal_result, attempts
+                FROM distillation_artifact_daily_rollup
+                WHERE day >= %s AND day <= %s
+                ORDER BY day, access_path, distill_kind, artifact, outcome
+                """,
+                ((end_day - timedelta(days=6)).isoformat(), end_day.isoformat()),
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        level, message = _admin_event_read_failure(exc)
+        return {
+            "read_status": {"level": level, "message": message},
+            "history_backfill": "unavailable",
+            "windows": [],
+        }
+
+    effective = date.fromisoformat(str(wm[0])) if wm else None
+    frozen_through = date.fromisoformat(str(wm[1])) if wm else None
+
+    def window(day_count: int) -> dict:
+        start_day = end_day - timedelta(days=day_count - 1)
+        covered_start = max(start_day, effective) if effective else None
+        covered_end = min(end_day, frozen_through) if frozen_through else None
+        covered_days = (
+            (covered_end - covered_start).days + 1
+            if covered_start and covered_end and covered_end >= covered_start
+            else 0
+        )
+        level = (
+            "green" if covered_days == day_count
+            else "yellow" if covered_days
+            else "red"
+        )
+        cells: dict[str, dict] = {}
+        for raw in rows:
+            raw_day = date.fromisoformat(str(raw[0]))
+            if not start_day <= raw_day <= end_day:
+                continue
+            path, kind, artifact = str(raw[1]), str(raw[2]), str(raw[3])
+            outcome, terminal = str(raw[4]), str(raw[5])
+            count = int(raw[6] or 0)
+            cell = (
+                cells.setdefault(kind, {})
+                .setdefault(artifact, {})
+                .setdefault(path, {
+                    "succeeded": 0, "failed": 0, "no_write": 0,
+                    "outcomes": {},
+                })
+            )
+            cell[terminal] += count
+            cell["outcomes"][outcome] = cell["outcomes"].get(outcome, 0) + count
+        return {
+            "day_count": day_count,
+            "start_day": start_day.isoformat(),
+            "end_day": end_day.isoformat(),
+            "coverage": level,
+            "covered_days": covered_days,
+            "effective_from": effective.isoformat() if effective else None,
+            "through_day": frozen_through.isoformat() if frozen_through else None,
+            "cells": cells,
+        }
+
+    return {
+        "read_status": {"level": "ok", "message": ""},
+        "history_backfill": "unavailable",
+        "history_note": (
+            "artifact attempt 账本只覆盖生效日之后；历史 job 无 attempt 边界，"
+            "不可回填，生效日前无数据不等于 0"
+        ),
+        "effective_from": effective.isoformat() if effective else None,
+        "through_day": frozen_through.isoformat() if frozen_through else None,
+        "windows": [window(1), window(7)],
+    }
+
+
 # 删号后的格子处置（Seven 2026-08-18 拍板）：匿名化归并——既非级联删除（会让
 # 冻结的历史聚合数字事后变动），也非带 id 永久保留（0021 先例是匿名 cohort，
 # 与逐用户行不等价，codex2 审出）。归并目标行 user_id='deleted'。
@@ -6281,6 +6541,196 @@ def _admin_event_read_failure(exc: Exception) -> tuple[str, str]:
     return "read_error", "取数失败（记了，但这里读不出来）"
 
 
+def admin_background_lane_users(
+    user_ids: list[str], *, days: int = 7, tz: str = "Asia/Shanghai"
+) -> dict:
+    """Bounded per-user heartbeat/capture outcomes from immutable day cells.
+
+    The old users index issued several whole-history GROUP BY queries over
+    ``user_logs`` for every page load and reached the production server's 240s
+    boundary.  This reader scans only completed Beijing-day cells.  Counts and
+    coverage stay separate so an unmeasured zero cannot look healthy.
+    """
+    ids = list(dict.fromkeys(str(uid) for uid in user_ids if str(uid)))
+    day_count = max(1, min(int(days or 7), 90))
+    zone = ZoneInfo(tz)
+    end_day = datetime.now(zone).date() - timedelta(days=1)
+    start_day = end_day - timedelta(days=day_count - 1)
+
+    def empty_coverage(level: str, message: str = "") -> dict[str, dict]:
+        return {
+            route: {
+                "level": level,
+                "message": message,
+                "backfill_from": None,
+                "through_day": None,
+                "outcomes_from": None,
+                "required_start_day": start_day.isoformat(),
+                "required_end_day": end_day.isoformat(),
+            }
+            for route in ("resident", "model_api")
+        }
+
+    base = {
+        "window": {
+            "timezone": tz,
+            "days": day_count,
+            "start_day": start_day.isoformat(),
+            "end_day": end_day.isoformat(),
+            "open_day_excluded": True,
+        },
+        "coverage_by_route": empty_coverage("unavailable"),
+        "users": {},
+        "read_status": {"level": "ok", "message": ""},
+    }
+    if not ids:
+        return base
+
+    try:
+        with _admin_data_track_connection() as conn:
+            rows = conn.execute(
+                """
+                WITH selected AS (
+                  SELECT user_id, route, lane, completed, failed, expired,
+                         superseded, operational_failures, control_outcomes,
+                         user_unavailable, failure_codes
+                  FROM lane_daily_rollup
+                  WHERE user_id = ANY(%s)
+                    AND day >= %s AND day <= %s
+                    AND lane IN ('heartbeat', 'capture')
+                ), totals AS (
+                  SELECT user_id, route, lane,
+                         coalesce(sum(completed), 0)::bigint AS completed,
+                         coalesce(sum(failed), 0)::bigint AS failed,
+                         coalesce(sum(expired), 0)::bigint AS expired,
+                         coalesce(sum(superseded), 0)::bigint AS superseded,
+                         coalesce(sum(operational_failures), 0)::bigint
+                           AS operational_failures,
+                         coalesce(sum(control_outcomes), 0)::bigint
+                           AS control_outcomes,
+                         coalesce(sum(user_unavailable), 0)::bigint
+                           AS user_unavailable
+                  FROM selected
+                  GROUP BY user_id, route, lane
+                ), code_counts AS (
+                  SELECT s.user_id, s.route, s.lane, code.key AS code,
+                         coalesce(sum(
+                           CASE WHEN code.value ~ '^[0-9]+$'
+                                THEN code.value::bigint ELSE 0 END
+                         ), 0)::bigint AS count
+                  FROM selected s
+                  CROSS JOIN LATERAL jsonb_each_text(s.failure_codes) AS code
+                  GROUP BY s.user_id, s.route, s.lane, code.key
+                ), codes AS (
+                  SELECT user_id, route, lane,
+                         jsonb_object_agg(code, count) AS failure_codes
+                  FROM code_counts
+                  GROUP BY user_id, route, lane
+                )
+                SELECT t.user_id, t.route, t.lane, t.completed, t.failed,
+                       t.expired, t.superseded, t.operational_failures,
+                       t.control_outcomes, t.user_unavailable,
+                       coalesce(c.failure_codes, '{}'::jsonb)
+                FROM totals t
+                LEFT JOIN codes c USING (user_id, route, lane)
+                ORDER BY t.user_id, t.route, t.lane
+                """,
+                (ids, start_day.isoformat(), end_day.isoformat()),
+            ).fetchall()
+            watermarks = {
+                str(row[0]): {
+                    "backfill_from": str(row[1]) if row[1] is not None else None,
+                    "through_day": str(row[2]) if row[2] is not None else None,
+                    "outcomes_from": str(row[3]) if row[3] is not None else None,
+                }
+                for row in conn.execute(
+                    "SELECT route, backfill_from, through_day, outcomes_from "
+                    "FROM lane_rollup_watermark "
+                    "WHERE route IN ('resident','model_api')"
+                ).fetchall()
+            }
+    except Exception as exc:  # noqa: BLE001 — admin evidence degrades closed
+        level, message = _admin_event_read_failure(exc)
+        log.error("[db] admin_background_lane_users failed: %s", exc)
+        base["read_status"] = {"level": level, "message": message}
+        base["coverage_by_route"] = empty_coverage(level, message)
+        return base
+
+    coverage: dict[str, dict] = {}
+    for route in ("resident", "model_api"):
+        wm = watermarks.get(route)
+        if wm is None:
+            coverage[route] = empty_coverage("unavailable")[route]
+            continue
+        complete = (
+            bool(wm.get("backfill_from"))
+            and bool(wm.get("through_day"))
+            and bool(wm.get("outcomes_from"))
+            and str(wm["backfill_from"]) <= start_day.isoformat()
+            and str(wm["outcomes_from"]) <= start_day.isoformat()
+            and str(wm["through_day"]) >= end_day.isoformat()
+        )
+        coverage[route] = {
+            "level": "green" if complete else "partial",
+            "message": "" if complete else "窗口仅部分落入冻结/分类覆盖范围",
+            **wm,
+            "required_start_day": start_day.isoformat(),
+            "required_end_day": end_day.isoformat(),
+        }
+
+    users: dict[str, dict] = {}
+    for row in rows:
+        uid, route, lane = str(row[0]), str(row[1]), str(row[2])
+        completed = int(row[3] or 0)
+        operational = int(row[7] or 0)
+        denominator = completed + operational
+        lane_row = {
+            "completed": completed,
+            "failed": int(row[4] or 0),
+            "expired": int(row[5] or 0),
+            "superseded": int(row[6] or 0),
+            "operational_failures": operational,
+            "control_outcomes": int(row[8] or 0),
+            "user_unavailable": int(row[9] or 0),
+            "terminal_attempts": denominator,
+            "failure_rate": operational / denominator if denominator else None,
+            "failure_codes": {
+                str(code): int(count or 0)
+                for code, count in dict(row[10] or {}).items()
+            },
+        }
+        user = users.setdefault(uid, {"routes": {}, "lanes": {}})
+        user["routes"].setdefault(route, {})[lane] = dict(lane_row)
+        combined = user["lanes"].setdefault(
+            lane,
+            {
+                "completed": 0, "failed": 0, "expired": 0,
+                "superseded": 0, "operational_failures": 0,
+                "control_outcomes": 0, "user_unavailable": 0,
+                "terminal_attempts": 0, "failure_rate": None,
+                "failure_codes": {},
+            },
+        )
+        for field in (
+            "completed", "failed", "expired", "superseded",
+            "operational_failures", "control_outcomes", "user_unavailable",
+            "terminal_attempts",
+        ):
+            combined[field] += lane_row[field]
+        for code, count in lane_row["failure_codes"].items():
+            combined["failure_codes"][code] = (
+                combined["failure_codes"].get(code, 0) + count
+            )
+        combined["failure_rate"] = (
+            combined["operational_failures"] / combined["terminal_attempts"]
+            if combined["terminal_attempts"] else None
+        )
+
+    base["coverage_by_route"] = coverage
+    base["users"] = users
+    return base
+
+
 def _lane_rollup_path_window(*, path_rows, watermarks: dict,
                              start_day: date, end_day: date,
                              day_count: int) -> dict[str, dict]:
@@ -6877,7 +7327,10 @@ def admin_history_import_job_rolling_windows() -> dict:
         return {
             "calculated_at": calculated_at.isoformat(),
             "coverage": level,
-            "reason": f"{message}；无路径快照、未物理冻结；T247 补",
+            "reason": (
+                f"{message}；整单 history job 无事件时路径快照且未物理冻结；"
+                "artifact 分步账本是另一口径，仅覆盖生效后"
+            ),
             "windows": [],
         }
 
@@ -6901,7 +7354,10 @@ def admin_history_import_job_rolling_windows() -> dict:
     return {
         "calculated_at": calculated_at.isoformat(),
         "coverage": "red",
-        "reason": "无路径快照、未物理冻结；T247 补",
+        "reason": (
+            "整单 history job 无事件时路径快照且未物理冻结；"
+            "artifact 分步账本是另一口径，仅覆盖生效后"
+        ),
         "windows": windows,
     }
 
@@ -9699,8 +10155,9 @@ def recent_genesis_import_health(
     ``artifact_verified``.  The former is a reducer lifecycle fact; the latter
     is conservative evidence from the durable ledger that the job produced the
     artifact its mode called for.  This avoids turning a terminal row into a
-    false-green import result while we still lack a dedicated per-attempt
-    artifact-verification ledger.
+    false-green import result. This legacy final-snapshot classifier remains
+    separate from the post-rollout per-attempt artifact ledger: it can describe
+    older jobs conservatively, but must not be relabeled as attempt evidence.
 
     The returned failure code is derived in SQL from at most the first two
     snake-case error segments.  Free-form exception text is neither returned
@@ -9827,6 +10284,7 @@ def recent_genesis_import_health(
                   has_source_material,
                   memory_action_count,
                   identity_status,
+                  failed_phase,
                   created_at, updated_at, completed_at,
                   CASE
                     WHEN status='failed' AND
@@ -9989,6 +10447,9 @@ def genesis_reclaim_orphaned_processing_jobs(
     safe_limit = max(1, min(int(limit or 1), 200))
     live = list(dict.fromkeys(str(w) for w in (live_worker_ids or []) if str(w)))
     _UPDATE_SET = (
+        "failed_phase = CASE WHEN {j}.received_chunks > 0 THEN {j}.failed_phase "
+        "ELSE COALESCE(NULLIF({j}.output->>'stage', ''), "
+        "NULLIF({j}.status, 'failed'), NULLIF({j}.failed_phase, '')) END, "
         "status = CASE WHEN {j}.received_chunks > 0 THEN 'uploaded' ELSE 'failed' END, "
         "error = CASE WHEN {j}.received_chunks > 0 THEN '' ELSE %s END, "
         "worker_claimed_by = CASE WHEN {j}.received_chunks > 0 THEN '' ELSE {j}.worker_claimed_by END, "
@@ -10127,6 +10588,9 @@ def genesis_reap_stale_processing_jobs(older_than_sec: int, *, error: str, limit
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE genesis_import_jobs AS j SET
+                failed_phase = COALESCE(NULLIF(j.output->>'stage', ''),
+                                        NULLIF(j.status, 'failed'),
+                                        NULLIF(j.failed_phase, '')),
                 status = 'failed',
                 error = %s,
                 updated_at = now()
@@ -10150,7 +10614,10 @@ def genesis_reap_stale_processing_jobs(older_than_sec: int, *, error: str, limit
         # exact rows the primary reaped rather than re-picking independently.
         placeholders = ", ".join(["(%s, %s)"] * len(out))
         mirror_sql = (
-            "UPDATE genesis_import_jobs SET status = 'failed', error = %s, updated_at = now() "
+            "UPDATE genesis_import_jobs SET "
+            "failed_phase = COALESCE(NULLIF(output->>'stage', ''), "
+            "NULLIF(status, 'failed'), NULLIF(failed_phase, '')), "
+            "status = 'failed', error = %s, updated_at = now() "
             f"WHERE (user_id, job_id) IN ({placeholders})"
         )
         mirror_params = (error[:1000],) + tuple(
@@ -10181,6 +10648,9 @@ def genesis_fail_stale_plaintext_job(
     safe_sec = max(60, int(older_than_sec or 0))
     sql = """
         UPDATE genesis_import_jobs SET
+            failed_phase = COALESCE(NULLIF(output->>'stage', ''),
+                                    NULLIF(status, 'failed'),
+                                    NULLIF(failed_phase, '')),
             status = 'failed',
             error = %s,
             updated_at = now()
@@ -10205,7 +10675,10 @@ def genesis_fail_stale_plaintext_job(
     if result is not None:
         from tee_shadow import mirror
         mirror.execute(
-            "UPDATE genesis_import_jobs SET status='failed', error=%s, updated_at=now() "
+            "UPDATE genesis_import_jobs SET "
+            "failed_phase=COALESCE(NULLIF(output->>'stage',''), "
+            "NULLIF(status,'failed'), NULLIF(failed_phase,'')), "
+            "status='failed', error=%s, updated_at=now() "
             "WHERE user_id=%s AND job_id=%s AND status='processing' "
             "AND COALESCE(metadata->>'ingest', '')='plaintext' "
             "AND COALESCE(metadata->>'plaintext_worker_instance', '')=%s",
@@ -10262,6 +10735,10 @@ def genesis_reap_stale_resident_jobs(
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE genesis_import_jobs AS j SET
+                failed_phase = CASE WHEN j.resident_attempts < %s THEN j.failed_phase
+                    ELSE COALESCE(NULLIF(j.output->>'stage', ''),
+                                  NULLIF(j.status, 'failed'),
+                                  NULLIF(j.failed_phase, '')) END,
                 status = CASE WHEN j.resident_attempts < %s THEN 'awaiting_resident' ELSE 'failed' END,
                 error = CASE WHEN j.resident_attempts < %s THEN '' ELSE %s END,
                 resident_consumer_id = '',
@@ -10272,7 +10749,7 @@ def genesis_reap_stale_resident_jobs(
             WHERE j.user_id = picked.user_id AND j.job_id = picked.job_id
             RETURNING j.*
             """,
-            (safe_sec, safe_limit, safe_max, safe_max, error[:1000]),
+            (safe_sec, safe_limit, safe_max, safe_max, safe_max, error[:1000]),
         )
         rows = cur.fetchall()
         cols = [d[0] for d in cur.description]
@@ -10317,6 +10794,9 @@ def genesis_reap_stale_unclaimed_jobs(
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE genesis_import_jobs AS j SET
+                failed_phase = COALESCE(NULLIF(j.output->>'stage', ''),
+                                        NULLIF(j.status, 'failed'),
+                                        NULLIF(j.failed_phase, '')),
                 status = 'failed',
                 error = %s,
                 updated_at = now()
@@ -10512,6 +10992,7 @@ def genesis_mark_finalized(user_id: str, job_id: str) -> dict | None:
         """
         UPDATE genesis_import_jobs SET
             status = 'uploaded',
+            failed_phase = '',
             finalized_at = COALESCE(finalized_at, now()),
             updated_at = now()
         WHERE user_id = %s AND job_id = %s
@@ -10540,6 +11021,11 @@ def genesis_set_job_status(
     sql = (
         """
         UPDATE genesis_import_jobs SET
+            failed_phase = CASE WHEN %s = 'failed'
+                THEN COALESCE(NULLIF(output->>'stage', ''),
+                              NULLIF(status, 'failed'),
+                              NULLIF(failed_phase, ''))
+                ELSE failed_phase END,
             status = %s,
             error = %s,
             output = COALESCE(%s::jsonb, output),
@@ -10550,6 +11036,7 @@ def genesis_set_job_status(
         """
     )
     params = (
+        status,
         status,
         error[:1000],
         Jsonb(output) if output is not None else None,
@@ -10574,12 +11061,62 @@ def genesis_set_job_status(
     from tee_shadow import mirror
     mirror.execute(sql, (
         status,
+        status,
         error[:1000],
         Jsonb(output) if output is not None else None,
         processed_chunks,
         user_id,
         job_id,
     ))
+    return result
+
+
+def distillation_start_artifact_attempt(
+    *, attempt_id: str, user_id: str, job_id: str, flow: str,
+    distill_kind: str, artifact: str, access_path: str,
+) -> dict | None:
+    """Append the start boundary for one real artifact write attempt.
+
+    There is intentionally no uniqueness constraint on ``job_id + artifact``:
+    foreground/background passes and retries are separate attempts, and a later
+    success must never overwrite an earlier failure.
+    """
+    sql = """
+        INSERT INTO distillation_artifact_attempts
+            (attempt_id, user_id, job_id, flow, distill_kind, artifact,
+             access_path)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (attempt_id) DO NOTHING
+        RETURNING *
+    """
+    params = (
+        str(attempt_id), str(user_id), str(job_id), str(flow),
+        str(distill_kind), str(artifact), str(access_path),
+    )
+    with get_pool().connection() as conn:
+        cur = conn.execute(sql, params)
+        result = _genesis_row(cur, cur.fetchone())
+    from tee_shadow import mirror
+    mirror.execute(sql, params)
+    return result
+
+
+def distillation_finish_artifact_attempt(
+    attempt_id: str, *, outcome: str, terminal_result: str,
+) -> dict | None:
+    """Close exactly one attempt; a second close cannot rewrite its evidence."""
+    sql = """
+        UPDATE distillation_artifact_attempts SET
+            outcome = %s, terminal_result = %s, finished_at = now()
+        WHERE attempt_id = %s AND finished_at IS NULL
+        RETURNING *
+    """
+    params = (str(outcome), str(terminal_result), str(attempt_id))
+    with get_pool().connection() as conn:
+        cur = conn.execute(sql, params)
+        result = _genesis_row(cur, cur.fetchone())
+    from tee_shadow import mirror
+    mirror.execute(sql, params)
     return result
 
 
@@ -17176,7 +17713,7 @@ def frame_prune_to(user_id: str, max_frames: int) -> list[str]:
 
 
 def log_append(user_id: str, stream: str, doc: dict,
-               ts: float | None = None, item_key: str | None = None) -> None:
+               ts: float | None = None, item_key: str | None = None) -> bool:
     sql = ("INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
            "VALUES (%s, %s, %s, %s, %s) RETURNING seq")
     try:
@@ -17184,9 +17721,9 @@ def log_append(user_id: str, stream: str, doc: dict,
             row = conn.execute(sql, (user_id, stream, ts, item_key, Jsonb(doc))).fetchone()
     except Exception as e:
         log.error("[db] log_append(%s,%s) failed: %s", user_id, stream, e)
-        return
+        return False
     if row is None:
-        return
+        return False
     # Mirror with the PRIMARY-assigned seq pinned explicitly (OVERRIDING SYSTEM
     # VALUE): user_logs.seq is GENERATED ALWAYS AS IDENTITY, so a plain INSERT
     # on the TEE side would mint its own, independent seq and break the
@@ -17200,6 +17737,7 @@ def log_append(user_id: str, stream: str, doc: dict,
         "ON CONFLICT (user_id, stream, seq) DO NOTHING"
     )
     mirror.execute(mirror_sql, (user_id, stream, row[0], ts, item_key, Jsonb(doc)))
+    return True
 
 
 def log_append_numbered(
@@ -17353,6 +17891,27 @@ def log_trim(user_id: str, stream: str, max_rows: int,
     mirror.execute(sql, params)
 
 
+def log_clear(user_id: str, stream: str) -> bool:
+    """Delete one user's entire append-log stream from primary and TEE.
+
+    This is deliberately narrower than accepting an arbitrary predicate: callers
+    use it only when a whole bounded stream has reached its semantic terminal
+    state. Return whether the primary delete completed so best-effort callers can
+    avoid claiming that a clear happened when the database write failed.
+    """
+    sql = "DELETE FROM user_logs WHERE user_id = %s AND stream = %s"
+    params = (user_id, stream)
+    try:
+        with get_pool().connection() as conn:
+            conn.execute(sql, params)
+    except Exception as e:
+        log.error("[db] log_clear(%s,%s) failed: %s", user_id, stream, e)
+        return False
+    from tee_shadow import mirror
+    mirror.execute(sql, params)
+    return True
+
+
 def log_prune_older_than(user_id: str, stream: str, cutoff_epoch: float) -> None:
     """Delete rows whose ts is older than the cutoff. Rows with NULL ts are
     kept (those streams don't carry an epoch ts)."""
@@ -17399,6 +17958,7 @@ def delete_user_data(user_id: str) -> None:
         "perception_items",
         "perception_daily",
         "perception_signal_state_v2",
+        "distillation_artifact_attempts",
         "genesis_import_chunks",
         "genesis_import_outputs",
         "genesis_import_jobs",

@@ -33,7 +33,7 @@ mailbox="${AGENT_MAILBOX_DIR:-$root/.agents/mailbox}"
 # 发信侧至少写下了文件,读信侧直接让人误以为无事发生。
 # (claude3 2026-08-14 复现并报告;它自己没出事只是因为执行环境每次都重置 cwd,
 #  保护它的是环境不是纪律。)
-_MAIN_TREE="/Users/xiaotingtan/Desktop/feedling-mcp-test"
+_MAIN_TREE="/Users/xiaotingtan/workspace/io/feedling-mcp-test"
 case "$(cd "$root" && pwd -P)" in
   "$_MAIN_TREE") ;;
   *)

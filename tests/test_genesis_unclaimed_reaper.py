@@ -58,6 +58,7 @@ def test_stale_unclaimed_job_failed():
     assert (uid, "genesis_unclaimed1") in ids
     job = db.genesis_get_job(uid, "genesis_unclaimed1")
     assert job["status"] == "failed"
+    assert job["failed_phase"] == "awaiting_resident"
     assert str(job.get("error") or "").startswith("resident_never_claimed:")
     blob = db.get_blob(uid, "genesis_state")
     assert blob["job_id"] == "genesis_unclaimed1"
