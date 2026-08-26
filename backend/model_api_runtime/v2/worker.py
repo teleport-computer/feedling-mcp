@@ -14172,6 +14172,10 @@ async def process_job(
             self_thinking_absent_retry_pending = False
             self_thinking_absent_retry_response_seen = False
 
+        def _cancel_self_thinking_absent_language_retry() -> None:
+            _cancel_self_thinking_absent_retry()
+            _cancel_language_correction()
+
         async def _on_reply(
             text: str | WorkspaceFileReply,
             *,
@@ -14427,16 +14431,42 @@ async def process_job(
                 ):
                     self_thinking_absent_retry_requests += 1
                     self_thinking_absent_retry_pending = True
+                    correction_instruction = (
+                        _SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION
+                    )
+                    correction_cancel = _cancel_self_thinking_absent_retry
+                    (
+                        user_script,
+                        reply_script,
+                        follow_outcome,
+                    ) = _reply_language_follow_observation(
+                        language_user_rows, text
+                    )
+                    if (
+                        follow_outcome == "mismatch"
+                        and user_script not in {"indeterminate", "mixed"}
+                        and reply_script not in {"indeterminate", "mixed"}
+                    ):
+                        language_correction_attempted = True
+                        language_correction_pending = True
+                        correction_instruction += (
+                            "\n\n"
+                            + v2_language_follow.CORRECTION_INSTRUCTION
+                            + "\n这次重写要同时完成两件事：保留 <think>…</think> "
+                            "结构，并让思考段和可见回复都与用户语言一致。"
+                        )
+                        correction_cancel = (
+                            _cancel_self_thinking_absent_language_retry
+                        )
                     return v2_tool_loop.FinalReplyCorrectionRequest(
-                        instruction=_SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION,
+                        instruction=correction_instruction,
                         original_text=raw_reply_text,
                         original_reasoning=reasoning,
-                        on_cancel=_cancel_self_thinking_absent_retry,
+                        on_cancel=correction_cancel,
                     )
                 # One correction round is already consumed after an ABSENT retry.
-                # Publish a valid COMPLETE result directly instead of asking the
-                # generic one-rewrite loop for a second language rewrite (which
-                # would otherwise fail open to the original ABSENT candidate).
+                # Validate any combined language requirement below, but never add
+                # a second hidden rewrite beside this bounded correction.
                 if (
                     not retry_completed
                     and self_thinking_text
@@ -14463,7 +14493,14 @@ async def process_job(
                     follow_outcome,
                 ) = _reply_language_follow_observation(language_user_rows, text)
                 if language_correction_pending:
-                    if reply_script == user_script:
+                    thinking_mismatch = (
+                        _self_thinking_language_mismatch(
+                            self_thinking_text, language_user_rows
+                        )
+                        if self_thinking_text
+                        else None
+                    )
+                    if reply_script == user_script and thinking_mismatch is None:
                         language_correction_pending = False
                         language_correction_outcome = "corrected"
                     else:

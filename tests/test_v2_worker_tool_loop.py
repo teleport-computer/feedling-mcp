@@ -1746,6 +1746,66 @@ def test_chat_self_thinking_absent_final_retries_and_surfaces_complete(
     assert metric == (expected_calls, 7, 10)
 
 
+def test_chat_self_thinking_absent_wrong_language_combines_one_correction(
+    monkeypatch,
+):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_selfthink_absent_language_correction"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-selfthink-absent-language-correction")
+    _stub_envelope_build(monkeypatch)
+    calls = _script_provider(monkeypatch, [
+        _text_round(
+            "Done, the requested file was saved and delivered successfully"
+        ),
+        _text_round(
+            "<think>文件已经成功发送，我用中文完成回复。</think>"
+            "文件已经生成并发送，可以直接下载了。"
+        ),
+    ])
+    traces = []
+    deps = _deps(messages=[{
+        "id": "m-selfthink-absent-language-correction",
+        "ts": 10.0,
+        "role": "user",
+        "content": "请用中文告诉我这项工作已经完成，回答要自然一点。",
+    }])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    assert len(calls) == 2
+    retry_system = str(calls[1]["messages"][0]["content"])
+    assert worker._SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION in retry_system
+    assert language_follow.CORRECTION_INSTRUCTION in retry_system
+    assert [row["body_ct"] for row in _bubbles(uid)] == [
+        "文件已经生成并发送，可以直接下载了。"
+    ]
+    assert _bubbles(uid)[0]["thinking_body_ct"] == (
+        "文件已经成功发送，我用中文完成回复。"
+    )
+    language_trace = next(
+        trace
+        for trace in traces
+        if trace["event_type"] == "reply.language_follow"
+    )
+    assert language_trace["detail"] == {
+        "user_script": "han",
+        "reply_script": "han",
+        "outcome": "match",
+        "lane": "chat",
+        "correction_attempted": True,
+        "correction_outcome": "corrected",
+    }
+
+
 def test_chat_self_thinking_absent_retry_still_absent_keeps_original(
     monkeypatch,
 ):

@@ -2644,7 +2644,12 @@ def test_process_job_commits_text_then_workspace_file_as_one_final_reply(
     job = jobs_store.claim_next_job("download-worker")
     assert job is not None and job["id"] == job_id
 
-    def build_envelope(store, plaintext, *, item_id=None):
+    envelope_kinds = []
+
+    def build_envelope(
+        store, plaintext, *, item_id=None, content_kind="text"
+    ):
+        envelope_kinds.append(content_kind)
         return (
             {
                 "v": 1,
@@ -2748,6 +2753,7 @@ def test_process_job_commits_text_then_workspace_file_as_one_final_reply(
     assert loaded == [
         (user_id, "rt-download", "/workspace/report.md", 4),
     ]
+    assert envelope_kinds.count("binary") == 1
 
     store = core_store.get_store(user_id)
     store.reload()
