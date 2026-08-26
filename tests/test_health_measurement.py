@@ -288,3 +288,32 @@ def test_apply_unavailable_on_missing_prev_doc():
     doc = hm.apply_unavailable(None, group=_hr_group())
     assert doc["_observed"]["resting_heart_rate"] == "unavailable"
     assert "_ts_kind" not in doc
+
+
+# ---------------------------------------------------------------------------
+# select_rollup_rows_after_cutover — read-side half of the cutover: keeps old
+# (arrival-tagged) and new (measured-tagged) rows from ever being pooled into
+# one series.
+# ---------------------------------------------------------------------------
+
+def test_select_rollup_rows_keeps_only_measured_once_any_row_is_measured():
+    rows = [
+        {"date": "2026-01-15", "doc": {"weight_kg": 68.4}},               # old-meaning
+        {"date": "2026-03-01", "doc": {"weight_kg": 68.4}},               # old-meaning
+        {"date": "2026-01-14", "doc": {"weight_kg": 68.4, "_ts_kind": "measured"}},  # new-meaning
+    ]
+    kept = hm.select_rollup_rows_after_cutover(rows)
+    assert kept == [rows[2]]
+
+
+def test_select_rollup_rows_is_a_no_op_when_nothing_is_measurement_aware():
+    rows = [
+        {"date": "2026-01-15", "doc": {"weight_kg": 68.4}},
+        {"date": "2026-03-01", "doc": {"weight_kg": 68.4}},
+    ]
+    assert hm.select_rollup_rows_after_cutover(rows) == rows
+
+
+def test_select_rollup_rows_tolerates_empty_and_malformed_input():
+    assert hm.select_rollup_rows_after_cutover([]) == []
+    assert hm.select_rollup_rows_after_cutover(None) == []

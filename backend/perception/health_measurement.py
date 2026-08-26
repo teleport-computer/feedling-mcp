@@ -269,3 +269,37 @@ def apply_unavailable(prev_doc: Mapping | None, *, group: MeasurementGroup) -> d
         observed[field] = sg_observation.classify(None, available=False)
     doc["_observed"] = observed
     return doc
+
+
+def select_rollup_rows_after_cutover(rows: list[Mapping]) -> list[Mapping]:
+    """Read-side half of the cutover: keep old-meaning (arrival-tagged) rows
+    OUT of any multi-day series computation once this (user, signal) has at
+    least one measurement-time-aware row.
+
+    ``apply_group_update`` stops the poison from *growing* (a day-doc's first
+    measured write replaces its old aggregate outright), but it cannot erase
+    arrival-tagged rows already sitting under OTHER dates in
+    ``perception_daily`` — every day the phone re-uploaded the same stale
+    sample before this rollout got its own (fabricated-fresh) row. Those rows
+    are a different quantity from measured-time rows (arrival instant vs. true
+    measurement instant) and must never be pooled into one trend/baseline/
+    delta computation — see docs/NOTES-cutover.md.
+
+    Policy: if ANY row for this series carries ``_ts_kind == "measured"``,
+    keep ONLY the measured-tagged rows for series math. If none do (old app
+    traffic only, or a signal this module doesn't cover), every row lacks the
+    tag and this is a no-op — byte-identical to pre-cutover behavior. Rows
+    are never dropped from the raw per-day history read (``perception.
+    history`` capability) — only from series-shaped reads (trend/drift/
+    digest) that fold multiple days together; "stay readable" means the raw
+    endpoint keeps showing everything, tag included.
+    """
+    rows = list(rows or [])
+
+    def _is_measured(row: Mapping) -> bool:
+        doc = row.get("doc") if isinstance(row, Mapping) else None
+        return isinstance(doc, Mapping) and doc.get("_ts_kind") == "measured"
+
+    if not any(_is_measured(r) for r in rows):
+        return rows
+    return [r for r in rows if _is_measured(r)]

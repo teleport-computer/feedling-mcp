@@ -203,6 +203,33 @@ def test_cutover_replaces_poisoned_arrival_tagged_row(monkeypatch):
     assert doc["_ts_kind"] == "measured"
 
 
+def test_stale_resample_after_cutover_is_rejected_not_refolded(monkeypatch):
+    # Cutover already happened for this day (first measurement-aware report
+    # landed and replaced the old arrival-tagged aggregate outright).
+    fake = _env(monkeypatch)
+    payload = {
+        "health_vitals": {
+            "resting_heart_rate": 58,
+            "resting_heart_rate_measured_at": "2026-01-15T08:00:00-08:00",
+            "resting_heart_rate_sample_id": "hr-real-1",
+        }
+    }
+    service.ingest(UID, payload, client_ts=1_756_000_000.0)
+    doc_after_cutover = fake.daily[(UID, "2026-01-15", "health_vitals")]
+    assert doc_after_cutover["_ts_kind"] == "measured"
+    assert doc_after_cutover["resting_heart_rate"]["count"] == 1
+
+    # The phone keeps finding the SAME January sample as "newest within N
+    # days" on every later report and resends it, now correctly stamped with
+    # its true (unchanged) measured_at. This is genuinely stale re-traffic,
+    # not a new reading -> must be deduped, never refolded a second time.
+    for later_ts in (1_756_100_000.0, 1_756_200_000.0):
+        service.ingest(UID, payload, client_ts=later_ts)
+    doc_final = fake.daily[(UID, "2026-01-15", "health_vitals")]
+    assert doc_final["resting_heart_rate"] == {"min": 58.0, "max": 58.0, "sum": 58.0, "count": 1}
+    assert len(doc_final["_seen"]) == 1
+
+
 # ---------------------------------------------------------------------------
 # Old app versions: no measurement metadata at all -> unchanged behavior,
 # even for a signal this module knows how to group.

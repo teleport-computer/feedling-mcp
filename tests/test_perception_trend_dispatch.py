@@ -105,3 +105,53 @@ def test_unlisted_signal_defaults_to_fluctuating(monkeypatch):
     # lists it explicitly as fluctuating, but the dispatch must behave the
     # same for any signal absent from TREND_MODEL too (model_for's default).
     assert trend_models.model_for("no_such_signal_in_table") == trend_models.FLUCTUATING
+
+
+# ---------------------------------------------------------------------------
+# Cutover read-side guard: old arrival-tagged rows must never blend into a
+# drift/trend series alongside new measurement-time-tagged rows.
+# ---------------------------------------------------------------------------
+
+def test_drifting_trend_drops_arrival_tagged_rows_once_any_row_is_measured(monkeypatch):
+    # 8 months of the OLD bug: a January weigh-in re-uploaded and re-stamped
+    # with each day's arrival time, keyed by whatever day the phone happened
+    # to send it (no `_ts_kind` tag at all) — looks like a steady 68.4kg every
+    # day for 8 months, which is fabricated freshness, not a real trend.
+    poisoned_rows = [
+        {"date": d, "doc": {"weight_kg": 68.4}}
+        for d in ("2026-01-15", "2026-03-01", "2026-05-01", "2026-07-01")
+    ]
+    # After deploy, the real January sample lands under its true date, tagged
+    # `_ts_kind: "measured"` — plus a second, later genuine weigh-in.
+    measured_rows = [
+        {"date": "2026-01-14", "doc": {"weight_kg": 68.4, "_ts_kind": "measured"}},
+        {"date": "2026-08-20", "doc": {"weight_kg": 66.0, "_ts_kind": "measured"}},
+    ]
+    rows = sorted(poisoned_rows + measured_rows, key=lambda r: r["date"])
+    _patch_rows(monkeypatch, {"health_body": rows})
+
+    body = perception_core.perception_trend_payload(
+        _Store(), signal_raw="body", field_raw="weight_kg", days_raw="365"
+    )
+
+    # The drift computation must see ONLY the two measured-tagged points —
+    # the four arrival-tagged rows never entered the series at all.
+    expected = trend_models.read_drift(measured_rows, "health_body", "weight_kg")
+    assert body["trend"] == expected
+    assert body["trend"]["first"] == {"date": "2026-01-14", "value": 68.4}
+    assert body["trend"]["last"] == {"date": "2026-08-20", "value": 66.0}
+
+
+def test_trend_keeps_all_rows_when_none_are_measurement_aware_yet(monkeypatch):
+    # No row anywhere carries `_ts_kind` (old app / pre-cutover traffic only)
+    # -> the filter is a no-op, byte-identical to today's behavior.
+    rows = [
+        {"date": "2026-06-20", "doc": {"resting_heart_rate": {"sum": 60, "count": 1, "min": 60, "max": 60}}},
+        {"date": "2026-06-21", "doc": {"resting_heart_rate": {"sum": 62, "count": 1, "min": 62, "max": 62}}},
+    ]
+    _patch_rows(monkeypatch, {"health_vitals": rows})
+
+    body = perception_core.perception_trend_payload(
+        _Store(), signal_raw="vitals", field_raw="resting_heart_rate", days_raw="30"
+    )
+    assert body["trend"] == perception_history.read_trend(rows, "health_vitals", "resting_heart_rate")

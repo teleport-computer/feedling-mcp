@@ -20,6 +20,7 @@ import time
 from typing import Any
 
 from perception import catalog as perception_catalog
+from perception import health_measurement
 from perception import history as perception_history
 from perception import service as perception_service
 from perception import permissions as perception_permissions
@@ -283,6 +284,12 @@ def perception_trend_payload(store, *, signal_raw: str | None, field_raw: str | 
     field = (field_raw or "").strip() or None
     days = _parse_days(days_raw, "30")
     rows = perception_store.list_perception_daily(store.user_id, sig, days)
+    # Cutover read-side guard: once this series has any measurement-time-aware
+    # row, drop old arrival-tagged rows before they reach trend/drift math —
+    # the two are different quantities (arrival instant vs. true measurement
+    # instant) and must never be pooled into one baseline. No-op for signals
+    # never touched by the new contract (see health_measurement.py).
+    rows = health_measurement.select_rollup_rows_after_cutover(rows)
     model = trend_models.model_for(sig)
 
     if model == trend_models.DRIFTING:
@@ -343,8 +350,14 @@ def perception_digest_payload(store, *, days_raw: str | None) -> dict[str, Any]:
     # History rows for the numeric/health fold (comparable) plus the two
     # non-comparable shapes the board reads directly: playback tally + place dwell.
     history_signals = set(perception_history.comparable_signals()) | {"playback", "location_signal"}
+    # Same cutover read-side guard as perception_trend_payload — the digest's
+    # "notable changes" and cross-domain board fold multiple days together
+    # through the same read_trend/read_drift math, so they need the same
+    # old/new-meaning separation.
     rows_by_signal = {
-        signal: perception_store.list_perception_daily(uid, signal, days)
+        signal: health_measurement.select_rollup_rows_after_cutover(
+            perception_store.list_perception_daily(uid, signal, days)
+        )
         for signal in history_signals
     }
     try:
