@@ -60,6 +60,14 @@ New mailbox message for <recipient>: <id>. Run scripts/agent-mailbox/read.sh <re
 
 If no pane is configured, the message is still written and the wake is skipped.
 
+The wake outcome is always one line on stdout, mirrored to stderr when it is a
+failure, and it never claims more than was observed. `wake notice reached
+<recipient> at <pane>` means the notice was found in that pane afterwards — it
+does not mean the recipient read it. `wake failed` and `⚠️ wake unverified` both
+mean the message is on disk but the recipient probably never saw the notice:
+tell them yourself. A failed wake still exits 0, because the post itself
+succeeded and re-running it would only duplicate the message.
+
 ## Read And Ack
 
 ```sh
