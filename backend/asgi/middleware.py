@@ -26,6 +26,7 @@ from asgi import context as asgi_context
 from asgi import responses
 from asgi.context import current_user_id
 from asgi.settings import settings
+from core.store_sections import StoreSectionUnavailable
 from fastapi.exceptions import RequestValidationError
 from starlette.requests import ClientDisconnect
 from starlette.responses import Response
@@ -138,6 +139,13 @@ def register_exception_handlers(app) -> None:
     @app.exception_handler(auth_core.AuthError)
     async def _auth_error(request, exc: auth_core.AuthError):
         return responses.json_error(exc.status_code, {"error": exc.code})
+
+    @app.exception_handler(StoreSectionUnavailable)
+    async def _store_section_unavailable(request, exc: StoreSectionUnavailable):
+        return responses.json_error(
+            503,
+            {"error": exc.slug, "section": exc.section.value},
+        )
 
     # Routes that read the body/form directly (copytext, diagnostics, proactive,
     # genesis) hit a raised ClientDisconnect when the peer drops mid-upload —

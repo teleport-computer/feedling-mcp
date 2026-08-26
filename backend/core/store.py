@@ -14,12 +14,19 @@ import threading
 import time
 import uuid
 from datetime import datetime
+from typing import Iterable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import db
 from core import config
 from core import envelope as core_envelope
 from core import wake_bus
+from core.store_sections import (
+    SectionSlot,
+    StoreLoadMode,
+    StoreSection,
+    store_load_mode,
+)
 from core.telemetry_logging import stderr_info_logger
 
 log = stderr_info_logger("feedling.chat_sync")
@@ -84,6 +91,8 @@ _HEARTBEAT_NEXT_TICK_CAS_ATTEMPTS = 4
 # outside a load) still broadcast. Thread-local so a load on one thread can't
 # mute a concurrent genuine write on another.
 _reload_guard = threading.local()
+
+ALL_STORE_SECTIONS = frozenset(StoreSection)
 
 
 def _chat_snapshot_fallback_telemetry(
@@ -296,19 +305,57 @@ class UserStore:
         # cache is process-wide. Empty until the user's first request after
         # a process restart.
         self.last_seen_api_key: str = ""
+        self._section_slots = {
+            section: SectionSlot(section) for section in ALL_STORE_SECTIONS
+        }
 
-        # load persistent state (write-on-read normalization must not broadcast)
-        _prev_guard = getattr(_reload_guard, "active", False)
-        _reload_guard.active = True
-        try:
-            self._load_tokens()
-            self._load_push_state()
-            self._load_live_activity_state()
-            self._load_chat()
-            self._load_frames_meta()
-            self._load_world_books()
-        finally:
-            _reload_guard.active = _prev_guard
+    def _section_loader(self, section: StoreSection):
+        return {
+            StoreSection.CHAT: self.reload_chat_hot_strict,
+            StoreSection.FRAMES: self._load_frames_meta,
+            StoreSection.WORLD_BOOKS: self._load_world_books,
+            StoreSection.TOKENS: self._load_tokens,
+            StoreSection.PUSH_STATE: self._load_push_state,
+            StoreSection.LIVE_ACTIVITY: self._load_live_activity_state,
+        }[section]
+
+    def loaded_sections(self) -> frozenset[StoreSection]:
+        return frozenset(
+            section
+            for section, slot in self._section_slots.items()
+            if slot.has_cache
+        )
+
+    def ensure_sections(
+        self,
+        sections: Iterable[StoreSection],
+        *,
+        reason: str = "first_use",
+        strict: bool = True,
+        force: bool = False,
+    ) -> bool:
+        del reason  # Task 3 attaches fixed-enum load telemetry to this seam.
+        succeeded = True
+        for section in sorted(
+            {StoreSection(value) for value in sections},
+            key=lambda value: value.value,
+        ):
+            previous_guard = getattr(_reload_guard, "active", False)
+
+            def guarded_load(section=section, previous_guard=previous_guard):
+                _reload_guard.active = True
+                try:
+                    return self._section_loader(section)()
+                finally:
+                    _reload_guard.active = previous_guard
+
+            loaded = self._section_slots[section].ensure(
+                guarded_load,
+                force=force,
+                strict=strict,
+            )
+            succeeded = loaded and succeeded
+        return succeeded
 
     # ------- frames index -------
     def _load_frames_meta(self):
@@ -2184,7 +2231,11 @@ def _refresh_store_channel(user_id: str, channel: str) -> bool:
     return True
 
 
-def get_store(user_id: str) -> UserStore:
+def get_store(
+    user_id: str,
+    *,
+    require: Iterable[StoreSection] = (),
+) -> UserStore:
     now = time.monotonic()
     do_reload = False
     with _stores_lock:
@@ -2193,8 +2244,7 @@ def get_store(user_id: str) -> UserStore:
             store = UserStore(user_id)
             store.loaded_at = time.monotonic()
             _stores[user_id] = store
-            return store
-        if (now - getattr(store, "loaded_at", now)) >= STORE_CACHE_TTL_SECONDS:
+        elif (now - getattr(store, "loaded_at", now)) >= STORE_CACHE_TTL_SECONDS:
             # Expired. Claim the reload by stamping loaded_at now (under the
             # lock) so concurrent callers don't stampede, then refresh the SAME
             # instance in place outside the lock. In-place refresh keeps object
@@ -2206,4 +2256,27 @@ def get_store(user_id: str) -> UserStore:
     if do_reload:
         store.reload()
         _wake_store_waiters(store)
+    mode = store_load_mode()
+    if mode is StoreLoadMode.LEGACY:
+        store.ensure_sections(
+            ALL_STORE_SECTIONS,
+            reason="legacy_compat",
+            strict=False,
+        )
+    elif require:
+        store.ensure_sections(
+            require,
+            reason="first_use",
+            strict=True,
+        )
+    return store
+
+
+def get_store_legacy(user_id: str) -> UserStore:
+    store = get_store(user_id)
+    store.ensure_sections(
+        ALL_STORE_SECTIONS,
+        reason="legacy_compat",
+        strict=False,
+    )
     return store

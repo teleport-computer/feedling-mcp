@@ -15,6 +15,7 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from asgi import middleware  # noqa: E402
+from core.store_sections import StoreSection, StoreSectionUnavailable  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 
 
@@ -29,6 +30,13 @@ def _build_app():
     @app.get("/typed/{n}")
     async def typed(n: int):
         return {"n": n}
+
+    @app.get("/store-section")
+    async def store_section():
+        try:
+            raise RuntimeError("postgresql://private secret detail")
+        except RuntimeError as exc:
+            raise StoreSectionUnavailable(StoreSection.CHAT) from exc
 
     return app
 
@@ -62,6 +70,18 @@ def test_validation_error_reshaped_to_invalid_payload():
     assert isinstance(body["detail"], list) and body["detail"]
     # detail 条目精简为 {loc, msg} 两键
     assert set(body["detail"][0].keys()) == {"loc", "msg"}
+
+
+def test_store_section_failure_is_content_free_retryable_503():
+    resp = _get("/store-section")
+
+    assert resp.status_code == 503
+    assert resp.json() == {
+        "error": "store_section_unavailable",
+        "section": "chat",
+    }
+    assert "postgresql://private" not in resp.text
+    assert "secret detail" not in resp.text
 
 
 def test_uncaught_exception_logged_with_same_request_id(caplog):
