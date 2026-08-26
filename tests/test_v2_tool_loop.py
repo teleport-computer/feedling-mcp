@@ -3650,3 +3650,188 @@ def test_rejected_discovery_key_stays_dispatchable_after_recovery(monkeypatch):
         "rejected": "missing_tool_call_id"
     }
     assert outcome.stop_reason == "required_file_missing"
+
+
+# --- failed identity writes get one structured retry ----------------------
+
+
+def _identity_call(call_id="identity-1"):
+    return {
+        "id": call_id,
+        "name": "identity_patch",
+        "args": {"agent_name": "星禾"},
+    }
+
+
+class _IdentityResultDispatch(_RecordingDispatch):
+    def __init__(self, content):
+        super().__init__()
+        self.content = content
+
+    async def __call__(self, tool_calls):
+        self.calls.append(list(tool_calls))
+        return [
+            ToolResult(call_id=tool_call.id, content=self.content)
+            for tool_call in tool_calls
+        ]
+
+
+def _run_identity_script(provider, dispatch, *, max_calls=4, trajectory=None):
+    delivered = []
+
+    async def on_reply(text, *, final, reasoning="", media=()):
+        if final:
+            delivered.append(text)
+
+    async def on_trajectory(event_kind, detail):
+        if trajectory is not None:
+            trajectory.append((event_kind, detail))
+
+    asyncio.run(
+        tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_TranscriptBuildMessages(),
+            dispatch_tools=dispatch,
+            on_reply=on_reply,
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            max_calls=max_calls,
+            on_trajectory_event=on_trajectory,
+        )
+    )
+    return delivered
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "error: denied",
+        "error: validation failed",
+        "queued: identity_patch",
+    ],
+)
+def test_failed_identity_write_is_bounced_once(content, monkeypatch):
+    provider = _ScriptedProvider(
+        [
+            {"reply": "", "tool_calls": [_identity_call()], "usage": {}},
+            {"reply": "已经改好了", "tool_calls": [], "usage": {}},
+            {"reply": "这次没有改成", "tool_calls": [], "usage": {}},
+        ]
+    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    delivered = _run_identity_script(
+        provider,
+        _IdentityResultDispatch(content),
+    )
+
+    assert len(provider.calls) == 3
+    assert any(
+        "没有成功" in str(message.get("content", ""))
+        for message in provider.calls[2]["messages"]
+        if isinstance(message, dict)
+    )
+    assert delivered == ["这次没有改成"]
+
+
+def test_real_background_identity_denial_is_bounced(monkeypatch):
+    denial = (
+        "error: identity write refused in background turn for identity_patch"
+    )
+    provider = _ScriptedProvider(
+        [
+            {"reply": "", "tool_calls": [_identity_call()], "usage": {}},
+            {"reply": "已经改好了", "tool_calls": [], "usage": {}},
+            {"reply": "身份写入被拒绝了", "tool_calls": [], "usage": {}},
+        ]
+    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    delivered = _run_identity_script(
+        provider,
+        _IdentityResultDispatch(denial),
+    )
+
+    assert len(provider.calls) == 3
+    assert delivered == ["身份写入被拒绝了"]
+
+
+def test_successful_identity_write_is_not_bounced(monkeypatch):
+    provider = _ScriptedProvider(
+        [
+            {"reply": "", "tool_calls": [_identity_call()], "usage": {}},
+            {"reply": "名字已经改好了", "tool_calls": [], "usage": {}},
+        ]
+    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    delivered = _run_identity_script(
+        provider,
+        _IdentityResultDispatch("ok: identity_patch applied"),
+    )
+
+    assert len(provider.calls) == 2
+    assert delivered == ["名字已经改好了"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "好的，以后叫你999",
+        "名字已经改好了",
+        "我记住了",
+        "文件我帮你改好了",
+    ],
+)
+def test_no_identity_tool_call_never_triggers_identity_bounce(text, monkeypatch):
+    provider = _ScriptedProvider(
+        [{"reply": text, "tool_calls": [], "usage": {}}]
+    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    delivered = _run_identity_script(provider, _RecordingDispatch())
+
+    assert len(provider.calls) == 1
+    assert delivered == [text]
+
+
+def test_repeated_failed_identity_writes_are_bounced_at_most_once(monkeypatch):
+    responses = [
+        {"reply": "", "tool_calls": [_identity_call("identity-1")], "usage": {}},
+        {"reply": "第一次失败", "tool_calls": [], "usage": {}},
+        {"reply": "", "tool_calls": [_identity_call("identity-2")], "usage": {}},
+        {"reply": "第二次仍然失败", "tool_calls": [], "usage": {}},
+        {"reply": "", "tool_calls": [_identity_call("identity-3")], "usage": {}},
+        {"reply": "第三次仍然失败", "tool_calls": [], "usage": {}},
+        {"reply": "", "tool_calls": [_identity_call("identity-4")], "usage": {}},
+        {"reply": "第四次仍然失败", "tool_calls": [], "usage": {}},
+    ]
+    provider = _ScriptedProvider(responses)
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    trajectory = []
+
+    delivered = _run_identity_script(
+        provider,
+        _IdentityResultDispatch("error: denied"),
+        max_calls=len(responses),
+        trajectory=trajectory,
+    )
+
+    bounced = [
+        detail
+        for event_kind, detail in trajectory
+        if event_kind == "identity_write_failed_bounced"
+    ]
+    assert len(provider.calls) == 4
+    assert len(provider.responses) == 4, "the script must retain retry budget"
+    assert len(bounced) == 1
+    assert delivered == ["第二次仍然失败"]
+
+
+def test_identity_write_tool_names_are_derived_from_write_actions():
+    assert tool_loop._IDENTITY_WRITE_TOOL_NAMES == frozenset(
+        action
+        for action in cap_registry.WRITE_ACTIONS
+        if action.startswith("identity_")
+    )
+    assert tool_loop._IDENTITY_WRITE_TOOL_NAMES
