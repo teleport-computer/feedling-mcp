@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # 后端代码组织规范（Contributing Guide）
 
 > 背景：2026-06-12 我们把 17,600 行的 `backend/app.py` 单体拆成了 13 个
@@ -143,24 +147,22 @@ asgi_app.py（装配，最高）
   ↑ db / content_encryption / provider_client / dstack_tls / hosted_runtime /
      semantic_analysis / memory_readside_core / memory_index_selector /
      context_memory_selection（最低；均为无业务依赖的共享/底层模块）
-  ↑ memgarden（最低；记忆判断力内核，**不 import 任何 io 模块**，
-     由 tests/test_memgarden_purity.py 的 AST 守卫钉死）
-  ↑ core（最低；模型协议层的纯共享判据：思维链剥离、
-     协议残片识别。**与记忆无关** —— 聊天主链路、工具循环、主动唤醒、
-     记忆落卡都在用，所以它不属于任何一个领域。只依赖标准库）
+  ↑ memgarden（外部低层依赖；记忆判断力内核，不 import IO 模块）
+  ↑ agent_protocol_core（外部最低层依赖；模型协议判据，只依赖标准库；
+     memgarden → agent_protocol_core，二者都不依赖 backend/core）
 ```
 
-> `memgarden` 是被抽出来的纯函数内核（什么值得记 / 怎么归桶 / 打分排序 /
-> 要不要整理 / 解析并算 mutation）。它只依赖标准库，所以天然处在最低层，
-> 被 `memory` / `genesis` / `model_api_runtime` 等上层 import。
+> `memgarden` 是安装进来的外部判断力内核（什么值得记 / 怎么归桶 / 打分排序 /
+> 要不要整理 / 解析并算 mutation），不是 `backend/` 下的本地包。它只依赖标准库和
+> 同一外部发行物里的 `agent_protocol_core`，被 `memory` / `genesis` /
+> `model_api_runtime` 等 IO 上层单向 import。
 > 加解密、身份装配、锁、审计、调模型一律不在其中 —— 那些由调用方提供。
 >
-> `core` 与它平级、互不依赖。方向是单向的：
-> `memgarden` → `core`，聊天链路也 → `core`。
-> 第一版曾把这两个模块塞进 `memgarden`，导致普通聊天反向依赖记忆包，
-> 已在 2026-08-14 拆开。
+> IO 的 `backend/core` 不被外部包 import；仓库也不得恢复 `backend/memgarden`、
+> `backend/memory_garden` 或 `backend/agent_protocol_core` 副本，否则会静默遮蔽已安装依赖。
 >
-> 设计见 `docs/MEMORY_GARDEN_EXTRACTION_DESIGN.zh.md`。
+> 长期边界见 `docs/MEMORY_GARDEN_EXTRACTION_DESIGN.zh.md`；当前外部包、hash pin、
+> measured image 与 provenance 限制见 public architecture。
 
 - `routes.py` 可以 import 平级或更低的任何 service；`service.py` 只准向下。
 - **需要「向上」调用时，用注入，不用 import。** 现有范例：

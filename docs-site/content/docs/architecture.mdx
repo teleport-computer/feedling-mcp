@@ -881,24 +881,34 @@ an external package (`memgarden`, Apache-2.0, source at
 `github.com/teleport-computer/memgarden`). It is not vendored into this
 repository.
 
-It is installed at image build time from a versioned GitHub Release wheel pinned
-by sha256 in `backend/requirements.lock`, alongside its only non-stdlib
-dependency (`agent-protocol-core`). The installed bytes therefore end up inside
-the measured image like any other dependency, and the compose hash published
-on-chain covers them.
+Managed images install it at build time from a versioned GitHub Release wheel
+pinned by sha256 in `backend/requirements.lock`, alongside its only non-stdlib
+dependency (`agent-protocol-core`). The hash-locked build constrains the wheel
+bytes accepted as image input. The separately published on-chain compose hash
+binds the deployment YAML and its image tag/configuration; because the manifest
+does not pin an image digest, that compose hash does not by itself attest the
+image bytes or the wheel bytes inside them.
 
 What the hash pin does and does not establish:
 
 | | |
 | --- | --- |
 | Guaranteed | The wheel installed in a build is byte-identical to the reviewed artifact. Replacing the Release asset under the same URL fails the build rather than silently swapping the package. |
-| Not guaranteed | That those bytes were produced from the source at the public tag. The tag is not signed and there is no build provenance attestation yet, so a repository administrator could publish a wheel that does not match the tagged source. |
+| Best-effort evidence, not a hard gate | CI downloads both locked wheels and asks GitHub to verify their artifact attestations against the `teleport-computer/memgarden` repository. The check is deliberately `continue-on-error`, so a missing credential or attestation-service outage remains visible in the job summary but does not block a release. Deployment therefore must not claim provenance as an unconditional guarantee. |
 
 Two operational consequences follow. A cold build now requires egress to
 `github.com` and `release-assets.githubusercontent.com`; if the Release asset is
 deleted, builds fail loudly rather than falling back. And upgrading the kernel is
 a deliberate, reviewable change: a new Release, a new URL and hash in the lock,
 and a normal pull request.
+
+The user-VPS resident self-updater is a different supply chain: it follows
+`backend/requirements.txt` from the checked-out release and runs ordinary
+`pip -r` before re-exec. It does not enforce the managed image's
+`requirements.lock` hashes, and an install failure is currently non-fatal to
+the re-exec path. Requirements changes must therefore remain compatible with
+checkout/re-exec on existing VPS installations; managed-image hash and compose
+evidence must not be presented as a VPS guarantee.
 
 The kernel is pure judgment: no network, no database, no filesystem, and no
 access to plaintext beyond the strings the host passes in. Encryption, key
