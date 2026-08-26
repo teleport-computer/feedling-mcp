@@ -24,6 +24,7 @@ from capabilities import registry as cap_registry
 from capabilities import tool_schema as cap_tool_schema
 from provider_types import ProviderMedia, ToolExchange, ToolResult
 from model_api_runtime.v2 import executor as v2_executor
+from model_api_runtime.v2 import language_follow
 from model_api_runtime.v2 import tool_loop
 
 
@@ -2169,6 +2170,110 @@ def test_file_recovery_tool_choice_dispatches_by_provider_capability(
         "file_delivery_forced",
     ]
     assert all(item["dropped_tool_count"] > 0 for item in surfaces[:3])
+
+
+def test_compact_file_confirmation_keeps_language_correction_instruction(
+    monkeypatch,
+):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "write",
+                "name": "workspace_write",
+                "args": {
+                    "path": "/workspace/final.md",
+                    "content": "# 中文附件终验",
+                    "expected_revision": 0,
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "deliver",
+                "name": "send_file",
+                "args": {"path": "/workspace/final.md", "revision": 1},
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "Your work is saved and ready to open now.",
+            "tool_calls": [],
+            "usage": {},
+        },
+        {
+            "reply": "文件已经生成并发送，可以直接下载了。",
+            "tool_calls": [],
+            "usage": {},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=tool_call.id,
+                content=(
+                    "ok: workspace_write applied at revision 1; use the same "
+                    "path and revision 1 with send_file"
+                ),
+            )
+            for tool_call in tool_calls
+        ]
+
+    delivered = []
+
+    async def on_file(path, revision):
+        delivered.append((path, revision))
+
+    class CorrectingReply:
+        def __init__(self):
+            self.calls = []
+
+        async def __call__(
+            self, text, *, final, reasoning="", correction_outcome=""
+        ):
+            self.calls.append((text, final, correction_outcome))
+            if text.startswith("Your work") and not correction_outcome:
+                return tool_loop.FinalReplyCorrectionRequest(
+                    instruction=language_follow.CORRECTION_INSTRUCTION,
+                    original_text=text,
+                    original_reasoning=reasoning,
+                )
+            return None
+
+    replies = CorrectingReply()
+    user_message = {
+        "role": "user",
+        "content": (
+            "请直接生成并发送一个真实的 Markdown 文件，完成后用中文简短回复。"
+        ),
+    }
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=replies,
+        on_file_reply=on_file,
+        required_file_suffixes=(".md",),
+        file_requirement_messages=(user_message,),
+        fold_new_messages=_RecordingFold([[], [], []]),
+        add_usage=_noop_add_usage,
+        max_calls=4,
+    ))
+
+    correction_messages = json.dumps(
+        provider.calls[3]["messages"], ensure_ascii=False
+    )
+    assert language_follow.CORRECTION_INSTRUCTION in correction_messages
+    assert delivered == [("/workspace/final.md", 1)]
+    assert replies.calls == [
+        ("Your work is saved and ready to open now.", True, ""),
+        ("文件已经生成并发送，可以直接下载了。", True, ""),
+    ]
+    assert outcome.final_text == "文件已经生成并发送，可以直接下载了。"
 
 
 def test_invalid_artifact_write_is_model_visible_and_retries_in_workspace(

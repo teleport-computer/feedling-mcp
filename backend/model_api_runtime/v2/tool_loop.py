@@ -1618,6 +1618,12 @@ async def run_tool_loop(
                         ),
                     },
                 ]
+            # The compact confirmation replaces the normal transcript-shaped
+            # messages above. Re-attach bounded correction instructions here;
+            # otherwise a language rewrite is marked as attempted but the
+            # provider never sees the instruction that requested it.
+            if retry_instructions:
+                messages = _with_system_suffix(messages, retry_instructions)
         elif (
             forced_delivery_tool == tool_schema.FILE_REPLY_TOOL
             and workspace_delivery_target is not None
