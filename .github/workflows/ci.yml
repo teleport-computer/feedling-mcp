@@ -2204,7 +2204,6 @@ jobs:
         id: pin
         env:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-          FEEDLING_TEST_PREVIEW_DEPLOY: ${{ github.event_name == 'workflow_dispatch' && inputs.operation == 'deploy-test-preview' && '1' || '0' }}
         run: >-
           ./deploy/pin-runtime-release.sh main
           deploy/docker-compose.phala.yaml
@@ -2552,6 +2551,7 @@ jobs:
         id: pin
         env:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          FEEDLING_TEST_PREVIEW_DEPLOY: ${{ github.event_name == 'workflow_dispatch' && inputs.operation == 'deploy-test-preview' && '1' || '0' }}
         run: >-
           ./deploy/pin-runtime-release.sh test
           deploy/docker-compose.phala.test.yaml

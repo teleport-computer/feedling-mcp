@@ -328,6 +328,13 @@ def test_workflow_consumes_one_pinned_release_without_runner_branch_writes():
         job = _job(source, name, next_name)
         assert f"./deploy/pin-runtime-release.sh {branch}" in job
 
+    prod_main = _job(source, "deploy-cvm", "deploy-test-cvm")
+    test_main = _job(source, "deploy-test-cvm", "deploy-test-runner-cvm")
+    test_runner = _job(source, "deploy-test-runner-cvm", "deploy-pre-cvm")
+    assert "FEEDLING_TEST_PREVIEW_DEPLOY" not in prod_main
+    assert test_main.count("FEEDLING_TEST_PREVIEW_DEPLOY") == 1
+    assert test_runner.count("FEEDLING_TEST_PREVIEW_DEPLOY") == 1
+
     runner_jobs = (
         (
             "deploy-test-runner-cvm",
