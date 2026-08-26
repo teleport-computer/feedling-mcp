@@ -206,3 +206,69 @@ place; rollback does not run DDL or data conversion.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | TEST | legacy | 1h | pending | pending | pending | pending | pending | pending | pending | pending | pending |
 
+## Local verification evidence — 2026-08-26
+
+This evidence was collected from commit `19e342f8` (the candidate code was
+unchanged between the successful run and commit; only formatting followed the
+run). No production or shared TEST service was used.
+
+| Field | Value |
+| --- | --- |
+| Environment | isolated local PostgreSQL + backend |
+| Mode | `lazy`; Chat sync `incremental`; hot cache `256` |
+| UTC window | 2026-08-26 14:03:26–14:08:30 |
+| Asia/Shanghai window | 2026-08-26 22:03:26–22:08:30 |
+| Initial backend worker PIDs | `57512`, `57513`, `57514`, `57515` |
+| Replacement | `57512` terminated; Gunicorn started `57721` |
+| Temporary resources | local database, probe module, and data directory deleted after the run |
+
+Verification results:
+
+- Focused PostgreSQL-backed metadata-first suite: **129 passed**, no DB-backed
+  skip.
+- Cold-maintenance regression files: **190 passed**.
+- Full repository suite excluding `tests/test_api.py`: **11729 passed, 3
+  skipped, 9 xfailed, 3 subtests passed** in 507.88 seconds. Exit code 0.
+- Post-commit combined core plus previously-failing regression run: **320
+  passed** in 16.55 seconds. Exit code 0.
+- Documentation verification on the same branch: `types:check`, `lint`, and
+  `build` all exited 0; the build rendered 582 pages.
+- `~/fleet/bus/which_tests.sh --vs origin/test` was unavailable because the
+  script does not exist on this workstation; this is recorded as unavailable,
+  not as a pass or zero selection.
+
+Four-worker exercise results:
+
+| Check | Result |
+| --- | --- |
+| Cold Chat append | all four workers remained unloaded; snapshot calls `0/0/0/0` |
+| 100 concurrent `/history` reads | all status 200; shell-only snapshot calls `0/0/0/0` |
+| 100 concurrent explicit first Chat loads | request distribution `16/28/19/37`; exactly one snapshot per worker (`1/1/1/1`) |
+| First-load failure and retry | injected first load returned 503; same worker later returned 200 |
+| Dropped notification / listener recovery | all four LISTEN connections terminated; gap append returned 200; all four listeners reconnected and catch-up refreshed one loaded store each; post-reconnect history returned 200 |
+| Worker replacement | replacement worker `57721` started and served history with status 200 |
+| Chat lifecycle | append, poll, finalize CAS, delete, clear, and post-clear history returned 200; registration returned 201 |
+| Clear invariant | post-clear history was empty; no capture-state resurrection regression in focused/full suites |
+
+Content-free response hashes from the successful run:
+
+| Operation | Status | SHA-256 prefix |
+| --- | ---: | --- |
+| register | 201 | `a78b11ad9f8cc534` |
+| append | 200 | `519e7fab711d1469` |
+| poll | 200 | `08c823721de1ae2e` |
+| finalize CAS | 200 | `9710a9fdc8795641` |
+| delete | 200 | `89eb4fc118661ac7` |
+| clear | 200 | `4f7d23820457f990` |
+| post-clear history | 200 | `6ee353af0f513545` |
+| replacement-worker history | 200 | `4150923790f8adfc` |
+| first-load retry | 200 | `5800f0030634e2ef` |
+
+The four-worker run used the real assembled `asgi_app` under Gunicorn. A local
+temporary wrapper added only worker-PID headers, snapshot counters, and the
+fault-injection/direct-finalize probes. Product append/history/poll/clear paths
+were exercised through their public HTTP routes. The finalize CAS was called
+through `UserStore.finalize_chat_reply_once` because a standalone local backend
+correctly rejects `/v1/chat/response` until an official resident consumer has
+completed onboarding; bypassing that independent safety gate was outside this
+rollout's scope.
