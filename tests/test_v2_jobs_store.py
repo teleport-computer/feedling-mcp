@@ -633,10 +633,25 @@ def test_terminal_failure_reply_is_encrypted_linked_classified_and_idempotent(
     assert v2_cursor.load_seq(core_store.get_store(uid)) == parent_seq
 
 
-def test_canvas_delivery_failure_reply_does_not_claim_a_connection_problem(
+@pytest.mark.parametrize(
+    ("error_class", "expected_text"),
+    [
+        (
+            "file_delivery_incomplete",
+            "文件内容已经保存，但附件发送没有完成。请稍后再试。",
+        ),
+        (
+            "canvas_file_delivery_incomplete",
+            "画布内容已经保存，但卡片更新没有完成。请稍后再试。",
+        ),
+    ],
+)
+def test_file_delivery_failure_reply_does_not_claim_a_connection_problem(
     monkeypatch,
+    error_class,
+    expected_text,
 ):
-    uid = "u_js_canvas_delivery_failure"
+    uid = "u_js_" + error_class
     seed_user(uid)
     _reset(uid)
     _append_user_message(uid)
@@ -655,25 +670,21 @@ def test_canvas_delivery_failure_reply_does_not_claim_a_connection_problem(
     jobs_store.claim_next_job("w")
     assert jobs_store.mark_failed(
         job_id,
-        "turn_failed:canvas_file_delivery_incomplete",
+        f"turn_failed:{error_class}",
         claimed_by="w",
-        error_class="canvas_file_delivery_incomplete",
+        error_class=error_class,
     )
 
     result = jobs_store.reconcile_terminal_failure_outbox(job_id=job_id)
 
     assert result["reply_delivered"] == 1
-    assert encrypted_plaintexts == [
-        "画布内容已经保存，但卡片更新没有完成。请稍后再试。"
-    ]
+    assert encrypted_plaintexts == [expected_text]
     failure = next(
         row
         for row in db.chat_load_strict(uid)
         if str(row.get("terminal_failure_job_id") or "") == str(job_id)
     )
-    assert failure["turn_failure_error_class"] == (
-        "canvas_file_delivery_incomplete"
-    )
+    assert failure["turn_failure_error_class"] == error_class
     assert failure["turn_failure_blame"] == "system"
 
 

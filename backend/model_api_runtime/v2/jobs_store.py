@@ -4294,6 +4294,7 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
             user_text
             if error_class
             in {
+                "file_delivery_incomplete",
                 "canvas_file_delivery_incomplete",
                 "platform_queue_timeout",
                 "platform_execution_timeout",
