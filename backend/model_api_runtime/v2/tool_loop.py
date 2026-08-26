@@ -282,6 +282,40 @@ _NOT_A_CLAIM_RE = re.compile(
     re.IGNORECASE,
 )
 _IMAGE_NOUN = r"(?:自画像|画像|插画|图片|图像|图)"
+_IDENTITY_WRITE_TOOL_NAMES = frozenset(
+    action
+    for action in cap_registry.WRITE_ACTIONS
+    if action.startswith("identity_")
+)
+
+
+def _identity_write_attempted(transcript) -> bool:
+    """Return whether the turn transcript contains an identity-write call."""
+    return any(
+        call.name in _IDENTITY_WRITE_TOOL_NAMES
+        for item in transcript
+        if isinstance(item, ToolExchange)
+        for call in item.calls
+    )
+
+
+def _identity_write_succeeded(transcript) -> bool:
+    """Return whether a matched identity-write result is classified as success."""
+    from core import chat_activity as _ca
+
+    for item in transcript:
+        if not isinstance(item, ToolExchange):
+            continue
+        results_by_id = {str(result.call_id): result for result in item.results}
+        for call in item.calls:
+            if call.name not in _IDENTITY_WRITE_TOOL_NAMES:
+                continue
+            result = results_by_id.get(str(call.id))
+            if result is not None and _ca.result_code(result.content) == "ok":
+                return True
+    return False
+
+
 _IMAGE_CLAIM_RE = re.compile(
     r"("
     # 图 + (已经) + 完成动词:「图片已经生成」「图片生成好了」
@@ -993,7 +1027,9 @@ async def run_tool_loop(
     required_file_missing_recorded = False
     file_delivery_fallback_text = ""
     image_claim_bounces = 0
+    identity_write_failed_bounces = 0
     image_claim_retry_instruction = ""
+    identity_write_failed_instruction = ""
     file_delivery_fallback_reasoning = ""
     file_delivery_recovery_needed = False
     workspace_write_applied = False
@@ -1301,6 +1337,7 @@ async def run_tool_loop(
             for instruction in (
                 delivery_retry_instruction,
                 image_claim_retry_instruction,
+                identity_write_failed_instruction,
                 empty_response_retry_instruction,
                 _WAKE_CHOICE_INSTRUCTION if wake_choice_required else "",
                 final_reply_correction_instruction,
@@ -2523,6 +2560,30 @@ async def run_tool_loop(
                 # 不打回,谎话直接发给用户 —— codex 审出。)
                 if attempts < max_calls:
                     _progress("image_claim_retry_boundary")
+                    continue
+
+            # D scheme: a structured identity-write attempt that did not produce
+            # a successful result gets one extra provider round. Do not inspect
+            # or classify the model's prose.
+            if (
+                pr.text
+                and identity_write_failed_bounces < 1
+                and _identity_write_attempted(transcript)
+                and not _identity_write_succeeded(transcript)
+            ):
+                identity_write_failed_bounces += 1
+                await _trajectory(
+                    "identity_write_failed_bounced",
+                    {"round": attempts, "text_chars": len(pr.text)},
+                )
+                identity_write_failed_instruction = (
+                    "上一轮你调用了身份写工具,但那次调用**没有成功**"
+                    "(被拒绝、出错或仍在排队),身份没有真的改动。"
+                    "请据实处理:要么重试一次,要么照实告诉他没改成 —— "
+                    "不要把这次未生效的改动说成已经完成。"
+                )
+                if attempts < max_calls:
+                    _progress("identity_write_failed_retry_boundary")
                     continue
 
             requirement_met = (
