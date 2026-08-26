@@ -265,3 +265,81 @@ def test_decrypt_failure_records_unavailable_not_no_observation(monkeypatch):
     observed = rows[0]["doc"]["_observed"]
     assert observed["resting_heart_rate"] == "unavailable"
     assert "_ts_kind" not in rows[0]["doc"]  # no measurement time -> no cutover forced
+
+
+# ---------------------------------------------------------------------------
+# Sleep / workout: interval fields on the real wire names (`sleep_start`/
+# `sleep_end`, `workout_start`/`workout_end` — no `_interval_` infix), end to
+# end through service.ingest. Regression coverage for a naming mismatch that
+# would otherwise leave both signals silently on the legacy arrival-date path.
+# ---------------------------------------------------------------------------
+
+def test_sleep_interval_attributes_to_wake_up_day(monkeypatch):
+    fake = _env(monkeypatch)
+    service.ingest(
+        UID,
+        {"health_sleep": {
+            "asleep_minutes": 410,
+            "core_minutes": 200,
+            "deep_minutes": 90,
+            "rem_minutes": 120,
+            "sleep_start": "2026-03-01T23:00:00-05:00",
+            "sleep_end": "2026-03-02T07:00:00-05:00",
+            "sleep_sample_id": "sleep-1",
+        }},
+        client_ts=1_756_000_000.0,  # "today" is nowhere near March 2026.
+    )
+    rows = fake.list_perception_daily(UID, "health_sleep")
+    by_date = {r["date"]: r["doc"] for r in rows}
+    assert "2026-03-02" in by_date  # wake-up day, not the day sleep started.
+    assert by_date["2026-03-02"]["_ts_kind"] == "measured"
+    assert by_date["2026-03-02"]["asleep_minutes"] == 410
+
+
+def test_workout_interval_attributes_and_dedups(monkeypatch):
+    fake = _env(monkeypatch)
+    payload = {
+        "health_workout": {
+            "workout_type": "run",
+            "duration_min": 32,
+            "count_today": 1,
+            "workout_start": "2026-04-05T06:00:00-07:00",
+            "workout_end": "2026-04-05T06:32:00-07:00",
+            "workout_sample_id": "workout-1",
+        }
+    }
+    service.ingest(UID, payload, client_ts=1_756_000_000.0)
+    # Re-upload of the same workout sample must not double-count.
+    service.ingest(UID, payload, client_ts=1_756_000_300.0)
+    rows = fake.list_perception_daily(UID, "health_workout")
+    by_date = {r["date"]: r["doc"] for r in rows}
+    assert "2026-04-05" in by_date
+    doc = by_date["2026-04-05"]
+    # health_workout's rollup shape is an event list, not a numeric aggregate.
+    assert len(doc["events"]) == 1
+    assert doc["events"][0]["duration_min"] == 32
+    assert len(doc["_seen"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Malformed metadata must never drop the value itself — only the bookkeeping
+# falls back to today's report-arrival date.
+# ---------------------------------------------------------------------------
+
+def test_malformed_measured_at_still_folds_the_value(monkeypatch):
+    fake = _env(monkeypatch)
+    service.ingest(
+        UID,
+        {"health_body": {
+            "weight_kg": 70.2,
+            # No UTC offset — perceptkit.attribution refuses to guess one.
+            "weight_kg_measured_at": "2026-01-15T08:00:00",
+            "weight_kg_sample_id": "sample-weight-1",
+        }},
+        client_ts=1_756_000_000.0,
+    )
+    rows = fake.list_perception_daily(UID, "health_body")
+    assert len(rows) == 1  # falls back to today's date bucket, not dropped.
+    doc = rows[0]["doc"]
+    assert doc["weight_kg"] == 70.2
+    assert doc["_ts_kind"] == "measured"  # still measurement-aware (had a sample_id)

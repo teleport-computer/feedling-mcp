@@ -57,6 +57,46 @@ def test_extract_group_metadata_blood_pressure_shares_one_pair():
     assert d_glucose == "2026-02-02"
 
 
+def test_extract_group_metadata_sleep_uses_start_end_not_interval_infix():
+    # Wire contract: sleep sends `sleep_start`/`sleep_end` (no `_interval_`
+    # infix) — this pins that naming so it can't silently regress again.
+    raw = {
+        "asleep_minutes": 410,
+        "core_minutes": 200,
+        "deep_minutes": 90,
+        "rem_minutes": 120,
+        "sleep_start": "2026-03-01T23:00:00-05:00",
+        "sleep_end": "2026-03-02T07:00:00-05:00",
+        "sleep_sample_id": "sleep-1",
+    }
+    metas = {m.group.name: m for m in hm.extract_group_metadata("health_sleep", raw)}
+    meta = metas["sleep"]
+    assert meta.interval_start == "2026-03-01T23:00:00-05:00"
+    assert meta.interval_end == "2026-03-02T07:00:00-05:00"
+    assert meta.sample_id == "sleep-1"
+    assert meta.has_measurement_time
+    # Sleep attributes to the day it ends (wake-up day), not the day it started.
+    assert hm.attributed_date(meta, fallback="1970-01-01") == "2026-03-02"
+
+
+def test_extract_group_metadata_workout_uses_start_end_not_interval_infix():
+    raw = {
+        "workout_type": "run",
+        "duration_min": 32,
+        "count_today": 1,
+        "workout_start": "2026-04-05T06:00:00-07:00",
+        "workout_end": "2026-04-05T06:32:00-07:00",
+        "workout_sample_id": "workout-1",
+    }
+    metas = {m.group.name: m for m in hm.extract_group_metadata("health_workout", raw)}
+    meta = metas["workout"]
+    assert meta.interval_start == "2026-04-05T06:00:00-07:00"
+    assert meta.interval_end == "2026-04-05T06:32:00-07:00"
+    assert meta.sample_id == "workout-1"
+    assert meta.has_measurement_time
+    assert hm.attributed_date(meta, fallback="1970-01-01") == "2026-04-05"
+
+
 def test_extract_group_metadata_returns_empty_for_unmapped_signal():
     assert hm.extract_group_metadata("health_cycle", {"flow_level": "light"}) == []
 

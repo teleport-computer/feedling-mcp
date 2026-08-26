@@ -128,8 +128,10 @@ def extract_group_metadata(signal: str, raw_value: Any) -> list[GroupMeta]:
     for `signal` out of the RAW (pre-resolver) reported mapping.
 
     Naming convention: ``"<group>_measured_at"`` / ``"<group>_sample_id"`` for
-    instant groups, ``"<group>_interval_start"`` / ``"<group>_interval_end"`` /
-    ``"<group>_sample_id"`` for interval groups. Never raises — a malformed or
+    instant groups, ``"<group>_start"`` / ``"<group>_end"`` / ``"<group>_sample_id"``
+    for interval groups (matches the iOS wire contract exactly — sleep sends
+    ``sleep_start``/``sleep_end``, workout sends ``workout_start``/``workout_end``;
+    there is no ``_interval_`` infix on the wire). Never raises — a malformed or
     absent field simply comes back as None so the caller falls back to
     today's behavior.
     """
@@ -143,8 +145,8 @@ def extract_group_metadata(signal: str, raw_value: Any) -> list[GroupMeta]:
         if group.kind == INTERVAL:
             out.append(GroupMeta(
                 group,
-                interval_start=raw_value.get(f"{group.name}_interval_start"),
-                interval_end=raw_value.get(f"{group.name}_interval_end"),
+                interval_start=raw_value.get(f"{group.name}_start"),
+                interval_end=raw_value.get(f"{group.name}_end"),
                 sample_id=sample_id or None,
             ))
         else:
