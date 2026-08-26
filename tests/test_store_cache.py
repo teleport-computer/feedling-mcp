@@ -10,8 +10,11 @@ backend redeploy: a TTL on the cache, and a targeted admin eviction endpoint.
 from __future__ import annotations
 
 import base64
+import io
+import logging
 import sys
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -24,6 +27,17 @@ from core import store as core_store  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core.store_sections import SectionStatus, StoreSection, StoreSectionUnavailable  # noqa: E402
 from store_load_helpers import install_counting_loaders  # noqa: E402
+
+
+@contextmanager
+def _capture_logger(logger):
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    logger.addHandler(handler)
+    try:
+        yield stream
+    finally:
+        logger.removeHandler(handler)
 
 
 def _b64(raw: bytes) -> str:
@@ -136,6 +150,111 @@ def test_multi_section_failure_keeps_successful_section(monkeypatch):
         store._section_slots[StoreSection.WORLD_BOOKS].status
         is SectionStatus.UNLOADED
     )
+
+
+def test_ttl_marks_only_loaded_section_stale_without_loading(monkeypatch):
+    monkeypatch.setenv("FEEDLING_STORE_LOAD_MODE", "lazy")
+    core_store._stores.clear()
+    calls = install_counting_loaders(monkeypatch, core_store)
+    store = core_store.get_store(
+        "u-ttl", require={StoreSection.CHAT}
+    )
+    calls.clear()
+    store._section_slots[StoreSection.CHAT].loaded_at_mono = 1.0
+    store.loaded_at = 1.0
+    monkeypatch.setattr(core_store.time, "monotonic", lambda: 1000.0)
+
+    same = core_store.get_store("u-ttl")
+
+    assert same is store
+    assert calls == []
+    assert (
+        store._section_slots[StoreSection.CHAT].status
+        is SectionStatus.STALE
+    )
+    assert (
+        store._section_slots[StoreSection.TOKENS].status
+        is SectionStatus.UNLOADED
+    )
+
+
+def test_reload_refreshes_only_sections_used_before(monkeypatch):
+    monkeypatch.setenv("FEEDLING_STORE_LOAD_MODE", "lazy")
+    core_store._stores.clear()
+    calls = install_counting_loaders(monkeypatch, core_store)
+    store = core_store.get_store(
+        "u-reload",
+        require={StoreSection.CHAT, StoreSection.TOKENS},
+    )
+    calls.clear()
+
+    assert store.reload() is True
+
+    assert calls == ["chat", "tokens"]
+
+
+def test_evicting_shell_loads_no_sections(monkeypatch):
+    monkeypatch.setenv("FEEDLING_STORE_LOAD_MODE", "lazy")
+    core_store._stores.clear()
+    calls = install_counting_loaders(monkeypatch, core_store)
+    store = core_store.get_store("u-shell-evict")
+
+    assert core_store._evict_store(store.user_id) is True
+
+    assert calls == []
+    assert store.loaded_sections() == frozenset()
+
+
+def test_refresh_failure_retains_last_good_chat(monkeypatch):
+    monkeypatch.setenv("FEEDLING_STORE_LOAD_MODE", "lazy")
+    core_store._stores.clear()
+    store = core_store.get_store("u-last-good")
+
+    def initial_load():
+        store.chat_messages = [{"id": "kept", "seq": 1}]
+        return list(store.chat_messages)
+
+    monkeypatch.setattr(store, "reload_chat_hot_strict", initial_load)
+    assert store.ensure_sections({StoreSection.CHAT}) is True
+    store._section_slots[StoreSection.CHAT].mark_stale()
+    monkeypatch.setattr(
+        store,
+        "reload_chat_hot_strict",
+        lambda: (_ for _ in ()).throw(RuntimeError("postgresql://private")),
+    )
+
+    assert store.ensure_sections(
+        {StoreSection.CHAT}, reason="ttl", strict=False
+    ) is False
+    assert store.chat_messages == [{"id": "kept", "seq": 1}]
+    assert (
+        store._section_slots[StoreSection.CHAT].status
+        is SectionStatus.STALE
+    )
+
+
+def test_store_load_telemetry_is_fixed_enum_and_content_free():
+    with _capture_logger(core_store.log) as stream:
+        core_store._store_load_telemetry(
+            section=StoreSection.CHAT,
+            reason="first_use",
+            cache_state="cold",
+            row_count=256,
+            duration_ms=12.5,
+            outcome="applied",
+        )
+
+    text = stream.getvalue()
+    assert "section=chat reason=first_use cache_state=cold" in text
+    assert "rows=256" in text
+    assert "outcome=applied" in text
+    for forbidden in (
+        "user_id",
+        "body_ct",
+        "K_user",
+        "postgresql://",
+    ):
+        assert forbidden not in text
 
 
 def test_get_store_returns_cached_instance_within_ttl(client):
