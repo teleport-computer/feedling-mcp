@@ -119,9 +119,4 @@ agent-protocol-core @ https://github.com/teleport-computer/memgarden/releases/do
 # 感知内核 —— 同样从本仓库提取出去的独立库（sensegate），走法与上面的
 # memgarden 一致：GitHub Release 的 wheel URL，理由同上（--require-hashes +
 # compose 哈希上链要求构建可复现）。
-#
-# 2026-08-26 挂起：sensegate 仓库当前是私有的，且还没发过 Release，下面这个
-# URL 现在还 404。CI 装不了这一步，要等到：① 仓库转 public，② 打出
-# v0.1.0 这个 Release（带 wheel 附件）。挂起期间本地验证走
-# `pip install -e /Users/hx/Projects/sensegate`（见 docs/NOTES-sensegate-swap.md）。
 sensegate @ https://github.com/teleport-computer/sensegate/releases/download/v0.1.0/sensegate-0.1.0-py3-none-any.whl

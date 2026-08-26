@@ -600,6 +600,9 @@ mdurl==0.1.2 \
 memgarden @ https://github.com/teleport-computer/memgarden/releases/download/v0.2.0/memgarden-0.2.0-py3-none-any.whl \
     --hash=sha256:55f3b88d7313a8262de108a9859a7b2413062c5b1cee152d8cce0c650e3caa0d
     # via -r backend/requirements.txt
+sensegate @ https://github.com/teleport-computer/sensegate/releases/download/v0.1.0/sensegate-0.1.0-py3-none-any.whl \
+    --hash=sha256:7d2227b40a77446148e2e15e3d93c6c0644f859bcbd7a9ef23fc9aa4c9345885
+    # via -r backend/requirements.txt
 packaging==26.1 \
     --hash=sha256:5d9c0669c6285e491e0ced2eee587eaf67b670d94a19e94e3984a481aba6802f \
     --hash=sha256:f042152b681c4bfac5cae2742a55e103d27ab2ec0f3d88037136b6bfe7c9c5de
@@ -1048,15 +1051,6 @@ s3transfer==0.19.0 \
     --hash=sha256:777cc2415536f1debadb5c2ef7779275d0fc0fe0e042411cdd6caebeb2685262 \
     --hash=sha256:ce436931687addc4c1712d52d40b32f53e88315723f107ffa20ba82b05a0f685
     # via boto3
-# sensegate @ https://github.com/teleport-computer/sensegate/releases/download/v0.1.0/sensegate-0.1.0-py3-none-any.whl
-    # PENDING (2026-08-26)：sensegate 仓库还是私有的、还没打过 Release，这个
-    # URL 现在 404，`uv pip compile --generate-hashes` 也就算不出真哈希。
-    # 先注释掉，别在 --require-hashes 的锁文件里放一个没有哈希的条目
-    # （pip 会直接拒绝整个安装）。等仓库转 public + 打出 v0.1.0 Release 后，
-    # 取消注释这行、删掉这段注释，重新跑一次
-    # `uv pip compile backend/requirements.txt --generate-hashes --python-version 3.12 --python-platform linux -o backend/requirements.lock`
-    # 让 uv 补齐真实哈希。
-    # via -r backend/requirements.txt
 six==1.17.0 \
     --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274 \
     --hash=sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81
