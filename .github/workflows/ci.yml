@@ -838,6 +838,7 @@ jobs:
             tests/test_chat_incremental_sync.py \
             tests/test_v2_jobs_migration.py \
             tests/test_lane_rollup.py \
+            tests/test_distillation_ledger.py \
             tests/test_data_track_snapshot_golden.py \
             tests/test_v2_general_watchdog_budget.py \
             tests/test_v2_jobs_store.py \
