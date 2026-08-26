@@ -22,7 +22,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from core import wake_bus
+from core.store_sections import StoreSection
 from core.telemetry_logging import stderr_info_logger
+from store_load_helpers import install_counting_loaders
 
 
 @contextmanager
@@ -302,6 +304,66 @@ def test_dispatch_wake_only_only_wakes_chat_waiters(monkeypatch):
     ))
 
     assert calls == ["chat_waiters"]
+
+
+@pytest.mark.parametrize("channel", ["chat", "frames", "blob"])
+def test_notify_does_not_load_unloaded_sections(monkeypatch, channel):
+    from core import store as core_store
+
+    monkeypatch.setenv("FEEDLING_STORE_LOAD_MODE", "lazy")
+    monkeypatch.setenv("FEEDLING_CHAT_SYNC_MODE", "legacy")
+    monkeypatch.setattr(core_store, "_stores", {})
+    store = core_store.get_store("u-unloaded-notify")
+    calls = install_counting_loaders(monkeypatch, core_store)
+    payload = (
+        {"v": 2, "c": "chat", "u": store.user_id, "r": 7}
+        if channel == "chat"
+        else {"c": channel, "u": store.user_id, "o": "OTHER"}
+    )
+
+    wake_bus._dispatch(json.dumps(payload))
+
+    assert calls == []
+    assert store.loaded_sections() == frozenset()
+
+
+def test_unloaded_chat_mutation_wakes_without_loading(monkeypatch):
+    from core import store as core_store
+
+    monkeypatch.setenv("FEEDLING_STORE_LOAD_MODE", "lazy")
+    monkeypatch.setenv("FEEDLING_CHAT_SYNC_MODE", "incremental")
+    monkeypatch.setattr(core_store, "_stores", {})
+    store = core_store.get_store("u-unloaded-chat-wake")
+    calls = install_counting_loaders(monkeypatch, core_store)
+    wakes = []
+    monkeypatch.setattr(store, "notify_chat_waiters", lambda: wakes.append(True))
+
+    wake_bus._dispatch(json.dumps({
+        "v": 2, "c": "chat", "u": store.user_id, "r": 9,
+    }))
+
+    assert calls == []
+    assert wakes == [True]
+
+
+def test_blob_notify_refreshes_only_loaded_sections(monkeypatch):
+    from core import store as core_store
+
+    monkeypatch.setenv("FEEDLING_STORE_LOAD_MODE", "lazy")
+    monkeypatch.setattr(core_store, "_stores", {})
+    calls = install_counting_loaders(monkeypatch, core_store)
+    store = core_store.get_store(
+        "u-tokens-only", require={StoreSection.TOKENS}
+    )
+    assert calls == ["tokens"]
+    calls.clear()
+
+    wake_bus._dispatch(json.dumps({
+        "c": "blob", "u": store.user_id, "o": "OTHER",
+    }))
+
+    assert calls == ["tokens"]
+    assert store.loaded_sections() == frozenset({StoreSection.TOKENS})
 
 
 @pytest.mark.parametrize(
@@ -594,6 +656,33 @@ def test_reconnect_catch_up_refreshes_stores_and_handlers(monkeypatch):
     wake_bus._reconnect_catch_up()
     assert sorted(evicted) == ["u1", "u2"]
     assert fired == [("users", "")]
+
+
+def test_reconnect_refreshes_loaded_sections_and_wakes_shells(monkeypatch):
+    from core import store as core_store
+
+    monkeypatch.setenv("FEEDLING_STORE_LOAD_MODE", "lazy")
+    monkeypatch.setattr(core_store, "_stores", {})
+    monkeypatch.setattr(wake_bus, "_extra_handlers", {})
+    calls = install_counting_loaders(monkeypatch, core_store)
+    loaded = core_store.get_store(
+        "u-reconnect-loaded", require={StoreSection.CHAT}
+    )
+    shell = core_store.get_store("u-reconnect-shell")
+    assert calls == ["chat"]
+    calls.clear()
+    wakes = []
+    monkeypatch.setattr(
+        loaded, "notify_chat_waiters", lambda: wakes.append(loaded.user_id)
+    )
+    monkeypatch.setattr(
+        shell, "notify_chat_waiters", lambda: wakes.append(shell.user_id)
+    )
+
+    wake_bus._reconnect_catch_up()
+
+    assert calls == ["chat"]
+    assert sorted(wakes) == sorted([loaded.user_id, shell.user_id])
 
 
 def test_reconnect_catch_up_empty_cache_is_noop(monkeypatch):

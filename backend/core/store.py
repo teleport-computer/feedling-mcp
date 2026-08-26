@@ -377,6 +377,17 @@ class UserStore:
             if slot.has_cache
         )
 
+    def note_section_change(
+        self,
+        section: StoreSection,
+        *,
+        dirty_version: int | None = None,
+    ) -> bool:
+        """Record a remote mutation without loading a cold section."""
+        return self._section_slots[StoreSection(section)].mark_stale(
+            dirty_version=dirty_version
+        )
+
     def mark_expired_sections_stale(
         self,
         now_mono: float,
@@ -2335,6 +2346,35 @@ def _refresh_store_channel(user_id: str, channel: str) -> bool:
     store = _cached_store(user_id)
     if store is None:
         return False
+    if hasattr(store, "note_section_change"):
+        sections: set[StoreSection] = set()
+        if channel == "frames":
+            candidates = (StoreSection.FRAMES,)
+        elif channel == "blob":
+            candidates = (
+                StoreSection.WORLD_BOOKS,
+                StoreSection.TOKENS,
+                StoreSection.LIVE_ACTIVITY,
+                StoreSection.PUSH_STATE,
+            )
+        elif channel == "proactive":
+            store.notify_proactive_job_waiters()
+            return True
+        else:
+            return False
+        for section in candidates:
+            if store.note_section_change(section):
+                sections.add(section)
+        if not sections:
+            return True
+        return store.ensure_sections(
+            sections,
+            reason="notify",
+            strict=False,
+        )
+
+    # Compatibility path for lightweight adapters that do not implement the
+    # section API. Production UserStore instances always take the branch above.
     previous_guard = getattr(_reload_guard, "active", False)
     _reload_guard.active = True
     try:
