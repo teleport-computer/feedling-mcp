@@ -294,6 +294,7 @@ services:
       # compose hash instead of relying on mutable deploy-time configuration.
       FEEDLING_CHAT_SYNC_MODE: "incremental"
       FEEDLING_CHAT_HOT_CACHE_LIMIT: "256"
+      FEEDLING_STORE_LOAD_MODE: "legacy"
       # TEE 明文影子库（feedling-io-db-prod，独立 pg CVM）。best-effort 双写：
       # db.py 写主库后镜像到这里，tee_shadow.mirror 永不 raise、失败只计数，绝不
       # 拖垮主路径。两个都为空 = 双写 OFF（mirror.enabled() 需 FEEDLING_TEE_DUAL_WRITE=1
@@ -478,6 +479,7 @@ services:
       # Match the HTTP backend's incremental view and bounded resident window.
       FEEDLING_CHAT_SYNC_MODE: "incremental"
       FEEDLING_CHAT_HOT_CACHE_LIMIT: "256"
+      FEEDLING_STORE_LOAD_MODE: "legacy"
       # Only the backend owns the elected decrypted-shadow drain.
       FEEDLING_PLAINTEXT_SHADOW_ENABLED: "0"
       # Must match the backend; CI admits 1 only with TEE-primary wiring.

@@ -23,6 +23,17 @@ doing more work.
 
 Correctness-sensitive reads do not depend on cache freshness. Verify uses exact ping/reply lookups, resident poll selects bounded durable unanswered candidates before its atomic claim, and Runtime V2 freezes prompt membership by sequence. Chat envelopes remain opaque to this synchronization layer, and telemetry contains no message documents, ciphertext, keys, or connection strings.
 
+Worker-local per-user state is metadata-first. Creating a user Store allocates
+identity, locks, section state, and waiters without reading PostgreSQL; a caller
+that truly needs an in-memory Chat, frame, World Book, token, push, or Live
+Activity projection explicitly loads only that section. History pagination,
+resident poll, and Runtime V2 prompt-tail reads continue to use bounded durable
+queries, so obtaining a waiter or user-scoped lock does not fetch a Chat hot
+snapshot. Notifications mark or refresh only sections already loaded in that
+worker, while still waking parked pollers. This changes query timing and worker
+cache shape only: PostgreSQL authority, API behavior, encryption, isolation,
+trust boundaries, and deployment topology are unchanged.
+
 Feedling separates ciphertext persistence from authorized decryption and agent
 execution. Managed production uses a main confidential VM for the public API and
 trusted-decrypt service, separate confidential-VM capacity for hosted agents,

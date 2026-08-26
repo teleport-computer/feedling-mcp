@@ -14,6 +14,15 @@ The hosted path is asynchronous. A successful send is always `202`, even when
 the assistant ciphertext is already available. It never returns a plaintext
 assistant reply.
 
+Backend workers create metadata-only per-user Store shells and load an in-memory
+section only when a path explicitly needs that projection. Chat history,
+resident long-poll selection, and Hosted Runtime V2 prompt-tail assembly remain
+bounded PostgreSQL reads; they do not load the worker's Chat hot snapshot merely
+to obtain user identity, locks, or waiters. PostgreSQL remains authoritative,
+and cross-worker notifications are latency hints that wake pollers and refresh
+only projections already loaded in that worker. Message ordering, clear
+semantics, API responses, and encryption behavior do not change.
+
 ## Scheduled reminders
 
 The hosted and resident agent runtimes share the same durable reminder
