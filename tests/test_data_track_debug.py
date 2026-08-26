@@ -404,7 +404,8 @@ def test_debug_payload_rejects_empty_producer_trace_vocabulary(monkeypatch):
         with bind("view=debug&user_id=user_a"):
             payload = data_track._data_track_debug_payload()
 
-        assert payload["observability"] == {"trace_vocabulary": "unavailable"}
+        assert payload["observability"]["trace_vocabulary"] == "unavailable"
+        assert payload["observability"]["failure_vocabulary"]["status"] == "ok"
         assert data_track._TRACE_VOCABULARY_CACHE is None
 
 
@@ -441,7 +442,8 @@ def test_debug_payload_marks_trace_vocabulary_failure_without_negative_caching(
     with bind("view=debug&mode=timeline&user_id=user_a"):
         payload = data_track._data_track_debug_payload()
 
-    assert payload["observability"] == {"trace_vocabulary": "unavailable"}
+    assert payload["observability"]["trace_vocabulary"] == "unavailable"
+    assert payload["observability"]["failure_vocabulary"]["status"] == "ok"
     assert payload["turns"][0]["lane"] == ""
     assert data_track._TRACE_VOCABULARY_CACHE is None
 
@@ -500,7 +502,8 @@ def test_debug_payload_groups_multi_user_trace_and_marks_stalled(monkeypatch):
         "turns",
         "events",
     }
-    assert payload["observability"] == {"trace_vocabulary": "ok"}
+    assert payload["observability"]["trace_vocabulary"] == "ok"
+    assert payload["observability"]["failure_vocabulary"]["status"] == "ok"
     assert set(payload["summary"]) == {
         "generated_at",
         "users_scanned",
@@ -538,7 +541,8 @@ def test_blank_flat_payload_does_not_append_zero_event_live_users(monkeypatch):
     with bind("view=debug"):
         payload = data_track._data_track_debug_payload()
 
-    assert payload["observability"] == {"trace_vocabulary": "ok"}
+    assert payload["observability"]["trace_vocabulary"] == "ok"
+    assert payload["observability"]["failure_vocabulary"]["status"] == "ok"
     assert payload["users"] == []
 
 

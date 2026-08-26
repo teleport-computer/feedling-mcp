@@ -12,6 +12,9 @@ canonical_owner: self
 - [`agent-diagnostic-benchmark.md`](agent-diagnostic-benchmark.md)：固定排查题、判分规则和前后对比协议。
 - [`document-lifecycle-inventory.md`](document-lifecycle-inventory.md)：由生命周期工具生成的已分类文档清单。
 - [`hosted-runtime-history.md`](hosted-runtime-history.md)：hosted runtime 历史文档的分批证据、owner 与归档记录。
+- [`resident-runtime-history.md`](resident-runtime-history.md)：Resident runtime 历史文档的分批证据、owner 与归档记录。
+- [`storage-tee-history.md`](storage-tee-history.md)：storage/TEE 历史文档的分批证据、拓扑方向与兼容义务。
+- [`memory-perception-history.md`](memory-perception-history.md)：Memory/Perception 历史文档的分批证据、内核/IO 边界与兼容义务。
 - `candidates/`：候选项的生产消费者、兼容义务、验证证据和结论；只在出现强候选后创建记录。
 - [`tools/repository_inventory.py`](../../tools/repository_inventory.py)：确定性的 tracked 文件分类器。
 

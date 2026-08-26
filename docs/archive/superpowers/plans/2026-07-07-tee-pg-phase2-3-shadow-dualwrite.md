@@ -1,3 +1,9 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md
+historical_reason: superseded
+superseded_by: docs/CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md
+---
 # TEE Postgres Phase 2–3（明文 schema + 双写 + 解密复制）Implementation Plan
 
 > **RETIRED / DO NOT DEPLOY.** Historical implementation record; references to
@@ -11,7 +17,7 @@
 
 **Tech Stack:** psycopg3/psycopg_pool、Alembic（第二链）、httpx（enclave decrypt 复用 `core.enclave`）、pytest（双临时库）。
 
-**Spec:** `docs/superpowers/specs/2026-07-04-tee-postgres-migration-design.md`。**前置**：Plan 1（Phase 0–1）完成，`TEE_DATABASE_URL` 可用。
+**Spec:** `docs/archive/superpowers/specs/2026-07-04-tee-postgres-migration-design.md`（历史设计）。**前置**：Plan 1（Phase 0–1）完成，`TEE_DATABASE_URL` 可用。
 
 ## Global Constraints
 

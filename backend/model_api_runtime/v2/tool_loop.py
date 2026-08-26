@@ -9,7 +9,13 @@ import json
 import posixpath
 import re
 import time
-from provider_types import ProviderResponse, ToolExchange, ToolResult, ToolSpec
+from provider_types import (
+    ProviderResponse,
+    ToolCall,
+    ToolExchange,
+    ToolResult,
+    ToolSpec,
+)
 from capabilities import registry as cap_registry
 from capabilities import result_budget
 from capabilities import tool_schema
@@ -55,8 +61,16 @@ DEFAULT_MAX_TOOL_ARGS_CHARS = 16000
 DEFAULT_MAX_TOOL_BATCH_ARGS_CHARS = 64000
 DEFAULT_MAX_NATIVE_ASSISTANT_TURN_CHARS = 65536
 DEFAULT_MAX_ASSISTANT_TOOL_TEXT_CHARS = 8192
+REJECTED_TOOL_ARGS_SUMMARY_CHAR_CAP = 500
+REJECTED_ASSISTANT_TEXT_CHAR_CAP = 500
+REJECTED_TOOL_CALL_ID_PREFIX = "feedling_rejected_"
+REJECTED_TOOL_NAME_PLACEHOLDER = "feedling_rejected_unknown_tool"
 MIN_TOOL_RESULT_ERROR_QUOTA = 64
 _RESULT_TRUNCATION_MARKER = "...[truncated]"
+_REJECTED_TOOL_ARGS_KEY = "_feedling_rejected_args"
+_REJECTED_TOOL_PLAIN_TEXT_INSTRUCTION = (
+    "工具当前不可用,请用纯文本直接回复"
+)
 MCP_MUTATION_OUTCOME_UNKNOWN_ERROR = "error: mcp_mutation_outcome_unknown"
 MUTATION_BLOCKED_AFTER_UNKNOWN_OUTCOME_ERROR = (
     "error: mutation_blocked_after_unknown_outcome"
@@ -269,6 +283,40 @@ _NOT_A_CLAIM_RE = re.compile(
     re.IGNORECASE,
 )
 _IMAGE_NOUN = r"(?:自画像|画像|插画|图片|图像|图)"
+_IDENTITY_WRITE_TOOL_NAMES = frozenset(
+    action
+    for action in cap_registry.WRITE_ACTIONS
+    if action.startswith("identity_")
+)
+
+
+def _identity_write_attempted(transcript) -> bool:
+    """Return whether the turn transcript contains an identity-write call."""
+    return any(
+        call.name in _IDENTITY_WRITE_TOOL_NAMES
+        for item in transcript
+        if isinstance(item, ToolExchange)
+        for call in item.calls
+    )
+
+
+def _identity_write_succeeded(transcript) -> bool:
+    """Return whether a matched identity-write result is classified as success."""
+    from core import chat_activity as _ca
+
+    for item in transcript:
+        if not isinstance(item, ToolExchange):
+            continue
+        results_by_id = {str(result.call_id): result for result in item.results}
+        for call in item.calls:
+            if call.name not in _IDENTITY_WRITE_TOOL_NAMES:
+                continue
+            result = results_by_id.get(str(call.id))
+            if result is not None and _ca.result_code(result.content) == "ok":
+                return True
+    return False
+
+
 _IMAGE_CLAIM_RE = re.compile(
     r"("
     # 图 + (已经) + 完成动词:「图片已经生成」「图片生成好了」
@@ -369,6 +417,90 @@ def _truncate_result_content(content: str, cap: int, *, marker: str = _RESULT_TR
     if cap <= len(marker):
         return marker[:cap]
     return text[: cap - len(marker)] + marker
+
+
+def _rejected_tool_args(tool_call: ToolCall) -> dict:
+    """Return one bounded, provider-encodable summary of rejected arguments."""
+    if tool_call.args_ok:
+        try:
+            raw = json.dumps(
+                tool_call.args,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError, OverflowError):
+            raw = "<unserializable arguments>"
+    else:
+        raw = str(tool_call.args_raw or "<invalid arguments>")
+    best = ""
+    low = 0
+    high = min(len(raw), REJECTED_TOOL_ARGS_SUMMARY_CHAR_CAP)
+    while low <= high:
+        midpoint = (low + high) // 2
+        candidate = _truncate_result_content(raw, midpoint)
+        encoded = {_REJECTED_TOOL_ARGS_KEY: candidate}
+        size = _serialized_chars(encoded)
+        if size is not None and size <= REJECTED_TOOL_ARGS_SUMMARY_CHAR_CAP:
+            best = candidate
+            low = midpoint + 1
+        else:
+            high = midpoint - 1
+    return {_REJECTED_TOOL_ARGS_KEY: best}
+
+
+def _rejected_tool_exchange(
+    tool_calls: list[ToolCall],
+    *,
+    assistant_text: str,
+    rejection_reasons: list[str],
+    attempt: int,
+) -> ToolExchange:
+    """Synthesize a bounded, non-executed exchange for one rejected batch.
+
+    Provider-native ids and assistant payloads can themselves be malformed, so
+    neither is retained. The reserved id prefix plus the monotonically
+    increasing provider-attempt number makes every synthetic id distinct within
+    this loop while keeping calls and results exactly paired on every wire.
+    """
+    if len(tool_calls) != len(rejection_reasons):
+        raise ValueError("rejected tool calls and reasons must match")
+    calls: list[ToolCall] = []
+    results: list[ToolResult] = []
+    for index, (tool_call, reason) in enumerate(
+        zip(tool_calls, rejection_reasons)
+    ):
+        call_id = f"{REJECTED_TOOL_CALL_ID_PREFIX}{attempt}_{index}"
+        normalized_reason = str(reason or "tool_call_rejected").strip()
+        calls.append(
+            ToolCall(
+                id=call_id,
+                name=(
+                    str(tool_call.name or "").strip()
+                    or REJECTED_TOOL_NAME_PLACEHOLDER
+                ),
+                args=_rejected_tool_args(tool_call),
+            )
+        )
+        results.append(
+            ToolResult(
+                call_id=call_id,
+                content=(
+                    f"Tool call rejected: {normalized_reason}. No tool was "
+                    f"executed. {_REJECTED_TOOL_PLAIN_TEXT_INSTRUCTION}"
+                ),
+                metadata={"rejected": normalized_reason},
+            )
+        )
+    return ToolExchange(
+        calls=tuple(calls),
+        results=tuple(results),
+        assistant_text=_truncate_result_content(
+            assistant_text,
+            REJECTED_ASSISTANT_TEXT_CHAR_CAP,
+        ),
+        assistant_turn=None,
+    )
 
 
 def _result_quotas(lengths: list[int], batch_cap: int) -> list[int]:
@@ -912,7 +1044,9 @@ async def run_tool_loop(
     required_file_missing_recorded = False
     file_delivery_fallback_text = ""
     image_claim_bounces = 0
+    identity_write_failed_bounces = 0
     image_claim_retry_instruction = ""
+    identity_write_failed_instruction = ""
     file_delivery_fallback_reasoning = ""
     file_delivery_recovery_needed = False
     workspace_write_applied = False
@@ -1220,6 +1354,7 @@ async def run_tool_loop(
             for instruction in (
                 delivery_retry_instruction,
                 image_claim_retry_instruction,
+                identity_write_failed_instruction,
                 empty_response_retry_instruction,
                 _WAKE_CHOICE_INSTRUCTION if wake_choice_required else "",
                 final_reply_correction_instruction,
@@ -2419,6 +2554,17 @@ async def run_tool_loop(
                 terminal_tool_call_retries < max_terminal_tool_call_retries
                 and attempts < max_calls
             )
+            transcript.append(
+                _rejected_tool_exchange(
+                    pr.tool_calls,
+                    assistant_text=pr.text,
+                    rejection_reasons=[
+                        "terminal_tool_call_rejected"
+                        for _tool_call in pr.tool_calls
+                    ],
+                    attempt=attempts,
+                )
+            )
             await _trajectory(
                 "protocol_fallback",
                 {
@@ -2426,6 +2572,7 @@ async def run_tool_loop(
                     "reason": "terminal_tool_call_rejected",
                     "action": "retry" if retrying else "terminate",
                     "retry": terminal_tool_call_retries,
+                    "transcript_appended": True,
                 },
             )
             if retrying:
@@ -2475,6 +2622,30 @@ async def run_tool_loop(
                 # 不打回,谎话直接发给用户 —— codex 审出。)
                 if attempts < max_calls:
                     _progress("image_claim_retry_boundary")
+                    continue
+
+            # D scheme: a structured identity-write attempt that did not produce
+            # a successful result gets one extra provider round. Do not inspect
+            # or classify the model's prose.
+            if (
+                pr.text
+                and identity_write_failed_bounces < 1
+                and _identity_write_attempted(transcript)
+                and not _identity_write_succeeded(transcript)
+            ):
+                identity_write_failed_bounces += 1
+                await _trajectory(
+                    "identity_write_failed_bounced",
+                    {"round": attempts, "text_chars": len(pr.text)},
+                )
+                identity_write_failed_instruction = (
+                    "上一轮你调用了身份写工具,但那次调用**没有成功**"
+                    "(被拒绝、出错或仍在排队),身份没有真的改动。"
+                    "请据实处理:要么重试一次,要么照实告诉他没改成 —— "
+                    "不要把这次未生效的改动说成已经完成。"
+                )
+                if attempts < max_calls:
+                    _progress("identity_write_failed_retry_boundary")
                     continue
 
             requirement_met = (
@@ -2720,28 +2891,35 @@ async def run_tool_loop(
             or tool_calls_used + len(pr.tool_calls) > max_tool_calls_per_turn
         )
         offered_names = {spec.name for spec in tools}
+        individual_rejection_reasons: list[list[str]] = []
+        for tc in pr.tool_calls:
+            reasons: list[str] = []
+            if not tc.id:
+                reasons.append("missing_tool_call_id")
+            if not tc.name:
+                reasons.append("missing_tool_name")
+            if not tc.args_ok:
+                reasons.append("invalid_tool_arguments")
+            if (
+                tc.name not in offered_names
+                and tc.name not in completed_memory_discovery_tools
+            ):
+                reasons.append("unknown_tool")
+            elif (
+                external_content_seen
+                and tc.name == "web_fetch"
+                and str(tc.args.get("url") or "").strip()
+                not in allowed_fetch_urls
+            ):
+                reasons.append("unapproved_external_url")
+            individual_rejection_reasons.append(reasons)
         # Provider media is terminal output. Do not silently discard or retain
         # its large inline payload when a broken relay also invents function
-        # calls in the same turn; fall back once with every tool disabled.
+        # calls in the same turn; fall back once with tool choice disabled.
         malformed = (
             (terminal_text_round and bool(pr.tool_calls))
             or bool(pr.media)
-            or any(
-                not tc.id
-                or not tc.name
-                or not tc.args_ok
-                or (
-                    tc.name not in offered_names
-                    and tc.name not in completed_memory_discovery_tools
-                )
-                or (
-                    external_content_seen
-                    and tc.name == "web_fetch"
-                    and str(tc.args.get("url") or "").strip()
-                    not in allowed_fetch_urls
-                )
-                for tc in pr.tool_calls
-            )
+            or any(individual_rejection_reasons)
         )
         image_reply_calls = [
             tc for tc in pr.tool_calls if tc.name == tool_schema.IMAGE_REPLY_TOOL
@@ -2766,6 +2944,49 @@ async def run_tool_loop(
         invalid_silence_batch = bool(stay_silent_calls) and (
             len(stay_silent_calls) != 1 or len(pr.tool_calls) != 1
         )
+        duplicate_call_ids = {
+            call_id
+            for call_id in call_ids
+            if call_id and call_ids.count(call_id) > 1
+        }
+        batch_rejection_reasons: list[str] = []
+        if terminal_text_round:
+            batch_rejection_reasons.append("terminal_tool_call_rejected")
+        if pr.media:
+            batch_rejection_reasons.append("provider_media_with_tool_calls")
+        if mixed_reply_write:
+            batch_rejection_reasons.append("mixed_reply_and_mutation")
+        if invalid_image_batch:
+            batch_rejection_reasons.append("invalid_image_reply_batch")
+        if invalid_silence_batch:
+            batch_rejection_reasons.append("invalid_stay_silent_batch")
+        if over_tool_call_budget:
+            batch_rejection_reasons.append("tool_call_budget_exceeded")
+        if sum(size or 0 for size in argument_sizes) > max_tool_batch_args_chars:
+            batch_rejection_reasons.append("tool_batch_arguments_too_large")
+        if (
+            native_turn_size is None
+            or native_turn_size > max_native_assistant_turn_chars
+        ):
+            batch_rejection_reasons.append("native_assistant_turn_too_large")
+        if len(pr.text) > max_assistant_tool_text_chars:
+            batch_rejection_reasons.append("assistant_tool_text_too_large")
+        call_rejection_reasons: list[str] = []
+        for tc, argument_size, individual_reasons in zip(
+            pr.tool_calls,
+            argument_sizes,
+            individual_rejection_reasons,
+        ):
+            reasons = list(individual_reasons)
+            if tc.id in duplicate_call_ids:
+                reasons.append("duplicate_tool_call_id")
+            if argument_size is None or argument_size > max_tool_args_chars:
+                reasons.append("tool_arguments_too_large")
+            reasons.extend(batch_rejection_reasons)
+            call_rejection_reasons.append(
+                ",".join(dict.fromkeys(reasons))
+                or "invalid_or_over_budget_tool_exchange"
+            )
         if (
             malformed
             or len(set(call_ids)) != len(call_ids)
@@ -2778,14 +2999,24 @@ async def run_tool_loop(
             # Invalid, over-budget, and duplicate-id batches are all-or-nothing:
             # executing a valid subset and then asking for a correction can
             # duplicate durable writes on the corrected round. Missing/duplicate
-            # ids also cannot form a provider-native result exchange. Make exactly
-            # one tools-disabled fallback from the original prompt instead.
+            # ids also cannot form a provider-native result exchange. Record one
+            # bounded synthetic rejection and make exactly one text-only fallback.
+            # Wires that require schemas for historical calls may retain the
+            # matching definitions, but tool_choice remains none.
             # An outbound delivery plus either a platform or MCP mutation is
             # rejected for the same reason: the bubble cannot truthfully claim
             # success before the later sink commits. The model may mutate in one
             # round and reply only after observing its result in the next.
             if attempts >= max_calls:
                 break
+            transcript.append(
+                _rejected_tool_exchange(
+                    pr.tool_calls,
+                    assistant_text=pr.text,
+                    rejection_reasons=call_rejection_reasons,
+                    attempt=attempts,
+                )
+            )
             await _trajectory(
                 "protocol_fallback",
                 {
@@ -2795,6 +3026,7 @@ async def run_tool_loop(
                     "mixed_reply_write": mixed_reply_write,
                     "over_tool_call_budget": over_tool_call_budget,
                     "oversized_tool_exchange": oversized_tool_exchange,
+                    "transcript_appended": True,
                 },
             )
             force_text_fallback = True
@@ -2835,6 +3067,21 @@ async def run_tool_loop(
             if compact_delivery_phase != "send_file":
                 if attempts >= max_calls:
                     break
+                transcript.append(
+                    _rejected_tool_exchange(
+                        pr.tool_calls,
+                        assistant_text=pr.text,
+                        rejection_reasons=[
+                            (
+                                "invalid_tool_arguments"
+                                if tc.id in validation_errors
+                                else "invalid_or_over_budget_tool_exchange"
+                            )
+                            for tc in pr.tool_calls
+                        ],
+                        attempt=attempts,
+                    )
+                )
                 await _trajectory(
                     "protocol_fallback",
                     {
@@ -2844,6 +3091,7 @@ async def run_tool_loop(
                         "mixed_reply_write": False,
                         "over_tool_call_budget": False,
                         "oversized_tool_exchange": False,
+                        "transcript_appended": True,
                     },
                 )
                 force_text_fallback = True

@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 
 import db
+import distillation_ledger
 
 log = logging.getLogger(__name__)
 from bootstrap import gates as boot_gates
@@ -1875,10 +1876,12 @@ def replace_identity_preserving_anchor(
         return "identity_write_conflict"
 
 
-def write_persona_artifact(store: UserStore, job_id: str, output: dict) -> tuple[str, str]:
+def _write_persona_artifact(
+    store: UserStore, job_id: str, output: dict,
+) -> tuple[str, str, str]:
     content, prompt_version = _persona_content_from_output(output)
     if not content:
-        return "", ""
+        return "", "", "not_provided"
     digest = _sha256_hex(content.encode("utf-8"))
     source_family = _persona_source_family_from_output(output)
     source_kind = _text(output.get("source_kind"), 80)
@@ -1890,7 +1893,11 @@ def write_persona_artifact(store: UserStore, job_id: str, output: dict) -> tuple
         except Exception:
             existing_priority = 0
         if existing_priority > new_priority:
-            return GENESIS_PERSONA_REF, str(existing.get("sha256") or "")
+            return (
+                GENESIS_PERSONA_REF,
+                str(existing.get("sha256") or ""),
+                "preserved",
+            )
     now = _now_iso()
     envelope, err = core_envelope._build_shared_envelope_for_store(
         store,
@@ -1913,13 +1920,27 @@ def write_persona_artifact(store: UserStore, job_id: str, output: dict) -> tuple
         "created_at": now,
         "updated_at": now,
     })
-    return GENESIS_PERSONA_REF, digest
+    return GENESIS_PERSONA_REF, digest, "written"
 
 
-def write_voice_artifact(store: UserStore, job_id: str, output: dict) -> tuple[str, str]:
+def write_persona_artifact(
+    store: UserStore, job_id: str, output: dict,
+) -> tuple[str, str]:
+    """Persist persona and classify the outcome at its producer boundary."""
+    with distillation_ledger.ArtifactAttempt(
+        store, job_id, "persona"
+    ) as attempt:
+        ref, digest, outcome = _write_persona_artifact(store, job_id, output)
+        attempt.finish(outcome)
+    return ref, digest
+
+
+def _write_voice_artifact(
+    store: UserStore, job_id: str, output: dict,
+) -> tuple[str, str, str]:
     voice_doc = _safe_voice_workset(output)
     if not voice_doc:
-        return "", ""
+        return "", "", "not_provided"
     raw = json.dumps(voice_doc, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     digest = _sha256_hex(raw)
     now = _now_iso()
@@ -1946,7 +1967,17 @@ def write_voice_artifact(store: UserStore, job_id: str, output: dict) -> tuple[s
         "created_at": now,
         "updated_at": now,
     })
-    return GENESIS_VOICE_REF, digest
+    return GENESIS_VOICE_REF, digest, "written"
+
+
+def write_voice_artifact(
+    store: UserStore, job_id: str, output: dict,
+) -> tuple[str, str]:
+    """Persist voice and classify the outcome at its producer boundary."""
+    with distillation_ledger.ArtifactAttempt(store, job_id, "voice") as attempt:
+        ref, digest, outcome = _write_voice_artifact(store, job_id, output)
+        attempt.finish(outcome)
+    return ref, digest
 
 
 def render_genesis_profile_source(output: dict) -> tuple[str, int, bool]:
@@ -2004,7 +2035,7 @@ def _profile_output_from_reducer(output: dict) -> dict:
     }
 
 
-def write_profile_artifact(
+def _write_profile_artifact(
     store: UserStore,
     job_id: str,
     output: dict,
@@ -2065,6 +2096,27 @@ def write_profile_artifact(
     return GENESIS_PROFILE_REF, digest, result.status
 
 
+def write_profile_artifact(
+    store: UserStore,
+    job_id: str,
+    output: dict,
+    api_key: str | None,
+    *,
+    runtime_token: str = "",
+) -> tuple[str, str, str]:
+    """Persist profile and preserve the CAS producer's exact outcome."""
+    with distillation_ledger.ArtifactAttempt(store, job_id, "profile") as attempt:
+        ref, digest, outcome = _write_profile_artifact(
+            store,
+            job_id,
+            output,
+            api_key,
+            runtime_token=runtime_token,
+        )
+        attempt.finish(outcome or "not_provided")
+    return ref, digest, outcome
+
+
 def apply_reducer_output(
     store: UserStore,
     api_key: str | None,
@@ -2088,7 +2140,6 @@ def apply_reducer_output(
     # run (notices emitted with dedupe_key="genesis:{job_id}:partial" also
     # match the "genesis:" prefix used here).
     notices.resolve(store, "genesis:")
-    memory_count, memory_results = apply_memory_outputs(store, api_key, output)
     # apply_memory_outputs has no job_id in its signature (many other call sites
     # depend on its (count, results) 2-tuple return, incl. direct unpack in
     # tests/test_genesis_service.py — widening it would ripple through those).
@@ -2100,14 +2151,23 @@ def apply_reducer_output(
     if raw_items is None:
         raw_items = output.get("facts")
     raw_count = len(raw_items) if isinstance(raw_items, list) else 0
-    dropped = raw_count - memory_count
+    with distillation_ledger.ArtifactAttempt(store, job_id, "memory") as memory_attempt:
+        memory_count, memory_results = apply_memory_outputs(store, api_key, output)
+        dropped = raw_count - memory_count
+        memory_attempt.finish(
+            "not_provided" if raw_count == 0
+            else "partial" if dropped > 0
+            else "written"
+        )
     if dropped > 0:
         notices.emit(store, source="genesis", error_class="genesis_partial",
                      blame="system", severity="warning",
                      user_text=catalog.user_text_for("genesis_partial"),
                      detail=f"dropped {dropped} card(s)",
                      dedupe_key=f"genesis:{job_id}:partial")
-    identity_status = init_identity_if_absent(store, output, api_key, runtime_token)
+    with distillation_ledger.ArtifactAttempt(store, job_id, "identity") as identity_attempt:
+        identity_status = init_identity_if_absent(store, output, api_key, runtime_token)
+        identity_attempt.finish(identity_status)
     persona_ref, persona_sha = write_persona_artifact(store, job_id, output)
     voice_ref, voice_sha = write_voice_artifact(store, job_id, output)
     profile_ref, profile_sha, profile_status = write_profile_artifact(
