@@ -104,6 +104,36 @@ def test_delayed_pre_clear_capture_refresh_cannot_recreate_state():
     assert db.get_blob_strict(uid, "capture_state") is None
 
 
+def test_clear_between_capture_state_read_and_empty_window_cannot_recreate_state(
+    monkeypatch,
+):
+    uid = "u_clear_capture_refresh_interleaving"
+    seed_user(uid)
+    _append_user_message(uid, "before-clear", ts=10.0)
+
+    class Store:
+        user_id = uid
+
+    store = Store()
+    before = capture_scheduler.refresh_capture_state_from_chat(store, now=11.0)
+    assert before["last_seen_message_id"] == "before-clear"
+
+    def clear_before_window_read(_store, _state):
+        assert db.chat_clear(uid) == 1
+        return []
+
+    monkeypatch.setattr(
+        capture_scheduler,
+        "_live_messages_after_capture",
+        clear_before_window_read,
+    )
+
+    after = capture_scheduler.refresh_capture_state_from_chat(store, now=12.0)
+
+    assert after["last_seen_message_id"] == ""
+    assert db.get_blob_strict(uid, "capture_state") is None
+
+
 def _running_job(user_id: str, owner: str = "clear-test-worker") -> tuple[int, int]:
     generation = db.get_runtime_generation(user_id)
     job_id, coalesced = jobs_store.enqueue_job(

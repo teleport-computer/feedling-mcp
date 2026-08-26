@@ -142,6 +142,7 @@ def _patch_capture_state(
     now: float | None = None,
     expected_frontier_id: str | None = None,
     source_message_id: str | None = None,
+    require_existing: bool = False,
 ) -> dict[str, Any]:
     """Atomically merge selected fields without clobbering another process.
 
@@ -165,12 +166,12 @@ def _patch_capture_state(
             with conn.cursor() as cur:
                 source_id = str(source_message_id or "")
                 source_valid = True
-                if source_id:
+                if source_id or require_existing:
                     # A chat-derived refresh uses the same shared fence as
                     # ordinary writers. If Clear linearized first, the stale
-                    # in-process store row no longer exists and must not
-                    # recreate capture_state metadata.
+                    # refresh must not recreate capture_state metadata.
                     db._lock_chat_user_fence_on_cursor(cur, store.user_id)
+                if source_id:
                     cur.execute(
                         "SELECT 1 FROM chat_messages WHERE user_id=%s "
                         "AND msg_id=%s AND doc->>'role' IN ('user','openclaw') "
@@ -183,11 +184,12 @@ def _patch_capture_state(
                     )
                     source_valid = cur.fetchone() is not None
                 if source_valid:
-                    cur.execute(
-                        "INSERT INTO user_blobs (user_id,kind,doc) "
-                        "VALUES (%s,%s,%s) ON CONFLICT (user_id,kind) DO NOTHING",
-                        (store.user_id, CAPTURE_STATE_KIND, Jsonb({})),
-                    )
+                    if not require_existing:
+                        cur.execute(
+                            "INSERT INTO user_blobs (user_id,kind,doc) "
+                            "VALUES (%s,%s,%s) ON CONFLICT (user_id,kind) DO NOTHING",
+                            (store.user_id, CAPTURE_STATE_KIND, Jsonb({})),
+                        )
                     sql = (
                         "UPDATE user_blobs SET doc=doc || %s "
                         "WHERE user_id=%s AND kind=%s"
@@ -298,6 +300,10 @@ def refresh_capture_state_from_chat(store, *, now: float | None = None) -> dict[
         source_message_id=(
             str(window_messages[-1].get("id") or "") if window_messages else None
         ),
+        # An empty refresh may update an existing frontier, but it must never
+        # create one. Clear can delete the row between the read above and this
+        # fenced write.
+        require_existing=not bool(window_messages),
     )
 
 
