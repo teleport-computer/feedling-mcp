@@ -9,9 +9,9 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 
 | Lifecycle | Classified documents |
 |---|---:|
-| `current` | 29 |
+| `current` | 32 |
 | `decision` | 15 |
-| `historical` | 30 |
+| `historical` | 31 |
 | `generated` | 1 |
 
 ## current
@@ -20,6 +20,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `CLAUDE.md`
 - `README.md`
 - `backend/agent_runtime/agent_tools_prompt.md`
+- `deploy/DEPLOYMENTS.md`
 - `docs-site/content/docs/architecture.mdx`
 - `docs-site/content/docs/changelog.mdx`
 - `docs-site/content/docs/self-hosting.mdx`
@@ -30,6 +31,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/DOCUMENT_LIFECYCLE.md`
 - `docs/PROJECT_OVERVIEW.md`
 - `docs/RDS_TRACE_PARTITIONS_RUNBOOK.md`
+- `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md`
 - `docs/ops/chat-incremental-sync-runbook.md`
 - `docs/repository-cleanup/README.md`
 - `docs/repository-cleanup/agent-diagnostic-benchmark.md`
@@ -41,6 +43,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/superpowers/plans/2026-08-24-repository-cleanup.zh-CN.md`
 - `docs/superpowers/plans/2026-08-26-resident-runtime-history-batch-1.md`
 - `docs/superpowers/plans/2026-08-26-storage-tee-history-batch-1.md`
+- `docs/superpowers/plans/2026-08-27-storage-tee-history-batch-2.md`
 - `docs/testing/README.md`
 - `docs/testing/RUNTIME_MAP.md`
 - `scripts/loadtest/README.md`
@@ -68,6 +71,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 
 - `docs/CHANGELOG.md`
 - `docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md`
+- `docs/archive/superpowers/plans/2026-07-07-tee-pg-phase0-1-infra.md`
 - `docs/archive/superpowers/plans/2026-07-07-tee-pg-phase2-3-shadow-dualwrite.md`
 - `docs/archive/superpowers/plans/2026-07-08-hosted-runtime-v2-A-capability-layer.md`
 - `docs/archive/superpowers/plans/2026-07-08-hosted-runtime-v2-B-db-jobs-worker.md`

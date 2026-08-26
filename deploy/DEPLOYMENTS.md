@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Feedling deployment records
 
 Canonical record of deployed artifacts. Entries accumulate as we move through
@@ -728,25 +732,30 @@ Record the new address + first-tx info in the table above.
 
 **状态更新**：`feedling-io-db-test` 与 `feedling-io-db-prod` 于 2026-07-18 已运行；
 `feedling-io-db-pre` 于 2026-07-31 独立开通，不再复用 test 影子库。三套均使用
-WAL-G 备份；test/prod 已接双写 + in-process 同步调度器，pre 在首次应用部署验证前
-保持双写关闭。
+WAL-G 备份。CVM 已开通不等于数据库已扶正：test 自 `82c4c019` 起使用 TEE primary；
+prod/pre 的 authority 与 selector 必须从各自 exact deployed release 和 live 配置确认，
+不能从历史 shadow/dual-write 清单推断。
 实际开通流程与踩坑记录见 `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md`——
-**新开实例以那篇为准**。下列原始 runbook 清单保留作核对参考（对应
-`docs/superpowers/plans/2026-07-07-tee-pg-phase0-1-infra.md` 的 Task 编号）：
+**新开实例以那篇为准**；扶正、回滚与当前拓扑以
+`docs/CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md` 为准。下列清单保留为长期运维约束，
+不依赖已完成实施计划的 Phase/Task 编号：
 
-- **首次 create + AppAuth**：为 feedling-pg 建独立 CVM 与独立 AppAuth 合约
-  （切勿复用主 app 合约，见「新建 runner CVM 换钥」教训），授权其 compose_hash
-  （Phase 0 / P1T3–T4）。
-- **R2 桶 + 双钥托管**：建 WAL-G 备份桶并把两把加密钥（内容钥 + 备份钥）按托管
-  流程分存（Phase 1 / P1T4）。
-- **证书重签**：用 `deploy/postgres/gen-certs.sh` 重签 server/client TLS 证书，
-  把 `TEE_DATABASE_URL` 的 sslmode/根证书接进后端 secrets（P1T1）。
+- **首次 create + 独立身份**：为 feedling-pg 建独立 CVM，切勿复用主 app 的身份或
+  KMS 边界；`--kms phala` 下 PG CVM 使用部署账号授权，不需要复用或新建主应用的
+  链上 AppAuth，部署后必须核验独立 KMS 身份。
+- **R2 桶 + break-glass 密钥托管**：建 WAL-G 备份桶，将 `WALG_LIBSODIUM_KEY` 与
+  TLS `ca.key` 分别放入平台外的 break-glass 冷存；装数据前必须让归档链 fail-closed
+  可验证。这里没有独立的数据库“内容钥”。
+- **证书重签**：用 `deploy/postgres/gen-certs.sh` 重签 CA/server TLS 证书；客户端以
+  CA 校验服务端并通过 SCRAM 登录，不生成 client certificate。把目标环境 DSN 的
+  sslmode/根证书接进对应 secrets。
+- **长连接验收**：新 PG CVM/新网关上线前验证跨 worker LISTEN/NOTIFY、掉线重连和
+  idle soak；若发现网关空闲超时，`DATABASE_URL` 的 libpq keepalive 必须短于该阈值。
 - **restore 演练**：开通前跑一次 WAL-G 全量 restore + PITR 演练；执行
   `restore-start-and-wait.sh` 并确认 `pg_is_in_recovery() = false`，不能把
-  `pg_ctl -w` 当作 WAL 回放完成
-  （Phase 1 验收）。
-- **Phase 1 验收清单**：走一遍 reconcile → replicate → verify（`ok==true`）
-  的三段收敛，作为停 RDS gate 的硬条件（P2T7 / plan Phase 1 验收 Task）。
+  `pg_ctl -w` 当作 WAL 回放完成。
+- **扶正前验收清单**：仍处于 RDS→TEE shadow 迁移的环境需走完
+  reconcile → replicate → verify（`ok==true`）三段收敛，作为停 RDS gate 的硬条件。
   verify 作为该 gate 前，先跑一遍 `python -m backend.tee_replicator run
   --table <t>`（对全部密文表）把 requeue 清空——verify 报告每张密文表的
   `requeue_backlog` 应读 0（非零只代表正常积压未收敛，不是 verify 的 bug，

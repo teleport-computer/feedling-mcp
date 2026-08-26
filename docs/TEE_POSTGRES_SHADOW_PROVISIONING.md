@@ -1,21 +1,31 @@
-# TEE Postgres 影子库 —— 开通到部署的可复制流程
+---
+document_lifecycle: current
+canonical_owner: self
+---
+# TEE Postgres CVM —— 开通、迁移与恢复运维手册
 
-> 一台跑在 TEE CVM（dstack / Phala）里的 PostgreSQL，作为主库（RDS）的**明文影子**：
-> 主库写入时 best-effort 双写到这里，密文表经 enclave 解密后复制成明文，为「切读 →
-> 停 RDS → 拆加解密层」的迁移做准备。本文记录 `feedling-io-db-{test,prod}` 的实际
-> 开通流程 + 踩过的坑，并于 2026-07-31 用同一流程开通独立的
-> `feedling-io-db-pre`，参数化以便别的项目参考。
+> 本文最初记录 RDS primary → TEE shadow 阶段的数据库 CVM 开通、双写与回填，随后补入
+> 迁移、备份和恢复经验。它现在是 TEE Postgres CVM 的开通、TLS、角色、WAL-G、迁移和
+> 恢复运维入口；历史迁移阶段的步骤会显式标注，不能直接套到已扶正 TEE primary 的环境。
 >
 > 本仓相关构件：`deploy/postgres/`（镜像全家桶）、`deploy/docker-compose.phala.postgres.yaml`
 > （test/prod 共用 compose）、`backend/alembic_tee/`（明文 schema）、`backend/tee_shadow/`
 > （双写 mirror + reconcile + verify）、`backend/tee_replicator/`（密文→明文复制 worker）、
 > `backend/admin/tee_sync_scheduler.py`（in-process 自动同步）。
+>
+> **当前状态的判定顺序**：先看目标环境 live 配置与 exact deployed commit，再看
+> [`deploy/DEPLOYMENTS.md`](../deploy/DEPLOYMENTS.md) 对应环境记录和
+> [`CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md`](CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md)。
+> test 自 release `82c4c019` 起以 TEE 为 primary；CVM 存在本身不能证明 prod/pre 已扶正，
+> 也不能证明历史 RDS→TEE 双写仍开启。扶正后的 plaintext projection 是相反方向的
+> TEE primary → plaintext shadow，使用独立 gate，不属于本文历史双写步骤。
 
 ---
 
 ## 0. 架构与连接模型（先理解这个）
 
-- **CVM 内一台 PG**，磁盘加密（TEE），业务表 = 主库明文子集。
+- **CVM 内一台 PG**，磁盘加密（TEE）；其业务表范围由当前 `alembic_tee` release head
+  决定。旧迁移阶段它是 RDS 的明文子集；扶正后可成为环境 primary。
 - **连接走网关 direct-TLS**：dstack/Phala 网关把容器的 `5432` 暴露成
   `<app_id>-5432s.<gateway-domain>:443`。客户端用 **libpq ≥ 17** 的
   `sslnegotiation=direct`（psycopg-binary 3.3.x 自带 libpq 18）。
@@ -24,7 +34,8 @@
 - **独立 CVM + 独立身份**：绝不复用主 app 的 AppAuth 合约（否则会翻主 enclave 的钥，
   血泪教训）。用 `--kms phala` 时 Phala 默认 KMS 按部署账号授权，**pg CVM 不需要
   链上 AppAuth**（这点和主 app 不同）。
-- **两条同步路径**（都在后端进程内，不是 CI workflow）：
+- **历史 RDS→TEE 同步路径**（仅在该环境仍处于 shadow 阶段且 gate 明确开启时成立；
+  都在后端进程内，不是 CI workflow）：
   - **双写（mirror）**：`db.py` 写主库后镜像明文表到影子库，`tee_shadow.mirror` 永不
     raise、失败只计数（fail-open），绝不拖垮主路径。
   - **复制（scheduler + worker）**：`tee_sync_scheduler` 选主单例（advisory-lock），
@@ -40,12 +51,14 @@
 - 一个 S3 兼容对象存储（本项目用 Cloudflare R2）做 WAL-G 备份，凭证在 `.env`
   （`R2_ENDPOINT` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY`）。
 - `feedling-postgres` 镜像已构建并推到 GHCR（见 `deploy/postgres/Dockerfile` +
-  `.github/workflows/pg-deploy.yml`；tag = `github.sha` **完整 40 位**）。镜像**环境无关**，
-  test/prod 复用同一 tag，差异全在注入的机密。
+  `.github/workflows/pg-deploy.yml`；tag = checkout 后 `git rev-parse HEAD` 的**完整 40 位**）。
+  `workflow_dispatch` 的 `github.sha` 可能不是实际 checkout 的目标分支，禁止拿它标镜像。
+  镜像**环境无关**，test/pre/prod 可复用同一 tag，差异全在注入的机密。
 - 本地 `psycopg`（libpq ≥ 17）用于验证连通。
 
-> 磁盘在创建时定死、事后扩容麻烦 → 一次留够。影子库 ≠ 主库逻辑大小（大表搬 R2 / 明文化
-> 后缩水）。本项目 prod 数据 ~700MB、月增 ~400MB → 建议 **50GB**（含 OS/WAL/膨胀，数年跑道）。
+> 磁盘在创建时定死、事后扩容麻烦 → 一次留够。历史迁移期曾按 prod 数据约 700MB、
+> 月增约 400MB 估算 **50GB**（含 OS/WAL/膨胀）；这是当时的容量快照，不是当前容量
+> 结论。新实例必须按 live 数据量、增长率、WAL 与恢复保留窗口重新计算。
 
 ---
 
@@ -108,8 +121,15 @@ export TEE_MIGRATION_DATABASE_URL="postgresql+psycopg://feedling_owner:<PW>@<APP
 python3 -c "from alembic_tee import upgrade_head; upgrade_head()"
 ```
 验收清单：`archive_mode=on`、`max_connections` 按容量公式、4 角色齐全、`app` 能读业务表、
-`monitoring` 读业务表被拒（负向权限）、`public` 表数 = alembic_tee 全量（本项目 20 张，
-版本表叫 **`alembic_tee_version`** 不是 `alembic_version`）。
+`monitoring` 读业务表被拒（负向权限）、`public` schema 与当前 release 的
+`alembic_tee` head 对齐。版本表叫 **`alembic_tee_version`**，不是 `alembic_version`；
+不要用本文历史表数或 revision 编号代替 release head 检查。
+
+新 PG CVM 或新网关上线前还要验证长连接契约：至少两个 worker 通过真实数据库完成一次
+跨 worker `NOTIFY`，让 listener 经历超过预期 idle 窗口的 soak，并主动断开连接确认
+`backend/core/wake_bus.py` 能重连和 catch-up。若网关存在 idle cutoff，把 `DATABASE_URL`
+中的 libpq TCP keepalive 参数设得短于该阈值；没有这项证据，direct-TLS 的一次性 `SELECT 1`
+不能代表 wake bus 可用。
 
 ### 2.5 接 WAL-G 备份（原地 redeploy，不重建）
 
@@ -130,13 +150,20 @@ phala deploy --cvm-id <CVM_ID> --compose compose.prod.yaml \
 
 ### 2.6 机密入库（GitHub Secrets）
 
-一整套 `<ENV_PREFIX>_*`（照 test 的 `TEST_*` 命名，pre 使用 `PRE_*`）：`PG_OWNER/APP/REPLICATOR/MONITORING_DB_PASSWORD`、
-`PG_SERVER_CERT_B64/KEY_B64`、`WALG_S3_PREFIX/LIBSODIUM_KEY`、`PG_BACKUP_R2_ENDPOINT/ACCESS_KEY_ID/SECRET_ACCESS_KEY`、
-`TEE_DATABASE_URL`（app 角色 DSN）、`FEEDLING_TEE_DUAL_WRITE`、`PHALA_CLOUD_API_KEY`。
+一整套 `<ENV_PREFIX>_*`（照 test 的 `TEST_*` 命名，pre 使用 `PRE_*`）基础设施机密：
+`PG_OWNER/APP/REPLICATOR/MONITORING_DB_PASSWORD`、`PG_SERVER_CERT_B64/KEY_B64`、
+`WALG_S3_PREFIX/LIBSODIUM_KEY`、`PG_BACKUP_R2_ENDPOINT/ACCESS_KEY_ID/SECRET_ACCESS_KEY`、
+owner migration DSN/CA 与 `PHALA_CLOUD_API_KEY`。应用 DSN 与 selector 按目标拓扑配置：
+legacy shadow 阶段才使用 `TEE_DATABASE_URL` + `FEEDLING_TEE_DUAL_WRITE`；TEE-primary 阶段
+由环境 `DATABASE_URL` 使用 app role，并按 migration runbook 清空旧 shadow 变量。
 `gh secret set <NAME> --repo <owner>/<repo>`（值从变量引用、别回显）。CVM ID 写进
 `deploy/<env>-pg-cvm-id.txt`（pg-deploy workflow fail-closed 需要）。
 
 ### 2.7 接后端双写（compose + CI 注入）
+
+> **历史迁移阶段步骤（RDS primary → TEE shadow）**：只适用于 exact release 与 live
+> 配置仍明确处于 legacy shadow 模式的环境。TEE-primary 环境不得重新注入这组变量；
+> 当前拓扑与 promote/rollback gate 以 migration runbook 为准。
 
 后端 compose 的 backend service 加两个 env（加密注入、不烧 compose_hash）：
 ```yaml
@@ -149,6 +176,9 @@ CI 部署步骤把 `<ENV_PREFIX>_TEE_DATABASE_URL` / `_FEEDLING_TEE_DUAL_WRITE` 
 日后加 CA 分发再升 verify-full）。
 
 ### 2.8 开双写 + 回填 + 盯健康
+
+> **历史迁移阶段步骤（RDS primary → TEE shadow）**：以下是扶正前的回填与 kill switch，
+> 不是 TEE-primary 环境的日常启动流程，也不是当前 TEE→plaintext projection 的操作说明。
 
 设 `FEEDLING_TEE_DUAL_WRITE=1` → 下次部署即开。开后：
 - 双写立刻镜像**新写入**（fail-open，旁路）。
@@ -187,19 +217,22 @@ alembic_tee 曾经**无 CI 钩子、纯人工执行**——0002/0003 合并后�
 
 ```bash
 gh workflow run "TEE migrate" -f environment=test -f confirm=MIGRATE-TEE
+# pre 同样使用 MIGRATE-TEE，workflow checkout pre 分支
+gh workflow run "TEE migrate" -f environment=pre -f confirm=MIGRATE-TEE
 # prod 需要 confirm=MIGRATE-TEE-PROD（typo guard，防误触）
 ```
 
 `.github/workflows/tee-migrate.yml`（`workflow_dispatch`，仿 `pg-deploy.yml` 的
 typo-guard 模式）：
-- test 跑 `test` 分支、prod 跑 `main`——与 app 发布流向一致。
+- test/pre/prod 分别跑 `test`/`pre`/`main` 分支——与 app 发布流向一致。
 - 在 **GitHub runner**（公网）上直连 TEE，用 **owner 角色**
-  `TEE_MIGRATION_DATABASE_URL`（CVM 里的 backend 只有 app 角色，没有 DDL 权限，
+  `<ENV>_TEE_MIGRATION_DSN`（runner 将其导出为 `TEE_MIGRATION_DATABASE_URL`；CVM 里的
+  backend 只有 app 角色，没有 DDL 权限，
   所以不能走 `tee-replicate.yml` 那种「admin 端点遥控 CVM 内进程」的模式）。
 - 连接**强制 `sslmode=verify-full` + CA**（`<ENV>_TEE_PG_CA_PEM` secret），不照抄
   生产 backend 的 `sslmode=require`——那是因为 backend 与 TEE 同在 Phala 内网且只有
   无 DDL 的 app 角色；这里是公网 + owner 角色执行 DDL，必须验证服务端身份。
-- 两套环境的机密（`TEST_*`/`PROD_*`）**都注入，在 shell 里按 `environment` 挑**，
+- 三套环境的机密（`TEST_*`/`PRE_*`/`PROD_*`）**都注入，在 shell 里按 `environment` 挑**，
   绝不用 GitHub 表达式 `${{ environment == 'prod' && secrets.PROD_X || secrets.TEST_X }}`
   ——GH 的 `&&`/`||` 是 JS 语义（空串是 falsy），`PROD_X` 恰好为空时会静默 fallback 到
   `TEST_X`，一次标记为 prod 的 dispatch 会实际跑在 test 库上而 job 仍然绿灯（`pg-deploy.yml`
@@ -209,13 +242,15 @@ typo-guard 模式）：
   这条 assert 就是为了根治「revision 合并了但从未在实库执行」这类问题，对不上直接红。
 
 2026-07-27 全量对齐落地时，Step 7.1（prod）已经在本地手动跑完（先于本通道成型），
-两个 TEE 实库都已 `0001→0004`、各 54 张表；日后的新 revision 一律走这个通道，不再
-手动执行。
+当时两个 TEE 实库都为 `0004`、各 54 张表。这是 point-in-time 迁移证据；当前 revision、
+表数和是否可执行迁移必须由 exact release 的 ScriptDirectory head 与 owner-only workflow
+预检得出。
 
-> ⚠️ **通道写好 ≠ 通道能用。** `tee-migrate.yml` 依赖 4 个 repo secret
+> **历史事故（2026-07-29，不代表当前 secret 状态）**：当时 `tee-migrate.yml` 依赖的
+> 4 个 repo secret
 > （`{TEST,PROD}_TEE_MIGRATION_DATABASE_URL`、`{TEST,PROD}_TEE_PG_CA_PEM`），
-> **截至 2026-07-29 这 4 个还没建**，所以 workflow 目前跑不起来，`alembic_tee`
-> 实际仍是手工执行。
+> 尚未建立，因此当时 workflow 跑不起来、`alembic_tee` 仍靠手工执行。当前 workflow
+> 会针对 exact head fail-closed 预检，不能从这段事故记录推断今天的 secret 是否存在。
 >
 > 这个缺口已经吃过一次：`0007_chat_activity_snapshot` 在 07-29 随新功能合进
 > `test`，登记、迁移、SKIP 判定全都写对了，但**没有人执行它**。TEE 库停在 0006，
@@ -224,7 +259,9 @@ typo-guard 模式）：
 > 巡检时才发现。同一批里 `model_api_routes` 的 4 个 vision 列更隐蔽——见 §3 的
 > 「加列漂移没有红灯」。
 
-**写了 alembic_tee revision 之后，必须做的一步**（secret 建好之前）：
+**历史手工兜底（仅供事故复盘）**：下列命令是迁移 secret 尚未建立时的做法。当前应优先
+使用受保护的 owner-only migration workflow；若 workflow 预检失败，先修复配置，不要把
+手工执行当作正常发布路径。
 
 ```bash
 # 本地手工执行（owner 凭证，libpq≥17 才支持 direct-TLS）
@@ -285,6 +322,9 @@ ORDER BY table_name;
 
 ### 2.10 pre 实例（2026-07-31）
 
+> 下列 CVM、placement、首次备份和 schema 数值是 2026-07-31 的 point-in-time 开通证据。
+> 当前值与数据库 authority 必须从 live 环境和 exact deployed release 重新确认。
+
 - CVM：`feedling-io-db-pre`，UUID `dc5c8593-0e44-43a9-b018-fe0431ff44d5`，
   App ID `ade3cabf133ec3e9ee6220265843c4ac993e1e63`。
 - 拓扑：prod9 node 18，`tdx.medium`（2 vCPU / 4GB），30GB ZFS；不要省略
@@ -300,9 +340,14 @@ ORDER BY table_name;
 
 ## 3. 关键决策与坑（血泪）
 
-- **独立 AppAuth，绝不复用主 app 合约** → 否则翻主 enclave 内容钥。`--kms phala` 下
-  pg CVM 靠默认 KMS 授权、**不需要链上 addComposeHash**（和主 app 不同）。
-- **镜像 tag = 完整 40 位 `github.sha`**；镜像环境无关，test/pre/prod 复用同一 tag。
+本节同时包含仍有效的基础设施不变量和历史 RDS→TEE 同步故障经验。当前 CVM 身份、TLS、
+WAL-G、机密替换与 restore 完成判据继续适用；mirror、scheduler、reconcile 和 verify 的
+启停则必须先由目标环境的 exact release 与 migration runbook 证明仍处于对应迁移阶段。
+
+- **独立 CVM/KMS 身份，绝不创建或复用主 app 的 AppAuth** → 否则会混淆主 enclave
+  内容钥边界。`--kms phala` 下 pg CVM 靠部署账号授权，不需要链上 `addComposeHash`。
+- **镜像 tag = checkout 后 `git rev-parse HEAD` 的完整 40 位 SHA**；镜像环境无关，
+  test/pre/prod 可复用同一 tag。`workflow_dispatch` 禁止用可能指向触发 ref 的 `github.sha`。
 - **WAL-G 可选起步**：`WALG_S3_PREFIX` 不设就不要求备份钥，空库先起来。但
   `archive_mode=on` + archive 失败会让 WAL 不回收 → **装数据前必须接上备份**。
 - **redeploy 会替换整份 env**：`--cvm-id` 更新时**所有既有机密都要重带**，只带新增会
@@ -374,7 +419,9 @@ ORDER BY table_name;
 
 ## 4. 停用 / 回滚
 
-- **停双写+回填**：`FEEDLING_TEE_DUAL_WRITE` 置空 → 重部署。主服务不受影响（fail-open）。
+- **历史 shadow 模式停双写+回填**：仅当该环境仍为 RDS primary 时，
+  `FEEDLING_TEE_DUAL_WRITE` 置空 → 重部署。TEE-primary 环境的回滚不能使用此动作，
+  必须走 migration runbook。
 - **停 CVM**：`phala cvms stop <CVM_ID>`（数据卷保留）；彻底删要连磁盘一起，注意
   restore 演练成功前 CVM 磁盘是数据唯一副本。
 - **重签证书**：用冷存的 `ca.key` 重跑 gen-certs 的 server 证书部分，redeploy 注入新
@@ -412,9 +459,9 @@ docker exec -u postgres feedling-restore-drill \
 前者同时约束 PostgreSQL 启动等待和后续 recovery 轮询，必须为正整数；超时会
 fail-closed 并保留恢复实例与日志供诊断。
 
-> 该 helper 随下一版 PostgreSQL 镜像交付；演练必须选择 CI 构建并验证过、包含该
-> helper 的 immutable tag/digest。现役 PROD PG 镜像尚未包含它，不能照搬现役 tag，
-> 也不能把当前镜像中的裸 `pg_ctl -w` 当作完成门禁。
+> **2026-08-19 当时状态**：该 helper 已进源码但尚未进入当时现役 PROD PG 镜像。
+> 今天演练时必须从 exact PG image tag/digest 检查 helper 是否存在；无论镜像年代，
+> 都不能把裸 `pg_ctl -w` 当作恢复完成门禁。
 
 机密取自 `~/documents/teleport/feedling-pg-test-secrets.txt` 的
 `TEST_WALG_*` / `TEST_PG_BACKUP_R2_*`（注意有 `TEST_` 前缀，且 compose 侧变量名是
