@@ -1,3 +1,9 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md
+historical_reason: superseded
+superseded_by: docs/CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md
+---
 # TEE Postgres Phase 2–3（明文 schema + 双写 + 解密复制）Implementation Plan
 
 > **RETIRED / DO NOT DEPLOY.** Historical implementation record; references to
