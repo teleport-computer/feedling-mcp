@@ -205,7 +205,7 @@ def test_plaintext_user_name_writeback_preserves_existing_identity(monkeypatch):
     )
 
     status = plaintext._write_back_plaintext_user_name(
-        _store(), "api-key", "小雨"
+        _store(), "api-key", "小雨", job_id="job_user_name_writeback"
     )
 
     assert status == "updated"

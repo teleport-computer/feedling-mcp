@@ -30,6 +30,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db  # noqa: E402
+import distillation_ledger  # noqa: E402
 from conftest import configure_model_api_route, seed_user  # noqa: E402
 from accounts import registry  # noqa: E402
 from admin import data_track  # noqa: E402
@@ -183,6 +184,205 @@ def clean_rollup():
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM lane_daily_rollup")
         conn.execute("DELETE FROM lane_rollup_watermark")
+
+
+@pytest.fixture()
+def clean_distillation_rollup():
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM distillation_artifact_daily_rollup")
+        conn.execute("DELETE FROM distillation_rollup_watermark")
+        conn.execute("DELETE FROM distillation_artifact_attempts")
+    yield
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM distillation_artifact_daily_rollup")
+        conn.execute("DELETE FROM distillation_rollup_watermark")
+        conn.execute("DELETE FROM distillation_artifact_attempts")
+
+
+def test_distillation_attempts_freeze_only_after_effective_beijing_day(
+    clean_distillation_rollup,
+):
+    uid = "usr_distillation_rollup"
+    seed_user(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO distillation_artifact_attempts
+                (attempt_id, user_id, job_id, flow, distill_kind, artifact,
+                 access_path, outcome, terminal_result, started_at, finished_at)
+            VALUES ('attempt_before_effective', %s, 'job_old', 'genesis',
+                    'onboarding', 'memory', 'apikey_v1', 'written', 'succeeded',
+                    %s, %s)
+            """,
+            (
+                uid,
+                datetime(2030, 5, 31, 1, 0, tzinfo=timezone.utc),
+                datetime(2030, 5, 31, 1, 1, tzinfo=timezone.utc),
+            ),
+        )
+        # An in-window attempt with no terminal evidence must neither enter the
+        # frozen denominator nor block the day watermark from advancing.
+        conn.execute(
+            """
+            INSERT INTO distillation_artifact_attempts
+                (attempt_id, user_id, job_id, flow, distill_kind, artifact,
+                 access_path, started_at)
+            VALUES ('attempt_memory_unfinished', %s, 'job_distill', 'genesis',
+                    'onboarding', 'memory', 'apikey_v2', %s)
+            """,
+            (uid, datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc)),
+        )
+    deploy_now = datetime(2030, 6, 1, 4, 0, tzinfo=timezone.utc).timestamp()
+    assert db.freeze_completed_distillation_days(now_epoch=deploy_now) == []
+
+    artifacts = ("memory", "identity", "persona", "voice", "profile")
+    with db.get_pool().connection() as conn:
+        for index, artifact in enumerate(artifacts):
+            conn.execute(
+                """
+                INSERT INTO distillation_artifact_attempts
+                    (attempt_id, user_id, job_id, flow, distill_kind, artifact,
+                     access_path, outcome, terminal_result, started_at, finished_at)
+                VALUES (%s, %s, 'job_distill', 'genesis', 'onboarding', %s,
+                        'apikey_v2', 'written', 'succeeded', %s, %s)
+                """,
+                (
+                    f"attempt_success_{index}", uid, artifact,
+                    datetime(2030, 6, 1, 1, index, tzinfo=timezone.utc),
+                    datetime(2030, 6, 1, 1, index + 1, tzinfo=timezone.utc),
+                ),
+            )
+        # Same job + same artifact, later retry: both attempts must survive.
+        conn.execute(
+            """
+            INSERT INTO distillation_artifact_attempts
+                (attempt_id, user_id, job_id, flow, distill_kind, artifact,
+                 access_path, outcome, terminal_result, started_at, finished_at)
+            VALUES ('attempt_memory_failed', %s, 'job_distill', 'genesis',
+                    'onboarding', 'memory', 'apikey_v2', 'write_failed', 'failed',
+                    %s, %s)
+            """,
+            (
+                uid,
+                datetime(2030, 6, 1, 2, 0, tzinfo=timezone.utc),
+                datetime(2030, 6, 1, 2, 1, tzinfo=timezone.utc),
+            ),
+        )
+
+    next_days = datetime(2030, 6, 3, 4, 0, tzinfo=timezone.utc).timestamp()
+    assert db.freeze_completed_distillation_days(now_epoch=next_days) == [
+        "2030-06-01", "2030-06-02"
+    ]
+    report = db.admin_distillation_artifact_rollup_windows(
+        through_day="2030-06-01"
+    )
+    one_day = next(w for w in report["windows"] if w["day_count"] == 1)
+    assert one_day["coverage"] == "green"
+    assert one_day["effective_from"] == "2030-06-01"
+    cells = one_day["cells"]["onboarding"]
+    assert set(cells) >= set(artifacts)
+    memory = cells["memory"]["apikey_v2"]
+    assert memory["succeeded"] == 1
+    assert memory["failed"] == 1
+    assert memory["outcomes"] == {"write_failed": 1, "written": 1}
+    seven_day = next(w for w in report["windows"] if w["day_count"] == 7)
+    assert seven_day["coverage"] == "yellow"
+    assert seven_day["covered_days"] == 1
+    assert report["history_backfill"] == "unavailable"
+    assert report["through_day"] == "2030-06-02"
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM distillation_artifact_daily_rollup "
+            "WHERE day < '2030-06-01'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM distillation_artifact_daily_rollup "
+            "WHERE outcome = ''"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT finished_at IS NULL FROM distillation_artifact_attempts "
+            "WHERE attempt_id = 'attempt_memory_unfinished'"
+        ).fetchone()[0] is True
+
+
+def test_genesis_failure_preserves_the_last_stage_before_failed():
+    uid = "usr_genesis_failed_phase"
+    seed_user(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM genesis_import_jobs WHERE user_id=%s AND job_id='job_phase'",
+            (uid,),
+        )
+    db.genesis_create_job(uid, {
+        "job_id": "job_phase",
+        "status": "processing",
+        "source_kind": "onboarding",
+        "metadata": {"ingest": "plaintext"},
+    })
+    db.genesis_set_job_status(
+        uid, "job_phase", status="processing",
+        output={"stage": "genesis_v2_background"},
+    )
+    failed = db.genesis_set_job_status(
+        uid, "job_phase", status="failed", error="provider_timeout"
+    )
+    assert failed["status"] == "failed"
+    assert failed["output"]["stage"] == "genesis_v2_background"
+    assert failed["failed_phase"] == "genesis_v2_background"
+
+    retried = db.genesis_mark_finalized(uid, "job_phase")
+    assert retried["status"] == "uploaded"
+    assert retried["failed_phase"] == ""
+    db.genesis_set_job_status(
+        uid, "job_phase", status="processing",
+        output={"stage": "plaintext_reducer"},
+    )
+    failed_again = db.genesis_set_job_status(
+        uid, "job_phase", status="failed", error="provider_timeout_again"
+    )
+    assert failed_again["failed_phase"] == "plaintext_reducer"
+
+
+def test_distillation_context_persists_producer_outcome_and_generic_terminal(
+    clean_distillation_rollup,
+):
+    uid = "usr_distillation_context"
+    seed_user(uid)
+    db.genesis_create_job(uid, {
+        "job_id": "job_distillation_context",
+        "status": "processing",
+        "source_kind": "onboarding",
+        "metadata": {"ingest": "plaintext", "mode": "onboarding"},
+    })
+    db.genesis_set_job_status(
+        uid,
+        "job_distillation_context",
+        status="processing",
+        output={"stage": "genesis_v2_foreground"},
+    )
+    store = type("Store", (), {"user_id": uid})()
+    with distillation_ledger.ArtifactAttempt(
+        store, "job_distillation_context", "memory"
+    ) as attempt:
+        attempt.finish("partial")
+
+    assert db.distillation_finish_artifact_attempt(
+        attempt.attempt_id,
+        outcome="write_failed",
+        terminal_result="failed",
+    ) is None
+
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT flow, distill_kind, artifact, access_path, outcome, "
+            "terminal_result, finished_at IS NOT NULL "
+            "FROM distillation_artifact_attempts WHERE user_id=%s AND job_id=%s",
+            (uid, "job_distillation_context"),
+        ).fetchone()
+    assert row == (
+        "genesis", "onboarding", "memory", "apikey_v2", "partial",
+        "succeeded", True,
+    )
 
 
 def test_freeze_buckets_by_beijing_day_boundary(clean_rollup):
@@ -2125,6 +2325,7 @@ def test_endpoint_passes_filters_through(admin_env, monkeypatch):
 def test_scheduler_tick_delegates_with_beijing_tz(monkeypatch):
     calls = []
     resident_calls = []
+    distillation_calls = []
 
     def freeze(*, now_epoch=None, tz):
         calls.append((now_epoch, tz))
@@ -2141,6 +2342,11 @@ def test_scheduler_tick_delegates_with_beijing_tz(monkeypatch):
     monkeypatch.setattr(
         sched.db, "freeze_completed_chat_days", lambda **_kwargs: []
     )
+    monkeypatch.setattr(
+        sched.db,
+        "freeze_completed_distillation_days",
+        lambda **kwargs: distillation_calls.append(kwargs) or [],
+    )
     assert sched._tick(now_epoch=123.0) == ["2030-06-03"]
     assert calls == [(123.0, "Asia/Shanghai")]
     assert resident_calls == [(
@@ -2148,6 +2354,9 @@ def test_scheduler_tick_delegates_with_beijing_tz(monkeypatch):
         "Asia/Shanghai",
         registry.connected_resident_user_ids,
     )]
+    assert distillation_calls == [{
+        "now_epoch": 123.0, "tz": "Asia/Shanghai"
+    }]
 
 
 def test_scheduler_start_spawns_daemon_thread(monkeypatch):

@@ -12,6 +12,7 @@ from typing import Any
 
 
 import db
+import distillation_ledger
 from core import envelope as core_envelope
 from core import enclave as core_enclave  # noqa: F401 — 读侧已改走 core_envelope.read_envelope_body；
 # 这行保留是因为测试 monkeypatch `<module>.core_enclave` 上的
@@ -158,10 +159,12 @@ def _history_import_find_reusable_job(
         if not (matches_client or matches_hash):
             continue
         if status in {"queued", "processing"} and _history_import_age_sec(job) > HISTORY_IMPORT_STALE_SEC:
+            failed_phase = str(job.get("phase") or "")
             job.update({
                 "status": "failed",
                 "failed_at": core_util._now_iso(),
                 "error": "RuntimeError:stale_history_import_job",
+                "failed_phase": failed_phase,
             })
             _update_history_job_phase(store, job, "failed", status="failed")
             notices.emit(store, source="history_import", error_class="import_stale",
@@ -3265,7 +3268,15 @@ def _process_history_import_sync(
         "memory_writing",
         memories_planned=len(cards),
     )
-    memory_rows = _append_import_memory_cards(store, cards)
+    with distillation_ledger.history_attempt(
+        store, str(job["job_id"]), "memory"
+    ) as attempt:
+        memory_rows = _append_import_memory_cards(store, cards)
+        attempt.finish(
+            "not_provided" if not cards
+            else "partial" if len(memory_rows) < len(cards)
+            else "written"
+        )
     _update_history_job_phase(
         store,
         job,
@@ -3283,14 +3294,18 @@ def _process_history_import_sync(
         "relationship_anchor_writing",
         memories_created=len(memory_rows),
     )
-    identity = _store_identity_payload(
-        store,
-        identity_payload,
-        days_with_user=days,
-        evidence=f"history_import:{job['job_id']} relationship_started_at={relationship_start.isoformat()}",
-        language=language,
-        relationship_started_at=relationship_start.isoformat(),
-    )
+    with distillation_ledger.history_attempt(
+        store, str(job["job_id"]), "identity"
+    ) as attempt:
+        identity = _store_identity_payload(
+            store,
+            identity_payload,
+            days_with_user=days,
+            evidence=f"history_import:{job['job_id']} relationship_started_at={relationship_start.isoformat()}",
+            language=language,
+            relationship_started_at=relationship_start.isoformat(),
+        )
+        attempt.finish("written" if identity else "not_provided")
     _update_history_job_phase(
         store,
         job,
@@ -3308,7 +3323,14 @@ def _process_history_import_sync(
         language,
     )
     warnings.extend(greeting_warnings)
-    greeting_row = _append_model_api_onboarding_greeting(store, greeting_text) if greeting_text else None
+    with distillation_ledger.history_attempt(
+        store, str(job["job_id"]), "greeting"
+    ) as attempt:
+        greeting_row = (
+            _append_model_api_onboarding_greeting(store, greeting_text)
+            if greeting_text else None
+        )
+        attempt.finish("written" if greeting_row else "not_provided")
     chat_ready_cards = int(import_targets.get("chat_ready_cards") or 2)
     chat_ready = bool(identity) and bool(greeting_row) and len(memory_rows) >= min(chat_ready_cards, max(2, len(cards)))
 
@@ -3371,7 +3393,15 @@ def _process_history_import_sync(
             )
             additional_cards = _new_cards_only(cards, all_cards)
             additional_cards = _sort_memory_cards_newest_first(additional_cards)
-            additional_rows = _append_import_memory_cards(store, additional_cards)
+            with distillation_ledger.history_attempt(
+                store, str(job["job_id"]), "memory"
+            ) as attempt:
+                additional_rows = _append_import_memory_cards(store, additional_cards)
+                attempt.finish(
+                    "not_provided" if not additional_cards
+                    else "partial" if len(additional_rows) < len(additional_cards)
+                    else "written"
+                )
             memory_rows.extend(additional_rows)
             cards = _sort_memory_cards_newest_first(_dedupe_memory_cards(cards + additional_cards))
             merged_all = _merge_import_candidates(all_candidates)
@@ -3427,9 +3457,11 @@ def _run_history_import_job(
             "created_at": core_util._now_iso(),
         }
         error_text = f"{type(e).__name__}:{str(e)[:500]}"
+        failed_phase = str(job.get("phase") or "")
         job.update({
             "failed_at": core_util._now_iso(),
             "error": error_text,
+            "failed_phase": failed_phase,
         })
         _update_history_job_phase(store, job, "failed", status="failed")
         # 归责：**先按异常类型确认来源是 provider，再谈分类**。

@@ -46,6 +46,8 @@ def test_top_level_failure_emits_import_failed():
 
     job = db.get_blob(uid, hi._history_job_kind(job_id))
     assert job["status"] == "failed"
+    assert job["phase"] == "failed"
+    assert job["failed_phase"] == "parsing_materials"
 
 
 @pytest.mark.parametrize(
@@ -144,6 +146,7 @@ def test_stale_job_emits_import_stale_and_marks_failed():
     db.set_blob(uid, hi._history_job_kind(job_id), {
         "job_id": job_id,
         "status": "processing",
+        "phase": "candidate_extracting",
         "client_job_id": "cj1",
         "created_at": old_ts,
         "updated_at": old_ts,
@@ -159,6 +162,9 @@ def test_stale_job_emits_import_stale_and_marks_failed():
     assert row["source"] == "history_import"
     assert row["error_class"] == "import_stale"
     assert row["blame"] == "system" and row["severity"] == "error"
+    failed = db.get_blob(uid, hi._history_job_kind(job_id))
+    assert failed["phase"] == "failed"
+    assert failed["failed_phase"] == "candidate_extracting"
 
 
 def test_completion_resolves_prior_failure_notice(monkeypatch):
@@ -183,6 +189,26 @@ def test_completion_resolves_prior_failure_notice(monkeypatch):
     )
     assert _notices(uid)[f"history_import:{other_job_id}"]["resolved"] is False
 
+    attempts = []
+
+    class Attempt:
+        def __init__(self, artifact):
+            self.artifact = artifact
+
+        def __enter__(self):
+            return self
+
+        def finish(self, outcome):
+            attempts.append((self.artifact, outcome))
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        hi.distillation_ledger,
+        "history_attempt",
+        lambda _store, _job_id, artifact: Attempt(artifact),
+    )
     monkeypatch.setattr(hi.hosted_config_store, "_load_runtime_provider_config",
                         lambda *_a, **_k: object())
     monkeypatch.setattr(hi, "_extract_memory_candidates_with_provider",
@@ -199,5 +225,10 @@ def test_completion_resolves_prior_failure_notice(monkeypatch):
     hi._process_history_import_sync(store, None, job, payload)
 
     assert job["status"] == "completed"
+    assert attempts == [
+        ("memory", "not_provided"),
+        ("identity", "not_provided"),
+        ("greeting", "not_provided"),
+    ]
     n = _notices(uid)
     assert n[f"history_import:{other_job_id}"]["resolved"] is True

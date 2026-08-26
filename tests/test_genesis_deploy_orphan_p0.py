@@ -46,6 +46,10 @@ def _status(uid, jid):
                          (uid, jid)).fetchone()[0]
 
 
+def _failed_phase(uid, jid):
+    return db.genesis_get_job(uid, jid)["failed_phase"]
+
+
 def _seed_in_process_plaintext(
     uid,
     jid,
@@ -91,6 +95,8 @@ def test_deploy_orphan_recovers_within_dead_cutoff_not_30min():
 
     assert _status("u_p0_plain", "j_plain") == "failed"     # fast-fail → client retries
     assert _status("u_p0_chunk", "j_chunk") == "uploaded"   # requeued → live worker re-runs
+    assert _failed_phase("u_p0_plain", "j_plain") == "processing"
+    assert _failed_phase("u_p0_chunk", "j_chunk") == ""
 
 
 def test_live_worker_job_never_falsely_reclaimed_even_when_updated_at_stale():
@@ -112,6 +118,7 @@ def test_time_reaper_backstop_still_fails_wedged_job():
                      claimed_age_sec=60, chunks=0, updated_age_sec=2000)
     db.genesis_reap_stale_processing_jobs(1800, error="genesis_stale_timeout:1800s")
     assert _status("u_p0_wedge", "j_wedge") == "failed"
+    assert _failed_phase("u_p0_wedge", "j_wedge") == "processing"
 
 
 def test_plaintext_lease_recovery_only_fails_matching_stale_job():
@@ -140,6 +147,7 @@ def test_plaintext_lease_recovery_only_fails_matching_stale_job():
     )
 
     assert failed and failed["status"] == "failed"
+    assert failed["failed_phase"] == "processing"
     assert fresh is None
     assert non_plain is None
     assert _status("u_plain_fresh", "j_plain_fresh") == "processing"

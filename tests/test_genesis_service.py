@@ -369,6 +369,26 @@ def test_chunk_envelope_from_row_reconstructs_worker_decrypt_payload():
 def test_apply_reducer_output_writes_persona_and_done_state(monkeypatch):
     blobs = []
     outputs = []
+    attempts = []
+
+    class Attempt:
+        def __init__(self, _store, _job_id, artifact):
+            self.artifact = artifact
+            self.finished = False
+
+        def __enter__(self):
+            return self
+
+        def finish(self, outcome):
+            assert not self.finished
+            self.finished = True
+            attempts.append((self.artifact, outcome))
+
+        def __exit__(self, *_args):
+            assert self.finished, f"{self.artifact} exited before finish"
+            return False
+
+    monkeypatch.setattr(service.distillation_ledger, "ArtifactAttempt", Attempt)
 
     monkeypatch.setattr(
         service.db,
@@ -437,6 +457,10 @@ def test_apply_reducer_output_writes_persona_and_done_state(monkeypatch):
     assert reducer_doc["persona_provided"] is True
     assert "You remember the user's voice." not in reducer_json
     assert any(output["type"] == "apply" for output in outputs)
+    assert [artifact for artifact, _outcome in attempts] == [
+        "memory", "identity", "persona", "voice", "profile",
+    ]
+    assert dict(attempts)["persona"] == "written"
 
 
 def test_apply_reducer_output_can_defer_job_completion(monkeypatch):

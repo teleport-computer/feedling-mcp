@@ -641,7 +641,10 @@ def test_history_import_overall_quality_labels_are_load_bearing():
     page = data_track_module._render_history_import_overall({
         "calculated_at": "2030-06-08T00:00:00+00:00",
         "coverage": "red",
-        "reason": "无路径快照、未物理冻结；T247 补",
+        "reason": (
+            "整单 history job 无事件时路径快照且未物理冻结；"
+            "artifact 分步账本是另一口径，仅覆盖生效后"
+        ),
         "windows": [{
             "key": "rolling_1d", "label": "过去 1 个滚动日",
             "completed": 3, "failed": 1, "denominator": 4,
@@ -649,7 +652,7 @@ def test_history_import_overall_quality_labels_are_load_bearing():
     })
     assert "全路径合计（滚动窗口 · 即时重算 · 未冻结）" in page
     assert "🔴 覆盖" in page
-    assert "无路径快照、未物理冻结；T247 补" in page
+    assert "artifact 分步账本是另一口径，仅覆盖生效后" in page
     assert "计算时刻（北京）" in page
     assert "75.0% 成功 · 25.0% 失败" in page
     assert "分母=4 个全部路径 terminal job" in page
@@ -663,6 +666,75 @@ def test_product_na_and_observability_gap_use_different_words():
     assert history["cells"]["apikey_v2"]["coverage"] == "black"
     assert identity["cells"]["apikey_v2"]["message"] == "当前记不到这一级"
     assert identity["cells"]["apikey_v2"]["coverage"] == "red"
+
+
+def test_distillation_artifact_attempts_replace_gap_only_with_full_coverage():
+    report = {
+        "read_status": {"level": "ok", "message": ""},
+        "history_backfill": "unavailable",
+        "history_note": "生效日前无数据不等于 0",
+        "windows": [{
+            "day_count": 1,
+            "start_day": "2030-06-07",
+            "end_day": "2030-06-07",
+            "coverage": "green",
+            "covered_days": 1,
+            "effective_from": "2030-06-07",
+            "through_day": "2030-06-07",
+            "cells": {
+                "onboarding": {
+                    "identity": {
+                        "apikey_v2": {
+                            "succeeded": 3,
+                            "failed": 1,
+                            "no_write": 2,
+                            "outcomes": {
+                                "initialized": 3,
+                                "write_failed": 1,
+                                "not_provided": 2,
+                            },
+                        }
+                    }
+                }
+            },
+        }],
+    }
+    payload = data_track_module._event_path_master_payload(
+        _master_frozen(), report
+    )
+    identity = _master_row(payload, "onboarding_identity")
+    cell = identity["cells"]["apikey_v2"]
+    assert cell["state"] == "metric"
+    assert cell["success"] == 3 and cell["failure"] == 1
+    assert cell["denominator"] == 4
+    assert cell["no_write"] == 2
+    assert cell["outcomes"]["not_provided"] == 2
+    page = data_track_module._render_event_master_tables(payload)
+    assert "75.0% 成功" in page
+    assert "no-write 2（单列剔除）" in page
+    assert "outcome initialized=3" in page
+    assert "生效日前无数据不等于 0" in page
+
+    identity_cell = (
+        report["windows"][0]["cells"]["onboarding"]["identity"]["apikey_v2"]
+    )
+    identity_cell.update({"succeeded": 0, "failed": 0, "no_write": 2})
+    no_write_page = data_track_module._render_event_master_tables(
+        data_track_module._event_path_master_payload(_master_frozen(), report)
+    )
+    assert "0 次进入成败分母" in no_write_page
+    assert "no-write 2 次单列" in no_write_page
+
+    report["windows"][0]["coverage"] = "yellow"
+    report["windows"][0]["covered_days"] = 0
+    partial = data_track_module._event_path_master_payload(
+        _master_frozen(), report
+    )
+    partial_cell = _master_row(
+        partial, "onboarding_identity"
+    )["cells"]["apikey_v2"]
+    assert partial_cell["state"] == "coverage_gap"
+    assert "denominator" not in partial_cell
 
 
 def test_rollup_read_timeout_is_not_rendered_as_zero_or_missing_probe(monkeypatch):
@@ -693,7 +765,11 @@ def test_history_import_read_timeout_has_its_own_marker():
     page = data_track_module._render_history_import_overall({
         "calculated_at": "2030-06-08T00:00:00+00:00",
         "coverage": "timeout",
-        "reason": "取数超时（记了，但这里读不出来）；无路径快照、未物理冻结；T247 补",
+        "reason": (
+            "取数超时（记了，但这里读不出来）；"
+            "整单 history job 无事件时路径快照且未物理冻结；"
+            "artifact 分步账本是另一口径，仅覆盖生效后"
+        ),
         "windows": [],
     })
     assert "⏱️ 覆盖" in page

@@ -21,6 +21,7 @@ from typing import Any
 
 import db
 import debug_trace
+import distillation_ledger
 import provider_client
 from core import envelope as core_envelope
 from genesis import checkpoint, dedup, foreground, foreground_identity, lightweight_identity, service, worker
@@ -1260,7 +1261,9 @@ def _attach_plaintext_profile(
     return output
 
 
-def _write_back_plaintext_user_name(store, api_key: str | None, user_name: str) -> str:
+def _write_back_plaintext_user_name(
+    store, api_key: str | None, user_name: str, *, job_id: str,
+) -> str:
     """Best-effort preferred-name merge for paths that intentionally skip identity."""
     name = sanitize_user_name(user_name)
     if name == "TA":
@@ -1272,10 +1275,16 @@ def _write_back_plaintext_user_name(store, api_key: str | None, user_name: str) 
         return "unchanged"
     payload = dict(existing)
     payload["user_preferred_name"] = name
-    try:
-        return service.replace_identity_preserving_anchor(store, {"identity": payload}, api_key)
-    except Exception:
-        return "write_failed"
+    with distillation_ledger.ArtifactAttempt(store, job_id, "identity") as attempt:
+        try:
+            outcome = service.replace_identity_preserving_anchor(
+                store, {"identity": payload}, api_key
+            )
+        except Exception:
+            attempt.finish("write_failed")
+            return "write_failed"
+        attempt.finish(outcome)
+        return outcome
 
 
 def _plaintext_existing_persona_for_update(store, api_key: str | None) -> str:
@@ -1588,21 +1597,34 @@ def _run_plaintext_genesis_v2(
     persona_ref = ""
     persona_sha = ""
     if combined_map and identity_first:
-        persona_ref, persona_sha = service.write_persona_artifact(store, job_id, fg_merged)
+        persona_ref, persona_sha = service.write_persona_artifact(
+            store, job_id, fg_merged
+        )
         service.write_voice_artifact(store, job_id, fg_merged)
 
     if identity_first:
         # core memories now; identity via the legacy _store_identity_payload (exact old
         # path — writes the card + relationship anchor); greeting via the legacy pair.
-        mem_count, _mr = service.apply_memory_outputs(store, api_key, {"memories": full_memories})
+        with distillation_ledger.ArtifactAttempt(store, job_id, "memory") as attempt:
+            mem_count, _mr = service.apply_memory_outputs(
+                store, api_key, {"memories": full_memories}
+            )
+            attempt.finish(
+                "not_provided" if not full_memories
+                else "partial" if mem_count < len(full_memories)
+                else "written"
+            )
         service.write_profile_artifact(store, job_id, fg_merged, api_key)
-        history_import._store_identity_payload(
-            store, identity_payload, days_with_user=days,
-            evidence=f"genesis_foreground:{job_id}", language=language,
-            relationship_started_at=explicit_started_at,
-        )
+        with distillation_ledger.ArtifactAttempt(store, job_id, "identity") as attempt:
+            identity_row = history_import._store_identity_payload(
+                store, identity_payload, days_with_user=days,
+                evidence=f"genesis_foreground:{job_id}", language=language,
+                relationship_started_at=explicit_started_at,
+            )
+            attempt.finish("written" if identity_row else "not_provided")
         _append_plaintext_onboarding_greeting(
             store,
+            job_id=job_id,
             runtime=runtime,
             analysis_messages=msgs,
             memories=full_memories,
@@ -1617,6 +1639,7 @@ def _run_plaintext_genesis_v2(
         # let background enrichment add an identity later if the full material supports it.
         _append_plaintext_onboarding_greeting(
             store,
+            job_id=job_id,
             runtime=runtime,
             analysis_messages=msgs,
             memories=full_memories,
@@ -1881,19 +1904,30 @@ def _run_plaintext_background_enrichment(
     # apply the REST without re-completing: memories (core already excluded), persona, voice
     background_memory_count = 0
     if include_memory:
-        apply_result = service.apply_memory_outputs(store, api_key, merged)
-        if isinstance(apply_result, tuple) and apply_result:
-            background_memory_count = int(apply_result[0] or 0)
+        with distillation_ledger.ArtifactAttempt(store, job_id, "memory") as attempt:
+            apply_result = service.apply_memory_outputs(store, api_key, merged)
+            if isinstance(apply_result, tuple) and apply_result:
+                background_memory_count = int(apply_result[0] or 0)
+            raw_memories = merged.get("memories") or merged.get("facts") or []
+            raw_count = len(raw_memories) if isinstance(raw_memories, list) else 0
+            attempt.finish(
+                "not_provided" if raw_count == 0
+                else "partial" if background_memory_count < raw_count
+                else "written"
+            )
     service.write_profile_artifact(store, job_id, merged, api_key)
     # Identity is normally written by the foreground (identity-first contract),
     # so the background skips it when write_identity=False.
     background_identity_status = ""
     if write_identity:
-        background_identity_status = service.init_identity_if_absent(
-            store, merged, api_key
-        )
+        with distillation_ledger.ArtifactAttempt(store, job_id, "identity") as attempt:
+            background_identity_status = service.init_identity_if_absent(
+                store, merged, api_key
+            ) or "not_provided"
+            attempt.finish(background_identity_status)
     background_persona_ref, background_persona_sha = service.write_persona_artifact(
-        store, job_id, merged)
+        store, job_id, merged
+    )
     service.write_voice_artifact(store, job_id, merged)
     if completion is not None:
         _complete_plaintext_v2_job(
@@ -1929,6 +1963,7 @@ def _run_plaintext_background_enrichment(
 def _append_plaintext_onboarding_greeting(
     store,
     *,
+    job_id: str,
     runtime,
     analysis_messages: list[dict],
     memories: list[dict],
@@ -1964,13 +1999,14 @@ def _append_plaintext_onboarding_greeting(
                 if str(language).startswith("zh")
                 else "Good to see you again — I'm glad we can talk."
             )
-    try:
-        history_import._append_model_api_onboarding_greeting(store, greeting_text)
-    except Exception as e:  # noqa: BLE001 — greeting is best-effort for import
-        # jobs (a distilled import without a greeting beats a failed job); the
-        # durable/idempotent contract lives in _append_model_api_onboarding_greeting.
-        print(f"[genesis:{getattr(store, 'user_id', '')}] onboarding greeting append failed: {type(e).__name__}:{str(e)[:160]}")
-        return ""
+    with distillation_ledger.ArtifactAttempt(store, job_id, "greeting") as attempt:
+        try:
+            history_import._append_model_api_onboarding_greeting(store, greeting_text)
+        except Exception as e:  # noqa: BLE001 — greeting stays best-effort
+            attempt.finish("write_failed")
+            print(f"[genesis:{getattr(store, 'user_id', '')}] onboarding greeting append failed: {type(e).__name__}:{str(e)[:160]}")
+            return ""
+        attempt.finish("written")
     return str(greeting_text or "")
 
 
@@ -2068,13 +2104,19 @@ def _run_plaintext_add_memory_job(
     if raw_items is None:
         raw_items = merged.get("facts")
     raw_count = len(raw_items) if isinstance(raw_items, list) else 0
-    mem_count, _results = service.apply_memory_outputs(
-        store,
-        api_key,
-        merged,
-        preserve_dates=keep_all_job,
-        fallback_occurred_at=str((relationship_anchor or {}).get("relationship_started_at") or "").strip(),
-    )
+    with distillation_ledger.ArtifactAttempt(store, job_id, "memory") as attempt:
+        mem_count, _results = service.apply_memory_outputs(
+            store,
+            api_key,
+            merged,
+            preserve_dates=keep_all_job,
+            fallback_occurred_at=str((relationship_anchor or {}).get("relationship_started_at") or "").strip(),
+        )
+        attempt.finish(
+            "not_provided" if raw_count == 0
+            else "partial" if mem_count < raw_count
+            else "written"
+        )
     if keep_all_job and mem_count == 0:
         distill_diagnostics = {
             "reason": "keep_all_zero_cards",
@@ -2123,7 +2165,7 @@ def _run_plaintext_add_memory_job(
         if progress:
             progress.mark_identity_ready()
             progress.publish(stage="plaintext_add_memory_done", status=service.DONE_JOB_STATUS)
-    _write_back_plaintext_user_name(store, api_key, user_name)
+    _write_back_plaintext_user_name(store, api_key, user_name, job_id=job_id)
 
 
 def _run_plaintext_update_identity_job(
@@ -2195,12 +2237,14 @@ def _run_plaintext_update_identity_job(
         llm=llm,
     )
     identity_field_lock = service.identity_field_lock_for_job(store, job_id)
-    status = service.replace_identity_preserving_anchor(
-        store,
-        {"identity": identity_payload, "relationship_anchor": relationship_anchor or {}},
-        api_key,
-        field_lock=identity_field_lock,
-    )
+    with distillation_ledger.ArtifactAttempt(store, job_id, "identity") as attempt:
+        status = service.replace_identity_preserving_anchor(
+            store,
+            {"identity": identity_payload, "relationship_anchor": relationship_anchor or {}},
+            api_key,
+            field_lock=identity_field_lock,
+        )
+        attempt.finish(status)
     if status not in {"initialized", "updated", "locked"}:
         service.mark_failed(store, job_id, status)
         return
@@ -2482,7 +2526,7 @@ def _run_plaintext_genesis_job(
         service.apply_reducer_output(store, api_key, job_id, reducer_output)
         progress.mark_identity_ready()
         progress.publish(stage="plaintext_reducer_done", status=service.DONE_JOB_STATUS)
-        _write_back_plaintext_user_name(store, api_key, user_name)
+        _write_back_plaintext_user_name(store, api_key, user_name, job_id=job_id)
         _trace_genesis(
             store,
             "genesis.plaintext.done",
