@@ -1171,6 +1171,7 @@ async def run_tool_loop(
     compact_delivery_validation_exchange: ToolExchange | None = None
     compact_delivery_mismatch_retry_used = False
     compact_delivery_args_retry_used = False
+    file_delivery_callback_retry_used = False
     compact_delivery_confirmation_needed = False
     # Names keep required schemas visible and completed discovery calls valid in
     # native history. Exact call keys independently decide whether dispatch would
@@ -1423,6 +1424,7 @@ async def run_tool_loop(
                         compact_delivery_validation_exchange = None
                         compact_delivery_mismatch_retry_used = False
                         compact_delivery_args_retry_used = False
+                        file_delivery_callback_retry_used = False
                         compact_delivery_confirmation_needed = False
                         if on_file_requirement_changed is not None:
                             await on_file_requirement_changed()
@@ -3595,7 +3597,56 @@ async def run_tool_loop(
                 await _tool_event(
                     tc, "tool_call_error", {"error": type(exc).__name__}
                 )
-                raise
+                await _trajectory(
+                    "file_reply_failed",
+                    {
+                        "round": attempts,
+                        "call_id": tc.id,
+                        "canvas": is_canvas_delivery,
+                        "action": (
+                            "fail"
+                            if file_delivery_callback_retry_used
+                            else "retry"
+                        ),
+                    },
+                )
+                file_result = ToolResult(
+                    call_id=tc.id,
+                    content=(
+                        "error: file delivery did not complete. Nothing was "
+                        "attached. Create or refresh the requested source with "
+                        "workspace_write, then call send_file again using the "
+                        "returned path and revision."
+                    ),
+                )
+                reply_results[tc.id] = file_result
+                await _tool_event(
+                    tc, "tool_call_result", {"result": file_result}
+                )
+                if file_delivery_callback_retry_used:
+                    # ``send_file`` is the publication boundary. The workspace
+                    # source may already exist at the selected revision, but
+                    # loading, validating, or staging the attachment can still
+                    # fail. Export the stable path-aware class after one bounded
+                    # correction so the worker/terminal outbox cannot collapse
+                    # this into ``unknown``.
+                    raise _delivery_incomplete(
+                        workspace_path,
+                        "file_delivery_callback_failed",
+                    ) from exc
+                file_delivery_callback_retry_used = True
+                file_delivery_recovery_needed = True
+                if workspace_delivery_target is not None:
+                    # Compact delivery rounds replace the normal transcript;
+                    # carry the native result explicitly so the exact-target
+                    # retry still sees why its previous send_file failed.
+                    compact_delivery_validation_exchange = ToolExchange(
+                        calls=(tc,),
+                        results=(file_result,),
+                        assistant_text=pr.text,
+                        assistant_turn=pr.assistant_turn,
+                    )
+                continue
             delivered_file_suffixes.add(file_suffix)
             workspace_write_applied = False
             workspace_delivery_target = None
@@ -3604,6 +3655,7 @@ async def run_tool_loop(
             compact_delivery_validation_exchange = None
             compact_delivery_mismatch_retry_used = False
             compact_delivery_args_retry_used = False
+            file_delivery_callback_retry_used = False
             file_completion_message = (
                 completion_message
                 if is_canvas_delivery or current_user_request

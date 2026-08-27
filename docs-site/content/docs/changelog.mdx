@@ -12,6 +12,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 now retries a failed file-publication boundary once.** If
+  attaching a requested Canvas or downloadable file fails after `send_file`,
+  Chat asks the model to refresh the workspace source and deliver the exact
+  revision again instead of ending the turn immediately. If that bounded retry
+  also fails, the terminal reply now identifies an incomplete Canvas or file
+  delivery in the user's language instead of showing the generic runtime
+  fallback.
+
 - **Hosted Runtime V2 file-capable Chat now has an independent 32,768-token
   output budget across OpenAI Responses, OpenAI-compatible, Anthropic, Bedrock,
   and Gemini providers.** The existing 4,096-token prompt-output reserve and
