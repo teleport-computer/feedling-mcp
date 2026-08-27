@@ -2718,6 +2718,11 @@ def _seed_log_stream_users(client, count: int) -> list[str]:
     statement about the SQL rather than about an empty table.
     """
     user_ids = _seed_memory_users(client, count)
+    _add_log_stream_fingerprint(user_ids)
+    return user_ids
+
+
+def _add_log_stream_fingerprint(user_ids: list[str]) -> None:
     for index, uid in enumerate(user_ids):
         for entry in range(index + 1):
             db.log_append(uid, "bootstrap_events", {
@@ -2726,7 +2731,6 @@ def _seed_log_stream_users(client, count: int) -> list[str]:
             db.log_append(uid, "memory_capture_jobs", {
                 "status": f"status_{index}", "mode": f"mode_{index}",
             })
-    return user_ids
 
 
 def test_bootstrap_events_on_nonzero_offset_equal_the_fleet_wide_read(client):
@@ -2975,6 +2979,11 @@ def _seed_frame_users(client, count: int) -> list[str]:
     confused for each other inside the tolerance latest_age_sec is read with.
     """
     user_ids = _seed_memory_users(client, count)
+    _add_frame_fingerprint(user_ids)
+    return user_ids
+
+
+def _add_frame_fingerprint(user_ids: list[str]) -> None:
     with db.get_pool().connection() as conn:
         for index, uid in enumerate(user_ids):
             newest_age = 600 - 60 * index
@@ -2994,7 +3003,6 @@ def _seed_frame_users(client, count: int) -> list[str]:
                         "frames/test/body" if frame == index else None,
                     ),
                 )
-    return user_ids
 
 
 def _seed_active_broadcast(user_id: str) -> None:
@@ -3232,3 +3240,180 @@ def test_frame_recency_is_not_a_last_activity_input(client):
         "_latest_epoch input, and the page-scoped screen-frame read now hides "
         "activity for every user off the current page"
     )
+
+
+# ── read-side parity ─────────────────────────────────────────────────────────
+# Each slice above proved itself equal to the fleet-wide read it replaced, on
+# its own fixture, on one page. What none of those comparisons can see is the
+# rest of the payload: a pushdown that moved last_activity_at, a summary
+# aggregate, the sort order or the pagination totals would leave every
+# per-slice test green. These two tests compare the whole payload, on one
+# fixture that carries all three page-scoped slices at once.
+
+
+def _seed_every_paged_slice(client, count: int) -> list[str]:
+    """One fixture carrying all three page-scoped slices on the same users.
+
+    The per-slice fixtures each register their own users, so until now no test
+    exercised a row whose memory, screen_frames and bootstrap_events are all
+    rebuilt in the same page loop. Ids come back in ascending memory order, and
+    the first one has nothing in any of the three slices — that is the branch
+    where the ``if breakdown:`` / ``if frames:`` / ``if logs:`` guards skip the
+    rebuild and the row keeps whatever the fleet-wide read left on it.
+    """
+    bare, _ = _register(client)
+    user_ids = _seed_memory_users(client, count)
+    _add_log_stream_fingerprint(user_ids)
+    _add_frame_fingerprint(user_ids)
+    return [bare, *user_ids]
+
+
+def _restore_the_fleet_wide_read(monkeypatch) -> None:
+    """Put the implementation back the way it was before the pushdowns.
+
+    The replaced code is still reachable — admin_data_track_snapshot's three
+    include_* flags all default to True — so "before" is produced by running it
+    rather than by restating its output, which would only let the same
+    misunderstanding be written twice and agree with itself. The page readers
+    are stubbed to an empty result so the page loop leaves the fleet-computed
+    values in place instead of rebuilding them.
+    """
+    real_snapshot = db.admin_data_track_snapshot
+
+    def fleet_wide(user_ids, **kwargs):
+        for flag in (
+            "include_memory_breakdowns",
+            "include_screen_frames",
+            "include_paged_log_streams",
+        ):
+            kwargs.pop(flag, None)
+        return real_snapshot(user_ids, **kwargs)
+
+    monkeypatch.setattr(db, "admin_data_track_snapshot", fleet_wide)
+    for reader in (
+        "admin_memory_breakdowns",
+        "admin_screen_frames",
+        "admin_paged_log_streams",
+    ):
+        monkeypatch.setattr(
+            db, reader, lambda ids: ({}, {"level": "ok", "message": ""})
+        )
+
+
+def _take_clock_fields(payload: dict) -> tuple[str, list]:
+    """Remove the two fields that read the wall clock, and only those two.
+
+    Everything else in the payload has to match exactly; these two cannot,
+    because the two sides are two requests served seconds apart.
+    summary.generated_at is the timestamp of the request itself, and
+    screen_frames.latest_age_sec is now() minus latest_at — which is compared
+    exactly along with everything else, and pinned against the seed by
+    test_page_rows_carry_all_three_slices_for_the_right_user.
+
+    Anything else that stops matching is a real divergence, so this list stays
+    closed: a new time-dependent field must be justified here, not skipped.
+    """
+    ages = []
+    for row in payload.get("users") or []:
+        ages.append((row.get("screen_frames") or {}).pop("latest_age_sec", None))
+    generated_at = (payload.get("summary") or {}).pop("generated_at", "")
+    return generated_at, ages
+
+
+@pytest.mark.parametrize("query", [
+    "sort=memory&dir=asc&limit=2&offset=0",
+    "sort=memory&dir=asc&limit=2&offset=2",
+    "sort=memory&dir=asc&limit=2&offset=4",
+    "sort=memory&dir=desc&limit=3&offset=3",
+    "sort=chat&dir=desc&limit=4&offset=2",
+    "limit=3&offset=3",
+])
+def test_paged_payload_is_field_identical_to_the_fleet_wide_read(
+    client, monkeypatch, query
+):
+    """Every field of every row, on every page, under every sort.
+
+    The bug this batch fixes was that pagination sliced *after* the fleet-wide
+    work had already been done. Moving the slice earlier is only correct if
+    nothing an admin can see moved with it — including the fields no page
+    reader touches, the summary block, and the ordering itself, which now
+    decides membership of the page instead of merely presenting it.
+    """
+    seeded = _seed_every_paged_slice(client, 5)
+
+    url = f"/v1/admin/data-track/users?{query}"
+    live = client.get(url, headers=_admin_headers()).get_json()
+    _restore_the_fleet_wide_read(monkeypatch)
+    reference = client.get(url, headers=_admin_headers()).get_json()
+
+    assert live["users"], (
+        f"{query} returned an empty page — the comparison below would hold "
+        "vacuously"
+    )
+    assert {r["user_id"] for r in live["users"]} <= set(seeded), (
+        "the page contains a user this fixture did not seed"
+    )
+
+    live_stamp, live_ages = _take_clock_fields(live)
+    reference_stamp, reference_ages = _take_clock_fields(reference)
+    assert live_stamp and reference_stamp and reference_stamp >= live_stamp, (
+        f"summary.generated_at is not the time of the request: {live_stamp} "
+        f"then {reference_stamp}"
+    )
+    assert len(live_ages) == len(reference_ages)
+    for before, after in zip(live_ages, reference_ages):
+        assert (before is None) == (after is None), (
+            "one side has a frame recency the other does not"
+        )
+        if before is not None:
+            assert after - before <= 5 and after >= before, (
+                f"latest_age_sec moved by more than the gap between the two "
+                f"requests: {before} -> {after}"
+            )
+
+    assert live == reference, (
+        "the paged read and the fleet-wide read it replaced disagree on some "
+        "field of the payload"
+    )
+
+
+def test_page_rows_carry_all_three_slices_for_the_right_user(client):
+    """Seed-derived oracle for the fixture the parity test compares.
+
+    Both sides of that comparison run through the same _*_into helpers, so a
+    mutation inside one of them moves them together and stays green. These
+    numbers come from the seed instead. The Nth user has N+1 of everything, so
+    a row that picked up a neighbour's counters for one slice and its own for
+    another is visible, and the fully empty user pins the branch where all
+    three rebuild guards are skipped.
+    """
+    seeded = _seed_every_paged_slice(client, 5)
+    body = client.get(
+        "/v1/admin/data-track/users?sort=memory&dir=asc&limit=6&offset=0",
+        headers=_admin_headers(),
+    ).get_json()
+    rows = {row["user_id"]: row for row in body["users"]}
+    assert list(rows) == seeded, (
+        f"sort=memory&dir=asc must order by card count; got {list(rows)}"
+    )
+
+    bare = rows[seeded[0]]
+    assert bare["memory"]["total"] == 0
+    assert bare["memory"]["by_source"] == {}
+    assert bare["screen_frames"]["total"] == 0
+    assert bare["screen_frames"]["latest_at"] == ""
+    assert bare["bootstrap_events"]["events"] == 0
+
+    for index, uid in enumerate(seeded[1:]):
+        row = rows[uid]
+        seeded_rows = index + 1
+        assert row["memory"]["total"] == seeded_rows
+        assert row["memory"]["by_source"] == {f"source_{index}": seeded_rows}
+        assert row["bootstrap_events"]["events"] == seeded_rows
+        assert row["screen_frames"]["total"] == seeded_rows
+        # _add_frame_fingerprint gives exactly one frame a body_key.
+        assert row["screen_frames"]["r2_count"] == 1
+        assert row["screen_frames"]["inline_count"] == seeded_rows - 1
+        assert row["screen_frames"]["latest_age_sec"] == pytest.approx(
+            600 - 60 * index, abs=30
+        )
