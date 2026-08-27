@@ -371,10 +371,10 @@ def list_moments(
     include_archived_raw,
 ) -> tuple[dict, int]:
     try:
-        limit = min(int(limit_raw), MEMORY_LIST_MAX_LIMIT)
+        limit = int(limit_raw)
     except (TypeError, ValueError):
         return {"error": "invalid limit"}, 400
-    if limit < 1:
+    if limit < 1 or limit > MEMORY_LIST_MAX_LIMIT:
         return {"error": "invalid limit"}, 400
     include_archived = str(include_archived_raw or "").lower() in {"1", "true", "yes"}
     moments = memory_service._load_moments(store)

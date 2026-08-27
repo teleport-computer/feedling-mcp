@@ -4436,7 +4436,7 @@
             "name": "limit",
             "in": "query",
             "required": false,
-            "description": "Page size; values above 500 are capped.",
+            "description": "Page size; values outside the supported range are rejected.",
             "schema": {
               "type": "integer",
               "minimum": 1,

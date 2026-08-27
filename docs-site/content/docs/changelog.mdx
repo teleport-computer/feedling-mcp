@@ -12,6 +12,20 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- `GET /v1/memory/list` now rejects page sizes outside its documented
+  `1`–`500` range with `400 invalid limit` instead of silently reducing an
+  oversized request to 500. Valid page sizes, cursor pagination, ordering, and
+  the default page size are unchanged. Chat's automatic memory-recall pool now
+  defaults to the full supported 500-card page; its operator setting forwards
+  positive integers unchanged so an unsupported value is rejected explicitly
+  by the same endpoint instead of being silently reduced inside the enclave.
+  Chat history remains best-effort: invalid operator configuration or a rejected
+  page size omits automatic memories for that round and returns a content-free
+  failed `context_memory_log` rather than failing the history request. Candidate
+  processing runs on every non-probe `/v1/chat/history`; in a local stub-decrypt
+  benchmark, increasing an actually full pool from 200 to 500 moved p95 from
+  about 21 ms to 52 ms (excluding TDX crypto, database, and network time).
+
 - Worker-local user state is now metadata-first: obtaining user identity,
   locks, or Chat waiters no longer eagerly loads Chat, frames, World Books,
   tokens, push state, and Live Activity state. Paths that need an in-memory
