@@ -12,6 +12,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 file-capable Chat now has an independent 32,768-token
+  output budget across OpenAI Responses, OpenAI-compatible, Anthropic, Bedrock,
+  and Gemini providers.** The existing 4,096-token prompt-output reserve and
+  input frontier are unchanged. If a provider explicitly reaches its output
+  limit while returning malformed tool arguments, Runtime V2 stops after that
+  provider call, does not execute or deliver the incomplete file, and reports a
+  localized output-limit error instead of retrying at the same budget.
+
 - Agents running on the pi driver, whether hosted or self-hosted, can now inspect
   images pulled during a turn by `screen-read --include-image`,
   `photo-read --include-image`, or `chat-image`. The pi runtime keeps its

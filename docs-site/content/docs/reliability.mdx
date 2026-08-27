@@ -121,6 +121,13 @@ Catalog-backed terminal errors that can become the visible Chat reply—such as
 provider credentials, quota, compatibility, context, and platform or provider
 timeouts—use the same account-language selection.
 
+File-capable Runtime V2 Chat requests use a 32,768-token provider output budget,
+independent of the 4,096-token prompt-output reserve used to calculate the input
+frontier. If a provider explicitly reports that it reached its output limit and
+its tool arguments are malformed, Runtime V2 does not retry at the same budget
+or execute the partial call. Foreground Chat instead reports a localized
+output-limit error, and no incomplete file or Canvas card is delivered.
+
 A relay that cuts the provider stream can also split one internal control
 envelope across the reasoning and content channels, leaving a bare JSON tail
 (for example `…"reason":"…"}]}`) in the visible reply while its head sits in the

@@ -206,7 +206,10 @@ def test_file_capable_chat_uses_v2_output_budget_without_changing_global_default
     )
 
     assert default_max == 700
-    assert seen_kwargs == [{"require_reply": False, "max_tokens": 4096}]
+    assert seen_kwargs == [{
+        "require_reply": False,
+        "max_tokens": provider_client.CHAT_OUTPUT_MAX_TOKENS,
+    }]
 
     seen_kwargs.clear()
     asyncio.run(

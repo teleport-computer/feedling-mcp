@@ -732,6 +732,14 @@ def test_terminal_failure_fallback_uses_shared_reply_language_policy(
             "stability before trying again.",
         ),
         (
+            "provider_output_truncated",
+            "模型在写完文件前达到了输出上限，未发送不完整的文件。"
+            "可缩小内容后重试，或换用输出上限更高的模型。",
+            "The model reached its output limit before finishing the file, so "
+            "the incomplete file was not sent. Try a smaller version or a "
+            "model with a higher output limit.",
+        ),
+        (
             "platform_queue_timeout",
             "这条消息没有及时开始处理，也没有生成回复。请稍后再试，不要连续发送。",
             "This message did not start processing in time, so no reply was "

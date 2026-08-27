@@ -3703,6 +3703,187 @@ def test_malformed_call_gets_fresh_prefixed_paired_rejection_id(monkeypatch):
     assert outcome.final_text == "plain fallback"
 
 
+def test_file_output_budget_is_independent_from_prompt_frontier_reserve(
+    monkeypatch,
+):
+    provider = _ScriptedProvider([
+        {"reply": "done", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    observed_frontier_reserves = []
+
+    class RecordingAdaptiveBuilder(_AdaptiveBuildMessages):
+        def plan_provider_round(self, **kwargs):
+            observed_frontier_reserves.append(kwargs["output_reserve_tokens"])
+            return super().plan_provider_round(**kwargs)
+
+    async def on_file(_path, _revision):
+        return None
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=RecordingAdaptiveBuilder(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        on_file_reply=on_file,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=3,
+        prompt_output_reserve_tokens=4096,
+        file_output_max_tokens=provider_client.CHAT_OUTPUT_MAX_TOKENS,
+    ))
+
+    assert outcome.final_text == "done"
+    assert observed_frontier_reserves == [4096]
+    assert provider.calls[0]["max_tokens"] == provider_client.CHAT_OUTPUT_MAX_TOKENS
+    assert provider.calls[0]["max_tokens"] not in {4096, 8192}
+
+
+@pytest.mark.parametrize("stop_reason", ["length", "MAX_TOKENS"])
+def test_token_limited_malformed_tool_call_fails_once_without_retry(
+    monkeypatch,
+    stop_reason,
+):
+    provider = _ScriptedProvider([{
+        "reply": "",
+        "stop_reason": stop_reason,
+        "tool_calls": [{
+            "id": "write-1",
+            "name": "workspace_write",
+            "args": {},
+            "args_raw": '{"path":"/workspace/large.io.html","content":"partial',
+            "args_ok": False,
+        }],
+        "usage": {"completion_tokens": 4096},
+    }])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch()
+    trajectory = []
+
+    async def record_trajectory(event_kind, detail):
+        trajectory.append((event_kind, detail))
+
+    async def on_file(_path, _revision):
+        return None
+
+    with pytest.raises(tool_loop.ProviderOutputTruncated, match="output_truncated"):
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=dispatch,
+            on_reply=_RecordingReply(),
+            on_file_reply=on_file,
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            max_calls=5,
+            on_trajectory_event=record_trajectory,
+        ))
+
+    assert len(provider.calls) == 1
+    assert dispatch.calls == []
+    truncated = [
+        detail
+        for event_kind, detail in trajectory
+        if event_kind == "provider_output_truncated"
+    ]
+    assert truncated == [{
+        "round": 1,
+        "reason": "output_truncated",
+        "finish_reason": provider_client.normalize_stop_reason(stop_reason),
+        "malformed_tool_arguments": True,
+        "retry": False,
+    }]
+    assert not any(
+        event_kind == "protocol_fallback"
+        and detail.get("reason") == "invalid_or_over_budget_tool_exchange"
+        for event_kind, detail in trajectory
+    )
+
+
+def test_quote_dense_canvas_at_utf8_contract_limit_reaches_workspace_dispatch(
+    monkeypatch,
+):
+    prefix = "<html><body>"
+    suffix = "</body></html>"
+    canvas = (
+        prefix
+        + ('"' * (cap_tool_schema.SHARED_WORK_MAX_BYTES - len(prefix) - len(suffix)))
+        + suffix
+    )
+    write_call = {
+        "id": "write-large",
+        "name": "workspace_write",
+        "args": {
+            "path": "/workspace/large.io.html",
+            "content": canvas,
+            "expected_revision": 0,
+        },
+    }
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "stop_reason": "tool_calls",
+            "tool_calls": [write_call],
+            "assistant_turn": {
+                "wire": "openai_chat",
+                "payload": {
+                    "role": "assistant",
+                    "tool_calls": [write_call],
+                },
+            },
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "stop_reason": "tool_calls",
+            "tool_calls": [{
+                "id": "send-large",
+                "name": "send_file",
+                "args": {
+                    "path": "/workspace/large.io.html",
+                    "revision": 1,
+                    "title": "Large Canvas",
+                    "subtitle": "Interactive work",
+                    "completion_message": "Canvas delivered.",
+                },
+            }],
+            "usage": {},
+        },
+        {"reply": "Canvas delivered.", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch(
+        "ok: workspace_write applied at revision 1; use revision 1 with send_file"
+    )
+    delivered = []
+
+    async def on_file(path, revision, **_metadata):
+        delivered.append((path, revision))
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_TranscriptBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        on_file_reply=on_file,
+        required_file_suffixes=(".io.html",),
+        fold_new_messages=_RecordingFold([[], []]),
+        add_usage=_noop_add_usage,
+        max_calls=5,
+    ))
+
+    assert len(canvas.encode("utf-8")) == cap_tool_schema.SHARED_WORK_MAX_BYTES
+    assert len(json.dumps(write_call["args"])) > (
+        cap_tool_schema.SHARED_WORK_MAX_BYTES + 4096
+    )
+    assert [[call.name for call in batch] for batch in dispatch.calls] == [
+        ["workspace_write"]
+    ]
+    assert dispatch.calls[0][0].args["content"] == canvas
+    assert delivered == [("/workspace/large.io.html", 1)]
+    assert outcome.final_text == "Canvas delivered."
+
+
 def test_rejected_invented_tool_name_does_not_restore_unknown_schema(monkeypatch):
     provider = _ScriptedProvider([
         {"reply": "", "tool_calls": [
