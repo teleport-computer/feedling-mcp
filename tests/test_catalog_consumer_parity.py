@@ -39,6 +39,7 @@ except ModuleNotFoundError:
 from notices import catalog  # noqa: E402
 from notices import core  # noqa: E402
 import tools.chat_resident_consumer as crc  # noqa: E402
+from model_api_runtime.v2 import jobs_store  # noqa: E402
 from model_api_runtime.v2 import worker  # noqa: E402
 
 
@@ -125,6 +126,26 @@ def test_image_generation_configuration_catalog_is_actionable_and_bilingual():
         assert catalog.user_text_for(
             error_class, language="en-US"
         ) != catalog.user_text_for(error_class, language="zh-Hans")
+
+
+def test_every_direct_terminal_chat_notice_is_bilingual():
+    direct_notice_classes = set(jobs_store._DIRECT_NOTICE_ERROR_CLASSES)
+    direct_notice_classes.update(
+        error_class
+        for error_class in catalog.ERROR_CLASSES
+        if catalog.blame_for(error_class) == "user_provider"
+    )
+
+    missing = {
+        error_class
+        for error_class in direct_notice_classes
+        if catalog.user_text_for(error_class, language="en-US")
+        == catalog.user_text_for(error_class, language="zh-Hans")
+    }
+    assert not missing, (
+        "a catalog notice selected directly as a terminal Chat reply must have "
+        f"distinct English and Chinese copies: {sorted(missing)}"
+    )
 
 
 def test_resident_decrypt_maintenance_classes_are_registered_as_user_environment():
