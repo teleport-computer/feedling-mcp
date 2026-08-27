@@ -41,6 +41,24 @@ current 测试规范和工具索引已同步到两个现役 round-trip 工具，
 与“本地服务端到端链路”。本批不修改 backend、公开 API、部署拓扑或
 `tools/chat_resident_consumer.py`。
 
+## 批次 3：已实施的 Perception 内核提取
+
+审计日期：2026-08-27。Step 1 实施计划的主干提取已落地，且归档前没有生产代码、
+部署配置、current runbook 或其他文档把该计划路径当作执行入口。设计文档保留为
+`decision`，架构与 prompt 资产表扶正为 current owner，并校准掉“尚待提取”、旧 IO
+owner 和过期行号所代表的当前事实。
+
+| 材料 | 状态与 current owner | 实现 / 修复证据 | 当前兼容义务 | 处理结果 |
+|---|---|---|---|---|
+| Perception Step 1 实施计划 | `historical` / `superseded`（主干已实施，剩余直连不可重放）；[architecture](../PERCEPTION_ARCHITECTURE.zh.md)、[boundary decision](../PERCEPTION_EXTRACTION_DESIGN.zh.md)、[prompt assets](../PERCEPTION_PROMPT_ASSETS.zh.md) | `ac7afd62` / `b043ae8d` 建立 prompt golden；`85f0046f` 建内核与纯度守卫；`1e3c6677`、`bcf3612d`、`42e93471`、`94fd56af`、`6959a3aa`、`1ad68346` 迁移 catalog、projection/glance、history、V2/V1 prompt 与已采用的 wake 判据；`27625742`、`73d99e7d`、`d97ece15` 完成命名和评审修正 | `perception_kernel` 保持纯函数、零 IO；V1/V2 共用判断 owner，但各自保留 role、投递、安全和工具预算协议；`perception/` 的数据库、加解密、鉴权、事务、metrics、入队及兼容 re-export 不得因归档而删除；`PERCEPTION_WAKE_SOURCES`、`is_significant_change`、`should_wake` 仍由未接线守卫保护，reason 映射与信号语义未决前不得直接接入 IO | [archive plan](../archive/superpowers/plans/2026-08-19-perception-extraction-step1.md) |
+| Perception 插件设计 | `decision`；current 文件图由 [architecture](../PERCEPTION_ARCHITECTURE.zh.md) 持有 | 提取实现证明 Step 1 边界可行；`c7cdae93` 又把 stale digest trend 收敛为 `last_known`，避免旧值伪装成当前值 | 保留 `wake ≠ 该开口了`、精确定位原始值/IO 边界、可信说明书与不可信事实分层；不得把定位 resolver 的丢弃保证套到 app Shortcut——后者会持久化 app/bundle alias；正文中的未来插件 API、CLI/MCP、新仓库和开源步骤不是当前能力 | retain: [decision](../PERCEPTION_EXTRACTION_DESIGN.zh.md) |
+| Perception 架构与 prompt 资产 | `current` / self | 生产模块、兼容壳、purity/catalog/projection/wake/history/prompt golden 测试 | current owner 使用稳定模块/符号，不把提取期行号当契约；V1/V2 文案差异可保留，但唯一出处和逐字节 golden 不得漂移 | retain: [architecture](../PERCEPTION_ARCHITECTURE.zh.md)、[prompt assets](../PERCEPTION_PROMPT_ASSETS.zh.md) |
+| Memory/Perception 历史文档批次 3 实施计划 | `historical` / `implemented`；本审计页 | repository cleanup 总计划与本审计页 | 仅保留本批范围和验证路径，不作为新的 runtime 修改入口 | [archive cleanup plan](../archive/superpowers/plans/2026-08-27-memory-perception-history-batch-3.md) |
+
+本批只变更内部 Markdown 生命周期、current-state 校准和生成的 inventory；不修改 backend、
+公开 API/OpenAPI、数据库、部署拓扑或 `tools/chat_resident_consumer.py`。归档不授权拆分
+consumer，也不改变用户 VPS 的 checkout/install/re-exec 或 import 契约。
+
 ## 当前边界与供应链义务
 
 - managed image 中，`memgarden` 与 `agent-protocol-core` 同时由 requirements 声明，
@@ -61,5 +79,7 @@ current 测试规范和工具索引已同步到两个现役 round-trip 工具，
 
 ## 后续
 
-Perception 的提取计划仍留在当前搜索面。本批不归档它：需要先核对 2026-08-26 freshness
-修复、现行 `perception_kernel` owner、V1/V2 共用面和 wake 语义，再由独立批次转移理由。
+Perception Step 1 已退出 current 搜索面。设计里的 CLI/MCP 壳、新仓库和开源发布仍未
+实施，也不自动构成 backlog；只有出现明确产品需求、owner、供应链方案和独立验收计划后
+才重新立项。任何 Perception 运行时清理仍须分别验证 V1/V2、兼容 re-export、wake 语义、
+freshness/权限遮蔽以及 IO 的事务与加密边界。

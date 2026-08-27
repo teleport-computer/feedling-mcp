@@ -1,4 +1,21 @@
+---
+document_lifecycle: historical
+historical_reason: superseded
+superseded_by: docs/PERCEPTION_ARCHITECTURE.zh.md
+canonical_owner: docs/repository-cleanup/memory-perception-history.md
+---
 # 主动感知插件提取 · 第一步（只切业务）实施计划
+
+> **HISTORICAL / PARTIALLY IMPLEMENTED, REMAINDER SUPERSEDED（2026-08-27 归档）**：
+> 主干提取由 `ac7afd62` 至 `d97ece15` 的实现链完成；`c7cdae93` 另补齐 stale digest
+> freshness。Task 7 计划直连的 `PERCEPTION_WAKE_SOURCES`、`is_significant_change`、
+> `should_wake` 刻意保持未接线：reason 字符串与真实信号语义尚不等价，现行测试会阻止
+> 未经决策的 IO 引用。本文的 checkbox、
+> 分支、行号、一次性迁移步骤和预期输出只保留为实施证据，不得作为当前操作手册重放。
+> 当前文件图见 `docs/PERCEPTION_ARCHITECTURE.zh.md`，长期边界见
+> `docs/PERCEPTION_EXTRACTION_DESIGN.zh.md`，prompt owner 见
+> `docs/PERCEPTION_PROMPT_ASSETS.zh.md`。CLI/MCP、新仓库、开源发布和上述直连接线均未
+> 随本计划交付。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

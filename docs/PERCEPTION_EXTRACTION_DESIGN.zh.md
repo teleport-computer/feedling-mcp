@@ -1,4 +1,28 @@
+---
+document_lifecycle: decision
+canonical_owner: docs/PERCEPTION_ARCHITECTURE.zh.md
+---
 # 主动感知插件 · 设计
+
+> **CURRENT-STATE NOTE（2026-08-27）**：本文保留 Perception 内核/IO 分层、
+> `wake ≠ 该开口了`、可信说明书与不可信事实分离等长期决策；正文里的基线、行号、
+> “第一步/本批”与未来插件 API 是提取期设计快照。主干提取已由 `ac7afd62` 至
+> `d97ece15` 的实现链落地为仓库内 `backend/perception_kernel/`，V1/V2 共用纯判断，
+> 数据库、加解密、鉴权、事务、metrics、入队和 role/protocol 仍由 IO 持有；
+> `c7cdae93` 又补齐了 stale digest 的 `last_known` 语义。当前文件图以
+> [`PERCEPTION_ARCHITECTURE.zh.md`](PERCEPTION_ARCHITECTURE.zh.md) 为准，prompt owner
+> 以 [`PERCEPTION_PROMPT_ASSETS.zh.md`](PERCEPTION_PROMPT_ASSETS.zh.md) 为准。
+>
+> **未实施范围**：CLI/MCP 壳、新仓库和开源发布并未随第一步交付，也不是当前运行时
+> 能力。原计划中的 `PERCEPTION_WAKE_SOURCES`、`is_significant_change`、`should_wake`
+> 也刻意未接入 IO：现行 reason 字符串和信号语义尚不等价，
+> `tests/test_perception_kernel_wake.py` 会阻止未经决策的直连。只有新的产品需求、owner
+> 与独立计划成立后，才重新进入 backlog。
+>
+> **当前数据例外**：本文关于“原始值当场丢弃”的正文是提取期目标，不可泛化到所有
+> 入口。现行 `location_signal` 会丢弃精确坐标、Wi-Fi BSSID 与完整地址；但
+> `/app_open`、`/app_close` 会把调用方提供的 `app`（`bundle_id` 只是兼容别名）写入
+> `app_name` 和事件流，并单独保存可选 category。以 current architecture 和路由测试为准。
 
 > **这份文档回答四件事：这个插件干什么、怎么切分、怎么用、下一个大版本能因此做什么。**
 >

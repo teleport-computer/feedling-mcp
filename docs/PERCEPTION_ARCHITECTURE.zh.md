@@ -1,12 +1,16 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # 主动感知系统 · 架构
 
 > 这份讲**现在的系统长什么样**：数据怎么进来、经过哪些层、每层做什么判断、
 > 两条运行时各自怎么走、边界画在哪。
 >
-> 想看**要改成什么样**去读 `PERCEPTION_EXTRACTION_DESIGN.zh.md`；
-> 想看**模型看到的原文在哪**去读 `PERCEPTION_PROMPT_ASSETS.zh.md`。
+> 想看**为什么按内核/IO 边界切分**去读 `PERCEPTION_EXTRACTION_DESIGN.zh.md`；
+> 想看**模型说明书由谁持有、接到哪里**去读 `PERCEPTION_PROMPT_ASSETS.zh.md`。
 >
-> 基线：`origin/test`。文中的行号会漂，模块名不会。
+> 本文是当前文件图 owner；模块与稳定符号优先于会漂移的行号。
 
 ---
 
@@ -22,21 +26,26 @@
 ## 一、系统边界：三件事，别混
 
 ```
-① 感知      现在周围是什么情况            —— 每一轮对话都用得上
+① 采集/状态  现在周围是什么情况            —— 持续更新，但不自动塞进每轮对话
 ② 叫醒      有件事发生了,值得戳 agent 一下 —— 只在少数几种事件上发生
 ③ 查询      agent 主动问「我最近睡得怎么样」 —— 跟叫醒无关
 ```
 
-**最容易混的是 ① 和 ②**：感知一直在收数据、每轮都喂给模型；
-叫醒是稀有事件，一天可能一次都没有。关掉全部叫醒，① 和 ③ 照常工作。
+**最容易混的是“状态存在”和“本轮模型可见”**：感知数据可以持续采集并保存，但
+foreground chat 不会因此被动获得整份 snapshot。V2 只在指定 proactive lane 预取有界
+grounding，V1 只在指定 proactive message 组装路径加入 digest；其他时候由 agent 显式
+调用感知工具。叫醒是稀有事件，一天可能一次都没有；关掉全部叫醒不影响采集和显式查询。
 
 ---
 
 ## 二、能感知什么
 
-21 个能力、20 个信号，声明在**一张表**里（`perception/catalog.py`），
+21 个能力、20 个信号，声明在**一张表**里（`perception_kernel/catalog.py`），
 其余机制全部由这张表驱动：接受哪些上报字段、哪个权限管它、多久算过期、
 是不是叫醒源、agent 能不能主动查。
+
+`perception/catalog.py` 只是现有 IO 调用方的兼容 re-export；新纯逻辑直接依赖内核，
+数据库、路由与 ingress 仍通过 IO adapter 接线。
 
 ```
 不用授权   time（本地时间/时区）· device（电量/充电）· broadcast（屏幕共享状态）
@@ -87,19 +96,19 @@ GET  /v1/perception/items/{kind}    集合型数据（workout / sleep / vitals�
 ② 解析 + 转标签   resolve.py
    收到 {lat: 31.23, lon: 121.47}
    查这个用户自己标过的地点 / 已知网络 → 算出 place_label = "公司"
-   ★ 经纬度当场丢弃,不入库。agent 永远看不到坐标
-   ★ 同理:WiFi 名 → 「已知网络」，app bundle id → 「社交类」
+   ★ location_signal 的经纬度、Wi-Fi BSSID、完整 placemark 地址不写入状态
+   ★ 保留的是 place_label / wifi_label / country / locality 等明确释放的粗粒度字段
    ↓
 ③ 写当前状态     store.py → perception_state
    place_label=公司,带 last_seen 时间戳。读的时候按 ttl 判过期
    ↓
-④ 判断「算不算一件事」  signal_state_v2.py
+④ 判断「算不算一件事」  signal_state_v2.py + perception_kernel/wake.py
    ★ 这一步在 Postgres 事务里，SELECT ... FOR UPDATE 锁住「这个用户 + 这个信号」
    ★ 为什么必须加锁:重复上报、乱序到达、同一时刻两个不同值，
      不锁的话会产生「假变化」→ 错误叫醒
    判据三件:时间戳序（旧的直接丢）· 指纹是否变了（HMAC）· 是不是第一次
    ↓
-⑤ 发事件         differ_v2.py
+⑤ 发事件         differ_v2.py + perception_kernel/wake.py
    把「变了」翻译成离散事件,并附带 presence_hints 和 change_digest
    ★ 只有 7 个信号是叫醒源:
      connectivity_anchor / wifi_anchor / bluetooth_anchor  （到了某个地方）
@@ -120,29 +129,34 @@ GET  /v1/perception/items/{kind}    集合型数据（workout / sleep / vitals�
 ⑧ 运行时取走     V2 worker 或 V1 consumer，见第六节
 ```
 
-**这条链上「判断」和「机制」是分开的**：②④⑤ 是判断（纯逻辑），
-③④ 的锁和事务、⑦ 的队列是机制。这也是内核提取那批要沿着切的那条线。
+**这条链上「判断」和「机制」是分开的**：字段投影、时间先后、wake source 等纯判据
+在 `perception_kernel`；解析/发射 adapter 在 `perception`；③④ 的锁和事务、⑦ 的队列
+以及 HMAC 指纹仍是 IO 机制。兼容壳保留旧 import path，不代表 owner 仍在 IO 模块。
+
+`perception_kernel.wake` 里并非所有导出都已接线：当前 IO 使用
+`observation_order` 与 `is_wake_worthy_signal`；`PERCEPTION_WAKE_SOURCES`、
+`is_significant_change`、`should_wake` 仍刻意未接入。后者的 reason 字符串和真实信号
+语义与现行 IO 不等价，`tests/test_perception_kernel_wake.py` 会在有人直连时失败，要求
+先完成兼容决策。
 
 ---
 
 ## 五、agent 看到的是什么
 
-分两种时机，**内容形态完全不同**，这是最容易误解的一处。
+按 lane 看，**grounding 形态完全不同**，这是最容易误解的一处。
 
-### ① 每一轮对话（含你主动说话的那种）
+### ① Foreground chat：不被动注入 snapshot
 
-`perception/wake.py::snapshot_for_wake` 把当前状态拼进本轮上下文。
-**不用调工具**，agent 手上直接就有。
+`perception/wake.py::snapshot_for_wake` 当前只有定义和兼容 re-export，没有生产 runtime
+调用方。V2 的 foreground context 明确不接受 wake payload 里的 `perception` snapshot；
+V1 foreground 也不拼 proactive digest。需要感知事实时，agent 走显式工具读取。
 
-```
-形态：当前状态的粗粒度快照
-      place_label / motion_state / battery_level / in_focus / app_name …
-      过期字段一律 null
-```
+### ② Proactive wake：按 lane 取有界 grounding
 
-### ② 主动回合（被感知戳醒的那种）
-
-给的是**「一瞥」**（`glance.py`）——**全是布尔值，一个数字都没有**：
+V2 `heartbeat` / `manual_wake` 预取**「一瞥」**（`perception_kernel/glance.py`），
+全是布尔值，一个数字都没有；`scheduled` 使用到期提醒数据，`screen_watch` 只预取
+`screen_recent`，不取 glance 或 snapshot。触发 job 携带的 perception 事件只能经
+`project_perception_wake_events` 投影成安全 marker，不能把原 payload 被动塞给模型。
 
 ```
 {
@@ -157,9 +171,11 @@ GET  /v1/perception/items/{kind}    集合型数据（workout / sleep / vitals�
 "你昨晚只睡了 5 小时 12 分钟哦"——像体检报告，不像人。
 一瞥的用途是让它**决定要不要多看一眼**，不是给它一张待汇报清单。
 
-想要真实数值？**它得自己调工具**。这一步是刻意加的摩擦。
+V1 的普通 non-screen proactive message 可以加入有界 presence hints、change fallback 与
+cross-domain board；screen-watch 明确令 `perception_digest=None`，scheduled 走独立提醒
+message。想要真实数值仍须显式调工具，这一步是刻意加的摩擦。
 
-### ③ agent 主动查（任何时候）
+### ③ agent 显式查询
 
 ```
 perception.now / location / weather / motion / calendar / focus / audio_route
@@ -172,7 +188,7 @@ perception.trend / history  最近 N 天的趋势与逐日数据
 
 ---
 
-## 六、两条运行时：同一份数据，两套读法
+## 六、两条运行时：共用内核，保留各自协议
 
 ```
 V2（云上托管）        model_api_runtime/v2/worker.py 的 wake lane
@@ -180,20 +196,21 @@ V1（自托管 VPS）      tools/chat_resident_consumer.py
                       ★ 这个文件同时服务 hosted 和自托管两类用户，改它两边都受影响
 ```
 
-两边拿到的**数据是同一份**，但告诉模型「该怎么读」的说明书**内容不一样**，
-而且各自散落：
+两边共用同一底层感知状态与 `perception_kernel` owner，但每轮投影与载荷不同；
+各 runtime 从 `perception_kernel.prompts` 读取感知说明书，并保留自己的 role、投递、安全和工具预算协议：
 
 ```
-V1   consumer 的 _native_reachout_perception_context —— 一大段英文
+V1   consumer 的 _native_reachout_perception_context
+     引用 perception_kernel.prompts.V1_GLANCE_HOWTO / V1_BOARD_HOWTO
      一瞥不是待汇报清单 · 最多挑 2-3 件 · 不许念具体数字 ·
      信号偏低时（深夜/悲伤的歌/没睡好）要更轻,别叠加担忧、别下诊断
 
-V2   散在三处：
+V2   三处接线引用同一个内核 owner：
      worker.py `_WAKE_SYSTEM_PROMPT`
        说与不说同等正当 · glance 只是提示 · 最多一个主题 ·
        别把多个感知域变成设备/健康报告 · 用 attention_facts 避免打断和重复
      context.py `_RUNTIME_PERCEPTION_*_POLICY`
-     capabilities/tool_schema.py（工具说明里还有一份读法）
+     capabilities/tool_schema.py（引用 `PERCEPTION_TOOL_NOTES`）
 ```
 
 逐条对照：
@@ -206,29 +223,34 @@ V2   散在三处：
 说与不说同等    V1 无          V2 有
 ```
 
-**没有任何一个地方能一眼看全「感知该怎么读」。**
-这就是内核提取那批要消掉的东西——注意它消的是**散落**，
-不是**内容差异**；差异要不要拉平是另一个产品判断。
+V1/V2 的内容差异是保留的产品语义，不因共用 owner 自动拉平。唯一出处、runtime
+接线与逐字节 golden 的对应关系见 `PERCEPTION_PROMPT_ASSETS.zh.md` 和
+`tests/test_perception_prompt_golden.py`。
 
 ---
 
-## 七、隐私边界：三条线
+## 七、隐私边界：四条线
 
 ```
-① 原始值不落库
-   经纬度 / WiFi 名 / bundle id 在 resolve 阶段就换成标签，原值当场丢弃
+① 精确定位原始值不进状态
+   location_signal 的经纬度 / Wi-Fi BSSID / 完整 placemark 地址在 resolver 中丢弃；
+   只保留 place_label / wifi_label / country / locality 等粗粒度输出
 
-② 未授权 = null，不是 0 也不是空字符串
-   权限判据在 permissions.py，按能力粒度判；
+② app Shortcut 数据是显式持久化面
+   /app_open 与 /app_close 把 app 参数写入 app_name 和事件流；bundle_id 只是 app 的
+   兼容 query alias，不会自动匿名化。可选 category 单独持久化，且只覆盖用户配置的自动化
+
+③ 未授权 = null，不是 0 也不是空字符串
+   权限判据在 perception_kernel/fields.py，perception/permissions.py 保留兼容 re-export；
    注意 step_count 归 steps 管、不归 vitals 管这类细节也在表里
 
-③ 照片走加密信封
+④ 照片走加密信封
    /photo/evaluate 的像素进加密通道，元数据（scene_hint 等）才进感知状态；
    敏感场景（document / id_card / medical / screenshot / private / receipt）
    在 V2 里不再是硬拦截，而是作为**表达策略的输入**交给 agent 判断
 ```
 
-历史数据在读的时候还会**按权限二次遮蔽**（`perception_core.py` 里那层 mask）——
+历史数据在读的时候还会**按权限二次遮蔽**（`perception/perception_read_core.py`）——
 防的是：一条没授权的高排名变化，把「显著变化」的名额占掉，
 挤掉一条真正该看到的。
 
@@ -242,7 +264,8 @@ V2   散在三处：
 趋势      history.read_trend       最近 N 天的滚动基线与偏离
 ```
 
-`history.py` 里还有两个专门给主动回合用的：
+`perception_kernel/history.py` 里还有两个专门给主动回合用的纯计算；
+`perception/history.py` 只保留兼容 re-export：
 
 ```
 notable_changes      从逐日数据里挑出「显著变化」，有 top-N 上限
@@ -273,8 +296,8 @@ cross_domain_recent  跨域看板：位置/媒体/app/健康/天气/心情/提�
      │
      ▼
 ┌──────────────────────────────────────────────────────────┐
-│  算不算一件事  signal_state_v2   事务 + FOR UPDATE + HMAC   │
-│  发事件        differ_v2         7 个叫醒源                 │
+│  纯判据        perception_kernel  字段/时间先后/wake source    │
+│  IO adapter    signal_state_v2 + differ_v2（事务/HMAC/发事件）│
 └──────────────────────────────────────────────────────────┘
      │
      ▼
@@ -286,7 +309,7 @@ cross_domain_recent  跨域看板：位置/媒体/app/健康/天气/心情/提�
      ▼
 ┌────────────────────────┬─────────────────────────────────┐
 │  V2 worker（云上）      │  V1 consumer（自托管 VPS）        │
-│  一瞥 + 三处说明书       │  一瞥 + 一处说明书                │
+│  内核说明书 + V2 协议    │  内核说明书 + V1 投递协议          │
 └────────────────────────┴─────────────────────────────────┘
      │
      ▼
