@@ -577,8 +577,9 @@ lint / dcap ┘
 - **审计 CLI**：`tools/audit_live_cvm.py`——逐行镜像 iOS 审计卡的检查
   （quote 解析、度量、链上授权、证书 pin），任何人可对生产 CVM 复跑。
 - **DCAP 解析器**：`tools/dcap/` Python 参考实现 + 单测。
-- **信封往返测试**：`tools/v1_envelope_roundtrip_test.py` 等，保证
-  Python / iOS / enclave 三方加密实现一致。
+- **信封往返测试**：pytest 互操作守卫持续校验工具侧 BoxSeal 与当前
+  backend/enclave 协议一致；`tools/v1_envelope_roundtrip_test.py` 和
+  `tools/frame_envelope_roundtrip_test.py` 再对本地 chat/frame 服务链路做端到端验证。
 - **运维工具**：`tools/recover_orphan_accounts.py`（重装铸新账号的孤儿
   数据合并，dry-run 优先）、`tools/check_chat_pipeline.py`（链路健康
   检查）。

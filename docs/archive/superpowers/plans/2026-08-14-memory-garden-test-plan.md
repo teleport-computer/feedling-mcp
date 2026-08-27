@@ -1,4 +1,14 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/MEMORY_GARDEN_EXTRACTION_DESIGN.zh.md
+historical_reason: implemented
+---
 # Memory Garden 内核提取 · 测试方案
+
+> **IMPLEMENTED / DO NOT RE-RUN**：本文记录内核提取期的风险、基线和验收证据，
+> 其中路径、分支、失败数和一次性上线关卡不是当前测试入口。现行回归由
+> `docs/testing/TESTING.md`、CI 和聚焦测试持有。文末记录的旧 BoxSeal 工具缺口已于
+> 2026-08-27 修复，并由双向协议互操作测试锁定；保留原文仅作为历史根因证据。
 
 > 配套分支 `feat/memgarden-kernel`（15 个提交）。
 > 本文回答：这次改动的风险面在哪、已经验了什么、**还缺什么**、上线前必须过哪些关。
@@ -364,3 +374,7 @@ enclave，发一条**真实加密**的用户消息：
 > `salt=None` + `nonce=sha256(ek_pub||recipient)` **不兼容**。照它写会静默失败 ——
 > consumer 只报一句「user message has no plaintext content … skipping」，
 > 看不出是封装错了。要抄就抄 `tools/memory_readside_docker_e2e.py` 那份。
+>
+> **后续状态（2026-08-27）**：`v1_envelope_roundtrip_test.py` 与同类 frame 工具均已
+> 改为当前 salt/nonce 契约，且导入不再触发文件或网络副作用。当前代码应以
+> `backend/content_encryption.py` 为权威实现，并由对应 pytest 互操作守卫防止再次漂移。
