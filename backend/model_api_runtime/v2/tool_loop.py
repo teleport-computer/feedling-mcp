@@ -983,7 +983,10 @@ async def run_tool_loop(
     private_read_seen = False
     tagged_image_fallback_active = False
     file_requirement_message_state = [
-        dict(message)
+        {
+            **dict(message),
+            "role": str(message.get("role") or "user"),
+        }
         for message in file_requirement_messages
         if isinstance(message, dict)
     ]
@@ -1300,7 +1303,10 @@ async def run_tool_loop(
                 )
                 transcript.extend(folded)
                 file_requirement_message_state.extend(
-                    dict(message)
+                    {
+                        **dict(message),
+                        "role": str(message.get("role") or "user"),
+                    }
                     for message in folded
                     if isinstance(message, dict)
                 )

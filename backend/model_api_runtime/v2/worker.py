@@ -13527,8 +13527,14 @@ async def process_job(
                     "voice_call_id": call_id,
                     "voice_turn_id": turn_id,
                 }
+        # Coalesced input is user-only but roleless until prompt rendering.
+        # Restore the role for file intent and delivery-language checks.
+        current_user_messages = [
+            {**row, "role": "user"}
+            for row in coalesced
+        ]
         detected_file_requirement = (
-            context.required_file_suffixes(coalesced)
+            context.required_file_suffixes(current_user_messages)
             if lane == "chat"
             else None
         )
@@ -15664,7 +15670,7 @@ async def process_job(
             on_tool_event=chat_tool_activity_callback,
             required_file_suffixes=required_file_suffixes,
             file_requirement_messages=(
-                coalesced
+                current_user_messages
                 if mutation_recovery_barrier is None
                 or recovery_existing_file_delivery
                 else ()

@@ -242,7 +242,11 @@ def test_send_file_is_chat_only_and_invokes_explicit_callback(monkeypatch):
                     {
                         "id": "f1",
                         "name": "send_file",
-                        "args": {"path": "/workspace/计划.md", "revision": 2},
+                        "args": {
+                            "path": "/workspace/计划.md",
+                            "revision": 2,
+                            "completion_message": "文件已经发给你了。",
+                        },
                     }
                 ],
                 "usage": {},
@@ -396,7 +400,11 @@ def test_required_file_turn_offers_only_delivery_pipeline_tools(monkeypatch):
                     {
                         "id": "f1",
                         "name": "send_file",
-                        "args": {"path": "/workspace/summary.md", "revision": 1},
+                        "args": {
+                            "path": "/workspace/summary.md",
+                            "revision": 1,
+                            "completion_message": "文档已生成。",
+                        },
                     }
                 ],
                 "usage": {},
@@ -459,7 +467,11 @@ def test_send_file_cannot_share_a_batch_with_workspace_write(monkeypatch):
                     {
                         "id": "f1",
                         "name": "send_file",
-                        "args": {"path": "/workspace/a.md", "revision": 1},
+                        "args": {
+                            "path": "/workspace/a.md",
+                            "revision": 1,
+                            "completion_message": "File delivered.",
+                        },
                     },
                 ],
                 "usage": {},
@@ -1023,10 +1035,7 @@ def test_canvas_update_compact_delivery_preserves_request_and_corrects_metadata(
     assert [result.call_id for result in validation_exchange.results] == [
         "missing-metadata"
     ]
-    assert (
-        "requires title, subtitle, and completion_message"
-        in validation_exchange.results[0].content
-    )
+    assert "completion_message" in validation_exchange.results[0].content
     assert [event[2] for event in tool_events if event[0] == "missing-metadata"] == [
         "tool_call_started",
         "tool_call_result",
@@ -1278,24 +1287,26 @@ def test_repeated_ordinary_file_target_mismatch_is_not_a_canvas_failure(
                 {
                     "reply": "",
                     "tool_calls": [{
-                        "id": "wrong-file-1",
-                        "name": "send_file",
-                        "args": {
-                            "path": "/workspace/other.md",
-                            "revision": 9,
-                        },
+                    "id": "wrong-file-1",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/other.md",
+                        "revision": 9,
+                        "completion_message": "The file is ready.",
+                    },
                     }],
                     "usage": {},
                 },
                 {
                     "reply": "",
                     "tool_calls": [{
-                        "id": "wrong-file-2",
-                        "name": "send_file",
-                        "args": {
-                            "path": "/workspace/other.md",
-                            "revision": 9,
-                        },
+                    "id": "wrong-file-2",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/other.md",
+                        "revision": 9,
+                        "completion_message": "The file is ready.",
+                    },
                     }],
                     "usage": {},
                 },
@@ -1601,7 +1612,11 @@ def test_empty_file_requirement_requires_any_downloadable_file(monkeypatch):
                 "tool_calls": [{
                     "id": "f1",
                     "name": "send_file",
-                    "args": {"path": "/workspace/工作清单.md", "revision": 1},
+                    "args": {
+                        "path": "/workspace/工作清单.md",
+                        "revision": 1,
+                        "completion_message": "工作清单已经发给你了。",
+                    },
                 }],
                 "usage": {},
             },
@@ -1737,7 +1752,10 @@ def test_late_cancellation_discards_an_already_staged_file(monkeypatch):
                     {
                         "id": "f1",
                         "name": "send_file",
-                        "args": {"path": "/workspace/计划.docx", "revision": 1},
+                        "args": {
+                            "path": "/workspace/计划.docx",
+                            "revision": 1,
+                        },
                     }
                 ],
                 "usage": {},
@@ -1790,7 +1808,11 @@ def test_required_word_file_retries_plain_text_until_docx_is_delivered(monkeypat
                     {
                         "id": "f1",
                         "name": "send_file",
-                        "args": {"path": "/workspace/计划.docx", "revision": 1},
+                        "args": {
+                            "path": "/workspace/计划.docx",
+                            "revision": 1,
+                            "completion_message": "Word 文档已经发给你了。",
+                        },
                     }
                 ],
                 "usage": {},
@@ -1893,7 +1915,11 @@ def test_required_word_file_rejects_markdown_substitution(monkeypatch):
                     {
                         "id": "f1",
                         "name": "send_file",
-                        "args": {"path": "/workspace/计划.md", "revision": 1},
+                        "args": {
+                            "path": "/workspace/计划.md",
+                            "revision": 1,
+                            "completion_message": "已经发给你了。",
+                        },
                     }
                 ],
                 "usage": {},
