@@ -14572,6 +14572,9 @@ async def process_job(
             nonlocal self_thinking_absent_retry_pending
             nonlocal self_thinking_absent_retry_response_seen
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
+            validated_final_reply = isinstance(
+                text, v2_tool_loop.ValidatedFinalReply
+            )
             raw_reply_text = "" if file_reply is not None else str(text or "").strip()
             text = raw_reply_text
             image_replies: list[GeneratedImageReply] = []
@@ -14615,7 +14618,11 @@ async def process_job(
             self_thinking_text = ""
             self_thinking_failed = False
             self_thinking_status = None
-            if (_st_gate_on or self_thinking_on) and file_reply is None and text:
+            if (
+                (_st_gate_on or self_thinking_on)
+                and file_reply is None
+                and text
+            ):
                 _st_split = (
                     self_thinking.strip_all_thinking
                     if _st_gate_on
@@ -14625,10 +14632,11 @@ async def process_job(
                 self_thinking_status = _st_status
                 if _st_status == self_thinking.COMPLETE:
                     text = _st_reply
-                    self_thinking_text = _st_thinking
-                    if _self_thinking_internal_term(self_thinking_text):
-                        self_thinking_text = ""
-                        self_thinking_failed = True
+                    if not validated_final_reply:
+                        self_thinking_text = _st_thinking
+                        if _self_thinking_internal_term(self_thinking_text):
+                            self_thinking_text = ""
+                            self_thinking_failed = True
                 elif _st_status in {self_thinking.SILENT, self_thinking.FAILED}:
                     # Foreground chat must always answer, so both malformed protocol
                     # and a clean thinking-only response keep the pre-existing FAILED
@@ -14778,7 +14786,13 @@ async def process_job(
                     )
                     language_correction_pending = False
                     thinking_language_correction_pending = False
-            elif final and file_reply is None and not image_replies and text:
+            elif (
+                final
+                and file_reply is None
+                and not validated_final_reply
+                and not image_replies
+                and text
+            ):
                 retry_completed = False
                 if self_thinking_absent_retry_pending:
                     self_thinking_absent_retried += 1

@@ -1812,6 +1812,69 @@ def test_chat_self_thinking_absent_final_retries_and_surfaces_complete(
     assert metric == (expected_calls, 7, 10)
 
 
+@pytest.mark.parametrize(
+    "completion",
+    [
+        (
+            "I created and sent the requested autumn file. "
+            "It is ready to download now."
+        ),
+        (
+            "<think>private delivery reasoning</think>"
+            "I created and sent the requested autumn file. "
+            "It is ready to download now."
+        ),
+    ],
+    ids=["plain", "thinking-block-stripped"],
+)
+def test_validated_file_completion_skips_terminal_thinking_rewrite(
+    monkeypatch, completion
+):
+    """A correct English send_file bubble must not re-enter the generic rewrite."""
+
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_file_completion_no_terminal_rewrite"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-file-completion-no-terminal-rewrite")
+    _stub_envelope_build(monkeypatch)
+    visible_completion = (
+        "I created and sent the requested autumn file. "
+        "It is ready to download now."
+    )
+    observed = {}
+
+    async def direct_loop(**kwargs):
+        observed["decision"] = await kwargs["on_reply"](
+            tool_loop.ValidatedFinalReply(completion),
+            final=True,
+        )
+        return worker.v2_tool_loop.LoopOutcome(
+            final_text=visible_completion,
+            rounds=2,
+            stop_reason="final_text",
+            replied_intermediate=True,
+        )
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", direct_loop)
+    deps = _deps(messages=[{
+        "id": "m-file-completion-no-terminal-rewrite",
+        "ts": 10.0,
+        "role": "user",
+        "content": "Please create and send an autumn text file.",
+    }])
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    assert observed["decision"] is None
+    assert [row["body_ct"] for row in _bubbles(uid)] == [visible_completion]
+    assert "thinking_body_ct" not in _bubbles(uid)[0]
+
+
 def test_chat_self_thinking_absent_wrong_language_combines_one_correction(
     monkeypatch,
 ):
