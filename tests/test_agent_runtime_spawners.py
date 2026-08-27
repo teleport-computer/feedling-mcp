@@ -1008,9 +1008,10 @@ def test_pi_default_cli_cmd():
     assert "pi --mode json" in cmd
     # -t bash would ALSO filter out extension-registered tools (pi 0.80.3
     # agent-session.js:1867 filters allCustomTools through isAllowedTool), which
-    # would silently kill the user-MCP bridge. -xt read,edit,write leaves the
-    # same active set (["bash"]) while letting extension tools through.
-    assert "-xt read,edit,write" in cmd
+    # would silently kill the user-MCP bridge. -xt edit,write keeps read available
+    # for io_cli's pull-on-demand image_file results while letting extension tools
+    # through and still disabling pi's file-mutating built-ins.
+    assert "-xt edit,write" in cmd
     assert "-t bash" not in cmd
     # -ne: with no -t, allowedToolNames is undefined and auto-discovered
     # extensions in ~/.pi/agent/extensions/ would get their tools activated by
@@ -1020,20 +1021,23 @@ def test_pi_default_cli_cmd():
     assert "{mcp}" in cmd
 
 
-def test_pi_default_cli_cmd_tool_posture_equals_old_t_bash():
-    """Regression: a pi user with no MCP config must keep the old active set.
+def test_pi_default_cli_cmd_keeps_read_for_pull_on_demand_images():
+    """Regression: pi must be able to view an image_file returned mid-turn.
 
     pi's defaultActiveToolNames is the hardcoded ["read","bash","edit","write"]
-    (sdk.js:131). Excluding read/edit/write leaves exactly ["bash"] — which is
-    what `-t bash` used to produce. Asserting this against the real command
-    (rather than against a literal) is the point: it is what would catch the
-    template drifting away from the posture it is supposed to preserve.
+    (sdk.js:131). io_cli replaces inline image bytes with an image_file plus a
+    Read instruction, so excluding read makes photo-read/screen-read/chat-image
+    structurally unusable even though current-message @path images still work.
+    Asserting this against the rendered command catches that regression while
+    preserving the edit/write deny and the extension-compatible -xt posture.
     """
     cmd = spawners._default_cli_cmd("pi", "/h", model="m")
     excluded = re.search(r"-xt (\S+)", cmd).group(1).split(",")
     # Order within -xt is not semantically meaningful; the SET is.
-    assert set(excluded) == {"read", "edit", "write"}
-    assert {"read", "bash", "edit", "write"} - set(excluded) == {"bash"}
+    assert set(excluded) == {"edit", "write"}
+    assert {"read", "bash", "edit", "write"} - set(excluded) == {"read", "bash"}
+    prompt = spawners.agent_home_files("/h", driver="pi")["/h/agent-tools-prompt.md"]
+    assert "Read tool on that `image_file` path" in prompt
 
 
 def test_pi_default_cli_cmd_omits_model_when_unset():
@@ -1261,7 +1265,7 @@ def test_consumer_env_uses_pi_cli_and_home_for_pi_driver():
         user_id="u_1", home="/h",
     )
     cmd = env["AGENT_CLI_CMD"]
-    assert cmd.startswith("pi --mode json -ne -xt read,edit,write {mcp} ")
+    assert cmd.startswith("pi --mode json -ne -xt edit,write {mcp} ")
     assert "--append-system-prompt /h/agent-tools-prompt.md" in cmd
     assert "--model feedling/qwen-max" in cmd
     assert "--session-id {session_id}" in cmd
