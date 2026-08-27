@@ -9,9 +9,9 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 
 | Lifecycle | Classified documents |
 |---|---:|
-| `current` | 40 |
-| `decision` | 20 |
-| `historical` | 39 |
+| `current` | 43 |
+| `decision` | 22 |
+| `historical` | 41 |
 | `generated` | 1 |
 
 ## current
@@ -24,8 +24,10 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `deploy/DEPLOYMENTS.md`
 - `docs-site/content/docs/architecture.mdx`
 - `docs-site/content/docs/changelog.mdx`
+- `docs-site/content/docs/reliability.mdx`
 - `docs-site/content/docs/self-hosting.mdx`
 - `docs-site/content/docs/workflows/chat.mdx`
+- `docs-site/content/docs/workflows/memory.mdx`
 - `docs-site/content/docs/workflows/perception.mdx`
 - `docs/AGENT_MAILBOX.md`
 - `docs/API_ERRORS.md`
@@ -42,6 +44,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/repository-cleanup/api-product-history.md`
 - `docs/repository-cleanup/hosted-runtime-history.md`
 - `docs/repository-cleanup/memory-perception-history.md`
+- `docs/repository-cleanup/operations-history.md`
 - `docs/repository-cleanup/resident-runtime-history.md`
 - `docs/repository-cleanup/storage-tee-history.md`
 - `docs/superpowers/plans/2026-08-24-io-marketing-website.md`
@@ -71,8 +74,10 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/superpowers/specs/2026-07-21-dual-runtime-v1-v2-coexistence-design.md`
 - `docs/superpowers/specs/2026-07-25-v2-push-parity-design.md`
 - `docs/superpowers/specs/2026-07-31-v2-photo-read-vision-observation-design.md`
+- `docs/superpowers/specs/2026-08-09-health-probe-isolation-design.md`
 - `docs/superpowers/specs/2026-08-10-new-model-api-users-default-v2-design.md`
 - `docs/superpowers/specs/2026-08-12-remove-v2-semantic-compaction-design.md`
+- `docs/superpowers/specs/2026-08-14-cpu-recorder-cycle-timeout-design.md`
 - `docs/superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md`
 - `docs/superpowers/specs/2026-08-17-garden-io-boundary.md`
 - `docs/superpowers/specs/2026-08-24-io-marketing-website-design.md`
@@ -103,7 +108,9 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/archive/superpowers/plans/2026-07-21-dual-runtime-v1-v2-coexistence.md`
 - `docs/archive/superpowers/plans/2026-07-25-v2-push-parity.md`
 - `docs/archive/superpowers/plans/2026-07-31-v2-photo-read-vision-observation.md`
+- `docs/archive/superpowers/plans/2026-08-09-health-probe-isolation.md`
 - `docs/archive/superpowers/plans/2026-08-10-new-model-api-users-default-v2.md`
+- `docs/archive/superpowers/plans/2026-08-14-cpu-recorder-cycle-timeout.md`
 - `docs/archive/superpowers/plans/2026-08-14-memory-garden-kernel.md`
 - `docs/archive/superpowers/plans/2026-08-14-memory-garden-test-plan.md`
 - `docs/archive/superpowers/plans/2026-08-14-runtime-v2-three-pool-slot-isolation.md`
