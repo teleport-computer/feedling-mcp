@@ -57,6 +57,13 @@ _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
 _WEEKDAYS_EN = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 _WEEKDAYS_ZH = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+DEFAULT_FAILURE_FALLBACK_ZH = (
+    "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。"
+)
+DEFAULT_FAILURE_FALLBACK_EN = (
+    "I'm running slow and didn't catch that one. Send it again in a bit — "
+    "I'll pick it up."
+)
 
 
 def _policy(language: str, source: str, *, confidence: float = 0.0, evidence_chars: int = 0) -> ReplyLanguagePolicy:
@@ -299,6 +306,22 @@ def reply_language_system_line(policy: ReplyLanguagePolicy, *, proactive: bool =
         "本轮用户最新消息如果明显使用另一种语言，就用那种语言回复；如果最新消息混合、不明确、主要是引用/上下文，或这是主动/后台回复，就使用简体中文。"
         "不要被记忆卡、OCR、时间戳或内部上下文带偏回复语言。引用、名字和用户指定的翻译目标语言保持原样。"
     )
+
+
+def failure_fallback_reply(
+    policy: ReplyLanguagePolicy,
+    *,
+    zh: str = DEFAULT_FAILURE_FALLBACK_ZH,
+    en: str = DEFAULT_FAILURE_FALLBACK_EN,
+) -> str:
+    """Choose the visible failure fallback from the same reply policy.
+
+    Callers may preserve their existing environment overrides by passing both
+    rendered strings.  Language selection remains shared with the system-prompt
+    policy so a failed turn cannot silently switch language.
+    """
+
+    return en if policy.language == "en" else zh
 
 
 def _age_text(seconds: float, language: str) -> str:

@@ -7,6 +7,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from chat.reply_language import (  # noqa: E402
+    DEFAULT_FAILURE_FALLBACK_EN,
+    DEFAULT_FAILURE_FALLBACK_ZH,
+    failure_fallback_reply,
     format_time_anchor,
     infer_reply_language_policy,
     reply_language_system_line,
@@ -73,6 +76,14 @@ def test_reply_language_system_line_uses_default_policy_not_absolute_pin():
     assert "Default reply language: English" in line
     assert "latest message is clearly in another language" in line
     assert "memory cards, OCR, timestamps" in line
+
+
+def test_failure_fallback_reply_selects_paired_shared_copy():
+    en = infer_reply_language_policy({}, [], locale="en-US")
+    zh = infer_reply_language_policy({}, [], locale="zh-Hans-CN")
+
+    assert failure_fallback_reply(en) == DEFAULT_FAILURE_FALLBACK_EN
+    assert failure_fallback_reply(zh) == DEFAULT_FAILURE_FALLBACK_ZH
 
 
 def test_time_anchor_formats_in_policy_language():

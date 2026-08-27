@@ -42,6 +42,13 @@ change must not be interpreted as an API guarantee.
   is invalid, and report an incomplete card delivery as a Canvas delivery issue
   instead of a model connection failure.
 
+- **Hosted Runtime V2 Chat now receives the same localized reply-language
+  policy as proactive wakes.** The account locale or archive language supplies
+  the default while a clearly different latest user message can still select
+  its own language. Generic degraded and terminal-failure replies now follow
+  the same English or Simplified Chinese default instead of always falling back
+  to Chinese; self-hosted deployments can override the two copies separately.
+
 - **Hosted Runtime V2 Chat now makes one bounded correction attempt when a
   final reply omits its self-authored thinking block.** The correction is
   text-only, reuses the existing `<think>` contract without asking the model to
