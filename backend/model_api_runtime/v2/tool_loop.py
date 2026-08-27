@@ -410,6 +410,25 @@ def _serialized_chars(value) -> int | None:
         return None
 
 
+def _tool_args_char_limit(tc: ToolCall, default_limit: int) -> int:
+    """Allow one schema-bounded Canvas body through the generic tool guard."""
+    if (
+        tc.name == "workspace_write"
+        and tc.args_ok
+        and str(tc.args.get("path") or "").strip().casefold().endswith(".io.html")
+        and tool_schema.validate_tool_args(tc.name, tc.args) is None
+    ):
+        serialized_size = _serialized_chars(tc.args)
+        if serialized_size is not None:
+            # The closed tool schema and its capability-level UTF-8 check are
+            # authoritative here. Derive the allowance from this exact parsed
+            # argument object: JSON escaping grows with quote/backslash density,
+            # so a fixed additive allowance would silently narrow the 256KB
+            # source contract when a future output budget reaches that boundary.
+            return max(default_limit, serialized_size)
+    return default_limit
+
+
 def _truncate_result_content(content: str, cap: int, *, marker: str = _RESULT_TRUNCATION_MARKER) -> str:
     """Deterministically cap one result, including the truncation marker."""
     text = str(content or "")
@@ -662,6 +681,15 @@ class ProviderEmptyReply(RuntimeError):
     """A structurally valid provider success had no foreground-usable output."""
 
 
+class ProviderOutputTruncated(RuntimeError):
+    """A provider stopped while serializing a tool call at its output limit."""
+
+    reason = "output_truncated"
+
+    def __init__(self):
+        super().__init__(self.reason)
+
+
 class FileDeliveryIncomplete(RuntimeError):
     """A requested attachment was saved but still failed bounded delivery."""
 
@@ -839,6 +867,7 @@ async def run_tool_loop(
     max_assistant_tool_text_chars: int = DEFAULT_MAX_ASSISTANT_TOOL_TEXT_CHARS,
     prompt_context_window_overrides=None,
     prompt_output_reserve_tokens: int = prompt_frontier.DEFAULT_OUTPUT_RESERVE_TOKENS,
+    file_output_max_tokens: int = provider_client.CHAT_OUTPUT_MAX_TOKENS,
     prompt_safety_margin_tokens: int | None = None,
     prompt_estimator_utf8_bytes_per_token: float = prompt_frontier.DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN,
     prompt_image_reserve_tokens: int = prompt_frontier.DEFAULT_IMAGE_RESERVE_TOKENS,
@@ -931,6 +960,10 @@ async def run_tool_loop(
     max_assistant_tool_text_chars = _positive_limit(
         max_assistant_tool_text_chars,
         name="max_assistant_tool_text_chars",
+    )
+    file_output_max_tokens = _positive_limit(
+        file_output_max_tokens,
+        name="file_output_max_tokens",
     )
     normalized_empty_response_correction = str(
         empty_response_correction or _EMPTY_RESPONSE_CORRECTION
@@ -2056,13 +2089,14 @@ async def run_tool_loop(
                 # generated document inside workspace_write arguments. The
                 # provider client's historical 700-token default predates V2
                 # tools and truncates even modest documents into malformed
-                # JSON. Use the output budget already reserved by V2's prompt
-                # frontier; wake/child/screen lanes omit on_file_reply and keep
-                # their existing limits unchanged.
+                # JSON. File generation owns a separate output budget: the
+                # prompt frontier's reserve is input accounting, and increasing
+                # it would silently evict otherwise usable history. Wake/child/
+                # screen lanes omit on_file_reply and keep their existing limits.
                 provider_kwargs["max_tokens"] = (
-                    min(prompt_output_reserve_tokens, 512)
+                    min(file_output_max_tokens, 512)
                     if compact_delivery_phase
-                    else prompt_output_reserve_tokens
+                    else file_output_max_tokens
                 )
             if on_provider_tool_surface is not None:
                 candidate_names = {
@@ -2972,16 +3006,38 @@ async def run_tool_loop(
             (_serialized_chars(tc.args) if tc.args_ok else len(str(tc.args_raw or "")))
             for tc in pr.tool_calls
         ]
+        argument_limits = [
+            _tool_args_char_limit(tc, max_tool_args_chars)
+            for tc in pr.tool_calls
+        ]
+        batch_arguments_limit = max_tool_batch_args_chars
+        native_assistant_turn_limit = max_native_assistant_turn_chars
+        if (
+            len(pr.tool_calls) == 1
+            and argument_limits
+            and argument_limits[0] > max_tool_args_chars
+        ):
+            batch_arguments_limit = max(
+                batch_arguments_limit,
+                argument_limits[0],
+            )
+            native_assistant_turn_limit = max(
+                native_assistant_turn_limit,
+                argument_limits[0] + max_assistant_tool_text_chars + 8192,
+            )
         native_turn_size = (
             _serialized_chars(pr.assistant_turn.payload)
             if pr.assistant_turn is not None
             else 0
         )
         oversized_tool_exchange = (
-            any(size is None or size > max_tool_args_chars for size in argument_sizes)
-            or sum(size or 0 for size in argument_sizes) > max_tool_batch_args_chars
+            any(
+                size is None or size > limit
+                for size, limit in zip(argument_sizes, argument_limits)
+            )
+            or sum(size or 0 for size in argument_sizes) > batch_arguments_limit
             or native_turn_size is None
-            or native_turn_size > max_native_assistant_turn_chars
+            or native_turn_size > native_assistant_turn_limit
             or len(pr.text) > max_assistant_tool_text_chars
         )
         over_tool_call_budget = (
@@ -3018,6 +3074,10 @@ async def run_tool_loop(
             (terminal_text_round and bool(pr.tool_calls))
             or bool(pr.media)
             or any(individual_rejection_reasons)
+        )
+        truncated_tool_arguments = (
+            provider_client.is_token_limit_stop_reason(raw_finish_reason)
+            and any(not tc.args_ok for tc in pr.tool_calls)
         )
         image_reply_calls = [
             tc for tc in pr.tool_calls if tc.name == tool_schema.IMAGE_REPLY_TOOL
@@ -3060,25 +3120,26 @@ async def run_tool_loop(
             batch_rejection_reasons.append("invalid_stay_silent_batch")
         if over_tool_call_budget:
             batch_rejection_reasons.append("tool_call_budget_exceeded")
-        if sum(size or 0 for size in argument_sizes) > max_tool_batch_args_chars:
+        if sum(size or 0 for size in argument_sizes) > batch_arguments_limit:
             batch_rejection_reasons.append("tool_batch_arguments_too_large")
         if (
             native_turn_size is None
-            or native_turn_size > max_native_assistant_turn_chars
+            or native_turn_size > native_assistant_turn_limit
         ):
             batch_rejection_reasons.append("native_assistant_turn_too_large")
         if len(pr.text) > max_assistant_tool_text_chars:
             batch_rejection_reasons.append("assistant_tool_text_too_large")
         call_rejection_reasons: list[str] = []
-        for tc, argument_size, individual_reasons in zip(
+        for tc, argument_size, argument_limit, individual_reasons in zip(
             pr.tool_calls,
             argument_sizes,
+            argument_limits,
             individual_rejection_reasons,
         ):
             reasons = list(individual_reasons)
             if tc.id in duplicate_call_ids:
                 reasons.append("duplicate_tool_call_id")
-            if argument_size is None or argument_size > max_tool_args_chars:
+            if argument_size is None or argument_size > argument_limit:
                 reasons.append("tool_arguments_too_large")
             reasons.extend(batch_rejection_reasons)
             call_rejection_reasons.append(
@@ -3105,6 +3166,25 @@ async def run_tool_loop(
             # rejected for the same reason: the bubble cannot truthfully claim
             # success before the later sink commits. The model may mutate in one
             # round and reply only after observing its result in the next.
+            # A provider that explicitly reports its output-token limit while
+            # returning unparseable tool arguments stopped in the middle of the
+            # JSON payload. Retrying the same artifact with the same budget
+            # cannot repair it and rewrites the real cause as a tool-usage error.
+            # Fail once with content-free evidence; no partial call is executed.
+            if truncated_tool_arguments:
+                await _trajectory(
+                    "provider_output_truncated",
+                    {
+                        "round": attempts,
+                        "reason": "output_truncated",
+                        "finish_reason": provider_client.normalize_stop_reason(
+                            raw_finish_reason
+                        ),
+                        "malformed_tool_arguments": True,
+                        "retry": False,
+                    },
+                )
+                raise ProviderOutputTruncated()
             if attempts >= max_calls:
                 break
             transcript.append(

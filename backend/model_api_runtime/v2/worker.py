@@ -224,6 +224,8 @@ async def _record_provider_failure(
 
 
 def _provider_health_error_class(exc: BaseException) -> str:
+    if isinstance(exc, v2_tool_loop.ProviderOutputTruncated):
+        return "provider_output_truncated"
     if isinstance(exc, v2_tool_loop.ProviderEmptyReply):
         return "provider_empty_reply"
     return provider_health.error_class_for_exception(exc)
@@ -494,6 +496,13 @@ except ValueError as exc:
     raise RuntimeError("FEEDLING_V2_PROMPT_CONTEXT_WINDOWS_JSON is invalid") from exc
 PROMPT_OUTPUT_RESERVE_TOKENS = _positive_int_env(
     "FEEDLING_V2_PROMPT_OUTPUT_RESERVE_TOKENS", "4096"
+)
+# File-capable foreground calls may serialize a complete document inside one
+# tool call. This is deliberately independent of PROMPT_OUTPUT_RESERVE_TOKENS:
+# that older knob is subtracted from the input context window, so raising it to
+# fix file output would silently discard conversation history.
+FILE_OUTPUT_MAX_TOKENS = _positive_int_env(
+    "FEEDLING_V2_FILE_OUTPUT_MAX_TOKENS", "32768"
 )
 PROMPT_SAFETY_MARGIN_TOKENS = _nonnegative_int_env(
     "FEEDLING_V2_PROMPT_SAFETY_MARGIN_TOKENS", "1024"
@@ -1618,6 +1627,8 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
         kind = candidate if candidate in notices_catalog.ERROR_CLASSES else "error"
     elif isinstance(exc, v2_tool_loop.ProviderEmptyReply):
         kind = "empty_reply"
+    elif isinstance(exc, v2_tool_loop.ProviderOutputTruncated):
+        kind = "output_truncated"
     elif isinstance(exc, v2_tool_loop.CanvasDeliveryIncomplete):
         kind = "canvas_file_delivery_incomplete"
     elif isinstance(exc, v2_tool_loop.FileDeliveryIncomplete):
@@ -1770,6 +1781,8 @@ def _turn_failure_error_class(exc: BaseException) -> str:
         return "context_overflow"
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
         return "provider_timeout"
+    if isinstance(exc, v2_tool_loop.ProviderOutputTruncated):
+        return "provider_output_truncated"
     if (
         isinstance(exc, v2_tool_loop.ProviderEmptyReply)
         or (isinstance(exc, TurnError) and str(exc) == "empty_reply")
@@ -16094,6 +16107,7 @@ async def process_job(
             max_assistant_tool_text_chars=MAX_ASSISTANT_TOOL_TEXT_CHARS,
             prompt_context_window_overrides=PROMPT_CONTEXT_WINDOW_OVERRIDES,
             prompt_output_reserve_tokens=PROMPT_OUTPUT_RESERVE_TOKENS,
+            file_output_max_tokens=FILE_OUTPUT_MAX_TOKENS,
             prompt_safety_margin_tokens=PROMPT_SAFETY_MARGIN_TOKENS,
             prompt_estimator_utf8_bytes_per_token=(
                 PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
