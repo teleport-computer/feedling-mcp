@@ -28,7 +28,7 @@ def _model_limit(context_window_tokens: int = 2_048) -> frontier.ModelPromptLimi
 
 
 _REAL_TOOL_COUNT = 69
-_REAL_TOOL_CATALOG_BYTES = 36_081
+_REAL_TOOL_CATALOG_BYTES = 36_426
 
 
 def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
@@ -68,6 +68,9 @@ def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
     The 2026-08-25 increase to 36,081 records the model-authored Canvas
     completion message contract, which adds 390 bytes without changing the tool
     count.
+    The T325 increase to 36,426 records the bounded proactive Canvas-offer
+    contract, which adds 345 bytes without changing the tool count or the
+    captured MCP description padding.
     """
     platform = list(tool_schema.build_tool_specs())
     mcp_count = _REAL_TOOL_COUNT - len(platform)
