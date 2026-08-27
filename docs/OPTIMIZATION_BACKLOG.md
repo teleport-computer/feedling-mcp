@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # 优化清单（技术债 backlog）
 
 > 基于 2026-06-10 的代码现状梳理（branch: test）。按"结构性瓶颈 → 性能 →
