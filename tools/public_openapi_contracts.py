@@ -1598,12 +1598,11 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "limit": {"type": "integer", "minimum": 0, "description": "0 or omitted requests the deployment hard cap."},
             "bucket": {"type": "string", "maxLength": 120},
             "thread": {"type": "string", "maxLength": 120},
-            "include_sensitive": {"type": "boolean", "default": False},
             "ambient": {"type": "boolean", "default": False},
             "ambient_top_n": {"type": "integer", "minimum": 1},
         },
         "additionalProperties": False,
-        "example": {"limit": 50, "bucket": "Collaboration", "thread": "communication style", "include_sensitive": False},
+        "example": {"limit": 50, "bucket": "Collaboration", "thread": "communication style"},
     },
     "MemoryFetchRequest": {
         "type": "object",
@@ -1611,21 +1610,6 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "properties": {
             "ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
             "limit": {"type": "integer", "minimum": 0},
-            "user_explicit_selection": {
-                "type": "boolean",
-                "default": False,
-                "description": (
-                    "True only when the user explicitly selected these exact IDs. "
-                    "Required together with include_sensitive to return sensitive content."
-                ),
-            },
-            "include_sensitive": {
-                "type": "boolean",
-                "default": False,
-                "description": (
-                    "Include sensitive content only when user_explicit_selection is also true."
-                ),
-            },
             "include_archived": {"type": "boolean", "default": False},
             "include_superseded": {"type": "boolean", "default": False},
         },
@@ -2506,11 +2490,10 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/chat/turn-activity/{turn_id}/events"): "Append one authenticated V1 resident tool transition. This endpoint is used by the shipped resident io_cli runtime, accepts only running/success/failure plus display-safe fixed metadata, rejects V2-owned users, and never accepts tool arguments, model prose, or result bodies.",
     ("post", "/v1/memory/index"): "Return lightweight memory cards. This is selection, not full-content retrieval; query is intentionally not exposed because it is not a search filter today.",
     ("post", "/v1/memory/fetch"): (
-        "Fetch full records for selected memory IDs in request order. Sensitive "
-        "content requires both include_sensitive and user_explicit_selection; "
-        "ambient, profile, and maintenance reads retain their normal filter. "
-        "Inspect the truncation object instead of assuming every requested ID "
-        "was processed."
+        "Fetch full records for selected memory IDs in request order. All shared "
+        "cards use the same read contract; legacy card-classification metadata is "
+        "ignored. Inspect the truncation object instead of assuming every "
+        "requested ID was processed."
     ),
     ("post", "/v1/memory/actions"): "Apply up to 20 memory actions independently and in order. Full or partial applied success returns HTTP 200. When no action is applied and at least one fails, HTTP 400 promotes the first failed item's error/detail while preserving every result and all counts. An all-skipped batch remains 200. The batch is not transactional and Idempotency-Key is not supported.",
     ("post", "/v1/perception/report"): "Submit device context. Sensitive signals must use encrypted envelopes; inspect each results entry even when HTTP status is 200.",

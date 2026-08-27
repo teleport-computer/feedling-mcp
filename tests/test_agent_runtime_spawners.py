@@ -646,6 +646,16 @@ def test_openclaw_feedling_plugin_declares_native_memory_screen_tools_with_costs
     assert "[fast caption, slow image] Read the decrypted caption/ocr" in text
 
 
+def test_openclaw_memory_index_does_not_advertise_retired_sensitive_flag():
+    """The native tool schema and io_cli argv mapping must retire together."""
+    plugin = Path(__file__).parent.parent / "deploy" / "openclaw-plugins" / "feedling-io-tools" / "index.js"
+    text = plugin.read_text()
+    memory_index = text.split("// memory.index", 1)[1].split("// memory.fetch", 1)[0]
+
+    assert "include_sensitive" not in memory_index
+    assert "--include-sensitive" not in memory_index
+
+
 def test_consumer_env_claude_deepseek_points_at_anthropic_compat_endpoint():
     # deepseek runs on the claude (Anthropic-wire) driver but is NOT anthropic:
     # the CLI must be pointed at deepseek's /anthropic-compatible endpoint + its

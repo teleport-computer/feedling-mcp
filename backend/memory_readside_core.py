@@ -303,6 +303,19 @@ def _ordered_items(items: list[dict], candidates: list[dict], limit: int) -> lis
     )[:limit]
 
 
+def _public_memory_item(item: dict) -> dict:
+    """Strip retired card-classification fields at the backend boundary.
+
+    During a rolling deploy an older enclave may still return these legacy
+    keys. Stored rows may also retain them until they are naturally rewritten.
+    Neither case may recreate the removed API concept.
+    """
+    clean = dict(item)
+    for key in ("is_sensitive", "sensitivity_class", "sensitive_scope"):
+        clean.pop(key, None)
+    return clean
+
+
 def _memory_index_partition(
     api_key: str | None,
     candidates: list[dict],
@@ -321,8 +334,6 @@ def _memory_index_partition(
     local_items, _local_unavailable = _local_memory_items(
         plaintext, owner_user_id, item_builder=builder)
     local_items = enclave_readside.memory_index_filter_items(local_items, payload)
-    if not bool(payload.get("include_sensitive", False)):
-        local_items = [item for item in local_items if not item.get("is_sensitive")]
 
     sealed_items: list[dict] = []
     if sealed:
@@ -332,7 +343,11 @@ def _memory_index_partition(
             operation="index",
             payload=payload,
         )
-        sealed_items = response.get("items") if isinstance(response.get("items"), list) else []
+        sealed_items = [
+            _public_memory_item(item)
+            for item in response.get("items", [])
+            if isinstance(item, dict)
+        ]
     items = _ordered_items(local_items + sealed_items, candidates, int(payload["limit"]))
     for item in items:
         item.pop("_search_content", None)
@@ -374,7 +389,6 @@ def memory_index_core(
             "ambient": ambient,
             "bucket": str(payload.get("bucket") or "")[:120],
             "thread": str(payload.get("thread") or "")[:120],
-            "include_sensitive": bool(payload.get("include_sensitive", False)),
             "limit": limit,
             "query": query,
     }
@@ -429,14 +443,6 @@ def memory_fetch_core(
     ids = requested_ids[:limit]
     include_archived = _bool_payload(payload.get("include_archived"))
     include_superseded = _bool_payload(payload.get("include_superseded"))
-    # ``include_sensitive`` existed at several internal call sites while fetch
-    # historically ignored it.  Activating it globally would silently broaden
-    # profile and Dream/Capture provider inputs.  Require the explicit user
-    # selection context so this task changes only Garden "Talk in Chat".
-    include_sensitive = (
-        _bool_payload(payload.get("include_sensitive"))
-        and _bool_payload(payload.get("user_explicit_selection"))
-    )
     moments = memory_service._load_moments(store)
     by_id = {m.get("id"): m for m in moments if isinstance(m, dict)}
     missing_ids: list[str] = []
@@ -463,13 +469,6 @@ def memory_fetch_core(
         store.user_id,
         item_builder=enclave_readside.build_memory_fetch_item,
     )
-    if not include_sensitive:
-        local_unavailable.extend(
-            str(item.get("id") or "")
-            for item in local_items
-            if item.get("is_sensitive") and str(item.get("id") or "")
-        )
-        local_items = [item for item in local_items if not item.get("is_sensitive")]
     response = {"items": [], "unavailable_ids": []}
     if sealed:
         response = (post_enclave or post_enclave_readside)(
@@ -479,31 +478,17 @@ def memory_fetch_core(
             payload={
                 "ids": [m.get("id") for m in sealed],
                 "limit": limit,
-                "include_sensitive": include_sensitive,
             },
         )
     enclave_unavailable = response.get("unavailable_ids") if isinstance(response.get("unavailable_ids"), list) else []
-    blocked_sensitive = response.get("blocked_sensitive_ids") if isinstance(response.get("blocked_sensitive_ids"), list) else []
     unavailable_ids.extend(invalid_ids)
     unavailable_ids.extend(local_unavailable)
     unavailable_ids.extend(str(mid) for mid in enclave_unavailable if isinstance(mid, str))
-    unavailable_ids.extend(str(mid) for mid in blocked_sensitive if isinstance(mid, str))
-    response_items = (
-        response.get("items") if isinstance(response.get("items"), list) else []
-    )
-    if not include_sensitive:
-        unavailable_ids.extend(
-            str(item.get("id") or "")
-            for item in response_items
-            if isinstance(item, dict)
-            and item.get("is_sensitive")
-            and str(item.get("id") or "")
-        )
-        response_items = [
-            item
-            for item in response_items
-            if not isinstance(item, dict) or not item.get("is_sensitive")
-        ]
+    response_items = [
+        _public_memory_item(item)
+        for item in response.get("items", [])
+        if isinstance(item, dict)
+    ]
     items_by_id = {
         item.get("id"): item
         for item in local_items + response_items

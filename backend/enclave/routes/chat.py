@@ -450,17 +450,15 @@ async def v1_chat_history(request: Request):
             quoted_ids = _quoted_memory_ids(hist.get("messages", []))
             if quoted_ids:
                 # User-selected cards are an exact lookup, not part of the
-                # ranked auto-recall candidate pool.  All three lifecycle/trust
-                # flags are intentional: an explicit Garden click authorizes
-                # the model to see sensitive, archived, and superseded cards.
+                # ranked auto-recall candidate pool.  Both lifecycle flags are
+                # intentional: an explicit Garden click authorizes the model to
+                # see archived and superseded cards.
                 quoted_fetch_task = asyncio.create_task(backend_client.backend_post(
                     "/v1/memory/fetch",
                     ctx.forward_headers,
                     {
                         "ids": quoted_ids,
                         "limit": len(quoted_ids),
-                        "user_explicit_selection": True,
-                        "include_sensitive": True,
                         "include_archived": True,
                         "include_superseded": True,
                     },

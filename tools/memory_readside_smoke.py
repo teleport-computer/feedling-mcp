@@ -15,7 +15,7 @@ import urllib.error
 import urllib.request
 
 
-BLOCKED_INDEX_FIELDS = {"verbatim", "her_quote", "follow_up", "sensitive_scope"}
+BLOCKED_INDEX_FIELDS = {"verbatim", "her_quote", "follow_up"}
 
 
 def _post_json(base_url: str, path: str, api_key: str, body: dict) -> dict:
@@ -56,7 +56,6 @@ def _print_index(items: list[dict]) -> None:
         print(
             f"{idx:02d}. {item.get('id', '')} | "
             f"salience={item.get('salience', 'medium')} | "
-            f"sensitive={item.get('is_sensitive', False)} | "
             f"score={item.get('score', 0)}"
         )
         print(f"    summary: {_clip(item.get('summary'))}")
@@ -83,8 +82,6 @@ def _print_fetch(items: list[dict], missing_ids: list[str], unavailable_ids: lis
             print(f"    follow  : {_clip(item.get('follow_up'))}")
         if item.get("context"):
             print(f"    context : {_clip(item.get('context'))}")
-        if "sensitive_scope" in item:
-            print("    FAIL: fetch leaked concrete sensitive_scope")
 
 
 def _print_acceptance(index_items: list[dict], fetch_body: dict) -> None:
@@ -104,7 +101,7 @@ def _print_acceptance(index_items: list[dict], fetch_body: dict) -> None:
             """
             人话：
             - index_count > 0：说明 agent 能先看到记忆目录。
-            - index_no_raw_quote=PASS：说明目录没有暴露原话/敏感 scope。
+            - index_no_raw_quote=PASS：说明目录没有暴露原话。
             - fetch_count > 0：说明 agent 可以按 id 拿到正文。
             - unavailable_ids 有值：通常是 local_only、无 K_enclave、被归档、或解密失败。
             """

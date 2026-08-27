@@ -150,7 +150,7 @@ def test_memory_index_exposes_partition_and_sensitivity_filters_without_offset()
     )
 
     assert set(spec.parameters["properties"]) == {
-        "limit", "bucket", "thread", "ambient", "include_sensitive"
+        "limit", "bucket", "thread", "ambient"
     }
     assert "offset" not in spec.parameters["properties"]
     assert tool_schema.validate_tool_args(
@@ -487,7 +487,7 @@ def test_wake_memory_write_surface_removes_only_delete_without_mutating_chat():
 
 def test_memory_search_shares_the_index_filters_it_already_consumes():
     """memory_search 和 memory_index 共用 memory_index_core,那个 core 一直在消费
-    bucket / thread / include_sensitive —— index 的 schema 开了,search 漏了。
+    bucket / thread —— index 的 schema 开了,search 漏了。
 
     后果:搜索不能限定在某个桶或某条线索里,只能拿回宽泛结果自己挑。
     V1 的 `memory-index --query` 本来可以组合这些条件,V2 拆成 search 之后丢了。
@@ -500,11 +500,11 @@ def test_memory_search_shares_the_index_filters_it_already_consumes():
     )
 
     assert set(spec.parameters["properties"]) == {
-        "query", "limit", "bucket", "thread", "include_sensitive"
+        "query", "limit", "bucket", "thread"
     }
     assert tool_schema.validate_tool_args(
         "memory_search",
-        {"query": "骑行", "bucket": "爱好", "thread": "自行车", "include_sensitive": True},
+        {"query": "骑行", "bucket": "爱好", "thread": "自行车"},
     ) is None
 
 

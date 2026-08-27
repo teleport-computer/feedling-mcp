@@ -149,7 +149,7 @@ def test_index_core_prefilters_sorts_caps_and_reports_card_count(monkeypatch):
 
     assert captured["api_key"] == "key_core"
     assert captured["operation"] == "index"
-    assert captured["payload"]["include_sensitive"] is False
+    assert "include_sensitive" not in captured["payload"]
     assert len(captured["ids"]) == 50
     assert captured["ids"][:2] == ["high_new", "open_old"]
     assert body["user_card_count"] == 62
@@ -404,12 +404,12 @@ def test_fetch_core_reports_limit_truncation_instead_of_silent_slicing(monkeypat
         }
 
 
-def test_fetch_core_explicit_quote_includes_sensitive_archived_and_superseded(
+def test_fetch_core_explicit_quote_includes_archived_and_superseded(
     monkeypatch,
 ):
     store = types.SimpleNamespace(user_id="usr_core")
     moments = [
-        _moment("sensitive"),
+        _moment("current"),
         _moment("archived", archived=True),
         _moment("superseded", status="superseded"),
     ]
@@ -425,118 +425,71 @@ def test_fetch_core_explicit_quote_includes_sensitive_archived_and_superseded(
                 {
                     "id": moment["id"],
                     "summary": moment["id"],
-                    "is_sensitive": moment["id"] == "sensitive",
+                    # Simulate an older enclave during a rolling deploy. The
+                    # backend must not let retired metadata recreate the API.
+                    "is_sensitive": moment["id"] == "current",
+                    "sensitivity_class": "private" if moment["id"] == "current" else "",
                 }
                 for moment in candidates
             ],
             "unavailable_ids": [],
-            "blocked_sensitive_ids": [],
         }
 
     body = readside_core.memory_fetch_core(
         store,
         "key_core",
         {
-            "ids": ["sensitive", "archived", "superseded"],
-            "user_explicit_selection": True,
-            "include_sensitive": True,
+            "ids": ["current", "archived", "superseded"],
             "include_archived": True,
             "include_superseded": True,
         },
         post_enclave=fake_enclave,
     )
 
-    assert captured["ids"] == ["sensitive", "archived", "superseded"]
-    assert captured["payload"]["include_sensitive"] is True
+    assert captured["ids"] == ["current", "archived", "superseded"]
+    assert captured["payload"] == {
+        "ids": ["current", "archived", "superseded"],
+        "limit": 1000,
+    }
     assert [item["id"] for item in body["items"]] == captured["ids"]
+    assert all("is_sensitive" not in item for item in body["items"])
+    assert all("sensitivity_class" not in item for item in body["items"])
     assert body["missing_ids"] == []
     assert body["unavailable_ids"] == []
 
 
-def test_fetch_core_include_sensitive_also_applies_to_plaintext_tier(monkeypatch):
+def test_fetch_core_ignores_legacy_classification_in_plaintext_tier(monkeypatch):
     store = types.SimpleNamespace(user_id="usr_core")
-    sensitive = _plaintext_moment("plain_sensitive", "private")
-    sensitive["body"] = __import__("json").dumps({
+    legacy = _plaintext_moment("plain_legacy", "private")
+    legacy["body"] = __import__("json").dumps({
         "summary": "private",
         "content": "private body",
         "bucket": "未分类",
         "threads": [],
         "is_sensitive": True,
+        "sensitivity_class": "private",
+        "sensitive_scope": "old_scope",
     })
     monkeypatch.setattr(
-        readside_core.memory_service, "_load_moments", lambda _store: [sensitive]
+        readside_core.memory_service, "_load_moments", lambda _store: [legacy]
     )
     monkeypatch.setattr(readside_core.memory_service, "_save_moments", lambda *_args: None)
 
     body = readside_core.memory_fetch_core(
         store,
         None,
-        {
-            "ids": ["plain_sensitive"],
-            "user_explicit_selection": True,
-            "include_sensitive": True,
-        },
+        {"ids": ["plain_legacy"]},
         post_enclave=lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("plaintext tier must not call enclave")
         ),
     )
 
-    assert [item["id"] for item in body["items"]] == ["plain_sensitive"]
+    assert [item["id"] for item in body["items"]] == ["plain_legacy"]
+    assert all(
+        key not in body["items"][0]
+        for key in ("is_sensitive", "sensitivity_class", "sensitive_scope")
+    )
     assert body["unavailable_ids"] == []
-
-
-def test_fetch_core_legacy_include_sensitive_flag_does_not_broaden_provider_reads(
-    monkeypatch,
-):
-    store = types.SimpleNamespace(user_id="usr_core")
-    sensitive = _moment("sealed_sensitive")
-    monkeypatch.setattr(
-        readside_core.memory_service, "_load_moments", lambda _store: [sensitive]
-    )
-
-    body = readside_core.memory_fetch_core(
-        store,
-        "key_core",
-        {"ids": ["sealed_sensitive"], "include_sensitive": True},
-        post_enclave=lambda *_args, **_kwargs: {
-            "items": [{
-                "id": "sealed_sensitive",
-                "summary": "private",
-                "is_sensitive": True,
-            }],
-            "unavailable_ids": [],
-        },
-    )
-
-    assert body["items"] == []
-    assert body["unavailable_ids"] == ["sealed_sensitive"]
-
-
-def test_fetch_core_explicit_selection_marker_alone_does_not_include_sensitive(
-    monkeypatch,
-):
-    store = types.SimpleNamespace(user_id="usr_core")
-    sensitive = _moment("sealed_sensitive")
-    monkeypatch.setattr(
-        readside_core.memory_service, "_load_moments", lambda _store: [sensitive]
-    )
-
-    body = readside_core.memory_fetch_core(
-        store,
-        "key_core",
-        {"ids": ["sealed_sensitive"], "user_explicit_selection": True},
-        post_enclave=lambda *_args, **_kwargs: {
-            "items": [{
-                "id": "sealed_sensitive",
-                "summary": "private",
-                "is_sensitive": True,
-            }],
-            "unavailable_ids": [],
-        },
-    )
-
-    assert body["items"] == []
-    assert body["unavailable_ids"] == ["sealed_sensitive"]
 
 
 class _FakeResp:

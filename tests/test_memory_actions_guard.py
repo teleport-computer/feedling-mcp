@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from memory import actions  # noqa: E402
 from memory.card_leak_signals import IO_LEAK_SIGNALS  # noqa: E402
+from model_api_runtime.v2 import jobs_store  # noqa: E402
 
 
 # --- 纯函数:桶降级 --------------------------------------------------------
@@ -44,6 +45,68 @@ def test_inner_keeps_clean_custom_bucket():
         "bucket": "健康饮食",
     })
     assert inner["bucket"] == "健康饮食"        # 干净自定义桶原样保留
+
+
+def test_memory_writes_drop_legacy_classification_metadata():
+    envelope = {
+        "id": "mem_legacy",
+        "type": "fact",
+        "body": '{"summary":"kept"}',
+        "is_sensitive": True,
+        "sensitivity_class": "private",
+    }
+    actions._memory_apply_v1_metadata(
+        envelope,
+        {
+            "is_sensitive": True,
+            "sensitivity_class": "private",
+        },
+        source="test",
+    )
+    stored = actions._memory_record_from_envelope(
+        None,
+        envelope,
+        existing={
+            "id": "mem_legacy",
+            "occurred_at": "2026-08-27T00:00:00Z",
+            "created_at": "2026-08-27T00:00:00Z",
+            "is_sensitive": True,
+            "sensitivity_class": "private",
+        },
+    )
+
+    assert all(
+        key not in stored
+        for key in ("is_sensitive", "sensitivity_class", "sensitive_scope")
+    )
+
+
+def test_capture_drops_legacy_classification_metadata():
+    user_id = "u_capture_legacy_label"
+    action = {
+        "type": "memory.add",
+        "envelope": {
+            "id": "mom-legacy-label",
+            "body_ct": "ciphertext",
+            "nonce": "nonce",
+            "K_user": "wrapped-user-key",
+            "K_enclave": "wrapped-enclave-key",
+            "visibility": "shared",
+            "owner_user_id": user_id,
+            "occurred_at": "2026-08-27T00:00:00Z",
+            "type": "moment",
+            "is_sensitive": True,
+            "sensitivity_class": "private",
+            "sensitive_scope": "old_scope",
+        },
+    }
+
+    normalized = jobs_store._validate_capture_actions(user_id, [action])[0]
+    document = jobs_store._capture_memory_doc(user_id, normalized)
+
+    for key in ("is_sensitive", "sensitivity_class", "sensitive_scope"):
+        assert key not in normalized["envelope"]
+        assert key not in document
 
 
 # --- 拒绝路径:硬字段污染 → 400（DB 之前 return，store=None 即可） ----------

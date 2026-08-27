@@ -12,12 +12,18 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Memory cards no longer expose or honor `is_sensitive`, `sensitivity_class`,
+  `sensitive_scope`, `include_sensitive`, or `user_explicit_selection`.
+  All shared cards are eligible for direct fetch, ambient recall, profile
+  refresh, Dream, and Capture under the same contract. Existing stored labels
+  are ignored; this change does not delete cards or rewrite production rows.
+
 - Memory Garden synchronization and explicit Chat references no longer depend
   on a 200-card candidate window. Memory list ordering now uses parsed
   `occurred_at` with parsed `created_at` as fallback and can continue from a
   valid cursor after its anchor is archived, superseded, or deleted. Exact
-  fetches report structured truncation counts; a user-explicit Garden reference
-  may include sensitive, archived, or superseded content, while an unresolved
+  fetches report structured truncation counts; a Garden reference may include
+  archived or superseded content, while an unresolved
   reference gives the model a generic unavailable notice instead of inviting it
   to guess the missing card.
 

@@ -208,7 +208,6 @@ def test_enclave_index_and_fetch_use_v1_shape_without_content_in_index():
         "created_at": "",
         "updated_at": "",
         "last_referenced_at": "2026-06-21T10:00:00",
-        "is_sensitive": False,
         "score": 0.0,
     }
     assert "content" not in index_item

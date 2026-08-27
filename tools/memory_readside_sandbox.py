@@ -12,7 +12,7 @@ import json
 from dataclasses import dataclass
 
 
-BLOCKED_INDEX_FIELDS = {"verbatim", "her_quote", "follow_up", "sensitive_scope"}
+BLOCKED_INDEX_FIELDS = {"verbatim", "her_quote", "follow_up"}
 SALIENCE_WEIGHT = {"critical": 4, "high": 3, "medium": 2, "low": 1}
 
 
@@ -28,7 +28,6 @@ class MemoryFixture:
     context: str = ""
     source_type: str = "chat"
     is_open_thread: bool = False
-    sensitive_scope: str = ""
     importance: float = 0.5
 
 
@@ -53,7 +52,6 @@ def fixture_cards() -> list[MemoryFixture]:
             salience="high",
             follow_up="涉及亲密话题时先确认边界，用温和词，不追问细节。",
             context="来自对人机恋聊天边界的讨论。",
-            sensitive_scope="intimacy_xp_boundary",
             importance=0.85,
         ),
         MemoryFixture(
@@ -125,7 +123,6 @@ def build_index(cards: list[MemoryFixture], *, limit: int) -> list[dict]:
             "status": card.status,
             "salience": card.salience,
             "is_open_thread": card.is_open_thread,
-            "is_sensitive": bool(card.sensitive_scope),
             "score": score(card),
         }
         for card in ordered[:limit]
@@ -151,7 +148,6 @@ def build_fetch(cards: list[MemoryFixture], ids: list[str]) -> dict:
             "follow_up": card.follow_up,
             "context": card.context,
             "source_type": card.source_type,
-            "is_sensitive": bool(card.sensitive_scope),
         })
     return {"items": items, "missing_ids": missing_ids, "unavailable_ids": []}
 
@@ -169,7 +165,6 @@ def run_sandbox(limit: int = 10, fetch_count: int = 3) -> dict:
             "index_count": len(index_items),
             "fetch_count": len(fetch["items"]),
             "index_no_raw_quote": "PASS" if not leaked else "FAIL",
-            "has_sensitive_fixture": any(item.get("is_sensitive") for item in index_items),
             "leaked_index_ids": leaked,
         },
     }
@@ -187,7 +182,7 @@ def print_report(result: dict) -> None:
     for idx, item in enumerate(result["index"]["items"], start=1):
         print(
             f"{idx:02d}. {item['id']} | salience={item['salience']} | "
-            f"sensitive={str(item['is_sensitive']).lower()} | score={item['score']}"
+            f"score={item['score']}"
         )
         print(f"    summary: {_clip(item['summary'])}")
         print(f"    buckets: {', '.join(item['bucket_refs'])}")
@@ -207,11 +202,9 @@ def print_report(result: dict) -> None:
     print(f"index_count={acceptance['index_count']}")
     print(f"fetch_count={acceptance['fetch_count']}")
     print(f"index_no_raw_quote={acceptance['index_no_raw_quote']}")
-    print(f"has_sensitive_fixture={str(acceptance['has_sensitive_fixture']).lower()}")
     print("\n人话：")
-    print("- index 是 agent 先看的目录：只给摘要、分类和敏感粗标记。")
+    print("- index 是 agent 先看的目录：只给摘要和分类。")
     print("- fetch 是 agent 命中后拿的正文：可以看到原话、上下文和 follow_up。")
-    print("- 敏感样例在 index 里只显示 is_sensitive=true，不暴露具体 sensitive_scope。")
 
 
 def main() -> int:

@@ -135,7 +135,6 @@ def _seed_memories(base_url: str, api_key: str, user_id: str, enclave_pk: nacl.p
             "context": card.context,
             "source_type": card.source_type,
             "is_open_thread": card.is_open_thread,
-            "sensitive_scope": card.sensitive_scope,
             "importance": card.importance,
             "type": "fact",
             "occurred_at": f"2026-06-20T15:{idx:02d}:00",
@@ -163,7 +162,7 @@ def _print_trace(query: str, index_items: list[dict], selector_trace: dict, fetc
     print("\nStep 2 enclave 做什么：")
     print("- backend 把候选 envelope 发给 enclave。")
     print("- enclave 解密密文正文，只生成安全 index。")
-    print("- index 只给 summary/bucket/status/salience/is_sensitive，不给原话。")
+    print("- index 只给 summary/bucket/status/salience，不给原话。")
     print("\nStep 3 agent 在 index 里看到这些候选：")
     for idx, item in enumerate(index_items, start=1):
         print(f"{idx:02d}. {item.get('id')} -> {item.get('summary')}")

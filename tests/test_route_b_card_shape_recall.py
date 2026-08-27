@@ -139,10 +139,36 @@ def test_summary_stays_empty_for_content_only_cards():
     assert item["_search_content"] == _SECRET
 
 
-def test_sensitive_canonical_card_is_still_gated():
-    """上一批修的敏感闸，对新放进来的这批卡同样有效。"""
-    sensitive = {**DOG, "id": "m_sensitive", "is_sensitive": True}
-    selected, _ = readside.select_context_memories_via_readside(
-        [sensitive], "我有一只狗吗", cap=8
+def test_legacy_classification_metadata_is_inert_and_not_exposed():
+    """Old stored labels cannot hide a card or recreate a public field."""
+    legacy = {
+        **DOG,
+        "id": "m_legacy_label",
+        "is_sensitive": True,
+        "sensitivity_class": "private",
+        "sensitive_scope": "old_scope",
+    }
+
+    item = readside.context_moment_to_index_item(legacy)
+    selected, trace = readside.select_context_memories_via_readside(
+        [legacy], "我有一只狗吗", cap=8
     )
-    assert [c["id"] for c in selected] == [], "新形状的敏感卡绕过了闸门"
+
+    assert [card["id"] for card in selected] == ["m_legacy_label"]
+    rendered = _blob({"item": item, "trace": trace})
+    for retired in ("is_sensitive", "sensitivity_class", "sensitive_scope", "allow_sensitive"):
+        assert retired not in rendered
+
+
+def test_selector_dependency_is_explicitly_told_all_cards_are_eligible(monkeypatch):
+    """A dependency default must not revive its retired query classifier."""
+    captured = {}
+
+    def _select(query, items, **kwargs):
+        captured.update(kwargs)
+        return {"selected_ids": [], "trace": {}}
+
+    monkeypatch.setattr(readside, "select_memory_index_items", _select)
+    readside.select_context_memories_via_readside([DOG], "狗", cap=8)
+
+    assert captured["include_sensitive"] is True

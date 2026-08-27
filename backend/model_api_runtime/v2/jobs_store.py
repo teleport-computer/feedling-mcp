@@ -2792,8 +2792,6 @@ _CAPTURE_ENVELOPE_FIELDS = frozenset(
         "pulse",
         "last_referenced_at",
         "anchor_memory_ids",
-        "is_sensitive",
-        "sensitivity_class",
     }
 )
 
@@ -3205,9 +3203,6 @@ def _capture_memory_doc(user_id: str, action: dict) -> dict:
     }
     if envelope.get("anchor_memory_ids"):
         doc["anchor_memory_ids"] = list(envelope["anchor_memory_ids"])
-    for key in ("is_sensitive", "sensitivity_class"):
-        if key in envelope:
-            doc[key] = envelope[key]
     if action["type"] == "memory.supersede":
         raw = action.get("supersedes")
         doc["supersedes"] = list(raw if isinstance(raw, list) else [raw])

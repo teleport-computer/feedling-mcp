@@ -1437,14 +1437,12 @@ def _expand_quoted_memories(user_id: str, rows: list[dict]) -> list[dict]:
         fetched, status = memory_core.fetch(
             store,
             None,
-            # An explicit Garden click authorizes all three shapes.  This is
-            # intentionally narrower than ambient recall, which keeps its
-            # existing sensitive/lifecycle filters.
+            # An explicit Garden click authorizes both non-current lifecycle
+            # shapes. Ambient recall still excludes archived and superseded
+            # cards unless they are explicitly requested here.
             {
                 "ids": wanted,
                 "limit": len(wanted),
-                "user_explicit_selection": True,
-                "include_sensitive": True,
                 "include_archived": True,
                 "include_superseded": True,
             },
@@ -2896,7 +2894,7 @@ def _read_profile_cards(
     body, status = memory_core.index(
         store,
         None,
-        {"limit": 0, "include_sensitive": True},
+        {"limit": 0},
         post_enclave=_post,
     )
     if status != 200 or not isinstance(body, dict):
@@ -2932,7 +2930,7 @@ def _read_profile_cards(
         fetched, fetch_status = memory_core.fetch(
             store,
             None,
-            {"ids": batch_ids, "limit": 0, "include_sensitive": True},
+            {"ids": batch_ids, "limit": 0},
             post_enclave=_post,
         )
         fetched_items = (
@@ -3039,7 +3037,7 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
                 fetched, fetch_status = memory_core.fetch(
                     store,
                     None,
-                    {"ids": ids, "limit": 0, "include_sensitive": True},
+                    {"ids": ids, "limit": 0},
                     post_enclave=_post,
                 )
                 fetched_items = (

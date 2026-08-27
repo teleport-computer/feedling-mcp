@@ -164,7 +164,6 @@ export default definePluginEntry({
           thread: { type: "string", description: "filter by thread/dimension tag" },
           query: { type: "string", description: "free-text relevance query" },
           ambient: { type: "boolean", description: "ambient/background selection mode" },
-          include_sensitive: { type: "boolean", description: "include sensitive-classed cards" },
         },
       },
       build: (p) => ["memory-index", ...flagsFromParams(p, [
@@ -173,7 +172,6 @@ export default definePluginEntry({
         ["thread", "--thread", "value"],
         ["query", "--query", "value"],
         ["ambient", "--ambient", "bool"],
-        ["include_sensitive", "--include-sensitive", "bool"],
       ])],
     });
 

@@ -204,6 +204,23 @@ def test_select_empty_garden():
     assert _select_context_memories([], "") == []
 
 
+def test_card_shape_drops_legacy_classification_metadata():
+    raw = {
+        **_moment(id="legacy-label", title="A card that remains readable"),
+        "is_sensitive": True,
+        "sensitivity_class": "private",
+        "sensitive_scope": "old_scope",
+    }
+
+    card = card_shape.to_garden_card(raw)
+
+    assert card["id"] == "legacy-label"
+    assert all(
+        key not in card
+        for key in ("is_sensitive", "sensitivity_class", "sensitive_scope")
+    )
+
+
 def test_select_returns_turning_points_first():
     moments = [
         _moment(id="r1", title="random card 1"),
