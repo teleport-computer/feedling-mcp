@@ -788,6 +788,11 @@ def test_kill_switch_off_restores_the_pre_history_startup_contract():
     proc = _import_worker(
         FEEDLING_V2_HISTORY_TOOLS_ENABLED="0",
         FEEDLING_V2_TOOL_BATCH_RESULT_CHAR_CAP="1000",
+        # Isolate the history switch: web_fetch is independently live and has
+        # its own atomic contract, so give it the smallest valid result shape.
+        FEEDLING_V2_WEB_FETCH_RESULT_MAX_CHARS=str(
+            result_budget.MIN_RESULT_CAPS["web_fetch"]
+        ),
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
 
@@ -797,9 +802,22 @@ def test_kill_switch_on_still_fails_fast_on_the_same_config():
     proc = _import_worker(
         FEEDLING_V2_HISTORY_TOOLS_ENABLED="1",
         FEEDLING_V2_TOOL_BATCH_RESULT_CHAR_CAP="1000",
+        FEEDLING_V2_WEB_FETCH_RESULT_MAX_CHARS=str(
+            result_budget.MIN_RESULT_CAPS["web_fetch"]
+        ),
     )
     assert proc.returncode != 0
     assert "TOOL_BATCH_RESULT_CHAR_CAP" in proc.stderr
+
+
+def test_web_fetch_atomic_contract_still_fails_fast_with_history_off():
+    """History's rollback valve cannot silently disable an unrelated producer."""
+    proc = _import_worker(
+        FEEDLING_V2_HISTORY_TOOLS_ENABLED="0",
+        FEEDLING_V2_TOOL_BATCH_RESULT_CHAR_CAP="1000",
+    )
+    assert proc.returncode != 0
+    assert "FEEDLING_V2_WEB_FETCH_RESULT_MAX_CHARS" in proc.stderr
 
 
 def test_disabled_history_skips_the_atomic_cap_validation():

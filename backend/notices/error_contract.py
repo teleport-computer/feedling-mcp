@@ -115,18 +115,18 @@ def _spec(
 def _chat_specs() -> tuple[ErrorSpec, ...]:
     return (
         _spec("model_mismatch", "chat", "provider", "system", "当前运行时没有成功加载所选模型，请重新选择模型或稍后重试。", matcher=r"\bmodel_mismatch\b"),
-        _spec("quota_insufficient", "chat", "provider", "user_provider", "模型服务额度不足，充值后再发消息即可恢复。", matcher=r"余额|额度|insufficient_quota|credit balance|requires more credits|payment required|\b402\b|provider_http_402|quota"),
-        _spec("auth_invalid", "chat", "provider", "user_provider", "API Key 无效或已过期，请到设置里重新保存。", matcher=r"invalid ?(x-)?api.?key|unauthorized|authentication|\b401\b|provider_http_40[13]"),
-        _spec("model_not_found", "chat", "provider", "user_provider", "模型名不可用，请检查设置里的模型名。", matcher=r"invalid model name|model_not_found|no such model|unknown model|supported .{0,40}model names|model .{0,80}does not exist|not a valid model|model[ _]not[ _]found"),
-        _spec("cli_config_invalid", "chat", "provider", "user_provider", "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。", matcher=r"missing the \{message\} placeholder"),
+        _spec("quota_insufficient", "chat", "provider", "user_provider", "模型服务额度不足，充值后再发消息即可恢复。", en="The model service has insufficient quota. Add credit, then send the message again.", matcher=r"余额|额度|insufficient_quota|credit balance|requires more credits|payment required|\b402\b|provider_http_402|quota"),
+        _spec("auth_invalid", "chat", "provider", "user_provider", "API Key 无效或已过期，请到设置里重新保存。", en="The API key is invalid or expired. Save it again in Settings.", matcher=r"invalid ?(x-)?api.?key|unauthorized|authentication|\b401\b|provider_http_40[13]"),
+        _spec("model_not_found", "chat", "provider", "user_provider", "模型名不可用，请检查设置里的模型名。", en="The model name is unavailable. Check the model name in Settings.", matcher=r"invalid model name|model_not_found|no such model|unknown model|supported .{0,40}model names|model .{0,80}does not exist|not a valid model|model[ _]not[ _]found"),
+        _spec("cli_config_invalid", "chat", "provider", "user_provider", "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。", en="The Agent launch command is invalid because it is missing the {message} placeholder. Fix AGENT_CLI_CMD.", matcher=r"missing the \{message\} placeholder"),
         _spec("vision_model_required", "vision", "vision_model", "user_provider", "由于当前模型没有视觉能力，模型无法收到图片信息，建议更改模型或在设置页单独添加视觉模型", en="Your current model can't process images, so it didn't receive this picture. Switch models, or add a dedicated vision model in Settings.", matcher=r"unknown variant `image_url`, expected `text`|no endpoints found that support image input"),
-        _spec("provider_incompatible", "chat", "provider", "user_provider", "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。", matcher=r"unknown variant|not supported|unsupported (parameter|tool)|invalid_request_error.*tool"),
-        _spec("context_overflow", "chat", "provider", "user_provider", "这次对话太长超出了模型上限，可精简后再试。", matcher=r"context.{0,20}(length|window)|maximum context|too many tokens|prompt is too long"),
+        _spec("provider_incompatible", "chat", "provider", "user_provider", "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。", en="The current model does not support a capability used by this request. Choose another model or adjust it in Settings.", matcher=r"unknown variant|not supported|unsupported (parameter|tool)|invalid_request_error.*tool"),
+        _spec("context_overflow", "chat", "provider", "user_provider", "这次对话太长超出了模型上限，可精简后再试。", en="This conversation is too long for the model's context window. Shorten it and try again.", matcher=r"context.{0,20}(length|window)|maximum context|too many tokens|prompt is too long"),
         _spec("content_filtered", "chat", "provider", "provider_transient", "这次回复被模型的内容策略拦下了，换个说法再试。", matcher=r"content_filter|content policy|safety|blocked by"),
         _spec("rate_limited", "chat", "provider", "provider_transient", "模型服务限流了，稍等几分钟再试。", matcher=r"\b429\b|provider_http_429|too many requests|rate.?limit"),
         _spec("upstream_unavailable", "chat", "provider", "provider_transient", "你的模型服务暂时不可用，稍后会自动恢复。", matcher=r"\b5\d{2}\b|provider_http_5\d{2}|overloaded|timed? ?out|connection (refused|reset|error)|unreachable|stream disconnected|ended without finish_reason"),
         _spec("turn_timeout", "chat", "provider", "system", "这轮回复超时了，稍后再试。"),
-        _spec("provider_timeout", "chat", "provider", "provider_transient", "你配置的模型服务这次没有及时响应。请先检查模型渠道稳定性，不要连续重发。"),
+        _spec("provider_timeout", "chat", "provider", "provider_transient", "你配置的模型服务这次没有及时响应。请先检查模型渠道稳定性，不要连续重发。", en="Your model service did not respond in time. Check the provider's stability before trying again."),
         _spec("provider_empty_reply", "chat", "provider", "provider_transient", "你的模型服务这次返回了空回复，稍后再试；反复出现请检查模型渠道或中转的稳定性。"),
         _spec("file_delivery_incomplete", "chat", "delivery", "system", "文件内容已经保存，但附件发送没有完成。请稍后再试。", en="The file was saved, but its attachment was not delivered. Please try again later.", matcher=r"\bfile_delivery_incomplete\b"),
         _spec("canvas_file_delivery_incomplete", "chat", "delivery", "system", "画布内容已经保存，但卡片更新没有完成。请稍后再试。", en="The Canvas content was saved, but its card update did not finish. Please try again later.", matcher=r"\bcanvas_file_delivery_incomplete\b"),
@@ -138,8 +138,8 @@ def _chat_specs() -> tuple[ErrorSpec, ...]:
 
 def _platform_specs() -> tuple[ErrorSpec, ...]:
     return (
-        _spec("platform_queue_timeout", "platform", "platform", "system", "这条消息没有及时开始处理，也没有生成回复。请稍后再试，不要连续发送。"),
-        _spec("platform_execution_timeout", "platform", "platform", "system", "这轮回复因系统执行异常没有完成，也不会重复生成回复。请稍后再试，不要连续发送。"),
+        _spec("platform_queue_timeout", "platform", "platform", "system", "这条消息没有及时开始处理，也没有生成回复。请稍后再试，不要连续发送。", en="This message did not start processing in time, so no reply was generated. Try again later and avoid sending it repeatedly."),
+        _spec("platform_execution_timeout", "platform", "platform", "system", "这轮回复因系统执行异常没有完成，也不会重复生成回复。请稍后再试，不要连续发送。", en="This reply did not finish because of a system execution error, and it will not be generated again automatically. Try again later and avoid sending it repeatedly."),
     )
 
 

@@ -284,6 +284,13 @@ _TERMINAL_FAILURE_FALLBACK_REPLY_EN = (
     ).strip()
     or DEFAULT_FAILURE_FALLBACK_EN
 )
+_DIRECT_NOTICE_ERROR_CLASSES = frozenset({
+    "file_delivery_incomplete",
+    "canvas_file_delivery_incomplete",
+    "platform_queue_timeout",
+    "platform_execution_timeout",
+    "provider_timeout",
+})
 
 # Migration 0041's database trigger rejects pending->claimed transitions from
 # pre-0041 workers. This transaction-local protocol marker is deliberately set
@@ -4305,14 +4312,7 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         if lane == "scheduled"
         else (
             user_text
-            if error_class
-            in {
-                "file_delivery_incomplete",
-                "canvas_file_delivery_incomplete",
-                "platform_queue_timeout",
-                "platform_execution_timeout",
-                "provider_timeout",
-            }
+            if error_class in _DIRECT_NOTICE_ERROR_CLASSES
             or blame == "user_provider"
             else failure_fallback_reply(
                 language_policy,

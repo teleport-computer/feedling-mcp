@@ -343,10 +343,10 @@ PARAMS: dict[str, dict] = {
         "properties": {"query": _STR, "limit": _INT},
         "required": ["query"],
     },
-    # web.fetch: params: {"url": str} — per module docstring.
+    # web.fetch: params: {"url": str, "offset": int?} — per module docstring.
     "web_fetch": {
         "type": "object",
-        "properties": {"url": _STR},
+        "properties": {"url": _STR, "offset": _INT},
         "required": ["url"],
     },
 
@@ -717,7 +717,11 @@ DESCRIPTIONS: dict[str, str] = {
                    "native vision observer and returns an untrusted visual_observation "
                    "instead of a local image_file path."),
     "web_search": "Search the live public web for current information such as news, weather, prices, or recent events, or anything past your training data that you are not sure is current. Prefer this over guessing or telling the user you cannot access the internet.",
-    "web_fetch": "Fetch a specific URL and return its main text content. Use when the user provides a link, or to read a page found through web_search.",
+    "web_fetch": ("Fetch a specific URL and return a possibly truncated page of its "
+                  "main text. The result reports offset, returned_chars, total_chars, "
+                  "has_more, and next_offset. When has_more is true, call web_fetch "
+                  "again in the same turn with the same URL and offset=next_offset; "
+                  "continuations reuse the retained page without another network request."),
     "schedule_wake": ("Schedule a future self-wake at an ISO timestamp or a relative "
                       "time such as 'in 2 hours', '+30m', or '两小时后', with optional "
                       "timezone, reason, and repeat ('daily' every 24 hours or "

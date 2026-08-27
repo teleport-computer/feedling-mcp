@@ -1,8 +1,14 @@
 ---
-document_lifecycle: current
-canonical_owner: docs/superpowers/plans/2026-08-24-repository-cleanup.zh-CN.md
+document_lifecycle: historical
+canonical_owner: docs/repository-cleanup/storage-tee-history.md
+historical_reason: implemented
 ---
 # Storage/TEE History Batch 3 Implementation Plan
+
+> **HISTORICAL / IMPLEMENTED（2026-08-27）**：本批已经完成。当前 Storage/TEE
+> 历史归档结论、D1–D4 决策结果与兼容义务由
+> `docs/repository-cleanup/storage-tee-history.md` 持有；下述任务、路径和命令仅保留为
+> 执行期证据，不应重放。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task with review checkpoints.
 
