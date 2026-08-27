@@ -2083,7 +2083,11 @@ def test_file_recovery_tool_choice_dispatches_by_provider_capability(
             "tool_calls": [{
                 "id": "f1",
                 "name": "send_file",
-                "args": {"path": "/workspace/summary.md", "revision": 1},
+                "args": {
+                    "path": "/workspace/summary.md",
+                    "revision": 1,
+                    "completion_message": "文档已生成。",
+                },
             }],
             "usage": {},
         },
@@ -2171,6 +2175,223 @@ def test_file_recovery_tool_choice_dispatches_by_provider_capability(
     assert all(item["dropped_tool_count"] > 0 for item in surfaces[:3])
 
 
+@pytest.mark.parametrize(
+    ("user_request", "wrong_message", "corrected_message"),
+    [
+        pytest.param(
+            "请直接生成并发送一个真实的 Markdown 文件，完成后用中文简短回复。",
+            "Your work is saved and ready to open now.",
+            "文件已经生成并发送，可以直接下载了。",
+            id="han-corrected",
+        ),
+        pytest.param(
+            "Create and attach a real Markdown file, then reply briefly in English.",
+            "文件已经生成并发送，可以直接下载了。",
+            "Your work is saved and ready to open now.",
+            id="latin-corrected",
+        ),
+        pytest.param(
+            "生成文件",
+            "Your work is saved and ready to open now.",
+            "文件已经生成，可以下载了。",
+            id="short-han-corrected",
+        ),
+        pytest.param(
+            "Make PDF.",
+            "文件已经生成并发送，可以直接下载了。",
+            "Your PDF is ready to download.",
+            id="short-latin-corrected",
+        ),
+        pytest.param(
+            "请生成一份 Markdown 文件，完成以后请用英文告诉我结果。",
+            "Your work is saved and ready to open now.",
+            "Your work is saved and ready to open now.",
+            id="explicit-language-confirmed",
+        ),
+    ],
+)
+def test_compact_file_delivery_corrects_or_confirms_language_before_delivery(
+    monkeypatch, user_request, wrong_message, corrected_message,
+):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "write",
+                "name": "workspace_write",
+                "args": {
+                    "path": "/workspace/final.md",
+                    "content": "# 中文附件终验",
+                    "expected_revision": 0,
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "deliver",
+                "name": "send_file",
+                "args": {
+                    "path": "/workspace/final.md",
+                    "revision": 1,
+                    "completion_message": wrong_message,
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "deliver-corrected",
+                "name": "send_file",
+                "args": {
+                    "path": "/workspace/final.md",
+                    "revision": 1,
+                    "completion_message": corrected_message,
+                },
+            }],
+            "usage": {},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=tool_call.id,
+                content=(
+                    "ok: workspace_write applied at revision 1; use the same "
+                    "path and revision 1 with send_file"
+                ),
+            )
+            for tool_call in tool_calls
+        ]
+
+    delivered = []
+
+    async def on_file(path, revision):
+        delivered.append((path, revision))
+
+    replies = _RecordingReply()
+    user_message = {"role": "user", "content": user_request}
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=replies,
+        on_file_reply=on_file,
+        required_file_suffixes=(".md",),
+        file_requirement_messages=(user_message,),
+        fold_new_messages=_RecordingFold([[], [], []]),
+        add_usage=_noop_add_usage,
+        max_calls=4,
+    ))
+
+    correction_exchange = provider.calls[2]["messages"][-1]
+    assert isinstance(correction_exchange, ToolExchange)
+    assert len(correction_exchange.results) == 1
+    correction_result = correction_exchange.results[0].content
+    assert "completion_message language mismatch" in correction_result
+    assert "same path and revision" in correction_result
+    assert delivered == [("/workspace/final.md", 1)]
+    assert replies.calls == [(corrected_message, True)]
+    assert outcome.final_text == corrected_message
+
+
+def test_file_delivery_uses_user_only_coalesced_row_for_completion_language(
+    monkeypatch,
+):
+    """Production coalesced rows omit role until the worker prompt boundary."""
+
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "write",
+                "name": "workspace_write",
+                "args": {
+                    "path": "/workspace/final.txt",
+                    "content": "TXT 下载正常。",
+                    "expected_revision": 0,
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "deliver-wrong-language",
+                "name": "send_file",
+                "args": {
+                    "path": "/workspace/final.txt",
+                    "revision": 1,
+                    "completion_message": "Your TXT file is ready to download.",
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "deliver-corrected",
+                "name": "send_file",
+                "args": {
+                    "path": "/workspace/final.txt",
+                    "revision": 1,
+                    "completion_message": "TXT 文件已经生成，可以下载了。",
+                },
+            }],
+            "usage": {},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=tool_call.id,
+                content=(
+                    "ok: workspace_write applied at revision 1; use the same "
+                    "path and revision 1 with send_file"
+                ),
+            )
+            for tool_call in tool_calls
+        ]
+
+    delivered = []
+
+    async def on_file(path, revision):
+        delivered.append((path, revision))
+
+    replies = _RecordingReply()
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=replies,
+        on_file_reply=on_file,
+        required_file_suffixes=(".txt",),
+        file_requirement_messages=({
+            "content": (
+                "请生成并发送一个真实的 TXT 文件，完成后用中文简短回复。"
+            ),
+        },),
+        fold_new_messages=_RecordingFold([[], [], []]),
+        add_usage=_noop_add_usage,
+        max_calls=4,
+    ))
+
+    correction_exchange = provider.calls[2]["messages"][-1]
+    assert isinstance(correction_exchange, ToolExchange)
+    assert "completion_message language mismatch" in (
+        correction_exchange.results[0].content
+    )
+    assert delivered == [("/workspace/final.txt", 1)]
+    assert replies.calls == [("TXT 文件已经生成，可以下载了。", True)]
+    assert outcome.final_text == "TXT 文件已经生成，可以下载了。"
+
+
 def test_invalid_artifact_write_is_model_visible_and_retries_in_workspace(
     monkeypatch,
 ):
@@ -2209,6 +2430,7 @@ def test_invalid_artifact_write_is_model_visible_and_retries_in_workspace(
                 "args": {
                     "path": "/workspace/memory_summary.md",
                     "revision": 1,
+                    "completion_message": "Markdown 文档已经生成。",
                 },
             }],
             "usage": {},

@@ -7361,6 +7361,7 @@ def _build_encrypted_file_reply_effect_payload(
         store,
         bytes(file_reply.data),
         item_id=item_id,
+        content_kind="binary",
     )
     if envelope is None:
         raise RuntimeError(error or "file reply envelope build failed")
@@ -13526,8 +13527,14 @@ async def process_job(
                     "voice_call_id": call_id,
                     "voice_turn_id": turn_id,
                 }
+        # Coalesced input is user-only but roleless until prompt rendering.
+        # Restore the role for file intent and delivery-language checks.
+        current_user_messages = [
+            {**row, "role": "user"}
+            for row in coalesced
+        ]
         detected_file_requirement = (
-            context.required_file_suffixes(coalesced)
+            context.required_file_suffixes(current_user_messages)
             if lane == "chat"
             else None
         )
@@ -14538,6 +14545,10 @@ async def process_job(
             self_thinking_absent_retry_pending = False
             self_thinking_absent_retry_response_seen = False
 
+        def _cancel_self_thinking_absent_language_retry() -> None:
+            _cancel_self_thinking_absent_retry()
+            _cancel_language_correction()
+
         async def _on_reply(
             text: str | WorkspaceFileReply,
             *,
@@ -14793,44 +14804,89 @@ async def process_job(
                 ):
                     self_thinking_absent_retry_requests += 1
                     self_thinking_absent_retry_pending = True
+                    correction_instruction = (
+                        _SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION
+                    )
+                    correction_cancel = _cancel_self_thinking_absent_retry
+                    (
+                        user_script,
+                        reply_script,
+                        follow_outcome,
+                    ) = _reply_language_follow_observation(
+                        language_user_rows, text
+                    )
+                    if (
+                        follow_outcome == "mismatch"
+                        and user_script not in {"indeterminate", "mixed"}
+                        and reply_script not in {"indeterminate", "mixed"}
+                    ):
+                        language_correction_attempted = True
+                        language_correction_pending = True
+                        correction_instruction += (
+                            "\n\n"
+                            + v2_language_follow.CORRECTION_INSTRUCTION
+                            + "\n这次重写要同时完成两件事：保留 <think>…</think> "
+                            "结构，并让思考段和可见回复都与用户语言一致。"
+                        )
+                        correction_cancel = (
+                            _cancel_self_thinking_absent_language_retry
+                        )
                     return v2_tool_loop.FinalReplyCorrectionRequest(
-                        instruction=_SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION,
+                        instruction=correction_instruction,
                         original_text=raw_reply_text,
                         original_reasoning=reasoning,
-                        on_cancel=_cancel_self_thinking_absent_retry,
+                        on_cancel=correction_cancel,
                     )
                 # One correction round is already consumed after an ABSENT retry.
-                # Publish a valid COMPLETE result directly instead of asking the
-                # generic one-rewrite loop for a second language rewrite (which
-                # would otherwise fail open to the original ABSENT candidate).
-                if (
-                    not retry_completed
-                    and self_thinking_text
-                    and not thinking_language_correction_pending
-                    and not correction_outcome
-                ):
-                    thinking_mismatch = _self_thinking_language_mismatch(
-                        self_thinking_text, language_user_rows
-                    )
-                    if thinking_mismatch is not None:
-                        thinking_language_correction_pending = True
-                        return v2_tool_loop.FinalReplyCorrectionRequest(
-                            instruction=(
-                                v2_language_follow.CORRECTION_INSTRUCTION
-                                + "\n重写时保留 <think>…</think> 结构，并让思考段与用户语言一致。"
-                            ),
-                            original_text=raw_reply_text,
-                            original_reasoning=reasoning,
-                            on_cancel=_cancel_language_correction,
-                        )
+                # Validate any combined language requirement below, but never add
+                # a second hidden rewrite beside this bounded correction.
                 (
                     user_script,
                     reply_script,
                     follow_outcome,
                 ) = _reply_language_follow_observation(language_user_rows, text)
+                visible_language_mismatch = (
+                    follow_outcome == "mismatch"
+                    and user_script not in {"indeterminate", "mixed"}
+                    and reply_script not in {"indeterminate", "mixed"}
+                )
+                thinking_mismatch = (
+                    _self_thinking_language_mismatch(
+                        self_thinking_text, language_user_rows
+                    )
+                    if self_thinking_text
+                    else None
+                )
+                if (
+                    not retry_completed
+                    and not language_correction_pending
+                    and not thinking_language_correction_pending
+                    and not correction_outcome
+                    and (visible_language_mismatch or thinking_mismatch is not None)
+                ):
+                    language_correction_attempted = True
+                    language_correction_pending = True
+                    thinking_language_correction_pending = (
+                        thinking_mismatch is not None
+                    )
+                    correction_instruction = (
+                        v2_language_follow.CORRECTION_INSTRUCTION
+                    )
+                    if self_thinking_text:
+                        correction_instruction += (
+                            "\n重写时保留 <think>…</think> 结构，并让思考段和可见回复"
+                            "都与用户语言一致。"
+                        )
+                    return v2_tool_loop.FinalReplyCorrectionRequest(
+                        instruction=correction_instruction,
+                        original_text=raw_reply_text,
+                        original_reasoning=reasoning,
+                        on_cancel=_cancel_language_correction,
+                    )
                 if language_correction_pending:
-                    if reply_script == user_script:
+                    if reply_script == user_script and thinking_mismatch is None:
                         language_correction_pending = False
+                        thinking_language_correction_pending = False
                         language_correction_outcome = "corrected"
                     else:
                         # The loop still owns the original candidate. Reject this
@@ -14838,20 +14894,6 @@ async def process_job(
                         # original rather than exposing a second wrong-language
                         # rewrite.
                         return v2_tool_loop.FinalReplyCorrectionRejected()
-                elif (
-                    not retry_completed
-                    and follow_outcome == "mismatch"
-                    and user_script not in {"indeterminate", "mixed"}
-                    and reply_script not in {"indeterminate", "mixed"}
-                ):
-                    language_correction_attempted = True
-                    language_correction_pending = True
-                    return v2_tool_loop.FinalReplyCorrectionRequest(
-                        instruction=v2_language_follow.CORRECTION_INSTRUCTION,
-                        original_text=raw_reply_text,
-                        original_reasoning=reasoning,
-                        on_cancel=_cancel_language_correction,
-                    )
             delivery_started_ns = time.monotonic_ns()
             # A cutover/ABA can happen while awaiting the provider. Fence at
             # the reply effect itself; the pre-round check is not sufficient.
@@ -15628,7 +15670,7 @@ async def process_job(
             on_tool_event=chat_tool_activity_callback,
             required_file_suffixes=required_file_suffixes,
             file_requirement_messages=(
-                coalesced
+                current_user_messages
                 if mutation_recovery_barrier is None
                 or recovery_existing_file_delivery
                 else ()
