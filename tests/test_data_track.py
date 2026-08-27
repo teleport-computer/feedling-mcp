@@ -3417,3 +3417,119 @@ def test_page_rows_carry_all_three_slices_for_the_right_user(client):
         assert row["screen_frames"]["latest_age_sec"] == pytest.approx(
             600 - 60 * index, abs=30
         )
+
+
+# --- T344: provider error bodies must not reach the admin surface -----------
+# The leak: `status_reason` is a `:`-joined chain of machine codes, but some
+# producers append the upstream error verbatim, so a provider 402 body (with a
+# key-management URL) became a `job_failed_reasons` key. Fix = per-segment
+# redaction at the display boundary. Both halves of that decision get their own
+# case below, in mirrored pairs, so neither half can rot unnoticed.
+
+_ADMIN_SAFE_REASONS = [
+    # Reasons the outcome classifier and the wake-lane dashboards match on
+    # exactly. If redaction ever touches one of these, it has stopped being a
+    # display boundary and started destroying the signal.
+    "unknown",
+    "agent_sleep",
+    "heartbeat_throttled",
+    "quota_insufficient",
+    "nothing_worth_keeping",
+    "wake_failed:empty_reply",
+    "wake_failed:malformed_self_thinking_suppressed",
+    "extraction_failed:quota_insufficient",
+    "turn_failed:image_generation_auth_invalid",
+    "json_decode_error:JSONDecodeError",
+    "a" * 64,
+]
+
+
+@pytest.mark.parametrize("reason", _ADMIN_SAFE_REASONS)
+def test_sanitize_status_reason_keeps_code_shaped_reasons_verbatim(reason):
+    from admin import data_track
+
+    assert data_track._sanitize_status_reason(reason) == reason
+
+
+@pytest.mark.parametrize(
+    ("unsafe", "expected"),
+    [
+        # Mirror of each safe case above: the minimal edit that makes a segment
+        # stop being a bare code must truncate the rest, and only the rest.
+        ("provider_error:timeout happened", "provider_error:<redacted>"),
+        ("provider_error:timeout/other", "provider_error:<redacted>"),
+        ("provider_error:" + "a" * 65, "provider_error:<redacted>"),
+        ("wake_failed:empty_reply:body here", "wake_failed:empty_reply:<redacted>"),
+        # First segment already unsafe => nothing survives to show.
+        ("https://example.invalid/keys/abc", "<redacted>"),
+        # Mirror: a real code in front of the URL survives, the URL does not.
+        ("provider_error:https://example.invalid/keys/abc", "provider_error:<redacted>"),
+        ("   ", ""),
+        ("", ""),
+    ],
+)
+def test_sanitize_status_reason_redacts_from_the_first_free_text_segment(
+    unsafe, expected
+):
+    from admin import data_track
+
+    assert data_track._sanitize_status_reason(unsafe) == expected
+
+
+def test_sanitize_reason_counts_merges_collapsed_keys_without_losing_jobs():
+    from admin import data_track
+
+    # An embedded error body made every occurrence its own bucket, so one
+    # failure mode showed up as N buckets of 1 and could not be read at all.
+    raw = {
+        "provider_payment_required: upstream said A": 3,
+        "provider_payment_required: upstream said B": 2,
+        "wake_failed:empty_reply": 4,
+    }
+    merged = data_track._sanitize_reason_counts(raw)
+
+    assert merged == {
+        "provider_payment_required:<redacted>": 5,
+        "wake_failed:empty_reply": 4,
+    }
+    assert sum(merged.values()) == sum(raw.values())
+
+
+def test_admin_user_detail_redacts_provider_error_body_in_failed_reasons(client):
+    user_id, _ = _register(client)
+    store = core_store.get_store(user_id)
+    # Shaped like the real 402: a key-management URL inside the error body.
+    # The URL is synthetic — the production one must never be written down.
+    secret_url = "https://openrouter.invalid/settings/keys/key-id-must-not-leak"
+    for index in range(2):
+        store.append_proactive_job({
+            "job_id": f"pj_402_{index}",
+            "status": "failed",
+            "status_reason": (
+                f"provider_payment_required: upstream 402 #{index} {secret_url}"
+            ),
+            "job_kind": "heartbeat",
+        })
+    store.append_proactive_job({
+        "job_id": "pj_empty",
+        "status": "failed",
+        "status_reason": "wake_failed:empty_reply",
+        "job_kind": "heartbeat",
+    })
+
+    response = client.get(
+        f"/v1/admin/data-track/users/{user_id}", headers=_admin_headers()
+    )
+    assert response.status_code == 200
+    dumped = json.dumps(response.get_json())
+    assert secret_url not in dumped
+    assert "key-id-must-not-leak" not in dumped
+
+    proactive = response.get_json()["user"]["proactive"]
+    # Redaction is not deletion: the code, the bucket and the count all survive,
+    # and the two raw bodies collapse into one readable bucket.
+    assert proactive["job_failed_reasons"] == {
+        "provider_payment_required:<redacted>": 2,
+        "wake_failed:empty_reply": 1,
+    }
+    assert proactive["heartbeat_failed"] == 3

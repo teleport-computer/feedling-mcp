@@ -322,7 +322,7 @@ def _memory_capture_validation_detail(store: UserStore, *, limit: int = 50) -> d
             rows.append({
                 "job_id": str(job.get("job_id") or ""),
                 "status": str(job.get("status") or ""),
-                "status_reason": str(job.get("status_reason") or ""),
+                "status_reason": _sanitize_status_reason(job.get("status_reason")),
                 "updated_at": str(
                     job.get("updated_at")
                     or job.get("ts")
@@ -342,6 +342,61 @@ def _memory_capture_validation_detail(store: UserStore, *, limit: int = 50) -> d
         "invalid_count_fields": sorted(set(invalid_count_fields)),
         "jobs": rows,
     }
+
+
+_REASON_SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
+_REASON_REDACTED = "<redacted>"
+_REASON_MAX_SEGMENTS = 8
+
+
+def _sanitize_status_reason(raw: object) -> str:
+    """Reduce a job ``status_reason`` to the part admin is allowed to see.
+
+    A reason is a ``:``-joined chain of machine codes
+    (``extraction_failed:quota_insufficient``). Producers append the upstream
+    error verbatim on some paths, so the tail can carry a provider error body —
+    which is how an OpenRouter key-management URL reached the admin page.
+
+    Segments are kept **verbatim** while they look like codes, so every reason
+    the outcome classifier and the wake-lane dashboards depend on survives
+    unchanged. The first segment that is not a bare code truncates the rest to
+    ``<redacted>``: the fact that detail existed stays visible, its content does
+    not. Redaction here is a display boundary only — classification upstream
+    still reads the raw reason.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    parts = text.split(":")
+    kept: list[str] = []
+    for index, segment in enumerate(parts):
+        rest = ":".join(parts[index + 1:])
+        # `https` is shaped exactly like a reason code, so a bare URL would
+        # otherwise be displayed as the bucket `https:<redacted>`. A segment
+        # followed by `//` is a URL scheme, never a code.
+        if (
+            index >= _REASON_MAX_SEGMENTS
+            or rest.startswith("//")
+            or not _REASON_SAFE_SEGMENT_RE.match(segment.strip())
+        ):
+            kept.append(_REASON_REDACTED)
+            break
+        kept.append(segment.strip())
+    return ":".join(kept)
+
+
+def _sanitize_reason_counts(counts: dict[str, int]) -> dict[str, int]:
+    """Sanitize reason keys, summing the raw keys that collapse into one.
+
+    Summing is the point, not a detail: an embedded error body made every
+    occurrence its own bucket, so the same failure appeared as N buckets of 1
+    and the aggregation could not be read at all.
+    """
+    merged: dict[str, int] = {}
+    for reason, count in counts.items():
+        key = _sanitize_status_reason(reason) or "unknown"
+        merged[key] = merged.get(key, 0) + int(count or 0)
+    return merged
 
 
 def _proactive_stats(store: UserStore) -> dict:
@@ -388,16 +443,20 @@ def _proactive_stats(store: UserStore) -> dict:
         outcome_class = notices_catalog.v1_proactive_outcome_class(
             status, reason
         )
+        # Classification above reads the raw reason; only the exposed key is
+        # sanitized. Sanitizing before `v1_proactive_outcome_class` would
+        # silently reclassify every reason it matches exactly.
+        shown = _sanitize_status_reason(reason) or "unknown"
         if outcome_class == "operational_failure":
             fail_lanes[lane] += 1
-            failed_reasons[reason] = failed_reasons.get(reason, 0) + 1
+            failed_reasons[shown] = failed_reasons.get(shown, 0) + 1
         elif outcome_class == "control":
             control_lanes[lane] += 1
-            control_reasons[reason] = control_reasons.get(reason, 0) + 1
+            control_reasons[shown] = control_reasons.get(shown, 0) + 1
         elif outcome_class == "user_unavailable":
             user_unavailable_lanes[lane] += 1
-            user_unavailable_reasons[reason] = (
-                user_unavailable_reasons.get(reason, 0) + 1
+            user_unavailable_reasons[shown] = (
+                user_unavailable_reasons.get(shown, 0) + 1
             )
     live_status_counts = _count_rows(proactive_messages, "live_activity_status")
     alert_status_counts = _count_rows(proactive_messages, "alert_status")
@@ -1074,8 +1133,10 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
         + alert_status_counts.get("delivered", 0)
         + alert_status_counts.get("logged_only", 0)
     )
-    failed_reasons = counts(
-        extra.get("jobs_failed_by_reason"), "proactive.jobs_failed_by_reason"
+    # The DB aggregates group by the raw reason, so redaction happens here and
+    # the raw keys that collapse together must have their counts summed.
+    failed_reasons = _sanitize_reason_counts(
+        counts(extra.get("jobs_failed_by_reason"), "proactive.jobs_failed_by_reason")
     )
     failed = (
         sum(fail_lanes.values())
@@ -1108,13 +1169,13 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
         "posted_jobs": status_counts.get("posted", 0) + status_counts.get("delivered", 0),
         "failed_jobs": failed,
         "job_failed_reasons": failed_reasons,
-        "job_control_reasons": counts(
+        "job_control_reasons": _sanitize_reason_counts(counts(
             extra.get("jobs_control_by_reason"), "proactive.jobs_control_by_reason"
-        ),
-        "job_user_unavailable_reasons": counts(
+        )),
+        "job_user_unavailable_reasons": _sanitize_reason_counts(counts(
             extra.get("jobs_user_unavailable_by_reason"),
             "proactive.jobs_user_unavailable_by_reason",
-        ),
+        )),
         "breakdowns_status": legacy_status,
         "proactive_messages": int(chat.get("proactive_messages") or 0),
         "delivery_signals": delivered,

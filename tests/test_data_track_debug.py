@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -355,6 +356,44 @@ def test_fast_proactive_snapshot_keeps_expired_out_of_failed_count():
     assert proactive["failed_jobs"] == 3
     assert proactive["jobs_by_status"]["expired"] == 2
     assert proactive["job_failed_reasons"] == {"model_timeout": 2, "unknown": 1}
+
+
+def test_fast_proactive_snapshot_redacts_provider_error_bodies_in_reasons():
+    """T344: the V2 snapshot path is the one that served the real leak.
+
+    The DB aggregate groups by the raw ``status_reason``, so an embedded
+    provider error body both exposed a key-management URL *and* split one
+    failure mode into a bucket per occurrence. Redaction happens at this
+    boundary, which means the collapsed buckets must be summed here too.
+    """
+    # Synthetic URL: the production one must never be written down.
+    secret_url = "https://openrouter.invalid/settings/keys/key-id-must-not-leak"
+    proactive = data_track._data_track_proactive_from_snapshot(
+        {
+            "logs": {"proactive_jobs": {"count": 6, "last_ts": 100}},
+            "proactive_extra": {
+                "jobs_by_status": {"failed": 6},
+                "jobs_failed_by_reason": {
+                    f"provider_payment_required: 402 #0 {secret_url}": 1,
+                    f"provider_payment_required: 402 #1 {secret_url}": 1,
+                    "wake_failed:empty_reply": 3,
+                    "wake_failed:malformed_self_thinking_suppressed": 1,
+                },
+            },
+        },
+        {},
+    )
+
+    assert secret_url not in json.dumps(proactive)
+    assert proactive["job_failed_reasons"] == {
+        "provider_payment_required:<redacted>": 2,
+        # The two wake reasons must stay distinguishable: telling
+        # "the model said nothing" apart from "we suppressed a malformed reply"
+        # is the whole point of this dashboard.
+        "wake_failed:empty_reply": 3,
+        "wake_failed:malformed_self_thinking_suppressed": 1,
+    }
+    assert proactive["failed_jobs"] == 6
 
 
 def test_trace_vocabulary_failure_is_explicit_retried_and_not_cached(monkeypatch):
