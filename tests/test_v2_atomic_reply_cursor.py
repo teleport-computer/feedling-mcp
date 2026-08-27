@@ -775,6 +775,14 @@ def test_atomic_reply_retains_source_history_without_tee_eviction(monkeypatch):
     mirrored: list[list[tuple[str, tuple]]] = []
     monkeypatch.setattr(mirror, "execute_many", lambda statements: mirrored.append(statements))
 
+    # The process-wide debug trace stats writer shares this mirror entrypoint
+    # and may flush while this test owns the monkeypatch.  Keep an unrelated
+    # batch in the regression so the assertion below cannot rely on global
+    # mirror silence.
+    mirror.execute_many([
+        ("INSERT INTO trace_write_stats (writer_id) VALUES (%s)", ("other",)),
+    ])
+
     db.chat_append_effect_with_cursor(
         uid,
         "reply-row",
@@ -792,7 +800,13 @@ def test_atomic_reply_retains_source_history_without_tee_eviction(monkeypatch):
             ).fetchall()
         }
     assert remaining == {"old-1", "old-2", "old-3", "reply-row"}
-    assert mirrored == []
+    chat_history_mirror_sql = [
+        sql
+        for statements in mirrored
+        for sql, _params in statements
+        if "chat_messages" in sql or "chat_message_bodies" in sql
+    ]
+    assert chat_history_mirror_sql == []
 
 
 def test_reply_effect_payload_contains_ciphertext_not_model_text(monkeypatch):
