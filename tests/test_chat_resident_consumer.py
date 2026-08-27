@@ -12914,26 +12914,142 @@ def test_wake_templates_share_the_foreground_thinking_switch(monkeypatch):
     """
     from agent_protocol_core import self_thinking as _st
 
+    monkeypatch.setattr(crc, "_report_runtime_error", lambda *_a, **_k: True)
+    monkeypatch.setattr(crc, "_worldbook_context_for_wake", lambda _job: "")
+    monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "zh-Hans"})
+
+    def _foreground_prompt(suffix: str) -> str:
+        crc._seen_ids.clear()
+        crc._seen_ids_order.clear()
+        captured = {}
+
+        def _call_agent(message, **_kwargs):
+            captured["message"] = message
+            return {"messages": ["好"]}
+
+        msg = {
+            "id": f"thinking-switch-{suffix}",
+            "role": "user",
+            "content": "陪我看星星",
+            "ts": 1_800_000_000.0,
+        }
+        with patch.object(crc, "call_agent", side_effect=_call_agent), patch.object(
+            crc, "post_reply", return_value={"id": f"reply-{suffix}"}
+        ):
+            crc._process_messages([msg])
+        return captured["message"]
+
+    monkeypatch.setattr(crc, "_wake_self_thinking_allowed", lambda: True)
+    on_foreground = _foreground_prompt("on")
+    on_proactive = crc._message_for_proactive_job(
+        {"trigger": "heartbeat_broadcast_off"}
+    )
+    on_scheduled = crc._scheduled_wake_message(
+        {"scheduled_note": "喝茶", "timezone": "Asia/Shanghai"}
+    )
+    assert _st.INSTRUCTION.strip() in on_foreground
+    assert "<think>" in on_proactive
+    assert "<think>" in on_scheduled
+    # 主动道只放开可选块，不前置前台的整份强制指令。
+    assert _st.INSTRUCTION.strip() not in on_proactive
+    assert _st.INSTRUCTION.strip() not in on_scheduled
+
+    # 只改共享开关，两条真实构建路径必须一起变化。
+    monkeypatch.setattr(crc, "_wake_self_thinking_allowed", lambda: False)
+    off_foreground = _foreground_prompt("off")
+    off_proactive = crc._message_for_proactive_job(
+        {"trigger": "heartbeat_broadcast_off"}
+    )
+    off_scheduled = crc._scheduled_wake_message({"scheduled_note": "喝茶"})
+    assert _st.INSTRUCTION.strip() not in off_foreground
+    assert "<think>" not in off_proactive
+    assert "<think>" not in off_scheduled
+
+    # 阴性对照:关掉 think 后主动回复协议仍在，证明不是整段模板消失。
+    assert '{"messages":["..."]}' in off_proactive
+
+
+@pytest.mark.parametrize(
+    ("locale", "archive_language", "expects_chinese"),
+    [
+        ("zh-Hans", "en", True),
+        ("en-US", "zh-Hans", False),
+    ],
+)
+def test_wake_thinking_rule_uses_the_reply_language_policy(
+    monkeypatch, locale, archive_language, expects_chinese
+):
+    monkeypatch.setattr(crc, "_wake_self_thinking_allowed", lambda: True)
+    monkeypatch.setattr(crc, "_worldbook_context_for_wake", lambda _job: "")
+    monkeypatch.setattr(
+        crc, "_whoami_cache", {"archive_language": archive_language}
+    )
+    presence = {"locale": locale}
+    think_rule = crc._wake_think_permission_line(presence)
+    reply_rule = crc._reply_language_line(presence)
+
+    message = crc._message_for_proactive_job(
+        {"trigger": "heartbeat_broadcast_off"},
+        perception_digest=(presence, [], {}),
+    )
+
+    def _contains_chinese(text: str) -> bool:
+        return any("\u3400" <= char <= "\u9fff" for char in text)
+
+    assert "<think>" in think_rule  # 最小存在性守卫；其余断言只钉两条规则的关系。
+    assert think_rule in message
+    assert reply_rule in message
+    assert _contains_chinese(think_rule) is expects_chinese
+    assert _contains_chinese(reply_rule) is expects_chinese
+    if expects_chinese:
+        assert "可以" in think_rule
+        assert "必须" not in think_rule
+    else:
+        normalized = f" {think_rule.lower()} "
+        assert " may " in normalized
+        assert " must " not in normalized
+
+
+@pytest.mark.parametrize(
+    ("archive_language", "expects_chinese"),
+    [("zh-Hans", True), ("en", False)],
+)
+def test_scheduled_wake_thinking_rule_uses_the_reply_language_policy(
+    monkeypatch, archive_language, expects_chinese
+):
+    monkeypatch.setattr(crc, "_wake_self_thinking_allowed", lambda: True)
+    monkeypatch.setattr(
+        crc, "_whoami_cache", {"archive_language": archive_language}
+    )
+    think_rule = crc._wake_think_permission_line()
+    reply_rule = crc._reply_language_line()
+
+    message = crc._scheduled_wake_message(
+        {"scheduled_note": "drink tea", "timezone": "Asia/Shanghai"}
+    )
+
+    def _contains_chinese(text: str) -> bool:
+        return any("\u3400" <= char <= "\u9fff" for char in text)
+
+    assert think_rule in message
+    assert reply_rule in message
+    assert _contains_chinese(think_rule) is expects_chinese
+    assert _contains_chinese(reply_rule) is expects_chinese
+
+
+def test_wake_thinking_switch_uses_same_enablement_and_model_support(monkeypatch):
+    from agent_protocol_core import self_thinking as _st
+
     monkeypatch.setattr(_st, "enabled", lambda: True)
     monkeypatch.setattr(crc, "_supports_mandatory_self_thinking_v1", lambda: True)
-    on_protocol = crc._reply_protocol_block()
-    on_scheduled = crc._scheduled_wake_message({"scheduled_note": "喝茶", "timezone": "Asia/Shanghai"})
-    assert "<think>" in on_protocol
-    assert "<think>" in on_scheduled
+    assert crc._wake_self_thinking_allowed() is True
 
-    # 同一个 kill switch 关掉 → 两个模板都不再提 <think>
     monkeypatch.setattr(_st, "enabled", lambda: False)
-    assert "<think>" not in crc._reply_protocol_block()
-    assert "<think>" not in crc._scheduled_wake_message({"scheduled_note": "喝茶"})
+    assert crc._wake_self_thinking_allowed() is False
 
-    # 模型不支持这套协议时同样不提(与前台同一条判据)
     monkeypatch.setattr(_st, "enabled", lambda: True)
     monkeypatch.setattr(crc, "_supports_mandatory_self_thinking_v1", lambda: False)
-    assert "<think>" not in crc._reply_protocol_block()
-    assert "<think>" not in crc._scheduled_wake_message({"scheduled_note": "喝茶"})
-
-    # 阴性对照:JSON 协议那句本身在四种情形下都还在,证明上面不是整段消失
-    assert '{"messages":["..."]}' in on_protocol
+    assert crc._wake_self_thinking_allowed() is False
 
 
 def test_mcp_wiring_trace_covers_the_proactive_lane(monkeypatch):

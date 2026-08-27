@@ -30,7 +30,7 @@ SHELL_ONLY_GET_STORE_SITES: dict[tuple[str, int], str] = {
     ("backend/admin/admin_core.py", 879): "runtime mode control is DB-backed",
     ("backend/admin/admin_core.py", 899): "runtime mode control is DB-backed",
     ("backend/admin/admin_core.py", 935): "runtime allowlist reconciliation is DB-backed",
-    ("backend/agent_runtime/spawners.py", 1110): "web settings are direct blob reads",
+    ("backend/agent_runtime/spawners.py", 1114): "web settings are direct blob reads",
     ("backend/agent_runtime/supervisor.py", 242): "notices are durable log writes",
     ("backend/agent_runtime/supervisor.py", 268): "notice resolution is a durable log write",
     ("backend/asgi_app.py", 178): "debug trace is a durable log write",

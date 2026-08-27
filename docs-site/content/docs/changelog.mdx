@@ -20,6 +20,25 @@ change must not be interpreted as an API guarantee.
   provider call, does not execute or deliver the incomplete file, and reports a
   localized output-limit error instead of retrying at the same budget.
 
+- Agents running on the pi driver, whether hosted or self-hosted, can now inspect
+  images pulled during a turn by `screen-read --include-image`,
+  `photo-read --include-image`, or `chat-image`. The pi runtime keeps its
+  read-only file tool active so the returned `image_file` becomes a real image
+  attachment; its edit and write tools remain disabled. Images attached to the
+  current message continue to use pi's native image-input path.
+
+- Resident V1 proactive wakes now apply the same private-thinking enablement as
+  foreground Chat while preserving their optional, rather than mandatory,
+  thinking behavior. When used, the entire private block follows the user's
+  language and stays in the agent's own inner voice instead of becoming an
+  assessment of the user or a plan for them.
+
+- Provider responses that report an expired account or plan now use the
+  actionable `provider_account_expired` error class and tell the user to renew
+  or restore service with the provider. Bare HTTP `403` authentication failures
+  are no longer misclassified as transient empty replies; generic credential
+  failures continue to use `auth_invalid`.
+
 - Memory cards no longer expose or honor `is_sensitive`, `sensitivity_class`,
   `sensitive_scope`, `include_sensitive`, or `user_explicit_selection`.
   All shared cards are eligible for direct fetch, ambient recall, profile

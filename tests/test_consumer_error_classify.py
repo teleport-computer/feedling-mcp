@@ -449,6 +449,35 @@ def test_pi_empty_reply_with_quota_detail_still_classifies_as_quota(monkeypatch)
     assert notice.blame == "user_provider"
 
 
+@pytest.mark.parametrize("status", ["403", "provider_http_403"])
+def test_pi_account_expired_is_actionable_not_transient_or_bad_key(status):
+    exc = RuntimeError(
+        f'{crc.EMPTY_PROVIDER_REPLY_MARK}: pi agent produced no reply: {status}: '
+        '{"code":"account_expired","message":"Account expired",'
+        '"type":"invalid_request_error"}'
+    )
+    notice = crc.classify_agent_error(exc)
+    assert notice.error_class == "provider_account_expired"
+    assert notice.blame == "user_provider"
+    assert "续费或恢复账号" in notice.user_text
+    assert "API Key" not in notice.user_text
+    assert "重新保存" not in notice.user_text
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "401: rejected",
+        "403 Forbidden",
+        "provider_http_403: Forbidden",
+    ],
+)
+def test_provider_auth_status_shapes_are_classified_as_auth_invalid(detail):
+    notice = crc.classify_agent_error(RuntimeError(f"provider rejected request: {detail}"))
+    assert notice.error_class == "auth_invalid"
+    assert notice.blame == "user_provider"
+
+
 def test_pi_empty_reply_without_detail_is_provider_empty_reply():
     exc = RuntimeError(
         f"{crc.EMPTY_PROVIDER_REPLY_MARK}: pi agent produced no reply: ")

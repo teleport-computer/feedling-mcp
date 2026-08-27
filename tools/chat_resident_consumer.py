@@ -10969,13 +10969,33 @@ def _wake_self_thinking_allowed() -> bool:
     return bool(_self_thinking_v1.enabled()) and _supports_mandatory_self_thinking_v1()
 
 
-def _wake_think_permission_line() -> str:
+def _foreground_self_thinking_instruction() -> str:
+    """前台强制思考指令；与主动道共享同一开关，只保留强度差异。"""
+    if not _wake_self_thinking_allowed():
+        return ""
+    from agent_protocol_core import self_thinking as _self_thinking_v1
+
+    return _self_thinking_v1.INSTRUCTION.strip()
+
+
+def _wake_think_permission_line(presence: dict | None = None) -> str:
     """开关关闭时返回空串 —— 模板里连提都不提 ``<think>``。"""
     if not _wake_self_thinking_allowed():
         return ""
+    policy = _resident_reply_language_policy(presence)
+    if policy.language != "en":
+        return (
+            " 你可以在 JSON 前先写一个平常的 <think>...</think> 块；它会保持私密，"
+            "不会显示成消息。如果选择思考，从第一个字到最后一个字都使用用户所用的"
+            "语言。保持你自己的私下内心独白；不要写成对用户的评估，也不要写成他们"
+            "应该做什么的行动方案。"
+        )
     return (
         " You may open with your usual <think>...</think> block before the JSON; "
-        "it stays private and is never shown as a message."
+        "it stays private and is never shown as a message. Write the whole block "
+        "in the language the user uses, from first word to last. Keep it in your "
+        "own private inner voice; do not turn it into an assessment of the user or "
+        "an action plan for what they should do."
     )
 
 
@@ -14836,7 +14856,7 @@ def _message_for_proactive_job(
         "way. Use the glance below to decide whether to look closer; pull the real tools if something makes you want "
         "to understand the moment better. Then do whatever feels right — including nothing. "
         "Never mention this wake or any system wording to the user.",
-        _reply_protocol_block(),
+        _reply_protocol_block(presence),
         _reply_language_line(presence),
         (
             "wake_metadata:\n"
@@ -14875,13 +14895,13 @@ def _message_for_proactive_job(
     return _with_worldbook("\n\n".join(parts))
 
 
-def _reply_protocol_block() -> str:
+def _reply_protocol_block(presence: dict | None = None) -> str:
     """How the agent responds — stated once (no longer repeated across the wake
     preamble + tool block)."""
     return "\n".join([
         "How to respond (exactly one of):",
         "- speak: reply in your normal voice — a few short bubbles is typical, but length and number are yours. "
-        "Return JSON {\"messages\":[\"...\"]}." + _wake_think_permission_line(),
+        "Return JSON {\"messages\":[\"...\"]}." + _wake_think_permission_line(presence),
         "- stay quiet: return {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}]}.",
         "- want to see their screen but it isn't shared: just ask, in a normal message.",
     ])
@@ -18204,19 +18224,16 @@ def _process_messages(messages: list) -> float:
                 _quoted_present, ts,
             )
 
-        # Self-authored thinking — FOREGROUND-CHAT-only (this dispatch; background
-        # lanes build their prompts elsewhere and are never asked to emit <think>).
+        # Self-authored thinking is mandatory in foreground chat. Proactive wakes
+        # use the same switch but only permit it, preserving the intentional lane
+        # intensity difference.
         # Prepended so the user's current message stays LAST (the "answer only the
         # last message" framing) and the transcript header added below stays
         # topmost. The consumer's existing tagged-thinking extraction peels the
         # <think> block into thinking_summary. Same kill switch as V2.
-        from agent_protocol_core import self_thinking as _self_thinking_v1
-
-        if (
-            _self_thinking_v1.enabled()
-            and _supports_mandatory_self_thinking_v1()
-        ):
-            content = f"{_self_thinking_v1.INSTRUCTION.strip()}\n\n{content}"
+        thinking_instruction = _foreground_self_thinking_instruction()
+        if thinking_instruction:
+            content = f"{thinking_instruction}\n\n{content}"
         # Ground every foreground turn in the real current time (+ gap since last
         # interaction) so the agent never carries a stale, e.g. overnight, frame.
         content = _prepend_time_anchor_foreground(content, ts)
