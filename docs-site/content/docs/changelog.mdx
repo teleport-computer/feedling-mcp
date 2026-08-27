@@ -12,6 +12,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Agents running on the pi driver, whether hosted or self-hosted, can now inspect
+  images pulled during a turn by `screen-read --include-image`,
+  `photo-read --include-image`, or `chat-image`. The pi runtime keeps its
+  read-only file tool active so the returned `image_file` becomes a real image
+  attachment; its edit and write tools remain disabled. Images attached to the
+  current message continue to use pi's native image-input path.
+
 - Memory cards no longer expose or honor `is_sensitive`, `sensitivity_class`,
   `sensitive_scope`, `include_sensitive`, or `user_explicit_selection`.
   All shared cards are eligible for direct fetch, ambient recall, profile
