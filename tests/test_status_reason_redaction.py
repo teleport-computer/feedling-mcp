@@ -19,7 +19,9 @@ import ast
 import sys
 from pathlib import Path
 
-BACKEND = Path(__file__).parent.parent / "backend"
+ROOT = Path(__file__).parent.parent
+BACKEND = ROOT / "backend"
+CONSUMER = ROOT / "tools" / "chat_resident_consumer.py"
 sys.path.insert(0, str(BACKEND))
 
 from notices import error_contract, status_reason  # noqa: E402
@@ -78,6 +80,54 @@ def _rejecting_wake_control_reasons() -> dict[str, list[str]]:
     return found
 
 
+def _consumer_reason_leads() -> dict[str, list[str]]:
+    """Leading segment of every reason the resident consumer writes.
+
+    The consumer reaches this column through ``/v1/proactive/jobs/{id}/status``
+    like any other caller, so it is a producer the ``backend/`` scan above is
+    structurally blind to. Most of its reasons are f-strings that append
+    exception text, so only the leading constant is collected — that is the part
+    the redaction has to keep.
+    """
+    tree = ast.parse(CONSUMER.read_text(encoding="utf-8"), filename=str(CONSUMER))
+    found: dict[str, list[str]] = {}
+
+    def record(text: str, lineno: int) -> None:
+        lead = text.split(":")[0].strip()
+        if lead:
+            found.setdefault(lead, []).append(f"chat_resident_consumer.py:{lineno}")
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+        if name != "update_proactive_job_status" or len(node.args) < 3:
+            continue
+        arg = node.args[2]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            record(arg.value, arg.lineno)
+        elif isinstance(arg, ast.JoinedStr) and arg.values:
+            head = arg.values[0]
+            if isinstance(head, ast.Constant) and isinstance(head.value, str):
+                record(head.value, arg.lineno)
+    return found
+
+
+# Producers whose bucket deliberately does not survive. Naming them here is the
+# point: a *new* unpreserved producer fails the test below instead of quietly
+# joining the ``<redacted>`` pile.
+CONSUMER_LEADS_WITHOUT_A_BUCKET = {
+    # ``f"chat_message_id={id}"`` — the whole value is an identifier, so there
+    # is no producer-owned prefix to keep. Preserving it would need a shape
+    # rule, and a shape rule is what this module exists to avoid.
+    "chat_message_id=",
+}
+
+
+def _bucket(reason: str) -> str:
+    return status_reason.sanitize_status_reason(reason).split(":")[0]
+
+
 def test_scanners_find_their_producers():
     """The two scanners must be measuring something.
 
@@ -98,6 +148,54 @@ def test_scanners_find_their_producers():
     # The accepting reasons must stay out; they are not this keyspace.
     assert "allowed" not in rejects
     assert "manual_bypass" not in rejects
+
+    leads = _consumer_reason_leads()
+    # One plain literal and one f-string prefix, so a scan that stopped seeing
+    # either node type fails here rather than silently guarding half the file.
+    assert "thinking_only_silence" in leads, leads
+    assert "agent_call_failed" in leads, leads
+    assert len(leads) >= 20, sorted(leads)
+
+
+def test_every_consumer_reason_keeps_its_bucket():
+    """The resident consumer's reasons must still be attributable.
+
+    Fail-closed redaction is only acceptable on this surface if the producer's
+    bucket survives; otherwise the admin failure table collapses every resident
+    failure into one ``<redacted>`` row, which is the illegibility T344 set out
+    to fix rather than something it may cause.
+    """
+    lost = {
+        lead: locations
+        for lead, locations in _consumer_reason_leads().items()
+        if lead not in CONSUMER_LEADS_WITHOUT_A_BUCKET and _bucket(lead) != lead
+    }
+    assert not lost, (
+        "the resident consumer writes these into status_reason but they are not "
+        "declared in RESIDENT_CONSUMER_REASONS, so every occurrence collapses "
+        f"into the same <redacted> bucket: {lost}"
+    )
+
+
+def test_memgarden_parser_errors_keep_their_bucket():
+    """Parser errors the drift guard cannot watch, pinned by hand instead.
+
+    ``memgarden.prompts.{capture,dream,migrate}`` return these as the parser
+    ``err`` and the consumer writes them straight into this column. They live in
+    a pinned wheel, so no scan of this repo will notice when the wheel adds one.
+    Asserting the set here at least makes the hand-maintained list explicit.
+    """
+    for reason in status_reason.MEMORY_PARSER_REASONS:
+        assert _bucket(reason) == reason, reason
+    # The two that carry an interpolated tail must lose only the tail.
+    assert (
+        status_reason.sanitize_status_reason("json_decode_error:JSONDecodeError")
+        == "json_decode_error:<redacted>"
+    )
+    assert (
+        status_reason.sanitize_status_reason("too_many_cards:41>40")
+        == "too_many_cards:<redacted>"
+    )
 
 
 def test_every_written_status_reason_literal_is_sanctioned():

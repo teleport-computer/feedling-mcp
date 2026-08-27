@@ -225,7 +225,11 @@ def test_record_capture_job_status_failed_emits_error_event(tmp_path, monkeypatc
     assert enqueued is True
 
     failed_job = dict(job)
-    failed_job.update({"status": "failed", "status_reason": "handler_exception"})
+    # A declared reason, so this test keeps asserting reason passthrough rather
+    # than accidentally asserting the redaction a fail-closed sanitizer applies
+    # to undeclared values. `runtime_failed` is what
+    # db.content_free_failure_code writes as its collapsed-failure placeholder.
+    failed_job.update({"status": "failed", "status_reason": "runtime_failed"})
 
     capture_scheduler.record_capture_job_status(store, failed_job, status="failed")
 
@@ -234,4 +238,97 @@ def test_record_capture_job_status_failed_emits_error_event(tmp_path, monkeypatc
     assert len(errors) == 1
     assert errors[0]["job_id"] == job["job_id"]
     assert errors[0]["status"] == "error"
-    assert errors[0]["detail"]["reason"] == "handler_exception"
+    assert errors[0]["detail"]["reason"] == "runtime_failed"
+
+
+# `GET /v1/debug/trace` returns trace details on the user's own auth, and
+# `debug_trace._safe_detail` bounds length without judging content, so a
+# provider error body carried in the job's reason would reach the end user.
+# Both source fields are externally supplied free text: `_job_status_patch`
+# stores `payload["reason"][:500]` and `payload["noop_reason"][:500]` straight
+# from the request body.
+#
+# Synthetic value only. `.invalid` is reserved by RFC 2606 and never resolves.
+_SYNTHETIC_LEAK = "https://keys.example.invalid/settings/keys/key_synthetic1"
+
+
+def test_capture_trace_error_reason_is_redacted(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch, "usr_capture_trace_redact_error")
+
+    job, enqueued, _ = capture_jobs.enqueue_memory_capture_job(
+        store, trigger="session_break", capture_key="cap_key_redact_error",
+        window={"after_message_id": "m1", "until_message_id": "m2", "message_count": 1},
+    )
+    assert enqueued is True
+
+    failed_job = dict(job)
+    failed_job.update({
+        "status": "failed",
+        "status_reason": f"auth_invalid: 402 {_SYNTHETIC_LEAK}",
+    })
+
+    capture_scheduler.record_capture_job_status(store, failed_job, status="failed")
+
+    events = debug_trace.read_trace(store, subsystem="memory")
+    errors = [e for e in events if e["type"] == "memory.capture.error"]
+    assert len(errors) == 1
+    # Redaction, not deletion: the sanctioned prefix survives so the event still
+    # reads as an auth failure.
+    assert errors[0]["detail"]["reason"] == "auth_invalid:<redacted>"
+    assert _SYNTHETIC_LEAK not in repr(events)
+
+
+def test_capture_trace_skipped_reason_is_redacted(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch, "usr_capture_trace_redact_skipped")
+
+    job, enqueued, _ = capture_jobs.enqueue_memory_capture_job(
+        store, trigger="session_break", capture_key="cap_key_redact_skipped",
+        window={"after_message_id": "m1", "until_message_id": "m2", "message_count": 1},
+    )
+    assert enqueued is True
+
+    skipped_job = dict(job)
+    skipped_job.update({
+        "status": "skipped",
+        "status_reason": f"heartbeat_throttled: gate said {_SYNTHETIC_LEAK}",
+    })
+
+    capture_scheduler.record_capture_job_status(store, skipped_job, status="skipped")
+
+    events = debug_trace.read_trace(store, subsystem="memory")
+    done = [e for e in events if e["type"] == "memory.capture.done"]
+    assert len(done) == 1
+    assert done[0]["detail"]["reason"] == "heartbeat_throttled:<redacted>"
+    assert _SYNTHETIC_LEAK not in repr(events)
+
+
+def test_capture_trace_noop_reason_is_redacted(tmp_path, monkeypatch):
+    """The fallback field is free text too, and is the one a reader forgets.
+
+    `status_reason` is absent here, so the writer falls through to
+    `noop_reason` — a separate `_job_status_patch` field with no producer-owned
+    vocabulary of its own (no backend code writes it as a literal).
+    """
+    store = _store(tmp_path, monkeypatch, "usr_capture_trace_redact_noop")
+
+    job, enqueued, _ = capture_jobs.enqueue_memory_capture_job(
+        store, trigger="session_break", capture_key="cap_key_redact_noop",
+        window={"after_message_id": "m1", "until_message_id": "m2", "message_count": 1},
+    )
+    assert enqueued is True
+
+    failed_job = dict(job)
+    failed_job.update({
+        "status": "failed",
+        "status_reason": "",
+        "noop_reason": f"402 from upstream {_SYNTHETIC_LEAK}",
+    })
+
+    capture_scheduler.record_capture_job_status(store, failed_job, status="failed")
+
+    events = debug_trace.read_trace(store, subsystem="memory")
+    errors = [e for e in events if e["type"] == "memory.capture.error"]
+    assert len(errors) == 1
+    # Nothing sanctioned leads this one, so it redacts whole.
+    assert errors[0]["detail"]["reason"] == "<redacted>"
+    assert _SYNTHETIC_LEAK not in repr(events)

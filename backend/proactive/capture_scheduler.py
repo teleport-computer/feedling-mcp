@@ -14,6 +14,7 @@ from typing import Any, Callable, Mapping
 
 import db
 from psycopg.types.json import Jsonb
+from notices import status_reason as notices_status_reason
 from proactive import capture_daily, capture_jobs
 from memory import migration as memory_migration
 
@@ -661,6 +662,19 @@ def _capture_trace_card_titles(job: Mapping[str, Any]) -> str:
     return " | ".join(str(t) for t in titles if t)[:1000]
 
 
+def _trace_safe_reason(job: Mapping[str, Any]) -> str:
+    """Reason for a trace event, redacted before it leaves the process.
+
+    Both fields are externally supplied free text — ``_job_status_patch`` stores
+    ``payload["reason"][:500]`` and ``payload["noop_reason"][:500]`` straight
+    from the request body — and ``GET /v1/debug/trace`` hands trace details back
+    on the user's own auth. ``debug_trace._safe_detail`` bounds length but does
+    not judge content, so redaction has to happen here, at the writer.
+    """
+    raw = str(job.get("status_reason") or job.get("noop_reason") or "").strip()
+    return notices_status_reason.sanitize_status_reason(raw)
+
+
 def record_migrate_job_status(store, job: Mapping[str, Any], *, status: str, now: float | None = None) -> dict[str, Any]:
     """migrate 终态只维护失败退避 streak——window 游标由 handler 自己重扫，
     这里不像 capture 那样推进 last_captured_*。"""
@@ -747,7 +761,7 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
         # render it red (see CAPTURE_RETRYABLE_TERMINAL comment in capture_jobs.py:
         # "failed = error; skipped = abnormal terminal — noop is reported as
         # completed, not skipped").
-        reason = str(job.get("status_reason") or job.get("noop_reason") or "").strip()
+        reason = _trace_safe_reason(job)
         detail = {"status": status_text}
         if reason:
             detail["reason"] = reason[:200]
@@ -763,7 +777,7 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
             detail=detail,
         )
     else:
-        reason = str(job.get("status_reason") or job.get("noop_reason") or "").strip()
+        reason = _trace_safe_reason(job)
         debug_trace.trace_event(
             store,
             subsystem="memory",
