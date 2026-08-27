@@ -184,7 +184,6 @@ tests/test_provider_tool_transcript_wire.py
 tests/test_provider_tools_acceptance.py
 tests/test_provider_tools_anthropic.py
 tests/test_provider_tools_bedrock.py
-tests/test_provider_tools_gemini.py
 tests/test_provider_tools_no_reply_text.py
 tests/test_provider_tools_openai.py
 tests/test_provider_tools_wire.py

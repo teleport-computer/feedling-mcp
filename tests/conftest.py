@@ -314,6 +314,7 @@ if not _provisioned:
         "test_ios_perception_contract_v2.py",
         "test_perception_ingress_v2.py",
         "test_provider_client.py",
+        "test_provider_tools_gemini.py",
         "test_provider_catalog_unit.py",
         "test_provider_health_unit.py",
         "test_provider_usage.py",
