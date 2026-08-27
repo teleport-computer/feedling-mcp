@@ -1611,11 +1611,55 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "properties": {
             "ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
             "limit": {"type": "integer", "minimum": 0},
+            "user_explicit_selection": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "True only when the user explicitly selected these exact IDs. "
+                    "Required together with include_sensitive to return sensitive content."
+                ),
+            },
+            "include_sensitive": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Include sensitive content only when user_explicit_selection is also true."
+                ),
+            },
             "include_archived": {"type": "boolean", "default": False},
             "include_superseded": {"type": "boolean", "default": False},
         },
         "additionalProperties": False,
         "example": {"ids": ["mem_abc123", "mem_def456"]},
+    },
+    "MemoryFetchResponse": {
+        "type": "object",
+        "required": ["items", "missing_ids", "unavailable_ids", "truncation"],
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {"type": "object", "additionalProperties": True},
+            },
+            "missing_ids": {"type": "array", "items": {"type": "string"}},
+            "unavailable_ids": {"type": "array", "items": {"type": "string"}},
+            "truncation": {
+                "type": "object",
+                "required": [
+                    "truncated",
+                    "requested_count",
+                    "processed_count",
+                    "omitted_count",
+                ],
+                "properties": {
+                    "truncated": {"type": "boolean"},
+                    "requested_count": {"type": "integer", "minimum": 0},
+                    "processed_count": {"type": "integer", "minimum": 0},
+                    "omitted_count": {"type": "integer", "minimum": 0},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "additionalProperties": False,
     },
     "MemoryRecordInput": {
         "type": "object",
@@ -2461,7 +2505,13 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("get", "/v1/chat/turn-activity/{turn_id}"): "Read display-safe activity for one V1 resident or Runtime V2 chat turn. V2 events come from backend jobs and tool dispatch; V1 events come from the authenticated resident io_cli boundary and are durably scoped to an existing user message. Both runtimes expose only bounded identifiers, state, timing, and result classification. Successful memory_search/memory_fetch events include the confirmed returned-item count and, only when every item uses the canonical bucket taxonomy, a complete category-count breakdown. Tool arguments, result bodies, assistant prose, reasoning, and custom bucket labels are never returned.",
     ("post", "/v1/chat/turn-activity/{turn_id}/events"): "Append one authenticated V1 resident tool transition. This endpoint is used by the shipped resident io_cli runtime, accepts only running/success/failure plus display-safe fixed metadata, rejects V2-owned users, and never accepts tool arguments, model prose, or result bodies.",
     ("post", "/v1/memory/index"): "Return lightweight memory cards. This is selection, not full-content retrieval; query is intentionally not exposed because it is not a search filter today.",
-    ("post", "/v1/memory/fetch"): "Fetch full records for selected memory IDs. Sensitive fetch behavior is not part of the current public contract.",
+    ("post", "/v1/memory/fetch"): (
+        "Fetch full records for selected memory IDs in request order. Sensitive "
+        "content requires both include_sensitive and user_explicit_selection; "
+        "ambient, profile, and maintenance reads retain their normal filter. "
+        "Inspect the truncation object instead of assuming every requested ID "
+        "was processed."
+    ),
     ("post", "/v1/memory/actions"): "Apply up to 20 memory actions independently and in order. Full or partial applied success returns HTTP 200. When no action is applied and at least one fails, HTTP 400 promotes the first failed item's error/detail while preserving every result and all counts. An all-skipped batch remains 200. The batch is not transactional and Idempotency-Key is not supported.",
     ("post", "/v1/perception/report"): "Submit device context. Sensitive signals must use encrypted envelopes; inspect each results entry even when HTTP status is 200.",
     ("get", "/v1/perception/app_open"): "Legacy iOS Shortcut compatibility endpoint. This GET records an event and therefore has side effects.",
@@ -2616,6 +2666,16 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
             "content": {
                 "application/json": {
                     "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                }
+            },
+        },
+    },
+    ("post", "/v1/memory/fetch"): {
+        "200": {
+            "description": "Selected memory records plus explicit resolution and truncation metadata.",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/MemoryFetchResponse"}
                 }
             },
         },

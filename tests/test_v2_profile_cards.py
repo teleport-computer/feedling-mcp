@@ -32,6 +32,8 @@ def _wire(monkeypatch, *, index_body, fetched_items=(), fetch_calls=None):
 
     def _fetch(_store, api_key, payload, *, post_enclave):
         assert api_key is None
+        assert payload["include_sensitive"] is True
+        assert "user_explicit_selection" not in payload
         if fetch_calls is not None:
             fetch_calls.append(tuple(payload["ids"]))
         post_enclave(None, [], operation="fetch", payload={})

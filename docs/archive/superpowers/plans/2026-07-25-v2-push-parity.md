@@ -1,3 +1,8 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/superpowers/specs/2026-07-25-v2-push-parity-design.md
+historical_reason: implemented
+---
 # Runtime V2 推送能力补齐 Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

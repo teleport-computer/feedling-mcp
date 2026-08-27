@@ -323,8 +323,7 @@ def test_enclave_limit_zero_uses_hard_max_instead_of_unbounded(monkeypatch):
     assert captured_lengths == [7]
 
 
-def test_enclave_negative_env_limit_falls_back_to_default_not_full_open(monkeypatch):
-    monkeypatch.setenv("FEEDLING_MEMORY_READSIDE_LIMIT", "-1")
+def test_enclave_unset_limit_falls_back_to_hard_max_not_full_open(monkeypatch):
     monkeypatch.delenv("FEEDLING_MEMORY_READSIDE_HARD_MAX", raising=False)
     c = _enclave_client(monkeypatch)
     captured_lengths = []
@@ -336,11 +335,11 @@ def test_enclave_negative_env_limit_falls_back_to_default_not_full_open(monkeypa
     monkeypatch.setattr(readside, "decrypt_readside_items", fake_decrypt)
 
     res = c.post("/v1/memory/index",
-                 json={"moments": [{"id": f"mem_{idx:03d}"} for idx in range(70)]},
+                 json={"moments": [{"id": f"mem_{idx:04d}"} for idx in range(1001)]},
                  headers={"X-API-Key": "key_readside"})
 
     assert res.status_code == 200
-    assert captured_lengths == [50]
+    assert captured_lengths == [1000]
 
 
 def test_enclave_fetch_item_returns_v1_full_card_without_sensitive_scope():

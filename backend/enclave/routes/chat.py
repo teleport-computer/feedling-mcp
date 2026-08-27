@@ -27,6 +27,7 @@ from enclave.routes._errors import backend_call_or_error, content_sk_or_503
 from enclave.routes._json import json_response_offthread
 
 router = APIRouter()
+_QUOTED_MEMORY_MAX = 8
 
 
 def _attach_chat_metadata(source: dict, target: dict) -> None:
@@ -217,19 +218,41 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
     return decrypted, errors
 
 
+def _quoted_memory_ids(messages: list[dict]) -> list[str]:
+    """Collect unique Garden references without inspecting message bodies."""
+    wanted: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        for memory_id in str(message.get("quoted_memory_ids") or "").split(",")[
+            :_QUOTED_MEMORY_MAX
+        ]:
+            memory_id = memory_id.strip()
+            if memory_id and memory_id not in wanted:
+                wanted.append(memory_id)
+    return wanted
+
+
 def _attach_quoted_memories(decrypted: list[dict], cards: list[dict]) -> None:
     """Expand user-selected memory ids (Garden「talk in chat」) into decrypted
     cards on their own message, so the resident consumer can inject them into
     the agent's context. Mutates `decrypted` in place; best-effort. The raw id
-    list is removed from each entry so it never leaks in the response.
+    list is removed from each entry so it never leaks in the response.  Every
+    referenced message also receives a content-free status shape.  Consumers
+    use it to show the model a generic "unavailable" note rather than silently
+    pretending that a deleted, replaced, unreadable, or failed-to-fetch card was
+    never selected.
     """
     by_id = {str(c.get("id") or ""): c for c in cards if c.get("id")}
     for entry in decrypted:
         raw = entry.pop("quoted_memory_ids", None)
         if not raw:
             continue
+        requested = [
+            i.strip() for i in str(raw).split(",") if i.strip()
+        ][:_QUOTED_MEMORY_MAX]
         quoted: list[dict] = []
-        for mid in [i.strip() for i in str(raw).split(",") if i.strip()][:8]:
+        for mid in requested:
             card = by_id.get(mid)
             if not card:
                 continue
@@ -249,6 +272,11 @@ def _attach_quoted_memories(decrypted: list[dict], cards: list[dict]) -> None:
             })
         if quoted:
             entry["quoted_memories"] = quoted
+        entry["quoted_memory_status"] = {
+            "requested": len(requested),
+            "resolved": len(quoted),
+            "unavailable": max(0, len(requested) - len(quoted)),
+        }
 
 
 def _build_context_memories(moments, decrypted, query_args):
@@ -279,11 +307,6 @@ def _build_context_memories(moments, decrypted, query_args):
     # 翻成内核认的形状：内核只读 summary/content/bucket + 宿主显式给的
     # search_text，不认 title/her_quote/linked_dimension。
     garden_cards = [card_shape.to_garden_card(c) for c in selectable]
-
-    # Expand any user-selected memory references (Garden「talk in chat」) onto
-    # their message using the already-decrypted cards. Best-effort side pass;
-    # does not affect the context_memories selection below.
-    _attach_quoted_memories(decrypted, cards)
 
     # 挑卡用翻译后的卡（内核只认那一种形状），但**注入给模型的是原卡** ——
     # 原卡带着 title/her_quote 等 io 侧要渲染和留痕的字段，翻译产物只是
@@ -384,6 +407,7 @@ async def v1_chat_history(request: Request):
     context_memories: list = []
     context_memory_trace: dict | None = None
     listing_task: asyncio.Task | None = None
+    quoted_fetch_task: asyncio.Task | None = None
     query_args: dict | None = None
     context_setup_error: Exception | None = None
     # Decrypt-health probes (the resident consumer fires one every
@@ -423,6 +447,24 @@ async def v1_chat_history(request: Request):
             listing_task = asyncio.create_task(backend_client.backend_get(
                 "/v1/memory/list", ctx.forward_headers,
                 params={"limit": str(memory_limit)}))
+            quoted_ids = _quoted_memory_ids(hist.get("messages", []))
+            if quoted_ids:
+                # User-selected cards are an exact lookup, not part of the
+                # ranked auto-recall candidate pool.  All three lifecycle/trust
+                # flags are intentional: an explicit Garden click authorizes
+                # the model to see sensitive, archived, and superseded cards.
+                quoted_fetch_task = asyncio.create_task(backend_client.backend_post(
+                    "/v1/memory/fetch",
+                    ctx.forward_headers,
+                    {
+                        "ids": quoted_ids,
+                        "limit": len(quoted_ids),
+                        "user_explicit_selection": True,
+                        "include_sensitive": True,
+                        "include_archived": True,
+                        "include_superseded": True,
+                    },
+                ))
     except Exception as e:
         context_setup_error = e
         print(f"[chat/history:{user_id}] context_memories failed: {e}")
@@ -433,7 +475,26 @@ async def v1_chat_history(request: Request):
     except BaseException:
         if listing_task is not None:
             listing_task.cancel()  # 解密意外失败时不留孤儿任务
+        if quoted_fetch_task is not None:
+            quoted_fetch_task.cancel()
         raise
+
+    quoted_cards: list[dict] = []
+    if quoted_fetch_task is not None:
+        try:
+            quoted_response = await quoted_fetch_task
+            quoted_cards = (
+                quoted_response.get("items", [])
+                if isinstance(quoted_response, dict)
+                and isinstance(quoted_response.get("items"), list)
+                else []
+            )
+        except Exception as e:
+            # The chat message still goes through.  _attach_quoted_memories
+            # turns the empty result into a generic, content-free unavailable
+            # marker so the model does not guess what the selected card said.
+            print(f"[chat/history:{user_id}] quoted memory fetch failed: {e}")
+    _attach_quoted_memories(decrypted, quoted_cards)
 
     context_memory_log: dict | None = None
     if context_setup_error is not None:
@@ -443,7 +504,7 @@ async def v1_chat_history(request: Request):
             "counts": {"candidate_pool": 0, "injected": 0},
         }
     elif listing_task is not None:
-        moments = []
+        moments: list = []
         try:
             listing = await listing_task
             moments = listing.get("moments", []) or []

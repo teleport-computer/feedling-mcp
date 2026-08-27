@@ -352,6 +352,191 @@ def test_fetch_core_splits_missing_unavailable_and_preserves_order(monkeypatch):
     assert [item["id"] for item in body["items"]] == ["ok_a", "ok_b"]
     assert body["missing_ids"] == ["missing", "other_user"]
     assert body["unavailable_ids"] == ["local", "archived", "superseded"]
+    assert body["truncation"] == {
+        "truncated": False,
+        "requested_count": 7,
+        "processed_count": 7,
+        "omitted_count": 0,
+    }
+
+
+def test_fetch_core_reports_limit_truncation_instead_of_silent_slicing(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_core")
+    moments = [_moment(f"card_{index}") for index in range(3)]
+    monkeypatch.setattr(readside_core.memory_service, "_load_moments", lambda _store: moments)
+    monkeypatch.setattr(readside_core.memory_service, "_save_moments", lambda *_args: None)
+
+    def fake_enclave(_api_key, candidates, *, operation, payload=None):
+        return {
+            "items": [{"id": moment["id"], "summary": moment["id"]} for moment in candidates],
+            "unavailable_ids": [],
+        }
+
+    body = readside_core.memory_fetch_core(
+        store,
+        "key_core",
+        {"ids": ["card_0", "card_1", "card_2"], "limit": 2},
+        post_enclave=fake_enclave,
+    )
+
+    assert [item["id"] for item in body["items"]] == ["card_0", "card_1"]
+    assert body["truncation"] == {
+        "truncated": True,
+        "requested_count": 3,
+        "processed_count": 2,
+        "omitted_count": 1,
+    }
+    for requested_count in (1, 2):
+        boundary = readside_core.memory_fetch_core(
+            store,
+            "key_core",
+            {
+                "ids": [f"card_{index}" for index in range(requested_count)],
+                "limit": 2,
+            },
+            post_enclave=fake_enclave,
+        )
+        assert boundary["truncation"] == {
+            "truncated": False,
+            "requested_count": requested_count,
+            "processed_count": requested_count,
+            "omitted_count": 0,
+        }
+
+
+def test_fetch_core_explicit_quote_includes_sensitive_archived_and_superseded(
+    monkeypatch,
+):
+    store = types.SimpleNamespace(user_id="usr_core")
+    moments = [
+        _moment("sensitive"),
+        _moment("archived", archived=True),
+        _moment("superseded", status="superseded"),
+    ]
+    monkeypatch.setattr(readside_core.memory_service, "_load_moments", lambda _store: moments)
+    monkeypatch.setattr(readside_core.memory_service, "_save_moments", lambda *_args: None)
+    captured = {}
+
+    def fake_enclave(_api_key, candidates, *, operation, payload=None):
+        captured["ids"] = [moment["id"] for moment in candidates]
+        captured["payload"] = dict(payload or {})
+        return {
+            "items": [
+                {
+                    "id": moment["id"],
+                    "summary": moment["id"],
+                    "is_sensitive": moment["id"] == "sensitive",
+                }
+                for moment in candidates
+            ],
+            "unavailable_ids": [],
+            "blocked_sensitive_ids": [],
+        }
+
+    body = readside_core.memory_fetch_core(
+        store,
+        "key_core",
+        {
+            "ids": ["sensitive", "archived", "superseded"],
+            "user_explicit_selection": True,
+            "include_sensitive": True,
+            "include_archived": True,
+            "include_superseded": True,
+        },
+        post_enclave=fake_enclave,
+    )
+
+    assert captured["ids"] == ["sensitive", "archived", "superseded"]
+    assert captured["payload"]["include_sensitive"] is True
+    assert [item["id"] for item in body["items"]] == captured["ids"]
+    assert body["missing_ids"] == []
+    assert body["unavailable_ids"] == []
+
+
+def test_fetch_core_include_sensitive_also_applies_to_plaintext_tier(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_core")
+    sensitive = _plaintext_moment("plain_sensitive", "private")
+    sensitive["body"] = __import__("json").dumps({
+        "summary": "private",
+        "content": "private body",
+        "bucket": "未分类",
+        "threads": [],
+        "is_sensitive": True,
+    })
+    monkeypatch.setattr(
+        readside_core.memory_service, "_load_moments", lambda _store: [sensitive]
+    )
+    monkeypatch.setattr(readside_core.memory_service, "_save_moments", lambda *_args: None)
+
+    body = readside_core.memory_fetch_core(
+        store,
+        None,
+        {
+            "ids": ["plain_sensitive"],
+            "user_explicit_selection": True,
+            "include_sensitive": True,
+        },
+        post_enclave=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext tier must not call enclave")
+        ),
+    )
+
+    assert [item["id"] for item in body["items"]] == ["plain_sensitive"]
+    assert body["unavailable_ids"] == []
+
+
+def test_fetch_core_legacy_include_sensitive_flag_does_not_broaden_provider_reads(
+    monkeypatch,
+):
+    store = types.SimpleNamespace(user_id="usr_core")
+    sensitive = _moment("sealed_sensitive")
+    monkeypatch.setattr(
+        readside_core.memory_service, "_load_moments", lambda _store: [sensitive]
+    )
+
+    body = readside_core.memory_fetch_core(
+        store,
+        "key_core",
+        {"ids": ["sealed_sensitive"], "include_sensitive": True},
+        post_enclave=lambda *_args, **_kwargs: {
+            "items": [{
+                "id": "sealed_sensitive",
+                "summary": "private",
+                "is_sensitive": True,
+            }],
+            "unavailable_ids": [],
+        },
+    )
+
+    assert body["items"] == []
+    assert body["unavailable_ids"] == ["sealed_sensitive"]
+
+
+def test_fetch_core_explicit_selection_marker_alone_does_not_include_sensitive(
+    monkeypatch,
+):
+    store = types.SimpleNamespace(user_id="usr_core")
+    sensitive = _moment("sealed_sensitive")
+    monkeypatch.setattr(
+        readside_core.memory_service, "_load_moments", lambda _store: [sensitive]
+    )
+
+    body = readside_core.memory_fetch_core(
+        store,
+        "key_core",
+        {"ids": ["sealed_sensitive"], "user_explicit_selection": True},
+        post_enclave=lambda *_args, **_kwargs: {
+            "items": [{
+                "id": "sealed_sensitive",
+                "summary": "private",
+                "is_sensitive": True,
+            }],
+            "unavailable_ids": [],
+        },
+    )
+
+    assert body["items"] == []
+    assert body["unavailable_ids"] == ["sealed_sensitive"]
 
 
 class _FakeResp:

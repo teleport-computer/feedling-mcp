@@ -17592,7 +17592,15 @@ def _quoted_memory_context(msg: dict) -> str:
     decrypted cards under ``quoted_memories``; returns "" when there are none.
     Shared by hosted and VPS resident replies (same consumer)."""
     quoted = msg.get("quoted_memories")
-    if not isinstance(quoted, list) or not quoted:
+    if not isinstance(quoted, list):
+        quoted = []
+    status = msg.get("quoted_memory_status")
+    unavailable = (
+        max(0, int(status.get("unavailable") or 0))
+        if isinstance(status, dict)
+        else 0
+    )
+    if not quoted and unavailable == 0:
         return ""
     lines: list[str] = []
     for card in quoted:
@@ -17606,14 +17614,26 @@ def _quoted_memory_context(msg: dict) -> str:
         mid = str(card.get("id") or "").strip()
         id_tag = f"(id={mid}) " if mid else ""
         lines.append(f"- {id_tag}{prefix}{text}")
-    if not lines:
-        return ""
-    return (
-        "The user is referring to this memory from their Garden:\n"
-        + "\n".join(lines)
-        + "\nIf they ask you to correct or delete it, act on it directly with memory_patch / "
-        "memory_delete using the id shown above."
+    unavailable_note = (
+        "One or more Garden memories the user selected are currently unavailable "
+        "or have been updated. Do not guess their contents; ask the user to "
+        "reselect them if the missing context matters."
+        if unavailable
+        else ""
     )
+    if not lines and not unavailable_note:
+        return ""
+    parts: list[str] = []
+    if lines:
+        parts.append(
+            "The user is referring to this memory from their Garden:\n"
+            + "\n".join(lines)
+            + "\nIf they ask you to correct or delete it, act on it directly with "
+            "memory_patch / memory_delete using the id shown above."
+        )
+    if unavailable_note:
+        parts.append(unavailable_note)
+    return "\n".join(parts)
 
 
 # --- Offline backlog collapse ----------------------------------------------
@@ -18154,20 +18174,28 @@ def _process_messages(messages: list) -> float:
         # without a lookup round-trip. Sits right above the user's message.
         quoted_text = _quoted_memory_context(msg)
         # Diagnostic breadcrumb: localizes where Garden「talk in chat」breaks.
-        #   present>0  → enclave attached quoted_memories (② ok) → should inject
-        #   has_ids but present==0 → ② did not expand id into a card (enclave side)
-        #   neither → the reference never reached this message (① / transport)
+        #   present>0       → enclave attached quoted_memories
+        #   unavailable>0   → exact lookup completed/failed without card text;
+        #                     the generic no-guess marker must still inject
+        #   requested==0    → the reference never reached this message
         _quoted_present = len(msg.get("quoted_memories") or [])
-        _quoted_has_ids = bool(str(msg.get("quoted_memory_ids") or "").strip())
+        _quoted_status = msg.get("quoted_memory_status") or {}
+        _quoted_requested = int(_quoted_status.get("requested") or 0)
+        _quoted_unavailable = int(_quoted_status.get("unavailable") or 0)
         _emit_debug_trace(
             "context", "context.quoted_memory", trace_id=trace_id,
             summary=f"quoted present={_quoted_present} injected={bool(quoted_text)}",
             explain=(
                 "注入了引用记忆" if quoted_text
-                else ("有 quoted_memory_ids 但 enclave 未展开成 quoted_memories"
-                      if _quoted_has_ids else "本轮消息未携带任何引用记忆")
+                else ("有引用记忆但 enclave 未生成安全降级上下文"
+                      if _quoted_requested else "本轮消息未携带任何引用记忆")
             ),
-            detail={"present": _quoted_present, "has_ids": _quoted_has_ids, "injected": bool(quoted_text)},
+            detail={
+                "requested": _quoted_requested,
+                "present": _quoted_present,
+                "unavailable": _quoted_unavailable,
+                "injected": bool(quoted_text),
+            },
         )
         if quoted_text:
             content = f"{quoted_text}\n\n{content}"

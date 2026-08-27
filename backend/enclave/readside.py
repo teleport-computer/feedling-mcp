@@ -60,8 +60,8 @@ def memory_readside_hard_max() -> int:
 def memory_readside_effective_limit(raw_limit=None) -> int:
     """Mirror backend readside limit semantics inside the enclave.
 
-    FEEDLING_MEMORY_READSIDE_LIMIT controls index/fetch candidate windows:
-    - unset: 50
+    The explicit payload limit controls index/fetch candidate windows:
+    - unset: full window, capped by HARD_MAX (same as the backend)
     - positive integer: that many candidates, capped by HARD_MAX
     - 0: "full window", still capped by FEEDLING_MEMORY_READSIDE_HARD_MAX
 
@@ -69,13 +69,13 @@ def memory_readside_effective_limit(raw_limit=None) -> int:
     older route-B auto-recall path. Keep both knobs distinct.
     """
     if raw_limit is None or str(raw_limit).strip() == "":
-        raw_limit = os.environ.get("FEEDLING_MEMORY_READSIDE_LIMIT", "50")
+        raw_limit = "0"
     try:
         requested = int(str(raw_limit).strip())
     except (TypeError, ValueError):
-        requested = 50
+        requested = 0
     if requested < 0:
-        requested = 50
+        requested = 0
     hard_max = memory_readside_hard_max()
     if requested == 0:
         return hard_max
