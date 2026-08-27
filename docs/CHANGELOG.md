@@ -55,6 +55,52 @@ historical_reason: point-in-time
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-27 — data-track 用户列表改成真分页；`memory_changes` 的全扫描**未**解决
+
+**[DONE] 管理端不再"先把全舰队算完再切片"，但这一批明确没有消除
+`memory_changes` 的无界扫描。**
+
+- 后台用户列表原先把每个用户的记忆分面、屏幕帧计数和 bootstrap_events 全舰队
+  算完，再对结果切 `rows[offset:offset+limit]`——分页只省了渲染，不省取数。
+  现在这三片只读当前页的用户。读侧与被替换的实现做了同夹具、多页、多排序的
+  **逐字段对拍**：除请求时刻戳和由它派生的帧龄外，整个 payload 必须逐字段相等。
+- `memory_capture_jobs` 是**整片删除**而不是随页读：fleet 行与详情页都不消费它
+  的 count/last_ts，全仓也没有任何 `log_trim` 以它为目标。放进页里只是把一个
+  无界 `GROUP BY` 换个位置，而且它与 bootstrap_events 共用一条查询，一个重用户
+  就能把本来可读的 bootstrap 行拖成 degraded。
+- `bootstrap_events` 的 `last_at` 从 MAX 里去掉：两条写入路径都不传 ts，所以它
+  结构上恒为空。这条"巧合"已由写入侧守卫测试钉成被守卫的前提——它一旦变红，
+  全舰队 `last_activity_at`（及其背后的 active_1d/3d）就不再看见这条流。
+- **仍未解决**：`memory.changes` 是 `sort=memory` 排序元组的第二元，排序决定谁
+  进这一页，所以它必须全舰队实时计算；它落在没有 trim 的 `user_logs` 流上，
+  依然是无界扫描。是否改成 per-user 累计器等 prod 复测再定，**不做成日格表**
+  （与 lane 日格不同形，不伪装成同一种东西）。见 `OPTIMIZATION_BACKLOG.md` #17。
+- **口径**：本批的 buffers 数字来自隔离环境热缓存实测，**不是毫秒，prod 未验证**；
+  "memory 片 46 万 buffers 就是那 87 秒"没有证据；memory 片的耗时改善不是承诺
+  产出。超时是否解决以 prod 复测为准，复测通过前不作此声明。
+- **CI 接线（超出本批原定范围，已获授权）**：这批的对拍测试写在
+  `tests/test_data_track.py` 里，而该文件在 `.github/pytest-uncovered-baseline.txt`
+  的豁免名单上——PR 全绿时它一次都没被执行，全批的正确性证明零覆盖
+  （`tests/test_v2_capture_batch_protocol.py` 同样如此）。棘轮之所以没咬住：它对
+  **新增**的未覆盖文件和**失效**的名单条目都硬失败，但往一个早已豁免的文件里加
+  测试，结构上不可见。修法是把这两个文件从豁免名单移进显式清单，放进已经拥有
+  四个同族 data-track 套件的那一步；不重构 workflow、不动别的 batch。
+  名单缩短必须同步棘轮常量：`tests/test_pytest_coverage_ratchet.py` 的
+  `MAX_EXEMPTED` 断言与实际条数**相等**（刻意留 0 余量，见该文件注释），
+  所以 297 → 295 是这次改动的一部分，不是可选项。
+  并进哪个 batch 按**实测**而非推断定：取该步骤的实际成员同进程跑一次，
+  加这两个文件（137 个）3164 passed / 44 failed，改动前的树跑它自己的 135 个成员
+  3046 passed / 44 failed；两侧失败**集合逐条相同**（对称差为空），
+  +118 passed、零新增失败。那 44 条与本单无关，在改动前的树上同样存在：
+  43 条来自 `tests/test_mcp_client.py`（本机 Python 3.10 没有 `asyncio.timeout`，
+  CI 跑 3.11+），1 条是 `tests/test_deploy_yaml_strict.py` 的 ingress 证书文案断言。
+  ⚠️ 这些绝对数是**合并前的本机测量**，环境不同不可复现；可复用的是方法
+  （同进程跑目标 batch 的实际成员、比失败**集合**而不是条数、对照必须取改动前的树）。
+  本项改动 `.github/` 下两个文件加一个棘轮常量，超出原定「零迁移零 DDL」批次范围，
+  授权来源为督导信 `20260827T162023Z_claudeclaude_to_claude_4a6f232a` 与
+  codex 信 `20260827T162059Z_codex_to_claude_bdedb7a6`。
+- 除上述 CI 接线外，整单零迁移、零 DDL、零标签改动。
+
 ## 2026-08-24 — V1 冻结按接入路径拆分并补齐托管人群
 
 **[DONE] 事件健康表不再把 Runtime V1 家族误当成一种接入方式。**
