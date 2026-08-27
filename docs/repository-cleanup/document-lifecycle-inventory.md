@@ -9,9 +9,9 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 
 | Lifecycle | Classified documents |
 |---|---:|
-| `current` | 45 |
+| `current` | 43 |
 | `decision` | 23 |
-| `historical` | 43 |
+| `historical` | 45 |
 | `generated` | 1 |
 
 ## current
@@ -53,8 +53,6 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/superpowers/plans/2026-08-24-repository-cleanup.md`
 - `docs/superpowers/plans/2026-08-24-repository-cleanup.zh-CN.md`
 - `docs/superpowers/plans/2026-08-26-metadata-first-user-store.md`
-- `docs/superpowers/plans/2026-08-26-resident-runtime-history-batch-1.md`
-- `docs/superpowers/plans/2026-08-27-storage-tee-history-batch-3.md`
 - `docs/testing/README.md`
 - `docs/testing/RUNTIME_MAP.md`
 - `docs/testing/TESTING.md`
@@ -118,10 +116,12 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/archive/superpowers/plans/2026-08-14-memory-garden-test-plan.md`
 - `docs/archive/superpowers/plans/2026-08-14-runtime-v2-three-pool-slot-isolation.md`
 - `docs/archive/superpowers/plans/2026-08-19-perception-extraction-step1.md`
+- `docs/archive/superpowers/plans/2026-08-26-resident-runtime-history-batch-1.md`
 - `docs/archive/superpowers/plans/2026-08-26-storage-tee-history-batch-1.md`
 - `docs/archive/superpowers/plans/2026-08-27-memory-perception-history-batch-1.md`
 - `docs/archive/superpowers/plans/2026-08-27-memory-perception-history-batch-3.md`
 - `docs/archive/superpowers/plans/2026-08-27-storage-tee-history-batch-2.md`
+- `docs/archive/superpowers/plans/2026-08-27-storage-tee-history-batch-3.md`
 - `docs/archive/superpowers/specs/2026-07-04-tee-postgres-migration-design.md`
 - `docs/archive/superpowers/specs/2026-07-08-hosted-runtime-v2-abc-design.md`
 - `docs/archive/superpowers/specs/2026-07-09-hosted-runtime-v2-D0-rollout-infrastructure-design.md`
