@@ -2492,6 +2492,19 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         # detail bypasses this payload and keeps the legacy breakdowns through
         # admin_data_track_snapshot's default True.
         include_legacy_background=False,
+        # Same reason, one layer down: the memory breakdowns are per-row
+        # rendering only, and each one costs another detoast pass of every
+        # encrypted card in the fleet. They are re-read for the page below.
+        include_memory_breakdowns=False,
+        # Screen frames likewise: every field is per-row or detail-page, and
+        # latest_ts is not one of _latest_epoch's inputs, so no fleet-wide
+        # consumer reads this aggregate. Re-read for the page below.
+        include_screen_frames=False,
+        # And bootstrap_events, which has no fleet-wide reader at all. See
+        # db._PAGED_LOG_STREAMS for why it qualifies — in particular why it may
+        # leave the fleet-wide _latest_epoch inputs, and why memory_capture_jobs
+        # is dropped outright instead of being re-read per page.
+        include_paged_log_streams=False,
     )
     human_cutoff = time.time() - int(filters.get("human_days") or 7) * 86400
     rows = []
@@ -2736,11 +2749,45 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         # runs on the page only. Nothing upstream reads background_lanes — no
         # filter, no sort key, no summary aggregate — and the fleet-level fields
         # below come from the ids-independent watermark table.
+        page_ids = [str(r.get("user_id") or "") for r in page]
         background_report = db.admin_background_lane_users(
-            [str(r.get("user_id") or "") for r in page],
+            page_ids,
             days=int(filters.get("lane_days") or 7),
         )
+        # Same pushdown for the memory breakdowns. The row is rebuilt through
+        # the one mapper rather than patched field by field, so the page result
+        # is field-identical to what the fleet-wide read produced.
+        memory_breakdowns, memory_read_status = db.admin_memory_breakdowns(page_ids)
+        # And the same for screen frames. broadcast_stalled is derived from the
+        # frame recency *and* the broadcast report, so the row is rebuilt from
+        # the still-fleet-wide screen_broadcast half plus the page-scoped
+        # counters rather than patched field by field.
+        screen_frames, screen_read_status = db.admin_screen_frames(page_ids)
+        paged_logs, logs_read_status = db.admin_paged_log_streams(page_ids)
         for row in page:
+            uid = str(row.get("user_id") or "")
+            snap = snapshot.get(uid) or {}
+            breakdown = memory_breakdowns.get(uid)
+            if breakdown:
+                row["memory"] = _data_track_memory_from_snapshot({
+                    **snap,
+                    "memory": {**(snap.get("memory") or {}), **breakdown},
+                })
+            frames = screen_frames.get(uid)
+            if frames:
+                row["screen_frames"] = _data_track_screen_frames_from_snapshot({
+                    **snap,
+                    "screen_frames": frames,
+                })
+            logs = paged_logs.get(uid)
+            if logs:
+                row["bootstrap_events"] = _data_track_bootstrap_from_snapshot({
+                    **snap,
+                    "logs": {**(snap.get("logs") or {}), **logs},
+                })
+            for status in (memory_read_status, screen_read_status, logs_read_status):
+                if status.get("level") != "ok":
+                    row["snapshot_read_status"] = dict(status)
             runtime_state = str(
                 (row.get("responder") or {}).get("runtime_state") or "resident"
             ).strip().lower()

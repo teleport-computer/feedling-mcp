@@ -1372,8 +1372,222 @@ def _admin_data_track_connection():
                 pass
 
 
+# user_logs streams read per page rather than fleet-wide.
+#
+# bootstrap_events qualifies twice over: `events` reaches no summary, sort key
+# or filter (the bootstrap_events argument _data_track_fast_validation declares
+# is not read in its body), and `last_at` is a _latest_epoch input that is
+# structurally always NULL — neither write site passes a ts. That premise is
+# guarded by test_bootstrap_events_are_written_without_a_ts; if it ever goes
+# red, the fleet-wide last_activity_at behind active_1d/3d stops seeing this
+# stream and this pushdown has to be revisited.
+#
+# memory_capture_jobs is deliberately absent rather than paged: nothing reads
+# the generic count/last_ts pair on the fleet row or the detail page
+# (memory.capture_jobs comes from memory_extra, and the by_status/by_mode
+# breakdowns from the legacy-background query), and the stream has no
+# log_trim/log_prune_older_than anywhere — so paging it would keep an unbounded
+# GROUP BY alive for no consumer, and, sharing this query with bootstrap_events,
+# could time the bootstrap read out and mark a readable row degraded.
+_PAGED_LOG_STREAMS = ("bootstrap_events",)
+
+
+def _paged_log_streams_into(conn, ids: list[str], out: dict, ensure) -> None:
+    rows = conn.execute(
+        """
+        SELECT user_id, stream, COUNT(*)::int, MAX(ts)
+        FROM user_logs
+        WHERE user_id = ANY(%s) AND stream = ANY(%s)
+        GROUP BY user_id, stream
+        """,
+        (ids, list(_PAGED_LOG_STREAMS)),
+    ).fetchall()
+    for uid, stream, count, max_ts in rows:
+        ensure(out, uid).setdefault("logs", {})[stream] = {
+            "count": count,
+            "last_ts": max_ts,
+        }
+
+
+def admin_paged_log_streams(
+    user_ids: list[str],
+) -> tuple[dict[str, dict], dict[str, str]]:
+    """The _PAGED_LOG_STREAMS slice for one page of users.
+
+    Returns ``({user_id: {stream: {count, last_ts}}}, read_status)`` — the same
+    shape admin_data_track_snapshot used to embed under ``logs``, so the caller
+    can merge it back and reuse the one mapping implementation.
+    """
+    ids = [str(uid) for uid in user_ids if uid]
+    ok: dict[str, str] = {"level": "ok", "message": ""}
+    if not ids:
+        return {}, ok
+
+    def ensure(bucket: dict[str, dict], uid: str) -> dict:
+        return bucket.setdefault(uid, {})
+
+    out: dict[str, dict] = {}
+    try:
+        with _admin_data_track_connection() as conn:
+            _paged_log_streams_into(conn, ids, out, ensure)
+    except Exception as e:
+        log.error("[db] admin_paged_log_streams failed: %s", e)
+        level, message = _admin_event_read_failure(e)
+        return {}, {"level": level, "message": message}
+    return {uid: (data.get("logs") or {}) for uid, data in out.items()}, ok
+
+
+def _screen_frames_into(conn, ids: list[str], out: dict, ensure) -> None:
+    """Per-user screen-frame counters — page-scoped, never fleet-wide.
+
+    Every field below lands on the user's own row (data_track.py's
+    _data_track_screen_frames_from_snapshot) or on the detail page; none of
+    them reaches the fleet summary, a sort key or a filter, and ``latest_ts``
+    in particular is not one of _latest_epoch's inputs, so it does not feed
+    last_activity_at / active_1d / active_3d.
+    """
+    rows = conn.execute(
+        """
+        SELECT user_id,
+               COUNT(*)::int AS total,
+               MAX(ts) AS latest_ts,
+               COUNT(*) FILTER (
+                 WHERE body_key IS NULL
+               )::int AS inline_count,
+               COUNT(*) FILTER (
+                 WHERE body_key IS NOT NULL
+               )::int AS r2_count
+        FROM frame_envelopes
+        WHERE user_id = ANY(%s)
+        GROUP BY user_id
+        """,
+        (ids,),
+    ).fetchall()
+    for uid, total, latest_ts, inline_count, r2_count in rows:
+        ensure(out, uid)["screen_frames"] = {
+            "total": total,
+            "latest_ts": latest_ts,
+            "inline_count": inline_count,
+            "r2_count": r2_count,
+        }
+
+
+def admin_screen_frames(
+    user_ids: list[str],
+) -> tuple[dict[str, dict], dict[str, str]]:
+    """Screen-frame counters for one page of users.
+
+    Returns ``({user_id: {total, latest_ts, inline_count, r2_count}},
+    read_status)`` — the per-user half is the same shape
+    admin_data_track_snapshot used to embed, so the caller can merge it back
+    into a snapshot and reuse the one mapping implementation. The read status
+    is returned rather than swallowed: before the pushdown a failure here
+    surfaced through snapshot_read_status, and a read failure must not become
+    an indistinguishable row of zeroes.
+    """
+    ids = [str(uid) for uid in user_ids if uid]
+    ok: dict[str, str] = {"level": "ok", "message": ""}
+    if not ids:
+        return {}, ok
+
+    def ensure(bucket: dict[str, dict], uid: str) -> dict:
+        return bucket.setdefault(uid, {})
+
+    out: dict[str, dict] = {}
+    try:
+        with _admin_data_track_connection() as conn:
+            _screen_frames_into(conn, ids, out, ensure)
+    except Exception as e:
+        log.error("[db] admin_screen_frames failed: %s", e)
+        level, message = _admin_event_read_failure(e)
+        return {}, {"level": level, "message": message}
+    return {uid: (data.get("screen_frames") or {}) for uid, data in out.items()}, ok
+
+
+def _memory_breakdowns_into(conn, ids: list[str], out: dict, ensure) -> None:
+    """Per-user memory breakdowns — page-scoped, never fleet-wide.
+
+    ``memory_moments.doc`` is an encrypted card large enough to live out of
+    line, so every additional ``doc->`` expression costs another detoast pass
+    over the whole matched set: on a 25.9k-row fixture the four-expression
+    aggregate read 310,819 buffers where a bare ``COUNT(*)`` read 320. None of
+    the fields below reaches fleet summary, sort or filters — data_track.py
+    renders them on the user's own row, and the detail page computes its own
+    via _memory_stats — so they are read for the current page only.
+    """
+    rows = conn.execute(
+        """
+        SELECT user_id,
+               MIN(NULLIF(doc->>'created_at', '')) AS first_created_at,
+               MIN(NULLIF(doc->>'occurred_at', '')) AS earliest_occurred_at,
+               MAX(NULLIF(doc->>'occurred_at', '')) AS latest_occurred_at
+        FROM memory_moments
+        WHERE user_id = ANY(%s)
+        GROUP BY user_id
+        """,
+        (ids,),
+    ).fetchall()
+    for uid, first_created_at, earliest_occurred_at, latest_occurred_at in rows:
+        memory = ensure(out, uid).setdefault("memory", {})
+        memory["first_created_at"] = first_created_at or ""
+        memory["earliest_occurred_at"] = earliest_occurred_at or ""
+        memory["latest_occurred_at"] = latest_occurred_at or ""
+
+    for field, target in (("type", "by_type"), ("source", "by_source")):
+        rows = conn.execute(
+            """
+            SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
+                   COUNT(*)::int
+            FROM memory_moments
+            WHERE user_id = ANY(%s)
+            GROUP BY user_id, value
+            """,
+            (field, ids),
+        ).fetchall()
+        for uid, value, count in rows:
+            memory = ensure(out, uid).setdefault("memory", {})
+            memory.setdefault(target, {})[value] = count
+
+
+def admin_memory_breakdowns(
+    user_ids: list[str],
+) -> tuple[dict[str, dict], dict[str, str]]:
+    """Memory breakdowns for one page of users.
+
+    Returns ``({user_id: {by_type, by_source, first_created_at,
+    earliest_occurred_at, latest_occurred_at}}, read_status)`` — the per-user
+    half is the same shape admin_data_track_snapshot used to embed, so the
+    caller can merge it back into a snapshot and reuse the one mapping
+    implementation. The read status is returned rather than swallowed: before
+    the pushdown a failure here surfaced through snapshot_read_status, and a
+    read failure must not become an indistinguishable row of zeroes.
+    """
+    ids = [str(uid) for uid in user_ids if uid]
+    ok: dict[str, str] = {"level": "ok", "message": ""}
+    if not ids:
+        return {}, ok
+
+    def ensure(bucket: dict[str, dict], uid: str) -> dict:
+        return bucket.setdefault(uid, {})
+
+    out: dict[str, dict] = {}
+    try:
+        with _admin_data_track_connection() as conn:
+            _memory_breakdowns_into(conn, ids, out, ensure)
+    except Exception as e:
+        log.error("[db] admin_memory_breakdowns failed: %s", e)
+        level, message = _admin_event_read_failure(e)
+        return {}, {"level": level, "message": message}
+    return {uid: (data.get("memory") or {}) for uid, data in out.items()}, ok
+
+
 def admin_data_track_snapshot(
-    user_ids: list[str], *, include_legacy_background: bool = True
+    user_ids: list[str],
+    *,
+    include_legacy_background: bool = True,
+    include_memory_breakdowns: bool = True,
+    include_screen_frames: bool = True,
+    include_paged_log_streams: bool = True,
 ) -> dict[str, dict]:
     """Return metadata-only aggregate stats for a set of users.
 
@@ -1400,30 +1614,8 @@ def admin_data_track_snapshot(
         with _admin_data_track_connection() as conn:
             _chat_rollup_into(conn, ids, out, ensure)
 
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       COUNT(*)::int AS total,
-                       MAX(ts) AS latest_ts,
-                       COUNT(*) FILTER (
-                         WHERE body_key IS NULL
-                       )::int AS inline_count,
-                       COUNT(*) FILTER (
-                         WHERE body_key IS NOT NULL
-                       )::int AS r2_count
-                FROM frame_envelopes
-                WHERE user_id = ANY(%s)
-                GROUP BY user_id
-                """,
-                (ids,),
-            ).fetchall()
-            for uid, total, latest_ts, inline_count, r2_count in rows:
-                ensure(out, uid)["screen_frames"] = {
-                    "total": total,
-                    "latest_ts": latest_ts,
-                    "inline_count": inline_count,
-                    "r2_count": r2_count,
-                }
+            if include_screen_frames:
+                _screen_frames_into(conn, ids, out, ensure)
 
             rows = conn.execute(
                 """
@@ -1445,14 +1637,16 @@ def admin_data_track_snapshot(
                     "broadcast_active_ts": active_ts,
                 }
 
+            # ``total`` and ``last_created_at`` are the only two memory fields a
+            # fleet-wide consumer reads: total feeds the summary and the memory
+            # sort key, last_created_at is laundered through _latest_epoch into
+            # last_activity_at and then active_1d/3d. Everything else is
+            # per-row rendering and moved to _memory_breakdowns_into.
             rows = conn.execute(
                 """
                 SELECT user_id,
                        COUNT(*)::int AS total,
-                       MIN(NULLIF(doc->>'created_at', '')) AS first_created_at,
-                       MAX(NULLIF(doc->>'created_at', '')) AS last_created_at,
-                       MIN(NULLIF(doc->>'occurred_at', '')) AS earliest_occurred_at,
-                       MAX(NULLIF(doc->>'occurred_at', '')) AS latest_occurred_at
+                       MAX(NULLIF(doc->>'created_at', '')) AS last_created_at
                 FROM memory_moments
                 WHERE user_id = ANY(%s)
                 GROUP BY user_id
@@ -1464,26 +1658,14 @@ def admin_data_track_snapshot(
                     "total": row[1],
                     "by_type": {},
                     "by_source": {},
-                    "first_created_at": row[2] or "",
-                    "last_created_at": row[3] or "",
-                    "earliest_occurred_at": row[4] or "",
-                    "latest_occurred_at": row[5] or "",
+                    "first_created_at": "",
+                    "last_created_at": row[2] or "",
+                    "earliest_occurred_at": "",
+                    "latest_occurred_at": "",
                 }
 
-            for field, target in (("type", "by_type"), ("source", "by_source")):
-                rows = conn.execute(
-                    """
-                    SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
-                           COUNT(*)::int
-                    FROM memory_moments
-                    WHERE user_id = ANY(%s)
-                    GROUP BY user_id, value
-                    """,
-                    (field, ids),
-                ).fetchall()
-                for uid, value, count in rows:
-                    memory = ensure(out, uid).setdefault("memory", {})
-                    memory.setdefault(target, {})[value] = count
+            if include_memory_breakdowns:
+                _memory_breakdowns_into(conn, ids, out, ensure)
 
             rows = conn.execute(
                 """
@@ -1491,9 +1673,8 @@ def admin_data_track_snapshot(
                 FROM user_logs
                 WHERE user_id = ANY(%s)
                   AND stream IN (
-                    'memory_changes', 'memory_capture_jobs', 'gate_decisions',
-                    'proactive_jobs', 'device_events', 'tracking_events',
-                    'bootstrap_events'
+                    'memory_changes', 'gate_decisions',
+                    'proactive_jobs', 'device_events', 'tracking_events'
                   )
                 GROUP BY user_id, stream
                 """,
@@ -1504,6 +1685,15 @@ def admin_data_track_snapshot(
                     "count": count,
                     "last_ts": max_ts,
                 }
+
+            # memory_changes stays here on a harder criterion than "feeds the
+            # summary": it is the second element of the memory sort tuple in
+            # _data_track_sort_rows, so it is part of a full-set ordering. The
+            # four remaining streams are per-user trimmed, and all of them are
+            # read fleet-wide (proactive_jobs/gate_decisions through the
+            # proactive sort tuple, tracking_events through _latest_epoch).
+            if include_paged_log_streams:
+                _paged_log_streams_into(conn, ids, out, ensure)
 
             rows = conn.execute(
                 """
