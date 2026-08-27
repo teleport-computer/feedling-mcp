@@ -18,8 +18,9 @@ from _ca_helpers import self_signed_ca_pem  # noqa: E402
 _UNSET = object()
 
 
-def _fake_mcp_app(*, require_auth=None, tools=None, call_result=None, call_is_error=False,
-                  fail_status=None, instructions=_UNSET):
+def _fake_mcp_app(*, require_auth=None, tools=None, call_result=None,
+                  call_content=_UNSET, call_structured_content=_UNSET,
+                  call_is_error=False, fail_status=None, instructions=_UNSET):
     """In-process streamable-HTTP MCP server supporting initialize /
     notifications/initialized / tools/list / tools/call."""
     tool_defs = tools if tools is not None else [
@@ -58,8 +59,15 @@ def _fake_mcp_app(*, require_auth=None, tools=None, call_result=None, call_is_er
         elif method == "tools/list":
             result = {"tools": tool_defs}
         elif method == "tools/call":
-            result = {"content": [{"type": "text", "text": call_result or "tool-said-hi"}],
-                      "isError": call_is_error}
+            result = {"isError": call_is_error}
+            if call_content is _UNSET:
+                result["content"] = [
+                    {"type": "text", "text": call_result or "tool-said-hi"}
+                ]
+            elif call_content is not None:
+                result["content"] = call_content
+            if call_structured_content is not _UNSET:
+                result["structuredContent"] = call_structured_content
         else:
             await _respond(send, 400, {"error": "bad method"})
             return
@@ -100,6 +108,160 @@ def test_call_tool_happy_path_returns_text(monkeypatch):
                                            transport=transport))
     assert out["is_error"] is False
     assert "weather is sunny" in out["text"]
+
+
+def test_call_tool_inlines_spec_embedded_text_resource(monkeypatch):
+    """MCP 2025-06-18 EmbeddedResource.resource is TextResourceContents."""
+    _global_ip(monkeypatch)
+    content = [{
+        "type": "resource",
+        "resource": {
+            "uri": "github://Janey717/Tesoro-s-dairy/README.md",
+            "mimeType": "text/markdown",
+            "text": "# Tesoro diary\nThe file body survives.",
+        },
+    }]
+    transport = httpx.ASGITransport(app=_fake_mcp_app(call_content=content))
+
+    out = asyncio.run(mcp_client.call_tool(
+        URL, {}, "read_file", {}, transport=transport))
+
+    assert out == {
+        "is_error": False,
+        "text": (
+            '[embedded resource: '
+            'uri="github://Janey717/Tesoro-s-dairy/README.md" '
+            'mimeType="text/markdown"]\n'
+            "# Tesoro diary\nThe file body survives."
+        ),
+    }
+    assert "resource content omitted" not in out["text"]
+
+
+def test_call_tool_keeps_spec_blob_resource_out_of_model_context(monkeypatch):
+    """BlobResourceContents.blob is base64 and must never be inlined."""
+    _global_ip(monkeypatch)
+    content = [{
+        "type": "resource",
+        "resource": {
+            "uri": "github://Janey717/Tesoro-s-dairy/photo.png",
+            "mimeType": "image/png",
+            "blob": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB",
+        },
+    }]
+    transport = httpx.ASGITransport(app=_fake_mcp_app(call_content=content))
+
+    out = asyncio.run(mcp_client.call_tool(
+        URL, {}, "read_file", {}, transport=transport))
+
+    assert out["text"] == (
+        '[binary resource omitted: '
+        'uri="github://Janey717/Tesoro-s-dairy/photo.png" '
+        'mimeType="image/png"]'
+    )
+    assert "iVBOR" not in out["text"]
+
+
+def test_call_tool_keeps_spec_image_data_out_of_model_context(monkeypatch):
+    """ImageContent.data is base64 and must never be copied into model text."""
+    _global_ip(monkeypatch)
+    content = [{
+        "type": "image",
+        "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB",
+        "mimeType": "image/png",
+    }]
+    transport = httpx.ASGITransport(app=_fake_mcp_app(call_content=content))
+
+    out = asyncio.run(mcp_client.call_tool(
+        URL, {}, "render_preview", {}, transport=transport))
+
+    assert out["text"] == '[image binary content omitted: mimeType="image/png"]'
+    assert "iVBOR" not in out["text"]
+
+
+def test_call_tool_describes_spec_resource_link_without_claiming_truncation(
+    monkeypatch,
+):
+    _global_ip(monkeypatch)
+    content = [{
+        "type": "resource_link",
+        "name": "diary",
+        "uri": "github://Janey717/Tesoro-s-dairy/diary.md",
+        "mimeType": "text/markdown",
+        "size": 123,
+    }]
+    transport = httpx.ASGITransport(app=_fake_mcp_app(call_content=content))
+
+    out = asyncio.run(mcp_client.call_tool(
+        URL, {}, "find_file", {}, transport=transport))
+
+    assert out["text"] == (
+        '[resource link; content not embedded by server: '
+        'uri="github://Janey717/Tesoro-s-dairy/diary.md" '
+        'mimeType="text/markdown"]'
+    )
+
+
+def test_call_tool_preserves_structured_only_result_deterministically(monkeypatch):
+    _global_ip(monkeypatch)
+    transport = httpx.ASGITransport(app=_fake_mcp_app(
+        call_content=None,
+        call_structured_content={"z": [2, 1], "message": "结构化正文"},
+    ))
+
+    out = asyncio.run(mcp_client.call_tool(
+        URL, {}, "structured_tool", {}, transport=transport))
+
+    assert out["text"] == (
+        '[structured content]\n{"message":"结构化正文","z":[2,1]}'
+    )
+
+
+def test_call_tool_keeps_distinct_text_and_structured_content(monkeypatch):
+    _global_ip(monkeypatch)
+    transport = httpx.ASGITransport(app=_fake_mcp_app(
+        call_content=[{"type": "text", "text": "Found two matching files."}],
+        call_structured_content={"paths": ["README.md", "diary.md"]},
+    ))
+
+    out = asyncio.run(mcp_client.call_tool(
+        URL, {}, "structured_tool", {}, transport=transport))
+
+    assert out["text"] == (
+        "Found two matching files.\n"
+        '[structured content]\n{"paths":["README.md","diary.md"]}'
+    )
+
+
+def test_call_tool_does_not_duplicate_fastmcp_result_wrapper(monkeypatch):
+    _global_ip(monkeypatch)
+    text = "one result, represented twice by the server"
+    transport = httpx.ASGITransport(app=_fake_mcp_app(
+        call_content=[{"type": "text", "text": text}],
+        call_structured_content={"result": text},
+    ))
+
+    out = asyncio.run(mcp_client.call_tool(
+        URL, {}, "fastmcp_tool", {}, transport=transport))
+
+    assert out["text"] == text
+
+
+def test_call_tool_does_not_duplicate_json_structured_content(monkeypatch):
+    _global_ip(monkeypatch)
+    structured = {"greeting": "Hi auditor", "visible": True}
+    transport = httpx.ASGITransport(app=_fake_mcp_app(
+        call_content=[{
+            "type": "text",
+            "text": '{"greeting":"Hi auditor","visible":true}',
+        }],
+        call_structured_content=structured,
+    ))
+
+    out = asyncio.run(mcp_client.call_tool(
+        URL, {}, "structured_tool", {}, transport=transport))
+
+    assert out["text"] == '{"greeting":"Hi auditor","visible":true}'
 
 
 def test_call_tool_surfaces_tool_error(monkeypatch):
