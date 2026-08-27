@@ -26,11 +26,9 @@ def test_memory_readside_sandbox_outputs_product_report():
     assert body["acceptance"]["index_count"] >= 5
     assert body["acceptance"]["fetch_count"] == 3
     assert body["acceptance"]["index_no_raw_quote"] == "PASS"
-    assert body["acceptance"]["has_sensitive_fixture"] is True
     assert all("verbatim" not in item for item in body["index"]["items"])
     assert all("her_quote" not in item for item in body["index"]["items"])
     assert all("follow_up" not in item for item in body["index"]["items"])
-    assert all("sensitive_scope" not in item for item in body["index"]["items"])
     assert any(item.get("verbatim") for item in body["fetch"]["items"])
 
 

@@ -58,7 +58,7 @@ def test_dream_context_fetches_full_cards_without_cross_run_cooldown(monkeypatch
         lambda *a, **k: ({"items": [{"id": "capture-old"}, {"id": "dream-new"}]}, 200),
     )
     def fetch_cards(_store, _api_key, payload, *, post_enclave):
-        assert payload["include_sensitive"] is True
+        assert "include_sensitive" not in payload
         assert "user_explicit_selection" not in payload
         return {"items": [
             {

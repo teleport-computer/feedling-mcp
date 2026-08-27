@@ -4256,7 +4256,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Fetch full records for selected memory IDs in request order. Sensitive content requires both include_sensitive and user_explicit_selection; ambient, profile, and maintenance reads retain their normal filter. Inspect the truncation object instead of assuming every requested ID was processed."
+        "description": "Fetch full records for selected memory IDs in request order. All shared cards use the same read contract; legacy card-classification metadata is ignored. Inspect the truncation object instead of assuming every requested ID was processed."
       }
     },
     "/v1/memory/get": {
@@ -10831,10 +10831,6 @@
             "type": "string",
             "maxLength": 120
           },
-          "include_sensitive": {
-            "type": "boolean",
-            "default": false
-          },
           "ambient": {
             "type": "boolean",
             "default": false
@@ -10848,8 +10844,7 @@
         "example": {
           "limit": 50,
           "bucket": "Collaboration",
-          "thread": "communication style",
-          "include_sensitive": false
+          "thread": "communication style"
         }
       },
       "MemoryFetchRequest": {
@@ -10869,16 +10864,6 @@
           "limit": {
             "type": "integer",
             "minimum": 0
-          },
-          "user_explicit_selection": {
-            "type": "boolean",
-            "default": false,
-            "description": "True only when the user explicitly selected these exact IDs. Required together with include_sensitive to return sensitive content."
-          },
-          "include_sensitive": {
-            "type": "boolean",
-            "default": false,
-            "description": "Include sensitive content only when user_explicit_selection is also true."
           },
           "include_archived": {
             "type": "boolean",

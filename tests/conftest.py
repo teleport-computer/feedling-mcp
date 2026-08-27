@@ -267,7 +267,6 @@ if not _provisioned:
     "test_garden_selection_pluggable.py",
     "test_garden_card_shape.py",
     "test_route_b_card_shape_recall.py",
-    "test_route_b_sensitive_gate.py",
         "test_card_guard.py",
         # Memory Garden 内核（2026-08-14）：纯函数包，零 DB / 零网络。
         # 六个文件都在「DATABASE_URL 指向不可达地址」的环境下实测通过。

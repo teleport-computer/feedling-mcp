@@ -149,8 +149,6 @@ def test_quoted_memory_uses_exact_fetch_outside_default_candidate_pool(
     assert seen["fetch_payload"] == {
         "ids": [quoted_id],
         "limit": 1,
-        "user_explicit_selection": True,
-        "include_sensitive": True,
         "include_archived": True,
         "include_superseded": True,
     }

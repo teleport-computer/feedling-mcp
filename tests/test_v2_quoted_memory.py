@@ -80,8 +80,6 @@ def test_quoted_card_is_expanded_into_the_message(monkeypatch):
     assert calls == [{
         "ids": ["mem_1"],
         "limit": 1,
-        "user_explicit_selection": True,
-        "include_sensitive": True,
         "include_archived": True,
         "include_superseded": True,
     }]
