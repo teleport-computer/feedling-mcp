@@ -9,9 +9,9 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 
 | Lifecycle | Classified documents |
 |---|---:|
-| `current` | 43 |
-| `decision` | 22 |
-| `historical` | 41 |
+| `current` | 45 |
+| `decision` | 23 |
+| `historical` | 43 |
 | `generated` | 1 |
 
 ## current
@@ -34,6 +34,8 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md`
 - `docs/CURRENT_STATE.md`
 - `docs/DOCUMENT_LIFECYCLE.md`
+- `docs/PERCEPTION_ARCHITECTURE.zh.md`
+- `docs/PERCEPTION_PROMPT_ASSETS.zh.md`
 - `docs/PROJECT_OVERVIEW.md`
 - `docs/RDS_TRACE_PARTITIONS_RUNBOOK.md`
 - `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md`
@@ -63,6 +65,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 ## decision
 
 - `docs/MEMORY_GARDEN_EXTRACTION_DESIGN.zh.md`
+- `docs/PERCEPTION_EXTRACTION_DESIGN.zh.md`
 - `docs/TRACE_T138_PLAN.md`
 - `docs/superpowers/plans/2026-08-25-chat-notify-convergence.md`
 - `docs/superpowers/specs/2026-07-09-hosted-runtime-v2-D-admission-ceiling-design.md`
@@ -114,8 +117,10 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/archive/superpowers/plans/2026-08-14-memory-garden-kernel.md`
 - `docs/archive/superpowers/plans/2026-08-14-memory-garden-test-plan.md`
 - `docs/archive/superpowers/plans/2026-08-14-runtime-v2-three-pool-slot-isolation.md`
+- `docs/archive/superpowers/plans/2026-08-19-perception-extraction-step1.md`
 - `docs/archive/superpowers/plans/2026-08-26-storage-tee-history-batch-1.md`
 - `docs/archive/superpowers/plans/2026-08-27-memory-perception-history-batch-1.md`
+- `docs/archive/superpowers/plans/2026-08-27-memory-perception-history-batch-3.md`
 - `docs/archive/superpowers/plans/2026-08-27-storage-tee-history-batch-2.md`
 - `docs/archive/superpowers/specs/2026-07-04-tee-postgres-migration-design.md`
 - `docs/archive/superpowers/specs/2026-07-08-hosted-runtime-v2-abc-design.md`
