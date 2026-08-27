@@ -178,7 +178,7 @@ def test_admin_data_track_aggregates_counts_without_content(client):
     store.append_proactive_job({
         "job_id": "pj_failed_timeout",
         "status": "failed",
-        "status_reason": "model_timeout",
+        "status_reason": "provider_timeout",
         "job_kind": "presence",
     })
     store.append_proactive_job({
@@ -207,7 +207,7 @@ def test_admin_data_track_aggregates_counts_without_content(client):
         f"/v1/admin/data-track/users/{user_id}", headers=_admin_headers()
     ).get_json()["user"]
     assert detail["proactive"]["job_failed_reasons"] == {
-        "model_timeout": 1,
+        "provider_timeout": 1,
         "unknown": 1,
     }
     dumped = json.dumps(body)
@@ -3417,3 +3417,171 @@ def test_page_rows_carry_all_three_slices_for_the_right_user(client):
         assert row["screen_frames"]["latest_age_sec"] == pytest.approx(
             600 - 60 * index, abs=30
         )
+
+
+# --- T344: provider error bodies must not reach the admin surface -----------
+# The leak: `status_reason` is externally supplied free text, and some producers
+# append the upstream error verbatim, so a provider 402 body (with a
+# key-management URL) became a `job_failed_reasons` key.
+#
+# The first fix here tested a *shape*: any `[A-Za-z0-9_.-]` segment was kept
+# verbatim. codex rejected it, correctly — an opaque key id is made of exactly
+# those characters, so the shape test cannot tell a reason code from a secret.
+# The boundary is now membership in the producer-owned vocabulary, and anything
+# undeclared is redacted whole. Every case below is synthetic.
+
+_ADMIN_SAFE_REASONS = [
+    # Reasons declared by a producer: notices error classes, Seven's V1
+    # user-unavailable set, and the proactive lifecycle terminals. If redaction
+    # ever touches one of these it has stopped being a display boundary and
+    # started destroying the signal.
+    "unknown",
+    "heartbeat_throttled",
+    "quota_insufficient",
+    "auth_invalid",
+    "agent_greeted",
+    "stale_wake_expired",
+    "ambient_disabled",
+    "migrate_no_legacy",
+    "extraction_failed:quota_insufficient",
+    "turn_failed:image_generation_auth_invalid",
+]
+
+
+@pytest.mark.parametrize("reason", _ADMIN_SAFE_REASONS)
+def test_sanitize_status_reason_keeps_declared_reasons_verbatim(reason):
+    from notices import status_reason
+
+    assert status_reason.sanitize_status_reason(reason) == reason
+
+
+@pytest.mark.parametrize(
+    ("unsafe", "expected"),
+    [
+        # An opaque identifier alone. This is the case the shape allowlist got
+        # wrong: it is indistinguishable from a reason code by inspection, so
+        # nothing about it may be echoed.
+        ("k1nb0Xz9QpLmR4td", "<redacted>"),
+        # …and as a colon tail, both behind an undeclared scope and behind a
+        # declared one. Only the declared segment may survive.
+        ("provider_error:k1nb0Xz9QpLmR4td", "<redacted>"),
+        ("auth_invalid:k1nb0Xz9QpLmR4td", "auth_invalid:<redacted>"),
+        # Free text: the observed leak shape, and a bare URL.
+        ("auth_invalid: 402 upstream said no", "auth_invalid:<redacted>"),
+        ("https://keys.example.invalid/settings/keys/key_synthetic1", "<redacted>"),
+        # A declared segment followed by an undeclared one keeps the bucket.
+        ("extraction_failed:not_a_declared_kind", "extraction_failed:<redacted>"),
+        ("   ", ""),
+        ("", ""),
+    ],
+)
+def test_sanitize_status_reason_redacts_everything_undeclared(unsafe, expected):
+    from notices import status_reason
+
+    assert status_reason.sanitize_status_reason(unsafe) == expected
+
+
+def test_sanitize_reason_counts_merges_collapsed_keys_without_losing_jobs():
+    from notices import status_reason
+
+    # An embedded error body made every occurrence its own bucket, so one
+    # failure mode showed up as N buckets of 1 and could not be read at all.
+    raw = {
+        "auth_invalid: upstream said A": 3,
+        "auth_invalid: upstream said B": 2,
+        "quota_insufficient": 4,
+    }
+    merged = status_reason.sanitize_reason_counts(raw)
+
+    assert merged == {
+        "auth_invalid:<redacted>": 5,
+        "quota_insufficient": 4,
+    }
+    assert sum(merged.values()) == sum(raw.values())
+
+
+def test_admin_user_detail_redacts_provider_error_body_in_failed_reasons(client):
+    user_id, _ = _register(client)
+    store = core_store.get_store(user_id)
+    # Shaped like the real 402: a key-management URL inside the error body.
+    # The URL is synthetic — the production one must never be written down.
+    secret_url = "https://openrouter.invalid/settings/keys/key-id-must-not-leak"
+    for index in range(2):
+        store.append_proactive_job({
+            "job_id": f"pj_402_{index}",
+            "status": "failed",
+            "status_reason": (
+                f"auth_invalid: upstream 402 #{index} {secret_url}"
+            ),
+            "job_kind": "heartbeat",
+        })
+    store.append_proactive_job({
+        "job_id": "pj_quota",
+        "status": "failed",
+        "status_reason": "quota_insufficient",
+        "job_kind": "heartbeat",
+    })
+
+    response = client.get(
+        f"/v1/admin/data-track/users/{user_id}", headers=_admin_headers()
+    )
+    assert response.status_code == 200
+    dumped = json.dumps(response.get_json())
+    assert secret_url not in dumped
+    assert "key-id-must-not-leak" not in dumped
+
+    proactive = response.get_json()["user"]["proactive"]
+    # Redaction is not deletion: the declared code, the bucket and the count all
+    # survive, and the two raw bodies collapse into one readable bucket.
+    assert proactive["job_failed_reasons"] == {"auth_invalid:<redacted>": 2}
+    assert proactive["heartbeat_failed"] == 2
+    # Classification still reads the raw reason. The two 402s carry a body, so
+    # they are not the exact `auth_invalid` in Seven's user-unavailable set and
+    # stay operational; the bare `quota_insufficient` does match. Sanitizing
+    # before `v1_proactive_outcome_class` would silently move both.
+    assert proactive["job_user_unavailable_reasons"] == {"quota_insufficient": 1}
+    assert proactive["heartbeat_user_unavailable"] == 1
+
+
+def test_admin_user_detail_redacts_skipped_control_reasons(client):
+    """Mirror of the failed bucket on the live V1 path.
+
+    codex pointed the V1 ``control_reasons`` bucket at the raw reason in an
+    isolated worktree and the suite stayed green: only the failed branch had a
+    case, while ``skipped`` reads the same free-text column. A skipped job is a
+    control outcome, so its reason never passes through the user-unavailable
+    exact match and can be arbitrary text.
+    """
+    user_id, _ = _register(client)
+    store = core_store.get_store(user_id)
+    secret_url = "https://openrouter.invalid/settings/keys/key-id-must-not-leak"
+    for index in range(2):
+        store.append_proactive_job({
+            "job_id": f"pj_skipped_{index}",
+            "status": "skipped",
+            "status_reason": f"ambient_disabled: gate said #{index} {secret_url}",
+            "job_kind": "heartbeat",
+        })
+    store.append_proactive_job({
+        "job_id": "pj_throttled",
+        "status": "skipped",
+        "status_reason": "heartbeat_throttled",
+        "job_kind": "heartbeat",
+    })
+
+    response = client.get(
+        f"/v1/admin/data-track/users/{user_id}", headers=_admin_headers()
+    )
+    assert response.status_code == 200
+    dumped = json.dumps(response.get_json())
+    assert secret_url not in dumped
+    assert "key-id-must-not-leak" not in dumped
+
+    proactive = response.get_json()["user"]["proactive"]
+    assert proactive["job_control_reasons"] == {
+        "ambient_disabled:<redacted>": 2,
+        "heartbeat_throttled": 1,
+    }
+    # Collapsing two raw keys into one bucket must not lose either job.
+    assert sum(proactive["job_control_reasons"].values()) == 3
+    assert proactive["heartbeat_control"] == 3

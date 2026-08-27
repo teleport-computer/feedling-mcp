@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -346,7 +347,7 @@ def test_fast_proactive_snapshot_keeps_expired_out_of_failed_count():
             "logs": {"proactive_jobs": {"count": 5, "last_ts": 100}},
             "proactive_extra": {
                 "jobs_by_status": {"failed": 3, "expired": 2},
-                "jobs_failed_by_reason": {"model_timeout": 2, "unknown": 1},
+                "jobs_failed_by_reason": {"provider_timeout": 2, "unknown": 1},
             },
         },
         {},
@@ -354,7 +355,97 @@ def test_fast_proactive_snapshot_keeps_expired_out_of_failed_count():
 
     assert proactive["failed_jobs"] == 3
     assert proactive["jobs_by_status"]["expired"] == 2
-    assert proactive["job_failed_reasons"] == {"model_timeout": 2, "unknown": 1}
+    assert proactive["job_failed_reasons"] == {"provider_timeout": 2, "unknown": 1}
+
+
+def test_fast_proactive_snapshot_redacts_provider_error_bodies_in_reasons():
+    """T344: the V2 snapshot path is the one that served the real leak.
+
+    The DB aggregate groups by the raw ``status_reason``, so an embedded
+    provider error body both exposed a key-management URL *and* split one
+    failure mode into a bucket per occurrence. Redaction happens at this
+    boundary, which means the collapsed buckets must be summed here too.
+    """
+    # Synthetic URL: the production one must never be written down.
+    secret_url = "https://openrouter.invalid/settings/keys/key-id-must-not-leak"
+    proactive = data_track._data_track_proactive_from_snapshot(
+        {
+            "logs": {"proactive_jobs": {"count": 6, "last_ts": 100}},
+            "proactive_extra": {
+                "jobs_by_status": {"failed": 6},
+                "jobs_failed_by_reason": {
+                    f"provider_timeout: 402 #0 {secret_url}": 1,
+                    f"provider_timeout: 402 #1 {secret_url}": 1,
+                    "content_filtered": 3,
+                    "reply_parse_failed": 1,
+                },
+            },
+        },
+        {},
+    )
+
+    assert secret_url not in json.dumps(proactive)
+    assert proactive["job_failed_reasons"] == {
+        "provider_timeout:<redacted>": 2,
+        # Declared reasons stay distinguishable from each other: telling one
+        # failure mode apart from another is the point of this dashboard.
+        "content_filtered": 3,
+        "reply_parse_failed": 1,
+    }
+    assert proactive["failed_jobs"] == 6
+
+
+def test_fast_proactive_snapshot_redacts_control_reasons():
+    """T344: the control bucket, which shipped unguarded the first time.
+
+    codex removed the redaction from ``job_control_reasons`` in an isolated
+    worktree and the suite stayed green — only the failed-reason branch had a
+    case. Control is the ``skipped`` status, whose reason is producer free text
+    exactly like the failed one, and it reads the same column of the same table.
+    """
+    secret_url = "https://openrouter.invalid/settings/keys/key-id-must-not-leak"
+    raw_control = {
+        f"ambient_disabled: skipped #0 {secret_url}": 2,
+        f"ambient_disabled: skipped #1 {secret_url}": 1,
+        "heartbeat_throttled": 4,
+    }
+    proactive = data_track._data_track_proactive_from_snapshot(
+        {
+            "logs": {"proactive_jobs": {"count": 7, "last_ts": 100}},
+            "proactive_extra": {
+                "jobs_by_status": {"skipped": 7},
+                "jobs_control_by_reason": raw_control,
+            },
+        },
+        {},
+    )
+
+    assert secret_url not in json.dumps(proactive)
+    assert proactive["job_control_reasons"] == {
+        "ambient_disabled:<redacted>": 3,
+        "heartbeat_throttled": 4,
+    }
+    # Collapsing buckets must not lose jobs — conservation is why the counts are
+    # summed rather than overwritten.
+    assert sum(proactive["job_control_reasons"].values()) == sum(
+        raw_control.values()
+    )
+
+
+def test_user_unavailable_bucket_cannot_carry_free_text_by_construction():
+    """T344: why the third bucket has no leak case, stated rather than assumed.
+
+    A job reaches ``job_user_unavailable_reasons`` only by matching Seven's V1
+    set *exactly* — ``v1_proactive_outcome_class`` on the live path and
+    ``= ANY(...)`` in the DB aggregate. So every key in that bucket is a
+    declared reason and redaction there is a no-op today. That holds only while
+    the whole set stays declared; if a reason is added to Seven's set without
+    being declared, this bucket starts redacting real signal and this fails.
+    """
+    from notices import catalog, status_reason
+
+    for reason in catalog.USER_UNAVAILABLE_V1_REASONS:
+        assert status_reason.sanitize_status_reason(reason) == reason
 
 
 def test_trace_vocabulary_failure_is_explicit_retried_and_not_cached(monkeypatch):

@@ -28,6 +28,7 @@ from admin import usage as admin_usage
 from chat import consumer as chat_consumer
 from memory import service as memory_service
 from notices import catalog as notices_catalog
+from notices import status_reason as notices_status_reason
 from notices import core as notices_core
 from proactive import service as proactive_service
 from screen import screen_read_core
@@ -322,7 +323,7 @@ def _memory_capture_validation_detail(store: UserStore, *, limit: int = 50) -> d
             rows.append({
                 "job_id": str(job.get("job_id") or ""),
                 "status": str(job.get("status") or ""),
-                "status_reason": str(job.get("status_reason") or ""),
+                "status_reason": notices_status_reason.sanitize_status_reason(job.get("status_reason")),
                 "updated_at": str(
                     job.get("updated_at")
                     or job.get("ts")
@@ -388,16 +389,20 @@ def _proactive_stats(store: UserStore) -> dict:
         outcome_class = notices_catalog.v1_proactive_outcome_class(
             status, reason
         )
+        # Classification above reads the raw reason; only the exposed key is
+        # sanitized. Sanitizing before `v1_proactive_outcome_class` would
+        # silently reclassify every reason it matches exactly.
+        shown = notices_status_reason.sanitize_status_reason(reason) or "unknown"
         if outcome_class == "operational_failure":
             fail_lanes[lane] += 1
-            failed_reasons[reason] = failed_reasons.get(reason, 0) + 1
+            failed_reasons[shown] = failed_reasons.get(shown, 0) + 1
         elif outcome_class == "control":
             control_lanes[lane] += 1
-            control_reasons[reason] = control_reasons.get(reason, 0) + 1
+            control_reasons[shown] = control_reasons.get(shown, 0) + 1
         elif outcome_class == "user_unavailable":
             user_unavailable_lanes[lane] += 1
-            user_unavailable_reasons[reason] = (
-                user_unavailable_reasons.get(reason, 0) + 1
+            user_unavailable_reasons[shown] = (
+                user_unavailable_reasons.get(shown, 0) + 1
             )
     live_status_counts = _count_rows(proactive_messages, "live_activity_status")
     alert_status_counts = _count_rows(proactive_messages, "alert_status")
@@ -1074,8 +1079,10 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
         + alert_status_counts.get("delivered", 0)
         + alert_status_counts.get("logged_only", 0)
     )
-    failed_reasons = counts(
-        extra.get("jobs_failed_by_reason"), "proactive.jobs_failed_by_reason"
+    # The DB aggregates group by the raw reason, so redaction happens here and
+    # the raw keys that collapse together must have their counts summed.
+    failed_reasons = notices_status_reason.sanitize_reason_counts(
+        counts(extra.get("jobs_failed_by_reason"), "proactive.jobs_failed_by_reason")
     )
     failed = (
         sum(fail_lanes.values())
@@ -1108,13 +1115,13 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
         "posted_jobs": status_counts.get("posted", 0) + status_counts.get("delivered", 0),
         "failed_jobs": failed,
         "job_failed_reasons": failed_reasons,
-        "job_control_reasons": counts(
+        "job_control_reasons": notices_status_reason.sanitize_reason_counts(counts(
             extra.get("jobs_control_by_reason"), "proactive.jobs_control_by_reason"
-        ),
-        "job_user_unavailable_reasons": counts(
+        )),
+        "job_user_unavailable_reasons": notices_status_reason.sanitize_reason_counts(counts(
             extra.get("jobs_user_unavailable_by_reason"),
             "proactive.jobs_user_unavailable_by_reason",
-        ),
+        )),
         "breakdowns_status": legacy_status,
         "proactive_messages": int(chat.get("proactive_messages") or 0),
         "delivery_signals": delivered,
