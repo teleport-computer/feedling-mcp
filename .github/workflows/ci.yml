@@ -917,10 +917,12 @@ jobs:
             tests/test_write_side_format_routing.py \
             tests/test_admin_debug_turn_view.py \
             tests/test_data_track_debug.py \
+            tests/test_data_track.py \
             tests/test_admin_discarded_reason.py \
             tests/test_admin_concentration.py \
             tests/test_admin_concentration_e2e.py \
             tests/test_admin_genesis_unavailable.py \
+            tests/test_v2_capture_batch_protocol.py \
             -v
 
       - name: Upload execution evidence (report only)

@@ -77,7 +77,6 @@ tests/test_chat_turn_failure_fields.py
 tests/test_consumer_state_cas.py
 tests/test_context_memories.py
 tests/test_copytext.py
-tests/test_data_track.py
 tests/test_dau_snapshot_scheduler.py
 tests/test_debug_trace_atomic.py
 tests/test_debug_trace_event_route.py
@@ -215,7 +214,6 @@ tests/test_users_reload_targeted.py
 tests/test_v2_admission.py
 tests/test_v2_bounded_tail_degrade.py
 tests/test_v2_capacity_health.py
-tests/test_v2_capture_batch_protocol.py
 tests/test_v2_capture_lifecycle.py
 tests/test_v2_chat_clear_fence.py
 tests/test_v2_child_supervisor.py
