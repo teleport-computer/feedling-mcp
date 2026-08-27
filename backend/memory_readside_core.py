@@ -425,9 +425,18 @@ def memory_fetch_core(
     if not isinstance(ids, list) or any(not isinstance(mid, str) or not mid.strip() for mid in ids):
         raise ValueError("ids must be a list of non-empty strings")
     limit = effective_readside_limit(payload.get("limit"))
-    ids = [mid.strip() for mid in ids[:limit]]
+    requested_ids = [mid.strip() for mid in ids]
+    ids = requested_ids[:limit]
     include_archived = _bool_payload(payload.get("include_archived"))
     include_superseded = _bool_payload(payload.get("include_superseded"))
+    # ``include_sensitive`` existed at several internal call sites while fetch
+    # historically ignored it.  Activating it globally would silently broaden
+    # profile and Dream/Capture provider inputs.  Require the explicit user
+    # selection context so this task changes only Garden "Talk in Chat".
+    include_sensitive = (
+        _bool_payload(payload.get("include_sensitive"))
+        and _bool_payload(payload.get("user_explicit_selection"))
+    )
     moments = memory_service._load_moments(store)
     by_id = {m.get("id"): m for m in moments if isinstance(m, dict)}
     missing_ids: list[str] = []
@@ -454,27 +463,60 @@ def memory_fetch_core(
         store.user_id,
         item_builder=enclave_readside.build_memory_fetch_item,
     )
-    local_items = [item for item in local_items if not item.get("is_sensitive")]
+    if not include_sensitive:
+        local_unavailable.extend(
+            str(item.get("id") or "")
+            for item in local_items
+            if item.get("is_sensitive") and str(item.get("id") or "")
+        )
+        local_items = [item for item in local_items if not item.get("is_sensitive")]
     response = {"items": [], "unavailable_ids": []}
     if sealed:
         response = (post_enclave or post_enclave_readside)(
             api_key,
             sealed,
             operation="fetch",
-            payload={"ids": [m.get("id") for m in sealed], "limit": limit},
+            payload={
+                "ids": [m.get("id") for m in sealed],
+                "limit": limit,
+                "include_sensitive": include_sensitive,
+            },
         )
     enclave_unavailable = response.get("unavailable_ids") if isinstance(response.get("unavailable_ids"), list) else []
+    blocked_sensitive = response.get("blocked_sensitive_ids") if isinstance(response.get("blocked_sensitive_ids"), list) else []
     unavailable_ids.extend(invalid_ids)
     unavailable_ids.extend(local_unavailable)
     unavailable_ids.extend(str(mid) for mid in enclave_unavailable if isinstance(mid, str))
+    unavailable_ids.extend(str(mid) for mid in blocked_sensitive if isinstance(mid, str))
     response_items = (
         response.get("items") if isinstance(response.get("items"), list) else []
     )
+    if not include_sensitive:
+        unavailable_ids.extend(
+            str(item.get("id") or "")
+            for item in response_items
+            if isinstance(item, dict)
+            and item.get("is_sensitive")
+            and str(item.get("id") or "")
+        )
+        response_items = [
+            item
+            for item in response_items
+            if not isinstance(item, dict) or not item.get("is_sensitive")
+        ]
     items_by_id = {
         item.get("id"): item
         for item in local_items + response_items
         if isinstance(item, dict)
     }
+    unavailable_set = {
+        str(memory_id)
+        for memory_id in unavailable_ids
+        if str(memory_id or "").strip()
+    }
+    unavailable_ids = [
+        memory_id for memory_id in ids if memory_id in unavailable_set
+    ]
     referenced_ids = {str(mid) for mid in items_by_id.keys() if str(mid or "").strip()}
     if referenced_ids:
         now = _now_iso()
@@ -495,4 +537,10 @@ def memory_fetch_core(
         "items": [items_by_id[mid] for mid in ids if mid in items_by_id],
         "missing_ids": missing_ids,
         "unavailable_ids": unavailable_ids,
+        "truncation": {
+            "truncated": len(requested_ids) > len(ids),
+            "requested_count": len(requested_ids),
+            "processed_count": len(ids),
+            "omitted_count": max(0, len(requested_ids) - len(ids)),
+        },
     }

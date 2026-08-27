@@ -142,6 +142,25 @@ def test_fetch_blocks_sensitive_by_default(client, _authed, monkeypatch):
     assert body["blocked_sensitive_ids"] == ["m1"]
 
 
+def test_fetch_allows_sensitive_for_explicit_garden_quote(client, _authed, monkeypatch):
+    sensitive = json.dumps({"summary": "s", "content": "c", "bucket": "b",
+                            "threads": [], "is_sensitive": True}).encode()
+    monkeypatch.setattr(envmod, "decrypt_envelope", lambda e, u, s: sensitive)
+
+    r = client.post(
+        "/v1/memory/fetch",
+        json={
+            "moments": [{"id": "m1", "K_enclave": "x"}],
+            "include_sensitive": True,
+        },
+        headers={"X-API-Key": "k"},
+    )
+
+    body = r.get_json()
+    assert [item["id"] for item in body["items"]] == ["m1"]
+    assert body["blocked_sensitive_ids"] == []
+
+
 def test_memory_list_decrypt_and_serve(client, _authed, monkeypatch):
     inner = json.dumps({"title": "t", "description": "d", "type": "fact"}).encode()
     async def fake_backend_get(path, headers, params=None):

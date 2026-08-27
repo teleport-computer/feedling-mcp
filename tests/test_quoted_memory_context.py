@@ -76,11 +76,16 @@ def test_attach_expands_id_into_card():
     assert "quoted_memories" not in decrypted[1]
 
 
-def test_attach_unknown_id_is_skipped_not_errored():
+def test_attach_unknown_id_gets_content_free_unavailable_status():
     decrypted = [{"id": "u1", "role": "user", "quoted_memory_ids": "missing"}]
     enclave_chat._attach_quoted_memories(decrypted, [])
     assert "quoted_memory_ids" not in decrypted[0]
     assert "quoted_memories" not in decrypted[0]
+    assert decrypted[0]["quoted_memory_status"] == {
+        "requested": 1,
+        "resolved": 0,
+        "unavailable": 1,
+    }
 
 
 def test_attach_title_only_memory_uses_title_as_text():
@@ -124,6 +129,24 @@ def test_attach_multiple_ids_preserve_order():
     assert ids == ["a", "b"]
 
 
+def test_partial_quote_hit_keeps_card_and_marks_remainder_unavailable():
+    decrypted = [{"id": "u1", "role": "user", "quoted_memory_ids": "a, gone"}]
+    enclave_chat._attach_quoted_memories(
+        decrypted,
+        [{"id": "a", "title": "A", "description": "body", "type": "fact"}],
+    )
+
+    assert [card["id"] for card in decrypted[0]["quoted_memories"]] == ["a"]
+    assert decrypted[0]["quoted_memory_status"] == {
+        "requested": 2,
+        "resolved": 1,
+        "unavailable": 1,
+    }
+    rendered = crc._quoted_memory_context(decrypted[0])
+    assert "(id=a)" in rendered
+    assert "currently unavailable or have been updated" in rendered
+
+
 # ---------------------------------------------------------------------------
 # chat_resident_consumer._quoted_memory_context
 # ---------------------------------------------------------------------------
@@ -161,3 +184,15 @@ def test_context_empty_returns_blank():
     assert crc._quoted_memory_context({"quoted_memories": []}) == ""
     assert crc._quoted_memory_context({"quoted_memories": [{"text": ""}]}) == ""
     assert crc._quoted_memory_context({"quoted_memories": "not-a-list"}) == ""
+
+
+def test_context_unavailable_marker_is_model_visible_but_content_free():
+    out = crc._quoted_memory_context({
+        "quoted_memory_status": {"requested": 1, "resolved": 0, "unavailable": 1}
+    })
+
+    assert "currently unavailable or have been updated" in out
+    assert "Do not guess" in out
+    assert "deleted" not in out
+    assert "superseded" not in out
+    assert "mem_secret" not in out
