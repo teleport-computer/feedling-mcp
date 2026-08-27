@@ -373,6 +373,7 @@ def test_worker_child_private_read_blocks_later_outbound_web(
         api_key="sk-parent-route",
     )
     offered = []
+    tool_choices = []
     responses = iter(
         [
             {
@@ -407,6 +408,7 @@ def test_worker_child_private_read_blocks_later_outbound_web(
 
     async def fake_provider(_config, _messages, *, tools=None, **kwargs):
         offered.append(tools)
+        tool_choices.append(kwargs.get("tool_choice"))
         return next(responses)
 
     capability_calls = []
@@ -466,7 +468,11 @@ def test_worker_child_private_read_blocks_later_outbound_web(
     assert capability_calls == ["workspace_read"]
     assert {spec.name for spec in offered[0]} == worker._SUBAGENT_ALLOWED_TOOLS
     assert {spec.name for spec in offered[1]}.isdisjoint({"web_search", "web_fetch"})
-    assert {spec.name for spec in offered[2]} == {"workspace_read"}
+    # The rejected call is recorded in native provider history, so compatible
+    # wires retain both referenced schemas on the terminal correction round.
+    # `tool_choice=none` is the execution fence: neither schema can dispatch.
+    assert {spec.name for spec in offered[2]} == {"workspace_read", "web_search"}
+    assert tool_choices == [None, None, "none"]
 
 
 def test_worker_child_forged_mutation_gets_text_fallback_without_dispatch(
