@@ -1,3 +1,8 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
+
 # tools/e2e — 发版 P0 冒烟（一键）
 
 `docs/testing/RELEASE_TESTING_PROTOCOL.md` §3 的可执行实现。**只打 test 环境**
@@ -11,7 +16,7 @@ python3 tools/e2e/p0.py --list                 # 看格子和 key 就位情况
 python3 tools/e2e/p0.py                        # 全量（无 key 的格子自动 SKIP）
 python3 tools/e2e/p0.py --only vps-claude-code # 只跑指定格子
 python3 tools/e2e/p0.py --cleanup-expired-failures # P0 值班人清理满七天的失败现场
-python3 tools/e2e/p0.py --cleanup-orphans      # 立即清理所有遗留账号
+python3 tools/e2e/p0.py --cleanup-orphans      # 清理遗留账号（保留期内 FAIL 现场除外）
 ```
 
 退出码：0 = 无硬失败（skip/warn 允许），1 = 有 FAIL（发版阻断）。
@@ -22,6 +27,8 @@ python3 tools/e2e/p0.py --cleanup-orphans      # 立即清理所有遗留账号
 诊断快照及 job/trace 定位符；最终 provider 输入继续只存在服务器端加密
 trajectory 中，不额外复制一份明文。七天清理由当班 P0 operator 执行；有本地
 admin token 时，清理器必须从 admin 用户接口复核 404 后才删除本地现场。
+`--cleanup-orphans` 也会在删号前检查该保留窗口：窗口内的 FAIL 账号与现场
+一并保留；现场 manifest 损坏或无法读取时也拒绝删号。
 
 ## key 池
 

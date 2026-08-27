@@ -23,6 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from tools.e2e.config import HOSTED_CELLS, VPS_CELLS, KEYS_FILE, load_keys  # noqa: E402
+from tools.e2e.client import FAILURE_RETENTION_DAYS  # noqa: E402
 from tools.e2e.hosted import run_hosted_cell  # noqa: E402
 from tools.e2e.vps import run_vps_cell  # noqa: E402
 
@@ -37,7 +38,8 @@ def main() -> int:
     ap.add_argument("--cleanup-orphans", action="store_true",
                     help="delete accounts left behind by crashed runs (leak manifest)")
     ap.add_argument("--cleanup-expired-failures", action="store_true",
-                    help="delete preserved failure sites after their 7-day retention")
+                    help=("delete preserved failure sites after their "
+                          f"{FAILURE_RETENTION_DAYS}-day retention"))
     args = ap.parse_args()
 
     if args.cleanup_orphans:
@@ -136,6 +138,27 @@ def _remove_failure_evidence(user_id: str) -> None:
         shutil.rmtree(target)
 
 
+def _failure_evidence_expired(run_dir: Path, *, now: datetime) -> bool:
+    """Return whether a failure site is outside retention, or raise to keep it.
+
+    The directory name and manifest identity must agree: cleanup is destructive,
+    so malformed or ambiguous evidence is never treated as permission to delete.
+    """
+    manifest = json.loads((run_dir / "evidence.json").read_text())
+    user_id = str(manifest["user_id"])
+    if user_id != run_dir.name:
+        raise ValueError(
+            f"failure manifest user_id {user_id!r} does not match {run_dir.name!r}"
+        )
+    created = datetime.fromisoformat(str(manifest["created_at"]).replace("Z", "+00:00"))
+    if created.tzinfo is None:
+        raise ValueError("failure manifest created_at must include a timezone")
+    days = int(manifest.get("retention_days", FAILURE_RETENTION_DAYS))
+    if days < 0:
+        raise ValueError("failure manifest retention_days must be non-negative")
+    return (now - created).total_seconds() >= days * 86400
+
+
 def _cleanup_orphans(*, only_user_ids: set[str] | None = None) -> int:
     """Sweep ~/.feedling-e2e-orphans: reset each leaked account with its stored
     key. Manifest entries are removed ONLY on proof of deletion: 200 (deleted
@@ -143,19 +166,22 @@ def _cleanup_orphans(*, only_user_ids: set[str] | None = None) -> int:
     account may well still exist, so the entry is KEPT as the evidence trail
     (codex2 R1). Every manifest is validated through _refuse_prod before any
     request: a corrupted/hand-edited manifest must not let the sweeper POST a
-    destructive reset at a non-test host. Bad files are reported, kept, and
-    never abort the rest of the sweep."""
+    destructive reset at a non-test host. An account with in-retention FAIL
+    evidence is also kept because its server-side encrypted trajectory is part
+    of that evidence. Bad files are reported, kept, and never abort the rest of
+    the sweep."""
     import json as _json
 
     import httpx as _httpx
 
-    from tools.e2e.client import _ORPHANS_DIR, _refuse_prod
+    from tools.e2e.client import _FAILURES_DIR, _ORPHANS_DIR, _refuse_prod
     files = sorted(_ORPHANS_DIR.glob("*.json")) if _ORPHANS_DIR.exists() else []
     if only_user_ids is not None:
         files = [f for f in files if f.stem in only_user_ids]
     if not files:
         print("no orphaned e2e accounts recorded")
         return 0
+    now = datetime.now(timezone.utc)
     remaining = 0
     for f in files:
         try:
@@ -163,11 +189,27 @@ def _cleanup_orphans(*, only_user_ids: set[str] | None = None) -> int:
             api_url = str(creds["api_url"])
             user_id = str(creds["user_id"])
             api_key = str(creds["api_key"])
+            if user_id != f.stem:
+                raise ValueError(
+                    f"orphan manifest user_id {user_id!r} does not match {f.stem!r}"
+                )
             _refuse_prod(api_url)               # the package's test-only line holds here too
         except Exception as e:  # noqa: BLE001 — one bad manifest must not stop the sweep
             print(f"  ❌ {f.name}: bad/unsafe manifest ({type(e).__name__}: {e}); kept")
             remaining += 1
             continue
+        failure_dir = _FAILURES_DIR / user_id
+        if failure_dir.exists():
+            try:
+                expired = _failure_evidence_expired(failure_dir, now=now)
+            except Exception as e:  # noqa: BLE001 — destructive cleanup fails closed
+                print(f"  ❌ {user_id}: unreadable failure evidence ({e}); account and evidence kept")
+                remaining += 1
+                continue
+            if not expired:
+                print(f"  ⏳ {user_id}: FAIL evidence is within retention; account and evidence kept")
+                remaining += 1
+                continue
         try:
             r = _httpx.post(f"{api_url}/v1/account/reset",
                             headers={"X-API-Key": api_key},
@@ -196,8 +238,8 @@ def _cleanup_orphans(*, only_user_ids: set[str] | None = None) -> int:
 
 
 def _cleanup_expired_failures() -> int:
-    """Seven-day retention sweep. Account deletion precedes local evidence removal."""
-    from tools.e2e.client import FAILURE_RETENTION_DAYS, _FAILURES_DIR
+    """Retention sweep. Account deletion precedes local evidence removal."""
+    from tools.e2e.client import _FAILURES_DIR
 
     if not _FAILURES_DIR.exists():
         print("no preserved e2e failure sites recorded")
@@ -207,11 +249,8 @@ def _cleanup_expired_failures() -> int:
     remaining = 0
     for run_dir in sorted(p for p in _FAILURES_DIR.iterdir() if p.is_dir()):
         try:
-            manifest = json.loads((run_dir / "evidence.json").read_text())
-            created = datetime.fromisoformat(str(manifest["created_at"]).replace("Z", "+00:00"))
-            days = int(manifest.get("retention_days", FAILURE_RETENTION_DAYS))
-            if (now - created).total_seconds() >= days * 86400:
-                expired.add(str(manifest["user_id"]))
+            if _failure_evidence_expired(run_dir, now=now):
+                expired.add(run_dir.name)
         except Exception as e:  # noqa: BLE001
             print(f"  ❌ {run_dir.name}: unreadable failure manifest ({e}); kept")
             remaining += 1

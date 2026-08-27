@@ -26,7 +26,7 @@ def test_catalog_covers_capabilities_plus_synthetic_tools_minus_internal_actions
     assert all(isinstance(s, ToolSpec) for s in specs)
 
 
-def test_canvas_send_file_requires_metadata_and_model_authored_completion():
+def test_send_file_requires_model_authored_completion_and_canvas_metadata():
     send_file = next(
         spec for spec in tool_schema.build_tool_specs()
         if spec.name == tool_schema.FILE_REPLY_TOOL
@@ -34,12 +34,13 @@ def test_canvas_send_file_requires_metadata_and_model_authored_completion():
     assert send_file.parameters["properties"]["title"]["maxLength"] == 120
     assert send_file.parameters["properties"]["subtitle"]["maxLength"] == 160
     assert send_file.parameters["properties"]["completion_message"]["minLength"] == 1
-    assert "user's current language" in send_file.description
+    assert send_file.parameters["required"] == [
+        "path", "revision", "completion_message",
+    ]
+    assert "language of the user's current request" in send_file.description
 
     base = {"path": "/workspace/接星星.io.html", "revision": 2}
-    assert "requires title, subtitle, and completion_message" in tool_schema.validate_tool_args(
-        "send_file", base
-    )
+    assert "completion_message" in tool_schema.validate_tool_args("send_file", base)
     assert tool_schema.validate_tool_args(
         "send_file",
         {
@@ -49,6 +50,10 @@ def test_canvas_send_file_requires_metadata_and_model_authored_completion():
             "completion_message": "接星星小游戏已经做好，可以直接打开玩了。",
         },
     ) is None
+    assert "completion_message" in tool_schema.validate_tool_args(
+        "send_file",
+        {"path": "/workspace/计划.pdf", "revision": 1},
+    )
     assert tool_schema.validate_tool_args(
         "send_file",
         {

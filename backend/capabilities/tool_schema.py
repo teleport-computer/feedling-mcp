@@ -439,7 +439,7 @@ PARAMS: dict[str, dict] = {
                 ),
             },
         },
-        "required": ["path", "revision"],
+        "required": ["path", "revision", "completion_message"],
     },
     IMAGE_REPLY_TOOL: {
         "type": "object",
@@ -775,14 +775,9 @@ DESCRIPTIONS: dict[str, str] = {
         "user never needs to know /workspace or provide an internal path. Create "
         "or update the file with workspace_write first, wait for that tool result, "
         "then call send_file in a later round with the exact returned revision. "
-        "For every .io.html Canvas, title, subtitle, and completion_message are "
-        "required. Generate all three in the user's current language, following the "
-        "language used or explicitly requested in the current request; "
-        "subtitle is one concise line describing what the Canvas contains, and "
-        "completion_message is the complete visible chat bubble confirming delivery "
-        "in your own voice. When revising a Canvas, preserve its current "
-        "title and subtitle unless the user asks to change them, and update either "
-        "when the new content makes it useful. "
+        "Every send_file call requires completion_message, the complete visible "
+        "delivery bubble, in the language of the user's current request. For "
+        ".io.html, also provide a concise title and subtitle in that language. "
         "Do not call this merely because a conversational answer contains a list "
         "or structured text. Host filesystem paths and /artifacts, /skills, or "
         "/memory entries are not accepted."
