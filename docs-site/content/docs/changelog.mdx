@@ -30,6 +30,15 @@ change must not be interpreted as an API guarantee.
   missing the real results container is now a retryable upstream failure rather
   than a silent empty result.
 
+- Memory Garden synchronization and explicit Chat references no longer depend
+  on a 200-card candidate window. Memory list ordering now uses parsed
+  `occurred_at` with parsed `created_at` as fallback and can continue from a
+  valid cursor after its anchor is archived, superseded, or deleted. Exact
+  fetches report structured truncation counts; a user-explicit Garden reference
+  may include sensitive, archived, or superseded content, while an unresolved
+  reference gives the model a generic unavailable notice instead of inviting it
+  to guess the missing card.
+
 - Worker-local user state is now metadata-first: obtaining user identity,
   locks, or Chat waiters no longer eagerly loads Chat, frames, World Books,
   tokens, push state, and Live Activity state. Paths that need an in-memory
@@ -50,6 +59,13 @@ change must not be interpreted as an API guarantee.
   card-delivery step, make one bounded correction when title or subtitle metadata
   is invalid, and report an incomplete card delivery as a Canvas delivery issue
   instead of a model connection failure.
+
+- **Hosted Runtime V2 Chat now receives the same localized reply-language
+  policy as proactive wakes.** The account locale or archive language supplies
+  the default while a clearly different latest user message can still select
+  its own language. Generic degraded and terminal-failure replies now follow
+  the same English or Simplified Chinese default instead of always falling back
+  to Chinese; self-hosted deployments can override the two copies separately.
 
 - **Hosted Runtime V2 Chat now makes one bounded correction attempt when a
   final reply omits its self-authored thinking block.** The correction is

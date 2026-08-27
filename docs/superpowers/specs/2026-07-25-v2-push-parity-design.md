@@ -1,9 +1,27 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # Runtime V2 推送能力补齐（对齐 V1）— 设计
 
-日期：2026-07-25
-状态：设计已确认，待写实现计划
+**状态：已实现，核心安全与投递决策仍有效。**
 
-## 1. 背景
+> **CURRENT-STATE NOTE（2026-08-27）**：本设计在 2026-07-25 落地。当前 V2
+> chat/wake 回合只把最后一条已应用回复的截断明文保留在回合内存中，经 backend
+> 内部 push endpoint 做至多一次 best-effort 投递；APNs 凭据仍只由 backend 持有，
+> push 失败不得改变回合结果。现行实现与守卫由 `backend/push/push_core.py`、
+> `backend/push/routes_asgi.py`、`backend/model_api_runtime/v2/worker.py`、
+> `backend/model_api_runtime/v2/serve_worker.py`、`tests/test_v2_push_endpoint.py` 和
+> `tests/test_v2_push_delivery.py` 持有。`e494a38b` 后，全局 system notifications
+> 开关是 chat、manual wake 与其他 wake lane 的统一投递硬 gate；`is_wake` / `lane`
+> 只是向后兼容的来源字段，当前 backend endpoint 不读取它们或按它们分支。下文的
+> 环境快照、数据库计数和行号只解释设计来源，不覆盖当前代码、测试、public
+> architecture 或 self-hosting 文档。
+
+日期：2026-07-25
+状态：已确认并实现；当前修订见顶部 current-state note
+
+## 1. 设计时背景（历史快照）
 
 ### 1.1 触发事件
 
@@ -111,10 +129,14 @@ visible mid-loop」—— 中间气泡必须即时对用户可见。
 
 【backend · 新端点】
   store ← auth.store（user_id 从 runtime token 派生，不信 payload）
-    ├─ is_wake ? evaluate_delivery_v2(settings) gate : 跳过
     ├─ push_service._deliver_ai_message_push_if_background(store, body=…)
+    │    └─ 所有回复统一用 USER_MESSAGE_SOURCE_V2 经过全局通知 gate
+    │       （chat / manual wake / 其他 wake lane 无旁路）
     └─ store.update_chat_message_metadata(msg_id, delivery_fields)
 ```
+
+`is_wake` 与 `lane` 仍作为向后兼容的来源字段随 transport 携带；当前 endpoint 不读取
+或记录它们，也不据此改变投递决策。
 
 推送发起写在 `worker.py` 的回合闭包里，但 HTTP 调用本身经 `TurnDeps` 注入
 （照抄 `deps.apply_pending_effects` 的既有模式），生产接线留在 `serve_worker.py`。
@@ -129,10 +151,10 @@ visible mid-loop」—— 中间气泡必须即时对用户可见。
    内存活一个回合。
 2. **推送永不早于落库。** 推送挂在 apply 之后，被 fence 丢弃的 effect 不会产生
    推送 —— 正是 §1.1 事故的反面（推送到了、消息在别处）。
-3. **复用 V1 全套决策链。** presence gate（`push/service.py:71`）、
-   `reminders_delivery` 开关（`proactive/controls_v2.py:271`）、delivery metadata
-   回写，一行都不重写。最后这条尤其重要：§1.1 的根因能定位，靠的就是
-   `push_decision` / `alert_status` 这几个字段。
+3. **所有 V2 回复统一复用当前推送决策链。** presence gate、全局
+   `reminders_delivery` 开关与 delivery metadata 回写均由 `push/service.py` 持有；
+   endpoint 不按 chat、manual wake 或其他 wake lane 建立旁路。最后这条尤其重要：
+   §1.1 的根因能定位，靠的就是 `push_decision` / `alert_status` 这几个字段。
 
 ## 5. 改动清单
 
@@ -142,7 +164,8 @@ visible mid-loop」—— 中间气泡必须即时对用户可见。
 
 - `_build_encrypted_reply_effect_payload`：payload 增加 `wake_kind` 字段（非明文）。
   chat lane 写空字符串；wake lane 写该次 wake 的 lane 名。落库后即
-  `chat_messages.doc.wake_kind`，推送分流与事后取证都读它。
+  `chat_messages.doc.wake_kind`，用于来源标记与事后取证；当前 push endpoint 不按它
+  分流。
 
   ⚠️ **它与 V1 `proactive_jobs` 日志里的同名字段不是同一套词表**（本设计初版误称
   「沿用同一套」，实现时发现不符，2026-07-25 订正）。V2 写的是 lane 名
@@ -189,10 +212,10 @@ reconciliation sweeper 可能抢在生产者 drain 之前赢下这一行，因�
 
 - 鉴权：`Depends(require_scope("chat_push"))`（`asgi/deps.py:39`）。user_id 一律从
   token claims 派生，**不读 payload 里的 user_id**。
-- 入参：`{"msg_id": str, "body": str, "is_wake": bool}`。
-- 逻辑：`is_wake` 为真时先过 `evaluate_delivery_v2` gate（用户可能关了
-  `reminders_delivery`）；然后调 `push_service._deliver_ai_message_push_if_background`
-  （`push/service.py:161`），title 传 `"IO"`；最后
+- 入参：`{"msg_id": str, "body": str, "is_wake": bool, "lane": str}`；后两项是来源
+  兼容信息，当前 endpoint 不据此分支。
+- 逻辑：直接调 `push_service._deliver_ai_message_push_if_background`，由它让所有回复
+  统一经过全局 `reminders_delivery` 与 presence gate，title 传 `"IO"`；最后
   `store.update_chat_message_metadata(msg_id, delivery_fields)` 回写。
 
 ### 5.5 `tools/export_public_openapi.py`
@@ -224,7 +247,7 @@ serve-worker 组装 `TurnDeps` 时据它决定是否注入 `send_reply_push`。�
 | 回合中途失败，只吐了中间气泡 | 槽位有值，`finally` 里照常推（这正是不放在成功路径上的原因） |
 | 正文为空 | `_on_reply` 对空文本本来就直接 return，不入队也不写槽位 |
 | app 在前台 | V1 presence gate 判定 `suppress`，记 metadata 不发推送 |
-| 用户关了 `reminders_delivery` | wake 消息记 `suppressed`，消息仍落库 |
+| 用户关了 `reminders_delivery` | chat、manual wake 与其他 wake lane 的回复均记 `suppressed`，消息仍落库 |
 | 槽位内存 | 回合闭包局部变量，随回合协程结束自然回收，无跨回合泄漏面 |
 | 账号已删除 | V1 `_deliver_ai_message_push_if_background` 开头的两级 account-gone 检查已覆盖 |
 | `deps.send_reply_push` 未注入 | 特性静默关闭，行为退回今天的「不推送」 |
@@ -247,7 +270,8 @@ worker，需要：
 
 - 无 `chat_push` scope 的 token → 403
 - payload 里塞别人的 user_id → 以 token 的 user_id 为准
-- `is_wake=true` 且 `reminders_delivery` 关闭 → `suppressed`，且 metadata 回写
+- chat、manual wake 与其他 wake lane 在 `reminders_delivery` 关闭时均为
+  `suppressed`，且 metadata 回写
 - 成功路径 → `alert_status` 等字段确实写回那条 chat message
 
 **回归**

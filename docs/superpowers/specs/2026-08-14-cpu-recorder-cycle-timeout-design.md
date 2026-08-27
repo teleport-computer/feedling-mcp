@@ -1,4 +1,23 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # CPU Recorder Cycle Timeout Fix
+
+**Status: implemented; the separate request and cycle budgets remain current.**
+
+> **CURRENT-STATE NOTE (2026-08-27):** Commit `705926fc` separated the request
+> and cycle budgets and updated the managed Compose contract; follow-up commit
+> `8c0d1179` made each effective Docker request timeout the smaller of the
+> client request limit and the remaining cycle budget. Managed test and
+> production Compose keep the client limit at 10 seconds and set
+> `CPU_RECORDER_DOCKER_CYCLE_TIMEOUT_SEC=30` for the complete sequential
+> sampling cycle. Current authority is
+> `ops/cpu_recorder.py`, the managed Compose files,
+> `tests/test_cpu_recorder.py`, and `tests/test_cpu_recorder_compose.py`.
+> Repository source proves the configured contract, not that a particular CVM
+> is currently healthy or producing fresh rows; live claims still require
+> environment evidence.
 
 ## Problem
 
@@ -27,7 +46,7 @@ two seconds and proves that a cycle can complete under the thirty-second
 budget. Preserve tests proving that individual requests remain bounded and
 that an exhausted cycle fails without writing partial data.
 
-After deployment to `test`, verify that:
+The original test-deployment acceptance checks were:
 
 - `cpu-recorder` no longer emits per-cycle `TimeoutError` messages;
 - a daily CSV exists and receives fresh rows at one-minute intervals;

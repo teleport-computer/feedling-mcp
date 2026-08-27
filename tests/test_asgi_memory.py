@@ -36,7 +36,6 @@ from memory import memory_core  # noqa: E402
 from memory import routes_asgi as memory_asgi  # noqa: E402
 from memory import service as memory_service  # noqa: E402
 import memory_readside_core  # noqa: E402
-from memgarden import timestamps as memory_timestamps  # noqa: E402
 
 _SECRET = "test-runtime-secret"
 
@@ -284,22 +283,21 @@ def test_list_cursor_paginates_221_cards_without_duplicates_or_omissions(
     assert {card["id"] for card in pages[2]["moments"]} >= {"mem_219", "mem_220"}
 
 
-def test_list_without_cursor_preserves_legacy_first_page(
+def test_list_without_cursor_uses_server_display_order(
     list_route_store, monkeypatch
 ):
     cards = _pagination_cards()
     monkeypatch.setattr(memory_service, "_load_moments", lambda _store: cards)
-    legacy_order = sorted(
-        cards,
-        key=lambda card: memory_timestamps.sort_key(card.get("occurred_at")),
-        reverse=True,
-    )
 
     status, body = _asgi("GET", "/v1/memory/list?limit=100")
 
     assert status == 200
-    assert body["moments"] == legacy_order[:100]
-    assert body["total"] == len(legacy_order)
+    # Independent oracle: this fixture is generated newest-first and its only
+    # timestamp tie (98...102) has the same ascending ID order as the contract.
+    assert [moment["id"] for moment in body["moments"]] == [
+        f"mem_{index:03d}" for index in range(100)
+    ]
+    assert body["total"] == len(cards)
     assert body["next_cursor"]
 
 
@@ -348,20 +346,28 @@ def test_list_rejects_invalid_cursor_with_400(
     assert (status, body) == (400, {"error": "invalid cursor"})
 
 
-def test_list_rejects_well_formed_cursor_without_matching_anchor(
+def test_list_continues_after_cursor_anchor_disappears(
     list_route_store, monkeypatch
 ):
-    monkeypatch.setattr(
-        memory_service, "_load_moments", lambda _store: _pagination_cards()
+    cards = _pagination_cards()
+    ordered = memory_core._sort_memory_list(cards)
+    current = list(cards)
+    monkeypatch.setattr(memory_service, "_load_moments", lambda _store: current)
+
+    first_status, first = _asgi("GET", "/v1/memory/list?limit=100")
+    assert first_status == 200
+    vanished_id = first["moments"][-1]["id"]
+    current[:] = [card for card in current if card["id"] != vanished_id]
+
+    status, body = _asgi(
+        "GET", f"/v1/memory/list?limit=100&cursor={first['next_cursor']}"
     )
-    forged = memory_core._encode_memory_list_cursor({
-        "id": "mem_not_present",
-        "occurred_at": "2026-08-18T08:00:00Z",
-    })
 
-    status, body = _asgi("GET", f"/v1/memory/list?cursor={forged}")
-
-    assert (status, body) == (400, {"error": "invalid cursor"})
+    assert status == 200
+    assert [card["id"] for card in body["moments"]] == [
+        card["id"] for card in ordered[100:200]
+    ]
+    assert vanished_id not in {card["id"] for card in body["moments"]}
 
 
 def test_get_missing_id_400_parity(user):

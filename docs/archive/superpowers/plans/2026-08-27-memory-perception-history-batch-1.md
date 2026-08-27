@@ -1,8 +1,13 @@
 ---
-document_lifecycle: current
+document_lifecycle: historical
 canonical_owner: docs/superpowers/plans/2026-08-24-repository-cleanup.zh-CN.md
+historical_reason: implemented
 ---
 # Memory/Perception 历史文档批次 1 实施计划
+
+> **IMPLEMENTED / DO NOT RE-RUN**：本计划对应的内核计划归档、current owner 修正、
+> 供应链说明和批次 1 审计已经完成。正文中的路径、基线、预期计数与命令保留为实施期
+> 证据；后续状态由 repository cleanup 总计划和 Memory/Perception 审计持有。
 
 > **Agent 执行要求：** 按 `superpowers:executing-plans` 逐项执行，并在提交前完成独立复审。
 

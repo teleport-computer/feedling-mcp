@@ -33,6 +33,12 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 import db
+from chat.reply_language import (
+    DEFAULT_FAILURE_FALLBACK_EN,
+    DEFAULT_FAILURE_FALLBACK_ZH,
+    failure_fallback_reply,
+    infer_reply_language_policy,
+)
 from core import wake_bus
 from memgarden import timestamps as memory_timestamps
 from model_api_runtime.v2 import usage_reporting
@@ -267,9 +273,16 @@ SCHEDULED_WAKE_STREAM = "proactive_scheduled_wakes_v2"
 _TERMINAL_FAILURE_FALLBACK_REPLY = (
     os.environ.get(
         "FALLBACK_REPLY",
-        "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。",
+        DEFAULT_FAILURE_FALLBACK_ZH,
     ).strip()
-    or "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。"
+    or DEFAULT_FAILURE_FALLBACK_ZH
+)
+_TERMINAL_FAILURE_FALLBACK_REPLY_EN = (
+    os.environ.get(
+        "FALLBACK_REPLY_EN",
+        DEFAULT_FAILURE_FALLBACK_EN,
+    ).strip()
+    or DEFAULT_FAILURE_FALLBACK_EN
 )
 
 # Migration 0041's database trigger rejects pending->claimed transitions from
@@ -4274,6 +4287,11 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         language = accounts_registry._get_user_archive_language(user_id) or ""
     except Exception:  # noqa: BLE001 — locale lookup must not block failure delivery
         language = ""
+    language_policy = infer_reply_language_policy(
+        {},
+        [],
+        archive_language=language,
+    )
     user_text = notices_catalog.user_text_for(
         error_class,
         language=language,
@@ -4301,7 +4319,11 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
                 "provider_timeout",
             }
             or blame == "user_provider"
-            else _TERMINAL_FAILURE_FALLBACK_REPLY
+            else failure_fallback_reply(
+                language_policy,
+                zh=_TERMINAL_FAILURE_FALLBACK_REPLY,
+                en=_TERMINAL_FAILURE_FALLBACK_REPLY_EN,
+            )
         )
     )
     store = core_store.get_store(user_id)

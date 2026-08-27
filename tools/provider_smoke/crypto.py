@@ -2,9 +2,9 @@
 
 AUTHORITATIVE SOURCE: ``backend/content_encryption.py`` (which is itself kept in
 lockstep with ContentEncryption.swift and the enclave's ``_box_seal_open_hkdf``).
-Do not re-derive this from ``tools/v1_envelope_roundtrip_test.py`` — that file
-still carries the OLD BoxSeal scheme (salt=ek_pub||recipient, zero nonce) and no
-longer matches what the server actually writes.
+Round-trip tools have their own cross-implementation drift guards, but this
+module must still follow the backend implementation rather than copying a test
+helper.
 
 box_seal:
   X25519 ECDH → HKDF-SHA256(salt=None, info=b"feedling-box-seal-v1")

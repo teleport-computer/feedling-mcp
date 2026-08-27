@@ -38,6 +38,7 @@ from perception_kernel import prompts as perception_prompts
 STAY_SILENT_TOOL = "stay_silent"
 FILE_REPLY_TOOL = "send_file"
 SHARED_WORK_MAX_BYTES = 256_000
+_SHARED_WORK_MAX_KB = SHARED_WORK_MAX_BYTES // 1000
 IMAGE_REPLY_TOOL = "generate_image"
 TASK_TOOL = "task"
 PROVIDER_USAGE_TOOL = "provider_usage"
@@ -747,7 +748,8 @@ DESCRIPTIONS: dict[str, str] = {
                         "to create. Generated files must use /workspace/<filename>; "
                         "never write them under /artifacts or /skills because those "
                         "namespaces are read-only. A .io.html Canvas must be no "
-                        "larger than 256 KB of UTF-8 source; keep it compact and use "
+                        f"larger than {_SHARED_WORK_MAX_KB} KB of UTF-8 source; "
+                        "keep it compact and use "
                         "CSS or SVG instead of embedding large base64 raster assets."),
     "workspace_delete": ("Delete an editable virtual file at its exact revision. "
                          "Artifacts and skills cannot be deleted by the model."),
@@ -763,7 +765,12 @@ DESCRIPTIONS: dict[str, str] = {
         "Deliver an existing /workspace source as a downloadable attachment. "
         "A self-contained .io.html target is presented by IO as an interactive "
         "Canvas. Choose it when you have decided an experience belongs in the "
-        "conversation. Put everything the work needs inline so it opens offline. "
+        "conversation. If the user has not asked for one and a Canvas could "
+        "materially help but the fit is uncertain, briefly offer to make one and "
+        "wait for the user's answer. Do not create or offer a Canvas merely to "
+        "decorate casual conversation, emotional support, or a question better "
+        "answered directly in chat, and do not repeat an offer the user did not "
+        "take up. Put everything the work needs inline so it opens offline. "
         "Let the user experience the work itself, and discuss its source only if "
         "they ask. "
         "Plain-text formats are sent directly; .docx and .pdf targets are rendered "
@@ -1025,7 +1032,7 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
             path.endswith(".io.html")
             and len(content.encode("utf-8")) > SHARED_WORK_MAX_BYTES
         ):
-            return "Canvas source exceeds the 256 KB UTF-8 limit"
+            return f"Canvas source exceeds the {_SHARED_WORK_MAX_KB} KB UTF-8 limit"
     if name == TASK_TOOL and not str(args.get("prompt") or "").strip():
         return "task requires a non-empty prompt"
     if name == FILE_REPLY_TOOL and not str(args.get("path") or "").strip():

@@ -2,8 +2,8 @@
   "canonical_json": "sort_keys=True,ensure_ascii=False,separators=(',',':')",
   "baseline_commit": "f6d17679a273fc7455d5f58c6c40b354fba54ad4",
   "intentional_updates": ["T330 web_fetch integer offset and paging description"],
-  "wire_bytes": 30799,
-  "wire_sha256": "1a5cdb4d2c4aac44c31344595fca8713872024ff3b84a82452ab278f9bbfba13",
+  "wire_bytes": 31144,
+  "wire_sha256": "5e8a4886b05f63de6a5d39bfdb88ea70886785af7a5acb43e3df774f5b82b392",
   "schema_sha256": {
     "cancel_wake": "aeb00721a85b3b99116c51d74a4ef21bb1110a4ef5d9bd685fea91546fd6b685",
     "generate_image": "b714761c24145e5c49120b413384b7a67cd0788590b988a345a9283da41d951a",

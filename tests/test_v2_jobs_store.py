@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db
+from chat import reply_language
 from psycopg.rows import dict_row
 from core import envelope as core_envelope
 from core import store as core_store
@@ -631,6 +632,58 @@ def test_terminal_failure_reply_is_encrypted_linked_classified_and_idempotent(
     assert parent["reply_message_id"] == failure["id"]
     assert parent["reply_error_class"] == "quota_insufficient"
     assert v2_cursor.load_seq(core_store.get_store(uid)) == parent_seq
+
+
+@pytest.mark.parametrize("archive_language", ["en-US", "zh-Hans-CN"])
+def test_terminal_failure_fallback_uses_shared_reply_language_policy(
+    monkeypatch,
+    archive_language,
+):
+    monkeypatch.setattr(
+        jobs_store,
+        "_TERMINAL_FAILURE_FALLBACK_REPLY",
+        reply_language.DEFAULT_FAILURE_FALLBACK_ZH,
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "_TERMINAL_FAILURE_FALLBACK_REPLY_EN",
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN,
+    )
+    uid = "u_js_terminal_language_" + archive_language.lower().replace("-", "_")
+    seed_user(uid, archive_language=archive_language)
+    _reset(uid)
+    _append_user_message(uid)
+    encrypted_plaintexts: list[str] = []
+
+    def capture_failure_envelope(store, plaintext, *, item_id=None):
+        encrypted_plaintexts.append(plaintext.decode("utf-8"))
+        return _fake_failure_envelope(store, plaintext, item_id=item_id)
+
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        capture_failure_envelope,
+    )
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    jobs_store.claim_next_job("w-terminal-language")
+    assert jobs_store.mark_failed(
+        job_id,
+        "turn_failed:runtimeerror",
+        claimed_by="w-terminal-language",
+    )
+
+    result = jobs_store.reconcile_terminal_failure_outbox(job_id=job_id)
+
+    policy = reply_language.infer_reply_language_policy(
+        {}, [], archive_language=archive_language
+    )
+    expected = (
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN
+        if policy.language == "en"
+        else reply_language.DEFAULT_FAILURE_FALLBACK_ZH
+    )
+    assert result["reply_delivered"] == 1
+    assert encrypted_plaintexts == [expected]
 
 
 @pytest.mark.parametrize(
