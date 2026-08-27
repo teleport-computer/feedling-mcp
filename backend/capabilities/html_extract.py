@@ -1,11 +1,13 @@
 """Pull the readable article out of an HTML page, or say you could not.
 
-``web_fetch`` hands the model at most 2000 characters of a page (the cap lives
-downstream, in ``executor._RESULT_CHAR_CAP``). Stripping tags with a regex
-spends most of that on the navigation menu: measured, "Jump to content / Main
-menu / Random article / Donate / Create account / Log in" fills the first 2257
-characters of an English Wikipedia article, so the article itself never arrives.
-A weather page opens with "首页 预报 预警 雷达 云图 台风路径 热门城市".
+``web_fetch`` now returns an atomic page of at most 8000 characters under its
+``result_budget`` policy and can continue through the retained document. That
+still makes signal density load-bearing: a plain tag strip spent the first 2257
+characters of a measured English Wikipedia page on "Jump to content / Main menu
+/ Random article / Donate / Create account / Log in", consuming over a quarter
+of the first page before the article began. A weather page similarly opens with
+"首页 预报 预警 雷达 云图 台风路径 热门城市". Extraction keeps each bounded page
+focused on the readable content instead of navigation chrome.
 
 This module returns only an *article candidate*. Deciding whether to use it,
 mix it with the plain strip, or ignore it stays in ``web.py`` — that keeps this

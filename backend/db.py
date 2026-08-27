@@ -703,15 +703,72 @@ def insert_user(entry: dict) -> None:
     mirror.execute(sql, (entry["user_id"], entry.get("created_at"), Jsonb(entry)))
 
 
-def upsert_user(entry: dict) -> None:
+def upsert_user(
+    entry: dict, *, seed_web_settings_on_insert: bool = False
+) -> bool | None:
     """Insert-or-update one user document from the in-memory user dict (the
-    source of truth after the caller mutates it under _users_lock)."""
+    source of truth after the caller mutates it under _users_lock).
+
+    ``seed_web_settings_on_insert`` is registration-only.  It writes the
+    enabled-by-default web preference in the same transaction, but only when
+    this call actually inserted the users row.  A retry that collides with an
+    existing row must never create or overwrite that blob: the account may be
+    an old no-blob user, or may already have explicitly switched web off.
+
+    The ordinary branch intentionally remains the exact historical upsert.
+    ``persist_user`` is the shared funnel for every account edit, so changing
+    its conflict update into a no-op would silently stop all existing-user
+    preference and key changes from reaching PostgreSQL.
+    """
     sql = ("INSERT INTO users (user_id, created_at, doc) VALUES (%s, %s, %s) "
            "ON CONFLICT (user_id) DO UPDATE SET created_at = EXCLUDED.created_at, doc = EXCLUDED.doc")
+    if not seed_web_settings_on_insert:
+        with get_pool().connection() as conn:
+            conn.execute(sql, (entry["user_id"], entry.get("created_at"), Jsonb(entry)))
+        from tee_shadow import mirror
+        mirror.execute(sql, (entry["user_id"], entry.get("created_at"), Jsonb(entry)))
+        return None
+
+    params = (entry["user_id"], entry.get("created_at"), Jsonb(entry))
+    insert_if_new_sql = (
+        "INSERT INTO users (user_id, created_at, doc) VALUES (%s, %s, %s) "
+        "ON CONFLICT (user_id) DO NOTHING RETURNING user_id"
+    )
+    seed_sql = (
+        "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
+        "ON CONFLICT (user_id, kind) DO NOTHING"
+    )
+    seed_params = (
+        entry["user_id"],
+        "web_settings",
+        Jsonb({"version": 1, "enabled": True}),
+    )
     with get_pool().connection() as conn:
-        conn.execute(sql, (entry["user_id"], entry.get("created_at"), Jsonb(entry)))
+        with conn.transaction():
+            created = conn.execute(insert_if_new_sql, params).fetchone() is not None
+            if created:
+                conn.execute(seed_sql, seed_params)
+            else:
+                # Preserve the old conflict-update semantics for a registration
+                # retry while deliberately leaving every existing blob alone.
+                conn.execute(sql, params)
     from tee_shadow import mirror
-    mirror.execute(sql, (entry["user_id"], entry.get("created_at"), Jsonb(entry)))
+    # Preserve the historic independent parameter construction for the shadow
+    # connection instead of reusing the primary connection's wrapper objects.
+    mirror.execute(
+        sql,
+        (entry["user_id"], entry.get("created_at"), Jsonb(entry)),
+    )
+    if created:
+        mirror.execute(
+            seed_sql,
+            (
+                entry["user_id"],
+                "web_settings",
+                Jsonb({"version": 1, "enabled": True}),
+            ),
+        )
+    return created
 
 
 def compare_and_set_user(

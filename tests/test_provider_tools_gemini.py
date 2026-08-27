@@ -385,11 +385,11 @@ def test_encode_tools_gemini_adapts_the_complete_builtin_catalog():
     }
 
 
-def test_encode_tools_gemini_builtin_schema_bytes_match_pre_ref_golden():
+def test_encode_tools_gemini_builtin_schema_bytes_match_golden():
     fixture_path = (
         Path(__file__).parent
         / "fixtures"
-        / "gemini_builtin_schema_digests_f6d17679.json"
+        / "gemini_builtin_schema_digests.json"
     )
     expected = json.loads(fixture_path.read_text())
     specs = build_tool_specs()
@@ -405,6 +405,13 @@ def test_encode_tools_gemini_builtin_schema_bytes_match_pre_ref_golden():
     assert len(specs) == len(expected["schema_sha256"])
     assert {spec.name for spec in specs} == set(expected["schema_sha256"])
     assert schema_digests == expected["schema_sha256"]
+    web_fetch_schema = next(
+        declaration["parameters"]
+        for declaration in declarations
+        if declaration["name"] == "web_fetch"
+    )
+    assert _rejected_schema_keywords(web_fetch_schema) == set()
+    assert web_fetch_schema["properties"]["offset"] == {"type": "integer"}
     # The only built-in schema whose old adapter behavior was more than
     # additionalProperties stripping: its boolean enum must remain removed.
     assert schema_digests["photo_read"] == expected["schema_sha256"]["photo_read"]

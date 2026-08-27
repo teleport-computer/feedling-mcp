@@ -31,6 +31,60 @@ def _path_call(call_id: str, name: str, path: str) -> ToolCall:
     return ToolCall(id=call_id, name=name, args=args)
 
 
+@pytest.mark.parametrize("offset", [True, -1, 1.5, "1"])
+def test_web_fetch_batch_key_rejects_non_integer_and_negative_offsets(offset):
+    call = ToolCall(
+        id="bad-offset",
+        name="web_fetch",
+        args={"url": "https://example.com/page", "offset": offset},
+    )
+
+    assert worker._web_fetch_batch_key(call) is None
+
+
+def test_web_fetch_continuations_wait_outside_the_read_gate_for_batch_owner():
+    """Four continuations must not fill a four-permit gate ahead of offset 0."""
+    async def _scenario():
+        owner_complete = asyncio.Event()
+        url = "https://example.com/large"
+        calls = [
+            ToolCall(
+                id=f"continuation-{index}",
+                name="web_fetch",
+                args={"url": url, "offset": index * 100},
+            )
+            for index in range(1, 5)
+        ]
+        calls.append(ToolCall(
+            id="owner", name="web_fetch", args={"url": url, "offset": 0}
+        ))
+
+        async def _platform_dispatch(call):
+            if call.args.get("offset", 0) == 0:
+                owner_complete.set()
+            else:
+                await owner_complete.wait()
+            return ToolResult(call_id=call.id, content="ok")
+
+        results = await asyncio.wait_for(
+            worker._dispatch_mixed_tool_calls(
+                calls,
+                mcp_turn=_DispatchingMcpTurn([], None),
+                mutating_mcp_names=frozenset(),
+                dispatch_platform_one=_platform_dispatch,
+                before_mcp_mutation=lambda: None,
+                read_parallelism=4,
+                mcp_timeout_sec=1,
+            ),
+            timeout=1,
+        )
+
+        assert [result.call_id for result in results] == [call.id for call in calls]
+        assert all(result.content == "ok" for result in results)
+
+    asyncio.run(_scenario())
+
+
 class _DispatchingMcpTurn:
     def __init__(self, names, dispatch):
         self.tool_specs = tuple(

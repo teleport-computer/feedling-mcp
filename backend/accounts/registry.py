@@ -624,7 +624,9 @@ def reload_users_after_notify(user_id: str = "") -> None:
     load_users()
 
 
-def persist_user(entry: dict) -> None:
+def persist_user(
+    entry: dict, *, seed_web_settings_on_insert: bool = False
+) -> None:
     """Persist ONE edited user row (non-destructive per-row upsert) and broadcast
     an UNTARGETED cross-worker reload. This is the multi-worker-safe way to
     persist a genuine single-user edit (registration, api-key add, access-binding
@@ -641,7 +643,11 @@ def persist_user(entry: dict) -> None:
     one high-frequency, row-confined writer, the resident heartbeat, does NOT go
     through here — it persists via ``_persist_resident_seen_cas`` and emits its
     own targeted ``notify_users_changed(user_id)``."""
-    db.upsert_user(entry)
+    if seed_web_settings_on_insert:
+        db.upsert_user(entry, seed_web_settings_on_insert=True)
+    else:
+        # Preserve the long-standing call shape for every existing-user edit.
+        db.upsert_user(entry)
     notify_users_changed()
 
 
@@ -761,7 +767,10 @@ def _register_user(public_key: str | None = None,
         entry["archive_language"] = archive_language.strip()
     with _users_lock:
         _users.append(entry)
-        persist_user(entry)  # per-row upsert (multi-worker-safe) + users broadcast
+        persist_user(
+            entry,
+            seed_web_settings_on_insert=True,
+        )  # per-row upsert + new-account web default + users broadcast
         _key_to_user[api_key_hash] = user_id
     print(f"[users] registered {user_id} archive_language={entry.get('archive_language', 'unset')}")
     return {"user_id": user_id, "principal_id": principal_id, "api_key": api_key}

@@ -822,6 +822,17 @@ read, Hosted Runtime V2 removes web and `task` for the remainder of the turn
 while user-configured MCP remains available, including mutations. Numeric
 health snapshot/trend reads remain compatible with outbound work.
 
+Managed web access also has two independent account/control layers. Accounts
+created after the default-on rollout receive an explicit `web_settings` blob;
+older accounts with no blob remain disabled, and saved explicit choices are not
+rewritten. Per-tool operator halts are evaluated after the account choice and
+still fail closed before outbound I/O. Within Hosted Runtime V2, a large
+`web_fetch` document may be retained only for one chat, wake, or child tool-loop
+attempt so `offset` continuations do not repeat the request. That cache is never
+global or cross-user, has both URL-count and retained-character ceilings, and is
+discarded before any job retry. A continuation miss fails visibly rather than
+performing a hidden refetch.
+
 ### Runtime V2 prompt caching
 
 Tool schemas, runtime policy, and canonical-path-sorted trusted `/skills` are

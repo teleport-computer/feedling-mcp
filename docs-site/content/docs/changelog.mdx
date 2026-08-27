@@ -12,6 +12,24 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **New accounts now start with managed web access enabled.** Registration
+  atomically creates `web_settings` with `enabled: true`. Existing accounts are
+  not migrated: an older account with no settings blob still reads as disabled,
+  and an explicit `enabled: false` is never overwritten by registration retries
+  or import/recovery flows. The independent operator halts continue to override
+  an enabled account before any search or fetch reaches the network.
+
+- **Hosted Runtime V2 can continue reading a large `web_fetch` result without
+  fetching the URL again.** Results now report `total_chars`, `offset`,
+  `returned_chars`, `next_offset`, `has_more`, and `source_truncated`, with up to
+  8,000 serialized characters per page. Calling the same URL with
+  `offset=next_offset` in the same tool-loop attempt reuses a bounded,
+  user-isolated retained page; a continuation cache miss fails explicitly and
+  never hides another outbound request. The stateless Runtime V1 HTTP endpoint
+  returns the first page only. A successful-status DuckDuckGo response that is
+  missing the real results container is now a retryable upstream failure rather
+  than a silent empty result.
+
 - Worker-local user state is now metadata-first: obtaining user identity,
   locks, or Chat waiters no longer eagerly loads Chat, frames, World Books,
   tokens, push state, and Live Activity state. Paths that need an in-memory

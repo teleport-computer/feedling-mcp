@@ -584,7 +584,9 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                     "targets are refused, and every redirect hop (up to 5) is "
                     "independently re-validated. HTML is reduced to readable "
                     "text; non-HTML (JSON, plain text, source) is returned as-is. "
-                    "The response body is size-capped and flags truncation."
+                    "The stateless V1 endpoint returns the first bounded page "
+                    "with total/range metadata. Hosted Runtime V2 can continue "
+                    "within the same tool-loop turn using next_offset."
                 ),
             }
         },
@@ -597,7 +599,8 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "endpoints. ALWAYS delivered as HTTP 200 — a transport 200 does NOT "
             "mean the call succeeded, so branch on `ok`, never on the HTTP "
             "status. When ok is true, `data` holds the tool payload (search: "
-            "`{query, results[], truncated}`; fetch: `{url, text, truncated}`). "
+            "`{query, results[], truncated}`; fetch: `{url, total_chars, offset, "
+            "returned_chars, next_offset, has_more, source_truncated, text}`). "
             "When ok is false, `error.code` is a stable slug: capability_disabled "
             "(the user's web switch is off — not retryable), "
             "capability_rate_limited (per-user budget spent — retryable), "
@@ -2404,7 +2407,10 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/agent/web/fetch"): (
         "Fetch one absolute http(s) URL and return its readable text (HTML is "
         "reduced to the main article; JSON, plain text, and source are returned "
-        "as-is), size-capped with a data.truncated flag. SSRF-guarded: "
+        "as-is). The bounded first page reports data.total_chars, offset, "
+        "returned_chars, next_offset, and has_more; data.source_truncated says "
+        "whether the source document itself exceeded the fetch retention cap, "
+        "not whether this result is merely one page. SSRF-guarded: "
         "private/loopback/link-local targets are refused and every redirect hop "
         "is independently re-validated (max 5). Cloud-only: requires a hosted "
         "per-user runtime token carrying the `web` scope — long-term api-key auth "
@@ -2680,7 +2686,9 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
         "200": {
             "description": (
                 "The capability envelope. Always HTTP 200 — inspect `ok`. On "
-                "success `data` holds `{url, text, truncated}`; otherwise "
+                "success `data` holds `{url, total_chars, offset, "
+                "returned_chars, next_offset, has_more, source_truncated, "
+                "text}`; otherwise "
                 "`error.code` explains the refusal (disabled, rate-limited, "
                 "invalid/blocked url, operator halt, or upstream status)."
             ),

@@ -9,6 +9,13 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 
 
+_DUCKDUCKGO_RESULTS_CONTAINER_RE = re.compile(
+    r'<div\b(?=[^>]*\bid=["\']links["\'])'
+    r'(?=[^>]*\bclass=["\'][^"\']*\bresults\b[^"\']*["\'])[^>]*>',
+    re.IGNORECASE,
+)
+
+
 def query_has_sensitive_data(query: str) -> bool:
     text = str(query or "")
     if re.search(r"\b(sk-[A-Za-z0-9_\-]{12,}|AIza[0-9A-Za-z_\-]{20,}|[A-Fa-f0-9]{48,})\b", text):
@@ -132,6 +139,18 @@ def web_search_duckduckgo(query: str, *, limit: int, timeout_sec: float) -> list
     )
     resp.raise_for_status()
     body = resp.text
+    # Positive proof that this is the HTML results page, rather than a
+    # successful-status challenge/interstitial whose lack of result anchors
+    # would otherwise be misreported as an honest empty search.  This guard is
+    # deliberately fail-loud if DDG changes the results-page structure.
+    #
+    # Scope is intentionally narrower than "all blocking": it covers responses
+    # that are not result pages because this container is absent.  A hypothetical
+    # blocking page that copied the real container but supplied zero entries
+    # would still look like a genuine empty result; we have no evidenced marker
+    # that can distinguish that shape without inventing a brittle denylist.
+    if _DUCKDUCKGO_RESULTS_CONTAINER_RE.search(body) is None:
+        raise RuntimeError("DuckDuckGo response was not an HTML results page")
     results: list[dict] = []
     seen_urls: set[str] = set()
     anchor_re = re.compile(
