@@ -779,6 +779,8 @@ jobs:
           python -m pytest \
             tests/test_ci_image_tag_width.py \
             tests/test_deploy_yaml_strict.py \
+            tests/test_store_sections.py \
+            tests/test_store_load_contract.py \
             tests/test_agent_mailbox_post.py \
             tests/test_release_pin_cas.py \
             tests/test_frame_r2_deploy_config.py \

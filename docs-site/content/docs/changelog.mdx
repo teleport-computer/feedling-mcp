@@ -12,6 +12,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Worker-local user state is now metadata-first: obtaining user identity,
+  locks, or Chat waiters no longer eagerly loads Chat, frames, World Books,
+  tokens, push state, and Live Activity state. Paths that need an in-memory
+  projection declare that section explicitly, while history, resident poll,
+  and Hosted Runtime V2 prompt-tail reads continue to use bounded PostgreSQL
+  queries. Cross-worker notifications refresh only projections already loaded
+  in that worker and still wake parked pollers. PostgreSQL authority, public API
+  schemas, encryption, trust boundaries, and deployment topology are unchanged.
+
 - Perception digest trend entries now distinguish fresh readings from stale
   daily rollups. Fresh entries retain `current`; stale entries retain the trend
   as `last_known` with a user-local `as_of` time (or an explicitly labeled UTC

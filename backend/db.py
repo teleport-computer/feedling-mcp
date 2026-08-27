@@ -12131,7 +12131,10 @@ def chat_capture_messages_after_seq(
 
     Eligibility is filtered in SQL *before* LIMIT. Filtering a newest raw
     window in Python can permanently hide an older uncaptured live row behind
-    a long run of synthetic/import records.
+    a long run of synthetic/import records.  This trigger-discovery read is
+    metadata-only on purpose: Capture workers fetch the encrypted transcript
+    separately, so returning the full ``doc`` here would retransmit ciphertext
+    on every append/scheduler tick merely to count turns and identify the edge.
     """
     cursor_seq = int(after_seq)
     bounded = max(1, min(int(limit), 1000))
@@ -12142,8 +12145,9 @@ def chat_capture_messages_after_seq(
         return []
     with get_pool().connection() as conn:
         rows = conn.execute(
-            "SELECT seq,msg_id,ts,doc FROM ("
-            " SELECT seq,msg_id,ts,doc FROM chat_messages "
+            "SELECT seq,msg_id,ts,role,source FROM ("
+            " SELECT seq,msg_id,ts,doc->>'role' AS role,"
+            " COALESCE(doc->>'source','') AS source FROM chat_messages "
             " WHERE user_id=%s AND seq>%s "
             " AND doc->>'role' IN ('user','openclaw') "
             " AND COALESCE(doc->>'source','')=ANY(%s::text[]) "
@@ -12153,13 +12157,30 @@ def chat_capture_messages_after_seq(
         ).fetchall()
     return [
         {
-            **dict(row[3] or {}),
             "id": str(row[1]),
             "ts": float(row[2]),
             "seq": int(row[0]),
+            "role": str(row[3] or ""),
+            "source": str(row[4] or ""),
         }
         for row in rows
     ]
+
+
+def chat_user_turn_count_strict(user_id: str) -> int:
+    """Return the durable count of chat rows whose role is exactly ``user``.
+
+    Dream scheduling needs one scalar ledger value, not a retained chat
+    snapshot.  Keeping the predicate identical to its former in-memory count
+    preserves behavior while making cold metadata-only stores correct.
+    """
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM chat_messages "
+            "WHERE user_id=%s AND doc->>'role'='user'",
+            (str(user_id),),
+        ).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
 
 
 def chat_seqs_after_seq(

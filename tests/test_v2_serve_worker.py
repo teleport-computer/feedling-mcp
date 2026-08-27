@@ -1420,7 +1420,9 @@ def test_production_deps_do_not_install_a_model_classifier():
 
 
 def test_resident_mode_is_final_fence_for_scheduled_and_screen_watch(monkeypatch):
-    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda uid: object())
+    monkeypatch.setattr(
+        serve_worker.core_store, "get_store", lambda uid, **_kwargs: object()
+    )
     monkeypatch.setattr(
         serve_worker.hosted_config_store,
         "hosted_runtime_v2_enabled_strict",
@@ -2298,7 +2300,9 @@ def test_kill_switch_unwires_the_push_dep(monkeypatch):
 def test_worldbook_reader_forwards_current_turn_and_runtime_token(monkeypatch):
     store = object()
     observed = {}
-    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda uid: store)
+    monkeypatch.setattr(
+        serve_worker.core_store, "get_store", lambda uid, **_kwargs: store
+    )
 
     def match(candidate_store, payload, *, api_key, runtime_token):
         observed.update({
@@ -2334,7 +2338,7 @@ def test_worldbook_reader_forwards_current_turn_and_runtime_token(monkeypatch):
 def test_worldbook_reader_forwards_trusted_trace_context(monkeypatch):
     observed = {}
     monkeypatch.setattr(
-        serve_worker.core_store, "get_store", lambda uid: f"store:{uid}"
+        serve_worker.core_store, "get_store", lambda uid, **_kwargs: f"store:{uid}"
     )
 
     def match(store, payload, **kwargs):

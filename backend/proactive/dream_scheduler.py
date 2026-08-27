@@ -145,22 +145,14 @@ def _within_night_window(store, *, now: float) -> bool:
 
 
 def _live_user_turn_count(store) -> int:
-    chat_messages = getattr(store, "chat_messages", None)
-    if not isinstance(chat_messages, list):
-        return 0
-    chat_lock = getattr(store, "chat_lock", None)
-    if chat_lock is not None:
-        with chat_lock:
-            messages = [dict(msg) for msg in chat_messages if isinstance(msg, Mapping)]
-    else:
-        messages = [dict(msg) for msg in chat_messages if isinstance(msg, Mapping)]
-    return sum(1 for msg in messages if str(msg.get("role") or "").strip() == "user")
+    return db.chat_user_turn_count_strict(store.user_id)
 
 
 def _dream_snapshot(store) -> dict[str, Any]:
     """取花园形状。**「什么算种子卡」「签名怎么算」已搬进内核** —— 那是 Garden
-    内部结构的知识；这里只负责取数（查库、按归属和可见性过滤）与拼上 io 侧的
-    对话轮数。见 memgarden/dreaming.py 的模块说明。
+    内部结构的知识；这里只负责取数（查库、按归属和可见性过滤）。对话轮数只在
+    真正准备入队时再查，避免稳定用户每个 scheduler tick 都扫描聊天历史。
+    见 memgarden/dreaming.py 的模块说明。
     """
     all_moments = [
         dict(moment)
@@ -187,7 +179,6 @@ def _dream_snapshot(store) -> dict[str, Any]:
     return {
         "card_count": snap.card_count,
         "seed_card_count": snap.seed_card_count,
-        "turn_count": _live_user_turn_count(store),
         "signature": snap.signature,
         "last_until": last_until,
     }
@@ -303,9 +294,7 @@ def _tick_memory_dream(
         now_ts,
     ):
         return {"enqueued": False, "reason": "failure_backoff", "state": state, "job": None, "snapshot": snapshot}
-    turn_count = max(0, int(snapshot.get("turn_count") or 0))
     last_turn_count = max(0, int(state.get("last_dreamed_turn_count") or 0))
-    new_turns = max(0, turn_count - last_turn_count)
 
     # 「值不值得整理」的判据在内核 —— 只数种子卡、比指纹，不看时间不看内容。
     # 这里保留的是「能不能 / 什么时候」那半（上面的开关/防重/夜间窗口/失败退避，
@@ -332,7 +321,7 @@ def _tick_memory_dream(
             "job": None,
             "snapshot": snapshot,
             "new_cards": new_cards,
-            "new_turns": new_turns,
+            "new_turns": 0,
         }
     last_completed = _safe_float(state.get("last_dream_completed_at"), 0.0)
     if last_completed and not force and now_ts - last_completed < min_interval_sec():
@@ -346,9 +335,16 @@ def _tick_memory_dream(
             "job": None,
             "snapshot": snapshot,
             "new_cards": new_cards,
-            "new_turns": new_turns,
+            "new_turns": 0,
         }
 
+    # Chat turns do not decide whether a dream is needed. Count them only for
+    # a real enqueue candidate, where they remain part of the legacy job stats
+    # and idempotency material without creating a periodic history-sized read.
+    turn_count = max(0, _live_user_turn_count(store))
+    snapshot = dict(snapshot)
+    snapshot["turn_count"] = turn_count
+    new_turns = max(0, turn_count - last_turn_count)
     key = dream_key_for_snapshot(state, snapshot)
     trigger = "force_dream" if force else "nightly_dream"
     # V2 seam（同 capture_scheduler.tick_quiet_capture）：默认 None = 今天的行为

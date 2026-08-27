@@ -21,6 +21,7 @@ from core import util
 
 from core import store as core_store
 from core.store import UserStore
+from core.store_sections import StoreSection
 from proactive import service
 from proactive.observability_v2 import (
     ProactiveMetricsAggregatorV2,
@@ -85,6 +86,11 @@ def _derive_message_delivery_status(live_status: str, alert_status: str) -> str:
 
 
 def _proactive_debug_snapshot(store: UserStore) -> dict:
+    store.ensure_sections(
+        {StoreSection.CHAT, StoreSection.FRAMES},
+        reason="first_use",
+        strict=True,
+    )
     # The debug dashboard is used as an investigation surface, not a tiny
     # status widget. Read enough rows to cover a normal day of proactive
     # activity; the renderer still lets callers cap visible sections via

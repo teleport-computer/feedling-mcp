@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
 import db
+from core.store_sections import StoreSection
 from core.telemetry_logging import stderr_info_logger
 
 log = stderr_info_logger("feedling.wake_bus")
@@ -54,7 +55,7 @@ _CHAT_SYNC_RESULTS = frozenset({"applied", "skipped", "error", "mismatch"})
 _CHAT_SYNC_REASONS = frozenset({
     "legacy_payload", "legacy_mode", "already_fresh", "event_sync",
     "observe_sample", "observe_control", "sync_failed", "fingerprint_diff",
-    "wake_only",
+    "wake_only", "unloaded",
 })
 
 # Extra per-channel handlers injected by the assembly layer for targets core may
@@ -174,6 +175,20 @@ def _dispatch_chat(data: dict, user_id: str) -> None:
         _chat_sync_telemetry(
             user_id=user_id, mode=mode, result="applied",
             reason="wake_only", hot_rows=len(store.chat_messages),
+        )
+        return
+    if (
+        hasattr(store, "chat_cache_loaded")
+        and not store.chat_cache_loaded()
+    ):
+        store.note_section_change(
+            StoreSection.CHAT,
+            dirty_version=target_version,
+        )
+        store.notify_chat_waiters()
+        _chat_sync_telemetry(
+            user_id=user_id, mode=mode, result="skipped",
+            reason="unloaded", hot_rows=0,
         )
         return
     if not is_v2 and mode == "incremental":

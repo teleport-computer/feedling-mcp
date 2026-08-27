@@ -284,6 +284,7 @@ services:
       # events instead of reloading the full chat window on every sync.
       FEEDLING_CHAT_SYNC_MODE: "incremental"
       FEEDLING_CHAT_HOT_CACHE_LIMIT: "256"
+      FEEDLING_STORE_LOAD_MODE: "legacy"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
       # Public HTTPS origin returned by POST /v1/voice/sessions for the
       # ElevenLabs Custom LLM callback. Keep this literal aligned with ingress
@@ -442,6 +443,7 @@ services:
       # bounded resident window as the HTTP backend.
       FEEDLING_CHAT_SYNC_MODE: "incremental"
       FEEDLING_CHAT_HOT_CACHE_LIMIT: "256"
+      FEEDLING_STORE_LOAD_MODE: "legacy"
       FEEDLING_PLAINTEXT_SHADOW_ENABLED: "0"
       # Keep Runtime V2 writes aligned with backend whoami/effective preference.
       FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "1"

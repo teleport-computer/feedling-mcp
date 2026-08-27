@@ -48,7 +48,8 @@ def _run_handler(monkeypatch, messages, valid, on_yield=None):
     monkeypatch.setattr(screen_ws.registry, "_resolve_user",
                         lambda key: valid.get(key))
     monkeypatch.setattr(screen_ws.core_store, "get_store",
-                        lambda uid: SimpleNamespace(user_id=uid, last_seen_api_key=""))
+                        lambda uid, **_kwargs: SimpleNamespace(
+                            user_id=uid, last_seen_api_key=""))
     monkeypatch.setattr(screen_ws.frames, "_save_frame",
                         lambda store, data: saved.append(data))
     # _save_frame 在线程里跑——同步执行以便断言。

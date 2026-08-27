@@ -1103,10 +1103,14 @@ def _web_visible_for_user(user_id: str) -> bool:
     imports keep this module pure-unit importable without DB/web deps (same idiom
     as ``_genesis_persona_content``)."""
     try:
-        from core.store import UserStore
+        from core import store as core_store
         from web import settings_core as web_settings_core
 
-        return bool(web_settings_core.get_settings(UserStore(user_id)).get("effective"))
+        return bool(
+            web_settings_core.get_settings(core_store.get_store(user_id)).get(
+                "effective"
+            )
+        )
     except Exception as e:  # noqa: BLE001 — advertised-verb display must never block a spawn
         log.warning("web-visibility read failed for %s (advertising off): %s", user_id, e)
         return False
