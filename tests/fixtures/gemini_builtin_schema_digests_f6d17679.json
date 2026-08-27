@@ -1,8 +1,8 @@
 {
   "canonical_json": "sort_keys=True,ensure_ascii=False,separators=(',',':')",
   "source_commit": "f6d17679a273fc7455d5f58c6c40b354fba54ad4",
-  "wire_bytes": 30917,
-  "wire_sha256": "2688d66b191e125e595d12805299ec100eb2107c2a11d6ae96c0b42e67737217",
+  "wire_bytes": 30803,
+  "wire_sha256": "a13396678b504e3ebad3f492965c90acb281d60baa4b6b356297f46041fa0fd0",
   "schema_sha256": {
     "cancel_wake": "aeb00721a85b3b99116c51d74a4ef21bb1110a4ef5d9bd685fea91546fd6b685",
     "generate_image": "b714761c24145e5c49120b413384b7a67cd0788590b988a345a9283da41d951a",
@@ -14,9 +14,9 @@
     "identity_patch": "3d7f601357050e95977e313a1c14b9f927cf26cbeaeb8b19164c7da1f273a7d2",
     "mcp_tool_search": "6ec85de3d96f8dfae661c3c61ab4013c0b4d84ba64300845bcb42bd38adfde18",
     "memory_fetch": "d1780aa7eb91c583b97f773aaf8d46a8b243a1bbc6fd92533b0afda0a8878328",
-    "memory_index": "0896410120f285c842cbb43ba8a44d75a008a5144ee79024d64319029cfa0ff1",
+    "memory_index": "bb7cb2ccd2cc8c875a81d9bf8a4a900ef8bb9fd06ae2f525c8f0f7aba490c220",
     "memory_organize": "efddc7bd8bbcef73a14eb1ace1ffdaec81e518ef1e13c1e9271d0b8acb694a49",
-    "memory_search": "f06075cf13acdfb259b1a67af587287c38f5587ca915dde5f7a596b8258594f9",
+    "memory_search": "f7edc92e9e1aa7cf4cf979f57a341e978d5c2852ee866ad7972a9c107e0c33c6",
     "memory_write": "b8d9f13d0a6efc2703359ed6287824f9ff7855d5d77dbb32c6520898544e32d7",
     "perception_history": "aea96ec5c3ac81d26f09ac9c1cc6d9b65412e78bc078488fdce42780837c9be6",
     "perception_recent_apps": "c4f9bef50fc1613d521477dbbb98c466c2ed49024ebfc7aefa0e6214ca578690",
