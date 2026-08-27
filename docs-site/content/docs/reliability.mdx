@@ -114,6 +114,9 @@ Foreground Chat replaces that fragment with the standard visible fallback and
 attributes it to a temporary upstream-provider failure. Automatic wake lanes
 fail silently instead: they write neither a chat bubble nor an error chip.
 Letters, numbers, CJK text, and emoji count as usable reply content.
+The visible fallback follows the account's default reply-language policy, with
+separate English and Simplified Chinese copies; self-hosted operators should
+configure both localized overrides together.
 
 A relay that cuts the provider stream can also split one internal control
 envelope across the reasoning and content channels, leaving a bare JSON tail
