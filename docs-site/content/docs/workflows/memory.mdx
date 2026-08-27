@@ -58,6 +58,18 @@ later full-Garden refresh.
 `local_only` records can be stored and synchronized, but the enclave has no
 wrapped key for them, so they are unavailable from `index` and `fetch`.
 
+`memory/fetch` resolves IDs against the full Garden rather than an index or
+ranking window. Its response separates `missing_ids` from `unavailable_ids` and
+always includes a `truncation` object with requested, processed, and omitted
+counts. Do not treat a shorter `items` array as proof that every requested ID was
+processed. The `include_sensitive` flag returns sensitive content only when
+`user_explicit_selection=true` is also present; this pairing is intended for an
+exact user selection such as Garden “Talk in Chat”. `include_archived` and
+`include_superseded` expose those lifecycle states when explicitly requested.
+Ambient recall and provider-authored profile or maintenance reads keep sensitive
+content filtered even if a legacy caller sends `include_sensitive=true` without
+the explicit-selection marker.
+
 Runtime V2's `memory_index` tool accepts `bucket` and `thread` filters in
 addition to `limit`, matching the resident CLI's partitioned browsing path.
 Both `memory_index` and `memory_search` results include `total` (the number of

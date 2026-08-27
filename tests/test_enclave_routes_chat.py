@@ -79,6 +79,130 @@ def test_memory_list_fetch_overlaps_history_decrypt(client, monkeypatch):
         f"memory/list 没有与解密并行: {order}"
 
 
+def test_quoted_memory_uses_exact_fetch_outside_200_candidate_pool(
+    client, monkeypatch
+):
+    seen: dict = {}
+    message = {
+        "id": "m1",
+        "role": "user",
+        "ts": 1.0,
+        "v": 1,
+        "source": "ios",
+        "K_enclave": "x",
+        "body_ct": "x",
+        "nonce": "x",
+        "owner_user_id": "usr_a",
+        "quoted_memory_ids": "quoted_201",
+    }
+
+    async def fake_backend_get(path, headers, params=None):
+        if path == "/v1/users/whoami":
+            return {"user_id": "usr_a"}
+        if path == "/v1/chat/history":
+            return {"messages": [message], "total": 1}
+        if path == "/v1/memory/list":
+            seen["list_limit"] = (params or {}).get("limit")
+            return {
+                "moments": [
+                    {"id": f"candidate_{index:03d}", "K_enclave": "x"}
+                    for index in range(200)
+                ],
+                "total": 201,
+            }
+        raise AssertionError(path)
+
+    async def fake_backend_post(path, headers, payload):
+        seen["fetch_path"] = path
+        seen["fetch_payload"] = dict(payload)
+        return {
+            "items": [{
+                "id": "quoted_201",
+                "title": "第 201 张",
+                "description": "精确引用可见",
+                "type": "fact",
+            }],
+            "missing_ids": [],
+            "unavailable_ids": [],
+        }
+
+    monkeypatch.setattr(backend_client, "backend_get", fake_backend_get)
+    monkeypatch.setattr(backend_client, "backend_post", fake_backend_post)
+    monkeypatch.setattr(envmod, "decrypt_envelope", lambda e, u, s: b"question")
+
+    async def fake_sk():
+        return object()
+
+    monkeypatch.setattr(keys, "get_content_sk", fake_sk)
+
+    response = client.get("/v1/chat/history", headers={"X-API-Key": "k"})
+
+    assert response.status_code == 200
+    quoted = response.get_json()["messages"][0]["quoted_memories"]
+    assert quoted[0]["id"] == "quoted_201"
+    assert quoted[0]["text"] == "第 201 张\n精确引用可见"
+    assert seen["list_limit"] == "200"
+    assert seen["fetch_path"] == "/v1/memory/fetch"
+    assert seen["fetch_payload"] == {
+        "ids": ["quoted_201"],
+        "limit": 1,
+        "user_explicit_selection": True,
+        "include_sensitive": True,
+        "include_archived": True,
+        "include_superseded": True,
+    }
+
+
+def test_quoted_memory_fetch_failure_returns_generic_unavailable_marker(
+    client, monkeypatch
+):
+    message = {
+        "id": "m1",
+        "role": "user",
+        "ts": 1.0,
+        "v": 1,
+        "source": "ios",
+        "K_enclave": "x",
+        "body_ct": "x",
+        "nonce": "x",
+        "owner_user_id": "usr_a",
+        "quoted_memory_ids": "gone",
+    }
+
+    async def fake_backend_get(path, headers, params=None):
+        if path == "/v1/users/whoami":
+            return {"user_id": "usr_a"}
+        if path == "/v1/chat/history":
+            return {"messages": [message], "total": 1}
+        if path == "/v1/memory/list":
+            return {"moments": [], "total": 0}
+        raise AssertionError(path)
+
+    async def failed_backend_post(path, headers, payload):
+        raise RuntimeError("fetch unavailable")
+
+    monkeypatch.setattr(backend_client, "backend_get", fake_backend_get)
+    monkeypatch.setattr(backend_client, "backend_post", failed_backend_post)
+    monkeypatch.setattr(envmod, "decrypt_envelope", lambda e, u, s: b"question")
+
+    async def fake_sk():
+        return object()
+
+    monkeypatch.setattr(keys, "get_content_sk", fake_sk)
+
+    response = client.get("/v1/chat/history", headers={"X-API-Key": "k"})
+
+    assert response.status_code == 200
+    message_out = response.get_json()["messages"][0]
+    assert "quoted_memory_ids" not in message_out
+    assert "quoted_memories" not in message_out
+    assert message_out["quoted_memory_status"] == {
+        "requested": 1,
+        "resolved": 0,
+        "unavailable": 1,
+    }
+
+
 def test_history_head_supported(client, monkeypatch):
     # Flask 给每个 GET 路由自动挂 HEAD；FastAPI 的 APIRoute 不会。HEAD 必须
     # 返回与 GET 相同的状态/头、空 body（HeadBodyStripMiddleware 负责剥体），

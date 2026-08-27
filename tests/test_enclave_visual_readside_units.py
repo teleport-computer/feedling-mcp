@@ -40,7 +40,7 @@ def test_parse_visual_plaintext_garbage_fails_closed():
 def test_readside_effective_limit(monkeypatch):
     monkeypatch.delenv("FEEDLING_MEMORY_READSIDE_LIMIT", raising=False)
     monkeypatch.delenv("FEEDLING_MEMORY_READSIDE_HARD_MAX", raising=False)
-    assert readside.memory_readside_effective_limit() == 50
+    assert readside.memory_readside_effective_limit() == 1000
     assert readside.memory_readside_effective_limit(0) == 1000  # 0 = full window, hard cap
     assert readside.memory_readside_effective_limit(7) == 7
     monkeypatch.setenv("FEEDLING_MEMORY_READSIDE_HARD_MAX", "100")
