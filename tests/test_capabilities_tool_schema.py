@@ -37,7 +37,7 @@ def test_send_file_requires_model_authored_completion_and_canvas_metadata():
     assert send_file.parameters["required"] == [
         "path", "revision", "completion_message",
     ]
-    assert "user's current language" in send_file.description
+    assert "language of the user's current request" in send_file.description
 
     base = {"path": "/workspace/接星星.io.html", "revision": 2}
     assert "completion_message" in tool_schema.validate_tool_args("send_file", base)
