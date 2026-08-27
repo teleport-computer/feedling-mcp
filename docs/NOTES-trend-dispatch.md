@@ -1,6 +1,6 @@
 # Trend endpoint dispatch on `perceptkit.trend_models`
 
-Branch: `feat/sensegate-integration`. Commit: see `git log` (this file is
+Branch: `feat/perceptkit-rewire`. Commit: see `git log` (this file is
 committed alongside the code change).
 
 ## Problem
@@ -133,7 +133,7 @@ this change existed. This is a direct equality assertion (`assert body ==
 ## Commands run + real output
 
 ```
-$ cd /Users/hx/Projects/io/worktrees/feedling-mcp/feat-sensegate-integration
+$ cd /Users/hx/Projects/io/worktrees/feedling-mcp/feat-perceptkit-rewire
 $ PYTHONPATH=backend FEEDLING_TEST_PG=postgresql://localhost:1/none \
     python3 -m pytest --collect-only tests/ 2>&1 | grep -c test_perception_trend_dispatch
 1

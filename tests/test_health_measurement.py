@@ -1,8 +1,8 @@
 """Unit tests for perception/health_measurement.py — attribution, dedup
 identity, observation-state, and the arrival->measured cutover.
 
-Pure functions only (no DB, no service.py) — mirrors the sensegate modules
-they wrap (sensegate.attribution / sensegate.identity / sensegate.observation)
+Pure functions only (no DB, no service.py) — mirrors the perceptkit modules
+they wrap (perceptkit.attribution / perceptkit.identity / perceptkit.observation)
 being pure/no-I/O themselves.
 """
 import sys
@@ -139,7 +139,7 @@ def test_attributed_date_falls_back_on_malformed_timestamp_without_raising():
     group = hm.MeasurementGroup("weight_kg", ("weight_kg",), hm.INSTANT)
     meta = hm.GroupMeta(group, measured_at="not-a-timestamp", sample_id="s1")
     assert hm.attributed_date(meta, fallback="2026-08-26") == "2026-08-26"
-    # No offset -> sensegate.attribution refuses to guess; must still fall back.
+    # No offset -> perceptkit.attribution refuses to guess; must still fall back.
     meta_naive = hm.GroupMeta(group, measured_at="2026-01-15T08:00:00", sample_id="s1")
     assert hm.attributed_date(meta_naive, fallback="2026-08-26") == "2026-08-26"
 

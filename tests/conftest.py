@@ -316,7 +316,7 @@ if not _provisioned:
         "test_perception_recent_apps_flow.py",
         "test_ios_perception_contract_v2.py",
         "test_perception_ingress_v2.py",
-        # sensegate batch-2 wiring (2026-08-26): both pure (health_measurement.py
+        # perceptkit batch-2 wiring (2026-08-26): both pure (health_measurement.py
         # has zero I/O; the wiring test uses an in-memory FakeStore, no Postgres).
         "test_health_measurement.py",
         "test_perception_health_measurement_wiring.py",
@@ -438,7 +438,7 @@ if not _provisioned:
         # Phase A CI 执行证据量具：临时文件 + 子进程 pytest，不碰 DB/网络。
         "test_ci_execution_evidence.py",
         # 2026-08-26：test_perception_kernel_{purity,catalog,projection,wake}.py
-        # 已删（内核成了外部包 sensegate，这几条纯度/等价性守卫搬进了包自己的仓库）。
+        # 已删（内核成了外部包 perceptkit，这几条纯度/等价性守卫搬进了包自己的仓库）。
         # 感知 prompt 基线快照(2026-08-19, 感知内核提取 Task 0)。纯:比对
         # V2 模块级常量字符串 + 调用 chat_resident_consumer 的一个纯函数,
         # 不碰 DB/网络。自带 sys.path 引导(backend/ + tools/)。这条留下——它测的是

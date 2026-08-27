@@ -1,4 +1,4 @@
-"""Integration-style unit tests for the batch-2 sensegate wiring inside
+"""Integration-style unit tests for the batch-2 perceptkit wiring inside
 perception/service.py: `_apply`'s Tier 2 rollup block and the decrypt-failure
 UNAVAILABLE path in `ingest_snapshot_v2`.
 
