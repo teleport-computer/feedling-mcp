@@ -107,3 +107,7 @@ current migration runbook 接管仍有效的迁移不变量、mixed-version 兼�
 义务；其一次性实施步骤已归档。已执行完的 cleanup 批次 1/2 计划也以 `implemented`
 归档，避免其阶段性限制继续出现在 current 搜索面。2026-07-04 总设计的 D1–D4 结果已由
 批次 3 转移；历史替代方案和未采纳终态保留在 archive 供追溯，不再覆盖 current owner。
+
+执行批次 3 的 [cleanup plan](../archive/superpowers/plans/2026-08-27-storage-tee-history-batch-3.md)
+也已在 2026-08-27 标记为 `historical` / `implemented`。其一次性归档步骤不再是待办；
+本页继续持有 D1–D4 结果、current owner 分工与兼容义务。

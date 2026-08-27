@@ -49,6 +49,10 @@ canonical_owner: self
 当前执行手册。保留的 design 引用有效，且 archive record 只用于追溯，不替代 current
 decision 或部署说明。
 
+执行本批归档的 [cleanup plan](../archive/superpowers/plans/2026-08-26-resident-runtime-history-batch-1.md)
+也已在 2026-08-27 标记为 `historical` / `implemented`。其任务清单不再是待办；本页继续
+持有归档证据与兼容义务。
+
 ## 已实现的新注册 Model API 用户 V2 cohort
 
 审计日期：2026-08-26。结论：将 [new-user V2 cohort implementation plan](../archive/superpowers/plans/2026-08-10-new-model-api-users-default-v2.md)

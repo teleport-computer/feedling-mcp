@@ -1,8 +1,13 @@
 ---
-document_lifecycle: current
-canonical_owner: docs/superpowers/plans/2026-08-24-repository-cleanup.zh-CN.md
+document_lifecycle: historical
+canonical_owner: docs/repository-cleanup/resident-runtime-history.md
+historical_reason: implemented
 ---
 # Resident Runtime History Batch 1 Implementation Plan
+
+> **HISTORICAL / IMPLEMENTED（2026-08-26）**：本批已经完成。当前 Resident runtime
+> 历史归档结论与兼容义务由 `docs/repository-cleanup/resident-runtime-history.md` 持有；
+> 下述任务、路径和命令仅保留为执行期证据，不应重放。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
