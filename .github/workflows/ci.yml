@@ -880,6 +880,7 @@ jobs:
             tests/test_t210_wake_sentinel_suppression.py \
             tests/test_v2_turn_budget_defaults.py \
             tests/test_v2_tool_loop_mcp.py \
+            tests/test_v2_subagents.py \
             tests/test_v2_worker_mcp.py \
             tests/test_v2_wake_mcp.py \
             tests/test_v2_worker_tool_loop.py \
