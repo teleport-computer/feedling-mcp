@@ -175,7 +175,7 @@ _AGENT_PROMPT_FALLBACK_COMMANDS = (
     "python {io_cli} voice-transcript-list [--limit <n>]\n"
     "python {io_cli} voice-transcript-read --call-id <call_id> [--offset <n>]\n"
     "python {io_cli} worldbook-match --query <current_request>\n"
-    "python {io_cli} memory-index [--query <text>] [--limit <n>] [--bucket <name>] [--thread <tag>] [--ambient] [--include-sensitive]\n"
+    "python {io_cli} memory-index [--query <text>] [--limit <n>] [--bucket <name>] [--thread <tag>] [--ambient]\n"
     "python {io_cli} memory-fetch <id> [<id> ...] [--limit <n>] [--include-archived] [--include-superseded]\n"
     "python {io_cli} memory-write [--summary <text>] [--content <text>] [--bucket <name>] [--threads <tag>] [--importance <0-1>] [--pulse <0-1>] [--type <fact|event|quote|moment>] [--source <label>]\n"
     "python {io_cli} memory-patch --id <memory_id> [--summary <text>] [--content <text>] [--bucket <name>] [--threads <tag>] [--importance <0-1>] [--pulse <0-1>] [--type <fact|event|quote|moment>] [--source <label>] [--reason <text>]\n"

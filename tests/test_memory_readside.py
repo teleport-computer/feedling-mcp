@@ -171,7 +171,7 @@ def test_memory_index_sends_full_light_index_and_calls_enclave(client, monkeypat
     assert res.status_code == 200
     assert captured["api_key"] == "key_readside"
     assert captured["operation"] == "index"
-    assert captured["payload"]["include_sensitive"] is False
+    assert "include_sensitive" not in captured["payload"]
     assert len(captured["ids"]) == 62
     assert captured["ids"][:2] == ["high_new", "open_old"]
     assert "local" not in captured["ids"]
@@ -233,6 +233,7 @@ def test_enclave_index_item_hides_content_body_field():
             "content": "记忆: She needs presence first.\n上下文: Do not expose this in index.\n使用提示: Only fetch should see this.",
             "bucket": "comfort",
             "threads": ["comfort"],
+            # Legacy stored metadata must be ignored by the projection.
             "sensitive_scope": "xp_private_detail",
         },
     )
@@ -249,13 +250,12 @@ def test_enclave_index_item_hides_content_body_field():
         "created_at": "",
         "updated_at": "",
         "last_referenced_at": "",
-        "is_sensitive": True,
         "score": 0.91,
     }
     assert "content" not in item
 
 
-def test_enclave_index_filters_sensitive_items_by_default(monkeypatch):
+def test_enclave_index_ignores_legacy_classification_toggle(monkeypatch):
     c = _enclave_client(monkeypatch)
     monkeypatch.setattr(
         readside,
@@ -263,25 +263,22 @@ def test_enclave_index_filters_sensitive_items_by_default(monkeypatch):
         lambda moments, authorized_user_id, content_sk, *, item_builder: (
             [
                 {"id": "plain", "summary": "Plain memory.", "is_sensitive": False},
-                {"id": "sensitive", "summary": "Private memory.", "is_sensitive": True},
+                {"id": "legacy", "summary": "Legacy-labelled memory.", "is_sensitive": True},
             ],
             [],
         ),
     )
 
-    default_res = c.post("/v1/memory/index",
-                         json={"moments": [{"id": "plain"}, {"id": "sensitive"}]},
-                         headers={"X-API-Key": "key_readside"})
-    sensitive_res = c.post(
+    response = c.post(
         "/v1/memory/index",
-        json={"moments": [{"id": "plain"}, {"id": "sensitive"}], "include_sensitive": True},
+        json={"moments": [{"id": "plain"}, {"id": "legacy"}], "include_sensitive": False},
         headers={"X-API-Key": "key_readside"},
     )
 
-    assert default_res.status_code == 200
-    assert [item["id"] for item in default_res.get_json()["items"]] == ["plain"]
-    assert sensitive_res.status_code == 200
-    assert [item["id"] for item in sensitive_res.get_json()["items"]] == ["plain", "sensitive"]
+    assert response.status_code == 200
+    items = response.get_json()["items"]
+    assert [item["id"] for item in items] == ["plain", "legacy"]
+    assert all("is_sensitive" not in item for item in items)
 
 
 def test_enclave_index_and_fetch_honor_payload_limit_above_50(monkeypatch):
@@ -342,7 +339,7 @@ def test_enclave_unset_limit_falls_back_to_hard_max_not_full_open(monkeypatch):
     assert captured_lengths == [1000]
 
 
-def test_enclave_fetch_item_returns_v1_full_card_without_sensitive_scope():
+def test_enclave_fetch_item_returns_v1_full_card_without_legacy_classification():
     item = readside.build_memory_fetch_item(
         {"id": "mem_1", "status": "active", "salience": "high", "source": "chat"},
         {
@@ -369,10 +366,11 @@ def test_enclave_fetch_item_returns_v1_full_card_without_sensitive_scope():
         "updated_at": "",
         "last_referenced_at": "",
         "voice_call_id": "",
-        "is_sensitive": True,
-        "voice_call_id": "",
     }
-    assert "sensitive_scope" not in item
+    assert all(
+        key not in item
+        for key in ("is_sensitive", "sensitivity_class", "sensitive_scope")
+    )
 
     voice_inner = {
         "summary": "Voice memory",

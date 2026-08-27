@@ -417,6 +417,19 @@ def test_chat_memory_and_perception_contracts_are_concrete(
     )["id"]
     assert memory_delete_id["required"] is True
 
+    memory_index_properties = set(schemas["MemoryIndexRequest"]["properties"])
+    memory_fetch_properties = set(schemas["MemoryFetchRequest"]["properties"])
+    retired_memory_fields = {
+        "include_sensitive",
+        "user_explicit_selection",
+        "is_sensitive",
+        "sensitivity_class",
+        "sensitive_scope",
+    }
+    assert memory_index_properties.isdisjoint(retired_memory_fields)
+    assert memory_fetch_properties.isdisjoint(retired_memory_fields)
+    assert retired_memory_fields.isdisjoint(json.dumps(public_schema).split('"'))
+
     perception_query = _parameters(
         operations[("get", "/v1/perception/app_open")], "query"
     )

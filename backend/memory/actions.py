@@ -423,8 +423,6 @@ def _memory_record_from_envelope(store: UserStore, envelope: dict, *, existing: 
         "pulse",
         "last_referenced_at",
         "superseded_by",
-        "is_sensitive",
-        "sensitivity_class",
     ):
         if key in envelope:
             moment[key] = envelope[key]
@@ -447,10 +445,6 @@ def _memory_apply_v1_metadata(envelope: dict, raw: dict, *, source: str, default
         last_referenced_at = occurred_at
     if last_referenced_at:
         envelope["last_referenced_at"] = last_referenced_at
-    if raw.get("is_sensitive") is not None:
-        envelope["is_sensitive"] = bool(raw.get("is_sensitive"))
-    if raw.get("sensitivity_class"):
-        envelope["sensitivity_class"] = _memory_action_text(raw.get("sensitivity_class"), 80)
 
 
 def _memory_action_effect(action: str, memory_id: str, fields: list[str] | None = None) -> dict:
@@ -647,7 +641,7 @@ def _memory_upgrade_apply(
             or memory_timestamps.now_iso()
         )
         envelope["source"] = str(existing.get("source") or envelope.get("source") or "live_conversation")
-        for key in ("status", "importance", "pulse", "last_referenced_at", "is_sensitive", "sensitivity_class"):
+        for key in ("status", "importance", "pulse", "last_referenced_at"):
             if key not in envelope and key in existing:
                 envelope[key] = existing[key]
         updated = _memory_record_from_envelope(store, envelope, existing=existing)

@@ -180,14 +180,13 @@ PARAMS: dict[str, dict] = {
             "bucket": _STR,
             "thread": _STR,
             "ambient": _BOOL,
-            "include_sensitive": _BOOL,
         },
         "required": [],
     },
     # memory.search(store, ...): params.get("query") (required, non-empty) + optional
     # limit (passed through like index).
     # memory.search 和 memory.index 走同一个 memory_index_core，那个 core 一直在
-    # 消费 bucket / thread / include_sensitive；index 的 schema 开了这几个、search
+    # 消费 bucket / thread；index 的 schema 开了这两个、search
     # 漏了，于是搜索没法限定在某个桶或线索里。V1 的 `memory-index --query` 本来
     # 能组合这些条件。ambient 刻意不开：search 强制带 query，走 exact-query 分支，
     # ambient_top_n 不参与候选限制，开了也是哑参数。
@@ -198,7 +197,6 @@ PARAMS: dict[str, dict] = {
             "limit": _INT,
             "bucket": _STR,
             "thread": _STR,
-            "include_sensitive": _BOOL,
         },
         "required": ["query"],
     },
@@ -548,8 +546,8 @@ DESCRIPTIONS: dict[str, str] = {
                      "talk, and do not resume an earlier answered memory workflow unless "
                      "the current message explicitly asks. Browse memory-card summaries, "
                      "optionally filtered by one exact "
-                     "bucket or thread and capped by limit. Set ambient/include_sensitive "
-                     "only when that broader or sensitive recall is genuinely needed. "
+                     "bucket or thread and capped by limit. Set ambient only when broader "
+                     "recall is genuinely needed. "
                      "Do not indiscriminately pull "
                      "the whole Garden. For an open-ended overview, inspect the returned "
                      "total/returned counts and browse bucket by bucket (or thread by "
