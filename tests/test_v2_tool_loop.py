@@ -3800,6 +3800,178 @@ def test_token_limited_malformed_tool_call_fails_once_without_retry(
     )
 
 
+@pytest.mark.parametrize(
+    ("path", "required_suffix", "expected_exception"),
+    [
+        pytest.param(
+            "/workspace/card.io.html",
+            ".io.html",
+            tool_loop.CanvasDeliveryIncomplete,
+            id="canvas",
+        ),
+        pytest.param(
+            "/workspace/report.md",
+            ".md",
+            tool_loop.FileDeliveryIncomplete,
+            id="ordinary-file",
+        ),
+    ],
+)
+def test_file_reply_callback_failure_preserves_delivery_class(
+    monkeypatch,
+    path,
+    required_suffix,
+    expected_exception,
+):
+    delivery_args = {
+        "path": path,
+        "revision": 1,
+        "title": "Saved work",
+        "subtitle": "Ready to open",
+        "completion_message": "Your file is ready.",
+    }
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "stop_reason": "stop",
+            "tool_calls": [{
+                "id": "send-1",
+                "name": "send_file",
+                "args": delivery_args,
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "stop_reason": "tool_calls",
+            "tool_calls": [{
+                "id": "write-1",
+                "name": "workspace_write",
+                "args": {
+                    "path": path,
+                    "content": "saved source",
+                    "expected_revision": 0,
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "stop_reason": "stop",
+            "tool_calls": [{
+                "id": "send-2",
+                "name": "send_file",
+                "args": delivery_args,
+            }],
+            "usage": {},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    async def fail_delivery(_path, _revision, **_metadata):
+        raise RuntimeError("private loader detail")
+
+    with pytest.raises(
+        expected_exception,
+        match="file_delivery_callback_failed",
+    ) as raised:
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=_RecordingDispatch(
+                "ok: workspace_write applied at revision 1; "
+                "use revision 1 with send_file"
+            ),
+            on_reply=_RecordingReply(),
+            on_file_reply=fail_delivery,
+            required_file_suffixes=(required_suffix,),
+            fold_new_messages=_RecordingFold([[], []]),
+            add_usage=_noop_add_usage,
+            max_calls=5,
+        ))
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "private loader detail"
+    assert len(provider.calls) == 3
+
+
+def test_file_reply_callback_failure_gets_one_forced_recovery(monkeypatch):
+    path = "/workspace/card.io.html"
+    delivery_args = {
+        "path": path,
+        "revision": 1,
+        "title": "Saved work",
+        "subtitle": "Ready to open",
+        "completion_message": "Your file is ready.",
+    }
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "stop_reason": "stop",
+            "tool_calls": [{
+                "id": "send-1",
+                "name": "send_file",
+                "args": delivery_args,
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "stop_reason": "tool_calls",
+            "tool_calls": [{
+                "id": "write-1",
+                "name": "workspace_write",
+                "args": {
+                    "path": path,
+                    "content": "saved source",
+                    "expected_revision": 0,
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "stop_reason": "stop",
+            "tool_calls": [{
+                "id": "send-2",
+                "name": "send_file",
+                "args": delivery_args,
+            }],
+            "usage": {},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    delivery_attempts = 0
+
+    async def flaky_delivery(_path, _revision, **_metadata):
+        nonlocal delivery_attempts
+        delivery_attempts += 1
+        if delivery_attempts == 1:
+            raise RuntimeError("private loader detail")
+
+    dispatch = _RecordingDispatch(
+        "ok: workspace_write applied at revision 1; use revision 1 with send_file"
+    )
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        on_file_reply=flaky_delivery,
+        required_file_suffixes=(".io.html",),
+        fold_new_messages=_RecordingFold([[], []]),
+        add_usage=_noop_add_usage,
+        max_calls=5,
+    ))
+
+    assert delivery_attempts == 2
+    assert [[tc.name for tc in batch] for batch in dispatch.calls] == [
+        ["workspace_write"]
+    ]
+    assert len(provider.calls) == 3
+    assert outcome.final_text == "Your file is ready."
+
+
 def test_quote_dense_canvas_at_utf8_contract_limit_reaches_workspace_dispatch(
     monkeypatch,
 ):

@@ -2137,6 +2137,245 @@ def test_validated_file_completion_skips_terminal_thinking_rewrite(
     assert "thinking_body_ct" not in _bubbles(uid)[0]
 
 
+@pytest.mark.parametrize(
+    (
+        "archive_language",
+        "user_text",
+        "path",
+        "expected_error_class",
+        "expected_notice",
+    ),
+    [
+        pytest.param(
+            "zh-Hans-CN",
+            "请生成并发送一个 HTML 文件",
+            "/workspace/card.io.html",
+            "canvas_file_delivery_incomplete",
+            "画布内容已经保存，但卡片更新没有完成。请稍后再试。",
+            id="canvas-zh",
+        ),
+        pytest.param(
+            "en-US",
+            "Please create and send an HTML file.",
+            "/workspace/card.io.html",
+            "canvas_file_delivery_incomplete",
+            (
+                "The Canvas content was saved, but its card update did not "
+                "finish. Please try again later."
+            ),
+            id="canvas-en",
+        ),
+        pytest.param(
+            "zh-Hans-CN",
+            "请生成并发送一个 Markdown 文件",
+            "/workspace/report.md",
+            "file_delivery_incomplete",
+            "文件内容已经保存，但附件发送没有完成。请稍后再试。",
+            id="ordinary-file-zh",
+        ),
+    ],
+)
+def test_file_reply_callback_failure_reaches_classified_terminal_outbox(
+    monkeypatch,
+    archive_language,
+    user_text,
+    path,
+    expected_error_class,
+    expected_notice,
+):
+    """A real send_file publication failure gets one repair round, then the
+    worker writes its path-aware class through mark_failed and the durable
+    terminal outbox.  The injected fault is the production callback itself,
+    above both classification boundaries; no error code or class is mocked.
+    """
+    uid = "u_file_callback_terminal_" + expected_error_class + "_" + (
+        "en" if archive_language.startswith("en") else "zh"
+    )
+    conftest.seed_user(uid, archive_language=archive_language)
+    _reset(uid)
+    generation = db.get_runtime_generation(uid)
+    input_seq, job_id = db.chat_append_and_enqueue(
+        uid,
+        "file-delivery-parent",
+        10.0,
+        _user_doc("file-delivery-parent", user_text),
+        5000,
+        "chat",
+        expected_generation=generation,
+    )
+    job = jobs_store.claim_next_job("w-file-callback-terminal")
+    assert job is not None and job["id"] == job_id
+    _patch_tool_effect_encryption(monkeypatch)
+
+    def read_after_seq(_user_id: str, after_seq: int):
+        return [
+            {
+                "id": row["id"],
+                "seq": int(row["seq"]),
+                "ts": float(row.get("ts") or 0),
+                "role": row.get("role"),
+                "content": row.get("test_plaintext") or "",
+            }
+            for row in db.chat_messages_after_seq(uid, after_seq, limit=None)
+            if row.get("role") == "user"
+        ]
+
+    delivery_args = {
+        "path": path,
+        "revision": 1,
+        "completion_message": (
+            "The requested file is ready."
+            if archive_language.startswith("en")
+            else "你要的文件已经准备好了。"
+        ),
+    }
+    if path.endswith(".io.html"):
+        delivery_args.update(
+            title="Saved work",
+            subtitle="Ready to open",
+        )
+    calls = _script_provider(
+        monkeypatch,
+        [
+            _tool_round(_tc("send-1", "send_file", **delivery_args)),
+            _tool_round(
+                _tc(
+                    "write-1",
+                    "workspace_write",
+                    path=path,
+                    content="saved source",
+                    expected_revision=0,
+                )
+            ),
+            _tool_round(_tc("send-2", "send_file", **delivery_args)),
+        ],
+    )
+    load_attempts = []
+
+    def fail_file_publication(_store, **kwargs):
+        load_attempts.append((kwargs["path"], kwargs["expected_revision"]))
+        raise RuntimeError("private workspace loader detail")
+
+    deps = worker.TurnDeps(
+        web_tools_enabled=lambda _user_id: True,
+        read_messages=lambda _user_id: read_after_seq(uid, 0),
+        read_messages_after_seq=read_after_seq,
+        read_tail_after_seq=(
+            lambda _user_id, after_seq, _limit, **_kwargs: read_after_seq(
+                uid, after_seq
+            )
+        ),
+        read_summary_with_seq=lambda _user_id: ("", 0.0, 0, 0),
+        resolve_provider=lambda _user_id: (_BYOK, {}),
+        mint_enclave_token=lambda _user_id: "rt",
+        apply_pending_effects=_apply_effects,
+        load_workspace_file=fail_file_publication,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "failed"
+    assert len(calls) == 3
+    assert load_attempts == [(path, 1), (path, 1)]
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == input_seq
+    with db.get_pool().connection() as conn:
+        job_row = conn.execute(
+            "SELECT status,last_error FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+        terminal_row = conn.execute(
+            "SELECT error_code,error_class FROM v2_terminal_failure_outbox "
+            "WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+    assert job_row == (
+        "failed",
+        "turn_failed:" + expected_error_class,
+    )
+    assert terminal_row == (
+        "turn_failed:" + expected_error_class,
+        expected_error_class,
+    )
+    failure = next(
+        row
+        for row in db.chat_load_strict(uid)
+        if str(row.get("terminal_failure_job_id") or "") == str(job_id)
+    )
+    assert failure["turn_failure_error_class"] == expected_error_class
+    assert failure["turn_failure_user_text"] == expected_notice
+    assert base64.b64decode(failure["body_ct"]).decode() == expected_notice
+    assert expected_notice not in {
+        reply_language.DEFAULT_FAILURE_FALLBACK_ZH,
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN,
+    }
+
+
+def test_genuinely_unclassified_process_failure_stays_unknown(monkeypatch):
+    """The producer fix must not turn the terminal reader into a guesser."""
+    uid = "u_unclassified_workspace_prompt_terminal"
+    conftest.seed_user(uid, archive_language="en-US")
+    _reset(uid)
+    _input_seq, job_id = db.chat_append_and_enqueue(
+        uid,
+        "unknown-parent",
+        10.0,
+        _user_doc("unknown-parent", "Hello"),
+        5000,
+        "chat",
+        expected_generation=db.get_runtime_generation(uid),
+    )
+    job = jobs_store.claim_next_job("w-unclassified-terminal")
+    assert job is not None and job["id"] == job_id
+    _patch_tool_effect_encryption(monkeypatch)
+    deps = _deps(
+        messages=[
+            {
+                "id": "unknown-parent",
+                "ts": 10.0,
+                "role": "user",
+                "content": "Hello",
+            }
+        ]
+    )
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: (
+        _ for _ in ()
+    ).throw(RuntimeError("private new failure reason"))
+    monkeypatch.setattr(
+        provider_client,
+        "chat_completion_async",
+        lambda *_args, **_kwargs: pytest.fail(
+            "provider called after workspace prompt failure"
+        ),
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "failed"
+    with db.get_pool().connection() as conn:
+        terminal_row = conn.execute(
+            "SELECT error_code,error_class FROM v2_terminal_failure_outbox "
+            "WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+    assert terminal_row == ("turn_failed:workspace_prompt_unavailable", "unknown")
+
+
 def test_chat_self_thinking_absent_wrong_language_combines_one_correction(
     monkeypatch,
 ):
