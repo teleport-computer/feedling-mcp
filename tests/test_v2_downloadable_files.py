@@ -339,7 +339,7 @@ def test_chinese_file_delivery_uses_chinese_compact_control_messages(monkeypatch
     assert request in messages_seen[1][0]["content"]
     assert "completion_message" in messages_seen[1][0]["content"]
     assert "必须使用中文" in messages_seen[1][0]["content"]
-    assert self_thinking.INSTRUCTION.strip() in messages_seen[1][0]["content"]
+    assert self_thinking.INSTRUCTION.strip() not in messages_seen[1][0]["content"]
     assert len(messages_seen) == 2
 
 
@@ -945,7 +945,103 @@ def test_chinese_canvas_compact_delivery_preserves_requested_card_metadata(
     assert request in compact_prompt
     assert "completion_message" in compact_prompt
     assert "title 和 subtitle" in compact_prompt
-    assert self_thinking.INSTRUCTION.strip() in compact_prompt
+    assert self_thinking.INSTRUCTION.strip() not in compact_prompt
+
+
+def test_canvas_delivery_validates_language_when_request_is_multimodal(
+    monkeypatch,
+):
+    files = []
+
+    async def on_file(path, revision, *, title="", subtitle=""):
+        files.append((path, revision, title, subtitle))
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content="ok: workspace_write applied at revision 1",
+                metadata={"workspace_revision": 1},
+            )
+            for call in tool_calls
+        ]
+
+    outcome, calls, replies, _messages_seen = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "write-canvas",
+                    "name": "workspace_write",
+                    "args": {
+                        "path": "/workspace/board.io.html",
+                        "content": "<main>Canvas board</main>",
+                        "expected_revision": 0,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "send-canvas-wrong-language",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/board.io.html",
+                        "revision": 1,
+                        "title": "Canvas board",
+                        "subtitle": "Interactive board",
+                        "completion_message": "画布已经生成，可以直接打开。",
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "send-canvas-corrected",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/board.io.html",
+                        "revision": 1,
+                        "title": "Canvas board",
+                        "subtitle": "Interactive board",
+                        "completion_message": (
+                            "<think>private delivery reasoning</think>"
+                            "Your canvas is ready to open."
+                        ),
+                    },
+                }],
+                "usage": {},
+            },
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        file_requirement_messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Build me a canvas board, reply in English.",
+                },
+            ],
+        }],
+        max_calls=4,
+        suppress_native_reasoning=True,
+    )
+
+    assert calls[1:] == [("send_file",), ("send_file",)]
+    assert files == [
+        (
+            "/workspace/board.io.html",
+            1,
+            "Canvas board",
+            "Interactive board",
+        )
+    ]
+    assert replies == [("Your canvas is ready to open.", True)]
+    assert outcome.stop_reason == "final_text"
 
 
 def test_canvas_update_compact_delivery_preserves_request_and_corrects_metadata(

@@ -2203,6 +2203,30 @@ def test_file_recovery_tool_choice_dispatches_by_provider_capability(
             id="short-latin-corrected",
         ),
         pytest.param(
+            "帮我生成一个 quarterly business report 的 TXT 文件发给我，里面写三行 summary。",
+            "The quarterly business report is ready to download.",
+            "季度业务报告已经生成并发送，可以下载了。",
+            id="han-with-latin-terms-corrected",
+        ),
+        pytest.param(
+            "Please create a file named 报告.txt for me, then reply briefly in English.",
+            "文件已经生成并发送，可以直接下载了。",
+            "Your report file is ready to download.",
+            id="latin-with-han-filename-corrected",
+        ),
+        pytest.param(
+            "Translate 你好 into English and save it as a Markdown file.",
+            "文件已经生成并发送，可以直接下载了。",
+            "Your translated file is ready to download.",
+            id="latin-with-han-quote-corrected",
+        ),
+        pytest.param(
+            "Write a Markdown file explaining what 道 means in Daoism, in English.",
+            "文件已经生成并发送，可以直接下载了。",
+            "Your explanation file is ready to download.",
+            id="latin-with-han-term-corrected",
+        ),
+        pytest.param(
             "请生成一份 Markdown 文件，完成以后请用英文告诉我结果。",
             "Your work is saved and ready to open now.",
             "Your work is saved and ready to open now.",
@@ -2296,6 +2320,7 @@ def test_compact_file_delivery_corrects_or_confirms_language_before_delivery(
     assert "same path and revision" in correction_result
     assert delivered == [("/workspace/final.md", 1)]
     assert replies.calls == [(corrected_message, True)]
+    assert isinstance(replies.calls[0][0], tool_loop.ValidatedFinalReply)
     assert outcome.final_text == corrected_message
 
 
