@@ -487,6 +487,15 @@ jobs:
             tests/test_repository_inventory.py \
             -v
 
+      - name: Envelope round-trip tool drift guards
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m pytest \
+            tests/test_v1_envelope_roundtrip_tool.py \
+            tests/test_frame_envelope_roundtrip_tool.py \
+            -v
+
       - name: Guard top-level pytest discovery coverage
         run: |
           export LC_ALL=C
@@ -610,7 +619,7 @@ jobs:
             tests/test_v2_quoted_memory.py \
             -v
 
-      - name: Run CI security tier 2 (72 files)
+      - name: Run CI security tier 2 (73 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
@@ -656,6 +665,7 @@ jobs:
             tests/test_genesis_identity_field_lock.py \
             tests/test_genesis_lightweight_identity.py \
             tests/test_genesis_notice.py \
+            tests/test_genesis_import_capture_mode.py \
             tests/test_genesis_v2_orchestration.py \
             tests/test_health_route_isolation.py \
             tests/test_history_import_identity.py \
@@ -878,6 +888,7 @@ jobs:
             tests/test_t210_wake_sentinel_suppression.py \
             tests/test_v2_turn_budget_defaults.py \
             tests/test_v2_tool_loop_mcp.py \
+            tests/test_v2_subagents.py \
             tests/test_v2_worker_mcp.py \
             tests/test_v2_wake_mcp.py \
             tests/test_v2_worker_tool_loop.py \

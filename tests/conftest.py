@@ -281,6 +281,10 @@ if not _provisioned:
         "test_memgarden_prompt_params.py",
         "test_memgarden_storage_port.py",
         "test_memgarden_dreaming.py",
+        # Envelope round-trip tool drift guards: import modules in subprocesses
+        # and compare pure BoxSeal helpers with current backend/enclave codecs.
+        "test_v1_envelope_roundtrip_tool.py",
+        "test_frame_envelope_roundtrip_tool.py",
         # Fully monkeypatched consumer prompt-gate unit — no DB, no network.
         "test_user_mcp_wait_hint.py",
         "test_bucket_lang_normalize.py",

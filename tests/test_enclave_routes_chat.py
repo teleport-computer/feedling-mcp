@@ -12,6 +12,7 @@ from asgi_test_client import _AsgiTestClient  # noqa: E402
 from enclave import auth as enclave_auth  # noqa: E402
 from enclave import backend_client, envelope as envmod, keys  # noqa: E402
 from enclave import state as enclave_state  # noqa: E402
+from enclave.readside import MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT  # noqa: E402
 from enclave.routes import build_app  # noqa: E402
 
 
@@ -79,10 +80,12 @@ def test_memory_list_fetch_overlaps_history_decrypt(client, monkeypatch):
         f"memory/list 没有与解密并行: {order}"
 
 
-def test_quoted_memory_uses_exact_fetch_outside_200_candidate_pool(
+def test_quoted_memory_uses_exact_fetch_outside_default_candidate_pool(
     client, monkeypatch
 ):
     seen: dict = {}
+    quoted_id = f"quoted_{MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT + 1}"
+    quoted_title = f"第 {MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT + 1} 张"
     message = {
         "id": "m1",
         "role": "user",
@@ -93,7 +96,7 @@ def test_quoted_memory_uses_exact_fetch_outside_200_candidate_pool(
         "body_ct": "x",
         "nonce": "x",
         "owner_user_id": "usr_a",
-        "quoted_memory_ids": "quoted_201",
+        "quoted_memory_ids": quoted_id,
     }
 
     async def fake_backend_get(path, headers, params=None):
@@ -106,9 +109,9 @@ def test_quoted_memory_uses_exact_fetch_outside_200_candidate_pool(
             return {
                 "moments": [
                     {"id": f"candidate_{index:03d}", "K_enclave": "x"}
-                    for index in range(200)
+                    for index in range(MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT)
                 ],
-                "total": 201,
+                "total": MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT + 1,
             }
         raise AssertionError(path)
 
@@ -117,8 +120,8 @@ def test_quoted_memory_uses_exact_fetch_outside_200_candidate_pool(
         seen["fetch_payload"] = dict(payload)
         return {
             "items": [{
-                "id": "quoted_201",
-                "title": "第 201 张",
+                "id": quoted_id,
+                "title": quoted_title,
                 "description": "精确引用可见",
                 "type": "fact",
             }],
@@ -139,12 +142,12 @@ def test_quoted_memory_uses_exact_fetch_outside_200_candidate_pool(
 
     assert response.status_code == 200
     quoted = response.get_json()["messages"][0]["quoted_memories"]
-    assert quoted[0]["id"] == "quoted_201"
-    assert quoted[0]["text"] == "第 201 张\n精确引用可见"
-    assert seen["list_limit"] == "200"
+    assert quoted[0]["id"] == quoted_id
+    assert quoted[0]["text"] == f"{quoted_title}\n精确引用可见"
+    assert seen["list_limit"] == str(MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT)
     assert seen["fetch_path"] == "/v1/memory/fetch"
     assert seen["fetch_payload"] == {
-        "ids": ["quoted_201"],
+        "ids": [quoted_id],
         "limit": 1,
         "include_archived": True,
         "include_superseded": True,

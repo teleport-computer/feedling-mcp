@@ -31,7 +31,11 @@ def _setup_plaintext_job(monkeypatch, *, job_id: str):
         lambda *_args: object(),
     )
     monkeypatch.setattr(plaintext, "_resolve_plaintext_user_name", lambda *_args: "TA")
-    monkeypatch.setattr(plaintext, "_write_back_plaintext_user_name", lambda *_args: None)
+    monkeypatch.setattr(
+        plaintext,
+        "_write_back_plaintext_user_name",
+        lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(plaintext, "_trace_genesis", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(service, "write_genesis_state", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(service, "load_genesis_checkpoint", lambda *_args, **_kwargs: None)

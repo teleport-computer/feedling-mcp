@@ -102,7 +102,7 @@ async def v1_memory_list(request: Request):
 
     Query params:
       since (ISO string, optional): pass-through to /v1/memory/list
-      limit (int, default 50, max 200)
+      limit (int, default 50, max 500; out-of-range values are rejected)
     """
     ctx = auth.extract_auth(request)
     user_id, error = await auth.resolve_read_caller(ctx)

@@ -320,17 +320,35 @@ def test_list_total_is_independent_of_cursor_and_limit(
 
 
 def test_list_default_and_max_page_sizes(list_route_store, monkeypatch):
-    cards = _pagination_cards(501)
+    max_limit = memory_core.MEMORY_LIST_MAX_LIMIT
+    cards = _pagination_cards(max_limit + 1)
     monkeypatch.setattr(memory_service, "_load_moments", lambda _store: cards)
 
     default_status, default_page = _asgi("GET", "/v1/memory/list")
-    capped_status, capped_page = _asgi("GET", "/v1/memory/list?limit=999")
+    max_status, max_page = _asgi(
+        "GET", f"/v1/memory/list?limit={max_limit}"
+    )
 
-    assert default_status == capped_status == 200
-    assert len(default_page["moments"]) == 50
-    assert len(capped_page["moments"]) == 500
-    assert default_page["total"] == capped_page["total"] == 501
-    assert default_page["next_cursor"] and capped_page["next_cursor"]
+    assert default_status == max_status == 200
+    assert len(default_page["moments"]) == memory_core.MEMORY_LIST_DEFAULT_LIMIT
+    assert len(max_page["moments"]) == max_limit
+    assert default_page["total"] == max_page["total"] == len(cards)
+    assert default_page["next_cursor"] and max_page["next_cursor"]
+
+
+def test_list_rejects_limit_above_declared_max(list_route_store, monkeypatch):
+    max_limit = memory_core.MEMORY_LIST_MAX_LIMIT
+    monkeypatch.setattr(
+        memory_service,
+        "_load_moments",
+        lambda _store: pytest.fail("invalid limit must fail before loading memories"),
+    )
+
+    status, body = _asgi(
+        "GET", f"/v1/memory/list?limit={max_limit + 1}"
+    )
+
+    assert (status, body) == (400, {"error": "invalid limit"})
 
 
 @pytest.mark.parametrize(

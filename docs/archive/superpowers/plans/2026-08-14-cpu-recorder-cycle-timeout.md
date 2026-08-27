@@ -1,3 +1,8 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/superpowers/specs/2026-08-14-cpu-recorder-cycle-timeout-design.md
+historical_reason: implemented
+---
 # CPU Recorder Cycle Timeout Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

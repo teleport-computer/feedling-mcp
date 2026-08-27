@@ -661,21 +661,30 @@ def test_recorder_deadline_failure_preserves_all_container_baselines(tmp_path):
                 ContainerRef("a" * 64, "first"),
                 ContainerRef("b" * 64, "second"),
             ]
-            self.totals = {
-                self.refs[0].container_id: [100, 200, 300],
-                self.refs[1].container_id: [100, 300],
+            self.snapshots = {
+                self.refs[0].container_id: [
+                    ContainerCpuSnapshot(100, 1000, 2),
+                    ContainerCpuSnapshot(200, 1200, 2),
+                    ContainerCpuSnapshot(300, 1600, 2),
+                ],
+                self.refs[1].container_id: [
+                    ContainerCpuSnapshot(100, 1000, 2),
+                    ContainerCpuSnapshot(300, 1600, 2),
+                ],
             }
 
         def list_running_containers(self, timeout_sec=None):
             self.round += 1
+            if self.round == 2:
+                self.clock.now += timeout_sec
             return self.refs
 
         def read_cpu_snapshot(self, container_id, timeout_sec=None):
-            if self.round == 2 and container_id == self.refs[1].container_id:
+            if self.round == 2:
                 self.clock.now += timeout_sec
-                raise TimeoutError("cycle exhausted")
-            total = self.totals[container_id].pop(0)
-            return ContainerCpuSnapshot(total, total * 4, 2)
+                if container_id == self.refs[1].container_id:
+                    raise TimeoutError("cycle exhausted")
+            return self.snapshots[container_id].pop(0)
 
     proc_root = tmp_path / "proc"
     data_dir = tmp_path / "history"
@@ -691,32 +700,91 @@ def test_recorder_deadline_failure_preserves_all_container_baselines(tmp_path):
     )
 
     assert recorder.sample_once(datetime(2026, 8, 13, tzinfo=timezone.utc)) is False
+    original_baselines = {
+        "a" * 64: ContainerCpuSnapshot(100, 1000, 2),
+        "b" * 64: ContainerCpuSnapshot(100, 1000, 2),
+    }
+    assert recorder._previous_containers == original_baselines
     _write_proc(proc_root, 430, idle=700, iowait=70)
     assert recorder.sample_once(
         datetime(2026, 8, 13, 0, 1, tzinfo=timezone.utc)
     ) is False
+    assert recorder._previous_containers == original_baselines
     _write_proc(proc_root, 510, idle=800, iowait=90)
     assert recorder.sample_once(
         datetime(2026, 8, 13, 0, 2, tzinfo=timezone.utc)
     ) is True
 
-    assert [row["container_name"] for row in _read_csv_rows(data_dir)] == [
+    rows = _read_csv_rows(data_dir)
+    assert [row["container_name"] for row in rows] == [
         "first",
         "second",
+    ]
+    assert [row["container_cpu_capacity_pct"] for row in rows] == [
+        "33.333333",
+        "33.333333",
     ]
 
 
 def test_recorder_keeps_request_timeout_separate_from_cycle_budget(tmp_path):
+    class _Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+    class _AdvancingUrlOpen(_FakeUrlOpen):
+        def __call__(self, request, timeout):
+            response = super().__call__(request, timeout)
+            if len(self.requests) == 1:
+                clock.now += 27.0
+            return response
+
     proc_root = tmp_path / "proc"
     data_dir = tmp_path / "history"
     data_dir.mkdir()
     _write_proc(proc_root, 350)
-    client = DockerStatsClient("http://proxy", timeout_sec=5)
+    container_id = "a" * 64
+    clock = _Clock()
+    fake_urlopen = _AdvancingUrlOpen(
+        [
+            [{"Id": container_id, "Names": ["/backend"]}],
+            {
+                "cpu_stats": {
+                    "cpu_usage": {
+                        "total_usage": 1200,
+                        "percpu_usage": [100, 100],
+                    },
+                    "system_cpu_usage": 9600,
+                    "online_cpus": 2,
+                }
+            },
+        ]
+    )
+    client = DockerStatsClient(
+        "http://proxy", timeout_sec=5, urlopen_fn=fake_urlopen
+    )
 
-    recorder = CpuRecorder(client, proc_root, DailyCsvStore(data_dir, "test"))
+    recorder = CpuRecorder(
+        client,
+        proc_root,
+        DailyCsvStore(data_dir, "test"),
+        docker_monotonic_fn=clock.monotonic,
+    )
 
     assert client.timeout_sec == 5.0
     assert recorder.docker_cycle_timeout_sec == 30.0
+    assert recorder.sample_once(
+        datetime(2026, 8, 13, tzinfo=timezone.utc)
+    ) is False
+    assert fake_urlopen.requests == [
+        ("GET", "http://proxy/containers/json?all=0", 5.0),
+        (
+            "GET",
+            f"http://proxy/containers/{container_id}/stats?stream=false",
+            3.0,
+        ),
+    ]
 
 
 def test_invalid_proc_sample_keeps_last_good_host_baseline(tmp_path, capsys):

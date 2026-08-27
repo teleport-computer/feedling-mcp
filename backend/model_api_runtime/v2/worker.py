@@ -76,6 +76,9 @@ from capabilities import result_budget as cap_result_budget
 from capabilities import tool_schema as cap_tool_schema
 from chat import file_display as chat_file_display
 from chat.reply_language import (
+    DEFAULT_FAILURE_FALLBACK_EN,
+    DEFAULT_FAILURE_FALLBACK_ZH,
+    failure_fallback_reply,
     garden_language_decision,
     infer_garden_language,
     infer_reply_language_policy,
@@ -1259,9 +1262,16 @@ _SCHEDULED_FAILURE_RETRY_DELAYS_SEC = (30.0, 120.0)
 _DEGENERATE_REPLY_FALLBACK = (
     os.environ.get(
         "FALLBACK_REPLY",
-        "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。",
+        DEFAULT_FAILURE_FALLBACK_ZH,
     ).strip()
-    or "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。"
+    or DEFAULT_FAILURE_FALLBACK_ZH
+)
+_DEGENERATE_REPLY_FALLBACK_EN = (
+    os.environ.get(
+        "FALLBACK_REPLY_EN",
+        DEFAULT_FAILURE_FALLBACK_EN,
+    ).strip()
+    or DEFAULT_FAILURE_FALLBACK_EN
 )
 _DEGENERATE_REPLY_ERROR_CLASS = "upstream_unavailable"
 # A torn/leaked protocol-JSON fragment (stream-cut relay split the envelope
@@ -13774,6 +13784,21 @@ async def process_job(
                 prompt_snapshot_through_seq if seq_native else None
             ),
         )
+        chat_language_policy = infer_reply_language_policy(
+            {},
+            [],
+            locale=str(temporal_snapshot.get("locale") or ""),
+            archive_language=str(
+                temporal_snapshot.get("archive_language") or ""
+            ),
+        )
+
+        def _chat_failure_fallback() -> str:
+            return failure_fallback_reply(
+                chat_language_policy,
+                zh=_DEGENERATE_REPLY_FALLBACK,
+                en=_DEGENERATE_REPLY_FALLBACK_EN,
+            )
 
         platform_effects_by_call: dict[str, tuple[str, str]] = {}
         platform_workspace_batches: dict[
@@ -14572,6 +14597,9 @@ async def process_job(
             nonlocal self_thinking_absent_retry_pending
             nonlocal self_thinking_absent_retry_response_seen
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
+            validated_final_reply = isinstance(
+                text, v2_tool_loop.ValidatedFinalReply
+            )
             raw_reply_text = "" if file_reply is not None else str(text or "").strip()
             text = raw_reply_text
             image_replies: list[GeneratedImageReply] = []
@@ -14615,7 +14643,11 @@ async def process_job(
             self_thinking_text = ""
             self_thinking_failed = False
             self_thinking_status = None
-            if (_st_gate_on or self_thinking_on) and file_reply is None and text:
+            if (
+                (_st_gate_on or self_thinking_on)
+                and file_reply is None
+                and text
+            ):
                 _st_split = (
                     self_thinking.strip_all_thinking
                     if _st_gate_on
@@ -14625,17 +14657,18 @@ async def process_job(
                 self_thinking_status = _st_status
                 if _st_status == self_thinking.COMPLETE:
                     text = _st_reply
-                    self_thinking_text = _st_thinking
-                    if _self_thinking_internal_term(self_thinking_text):
-                        self_thinking_text = ""
-                        self_thinking_failed = True
+                    if not validated_final_reply:
+                        self_thinking_text = _st_thinking
+                        if _self_thinking_internal_term(self_thinking_text):
+                            self_thinking_text = ""
+                            self_thinking_failed = True
                 elif _st_status in {self_thinking.SILENT, self_thinking.FAILED}:
                     # Foreground chat must always answer, so both malformed protocol
                     # and a clean thinking-only response keep the pre-existing FAILED
                     # behavior: honest fallback bubble + thinking-failed marker.
                     # Non-empty text keeps it off the empty_reply failure path so the
                     # marker rides the reply effect.
-                    text = _DEGENERATE_REPLY_FALLBACK
+                    text = _chat_failure_fallback()
                     self_thinking_failed = True
                 # ABSENT: text unchanged
             if file_reply is not None and final:
@@ -14654,7 +14687,7 @@ async def process_job(
                 )
                 if not final:
                     return
-                text = _DEGENERATE_REPLY_FALLBACK
+                text = _chat_failure_fallback()
                 turn_failure_error_class = _DEGENERATE_REPLY_ERROR_CLASS
                 reasoning = ""
             # Torn protocol-JSON leak. Foreground policy: only STRONG cross-channel
@@ -14671,7 +14704,7 @@ async def process_job(
                 )
                 if not final:
                     return
-                text = _DEGENERATE_REPLY_FALLBACK
+                text = _chat_failure_fallback()
                 turn_failure_error_class = _PROTOCOL_FRAGMENT_ERROR_CLASS
                 reasoning = ""
             # Keep this paired with the wake guard in _run_wake._on_reply. Some
@@ -14721,7 +14754,7 @@ async def process_job(
                     if _is_degenerate_reply(text):
                         if not final:
                             return
-                        text = _DEGENERATE_REPLY_FALLBACK
+                        text = _chat_failure_fallback()
                         turn_failure_error_class = tool_markup_leak.ERROR_CLASS
                         reasoning = ""
             if final and not text and not image_replies:
@@ -14778,7 +14811,13 @@ async def process_job(
                     )
                     language_correction_pending = False
                     thinking_language_correction_pending = False
-            elif final and file_reply is None and not image_replies and text:
+            elif (
+                final
+                and file_reply is None
+                and not validated_final_reply
+                and not image_replies
+                and text
+            ):
                 retry_completed = False
                 if self_thinking_absent_retry_pending:
                     self_thinking_absent_retried += 1
@@ -15525,8 +15564,15 @@ async def process_job(
             turn_trusted_system_blocks += (context.ORDERED_REPLY_TARGET_POLICY,)
 
         def _chat_builder():
+            chat_system_prompt = context._join_policy_blocks(
+                context.chat_system_prompt(provider_config),
+                reply_language_system_line(
+                    chat_language_policy,
+                    proactive=False,
+                ),
+            )
             return _make_build_messages_fn(
-                system_prompt=context.chat_system_prompt(provider_config),
+                system_prompt=chat_system_prompt,
                 summary=summary,
                 tail=tail,
                 extra_context=turn_extra_context,

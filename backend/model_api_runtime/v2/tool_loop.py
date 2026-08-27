@@ -665,6 +665,19 @@ class FileDeliveryIncomplete(RuntimeError):
     """A requested attachment was saved but still failed bounded delivery."""
 
 
+class ValidatedFinalReply(str):
+    """A sanitized structured reply whose language check budget is settled.
+
+    The worker's ordinary terminal-text path may ask the provider to rewrite a
+    reply that omits its private thinking envelope.  A file completion has
+    already passed through language validation and its bounded correction policy,
+    then is published atomically with the staged attachment. Treating it as
+    ordinary text can replace that settled delivery bubble with a second,
+    wrong-language provider answer. A ``str`` subtype keeps the callback API and
+    test equality stable while preserving that provenance at the worker boundary.
+    """
+
+
 class CanvasDeliveryIncomplete(FileDeliveryIncomplete):
     """Canvas source was saved but its card still failed bounded delivery."""
 
@@ -998,6 +1011,13 @@ async def run_tool_loop(
             if str(message.get("role") or "").strip().lower() != "user":
                 continue
             content = message.get("content")
+            if isinstance(content, list):
+                content = "\n".join(
+                    str(part.get("text") or "").strip()
+                    for part in content
+                    if isinstance(part, dict)
+                    and str(part.get("text") or "").strip()
+                )
             if isinstance(content, str) and content.strip():
                 return _truncate_result_content(
                     content.strip(),
@@ -1008,18 +1028,46 @@ async def run_tool_loop(
     def _delivery_control_uses_han(request: str) -> bool:
         """Keep compact delivery prompts aligned with the visible request."""
 
-        writing_system = language_follow.classify_writing_system(request)
-        return writing_system == "han" or (
-            writing_system == "indeterminate"
-            and re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", request) is not None
+        return _delivery_request_writing_system(request) == "han"
+
+    def _delivery_request_writing_system(request: str) -> str:
+        """Classify the conversational shell, not Latin-heavy file terms.
+
+        A Chinese request can contain a long English filename or subject, which
+        makes the shared character-count classifier report ``latin``.  A small
+        Han share can equally be an English request quoting a filename or term,
+        so the compact-delivery override requires at least two Han characters
+        and a 20% share whenever Latin is also present.  Kana keeps Japanese
+        requests out of this Chinese/Latin override.
+        """
+
+        han_count = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", request))
+        latin_count = len(re.findall(r"[A-Za-z]", request))
+        letter_count = han_count + latin_count
+        strong_han_shell = bool(
+            han_count
+            and re.search(r"[\u3040-\u30ff]", request) is None
+            and (
+                latin_count == 0
+                or (han_count >= 2 and han_count / letter_count >= 0.20)
+            )
         )
+        if strong_han_shell:
+            return "han"
+        writing_system = language_follow.classify_writing_system(request)
+        if writing_system == "indeterminate":
+            if latin_count:
+                return "latin"
+            if han_count:
+                return "han"
+        return writing_system
 
     def _delivery_completion_matches_request(
         request: str, completion_message: str
     ) -> bool:
         """Validate the model-authored delivery bubble against the live request."""
 
-        expected = language_follow.classify_writing_system(request)
+        expected = _delivery_request_writing_system(request)
         actual = language_follow.classify_writing_system(completion_message)
         if expected == "mixed":
             return True
@@ -1042,10 +1090,12 @@ async def run_tool_loop(
             return re.search(r"[A-Za-z]", completion_message) is not None
         return False
 
-    def _compact_delivery_system_prompt(instruction: str) -> str:
+    def _compact_delivery_system_prompt(
+        instruction: str, *, require_self_thinking: bool = True
+    ) -> str:
         """Preserve the normal final-reply contract in compact delivery rounds."""
 
-        if not suppress_native_reasoning:
+        if not suppress_native_reasoning or not require_self_thinking:
             return instruction
         return instruction.rstrip() + "\n\n" + self_thinking.INSTRUCTION.strip()
 
@@ -1720,7 +1770,8 @@ async def run_tool_loop(
                             separators=(",", ":"),
                         )
                         + metadata_instruction
-                        + request_instruction
+                        + request_instruction,
+                        require_self_thinking=False,
                     ),
                 },
                 {
@@ -3295,6 +3346,7 @@ async def run_tool_loop(
             return LoopOutcome("", attempts, "stay_silent", replied_intermediate)
 
         file_completion_message = ""
+        file_completion_validated = False
         for tc in file_reply_calls:
             workspace_path = str(tc.args.get("path") or "").strip()
             workspace_revision = int(tc.args["revision"])
@@ -3396,6 +3448,13 @@ async def run_tool_loop(
             completion_message = str(
                 tc.args.get("completion_message") or ""
             ).strip()
+            thinking_status, _thinking, visible_completion = (
+                self_thinking.strip_all_thinking(completion_message)
+            )
+            if thinking_status == self_thinking.COMPLETE:
+                completion_message = visible_completion
+            elif thinking_status in {self_thinking.SILENT, self_thinking.FAILED}:
+                completion_message = ""
             current_user_request = _latest_user_delivery_request()
             if current_user_request and not _delivery_completion_matches_request(
                 current_user_request, completion_message
@@ -3405,7 +3464,7 @@ async def run_tool_loop(
                         "file_completion_language_follow",
                         {
                             "round": attempts,
-                            "expected": language_follow.classify_writing_system(
+                            "expected": _delivery_request_writing_system(
                                 current_user_request
                             ),
                             "actual": language_follow.classify_writing_system(
@@ -3415,7 +3474,7 @@ async def run_tool_loop(
                         },
                     )
                 else:
-                    required_script = language_follow.classify_writing_system(
+                    required_script = _delivery_request_writing_system(
                         current_user_request
                     )
                     file_result = ToolResult(
@@ -3469,6 +3528,9 @@ async def run_tool_loop(
                 if is_canvas_delivery or current_user_request
                 else ""
             )
+            file_completion_validated = bool(
+                file_completion_message and current_user_request
+            )
             requirement_now_met = (
                 bool(delivered_file_suffixes)
                 if not normalized_required_suffixes
@@ -3502,8 +3564,13 @@ async def run_tool_loop(
                 },
             )
             try:
+                reply_text = (
+                    ValidatedFinalReply(file_completion_message)
+                    if file_completion_validated
+                    else file_completion_message
+                )
                 reply_decision = await on_reply(
-                    file_completion_message,
+                    reply_text,
                     final=True,
                     reasoning=_merged_reasoning(),
                 )

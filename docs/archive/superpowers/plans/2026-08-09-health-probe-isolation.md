@@ -1,3 +1,8 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/superpowers/specs/2026-08-09-health-probe-isolation-design.md
+historical_reason: implemented
+---
 # 健康探针隔离实施计划
 
 > **上游协调说明（2026-08-10）：** `test` 分支已将 `/healthz` 改为完全不访问

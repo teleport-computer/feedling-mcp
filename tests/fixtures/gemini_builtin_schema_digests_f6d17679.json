@@ -1,8 +1,8 @@
 {
   "canonical_json": "sort_keys=True,ensure_ascii=False,separators=(',',':')",
   "source_commit": "f6d17679a273fc7455d5f58c6c40b354fba54ad4",
-  "wire_bytes": 30572,
-  "wire_sha256": "ddfa3bf19b5b8a9626ea8d758a26f536e96ecce9f0adfc2219a927220b657e6d",
+  "wire_bytes": 30917,
+  "wire_sha256": "2688d66b191e125e595d12805299ec100eb2107c2a11d6ae96c0b42e67737217",
   "schema_sha256": {
     "cancel_wake": "aeb00721a85b3b99116c51d74a4ef21bb1110a4ef5d9bd685fea91546fd6b685",
     "generate_image": "b714761c24145e5c49120b413384b7a67cd0788590b988a345a9283da41d951a",

@@ -4,6 +4,7 @@ import json
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
 
@@ -15,6 +16,7 @@ from enclave import backend_client, keys, readside  # noqa: E402
 from enclave import state as enclave_state  # noqa: E402
 from enclave.routes import build_app  # noqa: E402
 from enclave.routes import chat as chat_route  # noqa: E402
+from memory import memory_core  # noqa: E402
 
 
 def _moment(mid: str, title: str, description: str, *, linked: str = "") -> dict:
@@ -212,23 +214,112 @@ def test_routeb_readside_uses_configurable_memory_limit(enclave_history_client, 
     monkeypatch.delenv("MEMORY_READSIDE_FOR_MODEL_API", raising=False)
     enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1",
                               headers={"X-API-Key": "key_routeb"})
-    assert captured_limits[-1] == 200
+    assert captured_limits[-1] == readside.MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT
 
     monkeypatch.setenv("MEMORY_READSIDE_FOR_MODEL_API", "true")
-    # 2026-08-18 统一之后默认值从 50 提到 200（resident 一直在用的值）——
-    # 挑法一样但候选池 50 vs 200 的话，「切 runtime 无感」仍不成立：
-    # 卡多的用户在小池子里会漏掉旧卡。旋钮本身保留，只是默认值变了。
+    # 开关不再改变挑法或候选池，默认值由 readside 的公开边界声明。
     monkeypatch.delenv("MEMORY_READSIDE_MODEL_API_LIMIT", raising=False)
     enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1",
                               headers={"X-API-Key": "key_routeb"})
-    assert captured_limits[-1] == 200
+    assert captured_limits[-1] == readside.MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT
 
-    monkeypatch.setenv("MEMORY_READSIDE_MODEL_API_LIMIT", "80")
+    configured = max(
+        readside.MEMORY_READSIDE_MODEL_API_MIN_LIMIT,
+        readside.MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT // 2,
+    )
+    monkeypatch.setenv("MEMORY_READSIDE_MODEL_API_LIMIT", str(configured))
     enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1",
                               headers={"X-API-Key": "key_routeb"})
-    assert captured_limits[-1] == 80
+    assert captured_limits[-1] == configured
 
-    monkeypatch.setenv("MEMORY_READSIDE_MODEL_API_LIMIT", "999")
+    # Enclave 不再有第二套静默上限：越过 backend 支持边界的配置也原样发出，
+    # 真实 backend 会以 invalid limit 显式拒绝（由 test_asgi_memory 守卫）。
+    unsupported = memory_core.MEMORY_LIST_MAX_LIMIT + 1
+    monkeypatch.setenv("MEMORY_READSIDE_MODEL_API_LIMIT", str(unsupported))
     enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1",
                               headers={"X-API-Key": "key_routeb"})
-    assert captured_limits[-1] == 200
+    assert captured_limits[-1] == unsupported
+
+
+def test_model_api_limit_default_uses_full_backend_supported_page():
+    assert (
+        readside.MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT
+        == memory_core.MEMORY_LIST_MAX_LIMIT
+    )
+
+
+@pytest.mark.parametrize("raw", ["not-an-integer", "1.5"])
+def test_model_api_limit_rejects_invalid_config(monkeypatch, raw):
+    monkeypatch.setenv("MEMORY_READSIDE_MODEL_API_LIMIT", raw)
+
+    with pytest.raises(ValueError, match="must be an integer"):
+        readside.memory_readside_model_api_limit()
+
+
+def test_model_api_limit_rejects_non_positive_config(monkeypatch):
+    unsupported = readside.MEMORY_READSIDE_MODEL_API_MIN_LIMIT - 1
+    monkeypatch.setenv("MEMORY_READSIDE_MODEL_API_LIMIT", str(unsupported))
+
+    with pytest.raises(ValueError, match="must be positive"):
+        readside.memory_readside_model_api_limit()
+
+
+@pytest.mark.parametrize("raw", ["not-an-integer", "0"])
+def test_routeb_bad_memory_limit_leaves_failed_log(
+    enclave_history_client, monkeypatch, raw
+):
+    monkeypatch.setenv("MEMORY_READSIDE_MODEL_API_LIMIT", raw)
+
+    res = enclave_history_client.get(
+        "/v1/chat/history?context_mode=model_api&context_trace=1",
+        headers={"X-API-Key": "key_routeb"},
+    )
+
+    assert res.status_code == 200
+    body = res.get_json()
+    assert body["context_memories"] == []
+    assert body["context_memory_log"] == {
+        "mode": "failed",
+        "error": "ValueError",
+        "counts": {"candidate_pool": 0, "injected": 0},
+    }
+
+
+def test_routeb_backend_limit_rejection_is_visible_as_failed_recall(
+    enclave_history_client, monkeypatch
+):
+    async def fake_backend_get(path, headers, params=None):
+        if path == "/v1/users/whoami":
+            return {"user_id": "usr_routeb"}
+        if path == "/v1/chat/history":
+            return {"messages": [], "total": 0}
+        assert path == "/v1/memory/list"
+        request = httpx.Request("GET", "https://backend.test/v1/memory/list")
+        response = httpx.Response(
+            400,
+            request=request,
+            json={"error": "invalid limit"},
+        )
+        raise httpx.HTTPStatusError(
+            "invalid limit",
+            request=request,
+            response=response,
+        )
+
+    monkeypatch.setattr(backend_client, "backend_get", fake_backend_get)
+    unsupported = memory_core.MEMORY_LIST_MAX_LIMIT + 1
+    monkeypatch.setenv("MEMORY_READSIDE_MODEL_API_LIMIT", str(unsupported))
+
+    res = enclave_history_client.get(
+        "/v1/chat/history?context_mode=model_api&context_trace=1",
+        headers={"X-API-Key": "key_routeb"},
+    )
+
+    assert res.status_code == 200
+    body = res.get_json()
+    assert body["context_memories"] == []
+    assert body["context_memory_log"] == {
+        "mode": "failed",
+        "error": "HTTPStatusError",
+        "counts": {"candidate_pool": 0, "injected": 0},
+    }
