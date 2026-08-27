@@ -24,18 +24,28 @@ def memory_readside_for_model_api_enabled() -> bool:
     return config.env_flag_enabled("MEMORY_READSIDE_FOR_MODEL_API")
 
 
-def memory_readside_model_api_limit(default: int = 50) -> int:
+MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT = 500
+MEMORY_READSIDE_MODEL_API_MIN_LIMIT = 1
+
+
+def memory_readside_model_api_limit() -> int:
     """自动注入的候选池大小。
 
-    2026-08-18：默认值由调用方给。两条 runtime 统一挑法之后，chat 入口传 200
-    （resident 一直在用的值）—— 池子大小是运维旋钮，不该随统一被写死。
+    正整数配置原样传给 backend；backend 的 memory/list 契约负责显式拒绝
+    超出其支持范围的值。这里不能再静默钳位，否则运维旋钮只可下调不可上调。
     """
-    raw = os.environ.get("MEMORY_READSIDE_MODEL_API_LIMIT", "")
+    raw = str(os.environ.get("MEMORY_READSIDE_MODEL_API_LIMIT", "")).strip()
     try:
-        value = int(str(raw).strip()) if str(raw).strip() else int(default)
-    except (TypeError, ValueError):
-        value = int(default)
-    return max(1, min(value, 200))
+        value = int(raw) if raw else MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "MEMORY_READSIDE_MODEL_API_LIMIT must be an integer"
+        ) from exc
+    if value < MEMORY_READSIDE_MODEL_API_MIN_LIMIT:
+        raise ValueError(
+            "MEMORY_READSIDE_MODEL_API_LIMIT must be positive"
+        )
+    return value
 
 
 def memory_readside_hard_max() -> int:

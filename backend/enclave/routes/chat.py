@@ -330,7 +330,7 @@ def _build_context_memories(moments, decrypted, query_args):
     #
     # 此前的分叉不是设计意图：`context_mode` 由调用方传，hosted/turn.py 传
     # "model_api"、resident consumer 不传，于是同一个产品有两套注入规则
-    # （分桶 vs 纯相关性；候选池 200 vs 50）。2026-06 换管道时顺手丢掉了
+    # （分桶 vs 纯相关性；候选池大小也不一致）。2026-06 换管道时顺手丢掉了
     # 打底逻辑，见 docs/superpowers/specs/2026-08-17-auto-injection-unification.md。
     #
     # MEMORY_READSIDE_FOR_MODEL_API 这个开关就此失效：它此前控制的两件事
@@ -409,11 +409,13 @@ async def v1_chat_history(request: Request):
     listing_task: asyncio.Task | None = None
     quoted_fetch_task: asyncio.Task | None = None
     query_args: dict | None = None
+    context_setup_error: Exception | None = None
     # Decrypt-health probes (the resident consumer fires one every
     # DECRYPT_HEALTH_REFRESH_SEC) only need the decrypt round-trip above to have
     # succeeded — they read the HTTP status, never the body. Skip the context
-    # fan-out for them: on a normal read it costs an extra memory/list(200) plus
-    # _build_context_memories on the enclave's single busy path, tripling the
+    # fan-out for them: on a normal read it costs an extra configured
+    # memory/list page plus _build_context_memories on the enclave's single busy
+    # path, tripling the
     # probe's weight for nothing. iOS / model_api callers never set probe, so
     # their context is unchanged.
     probe = str(request.query_params.get("probe") or "").lower() in {
@@ -431,12 +433,10 @@ async def v1_chat_history(request: Request):
         want_trace = str(
             request.query_params.get("context_trace") or ""
         ).lower() in {"1", "true", "yes", "on"}
-        # 候选池统一成 resident 一直在用的 200 —— 挑法一样但池子是 50 vs 200
-        # 的话，「切 runtime 无感」仍然不成立：卡多的用户在小池子里会漏掉旧卡。
-        #
-        # 仍然可配（MEMORY_READSIDE_MODEL_API_LIMIT），只是默认值从 50 提到 200：
-        # 池子大小是运维旋钮（数据规模问题），不该随这次统一一起被写死。
-        memory_limit = readside.memory_readside_model_api_limit(default=200)
+        # 两条 runtime 使用同一挑法和候选池默认值。池子仍可通过
+        # MEMORY_READSIDE_MODEL_API_LIMIT 调整；enclave 原样转发正整数，
+        # backend 对超出 memory/list 支持范围的值显式报错，不再静默缩小。
+        memory_limit = readside.memory_readside_model_api_limit()
         query_args = {
             "context_mode": context_mode,
             "want_trace": want_trace,
@@ -466,6 +466,7 @@ async def v1_chat_history(request: Request):
                     },
                 ))
     except Exception as e:
+        context_setup_error = e
         print(f"[chat/history:{user_id}] context_memories failed: {e}")
 
     try:
@@ -496,7 +497,13 @@ async def v1_chat_history(request: Request):
     _attach_quoted_memories(decrypted, quoted_cards)
 
     context_memory_log: dict | None = None
-    if listing_task is not None:
+    if context_setup_error is not None:
+        context_memory_log = {
+            "mode": "failed",
+            "error": type(context_setup_error).__name__,
+            "counts": {"candidate_pool": 0, "injected": 0},
+        }
+    elif listing_task is not None:
         moments: list = []
         try:
             listing = await listing_task
