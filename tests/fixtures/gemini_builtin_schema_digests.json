@@ -1,8 +1,9 @@
 {
   "canonical_json": "sort_keys=True,ensure_ascii=False,separators=(',',':')",
-  "source_commit": "f6d17679a273fc7455d5f58c6c40b354fba54ad4",
-  "wire_bytes": 30917,
-  "wire_sha256": "2688d66b191e125e595d12805299ec100eb2107c2a11d6ae96c0b42e67737217",
+  "baseline_commit": "f6d17679a273fc7455d5f58c6c40b354fba54ad4",
+  "intentional_updates": ["T330 web_fetch integer offset and paging description"],
+  "wire_bytes": 31144,
+  "wire_sha256": "5e8a4886b05f63de6a5d39bfdb88ea70886785af7a5acb43e3df774f5b82b392",
   "schema_sha256": {
     "cancel_wake": "aeb00721a85b3b99116c51d74a4ef21bb1110a4ef5d9bd685fea91546fd6b685",
     "generate_image": "b714761c24145e5c49120b413384b7a67cd0788590b988a345a9283da41d951a",
@@ -33,7 +34,7 @@
     "task": "9f6d86384e78e7bff71d16966f4e8a19878e1e7f4b15df8665c276811799fe1e",
     "voice_transcript_list": "56211780f6b9825901f7f022eb0b754d41ca9487a29803dc508f2b8dd761382b",
     "voice_transcript_read": "8fdce2c72377625ddab11db338fb131f6771c2b3f4a236fc1ca2451f8dc0cf55",
-    "web_fetch": "b2bc4e14629eaf8ef61bda177aa8adbc73be9ff46d060c622432cf57b867a625",
+    "web_fetch": "c4f690dd880c35506098b652364d5b523182a68b133a8c8e3c5a3a49d2e5af9e",
     "web_search": "76831ad1153d0799b75c73c883ca1b91fbd295bb5fd85104d21163e602af9d25",
     "workspace_delete": "89828379eb096f32632b139c39943b5a34b8d44f8b2b6433985826d87b4fe916",
     "workspace_list": "08a57a5dcadbc5a6aaca42aa9cc9a3e91226bc702236c6136c623385c428e461",

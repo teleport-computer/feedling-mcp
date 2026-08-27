@@ -74,6 +74,7 @@ from capabilities import history as cap_history
 from capabilities import registry as cap_registry
 from capabilities import result_budget as cap_result_budget
 from capabilities import tool_schema as cap_tool_schema
+from capabilities import web as cap_web
 from chat import file_display as chat_file_display
 from chat.reply_language import (
     DEFAULT_FAILURE_FALLBACK_EN,
@@ -533,23 +534,23 @@ if (
     raise RuntimeError(
         "FEEDLING_V2_TOOL_BATCH_RESULT_CHAR_CAP is too small for stable errors"
     )
-# Atomic-JSON producers (history tools) are reserved in full by the batch
+# Atomic-JSON producers (history and web-fetch tools) are reserved in full by the batch
 # water-fill and are never string-sliced, so their per-tool caps and this
 # batch cap have to be consistent with each other. Checked here, once, against
 # the deployment's real numbers — see capabilities/result_budget.py.
 #
-# Only while history is actually on. The kill switch has to restore the exact
-# pre-history startup contract, and a batch cap that was legal before the
-# history tools existed (it only had to clear MAX_TOOL_CALLS_PER_ROUND ×
-# MIN_TOOL_RESULT_ERROR_QUOTA) must not keep the worker from booting once the
-# feature is switched off — otherwise the valve cannot roll anything back.
-# The switch is read at call time, so a process that boots with history off and
-# is turned on later re-runs this check there; see
-# ``_history_tools_enabled_for_turn``.
+# Web fetch has no catalog-level startup switch, so its atomic contract is
+# always checked. History is checked here only while its rollout switch is on:
+# switching history off must restore its pre-feature startup contract. Because
+# that switch is read at call time, enabling history later re-runs the shared
+# atomic check in ``_history_tools_enabled_for_turn``.
 cap_result_budget.validate_result_caps(
     batch_cap=TOOL_BATCH_RESULT_CHAR_CAP,
-    tool_names=(
-        cap_result_budget.ATOMIC_TOOL_NAMES if cap_history.enabled() else ()
+    tool_names=tuple(
+        name
+        for name in cap_result_budget.ATOMIC_TOOL_NAMES
+        if name == "web_fetch"
+        or (cap_history.enabled() and name in cap_history.HISTORY_TOOL_NAMES)
     ),
 )
 # This is a true wall deadline around the whole async MCP call, including time
@@ -3473,6 +3474,34 @@ def _tail_window_callback(
     return _record
 
 
+def _web_fetch_batch_key(tc) -> tuple[str, int] | None:
+    """Return a validated (URL, offset) pair for batch-local fetch ordering."""
+    if str(getattr(tc, "name", "")) != "web_fetch":
+        return None
+    args = getattr(tc, "args", None)
+    if not isinstance(args, dict):
+        return None
+    offset = args.get("offset", 0)
+    if type(offset) is not int or offset < 0:
+        return None
+    url = str(args.get("url") or "").strip()
+    return (url, offset) if url else None
+
+
+def _web_fetch_batch_owner_events(tool_calls) -> dict[str, asyncio.Event]:
+    """Create completion signals only for URLs with an offset-zero owner.
+
+    Continuations wait for these signals before taking a read/enclave permit.
+    The synchronous WebFetchSession remains the singleflight authority; these
+    events are only admission ordering for one provider batch.
+    """
+    return {
+        key[0]: asyncio.Event()
+        for tc in tool_calls
+        if (key := _web_fetch_batch_key(tc)) is not None and key[1] == 0
+    }
+
+
 async def _dispatch_mixed_tool_calls(
     tool_calls,
     *,
@@ -3551,6 +3580,10 @@ async def _dispatch_mixed_tool_calls(
             # unknown/bad calls in the read phase lets executor return its stable
             # error without ever routing one through a write fence.
             reads.append(("platform", tc))
+
+    web_fetch_owner_events = _web_fetch_batch_owner_events(
+        tc for kind, tc in reads if kind == "platform"
+    )
 
     def _workspace_run(start: int) -> tuple[list[Any], int]:
         run: list[Any] = []
@@ -3688,9 +3721,20 @@ async def _dispatch_mixed_tool_calls(
         )
 
     async def _read(kind: str, tc) -> ToolResult:
-        await _event(tc, "tool_call_started", {"phase": f"{kind}_read"})
+        fetch_key = _web_fetch_batch_key(tc) if kind == "platform" else None
+        fetch_event = (
+            web_fetch_owner_events.get(fetch_key[0])
+            if fetch_key is not None
+            else None
+        )
+        is_fetch_owner = fetch_event is not None and fetch_key[1] == 0
+        if fetch_event is not None and fetch_key[1] > 0:
+            # Do not consume the read gate (and therefore the instance-wide
+            # enclave permit below it) while the same-batch owner is queued.
+            await fetch_event.wait()
         started_ns = time.monotonic_ns()
         try:
+            await _event(tc, "tool_call_started", {"phase": f"{kind}_read"})
             if kind == "mcp":
                 # wait_for encloses admission as well as transport: this is a total
                 # wall deadline, not another per-socket idle timeout.
@@ -3709,6 +3753,11 @@ async def _dispatch_mixed_tool_calls(
                 },
             )
             raise
+        finally:
+            if is_fetch_owner:
+                # Release continuations even when dispatch or observability
+                # fails; WebFetchSession will return the retained result/error.
+                fetch_event.set()
         await _event(
             tc,
             "tool_call_result",
@@ -5950,6 +5999,7 @@ def _make_task_batch_dispatcher(
 
             child_tool_event = _make_tool_trajectory_callback(child_recorder)
             child_read_gate = asyncio.Semaphore(MAX_READ_ACTION_PARALLELISM)
+            child_web_fetch_session = cap_web.WebFetchSession()
             # Computed ONCE and referenced by both the offer side
             # (disabled_tool_names below) and the execute side
             # (_child_dispatch). Deriving each independently is precisely how
@@ -5971,6 +6021,10 @@ def _make_task_batch_dispatcher(
                 )
                 if cancelled is not None:
                     return cancelled
+                child_web_fetch_session.prepare_batch(tool_calls)
+                child_web_fetch_owner_events = _web_fetch_batch_owner_events(
+                    tool_calls
+                )
                 if any(tc.name not in child_allowed_tools for tc in tool_calls):
                     # The child loop validates against its offered catalog before
                     # calling this closure. This is a second fail-closed boundary
@@ -5984,17 +6038,26 @@ def _make_task_batch_dispatcher(
                     ]
 
                 async def _one(tc) -> ToolResult:
-                    if child_tool_event is not None:
-                        await child_tool_event(
-                            tc,
-                            "tool_call_started",
-                            {"phase": "subagent_read"},
-                        )
+                    fetch_key = _web_fetch_batch_key(tc)
+                    fetch_event = (
+                        child_web_fetch_owner_events.get(fetch_key[0])
+                        if fetch_key is not None
+                        else None
+                    )
+                    is_fetch_owner = fetch_event is not None and fetch_key[1] == 0
+                    if fetch_event is not None and fetch_key[1] > 0:
+                        await fetch_event.wait()
 
                     def _no_child_write(_tc):
                         raise RuntimeError("subagent attempted a write")
 
                     try:
+                        if child_tool_event is not None:
+                            await child_tool_event(
+                                tc,
+                                "tool_call_started",
+                                {"phase": "subagent_read"},
+                            )
                         async with child_read_gate:
                             (result,) = await v2_executor.dispatch_tool_calls(
                                 [tc],
@@ -6007,6 +6070,7 @@ def _make_task_batch_dispatcher(
                                 before_write=None,
                                 observe_photo=observe_photo,
                                 read_parallelism=1,
+                                web_fetch_session=child_web_fetch_session,
                             )
                     except Exception as exc:
                         if child_tool_event is not None:
@@ -6019,6 +6083,9 @@ def _make_task_batch_dispatcher(
                                 },
                             )
                         raise
+                    finally:
+                        if is_fetch_owner:
+                            fetch_event.set()
                     if child_tool_event is not None:
                         await child_tool_event(
                             tc,
@@ -9439,6 +9506,7 @@ async def _run_wake(
         if lane == "screen_watch" and screen_frame_message is not None:
             wake_disabled_tool_names |= _IDENTITY_WRITE_ACTIONS
 
+        wake_web_fetch_session = cap_web.WebFetchSession()
         dispatch_task_batch = _make_task_batch_dispatcher(
             disabled_web_tool_names=wake_disabled_web_tool_names,
             provider_config=provider_config,
@@ -9459,6 +9527,7 @@ async def _run_wake(
             )
             if cancelled is not None:
                 return cancelled
+            wake_web_fetch_session.prepare_batch(tool_calls)
             await _fence_wake_effect("tool dispatch")
 
             async def _dispatch_platform_one(tc) -> ToolResult:
@@ -9495,6 +9564,7 @@ async def _run_wake(
                             "job_id": str(job_id),
                             "lane": lane,
                         },
+                        web_fetch_session=wake_web_fetch_session,
                     )
                 finally:
                     effect_reservations.mark_ready(tc)
@@ -9589,6 +9659,7 @@ async def _run_wake(
                             "job_id": str(job_id),
                             "lane": lane,
                         },
+                        web_fetch_session=wake_web_fetch_session,
                     )
                 finally:
                     effect_reservations.mark_batch_ready(calls)
@@ -14098,6 +14169,7 @@ async def process_job(
             api_key=api_key,
             runtime_token=runtime_token,
         )
+        chat_web_fetch_session = cap_web.WebFetchSession()
         dispatch_task_batch = _make_task_batch_dispatcher(
             disabled_web_tool_names=disabled_web_tool_names,
             provider_config=provider_config,
@@ -14133,6 +14205,7 @@ async def process_job(
             )
             if cancelled is not None:
                 return cancelled
+            chat_web_fetch_session.prepare_batch(tool_calls)
             # Fence once per round before any capability executes (mirrors the
             # old _run_tools's renewal ahead of the read burst); writes get a
             # second, per-write fence via before_write above.
@@ -14189,6 +14262,7 @@ async def process_job(
                                     "job_id": str(job_id),
                                     "lane": lane,
                                 },
+                                web_fetch_session=chat_web_fetch_session,
                             )
                         scanned_rows = _history_rows_charged(result, lease)
                     finally:
@@ -14236,6 +14310,7 @@ async def process_job(
                             "job_id": str(job_id),
                             "lane": lane,
                         },
+                        web_fetch_session=chat_web_fetch_session,
                     )
                 finally:
                     effect_reservations.mark_ready(tc)
@@ -14323,6 +14398,7 @@ async def process_job(
                             "job_id": str(job_id),
                             "lane": lane,
                         },
+                        web_fetch_session=chat_web_fetch_session,
                     )
                 finally:
                     effect_reservations.mark_batch_ready(calls)

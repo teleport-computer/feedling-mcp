@@ -180,6 +180,20 @@ def test_memory_index_exposes_partition_and_sensitivity_filters_without_offset()
     assert "memory_organize" in spec.description
 
 
+def test_web_fetch_exposes_offset_and_honestly_describes_paging():
+    spec = next(
+        item for item in tool_schema.build_tool_specs() if item.name == "web_fetch"
+    )
+    assert set(spec.parameters["properties"]) == {"url", "offset"}
+    assert spec.parameters["required"] == ["url"]
+    assert tool_schema.validate_tool_args(
+        "web_fetch", {"url": "https://example.com", "offset": 100}
+    ) is None
+    assert "possibly truncated" in spec.description
+    assert "offset=next_offset" in spec.description
+    assert "without another network request" in spec.description
+
+
 def test_recent_apps_and_memory_fetch_parity_parameters_are_model_facing():
     specs = {item.name: item for item in tool_schema.build_tool_specs()}
     assert set(specs["perception_recent_apps"].parameters["properties"]) == {

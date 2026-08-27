@@ -30,6 +30,7 @@ from workspace.backends import WorkspaceError, model_writable_path
 
 async def _run_one(
     store, step, *, api_key, runtime_token, enclave_sem, trace_context=None,
+    web_fetch_session=None,
 ) -> tuple[str, dict]:
     """Run one synchronous capability behind the shared enclave gate."""
     t = str(step.get("type") or "")
@@ -42,6 +43,8 @@ async def _run_one(
         }
         if t == "worldbook_match" and trace_context is not None:
             kwargs["trace_context"] = trace_context
+        if t == "web_fetch":
+            kwargs["web_fetch_session"] = web_fetch_session
         result = await asyncio.to_thread(
             cap_registry.run_capability, t, store,
             **kwargs,
@@ -158,6 +161,8 @@ async def dispatch_tool_calls(
     # Content-free correlation metadata from the trusted worker, never from
     # provider tool arguments. Only World Book consumes it today.
     trace_context: dict | None = None,
+    # Fresh per tool-loop attempt; never global or cross-user.
+    web_fetch_session=None,
 ) -> list[ToolResult]:
     """Dispatch provider tool_calls (spec C3). READ_ACTIONS run inline-parallel (their content
     feeds back to the model); WRITE_ACTIONS pass the provenance write_gate then are ENQUEUED as
@@ -206,6 +211,9 @@ async def dispatch_tool_calls(
                 continue
             writes.append(tc)
 
+    if web_fetch_session is not None:
+        web_fetch_session.prepare_batch(reads)
+
     async def _read(tc):
         params = dict(tc.args)
         # photo_recent is the metadata-only surface. Once the model chooses
@@ -220,6 +228,7 @@ async def dispatch_tool_calls(
                 store, step, api_key=api_key, runtime_token=runtime_token,
                 enclave_sem=enclave_sem,
                 trace_context=trace_context,
+                web_fetch_session=web_fetch_session,
             )
             if (
                 tc.name in {"photo_read", "screen_read"}
@@ -266,6 +275,29 @@ async def dispatch_tool_calls(
                 or activity_metadata.perception_result_metadata(tc.name, data)
                 or None
             )
+            if tc.name == "web_fetch" and data.get("ok"):
+                metadata = {
+                    **(metadata or {}),
+                    result_budget.RESULT_KIND_METADATA_KEY: tc.name,
+                }
+                payload = data.get("data") or {}
+                if isinstance(payload, dict) and payload.get("has_more") is True:
+                    next_offset = payload.get("next_offset")
+                    request_url = str(tc.args.get("url") or "").strip()
+                    final_url = str(payload.get("url") or "").strip()
+                    if type(next_offset) is int and next_offset >= 0:
+                        metadata = {
+                            **(metadata or {}),
+                            "web_fetch_next_offset": next_offset,
+                            # Trusted capability metadata, never page text. The
+                            # final URL passed every redirect SSRF check before
+                            # the facade emitted it.
+                            "web_fetch_continuation_urls": tuple(
+                                dict.fromkeys(
+                                    url for url in (request_url, final_url) if url
+                                )
+                            ),
+                        }
             if tc.name == "workspace_read" and data.get("ok"):
                 payload = data.get("data") or {}
                 path = payload.get("path") if isinstance(payload, dict) else None

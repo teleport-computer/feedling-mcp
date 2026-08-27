@@ -3759,7 +3759,19 @@ async def run_tool_loop(
             if tc.name == "web_search":
                 allowed_fetch_urls.update(_search_result_urls(result.content))
             elif tc.name == "web_fetch":
-                allowed_fetch_urls.discard(str(tc.args.get("url") or "").strip())
+                request_url = str(tc.args.get("url") or "").strip()
+                allowed_fetch_urls.discard(request_url)
+                metadata = result.metadata or {}
+                next_offset = metadata.get("web_fetch_next_offset")
+                continuation_urls = metadata.get("web_fetch_continuation_urls")
+                if type(next_offset) is int and isinstance(
+                    continuation_urls, (tuple, list)
+                ):
+                    allowed_fetch_urls.update(
+                        str(url).strip()
+                        for url in continuation_urls
+                        if str(url).strip()
+                    )
         for tc in dispatch_calls:
             discovery_call_key = _memory_discovery_call_key(tc)
             if discovery_call_key is not None:
