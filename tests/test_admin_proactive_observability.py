@@ -48,6 +48,7 @@ def test_v1_failure_classifier_is_fail_closed_and_keeps_keyspace_separate():
         "quota_insufficient",
         "extraction_failed:quota_insufficient",
         "image_generation_quota_insufficient",
+        "provider_account_expired",
         "auth_invalid",
         "image_generation_auth_invalid",
         "model_not_found",

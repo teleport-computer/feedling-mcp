@@ -111,6 +111,7 @@ def test_user_unavailable_outcomes_are_exact_and_producer_registered():
         "turn_failed:quota_insufficient",
         "extraction_failed:quota_insufficient",
         "turn_failed:image_generation_quota_insufficient",
+        "turn_failed:provider_account_expired",
         "turn_failed:auth_invalid",
         "turn_failed:image_generation_auth_invalid",
         "turn_failed:model_not_found",
