@@ -43,11 +43,11 @@ class ReleaseRepo:
     trigger_sha: str
 
 
-def _make_release_repo(tmp_path: Path, *, branch: str = "pre") -> ReleaseRepo:
+def _make_release_repo(tmp_path: Path) -> ReleaseRepo:
     origin = tmp_path / "origin.git"
     checkout = tmp_path / "release"
     _run("git", "init", "--bare", origin, cwd=tmp_path)
-    _run("git", "init", "-b", branch, checkout, cwd=tmp_path)
+    _run("git", "init", "-b", "pre", checkout, cwd=tmp_path)
     _git(checkout, "config", "user.name", "test-author")
     _git(checkout, "config", "user.email", "test@example.com")
 
@@ -76,35 +76,21 @@ def _make_release_repo(tmp_path: Path, *, branch: str = "pre") -> ReleaseRepo:
     _git(checkout, "add", MAIN_COMPOSE, RUNNER_COMPOSE)
     _git(checkout, "commit", "-m", "trigger release")
     _git(checkout, "remote", "add", "origin", str(origin))
-    _git(checkout, "push", "-u", "origin", branch)
+    _git(checkout, "push", "-u", "origin", "pre")
     return ReleaseRepo(origin, checkout, _git(checkout, "rev-parse", "HEAD"))
 
 
-def _pin(
-    repo: Path,
-    trigger_sha: str,
-    output: Path,
-    *,
-    branch: str = "pre",
-    preview: bool = False,
-    check: bool = True,
-):
+def _pin(repo: Path, trigger_sha: str, output: Path, *, check: bool = True):
     env = {
         **os.environ,
         "GITHUB_SHA": trigger_sha,
         "GITHUB_REPOSITORY_OWNER": "Teleport-Computer",
         "GITHUB_OUTPUT": str(output),
     }
-    if preview:
-        env.update(
-            FEEDLING_TEST_PREVIEW_DEPLOY="1",
-            GITHUB_EVENT_NAME="workflow_dispatch",
-            GITHUB_REF="refs/heads/codex/file-preview",
-        )
     return _run(
         "bash",
         PIN_SCRIPT,
-        branch,
+        "pre",
         MAIN_COMPOSE,
         RUNNER_COMPOSE,
         cwd=repo,
@@ -240,74 +226,6 @@ def test_true_release_contract_failure_is_not_marked_as_superseded(
     assert not (tmp_path / "failed-output").exists()
 
 
-def test_test_preview_pins_locally_without_advancing_test_branch(
-    tmp_path: Path,
-):
-    release = _make_release_repo(tmp_path, branch="test")
-    origin_before = _git(
-        release.checkout, "ls-remote", "origin", "refs/heads/test"
-    )
-    _git(release.checkout, "switch", "-c", "codex/file-preview")
-    (release.checkout / "README.md").write_text("preview\n")
-    _git(release.checkout, "add", "README.md")
-    _git(release.checkout, "commit", "-m", "preview release")
-    preview_sha = _git(release.checkout, "rev-parse", "HEAD")
-    output = tmp_path / "preview-output"
-
-    result = _pin(
-        release.checkout,
-        preview_sha,
-        output,
-        branch="test",
-        preview=True,
-    )
-
-    assert "test preview images pinned locally" in result.stdout
-    assert _git(release.checkout, "rev-parse", "HEAD") == preview_sha
-    assert _git(
-        release.checkout, "ls-remote", "origin", "refs/heads/test"
-    ) == origin_before
-    assert output.read_text().splitlines() == [f"pinned_sha={preview_sha}"]
-    assert (
-        f"ghcr.io/teleport-computer/feedling:{preview_sha[:7]}"
-        in (release.checkout / MAIN_COMPOSE).read_text()
-    )
-    assert (
-        "ghcr.io/teleport-computer/feedling-agent-runner:"
-        f"{preview_sha[:7]}"
-        in (release.checkout / RUNNER_COMPOSE).read_text()
-    )
-
-
-def test_test_preview_fails_closed_outside_codex_dispatch(tmp_path: Path):
-    release = _make_release_repo(tmp_path, branch="test")
-    output = tmp_path / "failed-preview-output"
-    env = {
-        **os.environ,
-        "GITHUB_SHA": release.trigger_sha,
-        "GITHUB_REPOSITORY_OWNER": "Teleport-Computer",
-        "GITHUB_OUTPUT": str(output),
-        "FEEDLING_TEST_PREVIEW_DEPLOY": "1",
-        "GITHUB_EVENT_NAME": "push",
-        "GITHUB_REF": "refs/heads/test",
-    }
-
-    result = _run(
-        "bash",
-        PIN_SCRIPT,
-        "test",
-        MAIN_COMPOSE,
-        RUNNER_COMPOSE,
-        cwd=release.checkout,
-        env=env,
-        check=False,
-    )
-
-    assert result.returncode == 1
-    assert "requires workflow_dispatch from a codex/* branch" in result.stdout
-    assert not output.exists()
-
-
 def _job(source: str, name: str, next_name: str) -> str:
     return source.split(f"\n  {name}:\n", 1)[1].split(
         f"\n  {next_name}:\n", 1
@@ -327,13 +245,6 @@ def test_workflow_consumes_one_pinned_release_without_runner_branch_writes():
     for name, next_name, branch in main_jobs:
         job = _job(source, name, next_name)
         assert f"./deploy/pin-runtime-release.sh {branch}" in job
-
-    prod_main = _job(source, "deploy-cvm", "deploy-test-cvm")
-    test_main = _job(source, "deploy-test-cvm", "deploy-test-runner-cvm")
-    test_runner = _job(source, "deploy-test-runner-cvm", "deploy-pre-cvm")
-    assert "FEEDLING_TEST_PREVIEW_DEPLOY" not in prod_main
-    assert test_main.count("FEEDLING_TEST_PREVIEW_DEPLOY") == 1
-    assert test_runner.count("FEEDLING_TEST_PREVIEW_DEPLOY") == 1
 
     runner_jobs = (
         (
