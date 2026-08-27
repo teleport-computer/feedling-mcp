@@ -102,6 +102,16 @@ def test_prompt_frontier_failures_use_stable_content_free_status_codes():
     assert worker._provider_health_error_class(
         worker.v2_tool_loop.ProviderEmptyReply("empty_reply")
     ) == "provider_empty_reply"
+    truncated = worker.v2_tool_loop.ProviderOutputTruncated()
+    assert worker._safe_failure_code("turn_failed", truncated) == (
+        "turn_failed:output_truncated"
+    )
+    assert worker._turn_failure_error_class(truncated) == (
+        "provider_output_truncated"
+    )
+    assert worker._provider_health_error_class(truncated) == (
+        "provider_output_truncated"
+    )
 
 
 @pytest.mark.parametrize(
@@ -407,8 +417,10 @@ def test_process_job_end_to_end_writes_reply_and_completes(monkeypatch):
     assert "action_digest" in state  # non-sensitive digest only; no capability data leaked here
 
 
-def test_process_job_passes_selected_vision_deadline_to_tool_loop(monkeypatch):
-    """A raw-pixel fallback may use only the dedicated batch's remaining time."""
+def test_process_job_passes_t336_file_budget_and_vision_deadline_to_tool_loop(
+    monkeypatch,
+):
+    """Worker hands both bounded budgets to the real foreground-loop call site."""
     uid = "u_w_vision_deadline"
     conftest.seed_user(uid)
     _reset(uid)
@@ -454,6 +466,7 @@ def test_process_job_passes_selected_vision_deadline_to_tool_loop(monkeypatch):
 
     async def run_loop(*, absolute_deadline, on_reply, **_kwargs):
         captured["absolute_deadline"] = absolute_deadline
+        captured["file_output_max_tokens"] = _kwargs["file_output_max_tokens"]
         await on_reply("MODEL REPLY", final=True)
         return worker.v2_tool_loop.LoopOutcome(
             "MODEL REPLY",
@@ -491,6 +504,10 @@ def test_process_job_passes_selected_vision_deadline_to_tool_loop(monkeypatch):
 
     assert status == "completed"
     assert captured["absolute_deadline"] == deadline
+    assert captured["file_output_max_tokens"] == worker.FILE_OUTPUT_MAX_TOKENS
+    assert captured["file_output_max_tokens"] == (
+        provider_client.CHAT_OUTPUT_MAX_TOKENS
+    )
 
 
 def test_chat_still_calls_provider_and_restores_unhealthy_state(monkeypatch):

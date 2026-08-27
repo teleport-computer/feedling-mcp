@@ -12,6 +12,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 file-capable Chat now has an independent 32,768-token
+  output budget across OpenAI Responses, OpenAI-compatible, Anthropic, Bedrock,
+  and Gemini providers.** The existing 4,096-token prompt-output reserve and
+  input frontier are unchanged. If a provider explicitly reaches its output
+  limit while returning malformed tool arguments, Runtime V2 stops after that
+  provider call, does not execute or deliver the incomplete file, and reports a
+  localized output-limit error instead of retrying at the same budget.
+
 - **New accounts now start with managed web access enabled.** Registration
   atomically creates `web_settings` with `enabled: true`. Existing accounts are
   not migrated: an older account with no settings blob still reads as disabled,

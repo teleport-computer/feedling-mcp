@@ -127,6 +127,7 @@ def _chat_specs() -> tuple[ErrorSpec, ...]:
         _spec("upstream_unavailable", "chat", "provider", "provider_transient", "你的模型服务暂时不可用，稍后会自动恢复。", matcher=r"\b5\d{2}\b|provider_http_5\d{2}|overloaded|timed? ?out|connection (refused|reset|error)|unreachable|stream disconnected|ended without finish_reason"),
         _spec("turn_timeout", "chat", "provider", "system", "这轮回复超时了，稍后再试。"),
         _spec("provider_timeout", "chat", "provider", "provider_transient", "你配置的模型服务这次没有及时响应。请先检查模型渠道稳定性，不要连续重发。", en="Your model service did not respond in time. Check the provider's stability before trying again."),
+        _spec("provider_output_truncated", "chat", "provider", "provider_transient", "模型在写完文件前达到了输出上限，未发送不完整的文件。可缩小内容后重试，或换用输出上限更高的模型。", en="The model reached its output limit before finishing the file, so the incomplete file was not sent. Try a smaller version or a model with a higher output limit.", matcher=r"\bprovider_output_truncated\b"),
         _spec("provider_empty_reply", "chat", "provider", "provider_transient", "你的模型服务这次返回了空回复，稍后再试；反复出现请检查模型渠道或中转的稳定性。"),
         _spec("file_delivery_incomplete", "chat", "delivery", "system", "文件内容已经保存，但附件发送没有完成。请稍后再试。", en="The file was saved, but its attachment was not delivered. Please try again later.", matcher=r"\bfile_delivery_incomplete\b"),
         _spec("canvas_file_delivery_incomplete", "chat", "delivery", "system", "画布内容已经保存，但卡片更新没有完成。请稍后再试。", en="The Canvas content was saved, but its card update did not finish. Please try again later.", matcher=r"\bcanvas_file_delivery_incomplete\b"),

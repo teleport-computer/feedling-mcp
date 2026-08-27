@@ -290,6 +290,7 @@ _DIRECT_NOTICE_ERROR_CLASSES = frozenset({
     "platform_queue_timeout",
     "platform_execution_timeout",
     "provider_timeout",
+    "provider_output_truncated",
 })
 
 # Migration 0041's database trigger rejects pending->claimed transitions from
