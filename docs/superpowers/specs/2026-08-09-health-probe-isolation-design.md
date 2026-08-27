@@ -1,150 +1,69 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # 健康探针隔离设计
 
-> **上游协调说明（2026-08-10）：** `test` 分支已将 `/healthz` 改为完全不访问
-> PostgreSQL 的进程存活探针，因此下文涉及 `/healthz` 数据库查询、专用执行器和 503
-> 的内容已被该上游契约取代。最终实现仅对 `/healthz/runner` 的 heartbeat 数据库查询
-> 使用专用有界执行器及三级超时；`/healthz` 保持进程内检查并在 worker 可响应时返回 200。
+**状态：已实现；当前决策以本文的现行边界为准。**
 
-**日期：** 2026-08-09
+日期：2026-08-09；现行状态校准：2026-08-27。
 
-**状态：** 方案已批准，等待实施
+## 现行决策
 
-**范围：** 对后端做最小改动，确保普通 ASGI 阻塞任务线程池饱和时，
-`/healthz` 和 `/healthz/runner` 仍能及时响应。
+Feedling 把进程存活与数据库支持的 runner fleet 健康拆成两个不同契约：
 
-## 背景
+1. `GET /healthz` 是无数据库 I/O 的进程内 liveness/readiness probe。只要 worker 能
+   响应就返回 HTTP 200；registry 为空或 wake bus 未监听通过 `status=degraded` 和
+   `checks.*` 表达，不与业务数据库连接池争抢容量。
+2. `GET /healthz/runner` 才查询 runner heartbeat。它使用独立于普通 ASGI work 的
+   `health_executor`，以及独立于业务连接池的 health DB pool。
+3. runner probe 的边界保持为：每进程 2 个执行线程、最多 4 个 outstanding work，
+   DB acquire 1 秒、transaction-local PostgreSQL statement timeout 1 秒、route deadline
+   3 秒。超限或饱和映射为稳定的 `runner_health_check_timeout`。
+4. runner fleet 的 expected/observed/healthy 聚合语义保持不变；公开响应不返回 runner
+   identifier，也不暴露数据库异常细节。其他查询错误使用
+   `runner_health_check_error`。
+5. 普通业务任务不得提交到 health executor，也不得使用 health DB pool。外部
+   health-server 的请求间隔、失败阈值和路由拓扑不由本决策改变。
 
-外部监控发现 `/healthz` 和 `/healthz/runner` 连续三次等待 15 秒后超时，
-约一分钟后恢复。生产 ingress 日志显示，这两条请求均已完成 TLS，并在 0–1ms
-内连接到后端，随后等待约 15.2 秒且未收到任何响应字节。与此同时，同一秒内的
-普通生产请求仍在持续以 HTTP 200 完成。CVM 和后端容器均未重启，也未发生内存耗尽。
+## 演进说明
 
-目前两个健康检查路由都通过 AnyIO 默认阻塞任务线程池执行同步数据库操作。
-普通 ASGI 路由也使用这个有界线程池。在高负载下，健康检查任务可能在真正开始执行
-内部数据库超时逻辑之前，就因等待线程令牌而超过监控截止时间。因此，
-`db.health_probe()` 现有的两秒超时并不能限制整个路由的端到端延迟。
+最初方案试图让 `/healthz` 和 `/healthz/runner` 都通过专用执行器执行数据库查询，
+以解决普通 AnyIO 阻塞线程池饱和时探针排队的问题。实施期间，`b20a6d63` 先把
+`/healthz` 收敛为纯进程内探针，因此只有 `/healthz/runner` 继续跨数据库边界。
+`1c8f7dd0` 又把 runner heartbeat 查询从普通 application pool 移到独立的 1–2 连接
+health pool，避免业务连接池饱和造成假性 runner outage。
 
-## 目标
+这两次收敛保留了原设计的核心目标——健康检查不排在普通业务容量之后——但放弃了
+“两个路由都查询数据库”和“runner probe 使用普通 DB pool”的早期细节。旧实施步骤、
+历史行号和预实施响应草案只保留在归档计划中，不能覆盖现行代码和公开契约。
 
-- 健康检查不得排在普通业务阻塞任务之后等待。
-- 业务线程池饱和时，两个公开健康检查路由都必须在三秒内返回响应。
-- 真实数据库故障或数据库连接池饱和仍须报告为不健康；不得把探针改成无条件存活响应。
-- 保持现有成功响应体和状态判定策略不变。
-- 外部监控的 15 秒请求超时、60 秒探测间隔和连续三次失败告警阈值保持不变。
+## 选择理由
 
-## 非目标
+- 单纯增大外部监控超时只会延后故障发现，不能解除探针与业务队列的竞争。
+- 独立健康服务或端口能提供更强隔离，但会增加部署、路由和运维复杂度；当前进程内
+  executor 加独立小型 DB pool 已覆盖已观测故障模式。
+- `/healthz` 不访问外部依赖，可稳定回答“worker 是否仍能服务”；runner 数据库健康由
+  `/healthz/runner` 单独表达，避免把业务池压力误报为整个 backend 不存活。
 
-- 不做告警关联或去重。
-- 不增加指标面板，也不开展通用线程池可观测性建设。
-- 不调整业务线程池、Gunicorn worker 数量或数据库连接池参数。
-- 不增加独立健康服务、容器或公开端口。
-- 不改变 runner fleet 健康判定策略或预期 runner 数量计算方式。
+## 当前 owner 与验证
 
-## 备选方案
+- 进程内 probe：`backend/asgi/health.py`。
+- runner route 与稳定错误：`backend/asgi/runner_health.py`。
+- 有界执行器：`backend/asgi/health_executor.py`。
+- 独立 health pool 与 bounded query：`backend/db.py`、`backend/gunicorn_conf.py`。
+- 回归守卫：`tests/test_health_executor.py`、`tests/test_health_route_isolation.py`、
+  `tests/test_db_health_timeouts.py`、`tests/test_asgi_runner_health.py`。
+- 对外响应与信任边界：public OpenAPI、public architecture、self-hosting 文档和
+  changelog；本文不替代这些 current owners。
 
-### 1. 增大外部监控超时
+验证必须同时覆盖：业务线程池/连接池饱和时的隔离、executor admission/deadline、独立
+health pool 生命周期、1 秒 acquire/statement timeout、3 秒 route deadline、聚合隐私、
+`/healthz` 无数据库 I/O 且保持 HTTP 200。环境上线状态仍以 live endpoint 和 exact
+deployed release 为准。
 
-这种方式可以减少告警频率，但健康检查仍排在同一个饱和队列中，而且会延迟真实故障的
-发现。它只处理症状，因此不采用。
+## 回滚边界
 
-### 2. 独立健康检查执行池，并限制数据库操作耗时
-
-为健康检查提供每个 Gunicorn worker 独享的双线程执行池，保留真实数据库检查，
-并分别限制连接获取、SQL 执行和路由总耗时。该方案直接消除已观测到的排队依赖，
-同时把改动限制在较小范围内，因此选用此方案。
-
-### 3. 独立健康服务或端口
-
-这种方式可以提供最强的进程级隔离，但会引入超出本次最小修复范围的部署、路由和运维
-复杂度。除非进程内隔离被证明仍不足，否则暂不采用。
-
-## 设计
-
-### 独立执行池
-
-新增一个轻量后端 ASGI 辅助模块，持有
-`ThreadPoolExecutor(max_workers=2)`。该模块提供一个异步操作，把同步健康检查函数
-提交到这个执行池，并施加三秒端到端截止时间。
-
-执行池为进程本地资源。生产环境当前有六个 Gunicorn worker，因此最多新增十二个
-健康检查线程。每个进程设置两个线程是有意为之：`/healthz` 和
-`/healthz/runner` 会被并发探测；即使两条连接落到同一个 worker，它们也不能相互阻塞。
-
-健康检查路由必须使用该辅助模块，不再使用 Starlette 的 `run_in_threadpool`，
-也不使用普通的 `asgi.threadpool.run_db` 桥接层。任何普通业务路由都不得向健康检查
-执行池提交任务。
-
-外层截止时间到期后，即使 Python 无法强制停止已经运行的线程，HTTP 请求也要立即返回。
-下文的数据库硬超时确保正常故障场景能释放线程。如果某个非预期的原生调用永久卡死，
-最多只会占满两个专用健康检查线程；业务容量不受影响，后续健康检查仍会在外层截止时间内
-快速失败。
-
-### 有界数据库操作
-
-两个健康检查路由使用的同步工作都必须分别限制以下两个阶段：
-
-1. 从现有进程内 Psycopg 连接池获取连接；
-2. 在该连接上执行健康检查 SQL。
-
-健康检查获取连接的超时设为一秒，PostgreSQL `statement_timeout` 也设为一秒。
-这些限制位于三秒路由总截止时间之内，为执行池调度、响应构造和正常调度抖动留出余量。
-
-`db.health_probe()` 保持“不抛出异常”的返回约定，并继续执行 `SELECT 1`。
-runner 心跳查询增加可选的健康检查专用超时路径，同时保持其他调用方的默认行为不变。
-语句超时必须限定在当前事务内，确保连接归还连接池后，不会把缩短后的超时泄漏给后续
-业务请求。
-
-### 路由行为
-
-`GET /healthz` 保持现有的 200/503 判定策略和成功响应结构。专用执行池或总截止时间
-失败时，返回 HTTP 503，并设置 `ok=false`、`status=unhealthy`，同时在数据库检查中
-返回稳定且不包含敏感信息的错误码 `health_check_timeout`。为保持兼容性和便于诊断，
-响应中继续包含 release 和 worker 元数据。
-
-`GET /healthz/runner` 保持现有的聚合响应，绝不返回 runner 标识。截止时间失败时，
-通过现有不健康响应构造器返回 HTTP 503，原因设为 `runner_health_check_timeout`。
-其他数据库异常仍使用 `runner_health_check_error`。
-
-这样，监控会及时收到结构化 503，而不是在客户端等待 15 秒后超时。如果真实过载连续
-发生三次，系统仍会告警，但告警会明确指出后端原因，不再看起来像 Phala 网络故障。
-
-## 数据流
-
-1. 外部监控访问现有公开 HTTPS 路由。
-2. Phala ingress 将请求转发给某个 Gunicorn worker。
-3. 路由仅把自身的健康检查函数提交给该 worker 的专用健康检查执行池。
-4. 检查函数使用健康检查专用的一秒限制，从普通 DB 连接池获取连接，并在事务内使用
-   一秒语句超时执行 SQL。
-5. 路由返回现有健康或不健康 JSON；如果超过三秒外层截止时间，则映射成结构化 503。
-
-## 测试
-
-增加以下确定性回归测试：
-
-- `/healthz` 继续返回现有的健康、降级和数据库故障响应结构；
-- `/healthz/runner` 继续返回现有的健康和数量不匹配响应结构；
-- 耗尽普通 AnyIO 阻塞任务令牌后，两个健康检查路由仍能完成；
-- 两个健康检查路由可以通过双槽专用执行池并发运行；
-- 获取连接超时和 PostgreSQL 语句超时都会转换成结构化 503；
-- 执行池任务超过外层截止时间时，会在规定时间内返回稳定的超时原因；
-- 公开响应继续隐藏 runner 标识和数据库异常细节。
-
-占满普通线程池的回归测试必须使用同步原语，不能只靠定时 `sleep`。CI 调度可以允许
-三秒截止时间附近有少量容差，但任何测试都不得依赖外部监控的 15 秒超时。
-
-## 验收标准
-
-- 在占满全部普通 ASGI 阻塞任务令牌的测试中，两个健康检查路由都能各自在 3.5 秒内完成。
-- 依赖健康时，生产同等配置仍返回 HTTP 200，且保持现有响应契约。
-- 数据库不可用、连接池获取失败、SQL 超时或执行池截止时间到期时，均返回 HTTP 503，
-  且不暴露数据库或 runner 细节。
-- 现有健康检查、runner 健康检查、ASGI 和公开 OpenAPI 测试全部通过。
-- 外部 health-server 配置保持不变。
-
-## 上线与回滚
-
-通过正常生产 CVM 流程部署。部署后并发调用两个健康检查路由，确认能快速返回 HTTP 200，
-然后检查 `/healthz` 报告的 release commit。
-
-回滚方式是正常回退到上一个镜像版本。本设计不增加 schema migration、持久化状态、密钥、
-端口或监控配置，因此回滚不依赖数据或基础设施变更。
+本决策不增加 schema migration、持久化状态、密钥、端口或独立容器。回滚通过正常镜像
+发布流程完成；不能用把 `/healthz` 重新绑定业务数据库或把 runner query 放回普通 pool
+作为“简化”，因为那会重新引入已验证的容量耦合。
