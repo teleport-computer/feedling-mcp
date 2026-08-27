@@ -693,9 +693,12 @@ live in `tools/dcap/test_dcap_parse.py`.
 
 | Tool | Verifies |
 |---|---|
-| `v1_envelope_roundtrip_test.py` | Python `build_envelope` + iOS-style unseal produce identical plaintext |
-| `frame_envelope_roundtrip_test.py` | Frame envelope variant (image bytes) round-trips |
+| `v1_envelope_roundtrip_test.py` | Current backend/iOS-compatible BoxSeal interop plus local chat envelope write/read/decrypt |
+| `frame_envelope_roundtrip_test.py` | Current backend/iOS-compatible BoxSeal plus local encrypted frame ingest/persistence |
 | `e2e_encryption_test.py` | Full end-to-end: write encrypted, fetch via enclave decrypt proxy, read back plaintext |
 
-These are correctness tests. Run them after touching `content_encryption.py`
-on either side.
+The BoxSeal contract is also covered without live services by
+`tests/test_v1_envelope_roundtrip_tool.py` and
+`tests/test_frame_envelope_roundtrip_tool.py`. Run those drift guards first,
+then run the matching local-service tool after touching envelope crypto or
+ingest behavior.
