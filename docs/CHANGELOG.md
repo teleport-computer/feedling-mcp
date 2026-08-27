@@ -55,6 +55,21 @@ historical_reason: point-in-time
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-28 — 主动回复新增协议残片窄防线与可读诊断
+
+**[DONE] 两种此前不在 JSON 协议检测器设计空间内的残片，在主动投递前有了
+可证伪的本仓防线；坏文本由 provider 产生还是仓内裁切仍未归因。**
+
+- Provider 的闭集 stop reason 现在随真实轮次贯通到回复安全闸；只有明确的
+  `length` / `max_tokens` / `max_output_tokens` 才算 transport cut，不按输出长度或
+  token 数猜测。它作为独立 admin 观测出现，但本批不改变主动消息的既有投递策略。
+- 工具调用尾巴只在“真实全文行尾的未配对 ASCII 引号闭合括号”与已观测的内部计划标记
+  同时出现时压制；普通函数示例与计划语句即使组合、中文括号/引号、窗口边界和长前文
+  都有镜像反例。纯散文不会因句首标点或 transport-cut 标志被猜测压制。
+- 压制会写 `reply.protocol_fragment_suppressed` 内容无关 trace：仅含闭集 evidence、
+  stop reason、lane 和布尔位，不含回复、reasoning、prompt 或工具参数；transport cut
+  使用另一独立事件与标签，避免和协议压制混桶；admin 时间线只放行闭集字段。
+
 ## 2026-08-27 — data-track 用户列表改成真分页；`memory_changes` 的全扫描**未**解决
 
 **[DONE] 管理端不再"先把全舰队算完再切片"，但这一批明确没有消除

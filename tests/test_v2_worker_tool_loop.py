@@ -1656,6 +1656,79 @@ def test_torn_protocol_evidence_lane_policy():
     # Normal reply: never suppressed.
     assert not worker._torn_protocol_evidence("晚安，做个好梦", "在想她累不累", lane="proactive")
     assert not worker._torn_protocol_evidence("晚安，做个好梦", "", lane="foreground")
+    # A real provider token-limit signal is evidence for the shared classifier,
+    # not permission to change delivery policy for otherwise ordinary prose.
+    prose = "。今天她步数都上5000了……刚才问她"
+    assert not worker._torn_protocol_evidence(
+        prose, "", lane="proactive", transport_cut=True
+    )
+    assert not worker._torn_protocol_evidence(
+        prose, "", lane="foreground", transport_cut=True
+    )
+    assert not worker._torn_protocol_evidence(
+        prose, "", lane="proactive", transport_cut=False
+    )
+
+
+def test_tool_call_tail_requires_both_orphan_syntax_and_planning_prose():
+    leaked = '大热天的").\n• Let\'s check the exact timeline:\n• 16:05:'
+    assert worker._torn_protocol_evidence(
+        leaked, "", lane="proactive"
+    ) == worker._LOCAL_TOOL_CALL_TAIL_EVIDENCE
+    assert not worker._torn_protocol_evidence(
+        leaked, "", lane="foreground"
+    )
+    # Mirror each half independently: ordinary function syntax and ordinary
+    # planning prose are both legal user-visible text.
+    assert not worker._torn_protocol_evidence(
+        '示例调用是 foo("大热天的").', "", lane="proactive"
+    )
+    assert not worker._torn_protocol_evidence(
+        "• Let's check the exact timeline together.", "", lane="proactive"
+    )
+    assert not worker._torn_protocol_evidence(
+        "• Let's check the exact timeline:\n• We'll compare the two drafts.",
+        "",
+        lane="proactive",
+    )
+    # Both individually legal halves remain legal when combined: a balanced
+    # function-call example is not an orphan protocol tail.
+    assert not worker._torn_protocol_evidence(
+        '示例调用是 foo("大热天的").\n'
+        "• Let's check the exact timeline together.",
+        "",
+        lane="proactive",
+    )
+    # Even the exact planning marker stays legal when the preceding function
+    # example has a matched quote pair.
+    assert not worker._torn_protocol_evidence(
+        '示例调用是 foo("大热天的").\n'
+        "• Let's check the exact timeline:\n• We'll compare the two drafts.",
+        "",
+        lane="proactive",
+    )
+    # Chinese punctuation/quotes are not an ASCII function-call tail.
+    assert not worker._torn_protocol_evidence(
+        "她说“大热天的”）。\n• Let's check the forecast.",
+        "",
+        lane="proactive",
+    )
+
+
+def test_tool_call_tail_uses_real_full_text_line_boundaries():
+    planning = "\n• Let's check the exact timeline:\n• 16:05:"
+    # The old 512-character slice manufactured an end-of-text immediately
+    # after this close-paren.  In the real reply normal text follows it.
+    boundary_false_positive = "x" * 510 + '")' + " still ordinary prose" + planning
+    assert not worker._torn_protocol_evidence(
+        boundary_false_positive, "", lane="proactive"
+    )
+
+    # Moving the real observed fragment beyond the old window must not hide it.
+    late_real_tail = "正常前文" * 180 + '\n大热天的").' + planning
+    assert worker._torn_protocol_evidence(
+        late_real_tail, "", lane="proactive"
+    ) == worker._LOCAL_TOOL_CALL_TAIL_EVIDENCE
 
 
 def _stub_envelope_build(monkeypatch):

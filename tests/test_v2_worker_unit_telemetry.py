@@ -825,6 +825,106 @@ def test_empty_provider_response_has_dedicated_admin_timeline_label():
     }) == ("🕳️", "空回复诊断")
 
 
+def test_protocol_suppression_trace_is_content_free_and_admin_readable():
+    from admin import data_track
+
+    captured = {}
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: captured.update(
+        user_id=user_id, type=event_type, **fields
+    )
+    asyncio.run(worker._emit_protocol_suppressed_trace(
+        deps,
+        "u_protocol_trace",
+        "heartbeat",
+        evidence="tool_call_tail",
+        stop_reason="",
+        transport_cut=False,
+        final=True,
+        trace_id="trace-protocol",
+        job_id=42,
+    ))
+
+    assert captured["detail"] == {
+        "lane": "heartbeat",
+        "evidence": "tool_call_tail",
+        "stop_reason": "",
+        "transport_cut": False,
+        "final": True,
+    }
+    public = data_track._debug_event_public_json(captured)
+    assert public["detail"] == captured["detail"]
+    assert data_track._debug_friendly_step(captured) == (
+        "🛡️", "回复安全 · 协议残片已压制"
+    )
+
+    forged = dict(captured)
+    forged["detail"] = {
+        **captured["detail"],
+        "evidence": "private reply text",
+        "stop_reason": "private stop text",
+    }
+    redacted = data_track._debug_event_public_json(forged)["detail"]
+    assert redacted["evidence"].startswith("<redacted string")
+    assert redacted["stop_reason"].startswith("<redacted string")
+
+
+def test_transport_cut_trace_is_distinct_content_free_admin_observation():
+    from admin import data_track
+
+    captured = {}
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: captured.update(
+        user_id=user_id, type=event_type, **fields
+    )
+    asyncio.run(worker._emit_transport_cut_trace(
+        deps,
+        "u_transport_cut",
+        "heartbeat",
+        stop_reason="max_output_tokens",
+        final=True,
+        trace_id="trace-cut",
+        job_id=43,
+    ))
+
+    assert captured["type"] == "reply.transport_cut_observed"
+    assert captured["status"] == "warning"
+    assert "outcome_class" not in captured
+    assert captured["detail"] == {
+        "lane": "heartbeat",
+        "stop_reason": "max_output_tokens",
+        "final": True,
+    }
+    public = data_track._debug_event_public_json(captured)
+    assert public["detail"] == captured["detail"]
+    assert data_track._debug_friendly_step(captured) == (
+        "✂️", "Provider 输出截断 · 仅观测"
+    )
+
+    forged = dict(captured)
+    forged["detail"] = {
+        **captured["detail"],
+        "stop_reason": "private free text",
+    }
+    redacted = data_track._debug_event_public_json(forged)["detail"]
+    assert redacted["stop_reason"].startswith("<redacted string")
+
+
+def test_provider_reply_signal_uses_only_real_closed_stop_reasons():
+    signal = worker._ProviderReplySignal()
+    callback = worker._provider_model_call_callback(signal, None)
+    asyncio.run(callback("start", {"finish_reason": "max_tokens"}))
+    assert signal.stop_reason == ""
+    assert signal.transport_cut is False
+    asyncio.run(callback("done", {"finish_reason": "max_output_tokens"}))
+    assert signal.stop_reason == "max_output_tokens"
+    assert signal.transport_cut is True
+    asyncio.run(callback("start", {}))
+    asyncio.run(callback("done", {"finish_reason": "private free text"}))
+    assert signal.stop_reason == ""
+    assert signal.transport_cut is False
+
+
 def test_silent_reply_events_are_content_free_admin_readable_and_distinct():
     from admin import data_track
 

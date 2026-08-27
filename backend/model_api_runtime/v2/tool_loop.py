@@ -141,6 +141,7 @@ _CONTENT_FREE_STOP_REASONS = frozenset(
         "image_safety",
         "language",
         "length",
+        "max_output_tokens",
         "malformed_function_call",
         "max_tokens",
         "other",

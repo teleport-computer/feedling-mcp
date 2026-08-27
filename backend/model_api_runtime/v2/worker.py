@@ -1290,6 +1290,14 @@ _DEGENERATE_REPLY_ERROR_CLASS = "upstream_unavailable"
 # job_failed_reasons aggregation instead of hiding behind a plain sleep.
 _PROTOCOL_FRAGMENT_ERROR_CLASS = "upstream_unavailable"
 _PROTOCOL_FRAGMENT_REASON = "protocol_fragment_suppressed"
+_LOCAL_TOOL_CALL_TAIL_EVIDENCE = "tool_call_tail"
+_TOOL_CALL_TAIL_RE = re.compile(
+    r'''(?m)(?P<quote>["'])\)[ \t]*(?:[.,!?;:。！？；：][ \t]*)?$'''
+)
+_INTERNAL_PLANNING_RE = re.compile(
+    r"(?im)(?:^|\n)[ \t]*(?:[-*•][ \t]*)?"
+    r"let['’]s[ \t]+check[ \t]+the[ \t]+exact[ \t]+timeline[ \t]*:"
+)
 _MALFORMED_SELF_THINKING_REASON = "malformed_self_thinking_suppressed"
 # 工具循环把我们自己的 _TURN_MAX_LLM_CALLS 预算跑光却始终没产出终局文本。
 # 这是**我们的配置上限**,不是 provider 给了空回复 —— 单独一个 reason,才能既
@@ -1303,15 +1311,93 @@ _TOOL_BUDGET_EXHAUSTED_REASON = "tool_budget_exhausted"
 _THINKING_ONLY_NO_REPLY_REASON = "thinking_only_no_reply"
 
 
-def _torn_protocol_evidence(text: str, reasoning: str, *, lane: str) -> str:
+def _has_high_confidence_tool_call_tail(text: str) -> bool:
+    """Detect the observed orphan function-call tail without invented edges.
+
+    The syntax must end a real line in the full reply, contain an unmatched
+    ASCII quote on that line, and be followed by the observed internal-planning
+    marker.  Each ingredient by itself is ordinary prose.
+    """
+    visible = str(text or "")
+    for match in _TOOL_CALL_TAIL_RE.finditer(visible):
+        line_start = visible.rfind("\n", 0, match.start()) + 1
+        line_to_quote = visible[line_start:match.start() + 1]
+        quote = match.group("quote")
+        unescaped_quotes = 0
+        for index, char in enumerate(line_to_quote):
+            if char != quote:
+                continue
+            backslashes = 0
+            cursor = index - 1
+            while cursor >= 0 and line_to_quote[cursor] == "\\":
+                backslashes += 1
+                cursor -= 1
+            if backslashes % 2 == 0:
+                unescaped_quotes += 1
+        if unescaped_quotes % 2 != 1:
+            continue
+        if _INTERNAL_PLANNING_RE.search(visible, match.end()):
+            return True
+    return False
+
+
+def _torn_protocol_evidence(
+    text: str,
+    reasoning: str,
+    *,
+    lane: str,
+    transport_cut: bool = False,
+) -> str:
     """Classify a V2 visible reply for a torn protocol leak, then
     apply the lane policy. Returns the evidence enum when it should be suppressed,
     or "" to deliver. `lane` here is the detector policy ("proactive"/"foreground"),
     not the wake lane."""
-    evidence = protocol_leak.classify(text, reasoning_text=reasoning)
+    evidence = protocol_leak.classify(
+        text,
+        reasoning_text=reasoning,
+        transport_cut=bool(transport_cut),
+    )
     if protocol_leak.should_suppress(evidence, lane=lane):
         return evidence
+    if lane == "proactive" and _has_high_confidence_tool_call_tail(text):
+        return _LOCAL_TOOL_CALL_TAIL_EVIDENCE
     return ""
+
+
+@dataclass
+class _ProviderReplySignal:
+    """Latest real provider completion signal for the reply callback."""
+
+    stop_reason: str = ""
+
+    def observe(self, event_kind: str, detail: dict[str, Any]) -> None:
+        if event_kind in {"start", "error"}:
+            self.stop_reason = ""
+            return
+        if event_kind != "done":
+            return
+        reason = provider_client.normalize_stop_reason(detail.get("finish_reason"))
+        self.stop_reason = (
+            reason
+            if reason in v2_tool_loop._CONTENT_FREE_STOP_REASONS
+            else ""
+        )
+
+    @property
+    def transport_cut(self) -> bool:
+        return provider_client.is_token_limit_stop_reason(self.stop_reason)
+
+
+def _provider_model_call_callback(
+    signal: _ProviderReplySignal,
+    trace: Any | None,
+):
+    async def _record(event_kind: str, detail: dict[str, Any]) -> None:
+        signal.observe(event_kind, detail)
+        if trace is not None:
+            await trace.record_model_call(event_kind, detail)
+
+    return _record
 
 
 class LostJobLease(RuntimeError):
@@ -3060,6 +3146,103 @@ async def _emit_silent_reply_trace(
     except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a turn
         log.warning(
             "[v2.silent_reply] trace failed user=%s lane=%s code=%s",
+            user_id,
+            safe_lane,
+            type(exc).__name__.lower(),
+        )
+
+
+async def _emit_protocol_suppressed_trace(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+    *,
+    evidence: str,
+    stop_reason: str,
+    transport_cut: bool,
+    final: bool,
+    trace_id: str = "",
+    job_id: object = "",
+) -> None:
+    """Expose a content-free suppression diagnosis on the admin timeline."""
+    if deps.emit_debug_trace is None:
+        return
+    safe_lane = _normalize_provider_trace_lane(lane)
+    safe_stop = provider_client.normalize_stop_reason(stop_reason)
+    if safe_stop not in v2_tool_loop._CONTENT_FREE_STOP_REASONS:
+        safe_stop = ""
+    try:
+        await asyncio.to_thread(
+            deps.emit_debug_trace,
+            user_id,
+            "reply.protocol_fragment_suppressed",
+            trace_id=str(trace_id or ""),
+            job_id=str(job_id or ""),
+            status="error",
+            outcome_class=jobs_store.terminal_outcome_class(
+                f"wake_failed:{_PROTOCOL_FRAGMENT_REASON}"
+            ),
+            summary="V2 回复在投递前压制了协议残片",
+            explain=(
+                "仅记录闭集检测类型、provider 结束原因和 lane；"
+                "不记录回复、reasoning、prompt 或工具参数。"
+            ),
+            detail={
+                "lane": safe_lane,
+                "evidence": str(evidence or ""),
+                "stop_reason": safe_stop,
+                "transport_cut": bool(transport_cut),
+                "final": bool(final),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a turn
+        log.warning(
+            "[v2.protocol_fragment] trace failed user=%s lane=%s code=%s",
+            user_id,
+            safe_lane,
+            type(exc).__name__.lower(),
+        )
+
+
+async def _emit_transport_cut_trace(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+    *,
+    stop_reason: str,
+    final: bool,
+    trace_id: str = "",
+    job_id: object = "",
+) -> None:
+    """Record a real provider output-limit signal without changing delivery."""
+    if deps.emit_debug_trace is None:
+        return
+    safe_lane = _normalize_provider_trace_lane(lane)
+    safe_stop = provider_client.normalize_stop_reason(stop_reason)
+    if not provider_client.is_token_limit_stop_reason(safe_stop):
+        return
+    try:
+        await asyncio.to_thread(
+            deps.emit_debug_trace,
+            user_id,
+            "reply.transport_cut_observed",
+            trace_id=str(trace_id or ""),
+            job_id=str(job_id or ""),
+            status="warning",
+            summary="Provider 标记回复达到输出上限（投递策略未改变）",
+            explain=(
+                "这是独立的闭集 transport-cut 观测，不代表协议残片已压制；"
+                "不记录回复、reasoning、prompt 或工具参数。"
+            ),
+            detail={
+                "lane": safe_lane,
+                "stop_reason": safe_stop,
+                "final": bool(final),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a turn
+        log.warning(
+            "[v2.transport_cut] trace failed user=%s lane=%s code=%s",
             user_id,
             safe_lane,
             type(exc).__name__.lower(),
@@ -8690,6 +8873,7 @@ async def _run_wake(
         lane,
         trace_id,
     )
+    provider_reply_signal = _ProviderReplySignal()
     try:
         store = core_store.get_store(user_id)
         seq_native = deps.read_messages_after_seq is not None
@@ -9855,6 +10039,16 @@ async def _run_wake(
             nonlocal discarded_draft_cleared
             text = str(text or "").strip()
             wake_self_thinking_failed = False
+            if provider_reply_signal.transport_cut:
+                await _emit_transport_cut_trace(
+                    deps,
+                    user_id,
+                    lane,
+                    stop_reason=provider_reply_signal.stop_reason,
+                    final=final,
+                    trace_id=trace_id,
+                    job_id=job_id,
+                )
             # Self-authored thinking (same mechanism as the chat lane): peel a leading
             # <think> off the wake reply BEFORE the degenerate/torn checks so they see
             # the real reply, and surface the block in the thinking channel instead of
@@ -9909,12 +10103,32 @@ async def _run_wake(
             # reasoning/content). Proactive policy suppresses any leak — silence
             # is the correct wake outcome anyway. Mirror the degenerate lifecycle:
             # final fails the turn (recorded, no bubble), intermediate is a no-op.
-            torn = _torn_protocol_evidence(text, reasoning, lane="proactive") if text else ""
+            torn = (
+                _torn_protocol_evidence(
+                    text,
+                    reasoning,
+                    lane="proactive",
+                    transport_cut=provider_reply_signal.transport_cut,
+                )
+                if text
+                else ""
+            )
             if torn:
                 log.warning(
                     "[v2.worker] wake torn protocol fragment suppressed user=%s "
                     "job=%s lane=%s final=%s evidence=%s fragment=%r",
                     user_id, job_id, lane, final, torn, text[:32],
+                )
+                await _emit_protocol_suppressed_trace(
+                    deps,
+                    user_id,
+                    lane,
+                    evidence=torn,
+                    stop_reason=provider_reply_signal.stop_reason,
+                    transport_cut=provider_reply_signal.transport_cut,
+                    final=final,
+                    trace_id=trace_id,
+                    job_id=job_id,
                 )
                 if final:
                     raise TurnError(_PROTOCOL_FRAGMENT_REASON)
@@ -10694,10 +10908,9 @@ async def _run_wake(
                     exc,
                 ),
                 on_provider_tool_surface=provider_roundtrip_trace,
-                on_provider_call_event=(
-                    provider_roundtrip_trace.record_model_call
-                    if provider_roundtrip_trace is not None
-                    else None
+                on_provider_call_event=_provider_model_call_callback(
+                    provider_reply_signal,
+                    provider_roundtrip_trace,
                 ),
                 on_empty_provider_response=(
                     _empty_provider_response_debug_callback(
@@ -13281,6 +13494,7 @@ async def process_job(
         if lane == "chat"
         else None
     )
+    provider_reply_signal = _ProviderReplySignal()
 
     try:
         if not claimed_by or not await asyncio.to_thread(
@@ -14784,7 +14998,10 @@ async def process_job(
             # a strong hit, substitute the honest fallback and drop the reasoning —
             # never render a torn protocol head next to the fallback bubble.
             elif file_reply is None and text and _torn_protocol_evidence(
-                text, reasoning, lane="foreground"
+                text,
+                reasoning,
+                lane="foreground",
+                transport_cut=provider_reply_signal.transport_cut,
             ):
                 log.warning(
                     "[v2.worker] chat torn protocol fragment suppressed user=%s "
@@ -15830,10 +16047,9 @@ async def process_job(
                 exc,
             ),
             on_provider_tool_surface=provider_roundtrip_trace,
-            on_provider_call_event=(
-                provider_roundtrip_trace.record_model_call
-                if provider_roundtrip_trace is not None
-                else None
+            on_provider_call_event=_provider_model_call_callback(
+                provider_reply_signal,
+                provider_roundtrip_trace,
             ),
             on_empty_provider_response=(
                 _empty_provider_response_debug_callback(

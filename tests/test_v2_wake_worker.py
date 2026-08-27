@@ -145,9 +145,12 @@ def _script_provider(monkeypatch, responses):
     return calls
 
 
-def _text_round(text, *, prompt_tokens=1, completion_tokens=1):
-    return {"reply": text, "tool_calls": [],
-            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
+def _text_round(text, *, prompt_tokens=1, completion_tokens=1, stop_reason=None):
+    result = {"reply": text, "tool_calls": [],
+              "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
+    if stop_reason is not None:
+        result["stop_reason"] = stop_reason
+    return result
 
 
 def _stay_silent_round(reason="没有值得打扰用户的新信息"):
@@ -1102,6 +1105,119 @@ def test_wake_full_chain_strips_tool_markup_after_user_decrypt(monkeypatch, lane
             "reason": "tool_markup_leak_sanitized",
         }
     ]
+
+
+def test_wake_suppresses_observed_orphan_tool_call_tail(monkeypatch):
+    reply = '大热天的").\n• Let\'s check the exact timeline:\n• 16:05:'
+    uid = "u_wake_protocol_tool_call_tail"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat", trace_id="trace-fragment")
+    claimed_by = _claim(job_id)
+    _script_provider(monkeypatch, [
+        _text_round(reply)
+    ])
+    writes = []
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda *_args, **_kwargs: writes.append(True),
+    )
+    traces = []
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "在吗"}]
+    )
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "heartbeat",
+        deps,
+        _BYOK,
+        asyncio.Semaphore(4),
+        claimed_by,
+        trace_id="trace-fragment",
+    ))
+
+    assert status == "failed"
+    assert writes == []
+    assert _job_status(job_id) == (
+        "failed",
+        "wake_failed:protocol_fragment_suppressed",
+    )
+    event = next(
+        item for item in traces
+        if item["event_type"] == "reply.protocol_fragment_suppressed"
+    )
+    assert event["trace_id"] == "trace-fragment"
+    assert event["detail"] == {
+        "lane": "heartbeat",
+        "evidence": "tool_call_tail",
+        "stop_reason": "",
+        "transport_cut": False,
+        "final": True,
+    }
+    assert reply not in json.dumps(traces, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("stop_reason", [None, "length"])
+def test_wake_prose_fragment_delivery_is_not_changed_by_cut_signal(
+    monkeypatch, stop_reason
+):
+    uid = f"u_wake_protocol_delivery_{stop_reason or 'missing'}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    prose = "。今天她步数都上5000了……刚才问她"
+    _script_provider(monkeypatch, [_text_round(prose, stop_reason=stop_reason)])
+    written = []
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda _store, text: written.append(text) or {"id": "plain-no-cut"},
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "在吗"}]
+    )
+    traces = []
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "heartbeat",
+        deps,
+        _BYOK,
+        asyncio.Semaphore(4),
+        claimed_by,
+    ))
+
+    assert status == "completed"
+    assert written == [prose]
+    assert not any(
+        item["event_type"] == "reply.protocol_fragment_suppressed"
+        for item in traces
+    )
+    cut_events = [
+        item for item in traces
+        if item["event_type"] == "reply.transport_cut_observed"
+    ]
+    if stop_reason is None:
+        assert cut_events == []
+    else:
+        assert len(cut_events) == 1
+        assert cut_events[0]["detail"] == {
+            "lane": "heartbeat",
+            "stop_reason": "length",
+            "final": True,
+        }
+        assert prose not in json.dumps(cut_events, ensure_ascii=False)
 
 
 def test_wake_markup_only_reply_sleeps_without_bubble(monkeypatch):
