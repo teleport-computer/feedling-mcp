@@ -3144,7 +3144,7 @@ _EMPTY_RESPONSE_PUBLIC_ENUMS = {
     "stop_reason": frozenset({
         "", "blocklist", "content_filter", "end_turn", "function_call",
         "image_safety", "language", "length", "malformed_function_call",
-        "max_tokens", "other", "pause_turn", "prohibited_content",
+        "max_output_tokens", "max_tokens", "other", "pause_turn", "prohibited_content",
         "recitation", "refusal", "safety", "spii", "stop",
         "stop_sequence", "tool_calls", "tool_use",
     }),
@@ -3156,6 +3156,18 @@ _EMPTY_RESPONSE_PUBLIC_ENUMS = {
 _SILENT_REPLY_PUBLIC_ENUMS = {
     "lane": _EMPTY_RESPONSE_PUBLIC_ENUMS["lane"],
     "cause": frozenset({"suppressed", "empty_response"}),
+}
+_PROTOCOL_FRAGMENT_PUBLIC_ENUMS = {
+    "lane": _EMPTY_RESPONSE_PUBLIC_ENUMS["lane"],
+    "evidence": frozenset({
+        "head_in_reasoning", "joined_known_protocol", "orphan_json_tail",
+        "tool_call_tail", "transport_cut", "upstream_response_envelope",
+    }),
+    "stop_reason": _EMPTY_RESPONSE_PUBLIC_ENUMS["stop_reason"],
+}
+_TRANSPORT_CUT_PUBLIC_ENUMS = {
+    "lane": _EMPTY_RESPONSE_PUBLIC_ENUMS["lane"],
+    "stop_reason": frozenset({"length", "max_output_tokens", "max_tokens"}),
 }
 
 _MODEL_CALL_TRACE_TYPES = frozenset({
@@ -3557,6 +3569,24 @@ def _debug_event_public_json(
                 value = raw_detail.get(key)
                 if isinstance(value, str) and value in allowed_values:
                     public_detail[key] = value
+    if (
+        ev.get("type") == "reply.protocol_fragment_suppressed"
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        for key, allowed_values in _PROTOCOL_FRAGMENT_PUBLIC_ENUMS.items():
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed_values:
+                public_detail[key] = value
+    if (
+        ev.get("type") == "reply.transport_cut_observed"
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        for key, allowed_values in _TRANSPORT_CUT_PUBLIC_ENUMS.items():
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed_values:
+                public_detail[key] = value
     if (
         ev.get("type") == "reply.language_follow"
         and isinstance(raw_detail, dict)
@@ -9952,6 +9982,8 @@ _DEBUG_STEP_LABELS = {
     "provider.empty_response": ("🕳️", "空回复诊断"),
     "reply.silent_by_choice": ("🤫", "主动静默 · 模型选择"),
     "reply.silent_empty_response": ("🕳️", "主动静默 · 空响应"),
+    "reply.protocol_fragment_suppressed": ("🛡️", "回复安全 · 协议残片已压制"),
+    "reply.transport_cut_observed": ("✂️", "Provider 输出截断 · 仅观测"),
     "mcp.surface.resolved": ("🧩", "MCP 工具面"),
     "mcp.surface.provider": ("🧩", "MCP Provider 实收工具面"),
     "mcp.roundtrip.provider": ("🔁", "Provider 本轮往返"),

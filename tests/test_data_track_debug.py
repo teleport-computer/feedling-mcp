@@ -682,6 +682,77 @@ def test_debug_page_renders_nav_filters_and_redacts_plaintext_by_default(monkeyp
     assert "Trace 词表暂不可用" not in html
 
 
+def test_debug_page_renders_protocol_suppression_without_reply_content(monkeypatch):
+    with registry._users_lock:
+        registry._users[:] = [{"user_id": "user_protocol", "principal_id": "p_protocol"}]
+
+    private_reply = "PRIVATE_PROTOCOL_FRAGMENT_MUST_NOT_RENDER"
+    event = _event(
+        101,
+        "user_protocol",
+        "reply.protocol_fragment_suppressed",
+        trace_id="t-protocol",
+        status="error",
+        detail={
+            "lane": "heartbeat",
+            "evidence": "tool_call_tail",
+            "stop_reason": "",
+            "transport_cut": False,
+            "final": True,
+        },
+        content_excerpt={},
+    )
+    event["private_reply"] = private_reply
+    _patch_blob_reads(monkeypatch, {
+        ("user_protocol", "trace_events"): {"events": [event]},
+    })
+
+    html = admin_core.page_html(
+        "view=debug&mode=timeline&user_id=user_protocol&trace_id=t-protocol"
+    )
+
+    assert "回复安全 · 协议残片已压制" in html
+    assert "tool_call_tail" in html
+    assert "heartbeat" in html
+    assert private_reply not in html
+
+
+def test_debug_page_renders_transport_cut_as_distinct_content_free_observation(
+    monkeypatch,
+):
+    with registry._users_lock:
+        registry._users[:] = [{"user_id": "user_cut", "principal_id": "p_cut"}]
+
+    private_reply = "PRIVATE_TRUNCATED_REPLY_MUST_NOT_RENDER"
+    event = _event(
+        102,
+        "user_cut",
+        "reply.transport_cut_observed",
+        trace_id="t-cut",
+        status="warning",
+        detail={
+            "lane": "heartbeat",
+            "stop_reason": "max_output_tokens",
+            "final": True,
+        },
+        content_excerpt={},
+    )
+    event["private_reply"] = private_reply
+    _patch_blob_reads(monkeypatch, {
+        ("user_cut", "trace_events"): {"events": [event]},
+    })
+
+    html = admin_core.page_html(
+        "view=debug&mode=timeline&user_id=user_cut&trace_id=t-cut"
+    )
+
+    assert "Provider 输出截断 · 仅观测" in html
+    assert "max_output_tokens" in html
+    assert "heartbeat" in html
+    assert "协议残片已压制" not in html
+    assert private_reply not in html
+
+
 def test_debug_page_renders_trace_vocabulary_unavailable_as_a_warning(monkeypatch):
     with registry._users_lock:
         registry._users[:] = [{"user_id": "user_a", "principal_id": "p_a"}]
