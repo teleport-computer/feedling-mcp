@@ -6583,11 +6583,12 @@ def admin_background_lane_users(
         "users": {},
         "read_status": {"level": "ok", "message": ""},
     }
-    if not ids:
-        return base
-
     try:
         with _admin_data_track_connection() as conn:
+            # ids is empty when the caller asks for a page past the end or the
+            # filters matched nothing.  The watermark read below does not depend
+            # on ids, so coverage still has to be measured; only the per-user
+            # scan is skipped.
             rows = conn.execute(
                 """
                 WITH selected AS (
@@ -6636,7 +6637,7 @@ def admin_background_lane_users(
                 ORDER BY t.user_id, t.route, t.lane
                 """,
                 (ids, start_day.isoformat(), end_day.isoformat()),
-            ).fetchall()
+            ).fetchall() if ids else []
             watermarks = {
                 str(row[0]): {
                     "backfill_from": str(row[1]) if row[1] is not None else None,

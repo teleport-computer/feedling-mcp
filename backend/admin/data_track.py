@@ -2493,12 +2493,6 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         # admin_data_track_snapshot's default True.
         include_legacy_background=False,
     )
-    background_report = (
-        db.admin_background_lane_users(
-            user_ids, days=int(filters.get("lane_days") or 7)
-        )
-        if include_users else {}
-    )
     human_cutoff = time.time() - int(filters.get("human_days") or 7) * 86400
     rows = []
     for u in users:
@@ -2546,21 +2540,6 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
                     (row.get("chat") or {}).get("last_user_at") or ""
                 ),
             }
-            runtime_state = str(
-                (row.get("responder") or {}).get("runtime_state") or "resident"
-            ).strip().lower()
-            # lane_daily_rollup.route is the execution family, not the account's
-            # onboarding selection. Hosted V2/draining work freezes into
-            # model_api; resident and hosted-V1 work freezes into resident.
-            coverage_route = (
-                "model_api" if runtime_state in {"v2", "draining"}
-                else "resident"
-            )
-            row["background_lanes"] = _background_lanes_for_user(
-                background_report,
-                user_id=uid,
-                route=coverage_route,
-            )
         rows.append(row)
     rows = _data_track_apply_runtime_filter(
         rows, str(filters.get("runtime_state") or "")
@@ -2750,6 +2729,33 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         },
     }
     if include_users:
+        offset = int(filters.get("offset") or 0)
+        limit = int(filters.get("limit") or 100)
+        page = rows[offset:offset + limit]
+        # The per-user lane scan grows with the number of ids handed to it, so it
+        # runs on the page only. Nothing upstream reads background_lanes — no
+        # filter, no sort key, no summary aggregate — and the fleet-level fields
+        # below come from the ids-independent watermark table.
+        background_report = db.admin_background_lane_users(
+            [str(r.get("user_id") or "") for r in page],
+            days=int(filters.get("lane_days") or 7),
+        )
+        for row in page:
+            runtime_state = str(
+                (row.get("responder") or {}).get("runtime_state") or "resident"
+            ).strip().lower()
+            # lane_daily_rollup.route is the execution family, not the account's
+            # onboarding selection. Hosted V2/draining work freezes into
+            # model_api; resident and hosted-V1 work freezes into resident.
+            coverage_route = (
+                "model_api" if runtime_state in {"v2", "draining"}
+                else "resident"
+            )
+            row["background_lanes"] = _background_lanes_for_user(
+                background_report,
+                user_id=str(row.get("user_id") or ""),
+                route=coverage_route,
+            )
         payload["background_lane_window"] = {
             "window": dict(background_report.get("window") or {}),
             "read_status": dict(background_report.get("read_status") or {}),
@@ -2762,10 +2768,7 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
                 "nonterminal jobs are reported by the separate stuck metric"
             ),
         }
-    if include_users:
-        offset = int(filters.get("offset") or 0)
-        limit = int(filters.get("limit") or 100)
-        payload["users"] = rows[offset:offset + limit]
+        payload["users"] = page
         payload["pagination"] = {
             "limit": limit,
             "offset": offset,

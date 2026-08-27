@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 from datetime import datetime, timedelta
 import itertools
 import json
@@ -411,6 +412,198 @@ def test_users_background_lanes_filter_by_last_user_message_and_skip_full_histor
     )
     assert summary_body["proactive_breakdowns_status"] == "omitted"
     assert summary_body["proactive_failed_total"] is None
+
+
+def _seed_lane_users(client, count: int) -> list[str]:
+    """Register ``count`` users with distinct chat volume and lane counts.
+
+    The Nth seeded user gets N+1 chat messages and a lane cell with
+    completed=(N+1)*10, so ``sort=chat`` is deterministic and a row carrying a
+    neighbour's lane data cannot coincidentally look right.
+    """
+    yesterday = (
+        datetime.now(ZoneInfo("Asia/Shanghai")).date() - timedelta(days=1)
+    ).isoformat()
+    user_ids = []
+    for index in range(count):
+        uid, _ = _register(client)
+        store = core_store.get_store(uid)
+        for turn in range(index + 1):
+            store.append_chat("user", "chat", _env(f"human-{index}-{turn}", uid))
+        user_ids.append(uid)
+    with db.get_pool().connection() as conn:
+        for index, uid in enumerate(user_ids):
+            conn.execute(
+                """
+                INSERT INTO lane_daily_rollup
+                  (user_id, day, route, lane, completed, failed,
+                   operational_failures, control_outcomes, user_unavailable,
+                   failure_codes)
+                VALUES (%s, %s, 'resident', 'heartbeat', %s, 0, 0, 0, 0,
+                        '{}'::jsonb)
+                """,
+                (uid, yesterday, (index + 1) * 10),
+            )
+        conn.execute(
+            """
+            INSERT INTO lane_rollup_watermark
+              (route, backfill_from, through_day, outcomes_from)
+            VALUES ('resident', %s, %s, %s)
+            ON CONFLICT (route) DO UPDATE SET
+              backfill_from=EXCLUDED.backfill_from,
+              through_day=EXCLUDED.through_day,
+              outcomes_from=EXCLUDED.outcomes_from
+            """,
+            (yesterday, yesterday, yesterday),
+        )
+    return user_ids
+
+
+def _observe_lane_reader(monkeypatch):
+    """Record every user_ids list handed to the per-user lane reader."""
+    real = db.admin_background_lane_users
+    seen: list[list[str]] = []
+
+    def observed(user_ids, **kwargs):
+        seen.append(list(user_ids))
+        return real(user_ids, **kwargs)
+
+    monkeypatch.setattr(db, "admin_background_lane_users", observed)
+    return seen
+
+
+def test_lane_reader_receives_exactly_the_page_ids_in_order(client, monkeypatch):
+    seeded = _seed_lane_users(client, 5)
+    seen = _observe_lane_reader(monkeypatch)
+
+    # Non-zero offset with a sort the production allowlist actually accepts
+    # (_data_track_request_filters keeps only chat/memory/proactive), so the
+    # ordering asserted here is the ordering the endpoint really applies. The
+    # correct page is neither the first N ids nor the previous page, so a
+    # length-only assertion would not catch handing the reader the wrong slice.
+    body = client.get(
+        "/v1/admin/data-track/users"
+        "?sort=chat&dir=asc&limit=2&offset=2&lane_days=1",
+        headers=_admin_headers(),
+    ).get_json()
+
+    page_ids = [row["user_id"] for row in body["users"]]
+    assert len(page_ids) == 2
+    assert body["pagination"] == {
+        "limit": 2, "offset": 2, "returned": 2, "total": 5,
+        "next_offset": 4, "prev_offset": 0,
+    }
+    assert seen == [page_ids], (
+        "the per-user lane scan must receive exactly the returned page, "
+        f"in order; got {seen} for page {page_ids}"
+    )
+
+    # sort=chat&dir=asc orders by chat volume, which _seed_lane_users made
+    # strictly increasing in seed order, so page[offset=2] is seeds 2 and 3.
+    assert page_ids == seeded[2:4]
+
+    # Each returned row must carry its own lane data, not a neighbour's:
+    # the Nth seeded user has completed=(N+1)*10, a different scale from the
+    # chat counts so the two cannot be confused for each other.
+    for row in body["users"]:
+        expected = (seeded.index(row["user_id"]) + 1) * 10
+        assert row["background_lanes"]["lanes"]["heartbeat"]["completed"] == expected
+
+
+def test_empty_page_keeps_fleet_level_lane_window(client, monkeypatch):
+    _seed_lane_users(client, 3)
+    seen = _observe_lane_reader(monkeypatch)
+
+    full = client.get(
+        "/v1/admin/data-track/users?limit=100&lane_days=1",
+        headers=_admin_headers(),
+    ).get_json()
+    empty = client.get(
+        "/v1/admin/data-track/users?limit=2&offset=99&lane_days=1",
+        headers=_admin_headers(),
+    ).get_json()
+
+    assert empty["users"] == []
+    # This only observes the argument handed to the reader. Whether the reader
+    # then issues the lane SQL is a separate claim, guarded at the DB seam by
+    # test_empty_ids_reads_watermark_without_scanning_lane_rows.
+    assert seen[-1] == [], "an empty page must hand the reader no user ids"
+    # window / read_status / coverage come from the ids-independent watermark
+    # read, so they must survive a page that selects nobody.
+    for field in ("window", "read_status", "coverage_by_route"):
+        assert empty["background_lane_window"][field] == \
+            full["background_lane_window"][field], field
+    assert empty["background_lane_window"]["read_status"]["level"] == "ok"
+    assert empty["background_lane_window"]["coverage_by_route"]["resident"][
+        "level"
+    ] == "green"
+
+
+class _RecordingConn:
+    """Delegates to a real connection while recording every SQL statement."""
+
+    def __init__(self, inner, executed: list[str]):
+        self._inner = inner
+        self._executed = executed
+
+    def execute(self, sql, params=None, *args, **kwargs):
+        self._executed.append(str(sql))
+        if params is None:
+            return self._inner.execute(sql, *args, **kwargs)
+        return self._inner.execute(sql, params, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_empty_ids_reads_watermark_without_scanning_lane_rows(client, monkeypatch):
+    _seed_lane_users(client, 2)
+    executed: list[str] = []
+    real_connection = db._admin_data_track_connection
+
+    @contextlib.contextmanager
+    def recording_connection(*args, **kwargs):
+        with real_connection(*args, **kwargs) as conn:
+            yield _RecordingConn(conn, executed)
+
+    monkeypatch.setattr(db, "_admin_data_track_connection", recording_connection)
+    report = db.admin_background_lane_users([], days=1)
+
+    lane_sql = [sql for sql in executed if "lane_daily_rollup" in sql]
+    watermark_sql = [sql for sql in executed if "lane_rollup_watermark" in sql]
+    assert lane_sql == [], (
+        "no page ids means nothing to scan: the per-user lane query must not "
+        "be issued at all"
+    )
+    # ...and the ids-independent watermark read must still happen, otherwise
+    # coverage silently degrades to 'unavailable' on an empty page.
+    assert len(watermark_sql) == 1
+    assert report["users"] == {}
+    assert report["read_status"]["level"] == "ok"
+    assert report["coverage_by_route"]["resident"]["level"] == "green"
+
+
+def test_summary_aggregates_ignore_pagination_window(client):
+    _seed_lane_users(client, 4)
+
+    def _summary(query: str) -> dict:
+        body = client.get(
+            f"/v1/admin/data-track/users?{query}", headers=_admin_headers()
+        ).get_json()
+        summary = dict(body["summary"])
+        # generated_at is wall-clock; everything else must be pagination-blind.
+        summary.pop("generated_at", None)
+        return summary
+
+    whole = _summary("limit=100&lane_days=1")
+    single = _summary("limit=1&lane_days=1")
+    tail = _summary("limit=1&offset=3&lane_days=1")
+    past_end = _summary("limit=1&offset=99&lane_days=1")
+
+    assert single == whole
+    assert tail == whole
+    assert past_end == whole
+    assert whole["activation_funnel"]["registered"] == 4
 
 
 def test_background_lane_coverage_uses_weakest_observed_and_current_route():
