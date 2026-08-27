@@ -9,9 +9,9 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 
 | Lifecycle | Classified documents |
 |---|---:|
-| `current` | 36 |
-| `decision` | 17 |
-| `historical` | 37 |
+| `current` | 40 |
+| `decision` | 20 |
+| `historical` | 39 |
 | `generated` | 1 |
 
 ## current
@@ -25,6 +25,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs-site/content/docs/architecture.mdx`
 - `docs-site/content/docs/changelog.mdx`
 - `docs-site/content/docs/self-hosting.mdx`
+- `docs-site/content/docs/workflows/chat.mdx`
 - `docs-site/content/docs/workflows/perception.mdx`
 - `docs/AGENT_MAILBOX.md`
 - `docs/API_ERRORS.md`
@@ -35,8 +36,10 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/RDS_TRACE_PARTITIONS_RUNBOOK.md`
 - `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md`
 - `docs/ops/chat-incremental-sync-runbook.md`
+- `docs/ops/metadata-first-user-store-runbook.md`
 - `docs/repository-cleanup/README.md`
 - `docs/repository-cleanup/agent-diagnostic-benchmark.md`
+- `docs/repository-cleanup/api-product-history.md`
 - `docs/repository-cleanup/hosted-runtime-history.md`
 - `docs/repository-cleanup/memory-perception-history.md`
 - `docs/repository-cleanup/resident-runtime-history.md`
@@ -44,6 +47,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/superpowers/plans/2026-08-24-io-marketing-website.md`
 - `docs/superpowers/plans/2026-08-24-repository-cleanup.md`
 - `docs/superpowers/plans/2026-08-24-repository-cleanup.zh-CN.md`
+- `docs/superpowers/plans/2026-08-26-metadata-first-user-store.md`
 - `docs/superpowers/plans/2026-08-26-resident-runtime-history-batch-1.md`
 - `docs/superpowers/plans/2026-08-27-storage-tee-history-batch-3.md`
 - `docs/testing/README.md`
@@ -65,6 +69,8 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop-design.md`
 - `docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md`
 - `docs/superpowers/specs/2026-07-21-dual-runtime-v1-v2-coexistence-design.md`
+- `docs/superpowers/specs/2026-07-25-v2-push-parity-design.md`
+- `docs/superpowers/specs/2026-07-31-v2-photo-read-vision-observation-design.md`
 - `docs/superpowers/specs/2026-08-10-new-model-api-users-default-v2-design.md`
 - `docs/superpowers/specs/2026-08-12-remove-v2-semantic-compaction-design.md`
 - `docs/superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md`
@@ -72,6 +78,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/superpowers/specs/2026-08-24-io-marketing-website-design.md`
 - `docs/superpowers/specs/2026-08-25-chat-notify-convergence-design.md`
 - `docs/superpowers/specs/2026-08-25-chat-snapshot-convergence-and-rds-trace-repair-design.md`
+- `docs/superpowers/specs/2026-08-26-metadata-first-user-store-design.md`
 
 ## historical
 
@@ -94,6 +101,8 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/archive/superpowers/plans/2026-07-13-hosted-runtime-v2-PR-C-unified-tool-loop.md`
 - `docs/archive/superpowers/plans/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety.md`
 - `docs/archive/superpowers/plans/2026-07-21-dual-runtime-v1-v2-coexistence.md`
+- `docs/archive/superpowers/plans/2026-07-25-v2-push-parity.md`
+- `docs/archive/superpowers/plans/2026-07-31-v2-photo-read-vision-observation.md`
 - `docs/archive/superpowers/plans/2026-08-10-new-model-api-users-default-v2.md`
 - `docs/archive/superpowers/plans/2026-08-14-memory-garden-kernel.md`
 - `docs/archive/superpowers/plans/2026-08-14-memory-garden-test-plan.md`
