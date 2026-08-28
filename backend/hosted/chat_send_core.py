@@ -248,7 +248,8 @@ def model_api_chat_send_core(
         debug_trace.trace_event(
             store, subsystem="route", type="route.decided", actor="host_agent_runtime",
             status="ok", summary="admission_failopen",
-            detail={"mode": "admit", "error": str(exc)[:120]},
+            detail={"mode": "admit", "reason": "admission_unavailable",
+                    "error_class": type(exc).__name__},
         )
         _admit = True
         _est = 0.0

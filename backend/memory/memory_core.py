@@ -107,17 +107,16 @@ def index(store, api_key, payload: dict, *, post_enclave) -> tuple[dict, int]:
             post_enclave=post_enclave,
         )
     except RuntimeError as e:
-        detail = {"counts": {"limit": requested_limit}}
+        # The query is end-to-end private and the upstream exception can echo
+        # it, so neither lane reports exception text: a closed category plus the
+        # exception class, which is a bounded set carrying no message.
+        detail = {
+            "counts": {"limit": requested_limit},
+            "reason": "readside_unavailable",
+            "error_class": type(e).__name__,
+        }
         if is_search:
-            # The query is end-to-end private. Even the upstream exception can
-            # echo it, so the search event keeps only a stable fingerprint and
-            # a closed failure category.
-            detail.update({
-                "query_fingerprint": query_fingerprint,
-                "reason": "readside_unavailable",
-            })
-        else:
-            detail["reason"] = str(e)[:80]
+            detail["query_fingerprint"] = query_fingerprint
         debug_trace.trace_event(
             store, subsystem="memory", type=event_type, actor="agent",
             status="failed", summary=f"{operation_label} failed", detail=detail)
@@ -148,12 +147,14 @@ def fetch(store, api_key, payload: dict, *, post_enclave) -> tuple[dict, int]:
     except RuntimeError as e:
         debug_trace.trace_event(
             store, subsystem="memory", type="memory.fetch.called", actor="agent",
-            status="failed", summary="fetch failed", detail={"reason": str(e)[:80]})
+            status="failed", summary="fetch failed",
+            detail={"reason": "readside_unavailable", "error_class": type(e).__name__})
         return {"error": str(e)}, 503
     except ValueError as e:
         debug_trace.trace_event(
             store, subsystem="memory", type="memory.fetch.called", actor="agent",
-            status="failed", summary="fetch failed", detail={"reason": str(e)[:80]})
+            status="failed", summary="fetch failed",
+            detail={"reason": "request_invalid", "error_class": type(e).__name__})
         return {"error": str(e)}, 400
     _items = response.get("items") if isinstance(response.get("items"), list) else []
     _missing = response.get("missing_ids") if isinstance(response.get("missing_ids"), list) else []
