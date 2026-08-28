@@ -361,15 +361,27 @@ def test_uncovered_batch_mirrors_deletes_and_repairs_absent_primary_row(
     monkeypatch.setattr(
         mirror, "execute_many", lambda statements: mirrored.append(statements)
     )
+    # The process-wide trace stats writer shares this mirror entrypoint and
+    # may flush while this test owns the monkeypatch. Reproduce that unrelated
+    # traffic deterministically so the assertion cannot rely on global mirror
+    # silence.
+    mirror.execute_many([
+        ("INSERT INTO trace_write_stats (writer_id) VALUES (%s)", ("other",)),
+    ])
     result = db.chat_delete_uncovered_many(uid, targets)
 
     assert result == {"deleted": 1, "retained_covered": 1, "remaining": 0}
     assert db.chat_get_strict(uid, covered_id) is not None
     assert db.chat_get_strict(uid, absent_id) is None
     assert db.chat_get_strict(uid, current_id) is None
-    assert len(mirrored) == 1
-    assert len(mirrored[0]) == 2
-    for _sql, params in mirrored[0]:
+    chat_delete_batches = [
+        statements
+        for statements in mirrored
+        if any(sql.startswith("DELETE FROM chat_messages") for sql, _ in statements)
+    ]
+    assert len(chat_delete_batches) == 1
+    assert len(chat_delete_batches[0]) == 2
+    for _sql, params in chat_delete_batches[0]:
         assert params[0] == uid
         assert set(params[1]) == {absent_id, current_id}
         assert covered_id not in params[1]
