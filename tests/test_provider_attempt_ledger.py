@@ -133,6 +133,104 @@ def test_record_runtime_attempt_accepts_hosted_model_api_probe(monkeypatch):
     assert doc["provider_request_id"] == "req_1"
 
 
+def test_record_runtime_attempt_closes_fallback_metadata(monkeypatch):
+    stored = []
+
+    def fake_append(user_id, stream, doc, *, number_field, ts, item_key):
+        stored.append(dict(doc))
+        return {**doc, number_field: len(stored)}
+
+    monkeypatch.setattr(
+        provider_attempt_ledger.db, "log_append_numbered", fake_append
+    )
+
+    assert provider_attempt_ledger.record_runtime_attempt(
+        "usr_fallback",
+        parent_key="v2job:1",
+        trigger="v2_turn",
+        outcome="provider_error",
+        status_code="422",
+        fallback_reason="tool_schema_rejected",
+        provider_error_class="provider_config",
+        dur_ms=125.5,
+    )
+    assert provider_attempt_ledger.record_runtime_attempt(
+        "usr_fallback",
+        parent_key="v2job:2",
+        trigger="v2_turn",
+        outcome="provider_error",
+        status_code=42,
+        fallback_reason="raw provider body",
+        provider_error_class="private upstream class",
+        dur_ms=float("inf"),
+    )
+
+    assert stored[0]["status_code"] == 422
+    assert stored[0]["fallback_reason"] == "tool_schema_rejected"
+    assert stored[0]["provider_error_class"] == "provider_config"
+    assert stored[0]["dur_ms"] == 125.5
+    assert stored[1]["status_code"] is None
+    assert stored[1]["fallback_reason"] == ""
+    assert stored[1]["provider_error_class"] == ""
+    assert stored[1]["dur_ms"] is None
+
+
+def test_summarize_fallbacks_counts_only_closed_pairs():
+    assert provider_attempt_ledger.summarize_fallbacks([
+        {
+            "outcome": "provider_error",
+            "fallback_reason": "tool_schema_rejected",
+            "status_code": 400,
+        },
+        {
+            "outcome": "provider_error",
+            "fallback_reason": "tool_schema_rejected",
+            "status_code": "400",
+        },
+        {
+            "outcome": "provider_error",
+            "fallback_reason": "tool_schema_rejected",
+            "status_code": 422,
+        },
+        {
+            "outcome": "provider_error",
+            "fallback_reason": "tagged_images_rejected",
+            "status_code": 404,
+        },
+        {
+            "outcome": "provider_error",
+            "fallback_reason": "provider said secret",
+            "status_code": 400,
+        },
+        {
+            "outcome": "provider_error",
+            "fallback_reason": "tool_schema_rejected",
+            "status_code": 42,
+        },
+        {
+            "outcome": "ok",
+            "fallback_reason": "tool_schema_rejected",
+            "status_code": 400,
+        },
+    ]) == [
+        {
+            "fallback_reason": "tagged_images_rejected",
+            "status_code": 404,
+            "count": 1,
+        },
+        {
+            "fallback_reason": "tool_schema_rejected",
+            "status_code": 400,
+            "count": 2,
+        },
+        {
+            "fallback_reason": "tool_schema_rejected",
+            "status_code": 422,
+            "count": 1,
+        },
+    ]
+
+
 def test_diagnostics_payload_routes_ledger_without_trace_ring(monkeypatch):
     monkeypatch.setattr(
         diagnostics_core.debug_trace,

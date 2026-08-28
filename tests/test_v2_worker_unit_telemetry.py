@@ -20,6 +20,7 @@ from model_api_runtime.v2 import prompt_frontier  # noqa: E402
 from model_api_runtime.v2 import summary_frontier  # noqa: E402
 from notices import catalog as notices_catalog  # noqa: E402
 from provider_types import ToolCall, ToolExchange, ToolResult  # noqa: E402
+import provider_attempt_ledger  # noqa: E402
 
 
 def test_thinking_extra_preserves_plaintext_body():
@@ -169,6 +170,44 @@ def test_provider_attempt_ledger_inherits_job_lane_when_event_omits_it(monkeypat
     assert original == {"error_class": "upstream_unavailable"}
     assert captured["payload"]["lane"] == "maintenance"
     assert captured["kwargs"]["provider"] == "anthropic"
+
+
+def test_provider_attempt_ledger_receives_closed_failure_facts(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        provider_attempt_ledger,
+        "record_runtime_attempt",
+        lambda user_id, **kwargs: captured.update(user_id=user_id, **kwargs),
+    )
+
+    worker._note_provider_attempt(
+        "u_fallback",
+        "provider_error",
+        {
+            "lane": "chat",
+            "error_class": "ProviderError",
+            "status_code": 422,
+            "fallback_reason": "tool_schema_rejected",
+            "provider_error_class": "provider_config",
+            "dur_ms": 321.5,
+        },
+        job_id=42,
+        provider="openrouter",
+        model="relay-model",
+    )
+
+    assert captured["user_id"] == "u_fallback"
+    assert captured["parent_key"] == "v2job:42"
+    assert captured["provider"] == "openrouter"
+    assert captured["model"] == "relay-model"
+    assert captured["status_code"] == 422
+    assert captured["fallback_reason"] == "tool_schema_rejected"
+    assert captured["provider_error_class"] == "provider_config"
+    assert captured["dur_ms"] == 321.5
+    assert (
+        provider_attempt_ledger.VALID_FALLBACK_REASONS
+        == tool_loop._PROVIDER_ATTEMPT_FALLBACK_REASONS
+    )
 
 
 def _minimal_deps():

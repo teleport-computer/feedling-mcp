@@ -2225,7 +2225,26 @@ def test_detail_payload_exposes_capture_validation_decisions(client):
 
 
 def test_provider_attempts_detail_is_bounded_and_reports_more(monkeypatch):
-    rows = [{"attempt_n": n} for n in range(1, 202)]
+    rows = [{"attempt_n": n} for n in range(1, 199)] + [
+        {
+            "attempt_n": 199,
+            "outcome": "provider_error",
+            "fallback_reason": "tool_schema_rejected",
+            "status_code": 400,
+        },
+        {
+            "attempt_n": 200,
+            "outcome": "provider_error",
+            "fallback_reason": "tool_schema_rejected",
+            "status_code": 422,
+        },
+        {
+            "attempt_n": 201,
+            "outcome": "provider_error",
+            "fallback_reason": "tool_schema_rejected",
+            "status_code": 422,
+        },
+    ]
     calls = []
 
     def fake_log_read(user_id, stream, limit):
@@ -2238,10 +2257,23 @@ def test_provider_attempts_detail_is_bounded_and_reports_more(monkeypatch):
 
     assert calls == [("usr_ledger", "provider_attempts", 201)]
     assert detail["coverage"] == "provider_runtime_and_model_api_probes"
+    assert detail["user_id"] == "usr_ledger"
     assert detail["has_more"] is True
     assert len(detail["attempts"]) == 200
     assert detail["attempts"][0]["attempt_n"] == 2
     assert detail["attempts"][-1]["attempt_n"] == 201
+    assert detail["fallback_counts"] == [
+        {
+            "fallback_reason": "tool_schema_rejected",
+            "status_code": 400,
+            "count": 1,
+        },
+        {
+            "fallback_reason": "tool_schema_rejected",
+            "status_code": 422,
+            "count": 2,
+        },
+    ]
 
 
 def test_perception_permissions_block_renders_granted_denied_and_switches():

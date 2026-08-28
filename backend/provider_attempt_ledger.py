@@ -35,6 +35,15 @@ VALID_TRIGGERS = frozenset(
         "model_api_probe",
     }
 )
+VALID_FALLBACK_REASONS = frozenset(
+    {
+        "tagged_images_rejected",
+        "tool_schema_rejected",
+    }
+)
+VALID_PROVIDER_ERROR_CLASSES = frozenset(
+    {"provider_config", "transient", "unknown"}
+)
 _SAFE_OUTCOME_RE = re.compile(r"[^a-z0-9_.-]+")
 _MAX_BATCH = 64
 
@@ -59,6 +68,62 @@ def _timestamp(value: Any) -> float:
     except (TypeError, ValueError):
         return time.time()
     return ts if math.isfinite(ts) and ts > 0 else time.time()
+
+
+def _status_code(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        status = int(value)
+    except (TypeError, ValueError):
+        return None
+    return status if 100 <= status <= 599 else None
+
+
+def _fallback_reason(value: Any) -> str:
+    reason = str(value or "").strip()
+    return reason if reason in VALID_FALLBACK_REASONS else ""
+
+
+def _provider_error_class(value: Any) -> str:
+    error_class = str(value or "").strip()
+    return (
+        error_class if error_class in VALID_PROVIDER_ERROR_CLASSES else ""
+    )
+
+
+def _duration_ms(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(duration):
+        return None
+    return max(0.0, duration)
+
+
+def summarize_fallbacks(rows: list[dict]) -> list[dict]:
+    """Count provider-error fallback/status pairs in a bounded row window.
+
+    This is intentionally not a distribution of every tool-loop degradation:
+    it covers only failed provider calls that caused a deliberate retry.
+    """
+    counts: dict[tuple[str, int], int] = {}
+    for row in rows:
+        if not isinstance(row, dict) or row.get("outcome") != "provider_error":
+            continue
+        reason = _fallback_reason(row.get("fallback_reason"))
+        status = _status_code(row.get("status_code"))
+        if not reason or status is None:
+            continue
+        key = (reason, status)
+        counts[key] = counts.get(key, 0) + 1
+    return [
+        {"fallback_reason": reason, "status_code": status, "count": count}
+        for (reason, status), count in sorted(counts.items())
+    ]
 
 
 def _normalize_attempt(raw: Any) -> tuple[dict | None, str]:
@@ -139,14 +204,23 @@ def record_runtime_attempt(
     output_tokens: Any = None,
     total_tokens: Any = None,
     error_class: str = "",
+    status_code: Any = None,
+    fallback_reason: str = "",
+    provider_error_class: str = "",
+    dur_ms: Any = None,
     provider_request_id: str = "",
     ts: float | None = None,
 ) -> bool:
     """Append one server-side provider attempt. Never raises.
 
     Same stream and same field names as the resident consumer's ledger, plus
-    ``provider``/``model``/``lane``/``runtime``/``error_class`` — V1 gets those
-    from the consumer's own config, server-side callers state them explicitly.
+    ``provider``/``model``/``lane``/``runtime``/``error_class`` and closed
+    fallback metadata — V1 gets route fields from the consumer's own config,
+    server-side callers state them explicitly.
+
+    For Runtime V2, the database-assigned ``attempt_n`` counts outer tool-loop
+    provider rounds. It does not expose or count retries internal to the
+    provider transport client.
 
     Telemetry must never be able to fail a turn that would otherwise succeed,
     so every failure here is swallowed and reported as ``False``.
@@ -181,6 +255,12 @@ def record_runtime_attempt(
             "provider": _bounded_text(provider, 64),
             "model": _bounded_text(model, 128),
             "error_class": _bounded_text(error_class, 64),
+            "status_code": _status_code(status_code),
+            "fallback_reason": _fallback_reason(fallback_reason),
+            "provider_error_class": _provider_error_class(
+                provider_error_class
+            ),
+            "dur_ms": _duration_ms(dur_ms),
         }
         stored = db.log_append_numbered(
             uid,

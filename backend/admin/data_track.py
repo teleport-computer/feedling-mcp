@@ -17,6 +17,7 @@ from core.reqctx import request
 
 import db
 import debug_trace
+import provider_attempt_ledger
 from core.store import UserStore
 from urllib.parse import urlencode
 import html
@@ -40,7 +41,7 @@ from identity import service as identity_service
 from memory import dream_trace as memory_dream_trace
 
 
-_PROVIDER_ATTEMPT_STREAM = "provider_attempts"
+_PROVIDER_ATTEMPT_STREAM = provider_attempt_ledger.STREAM
 _PROVIDER_ATTEMPT_DETAIL_LIMIT = 200
 _NOTICE_SUMMARY_LIMIT = 20
 _DATA_TRACK_USER_ID_RE = re.compile(r"^usr_[0-9a-f]{16}$")
@@ -1887,9 +1888,14 @@ def _provider_attempts_detail(store: UserStore) -> dict:
         _PROVIDER_ATTEMPT_STREAM,
         limit=_PROVIDER_ATTEMPT_DETAIL_LIMIT + 1,
     )
+    attempts = rows[-_PROVIDER_ATTEMPT_DETAIL_LIMIT:]
     return {
+        "user_id": store.user_id,
         "coverage": "provider_runtime_and_model_api_probes",
-        "attempts": rows[-_PROVIDER_ATTEMPT_DETAIL_LIMIT:],
+        "attempts": attempts,
+        # Counts cover the same explicit recent-attempt window returned below;
+        # they are not presented as all-time totals.
+        "fallback_counts": provider_attempt_ledger.summarize_fallbacks(attempts),
         "has_more": len(rows) > _PROVIDER_ATTEMPT_DETAIL_LIMIT,
     }
 
