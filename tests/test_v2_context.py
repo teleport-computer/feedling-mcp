@@ -12,7 +12,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
 from agent_protocol_core import self_thinking
 from chat.reply_language import format_time_anchor, infer_reply_language_policy
 from capabilities import tool_schema
-from model_api_runtime.v2 import context, language_follow, worker
+from chat import language_follow
+from model_api_runtime.v2 import context, worker
 import worldbook_readside_core
 
 
