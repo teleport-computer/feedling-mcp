@@ -1820,6 +1820,59 @@ def test_frontier_keeps_historical_memory_schema_when_optional_catalog_is_omitte
     assert outcome.final_text == "direct answer"
 
 
+def test_tools_none_round_does_not_report_generic_call_rejection(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "provider fallback",
+            "tool_calls": [
+                {"id": "unexpected", "name": "identity_get", "args": {}}
+            ],
+            "usage": {},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    surfaces = []
+
+    def omit_optional_tool_schemas(*, model_limit, **_kwargs):
+        return tool_loop.prompt_frontier.plan_prompt(
+            model_limit=model_limit,
+            components=[
+                tool_loop.prompt_frontier.PromptComponent(
+                    "message_context", 1, required=True
+                ),
+                tool_loop.prompt_frontier.PromptComponent(
+                    "tool_schemas", 10_000_000, required=False
+                ),
+            ],
+            output_reserve_tokens=128,
+            safety_margin_tokens=128,
+        )
+
+    async def record_surface(detail):
+        surfaces.append(detail)
+
+    monkeypatch.setattr(
+        tool_loop.prompt_frontier,
+        "plan_provider_round",
+        omit_optional_tool_schemas,
+    )
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=3,
+        on_provider_tool_surface=record_surface,
+    ))
+
+    assert provider.calls[0]["tools"] is None
+    assert surfaces[0]["reason"] == "frontier_omitted"
+    assert surfaces[0]["call_rejection_reasons"] == []
+    assert outcome.final_text == "provider fallback"
+
+
 def test_repeated_memory_discovery_reuses_prior_result_without_dispatch(monkeypatch):
     provider = _ScriptedProvider([
         {
@@ -2823,6 +2876,60 @@ def test_per_turn_tool_call_ceiling_rejects_only_the_overflow_batch(monkeypatch)
     assert outcome.final_text == "turn fallback"
 
 
+def test_provider_call_rejection_producers_are_all_in_public_vocabulary():
+    assert (
+        tool_loop._PROVIDER_CALL_REJECTION_PRODUCER_REASONS
+        <= tool_loop._PROVIDER_CALL_REJECTION_REASONS
+    )
+    assert (
+        "unclassified_rejection"
+        in tool_loop._PROVIDER_CALL_REJECTION_REASONS
+        - tool_loop._PROVIDER_CALL_REJECTION_PRODUCER_REASONS
+    )
+
+
+def test_rejected_round_with_unknown_vocabulary_is_not_reported_as_healthy(
+    monkeypatch,
+):
+    provider = _ScriptedProvider([
+        {
+            "reply": "trying",
+            "tool_calls": [
+                {"id": "", "name": "identity_get", "args": {}}
+            ],
+            "usage": {},
+        },
+        {"reply": "fallback", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    monkeypatch.setattr(
+        tool_loop,
+        "_PROVIDER_CALL_REJECTION_REASONS",
+        frozenset({"unclassified_rejection"}),
+    )
+    surfaces = []
+
+    async def record_surface(detail):
+        surfaces.append(detail)
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[]]),
+        add_usage=_noop_add_usage,
+        max_calls=3,
+        on_provider_tool_surface=record_surface,
+    ))
+
+    assert [surface["call_rejection_reasons"] for surface in surfaces] == [
+        ["unclassified_rejection"],
+        [],
+    ]
+    assert outcome.final_text == "fallback"
+
+
 @pytest.mark.parametrize("oversized_part", ["args", "native_turn", "assistant_text"])
 def test_oversized_tool_exchange_falls_back_before_dispatch(
     monkeypatch,
@@ -2856,6 +2963,10 @@ def test_oversized_tool_exchange_falls_back_before_dispatch(
     ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     dispatch = _RecordingDispatch()
+    surfaces = []
+
+    async def record_surface(detail):
+        surfaces.append(detail)
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
         provider_config=_TEST_PROVIDER_CONFIG,
@@ -2865,12 +2976,25 @@ def test_oversized_tool_exchange_falls_back_before_dispatch(
         fold_new_messages=_RecordingFold([[]]),
         add_usage=_noop_add_usage,
         max_calls=5,
+        on_provider_tool_surface=record_surface,
         **kwargs,
     ))
 
     assert dispatch.calls == []
     assert {spec.name for spec in provider.calls[1]["tools"]} == {"memory_index"}
     assert provider.calls[1]["tool_choice"] == "none"
+    expected_reasons = {
+        "args": [
+            "tool_arguments_too_large",
+            "tool_batch_arguments_too_large",
+        ],
+        "native_turn": ["native_assistant_turn_too_large"],
+        "assistant_text": ["assistant_tool_text_too_large"],
+    }
+    assert [surface["call_rejection_reasons"] for surface in surfaces] == [
+        expected_reasons[oversized_part],
+        [],
+    ]
     assert outcome.final_text == "bounded fallback"
 
 
@@ -2979,12 +3103,54 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
         "none",
         "tool_schema_rejected",
     ]
+    assert all(item["call_rejection_reasons"] == [] for item in surfaces)
     assert surfaces[0]["sent_tool_count"] > 0
     assert surfaces[1]["sent_tool_count"] == 0
     assert surfaces[1]["dropped_tool_count"] == surfaces[1]["candidate_tool_count"]
     assert surfaces[1]["terminal_text_round"] is True
     assert surfaces[1]["terminal_text_round_reason"] == "force_text_fallback"
     assert surfaces[1]["force_text_fallback_reason"] == "tool_schema_rejected"
+
+
+def test_terminal_surface_preserves_same_round_rejection_subtype(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "first", "name": "identity_get", "args": {}}
+            ],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "", "name": "identity_get", "args": {}}
+            ],
+            "usage": {},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    surfaces = []
+
+    async def record_surface(detail):
+        surfaces.append(detail)
+
+    asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[]]),
+        add_usage=_noop_add_usage,
+        max_calls=2,
+        on_provider_tool_surface=record_surface,
+    ))
+
+    assert surfaces[1]["terminal_text_round"] is True
+    assert surfaces[1]["call_rejection_reasons"] == [
+        "missing_tool_call_id",
+        "terminal_tool_call_rejected",
+    ]
 
 
 def test_provider_surface_marks_reserved_terminal_text_round(monkeypatch):
@@ -3427,6 +3593,47 @@ def test_stay_silent_is_hidden_without_callback(monkeypatch):
     assert "stay_silent" not in {spec.name for spec in provider.calls[0]["tools"]}
 
 
+def test_forced_wake_choice_does_not_report_generic_call_rejection(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "", "tool_calls": [], "usage": {}},
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "", "name": "identity_get", "args": {}}
+            ],
+            "usage": {},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    surfaces = []
+
+    async def on_stay_silent(_reason):
+        return None
+
+    async def record_surface(detail):
+        surfaces.append(detail)
+
+    with pytest.raises(tool_loop.ProviderEmptyReply, match="empty_reply"):
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=_RecordingReply(),
+            on_stay_silent=on_stay_silent,
+            fold_new_messages=_RecordingFold([[]]),
+            add_usage=_noop_add_usage,
+            max_calls=3,
+            require_reply=False,
+            on_provider_tool_surface=record_surface,
+        ))
+
+    assert surfaces[1]["wake_choice_required"] is True
+    assert [surface["call_rejection_reasons"] for surface in surfaces] == [
+        [],
+        [],
+    ]
+
+
 def test_empty_wake_forces_reply_or_stay_silent_on_same_turn_budget(monkeypatch):
     provider = _ScriptedProvider([
         {"reply": "", "tool_calls": [], "usage": {}},
@@ -3664,9 +3871,13 @@ def test_malformed_call_gets_fresh_prefixed_paired_rejection_id(monkeypatch):
     ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     trajectory = []
+    surfaces = []
 
     async def record_trajectory(event_kind, detail):
         trajectory.append((event_kind, detail))
+
+    async def record_surface(detail):
+        surfaces.append(detail)
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
         provider_config=_TEST_PROVIDER_CONFIG,
@@ -3674,6 +3885,7 @@ def test_malformed_call_gets_fresh_prefixed_paired_rejection_id(monkeypatch):
         dispatch_tools=_RecordingDispatch(), on_reply=_RecordingReply(),
         fold_new_messages=_RecordingFold([[], []]), add_usage=_noop_add_usage,
         max_calls=4, on_trajectory_event=record_trajectory,
+        on_provider_tool_surface=record_surface,
     ))
 
     exchange = next(
@@ -3700,6 +3912,12 @@ def test_malformed_call_gets_fresh_prefixed_paired_rejection_id(monkeypatch):
         and detail.get("transcript_appended") is True
         for event_kind, detail in trajectory
     )
+    assert len(surfaces) == len(provider.calls) == 3
+    assert [surface["call_rejection_reasons"] for surface in surfaces] == [
+        [],
+        ["missing_tool_call_id"],
+        [],
+    ]
     assert outcome.final_text == "plain fallback"
 
 

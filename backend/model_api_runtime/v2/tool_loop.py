@@ -180,6 +180,66 @@ _PROVIDER_FORCE_TEXT_FALLBACK_REASONS = frozenset(
         "other",
     }
 )
+# Keep the producer inventory separate from the public vocabulary. A regression
+# test compares the two so adding a classification branch cannot silently turn a
+# rejected round into the same empty list used by a healthy round.
+_PROVIDER_CALL_REJECTION_PRODUCER_REASONS = frozenset(
+    {
+        "assistant_tool_text_too_large",
+        "duplicate_tool_call_id",
+        "invalid_image_reply_batch",
+        "invalid_or_over_budget_tool_exchange",
+        "invalid_stay_silent_batch",
+        "invalid_tool_arguments",
+        "missing_tool_call_id",
+        "missing_tool_name",
+        "mixed_reply_and_mutation",
+        "native_assistant_turn_too_large",
+        "provider_media_with_tool_calls",
+        "terminal_tool_call_rejected",
+        "tool_arguments_too_large",
+        "tool_batch_arguments_too_large",
+        "tool_call_budget_exceeded",
+        "unapproved_external_url",
+        "unknown_tool",
+    }
+)
+_PROVIDER_CALL_REJECTION_REASONS = frozenset(
+    {
+        "assistant_tool_text_too_large",
+        "duplicate_tool_call_id",
+        "invalid_image_reply_batch",
+        "invalid_or_over_budget_tool_exchange",
+        "invalid_stay_silent_batch",
+        "invalid_tool_arguments",
+        "missing_tool_call_id",
+        "missing_tool_name",
+        "mixed_reply_and_mutation",
+        "native_assistant_turn_too_large",
+        "provider_media_with_tool_calls",
+        "terminal_tool_call_rejected",
+        "tool_arguments_too_large",
+        "tool_batch_arguments_too_large",
+        "tool_call_budget_exceeded",
+        "unapproved_external_url",
+        "unclassified_rejection",
+        "unknown_tool",
+    }
+)
+
+
+def _normalize_provider_call_rejection_reasons(values) -> list[str]:
+    """Return unique producer-owned rejection tokens, never arbitrary text."""
+    if not isinstance(values, (list, tuple)):
+        return []
+    return list(
+        dict.fromkeys(
+            value
+            for value in values
+            if isinstance(value, str)
+            and value in _PROVIDER_CALL_REJECTION_REASONS
+        )
+    )
 
 
 def _catalog():
@@ -427,6 +487,216 @@ def _tool_args_char_limit(tc: ToolCall, default_limit: int) -> int:
             # source contract when a future output budget reaches that boundary.
             return max(default_limit, serialized_size)
     return default_limit
+
+
+@dataclass(frozen=True)
+class _ToolCallRejectionFacts:
+    call_ids: list[str]
+    image_reply_calls: list[ToolCall]
+    stay_silent_calls: list[ToolCall]
+    oversized_tool_exchange: bool
+    over_tool_call_budget: bool
+    malformed: bool
+    truncated_tool_arguments: bool
+    mixed_reply_write: bool
+    invalid_image_batch: bool
+    invalid_silence_batch: bool
+    call_rejection_reasons: list[str]
+    reason_tokens: list[str]
+
+
+def _tool_call_rejection_facts(
+    pr: ProviderResponse,
+    *,
+    tools: list[ToolSpec] | None,
+    raw_finish_reason: str,
+    terminal_text_round: bool,
+    tool_calls_used: int,
+    completed_memory_discovery_tools: set[str],
+    external_content_seen: bool,
+    allowed_fetch_urls: set[str],
+    mutating_mcp_names: set[str],
+    max_tool_args_chars: int,
+    max_tool_batch_args_chars: int,
+    max_native_assistant_turn_chars: int,
+    max_assistant_tool_text_chars: int,
+    max_tool_calls_per_round: int,
+    max_tool_calls_per_turn: int,
+) -> _ToolCallRejectionFacts:
+    """Classify one provider tool batch using content-free closed tokens."""
+    call_ids = [tc.id for tc in pr.tool_calls]
+    argument_sizes = [
+        (_serialized_chars(tc.args) if tc.args_ok else len(str(tc.args_raw or "")))
+        for tc in pr.tool_calls
+    ]
+    argument_limits = [
+        _tool_args_char_limit(tc, max_tool_args_chars)
+        for tc in pr.tool_calls
+    ]
+    batch_arguments_limit = max_tool_batch_args_chars
+    native_assistant_turn_limit = max_native_assistant_turn_chars
+    if (
+        len(pr.tool_calls) == 1
+        and argument_limits
+        and argument_limits[0] > max_tool_args_chars
+    ):
+        batch_arguments_limit = max(batch_arguments_limit, argument_limits[0])
+        native_assistant_turn_limit = max(
+            native_assistant_turn_limit,
+            argument_limits[0] + max_assistant_tool_text_chars + 8192,
+        )
+    native_turn_size = (
+        _serialized_chars(pr.assistant_turn.payload)
+        if pr.assistant_turn is not None
+        else 0
+    )
+    oversized_tool_exchange = (
+        any(
+            size is None or size > limit
+            for size, limit in zip(argument_sizes, argument_limits)
+        )
+        or sum(size or 0 for size in argument_sizes) > batch_arguments_limit
+        or native_turn_size is None
+        or native_turn_size > native_assistant_turn_limit
+        or len(pr.text) > max_assistant_tool_text_chars
+    )
+    over_tool_call_budget = (
+        len(pr.tool_calls) > max_tool_calls_per_round
+        or tool_calls_used + len(pr.tool_calls) > max_tool_calls_per_turn
+    )
+    offered_names = {spec.name for spec in (tools or [])}
+    individual_rejection_reasons: list[list[str]] = []
+    for tc in pr.tool_calls:
+        reasons: list[str] = []
+        if not tc.id:
+            reasons.append("missing_tool_call_id")
+        if not tc.name:
+            reasons.append("missing_tool_name")
+        if not tc.args_ok:
+            reasons.append("invalid_tool_arguments")
+        if (
+            tc.name not in offered_names
+            and tc.name not in completed_memory_discovery_tools
+        ):
+            reasons.append("unknown_tool")
+        elif (
+            external_content_seen
+            and tc.name == "web_fetch"
+            and str(tc.args.get("url") or "").strip() not in allowed_fetch_urls
+        ):
+            reasons.append("unapproved_external_url")
+        individual_rejection_reasons.append(reasons)
+    # Provider media is terminal output. Do not silently discard or retain
+    # its large inline payload when a broken relay also invents function calls.
+    malformed = (
+        (terminal_text_round and bool(pr.tool_calls))
+        or bool(pr.media)
+        or any(individual_rejection_reasons)
+    )
+    truncated_tool_arguments = (
+        provider_client.is_token_limit_stop_reason(raw_finish_reason)
+        and any(not tc.args_ok for tc in pr.tool_calls)
+    )
+    image_reply_calls = [
+        tc for tc in pr.tool_calls if tc.name == tool_schema.IMAGE_REPLY_TOOL
+    ]
+    stay_silent_calls = [
+        tc for tc in pr.tool_calls if tc.name == tool_schema.STAY_SILENT_TOOL
+    ]
+    mixed_reply_write = any(
+        tc.name in {
+            tool_schema.FILE_REPLY_TOOL,
+            tool_schema.IMAGE_REPLY_TOOL,
+            tool_schema.STAY_SILENT_TOOL,
+        }
+        for tc in pr.tool_calls
+    ) and any(
+        tc.name in _PLATFORM_MUTATION_TOOLS or tc.name in mutating_mcp_names
+        for tc in pr.tool_calls
+    )
+    invalid_image_batch = bool(image_reply_calls) and (
+        len(image_reply_calls) != 1 or len(pr.tool_calls) != 1
+    )
+    invalid_silence_batch = bool(stay_silent_calls) and (
+        len(stay_silent_calls) != 1 or len(pr.tool_calls) != 1
+    )
+    duplicate_call_ids = {
+        call_id
+        for call_id in call_ids
+        if call_id and call_ids.count(call_id) > 1
+    }
+    batch_rejection_reasons: list[str] = []
+    if terminal_text_round:
+        batch_rejection_reasons.append("terminal_tool_call_rejected")
+    if pr.media:
+        batch_rejection_reasons.append("provider_media_with_tool_calls")
+    if mixed_reply_write:
+        batch_rejection_reasons.append("mixed_reply_and_mutation")
+    if invalid_image_batch:
+        batch_rejection_reasons.append("invalid_image_reply_batch")
+    if invalid_silence_batch:
+        batch_rejection_reasons.append("invalid_stay_silent_batch")
+    if over_tool_call_budget:
+        batch_rejection_reasons.append("tool_call_budget_exceeded")
+    if sum(size or 0 for size in argument_sizes) > batch_arguments_limit:
+        batch_rejection_reasons.append("tool_batch_arguments_too_large")
+    if native_turn_size is None or native_turn_size > native_assistant_turn_limit:
+        batch_rejection_reasons.append("native_assistant_turn_too_large")
+    if len(pr.text) > max_assistant_tool_text_chars:
+        batch_rejection_reasons.append("assistant_tool_text_too_large")
+    call_rejection_reasons: list[str] = []
+    for tc, argument_size, argument_limit, individual_reasons in zip(
+        pr.tool_calls,
+        argument_sizes,
+        argument_limits,
+        individual_rejection_reasons,
+    ):
+        reasons = list(individual_reasons)
+        if tc.id in duplicate_call_ids:
+            reasons.append("duplicate_tool_call_id")
+        if argument_size is None or argument_size > argument_limit:
+            reasons.append("tool_arguments_too_large")
+        reasons.extend(batch_rejection_reasons)
+        call_rejection_reasons.append(
+            ",".join(dict.fromkeys(reasons))
+            or "invalid_or_over_budget_tool_exchange"
+        )
+    rejected = bool(pr.tool_calls) and (
+        malformed
+        or len(set(call_ids)) != len(call_ids)
+        or mixed_reply_write
+        or invalid_image_batch
+        or invalid_silence_batch
+        or over_tool_call_budget
+        or oversized_tool_exchange
+    )
+    reason_tokens = (
+        _normalize_provider_call_rejection_reasons(
+            [
+                token
+                for joined_reasons in call_rejection_reasons
+                for token in joined_reasons.split(",")
+            ]
+        )
+        if rejected
+        else []
+    )
+    if rejected and not reason_tokens:
+        reason_tokens = ["unclassified_rejection"]
+    return _ToolCallRejectionFacts(
+        call_ids=call_ids,
+        image_reply_calls=image_reply_calls,
+        stay_silent_calls=stay_silent_calls,
+        oversized_tool_exchange=oversized_tool_exchange,
+        over_tool_call_budget=over_tool_call_budget,
+        malformed=malformed,
+        truncated_tool_arguments=truncated_tool_arguments,
+        mixed_reply_write=mixed_reply_write,
+        invalid_image_batch=invalid_image_batch,
+        invalid_silence_batch=invalid_silence_batch,
+        call_rejection_reasons=call_rejection_reasons,
+        reason_tokens=reason_tokens,
+    )
 
 
 def _truncate_result_content(content: str, cap: int, *, marker: str = _RESULT_TRUNCATION_MARKER) -> str:
@@ -1275,6 +1545,27 @@ async def run_tool_loop(
         except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
             pass
 
+    async def _emit_provider_tool_surface(
+        detail: dict | None,
+        rejection_reasons=(),
+    ) -> None:
+        """Emit the request surface once its same-round response is classified."""
+        if on_provider_tool_surface is None or detail is None:
+            return
+        try:
+            await on_provider_tool_surface(
+                {
+                    **detail,
+                    "call_rejection_reasons": (
+                        _normalize_provider_call_rejection_reasons(
+                            list(rejection_reasons)
+                        )
+                    ),
+                }
+            )
+        except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
+            pass
+
     def _provider_error_facts(exc: BaseException) -> dict[str, object]:
         """Derive closed failure metadata without trusting exception text."""
         status_code = getattr(exc, "status_code", None)
@@ -2043,6 +2334,7 @@ async def run_tool_loop(
         )
         provider_call_started_at = time.monotonic()
         provider_error: BaseException | None = None
+        provider_surface_detail: dict | None = None
         try:
             # V2 owns the lane-specific empty-response policy. Let the provider
             # parser return any structurally valid success so an abnormal HTTP
@@ -2107,34 +2399,27 @@ async def run_tool_loop(
                 sent_names = {str(spec.name) for spec in (tools or [])}
                 mcp_candidate_names = candidate_names & mcp_names
                 mcp_sent_names = sent_names & mcp_names
-                try:
-                    await on_provider_tool_surface(
-                        {
-                            "round": attempts,
-                            "candidate_tool_count": len(candidate_names),
-                            "sent_tool_count": len(sent_names),
-                            "dropped_tool_count": len(candidate_names - sent_names),
-                            "mcp_candidate_tool_count": len(mcp_candidate_names),
-                            "mcp_sent_tool_count": len(mcp_sent_names),
-                            "mcp_dropped_tool_count": len(
-                                mcp_candidate_names - mcp_sent_names
-                            ),
-                            "reason": surface_reason or "none",
-                            "terminal_text_round": terminal_text_round,
-                            "terminal_text_round_reason": (
-                                terminal_text_round_reason
-                            ),
-                            "force_text_fallback_reason": (
-                                force_text_fallback_reason or "none"
-                            ),
-                            "empty_response_recovery": bool(
-                                empty_response_retry_instruction
-                            ),
-                            "wake_choice_required": wake_choice_required,
-                        }
-                    )
-                except Exception:
-                    pass
+                provider_surface_detail = {
+                    "round": attempts,
+                    "candidate_tool_count": len(candidate_names),
+                    "sent_tool_count": len(sent_names),
+                    "dropped_tool_count": len(candidate_names - sent_names),
+                    "mcp_candidate_tool_count": len(mcp_candidate_names),
+                    "mcp_sent_tool_count": len(mcp_sent_names),
+                    "mcp_dropped_tool_count": len(
+                        mcp_candidate_names - mcp_sent_names
+                    ),
+                    "reason": surface_reason or "none",
+                    "terminal_text_round": terminal_text_round,
+                    "terminal_text_round_reason": terminal_text_round_reason,
+                    "force_text_fallback_reason": (
+                        force_text_fallback_reason or "none"
+                    ),
+                    "empty_response_recovery": bool(
+                        empty_response_retry_instruction
+                    ),
+                    "wake_choice_required": wake_choice_required,
+                }
             result = await provider_client.reliable_chat_completion_async(
                 provider_config,
                 messages,
@@ -2200,6 +2485,7 @@ async def run_tool_loop(
                 provider_error = exc
         if provider_error is not None:
             exc = provider_error
+            await _emit_provider_tool_surface(provider_surface_detail)
             await _provider_call_event(
                 "error",
                 {
@@ -2384,6 +2670,53 @@ async def run_tool_loop(
         # ProviderResponse.raw keeps its input mapping alive.
         result = provider_client.without_runtime_provider_attempt_trace(result)
         pr = ProviderResponse.from_result(result)
+        rejection_facts = (
+            _tool_call_rejection_facts(
+                pr,
+                tools=tools,
+                raw_finish_reason=raw_finish_reason,
+                terminal_text_round=terminal_text_round,
+                tool_calls_used=tool_calls_used,
+                completed_memory_discovery_tools=(
+                    completed_memory_discovery_tools
+                ),
+                external_content_seen=external_content_seen,
+                allowed_fetch_urls=allowed_fetch_urls,
+                mutating_mcp_names=mutating_mcp_names,
+                max_tool_args_chars=max_tool_args_chars,
+                max_tool_batch_args_chars=max_tool_batch_args_chars,
+                max_native_assistant_turn_chars=(
+                    max_native_assistant_turn_chars
+                ),
+                max_assistant_tool_text_chars=max_assistant_tool_text_chars,
+                max_tool_calls_per_round=max_tool_calls_per_round,
+                max_tool_calls_per_turn=max_tool_calls_per_turn,
+            )
+            if pr.tool_calls
+            else None
+        )
+        surface_rejection_reasons = (
+            rejection_facts.reason_tokens if rejection_facts is not None else []
+        )
+        if wake_choice_required or tools is None:
+            # These branches have their own terminal/empty response contracts;
+            # they never enter the generic rejected-tool-exchange path below.
+            surface_rejection_reasons = []
+        if terminal_text_round and pr.tool_calls and (
+            tools is not None or pr.text.strip()
+        ):
+            surface_rejection_reasons = (
+                _normalize_provider_call_rejection_reasons(
+                    [
+                        *surface_rejection_reasons,
+                        "terminal_tool_call_rejected",
+                    ]
+                )
+            )
+        await _emit_provider_tool_surface(
+            provider_surface_detail,
+            surface_rejection_reasons,
+        )
 
         if wake_choice_required:
             wake_reply_calls = [
@@ -3003,151 +3336,18 @@ async def run_tool_loop(
                 delivered_media_count=len(pr.media),
             )
 
-        call_ids = [tc.id for tc in pr.tool_calls]
-        argument_sizes = [
-            (_serialized_chars(tc.args) if tc.args_ok else len(str(tc.args_raw or "")))
-            for tc in pr.tool_calls
-        ]
-        argument_limits = [
-            _tool_args_char_limit(tc, max_tool_args_chars)
-            for tc in pr.tool_calls
-        ]
-        batch_arguments_limit = max_tool_batch_args_chars
-        native_assistant_turn_limit = max_native_assistant_turn_chars
-        if (
-            len(pr.tool_calls) == 1
-            and argument_limits
-            and argument_limits[0] > max_tool_args_chars
-        ):
-            batch_arguments_limit = max(
-                batch_arguments_limit,
-                argument_limits[0],
-            )
-            native_assistant_turn_limit = max(
-                native_assistant_turn_limit,
-                argument_limits[0] + max_assistant_tool_text_chars + 8192,
-            )
-        native_turn_size = (
-            _serialized_chars(pr.assistant_turn.payload)
-            if pr.assistant_turn is not None
-            else 0
-        )
-        oversized_tool_exchange = (
-            any(
-                size is None or size > limit
-                for size, limit in zip(argument_sizes, argument_limits)
-            )
-            or sum(size or 0 for size in argument_sizes) > batch_arguments_limit
-            or native_turn_size is None
-            or native_turn_size > native_assistant_turn_limit
-            or len(pr.text) > max_assistant_tool_text_chars
-        )
-        over_tool_call_budget = (
-            len(pr.tool_calls) > max_tool_calls_per_round
-            or tool_calls_used + len(pr.tool_calls) > max_tool_calls_per_turn
-        )
-        offered_names = {spec.name for spec in tools}
-        individual_rejection_reasons: list[list[str]] = []
-        for tc in pr.tool_calls:
-            reasons: list[str] = []
-            if not tc.id:
-                reasons.append("missing_tool_call_id")
-            if not tc.name:
-                reasons.append("missing_tool_name")
-            if not tc.args_ok:
-                reasons.append("invalid_tool_arguments")
-            if (
-                tc.name not in offered_names
-                and tc.name not in completed_memory_discovery_tools
-            ):
-                reasons.append("unknown_tool")
-            elif (
-                external_content_seen
-                and tc.name == "web_fetch"
-                and str(tc.args.get("url") or "").strip()
-                not in allowed_fetch_urls
-            ):
-                reasons.append("unapproved_external_url")
-            individual_rejection_reasons.append(reasons)
-        # Provider media is terminal output. Do not silently discard or retain
-        # its large inline payload when a broken relay also invents function
-        # calls in the same turn; fall back once with tool choice disabled.
-        malformed = (
-            (terminal_text_round and bool(pr.tool_calls))
-            or bool(pr.media)
-            or any(individual_rejection_reasons)
-        )
-        truncated_tool_arguments = (
-            provider_client.is_token_limit_stop_reason(raw_finish_reason)
-            and any(not tc.args_ok for tc in pr.tool_calls)
-        )
-        image_reply_calls = [
-            tc for tc in pr.tool_calls if tc.name == tool_schema.IMAGE_REPLY_TOOL
-        ]
-        stay_silent_calls = [
-            tc for tc in pr.tool_calls if tc.name == tool_schema.STAY_SILENT_TOOL
-        ]
-        mixed_reply_write = any(
-            tc.name in {
-                tool_schema.FILE_REPLY_TOOL,
-                tool_schema.IMAGE_REPLY_TOOL,
-                tool_schema.STAY_SILENT_TOOL,
-            }
-            for tc in pr.tool_calls
-        ) and any(
-            tc.name in _PLATFORM_MUTATION_TOOLS or tc.name in mutating_mcp_names
-            for tc in pr.tool_calls
-        )
-        invalid_image_batch = bool(image_reply_calls) and (
-            len(image_reply_calls) != 1 or len(pr.tool_calls) != 1
-        )
-        invalid_silence_batch = bool(stay_silent_calls) and (
-            len(stay_silent_calls) != 1 or len(pr.tool_calls) != 1
-        )
-        duplicate_call_ids = {
-            call_id
-            for call_id in call_ids
-            if call_id and call_ids.count(call_id) > 1
-        }
-        batch_rejection_reasons: list[str] = []
-        if terminal_text_round:
-            batch_rejection_reasons.append("terminal_tool_call_rejected")
-        if pr.media:
-            batch_rejection_reasons.append("provider_media_with_tool_calls")
-        if mixed_reply_write:
-            batch_rejection_reasons.append("mixed_reply_and_mutation")
-        if invalid_image_batch:
-            batch_rejection_reasons.append("invalid_image_reply_batch")
-        if invalid_silence_batch:
-            batch_rejection_reasons.append("invalid_stay_silent_batch")
-        if over_tool_call_budget:
-            batch_rejection_reasons.append("tool_call_budget_exceeded")
-        if sum(size or 0 for size in argument_sizes) > batch_arguments_limit:
-            batch_rejection_reasons.append("tool_batch_arguments_too_large")
-        if (
-            native_turn_size is None
-            or native_turn_size > native_assistant_turn_limit
-        ):
-            batch_rejection_reasons.append("native_assistant_turn_too_large")
-        if len(pr.text) > max_assistant_tool_text_chars:
-            batch_rejection_reasons.append("assistant_tool_text_too_large")
-        call_rejection_reasons: list[str] = []
-        for tc, argument_size, argument_limit, individual_reasons in zip(
-            pr.tool_calls,
-            argument_sizes,
-            argument_limits,
-            individual_rejection_reasons,
-        ):
-            reasons = list(individual_reasons)
-            if tc.id in duplicate_call_ids:
-                reasons.append("duplicate_tool_call_id")
-            if argument_size is None or argument_size > argument_limit:
-                reasons.append("tool_arguments_too_large")
-            reasons.extend(batch_rejection_reasons)
-            call_rejection_reasons.append(
-                ",".join(dict.fromkeys(reasons))
-                or "invalid_or_over_budget_tool_exchange"
-            )
+        assert rejection_facts is not None
+        call_ids = rejection_facts.call_ids
+        image_reply_calls = rejection_facts.image_reply_calls
+        stay_silent_calls = rejection_facts.stay_silent_calls
+        malformed = rejection_facts.malformed
+        truncated_tool_arguments = rejection_facts.truncated_tool_arguments
+        mixed_reply_write = rejection_facts.mixed_reply_write
+        invalid_image_batch = rejection_facts.invalid_image_batch
+        invalid_silence_batch = rejection_facts.invalid_silence_batch
+        over_tool_call_budget = rejection_facts.over_tool_call_budget
+        oversized_tool_exchange = rejection_facts.oversized_tool_exchange
+        call_rejection_reasons = rejection_facts.call_rejection_reasons
         if (
             malformed
             or len(set(call_ids)) != len(call_ids)

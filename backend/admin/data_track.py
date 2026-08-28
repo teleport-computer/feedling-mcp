@@ -3668,6 +3668,25 @@ def _debug_event_public_json(
         ):
             public_detail["components"] = [dict(item) for item in components]
     if (
+        ev.get("type") == "mcp.surface.provider"
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        # This list is emitted only after the same provider round has been
+        # classified. Expose it only when the whole value is the producer's
+        # already-normalized, deduplicated closed vocabulary.
+        from model_api_runtime.v2 import tool_loop as v2_tool_loop
+
+        rejection_reasons = raw_detail.get("call_rejection_reasons")
+        if (
+            isinstance(rejection_reasons, list)
+            and v2_tool_loop._normalize_provider_call_rejection_reasons(
+                rejection_reasons
+            )
+            == rejection_reasons
+        ):
+            public_detail["call_rejection_reasons"] = list(rejection_reasons)
+    if (
         ev.get("type") == "mcp.roundtrip.provider"
         and isinstance(raw_detail, dict)
         and isinstance(public_detail, dict)
