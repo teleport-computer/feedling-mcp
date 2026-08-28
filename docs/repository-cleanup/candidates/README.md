@@ -12,7 +12,7 @@ gross 删除估算均以该提交为准，实施前必须 rebase `test` 并重�
 
 | 顺序 | 候选 | 结论 | gross 删除 / net | 主要原因 |
 |---|---|---|---:|---|
-| 1 | [失效的 `e2e_model_api_test.py`](e2e-model-api-test.md) | `delete` | gross 253 行；net 待 diff | 当前 202 契约会被判失败，脚本最终又无条件返回成功 |
+| 1 | [失效的 `e2e_model_api_test.py`](e2e-model-api-test.md) | `delete`（已实施） | gross 253 行；net 删除 239 行 | 当前 202 契约会被判失败，脚本最终又无条件返回成功 |
 | 2 | [Route-B 旧 selector/feature flag 岛](route-b-readside-island.md) | `delete` | gross 约 250–300 行；net 待 diff | 生产已固定走统一 bucketed selector，旧实现仅剩测试消费者 |
 | 3 | [`db.py` 三个零消费者叶子](db-dead-leaves.md) | `delete` | gross 约 31 行；预期 net 接近 31 行 | 无生产、测试、文档和动态调用证据 |
 | 3 | [`v2_user_triage.py` 旧 semantic-compaction 诊断](v2-user-triage-semantic-compaction.md) | `delete`（局部） | gross 约 90–110 行；net 待 diff | 旧 body/char-budget 与泛化错误归因会误诊当前 metadata-only compaction |

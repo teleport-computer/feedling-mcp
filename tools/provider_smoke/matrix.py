@@ -1,5 +1,9 @@
-"""Provider/relay test matrix. Models mirror tests/e2e_model_api_test.py and are
-the single place to edit when a provider's available model id changes."""
+"""Legacy Hosted Resident provider/relay smoke matrix.
+
+This surface is intentionally separate from the release P0 matrix in
+``tools.e2e.config`` until canonical E2E covers Resident route switching and
+runner respawn.  Do not treat these model ids as the release truth-map.
+"""
 
 # provider -> static spec. `models` is a candidate list tried in order at setup.
 PROVIDER_MATRIX: dict[str, dict] = {

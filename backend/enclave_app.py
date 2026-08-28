@@ -5,7 +5,7 @@
 2026-07-04-enclave-asgi-migration-design 已删，见 git 历史）。
 本文件保持 `python -u backend/enclave_app.py` 启动方式不变
 （compose 命令与 compose_hash 故事不变，CONTRIBUTING §7；
-tools/e2e_encryption_test.py 与 tests/e2e_model_api_test.py 也直接拉起它）。"""
+tools/e2e_encryption_test.py 也直接拉起它）。"""
 
 from __future__ import annotations
 

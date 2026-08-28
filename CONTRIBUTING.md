@@ -250,16 +250,15 @@ result = chat_completion(runtime, messages)
   的一次性测试库（`FEEDLING_TEST_PG`，默认 `127.0.0.1:55432`）；
   **不需要 DB 的纯单元测试**，把文件名加进 `tests/conftest.py` 的
   `_PURE_UNIT` 集合，这样没有 Postgres 的机器也能跑它。
-- 两个特例不是 pytest 套件，永远用 `--ignore` 排除：
-  `tests/test_api.py`（活服务器集成脚本，CI 单独起后端再跑它）、
-  `tests/e2e_model_api_test.py`。
+- 唯一特例 `tests/test_api.py` 是活服务器集成脚本，不是 pytest 套件；
+  本地 pytest 永远用 `--ignore` 排除，CI 会单独起后端再跑它。
 - 提交前本地至少跑：
   ```bash
-  python -m pytest tests/ -q \
-      --ignore=tests/e2e_model_api_test.py --ignore=tests/test_api.py
+  python -m pytest tests/ -q --ignore=tests/test_api.py
   python -m pyflakes backend/<你改动的包>
   ```
-  已知 2 个长期红的 enclave 依赖用例（见 backlog #12），判据是**零新增失败**。
+  测试红时先排除本地 PostgreSQL、loopback/socket 权限等环境差异；不要把环境错误
+  当成代码基线，也不要用“零新增失败”接受未登记的长期红。
 
 ---
 
