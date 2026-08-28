@@ -1670,6 +1670,9 @@ def admin_data_track_snapshot(
     out: dict[str, dict] = {
         uid: {
             "app_usage": {"foreground_sec": 0, "sessions": 0, "last_at": None},
+            "legacy_background_breakdowns_status": (
+                "available" if include_legacy_background else "omitted"
+            ),
             "snapshot_read_status": {"level": "ok", "message": ""},
         }
         for uid in ids
