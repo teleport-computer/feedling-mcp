@@ -1111,9 +1111,11 @@ def _web_visible_for_user(user_id: str) -> bool:
         from web import settings_core as web_settings_core
 
         return bool(
-            web_settings_core.get_settings(core_store.get_store(user_id)).get(
-                "effective"
-            )
+            web_settings_core.get_settings(
+                core_store.get_store_shell_only(
+                    user_id, reason="web settings are direct blob reads"
+                )
+            ).get("effective")
         )
     except Exception as e:  # noqa: BLE001 — advertised-verb display must never block a spawn
         log.warning("web-visibility read failed for %s (advertising off): %s", user_id, e)

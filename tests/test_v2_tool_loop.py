@@ -10,6 +10,7 @@ not the pytest-asyncio marker, to avoid a plugin-config dependency.
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import sys
@@ -2885,6 +2886,114 @@ def test_provider_call_rejection_producers_are_all_in_public_vocabulary():
         "unclassified_rejection"
         in tool_loop._PROVIDER_CALL_REJECTION_REASONS
         - tool_loop._PROVIDER_CALL_REJECTION_PRODUCER_REASONS
+    )
+
+
+def _provider_call_rejection_producer_scan():
+    path = Path(tool_loop.__file__)
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    facts = functions["_tool_call_rejection_facts"]
+    run_loop = functions["run_tool_loop"]
+
+    module_strings = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Constant):
+            continue
+        if not isinstance(node.value.value, str):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                module_strings[target.id] = node.value.value
+
+    expressions: list[tuple[str, ast.expr]] = []
+    for node in ast.walk(facts):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "append"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id.endswith("reasons")
+            and node.args
+        ):
+            expressions.append(("_tool_call_rejection_facts", node.args[0]))
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(
+                isinstance(target, ast.Name) and target.id == "reason_tokens"
+                for target in targets
+            ):
+                expressions.append(("_tool_call_rejection_facts", node.value))
+
+    for node in ast.walk(run_loop):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(
+                isinstance(target, ast.Name)
+                and target.id in {"schema_rejection_reasons", "surface_rejection_reasons"}
+                for target in targets
+            ):
+                expressions.append(("run_tool_loop", node.value))
+        elif (
+            isinstance(node, ast.Call)
+            and (
+                getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            )
+            == "_rejected_tool_exchange"
+        ):
+            expressions.extend(
+                ("run_tool_loop", keyword.value)
+                for keyword in node.keywords
+                if keyword.arg == "rejection_reasons"
+            )
+
+    found: dict[str, list[str]] = {}
+    bare: list[str] = []
+    for function_name, expression in expressions:
+        for node in ast.walk(expression):
+            if isinstance(node, ast.Name) and node.id in module_strings:
+                value = module_strings[node.id]
+                if value.replace("_", "").isalnum() and value == value.lower():
+                    found.setdefault(value, []).append(
+                        f"{function_name}:{node.lineno}:{node.id}"
+                    )
+            elif (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and node.value.replace("_", "").isalnum()
+                and node.value == node.value.lower()
+            ):
+                bare.append(f"{function_name}:{node.lineno}:{node.value}")
+    return found, bare
+
+
+def test_provider_call_rejection_scanner_finds_named_producer_sites():
+    found, bare = _provider_call_rejection_producer_scan()
+    assert not bare, bare
+    assert "missing_tool_call_id" in found, found
+    assert any(
+        location.startswith("_tool_call_rejection_facts:")
+        for location in found["missing_tool_call_id"]
+    )
+    assert "invalid_tool_arguments" in found, found
+    assert any(
+        location.startswith("run_tool_loop:")
+        for location in found["invalid_tool_arguments"]
+    )
+    assert "unclassified_rejection" in found, found
+
+
+def test_provider_call_rejection_vocabulary_is_derived_from_producer_sites():
+    found, bare = _provider_call_rejection_producer_scan()
+    assert not bare, bare
+    assert set(found) == tool_loop._PROVIDER_CALL_REJECTION_REASONS
+    assert (
+        set(found) - {tool_loop._PROVIDER_CALL_REJECTION_REASON_UNCLASSIFIED}
+        == tool_loop._PROVIDER_CALL_REJECTION_PRODUCER_REASONS
     )
 
 

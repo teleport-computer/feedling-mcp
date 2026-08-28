@@ -21,7 +21,7 @@ import httpx
 import db
 import debug_trace
 import provider_client
-from core.store import get_store
+from core.store import get_store_shell_only
 from genesis import checkpoint, foreground, prompts, service
 from genesis.llm_client import GenesisLLMClient
 from identity.user_naming import rewrite_user_reference
@@ -1907,7 +1907,9 @@ def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_toke
     job_id = str(job.get("job_id") or "")
     if not user_id or not job_id:
         raise GenesisWorkerError("invalid_claimed_job")
-    store = get_store(user_id)
+    store = get_store_shell_only(
+        user_id, reason="genesis state and tracing use direct DB/blob helpers"
+    )
     _trace_genesis(
         store,
         "genesis.worker.claimed",
@@ -2033,7 +2035,9 @@ def reap_stale_processing_jobs() -> list[dict]:
         job_id = str(job.get("job_id") or "")
         if not user_id or not job_id:
             continue
-        store = get_store(user_id)
+        store = get_store_shell_only(
+            user_id, reason="genesis reaper uses direct DB/blob helpers"
+        )
         try:
             service.write_genesis_state(store, job, status="failed")
         except Exception as e:  # noqa: BLE001
@@ -2094,7 +2098,9 @@ def reclaim_orphaned_processing_jobs(live_worker_ids: list[str]) -> list[dict]:
         if not user_id or not job_id:
             continue
         action = str(job.get("_reclaim_action") or "failed")
-        store = get_store(user_id)
+        store = get_store_shell_only(
+            user_id, reason="genesis reclaim uses direct DB/blob helpers"
+        )
         # requeued -> back to 'uploaded' (still importing); failed -> terminal.
         blob_status = "uploaded" if action == "requeued" else "failed"
         try:
@@ -2138,7 +2144,9 @@ def reap_stale_resident_jobs() -> list[dict]:
         if not user_id or not job_id:
             continue
         status = str(job.get("status") or "")
-        store = get_store(user_id)
+        store = get_store_shell_only(
+            user_id, reason="resident genesis reaper uses direct DB/blob helpers"
+        )
         if status == "failed":
             try:
                 service.write_genesis_state(store, job, status="failed")
@@ -2207,7 +2215,9 @@ def reap_stale_unclaimed_jobs() -> list[dict]:
         job_id = str(job.get("job_id") or "")
         if not user_id or not job_id:
             continue
-        store = get_store(user_id)
+        store = get_store_shell_only(
+            user_id, reason="unclaimed genesis reaper uses direct DB/blob helpers"
+        )
         try:
             _write_genesis_state_if_current(store, job)
         except Exception as e:  # noqa: BLE001
@@ -2269,7 +2279,10 @@ def tick(
         except Exception as e:  # noqa: BLE001
             failed += 1
             if user_id and job_id:
-                store = get_store(user_id)
+                store = get_store_shell_only(
+                    user_id,
+                    reason="genesis failure handling uses direct DB/blob helpers",
+                )
                 _trace_genesis(
                     store,
                     "genesis.worker.failed",

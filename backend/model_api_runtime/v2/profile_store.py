@@ -224,7 +224,9 @@ def validate_profile_document(value: Any) -> dict:
 
 
 def _seal_text(user_id: str, plaintext: str) -> dict:
-    store = core_store.get_store(str(user_id))
+    store = core_store.get_store_shell_only(
+        str(user_id), reason="envelope construction needs identity only"
+    )
     envelope, _error = core_envelope._build_shared_envelope_for_store(
         store,
         str(plaintext).encode("utf-8"),
