@@ -28,7 +28,7 @@ from admin import trace_events_monitor as monitor  # noqa: E402
 from admin import trace_events_partitions as partitions  # noqa: E402
 from core import leader as core_leader  # noqa: E402
 from core.reqctx import bind  # noqa: E402
-from model_api_runtime.v2 import jobs_store  # noqa: E402
+from model_api_runtime.v2 import jobs_store, tool_loop  # noqa: E402
 
 
 _ZONE = ZoneInfo("Asia/Shanghai")
@@ -583,6 +583,10 @@ def test_detail_list_caps_cannot_drift_past_the_silent_ceiling():
     from model_api_runtime.v2 import serve_worker
 
     assert serve_worker._MCP_CATALOG_MAX_TOOLS <= debug_trace._DETAIL_MAX_LIST
+    assert (
+        tool_loop._PROVIDER_TOOL_NAME_TRACE_CAP
+        <= debug_trace._DETAIL_MAX_LIST
+    )
 
     names = [f"tool_{i}" for i in range(debug_trace._DETAIL_MAX_LIST + 14)]
     bounded = debug_trace.bounded_names("collapsed_names", names)
