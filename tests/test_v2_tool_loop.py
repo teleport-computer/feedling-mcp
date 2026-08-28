@@ -2902,10 +2902,14 @@ def test_rejected_round_with_unknown_vocabulary_is_not_reported_as_healthy(
         {"reply": "fallback", "tool_calls": [], "usage": {}},
     ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    (unclassified_reason,) = (
+        tool_loop._PROVIDER_CALL_REJECTION_REASONS
+        - tool_loop._PROVIDER_CALL_REJECTION_PRODUCER_REASONS
+    )
     monkeypatch.setattr(
         tool_loop,
         "_PROVIDER_CALL_REJECTION_REASONS",
-        frozenset({"unclassified_rejection"}),
+        frozenset({unclassified_reason}),
     )
     surfaces = []
 
@@ -2924,7 +2928,53 @@ def test_rejected_round_with_unknown_vocabulary_is_not_reported_as_healthy(
     ))
 
     assert [surface["call_rejection_reasons"] for surface in surfaces] == [
-        ["unclassified_rejection"],
+        [unclassified_reason],
+        [],
+    ]
+    assert outcome.final_text == "fallback"
+
+
+def test_schema_rejected_round_with_unknown_vocabulary_uses_sentinel(
+    monkeypatch,
+):
+    provider = _ScriptedProvider([
+        {
+            "reply": "trying",
+            "tool_calls": [
+                {"id": "schema-invalid", "name": "memory_search", "args": {}}
+            ],
+            "usage": {},
+        },
+        {"reply": "fallback", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    (unclassified_reason,) = (
+        tool_loop._PROVIDER_CALL_REJECTION_REASONS
+        - tool_loop._PROVIDER_CALL_REJECTION_PRODUCER_REASONS
+    )
+    monkeypatch.setattr(
+        tool_loop,
+        "_PROVIDER_CALL_REJECTION_REASONS",
+        frozenset({unclassified_reason}),
+    )
+    surfaces = []
+
+    async def record_surface(detail):
+        surfaces.append(detail)
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[]]),
+        add_usage=_noop_add_usage,
+        max_calls=3,
+        on_provider_tool_surface=record_surface,
+    ))
+
+    assert [surface["call_rejection_reasons"] for surface in surfaces] == [
+        [unclassified_reason],
         [],
     ]
     assert outcome.final_text == "fallback"
@@ -4274,6 +4324,21 @@ def test_quote_dense_canvas_at_utf8_contract_limit_reaches_workspace_dispatch(
     assert outcome.final_text == "Canvas delivered."
 
 
+def test_withdrawn_and_unknown_tokens_stay_distinguishable():
+    withdrawn = tool_loop._TOOL_WITHDRAWN_REJECTION_REASON
+    unknown = tool_loop._UNKNOWN_TOOL_REJECTION_REASON
+
+    assert withdrawn != unknown
+    assert {
+        withdrawn,
+        unknown,
+    } <= tool_loop._PROVIDER_CALL_REJECTION_PRODUCER_REASONS
+    assert {
+        withdrawn,
+        unknown,
+    } <= tool_loop._PROVIDER_CALL_REJECTION_REASONS
+
+
 def test_rejected_invented_tool_name_does_not_restore_unknown_schema(monkeypatch):
     provider = _ScriptedProvider([
         {"reply": "", "tool_calls": [
@@ -4281,6 +4346,10 @@ def test_rejected_invented_tool_name_does_not_restore_unknown_schema(monkeypatch
         {"reply": "plain fallback", "tool_calls": [], "usage": {}},
     ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    surfaces = []
+
+    async def record_surface(detail):
+        surfaces.append(detail)
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
         provider_config=_TEST_PROVIDER_CONFIG,
@@ -4288,6 +4357,7 @@ def test_rejected_invented_tool_name_does_not_restore_unknown_schema(monkeypatch
         dispatch_tools=_RecordingDispatch(), on_reply=_RecordingReply(),
         fold_new_messages=_RecordingFold([[]]), add_usage=_noop_add_usage,
         max_calls=3,
+        on_provider_tool_surface=record_surface,
     ))
 
     assert provider.calls[1]["tools"] is None
@@ -4297,7 +4367,157 @@ def test_rejected_invented_tool_name_does_not_restore_unknown_schema(monkeypatch
         if isinstance(item, ToolExchange)
     )
     assert exchange.calls[0].name == "invented_tool"
-    assert exchange.results[0].metadata == {"rejected": "unknown_tool"}
+    assert exchange.results[0].metadata == {
+        "rejected": tool_loop._UNKNOWN_TOOL_REJECTION_REASON
+    }
+    assert surfaces[0]["call_rejection_reasons"] == [
+        tool_loop._UNKNOWN_TOOL_REJECTION_REASON
+    ]
+    assert outcome.final_text == "plain fallback"
+
+
+def test_tool_removed_after_workspace_write_is_reported_as_withdrawn(monkeypatch):
+    path = "/workspace/card.io.html"
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "write-first",
+                "name": "workspace_write",
+                "args": {
+                    "path": path,
+                    "content": "saved source",
+                    "expected_revision": 0,
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "write-withdrawn",
+                "name": "workspace_write",
+                "args": {
+                    "path": path,
+                    "content": "second write",
+                    "expected_revision": 1,
+                },
+            }],
+            "usage": {},
+        },
+        {"reply": "plain fallback", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    surfaces = []
+
+    async def record_surface(detail):
+        surfaces.append(detail)
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_TranscriptBuildMessages(),
+        dispatch_tools=_RecordingDispatch(
+            "ok: workspace_write applied at revision 1; "
+            "use revision 1 with send_file"
+        ),
+        on_reply=_RecordingReply(),
+        on_file_reply=lambda *_args, **_kwargs: None,
+        required_file_suffixes=(".io.html",),
+        fold_new_messages=_RecordingFold([[], []]),
+        add_usage=_noop_add_usage,
+        max_calls=4,
+        on_provider_tool_surface=record_surface,
+    ))
+
+    first_round_names = {
+        spec.name for spec in (provider.calls[0]["tools"] or [])
+    }
+    second_round_names = {
+        spec.name for spec in (provider.calls[1]["tools"] or [])
+    }
+    assert "workspace_write" in first_round_names
+    assert "workspace_write" not in second_round_names
+    exchange = next(
+        item for item in provider.calls[2]["messages"]
+        if isinstance(item, ToolExchange)
+        and item.calls[0].id.startswith(tool_loop.REJECTED_TOOL_CALL_ID_PREFIX)
+    )
+    assert exchange.results[0].metadata == {
+        "rejected": tool_loop._TOOL_WITHDRAWN_REJECTION_REASON
+    }
+    assert surfaces[1]["call_rejection_reasons"] == [
+        tool_loop._TOOL_WITHDRAWN_REJECTION_REASON
+    ]
+    assert outcome.final_text == "plain fallback"
+
+
+def test_provenance_withdrawn_workspace_write_is_reported_as_withdrawn(
+    monkeypatch,
+):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "search-first",
+                "name": "web_search",
+                "args": {"query": "external evidence"},
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "write-after-external",
+                "name": "workspace_write",
+                "args": {
+                    "path": "/workspace/card.io.html",
+                    "content": "untrusted write",
+                    "expected_revision": 0,
+                },
+            }],
+            "usage": {},
+        },
+        {"reply": "plain fallback", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    surfaces = []
+
+    async def record_surface(detail):
+        surfaces.append(detail)
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_TranscriptBuildMessages(),
+        dispatch_tools=_RecordingDispatch(
+            '{"results":[{"url":"https://example.com/evidence"}]}'
+        ),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[], []]),
+        add_usage=_noop_add_usage,
+        max_calls=4,
+        on_provider_tool_surface=record_surface,
+    ))
+
+    first_round_names = {
+        spec.name for spec in (provider.calls[0]["tools"] or [])
+    }
+    second_round_names = {
+        spec.name for spec in (provider.calls[1]["tools"] or [])
+    }
+    assert "workspace_write" in first_round_names
+    assert "workspace_write" not in second_round_names
+    assert "web_fetch" in second_round_names
+    exchange = next(
+        item for item in provider.calls[2]["messages"]
+        if isinstance(item, ToolExchange)
+        and item.calls[0].id.startswith(tool_loop.REJECTED_TOOL_CALL_ID_PREFIX)
+    )
+    assert exchange.results[0].metadata == {
+        "rejected": tool_loop._TOOL_WITHDRAWN_REJECTION_REASON
+    }
+    assert surfaces[1]["call_rejection_reasons"] == [
+        tool_loop._TOOL_WITHDRAWN_REJECTION_REASON
+    ]
     assert outcome.final_text == "plain fallback"
 
 
@@ -4376,21 +4596,26 @@ def test_rejected_exchanges_do_not_spend_tool_call_budget(monkeypatch):
 
 
 def test_schema_invalid_call_enters_rejection_transcript(monkeypatch):
+    invalid_call = {
+        "id": "invalid-schema", "name": "memory_search", "args": {},
+    }
     provider = _ScriptedProvider([
-        {"reply": "searching", "tool_calls": [{
-            "id": "invalid-schema", "name": "memory_search", "args": {},
-        }], "usage": {}},
+        {"reply": "searching", "tool_calls": [invalid_call], "usage": {}},
         {"reply": "plain fallback", "tool_calls": [], "usage": {}},
     ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     dispatch = _RecordingDispatch()
+    surfaces = []
+
+    async def record_surface(detail):
+        surfaces.append(detail)
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
         provider_config=_TEST_PROVIDER_CONFIG,
         build_messages=_TranscriptBuildMessages(),
         dispatch_tools=dispatch, on_reply=_RecordingReply(),
         fold_new_messages=_RecordingFold([[]]), add_usage=_noop_add_usage,
-        max_calls=3,
+        max_calls=3, on_provider_tool_surface=record_surface,
     ))
 
     exchange = next(
@@ -4399,7 +4624,77 @@ def test_schema_invalid_call_enters_rejection_transcript(monkeypatch):
     )
     assert exchange.calls[0].id.startswith(tool_loop.REJECTED_TOOL_CALL_ID_PREFIX)
     assert exchange.calls[0].id != "invalid-schema"
-    assert exchange.results[0].metadata == {"rejected": "invalid_tool_arguments"}
+    assert set(exchange.results[0].metadata or {}) == {"rejected"}
+    schema_rejection_reason = exchange.results[0].metadata["rejected"]
+    assert (
+        schema_rejection_reason
+        in tool_loop._PROVIDER_CALL_REJECTION_PRODUCER_REASONS
+    )
+    assert cap_tool_schema.validate_tool_args(
+        invalid_call["name"], invalid_call["args"]
+    ) is not None
+    assert [surface["call_rejection_reasons"] for surface in surfaces] == [
+        [schema_rejection_reason],
+        [],
+    ]
+    assert dispatch.calls == []
+    assert outcome.final_text == "plain fallback"
+
+
+def test_protocol_invalid_call_keeps_its_existing_surface_reason(monkeypatch):
+    parsed_args = {"query": "valid query"}
+    invalid_call = {
+        "id": "invalid-protocol",
+        "name": "memory_search",
+        "args": parsed_args,
+        "args_raw": "{",
+        "args_ok": False,
+    }
+    real_validate_tool_args = cap_tool_schema.validate_tool_args
+    assert real_validate_tool_args(invalid_call["name"], parsed_args) is None
+    validation_calls = []
+
+    def record_schema_validation(*args, **kwargs):
+        validation_calls.append((args, kwargs))
+        return real_validate_tool_args(*args, **kwargs)
+
+    monkeypatch.setattr(
+        cap_tool_schema,
+        "validate_tool_args",
+        record_schema_validation,
+    )
+    provider = _ScriptedProvider([
+        {"reply": "searching", "tool_calls": [invalid_call], "usage": {}},
+        {"reply": "plain fallback", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch()
+    surfaces = []
+
+    async def record_surface(detail):
+        surfaces.append(detail)
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_TranscriptBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[]]),
+        add_usage=_noop_add_usage,
+        max_calls=3,
+        on_provider_tool_surface=record_surface,
+    ))
+
+    exchange = next(
+        item for item in provider.calls[1]["messages"]
+        if isinstance(item, ToolExchange)
+    )
+    protocol_rejection_reason = exchange.results[0].metadata["rejected"]
+    assert validation_calls == []
+    assert [surface["call_rejection_reasons"] for surface in surfaces] == [
+        [protocol_rejection_reason],
+        [],
+    ]
     assert dispatch.calls == []
     assert outcome.final_text == "plain fallback"
 
