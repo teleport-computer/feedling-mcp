@@ -9,7 +9,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 
 | Lifecycle | Classified documents |
 |---|---:|
-| `current` | 43 |
+| `current` | 52 |
 | `decision` | 23 |
 | `historical` | 45 |
 | `generated` | 1 |
@@ -24,6 +24,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `deploy/DEPLOYMENTS.md`
 - `docs-site/content/docs/architecture.mdx`
 - `docs-site/content/docs/changelog.mdx`
+- `docs-site/content/docs/errors.mdx`
 - `docs-site/content/docs/reliability.mdx`
 - `docs-site/content/docs/self-hosting.mdx`
 - `docs-site/content/docs/workflows/chat.mdx`
@@ -34,6 +35,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md`
 - `docs/CURRENT_STATE.md`
 - `docs/DOCUMENT_LIFECYCLE.md`
+- `docs/OPTIMIZATION_BACKLOG.md`
 - `docs/PERCEPTION_ARCHITECTURE.zh.md`
 - `docs/PERCEPTION_PROMPT_ASSETS.zh.md`
 - `docs/PROJECT_OVERVIEW.md`
@@ -44,6 +46,13 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/repository-cleanup/README.md`
 - `docs/repository-cleanup/agent-diagnostic-benchmark.md`
 - `docs/repository-cleanup/api-product-history.md`
+- `docs/repository-cleanup/candidates/README.md`
+- `docs/repository-cleanup/candidates/db-dead-leaves.md`
+- `docs/repository-cleanup/candidates/e2e-model-api-test.md`
+- `docs/repository-cleanup/candidates/provider-smoke-harness.md`
+- `docs/repository-cleanup/candidates/route-b-readside-island.md`
+- `docs/repository-cleanup/candidates/v2-user-triage-semantic-compaction.md`
+- `docs/repository-cleanup/candidates/v2-watchdog-compatibility.md`
 - `docs/repository-cleanup/hosted-runtime-history.md`
 - `docs/repository-cleanup/memory-perception-history.md`
 - `docs/repository-cleanup/operations-history.md`
