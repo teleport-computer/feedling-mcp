@@ -2802,14 +2802,7 @@ class _ProviderRoundtripTrace:
         if detail.get("empty_response_recovery") is True:
             self.empty_response_recovery_used = True
 
-        trace_detail = {"lane": self.lane, **dict(detail)}
-        trace_detail["call_rejection_reasons"] = (
-            v2_tool_loop._normalize_provider_call_rejection_reasons(
-                detail.get("call_rejection_reasons")
-            )
-        )
-        if self.lane != "chat":
-            trace_detail["wake_kind"] = self.lane
+        trace_detail = _provider_tool_surface_trace_detail(self.lane, detail)
         await asyncio.to_thread(
             self.deps.emit_debug_trace,
             self.user_id,
@@ -2825,8 +2818,9 @@ class _ProviderRoundtripTrace:
                 f"裁剪 {trace_detail['dropped_tool_count']} 个"
             ),
             explain=(
-                "记录每次 provider 请求真正携带的工具数量;不记录工具参数、"
-                "返回值或用户内容。"
+                "记录每次 provider 请求真正携带的工具数量、平台闭词表内的"
+                "撤回/不可用调用名,以及非平台工具的分桶计数;不记录 MCP 名称、"
+                "工具参数、返回值或用户内容。"
             ),
             detail=trace_detail,
         )
@@ -2980,6 +2974,29 @@ class _ProviderRoundtripTrace:
                 self.user_id,
                 type(exc).__name__.lower(),
             )
+
+
+def _provider_tool_surface_trace_detail(
+    lane: str,
+    detail: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply the production worker-owned provider-surface detail projection."""
+    trace_detail = {"lane": lane, **dict(detail)}
+    trace_detail["call_rejection_reasons"] = (
+        v2_tool_loop._normalize_provider_call_rejection_reasons(
+            detail.get("call_rejection_reasons")
+        )
+    )
+    if lane != "chat":
+        trace_detail["wake_kind"] = lane
+    return trace_detail
+
+
+def _provider_tool_surface_added_detail_keys(lane: str) -> frozenset[str]:
+    """Derive worker-owned keys from the production projection itself."""
+    loop_owned_seed = {"call_rejection_reasons": []}
+    projected = _provider_tool_surface_trace_detail(lane, loop_owned_seed)
+    return frozenset(projected).difference(loop_owned_seed)
 
 
 def _provider_tool_surface_callback(

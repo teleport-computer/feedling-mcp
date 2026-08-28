@@ -20,10 +20,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import pytest
 
+import debug_trace
 import provider_client
 from capabilities import registry as cap_registry
 from capabilities import tool_schema as cap_tool_schema
-from provider_types import ProviderMedia, ToolExchange, ToolResult
+from provider_types import ProviderMedia, ToolExchange, ToolResult, ToolSpec
 from model_api_runtime.v2 import executor as v2_executor
 from model_api_runtime.v2 import tool_loop
 
@@ -4482,6 +4483,79 @@ def test_rejected_invented_tool_name_does_not_restore_unknown_schema(monkeypatch
     assert surfaces[0]["call_rejection_reasons"] == [
         tool_loop._UNKNOWN_TOOL_REJECTION_REASON
     ]
+    assert surfaces[0]["unavailable_platform_tool_call_labels"] == []
+    assert surfaces[0]["unavailable_tool_call_counts"] == {
+        "platform": 0,
+        "mcp": 0,
+        "other": 1,
+    }
+    assert outcome.final_text == "plain fallback"
+
+
+def test_provider_surface_never_emits_user_mcp_names(monkeypatch):
+    private_mcp_name = "mcp__private_server__private_tool"
+    private_spec = ToolSpec(
+        name=private_mcp_name,
+        description="private server tool",
+        parameters={"type": "object", "properties": {}},
+    )
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "memory-first",
+                "name": "memory_search",
+                "args": {"query": "evidence"},
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "withdrawn-mcp",
+                "name": private_mcp_name,
+                "args": {},
+            }],
+            "usage": {},
+        },
+        {"reply": "plain fallback", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    refreshes = iter(([private_spec], [], []))
+    surfaces = []
+
+    async def record_surface(detail):
+        surfaces.append(detail)
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_TranscriptBuildMessages(),
+        dispatch_tools=_RecordingDispatch("[]"),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[], []]),
+        add_usage=_noop_add_usage,
+        max_calls=4,
+        extra_tool_specs=[private_spec],
+        refresh_extra_tool_specs=lambda: next(refreshes),
+        on_provider_tool_surface=record_surface,
+    ))
+
+    assert surfaces[1]["call_rejection_reasons"] == [
+        tool_loop._TOOL_WITHDRAWN_REJECTION_REASON
+    ]
+    assert surfaces[1]["withdrawn_platform_tool_names"] == []
+    assert surfaces[1]["withdrawn_tool_counts"] == {
+        "platform": 0,
+        "mcp": 1,
+        "other": 0,
+    }
+    assert surfaces[1]["unavailable_platform_tool_call_labels"] == []
+    assert surfaces[1]["unavailable_tool_call_counts"] == {
+        "platform": 0,
+        "mcp": 1,
+        "other": 0,
+    }
+    assert private_mcp_name not in str(surfaces[1])
     assert outcome.final_text == "plain fallback"
 
 
@@ -4601,6 +4675,7 @@ def test_provenance_withdrawn_workspace_write_is_reported_as_withdrawn(
             '{"results":[{"url":"https://example.com/evidence"}]}'
         ),
         on_reply=_RecordingReply(),
+        on_file_reply=lambda *_args, **_kwargs: None,
         fold_new_messages=_RecordingFold([[], []]),
         add_usage=_noop_add_usage,
         max_calls=4,
@@ -4616,6 +4691,57 @@ def test_provenance_withdrawn_workspace_write_is_reported_as_withdrawn(
     assert "workspace_write" in first_round_names
     assert "workspace_write" not in second_round_names
     assert "web_fetch" in second_round_names
+    expected_withdrawn_names = set(tool_loop._PLATFORM_MUTATION_TOOLS) | {
+        "web_search",
+        cap_tool_schema.TASK_TOOL,
+    }
+    assert first_round_names - second_round_names == expected_withdrawn_names
+    assert expected_withdrawn_names <= first_round_names
+    assert second_round_names == first_round_names - expected_withdrawn_names
+    assert surfaces[1]["withdrawn_platform_tool_names"] == sorted(
+        expected_withdrawn_names
+    )
+    assert surfaces[1]["withdrawn_tool_counts"] == {
+        "platform": len(expected_withdrawn_names),
+        "mcp": 0,
+        "other": 0,
+    }
+    assert surfaces[1]["unavailable_platform_tool_call_labels"] == [
+        "tool_withdrawn:workspace_write"
+    ]
+    assert surfaces[1]["unavailable_tool_call_counts"] == {
+        "platform": 1,
+        "mcp": 0,
+        "other": 0,
+    }
+    # This is the production-built detail, not a hand-copied proxy.  Worker
+    # prepends ``lane`` and adds ``wake_kind`` outside foreground chat, so guard
+    # the worst-case shape before _safe_detail's insertion-ordered key cap can
+    # silently discard the last key (call_rejection_reasons).
+    from model_api_runtime.v2 import worker as v2_worker
+
+    worker_added_surface_keys = (
+        v2_worker._provider_tool_surface_added_detail_keys("heartbeat")
+    )
+    # This guard is intentionally at capacity for the worst lane.  If it turns
+    # red, the default fix is NOT to raise _DETAIL_MAX_KEYS.  Name the existing
+    # field the new one replaces; insertion order must not choose the victim.
+    # ``call_rejection_reasons`` may not be that victim: losing T358's
+    # discriminator appears as ABSENT and invalidates the whole evidence batch.
+    # Raising the cap is allowed only with a recorded reason why 20 is no longer
+    # appropriate, never merely because changing the number is the easiest fix.
+    # The tail order is causal, not incidental: tool_loop appends the
+    # discriminator with ``{**detail, ...}``, so two new loop-owned keys made
+    # the 21-key chat shape silently drop call_rejection_reasons in review.
+    # Worker-owned keys are appended after that discriminator; inserting one
+    # before the existing tail wake_kind instead drops wake_kind, the field that
+    # distinguishes a heartbeat's 29-tool surface from foreground chat's 34.
+    # Appending after wake_kind merely chooses the new key itself as the victim.
+    # In every case the replacement must be explicit rather than left to order.
+    assert (
+        len(surfaces[1]) + len(worker_added_surface_keys)
+        <= debug_trace._DETAIL_MAX_KEYS
+    )
     exchange = next(
         item for item in provider.calls[2]["messages"]
         if isinstance(item, ToolExchange)

@@ -981,11 +981,12 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
     deps.emit_debug_trace = lambda user_id, event_type, **fields: captured.append(
         {"user_id": user_id, "type": event_type, **fields}
     )
+    trace_lane = "heartbeat"
     trace = worker._provider_tool_surface_callback(
-        deps, "u_roundtrip_trace", "chat", "trace-roundtrip"
+        deps, "u_roundtrip_trace", trace_lane, "trace-roundtrip"
     )
     assert trace is not None
-    asyncio.run(trace({
+    provider_surface_input = {
         "round": 2,
         "candidate_tool_count": 4,
         "sent_tool_count": 0,
@@ -1004,7 +1005,18 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
             "missing_tool_call_id",
             "unclassified_rejection",
         ],
-    }))
+        "withdrawn_platform_tool_names": ["workspace_write"],
+        "withdrawn_tool_counts": {"platform": 1, "mcp": 0, "other": 0},
+        "unavailable_platform_tool_call_labels": [
+            "tool_withdrawn:workspace_write"
+        ],
+        "unavailable_tool_call_counts": {
+            "platform": 1,
+            "mcp": 0,
+            "other": 0,
+        },
+    }
+    asyncio.run(trace(provider_surface_input))
     asyncio.run(trace.emit_summary())
 
     roundtrip = next(
@@ -1012,7 +1024,8 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
     )
     assert roundtrip["trace_id"] == "trace-roundtrip"
     public = data_track._debug_event_public_json(roundtrip)
-    assert public["detail"]["lane"] == "chat"
+    assert public["detail"]["lane"] == trace_lane
+    assert public["detail"]["wake_kind"] == trace_lane
     assert public["detail"]["terminal_text_round_reason"] == (
         "force_text_fallback"
     )
@@ -1028,6 +1041,28 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
         "missing_tool_call_id",
         "unclassified_rejection",
     ]
+    assert surface["detail"]["withdrawn_platform_tool_names"] == [
+        "workspace_write"
+    ]
+    assert surface["detail"]["withdrawn_tool_counts"] == {
+        "platform": 1,
+        "mcp": 0,
+        "other": 0,
+    }
+    assert surface["detail"]["unavailable_platform_tool_call_labels"] == [
+        "tool_withdrawn:workspace_write"
+    ]
+    assert surface["detail"]["unavailable_tool_call_counts"] == {
+        "platform": 1,
+        "mcp": 0,
+        "other": 0,
+    }
+    actual_worker_added_keys = set(surface["detail"]).difference(
+        provider_surface_input
+    )
+    assert actual_worker_added_keys == set(
+        worker._provider_tool_surface_added_detail_keys(trace_lane)
+    )
     assert "private model text" not in str(surface)
     surface_public = data_track._debug_event_public_json(surface)["detail"]
     assert surface_public["call_rejection_reasons"] == [

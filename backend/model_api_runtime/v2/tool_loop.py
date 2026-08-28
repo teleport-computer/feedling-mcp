@@ -61,6 +61,14 @@ DEFAULT_MAX_TOOL_ARGS_CHARS = 16000
 DEFAULT_MAX_TOOL_BATCH_ARGS_CHARS = 64000
 DEFAULT_MAX_NATIVE_ASSISTANT_TURN_CHARS = 65536
 DEFAULT_MAX_ASSISTANT_TOOL_TEXT_CHARS = 8192
+# ``debug_trace._safe_detail`` retains at most 20 keys and 20 list items.  This
+# module stays dependency-clean, so it cannot import debug_trace; a test at the
+# real provider-surface capture point pins both ceilings, including the worker's
+# later ``lane``/``wake_kind`` keys.  We intentionally share the two compact
+# count dictionaries instead of spending the three keys per list required by
+# ``debug_trace.bounded_names``.  A bucket count above its list length is the
+# explicit truncation signal for the emitted platform-name lists.
+_PROVIDER_TOOL_NAME_TRACE_CAP = 20
 REJECTED_TOOL_ARGS_SUMMARY_CHAR_CAP = 500
 REJECTED_ASSISTANT_TEXT_CHAR_CAP = 500
 REJECTED_TOOL_CALL_ID_PREFIX = "feedling_rejected_"
@@ -260,6 +268,12 @@ def _normalize_provider_call_rejection_reasons(values) -> list[str]:
             and value in _PROVIDER_CALL_REJECTION_REASONS
         )
     )
+
+
+def _bounded_provider_tool_names(values) -> tuple[list[str], int]:
+    """Return sorted content-free tool names plus the pre-truncation count."""
+    names = sorted({str(value) for value in (values or ()) if str(value)})
+    return names[:_PROVIDER_TOOL_NAME_TRACE_CAP], len(names)
 
 
 def _catalog():
@@ -2468,6 +2482,31 @@ async def run_tool_loop(
                     ),
                     "wake_choice_required": wake_choice_required,
                 }
+                withdrawn_names = (
+                    previous_offered_tool_names - current_offered_tool_names
+                )
+                platform_tool_names = {spec.name for spec in _catalog()}
+                withdrawn_platform_names, withdrawn_platform_count = (
+                    _bounded_provider_tool_names(
+                        withdrawn_names & platform_tool_names
+                    )
+                )
+                provider_surface_detail.update(
+                    {
+                        "withdrawn_platform_tool_names": (
+                            withdrawn_platform_names
+                        ),
+                        "withdrawn_tool_counts": {
+                            "platform": withdrawn_platform_count,
+                            "mcp": len(withdrawn_names & mcp_names),
+                            "other": len(
+                                withdrawn_names
+                                - platform_tool_names
+                                - mcp_names
+                            ),
+                        },
+                    }
+                )
             # Update the history at the exact outbound boundary. Classification
             # of this response keeps the saved previous set, while a provider
             # error followed by another loop round still remembers what was sent.
@@ -2832,6 +2871,41 @@ async def run_tool_loop(
                     *surface_rejection_reasons,
                     _PROVIDER_CALL_REJECTION_REASON_TERMINAL_TOOL_CALL_REJECTED,
                 ]
+            )
+        unavailable_platform_call_labels: list[str] = []
+        unavailable_call_counts = {"platform": 0, "mcp": 0, "other": 0}
+        if rejection_facts is not None:
+            platform_tool_names = {spec.name for spec in _catalog()}
+            for tc, joined_reasons in zip(
+                pr.tool_calls,
+                rejection_facts.call_rejection_reasons,
+            ):
+                reason_tokens = set(joined_reasons.split(","))
+                for reason in (
+                    _TOOL_WITHDRAWN_REJECTION_REASON,
+                    _UNKNOWN_TOOL_REJECTION_REASON,
+                ):
+                    if reason in reason_tokens:
+                        if tc.name in platform_tool_names:
+                            unavailable_call_counts["platform"] += 1
+                            unavailable_platform_call_labels.append(
+                                f"{reason}:{tc.name}"
+                            )
+                        elif tc.name in mcp_names:
+                            unavailable_call_counts["mcp"] += 1
+                        else:
+                            unavailable_call_counts["other"] += 1
+        unavailable_platform_call_labels = sorted(
+            unavailable_platform_call_labels
+        )[:_PROVIDER_TOOL_NAME_TRACE_CAP]
+        if provider_surface_detail is not None:
+            provider_surface_detail.update(
+                {
+                    "unavailable_platform_tool_call_labels": (
+                        unavailable_platform_call_labels
+                    ),
+                    "unavailable_tool_call_counts": unavailable_call_counts,
+                }
             )
         await _emit_provider_tool_surface(
             provider_surface_detail,
