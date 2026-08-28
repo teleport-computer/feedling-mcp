@@ -36,6 +36,20 @@ class LocalTimeLabels:
     day_period: str
 
 
+@dataclass(frozen=True)
+class LanguageHintResult:
+    """Closed, content-free result of parsing one language hint.
+
+    ``absent`` and ``unparseable`` deliberately remain distinct. Both fall
+    through to weaker evidence, but collapsing them to the same empty string
+    would make it impossible for a future content-free observer to measure how
+    often a stored hint exists but cannot be understood.
+    """
+
+    language: str
+    status: str
+
+
 IDENTITY_LANGUAGE_FIELDS = (
     "custom_persona_prompt",
     "self_introduction",
@@ -72,15 +86,53 @@ def _policy(language: str, source: str, *, confidence: float = 0.0, evidence_cha
     return ReplyLanguagePolicy("zh-Hans", "简体中文", source, confidence, evidence_chars)
 
 
-def _language_from_hint(value: Any) -> str:
-    raw = str(value or "").strip().lower()
-    if not raw:
-        return ""
-    if raw.startswith("en") or "english" in raw:
+_MACHINE_LANGUAGE_TAG_RE = re.compile(
+    r"^(?P<primary>en|zh|yue)(?:[-_][a-z0-9]{2,8})*$",
+    re.IGNORECASE,
+)
+_ENGLISH_NAMES = frozenset({"english", "英语", "英文"})
+_CHINESE_NAMES = frozenset(
+    {
+        "chinese",
+        "mandarin",
+        "cantonese",
+        "中文",
+        "汉语",
+        "漢語",
+        "普通话",
+        "普通話",
+        "简体",
+        "簡體",
+        "繁体",
+        "繁體",
+        "粤语",
+        "粵語",
+    }
+)
+
+
+def _machine_language_from_hint(raw: str) -> str:
+    """Parse a machine-shaped locale/archive hint without prefix guessing."""
+    match = _MACHINE_LANGUAGE_TAG_RE.fullmatch(raw)
+    if match:
+        return "en" if match.group("primary").lower() == "en" else "zh-Hans"
+    lowered = raw.lower()
+    if lowered in _ENGLISH_NAMES:
         return "en"
-    if raw.startswith(("zh", "cn")) or "chinese" in raw or "中文" in raw or "简体" in raw or "繁體" in raw:
+    if lowered in _CHINESE_NAMES:
         return "zh-Hans"
     return ""
+
+
+def _language_from_hint(value: Any) -> LanguageHintResult:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return LanguageHintResult("", "absent")
+    language = _machine_language_from_hint(raw)
+    return LanguageHintResult(
+        language,
+        "parsed" if language else "unparseable",
+    )
 
 
 def _iter_text(value: Any):
@@ -142,7 +194,11 @@ def infer_reply_language_policy(
     locale: str = "",
     archive_language: str = "",
 ) -> ReplyLanguagePolicy:
-    explicit = _language_from_hint((identity or {}).get("language_preference") if isinstance(identity, dict) else "")
+    explicit = _language_from_hint(
+        (identity or {}).get("language_preference")
+        if isinstance(identity, dict)
+        else "",
+    ).language
     if explicit:
         return _policy(explicit, "identity.language_preference", confidence=1.0)
 
@@ -157,9 +213,15 @@ def infer_reply_language_policy(
     if lang:
         return _policy(lang, "identity_memory_dominant", confidence=confidence, evidence_chars=total)
 
-    hinted = _language_from_hint(locale) or _language_from_hint(archive_language)
+    locale_hint = _language_from_hint(locale)
+    archive_hint = _language_from_hint(archive_language)
+    hinted = locale_hint.language or archive_hint.language
     if hinted:
-        return _policy(hinted, "locale" if _language_from_hint(locale) else "archive_language", confidence=1.0)
+        return _policy(
+            hinted,
+            "locale" if locale_hint.language else "archive_language",
+            confidence=1.0,
+        )
     return _policy("zh-Hans", "default", confidence=0.0)
 
 
@@ -268,7 +330,7 @@ def garden_language_decision(
     """
     explicit = _language_from_hint(
         (identity or {}).get("language_preference") if isinstance(identity, dict) else ""
-    )
+    ).language
     # 「他写的字」= 这轮对话里他自己说的话 + 身份卡正文。前者是最新最真的信号，
     # 后者在还没聊过时兜底。
     sample = "\n".join(x for x in ([written] + _identity_texts(identity or {})) if x)
@@ -276,7 +338,11 @@ def garden_language_decision(
     d = decide_garden_language(
         explicit=explicit or None,
         written=sample,
-        locale=_language_from_hint(locale) or _language_from_hint(archive_language) or None,
+        locale=(
+            _language_from_hint(locale).language
+            or _language_from_hint(archive_language).language
+            or None
+        ),
     )
     zh, en = count_bucket_languages(existing_buckets or "")
     names = split_bucket_names(existing_buckets or "")
