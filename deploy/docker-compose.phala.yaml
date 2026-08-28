@@ -173,8 +173,7 @@ services:
         # 实测 2 worker 仅 223MB/7% CPU——4 worker 让解密并行度翻倍、单 worker 忙时
         # 尾延迟更稳，资源代价可忽略（每 worker ~100-200MB，无 PG 连接、无端口单例）。
         FEEDLING_ENCLAVE_WORKERS: "${FEEDLING_ENCLAVE_WORKERS:-4}"
-        # model_api reads from the memory read-side (mirrors the test enclave).
-        MEMORY_READSIDE_FOR_MODEL_API: "true"
+        # Resident and Hosted Runtime V2 share the enclave's unified automatic recall.
         # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
         # dstack-sdk treats "is this env var PRESENT?" as "use simulator"
         # even when the value is empty, so an empty string would make it

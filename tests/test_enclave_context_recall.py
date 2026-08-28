@@ -1,3 +1,5 @@
+"""Enclave chat-context recall, compatibility, and candidate-limit contracts."""
+
 from __future__ import annotations
 
 import json
@@ -15,7 +17,6 @@ from enclave import auth as enclave_auth  # noqa: E402
 from enclave import backend_client, keys, readside  # noqa: E402
 from enclave import state as enclave_state  # noqa: E402
 from enclave.routes import build_app  # noqa: E402
-from enclave.routes import chat as chat_route  # noqa: E402
 from memory import memory_core  # noqa: E402
 
 
@@ -56,36 +57,6 @@ def _inner_json(title: str, description: str, *, linked: str = "") -> bytes:
         "context": "",
         "linked_dimension": linked,
     }).encode("utf-8")
-
-
-def test_routeb_readside_helper_selects_index_then_returns_old_context_shape():
-    moments = [
-        _moment(
-            "mem_cat",
-            "猫咪照顾",
-            "用户聊猫咪健康问题时，先需要被安抚，再给观察饮水和精神状态的建议。",
-            linked="猫咪",
-        ),
-        _moment(
-            "mem_lark",
-            "Lark 工作流",
-            "用户希望 agent 帮忙读 Lark 群消息并整理重点。",
-            linked="Lark",
-        ),
-    ]
-
-    selected, trace = readside.select_context_memories_via_readside(
-        moments,
-        "猫咪最近不吃饭，我有点担心",
-    )
-
-    assert [item["id"] for item in selected] == ["mem_cat"]
-    assert selected[0]["title"] == "猫咪照顾"
-    assert "summary" not in selected[0]
-    assert trace["mode"] == "model_api_readside_v1"
-    assert trace["readside_enabled"] is True
-    assert trace["index_count"] == 2
-    assert trace["selected"][0]["id"] == "mem_cat"
 
 
 @pytest.fixture()
@@ -144,55 +115,31 @@ def enclave_history_client(monkeypatch):
     return _AsgiTestClient(build_app())
 
 
-def test_routeb_flag_false_keeps_legacy_context_selection(enclave_history_client, monkeypatch):
-    monkeypatch.delenv("MEMORY_READSIDE_FOR_MODEL_API", raising=False)
-    monkeypatch.setattr(
-        chat_route,
-        "select_context_memories_with_trace",
-        lambda moments, latest, mode="": ([{"id": "legacy", "title": "legacy"}], {"mode": "model_api"}),
+def test_context_mode_compat_inputs_do_not_fork_selection(enclave_history_client):
+    """Passing an old mode parameter must not restore the split selector."""
+    query_strings = (
+        "context_trace=1",
+        "context_mode=model_api&context_trace=1",
+        "context_strict=1&context_trace=1",
     )
-    monkeypatch.setattr(
-        readside,
-        "select_context_memories_via_readside",
-        lambda *_args, **_kwargs: pytest.fail("readside should not run when flag is false"),
-    )
+    selected_ids = []
 
-    res = enclave_history_client.get(
-        "/v1/chat/history?context_mode=model_api&context_trace=1",
-        headers={"X-API-Key": "key_routeb"},
-    )
+    for query_string in query_strings:
+        res = enclave_history_client.get(
+            f"/v1/chat/history?{query_string}",
+            headers={"X-API-Key": "key_routeb"},
+        )
+        assert res.status_code == 200
+        body = res.get_json()
+        ids = [item["id"] for item in body["context_memories"]]
+        assert "mem_cat" in ids
+        assert "index_sample" not in body["context_memory_trace"]
+        selected_ids.append(ids)
 
-    assert res.status_code == 200
-    body = res.get_json()
-    assert body["context_memories"] == [{"id": "legacy", "title": "legacy"}]
-    assert body["context_memory_trace"]["mode"] == "model_api"
-
-
-def test_model_api_now_uses_the_same_selection_as_resident(enclave_history_client, monkeypatch):
-    """2026-08-18 统一：两条 runtime 走**同一套**挑卡，开关不再影响挑法。
-
-    hx 拍板「v2 的挑卡参考 v1 的，就是挑桶那种」，目标是用户切 runtime 无感。
-
-    此前这条测试断言的是反面 ——「开关为真时不许走老 selector」。那个分叉
-    经查并非有意设计：2026-06-21 换管道时顺手丢掉了打底逻辑，当次设计文档
-    对「转折/最近/打底」一个字未提，代码注释也没有取舍记录。
-    """
-    monkeypatch.setenv("MEMORY_READSIDE_FOR_MODEL_API", "true")
-
-    res = enclave_history_client.get(
-        "/v1/chat/history?context_mode=model_api&context_trace=1",
-        headers={"X-API-Key": "key_routeb"},
-    )
-
-    assert res.status_code == 200
-    body = res.get_json()
-    # 开关仍为真，但挑法已统一 —— trace 不再是 readside 那套的形状
-    assert body["context_memory_trace"].get("mode") != "model_api_readside_v1", (
-        "model_api 仍在走 readside 挑法 —— 统一没生效"
-    )
+    assert selected_ids[1:] == selected_ids[:1] * 2
 
 
-def test_routeb_readside_uses_configurable_memory_limit(enclave_history_client, monkeypatch):
+def test_context_recall_uses_configurable_memory_limit(enclave_history_client, monkeypatch):
     captured_limits = []
 
     from enclave import envelope as envmod
@@ -211,13 +158,6 @@ def test_routeb_readside_uses_configurable_memory_limit(enclave_history_client, 
         lambda e, u, s: _inner_json("猫咪照顾", "用户聊猫咪健康问题时，先需要被安抚。", linked="猫咪"),
     )
 
-    monkeypatch.delenv("MEMORY_READSIDE_FOR_MODEL_API", raising=False)
-    enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1",
-                              headers={"X-API-Key": "key_routeb"})
-    assert captured_limits[-1] == readside.MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT
-
-    monkeypatch.setenv("MEMORY_READSIDE_FOR_MODEL_API", "true")
-    # 开关不再改变挑法或候选池，默认值由 readside 的公开边界声明。
     monkeypatch.delenv("MEMORY_READSIDE_MODEL_API_LIMIT", raising=False)
     enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1",
                               headers={"X-API-Key": "key_routeb"})
@@ -265,7 +205,7 @@ def test_model_api_limit_rejects_non_positive_config(monkeypatch):
 
 
 @pytest.mark.parametrize("raw", ["not-an-integer", "0"])
-def test_routeb_bad_memory_limit_leaves_failed_log(
+def test_context_recall_bad_memory_limit_leaves_failed_log(
     enclave_history_client, monkeypatch, raw
 ):
     monkeypatch.setenv("MEMORY_READSIDE_MODEL_API_LIMIT", raw)
@@ -285,7 +225,7 @@ def test_routeb_bad_memory_limit_leaves_failed_log(
     }
 
 
-def test_routeb_backend_limit_rejection_is_visible_as_failed_recall(
+def test_context_recall_backend_limit_rejection_is_visible_as_failed_recall(
     enclave_history_client, monkeypatch
 ):
     async def fake_backend_get(path, headers, params=None):
