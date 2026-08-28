@@ -981,11 +981,6 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
     deps.emit_debug_trace = lambda user_id, event_type, **fields: captured.append(
         {"user_id": user_id, "type": event_type, **fields}
     )
-    trace_lane = "heartbeat"
-    trace = worker._provider_tool_surface_callback(
-        deps, "u_roundtrip_trace", trace_lane, "trace-roundtrip"
-    )
-    assert trace is not None
     provider_surface_input = {
         "round": 2,
         "candidate_tool_count": 4,
@@ -1016,13 +1011,64 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
             "other": 0,
         },
     }
-    asyncio.run(trace(provider_surface_input))
-    asyncio.run(trace.emit_summary())
+    provider_surface_lanes = (
+        "chat",
+        *sorted(worker._WAKE_LANES),
+        "other",
+    )
+    for candidate_lane in provider_surface_lanes:
+        trace = worker._provider_tool_surface_callback(
+            deps,
+            "u_roundtrip_trace",
+            candidate_lane,
+            f"trace-roundtrip-{candidate_lane}",
+        )
+        assert trace is not None
+        asyncio.run(trace(provider_surface_input))
+        asyncio.run(trace.emit_summary())
+
+    surface_by_lane = {
+        event["detail"]["lane"]: event
+        for event in captured
+        if event["type"] == "mcp.surface.provider"
+    }
+    actual_worker_added_keys_by_lane = {
+        lane: set(surface_by_lane[lane]["detail"]).difference(
+            provider_surface_input
+        )
+        for lane in provider_surface_lanes
+    }
+    expected_worker_added_keys_by_lane = {
+        lane: set(worker._provider_tool_surface_added_detail_keys(lane))
+        for lane in provider_surface_lanes
+    }
+    # Select the worst real callback/helper disagreement across the same closed
+    # lane vocabulary consumed by production.  With no disagreement, the
+    # largest production shape remains the representative below; a lane-only
+    # callback bypass becomes the representative and reaches the equality guard.
+    trace_lane = max(
+        provider_surface_lanes,
+        key=lambda lane: (
+            len(
+                actual_worker_added_keys_by_lane[lane]
+                ^ expected_worker_added_keys_by_lane[lane]
+            ),
+            len(actual_worker_added_keys_by_lane[lane]),
+        ),
+    )
+    actual_worker_added_keys = actual_worker_added_keys_by_lane[trace_lane]
+    assert (
+        actual_worker_added_keys
+        == expected_worker_added_keys_by_lane[trace_lane]
+    )
 
     roundtrip = next(
-        event for event in captured if event["type"] == "mcp.roundtrip.provider"
+        event
+        for event in captured
+        if event["type"] == "mcp.roundtrip.provider"
+        and event["detail"]["lane"] == trace_lane
     )
-    assert roundtrip["trace_id"] == "trace-roundtrip"
+    assert roundtrip["trace_id"] == f"trace-roundtrip-{trace_lane}"
     public = data_track._debug_event_public_json(roundtrip)
     assert public["detail"]["lane"] == trace_lane
     assert public["detail"]["wake_kind"] == trace_lane
@@ -1033,10 +1079,8 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
         "tool_schema_rejected"
     )
 
-    surface = next(
-        event for event in captured if event["type"] == "mcp.surface.provider"
-    )
-    assert surface["trace_id"] == "trace-roundtrip"
+    surface = surface_by_lane[trace_lane]
+    assert surface["trace_id"] == f"trace-roundtrip-{trace_lane}"
     assert surface["detail"]["call_rejection_reasons"] == [
         "missing_tool_call_id",
         "unclassified_rejection",
@@ -1057,12 +1101,6 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
         "mcp": 0,
         "other": 0,
     }
-    actual_worker_added_keys = set(surface["detail"]).difference(
-        provider_surface_input
-    )
-    assert actual_worker_added_keys == set(
-        worker._provider_tool_surface_added_detail_keys(trace_lane)
-    )
     assert "private model text" not in str(surface)
     surface_public = data_track._debug_event_public_json(surface)["detail"]
     assert surface_public["call_rejection_reasons"] == [
