@@ -743,10 +743,15 @@ def _handoff_legacy_chat_final_on_cursor(
         return None
     cur.execute(
         "UPDATE agent_jobs SET status='completed',finished_at=now(),"
-        "last_error='legacy_final_regeneration' "
+        "last_error=%s "
         "WHERE id=%s AND user_id=%s AND lane='chat' AND status='running' "
         "AND claimed_by=%s RETURNING priority",
-        (job_id, user_id, claimed_by),
+        (
+            jobs_store.LEGACY_FINAL_REGENERATION_REASON,
+            job_id,
+            user_id,
+            claimed_by,
+        ),
     )
     row = cur.fetchone()
     if row is None:
@@ -755,10 +760,11 @@ def _handoff_legacy_chat_final_on_cursor(
         "INSERT INTO agent_jobs "
         "(user_id,lane,status,reason,priority,queue_deadline_at,"
         " expected_runtime_generation) "
-        "VALUES (%s,'chat','pending','legacy_final_regeneration',%s,"
+        "VALUES (%s,'chat','pending',%s,%s,"
         "now() + make_interval(secs => %s),%s) RETURNING id",
         (
             user_id,
+            jobs_store.LEGACY_FINAL_REGENERATION_REASON,
             int(row[0]),
             float(jobs_store.PENDING_CHAT_TTL_SEC),
             int(runtime_generation),

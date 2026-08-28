@@ -13920,7 +13920,7 @@ async def process_job(
                 await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
             await asyncio.to_thread(_emit_status, user_id, job_id, "done")
             await asyncio.to_thread(core_wake_bus.notify, "chat", user_id)
-            tm.flush(failed=False, status="ok")
+            tm.flush(failed=False, status=jobs_store.CHAT_TURN_STATUS_OK)
             return "completed"
 
         # Load after recovery and empty-input finalization so a workspace outage
@@ -16207,7 +16207,10 @@ async def process_job(
             if not completed or successor_id is None:
                 raise LostJobLease("job ownership lost during late-input handoff")
             await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
-            tm.flush(failed=False, status="input_advanced_handoff")
+            tm.flush(
+                failed=False,
+                status=jobs_store.CHAT_INPUT_ADVANCED_HANDOFF_STATUS,
+            )
             mcp_turn_outcome = "completed"
             return "completed"
         if outcome.stop_reason == "required_file_missing":

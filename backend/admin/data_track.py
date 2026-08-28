@@ -6331,6 +6331,36 @@ def _ops_import_level(report: dict | None) -> tuple[str, list[str]]:
     return level, reasons
 
 
+def _chat_missing_split(delivery: dict) -> tuple[int, int, int]:
+    """把「completed 无 applied」拆成 (判得了的红, 判不了的, 本就不欠回复的).
+
+    三个桶，因为这个总量里混了三种东西：
+
+    1. **红** —— 证据本该在、也没人删过它 ⇒ 干净的缺陷信号。
+    2. **判不了** —— Clear Chat 整表删掉 ``v2_effect_outbox`` 却保留
+       ``agent_jobs``，于是一个历史上真的送达过的 job 会退化成「无证据」，
+       **与真缺陷在这张表上完全同形**。算进红等于把合规删除报成缺陷，算进绿
+       等于用不确定性洗白真缺陷 ⇒ 只能单列。
+    3. **本就不欠** —— 这条 job 按其完成路径结构上就不产生 final effect
+       （空 coalesced / 迟到输入交接 / legacy final 重生）。它进红是**假红**，
+       而假红正是本单要治的病。
+
+    SQL 侧已经把三者做成互斥（benign 优先于 shadowed），所以这里是纯算术，
+    不会两处各减一次把红减成负数。仍然 clamp：上游口径万一漂了，宁可少报红
+    也不要报出一个负数把整页读者带偏。
+
+    判决与页面共用这一处派生 —— 两边各算一次就迟早会漂成两个口径。
+    """
+    missing = int(delivery.get("completed_without_final_applied") or 0)
+    benign = int(delivery.get("completed_without_final_applied_benign") or 0)
+    shadowed = int(
+        delivery.get("completed_without_final_applied_clear_shadowed") or 0
+    )
+    benign = max(0, min(benign, missing))
+    shadowed = max(0, min(shadowed, missing - benign))
+    return missing - benign - shadowed, shadowed, benign
+
+
 def _ops_chat_level(report: dict | None) -> tuple[str, list[str]]:
     if report is None:
         return "unknown", ["聊天统计暂不可用"]
@@ -6352,11 +6382,19 @@ def _ops_chat_level(report: dict | None) -> tuple[str, list[str]]:
             level = "bad"
         if failure_rate >= 0.05:
             reasons.append(f"chat 终态未成功率 {failure_rate * 100:.1f}%")
-    missing = int(delivery.get("completed_without_final_applied") or 0)
+    unshadowed, shadowed, _benign = _chat_missing_split(delivery)
     reconciliation = int(delivery.get("final_reconciliation_jobs") or 0)
-    if missing:
+    if unshadowed:
         level = "bad"
-        reasons.append(f"{missing} 个 completed 没有 final reply server-applied 证据")
+        reasons.append(
+            f"{unshadowed} 个 completed 没有 final reply server-applied 证据"
+            "（且无 Clear Chat 痕）"
+        )
+    if shadowed:
+        reasons.append(
+            f"{shadowed} 个 completed 判不了：证据本该在，但落在该用户一次 "
+            "Clear Chat 之前，已被合规删除"
+        )
     if reconciliation:
         level = "bad"
         reasons.append(f"{reconciliation} 个 final reply 需要人工 reconcile")
@@ -6729,6 +6767,22 @@ def _render_chat_reliability_page(report: dict | None, *, within_hours: int) -> 
     delivery = report.get("reply_delivery") or {}
     failure_delivery = report.get("failure_delivery") or {}
     reply_quality = report.get("reply_quality") or {}
+    # 「未知不会显示成 0」是这一页的成文契约：总量取不到时两格都必须是 —，
+    # 遮蔽数取不到时只有那一格是 —（红仍按整个总量报，方向偏红不偏绿）。
+    _missing_total = delivery.get("completed_without_final_applied")
+    _missing_shadowed = delivery.get(
+        "completed_without_final_applied_clear_shadowed"
+    )
+    _missing_benign = delivery.get("completed_without_final_applied_benign")
+    _red, _undecidable, _benign = _chat_missing_split(delivery)
+    missing_red = _fmt_count(None if _missing_total is None else _red)
+    missing_undecidable = _fmt_count(
+        None if _missing_total is None or _missing_shadowed is None
+        else _undecidable
+    )
+    missing_benign = _fmt_count(
+        None if _missing_total is None or _missing_benign is None else _benign
+    )
     failure_rows = "".join(
         "<tr>"
         f"{_failure_code_cell(row.get('code'))}"
@@ -6772,7 +6826,9 @@ def _render_chat_reliability_page(report: dict | None, *, within_hours: int) -> 
       {_render_metric('仍在飞', _fmt_count(outcomes.get('in_flight')))}
       {_render_metric('Final pending', _fmt_count(delivery.get('final_pending_jobs')))}
       {_render_metric('需 reconcile', _fmt_count(delivery.get('final_reconciliation_jobs')))}
-      {_render_metric('Completed 无 applied', _fmt_count(delivery.get('completed_without_final_applied')))}
+      {_render_metric('Completed 无 applied（判红）', f"{missing_red} / 涉及 {_fmt_count(delivery.get('completed_without_final_applied_users'))} 用户（去重，仅判红）")}
+      {_render_metric('其中判不了（Clear Chat 已删证据）', missing_undecidable)}
+      {_render_metric('其中本就不欠回复（已交接/空回合）', missing_benign)}
       {_render_metric('失败 fallback 已投递', _fmt_count(failure_delivery.get('fallback_reply_delivered')))}
       {_render_metric('失败 fallback 待投递', _fmt_count(failure_delivery.get('fallback_reply_pending')))}
       {_render_metric('≥2 条可见回复的回合', f"{_fmt_count(reply_quality.get('multi_reply_turns'))} / {_fmt_ratio(reply_quality.get('multi_reply_turn_rate'))}")}
