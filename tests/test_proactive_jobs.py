@@ -1989,12 +1989,21 @@ def test_capture_coordinator_dedupes_same_window_across_signals(tmp_path, monkey
     store = core_store.get_store(user_id)
 
     msg = store.append_chat("user", "chat", _capture_test_envelope(user_id, "msg_capture_dedupe"))
-    first_jobs = _memory_capture_jobs(store)
-    assert len(first_jobs) == 1
-    assert first_jobs[0]["trigger"] == "turn_backstop"
+    assert _memory_capture_jobs(store) == []
 
     client = make_client()
     headers = {"X-API-Key": api_key}
+    first = client.post(
+        "/v1/capture/tick",
+        headers=headers,
+        json={"now": float(msg["ts"]) + 1.0},
+    )
+    first_jobs = _memory_capture_jobs(store)
+    assert first.status_code == 200
+    assert first.get_json()["enqueued"] is True
+    assert len(first_jobs) == 1
+    assert first_jobs[0]["trigger"] == "turn_backstop"
+
     background = client.post(
         "/v1/device/events",
         headers=headers,
@@ -2039,9 +2048,12 @@ def test_capture_quiet_tick_noops_without_new_messages(tmp_path, monkeypatch):
     assert _memory_capture_jobs(core_store.get_store(user_id)) == []
 
 
-def test_capture_turn_backstop_enqueues_only_when_due(tmp_path, monkeypatch):
+def test_capture_tick_enqueues_resident_turn_backstop_before_quiet_timeout(
+    tmp_path, monkeypatch
+):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     monkeypatch.setenv("FEEDLING_CAPTURE_TURN_BACKSTOP", "2")
+    monkeypatch.setenv("FEEDLING_CAPTURE_QUIET_SEC", "1200")
     monkeypatch.setenv("FEEDLING_CAPTURE_MIN_INTERVAL_SEC", "0")
     store = core_store.UserStore("usr_capture_turn_backstop")
     seed_user(store.user_id)
@@ -2049,9 +2061,17 @@ def test_capture_turn_backstop_enqueues_only_when_due(tmp_path, monkeypatch):
     store.append_chat("user", "chat", _capture_test_envelope(store.user_id, "msg_turn_1"))
     assert _memory_capture_jobs(store) == []
 
-    store.append_chat("user", "chat", _capture_test_envelope(store.user_id, "msg_turn_2"))
+    msg = store.append_chat(
+        "user", "chat", _capture_test_envelope(store.user_id, "msg_turn_2")
+    )
+    assert _memory_capture_jobs(store) == []
+
+    result = proactive_capture_scheduler.tick_quiet_capture(
+        store, now=float(msg["ts"]) + 1.0
+    )
     jobs = _memory_capture_jobs(store)
 
+    assert result["enqueued"] is True
     assert len(jobs) == 1
     assert jobs[0]["trigger"] == "turn_backstop"
     assert jobs[0]["window"]["until_message_id"] == "msg_turn_2"

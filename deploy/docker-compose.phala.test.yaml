@@ -382,6 +382,9 @@ services:
       # Normal-on in test (V1-parity program 2026-08-05): product lanes are
       # hardcoded, not env-toggled, so the test state is legible in one file.
       FEEDLING_V2_CAPTURE_ENABLED: "1"
+      # Foreground Chat defaults to tick-owned Capture discovery. Set sync as
+      # an emergency rollback without reverting the durable-seq/Clear fences.
+      FEEDLING_CAPTURE_APPEND_REFRESH_MODE: "${FEEDLING_CAPTURE_APPEND_REFRESH_MODE:-deferred}"
       # Backend owns the V2-cutover profile trigger; serve-worker executes it.
       # M1-M5 (generation + MEMORY/USER prompt injection) merged 3086025c
       # (2026-07-31); normal-on since 2026-08-05 (V1-parity program).

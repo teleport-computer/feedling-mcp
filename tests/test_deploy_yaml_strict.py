@@ -156,6 +156,17 @@ def test_all_deploy_yaml_files_have_unique_mapping_keys():
         load_yaml_strict(path.read_text(), source_name=str(path.relative_to(ROOT)))
 
 
+@pytest.mark.parametrize("path", INGRESS_COMPOSES)
+def test_backend_wires_capture_append_refresh_rollback(path):
+    compose = load_yaml_strict(
+        path.read_text(), source_name=str(path.relative_to(ROOT))
+    )
+
+    assert compose["services"]["backend"]["environment"][
+        "FEEDLING_CAPTURE_APPEND_REFRESH_MODE"
+    ] == "${FEEDLING_CAPTURE_APPEND_REFRESH_MODE:-deferred}"
+
+
 def test_ci_runs_the_strict_deploy_yaml_gate():
     path = ROOT / ".github" / "workflows" / "ci.yml"
     workflow = load_yaml_strict(
