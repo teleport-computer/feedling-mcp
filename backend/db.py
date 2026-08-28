@@ -8097,13 +8097,6 @@ def _blob_revision(doc) -> int:
     return int(raw)
 
 
-def _next_blob_revision(doc) -> int:
-    revision = _blob_revision(doc)
-    if revision >= 999_999_999_999_999_999:
-        raise RuntimeError("blob mirror revision exhausted")
-    return revision + 1
-
-
 def get_blob_strict(user_id: str, kind: str):
     """Return a blob or ``None`` for a genuine miss; propagate DB failures."""
     with get_pool().connection() as conn:
@@ -11745,15 +11738,6 @@ def chat_poll_candidates_strict(
             (user_id, float(since), float(redelivery_floor), bounded),
         ).fetchall()
     return [_chat_project_row(row) for row in rows]
-
-
-def chat_load_recent(user_id: str, limit: int) -> list[dict]:
-    """Legacy best-effort wrapper around :func:`chat_load_recent_strict`."""
-    try:
-        return chat_load_recent_strict(user_id, limit)
-    except Exception as e:
-        log.error("[db] chat_load_recent(%s,%s) failed: %s", user_id, limit, e)
-        return []
 
 
 def chat_history_page_strict(
@@ -16610,27 +16594,6 @@ def memory_load(user_id: str) -> list[dict]:
     except Exception as e:
         log.error("[db] memory_load(%s) failed: %s", user_id, e)
         return []
-
-
-def memory_profile_source_snapshot(user_id: str) -> dict:
-    """Content-free Memory Garden fingerprint used by profile refresh policy.
-
-    The profile generator itself still reads/decrypts every eligible card
-    through the enclave readside.  This aggregate is deliberately DB-only so a
-    normal chat turn can decide whether a seven-day-old profile is stale
-    without disclosing or loading any card plaintext.
-    """
-    with get_pool().connection() as conn:
-        row = conn.execute(
-            "SELECT count(*)::bigint, "
-            "COALESCE(max(doc->>'updated_at'), '') "
-            "FROM memory_moments WHERE user_id=%s",
-            (str(user_id),),
-        ).fetchone()
-    return {
-        "card_count": int(row[0]) if row and row[0] is not None else 0,
-        "max_updated_at": str(row[1] or "") if row else "",
-    }
 
 
 def memory_upsert(user_id: str, moment_id: str, occurred_at: str, doc: dict) -> bool:
