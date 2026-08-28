@@ -12,6 +12,8 @@ from datetime import datetime, date
 from typing import Any
 
 import httpx
+import psycopg
+from psycopg_pool import PoolClosed, PoolTimeout, TooManyRequests
 
 import db
 import distillation_ledger
@@ -41,6 +43,10 @@ GENESIS_SOURCE = "genesis_import"
 GENESIS_PERSONA_REF = f"user_blob:{GENESIS_PERSONA_BLOB}"
 GENESIS_VOICE_REF = f"user_blob:{GENESIS_VOICE_BLOB}"
 GENESIS_PROFILE_REF = f"user_blob:{v2_profile_store.PROFILE_BLOB_KIND}"
+_STAGED_DB_WRITE_ATTEMPTS = 3
+_STAGED_DB_RETRY_BACKOFF_SEC = 0.1
+_STAGED_DB_ERROR_DETAIL_MAX = 240
+_STAGED_DB_NON_RETRYABLE_ERRORS = (PoolClosed, PoolTimeout, TooManyRequests)
 PERSONA_SOURCE_PRIORITY = {
     "ai_persona": 100,
     "merged": 100,
@@ -555,6 +561,54 @@ def _staged_blob_kind(staged_id: str) -> str:
     return f"{GENESIS_STAGED_BLOB_PREFIX}{safe_staged_id}"
 
 
+def _staged_db_error_detail(exc: BaseException) -> str:
+    """Keep a bounded connection diagnostic without credentials or newlines."""
+    detail = " ".join(str(exc or "").split())
+    detail = re.sub(
+        r"(?i)\b(password|pass|token|api[_-]?key|secret)\s*[:=]\s*[^\s,;]+",
+        r"\1=<redacted>",
+        detail,
+    )
+    detail = re.sub(
+        r"(?i)\b(postgres(?:ql)?://)[^@\s]+@",
+        r"\1<redacted>@",
+        detail,
+    )
+    return (detail or type(exc).__name__)[:_STAGED_DB_ERROR_DETAIL_MAX]
+
+
+def _write_genesis_staged_blob(user_id: str, kind: str, doc: dict) -> None:
+    """Retry a connection-level staged-payload write on a fresh pool checkout.
+
+    Large plaintext estimates produce a correspondingly large encrypted JSONB
+    document.  A broken PostgreSQL connection may fail while sending it, or after
+    the server committed but before the client received the acknowledgement.
+    Replaying this exact ``INSERT .. ON CONFLICT DO UPDATE`` document is idempotent,
+    so a small connection-only retry closes both cases without retrying validation,
+    envelope construction, or any provider work.
+    """
+    for attempt in range(1, _STAGED_DB_WRITE_ATTEMPTS + 1):
+        try:
+            db.set_blob_strict_mirrored(user_id, kind, doc)
+            return
+        except _STAGED_DB_NON_RETRYABLE_ERRORS:
+            # Pool lifecycle/capacity failures already include the pool's own
+            # checkout timeout. Repeating them here would turn one saturated
+            # 10-second wait into three and hold the request worker even longer.
+            raise
+        except psycopg.OperationalError as exc:
+            log.warning(
+                "genesis staged payload DB write failed attempt=%d/%d "
+                "code=operational_error detail=%s",
+                attempt,
+                _STAGED_DB_WRITE_ATTEMPTS,
+                _staged_db_error_detail(exc),
+            )
+            if attempt >= _STAGED_DB_WRITE_ATTEMPTS:
+                raise
+            time.sleep(_STAGED_DB_RETRY_BACKOFF_SEC * attempt)
+
+
 def create_genesis_staged_payload(store: UserStore, payload: dict, *, ttl_sec: int) -> str:
     if not isinstance(payload, dict):
         raise ValueError("json_object_required")
@@ -570,7 +624,7 @@ def create_genesis_staged_payload(store: UserStore, payload: dict, *, ttl_sec: i
         store, raw, item_id=f"genesis_staged_{staged_id}")
     if envelope is None:
         raise RuntimeError(f"genesis_staged_envelope_failed:{err}")
-    db.set_blob_strict_mirrored(store.user_id, _staged_blob_kind(staged_id), {
+    _write_genesis_staged_blob(store.user_id, _staged_blob_kind(staged_id), {
         "v": 1,
         "staged_id": staged_id,
         "content_envelope": envelope,
