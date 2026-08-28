@@ -4,7 +4,7 @@ canonical_owner: self
 ---
 # 候选：删除 Route-B 旧 selector/feature flag 岛
 
-结论：`delete`，但必须先迁移安全与召回断言；排在非生产测试工具之后。
+结论：`delete`，已按“先迁移安全与召回断言，再删除旧岛”的顺序实施。
 
 ## 范围与证据
 
@@ -21,8 +21,9 @@ canonical_owner: self
 - 旧 `model_api_readside_v1` trace 已不可达。当前 `context_mode/context_strict` 仍被解析，
   但选择函数忽略其值；`docs/MEMORY.md` 仍错误描述 default/model_api 两套现役模式。
 
-预计 gross 删除约 250–300 行：旧实现、test-only 测试岛、三个 compose 注入和陈旧
-注释/import。安全与召回断言迁移会增加 glue，最终 net 待实施 diff 复算。
+实施批次删除 540 行，包含旧实现、test-only 测试岛、三个 compose 注入和陈旧
+注释/import；同时增加和迁移真实路径门禁、当前文档及实施记录。最终净删除量以实施 PR
+相对其最新 `test` 基线的 diff 为准。
 
 ## 兼容与保护
 
@@ -45,3 +46,15 @@ canonical_owner: self
    compose hash 变化只能证明新配置已发布，不能反推旧环境变量已被平台清除。
 
 回滚方式：回退代码与 compose 提交并按正常 test/pre/prod compose 流程重新部署。
+
+## 实施结果
+
+- 当前 `/v1/chat/history` 仍固定使用统一 bucketed selector；`context_mode`、
+  `contextMode` 和 `context_strict` 继续作为兼容输入被接受，但不再暗示存在第二套策略。
+- canonical card 召回、trace 私密内容不外泄和 query-mode convergence 已迁到真实 selector
+  与 ASGI 路由测试；回归测试通过 mutation red/green 证明能拦截策略重新分叉。
+- 已删除旧 readside adapter、零消费者 policy module、旧测试岛和
+  `MEMORY_READSIDE_FOR_MODEL_API` 的仓库 compose 注入；保留 active limit、wire 参数、
+  数据库/加密/租户边界及 `tools/chat_resident_consumer.py`。
+- 本地最终门禁：受影响测试 153 passed；标准完整测试 12082 passed、3 skipped、
+  9 xfailed。test 环境部署与真实回合证据在合入 `test` 后记录。

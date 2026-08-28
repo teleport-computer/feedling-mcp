@@ -19,7 +19,7 @@ historical_reason: implemented
 
 - Migrated the current-path recall, trace-privacy, and query-mode convergence guards before deleting the old island.
 - Local gates: targeted 180 passed / 8 xfailed; Memory Garden CI lane 262 passed; enclave path plus coverage ratchet 33 passed; first full suite 12082 passed / 3 skipped / 9 xfailed.
-- Branch diff is 256 insertions / 540 deletions (net -284, including this 124-line plan); excluding the plan artifact, the cleanup is net -408. Test deployment remains gated on integration; update the candidate index after PR #461 lands and this branch rebases onto it.
+- The implementation deleted 540 lines before the post-rebase candidate-record update; excluding this 124-line plan artifact, that verified tree was net -408. PR #461 and the stale-E2E cleanup have since landed, this branch is rebased onto them, and the candidate index now records Route-B as implemented. Test deployment remains gated on integration.
 
 ## Global Constraints
 
