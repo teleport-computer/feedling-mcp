@@ -11,6 +11,7 @@ Run with: pytest tests/test_context_memories.py -v
 """
 
 from __future__ import annotations
+import json
 import sys
 from pathlib import Path
 
@@ -219,6 +220,55 @@ def test_card_shape_drops_legacy_classification_metadata():
         key not in card
         for key in ("is_sensitive", "sensitivity_class", "sensitive_scope")
     )
+
+
+def test_default_selector_recalls_canonical_card_from_private_content():
+    """Removing the host translation would make content-only cards unfindable."""
+    moments = [
+        {
+            "id": "disk",
+            "summary": "磁盘故障复盘",
+            "content": "原因是 DerivedData 堆积占满磁盘",
+            "created_at": "2026-01-01T00:00:00Z",
+        },
+        _moment(id="recent-a", title="最近卡 A", created_at="2026-03-02T00:00:00Z"),
+        _moment(id="recent-b", title="最近卡 B", created_at="2026-03-01T00:00:00Z"),
+    ]
+
+    selected, trace = _select_context_memories_with_trace(
+        moments,
+        "DerivedData 为什么占满磁盘",
+        mode="default",
+    )
+
+    assert "disk" in [card["id"] for card in selected]
+    selected_trace = {item["id"]: item for item in trace["selected"]}
+    assert selected_trace["disk"]["bucket"] == "query"
+
+
+def test_default_selector_trace_never_exposes_private_content():
+    """Removing trace sanitization would expose the private search corpus."""
+    secret = "病历密语-ZXQ-917：康帕内拉是只布偶猫"
+    moments = [
+        {
+            "id": "private-card",
+            "summary": "",
+            "content": secret,
+            "created_at": "2026-01-01T00:00:00Z",
+        },
+        _moment(id="recent-a", title="最近卡 A", created_at="2026-03-02T00:00:00Z"),
+        _moment(id="recent-b", title="最近卡 B", created_at="2026-03-01T00:00:00Z"),
+    ]
+
+    _selected, trace = _select_context_memories_with_trace(
+        moments,
+        "我养的是布偶猫吗",
+        mode="default",
+    )
+
+    selected_trace = {item["id"]: item for item in trace["selected"]}
+    assert selected_trace["private-card"]["bucket"] == "query"
+    assert secret not in json.dumps(trace, ensure_ascii=False)
 
 
 def test_select_returns_turning_points_first():

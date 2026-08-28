@@ -455,7 +455,7 @@ jobs:
           python -m pytest \
             tests/test_garden_selection_pluggable.py \
             tests/test_garden_card_shape.py \
-            tests/test_route_b_card_shape_recall.py \
+            tests/test_context_memories.py \
             tests/test_memory_injection_observability.py \
             tests/test_memgarden_is_a_real_dependency.py \
             tests/test_card_leak_signals_wired.py \
@@ -649,7 +649,7 @@ jobs:
             tests/test_enclave_http_client_reuse.py \
             tests/test_enclave_route_error_helpers.py \
             tests/test_enclave_route_errors.py \
-            tests/test_enclave_routeb_readside.py \
+            tests/test_enclave_context_recall.py \
             tests/test_enclave_routes_chat.py \
             tests/test_enclave_routes_envelope.py \
             tests/test_enclave_routes_frames.py \

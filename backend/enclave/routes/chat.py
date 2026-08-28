@@ -325,23 +325,14 @@ def _build_context_memories(moments, decrypted, query_args):
     started = time.monotonic()
     selection_trace: dict | None = None
 
-    # 🔴 两条 runtime 统一走**分桶**那套（hx 2026-08-18 拍板：
-    # 「v2 的挑卡参考 v1 的，就是挑桶那种」—— 目标是用户切 runtime 无感）。
-    #
-    # 此前的分叉不是设计意图：`context_mode` 由调用方传，hosted/turn.py 传
-    # "model_api"、resident consumer 不传，于是同一个产品有两套注入规则
-    # （分桶 vs 纯相关性；候选池大小也不一致）。2026-06 换管道时顺手丢掉了
-    # 打底逻辑，见 docs/superpowers/specs/2026-08-17-auto-injection-unification.md。
-    #
-    # MEMORY_READSIDE_FOR_MODEL_API 这个开关就此失效：它此前控制的两件事
-    # （用哪套挑法、候选池多大）现在都统一了。开关本身留在 readside.py 里
-    # 没有清理 —— 别的地方可能还读它，删之前要全仓确认。
+    # Resident 与 Hosted Runtime V2 固定走同一套分桶策略，确保用户切换
+    # runtime 时召回不漂移。context_mode/context_strict 仍作为兼容参数接收，
+    # 但不再选择不同 policy。
     mode = "bucketed:unified"
     picked, selection_trace = select_context_memories_with_trace(
         garden_cards,
         latest_user_text,
-        # 固定 default：strict 那套（纠正卡 ≤2 + 严格阈值）是 model_api 专有的
-        # 判据，统一之后不再按调用方分叉。
+        # 固定 default；兼容参数不得恢复旧的 strict 分叉。
         mode="default",
     )
     context_memories = _back_to_original(picked)
@@ -433,9 +424,9 @@ async def v1_chat_history(request: Request):
         want_trace = str(
             request.query_params.get("context_trace") or ""
         ).lower() in {"1", "true", "yes", "on"}
-        # 两条 runtime 使用同一挑法和候选池默认值。池子仍可通过
-        # MEMORY_READSIDE_MODEL_API_LIMIT 调整；enclave 原样转发正整数，
-        # backend 对超出 memory/list 支持范围的值显式报错，不再静默缩小。
+        # context_mode/context_strict 只做 wire 兼容解析，不改变挑法。候选池仍可
+        # 通过 MEMORY_READSIDE_MODEL_API_LIMIT 调整；enclave 原样转发正整数，
+        # backend 对超出 memory/list 支持范围的值显式报错。
         memory_limit = readside.memory_readside_model_api_limit()
         query_args = {
             "context_mode": context_mode,
