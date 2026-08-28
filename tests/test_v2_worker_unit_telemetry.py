@@ -998,6 +998,12 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
         "terminal_text_round_reason": "force_text_fallback",
         "force_text_fallback_reason": "tool_schema_rejected",
         "empty_response_recovery": False,
+        "call_rejection_reasons": [
+            "missing_tool_call_id",
+            "private model text",
+            "missing_tool_call_id",
+            "unclassified_rejection",
+        ],
     }))
     asyncio.run(trace.emit_summary())
 
@@ -1018,11 +1024,34 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
         event for event in captured if event["type"] == "mcp.surface.provider"
     )
     assert surface["trace_id"] == "trace-roundtrip"
+    assert surface["detail"]["call_rejection_reasons"] == [
+        "missing_tool_call_id",
+        "unclassified_rejection",
+    ]
+    assert "private model text" not in str(surface)
     surface_public = data_track._debug_event_public_json(surface)["detail"]
+    assert surface_public["call_rejection_reasons"] == [
+        "missing_tool_call_id",
+        "unclassified_rejection",
+    ]
     assert surface_public["lane"].startswith("<redacted string")
     assert surface_public["terminal_text_round_reason"].startswith(
         "<redacted string"
     )
+    forged_surface = {
+        **surface,
+        "detail": {
+            **surface["detail"],
+            "call_rejection_reasons": [
+                "missing_tool_call_id",
+                "private model text",
+            ],
+        },
+    }
+    forged_reasons = data_track._debug_event_public_json(forged_surface)[
+        "detail"
+    ]["call_rejection_reasons"]
+    assert all(value.startswith("<redacted string") for value in forged_reasons)
 
 
 def test_provider_roundtrip_trace_normalizes_unknowns_and_admin_redacts_forgery():

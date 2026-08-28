@@ -2803,6 +2803,11 @@ class _ProviderRoundtripTrace:
             self.empty_response_recovery_used = True
 
         trace_detail = {"lane": self.lane, **dict(detail)}
+        trace_detail["call_rejection_reasons"] = (
+            v2_tool_loop._normalize_provider_call_rejection_reasons(
+                detail.get("call_rejection_reasons")
+            )
+        )
         if self.lane != "chat":
             trace_detail["wake_kind"] = self.lane
         await asyncio.to_thread(
