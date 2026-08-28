@@ -7789,7 +7789,6 @@ def _surface_terminal_error(deps: TurnDeps, user_id: str, job_id, message: str) 
         )
 
 
-
 def _bounded_voice_transcript(text: str, *, budget: int) -> str:
     """把一通电话的全文压进预算：超了就头尾采样并说明中间省了多少。"""
     text = str(text or "").strip()
@@ -7828,7 +7827,6 @@ def _render_capture_line(message: dict, voice_transcripts: dict,
         str(message.get("role") or ""), user_name=user_name, ai_name=ai_name
     )
     return f"- {label}: {context.text_of(message.get('content'))}"
-
 
 
 async def _rebalance_summary_frontier(
@@ -8636,7 +8634,6 @@ async def _assert_prompt_tail_exact(
         raise TurnError("prompt_coverage_incomplete")
 
 
-
 async def _ensure_prompt_coverage(
     user_id: str,
     deps: TurnDeps,
@@ -8880,7 +8877,9 @@ async def _run_wake(
     )
     provider_reply_signal = _ProviderReplySignal()
     try:
-        store = core_store.get_store(user_id)
+        store = core_store.get_store_shell_only(
+            user_id, reason="wake lane reads bounded DB inputs and durable cursors"
+        )
         seq_native = deps.read_messages_after_seq is not None
         observed_generation = 0
         wake_reply_cursor_seq = 0
@@ -13697,7 +13696,9 @@ async def process_job(
             )
             tm.flush(failed=True, status=f"unhandled_lane:{lane}")
             return "failed"
-        store = core_store.get_store(user_id)
+        store = core_store.get_store_shell_only(
+            user_id, reason="chat lane reads bounded DB inputs and durable cursors"
+        )
         runtime_state = await asyncio.to_thread(jobs_store.get_runtime_state, user_id)
         await asyncio.to_thread(_emit_status, user_id, job_id, "processing")
 

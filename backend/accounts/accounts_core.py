@@ -223,7 +223,10 @@ def access_link_token_claim(payload: dict):
                             return {"error": err}, 400
 
                 if make_active:
-                    store = core_store.get_store(user_id)
+                    store = core_store.get_store_shell_only(
+                        user_id,
+                        reason="access-mode mutation uses DB-backed control state",
+                    )
                     # The outer per-user lock is deliberately reentrant.  In
                     # particular, a resident token must use the same durable
                     # pin + compensated fence transition as every other
@@ -260,7 +263,11 @@ def access_link_token_claim(payload: dict):
         "api_key": issued["api_key"],
         "access_mode": mode,
         "route": mode,
-        "active_route": onboarding._load_onboarding_route(core_store.get_store(user_id)),
+        "active_route": onboarding._load_onboarding_route(
+            core_store.get_store_shell_only(
+                user_id, reason="onboarding route is a direct blob read"
+            )
+        ),
         "key_id": issued["key_entry"]["key_id"],
     }, 201
 

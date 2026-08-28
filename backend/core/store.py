@@ -2424,6 +2424,13 @@ def get_store(
     return store
 
 
+def get_store_shell_only(user_id: str, *, reason: str) -> UserStore:
+    """Return an unloaded store shell with a mandatory review reason."""
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("shell-only store reason required")
+    return get_store(user_id)
+
+
 def get_store_legacy(user_id: str) -> UserStore:
     store = get_store(user_id)
     store.ensure_sections(

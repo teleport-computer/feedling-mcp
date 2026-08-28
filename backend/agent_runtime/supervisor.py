@@ -56,7 +56,7 @@ if str(_BACKEND_DIR) not in sys.path:
 
 import db
 from core import runtime_token
-from core.store import get_store
+from core.store import get_store_shell_only
 from agent_runtime import leases, spawners
 from agent_runtime.heartbeat_policy import SUPERVISOR_HEARTBEAT_MAX_AGE_SEC
 # One-shot introduction machinery is shared with chat.chat_core so BOTH the
@@ -239,7 +239,9 @@ class Supervisor:
                 if now - last < self._notice_min_interval:
                     return
                 self._notice_debounce[key] = now
-            store = get_store(user_id)
+            store = get_store_shell_only(
+                user_id, reason="notices are durable log writes"
+            )
             suffix = _RUNNER_NOTICE_SUFFIX.get(error_class, error_class)
             notices.emit(store, source="runner", error_class=error_class,
                          blame=catalog.blame_for(error_class), severity=severity,
@@ -265,7 +267,9 @@ class Supervisor:
             with self._notice_lock:            # 恢复时清去抖，允许下次故障立即再报
                 for ec in error_classes:
                     self._notice_debounce.pop((user_id, ec), None)
-            store = get_store(user_id)
+            store = get_store_shell_only(
+                user_id, reason="notice resolution is a durable log write"
+            )
             for ec in error_classes:
                 suffix = _RUNNER_NOTICE_SUFFIX.get(ec, ec)
                 notices.resolve(store, f"runner:{suffix}")
