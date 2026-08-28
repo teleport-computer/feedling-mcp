@@ -202,8 +202,8 @@ def test_test_environment_uses_literal_three_pool_runtime_values():
         assert retired not in environment
 
 
-def test_test_environment_attests_selective_store_with_incremental_chat_sync():
-    """TEST must preserve the reviewed selective Store rollout controls."""
+def test_test_environment_attests_lazy_store_with_incremental_chat_sync():
+    """TEST must preserve the reviewed lazy Store rollout controls."""
     path = ROOT / "deploy" / "docker-compose.phala.test.yaml"
     compose = load_yaml_strict(
         path.read_text(),
@@ -214,7 +214,7 @@ def test_test_environment_attests_selective_store_with_incremental_chat_sync():
         environment = compose["services"][service_name]["environment"]
         assert environment["FEEDLING_CHAT_SYNC_MODE"] == "incremental"
         assert environment["FEEDLING_CHAT_HOT_CACHE_LIMIT"] == "256"
-        assert environment["FEEDLING_STORE_LOAD_MODE"] == "selective"
+        assert environment["FEEDLING_STORE_LOAD_MODE"] == "lazy"
         assert "${" not in environment["FEEDLING_CHAT_SYNC_MODE"]
         assert "${" not in environment["FEEDLING_CHAT_HOT_CACHE_LIMIT"]
         assert "${" not in environment["FEEDLING_STORE_LOAD_MODE"]
