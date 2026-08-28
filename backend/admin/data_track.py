@@ -3778,6 +3778,27 @@ DEBUG_TRACE_CANDIDATE_CAP = 5_000
 DEBUG_TRACE_SIBLING_CAP = 5_000
 DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS = 2_000
 DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC = 1.0
+DEBUG_TRACE_DB_TOTAL_TIMEOUT_SEC = 2.75
+_DEBUG_TRACE_DB_DEADLINE_RESERVE_SEC = 0.05
+
+
+def _debug_db_limits(deadline: float) -> tuple[float, int]:
+    """Fit the next pool checkout and statement inside one request budget."""
+    remaining = float(deadline) - time.monotonic()
+    connection_timeout = min(
+        DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC,
+        max(0.01, remaining / 4),
+    )
+    statement_seconds = (
+        remaining - connection_timeout - _DEBUG_TRACE_DB_DEADLINE_RESERVE_SEC
+    )
+    if statement_seconds <= 0:
+        raise TimeoutError("debug database deadline exhausted")
+    statement_timeout_ms = min(
+        DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS,
+        max(1, int(statement_seconds * 1000)),
+    )
+    return connection_timeout, statement_timeout_ms
 
 
 def _normalize_debug_event_durations(events: list[dict]) -> None:
@@ -3802,9 +3823,11 @@ def _data_track_debug_flat_payload(
     q: str,
     since_epoch: float,
     live_users: dict[str, dict],
+    db_deadline: float,
 ) -> dict:
     """Build the flat firehose without materialising 50k wide rows in Python."""
     offset = min(max(0, int(offset)), DEBUG_TRACE_CANDIDATE_CAP)
+    connection_timeout, statement_timeout_ms = _debug_db_limits(db_deadline)
     result = db.query_trace_events_flat_page(
         user_id=user_filter,
         trace_id_contains=trace_filter,
@@ -3815,8 +3838,8 @@ def _data_track_debug_flat_payload(
         limit=limit,
         offset=offset,
         candidate_limit=DEBUG_TRACE_CANDIDATE_CAP,
-        connection_timeout=DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC,
-        statement_timeout_ms=DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS,
+        connection_timeout=connection_timeout,
+        statement_timeout_ms=statement_timeout_ms,
     )
     # The extra row is a deterministic regression anchor: changing the DB call
     # back to the old 50k fetch, or fetching exactly ``limit`` and guessing
@@ -3831,6 +3854,7 @@ def _data_track_debug_flat_payload(
         )
         for event in events_out
     ))
+    connection_timeout, statement_timeout_ms = _debug_db_limits(db_deadline)
     sibling_rows, sibling_truncated = db.query_trace_event_turn_rows(
         turn_keys=page_ids,
         user_id=user_filter,
@@ -3840,8 +3864,8 @@ def _data_track_debug_flat_payload(
         since_epoch=since_epoch,
         candidate_limit=DEBUG_TRACE_CANDIDATE_CAP,
         sibling_limit=DEBUG_TRACE_SIBLING_CAP,
-        connection_timeout=DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC,
-        statement_timeout_ms=DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS,
+        connection_timeout=connection_timeout,
+        statement_timeout_ms=statement_timeout_ms,
     )
     _normalize_debug_event_durations(sibling_rows)
     turns_out = _debug_trace_group_turns(
@@ -3870,8 +3894,13 @@ def _data_track_debug_flat_payload(
             {"user_id": user_filter, "events": 0, "last_ts": 0},
         )
     user_ids = sorted(user_stats)
+    connection_timeout, statement_timeout_ms = _debug_db_limits(db_deadline)
     trace_flags = db.get_blobs_for_users(
-        user_ids, [debug_trace.DEBUG_TRACE_FLAG_BLOB]
+        user_ids,
+        [debug_trace.DEBUG_TRACE_FLAG_BLOB],
+        connection_timeout=connection_timeout,
+        statement_timeout_ms=statement_timeout_ms,
+        raise_on_error=True,
     )
     user_rows = []
     for uid in user_ids:
@@ -3955,6 +3984,7 @@ def _data_track_debug_flat_payload(
 
 
 def _data_track_debug_payload() -> dict:
+    db_deadline = time.monotonic() + DEBUG_TRACE_DB_TOTAL_TIMEOUT_SEC
     trace_vocabulary = _trace_vocabulary()
     failure_vocabulary = _failure_vocabulary_observability()
     filters = _data_track_request_filters()
@@ -4010,12 +4040,14 @@ def _data_track_debug_payload() -> dict:
             q=q,
             since_epoch=since_epoch,
             live_users=live_users,
+            db_deadline=db_deadline,
         )
 
     # Direct table scan is bounded and filter-aware. Crucially, it begins from
     # trace rows rather than the live account registry, so an exact deleted uid
     # remains reachable for the 30-day incident window (T184 D7).
     scan_limit = DEBUG_TRACE_CANDIDATE_CAP
+    connection_timeout, statement_timeout_ms = _debug_db_limits(db_deadline)
     all_events_raw = db.query_trace_events(
         user_id=user_filter,
         trace_id_contains=trace_filter,
@@ -4023,8 +4055,8 @@ def _data_track_debug_payload() -> dict:
         q=q,
         since_epoch=since_epoch,
         limit=scan_limit,
-        connection_timeout=DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC,
-        statement_timeout_ms=DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS,
+        connection_timeout=connection_timeout,
+        statement_timeout_ms=statement_timeout_ms,
     )
     # ⭐ 归一化放在**事件刚进来的这一刻**,而不是任何一个出口。
     #
@@ -4044,7 +4076,14 @@ def _data_track_debug_payload() -> dict:
         if event.get("user_id")
     }
     user_ids = sorted(set(live_users) | event_user_ids)
-    trace_flags = db.get_blobs_for_users(user_ids, [debug_trace.DEBUG_TRACE_FLAG_BLOB])
+    connection_timeout, statement_timeout_ms = _debug_db_limits(db_deadline)
+    trace_flags = db.get_blobs_for_users(
+        user_ids,
+        [debug_trace.DEBUG_TRACE_FLAG_BLOB],
+        connection_timeout=connection_timeout,
+        statement_timeout_ms=statement_timeout_ms,
+        raise_on_error=True,
+    )
 
     all_events = list(all_events_raw)
     user_rows: dict[str, dict] = {}

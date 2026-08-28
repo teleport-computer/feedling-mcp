@@ -159,6 +159,68 @@ def test_debug_query_timeout_and_pool_busy_have_distinct_503s(env, monkeypatch):
     assert (status, payload) == (503, {"error": "service_busy"})
 
 
+def test_debug_trace_flag_read_timeout_is_a_503(env, monkeypatch):
+    """The deliberate flag-read fail-closed contract reaches the HTTP route."""
+    registry._users[:] = [
+        {"user_id": "user_a", "principal_id": "p_a"},
+    ]
+    event = {
+        "ts": 100,
+        "user_id": "user_a",
+        "subsystem": "agent",
+        "type": "agent.reply",
+        "actor": "backend",
+        "status": "ok",
+        "summary": "",
+        "explain": "agent.reply",
+        "trace_id": "t-flag-timeout",
+        "turn_id": "t-flag-timeout",
+        "job_id": "",
+        "dur_ms": None,
+        "detail": {},
+        "content_excerpt": {},
+    }
+    monkeypatch.setattr(
+        data_track.db,
+        "query_trace_events_flat_page",
+        lambda **_kwargs: {
+            "events_total": 1,
+            "turns_total": 1,
+            "stalled_turns": 0,
+            "error_turns": 0,
+            "scan_truncated": False,
+            "users": [{"user_id": "user_a", "events": 1, "last_ts": 100}],
+            "subsystems": ["agent"],
+            "statuses": ["ok"],
+            "rows": [event],
+        },
+    )
+    monkeypatch.setattr(
+        data_track.db,
+        "query_trace_event_turn_rows",
+        lambda **_kwargs: ([event], False),
+    )
+    calls = []
+
+    def fail_flag_read(_user_ids, _kinds, **kwargs):
+        calls.append(kwargs)
+        raise TimeoutError("trace flag read timed out")
+
+    monkeypatch.setattr(data_track.db, "get_blobs_for_users", fail_flag_read)
+
+    status, payload = _asgi_json(
+        "GET",
+        "/v1/admin/data-track/debug?mode=flat&user_id=user_a",
+        headers=_admin(),
+    )
+
+    assert (status, payload) == (503, {"error": "debug_query_timeout"})
+    assert len(calls) == 1
+    assert calls[0]["raise_on_error"] is True
+    assert calls[0]["connection_timeout"] > 0
+    assert calls[0]["statement_timeout_ms"] > 0
+
+
 def test_debug_route_deadline_abandons_a_slow_sync_worker(env, monkeypatch):
     monkeypatch.setattr(admin_asgi, "DEBUG_TRACE_REQUEST_TIMEOUT_SEC", 0.05)
 
