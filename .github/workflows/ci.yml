@@ -917,6 +917,9 @@ jobs:
             tests/test_uploaded_envelope_gate.py \
             tests/test_write_side_format_routing.py \
             tests/test_admin_debug_turn_view.py \
+            tests/test_admin_data_track_detail_read_failure.py \
+            tests/test_admin_data_track_detail_read_failure_html.py \
+            tests/test_admin_data_track_status_label_tristate.py \
             tests/test_data_track_debug.py \
             tests/test_data_track.py \
             tests/test_admin_discarded_reason.py \
