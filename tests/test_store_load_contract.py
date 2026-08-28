@@ -3,14 +3,26 @@
 from __future__ import annotations
 
 import ast
+import difflib
+import json
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKEND_ROOT = REPO_ROOT / "backend"
+sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(BACKEND_ROOT))
+
+from tools.store_shell_only_inventory import (  # noqa: E402
+    derive_shell_only_sites,
+    render_inventory,
+)
+
+
+SHELL_ONLY_SNAPSHOT = REPO_ROOT / "tests/fixtures/store_shell_only_sites.json"
 
 
 @dataclass(frozen=True)
@@ -114,6 +126,87 @@ def test_get_store_sites_are_explicit_or_reviewed_shell_only():
         "backend/voice/routes_asgi.py",
     } <= {site.path for site in shell_only}
     assert all(site.review_reason for site in shell_only)
+
+
+def test_shell_only_inventory_matches_reviewed_snapshot():
+    expected = SHELL_ONLY_SNAPSHOT.read_text()
+    actual = render_inventory(REPO_ROOT)
+    diff = "".join(
+        difflib.unified_diff(
+            expected.splitlines(keepends=True),
+            actual.splitlines(keepends=True),
+            fromfile="reviewed snapshot",
+            tofile="derived inventory",
+        )
+    )
+
+    assert actual == expected, (
+        "shell-only Store call inventory changed; review the semantic diff, then "
+        "run `python tools/store_shell_only_inventory.py --write` to accept it:\n"
+        f"{diff}"
+    )
+
+
+def test_shell_only_snapshot_matches_independent_scanner():
+    snapshot = json.loads(SHELL_ONLY_SNAPSHOT.read_text())
+    snapshot_counts = Counter(
+        {
+            (entry["path"], entry["reason"]): entry["count"]
+            for entry in snapshot["sites"]
+        }
+    )
+    independently_scanned = Counter(
+        (site.path, site.review_reason)
+        for site in _find_calls(
+            "get_store_shell_only", exclude={"backend/core/store.py"}
+        )
+    )
+
+    assert snapshot_counts == independently_scanned
+
+
+def test_shell_only_inventory_identity_ignores_file_local_refactors(tmp_path):
+    backend = tmp_path / "backend"
+    backend.mkdir()
+    source = backend / "worker.py"
+    source.write_text(
+        "def run(user_id):\n"
+        "    return get_store_shell_only(user_id, reason='direct DB helper')\n"
+    )
+    baseline = derive_shell_only_sites(tmp_path)
+
+    source.write_text(
+        "# unrelated heading\n"
+        "# another unrelated line\n"
+        "def renamed_run(user_id):\n"
+        "    return get_store_shell_only(\n"
+        "        user_id, reason='direct DB helper'\n"
+        "    )\n"
+    )
+
+    assert derive_shell_only_sites(tmp_path) == baseline
+
+
+def test_shell_only_inventory_identity_detects_a_new_site(tmp_path):
+    backend = tmp_path / "backend"
+    backend.mkdir()
+    source = backend / "worker.py"
+    source.write_text(
+        "def first(user_id):\n"
+        "    return get_store_shell_only(user_id, reason='first helper')\n"
+    )
+    baseline = derive_shell_only_sites(tmp_path)
+
+    source.write_text(
+        source.read_text()
+        + "\ndef second(user_id):\n"
+        + "    return get_store_shell_only(user_id, reason='first helper')\n"
+    )
+    updated = derive_shell_only_sites(tmp_path)
+
+    assert len(updated) == len(baseline) == 1
+    assert baseline[0].count == 1
+    assert updated[0].count == 2
 
 
 def test_empty_require_does_not_leave_the_implicit_audit_surface():
