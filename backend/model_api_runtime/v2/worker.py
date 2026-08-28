@@ -82,7 +82,7 @@ from chat.reply_language import (
     failure_fallback_reply,
     garden_language_decision,
     infer_garden_language,
-    infer_reply_language_policy,
+    infer_reply_language,
     reply_language_system_line,
     user_written_text,
 )
@@ -10733,9 +10733,7 @@ async def _run_wake(
             # open its reply with a <think> block so proactive turns show a clean
             # self-authored thought instead of raw native reasoning.
             _wake_sys = _wake_system_prompt_for_lane(lane, _wake_sys)
-            language_policy = infer_reply_language_policy(
-                {},
-                [],
+            reply_language = infer_reply_language(
                 locale=str(temporal_snapshot.get("locale") or ""),
                 archive_language=str(
                     temporal_snapshot.get("archive_language") or ""
@@ -10743,7 +10741,7 @@ async def _run_wake(
             )
             _wake_sys = context._join_policy_blocks(
                 _wake_sys,
-                reply_language_system_line(language_policy, proactive=True),
+                reply_language_system_line(reply_language, proactive=True),
             )
             return _make_build_messages_fn(
                 system_prompt=_wake_sys,
@@ -14116,9 +14114,7 @@ async def process_job(
                 prompt_snapshot_through_seq if seq_native else None
             ),
         )
-        chat_language_policy = infer_reply_language_policy(
-            {},
-            [],
+        chat_reply_language = infer_reply_language(
             locale=str(temporal_snapshot.get("locale") or ""),
             archive_language=str(
                 temporal_snapshot.get("archive_language") or ""
@@ -14127,7 +14123,7 @@ async def process_job(
 
         def _chat_failure_fallback() -> str:
             return failure_fallback_reply(
-                chat_language_policy,
+                chat_reply_language,
                 zh=_DEGENERATE_REPLY_FALLBACK,
                 en=_DEGENERATE_REPLY_FALLBACK_EN,
             )
@@ -15907,7 +15903,7 @@ async def process_job(
             chat_system_prompt = context._join_policy_blocks(
                 context.chat_system_prompt(provider_config),
                 reply_language_system_line(
-                    chat_language_policy,
+                    chat_reply_language,
                     proactive=False,
                 ),
             )

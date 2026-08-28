@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
 from agent_protocol_core import self_thinking
-from chat.reply_language import format_time_anchor, infer_reply_language_policy
+from chat.reply_language import format_time_anchor, infer_reply_language
 from capabilities import tool_schema
 from chat import language_follow
 from model_api_runtime.v2 import context, worker
@@ -1124,9 +1124,7 @@ def test_v1_anchor_and_v2_temporal_context_share_local_labels(
     day_period,
 ):
     now_dt = datetime(2026, 8, 12, 13, 45, tzinfo=timezone.utc)
-    policy = infer_reply_language_policy(
-        {},
-        [],
+    policy = infer_reply_language(
         locale=locale,
         archive_language=archive_language,
     )

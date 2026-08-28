@@ -202,7 +202,7 @@ from chat.reply_language import (
     format_time_anchor,
     garden_language_decision,
     infer_garden_language,
-    infer_reply_language_policy,
+    infer_reply_language,
     reply_language_system_line,
     user_written_text,
 )
@@ -10982,7 +10982,7 @@ def _wake_think_permission_line(presence: dict | None = None) -> str:
     """开关关闭时返回空串 —— 模板里连提都不提 ``<think>``。"""
     if not _wake_self_thinking_allowed():
         return ""
-    policy = _resident_reply_language_policy(presence)
+    policy = _resident_reply_language(presence)
     if policy.language != "en":
         return (
             " 你可以在 JSON 前先写一个平常的 <think>...</think> 块；它会保持私密，"
@@ -14907,14 +14907,11 @@ def _reply_protocol_block(presence: dict | None = None) -> str:
     ])
 
 
-def _resident_reply_language_policy(presence: dict | None = None):
-    """Resident-side reply-language policy via the shared helper. Resident has no
-    identity-card/memory text in hand (only whoami archive_language + presence
-    locale), so it degrades to the helper's locale → archive_language → default
-    tier — same wording, mirror rule, and time-anchor localization as model_api."""
+def _resident_reply_language(presence: dict | None = None):
+    """Resident-side locale → archive-language → default selection."""
     locale = str((presence or {}).get("locale") or "").strip()
     archive_language = str(_whoami_cache.get("archive_language") or "").strip()
-    return infer_reply_language_policy({}, [], locale=locale, archive_language=archive_language)
+    return infer_reply_language(locale=locale, archive_language=archive_language)
 
 
 def _reply_language_line(presence: dict | None = None) -> str:
@@ -14922,7 +14919,7 @@ def _reply_language_line(presence: dict | None = None) -> str:
     mirror of the user's latest-message language). Wired into both the proactive
     wakes and the foreground reply so the model stops drifting to Chinese when the
     user is in an English context."""
-    return reply_language_system_line(_resident_reply_language_policy(presence))
+    return reply_language_system_line(_resident_reply_language(presence))
 
 
 def _native_reachout_tool_instructions() -> str:
@@ -15041,7 +15038,7 @@ def _local_time_anchor(since_sec: float | None = None, presence: dict | None = N
     tzs = _user_timezone()
     is_default = not tzs
     zone = tzs or _DEFAULT_TIMEZONE
-    policy = _resident_reply_language_policy(presence)
+    policy = _resident_reply_language(presence)
     return format_time_anchor(
         datetime.now(_tzmod.utc), zone, policy,
         since_sec=since_sec, timezone_default=is_default,
