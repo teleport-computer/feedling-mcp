@@ -15,7 +15,7 @@ from agent_protocol_core import self_thinking  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
 from model_api_runtime.v2 import tool_loop  # noqa: E402
 from model_api_runtime.v2 import worker  # noqa: E402
-from model_api_runtime.v2 import language_follow  # noqa: E402
+from chat import language_follow  # noqa: E402
 from model_api_runtime.v2 import prompt_frontier  # noqa: E402
 from model_api_runtime.v2 import summary_frontier  # noqa: E402
 from notices import catalog as notices_catalog  # noqa: E402

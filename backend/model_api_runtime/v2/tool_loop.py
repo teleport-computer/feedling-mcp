@@ -20,7 +20,7 @@ from capabilities import registry as cap_registry
 from capabilities import result_budget
 from capabilities import tool_schema
 from agent_protocol_core import protocol_leak, self_thinking
-from model_api_runtime.v2 import language_follow
+from chat import language_follow
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import provenance
 from model_api_runtime.v2 import tool_surface

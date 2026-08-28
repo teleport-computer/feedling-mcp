@@ -415,6 +415,7 @@ jobs:
             tests/test_card_user_referent.py \
             tests/test_garden_language_flip.py \
             tests/test_reply_language.py \
+            tests/test_chat_language_follow_module.py \
             tests/test_pr_branch_flow.py \
             tests/test_pi_mcp_bridge.py \
             tests/test_v2_cache_retry_metrics.py \
