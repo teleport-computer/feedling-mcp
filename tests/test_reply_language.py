@@ -4,16 +4,121 @@ from datetime import datetime, timezone
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from chat.reply_language import (  # noqa: E402
     DEFAULT_FAILURE_FALLBACK_EN,
     DEFAULT_FAILURE_FALLBACK_ZH,
+    _language_from_hint,
     failure_fallback_reply,
     format_time_anchor,
     infer_reply_language_policy,
     reply_language_system_line,
 )
+
+
+@pytest.mark.parametrize(
+    ("hint", "language"),
+    [
+        ("zh-Hant-TW", "zh-Hans"),
+        ("zh-TW", "zh-Hans"),
+        ("yue-HK", "zh-Hans"),
+        ("en-GB", "en"),
+        ("en-AU", "en"),
+    ],
+)
+def test_machine_language_hint_accepts_supported_tags(
+    hint,
+    language,
+):
+    policy = infer_reply_language_policy({}, [], locale=hint)
+
+    assert policy.language == language
+    assert policy.source == "locale"
+
+
+def test_invalid_cn_locale_falls_through_to_archive_language():
+    policy = infer_reply_language_policy(
+        {},
+        [],
+        locale="cn",
+        archive_language="en-US",
+    )
+
+    assert policy.language == "en"
+    assert policy.source == "archive_language"
+
+
+@pytest.mark.parametrize(
+    ("hint", "language", "opposite_archive"),
+    [
+        ("英语", "en", "zh-CN"),
+        ("英文", "en", "zh-CN"),
+        ("粤语", "zh-Hans", "en-US"),
+    ],
+)
+def test_machine_language_hint_accepts_exact_chinese_language_names(
+    hint,
+    language,
+    opposite_archive,
+):
+    policy = infer_reply_language_policy(
+        {},
+        [],
+        locale=hint,
+        archive_language=opposite_archive,
+    )
+
+    assert policy.language == language
+    assert policy.source == "locale"
+
+
+@pytest.mark.parametrize(
+    "hint",
+    [
+        "no English, 中文 only",
+        "中文, not English",
+        "en français",
+        "不要英文",
+    ],
+)
+def test_machine_language_hint_has_an_explicit_unparseable_result(hint):
+    parsed = _language_from_hint(hint)
+
+    assert parsed.status == "unparseable"
+    assert parsed.language == ""
+
+
+@pytest.mark.parametrize(
+    "locale",
+    [
+        "no English, 中文 only",
+        "中文, not English",
+        "en français",
+    ],
+)
+def test_unparseable_locale_falls_through_instead_of_forcing_opposite_language(locale):
+    policy = infer_reply_language_policy(
+        {},
+        [],
+        locale=locale,
+        archive_language="zh-Hant-TW",
+    )
+
+    assert policy.language == "zh-Hans"
+    assert policy.source == "archive_language"
+
+
+def test_machine_language_hint_result_distinguishes_all_three_states():
+    absent = _language_from_hint("")
+    unparseable = _language_from_hint("不要英文")
+    parsed = _language_from_hint("en-GB")
+
+    assert (absent.status, absent.language) == ("absent", "")
+    assert (unparseable.status, unparseable.language) == ("unparseable", "")
+    assert (parsed.status, parsed.language) == ("parsed", "en")
 
 
 def test_language_preference_overrides_text_evidence():
