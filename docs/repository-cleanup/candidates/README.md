@@ -13,15 +13,14 @@ gross 删除估算均以该提交为准，实施前必须 rebase `test` 并重�
 | 顺序 | 候选 | 结论 | gross 删除 / net | 主要原因 |
 |---|---|---|---:|---|
 | 1 | [失效的 `e2e_model_api_test.py`](e2e-model-api-test.md) | `delete`（已实施） | gross 253 行；net 删除 239 行 | 当前 202 契约会被判失败，脚本最终又无条件返回成功 |
-| 2 | [Route-B 旧 selector/feature flag 岛](route-b-readside-island.md) | `delete` | gross 约 250–300 行；net 待 diff | 生产已固定走统一 bucketed selector，旧实现仅剩测试消费者 |
+| 2 | [Route-B 旧 selector/feature flag 岛](route-b-readside-island.md) | `delete`（已实施） | gross 删除 540 行；net 删除见实施 PR | 生产继续固定走统一 bucketed selector，旧实现和测试岛已退役 |
 | 3 | [`db.py` 三个零消费者叶子](db-dead-leaves.md) | `delete` | gross 约 31 行；预期 net 接近 31 行 | 无生产、测试、文档和动态调用证据 |
 | 3 | [`v2_user_triage.py` 旧 semantic-compaction 诊断](v2-user-triage-semantic-compaction.md) | `delete`（局部） | gross 约 90–110 行；net 待 diff | 旧 body/char-budget 与泛化错误归因会误诊当前 metadata-only compaction |
 | 4 | [Runtime V2 watchdog 旧兼容层](v2-watchdog-compatibility.md) | `delete` | production gross 约 35–50 行；net 待 diff | 仅服务旧 test-double/旧 Python 参数，需保留当前恢复顺序 |
 
-第一项最符合“减少误导 agent 的检索面”：它是无消费者且无法判断当前协议的测试脚本，
-替代入口已经存在。Route-B 候选 gross 收益也很高，但会修改 production source 和
-compose，必须先把安全与召回断言迁移到当前真实路径。表中只有 gross 删除量可由当前
-文件直接复算；新增/迁移门禁产生的 glue 必须以实施 PR 的最终 diff 计算，不能预先冒充 net。
+前两项均已实施：失效 E2E 脚本由 canonical E2E 和路由契约测试接管；Route-B 的召回、
+trace 隐私和 query 参数兼容断言已先迁到真实 bucketed 路径，再删除旧 selector、flag、
+测试岛和陈旧文档。其余候选仍须独立重做引用搜索和门禁，不能从前两项的结论外推。
 
 ## 延后到功能决策
 

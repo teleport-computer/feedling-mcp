@@ -171,7 +171,6 @@ services:
         # awaiting the very decrypt that triggered them → decrypt p95 19.6s /
         # max 47.7s → 34s chat replies of which pi was only 3.1s.
         FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
-        MEMORY_READSIDE_FOR_MODEL_API: "true"
         # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
         # dstack-sdk treats "is this env var PRESENT?" as "use simulator"
         # even when the value is empty, so an empty string would make it

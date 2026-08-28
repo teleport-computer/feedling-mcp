@@ -263,10 +263,10 @@ if not _provisioned:
     # Pure-unit modules that don't touch the DB — keep them collectable so a
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
-    "test_memory_injection_observability.py",
-    "test_garden_selection_pluggable.py",
-    "test_garden_card_shape.py",
-    "test_route_b_card_shape_recall.py",
+        "test_memory_injection_observability.py",
+        "test_garden_selection_pluggable.py",
+        "test_garden_card_shape.py",
+        "test_context_memories.py",
         "test_card_guard.py",
         # Memory Garden 内核（2026-08-14）：纯函数包，零 DB / 零网络。
         # 六个文件都在「DATABASE_URL 指向不可达地址」的环境下实测通过。
