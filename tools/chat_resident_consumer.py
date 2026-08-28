@@ -20708,6 +20708,44 @@ def run() -> None:
                     last_ts=last_ts,
                 )
 
+            # The agent call below can occupy this single loop for up to the
+            # full turn timeout. Reconcile Capture after the claimed messages
+            # are known but before that blocking call, so a turn-backstop is
+            # never delayed by a long foreground turn. This remains fail-open:
+            # Capture availability must not prevent the user turn from running.
+            if capture_tick_enabled:
+                try:
+                    capture_result = fire_capture_tick()
+                    if capture_result.get("enqueued") or str(
+                        capture_result.get("reason") or ""
+                    ) not in {
+                        "",
+                        "no_new_messages",
+                        "quiet_not_due",
+                        "already_captured",
+                    }:
+                        log.info(
+                            "pre-turn capture tick enqueued=%s reason=%s quiet_for=%s",
+                            bool(capture_result.get("enqueued")),
+                            capture_result.get("reason"),
+                            capture_result.get("quiet_for_sec", ""),
+                        )
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        capture_tick_enabled = False
+                        log.warning(
+                            "capture tick endpoint not available on this backend; "
+                            "disabling capture tick for this process"
+                        )
+                    else:
+                        log.warning("pre-turn capture tick failed: HTTP %d", e.response.status_code)
+                except Exception as e:
+                    log.warning("pre-turn capture tick failed: %s", e)
+                finally:
+                    next_capture_tick_mono = (
+                        time.monotonic() + max(10, CAPTURE_TICK_INTERVAL_SEC)
+                    )
+
             new_ts = _process_messages(messages)
             if new_ts > last_ts:
                 last_ts = new_ts

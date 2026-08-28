@@ -378,6 +378,9 @@ services:
       # Backend owns capture admission/triggers; serve-worker executes the lane.
       # Keep both deployment gates aligned. User consent remains independent.
       FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
+      # Foreground Chat defaults to tick-owned Capture discovery. Set sync as
+      # an emergency rollback without reverting the durable-seq/Clear fences.
+      FEEDLING_CAPTURE_APPEND_REFRESH_MODE: "${FEEDLING_CAPTURE_APPEND_REFRESH_MODE:-deferred}"
       # Backend owns the V2-cutover profile trigger; serve-worker executes it.
       # M1-M5 (generation + MEMORY/USER prompt injection) merged 3086025c
       # (2026-07-31). Hard-coded on 2026-08-12 to match test, which has run this

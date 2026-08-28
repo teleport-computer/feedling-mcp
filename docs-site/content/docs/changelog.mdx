@@ -12,6 +12,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Chat writes no longer wait for Memory Capture discovery queries.** Resident
+  and Runtime V2 now reconcile the durable Capture frontier on the existing
+  periodic tick, including the turn-count backstop, so Capture can begin up to
+  one scheduler cadence later without delaying message acceptance. Operators
+  can temporarily restore the previous synchronous behavior with
+  `FEEDLING_CAPTURE_APPEND_REFRESH_MODE=sync`; Chat route traces now report the
+  append duration and active refresh mode for rollout comparison.
+
 - **Hosted Runtime V2 now retries a failed file-publication boundary once.** If
   attaching a requested Canvas or downloadable file fails after `send_file`,
   Chat asks the model to refresh the workspace source and deliver the exact

@@ -511,6 +511,55 @@ def test_invalid_key_exits_on_startup():
     assert exc_info.value.code != 0
 
 
+def test_run_fires_capture_tick_before_a_long_foreground_turn(monkeypatch):
+    order = []
+    message = {"id": "user-before-long-turn", "role": "user", "content": "hi", "ts": 2.0}
+
+    monkeypatch.setattr(crc, "_running", True)
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_load_whoami_with_retries", lambda: True)
+    monkeypatch.setattr(crc, "_warn_if_agent_entry_may_drift", lambda: None)
+    monkeypatch.setattr(crc, "_resident_ipc_listener_enabled", lambda: False)
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "")
+    monkeypatch.setattr(crc, "_apply_infra_health", lambda _status: None)
+    monkeypatch.setattr(crc, "_load_checkpoint", lambda: 1.0)
+    monkeypatch.setattr(crc, "_save_checkpoint", lambda _ts: None)
+    monkeypatch.setattr(crc, "_load_proactive_checkpoint", lambda: 0.0)
+    monkeypatch.setattr(crc, "PROACTIVE_POLL_ENABLED", False)
+    monkeypatch.setattr(crc, "CAPTURE_TICK_ENABLED", True)
+    monkeypatch.setattr(crc, "CAPTURE_TICK_START_DELAY_SEC", 3600)
+    monkeypatch.setattr(crc, "_refresh_auth_header", lambda: None)
+    monkeypatch.setattr(crc, "_process_resident_distill_once", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        crc,
+        "poll_chat",
+        lambda _since: {"timed_out": False, "messages": [message]},
+    )
+    monkeypatch.setattr(crc, "_maybe_apply_user_mcp", lambda: None)
+    monkeypatch.setattr(crc, "_process_vision_probe", lambda _result: None)
+    monkeypatch.setattr(
+        crc,
+        "_filter_messages_to_poll_ids",
+        lambda _history, poll_messages, **_kwargs: poll_messages,
+    )
+    monkeypatch.setattr(
+        crc,
+        "fire_capture_tick",
+        lambda: order.append("capture") or {"enqueued": False, "reason": "quiet_not_due"},
+    )
+
+    def _process(_messages):
+        order.append("process")
+        crc._running = False
+        return 2.0
+
+    monkeypatch.setattr(crc, "_process_messages", _process)
+
+    crc.run()
+
+    assert order == ["capture", "process"]
+
+
 def test_whoami_startup_retries_transient_failure(monkeypatch):
     """Startup whoami should tolerate transient network failures."""
     calls = []
