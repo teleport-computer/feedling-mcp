@@ -869,6 +869,7 @@ jobs:
             tests/test_data_track_runtime_view.py \
             tests/test_data_track_ops_views.py \
             tests/test_ops_dashboard_queries.py \
+            tests/test_data_track_chat_clear_shadow.py \
             tests/test_v2_runtime_health.py \
             tests/test_v2_scheduler_wiring.py \
             tests/test_v2_screen_watch_gate.py \
