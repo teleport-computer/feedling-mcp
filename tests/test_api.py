@@ -9,7 +9,7 @@ Usage:
 
 NOTE: this is a live-server integration script (point it at a running
 backend), NOT a pytest suite — keep it excluded from `pytest tests/`
-via --ignore, same as e2e_model_api_test.py.
+via --ignore.
 
 Post-SINGLE_USER/v0 strip (2026-04-20):
     The backend rejects plaintext chat / identity / memory writes with 400.
