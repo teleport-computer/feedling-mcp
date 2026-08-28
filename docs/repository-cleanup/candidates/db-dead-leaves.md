@@ -4,7 +4,7 @@ canonical_owner: self
 ---
 # 候选：删除 `db.py` 三个零消费者叶子
 
-结论：`delete`，适合作为低风险叶子批次。
+结论：`delete`（已实施），低风险叶子批次。
 
 ## 范围与证据
 
@@ -15,8 +15,8 @@ canonical_owner: self
 - `backend/db.py::memory_profile_source_snapshot`：只有定义；现役
   `memory_profile_source_stats` 提供相同的 content-free freshness 聚合，并有 Genesis、
   V2 worker 和测试消费者。
-- 未发现生产、测试、current 文档、工具脚本或字符串动态调用消费者。预计 gross 删除约
-  31 行；若验证不新增长期 glue，最终 net 应接近该数字，仍以实施 diff 为准。
+- 未发现生产、测试、current 文档、工具脚本或字符串动态调用消费者。实施 diff 最终从
+  `backend/db.py` gross/net 删除 37 行，且未新增长期 glue。
 
 ## 兼容与验证
 
@@ -26,3 +26,17 @@ canonical_owner: self
 - 运行 chat recent、profile freshness、blob revision/CAS 相关测试和数据库契约测试。
 
 回滚方式：回退删除提交；不得创建或修改 Alembic migration。
+
+## 实施结果（2026-08-28）
+
+- 从 `origin/test`（`1ae5da56850ffaf14ce55cd24d2a8e8c7c916471`）建立独立
+  worktree，并在最终验证前 rebase 到后续部署钉住提交 `ec32e1f2`；删除上述三个定义，
+  `backend/db.py` 净删除 37 行，未增加兼容层。
+- 删除前后精确扫描定义、调用、字符串引用以及 `tools/`、`ops/`、`scripts/` 消费者，
+  除候选记录外未发现仓内引用。
+- 现役 `_blob_revision`/CAS、`chat_load_recent_strict` 和
+  `memory_profile_source_stats` 路径保持不变；相关 PostgreSQL 行为测试删除前后均通过。
+- 未修改 schema、migration、公开 API、部署配置或 `chat_resident_consumer.py`。
+
+已知边界仍是仓库外临时脚本：若其直接 import 这三个未承诺的内部函数，升级后会收到
+`AttributeError`/`ImportError`。仓库内没有该消费者证据；如需回滚，回退本批删除提交。
