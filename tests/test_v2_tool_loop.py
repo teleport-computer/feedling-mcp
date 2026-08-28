@@ -4720,8 +4720,13 @@ def test_provenance_withdrawn_workspace_write_is_reported_as_withdrawn(
     # silently discard the last key (call_rejection_reasons).
     from model_api_runtime.v2 import worker as v2_worker
 
-    worker_added_surface_keys = (
-        v2_worker._provider_tool_surface_added_detail_keys("heartbeat")
+    provider_surface_lanes = {"chat", "other", *v2_worker._WAKE_LANES}
+    worker_added_surface_keys = max(
+        (
+            v2_worker._provider_tool_surface_added_detail_keys(lane)
+            for lane in provider_surface_lanes
+        ),
+        key=len,
     )
     # This guard is intentionally at capacity for the worst lane.  If it turns
     # red, the default fix is NOT to raise _DETAIL_MAX_KEYS.  Name the existing
@@ -4736,6 +4741,10 @@ def test_provenance_withdrawn_workspace_write_is_reported_as_withdrawn(
     # Worker-owned keys are appended after that discriminator; inserting one
     # before the existing tail wake_kind instead drops wake_kind, the field that
     # distinguishes a heartbeat's 29-tool surface from foreground chat's 34.
+    # ``wake_kind`` is therefore not expendable padding: on a wake lane it is
+    # the discriminator's one-key overflow buffer.  Deleting it puts
+    # call_rejection_reasons at the outer edge, so the next key drops the
+    # discriminator itself rather than proving the shape is safe.
     # Appending after wake_kind merely chooses the new key itself as the victim.
     # In every case the replacement must be explicit rather than left to order.
     assert (
