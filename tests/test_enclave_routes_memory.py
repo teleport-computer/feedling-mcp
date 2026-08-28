@@ -11,6 +11,7 @@ import pytest  # noqa: E402
 from asgi_test_client import _AsgiTestClient  # noqa: E402
 from enclave import auth as enclave_auth  # noqa: E402
 from enclave import backend_client, envelope as envmod, keys  # noqa: E402
+from enclave import readside as enclave_readside  # noqa: E402
 from enclave import state as enclave_state  # noqa: E402
 from enclave.routes import build_app  # noqa: E402
 
@@ -130,16 +131,29 @@ def test_index_query_filters_full_candidate_window_before_result_limit(
     assert [item["id"] for item in r.get_json()["items"]] == ["m2"]
 
 
-def test_fetch_blocks_sensitive_by_default(client, _authed, monkeypatch):
-    sensitive = json.dumps({"summary": "s", "content": "c", "bucket": "b",
-                            "threads": [], "is_sensitive": True}).encode()
-    monkeypatch.setattr(envmod, "decrypt_envelope", lambda e, u, s: sensitive)
+def test_fetch_ignores_legacy_classification_metadata(client, _authed, monkeypatch):
+    monkeypatch.setattr(envmod, "decrypt_envelope", lambda e, u, s: _v1_inner())
+    monkeypatch.setattr(
+        enclave_readside,
+        "build_memory_fetch_item",
+        lambda envelope, _inner: {
+            "id": envelope["id"],
+            "summary": "s",
+            "is_sensitive": True,
+            "sensitivity_class": "private",
+            "sensitive_scope": "old_scope",
+        },
+    )
     r = client.post("/v1/memory/fetch",
                     json={"moments": [{"id": "m1", "K_enclave": "x"}]},
                     headers={"X-API-Key": "k"})
     body = r.get_json()
-    assert body["items"] == []
-    assert body["blocked_sensitive_ids"] == ["m1"]
+    assert [item["id"] for item in body["items"]] == ["m1"]
+    assert "blocked_sensitive_ids" not in body
+    assert all(
+        key not in body["items"][0]
+        for key in ("is_sensitive", "sensitivity_class", "sensitive_scope")
+    )
 
 
 def test_memory_list_decrypt_and_serve(client, _authed, monkeypatch):

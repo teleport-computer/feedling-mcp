@@ -53,6 +53,8 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable
 
+from psycopg_pool import PoolTimeout as PsycopgPoolTimeout
+
 import db
 import generated_image
 import provider_attempt_ledger
@@ -72,8 +74,12 @@ from capabilities import history as cap_history
 from capabilities import registry as cap_registry
 from capabilities import result_budget as cap_result_budget
 from capabilities import tool_schema as cap_tool_schema
+from capabilities import web as cap_web
 from chat import file_display as chat_file_display
 from chat.reply_language import (
+    DEFAULT_FAILURE_FALLBACK_EN,
+    DEFAULT_FAILURE_FALLBACK_ZH,
+    failure_fallback_reply,
     garden_language_decision,
     infer_garden_language,
     infer_reply_language_policy,
@@ -218,6 +224,8 @@ async def _record_provider_failure(
 
 
 def _provider_health_error_class(exc: BaseException) -> str:
+    if isinstance(exc, v2_tool_loop.ProviderOutputTruncated):
+        return "provider_output_truncated"
     if isinstance(exc, v2_tool_loop.ProviderEmptyReply):
         return "provider_empty_reply"
     return provider_health.error_class_for_exception(exc)
@@ -489,6 +497,13 @@ except ValueError as exc:
 PROMPT_OUTPUT_RESERVE_TOKENS = _positive_int_env(
     "FEEDLING_V2_PROMPT_OUTPUT_RESERVE_TOKENS", "4096"
 )
+# File-capable foreground calls may serialize a complete document inside one
+# tool call. This is deliberately independent of PROMPT_OUTPUT_RESERVE_TOKENS:
+# that older knob is subtracted from the input context window, so raising it to
+# fix file output would silently discard conversation history.
+FILE_OUTPUT_MAX_TOKENS = _positive_int_env(
+    "FEEDLING_V2_FILE_OUTPUT_MAX_TOKENS", "32768"
+)
 PROMPT_SAFETY_MARGIN_TOKENS = _nonnegative_int_env(
     "FEEDLING_V2_PROMPT_SAFETY_MARGIN_TOKENS", "1024"
 )
@@ -528,23 +543,23 @@ if (
     raise RuntimeError(
         "FEEDLING_V2_TOOL_BATCH_RESULT_CHAR_CAP is too small for stable errors"
     )
-# Atomic-JSON producers (history tools) are reserved in full by the batch
+# Atomic-JSON producers (history and web-fetch tools) are reserved in full by the batch
 # water-fill and are never string-sliced, so their per-tool caps and this
 # batch cap have to be consistent with each other. Checked here, once, against
 # the deployment's real numbers — see capabilities/result_budget.py.
 #
-# Only while history is actually on. The kill switch has to restore the exact
-# pre-history startup contract, and a batch cap that was legal before the
-# history tools existed (it only had to clear MAX_TOOL_CALLS_PER_ROUND ×
-# MIN_TOOL_RESULT_ERROR_QUOTA) must not keep the worker from booting once the
-# feature is switched off — otherwise the valve cannot roll anything back.
-# The switch is read at call time, so a process that boots with history off and
-# is turned on later re-runs this check there; see
-# ``_history_tools_enabled_for_turn``.
+# Web fetch has no catalog-level startup switch, so its atomic contract is
+# always checked. History is checked here only while its rollout switch is on:
+# switching history off must restore its pre-feature startup contract. Because
+# that switch is read at call time, enabling history later re-runs the shared
+# atomic check in ``_history_tools_enabled_for_turn``.
 cap_result_budget.validate_result_caps(
     batch_cap=TOOL_BATCH_RESULT_CHAR_CAP,
-    tool_names=(
-        cap_result_budget.ATOMIC_TOOL_NAMES if cap_history.enabled() else ()
+    tool_names=tuple(
+        name
+        for name in cap_result_budget.ATOMIC_TOOL_NAMES
+        if name == "web_fetch"
+        or (cap_history.enabled() and name in cap_history.HISTORY_TOOL_NAMES)
     ),
 )
 # This is a true wall deadline around the whole async MCP call, including time
@@ -922,6 +937,25 @@ _SUBAGENT_DISABLED_TOOLS = frozenset(
 # silently mishandled by this task's scope.
 _WAKE_LANES = frozenset({"heartbeat", "scheduled", "manual_wake", "screen_watch"})
 
+# A proactive reply rejected by the post-time chat-collision gate never reached
+# the user, but without a bounded breadcrumb the next wake sees the same prompt
+# frontier and can regenerate it verbatim. Keep two encrypted rows for
+# observability, while only the newest one is injected into the next weak wake.
+WAKE_DISCARDED_DRAFT_STREAM = "v2_wake_discarded_draft"
+WAKE_DISCARDED_DRAFT_TEXT_CAP = 2000
+WAKE_DISCARDED_DRAFT_PROMPT_CAP = 2600
+WAKE_DISCARDED_DRAFT_STREAM_MAX = 2
+_WAKE_DISCARDED_DRAFT_LANES = frozenset(
+    {"heartbeat", "manual_wake", "screen_watch"}
+)
+_WAKE_DISCARDED_DRAFT_DELIVERY_NOTE = (
+    "这段话未送达，用户没有看到过。"
+)
+_WAKE_DISCARDED_DRAFT_GUIDANCE = (
+    "若它仍然相关，请自然融入这一次的新回复；若已被其间对话覆盖或已经过时，"
+    "请放下。不要逐字重发。"
+)
+
 # 记忆抽取 lane（capture=一窗对话→记忆卡，dream=现有卡片→合并）。同形：
 # build prompt → BYOK 抽取 → parse → memory actions。永不写气泡、永不弹 error chip。
 _EXTRACTION_LANES = frozenset({"capture", "dream"})
@@ -990,6 +1024,235 @@ def _wake_system_prompt_for_lane(lane: str, base_prompt: str) -> str:
     return context._join_policy_blocks(*blocks)
 
 
+def _store_wake_discarded_draft(
+    store,
+    text: str,
+    *,
+    wake_kind: str,
+    source_job_id: str,
+    collision_seq_hint: int,
+) -> dict | None:
+    """Seal and retain one collision-discarded weak-wake draft.
+
+    The plaintext exists only in this worker call. ``user_logs`` receives the
+    same at-rest envelope shape used by chat replies, never a ghost chat row.
+    Persistence is intentionally best-effort: a crash/failure in the small gap
+    after discard degrades to the pre-T310 behavior and must not resurrect or
+    fail an otherwise safely suppressed reply.
+    """
+    bounded = str(text or "").strip()[:WAKE_DISCARDED_DRAFT_TEXT_CAP]
+    if not bounded or wake_kind not in _WAKE_DISCARDED_DRAFT_LANES:
+        return None
+    created_at = time.time()
+    item_id = hashlib.sha256(
+        (
+            f"v2-wake-discarded:{store.user_id}:{source_job_id}:"
+            f"{collision_seq_hint}:{created_at:.9f}"
+        ).encode("utf-8")
+    ).hexdigest()[:32]
+    envelope, error = core_envelope._build_shared_envelope_for_store(
+        store,
+        bounded.encode("utf-8"),
+        item_id=item_id,
+    )
+    if envelope is None:
+        log.warning(
+            "[v2.worker] wake discarded-draft envelope failed user=%s job=%s "
+            "lane=%s error=%s",
+            store.user_id,
+            source_job_id,
+            wake_kind,
+            error or "unknown",
+        )
+        return None
+    doc = {
+        "sealed_text": envelope,
+        "created_at": created_at,
+        "wake_kind": wake_kind,
+        "source_job_id": str(source_job_id),
+        "collision_seq_hint": max(0, int(collision_seq_hint)),
+    }
+    persisted = db.log_append(
+        str(store.user_id),
+        WAKE_DISCARDED_DRAFT_STREAM,
+        doc,
+        ts=created_at,
+        item_key=str(source_job_id),
+    )
+    # ``None`` remains accepted for narrow legacy/test fakes that predate the
+    # return value; production returns an exact bool and must not emit a stored
+    # trace after a swallowed primary failure.
+    if persisted is False:
+        return None
+    db.log_trim(
+        str(store.user_id),
+        WAKE_DISCARDED_DRAFT_STREAM,
+        WAKE_DISCARDED_DRAFT_STREAM_MAX,
+    )
+    return {
+        "source_job_id": str(source_job_id),
+        "chars": len(bounded),
+        "created_at": created_at,
+    }
+
+
+def _read_latest_wake_discarded_draft(
+    user_id: str,
+    *,
+    runtime_token: str,
+) -> dict | None:
+    """Open only the newest retained draft for one subsequent weak wake."""
+    rows = db.log_read(user_id, WAKE_DISCARDED_DRAFT_STREAM, limit=1)
+    if not rows:
+        return None
+    row = rows[-1]
+    if not isinstance(row, dict) or not isinstance(row.get("sealed_text"), dict):
+        return None
+    raw = core_envelope.read_envelope_body(
+        row["sealed_text"],
+        None,
+        purpose="v2_wake_discarded_draft",
+        runtime_token=runtime_token,
+    )
+    text = raw.decode("utf-8").strip()[:WAKE_DISCARDED_DRAFT_TEXT_CAP]
+    if not text:
+        return None
+    try:
+        created_at = float(row.get("created_at") or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        created_at = 0.0
+    return {
+        "text": text,
+        "created_at": created_at,
+        "wake_kind": str(row.get("wake_kind") or ""),
+        "source_job_id": str(row.get("source_job_id") or ""),
+        "collision_seq_hint": max(0, int(row.get("collision_seq_hint") or 0)),
+    }
+
+
+def _wake_discarded_draft_prompt_data(draft: dict) -> dict:
+    """Build an untrusted prompt segment capped in serialized JSON space."""
+    metadata = {
+        "created_at": draft.get("created_at", 0.0),
+        "delivery_note": _WAKE_DISCARDED_DRAFT_DELIVERY_NOTE,
+        "guidance": _WAKE_DISCARDED_DRAFT_GUIDANCE,
+        "source_job_id": str(draft.get("source_job_id") or ""),
+        "wake_kind": str(draft.get("wake_kind") or ""),
+    }
+    wrapper = {"wake_discarded_draft": {**metadata, "text": ""}}
+    raw_text = str(draft.get("text") or "")[:WAKE_DISCARDED_DRAFT_TEXT_CAP]
+    # Cap what the provider receives: escaping can expand newlines, quotes and
+    # backslashes, so truncate in rendered JSON space rather than raw chars.
+    best = ""
+    low = 0
+    high = len(raw_text)
+    while low <= high:
+        midpoint = (low + high) // 2
+        wrapper["wake_discarded_draft"]["text"] = raw_text[:midpoint]
+        rendered = json.dumps(
+            wrapper,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(rendered) <= WAKE_DISCARDED_DRAFT_PROMPT_CAP:
+            best = raw_text[:midpoint]
+            low = midpoint + 1
+        else:
+            high = midpoint - 1
+    wrapper["wake_discarded_draft"]["text"] = best
+    return wrapper
+
+
+def _wake_action_context_str(
+    grounding_results: dict | None,
+    discarded_draft: dict | None,
+) -> str:
+    """Render ordinary grounding plus one latest undelivered draft.
+
+    With no draft this delegates byte-for-byte to the existing renderer. When
+    a draft exists it is retained first under the global action-context cap;
+    ordinary grounding observations are then added whole while they fit.
+    """
+    if discarded_draft is None:
+        return context.action_context_str(grounding_results)
+    try:
+        draft_payload = _wake_discarded_draft_prompt_data(discarded_draft)
+        folded = context.fold_action_results(grounding_results)
+        combined = {**folded, **draft_payload}
+        rendered = json.dumps(
+            combined,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(rendered) <= context.ACTION_CONTEXT_CHAR_CAP:
+            return rendered
+        bounded = {"_truncated": True, **draft_payload}
+        for action_type, value in folded.items():
+            if action_type in {"_truncated", "wake_discarded_draft"}:
+                continue
+            candidate = {**bounded, action_type: value}
+            candidate_rendered = json.dumps(
+                candidate,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if len(candidate_rendered) <= context.ACTION_CONTEXT_CHAR_CAP:
+                bounded[action_type] = value
+        return json.dumps(
+            bounded,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except Exception as exc:  # noqa: BLE001 — stale context must not kill wake
+        log.warning(
+            "[v2.worker] wake discarded-draft prompt omitted code=%s",
+            type(exc).__name__.lower(),
+        )
+        return context.action_context_str(grounding_results)
+
+
+async def _emit_wake_discarded_draft_trace(
+    emit_debug_trace: Callable[..., None] | None,
+    user_id: str,
+    event: str,
+    *,
+    source_job_id: str,
+    chars: int,
+    current_job_id: str,
+    lane: str,
+) -> None:
+    """Emit content-free draft lifecycle telemetry without affecting a turn."""
+    if emit_debug_trace is None:
+        return
+    try:
+        await asyncio.to_thread(
+            emit_debug_trace,
+            user_id,
+            event,
+            status="ok",
+            summary="V2 撞车丢弃草稿生命周期",
+            explain="仅记录来源任务、字符数和 wake lane；不记录草稿正文。",
+            detail={
+                "source_job_id": str(source_job_id),
+                "current_job_id": str(current_job_id),
+                "chars": max(0, int(chars)),
+                "lane": str(lane),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — diagnostics never affect delivery
+        log.warning(
+            "[v2.worker] wake discarded-draft trace failed user=%s event=%s "
+            "code=%s",
+            user_id,
+            event,
+            type(exc).__name__.lower(),
+        )
+
+
 # Wake-lane BYOK payment cooldown: a "provider_config" failure (402 out-of-credits,
 # 401/403 bad key) means the user's BYOK key is dead/broke — retrying it every heartbeat
 # interval is a retry storm against a key that cannot succeed until the user fixes it
@@ -1009,9 +1272,16 @@ _SCHEDULED_FAILURE_RETRY_DELAYS_SEC = (30.0, 120.0)
 _DEGENERATE_REPLY_FALLBACK = (
     os.environ.get(
         "FALLBACK_REPLY",
-        "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。",
+        DEFAULT_FAILURE_FALLBACK_ZH,
     ).strip()
-    or "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。"
+    or DEFAULT_FAILURE_FALLBACK_ZH
+)
+_DEGENERATE_REPLY_FALLBACK_EN = (
+    os.environ.get(
+        "FALLBACK_REPLY_EN",
+        DEFAULT_FAILURE_FALLBACK_EN,
+    ).strip()
+    or DEFAULT_FAILURE_FALLBACK_EN
 )
 _DEGENERATE_REPLY_ERROR_CLASS = "upstream_unavailable"
 # A torn/leaked protocol-JSON fragment (stream-cut relay split the envelope
@@ -1020,6 +1290,14 @@ _DEGENERATE_REPLY_ERROR_CLASS = "upstream_unavailable"
 # job_failed_reasons aggregation instead of hiding behind a plain sleep.
 _PROTOCOL_FRAGMENT_ERROR_CLASS = "upstream_unavailable"
 _PROTOCOL_FRAGMENT_REASON = "protocol_fragment_suppressed"
+_LOCAL_TOOL_CALL_TAIL_EVIDENCE = "tool_call_tail"
+_TOOL_CALL_TAIL_RE = re.compile(
+    r'''(?m)(?P<quote>["'])\)[ \t]*(?:[.,!?;:。！？；：][ \t]*)?$'''
+)
+_INTERNAL_PLANNING_RE = re.compile(
+    r"(?im)(?:^|\n)[ \t]*(?:[-*•][ \t]*)?"
+    r"let['’]s[ \t]+check[ \t]+the[ \t]+exact[ \t]+timeline[ \t]*:"
+)
 _MALFORMED_SELF_THINKING_REASON = "malformed_self_thinking_suppressed"
 # 工具循环把我们自己的 _TURN_MAX_LLM_CALLS 预算跑光却始终没产出终局文本。
 # 这是**我们的配置上限**,不是 provider 给了空回复 —— 单独一个 reason,才能既
@@ -1033,15 +1311,93 @@ _TOOL_BUDGET_EXHAUSTED_REASON = "tool_budget_exhausted"
 _THINKING_ONLY_NO_REPLY_REASON = "thinking_only_no_reply"
 
 
-def _torn_protocol_evidence(text: str, reasoning: str, *, lane: str) -> str:
+def _has_high_confidence_tool_call_tail(text: str) -> bool:
+    """Detect the observed orphan function-call tail without invented edges.
+
+    The syntax must end a real line in the full reply, contain an unmatched
+    ASCII quote on that line, and be followed by the observed internal-planning
+    marker.  Each ingredient by itself is ordinary prose.
+    """
+    visible = str(text or "")
+    for match in _TOOL_CALL_TAIL_RE.finditer(visible):
+        line_start = visible.rfind("\n", 0, match.start()) + 1
+        line_to_quote = visible[line_start:match.start() + 1]
+        quote = match.group("quote")
+        unescaped_quotes = 0
+        for index, char in enumerate(line_to_quote):
+            if char != quote:
+                continue
+            backslashes = 0
+            cursor = index - 1
+            while cursor >= 0 and line_to_quote[cursor] == "\\":
+                backslashes += 1
+                cursor -= 1
+            if backslashes % 2 == 0:
+                unescaped_quotes += 1
+        if unescaped_quotes % 2 != 1:
+            continue
+        if _INTERNAL_PLANNING_RE.search(visible, match.end()):
+            return True
+    return False
+
+
+def _torn_protocol_evidence(
+    text: str,
+    reasoning: str,
+    *,
+    lane: str,
+    transport_cut: bool = False,
+) -> str:
     """Classify a V2 visible reply for a torn protocol leak, then
     apply the lane policy. Returns the evidence enum when it should be suppressed,
     or "" to deliver. `lane` here is the detector policy ("proactive"/"foreground"),
     not the wake lane."""
-    evidence = protocol_leak.classify(text, reasoning_text=reasoning)
+    evidence = protocol_leak.classify(
+        text,
+        reasoning_text=reasoning,
+        transport_cut=bool(transport_cut),
+    )
     if protocol_leak.should_suppress(evidence, lane=lane):
         return evidence
+    if lane == "proactive" and _has_high_confidence_tool_call_tail(text):
+        return _LOCAL_TOOL_CALL_TAIL_EVIDENCE
     return ""
+
+
+@dataclass
+class _ProviderReplySignal:
+    """Latest real provider completion signal for the reply callback."""
+
+    stop_reason: str = ""
+
+    def observe(self, event_kind: str, detail: dict[str, Any]) -> None:
+        if event_kind in {"start", "error"}:
+            self.stop_reason = ""
+            return
+        if event_kind != "done":
+            return
+        reason = provider_client.normalize_stop_reason(detail.get("finish_reason"))
+        self.stop_reason = (
+            reason
+            if reason in v2_tool_loop._CONTENT_FREE_STOP_REASONS
+            else ""
+        )
+
+    @property
+    def transport_cut(self) -> bool:
+        return provider_client.is_token_limit_stop_reason(self.stop_reason)
+
+
+def _provider_model_call_callback(
+    signal: _ProviderReplySignal,
+    trace: Any | None,
+):
+    async def _record(event_kind: str, detail: dict[str, Any]) -> None:
+        signal.observe(event_kind, detail)
+        if trace is not None:
+            await trace.record_model_call(event_kind, detail)
+
+    return _record
 
 
 class LostJobLease(RuntimeError):
@@ -1271,8 +1627,12 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
         kind = candidate if candidate in notices_catalog.ERROR_CLASSES else "error"
     elif isinstance(exc, v2_tool_loop.ProviderEmptyReply):
         kind = "empty_reply"
+    elif isinstance(exc, v2_tool_loop.ProviderOutputTruncated):
+        kind = "output_truncated"
     elif isinstance(exc, v2_tool_loop.CanvasDeliveryIncomplete):
         kind = "canvas_file_delivery_incomplete"
+    elif isinstance(exc, v2_tool_loop.FileDeliveryIncomplete):
+        kind = "file_delivery_incomplete"
     elif isinstance(exc, TurnError):
         raw = str(exc)
         if raw in {
@@ -1350,6 +1710,7 @@ _EXTRACTION_FAILURE_KINDS = frozenset(
     set(_EXTRACTION_FAILURE_REASONS)
     | set(v2_extraction.PUBLIC_PROVIDER_FAILURE_CODES)
     | {
+        "database_pool_timeout",
         "invalid_card_content",
         "invalid_card_content_after_retry",
         "json_decode_error",
@@ -1376,6 +1737,16 @@ PUBLIC_FAILURE_CODES = frozenset(
 
 def _extraction_failure_code(exc: BaseException) -> str:
     """Preserve expected extraction causes without persisting raw messages."""
+    # Historical workers persisted this exception by its bare class name as
+    # ``extraction_failed:pooltimeout``.  That lost the defining provenance:
+    # psycopg_pool and HTTP clients both expose a ``PoolTimeout`` class.  The
+    # provider seam catches and normalizes its own transport exceptions before
+    # they reach this boundary, while psycopg acquisition errors can arise from
+    # Capture state, fence, journal, or commit reads.  Match the concrete DB
+    # exception before the generic closed vocabulary so operators can tell a
+    # database-capacity failure from a model failure without exposing details.
+    if isinstance(exc, PsycopgPoolTimeout):
+        return "extraction_failed:database_pool_timeout"
     raw = str(exc or "").strip()
     provider_code = v2_extraction.provider_failure_code_from_reason(raw)
     if provider_code is not None:
@@ -1399,6 +1770,8 @@ def _turn_failure_error_class(exc: BaseException) -> str:
         return exc.error_code
     if isinstance(exc, v2_tool_loop.CanvasDeliveryIncomplete):
         return "canvas_file_delivery_incomplete"
+    if isinstance(exc, v2_tool_loop.FileDeliveryIncomplete):
+        return "file_delivery_incomplete"
     if isinstance(exc, v2_prompt_frontier.PromptFrontierExhausted):
         # An unaudited default is our conservative local ceiling, not the
         # provider's model limit. Never blame the user or tell them to shorten
@@ -1408,6 +1781,8 @@ def _turn_failure_error_class(exc: BaseException) -> str:
         return "context_overflow"
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
         return "provider_timeout"
+    if isinstance(exc, v2_tool_loop.ProviderOutputTruncated):
+        return "provider_output_truncated"
     if (
         isinstance(exc, v2_tool_loop.ProviderEmptyReply)
         or (isinstance(exc, TurnError) and str(exc) == "empty_reply")
@@ -2777,6 +3152,103 @@ async def _emit_silent_reply_trace(
         )
 
 
+async def _emit_protocol_suppressed_trace(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+    *,
+    evidence: str,
+    stop_reason: str,
+    transport_cut: bool,
+    final: bool,
+    trace_id: str = "",
+    job_id: object = "",
+) -> None:
+    """Expose a content-free suppression diagnosis on the admin timeline."""
+    if deps.emit_debug_trace is None:
+        return
+    safe_lane = _normalize_provider_trace_lane(lane)
+    safe_stop = provider_client.normalize_stop_reason(stop_reason)
+    if safe_stop not in v2_tool_loop._CONTENT_FREE_STOP_REASONS:
+        safe_stop = ""
+    try:
+        await asyncio.to_thread(
+            deps.emit_debug_trace,
+            user_id,
+            "reply.protocol_fragment_suppressed",
+            trace_id=str(trace_id or ""),
+            job_id=str(job_id or ""),
+            status="error",
+            outcome_class=jobs_store.terminal_outcome_class(
+                f"wake_failed:{_PROTOCOL_FRAGMENT_REASON}"
+            ),
+            summary="V2 回复在投递前压制了协议残片",
+            explain=(
+                "仅记录闭集检测类型、provider 结束原因和 lane；"
+                "不记录回复、reasoning、prompt 或工具参数。"
+            ),
+            detail={
+                "lane": safe_lane,
+                "evidence": str(evidence or ""),
+                "stop_reason": safe_stop,
+                "transport_cut": bool(transport_cut),
+                "final": bool(final),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a turn
+        log.warning(
+            "[v2.protocol_fragment] trace failed user=%s lane=%s code=%s",
+            user_id,
+            safe_lane,
+            type(exc).__name__.lower(),
+        )
+
+
+async def _emit_transport_cut_trace(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+    *,
+    stop_reason: str,
+    final: bool,
+    trace_id: str = "",
+    job_id: object = "",
+) -> None:
+    """Record a real provider output-limit signal without changing delivery."""
+    if deps.emit_debug_trace is None:
+        return
+    safe_lane = _normalize_provider_trace_lane(lane)
+    safe_stop = provider_client.normalize_stop_reason(stop_reason)
+    if not provider_client.is_token_limit_stop_reason(safe_stop):
+        return
+    try:
+        await asyncio.to_thread(
+            deps.emit_debug_trace,
+            user_id,
+            "reply.transport_cut_observed",
+            trace_id=str(trace_id or ""),
+            job_id=str(job_id or ""),
+            status="warning",
+            summary="Provider 标记回复达到输出上限（投递策略未改变）",
+            explain=(
+                "这是独立的闭集 transport-cut 观测，不代表协议残片已压制；"
+                "不记录回复、reasoning、prompt 或工具参数。"
+            ),
+            detail={
+                "lane": safe_lane,
+                "stop_reason": safe_stop,
+                "final": bool(final),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a turn
+        log.warning(
+            "[v2.transport_cut] trace failed user=%s lane=%s code=%s",
+            user_id,
+            safe_lane,
+            type(exc).__name__.lower(),
+        )
+
+
 def _silent_empty_response_debug_callback(
     deps: TurnDeps,
     user_id: str,
@@ -3198,6 +3670,34 @@ def _tail_window_callback(
     return _record
 
 
+def _web_fetch_batch_key(tc) -> tuple[str, int] | None:
+    """Return a validated (URL, offset) pair for batch-local fetch ordering."""
+    if str(getattr(tc, "name", "")) != "web_fetch":
+        return None
+    args = getattr(tc, "args", None)
+    if not isinstance(args, dict):
+        return None
+    offset = args.get("offset", 0)
+    if type(offset) is not int or offset < 0:
+        return None
+    url = str(args.get("url") or "").strip()
+    return (url, offset) if url else None
+
+
+def _web_fetch_batch_owner_events(tool_calls) -> dict[str, asyncio.Event]:
+    """Create completion signals only for URLs with an offset-zero owner.
+
+    Continuations wait for these signals before taking a read/enclave permit.
+    The synchronous WebFetchSession remains the singleflight authority; these
+    events are only admission ordering for one provider batch.
+    """
+    return {
+        key[0]: asyncio.Event()
+        for tc in tool_calls
+        if (key := _web_fetch_batch_key(tc)) is not None and key[1] == 0
+    }
+
+
 async def _dispatch_mixed_tool_calls(
     tool_calls,
     *,
@@ -3276,6 +3776,10 @@ async def _dispatch_mixed_tool_calls(
             # unknown/bad calls in the read phase lets executor return its stable
             # error without ever routing one through a write fence.
             reads.append(("platform", tc))
+
+    web_fetch_owner_events = _web_fetch_batch_owner_events(
+        tc for kind, tc in reads if kind == "platform"
+    )
 
     def _workspace_run(start: int) -> tuple[list[Any], int]:
         run: list[Any] = []
@@ -3413,9 +3917,20 @@ async def _dispatch_mixed_tool_calls(
         )
 
     async def _read(kind: str, tc) -> ToolResult:
-        await _event(tc, "tool_call_started", {"phase": f"{kind}_read"})
+        fetch_key = _web_fetch_batch_key(tc) if kind == "platform" else None
+        fetch_event = (
+            web_fetch_owner_events.get(fetch_key[0])
+            if fetch_key is not None
+            else None
+        )
+        is_fetch_owner = fetch_event is not None and fetch_key[1] == 0
+        if fetch_event is not None and fetch_key[1] > 0:
+            # Do not consume the read gate (and therefore the instance-wide
+            # enclave permit below it) while the same-batch owner is queued.
+            await fetch_event.wait()
         started_ns = time.monotonic_ns()
         try:
+            await _event(tc, "tool_call_started", {"phase": f"{kind}_read"})
             if kind == "mcp":
                 # wait_for encloses admission as well as transport: this is a total
                 # wall deadline, not another per-socket idle timeout.
@@ -3434,6 +3949,11 @@ async def _dispatch_mixed_tool_calls(
                 },
             )
             raise
+        finally:
+            if is_fetch_owner:
+                # Release continuations even when dispatch or observability
+                # fails; WebFetchSession will return the retained result/error.
+                fetch_event.set()
         await _event(
             tc,
             "tool_call_result",
@@ -5675,6 +6195,7 @@ def _make_task_batch_dispatcher(
 
             child_tool_event = _make_tool_trajectory_callback(child_recorder)
             child_read_gate = asyncio.Semaphore(MAX_READ_ACTION_PARALLELISM)
+            child_web_fetch_session = cap_web.WebFetchSession()
             # Computed ONCE and referenced by both the offer side
             # (disabled_tool_names below) and the execute side
             # (_child_dispatch). Deriving each independently is precisely how
@@ -5696,6 +6217,10 @@ def _make_task_batch_dispatcher(
                 )
                 if cancelled is not None:
                     return cancelled
+                child_web_fetch_session.prepare_batch(tool_calls)
+                child_web_fetch_owner_events = _web_fetch_batch_owner_events(
+                    tool_calls
+                )
                 if any(tc.name not in child_allowed_tools for tc in tool_calls):
                     # The child loop validates against its offered catalog before
                     # calling this closure. This is a second fail-closed boundary
@@ -5709,17 +6234,26 @@ def _make_task_batch_dispatcher(
                     ]
 
                 async def _one(tc) -> ToolResult:
-                    if child_tool_event is not None:
-                        await child_tool_event(
-                            tc,
-                            "tool_call_started",
-                            {"phase": "subagent_read"},
-                        )
+                    fetch_key = _web_fetch_batch_key(tc)
+                    fetch_event = (
+                        child_web_fetch_owner_events.get(fetch_key[0])
+                        if fetch_key is not None
+                        else None
+                    )
+                    is_fetch_owner = fetch_event is not None and fetch_key[1] == 0
+                    if fetch_event is not None and fetch_key[1] > 0:
+                        await fetch_event.wait()
 
                     def _no_child_write(_tc):
                         raise RuntimeError("subagent attempted a write")
 
                     try:
+                        if child_tool_event is not None:
+                            await child_tool_event(
+                                tc,
+                                "tool_call_started",
+                                {"phase": "subagent_read"},
+                            )
                         async with child_read_gate:
                             (result,) = await v2_executor.dispatch_tool_calls(
                                 [tc],
@@ -5732,6 +6266,7 @@ def _make_task_batch_dispatcher(
                                 before_write=None,
                                 observe_photo=observe_photo,
                                 read_parallelism=1,
+                                web_fetch_session=child_web_fetch_session,
                             )
                     except Exception as exc:
                         if child_tool_event is not None:
@@ -5744,6 +6279,9 @@ def _make_task_batch_dispatcher(
                                 },
                             )
                         raise
+                    finally:
+                        if is_fetch_owner:
+                            fetch_event.set()
                     if child_tool_event is not None:
                         await child_tool_event(
                             tc,
@@ -6567,13 +7105,6 @@ def _workspace_file_mime(name: str, declared: str = "") -> str:
     """Choose a safe MIME for generated workspace files sent without rendering."""
     if str(name or "").casefold().endswith(".io.html"):
         return "text/html"
-    explicit = str(declared or "").strip().lower()
-    if explicit.startswith("text/") or explicit in {
-        "application/json",
-        "application/xml",
-        "application/yaml",
-    }:
-        return explicit[:120]
     suffix = posixpath.splitext(name)[1].lower()
     known = {
         ".csv": "text/csv",
@@ -6585,11 +7116,21 @@ def _workspace_file_mime(name: str, declared: str = "") -> str:
         ".rtf": "text/rtf",
         ".svg": "image/svg+xml",
         ".tsv": "text/tab-separated-values",
+        ".txt": "text/plain",
         ".xml": "application/xml",
         ".yaml": "application/yaml",
         ".yml": "application/yaml",
     }
-    return known.get(suffix) or mimetypes.guess_type(name)[0] or "text/plain"
+    if suffix in known:
+        return known[suffix]
+    explicit = str(declared or "").strip().lower()
+    if explicit.startswith("text/") or explicit in {
+        "application/json",
+        "application/xml",
+        "application/yaml",
+    }:
+        return explicit[:120]
+    return mimetypes.guess_type(name)[0] or "text/plain"
 
 
 def _workspace_file_reply_from_result(
@@ -7093,6 +7634,7 @@ def _build_encrypted_file_reply_effect_payload(
         store,
         bytes(file_reply.data),
         item_id=item_id,
+        content_kind="binary",
     )
     if envelope is None:
         raise RuntimeError(error or "file reply envelope build failed")
@@ -8315,6 +8857,8 @@ async def _run_wake(
     push_slot: dict | None = None
     shadow_decision_allowed: bool | None = None
     stay_silent_reason: str | None = None
+    discarded_draft: dict | None = None
+    discarded_draft_cleared = False
     language_user_rows: list[dict] = []
     # Same content-free MCP usage counters chat keeps, declared before the try so
     # the finally can emit `mcp.turn.usage` for wake lanes too. Without a wake
@@ -8329,6 +8873,7 @@ async def _run_wake(
         lane,
         trace_id,
     )
+    provider_reply_signal = _ProviderReplySignal()
     try:
         store = core_store.get_store(user_id)
         seq_native = deps.read_messages_after_seq is not None
@@ -8426,6 +8971,36 @@ async def _run_wake(
         # wake turn. Load before any prompt-coverage provider call so a broken
         # workspace never produces an under-authorized proactive response.
         token = deps.mint_enclave_token(user_id)
+        if lane in _WAKE_DISCARDED_DRAFT_LANES:
+            try:
+                async with enclave_sem:
+                    discarded_draft = await asyncio.to_thread(
+                        _read_latest_wake_discarded_draft,
+                        user_id,
+                        runtime_token=token,
+                    )
+            except Exception as exc:  # noqa: BLE001 — optional stale context
+                log.warning(
+                    "[v2.worker] wake discarded-draft read failed user=%s "
+                    "job=%s lane=%s code=%s",
+                    user_id,
+                    job_id,
+                    lane,
+                    type(exc).__name__.lower(),
+                )
+                discarded_draft = None
+            if discarded_draft is not None:
+                await _emit_wake_discarded_draft_trace(
+                    deps.emit_debug_trace,
+                    user_id,
+                    "wake.discarded_draft.consumed",
+                    source_job_id=str(
+                        discarded_draft.get("source_job_id") or ""
+                    ),
+                    chars=len(str(discarded_draft.get("text") or "")),
+                    current_job_id=str(job_id),
+                    lane=lane,
+                )
         observe_photo = _make_photo_observer(
             deps,
             user_id=user_id,
@@ -9128,6 +9703,7 @@ async def _run_wake(
         if lane == "screen_watch" and screen_frame_message is not None:
             wake_disabled_tool_names |= _IDENTITY_WRITE_ACTIONS
 
+        wake_web_fetch_session = cap_web.WebFetchSession()
         dispatch_task_batch = _make_task_batch_dispatcher(
             disabled_web_tool_names=wake_disabled_web_tool_names,
             provider_config=provider_config,
@@ -9148,6 +9724,7 @@ async def _run_wake(
             )
             if cancelled is not None:
                 return cancelled
+            wake_web_fetch_session.prepare_batch(tool_calls)
             await _fence_wake_effect("tool dispatch")
 
             async def _dispatch_platform_one(tc) -> ToolResult:
@@ -9184,6 +9761,7 @@ async def _run_wake(
                             "job_id": str(job_id),
                             "lane": lane,
                         },
+                        web_fetch_session=wake_web_fetch_session,
                     )
                 finally:
                     effect_reservations.mark_ready(tc)
@@ -9278,6 +9856,7 @@ async def _run_wake(
                             "job_id": str(job_id),
                             "lane": lane,
                         },
+                        web_fetch_session=wake_web_fetch_session,
                     )
                 finally:
                     effect_reservations.mark_batch_ready(calls)
@@ -9457,8 +10036,19 @@ async def _run_wake(
             nonlocal thinking_trace_emitted, language_trace_emitted
             nonlocal shadow_decision_allowed
             nonlocal wake_self_thinking_failed
+            nonlocal discarded_draft_cleared
             text = str(text or "").strip()
             wake_self_thinking_failed = False
+            if provider_reply_signal.transport_cut:
+                await _emit_transport_cut_trace(
+                    deps,
+                    user_id,
+                    lane,
+                    stop_reason=provider_reply_signal.stop_reason,
+                    final=final,
+                    trace_id=trace_id,
+                    job_id=job_id,
+                )
             # Self-authored thinking (same mechanism as the chat lane): peel a leading
             # <think> off the wake reply BEFORE the degenerate/torn checks so they see
             # the real reply, and surface the block in the thinking channel instead of
@@ -9513,12 +10103,32 @@ async def _run_wake(
             # reasoning/content). Proactive policy suppresses any leak — silence
             # is the correct wake outcome anyway. Mirror the degenerate lifecycle:
             # final fails the turn (recorded, no bubble), intermediate is a no-op.
-            torn = _torn_protocol_evidence(text, reasoning, lane="proactive") if text else ""
+            torn = (
+                _torn_protocol_evidence(
+                    text,
+                    reasoning,
+                    lane="proactive",
+                    transport_cut=provider_reply_signal.transport_cut,
+                )
+                if text
+                else ""
+            )
             if torn:
                 log.warning(
                     "[v2.worker] wake torn protocol fragment suppressed user=%s "
                     "job=%s lane=%s final=%s evidence=%s fragment=%r",
                     user_id, job_id, lane, final, torn, text[:32],
+                )
+                await _emit_protocol_suppressed_trace(
+                    deps,
+                    user_id,
+                    lane,
+                    evidence=torn,
+                    stop_reason=provider_reply_signal.stop_reason,
+                    transport_cut=provider_reply_signal.transport_cut,
+                    final=final,
+                    trace_id=trace_id,
+                    job_id=job_id,
                 )
                 if final:
                     raise TurnError(_PROTOCOL_FRAGMENT_REASON)
@@ -9798,6 +10408,41 @@ async def _run_wake(
                 )
                 if status == "applied":
                     shadow_decision_allowed = True
+                    if (
+                        discarded_draft is not None
+                        and not discarded_draft_cleared
+                    ):
+                        try:
+                            cleared = await asyncio.to_thread(
+                                db.log_clear,
+                                user_id,
+                                WAKE_DISCARDED_DRAFT_STREAM,
+                            )
+                        except Exception as exc:  # noqa: BLE001 — reply applied
+                            cleared = False
+                            log.warning(
+                                "[v2.worker] wake discarded-draft clear failed "
+                                "user=%s job=%s lane=%s code=%s",
+                                user_id,
+                                job_id,
+                                lane,
+                                type(exc).__name__.lower(),
+                            )
+                        if cleared:
+                            discarded_draft_cleared = True
+                            await _emit_wake_discarded_draft_trace(
+                                deps.emit_debug_trace,
+                                user_id,
+                                "wake.discarded_draft.cleared",
+                                source_job_id=str(
+                                    discarded_draft.get("source_job_id") or ""
+                                ),
+                                chars=len(
+                                    str(discarded_draft.get("text") or "")
+                                ),
+                                current_job_id=str(job_id),
+                                lane=lane,
+                            )
                     # 覆盖式：一个回合可能吐多条气泡，只有最后一条会成为推送。构建槽位
                     # 本身也是 best-effort：payload 缺 "envelope"（例如未来出现的非
                     # seq_native / 测试注入变体）不该把一个已经成功落库的回合打成
@@ -9855,7 +10500,46 @@ async def _run_wake(
                 ):
                     # Post-time collision is an intentional sleep, not stale
                     # input to fold into another provider call. The wake job
-                    # finishes normally without publishing or pushing.
+                    # finishes normally without publishing or pushing. Preserve
+                    # a bounded encrypted draft so the next weak wake knows this
+                    # wording was never shown. Persistence is best-effort and
+                    # cannot retry or publish this discarded reply.
+                    try:
+                        collision_seq_hint = await asyncio.to_thread(
+                            db.chat_max_seq,
+                            user_id,
+                        )
+                    except Exception:  # noqa: BLE001 — diagnostic hint only
+                        collision_seq_hint = wake_snapshot_seq
+                    try:
+                        stored_draft = await asyncio.to_thread(
+                            _store_wake_discarded_draft,
+                            store,
+                            text,
+                            wake_kind=lane,
+                            source_job_id=str(job_id),
+                            collision_seq_hint=int(collision_seq_hint or 0),
+                        )
+                    except Exception as exc:  # noqa: BLE001 — fail-open observe
+                        stored_draft = None
+                        log.warning(
+                            "[v2.worker] wake discarded-draft write failed "
+                            "user=%s job=%s lane=%s code=%s",
+                            user_id,
+                            job_id,
+                            lane,
+                            type(exc).__name__.lower(),
+                        )
+                    if stored_draft is not None:
+                        await _emit_wake_discarded_draft_trace(
+                            deps.emit_debug_trace,
+                            user_id,
+                            "wake.discarded_draft.stored",
+                            source_job_id=str(job_id),
+                            chars=int(stored_draft.get("chars") or 0),
+                            current_job_id=str(job_id),
+                            lane=lane,
+                        )
                     return
                 if (
                     status == "discarded"
@@ -10033,10 +10717,9 @@ async def _run_wake(
                 system_prompt=_wake_sys,
                 summary=summary,
                 tail=wake_tail,
-                extra_context=(
-                    context.action_context_str(grounding_results)
-                    if grounding_results
-                    else ""
+                extra_context=_wake_action_context_str(
+                    grounding_results,
+                    discarded_draft,
                 ),
                 identity_card_or_persona=identity_card_or_persona,
                 trusted_system_blocks=trusted_system_blocks,
@@ -10225,10 +10908,9 @@ async def _run_wake(
                     exc,
                 ),
                 on_provider_tool_surface=provider_roundtrip_trace,
-                on_provider_call_event=(
-                    provider_roundtrip_trace.record_model_call
-                    if provider_roundtrip_trace is not None
-                    else None
+                on_provider_call_event=_provider_model_call_callback(
+                    provider_reply_signal,
+                    provider_roundtrip_trace,
                 ),
                 on_empty_provider_response=(
                     _empty_provider_response_debug_callback(
@@ -12812,6 +13494,7 @@ async def process_job(
         if lane == "chat"
         else None
     )
+    provider_reply_signal = _ProviderReplySignal()
 
     try:
         if not claimed_by or not await asyncio.to_thread(
@@ -13152,8 +13835,14 @@ async def process_job(
                     "voice_call_id": call_id,
                     "voice_turn_id": turn_id,
                 }
+        # Coalesced input is user-only but roleless until prompt rendering.
+        # Restore the role for file intent and delivery-language checks.
+        current_user_messages = [
+            {**row, "role": "user"}
+            for row in coalesced
+        ]
         detected_file_requirement = (
-            context.required_file_suffixes(coalesced)
+            context.required_file_suffixes(current_user_messages)
             if lane == "chat"
             else None
         )
@@ -13393,6 +14082,21 @@ async def process_job(
                 prompt_snapshot_through_seq if seq_native else None
             ),
         )
+        chat_language_policy = infer_reply_language_policy(
+            {},
+            [],
+            locale=str(temporal_snapshot.get("locale") or ""),
+            archive_language=str(
+                temporal_snapshot.get("archive_language") or ""
+            ),
+        )
+
+        def _chat_failure_fallback() -> str:
+            return failure_fallback_reply(
+                chat_language_policy,
+                zh=_DEGENERATE_REPLY_FALLBACK,
+                en=_DEGENERATE_REPLY_FALLBACK_EN,
+            )
 
         platform_effects_by_call: dict[str, tuple[str, str]] = {}
         platform_workspace_batches: dict[
@@ -13692,6 +14396,7 @@ async def process_job(
             api_key=api_key,
             runtime_token=runtime_token,
         )
+        chat_web_fetch_session = cap_web.WebFetchSession()
         dispatch_task_batch = _make_task_batch_dispatcher(
             disabled_web_tool_names=disabled_web_tool_names,
             provider_config=provider_config,
@@ -13727,6 +14432,7 @@ async def process_job(
             )
             if cancelled is not None:
                 return cancelled
+            chat_web_fetch_session.prepare_batch(tool_calls)
             # Fence once per round before any capability executes (mirrors the
             # old _run_tools's renewal ahead of the read burst); writes get a
             # second, per-write fence via before_write above.
@@ -13783,6 +14489,7 @@ async def process_job(
                                     "job_id": str(job_id),
                                     "lane": lane,
                                 },
+                                web_fetch_session=chat_web_fetch_session,
                             )
                         scanned_rows = _history_rows_charged(result, lease)
                     finally:
@@ -13830,6 +14537,7 @@ async def process_job(
                             "job_id": str(job_id),
                             "lane": lane,
                         },
+                        web_fetch_session=chat_web_fetch_session,
                     )
                 finally:
                     effect_reservations.mark_ready(tc)
@@ -13917,6 +14625,7 @@ async def process_job(
                             "job_id": str(job_id),
                             "lane": lane,
                         },
+                        web_fetch_session=chat_web_fetch_session,
                     )
                 finally:
                     effect_reservations.mark_batch_ready(calls)
@@ -14164,6 +14873,10 @@ async def process_job(
             self_thinking_absent_retry_pending = False
             self_thinking_absent_retry_response_seen = False
 
+        def _cancel_self_thinking_absent_language_retry() -> None:
+            _cancel_self_thinking_absent_retry()
+            _cancel_language_correction()
+
         async def _on_reply(
             text: str | WorkspaceFileReply,
             *,
@@ -14187,6 +14900,9 @@ async def process_job(
             nonlocal self_thinking_absent_retry_pending
             nonlocal self_thinking_absent_retry_response_seen
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
+            validated_final_reply = isinstance(
+                text, v2_tool_loop.ValidatedFinalReply
+            )
             raw_reply_text = "" if file_reply is not None else str(text or "").strip()
             text = raw_reply_text
             image_replies: list[GeneratedImageReply] = []
@@ -14230,7 +14946,11 @@ async def process_job(
             self_thinking_text = ""
             self_thinking_failed = False
             self_thinking_status = None
-            if (_st_gate_on or self_thinking_on) and file_reply is None and text:
+            if (
+                (_st_gate_on or self_thinking_on)
+                and file_reply is None
+                and text
+            ):
                 _st_split = (
                     self_thinking.strip_all_thinking
                     if _st_gate_on
@@ -14240,17 +14960,18 @@ async def process_job(
                 self_thinking_status = _st_status
                 if _st_status == self_thinking.COMPLETE:
                     text = _st_reply
-                    self_thinking_text = _st_thinking
-                    if _self_thinking_internal_term(self_thinking_text):
-                        self_thinking_text = ""
-                        self_thinking_failed = True
+                    if not validated_final_reply:
+                        self_thinking_text = _st_thinking
+                        if _self_thinking_internal_term(self_thinking_text):
+                            self_thinking_text = ""
+                            self_thinking_failed = True
                 elif _st_status in {self_thinking.SILENT, self_thinking.FAILED}:
                     # Foreground chat must always answer, so both malformed protocol
                     # and a clean thinking-only response keep the pre-existing FAILED
                     # behavior: honest fallback bubble + thinking-failed marker.
                     # Non-empty text keeps it off the empty_reply failure path so the
                     # marker rides the reply effect.
-                    text = _DEGENERATE_REPLY_FALLBACK
+                    text = _chat_failure_fallback()
                     self_thinking_failed = True
                 # ABSENT: text unchanged
             if file_reply is not None and final:
@@ -14269,7 +14990,7 @@ async def process_job(
                 )
                 if not final:
                     return
-                text = _DEGENERATE_REPLY_FALLBACK
+                text = _chat_failure_fallback()
                 turn_failure_error_class = _DEGENERATE_REPLY_ERROR_CLASS
                 reasoning = ""
             # Torn protocol-JSON leak. Foreground policy: only STRONG cross-channel
@@ -14277,7 +14998,10 @@ async def process_job(
             # a strong hit, substitute the honest fallback and drop the reasoning —
             # never render a torn protocol head next to the fallback bubble.
             elif file_reply is None and text and _torn_protocol_evidence(
-                text, reasoning, lane="foreground"
+                text,
+                reasoning,
+                lane="foreground",
+                transport_cut=provider_reply_signal.transport_cut,
             ):
                 log.warning(
                     "[v2.worker] chat torn protocol fragment suppressed user=%s "
@@ -14286,7 +15010,7 @@ async def process_job(
                 )
                 if not final:
                     return
-                text = _DEGENERATE_REPLY_FALLBACK
+                text = _chat_failure_fallback()
                 turn_failure_error_class = _PROTOCOL_FRAGMENT_ERROR_CLASS
                 reasoning = ""
             # Keep this paired with the wake guard in _run_wake._on_reply. Some
@@ -14336,7 +15060,7 @@ async def process_job(
                     if _is_degenerate_reply(text):
                         if not final:
                             return
-                        text = _DEGENERATE_REPLY_FALLBACK
+                        text = _chat_failure_fallback()
                         turn_failure_error_class = tool_markup_leak.ERROR_CLASS
                         reasoning = ""
             if final and not text and not image_replies:
@@ -14393,7 +15117,13 @@ async def process_job(
                     )
                     language_correction_pending = False
                     thinking_language_correction_pending = False
-            elif final and file_reply is None and not image_replies and text:
+            elif (
+                final
+                and file_reply is None
+                and not validated_final_reply
+                and not image_replies
+                and text
+            ):
                 retry_completed = False
                 if self_thinking_absent_retry_pending:
                     self_thinking_absent_retried += 1
@@ -14419,44 +15149,89 @@ async def process_job(
                 ):
                     self_thinking_absent_retry_requests += 1
                     self_thinking_absent_retry_pending = True
+                    correction_instruction = (
+                        _SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION
+                    )
+                    correction_cancel = _cancel_self_thinking_absent_retry
+                    (
+                        user_script,
+                        reply_script,
+                        follow_outcome,
+                    ) = _reply_language_follow_observation(
+                        language_user_rows, text
+                    )
+                    if (
+                        follow_outcome == "mismatch"
+                        and user_script not in {"indeterminate", "mixed"}
+                        and reply_script not in {"indeterminate", "mixed"}
+                    ):
+                        language_correction_attempted = True
+                        language_correction_pending = True
+                        correction_instruction += (
+                            "\n\n"
+                            + v2_language_follow.CORRECTION_INSTRUCTION
+                            + "\n这次重写要同时完成两件事：保留 <think>…</think> "
+                            "结构，并让思考段和可见回复都与用户语言一致。"
+                        )
+                        correction_cancel = (
+                            _cancel_self_thinking_absent_language_retry
+                        )
                     return v2_tool_loop.FinalReplyCorrectionRequest(
-                        instruction=_SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION,
+                        instruction=correction_instruction,
                         original_text=raw_reply_text,
                         original_reasoning=reasoning,
-                        on_cancel=_cancel_self_thinking_absent_retry,
+                        on_cancel=correction_cancel,
                     )
                 # One correction round is already consumed after an ABSENT retry.
-                # Publish a valid COMPLETE result directly instead of asking the
-                # generic one-rewrite loop for a second language rewrite (which
-                # would otherwise fail open to the original ABSENT candidate).
-                if (
-                    not retry_completed
-                    and self_thinking_text
-                    and not thinking_language_correction_pending
-                    and not correction_outcome
-                ):
-                    thinking_mismatch = _self_thinking_language_mismatch(
-                        self_thinking_text, language_user_rows
-                    )
-                    if thinking_mismatch is not None:
-                        thinking_language_correction_pending = True
-                        return v2_tool_loop.FinalReplyCorrectionRequest(
-                            instruction=(
-                                v2_language_follow.CORRECTION_INSTRUCTION
-                                + "\n重写时保留 <think>…</think> 结构，并让思考段与用户语言一致。"
-                            ),
-                            original_text=raw_reply_text,
-                            original_reasoning=reasoning,
-                            on_cancel=_cancel_language_correction,
-                        )
+                # Validate any combined language requirement below, but never add
+                # a second hidden rewrite beside this bounded correction.
                 (
                     user_script,
                     reply_script,
                     follow_outcome,
                 ) = _reply_language_follow_observation(language_user_rows, text)
+                visible_language_mismatch = (
+                    follow_outcome == "mismatch"
+                    and user_script not in {"indeterminate", "mixed"}
+                    and reply_script not in {"indeterminate", "mixed"}
+                )
+                thinking_mismatch = (
+                    _self_thinking_language_mismatch(
+                        self_thinking_text, language_user_rows
+                    )
+                    if self_thinking_text
+                    else None
+                )
+                if (
+                    not retry_completed
+                    and not language_correction_pending
+                    and not thinking_language_correction_pending
+                    and not correction_outcome
+                    and (visible_language_mismatch or thinking_mismatch is not None)
+                ):
+                    language_correction_attempted = True
+                    language_correction_pending = True
+                    thinking_language_correction_pending = (
+                        thinking_mismatch is not None
+                    )
+                    correction_instruction = (
+                        v2_language_follow.CORRECTION_INSTRUCTION
+                    )
+                    if self_thinking_text:
+                        correction_instruction += (
+                            "\n重写时保留 <think>…</think> 结构，并让思考段和可见回复"
+                            "都与用户语言一致。"
+                        )
+                    return v2_tool_loop.FinalReplyCorrectionRequest(
+                        instruction=correction_instruction,
+                        original_text=raw_reply_text,
+                        original_reasoning=reasoning,
+                        on_cancel=_cancel_language_correction,
+                    )
                 if language_correction_pending:
-                    if reply_script == user_script:
+                    if reply_script == user_script and thinking_mismatch is None:
                         language_correction_pending = False
+                        thinking_language_correction_pending = False
                         language_correction_outcome = "corrected"
                     else:
                         # The loop still owns the original candidate. Reject this
@@ -14464,20 +15239,6 @@ async def process_job(
                         # original rather than exposing a second wrong-language
                         # rewrite.
                         return v2_tool_loop.FinalReplyCorrectionRejected()
-                elif (
-                    not retry_completed
-                    and follow_outcome == "mismatch"
-                    and user_script not in {"indeterminate", "mixed"}
-                    and reply_script not in {"indeterminate", "mixed"}
-                ):
-                    language_correction_attempted = True
-                    language_correction_pending = True
-                    return v2_tool_loop.FinalReplyCorrectionRequest(
-                        instruction=v2_language_follow.CORRECTION_INSTRUCTION,
-                        original_text=raw_reply_text,
-                        original_reasoning=reasoning,
-                        on_cancel=_cancel_language_correction,
-                    )
             delivery_started_ns = time.monotonic_ns()
             # A cutover/ABA can happen while awaiting the provider. Fence at
             # the reply effect itself; the pre-round check is not sufficient.
@@ -15109,8 +15870,15 @@ async def process_job(
             turn_trusted_system_blocks += (context.ORDERED_REPLY_TARGET_POLICY,)
 
         def _chat_builder():
+            chat_system_prompt = context._join_policy_blocks(
+                context.chat_system_prompt(provider_config),
+                reply_language_system_line(
+                    chat_language_policy,
+                    proactive=False,
+                ),
+            )
             return _make_build_messages_fn(
-                system_prompt=context.chat_system_prompt(provider_config),
+                system_prompt=chat_system_prompt,
                 summary=summary,
                 tail=tail,
                 extra_context=turn_extra_context,
@@ -15254,7 +16022,7 @@ async def process_job(
             on_tool_event=chat_tool_activity_callback,
             required_file_suffixes=required_file_suffixes,
             file_requirement_messages=(
-                coalesced
+                current_user_messages
                 if mutation_recovery_barrier is None
                 or recovery_existing_file_delivery
                 else ()
@@ -15279,10 +16047,9 @@ async def process_job(
                 exc,
             ),
             on_provider_tool_surface=provider_roundtrip_trace,
-            on_provider_call_event=(
-                provider_roundtrip_trace.record_model_call
-                if provider_roundtrip_trace is not None
-                else None
+            on_provider_call_event=_provider_model_call_callback(
+                provider_reply_signal,
+                provider_roundtrip_trace,
             ),
             on_empty_provider_response=(
                 _empty_provider_response_debug_callback(
@@ -15340,6 +16107,7 @@ async def process_job(
             max_assistant_tool_text_chars=MAX_ASSISTANT_TOOL_TEXT_CHARS,
             prompt_context_window_overrides=PROMPT_CONTEXT_WINDOW_OVERRIDES,
             prompt_output_reserve_tokens=PROMPT_OUTPUT_RESERVE_TOKENS,
+            file_output_max_tokens=FILE_OUTPUT_MAX_TOKENS,
             prompt_safety_margin_tokens=PROMPT_SAFETY_MARGIN_TOKENS,
             prompt_estimator_utf8_bytes_per_token=(
                 PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN

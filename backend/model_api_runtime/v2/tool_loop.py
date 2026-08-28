@@ -9,11 +9,18 @@ import json
 import posixpath
 import re
 import time
-from provider_types import ProviderResponse, ToolExchange, ToolResult, ToolSpec
+from provider_types import (
+    ProviderResponse,
+    ToolCall,
+    ToolExchange,
+    ToolResult,
+    ToolSpec,
+)
 from capabilities import registry as cap_registry
 from capabilities import result_budget
 from capabilities import tool_schema
-from agent_protocol_core import protocol_leak
+from agent_protocol_core import protocol_leak, self_thinking
+from model_api_runtime.v2 import language_follow
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import provenance
 from model_api_runtime.v2 import tool_surface
@@ -54,8 +61,16 @@ DEFAULT_MAX_TOOL_ARGS_CHARS = 16000
 DEFAULT_MAX_TOOL_BATCH_ARGS_CHARS = 64000
 DEFAULT_MAX_NATIVE_ASSISTANT_TURN_CHARS = 65536
 DEFAULT_MAX_ASSISTANT_TOOL_TEXT_CHARS = 8192
+REJECTED_TOOL_ARGS_SUMMARY_CHAR_CAP = 500
+REJECTED_ASSISTANT_TEXT_CHAR_CAP = 500
+REJECTED_TOOL_CALL_ID_PREFIX = "feedling_rejected_"
+REJECTED_TOOL_NAME_PLACEHOLDER = "feedling_rejected_unknown_tool"
 MIN_TOOL_RESULT_ERROR_QUOTA = 64
 _RESULT_TRUNCATION_MARKER = "...[truncated]"
+_REJECTED_TOOL_ARGS_KEY = "_feedling_rejected_args"
+_REJECTED_TOOL_PLAIN_TEXT_INSTRUCTION = (
+    "工具当前不可用,请用纯文本直接回复"
+)
 MCP_MUTATION_OUTCOME_UNKNOWN_ERROR = "error: mcp_mutation_outcome_unknown"
 MUTATION_BLOCKED_AFTER_UNKNOWN_OUTCOME_ERROR = (
     "error: mutation_blocked_after_unknown_outcome"
@@ -126,6 +141,7 @@ _CONTENT_FREE_STOP_REASONS = frozenset(
         "image_safety",
         "language",
         "length",
+        "max_output_tokens",
         "malformed_function_call",
         "max_tokens",
         "other",
@@ -268,6 +284,40 @@ _NOT_A_CLAIM_RE = re.compile(
     re.IGNORECASE,
 )
 _IMAGE_NOUN = r"(?:自画像|画像|插画|图片|图像|图)"
+_IDENTITY_WRITE_TOOL_NAMES = frozenset(
+    action
+    for action in cap_registry.WRITE_ACTIONS
+    if action.startswith("identity_")
+)
+
+
+def _identity_write_attempted(transcript) -> bool:
+    """Return whether the turn transcript contains an identity-write call."""
+    return any(
+        call.name in _IDENTITY_WRITE_TOOL_NAMES
+        for item in transcript
+        if isinstance(item, ToolExchange)
+        for call in item.calls
+    )
+
+
+def _identity_write_succeeded(transcript) -> bool:
+    """Return whether a matched identity-write result is classified as success."""
+    from core import chat_activity as _ca
+
+    for item in transcript:
+        if not isinstance(item, ToolExchange):
+            continue
+        results_by_id = {str(result.call_id): result for result in item.results}
+        for call in item.calls:
+            if call.name not in _IDENTITY_WRITE_TOOL_NAMES:
+                continue
+            result = results_by_id.get(str(call.id))
+            if result is not None and _ca.result_code(result.content) == "ok":
+                return True
+    return False
+
+
 _IMAGE_CLAIM_RE = re.compile(
     r"("
     # 图 + (已经) + 完成动词:「图片已经生成」「图片生成好了」
@@ -338,7 +388,12 @@ def _file_suffix_for_requirement(
         return max(matches, key=len)
     if normalized.endswith(".io.html"):
         return ".io.html"
-    return posixpath.splitext(normalized)[1]
+    suffix = posixpath.splitext(normalized)[1]
+    return {
+        ".htm": ".html",
+        ".markdown": ".md",
+        ".yml": ".yaml",
+    }.get(suffix, suffix)
 
 
 def _serialized_chars(value) -> int | None:
@@ -355,6 +410,25 @@ def _serialized_chars(value) -> int | None:
         return None
 
 
+def _tool_args_char_limit(tc: ToolCall, default_limit: int) -> int:
+    """Allow one schema-bounded Canvas body through the generic tool guard."""
+    if (
+        tc.name == "workspace_write"
+        and tc.args_ok
+        and str(tc.args.get("path") or "").strip().casefold().endswith(".io.html")
+        and tool_schema.validate_tool_args(tc.name, tc.args) is None
+    ):
+        serialized_size = _serialized_chars(tc.args)
+        if serialized_size is not None:
+            # The closed tool schema and its capability-level UTF-8 check are
+            # authoritative here. Derive the allowance from this exact parsed
+            # argument object: JSON escaping grows with quote/backslash density,
+            # so a fixed additive allowance would silently narrow the 256KB
+            # source contract when a future output budget reaches that boundary.
+            return max(default_limit, serialized_size)
+    return default_limit
+
+
 def _truncate_result_content(content: str, cap: int, *, marker: str = _RESULT_TRUNCATION_MARKER) -> str:
     """Deterministically cap one result, including the truncation marker."""
     text = str(content or "")
@@ -363,6 +437,90 @@ def _truncate_result_content(content: str, cap: int, *, marker: str = _RESULT_TR
     if cap <= len(marker):
         return marker[:cap]
     return text[: cap - len(marker)] + marker
+
+
+def _rejected_tool_args(tool_call: ToolCall) -> dict:
+    """Return one bounded, provider-encodable summary of rejected arguments."""
+    if tool_call.args_ok:
+        try:
+            raw = json.dumps(
+                tool_call.args,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError, OverflowError):
+            raw = "<unserializable arguments>"
+    else:
+        raw = str(tool_call.args_raw or "<invalid arguments>")
+    best = ""
+    low = 0
+    high = min(len(raw), REJECTED_TOOL_ARGS_SUMMARY_CHAR_CAP)
+    while low <= high:
+        midpoint = (low + high) // 2
+        candidate = _truncate_result_content(raw, midpoint)
+        encoded = {_REJECTED_TOOL_ARGS_KEY: candidate}
+        size = _serialized_chars(encoded)
+        if size is not None and size <= REJECTED_TOOL_ARGS_SUMMARY_CHAR_CAP:
+            best = candidate
+            low = midpoint + 1
+        else:
+            high = midpoint - 1
+    return {_REJECTED_TOOL_ARGS_KEY: best}
+
+
+def _rejected_tool_exchange(
+    tool_calls: list[ToolCall],
+    *,
+    assistant_text: str,
+    rejection_reasons: list[str],
+    attempt: int,
+) -> ToolExchange:
+    """Synthesize a bounded, non-executed exchange for one rejected batch.
+
+    Provider-native ids and assistant payloads can themselves be malformed, so
+    neither is retained. The reserved id prefix plus the monotonically
+    increasing provider-attempt number makes every synthetic id distinct within
+    this loop while keeping calls and results exactly paired on every wire.
+    """
+    if len(tool_calls) != len(rejection_reasons):
+        raise ValueError("rejected tool calls and reasons must match")
+    calls: list[ToolCall] = []
+    results: list[ToolResult] = []
+    for index, (tool_call, reason) in enumerate(
+        zip(tool_calls, rejection_reasons)
+    ):
+        call_id = f"{REJECTED_TOOL_CALL_ID_PREFIX}{attempt}_{index}"
+        normalized_reason = str(reason or "tool_call_rejected").strip()
+        calls.append(
+            ToolCall(
+                id=call_id,
+                name=(
+                    str(tool_call.name or "").strip()
+                    or REJECTED_TOOL_NAME_PLACEHOLDER
+                ),
+                args=_rejected_tool_args(tool_call),
+            )
+        )
+        results.append(
+            ToolResult(
+                call_id=call_id,
+                content=(
+                    f"Tool call rejected: {normalized_reason}. No tool was "
+                    f"executed. {_REJECTED_TOOL_PLAIN_TEXT_INSTRUCTION}"
+                ),
+                metadata={"rejected": normalized_reason},
+            )
+        )
+    return ToolExchange(
+        calls=tuple(calls),
+        results=tuple(results),
+        assistant_text=_truncate_result_content(
+            assistant_text,
+            REJECTED_ASSISTANT_TEXT_CHAR_CAP,
+        ),
+        assistant_turn=None,
+    )
 
 
 def _result_quotas(lengths: list[int], batch_cap: int) -> list[int]:
@@ -523,8 +681,40 @@ class ProviderEmptyReply(RuntimeError):
     """A structurally valid provider success had no foreground-usable output."""
 
 
-class CanvasDeliveryIncomplete(RuntimeError):
+class ProviderOutputTruncated(RuntimeError):
+    """A provider stopped while serializing a tool call at its output limit."""
+
+    reason = "output_truncated"
+
+    def __init__(self):
+        super().__init__(self.reason)
+
+
+class FileDeliveryIncomplete(RuntimeError):
+    """A requested attachment was saved but still failed bounded delivery."""
+
+
+class ValidatedFinalReply(str):
+    """A sanitized structured reply whose language check budget is settled.
+
+    The worker's ordinary terminal-text path may ask the provider to rewrite a
+    reply that omits its private thinking envelope.  A file completion has
+    already passed through language validation and its bounded correction policy,
+    then is published atomically with the staged attachment. Treating it as
+    ordinary text can replace that settled delivery bubble with a second,
+    wrong-language provider answer. A ``str`` subtype keeps the callback API and
+    test equality stable while preserving that provenance at the worker boundary.
+    """
+
+
+class CanvasDeliveryIncomplete(FileDeliveryIncomplete):
     """Canvas source was saved but its card still failed bounded delivery."""
+
+
+def _delivery_incomplete(path: str, reason: str) -> FileDeliveryIncomplete:
+    if str(path or "").strip().casefold().endswith(".io.html"):
+        return CanvasDeliveryIncomplete(reason)
+    return FileDeliveryIncomplete(reason)
 
 
 @dataclass(frozen=True)
@@ -677,6 +867,7 @@ async def run_tool_loop(
     max_assistant_tool_text_chars: int = DEFAULT_MAX_ASSISTANT_TOOL_TEXT_CHARS,
     prompt_context_window_overrides=None,
     prompt_output_reserve_tokens: int = prompt_frontier.DEFAULT_OUTPUT_RESERVE_TOKENS,
+    file_output_max_tokens: int = provider_client.CHAT_OUTPUT_MAX_TOKENS,
     prompt_safety_margin_tokens: int | None = None,
     prompt_estimator_utf8_bytes_per_token: float = prompt_frontier.DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN,
     prompt_image_reserve_tokens: int = prompt_frontier.DEFAULT_IMAGE_RESERVE_TOKENS,
@@ -770,6 +961,10 @@ async def run_tool_loop(
         max_assistant_tool_text_chars,
         name="max_assistant_tool_text_chars",
     )
+    file_output_max_tokens = _positive_limit(
+        file_output_max_tokens,
+        name="file_output_max_tokens",
+    )
     normalized_empty_response_correction = str(
         empty_response_correction or _EMPTY_RESPONSE_CORRECTION
     ).strip()
@@ -835,7 +1030,10 @@ async def run_tool_loop(
     private_read_seen = False
     tagged_image_fallback_active = False
     file_requirement_message_state = [
-        dict(message)
+        {
+            **dict(message),
+            "role": str(message.get("role") or "user"),
+        }
         for message in file_requirement_messages
         if isinstance(message, dict)
     ]
@@ -847,12 +1045,93 @@ async def run_tool_loop(
             if str(message.get("role") or "").strip().lower() != "user":
                 continue
             content = message.get("content")
+            if isinstance(content, list):
+                content = "\n".join(
+                    str(part.get("text") or "").strip()
+                    for part in content
+                    if isinstance(part, dict)
+                    and str(part.get("text") or "").strip()
+                )
             if isinstance(content, str) and content.strip():
                 return _truncate_result_content(
                     content.strip(),
                     DEFAULT_TOOL_RESULT_CHAR_CAP,
                 )
         return ""
+
+    def _delivery_control_uses_han(request: str) -> bool:
+        """Keep compact delivery prompts aligned with the visible request."""
+
+        return _delivery_request_writing_system(request) == "han"
+
+    def _delivery_request_writing_system(request: str) -> str:
+        """Classify the conversational shell, not Latin-heavy file terms.
+
+        A Chinese request can contain a long English filename or subject, which
+        makes the shared character-count classifier report ``latin``.  A small
+        Han share can equally be an English request quoting a filename or term,
+        so the compact-delivery override requires at least two Han characters
+        and a 20% share whenever Latin is also present.  Kana keeps Japanese
+        requests out of this Chinese/Latin override.
+        """
+
+        han_count = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", request))
+        latin_count = len(re.findall(r"[A-Za-z]", request))
+        letter_count = han_count + latin_count
+        strong_han_shell = bool(
+            han_count
+            and re.search(r"[\u3040-\u30ff]", request) is None
+            and (
+                latin_count == 0
+                or (han_count >= 2 and han_count / letter_count >= 0.20)
+            )
+        )
+        if strong_han_shell:
+            return "han"
+        writing_system = language_follow.classify_writing_system(request)
+        if writing_system == "indeterminate":
+            if latin_count:
+                return "latin"
+            if han_count:
+                return "han"
+        return writing_system
+
+    def _delivery_completion_matches_request(
+        request: str, completion_message: str
+    ) -> bool:
+        """Validate the model-authored delivery bubble against the live request."""
+
+        expected = _delivery_request_writing_system(request)
+        actual = language_follow.classify_writing_system(completion_message)
+        if expected == "mixed":
+            return True
+        if expected == "indeterminate":
+            if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", request) is not None:
+                expected = "han"
+            elif re.search(r"[A-Za-z]", request) is not None:
+                expected = "latin"
+            else:
+                return True
+        if actual == expected or actual == "mixed":
+            return True
+        if actual != "indeterminate":
+            return False
+        if expected == "han":
+            return re.search(
+                r"[\u3400-\u4dbf\u4e00-\u9fff]", completion_message
+            ) is not None
+        if expected == "latin":
+            return re.search(r"[A-Za-z]", completion_message) is not None
+        return False
+
+    def _compact_delivery_system_prompt(
+        instruction: str, *, require_self_thinking: bool = True
+    ) -> str:
+        """Preserve the normal final-reply contract in compact delivery rounds."""
+
+        if not suppress_native_reasoning or not require_self_thinking:
+            return instruction
+        return instruction.rstrip() + "\n\n" + self_thinking.INSTRUCTION.strip()
 
     def _normalize_file_requirement(value) -> tuple[bool, frozenset[str]]:
         suffixes = frozenset(
@@ -880,7 +1159,9 @@ async def run_tool_loop(
     required_file_missing_recorded = False
     file_delivery_fallback_text = ""
     image_claim_bounces = 0
+    identity_write_failed_bounces = 0
     image_claim_retry_instruction = ""
+    identity_write_failed_instruction = ""
     file_delivery_fallback_reasoning = ""
     file_delivery_recovery_needed = False
     workspace_write_applied = False
@@ -890,6 +1171,7 @@ async def run_tool_loop(
     compact_delivery_validation_exchange: ToolExchange | None = None
     compact_delivery_mismatch_retry_used = False
     compact_delivery_args_retry_used = False
+    file_delivery_callback_retry_used = False
     compact_delivery_confirmation_needed = False
     # Names keep required schemas visible and completed discovery calls valid in
     # native history. Exact call keys independently decide whether dispatch would
@@ -1106,7 +1388,10 @@ async def run_tool_loop(
                 )
                 transcript.extend(folded)
                 file_requirement_message_state.extend(
-                    dict(message)
+                    {
+                        **dict(message),
+                        "role": str(message.get("role") or "user"),
+                    }
                     for message in folded
                     if isinstance(message, dict)
                 )
@@ -1139,6 +1424,7 @@ async def run_tool_loop(
                         compact_delivery_validation_exchange = None
                         compact_delivery_mismatch_retry_used = False
                         compact_delivery_args_retry_used = False
+                        file_delivery_callback_retry_used = False
                         compact_delivery_confirmation_needed = False
                         if on_file_requirement_changed is not None:
                             await on_file_requirement_changed()
@@ -1188,6 +1474,7 @@ async def run_tool_loop(
             for instruction in (
                 delivery_retry_instruction,
                 image_claim_retry_instruction,
+                identity_write_failed_instruction,
                 empty_response_retry_instruction,
                 _WAKE_CHOICE_INSTRUCTION if wake_choice_required else "",
                 final_reply_correction_instruction,
@@ -1418,21 +1705,45 @@ async def run_tool_loop(
         if compact_delivery_confirmation_needed:
             compact_delivery_phase = "confirm"
             current_user_request = _latest_user_delivery_request()
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "The work the user asked for was saved and delivered "
-                        "successfully. Finish this turn in your own voice, using the "
-                        "same language as the user's current request below, with "
-                        "that fact available; the user can open the work now."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": current_user_request or "Finish your response to me.",
-                },
-            ]
+            if _delivery_control_uses_han(current_user_request):
+                messages = [
+                    {
+                        "role": "system",
+                        "content": _compact_delivery_system_prompt(
+                            "对方要求的内容已经成功保存并发送。请用你自己的口吻结束本轮，"
+                            "使用与下方当前请求相同的语言，把这件事实自然地告诉对方；"
+                            "文件现在已经可以打开或下载。"
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": current_user_request or "请完成对我的回复。",
+                    },
+                ]
+            else:
+                messages = [
+                    {
+                        "role": "system",
+                        "content": _compact_delivery_system_prompt(
+                            "The work the user asked for was saved and delivered "
+                            "successfully. Finish this turn in your own voice, using the "
+                            "same language as the user's current request below, with "
+                            "that fact available; the user can open the work now."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            current_user_request or "Finish your response to me."
+                        ),
+                    },
+                ]
+            # The compact confirmation replaces the normal transcript-shaped
+            # messages above. Re-attach bounded correction instructions here;
+            # otherwise a language rewrite is marked as attempted but the
+            # provider never sees the instruction that requested it.
+            if retry_instructions:
+                messages = _with_system_suffix(messages, retry_instructions)
         elif (
             forced_delivery_tool == tool_schema.FILE_REPLY_TOOL
             and workspace_delivery_target is not None
@@ -1440,39 +1751,73 @@ async def run_tool_loop(
             compact_delivery_phase = "send_file"
             target_path, target_revision = workspace_delivery_target
             current_user_request = _latest_user_delivery_request()
-            metadata_instruction = ""
-            if target_path.casefold().endswith(".io.html"):
-                metadata_instruction = (
-                    " This is a Canvas file, so send_file also requires a concise "
-                    "title, subtitle, and completion_message in the language of the "
-                    "user's current request. completion_message is the complete "
-                    "user-visible chat bubble in your own voice; do not default it "
-                    "to English or Chinese. Preserve or change the metadata according "
-                    "to the current user request."
+            use_han_control = _delivery_control_uses_han(current_user_request)
+            metadata_instruction = (
+                (
+                    " send_file 必须同时提供 completion_message，作为发送附件后的"
+                    "完整可见聊天气泡；必须使用中文并保持你自己的口吻。"
                 )
-            request_instruction = (
-                " Current user request: "
-                + json.dumps(current_user_request, ensure_ascii=False)
-                + "."
-                if current_user_request
-                else ""
+                if use_han_control
+                else (
+                    " send_file must also provide completion_message as the complete "
+                    "visible chat bubble after delivery; write it in English and in "
+                    "your own voice."
+                )
+            )
+            if target_path.casefold().endswith(".io.html"):
+                metadata_instruction += (
+                    (
+                        " 这是 Canvas 文件，所以还必须提供简洁的 title 和 subtitle；"
+                        "按照当前请求保留或修改这些元数据。"
+                    )
+                    if use_han_control
+                    else (
+                        " This is a Canvas file, so send_file also requires a concise "
+                        "title and subtitle. Preserve or change that metadata according "
+                        "to the current user request."
+                    )
+                )
+            request_instruction = ""
+            if current_user_request:
+                request_instruction = (
+                    (" 对方当前请求：" if use_han_control else " Current user request: ")
+                    + json.dumps(current_user_request, ensure_ascii=False)
+                    + "。"
+                )
+            delivery_instruction = (
+                (
+                    "作品源文件已经保存。现在调用 send_file 一次完成发送，"
+                    "目标必须完全一致："
+                )
+                if use_han_control
+                else (
+                    "The work's source is already saved. Complete the delivery "
+                    "now by calling send_file once with this exact target: "
+                )
             )
             messages = [
                 {
                     "role": "system",
-                    "content": (
-                        "The work's source is already saved. Complete the delivery "
-                        "now by calling send_file once with this exact target: "
+                    "content": _compact_delivery_system_prompt(
+                        delivery_instruction
                         + json.dumps(
                             {"path": target_path, "revision": target_revision},
                             ensure_ascii=False,
                             separators=(",", ":"),
                         )
                         + metadata_instruction
-                        + request_instruction
+                        + request_instruction,
+                        require_self_thinking=False,
                     ),
                 },
-                {"role": "user", "content": "Complete the pending delivery now."},
+                {
+                    "role": "user",
+                    "content": (
+                        "现在完成待发送的文件。"
+                        if use_han_control
+                        else "Complete the pending delivery now."
+                    ),
+                },
             ]
             if compact_delivery_validation_exchange is not None:
                 messages.append(compact_delivery_validation_exchange)
@@ -1746,13 +2091,14 @@ async def run_tool_loop(
                 # generated document inside workspace_write arguments. The
                 # provider client's historical 700-token default predates V2
                 # tools and truncates even modest documents into malformed
-                # JSON. Use the output budget already reserved by V2's prompt
-                # frontier; wake/child/screen lanes omit on_file_reply and keep
-                # their existing limits unchanged.
+                # JSON. File generation owns a separate output budget: the
+                # prompt frontier's reserve is input accounting, and increasing
+                # it would silently evict otherwise usable history. Wake/child/
+                # screen lanes omit on_file_reply and keep their existing limits.
                 provider_kwargs["max_tokens"] = (
-                    min(prompt_output_reserve_tokens, 512)
+                    min(file_output_max_tokens, 512)
                     if compact_delivery_phase
-                    else prompt_output_reserve_tokens
+                    else file_output_max_tokens
                 )
             if on_provider_tool_surface is not None:
                 candidate_names = {
@@ -2342,6 +2688,17 @@ async def run_tool_loop(
                 terminal_tool_call_retries < max_terminal_tool_call_retries
                 and attempts < max_calls
             )
+            transcript.append(
+                _rejected_tool_exchange(
+                    pr.tool_calls,
+                    assistant_text=pr.text,
+                    rejection_reasons=[
+                        "terminal_tool_call_rejected"
+                        for _tool_call in pr.tool_calls
+                    ],
+                    attempt=attempts,
+                )
+            )
             await _trajectory(
                 "protocol_fallback",
                 {
@@ -2349,6 +2706,7 @@ async def run_tool_loop(
                     "reason": "terminal_tool_call_rejected",
                     "action": "retry" if retrying else "terminate",
                     "retry": terminal_tool_call_retries,
+                    "transcript_appended": True,
                 },
             )
             if retrying:
@@ -2398,6 +2756,30 @@ async def run_tool_loop(
                 # 不打回,谎话直接发给用户 —— codex 审出。)
                 if attempts < max_calls:
                     _progress("image_claim_retry_boundary")
+                    continue
+
+            # D scheme: a structured identity-write attempt that did not produce
+            # a successful result gets one extra provider round. Do not inspect
+            # or classify the model's prose.
+            if (
+                pr.text
+                and identity_write_failed_bounces < 1
+                and _identity_write_attempted(transcript)
+                and not _identity_write_succeeded(transcript)
+            ):
+                identity_write_failed_bounces += 1
+                await _trajectory(
+                    "identity_write_failed_bounced",
+                    {"round": attempts, "text_chars": len(pr.text)},
+                )
+                identity_write_failed_instruction = (
+                    "上一轮你调用了身份写工具,但那次调用**没有成功**"
+                    "(被拒绝、出错或仍在排队),身份没有真的改动。"
+                    "请据实处理:要么重试一次,要么照实告诉他没改成 —— "
+                    "不要把这次未生效的改动说成已经完成。"
+                )
+                if attempts < max_calls:
+                    _progress("identity_write_failed_retry_boundary")
                     continue
 
             requirement_met = (
@@ -2467,6 +2849,9 @@ async def run_tool_loop(
                 file_delivery_recovery_needed = True
                 if not file_delivery_retry_used and attempts < max_calls - 1:
                     file_delivery_retry_used = True
+                    # Reset stale stall history so required write/send recovery
+                    # is not preempted immediately after workspace_write.
+                    consecutive_tool_only_rounds = 0
                     _progress("required_file_retry_boundary")
                     continue
                 await _record_required_file_missing(attempts)
@@ -2623,16 +3008,38 @@ async def run_tool_loop(
             (_serialized_chars(tc.args) if tc.args_ok else len(str(tc.args_raw or "")))
             for tc in pr.tool_calls
         ]
+        argument_limits = [
+            _tool_args_char_limit(tc, max_tool_args_chars)
+            for tc in pr.tool_calls
+        ]
+        batch_arguments_limit = max_tool_batch_args_chars
+        native_assistant_turn_limit = max_native_assistant_turn_chars
+        if (
+            len(pr.tool_calls) == 1
+            and argument_limits
+            and argument_limits[0] > max_tool_args_chars
+        ):
+            batch_arguments_limit = max(
+                batch_arguments_limit,
+                argument_limits[0],
+            )
+            native_assistant_turn_limit = max(
+                native_assistant_turn_limit,
+                argument_limits[0] + max_assistant_tool_text_chars + 8192,
+            )
         native_turn_size = (
             _serialized_chars(pr.assistant_turn.payload)
             if pr.assistant_turn is not None
             else 0
         )
         oversized_tool_exchange = (
-            any(size is None or size > max_tool_args_chars for size in argument_sizes)
-            or sum(size or 0 for size in argument_sizes) > max_tool_batch_args_chars
+            any(
+                size is None or size > limit
+                for size, limit in zip(argument_sizes, argument_limits)
+            )
+            or sum(size or 0 for size in argument_sizes) > batch_arguments_limit
             or native_turn_size is None
-            or native_turn_size > max_native_assistant_turn_chars
+            or native_turn_size > native_assistant_turn_limit
             or len(pr.text) > max_assistant_tool_text_chars
         )
         over_tool_call_budget = (
@@ -2640,28 +3047,39 @@ async def run_tool_loop(
             or tool_calls_used + len(pr.tool_calls) > max_tool_calls_per_turn
         )
         offered_names = {spec.name for spec in tools}
+        individual_rejection_reasons: list[list[str]] = []
+        for tc in pr.tool_calls:
+            reasons: list[str] = []
+            if not tc.id:
+                reasons.append("missing_tool_call_id")
+            if not tc.name:
+                reasons.append("missing_tool_name")
+            if not tc.args_ok:
+                reasons.append("invalid_tool_arguments")
+            if (
+                tc.name not in offered_names
+                and tc.name not in completed_memory_discovery_tools
+            ):
+                reasons.append("unknown_tool")
+            elif (
+                external_content_seen
+                and tc.name == "web_fetch"
+                and str(tc.args.get("url") or "").strip()
+                not in allowed_fetch_urls
+            ):
+                reasons.append("unapproved_external_url")
+            individual_rejection_reasons.append(reasons)
         # Provider media is terminal output. Do not silently discard or retain
         # its large inline payload when a broken relay also invents function
-        # calls in the same turn; fall back once with every tool disabled.
+        # calls in the same turn; fall back once with tool choice disabled.
         malformed = (
             (terminal_text_round and bool(pr.tool_calls))
             or bool(pr.media)
-            or any(
-                not tc.id
-                or not tc.name
-                or not tc.args_ok
-                or (
-                    tc.name not in offered_names
-                    and tc.name not in completed_memory_discovery_tools
-                )
-                or (
-                    external_content_seen
-                    and tc.name == "web_fetch"
-                    and str(tc.args.get("url") or "").strip()
-                    not in allowed_fetch_urls
-                )
-                for tc in pr.tool_calls
-            )
+            or any(individual_rejection_reasons)
+        )
+        truncated_tool_arguments = (
+            provider_client.is_token_limit_stop_reason(raw_finish_reason)
+            and any(not tc.args_ok for tc in pr.tool_calls)
         )
         image_reply_calls = [
             tc for tc in pr.tool_calls if tc.name == tool_schema.IMAGE_REPLY_TOOL
@@ -2686,6 +3104,50 @@ async def run_tool_loop(
         invalid_silence_batch = bool(stay_silent_calls) and (
             len(stay_silent_calls) != 1 or len(pr.tool_calls) != 1
         )
+        duplicate_call_ids = {
+            call_id
+            for call_id in call_ids
+            if call_id and call_ids.count(call_id) > 1
+        }
+        batch_rejection_reasons: list[str] = []
+        if terminal_text_round:
+            batch_rejection_reasons.append("terminal_tool_call_rejected")
+        if pr.media:
+            batch_rejection_reasons.append("provider_media_with_tool_calls")
+        if mixed_reply_write:
+            batch_rejection_reasons.append("mixed_reply_and_mutation")
+        if invalid_image_batch:
+            batch_rejection_reasons.append("invalid_image_reply_batch")
+        if invalid_silence_batch:
+            batch_rejection_reasons.append("invalid_stay_silent_batch")
+        if over_tool_call_budget:
+            batch_rejection_reasons.append("tool_call_budget_exceeded")
+        if sum(size or 0 for size in argument_sizes) > batch_arguments_limit:
+            batch_rejection_reasons.append("tool_batch_arguments_too_large")
+        if (
+            native_turn_size is None
+            or native_turn_size > native_assistant_turn_limit
+        ):
+            batch_rejection_reasons.append("native_assistant_turn_too_large")
+        if len(pr.text) > max_assistant_tool_text_chars:
+            batch_rejection_reasons.append("assistant_tool_text_too_large")
+        call_rejection_reasons: list[str] = []
+        for tc, argument_size, argument_limit, individual_reasons in zip(
+            pr.tool_calls,
+            argument_sizes,
+            argument_limits,
+            individual_rejection_reasons,
+        ):
+            reasons = list(individual_reasons)
+            if tc.id in duplicate_call_ids:
+                reasons.append("duplicate_tool_call_id")
+            if argument_size is None or argument_size > argument_limit:
+                reasons.append("tool_arguments_too_large")
+            reasons.extend(batch_rejection_reasons)
+            call_rejection_reasons.append(
+                ",".join(dict.fromkeys(reasons))
+                or "invalid_or_over_budget_tool_exchange"
+            )
         if (
             malformed
             or len(set(call_ids)) != len(call_ids)
@@ -2698,14 +3160,43 @@ async def run_tool_loop(
             # Invalid, over-budget, and duplicate-id batches are all-or-nothing:
             # executing a valid subset and then asking for a correction can
             # duplicate durable writes on the corrected round. Missing/duplicate
-            # ids also cannot form a provider-native result exchange. Make exactly
-            # one tools-disabled fallback from the original prompt instead.
+            # ids also cannot form a provider-native result exchange. Record one
+            # bounded synthetic rejection and make exactly one text-only fallback.
+            # Wires that require schemas for historical calls may retain the
+            # matching definitions, but tool_choice remains none.
             # An outbound delivery plus either a platform or MCP mutation is
             # rejected for the same reason: the bubble cannot truthfully claim
             # success before the later sink commits. The model may mutate in one
             # round and reply only after observing its result in the next.
+            # A provider that explicitly reports its output-token limit while
+            # returning unparseable tool arguments stopped in the middle of the
+            # JSON payload. Retrying the same artifact with the same budget
+            # cannot repair it and rewrites the real cause as a tool-usage error.
+            # Fail once with content-free evidence; no partial call is executed.
+            if truncated_tool_arguments:
+                await _trajectory(
+                    "provider_output_truncated",
+                    {
+                        "round": attempts,
+                        "reason": "output_truncated",
+                        "finish_reason": provider_client.normalize_stop_reason(
+                            raw_finish_reason
+                        ),
+                        "malformed_tool_arguments": True,
+                        "retry": False,
+                    },
+                )
+                raise ProviderOutputTruncated()
             if attempts >= max_calls:
                 break
+            transcript.append(
+                _rejected_tool_exchange(
+                    pr.tool_calls,
+                    assistant_text=pr.text,
+                    rejection_reasons=call_rejection_reasons,
+                    attempt=attempts,
+                )
+            )
             await _trajectory(
                 "protocol_fallback",
                 {
@@ -2715,6 +3206,7 @@ async def run_tool_loop(
                     "mixed_reply_write": mixed_reply_write,
                     "over_tool_call_budget": over_tool_call_budget,
                     "oversized_tool_exchange": oversized_tool_exchange,
+                    "transcript_appended": True,
                 },
             )
             force_text_fallback = True
@@ -2741,6 +3233,19 @@ async def run_tool_loop(
             )
             is not None
         }
+        if compact_delivery_phase == "send_file" and _latest_user_delivery_request():
+            for tc in pr.tool_calls:
+                if (
+                    tc.name == tool_schema.FILE_REPLY_TOOL
+                    and tc.id not in validation_errors
+                    and not str(
+                    tc.args.get("completion_message") or ""
+                    ).strip()
+                ):
+                    validation_errors[tc.id] = (
+                        "send_file requires completion_message for the visible "
+                        "delivery bubble"
+                    )
         if compact_delivery_phase == "send_file" and len(pr.tool_calls) != 1:
             validation_errors.update(
                 {
@@ -2755,6 +3260,21 @@ async def run_tool_loop(
             if compact_delivery_phase != "send_file":
                 if attempts >= max_calls:
                     break
+                transcript.append(
+                    _rejected_tool_exchange(
+                        pr.tool_calls,
+                        assistant_text=pr.text,
+                        rejection_reasons=[
+                            (
+                                "invalid_tool_arguments"
+                                if tc.id in validation_errors
+                                else "invalid_or_over_budget_tool_exchange"
+                            )
+                            for tc in pr.tool_calls
+                        ],
+                        attempt=attempts,
+                    )
+                )
                 await _trajectory(
                     "protocol_fallback",
                     {
@@ -2764,6 +3284,7 @@ async def run_tool_loop(
                         "mixed_reply_write": False,
                         "over_tool_call_budget": False,
                         "oversized_tool_exchange": False,
+                        "transcript_appended": True,
                     },
                 )
                 force_text_fallback = True
@@ -2772,11 +3293,25 @@ async def run_tool_loop(
                 )
                 continue
             if compact_delivery_args_retry_used:
+                delivery_path = (
+                    workspace_delivery_target[0]
+                    if workspace_delivery_target is not None
+                    else workspace_delivery_candidate[0]
+                    if workspace_delivery_candidate is not None
+                    else str(pr.tool_calls[0].args.get("path") or "")
+                    if pr.tool_calls
+                    else ""
+                )
+                canvas_delivery = delivery_path.casefold().endswith(".io.html")
                 await _trajectory(
                     "protocol_fallback",
                     {
                         "round": attempts,
-                        "reason": "repeated_invalid_canvas_delivery_args",
+                        "reason": (
+                            "repeated_invalid_canvas_delivery_args"
+                            if canvas_delivery
+                            else "repeated_invalid_file_delivery_args"
+                        ),
                         "invalid_tool_names": sorted(
                             {
                                 tc.name
@@ -2786,7 +3321,14 @@ async def run_tool_loop(
                         ),
                     },
                 )
-                raise CanvasDeliveryIncomplete("invalid_canvas_delivery_args")
+                raise _delivery_incomplete(
+                    delivery_path,
+                    (
+                        "invalid_canvas_delivery_args"
+                        if canvas_delivery
+                        else "invalid_file_delivery_args"
+                    ),
+                )
 
             compact_delivery_args_retry_used = True
             tool_calls_used += len(pr.tool_calls)
@@ -2886,7 +3428,8 @@ async def run_tool_loop(
             await _tool_event(tc, "tool_call_result", {"result": silent_result})
             return LoopOutcome("", attempts, "stay_silent", replied_intermediate)
 
-        canvas_completion_message = ""
+        file_completion_message = ""
+        file_completion_validated = False
         for tc in file_reply_calls:
             workspace_path = str(tc.args.get("path") or "").strip()
             workspace_revision = int(tc.args["revision"])
@@ -2949,8 +3492,8 @@ async def run_tool_loop(
                     tc, "tool_call_result", {"result": file_result}
                 )
                 if compact_delivery_mismatch_retry_used:
-                    raise CanvasDeliveryIncomplete(
-                        "pending_delivery_target_mismatch"
+                    raise _delivery_incomplete(
+                        target_path, "pending_delivery_target_mismatch"
                     )
                 else:
                     compact_delivery_mismatch_retry_used = True
@@ -2980,11 +3523,66 @@ async def run_tool_loop(
                     tc, "tool_call_result", {"result": file_result}
                 )
                 if compact_delivery_mismatch_retry_used:
-                    raise CanvasDeliveryIncomplete(
-                        "existing_delivery_candidate_mismatch"
+                    raise _delivery_incomplete(
+                        target_path, "existing_delivery_candidate_mismatch"
                     )
                 compact_delivery_mismatch_retry_used = True
                 continue
+            completion_message = str(
+                tc.args.get("completion_message") or ""
+            ).strip()
+            thinking_status, _thinking, visible_completion = (
+                self_thinking.strip_all_thinking(completion_message)
+            )
+            if thinking_status == self_thinking.COMPLETE:
+                completion_message = visible_completion
+            elif thinking_status in {self_thinking.SILENT, self_thinking.FAILED}:
+                completion_message = ""
+            current_user_request = _latest_user_delivery_request()
+            if current_user_request and not _delivery_completion_matches_request(
+                current_user_request, completion_message
+            ):
+                if compact_delivery_args_retry_used:
+                    await _trajectory(
+                        "file_completion_language_follow",
+                        {
+                            "round": attempts,
+                            "expected": _delivery_request_writing_system(
+                                current_user_request
+                            ),
+                            "actual": language_follow.classify_writing_system(
+                                completion_message
+                            ),
+                            "outcome": "kept_after_bounded_correction",
+                        },
+                    )
+                else:
+                    required_script = _delivery_request_writing_system(
+                        current_user_request
+                    )
+                    file_result = ToolResult(
+                        call_id=tc.id,
+                        content=(
+                            "error: completion_message language mismatch; no file was "
+                            f"delivered. Rewrite completion_message using {required_script} "
+                            "and call send_file again with the same path and revision. "
+                            "If the current request explicitly requires another language, "
+                            "resubmit the same completion_message unchanged to confirm "
+                            "that choice."
+                        ),
+                    )
+                    reply_results[tc.id] = file_result
+                    compact_delivery_validation_exchange = ToolExchange(
+                        calls=(tc,),
+                        results=(file_result,),
+                        assistant_text=pr.text,
+                        assistant_turn=pr.assistant_turn,
+                    )
+                    await _tool_event(
+                        tc, "tool_call_result", {"result": file_result}
+                    )
+                    compact_delivery_args_retry_used = True
+                    continue
             try:
                 if is_canvas_delivery:
                     await on_file_reply(
@@ -2999,7 +3597,56 @@ async def run_tool_loop(
                 await _tool_event(
                     tc, "tool_call_error", {"error": type(exc).__name__}
                 )
-                raise
+                await _trajectory(
+                    "file_reply_failed",
+                    {
+                        "round": attempts,
+                        "call_id": tc.id,
+                        "canvas": is_canvas_delivery,
+                        "action": (
+                            "fail"
+                            if file_delivery_callback_retry_used
+                            else "retry"
+                        ),
+                    },
+                )
+                file_result = ToolResult(
+                    call_id=tc.id,
+                    content=(
+                        "error: file delivery did not complete. Nothing was "
+                        "attached. Create or refresh the requested source with "
+                        "workspace_write, then call send_file again using the "
+                        "returned path and revision."
+                    ),
+                )
+                reply_results[tc.id] = file_result
+                await _tool_event(
+                    tc, "tool_call_result", {"result": file_result}
+                )
+                if file_delivery_callback_retry_used:
+                    # ``send_file`` is the publication boundary. The workspace
+                    # source may already exist at the selected revision, but
+                    # loading, validating, or staging the attachment can still
+                    # fail. Export the stable path-aware class after one bounded
+                    # correction so the worker/terminal outbox cannot collapse
+                    # this into ``unknown``.
+                    raise _delivery_incomplete(
+                        workspace_path,
+                        "file_delivery_callback_failed",
+                    ) from exc
+                file_delivery_callback_retry_used = True
+                file_delivery_recovery_needed = True
+                if workspace_delivery_target is not None:
+                    # Compact delivery rounds replace the normal transcript;
+                    # carry the native result explicitly so the exact-target
+                    # retry still sees why its previous send_file failed.
+                    compact_delivery_validation_exchange = ToolExchange(
+                        calls=(tc,),
+                        results=(file_result,),
+                        assistant_text=pr.text,
+                        assistant_turn=pr.assistant_turn,
+                    )
+                continue
             delivered_file_suffixes.add(file_suffix)
             workspace_write_applied = False
             workspace_delivery_target = None
@@ -3008,16 +3655,21 @@ async def run_tool_loop(
             compact_delivery_validation_exchange = None
             compact_delivery_mismatch_retry_used = False
             compact_delivery_args_retry_used = False
-            if is_canvas_delivery:
-                canvas_completion_message = str(
-                    tc.args.get("completion_message") or ""
-                ).strip()
+            file_delivery_callback_retry_used = False
+            file_completion_message = (
+                completion_message
+                if is_canvas_delivery or current_user_request
+                else ""
+            )
+            file_completion_validated = bool(
+                file_completion_message and current_user_request
+            )
             requirement_now_met = (
                 bool(delivered_file_suffixes)
                 if not normalized_required_suffixes
                 else normalized_required_suffixes.issubset(delivered_file_suffixes)
             )
-            if requirement_now_met and not canvas_completion_message:
+            if requirement_now_met and not file_completion_message:
                 compact_delivery_confirmation_needed = True
             replied_intermediate = True
             file_result = ToolResult(
@@ -3029,8 +3681,8 @@ async def run_tool_loop(
                 tc, "tool_call_result", {"result": file_result}
             )
 
-        if canvas_completion_message:
-            # Canvas metadata and the visible completion bubble are one model
+        if file_completion_message:
+            # Attachment metadata and the visible completion bubble are one model
             # expression. Publishing the tool-authored bubble here keeps the
             # staged attachment and its text in the same final effect, and avoids
             # a second provider round seeded by runtime-authored English copy.
@@ -3040,13 +3692,18 @@ async def run_tool_loop(
                 {
                     "round": attempts,
                     "final": True,
-                    "text": canvas_completion_message,
-                    "reason": "canvas_tool_completion",
+                    "text": file_completion_message,
+                    "reason": "file_tool_completion",
                 },
             )
             try:
+                reply_text = (
+                    ValidatedFinalReply(file_completion_message)
+                    if file_completion_validated
+                    else file_completion_message
+                )
                 reply_decision = await on_reply(
-                    canvas_completion_message,
+                    reply_text,
                     final=True,
                     reasoning=_merged_reasoning(),
                 )
@@ -3093,7 +3750,7 @@ async def run_tool_loop(
                 raise RuntimeError("unsupported final reply decision")
             else:
                 return LoopOutcome(
-                    canvas_completion_message,
+                    file_completion_message,
                     attempts,
                     "final_text",
                     replied_intermediate,
@@ -3235,7 +3892,19 @@ async def run_tool_loop(
             if tc.name == "web_search":
                 allowed_fetch_urls.update(_search_result_urls(result.content))
             elif tc.name == "web_fetch":
-                allowed_fetch_urls.discard(str(tc.args.get("url") or "").strip())
+                request_url = str(tc.args.get("url") or "").strip()
+                allowed_fetch_urls.discard(request_url)
+                metadata = result.metadata or {}
+                next_offset = metadata.get("web_fetch_next_offset")
+                continuation_urls = metadata.get("web_fetch_continuation_urls")
+                if type(next_offset) is int and isinstance(
+                    continuation_urls, (tuple, list)
+                ):
+                    allowed_fetch_urls.update(
+                        str(url).strip()
+                        for url in continuation_urls
+                        if str(url).strip()
+                    )
         for tc in dispatch_calls:
             discovery_call_key = _memory_discovery_call_key(tc)
             if discovery_call_key is not None:

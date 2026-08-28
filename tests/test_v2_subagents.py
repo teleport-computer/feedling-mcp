@@ -13,6 +13,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
 from model_api_runtime.v2 import subagents  # noqa: E402
 from model_api_runtime.v2 import worker  # noqa: E402
 from capabilities import registry as cap_registry  # noqa: E402
+from capabilities import web as cap_web  # noqa: E402
+from capabilities.types import ok  # noqa: E402
 import provider_client  # noqa: E402
 from provider_types import ToolCall  # noqa: E402
 
@@ -364,6 +366,86 @@ def test_worker_subagent_budget_is_shared_across_parent_task_batches(
     assert len(provider_calls) == 1
 
 
+def test_worker_child_fetch_continuations_cannot_fill_gate_ahead_of_owner(
+    monkeypatch,
+) -> None:
+    provider_config = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-sonnet-4-test",
+        api_key="sk-parent-route",
+    )
+    url = "https://example.com/large"
+    provider_round = 0
+    fetch_results = []
+    loader_calls = 0
+
+    async def fake_provider(_config, _messages, *, tools=None, **kwargs):
+        nonlocal provider_round
+        provider_round += 1
+        if provider_round == 1:
+            calls = [{
+                "id": "search",
+                "name": "web_search",
+                "args": {"query": "large article"},
+            }]
+            return {"reply": "", "tool_calls": calls, "usage": {}}
+        if provider_round == 2:
+            calls = [
+                {
+                    "id": f"continuation-{index}",
+                    "name": "web_fetch",
+                    "args": {"url": url, "offset": index * 100},
+                }
+                for index in range(1, 5)
+            ]
+            calls.append({
+                "id": "owner", "name": "web_fetch", "args": {"url": url}
+            })
+            return {"reply": "", "tool_calls": calls, "usage": {}}
+        return {"reply": "complete", "tool_calls": [], "usage": {}}
+
+    real_run_capability = cap_registry.run_capability
+
+    def fake_run_capability(name, store, **kwargs):
+        if name == "web_search":
+            return ok(data={"query": "large article", "results": [{"url": url}]})
+        result = real_run_capability(name, store, **kwargs)
+        if name == "web_fetch":
+            fetch_results.append(result.to_dict())
+        return result
+
+    def fake_fetch_document(request_url):
+        nonlocal loader_calls
+        loader_calls += 1
+        return cap_web._FetchDocument(
+            url=request_url,
+            text="evidence " * 100,
+            source_truncated=False,
+        )
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", fake_provider)
+    monkeypatch.setattr(cap_registry, "run_capability", fake_run_capability)
+    monkeypatch.setattr(cap_web, "_fetch_document", fake_fetch_document)
+    monkeypatch.setattr(worker.kill_switch, "web_halted", lambda: (False, False))
+
+    dispatcher = worker._make_task_batch_dispatcher(
+        disabled_web_tool_names=frozenset(),
+        provider_config=provider_config,
+        store=object(),
+        api_key=None,
+        runtime_token="runtime-token",
+        enclave_sem=asyncio.Semaphore(4),
+        trusted_system_blocks=(),
+        add_usage=lambda _usage: None,
+    )
+    (result,) = asyncio.run(dispatcher([_call("parent", "read the article")]))
+
+    assert json.loads(result.content)["status"] == "completed", result.content
+    assert len(fetch_results) == 5
+    assert all(fetch_result["ok"] is True for fetch_result in fetch_results)
+    assert loader_calls == 1
+
+
 def test_worker_child_private_read_blocks_later_outbound_web(
     monkeypatch,
 ) -> None:
@@ -373,6 +455,7 @@ def test_worker_child_private_read_blocks_later_outbound_web(
         api_key="sk-parent-route",
     )
     offered = []
+    tool_choices = []
     responses = iter(
         [
             {
@@ -407,6 +490,7 @@ def test_worker_child_private_read_blocks_later_outbound_web(
 
     async def fake_provider(_config, _messages, *, tools=None, **kwargs):
         offered.append(tools)
+        tool_choices.append(kwargs.get("tool_choice"))
         return next(responses)
 
     capability_calls = []
@@ -466,7 +550,11 @@ def test_worker_child_private_read_blocks_later_outbound_web(
     assert capability_calls == ["workspace_read"]
     assert {spec.name for spec in offered[0]} == worker._SUBAGENT_ALLOWED_TOOLS
     assert {spec.name for spec in offered[1]}.isdisjoint({"web_search", "web_fetch"})
-    assert {spec.name for spec in offered[2]} == {"workspace_read"}
+    # The rejected call is recorded in native provider history, so compatible
+    # wires retain both referenced schemas on the terminal correction round.
+    # `tool_choice=none` is the execution fence: neither schema can dispatch.
+    assert {spec.name for spec in offered[2]} == {"workspace_read", "web_search"}
+    assert tool_choices == [None, None, "none"]
 
 
 def test_worker_child_forged_mutation_gets_text_fallback_without_dispatch(

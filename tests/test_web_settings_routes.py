@@ -22,6 +22,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from accounts import registry  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
+import db  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import runtime_token  # noqa: E402
 from core import store as core_store  # noqa: E402
@@ -107,41 +108,67 @@ def test_get_rejects_a_runtime_token(client, monkeypatch):
 def test_a_refused_runtime_token_leaves_the_preference_untouched(client, monkeypatch):
     monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", _RUNTIME_SECRET)
     user_id, key = _register(client)
+    disabled = client.post(
+        "/v1/web/settings",
+        headers=_auth(key),
+        json={"enabled": False},
+    )
+    assert disabled.status_code == 200
+    assert disabled.get_json()["enabled"] is False
+
     tok = _mint(user_id, scope=["chat"])
-    client.post(
+    refused = client.post(
         "/v1/web/settings",
         headers={"X-Feedling-Runtime-Token": tok},
         json={"enabled": True},
     )
+    assert refused.status_code == 403
     assert client.get("/v1/web/settings", headers=_auth(key)).get_json()["enabled"] is False
 
 
 # --------------------------------------------------------------- happy path
 
-def test_defaults_to_disabled(client):
+def test_new_registration_defaults_to_enabled(client):
     _, key = _register(client)
     body = client.get("/v1/web/settings", headers=_auth(key)).get_json()
-    assert body["enabled"] is False
-    assert body["effective"] is False
+    assert body["enabled"] is True
+    assert isinstance(body["effective"], bool)
     assert set(body) == {
         "enabled", "runtime_supported", "status", "effective", "tools",
     }
     assert body["status"] in {"available", "degraded", "unavailable"}
 
 
+def test_existing_user_without_a_settings_blob_stays_disabled(client):
+    user_id, key = _register(client)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM user_blobs WHERE user_id = %s AND kind = %s",
+            (user_id, "web_settings"),
+        )
+
+    body = client.get("/v1/web/settings", headers=_auth(key)).get_json()
+    assert body["enabled"] is False
+    assert body["effective"] is False
+
+
 def test_roundtrip_with_api_key(client):
     _, key = _register(client)
-    posted = client.post(
+    disabled = client.post(
+        "/v1/web/settings", headers=_auth(key), json={"enabled": False}
+    )
+    assert disabled.status_code == 200, disabled.get_data(as_text=True)
+    assert disabled.get_json()["enabled"] is False
+    enabled = client.post(
         "/v1/web/settings", headers=_auth(key), json={"enabled": True}
     )
-    assert posted.status_code == 200, posted.get_data(as_text=True)
-    assert posted.get_json()["enabled"] is True
+    assert enabled.status_code == 200, enabled.get_data(as_text=True)
+    assert enabled.get_json()["enabled"] is True
     assert client.get("/v1/web/settings", headers=_auth(key)).get_json()["enabled"] is True
 
 
-def test_can_be_turned_back_off(client):
+def test_existing_user_explicitly_disabled_stays_disabled(client):
     _, key = _register(client)
-    client.post("/v1/web/settings", headers=_auth(key), json={"enabled": True})
     client.post("/v1/web/settings", headers=_auth(key), json={"enabled": False})
     assert client.get("/v1/web/settings", headers=_auth(key)).get_json()["enabled"] is False
 

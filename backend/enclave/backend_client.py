@@ -58,3 +58,15 @@ async def backend_get(path: str, headers: dict, params: dict | None = None) -> d
     )
     r.raise_for_status()
     return r.json()
+
+
+async def backend_post(path: str, headers: dict, payload: dict) -> dict:
+    """POST JSON to the backend and return its decoded response.
+
+    Error mapping deliberately stays with the route, matching ``backend_get``.
+    """
+    r = await get_async_client().post(
+        f"{config.FLASK_URL}{path}", json=payload, headers=headers
+    )
+    r.raise_for_status()
+    return r.json()

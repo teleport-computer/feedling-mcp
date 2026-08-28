@@ -17,7 +17,6 @@ def _index_item(
     bucket: str = "",
     threads: list[str] | None = None,
     salience: str = "medium",
-    sensitive: bool = False,
     open_thread: bool = False,
     score: float = 0.5,
 ) -> dict:
@@ -30,7 +29,6 @@ def _index_item(
         "status": "active",
         "salience": salience,
         "is_open_thread": open_thread,
-        "is_sensitive": sensitive,
         "score": score,
     }
 
@@ -76,22 +74,6 @@ def test_selector_uses_v1_bucket_and_threads_as_topic_context():
     )
 
     assert result["selected_ids"] == ["dog"]
-
-
-def test_selector_skips_sensitive_items_unless_query_allows_sensitive():
-    items = [
-        _index_item("comfort", "用户低落时需要先被陪伴，不要马上给建议。", buckets=["安抚方式"]),
-        _index_item("intimacy", "用户在亲密语境里有特定安抚偏好。", buckets=["亲密边界"], sensitive=True, salience="high"),
-    ]
-
-    normal = select_memory_index_items("我今天有点低落，你怎么安慰我？", items)
-    assert normal["selected_ids"] == ["comfort"]
-    skipped = {item["id"]: item for item in normal["trace"]["skipped_sample"]}
-    assert skipped["intimacy"]["reason"] == "sensitive_not_allowed_for_query"
-
-    sensitive = select_memory_index_items("我想聊一下亲密关系里的安抚边界", items)
-    assert "intimacy" in sensitive["selected_ids"]
-    assert sensitive["trace"]["allow_sensitive"] is True
 
 
 def test_selector_reuses_generic_term_filtering_for_index_items():

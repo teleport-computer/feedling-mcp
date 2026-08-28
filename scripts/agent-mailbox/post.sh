@@ -106,7 +106,7 @@ mailbox="${AGENT_MAILBOX_DIR:-$root/.agents/mailbox}"
 # 其中 2 封是发给 Supervisor 的,它一直不知道。
 # 这是最坏的一种失败:没有报错、没有信号。所以宁可拒发,不许静默。
 # 显式 AGENT_MAILBOX_DIR 是调用者选择的投递根,也供隔离测试使用。
-_MAIN_TREE="/Users/xiaotingtan/Desktop/feedling-mcp-test"
+_MAIN_TREE="/Users/xiaotingtan/workspace/io/feedling-mcp-test"
 if [ -z "${AGENT_MAILBOX_DIR:-}" ]; then
   case "$(cd "$root" && pwd -P)" in
     "$_MAIN_TREE") ;;
@@ -193,15 +193,47 @@ if ! command -v tmux >/dev/null 2>&1; then
   exit 0
 fi
 
-notice="New mailbox message for $to: $id. Run scripts/agent-mailbox/read.sh $to $id"
-# Submit reliably: type the notice, then send Enter as a SEPARATE key event
-# after a short delay. Sending "$notice" Enter in one call often types the text
-# but doesn't submit it in the Claude/Codex TUI (the Enter arrives as part of the
-# same paste), leaving the read command stuck in the input box.
-if tmux send-keys -t "$target_pane" "$notice"; then
-  sleep 0.5
-  tmux send-keys -t "$target_pane" Enter
-  echo "woke $to at $target_pane"
-else
-  echo "wake failed for $to at $target_pane" >&2
+notice_head="New mailbox message for $to: $id"
+notice="$notice_head. Run scripts/agent-mailbox/read.sh $to $id"
+
+# 唤醒道的两个病(2026-08-27 Seven 点名修;T274 在 bus post.sh 修的是同一族):
+# ① 假报:`tmux send-keys` 返回 0 只说明 tmux 把按键交给了 pane,不说明 TUI 接住了,
+#    更不说明对方读了信。旧文案「woke $to」把这三件事说成一件。
+# ② 静默退出:旧写法把第二次 send-keys(Enter)裸放在 then 块里,而本脚本是 set -e。
+#    它一失败脚本当场退出:woke 没打印、wake failed 也没打印 —— 信已落盘却零信号,
+#    正是本文件 08-14 那条注释说的「最坏的一种失败」。写盘那端堵住了,唤醒这端还开着。
+# 于是:每次 tmux 调用都判返回值;打完字回读 pane 确认按键真的落进去了;
+# 任何一条路径都要留下一行输出,且失败也写 stdout —— 调用方常常只捕获 stdout。
+wake_failed() {
+  echo "$1"
+  echo "$1" >&2
+}
+
+if ! tmux send-keys -t "$target_pane" "$notice"; then
+  wake_failed "wake failed for $to at $target_pane: tmux refused the notice keys (信已落盘:$id,请人工通知)"
+  exit 0
 fi
+
+# Enter 必须是独立的一次按键事件:和正文一起发常常只把字打进输入框、不提交,
+# 指令滞留在对方输入框里等下一次回车才引爆。
+sleep 0.5
+if ! tmux send-keys -t "$target_pane" Enter; then
+  wake_failed "wake failed for $to at $target_pane: notice typed but Enter was refused (信已落盘:$id,对方输入框里可能滞留一条未提交的指令)"
+  exit 0
+fi
+
+# 回读证明按键确实落进了那个窗口。锚点必须是通知的整个抬头,**不能是裸 id**:
+# 上面那行 `posted $id` 就打在发信人自己的终端上,一旦目标 pane 就是发信人这一格
+# (自己发给自己),裸 id 会被这行喂中,通知被 TUI 吞掉也照报「已送达」——
+# 假阳性,codex4 用 fake tmux 实弹打出来的。
+# -J 拼接 tmux 层折行。收信端 TUI 有自己的软折行,长抬头在窄 pane 里可能被它折断
+# 而漏判;这个方向是安全的(多报一次「未确认」),反过来不是。
+pane_text="$(tmux capture-pane -p -J -t "$target_pane" 2>/dev/null || true)"
+case "$pane_text" in
+  *"$notice_head"*)
+    echo "wake notice reached $to at $target_pane; mailbox processing not verified"
+    ;;
+  *)
+    wake_failed "⚠️ wake unverified for $to at $target_pane: send-keys succeeded but the notice never appeared in that pane (信已落盘:$id,请人工核对对方是否收到)"
+    ;;
+esac

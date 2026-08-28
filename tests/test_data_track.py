@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 from datetime import datetime, timedelta
 import itertools
 import json
@@ -177,7 +178,7 @@ def test_admin_data_track_aggregates_counts_without_content(client):
     store.append_proactive_job({
         "job_id": "pj_failed_timeout",
         "status": "failed",
-        "status_reason": "model_timeout",
+        "status_reason": "provider_timeout",
         "job_kind": "presence",
     })
     store.append_proactive_job({
@@ -200,7 +201,15 @@ def test_admin_data_track_aggregates_counts_without_content(client):
     assert row["memory"]["by_tab"]["story"] == 1
     assert row["memory"]["by_tab"]["about_me"] == 1
     assert row["proactive"]["proactive_messages"] == 1
-    assert row["proactive"]["job_failed_reasons"] == {"model_timeout": 1, "unknown": 1}
+    # The users index intentionally skips the whole-history background
+    # breakdown; that legacy evidence remains available on the one-user detail.
+    detail = client.get(
+        f"/v1/admin/data-track/users/{user_id}", headers=_admin_headers()
+    ).get_json()["user"]
+    assert detail["proactive"]["job_failed_reasons"] == {
+        "provider_timeout": 1,
+        "unknown": 1,
+    }
     dumped = json.dumps(body)
     assert "ciphertext-that-must-not-leak" not in dumped
     assert "private alert preview" not in dumped
@@ -239,9 +248,11 @@ def test_users_surface_separates_v1_failure_control_and_user_unavailable(client)
     ):
         store.append_proactive_job(job)
 
-    response = client.get("/v1/admin/data-track/users", headers=_admin_headers())
+    response = client.get(
+        f"/v1/admin/data-track/users/{user_id}", headers=_admin_headers()
+    )
     assert response.status_code == 200
-    proactive = response.get_json()["users"][0]["proactive"]
+    proactive = response.get_json()["user"]["proactive"]
     assert proactive["lens"] == "v1_proactive_jobs_log"
     assert proactive["failure_definition"]["window"] == "all_history"
     assert proactive["heartbeat_jobs"] == 4
@@ -257,10 +268,434 @@ def test_users_surface_separates_v1_failure_control_and_user_unavailable(client)
     page = client.get("/admin/data-track?view=users", headers=_admin_headers())
     assert page.status_code == 200
     body = page.get_data(as_text=True)
-    assert "心跳 总4 / 失败1 / 控制1 / 用户侧1" in body
-    assert "Proactive 失败口径（Resident / V1）" in body
-    assert "未知/未登记原因仍算我方失败" in body
-    assert "本列不含 Runtime V2 用户" in body
+    assert "后台道失败率（按用户）" in body
+    assert "冻结" in body
+    assert "chat.last_user_at" in body
+
+
+def test_users_background_lanes_filter_by_last_user_message_and_skip_full_history(
+        client, monkeypatch):
+    active_user, _ = _register(client)
+    inactive_user, _ = _register(client)
+    active_store = core_store.get_store(active_user)
+    active_store.append_chat(
+        "user", "chat", _env("human-active-now", active_user)
+    )
+    active_store.append_proactive_job({
+        "job_id": "legacy-breakdown-must-not-be-read",
+        "status": "failed",
+        "status_reason": "legacy_provider_timeout",
+        "job_kind": "heartbeat",
+    })
+    active_store.append_gate_decision({
+        "decision_id": "legacy-gate-json-must-not-be-read",
+        "should_reach_out": True,
+    })
+    active_store.append_tracking_event(tracking_core._make_tracking_event(
+        active_store,
+        "legacy-tracking-json-must-not-be-read",
+        {"payload": {}},
+    ))
+    yesterday = (
+        datetime.now(ZoneInfo("Asia/Shanghai")).date() - timedelta(days=1)
+    ).isoformat()
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO lane_daily_rollup
+              (user_id, day, route, lane, completed, failed,
+               operational_failures, control_outcomes, user_unavailable,
+               failure_codes)
+            VALUES
+              (%s, %s, 'resident', 'heartbeat', 3, 4, 1, 2, 1,
+               '{"wake_failed:providererror":1}'::jsonb),
+              (%s, %s, 'resident', 'capture', 0, 2, 2, 0, 0,
+               '{"extraction_failed:pooltimeout":2}'::jsonb),
+              (%s, %s, 'resident', 'heartbeat', 0, 5, 5, 0, 0,
+               '{"wake_failed:providererror":5}'::jsonb)
+            """,
+            (
+                active_user, yesterday,
+                active_user, yesterday,
+                inactive_user, yesterday,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO lane_rollup_watermark
+              (route, backfill_from, through_day, outcomes_from)
+            VALUES ('resident', %s, %s, %s)
+            ON CONFLICT (route) DO UPDATE SET
+              backfill_from=EXCLUDED.backfill_from,
+              through_day=EXCLUDED.through_day,
+              outcomes_from=EXCLUDED.outcomes_from
+            """,
+            (yesterday, yesterday, yesterday),
+        )
+
+    real_snapshot = db.admin_data_track_snapshot
+    snapshot_modes = []
+
+    def observed_snapshot(user_ids, **kwargs):
+        snapshot_modes.append(kwargs.get("include_legacy_background"))
+        return real_snapshot(user_ids, **kwargs)
+
+    monkeypatch.setattr(db, "admin_data_track_snapshot", observed_snapshot)
+    active = client.get(
+        "/v1/admin/data-track/users?human_activity=active&human_days=7&lane_days=1",
+        headers=_admin_headers(),
+    )
+    assert active.status_code == 200, active.get_data(as_text=True)
+    active_body = active.get_json()
+    assert [row["user_id"] for row in active_body["users"]] == [active_user]
+    assert active_body["filters"]["human_activity"] == "active"
+    assert active_body["filters"]["human_days"] == 7
+    assert active_body["filters"]["lane_days"] == 1
+    assert snapshot_modes[-1] is False, (
+        "users index must not reopen the legacy whole-history background scans"
+    )
+
+    row = active_body["users"][0]
+    assert row["human_activity"] == {
+        "state": "active",
+        "basis": "chat.last_user_at",
+        "days": 7,
+        "last_user_at": row["chat"]["last_user_at"],
+    }
+    heartbeat = row["background_lanes"]["lanes"]["heartbeat"]
+    capture = row["background_lanes"]["lanes"]["capture"]
+    assert row["proactive"]["breakdowns_status"] == "omitted"
+    assert row["proactive"]["job_failed_reasons"] == {}
+    assert row["proactive"]["decisions"] == 1
+    assert row["proactive"]["decision_true"] == 0
+    assert row["memory"]["capture_breakdowns_status"] == "omitted"
+    assert row["tracking"]["events"] == 1
+    assert row["tracking"]["by_type"] == {}
+    assert row["tracking"]["breakdowns_status"] == "omitted"
+    assert row["background_lanes"]["coverage_route"] == "resident"
+    assert row["background_lanes"]["coverage_routes"] == ["resident"]
+    assert row["background_lanes"]["coverage"]["level"] == "green"
+    assert heartbeat["terminal_attempts"] == 4
+    assert heartbeat["failure_rate"] == pytest.approx(0.25)
+    assert capture["terminal_attempts"] == 2
+    assert capture["failure_rate"] == 1.0
+
+    inactive = client.get(
+        "/v1/admin/data-track/users?human_activity=inactive&human_days=7&lane_days=1",
+        headers=_admin_headers(),
+    ).get_json()
+    assert [row["user_id"] for row in inactive["users"]] == [inactive_user]
+    assert inactive["users"][0]["human_activity"]["state"] == "inactive"
+    assert inactive["users"][0]["background_lanes"]["lanes"]["heartbeat"][
+        "failure_rate"
+    ] == 1.0
+
+    page = client.get(
+        "/admin/data-track?view=users&human_activity=active&human_days=7&lane_days=1",
+        headers=_admin_headers(),
+    )
+    rendered = page.get_data(as_text=True)
+    assert page.status_code == 200, rendered
+    assert "后台道失败率（按用户）" in rendered
+    assert "chat.last_user_at" in rendered
+    assert "心跳 25%（成3/故1/分母4）" in rendered
+    assert "capture 100%（成0/故2/分母2）" in rendered
+    assert inactive_user not in rendered
+
+    summary = client.get(
+        "/v1/admin/data-track/summary", headers=_admin_headers()
+    )
+    assert summary.status_code == 200, summary.get_data(as_text=True)
+    summary_body = summary.get_json()["summary"]
+    assert snapshot_modes[-1] is False, (
+        "fleet-wide summary must not reopen legacy JSON breakdown scans"
+    )
+    assert summary_body["proactive_breakdowns_status"] == "omitted"
+    assert summary_body["proactive_failed_total"] is None
+
+
+def _seed_lane_users(client, count: int) -> list[str]:
+    """Register ``count`` users with distinct chat volume and lane counts.
+
+    The Nth seeded user gets N+1 chat messages and a lane cell with
+    completed=(N+1)*10, so ``sort=chat`` is deterministic and a row carrying a
+    neighbour's lane data cannot coincidentally look right.
+    """
+    yesterday = (
+        datetime.now(ZoneInfo("Asia/Shanghai")).date() - timedelta(days=1)
+    ).isoformat()
+    user_ids = []
+    for index in range(count):
+        uid, _ = _register(client)
+        store = core_store.get_store(uid)
+        for turn in range(index + 1):
+            store.append_chat("user", "chat", _env(f"human-{index}-{turn}", uid))
+        user_ids.append(uid)
+    with db.get_pool().connection() as conn:
+        for index, uid in enumerate(user_ids):
+            conn.execute(
+                """
+                INSERT INTO lane_daily_rollup
+                  (user_id, day, route, lane, completed, failed,
+                   operational_failures, control_outcomes, user_unavailable,
+                   failure_codes)
+                VALUES (%s, %s, 'resident', 'heartbeat', %s, 0, 0, 0, 0,
+                        '{}'::jsonb)
+                """,
+                (uid, yesterday, (index + 1) * 10),
+            )
+        conn.execute(
+            """
+            INSERT INTO lane_rollup_watermark
+              (route, backfill_from, through_day, outcomes_from)
+            VALUES ('resident', %s, %s, %s)
+            ON CONFLICT (route) DO UPDATE SET
+              backfill_from=EXCLUDED.backfill_from,
+              through_day=EXCLUDED.through_day,
+              outcomes_from=EXCLUDED.outcomes_from
+            """,
+            (yesterday, yesterday, yesterday),
+        )
+    return user_ids
+
+
+def _observe_lane_reader(monkeypatch):
+    """Record every user_ids list handed to the per-user lane reader."""
+    real = db.admin_background_lane_users
+    seen: list[list[str]] = []
+
+    def observed(user_ids, **kwargs):
+        seen.append(list(user_ids))
+        return real(user_ids, **kwargs)
+
+    monkeypatch.setattr(db, "admin_background_lane_users", observed)
+    return seen
+
+
+def test_lane_reader_receives_exactly_the_page_ids_in_order(client, monkeypatch):
+    seeded = _seed_lane_users(client, 5)
+    seen = _observe_lane_reader(monkeypatch)
+
+    # Non-zero offset with a sort the production allowlist actually accepts
+    # (_data_track_request_filters keeps only chat/memory/proactive), so the
+    # ordering asserted here is the ordering the endpoint really applies. The
+    # correct page is neither the first N ids nor the previous page, so a
+    # length-only assertion would not catch handing the reader the wrong slice.
+    body = client.get(
+        "/v1/admin/data-track/users"
+        "?sort=chat&dir=asc&limit=2&offset=2&lane_days=1",
+        headers=_admin_headers(),
+    ).get_json()
+
+    page_ids = [row["user_id"] for row in body["users"]]
+    assert len(page_ids) == 2
+    assert body["pagination"] == {
+        "limit": 2, "offset": 2, "returned": 2, "total": 5,
+        "next_offset": 4, "prev_offset": 0,
+    }
+    assert seen == [page_ids], (
+        "the per-user lane scan must receive exactly the returned page, "
+        f"in order; got {seen} for page {page_ids}"
+    )
+
+    # sort=chat&dir=asc orders by chat volume, which _seed_lane_users made
+    # strictly increasing in seed order, so page[offset=2] is seeds 2 and 3.
+    assert page_ids == seeded[2:4]
+
+    # Each returned row must carry its own lane data, not a neighbour's:
+    # the Nth seeded user has completed=(N+1)*10, a different scale from the
+    # chat counts so the two cannot be confused for each other.
+    for row in body["users"]:
+        expected = (seeded.index(row["user_id"]) + 1) * 10
+        assert row["background_lanes"]["lanes"]["heartbeat"]["completed"] == expected
+
+
+def test_empty_page_keeps_fleet_level_lane_window(client, monkeypatch):
+    _seed_lane_users(client, 3)
+    seen = _observe_lane_reader(monkeypatch)
+
+    full = client.get(
+        "/v1/admin/data-track/users?limit=100&lane_days=1",
+        headers=_admin_headers(),
+    ).get_json()
+    empty = client.get(
+        "/v1/admin/data-track/users?limit=2&offset=99&lane_days=1",
+        headers=_admin_headers(),
+    ).get_json()
+
+    assert empty["users"] == []
+    # This only observes the argument handed to the reader. Whether the reader
+    # then issues the lane SQL is a separate claim, guarded at the DB seam by
+    # test_empty_ids_reads_watermark_without_scanning_lane_rows.
+    assert seen[-1] == [], "an empty page must hand the reader no user ids"
+    # window / read_status / coverage come from the ids-independent watermark
+    # read, so they must survive a page that selects nobody.
+    for field in ("window", "read_status", "coverage_by_route"):
+        assert empty["background_lane_window"][field] == \
+            full["background_lane_window"][field], field
+    assert empty["background_lane_window"]["read_status"]["level"] == "ok"
+    assert empty["background_lane_window"]["coverage_by_route"]["resident"][
+        "level"
+    ] == "green"
+
+
+class _RecordingConn:
+    """Delegates to a real connection while recording every SQL statement."""
+
+    def __init__(self, inner, executed: list[str]):
+        self._inner = inner
+        self._executed = executed
+
+    def execute(self, sql, params=None, *args, **kwargs):
+        self._executed.append(str(sql))
+        if params is None:
+            return self._inner.execute(sql, *args, **kwargs)
+        return self._inner.execute(sql, params, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_empty_ids_reads_watermark_without_scanning_lane_rows(client, monkeypatch):
+    _seed_lane_users(client, 2)
+    executed: list[str] = []
+    real_connection = db._admin_data_track_connection
+
+    @contextlib.contextmanager
+    def recording_connection(*args, **kwargs):
+        with real_connection(*args, **kwargs) as conn:
+            yield _RecordingConn(conn, executed)
+
+    monkeypatch.setattr(db, "_admin_data_track_connection", recording_connection)
+    report = db.admin_background_lane_users([], days=1)
+
+    lane_sql = [sql for sql in executed if "lane_daily_rollup" in sql]
+    watermark_sql = [sql for sql in executed if "lane_rollup_watermark" in sql]
+    assert lane_sql == [], (
+        "no page ids means nothing to scan: the per-user lane query must not "
+        "be issued at all"
+    )
+    # ...and the ids-independent watermark read must still happen, otherwise
+    # coverage silently degrades to 'unavailable' on an empty page.
+    assert len(watermark_sql) == 1
+    assert report["users"] == {}
+    assert report["read_status"]["level"] == "ok"
+    assert report["coverage_by_route"]["resident"]["level"] == "green"
+
+
+def test_summary_aggregates_ignore_pagination_window(client):
+    _seed_lane_users(client, 4)
+
+    def _summary(query: str) -> dict:
+        body = client.get(
+            f"/v1/admin/data-track/users?{query}", headers=_admin_headers()
+        ).get_json()
+        summary = dict(body["summary"])
+        # generated_at is wall-clock; everything else must be pagination-blind.
+        summary.pop("generated_at", None)
+        return summary
+
+    whole = _summary("limit=100&lane_days=1")
+    single = _summary("limit=1&lane_days=1")
+    tail = _summary("limit=1&offset=3&lane_days=1")
+    past_end = _summary("limit=1&offset=99&lane_days=1")
+
+    assert single == whole
+    assert tail == whole
+    assert past_end == whole
+    assert whole["activation_funnel"]["registered"] == 4
+
+
+def test_background_lane_coverage_uses_weakest_observed_and_current_route():
+    from admin import data_track
+
+    report = {
+        "window": {"days": 7},
+        "read_status": {"level": "ok", "message": ""},
+        "coverage_by_route": {
+            "resident": {"level": "green", "message": ""},
+            "model_api": {"level": "partial", "message": "late backfill"},
+        },
+        "users": {
+            "usr_switching": {
+                "lanes": {
+                    "heartbeat": {
+                        **data_track._background_lane_empty(),
+                        "completed": 3,
+                        "terminal_attempts": 3,
+                        "failure_rate": 0.0,
+                    },
+                },
+                "routes": {
+                    "resident": {"heartbeat": {"completed": 2}},
+                    "model_api": {"heartbeat": {"completed": 1}},
+                },
+            },
+            "usr_just_switched": {
+                "lanes": {
+                    "heartbeat": {
+                        **data_track._background_lane_empty(),
+                        "completed": 2,
+                        "terminal_attempts": 2,
+                        "failure_rate": 0.0,
+                    },
+                },
+                "routes": {"resident": {"heartbeat": {"completed": 2}}},
+            },
+        },
+    }
+
+    mixed = data_track._background_lanes_for_user(
+        report, user_id="usr_switching", route="model_api"
+    )
+    assert mixed["coverage_routes"] == ["model_api", "resident"]
+    assert mixed["coverage"]["level"] == "partial"
+    assert "model_api=partial" in mixed["coverage"]["message"]
+    assert "resident=green" in mixed["coverage"]["message"]
+
+    report["coverage_by_route"]["model_api"] = {
+        "level": "unavailable", "message": "no watermark"
+    }
+    switched = data_track._background_lanes_for_user(
+        report, user_id="usr_just_switched", route="model_api"
+    )
+    assert switched["coverage_routes"] == ["model_api", "resident"]
+    assert switched["coverage"]["level"] == "unavailable"
+    assert "model_api=unavailable" in switched["coverage"]["message"]
+
+
+def test_data_track_admin_connection_sets_session_timeout_and_resets(
+        monkeypatch):
+    executed = []
+
+    class FakeConnection:
+        def execute(self, sql):
+            executed.append(sql)
+
+    class FakeLease:
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        def __enter__(self):
+            return self.connection
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakePool:
+        def connection(self, *, timeout):
+            assert timeout == 5
+            return FakeLease()
+
+    monkeypatch.setattr(db, "get_pool", lambda: FakePool())
+    with pytest.raises(RuntimeError, match="probe"):
+        with db._admin_data_track_connection():
+            raise RuntimeError("probe")
+
+    assert executed == [
+        "SET statement_timeout = '5000ms'",
+        "RESET statement_timeout",
+    ]
 
 
 def test_admin_data_track_reports_screen_frame_storage_and_freshness(client):
@@ -1183,7 +1618,9 @@ def test_admin_data_track_app_usage_rollup(client):
         for r in client.get("/v1/admin/data-track/users", headers=_admin_headers()).get_json()["users"]
     }
     assert rows2[u_none]["app_usage"] == {
-        "foreground_sec": 0, "sessions": 0, "last_at_epoch": 0.0, "last_at": "",
+        "foreground_sec": 0, "sessions": 0,
+        "last_at_epoch": 0.0, "last_at": "",
+        "fields_status": "ok", "invalid_fields": [],
     }
 
 
@@ -1471,6 +1908,7 @@ def test_admin_route_and_notice_summary_helpers_are_explicit_allowlists(monkeypa
         "blame": "provider_transient",
         "severity": "warning",
         "occurrences": 3,
+        "occurrences_status": "ok",
         "last_ts": 2.0,
     }]
     serialized = json.dumps({"routes": routes, "notices": notices})
@@ -1562,10 +2000,12 @@ def test_detail_payload_exposes_content_free_route_errors_and_notice_summaries(c
         "blame": "provider_transient",
         "severity": "warning",
         "occurrences": 22,
+        "occurrences_status": "ok",
         "last_ts": 22.0,
     }
     assert all(set(item) == {
-        "error_class", "blame", "severity", "occurrences", "last_ts"
+        "error_class", "blame", "severity", "occurrences",
+        "occurrences_status", "last_ts"
     } for item in row["notice_summaries"])
     serialized = json.dumps(row)
     assert "private-relay.example" not in serialized
@@ -1583,7 +2023,10 @@ def test_detail_payload_exposes_content_free_v2_profile_status_true_pg(client):
 
     missing = client.get(endpoint, headers=_admin_headers())
     assert missing.status_code == 200
-    assert missing.get_json()["user"]["v2_profile"] == {"state": "missing"}
+    assert missing.get_json()["user"]["v2_profile"] == {
+        "state": "missing",
+        "document_status": "missing",
+    }
 
     pending_doc = profile_store.build_profile_document(
         user_id,
@@ -1607,6 +2050,7 @@ def test_detail_payload_exposes_content_free_v2_profile_status_true_pg(client):
     assert pending.status_code == 200
     assert pending.get_json()["user"]["v2_profile"] == {
         "state": "pending",
+        "document_status": "ok",
         "memory_chars": 0,
         "style_chars": 0,
         "user_chars": 0,
@@ -1653,6 +2097,7 @@ def test_detail_payload_exposes_content_free_v2_profile_status_true_pg(client):
     profile = user_detail["v2_profile"]
     assert profile == {
         "state": "ok",
+        "document_status": "ok",
         "memory_chars": len("private memory profile"),
         "style_chars": len("private style profile"),
         "user_chars": len("private style profile"),
@@ -1674,13 +2119,14 @@ def test_detail_payload_exposes_content_free_v2_profile_status_true_pg(client):
     assert "private" not in serialized
 
 
-def test_v2_profile_detail_is_allowlisted_truncated_and_read_safe(monkeypatch):
+def test_v2_profile_detail_is_allowlisted_and_read_safe(monkeypatch):
     from admin import data_track as data_track
 
     monkeypatch.setattr(
         data_track.db,
         "get_blob_strict",
         lambda *_args: {
+            "v": 1,
             "state": "degraded",
             "memory": {"chars": 4, "envelope": {"body_ct": "secret"}},
             "user": {"chars": 5, "envelope": {"body_ct": "secret"}},
@@ -1691,8 +2137,12 @@ def test_v2_profile_detail_is_allowlisted_truncated_and_read_safe(monkeypatch):
                 "private_source": "secret",
             },
             "last_attempt": {
-                "reject_code": "r" * 200,
+                "at": "2026-08-01T10:01:00Z",
+                "reject_code": "provider_retry",
                 "attempts": 7,
+                "retry_disposition": "scheduled",
+                "retry_family": "transient",
+                "retry_attempts": 1,
                 "retry_not_before": 8,
                 "private_error": "secret",
             },
@@ -1702,10 +2152,10 @@ def test_v2_profile_detail_is_allowlisted_truncated_and_read_safe(monkeypatch):
     )
 
     detail = data_track._v2_profile_detail("usr_test")
-    assert detail["last_attempt"]["reject_code"] == "r" * 160
+    assert detail["last_attempt"]["reject_code"] == "provider_retry"
     assert set(detail) == {
-        "state", "memory_chars", "style_chars", "user_chars", "source",
-        "last_attempt", "disabled"
+        "state", "document_status", "memory_chars", "style_chars",
+        "user_chars", "source", "last_attempt", "disabled"
     }
     assert set(detail["source"]) == {
         "card_count", "max_updated_at", "generated_at"
@@ -1719,7 +2169,10 @@ def test_v2_profile_detail_is_allowlisted_truncated_and_read_safe(monkeypatch):
         raise RuntimeError("database unavailable")
 
     monkeypatch.setattr(data_track.db, "get_blob_strict", _fail)
-    assert data_track._v2_profile_detail("usr_test") == {"state": "read_error"}
+    assert data_track._v2_profile_detail("usr_test") == {
+        "state": "read_error",
+        "document_status": "unavailable",
+    }
 
 
 def test_detail_payload_exposes_capture_validation_decisions(client):
@@ -1956,3 +2409,1179 @@ def test_admin_data_track_user_mcp_absent_reads_as_not_configured(client):
         "configured": False, "configured_count": 0,
         "enabled_count": 0, "fingerprint": "",
     }
+
+
+# --- T337 B5: memory breakdowns pushed down to the current page ------------
+#
+# memory_moments.doc is an encrypted card large enough to be stored out of
+# line, so every extra ``doc->`` expression in a fleet-wide aggregate costs
+# another detoast pass over every card in the fleet. by_type/by_source and the
+# first/earliest/latest timestamps are rendered on the user's own row only, so
+# they moved to a page-scoped read. ``total`` and ``last_created_at`` did NOT
+# move: total feeds the summary and the memory sort key, and last_created_at is
+# laundered through _latest_epoch into last_activity_at and then active_1d/3d.
+
+
+def _seed_memory_users(client, count: int) -> list[str]:
+    """Register ``count`` users, each with a distinct memory fingerprint.
+
+    The Nth user gets N+1 cards, all of type/source scaled to N so no two users
+    share a breakdown, and created_at/occurred_at windows that are disjoint
+    across users — a row carrying a neighbour's breakdown cannot coincidentally
+    look right.
+    """
+    user_ids: list[str] = []
+    for index in range(count):
+        uid, _ = _register(client)
+        for card in range(index + 1):
+            db.memory_upsert(
+                uid,
+                f"mom-{index}-{card}",
+                f"2020-{index + 1:02d}-{card + 1:02d}T00:00:00Z",
+                {
+                    "type": f"type_{index}",
+                    "source": f"source_{index}",
+                    "created_at": f"2021-{index + 1:02d}-{card + 1:02d}T00:00:00Z",
+                    "occurred_at": f"2020-{index + 1:02d}-{card + 1:02d}T00:00:00Z",
+                },
+            )
+        user_ids.append(uid)
+    return user_ids
+
+
+def test_memory_breakdowns_on_nonzero_offset_equal_the_fleet_wide_read(client):
+    """Field-equality against the implementation this replaced.
+
+    The old fleet-wide read is still reachable via the default
+    include_memory_breakdowns=True, so the expected value is computed by the
+    code being replaced rather than restated by hand — restating it would let
+    the same misunderstanding be written twice and agree with itself.
+    """
+    from admin import data_track as data_track_mod
+
+    seeded = _seed_memory_users(client, 5)
+    body = client.get(
+        "/v1/admin/data-track/users?sort=memory&dir=asc&limit=2&offset=2",
+        headers=_admin_headers(),
+    ).get_json()
+    page_ids = [row["user_id"] for row in body["users"]]
+    assert page_ids == seeded[2:4], (
+        "sort=memory&dir=asc orders by card count, which _seed_memory_users "
+        f"made strictly increasing; expected {seeded[2:4]} got {page_ids}"
+    )
+
+    old = db.admin_data_track_snapshot(page_ids, include_legacy_background=False)
+    for row in body["users"]:
+        expected = data_track_mod._data_track_memory_from_snapshot(
+            old[row["user_id"]]
+        )
+        assert row["memory"] == expected, (
+            f"pushed-down memory for {row['user_id']} diverged from the "
+            "fleet-wide read it replaced"
+        )
+
+    # The equality above shares _memory_breakdowns_into with the read it is
+    # compared against, so a mutation inside that SQL moves both sides together
+    # and stays green. These expectations are computed from the seed instead —
+    # an oracle the implementation cannot follow. The Nth user's cards live on
+    # a key space no other user uses, so a neighbour's data cannot pass either.
+    for row in body["users"]:
+        index = seeded.index(row["user_id"])
+        cards = index + 1
+        month = f"{index + 1:02d}"
+        memory = row["memory"]
+        assert memory["by_source"] == {f"source_{index}": cards}
+        assert memory["by_type"][f"type_{index}"] == cards
+        # first/earliest are MIN (day 01), latest is MAX (day == card count).
+        assert memory["first_created_at"] == f"2021-{month}-01T00:00:00Z"
+        assert memory["earliest_occurred_at"] == f"2020-{month}-01T00:00:00Z"
+        assert memory["latest_occurred_at"] == f"2020-{month}-{cards:02d}T00:00:00Z"
+
+
+def test_fleet_wide_read_does_not_scan_memory_docs_for_breakdowns(client, monkeypatch):
+    """The scan that was removed must not come back alongside the page read.
+
+    Restoring include_memory_breakdowns=True on the fleet call would leave
+    every assertion about page correctness green — the page read still runs and
+    still returns the right rows — while quietly reinstating the whole cost
+    this batch exists to remove. The only place it is visible is the ids handed
+    to the doc-scanning SQL.
+    """
+    seeded = _seed_memory_users(client, 5)
+    calls: list[tuple[str, object]] = []
+    real_connection = db._admin_data_track_connection
+
+    class _Recorder:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, params=None, *args, **kwargs):
+            calls.append((str(sql), params))
+            if params is None:
+                return self._inner.execute(sql, *args, **kwargs)
+            return self._inner.execute(sql, params, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    @contextlib.contextmanager
+    def recording_connection(*args, **kwargs):
+        with real_connection(*args, **kwargs) as conn:
+            yield _Recorder(conn)
+
+    monkeypatch.setattr(db, "_admin_data_track_connection", recording_connection)
+    body = client.get(
+        "/v1/admin/data-track/users?sort=memory&dir=asc&limit=2&offset=2",
+        headers=_admin_headers(),
+    ).get_json()
+    page_ids = [row["user_id"] for row in body["users"]]
+    assert page_ids == seeded[2:4]
+
+    breakdown_ids = [
+        params[1]
+        for sql, params in calls
+        if "COALESCE(NULLIF(doc->>%s" in sql and "memory_moments" in sql
+    ]
+    assert breakdown_ids, (
+        "no by_type/by_source SQL ran at all — this guard would pass "
+        "vacuously; the search string no longer matches the query"
+    )
+    assert all(ids == page_ids for ids in breakdown_ids), (
+        "the by_type/by_source scan must only ever see the current page; got "
+        f"{[len(ids) for ids in breakdown_ids]} ids per call for a page of "
+        f"{len(page_ids)} out of {len(seeded)} seeded users"
+    )
+
+    fleet_memory_sql = [
+        sql for sql, _ in calls
+        if "FROM memory_moments" in sql and "COUNT(*)::int AS total" in sql
+    ]
+    assert len(fleet_memory_sql) == 1
+    assert "occurred_at" not in fleet_memory_sql[0], (
+        "the fleet-wide memory aggregate must carry no occurred_at expression: "
+        "each extra doc-> expression is another detoast pass of every card"
+    )
+    assert "MIN(" not in fleet_memory_sql[0]
+
+
+def test_memory_breakdown_reader_receives_exactly_the_page_ids(client, monkeypatch):
+    """The pushdown itself, not just its result.
+
+    Field-equality alone cannot see this: handing the reader every fleet id
+    still produces correct rows, which is exactly the bug being fixed.
+    """
+    seeded = _seed_memory_users(client, 5)
+    seen: list[list[str]] = []
+    real = db.admin_memory_breakdowns
+
+    def observed(user_ids, *args, **kwargs):
+        seen.append(list(user_ids))
+        return real(user_ids, *args, **kwargs)
+
+    monkeypatch.setattr(db, "admin_memory_breakdowns", observed)
+    body = client.get(
+        "/v1/admin/data-track/users?sort=memory&dir=asc&limit=2&offset=2",
+        headers=_admin_headers(),
+    ).get_json()
+
+    page_ids = [row["user_id"] for row in body["users"]]
+    assert page_ids == seeded[2:4]
+    assert seen == [page_ids], (
+        "the memory breakdown read must receive exactly the returned page, in "
+        f"order; got {seen} for page {page_ids} out of {len(seeded)} users"
+    )
+
+
+def test_last_created_at_still_covers_users_off_the_current_page(client):
+    """last_created_at must NOT be pushed down.
+
+    It reaches the fleet summary indirectly — _latest_epoch folds it into
+    last_activity_at, which drives active_1d/3d — so a user whose only recent
+    activity is a memory card must still be counted while off the page.
+    """
+    _seed_memory_users(client, 3)
+    recent_uid, _ = _register(client)
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    db.memory_upsert(
+        recent_uid,
+        "mom-recent",
+        now.isoformat(),
+        {"type": "fact", "source": "chat", "created_at": now.isoformat()},
+    )
+
+    # recent_uid holds a single card, so ordering by card count descending and
+    # keeping one row puts it off the page.
+    body = client.get(
+        "/v1/admin/data-track/users?sort=memory&dir=desc&limit=1&offset=0",
+        headers=_admin_headers(),
+    ).get_json()
+    assert recent_uid not in [row["user_id"] for row in body["users"]]
+
+    # Asserting on active_1d here would prove nothing: every user in this test
+    # registered seconds ago, and registered_at is itself a _latest_epoch input,
+    # so the count stays put whatever memory does. Anchor on the value instead.
+    fleet = db.admin_data_track_snapshot(
+        [recent_uid],
+        include_legacy_background=False,
+        include_memory_breakdowns=False,
+    )
+    assert fleet[recent_uid]["memory"]["last_created_at"] == now.isoformat(), (
+        "the fleet-wide read must still carry last_created_at with the "
+        "breakdowns pushed down — it is the only memory field that reaches "
+        "active_1d/3d, and off-page users are never re-read"
+    )
+
+    # ...and that value really is what drives last_activity_at. Registration
+    # happened microseconds before the card, so the card is the newest input
+    # and last_activity_at must equal it exactly.
+    own_page = client.get(
+        f"/v1/admin/data-track/users?q={quote(recent_uid)}&limit=10",
+        headers=_admin_headers(),
+    ).get_json()
+    own_row = next(r for r in own_page["users"] if r["user_id"] == recent_uid)
+    # Compared as instants, not strings: the two fields are rendered by
+    # different helpers (memory keeps the offset, last_activity_at does not),
+    # and it is the instant _latest_epoch propagates that matters here.
+    from core import util as core_util
+
+    assert own_row["memory"]["last_created_at"]
+    assert core_util._to_epoch(own_row["last_activity_at"]) == pytest.approx(
+        core_util._to_epoch(own_row["memory"]["last_created_at"])
+    ), (
+        "last_activity_at stopped tracking the newest memory card; the "
+        "_latest_epoch chain into active_1d/3d is broken"
+    )
+
+
+def test_memory_totals_are_fleet_wide_not_page_wide(client):
+    """total feeds the summary and the memory sort key, so it cannot be paged."""
+    _seed_memory_users(client, 4)
+
+    def _memory_total(query: str) -> int:
+        body = client.get(
+            f"/v1/admin/data-track/users?{query}", headers=_admin_headers()
+        ).get_json()
+        return int(body["summary"]["memory_total"])
+
+    full = _memory_total("limit=100&offset=0")
+    paged = _memory_total("limit=1&offset=2")
+    assert full == paged == 1 + 2 + 3 + 4, (
+        "memory.total is a fleet aggregate; it must not follow the page "
+        f"window (full={full} paged={paged})"
+    )
+
+
+def test_breakdown_read_failure_is_reported_not_zeroed(client, monkeypatch):
+    """A failed page read must not look like a user with no memory cards.
+
+    Before the pushdown these queries lived inside admin_data_track_snapshot,
+    whose except block marks every row's snapshot_read_status. Moving them out
+    created a path where the same failure could return an empty dict instead —
+    indistinguishable, on the rendered page, from a real absence of data.
+    The failure is injected where it actually occurs: the DB read.
+    """
+    _seed_memory_users(client, 3)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated breakdown read failure")
+
+    monkeypatch.setattr(db, "_memory_breakdowns_into", boom)
+
+    breakdowns, read_status = db.admin_memory_breakdowns(["usr_whatever"])
+    assert breakdowns == {}
+    assert read_status["level"] != "ok", (
+        "a failed breakdown read reported level=ok; the caller cannot tell it "
+        "apart from a user who genuinely has no cards"
+    )
+    assert read_status["message"]
+
+    body = client.get(
+        "/v1/admin/data-track/users?sort=memory&dir=asc&limit=2",
+        headers=_admin_headers(),
+    ).get_json()
+    assert body["users"], "the page must still render, degraded"
+    for row in body["users"]:
+        assert row["snapshot_read_status"]["level"] != "ok", (
+            "the degraded read never reached the row the admin actually sees"
+        )
+
+
+def _seed_log_stream_users(client, count: int) -> list[str]:
+    """Users from ``_seed_memory_users``, each with a distinct log fingerprint.
+
+    The Nth user gets N+1 bootstrap_events, written through db.log_append with
+    no ts — the same way both production writers do, which is what makes
+    bootstrap_events.last_at structurally empty.
+
+    The N+1 memory_capture_jobs rows are seeded on purpose even though nothing
+    reads them: they are what makes "no query names memory_capture_jobs" a
+    statement about the SQL rather than about an empty table.
+    """
+    user_ids = _seed_memory_users(client, count)
+    _add_log_stream_fingerprint(user_ids)
+    return user_ids
+
+
+def _add_log_stream_fingerprint(user_ids: list[str]) -> None:
+    for index, uid in enumerate(user_ids):
+        for entry in range(index + 1):
+            db.log_append(uid, "bootstrap_events", {
+                "event_type": f"boot_{index}", "success": True,
+            })
+            db.log_append(uid, "memory_capture_jobs", {
+                "status": f"status_{index}", "mode": f"mode_{index}",
+            })
+
+
+def test_bootstrap_events_on_nonzero_offset_equal_the_fleet_wide_read(client):
+    """Field-equality against the implementation this replaced."""
+    from admin import data_track as data_track_mod
+
+    seeded = _seed_log_stream_users(client, 5)
+    body = client.get(
+        "/v1/admin/data-track/users?sort=memory&dir=asc&limit=2&offset=2",
+        headers=_admin_headers(),
+    ).get_json()
+    page_ids = [row["user_id"] for row in body["users"]]
+    assert page_ids == seeded[2:4]
+
+    old = db.admin_data_track_snapshot(page_ids, include_legacy_background=False)
+    for row in body["users"]:
+        expected = data_track_mod._data_track_bootstrap_from_snapshot(
+            old[row["user_id"]]
+        )
+        assert row["bootstrap_events"] == expected, (
+            f"pushed-down bootstrap_events for {row['user_id']} diverged from "
+            "the fleet-wide read it replaced"
+        )
+
+    # Seed-derived, so a mutation inside the shared helper cannot move both
+    # sides of the comparison above together.
+    for row in body["users"]:
+        index = seeded.index(row["user_id"])
+        assert row["bootstrap_events"]["events"] == index + 1
+        assert row["bootstrap_events"]["last_at"] == "", (
+            "bootstrap_events rows are written without a ts, so last_at must "
+            "stay empty — that is the premise this whole pushdown rests on"
+        )
+
+
+def test_fleet_wide_read_does_not_scan_the_paged_log_streams(client, monkeypatch):
+    """The fleet log aggregate must stop naming bootstrap_events, the page read
+    must only ever see the page, and memory_capture_jobs must not be scanned by
+    either one.
+
+    memory_capture_jobs is the sharper half: it has no consumer anywhere and no
+    log_trim, so re-reading it per page would keep an unbounded GROUP BY alive
+    for nothing — and it would share a query with bootstrap_events, so a heavy
+    user could time that read out and mark a readable row degraded. The seed
+    writes rows to the stream precisely so this stays a claim about the query
+    rather than about an empty table.
+    """
+    seeded = _seed_log_stream_users(client, 5)
+    calls: list[tuple[str, object]] = []
+    real_connection = db._admin_data_track_connection
+
+    class _Recorder:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, params=None, *args, **kwargs):
+            calls.append((str(sql), params))
+            if params is None:
+                return self._inner.execute(sql, *args, **kwargs)
+            return self._inner.execute(sql, params, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    @contextlib.contextmanager
+    def recording_connection(*args, **kwargs):
+        with real_connection(*args, **kwargs) as conn:
+            yield _Recorder(conn)
+
+    monkeypatch.setattr(db, "_admin_data_track_connection", recording_connection)
+    body = client.get(
+        "/v1/admin/data-track/users?sort=memory&dir=asc&limit=2&offset=2",
+        headers=_admin_headers(),
+    ).get_json()
+    page_ids = [row["user_id"] for row in body["users"]]
+    assert page_ids == seeded[2:4]
+
+    fleet_log_sql = [
+        sql for sql, _ in calls
+        if "FROM user_logs" in sql and "'memory_changes'" in sql
+    ]
+    assert len(fleet_log_sql) == 1, (
+        "no fleet-wide user_logs aggregate ran — this guard would pass "
+        "vacuously; the search string no longer matches the query"
+    )
+    assert "bootstrap_events" not in fleet_log_sql[0], (
+        "bootstrap_events is back in the fleet-wide user_logs aggregate"
+    )
+    assert "'memory_changes'" in fleet_log_sql[0], (
+        "memory_changes must stay fleet-wide: it is the second element of the "
+        "memory sort tuple, so it takes part in a full-set ordering"
+    )
+
+    paged_calls = [
+        (sql, params)
+        for sql, params in calls
+        if "FROM user_logs" in sql and "stream = ANY(%s)" in sql
+    ]
+    assert paged_calls, "the page-scoped log read never ran"
+    assert all(params[0] == page_ids for _, params in paged_calls), (
+        "the page-scoped log read must only ever see the current page; got "
+        f"{[len(params[0]) for _, params in paged_calls]} ids per call for a "
+        f"page of {len(page_ids)} out of {len(seeded)} seeded users"
+    )
+    assert all(list(params[1]) == ["bootstrap_events"] for _, params in paged_calls), (
+        "the page-scoped log read must ask for exactly bootstrap_events; got "
+        f"{[list(params[1]) for _, params in paged_calls]}"
+    )
+
+    # And nowhere else either — not the fleet aggregate, not the page read, not
+    # a query someone adds later that happens to run on this request.
+    scanned_capture_jobs = [sql for sql, _ in calls if "memory_capture_jobs" in sql]
+    assert not scanned_capture_jobs, (
+        "memory_capture_jobs is untrimmed and has no consumer; something is "
+        f"scanning it again: {scanned_capture_jobs}"
+    )
+
+
+def test_paged_log_reader_receives_exactly_the_page_ids(client, monkeypatch):
+    seeded = _seed_log_stream_users(client, 5)
+    seen: list[list[str]] = []
+    real = db.admin_paged_log_streams
+
+    def observed(user_ids, *args, **kwargs):
+        seen.append(list(user_ids))
+        return real(user_ids, *args, **kwargs)
+
+    monkeypatch.setattr(db, "admin_paged_log_streams", observed)
+    body = client.get(
+        "/v1/admin/data-track/users?sort=memory&dir=asc&limit=2&offset=2",
+        headers=_admin_headers(),
+    ).get_json()
+
+    page_ids = [row["user_id"] for row in body["users"]]
+    assert page_ids == seeded[2:4]
+    assert seen == [page_ids], (
+        "the paged log read must receive exactly the returned page, in order; "
+        f"got {seen} for page {page_ids} out of {len(seeded)} users"
+    )
+
+
+def test_memory_changes_stays_fleet_wide_for_the_memory_sort(client):
+    """memory_changes must NOT follow bootstrap_events onto the page.
+
+    It is the second element of the memory sort tuple, so it breaks ties across
+    the whole fleet — before any page window exists. Three users hold one card
+    each, so total ties and only ``changes`` can order them; the change counts
+    run opposite to registration order, which is what the sort falls back to
+    when the tie-break reads zero.
+    """
+    user_ids: list[str] = []
+    for index in range(3):
+        uid, _ = _register(client)
+        db.memory_upsert(
+            uid, f"mom-tie-{index}", "2020-01-01T00:00:00Z",
+            {"type": "fact", "source": "chat", "created_at": "2021-01-01T00:00:00Z"},
+        )
+        for change in range(3 - index):
+            db.log_append(uid, "memory_changes", {"action": "add", "n": change})
+        user_ids.append(uid)
+
+    body = client.get(
+        "/v1/admin/data-track/users?sort=memory&dir=desc&limit=1&offset=0",
+        headers=_admin_headers(),
+    ).get_json()
+    top = body["users"][0]
+    assert top["user_id"] == user_ids[0], (
+        "the memory sort stopped tie-breaking on changes; it fell back to "
+        f"registration order (would give {user_ids[-1]}), which is what "
+        "happens the moment memory_changes is read per page instead of "
+        "fleet-wide"
+    )
+    assert top["memory"]["changes"] == 3
+
+
+@pytest.mark.parametrize("reader_name", [
+    "admin_memory_breakdowns",
+    "admin_screen_frames",
+    "admin_paged_log_streams",
+])
+def test_page_readers_lease_no_connection_for_an_empty_page(monkeypatch, reader_name):
+    """An empty page must cost zero database work, not one connection each.
+
+    The `if not ids` early return is the cheap part; the part worth a test is
+    that it happens *before* the pool is touched. Asserting on the return value
+    alone would pass just as happily if the reader opened a connection, ran
+    three aggregates over no ids and mapped the empty result — which is the
+    shape B1 shipped once already.
+    """
+    leases: list[object] = []
+
+    def refuse(*args, **kwargs):
+        leases.append(args)
+        raise AssertionError(
+            f"{reader_name} leased a connection for an empty page"
+        )
+
+    monkeypatch.setattr(db, "_admin_data_track_connection", refuse)
+    result, read_status = getattr(db, reader_name)([])
+
+    assert result == {}
+    assert read_status == {"level": "ok", "message": ""}, (
+        "an empty page is not a read failure; it must report ok so the row "
+        "does not pick up a snapshot_read_status it did not earn"
+    )
+    assert leases == []
+
+
+def test_paged_log_read_failure_is_reported_not_zeroed(client, monkeypatch):
+    """A failed page read must not look like a user with no bootstrap events."""
+    _seed_log_stream_users(client, 3)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated paged log read failure")
+
+    monkeypatch.setattr(db, "_paged_log_streams_into", boom)
+
+    logs, read_status = db.admin_paged_log_streams(["usr_whatever"])
+    assert logs == {}
+    assert read_status["level"] != "ok", (
+        "a failed paged log read reported level=ok; the caller cannot tell it "
+        "apart from a user who genuinely has no bootstrap events"
+    )
+    assert read_status["message"]
+
+    body = client.get(
+        "/v1/admin/data-track/users?sort=memory&dir=asc&limit=2",
+        headers=_admin_headers(),
+    ).get_json()
+    assert body["users"], "the page must still render, degraded"
+    for row in body["users"]:
+        assert row["snapshot_read_status"]["level"] != "ok", (
+            "the degraded read never reached the row the admin actually sees"
+        )
+
+
+def _seed_frame_users(client, count: int) -> list[str]:
+    """Users from ``_seed_memory_users``, each also given a frame fingerprint.
+
+    The memory cards are only there to make the page order deterministic —
+    screen frames have no sort key of their own. The Nth user gets N+1 frames,
+    exactly one of them in R2, and a newest frame ``600 - 60N`` seconds old, so
+    total / inline_count / r2_count / latest_age_sec are all distinct per user
+    and a row carrying a neighbour's counters cannot look right. A user's own
+    frames are spread an hour apart so that the newest and the oldest cannot be
+    confused for each other inside the tolerance latest_age_sec is read with.
+    """
+    user_ids = _seed_memory_users(client, count)
+    _add_frame_fingerprint(user_ids)
+    return user_ids
+
+
+def _add_frame_fingerprint(user_ids: list[str]) -> None:
+    with db.get_pool().connection() as conn:
+        for index, uid in enumerate(user_ids):
+            newest_age = 600 - 60 * index
+            for frame in range(index + 1):
+                conn.execute(
+                    """
+                    INSERT INTO frame_envelopes
+                        (user_id, frame_id, ts, doc, env_meta, body_key)
+                    VALUES (%s, %s, extract(epoch FROM now()) - %s,
+                            %s::jsonb, NULL, %s)
+                    """,
+                    (
+                        uid,
+                        f"frame-{index}-{frame}",
+                        newest_age + frame * 3600,
+                        json.dumps({"v": 1, "body_ct": "must-not-leak"}),
+                        "frames/test/body" if frame == index else None,
+                    ),
+                )
+
+
+def _seed_active_broadcast(user_id: str) -> None:
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_blobs (user_id, kind, doc)
+            VALUES (
+                %s,
+                'perception_state',
+                jsonb_build_object(
+                    'broadcast_state', jsonb_build_object(
+                        'v', 'on', 'ts', extract(epoch FROM now())
+                    ),
+                    'broadcast_active', jsonb_build_object(
+                        'v', true, 'ts', extract(epoch FROM now())
+                    )
+                )
+            )
+            ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc
+            """,
+            (user_id,),
+        )
+
+
+def test_screen_frames_on_nonzero_offset_equal_the_fleet_wide_read(client):
+    """Field-equality against the implementation this replaced."""
+    from admin import data_track as data_track_mod
+
+    seeded = _seed_frame_users(client, 5)
+    body = client.get(
+        "/v1/admin/data-track/users?sort=memory&dir=asc&limit=2&offset=2",
+        headers=_admin_headers(),
+    ).get_json()
+    page_ids = [row["user_id"] for row in body["users"]]
+    assert page_ids == seeded[2:4]
+
+    old = db.admin_data_track_snapshot(page_ids, include_legacy_background=False)
+    for row in body["users"]:
+        expected = data_track_mod._data_track_screen_frames_from_snapshot(
+            old[row["user_id"]]
+        )
+        got = dict(row["screen_frames"])
+        # latest_age_sec is derived from wall-clock at read time, so the two
+        # reads legitimately differ by the seconds between them.
+        assert got.pop("latest_age_sec") == pytest.approx(
+            expected.pop("latest_age_sec"), abs=5
+        )
+        assert got == expected, (
+            f"pushed-down screen_frames for {row['user_id']} diverged from the "
+            "fleet-wide read it replaced"
+        )
+
+    # The equality above shares _screen_frames_into with the read it compares
+    # against, so a mutation inside that SQL moves both sides together and stays
+    # green. These expectations come from the seed instead.
+    for row in body["users"]:
+        index = seeded.index(row["user_id"])
+        frames = row["screen_frames"]
+        assert frames["total"] == index + 1
+        assert frames["inline_count"] == index
+        assert frames["r2_count"] == 1
+        newest_age = 600 - 60 * index
+        assert newest_age <= frames["latest_age_sec"] < newest_age + 30, (
+            "latest_at is not the newest frame for this user"
+        )
+    assert "must-not-leak" not in json.dumps(body)
+
+
+def test_fleet_wide_read_does_not_scan_frame_envelopes(client, monkeypatch):
+    """Restoring include_screen_frames=True would leave every page assertion
+    green while reinstating the fleet-wide scan this batch removes. The ids
+    handed to the SQL are the only place it is visible."""
+    seeded = _seed_frame_users(client, 5)
+    calls: list[tuple[str, object]] = []
+    real_connection = db._admin_data_track_connection
+
+    class _Recorder:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, params=None, *args, **kwargs):
+            calls.append((str(sql), params))
+            if params is None:
+                return self._inner.execute(sql, *args, **kwargs)
+            return self._inner.execute(sql, params, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    @contextlib.contextmanager
+    def recording_connection(*args, **kwargs):
+        with real_connection(*args, **kwargs) as conn:
+            yield _Recorder(conn)
+
+    monkeypatch.setattr(db, "_admin_data_track_connection", recording_connection)
+    body = client.get(
+        "/v1/admin/data-track/users?sort=memory&dir=asc&limit=2&offset=2",
+        headers=_admin_headers(),
+    ).get_json()
+    page_ids = [row["user_id"] for row in body["users"]]
+    assert page_ids == seeded[2:4]
+
+    frame_ids = [
+        params[0]
+        for sql, params in calls
+        if "FROM frame_envelopes" in sql and "r2_count" in sql
+    ]
+    assert frame_ids, (
+        "no frame_envelopes aggregate ran at all — this guard would pass "
+        "vacuously; the search string no longer matches the query"
+    )
+    assert all(ids == page_ids for ids in frame_ids), (
+        "the frame aggregate must only ever see the current page; got "
+        f"{[len(ids) for ids in frame_ids]} ids per call for a page of "
+        f"{len(page_ids)} out of {len(seeded)} seeded users"
+    )
+
+
+def test_screen_frame_reader_receives_exactly_the_page_ids(client, monkeypatch):
+    """The pushdown itself, not just its result: handing the reader every fleet
+    id still produces correct rows, which is exactly the bug being fixed."""
+    seeded = _seed_frame_users(client, 5)
+    seen: list[list[str]] = []
+    real = db.admin_screen_frames
+
+    def observed(user_ids, *args, **kwargs):
+        seen.append(list(user_ids))
+        return real(user_ids, *args, **kwargs)
+
+    monkeypatch.setattr(db, "admin_screen_frames", observed)
+    body = client.get(
+        "/v1/admin/data-track/users?sort=memory&dir=asc&limit=2&offset=2",
+        headers=_admin_headers(),
+    ).get_json()
+
+    page_ids = [row["user_id"] for row in body["users"]]
+    assert page_ids == seeded[2:4]
+    assert seen == [page_ids], (
+        "the screen-frame read must receive exactly the returned page, in "
+        f"order; got {seen} for page {page_ids} out of {len(seeded)} users"
+    )
+
+
+def test_broadcast_stalled_still_derives_from_both_halves_on_a_paged_row(client):
+    """broadcast_stalled needs the page-scoped frame recency *and* the still
+    fleet-wide broadcast report. Patching the counters onto the row instead of
+    re-running the mapper would leave every count right and this flag wrong."""
+    seeded = _seed_frame_users(client, 5)
+    _seed_active_broadcast(seeded[2])
+
+    body = client.get(
+        "/v1/admin/data-track/users?sort=memory&dir=asc&limit=1&offset=2",
+        headers=_admin_headers(),
+    ).get_json()
+    row = body["users"][0]
+    assert row["user_id"] == seeded[2]
+    frames = row["screen_frames"]
+    assert frames["broadcast_report_active"] is True
+    assert frames["broadcast_stalled"] is True, (
+        "the device still reports broadcast=on and its newest frame is "
+        f"{frames['latest_age_sec']}s old, but the paged row does not raise "
+        "the stalled alert the admin page renders"
+    )
+
+
+def test_screen_frame_read_failure_is_reported_not_zeroed(client, monkeypatch):
+    """A failed page read must not look like a user who never shared a screen.
+
+    Before the pushdown this query lived inside admin_data_track_snapshot,
+    whose except block marks every row's snapshot_read_status. Moving it out
+    created a path where the same failure could return an empty dict instead.
+    The failure is injected where it actually occurs: the DB read.
+    """
+    _seed_frame_users(client, 3)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated frame read failure")
+
+    monkeypatch.setattr(db, "_screen_frames_into", boom)
+
+    frames, read_status = db.admin_screen_frames(["usr_whatever"])
+    assert frames == {}
+    assert read_status["level"] != "ok", (
+        "a failed frame read reported level=ok; the caller cannot tell it "
+        "apart from a user who genuinely has no frames"
+    )
+    assert read_status["message"]
+
+    body = client.get(
+        "/v1/admin/data-track/users?sort=memory&dir=asc&limit=2",
+        headers=_admin_headers(),
+    ).get_json()
+    assert body["users"], "the page must still render, degraded"
+    for row in body["users"]:
+        assert row["snapshot_read_status"]["level"] != "ok", (
+            "the degraded read never reached the row the admin actually sees"
+        )
+
+
+def test_frame_recency_is_not_a_last_activity_input(client):
+    """The premise of this pushdown, guarded.
+
+    Pushing screen_frames onto the page is sound only because latest_ts is not
+    one of _latest_epoch's inputs — off-page users are never re-read, so if it
+    ever became one, last_activity_at (and active_1d/3d behind it) would
+    silently stop seeing frames. The frame is dated in the future so that a
+    regression is visible: a past frame could never move a MAX that already
+    contains a registration timestamp from seconds ago.
+    """
+    from core import util as core_util
+
+    user_id, _ = _register(client)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO frame_envelopes
+                (user_id, frame_id, ts, doc, env_meta, body_key)
+            VALUES (%s, 'frame_future', extract(epoch FROM now()) + 3600,
+                    %s::jsonb, NULL, NULL)
+            """,
+            (user_id, json.dumps({"v": 1, "body_ct": "must-not-leak"})),
+        )
+
+    body = client.get(
+        f"/v1/admin/data-track/users?q={quote(user_id)}&limit=10",
+        headers=_admin_headers(),
+    ).get_json()
+    row = next(r for r in body["users"] if r["user_id"] == user_id)
+    assert row["screen_frames"]["total"] == 1, "the frame was not seeded"
+    assert core_util._to_epoch(row["last_activity_at"]) == pytest.approx(
+        core_util._to_epoch(row["registered_at"]), abs=5
+    ), (
+        "last_activity_at moved with a screen frame; latest_ts has become a "
+        "_latest_epoch input, and the page-scoped screen-frame read now hides "
+        "activity for every user off the current page"
+    )
+
+
+# ── read-side parity ─────────────────────────────────────────────────────────
+# Each slice above proved itself equal to the fleet-wide read it replaced, on
+# its own fixture, on one page. What none of those comparisons can see is the
+# rest of the payload: a pushdown that moved last_activity_at, a summary
+# aggregate, the sort order or the pagination totals would leave every
+# per-slice test green. These two tests compare the whole payload, on one
+# fixture that carries all three page-scoped slices at once.
+
+
+def _seed_every_paged_slice(client, count: int) -> list[str]:
+    """One fixture carrying all three page-scoped slices on the same users.
+
+    The per-slice fixtures each register their own users, so until now no test
+    exercised a row whose memory, screen_frames and bootstrap_events are all
+    rebuilt in the same page loop. Ids come back in ascending memory order, and
+    the first one has nothing in any of the three slices — that is the branch
+    where the ``if breakdown:`` / ``if frames:`` / ``if logs:`` guards skip the
+    rebuild and the row keeps whatever the fleet-wide read left on it.
+    """
+    bare, _ = _register(client)
+    user_ids = _seed_memory_users(client, count)
+    _add_log_stream_fingerprint(user_ids)
+    _add_frame_fingerprint(user_ids)
+    return [bare, *user_ids]
+
+
+def _restore_the_fleet_wide_read(monkeypatch) -> None:
+    """Put the implementation back the way it was before the pushdowns.
+
+    The replaced code is still reachable — admin_data_track_snapshot's three
+    include_* flags all default to True — so "before" is produced by running it
+    rather than by restating its output, which would only let the same
+    misunderstanding be written twice and agree with itself. The page readers
+    are stubbed to an empty result so the page loop leaves the fleet-computed
+    values in place instead of rebuilding them.
+    """
+    real_snapshot = db.admin_data_track_snapshot
+
+    def fleet_wide(user_ids, **kwargs):
+        for flag in (
+            "include_memory_breakdowns",
+            "include_screen_frames",
+            "include_paged_log_streams",
+        ):
+            kwargs.pop(flag, None)
+        return real_snapshot(user_ids, **kwargs)
+
+    monkeypatch.setattr(db, "admin_data_track_snapshot", fleet_wide)
+    for reader in (
+        "admin_memory_breakdowns",
+        "admin_screen_frames",
+        "admin_paged_log_streams",
+    ):
+        monkeypatch.setattr(
+            db, reader, lambda ids: ({}, {"level": "ok", "message": ""})
+        )
+
+
+def _take_clock_fields(payload: dict) -> tuple[str, list]:
+    """Remove the two fields that read the wall clock, and only those two.
+
+    Everything else in the payload has to match exactly; these two cannot,
+    because the two sides are two requests served seconds apart.
+    summary.generated_at is the timestamp of the request itself, and
+    screen_frames.latest_age_sec is now() minus latest_at — which is compared
+    exactly along with everything else, and pinned against the seed by
+    test_page_rows_carry_all_three_slices_for_the_right_user.
+
+    Anything else that stops matching is a real divergence, so this list stays
+    closed: a new time-dependent field must be justified here, not skipped.
+    """
+    ages = []
+    for row in payload.get("users") or []:
+        ages.append((row.get("screen_frames") or {}).pop("latest_age_sec", None))
+    generated_at = (payload.get("summary") or {}).pop("generated_at", "")
+    return generated_at, ages
+
+
+@pytest.mark.parametrize("query", [
+    "sort=memory&dir=asc&limit=2&offset=0",
+    "sort=memory&dir=asc&limit=2&offset=2",
+    "sort=memory&dir=asc&limit=2&offset=4",
+    "sort=memory&dir=desc&limit=3&offset=3",
+    "sort=chat&dir=desc&limit=4&offset=2",
+    "limit=3&offset=3",
+])
+def test_paged_payload_is_field_identical_to_the_fleet_wide_read(
+    client, monkeypatch, query
+):
+    """Every field of every row, on every page, under every sort.
+
+    The bug this batch fixes was that pagination sliced *after* the fleet-wide
+    work had already been done. Moving the slice earlier is only correct if
+    nothing an admin can see moved with it — including the fields no page
+    reader touches, the summary block, and the ordering itself, which now
+    decides membership of the page instead of merely presenting it.
+    """
+    seeded = _seed_every_paged_slice(client, 5)
+
+    url = f"/v1/admin/data-track/users?{query}"
+    live = client.get(url, headers=_admin_headers()).get_json()
+    _restore_the_fleet_wide_read(monkeypatch)
+    reference = client.get(url, headers=_admin_headers()).get_json()
+
+    assert live["users"], (
+        f"{query} returned an empty page — the comparison below would hold "
+        "vacuously"
+    )
+    assert {r["user_id"] for r in live["users"]} <= set(seeded), (
+        "the page contains a user this fixture did not seed"
+    )
+
+    live_stamp, live_ages = _take_clock_fields(live)
+    reference_stamp, reference_ages = _take_clock_fields(reference)
+    assert live_stamp and reference_stamp and reference_stamp >= live_stamp, (
+        f"summary.generated_at is not the time of the request: {live_stamp} "
+        f"then {reference_stamp}"
+    )
+    assert len(live_ages) == len(reference_ages)
+    for before, after in zip(live_ages, reference_ages):
+        assert (before is None) == (after is None), (
+            "one side has a frame recency the other does not"
+        )
+        if before is not None:
+            assert after - before <= 5 and after >= before, (
+                f"latest_age_sec moved by more than the gap between the two "
+                f"requests: {before} -> {after}"
+            )
+
+    assert live == reference, (
+        "the paged read and the fleet-wide read it replaced disagree on some "
+        "field of the payload"
+    )
+
+
+def test_page_rows_carry_all_three_slices_for_the_right_user(client):
+    """Seed-derived oracle for the fixture the parity test compares.
+
+    Both sides of that comparison run through the same _*_into helpers, so a
+    mutation inside one of them moves them together and stays green. These
+    numbers come from the seed instead. The Nth user has N+1 of everything, so
+    a row that picked up a neighbour's counters for one slice and its own for
+    another is visible, and the fully empty user pins the branch where all
+    three rebuild guards are skipped.
+    """
+    seeded = _seed_every_paged_slice(client, 5)
+    body = client.get(
+        "/v1/admin/data-track/users?sort=memory&dir=asc&limit=6&offset=0",
+        headers=_admin_headers(),
+    ).get_json()
+    rows = {row["user_id"]: row for row in body["users"]}
+    assert list(rows) == seeded, (
+        f"sort=memory&dir=asc must order by card count; got {list(rows)}"
+    )
+
+    bare = rows[seeded[0]]
+    assert bare["memory"]["total"] == 0
+    assert bare["memory"]["by_source"] == {}
+    assert bare["screen_frames"]["total"] == 0
+    assert bare["screen_frames"]["latest_at"] == ""
+    assert bare["bootstrap_events"]["events"] == 0
+
+    for index, uid in enumerate(seeded[1:]):
+        row = rows[uid]
+        seeded_rows = index + 1
+        assert row["memory"]["total"] == seeded_rows
+        assert row["memory"]["by_source"] == {f"source_{index}": seeded_rows}
+        assert row["bootstrap_events"]["events"] == seeded_rows
+        assert row["screen_frames"]["total"] == seeded_rows
+        # _add_frame_fingerprint gives exactly one frame a body_key.
+        assert row["screen_frames"]["r2_count"] == 1
+        assert row["screen_frames"]["inline_count"] == seeded_rows - 1
+        assert row["screen_frames"]["latest_age_sec"] == pytest.approx(
+            600 - 60 * index, abs=30
+        )
+
+
+# --- T344: provider error bodies must not reach the admin surface -----------
+# The leak: `status_reason` is externally supplied free text, and some producers
+# append the upstream error verbatim, so a provider 402 body (with a
+# key-management URL) became a `job_failed_reasons` key.
+#
+# The first fix here tested a *shape*: any `[A-Za-z0-9_.-]` segment was kept
+# verbatim. codex rejected it, correctly — an opaque key id is made of exactly
+# those characters, so the shape test cannot tell a reason code from a secret.
+# The boundary is now membership in the producer-owned vocabulary, and anything
+# undeclared is redacted whole. Every case below is synthetic.
+
+_ADMIN_SAFE_REASONS = [
+    # Reasons declared by a producer: notices error classes, Seven's V1
+    # user-unavailable set, and the proactive lifecycle terminals. If redaction
+    # ever touches one of these it has stopped being a display boundary and
+    # started destroying the signal.
+    "unknown",
+    "heartbeat_throttled",
+    "quota_insufficient",
+    "auth_invalid",
+    "agent_greeted",
+    "stale_wake_expired",
+    "ambient_disabled",
+    "migrate_no_legacy",
+    "extraction_failed:quota_insufficient",
+    "turn_failed:image_generation_auth_invalid",
+]
+
+
+@pytest.mark.parametrize("reason", _ADMIN_SAFE_REASONS)
+def test_sanitize_status_reason_keeps_declared_reasons_verbatim(reason):
+    from notices import status_reason
+
+    assert status_reason.sanitize_status_reason(reason) == reason
+
+
+@pytest.mark.parametrize(
+    ("unsafe", "expected"),
+    [
+        # An opaque identifier alone. This is the case the shape allowlist got
+        # wrong: it is indistinguishable from a reason code by inspection, so
+        # nothing about it may be echoed.
+        ("k1nb0Xz9QpLmR4td", "<redacted>"),
+        # …and as a colon tail, both behind an undeclared scope and behind a
+        # declared one. Only the declared segment may survive.
+        ("provider_error:k1nb0Xz9QpLmR4td", "<redacted>"),
+        ("auth_invalid:k1nb0Xz9QpLmR4td", "auth_invalid:<redacted>"),
+        # Free text: the observed leak shape, and a bare URL.
+        ("auth_invalid: 402 upstream said no", "auth_invalid:<redacted>"),
+        ("https://keys.example.invalid/settings/keys/key_synthetic1", "<redacted>"),
+        # A declared segment followed by an undeclared one keeps the bucket.
+        ("extraction_failed:not_a_declared_kind", "extraction_failed:<redacted>"),
+        ("   ", ""),
+        ("", ""),
+    ],
+)
+def test_sanitize_status_reason_redacts_everything_undeclared(unsafe, expected):
+    from notices import status_reason
+
+    assert status_reason.sanitize_status_reason(unsafe) == expected
+
+
+def test_sanitize_reason_counts_merges_collapsed_keys_without_losing_jobs():
+    from notices import status_reason
+
+    # An embedded error body made every occurrence its own bucket, so one
+    # failure mode showed up as N buckets of 1 and could not be read at all.
+    raw = {
+        "auth_invalid: upstream said A": 3,
+        "auth_invalid: upstream said B": 2,
+        "quota_insufficient": 4,
+    }
+    merged = status_reason.sanitize_reason_counts(raw)
+
+    assert merged == {
+        "auth_invalid:<redacted>": 5,
+        "quota_insufficient": 4,
+    }
+    assert sum(merged.values()) == sum(raw.values())
+
+
+def test_admin_user_detail_redacts_provider_error_body_in_failed_reasons(client):
+    user_id, _ = _register(client)
+    store = core_store.get_store(user_id)
+    # Shaped like the real 402: a key-management URL inside the error body.
+    # The URL is synthetic — the production one must never be written down.
+    secret_url = "https://openrouter.invalid/settings/keys/key-id-must-not-leak"
+    for index in range(2):
+        store.append_proactive_job({
+            "job_id": f"pj_402_{index}",
+            "status": "failed",
+            "status_reason": (
+                f"auth_invalid: upstream 402 #{index} {secret_url}"
+            ),
+            "job_kind": "heartbeat",
+        })
+    store.append_proactive_job({
+        "job_id": "pj_quota",
+        "status": "failed",
+        "status_reason": "quota_insufficient",
+        "job_kind": "heartbeat",
+    })
+
+    response = client.get(
+        f"/v1/admin/data-track/users/{user_id}", headers=_admin_headers()
+    )
+    assert response.status_code == 200
+    dumped = json.dumps(response.get_json())
+    assert secret_url not in dumped
+    assert "key-id-must-not-leak" not in dumped
+
+    proactive = response.get_json()["user"]["proactive"]
+    # Redaction is not deletion: the declared code, the bucket and the count all
+    # survive, and the two raw bodies collapse into one readable bucket.
+    assert proactive["job_failed_reasons"] == {"auth_invalid:<redacted>": 2}
+    assert proactive["heartbeat_failed"] == 2
+    # Classification still reads the raw reason. The two 402s carry a body, so
+    # they are not the exact `auth_invalid` in Seven's user-unavailable set and
+    # stay operational; the bare `quota_insufficient` does match. Sanitizing
+    # before `v1_proactive_outcome_class` would silently move both.
+    assert proactive["job_user_unavailable_reasons"] == {"quota_insufficient": 1}
+    assert proactive["heartbeat_user_unavailable"] == 1
+
+
+def test_admin_user_detail_redacts_skipped_control_reasons(client):
+    """Mirror of the failed bucket on the live V1 path.
+
+    codex pointed the V1 ``control_reasons`` bucket at the raw reason in an
+    isolated worktree and the suite stayed green: only the failed branch had a
+    case, while ``skipped`` reads the same free-text column. A skipped job is a
+    control outcome, so its reason never passes through the user-unavailable
+    exact match and can be arbitrary text.
+    """
+    user_id, _ = _register(client)
+    store = core_store.get_store(user_id)
+    secret_url = "https://openrouter.invalid/settings/keys/key-id-must-not-leak"
+    for index in range(2):
+        store.append_proactive_job({
+            "job_id": f"pj_skipped_{index}",
+            "status": "skipped",
+            "status_reason": f"ambient_disabled: gate said #{index} {secret_url}",
+            "job_kind": "heartbeat",
+        })
+    store.append_proactive_job({
+        "job_id": "pj_throttled",
+        "status": "skipped",
+        "status_reason": "heartbeat_throttled",
+        "job_kind": "heartbeat",
+    })
+
+    response = client.get(
+        f"/v1/admin/data-track/users/{user_id}", headers=_admin_headers()
+    )
+    assert response.status_code == 200
+    dumped = json.dumps(response.get_json())
+    assert secret_url not in dumped
+    assert "key-id-must-not-leak" not in dumped
+
+    proactive = response.get_json()["user"]["proactive"]
+    assert proactive["job_control_reasons"] == {
+        "ambient_disabled:<redacted>": 2,
+        "heartbeat_throttled": 1,
+    }
+    # Collapsing two raw keys into one bucket must not lose either job.
+    assert sum(proactive["job_control_reasons"].values()) == 3
+    assert proactive["heartbeat_control"] == 3

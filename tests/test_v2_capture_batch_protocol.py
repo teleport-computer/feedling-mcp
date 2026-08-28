@@ -1884,3 +1884,62 @@ def test_applied_batch_survives_apply_job_deletion_as_null():
             (uid,),
         ).fetchone()
     assert row[0] == "applied" and row[1] is None and row[2] is True
+
+
+def test_bootstrap_events_are_written_without_a_ts():
+    """Guards the premise of the data-track bootstrap_events pushdown.
+
+    admin_data_track_snapshot no longer reads bootstrap_events fleet-wide
+    (db._PAGED_LOG_STREAMS). That is an identity transform for the fleet-wide
+    last_activity_at only because bootstrap_events.ts is structurally always
+    NULL — neither write site passes one. That is a property of the writers,
+    not a schema constraint: the moment someone stamps a ts, the fleet-wide
+    _latest_epoch behind active_1d/3d silently stops seeing this stream while
+    the detail page still sees it. This must go red before that ships.
+
+    Anchored on behaviour — write a row through each path, read its ts column
+    back — not on line numbers or source text.
+    """
+    from bootstrap import gates as boot_gates
+
+    uid = "u_bootstrap_ts_guard"
+    _seed(uid)
+
+    class _Store:
+        user_id = uid
+
+    boot_gates._log_bootstrap_event(_Store(), "guard_probe", success=True)
+
+    job_id, _job = _running(uid)
+    batch = jobs_store.prepare_capture_batch(
+        job_id=job_id,
+        user_id=uid,
+        claimed_by="capture-worker",
+        window=_window(),
+        actions=[_add(uid, "mom-bootstrap-ts")],
+    )
+    assert batch is not None
+    assert jobs_store.commit_capture_batch(
+        job_id=job_id,
+        user_id=uid,
+        claimed_by="capture-worker",
+        batch_id=batch["id"],
+    )["committed"] is True
+
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT doc->>'event_type', ts FROM user_logs "
+            "WHERE user_id=%s AND stream='bootstrap_events' ORDER BY seq",
+            (uid,),
+        ).fetchall()
+
+    written = {row[0] for row in rows}
+    assert "guard_probe" in written, "the bootstrap/gates write path never ran"
+    assert "memory_action_added_envelope_v1" in written, (
+        "the V2 capture-commit write path never ran"
+    )
+    assert [row[1] for row in rows] == [None] * len(rows), (
+        "a bootstrap_events row now carries a ts; the data-track fleet query no "
+        "longer reads this stream, so last_activity_at (and active_1d/3d) will "
+        "silently ignore it — revisit db._PAGED_LOG_STREAMS before landing this"
+    )

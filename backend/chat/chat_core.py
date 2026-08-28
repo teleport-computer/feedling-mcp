@@ -585,8 +585,12 @@ def clear_history(store: UserStore, payload: dict) -> tuple[dict, int]:
     if deleted is None:
         return {"error": "chat_clear_failed"}, 500
 
-    with store.chat_lock:
-        store.chat_messages = []
+    if hasattr(store, "apply_committed_chat_clear"):
+        store.apply_committed_chat_clear()
+    else:
+        # Compatibility for narrow test doubles and external store adapters.
+        with store.chat_lock:
+            store.chat_messages = []
 
     store.notify_chat_waiters()
     # Cross-worker refresh is emitted by the committed chat delete trigger.

@@ -17,8 +17,12 @@ in separately so the math is unit-testable without Postgres.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime, timezone
 import math
 from typing import Any
+from zoneinfo import ZoneInfo
+
+from . import catalog
 
 # --- shapes -----------------------------------------------------------------
 NUMERIC_DIST = "numeric_dist"        # per numeric field: min/max/sum/count -> avg
@@ -382,7 +386,50 @@ def _finite_number(v: Any) -> float | None:
     return n
 
 
-def notable_changes(rows_by_signal: Mapping[str, list[Mapping]], *, max_changes: int = 8) -> list[dict]:
+def _field_report_freshness(
+    signal: str,
+    field: str,
+    *,
+    last_report_ts_by_signal: Mapping[str, Mapping[str, Any]],
+    now: float,
+) -> tuple[float | None, float | None, bool]:
+    """Return the field report timestamp, age, and catalog-TTL verdict."""
+
+    raw_by_field = last_report_ts_by_signal.get(signal)
+    raw_ts = raw_by_field.get(field) if isinstance(raw_by_field, Mapping) else None
+    try:
+        report_ts = float(raw_ts)
+    except (TypeError, ValueError):
+        return None, None, False
+    if report_ts <= 0 or not math.isfinite(report_ts):
+        return None, None, False
+    age = float(now) - report_ts
+    return report_ts, age, age <= catalog.SIGNALS[signal].ttl_sec
+
+
+def _format_report_as_of(report_ts: float | None, timezone_name: str | None) -> str | None:
+    """Format a stable, model-readable report time in the user's timezone."""
+
+    if report_ts is None:
+        return None
+    if timezone_name:
+        try:
+            return datetime.fromtimestamp(report_ts, ZoneInfo(timezone_name)).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+        except Exception:
+            pass
+    return datetime.fromtimestamp(report_ts, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def notable_changes(
+    rows_by_signal: Mapping[str, list[Mapping]],
+    *,
+    last_report_ts_by_signal: Mapping[str, Mapping[str, Any]],
+    now: float,
+    timezone_name: str | None,
+    max_changes: int = 8,
+) -> list[dict]:
     """Return top-N relative numeric changes across all comparable history.
 
     ``rows_by_signal`` maps canonical catalog signals to ascending daily rows,
@@ -407,15 +454,30 @@ def notable_changes(rows_by_signal: Mapping[str, list[Mapping]], *, max_changes:
                 continue
             denom = max(abs(baseline_median), _SIGNIFICANCE_FLOOR)
             magnitude = round(abs(delta) / denom, 6)
-            changes.append({
+            report_ts, _age, fresh = _field_report_freshness(
+                signal,
+                field,
+                last_report_ts_by_signal=last_report_ts_by_signal,
+                now=now,
+            )
+            change = {
                 "signal": signal,
                 "field": field,
-                "current": current,
                 "baseline_median": baseline_median,
                 "delta": delta,
                 "direction": trend.get("direction") or "flat",
                 "magnitude": magnitude,
-            })
+            }
+            if fresh:
+                change["current"] = current
+            else:
+                # Preserve the useful historical value and trend, but remove
+                # the false claim that the last daily rollup is current. The
+                # stable report timestamp also avoids heartbeat fingerprint
+                # churn while giving the model an exact "as of" anchor.
+                change["last_known"] = current
+                change["as_of"] = _format_report_as_of(report_ts, timezone_name)
+            changes.append(change)
     changes.sort(key=lambda c: (-c["magnitude"], c["signal"], c["field"]))
     return changes[:cap]
 
@@ -540,6 +602,9 @@ def cross_domain_recent(
     snapshot: Mapping | None,
     pull_snapshot: Mapping | None,
     rows_by_signal: Mapping[str, list[Mapping]] | None,
+    last_report_ts_by_signal: Mapping[str, Mapping[str, Any]],
+    now: float,
+    timezone_name: str | None,
     photos: Any = None,
     max_health_notable: int = 8,
 ) -> dict:
@@ -551,7 +616,15 @@ def cross_domain_recent(
         "location": _location_domain(snap, list(rbs.get("location_signal") or [])),
         "media": _media_domain(snap, list(rbs.get("playback") or [])),
         "app": _app_domain(snap),
-        "health": {"notable": notable_changes(rbs, max_changes=max_health_notable)},
+        "health": {
+            "notable": notable_changes(
+                rbs,
+                last_report_ts_by_signal=last_report_ts_by_signal,
+                now=now,
+                timezone_name=timezone_name,
+                max_changes=max_health_notable,
+            )
+        },
         "weather": _weather_domain(pull),
         "mood": _mood_domain(pull),
         "reminders": _reminders_domain(pull),

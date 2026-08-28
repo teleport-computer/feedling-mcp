@@ -201,7 +201,7 @@ OPERATION_PARAMETERS: dict[Operation, list[dict[str, Any]]] = {
         _query("since", _schema("string"), "Return changes whose ISO-8601 ts is strictly newer than this value.", example="2026-07-01T00:00:00Z"),
     ],
     ("get", "/v1/memory/list"): [
-        _query("limit", _schema("integer", minimum=1, maximum=500, default=50), "Page size; values above 500 are capped.", example=50),
+        _query("limit", _schema("integer", minimum=1, maximum=500, default=50), "Page size; values outside the supported range are rejected.", example=50),
         _query("cursor", _schema("string", minLength=1, maxLength=1024), "Opaque continuation token from next_cursor. Omit for the first page.", example="eyJoIjp0cnVlLCJpIjoibWVtXzEyMyIsInQiOiIyMDI2LTA3LTEzVDEyOjMwOjAwKzAwOjAwIiwidiI6MX0"),
         _query("since", _schema("string"), "Return memories whose occurred_at is at or after this ISO-8601 value.", example="2026-07-01T00:00:00Z"),
         _query("include_archived", _schema("boolean", default=False), "Include archived memories.", example=False),
@@ -584,7 +584,9 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                     "targets are refused, and every redirect hop (up to 5) is "
                     "independently re-validated. HTML is reduced to readable "
                     "text; non-HTML (JSON, plain text, source) is returned as-is. "
-                    "The response body is size-capped and flags truncation."
+                    "The stateless V1 endpoint returns the first bounded page "
+                    "with total/range metadata. Hosted Runtime V2 can continue "
+                    "within the same tool-loop turn using next_offset."
                 ),
             }
         },
@@ -597,7 +599,8 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "endpoints. ALWAYS delivered as HTTP 200 — a transport 200 does NOT "
             "mean the call succeeded, so branch on `ok`, never on the HTTP "
             "status. When ok is true, `data` holds the tool payload (search: "
-            "`{query, results[], truncated}`; fetch: `{url, text, truncated}`). "
+            "`{query, results[], truncated}`; fetch: `{url, total_chars, offset, "
+            "returned_chars, next_offset, has_more, source_truncated, text}`). "
             "When ok is false, `error.code` is a stable slug: capability_disabled "
             "(the user's web switch is off — not retryable), "
             "capability_rate_limited (per-user budget spent — retryable), "
@@ -1526,8 +1529,9 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                     "Who the failure belongs to. Server-derived from error_class via the "
                     "notices catalog — a value sent here is NOT trusted (an unknown class "
                     "always falls back to system, so our own faults are never blamed on the "
-                    "user). user_provider is actionable by the user (top up / fix key / fix "
-                    "model name); system must never point the user at their own configuration."
+                    "user). user_provider is actionable by the user (top up or renew the "
+                    "provider account / fix key / fix model name); system must never point "
+                    "the user at their own configuration."
                 ),
             },
             "turn_failure_user_text": {
@@ -1598,12 +1602,11 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "limit": {"type": "integer", "minimum": 0, "description": "0 or omitted requests the deployment hard cap."},
             "bucket": {"type": "string", "maxLength": 120},
             "thread": {"type": "string", "maxLength": 120},
-            "include_sensitive": {"type": "boolean", "default": False},
             "ambient": {"type": "boolean", "default": False},
             "ambient_top_n": {"type": "integer", "minimum": 1},
         },
         "additionalProperties": False,
-        "example": {"limit": 50, "bucket": "Collaboration", "thread": "communication style", "include_sensitive": False},
+        "example": {"limit": 50, "bucket": "Collaboration", "thread": "communication style"},
     },
     "MemoryFetchRequest": {
         "type": "object",
@@ -1616,6 +1619,35 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "additionalProperties": False,
         "example": {"ids": ["mem_abc123", "mem_def456"]},
+    },
+    "MemoryFetchResponse": {
+        "type": "object",
+        "required": ["items", "missing_ids", "unavailable_ids", "truncation"],
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {"type": "object", "additionalProperties": True},
+            },
+            "missing_ids": {"type": "array", "items": {"type": "string"}},
+            "unavailable_ids": {"type": "array", "items": {"type": "string"}},
+            "truncation": {
+                "type": "object",
+                "required": [
+                    "truncated",
+                    "requested_count",
+                    "processed_count",
+                    "omitted_count",
+                ],
+                "properties": {
+                    "truncated": {"type": "boolean"},
+                    "requested_count": {"type": "integer", "minimum": 0},
+                    "processed_count": {"type": "integer", "minimum": 0},
+                    "omitted_count": {"type": "integer", "minimum": 0},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "additionalProperties": False,
     },
     "MemoryRecordInput": {
         "type": "object",
@@ -2404,7 +2436,10 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/agent/web/fetch"): (
         "Fetch one absolute http(s) URL and return its readable text (HTML is "
         "reduced to the main article; JSON, plain text, and source are returned "
-        "as-is), size-capped with a data.truncated flag. SSRF-guarded: "
+        "as-is). The bounded first page reports data.total_chars, offset, "
+        "returned_chars, next_offset, and has_more; data.source_truncated says "
+        "whether the source document itself exceeded the fetch retention cap, "
+        "not whether this result is merely one page. SSRF-guarded: "
         "private/loopback/link-local targets are refused and every redirect hop "
         "is independently re-validated (max 5). Cloud-only: requires a hosted "
         "per-user runtime token carrying the `web` scope — long-term api-key auth "
@@ -2461,7 +2496,12 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("get", "/v1/chat/turn-activity/{turn_id}"): "Read display-safe activity for one V1 resident or Runtime V2 chat turn. V2 events come from backend jobs and tool dispatch; V1 events come from the authenticated resident io_cli boundary and are durably scoped to an existing user message. Both runtimes expose only bounded identifiers, state, timing, and result classification. Successful memory_search/memory_fetch events include the confirmed returned-item count and, only when every item uses the canonical bucket taxonomy, a complete category-count breakdown. Tool arguments, result bodies, assistant prose, reasoning, and custom bucket labels are never returned.",
     ("post", "/v1/chat/turn-activity/{turn_id}/events"): "Append one authenticated V1 resident tool transition. This endpoint is used by the shipped resident io_cli runtime, accepts only running/success/failure plus display-safe fixed metadata, rejects V2-owned users, and never accepts tool arguments, model prose, or result bodies.",
     ("post", "/v1/memory/index"): "Return lightweight memory cards. This is selection, not full-content retrieval; query is intentionally not exposed because it is not a search filter today.",
-    ("post", "/v1/memory/fetch"): "Fetch full records for selected memory IDs. Sensitive fetch behavior is not part of the current public contract.",
+    ("post", "/v1/memory/fetch"): (
+        "Fetch full records for selected memory IDs in request order. All shared "
+        "cards use the same read contract; legacy card-classification metadata is "
+        "ignored. Inspect the truncation object instead of assuming every "
+        "requested ID was processed."
+    ),
     ("post", "/v1/memory/actions"): "Apply up to 20 memory actions independently and in order. Full or partial applied success returns HTTP 200. When no action is applied and at least one fails, HTTP 400 promotes the first failed item's error/detail while preserving every result and all counts. An all-skipped batch remains 200. The batch is not transactional and Idempotency-Key is not supported.",
     ("post", "/v1/perception/report"): "Submit device context. Sensitive signals must use encrypted envelopes; inspect each results entry even when HTTP status is 200.",
     ("get", "/v1/perception/app_open"): "Legacy iOS Shortcut compatibility endpoint. This GET records an event and therefore has side effects.",
@@ -2620,6 +2660,16 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
             },
         },
     },
+    ("post", "/v1/memory/fetch"): {
+        "200": {
+            "description": "Selected memory records plus explicit resolution and truncation metadata.",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/MemoryFetchResponse"}
+                }
+            },
+        },
+    },
     ("post", "/v1/memory/actions"): {
         "200": {
             "description": (
@@ -2680,7 +2730,9 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
         "200": {
             "description": (
                 "The capability envelope. Always HTTP 200 — inspect `ok`. On "
-                "success `data` holds `{url, text, truncated}`; otherwise "
+                "success `data` holds `{url, total_chars, offset, "
+                "returned_chars, next_offset, has_more, source_truncated, "
+                "text}`; otherwise "
                 "`error.code` explains the refusal (disabled, rate-limited, "
                 "invalid/blocked url, operator halt, or upstream status)."
             ),

@@ -214,8 +214,10 @@ def test_test_environment_attests_incremental_chat_sync_with_256_row_hot_cache()
         environment = compose["services"][service_name]["environment"]
         assert environment["FEEDLING_CHAT_SYNC_MODE"] == "incremental"
         assert environment["FEEDLING_CHAT_HOT_CACHE_LIMIT"] == "256"
+        assert environment["FEEDLING_STORE_LOAD_MODE"] == "legacy"
         assert "${" not in environment["FEEDLING_CHAT_SYNC_MODE"]
         assert "${" not in environment["FEEDLING_CHAT_HOT_CACHE_LIMIT"]
+        assert "${" not in environment["FEEDLING_STORE_LOAD_MODE"]
 
 
 def test_prod_environment_attests_incremental_chat_sync_with_256_row_hot_cache():
@@ -230,8 +232,10 @@ def test_prod_environment_attests_incremental_chat_sync_with_256_row_hot_cache()
         environment = compose["services"][service_name]["environment"]
         assert environment["FEEDLING_CHAT_SYNC_MODE"] == "incremental"
         assert environment["FEEDLING_CHAT_HOT_CACHE_LIMIT"] == "256"
+        assert environment["FEEDLING_STORE_LOAD_MODE"] == "legacy"
         assert "${" not in environment["FEEDLING_CHAT_SYNC_MODE"]
         assert "${" not in environment["FEEDLING_CHAT_HOT_CACHE_LIMIT"]
+        assert "${" not in environment["FEEDLING_STORE_LOAD_MODE"]
 
 
 def _ingress_entrypoint(path: Path) -> str:

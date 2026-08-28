@@ -25,6 +25,7 @@ import pytest
 import conftest
 import db
 import provider_client
+from chat import reply_language
 from admin import data_track as admin_data_track
 from provider_types import ToolCall, ToolExchange
 from capabilities import registry as cap_registry
@@ -389,6 +390,49 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     assert _job_status_row(job_id)[0] == "completed"
 
 
+@pytest.mark.parametrize(
+    ("locale", "user_text"),
+    [("en-US", "Hello there"), ("zh-Hans-CN", "你好呀")],
+)
+def test_chat_system_prompt_uses_shared_reply_language_policy(
+    monkeypatch,
+    locale,
+    user_text,
+):
+    uid = "u_toolloop_chat_language_" + locale.lower().replace("-", "_")
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-chat-language")
+    _patch_real_write(monkeypatch)
+    calls = _script_provider(monkeypatch, [_text_round("ordinary reply")])
+    deps = _deps(messages=[{
+        "id": "m-language",
+        "ts": 10.0,
+        "role": "user",
+        "content": user_text,
+    }])
+    deps.read_temporal_snapshot = lambda *_args, **_kwargs: {
+        "locale": locale,
+        "archive_language": "",
+    }
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    policy = reply_language.infer_reply_language_policy(
+        {}, [], locale=locale
+    )
+    expected = reply_language.reply_language_system_line(
+        policy, proactive=False
+    )
+    system_text = str(calls[0]["messages"][0]["content"])
+    assert status == "completed"
+    assert expected in system_text
+    assert system_text.count(expected) == 1
+
+
 def test_successful_chat_rearms_provider_config_profile_without_resealing(
     monkeypatch,
 ):
@@ -613,6 +657,72 @@ def test_language_follow_emits_once_for_terminal_visible_body_after_thinking(
         "correction_outcome": "retry_error",
     }
     assert private_thinking not in json.dumps(language_traces, ensure_ascii=False)
+
+
+def test_chat_thinking_and_visible_language_mismatch_share_one_correction(
+    monkeypatch,
+):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_thinking_visible_language_correction"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-thinking-visible-language-correction")
+    _stub_envelope_build(monkeypatch)
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: _FakeCapResult({"snippet": "result"}),
+    )
+    calls = _script_provider(monkeypatch, [
+        _tool_round(_tc("s1", "web_search", query="first")),
+        _tool_round(_tc("s2", "web_search", query="second")),
+        _text_round(
+            "<think>The file is ready and I will finish in English.</think>"
+            "Your work is saved and delivered successfully. You can open it now."
+        ),
+        _text_round(
+            "<think>文件已经准备好，我会用中文完成回复。</think>"
+            "文件已经生成并发送，可以直接下载了。"
+        ),
+    ])
+    traces = []
+    deps = _deps(messages=[{
+        "id": "m-thinking-visible-language-correction",
+        "ts": 10.0,
+        "role": "user",
+        "content": "请处理这件事情，完成以后用中文给我一句简短回复。",
+    }])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    assert len(calls) == 4
+    correction_prompt = str(calls[3]["messages"])
+    assert language_follow.CORRECTION_INSTRUCTION in correction_prompt
+    assert "思考段和可见回复都与用户语言一致" in correction_prompt
+    assert [row["body_ct"] for row in _bubbles(uid)] == [
+        "文件已经生成并发送，可以直接下载了。"
+    ]
+    assert _bubbles(uid)[0]["thinking_body_ct"] == (
+        "文件已经准备好，我会用中文完成回复。"
+    )
+    language_trace = next(
+        trace for trace in traces if trace["type"] == "reply.language_follow"
+    )
+    assert language_trace["detail"] == {
+        "user_script": "han",
+        "reply_script": "han",
+        "outcome": "match",
+        "lane": "chat",
+        "correction_attempted": True,
+        "correction_outcome": "corrected",
+    }
 
 
 def test_chat_language_mismatch_rewrites_once_and_publishes_matching_reply(
@@ -1093,9 +1203,27 @@ def test_fable_chat_omits_mandatory_self_thinking_prompt(monkeypatch):
     assert _bubbles(uid)[-1]["body_ct"] == "Fable plain reply"
 
 
-def test_chat_thinking_only_keeps_existing_required_reply_fallback(monkeypatch):
+@pytest.mark.parametrize(
+    ("locale", "user_text"),
+    [("en-US", "Are you there?"), ("zh-Hans-CN", "在吗")],
+)
+def test_chat_thinking_only_keeps_existing_required_reply_fallback(
+    monkeypatch,
+    locale,
+    user_text,
+):
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
-    uid = "u_toolloop_selfthink_only"
+    monkeypatch.setattr(
+        worker,
+        "_DEGENERATE_REPLY_FALLBACK",
+        reply_language.DEFAULT_FAILURE_FALLBACK_ZH,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_DEGENERATE_REPLY_FALLBACK_EN",
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN,
+    )
+    uid = "u_toolloop_selfthink_only_" + locale.lower().replace("-", "_")
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
@@ -1104,12 +1232,18 @@ def test_chat_thinking_only_keeps_existing_required_reply_fallback(monkeypatch):
     _patch_real_write(monkeypatch)
     _script_provider(monkeypatch, [_text_round("<think>只想了但没回答</think>")])
 
+    deps = _deps(messages=[{
+        "id": "m1", "ts": 10.0, "role": "user", "content": user_text
+    }])
+    deps.read_temporal_snapshot = lambda *_args, **_kwargs: {
+        "locale": locale,
+        "archive_language": "",
+    }
+
     status = asyncio.run(
         worker.process_job(
             job,
-            _deps(messages=[{
-                "id": "m1", "ts": 10.0, "role": "user", "content": "在吗"
-            }]),
+            deps,
             provider_config=_BYOK,
             api_key=None,
             runtime_token="rt",
@@ -1119,10 +1253,69 @@ def test_chat_thinking_only_keeps_existing_required_reply_fallback(monkeypatch):
     assert status == "completed"
     bubbles = _bubbles(uid)
     assert len(bubbles) == 1
-    assert bubbles[0]["body_ct"] == worker._DEGENERATE_REPLY_FALLBACK
+    policy = reply_language.infer_reply_language_policy({}, [], locale=locale)
+    expected = (
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN
+        if policy.language == "en"
+        else reply_language.DEFAULT_FAILURE_FALLBACK_ZH
+    )
+    assert bubbles[0]["body_ct"] == expected
     assert bubbles[0]["turn_failure_error_class"] == "upstream_unavailable"
     assert bubbles[0]["thinking_body_ct"] == "（思考没写完）"
     assert _job_status_row(job_id)[0] == "completed"
+
+
+@pytest.mark.parametrize(
+    ("locale", "user_text"),
+    [("en-US", "Please try again"), ("zh-Hans-CN", "请再试一次")],
+)
+def test_chat_degenerate_fallback_uses_shared_reply_language_policy(
+    monkeypatch,
+    locale,
+    user_text,
+):
+    monkeypatch.setattr(
+        worker,
+        "_DEGENERATE_REPLY_FALLBACK",
+        reply_language.DEFAULT_FAILURE_FALLBACK_ZH,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_DEGENERATE_REPLY_FALLBACK_EN",
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN,
+    )
+    uid = "u_toolloop_fallback_language_" + locale.lower().replace("-", "_")
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-fallback-language")
+    _patch_real_write(monkeypatch)
+    _script_provider(monkeypatch, [_text_round("。")])
+    deps = _deps(messages=[{
+        "id": "m-fallback-language",
+        "ts": 10.0,
+        "role": "user",
+        "content": user_text,
+    }])
+    deps.read_temporal_snapshot = lambda *_args, **_kwargs: {
+        "locale": locale,
+        "archive_language": "",
+    }
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    policy = reply_language.infer_reply_language_policy(
+        {}, [], locale=locale
+    )
+    expected = (
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN
+        if policy.language == "en"
+        else reply_language.DEFAULT_FAILURE_FALLBACK_ZH
+    )
+    assert status == "completed"
+    assert [row["body_ct"] for row in _bubbles(uid)] == [expected]
 
 
 @pytest.mark.parametrize("provider_text", ["。", "</s>"])
@@ -1227,11 +1420,29 @@ _UPSTREAM_RESPONSE_ENVELOPE = json.dumps(
 )
 
 
-def test_torn_protocol_tail_with_reasoning_head_becomes_fallback(monkeypatch):
+@pytest.mark.parametrize(
+    ("locale", "user_text"),
+    [("en-US", "Are you there?"), ("zh-Hans-CN", "在吗")],
+)
+def test_torn_protocol_tail_with_reasoning_head_becomes_fallback(
+    monkeypatch,
+    locale,
+    user_text,
+):
     """Chat: reply=tail + reasoning=head is STRONG cross-channel evidence. The
     bubble must be the honest fallback, not the leaked JSON tail, and the torn
     head must NOT surface as a thinking bubble."""
-    uid = "u_toolloop_torn_fallback"
+    monkeypatch.setattr(
+        worker,
+        "_DEGENERATE_REPLY_FALLBACK",
+        reply_language.DEFAULT_FAILURE_FALLBACK_ZH,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_DEGENERATE_REPLY_FALLBACK_EN",
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN,
+    )
+    uid = "u_toolloop_torn_fallback_" + locale.lower().replace("-", "_")
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
@@ -1246,7 +1457,13 @@ def test_torn_protocol_tail_with_reasoning_head_becomes_fallback(monkeypatch):
             "usage": {"prompt_tokens": 1, "completion_tokens": 1},
         }],
     )
-    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "在吗"}])
+    deps = _deps(messages=[{
+        "id": "m1", "ts": 10.0, "role": "user", "content": user_text
+    }])
+    deps.read_temporal_snapshot = lambda *_args, **_kwargs: {
+        "locale": locale,
+        "archive_language": "",
+    }
 
     status = asyncio.run(
         worker.process_job(job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt")
@@ -1255,7 +1472,13 @@ def test_torn_protocol_tail_with_reasoning_head_becomes_fallback(monkeypatch):
     assert status == "completed"
     bubbles = _bubbles(uid)
     assert len(bubbles) == 1
-    assert bubbles[0]["body_ct"] == worker._DEGENERATE_REPLY_FALLBACK
+    policy = reply_language.infer_reply_language_policy({}, [], locale=locale)
+    expected = (
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN
+        if policy.language == "en"
+        else reply_language.DEFAULT_FAILURE_FALLBACK_ZH
+    )
+    assert bubbles[0]["body_ct"] == expected
     assert _TORN_TAIL not in bubbles[0]["body_ct"]
     assert bubbles[0]["turn_failure_error_class"] == "upstream_unavailable"
     # Reasoning head must not ride along as a thinking bubble.
@@ -1325,8 +1548,26 @@ def test_foreground_real_chain_strips_tool_markup_and_emits_content_free_trace(
     }
 
 
-def test_foreground_markup_only_reply_uses_existing_fallback(monkeypatch):
-    uid = "u_toolloop_tool_markup_only"
+@pytest.mark.parametrize(
+    ("locale", "user_text"),
+    [("en-US", "Are you there?"), ("zh-Hans-CN", "在吗")],
+)
+def test_foreground_markup_only_reply_uses_existing_fallback(
+    monkeypatch,
+    locale,
+    user_text,
+):
+    monkeypatch.setattr(
+        worker,
+        "_DEGENERATE_REPLY_FALLBACK",
+        reply_language.DEFAULT_FAILURE_FALLBACK_ZH,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_DEGENERATE_REPLY_FALLBACK_EN",
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN,
+    )
+    uid = "u_toolloop_tool_markup_only_" + locale.lower().replace("-", "_")
     conftest.seed_user(uid)
     _reset(uid)
     jobs_store.enqueue_job(uid, "chat")
@@ -1334,10 +1575,18 @@ def test_foreground_markup_only_reply_uses_existing_fallback(monkeypatch):
     _patch_real_write(monkeypatch)
     _script_provider(monkeypatch, [_text_round("<tool_call></tool_call>")])
 
+    deps = _deps(messages=[{
+        "id": "m1", "ts": 10.0, "role": "user", "content": user_text
+    }])
+    deps.read_temporal_snapshot = lambda *_args, **_kwargs: {
+        "locale": locale,
+        "archive_language": "",
+    }
+
     status = asyncio.run(
         worker.process_job(
             job,
-            _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "在吗"}]),
+            deps,
             provider_config=_BYOK,
             api_key=None,
             runtime_token="rt",
@@ -1346,7 +1595,13 @@ def test_foreground_markup_only_reply_uses_existing_fallback(monkeypatch):
 
     assert status == "completed"
     bubble = _bubbles(uid)[0]
-    assert bubble["body_ct"] == worker._DEGENERATE_REPLY_FALLBACK
+    policy = reply_language.infer_reply_language_policy({}, [], locale=locale)
+    expected = (
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN
+        if policy.language == "en"
+        else reply_language.DEFAULT_FAILURE_FALLBACK_ZH
+    )
+    assert bubble["body_ct"] == expected
     assert bubble["turn_failure_error_class"] == "upstream_unavailable"
 
 
@@ -1401,6 +1656,79 @@ def test_torn_protocol_evidence_lane_policy():
     # Normal reply: never suppressed.
     assert not worker._torn_protocol_evidence("晚安，做个好梦", "在想她累不累", lane="proactive")
     assert not worker._torn_protocol_evidence("晚安，做个好梦", "", lane="foreground")
+    # A real provider token-limit signal is evidence for the shared classifier,
+    # not permission to change delivery policy for otherwise ordinary prose.
+    prose = "。今天她步数都上5000了……刚才问她"
+    assert not worker._torn_protocol_evidence(
+        prose, "", lane="proactive", transport_cut=True
+    )
+    assert not worker._torn_protocol_evidence(
+        prose, "", lane="foreground", transport_cut=True
+    )
+    assert not worker._torn_protocol_evidence(
+        prose, "", lane="proactive", transport_cut=False
+    )
+
+
+def test_tool_call_tail_requires_both_orphan_syntax_and_planning_prose():
+    leaked = '大热天的").\n• Let\'s check the exact timeline:\n• 16:05:'
+    assert worker._torn_protocol_evidence(
+        leaked, "", lane="proactive"
+    ) == worker._LOCAL_TOOL_CALL_TAIL_EVIDENCE
+    assert not worker._torn_protocol_evidence(
+        leaked, "", lane="foreground"
+    )
+    # Mirror each half independently: ordinary function syntax and ordinary
+    # planning prose are both legal user-visible text.
+    assert not worker._torn_protocol_evidence(
+        '示例调用是 foo("大热天的").', "", lane="proactive"
+    )
+    assert not worker._torn_protocol_evidence(
+        "• Let's check the exact timeline together.", "", lane="proactive"
+    )
+    assert not worker._torn_protocol_evidence(
+        "• Let's check the exact timeline:\n• We'll compare the two drafts.",
+        "",
+        lane="proactive",
+    )
+    # Both individually legal halves remain legal when combined: a balanced
+    # function-call example is not an orphan protocol tail.
+    assert not worker._torn_protocol_evidence(
+        '示例调用是 foo("大热天的").\n'
+        "• Let's check the exact timeline together.",
+        "",
+        lane="proactive",
+    )
+    # Even the exact planning marker stays legal when the preceding function
+    # example has a matched quote pair.
+    assert not worker._torn_protocol_evidence(
+        '示例调用是 foo("大热天的").\n'
+        "• Let's check the exact timeline:\n• We'll compare the two drafts.",
+        "",
+        lane="proactive",
+    )
+    # Chinese punctuation/quotes are not an ASCII function-call tail.
+    assert not worker._torn_protocol_evidence(
+        "她说“大热天的”）。\n• Let's check the forecast.",
+        "",
+        lane="proactive",
+    )
+
+
+def test_tool_call_tail_uses_real_full_text_line_boundaries():
+    planning = "\n• Let's check the exact timeline:\n• 16:05:"
+    # The old 512-character slice manufactured an end-of-text immediately
+    # after this close-paren.  In the real reply normal text follows it.
+    boundary_false_positive = "x" * 510 + '")' + " still ordinary prose" + planning
+    assert not worker._torn_protocol_evidence(
+        boundary_false_positive, "", lane="proactive"
+    )
+
+    # Moving the real observed fragment beyond the old window must not hide it.
+    late_real_tail = "正常前文" * 180 + '\n大热天的").' + planning
+    assert worker._torn_protocol_evidence(
+        late_real_tail, "", lane="proactive"
+    ) == worker._LOCAL_TOOL_CALL_TAIL_EVIDENCE
 
 
 def _stub_envelope_build(monkeypatch):
@@ -1744,6 +2072,368 @@ def test_chat_self_thinking_absent_final_retries_and_surfaces_complete(
             (job["id"],),
         ).fetchone()
     assert metric == (expected_calls, 7, 10)
+
+
+@pytest.mark.parametrize(
+    "completion",
+    [
+        (
+            "I created and sent the requested autumn file. "
+            "It is ready to download now."
+        ),
+        (
+            "<think>private delivery reasoning</think>"
+            "I created and sent the requested autumn file. "
+            "It is ready to download now."
+        ),
+    ],
+    ids=["plain", "thinking-block-stripped"],
+)
+def test_validated_file_completion_skips_terminal_thinking_rewrite(
+    monkeypatch, completion
+):
+    """A correct English send_file bubble must not re-enter the generic rewrite."""
+
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_file_completion_no_terminal_rewrite"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-file-completion-no-terminal-rewrite")
+    _stub_envelope_build(monkeypatch)
+    visible_completion = (
+        "I created and sent the requested autumn file. "
+        "It is ready to download now."
+    )
+    observed = {}
+
+    async def direct_loop(**kwargs):
+        observed["decision"] = await kwargs["on_reply"](
+            tool_loop.ValidatedFinalReply(completion),
+            final=True,
+        )
+        return worker.v2_tool_loop.LoopOutcome(
+            final_text=visible_completion,
+            rounds=2,
+            stop_reason="final_text",
+            replied_intermediate=True,
+        )
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", direct_loop)
+    deps = _deps(messages=[{
+        "id": "m-file-completion-no-terminal-rewrite",
+        "ts": 10.0,
+        "role": "user",
+        "content": "Please create and send an autumn text file.",
+    }])
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    assert observed["decision"] is None
+    assert [row["body_ct"] for row in _bubbles(uid)] == [visible_completion]
+    assert "thinking_body_ct" not in _bubbles(uid)[0]
+
+
+@pytest.mark.parametrize(
+    (
+        "archive_language",
+        "user_text",
+        "path",
+        "expected_error_class",
+        "expected_notice",
+    ),
+    [
+        pytest.param(
+            "zh-Hans-CN",
+            "请生成并发送一个 HTML 文件",
+            "/workspace/card.io.html",
+            "canvas_file_delivery_incomplete",
+            "画布内容已经保存，但卡片更新没有完成。请稍后再试。",
+            id="canvas-zh",
+        ),
+        pytest.param(
+            "en-US",
+            "Please create and send an HTML file.",
+            "/workspace/card.io.html",
+            "canvas_file_delivery_incomplete",
+            (
+                "The Canvas content was saved, but its card update did not "
+                "finish. Please try again later."
+            ),
+            id="canvas-en",
+        ),
+        pytest.param(
+            "zh-Hans-CN",
+            "请生成并发送一个 Markdown 文件",
+            "/workspace/report.md",
+            "file_delivery_incomplete",
+            "文件内容已经保存，但附件发送没有完成。请稍后再试。",
+            id="ordinary-file-zh",
+        ),
+    ],
+)
+def test_file_reply_callback_failure_reaches_classified_terminal_outbox(
+    monkeypatch,
+    archive_language,
+    user_text,
+    path,
+    expected_error_class,
+    expected_notice,
+):
+    """A real send_file publication failure gets one repair round, then the
+    worker writes its path-aware class through mark_failed and the durable
+    terminal outbox.  The injected fault is the production callback itself,
+    above both classification boundaries; no error code or class is mocked.
+    """
+    uid = "u_file_callback_terminal_" + expected_error_class + "_" + (
+        "en" if archive_language.startswith("en") else "zh"
+    )
+    conftest.seed_user(uid, archive_language=archive_language)
+    _reset(uid)
+    generation = db.get_runtime_generation(uid)
+    input_seq, job_id = db.chat_append_and_enqueue(
+        uid,
+        "file-delivery-parent",
+        10.0,
+        _user_doc("file-delivery-parent", user_text),
+        5000,
+        "chat",
+        expected_generation=generation,
+    )
+    job = jobs_store.claim_next_job("w-file-callback-terminal")
+    assert job is not None and job["id"] == job_id
+    _patch_tool_effect_encryption(monkeypatch)
+
+    def read_after_seq(_user_id: str, after_seq: int):
+        return [
+            {
+                "id": row["id"],
+                "seq": int(row["seq"]),
+                "ts": float(row.get("ts") or 0),
+                "role": row.get("role"),
+                "content": row.get("test_plaintext") or "",
+            }
+            for row in db.chat_messages_after_seq(uid, after_seq, limit=None)
+            if row.get("role") == "user"
+        ]
+
+    delivery_args = {
+        "path": path,
+        "revision": 1,
+        "completion_message": (
+            "The requested file is ready."
+            if archive_language.startswith("en")
+            else "你要的文件已经准备好了。"
+        ),
+    }
+    if path.endswith(".io.html"):
+        delivery_args.update(
+            title="Saved work",
+            subtitle="Ready to open",
+        )
+    calls = _script_provider(
+        monkeypatch,
+        [
+            _tool_round(_tc("send-1", "send_file", **delivery_args)),
+            _tool_round(
+                _tc(
+                    "write-1",
+                    "workspace_write",
+                    path=path,
+                    content="saved source",
+                    expected_revision=0,
+                )
+            ),
+            _tool_round(_tc("send-2", "send_file", **delivery_args)),
+        ],
+    )
+    load_attempts = []
+
+    def fail_file_publication(_store, **kwargs):
+        load_attempts.append((kwargs["path"], kwargs["expected_revision"]))
+        raise RuntimeError("private workspace loader detail")
+
+    deps = worker.TurnDeps(
+        web_tools_enabled=lambda _user_id: True,
+        read_messages=lambda _user_id: read_after_seq(uid, 0),
+        read_messages_after_seq=read_after_seq,
+        read_tail_after_seq=(
+            lambda _user_id, after_seq, _limit, **_kwargs: read_after_seq(
+                uid, after_seq
+            )
+        ),
+        read_summary_with_seq=lambda _user_id: ("", 0.0, 0, 0),
+        resolve_provider=lambda _user_id: (_BYOK, {}),
+        mint_enclave_token=lambda _user_id: "rt",
+        apply_pending_effects=_apply_effects,
+        load_workspace_file=fail_file_publication,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "failed"
+    assert len(calls) == 3
+    assert load_attempts == [(path, 1), (path, 1)]
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == input_seq
+    with db.get_pool().connection() as conn:
+        job_row = conn.execute(
+            "SELECT status,last_error FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+        terminal_row = conn.execute(
+            "SELECT error_code,error_class FROM v2_terminal_failure_outbox "
+            "WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+    assert job_row == (
+        "failed",
+        "turn_failed:" + expected_error_class,
+    )
+    assert terminal_row == (
+        "turn_failed:" + expected_error_class,
+        expected_error_class,
+    )
+    failure = next(
+        row
+        for row in db.chat_load_strict(uid)
+        if str(row.get("terminal_failure_job_id") or "") == str(job_id)
+    )
+    assert failure["turn_failure_error_class"] == expected_error_class
+    assert failure["turn_failure_user_text"] == expected_notice
+    assert base64.b64decode(failure["body_ct"]).decode() == expected_notice
+    assert expected_notice not in {
+        reply_language.DEFAULT_FAILURE_FALLBACK_ZH,
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN,
+    }
+
+
+def test_genuinely_unclassified_process_failure_stays_unknown(monkeypatch):
+    """The producer fix must not turn the terminal reader into a guesser."""
+    uid = "u_unclassified_workspace_prompt_terminal"
+    conftest.seed_user(uid, archive_language="en-US")
+    _reset(uid)
+    _input_seq, job_id = db.chat_append_and_enqueue(
+        uid,
+        "unknown-parent",
+        10.0,
+        _user_doc("unknown-parent", "Hello"),
+        5000,
+        "chat",
+        expected_generation=db.get_runtime_generation(uid),
+    )
+    job = jobs_store.claim_next_job("w-unclassified-terminal")
+    assert job is not None and job["id"] == job_id
+    _patch_tool_effect_encryption(monkeypatch)
+    deps = _deps(
+        messages=[
+            {
+                "id": "unknown-parent",
+                "ts": 10.0,
+                "role": "user",
+                "content": "Hello",
+            }
+        ]
+    )
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: (
+        _ for _ in ()
+    ).throw(RuntimeError("private new failure reason"))
+    monkeypatch.setattr(
+        provider_client,
+        "chat_completion_async",
+        lambda *_args, **_kwargs: pytest.fail(
+            "provider called after workspace prompt failure"
+        ),
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "failed"
+    with db.get_pool().connection() as conn:
+        terminal_row = conn.execute(
+            "SELECT error_code,error_class FROM v2_terminal_failure_outbox "
+            "WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+    assert terminal_row == ("turn_failed:workspace_prompt_unavailable", "unknown")
+
+
+def test_chat_self_thinking_absent_wrong_language_combines_one_correction(
+    monkeypatch,
+):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_selfthink_absent_language_correction"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-selfthink-absent-language-correction")
+    _stub_envelope_build(monkeypatch)
+    calls = _script_provider(monkeypatch, [
+        _text_round(
+            "Done, the requested file was saved and delivered successfully"
+        ),
+        _text_round(
+            "<think>文件已经成功发送，我用中文完成回复。</think>"
+            "文件已经生成并发送，可以直接下载了。"
+        ),
+    ])
+    traces = []
+    deps = _deps(messages=[{
+        "id": "m-selfthink-absent-language-correction",
+        "ts": 10.0,
+        "role": "user",
+        "content": "请用中文告诉我这项工作已经完成，回答要自然一点。",
+    }])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    assert len(calls) == 2
+    retry_system = str(calls[1]["messages"][0]["content"])
+    assert worker._SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION in retry_system
+    assert language_follow.CORRECTION_INSTRUCTION in retry_system
+    assert [row["body_ct"] for row in _bubbles(uid)] == [
+        "文件已经生成并发送，可以直接下载了。"
+    ]
+    assert _bubbles(uid)[0]["thinking_body_ct"] == (
+        "文件已经成功发送，我用中文完成回复。"
+    )
+    language_trace = next(
+        trace
+        for trace in traces
+        if trace["event_type"] == "reply.language_follow"
+    )
+    assert language_trace["detail"] == {
+        "user_script": "han",
+        "reply_script": "han",
+        "outcome": "match",
+        "lane": "chat",
+        "correction_attempted": True,
+        "correction_outcome": "corrected",
+    }
 
 
 def test_chat_self_thinking_absent_retry_still_absent_keeps_original(

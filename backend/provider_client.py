@@ -15,7 +15,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 
@@ -63,10 +63,16 @@ _RETRYABLE_HTTPX = (httpx.TimeoutException, httpx.TransportError)
 _RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 _PROVIDER_CONFIG_STATUS = frozenset({400, 401, 402, 403, 404, 415, 422})
 _MAX_PG_BIGINT = (1 << 63) - 1
-# The chat wires cap max_tokens at 8192 when they encode the payload; image
-# bytes are billed against that same completion budget, so image requests ask
-# for the ceiling rather than a text-sized slice.
-IMAGE_OUTPUT_MAX_TOKENS = 8192
+# One provider-neutral ceiling for every chat payload builder. File-capable V2
+# turns may place a complete generated document inside tool-call arguments, so
+# the historical 8192-token wire clamp truncated otherwise valid calls before
+# the runtime could validate or save them. Keep the provider encoders on one
+# constant: a per-wire literal lets one relay appear fixed while other wires
+# silently retain the old limit.
+CHAT_OUTPUT_MAX_TOKENS = 32768
+# Generated image bytes are billed against the same completion budget. Ask for
+# the live chat-wire ceiling instead of maintaining a second stale copy.
+IMAGE_OUTPUT_MAX_TOKENS = CHAT_OUTPUT_MAX_TOKENS
 # One wall-clock budget for every link in a single image response, so a handful
 # of slow links cannot each add a fresh fetch deadline to the turn.
 IMAGE_LINK_TOTAL_DEADLINE_SECONDS = 45.0
@@ -84,6 +90,11 @@ def is_token_limit_stop_reason(value: Any) -> bool:
         "max_tokens",
         "max_output_tokens",
     }
+
+
+def cap_chat_output_tokens(value: Any) -> int:
+    """Clamp one requested completion budget to the shared chat-wire ceiling."""
+    return max(1, min(int(value), CHAT_OUTPUT_MAX_TOKENS))
 
 
 def classify_provider_error(exc: BaseException) -> str:
@@ -1813,6 +1824,17 @@ _GEMINI_UNSUPPORTED_SCHEMA_KEYS = frozenset({
     "additionalProperties",
     "enforceItemBounds",
 })
+_GEMINI_SCHEMA_DEFINITION_KEYS = frozenset({"$defs", "definitions"})
+_GEMINI_SCHEMA_LOOSENING_KEYS = frozenset({
+    "dependentSchemas",
+    "patternProperties",
+})
+_GEMINI_REJECTED_SCHEMA_KEYS = (
+    _GEMINI_UNSUPPORTED_SCHEMA_KEYS
+    | _GEMINI_SCHEMA_DEFINITION_KEYS
+    | _GEMINI_SCHEMA_LOOSENING_KEYS
+    | {"$ref"}
+)
 _SCHEMA_MAP_KEYS = frozenset({
     "$defs",
     "definitions",
@@ -1826,20 +1848,156 @@ _OPAQUE_SCHEMA_VALUE_KEYS = frozenset({
     "example",
     "examples",
 })
+_GEMINI_MAX_REF_DEPTH = 64
+_GEMINI_MAX_REF_EXPANSIONS = 256
 
 
-def _adapt_tool_schema_gemini(schema: Any) -> Any:
-    """Return a Gemini-compatible copy of one JSON Schema node.
+class _GeminiSchemaRefFallback(Exception):
+    """Signal that a schema must retain the adapter's pre-expansion behavior."""
 
-    Gemini's function-declaration schema is narrower than JSON Schema.  In
-    particular, its v1beta endpoint rejects ``additionalProperties`` and our
-    local-only ``enforceItemBounds`` marker, and accepts enum members only as
-    strings.  Keep every other constraint intact: this is a wire adapter, not a
-    replacement for the source schema or the server-side argument validator.
 
-    Schema maps need special handling because their keys are parameter names,
-    not schema keywords.  A tool is therefore still allowed to have a property
-    literally named ``additionalProperties`` or ``enum``.
+def _resolve_local_schema_ref_gemini(root: dict[Any, Any], ref: str) -> Any:
+    """Resolve a supported local definitions reference from *root*."""
+    if ref == "#" or not ref.startswith("#/"):
+        raise _GeminiSchemaRefFallback
+
+    pointer = unquote(ref[1:])
+    raw_tokens = pointer[1:].split("/")
+    tokens: list[str] = []
+    for raw_token in raw_tokens:
+        token = ""
+        index = 0
+        while index < len(raw_token):
+            char = raw_token[index]
+            if char != "~":
+                token += char
+                index += 1
+                continue
+            if index + 1 >= len(raw_token) or raw_token[index + 1] not in "01":
+                raise _GeminiSchemaRefFallback
+            token += "~" if raw_token[index + 1] == "0" else "/"
+            index += 2
+        tokens.append(token)
+
+    if len(tokens) < 2 or tokens[0] not in _GEMINI_SCHEMA_DEFINITION_KEYS:
+        raise _GeminiSchemaRefFallback
+
+    target: Any = root
+    for token in tokens:
+        if isinstance(target, dict) and token in target:
+            target = target[token]
+            continue
+        if isinstance(target, list) and token.isdecimal():
+            item_index = int(token)
+            if item_index < len(target):
+                target = target[item_index]
+                continue
+        raise _GeminiSchemaRefFallback
+    if not isinstance(target, dict):
+        raise _GeminiSchemaRefFallback
+    return target
+
+
+def _inline_tool_schema_refs_gemini(
+    schema: Any,
+    *,
+    root: dict[Any, Any],
+    ref_stack: tuple[str, ...] = (),
+    ref_count: list[int] | None = None,
+) -> Any:
+    """Inline supported local refs and remove declarations Gemini rejects."""
+    if not isinstance(schema, dict):
+        return copy.deepcopy(schema)
+    if ref_count is None:
+        ref_count = [0]
+
+    if "$ref" in schema:
+        ref = schema["$ref"]
+        if (
+            not isinstance(ref, str)
+            or ref in ref_stack
+            or len(ref_stack) >= _GEMINI_MAX_REF_DEPTH
+            or ref_count[0] >= _GEMINI_MAX_REF_EXPANSIONS
+        ):
+            raise _GeminiSchemaRefFallback
+        ref_count[0] += 1
+        target = _resolve_local_schema_ref_gemini(root, ref)
+        expanded_target = _inline_tool_schema_refs_gemini(
+            target,
+            root=root,
+            ref_stack=(*ref_stack, ref),
+            ref_count=ref_count,
+        )
+        siblings = {key: value for key, value in schema.items() if key != "$ref"}
+        expanded_siblings = _inline_tool_schema_refs_gemini(
+            siblings,
+            root=root,
+            ref_stack=ref_stack,
+            ref_count=ref_count,
+        )
+        if expanded_siblings:
+            return {"allOf": [expanded_target, expanded_siblings]}
+        return expanded_target
+
+    expanded: dict[Any, Any] = {}
+    for key, value in schema.items():
+        if key in _GEMINI_SCHEMA_DEFINITION_KEYS:
+            continue
+        if key in _GEMINI_SCHEMA_LOOSENING_KEYS:
+            # Dropping these constraints is conservative at the provider wire:
+            # it can admit more candidate arguments, never reject a valid one.
+            # The server-side tool validator remains authoritative.
+            continue
+        if key == "enum":
+            # Enum members are application values, not child schemas. The
+            # established sanitizer below still removes non-string enums.
+            expanded[key] = copy.deepcopy(value)
+            continue
+        if key in _OPAQUE_SCHEMA_VALUE_KEYS:
+            expanded[key] = copy.deepcopy(value)
+            continue
+        if key == "properties" and isinstance(value, dict):
+            expanded[key] = {
+                name: _inline_tool_schema_refs_gemini(
+                    child_schema,
+                    root=root,
+                    ref_stack=ref_stack,
+                    ref_count=ref_count,
+                )
+                for name, child_schema in value.items()
+            }
+            continue
+        if isinstance(value, dict):
+            expanded[key] = _inline_tool_schema_refs_gemini(
+                value,
+                root=root,
+                ref_stack=ref_stack,
+                ref_count=ref_count,
+            )
+        elif isinstance(value, list):
+            expanded[key] = [
+                _inline_tool_schema_refs_gemini(
+                    item,
+                    root=root,
+                    ref_stack=ref_stack,
+                    ref_count=ref_count,
+                )
+                if isinstance(item, dict)
+                else copy.deepcopy(item)
+                for item in value
+            ]
+        else:
+            expanded[key] = copy.deepcopy(value)
+    return expanded
+
+
+def _adapt_tool_schema_gemini_legacy(schema: Any) -> Any:
+    """Apply the pre-ref-expansion Gemini schema adaptation rules.
+
+    This helper deliberately retains the old recursion and output shape. It is
+    also the fail-safe for cyclic, external, root, over-deep, or unresolved
+    references, where silently changing the schema would be less safe than the
+    adapter's previous provider-rejection behavior.
     """
     if not isinstance(schema, dict):
         return copy.deepcopy(schema)
@@ -1859,15 +2017,15 @@ def _adapt_tool_schema_gemini(schema: Any) -> Any:
             continue
         if key in _SCHEMA_MAP_KEYS and isinstance(value, dict):
             adapted[key] = {
-                name: _adapt_tool_schema_gemini(child_schema)
+                name: _adapt_tool_schema_gemini_legacy(child_schema)
                 for name, child_schema in value.items()
             }
             continue
         if isinstance(value, dict):
-            adapted[key] = _adapt_tool_schema_gemini(value)
+            adapted[key] = _adapt_tool_schema_gemini_legacy(value)
         elif isinstance(value, list):
             adapted[key] = [
-                _adapt_tool_schema_gemini(item)
+                _adapt_tool_schema_gemini_legacy(item)
                 if isinstance(item, dict)
                 else copy.deepcopy(item)
                 for item in value
@@ -1875,6 +2033,31 @@ def _adapt_tool_schema_gemini(schema: Any) -> Any:
         else:
             adapted[key] = copy.deepcopy(value)
     return adapted
+
+
+def _adapt_tool_schema_gemini(schema: Any) -> Any:
+    """Return a Gemini-compatible copy of one JSON Schema node.
+
+    Gemini's function-declaration schema is narrower than JSON Schema.  In
+    particular, its v1beta endpoint rejects JSON Schema references and
+    definition maps in addition to ``additionalProperties`` and our local-only
+    ``enforceItemBounds`` marker. Resolve supported local definition refs before
+    applying the established sanitizer. Keep every other safe constraint intact:
+    this is a wire adapter, not a replacement for the source schema or the
+    server-side argument validator.
+
+    Schema maps need special handling because their keys are parameter names,
+    not schema keywords.  A tool is therefore still allowed to have a property
+    literally named ``$ref``, ``additionalProperties``, or ``enum``.
+    """
+    if not isinstance(schema, dict):
+        return copy.deepcopy(schema)
+
+    try:
+        expanded = _inline_tool_schema_refs_gemini(schema, root=schema)
+    except _GeminiSchemaRefFallback:
+        expanded = schema
+    return _adapt_tool_schema_gemini_legacy(expanded)
 
 
 def _encode_tools_gemini(tools) -> list[dict]:
@@ -2340,7 +2523,7 @@ def _build_openai_responses_payload(
     payload: dict[str, Any] = {
         "model": model,
         "input": input_items,
-        "max_output_tokens": max(1, min(int(max_tokens), 8192)),
+        "max_output_tokens": cap_chat_output_tokens(max_tokens),
         "store": False,
     }
     if include_reasoning:
@@ -2511,7 +2694,7 @@ def _build_openai_compat_payload(
         "model": model,
         "messages": encoded_messages,
         "stream": False,
-        "max_tokens": max(1, min(int(max_tokens), 8192)),
+        "max_tokens": cap_chat_output_tokens(max_tokens),
     }
     # temperature is OPTIONAL on this wire: the Claude 5 / GPT-5 generation rejects
     # it outright ("`temperature` is deprecated for this model" → 400). Relays pool
@@ -3370,7 +3553,7 @@ def _build_anthropic_payload(
     json_instruction = _json_only_instruction(response_format)
     if json_instruction:
         system = f"{system}\n\n{json_instruction}".strip()
-    capped_max_tokens = max(1, min(int(max_tokens), 8192))
+    capped_max_tokens = cap_chat_output_tokens(max_tokens)
     payload: dict[str, Any] = {
         "model": model,
         "messages": provider_messages,
@@ -3610,7 +3793,7 @@ def _build_bedrock_payload(
     if json_instruction:
         system_parts.append(json_instruction)
 
-    capped_max_tokens = max(1, min(int(max_tokens), 8192))
+    capped_max_tokens = cap_chat_output_tokens(max_tokens)
     inference_config: dict[str, Any] = {"maxTokens": capped_max_tokens}
     thinking_enabled = (
         include_reasoning
@@ -3839,7 +4022,7 @@ def _build_gemini_payload(
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
     system, contents = _split_system_messages_gemini(messages)
     generation_config: dict[str, Any] = {
-        "maxOutputTokens": max(1, min(int(max_tokens), 8192)),
+        "maxOutputTokens": cap_chat_output_tokens(max_tokens),
     }
     if temperature is not None:
         generation_config["temperature"] = temperature

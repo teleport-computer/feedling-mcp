@@ -32,7 +32,8 @@ def _wire(monkeypatch, *, frames, last_frame_id, chat_msgs, should_wake):
         lambda uid: {"last_screen_watch_frame_id": last_frame_id})
     monkeypatch.setattr(
         serve_worker.core_store, "get_store",
-        lambda uid: types.SimpleNamespace(chat_messages=list(chat_msgs)))
+        lambda uid, **_kwargs: types.SimpleNamespace(
+            chat_messages=list(chat_msgs)))
     monkeypatch.setattr(
         serve_worker, "_wake_decision_for_user",
         lambda uid, trigger="heartbeat": {

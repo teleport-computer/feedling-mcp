@@ -1955,12 +1955,23 @@ def test_dream_output_and_new_turns_do_not_retrigger_without_new_seed_cards(
             _capture_test_envelope(user_id, f"msg-dream-{i}"),
         )
 
+    def fail_if_full_history_count_runs(_user_id):
+        raise AssertionError("already-dreamed ticks must not count full chat history")
+
+    monkeypatch.setattr(
+        proactive_dream_scheduler.db,
+        "chat_user_turn_count_strict",
+        fail_if_full_history_count_runs,
+    )
+
     second = proactive_dream_scheduler.tick_memory_dream(store, now=2000.0)
 
     assert second["enqueued"] is False
     assert second["reason"] == "already_dreamed"
     assert second["new_cards"] == 0
-    assert second["new_turns"] == 30
+    # This diagnostic is intentionally deferred until an enqueue candidate;
+    # stable ticks must remain independent of chat-history size.
+    assert second["new_turns"] == 0
     assert len(_memory_dream_jobs(store)) == 1
 
 

@@ -16,12 +16,14 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db
+from chat import reply_language
 from psycopg.rows import dict_row
 from core import envelope as core_envelope
 from core import store as core_store
 from core import wake_bus
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import jobs_store
+from notices import catalog as notices_catalog
 
 from conftest import seed_user
 
@@ -633,10 +635,198 @@ def test_terminal_failure_reply_is_encrypted_linked_classified_and_idempotent(
     assert v2_cursor.load_seq(core_store.get_store(uid)) == parent_seq
 
 
-def test_canvas_delivery_failure_reply_does_not_claim_a_connection_problem(
+@pytest.mark.parametrize("archive_language", ["en-US", "zh-Hans-CN"])
+def test_terminal_failure_fallback_uses_shared_reply_language_policy(
     monkeypatch,
+    archive_language,
 ):
-    uid = "u_js_canvas_delivery_failure"
+    monkeypatch.setattr(
+        jobs_store,
+        "_TERMINAL_FAILURE_FALLBACK_REPLY",
+        reply_language.DEFAULT_FAILURE_FALLBACK_ZH,
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "_TERMINAL_FAILURE_FALLBACK_REPLY_EN",
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN,
+    )
+    uid = "u_js_terminal_language_" + archive_language.lower().replace("-", "_")
+    seed_user(uid, archive_language=archive_language)
+    _reset(uid)
+    _append_user_message(uid)
+    encrypted_plaintexts: list[str] = []
+
+    def capture_failure_envelope(store, plaintext, *, item_id=None):
+        encrypted_plaintexts.append(plaintext.decode("utf-8"))
+        return _fake_failure_envelope(store, plaintext, item_id=item_id)
+
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        capture_failure_envelope,
+    )
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    jobs_store.claim_next_job("w-terminal-language")
+    assert jobs_store.mark_failed(
+        job_id,
+        "turn_failed:runtimeerror",
+        claimed_by="w-terminal-language",
+    )
+
+    result = jobs_store.reconcile_terminal_failure_outbox(job_id=job_id)
+
+    policy = reply_language.infer_reply_language_policy(
+        {}, [], archive_language=archive_language
+    )
+    expected = (
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN
+        if policy.language == "en"
+        else reply_language.DEFAULT_FAILURE_FALLBACK_ZH
+    )
+    assert result["reply_delivered"] == 1
+    assert encrypted_plaintexts == [expected]
+
+
+@pytest.mark.parametrize(
+    ("error_class", "expected_zh", "expected_en"),
+    [
+        (
+            "quota_insufficient",
+            "模型服务额度不足，充值后再发消息即可恢复。",
+            "The model service has insufficient quota. Add credit, then send "
+            "the message again.",
+        ),
+        (
+            "auth_invalid",
+            "API Key 无效或已过期，请到设置里重新保存。",
+            "The API key is invalid or expired. Save it again in Settings.",
+        ),
+        (
+            "model_not_found",
+            "模型名不可用，请检查设置里的模型名。",
+            "The model name is unavailable. Check the model name in Settings.",
+        ),
+        (
+            "cli_config_invalid",
+            "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。"
+            "请修正 AGENT_CLI_CMD。",
+            "The Agent launch command is invalid because it is missing the "
+            "{message} placeholder. Fix AGENT_CLI_CMD.",
+        ),
+        (
+            "provider_incompatible",
+            "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。",
+            "The current model does not support a capability used by this "
+            "request. Choose another model or adjust it in Settings.",
+        ),
+        (
+            "context_overflow",
+            "这次对话太长超出了模型上限，可精简后再试。",
+            "This conversation is too long for the model's context window. "
+            "Shorten it and try again.",
+        ),
+        (
+            "provider_timeout",
+            "你配置的模型服务这次没有及时响应。请先检查模型渠道稳定性，不要连续重发。",
+            "Your model service did not respond in time. Check the provider's "
+            "stability before trying again.",
+        ),
+        (
+            "provider_output_truncated",
+            "模型在写完文件前达到了输出上限，未发送不完整的文件。"
+            "可缩小内容后重试，或换用输出上限更高的模型。",
+            "The model reached its output limit before finishing the file, so "
+            "the incomplete file was not sent. Try a smaller version or a "
+            "model with a higher output limit.",
+        ),
+        (
+            "platform_queue_timeout",
+            "这条消息没有及时开始处理，也没有生成回复。请稍后再试，不要连续发送。",
+            "This message did not start processing in time, so no reply was "
+            "generated. Try again later and avoid sending it repeatedly.",
+        ),
+        (
+            "platform_execution_timeout",
+            "这轮回复因系统执行异常没有完成，也不会重复生成回复。请稍后再试，不要连续发送。",
+            "This reply did not finish because of a system execution error, "
+            "and it will not be generated again automatically. Try again "
+            "later and avoid sending it repeatedly.",
+        ),
+    ],
+)
+@pytest.mark.parametrize("archive_language", ["zh-Hans-CN", "en-US"])
+def test_terminal_catalog_reply_uses_user_archive_language(
+    monkeypatch,
+    archive_language,
+    error_class,
+    expected_zh,
+    expected_en,
+):
+    uid = (
+        "u_js_terminal_catalog_"
+        + error_class
+        + "_"
+        + archive_language.lower().replace("-", "_")
+    )
+    seed_user(uid, archive_language=archive_language)
+    _reset(uid)
+    _append_user_message(uid)
+    encrypted_plaintexts: list[str] = []
+
+    def capture_failure_envelope(store, plaintext, *, item_id=None):
+        encrypted_plaintexts.append(plaintext.decode("utf-8"))
+        return _fake_failure_envelope(store, plaintext, item_id=item_id)
+
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        capture_failure_envelope,
+    )
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    jobs_store.claim_next_job("w-terminal-catalog-language")
+    assert jobs_store.mark_failed(
+        job_id,
+        "turn_failed:" + error_class,
+        claimed_by="w-terminal-catalog-language",
+        error_class=error_class,
+    )
+
+    result = jobs_store.reconcile_terminal_failure_outbox(job_id=job_id)
+
+    expected = expected_en if archive_language.startswith("en") else expected_zh
+    assert result["reply_delivered"] == 1
+    assert encrypted_plaintexts == [expected]
+    failure = next(
+        row
+        for row in db.chat_load_strict(uid)
+        if str(row.get("terminal_failure_job_id") or "") == str(job_id)
+    )
+    assert failure["turn_failure_error_class"] == error_class
+    assert failure["turn_failure_user_text"] == expected
+    assert notices_catalog.user_text_for(
+        error_class, language=archive_language
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    ("error_class", "expected_text"),
+    [
+        (
+            "file_delivery_incomplete",
+            "文件内容已经保存，但附件发送没有完成。请稍后再试。",
+        ),
+        (
+            "canvas_file_delivery_incomplete",
+            "画布内容已经保存，但卡片更新没有完成。请稍后再试。",
+        ),
+    ],
+)
+def test_file_delivery_failure_reply_does_not_claim_a_connection_problem(
+    monkeypatch,
+    error_class,
+    expected_text,
+):
+    uid = "u_js_" + error_class
     seed_user(uid)
     _reset(uid)
     _append_user_message(uid)
@@ -655,25 +845,21 @@ def test_canvas_delivery_failure_reply_does_not_claim_a_connection_problem(
     jobs_store.claim_next_job("w")
     assert jobs_store.mark_failed(
         job_id,
-        "turn_failed:canvas_file_delivery_incomplete",
+        f"turn_failed:{error_class}",
         claimed_by="w",
-        error_class="canvas_file_delivery_incomplete",
+        error_class=error_class,
     )
 
     result = jobs_store.reconcile_terminal_failure_outbox(job_id=job_id)
 
     assert result["reply_delivered"] == 1
-    assert encrypted_plaintexts == [
-        "画布内容已经保存，但卡片更新没有完成。请稍后再试。"
-    ]
+    assert encrypted_plaintexts == [expected_text]
     failure = next(
         row
         for row in db.chat_load_strict(uid)
         if str(row.get("terminal_failure_job_id") or "") == str(job_id)
     )
-    assert failure["turn_failure_error_class"] == (
-        "canvas_file_delivery_incomplete"
-    )
+    assert failure["turn_failure_error_class"] == error_class
     assert failure["turn_failure_blame"] == "system"
 
 

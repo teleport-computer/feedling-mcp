@@ -12,12 +12,14 @@ So the numbers live here once and all three layers read them:
 
     history_fetch:  result_cap=4500  atomic_json=True  extra_batch_budget=2500
     history_search: result_cap=1800  atomic_json=True
+    web_fetch:      result_cap=8000  atomic_json=True  extra_batch_budget=6000
 
 * ``atomic_json`` — the water-fill reserves this result's full length up front
   and shares only the remainder with its siblings.  It is never cut, at any
   batch shape.  Only declare it for producers that shrink **structurally**
   before serializing (the history facade does); the cap is then a contract the
-  producer already met, not a blind guillotine.
+  producer already met, not a blind guillotine.  The history and web-fetch
+  facades both satisfy this contract before handing their JSON to the executor.
 * ``extra_batch_budget`` — how much the same-batch total may rise while such a
   result is present.  Without it a 4500-char fetch would leave the other seven
   results ~500 characters each, which is a real product regression.
@@ -66,6 +68,9 @@ HISTORY_FETCH_RESULT_MAX_CHARS_ENV = "FEEDLING_V2_HISTORY_FETCH_RESULT_MAX_CHARS
 DEFAULT_HISTORY_SEARCH_RESULT_MAX_CHARS = 1800
 DEFAULT_HISTORY_FETCH_RESULT_MAX_CHARS = 4500
 DEFAULT_HISTORY_FETCH_EXTRA_BATCH_CHARS = 2500
+WEB_FETCH_RESULT_MAX_CHARS_ENV = "FEEDLING_V2_WEB_FETCH_RESULT_MAX_CHARS"
+DEFAULT_WEB_FETCH_RESULT_MAX_CHARS = 8000
+DEFAULT_WEB_FETCH_EXTRA_BATCH_CHARS = 6000
 
 # history_search.CURSOR_MAX_CHARS.  Duplicated as a plain number on purpose:
 # model_api_runtime already imports this module (executor / tool_loop), so
@@ -111,6 +116,16 @@ MIN_RESULT_CAPS: Mapping[str, int] = {
         "before": [], "after": [],
         "unavailable_count": 0,
         "omitted_before": 0, "omitted_after": 0,
+    }),
+    "web_fetch": _skeleton_chars({
+        "url": "x" * 1000,
+        "total_chars": 300000,
+        "offset": 300000,
+        "returned_chars": 0,
+        "next_offset": None,
+        "has_more": False,
+        "source_truncated": True,
+        "text": "",
     }),
 }
 
@@ -162,6 +177,15 @@ def for_tool(tool_name) -> ResultBudget | None:
             atomic_json=True,
             extra_batch_budget=DEFAULT_HISTORY_FETCH_EXTRA_BATCH_CHARS,
         )
+    if name == "web_fetch":
+        return ResultBudget(
+            result_cap=_int_env(
+                WEB_FETCH_RESULT_MAX_CHARS_ENV,
+                DEFAULT_WEB_FETCH_RESULT_MAX_CHARS,
+            ),
+            atomic_json=True,
+            extra_batch_budget=DEFAULT_WEB_FETCH_EXTRA_BATCH_CHARS,
+        )
     return None
 
 
@@ -175,6 +199,7 @@ def for_metadata(metadata: Mapping[str, Any] | None) -> ResultBudget | None:
 _ENV_BY_TOOL = {
     "history_search": HISTORY_SEARCH_RESULT_MAX_CHARS_ENV,
     "history_fetch": HISTORY_FETCH_RESULT_MAX_CHARS_ENV,
+    "web_fetch": WEB_FETCH_RESULT_MAX_CHARS_ENV,
 }
 _BATCH_CAP_ENV = "FEEDLING_V2_TOOL_BATCH_RESULT_CHAR_CAP"
 

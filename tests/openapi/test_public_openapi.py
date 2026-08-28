@@ -24,6 +24,7 @@ sys.path.insert(0, str(TOOLS))
 sys.path.insert(0, str(BACKEND))
 
 from export_public_openapi import _build_public_schema, _load_schema  # noqa: E402
+from memory import memory_core  # noqa: E402
 from memory.source_policy import MEMORY_SOURCE_VALUES  # noqa: E402
 
 
@@ -399,12 +400,35 @@ def test_chat_memory_and_perception_contracts_are_concrete(
     assert history_query["limit"]["schema"]["maximum"] == 200
     assert history_query["include_image_bodies"]["deprecated"] is True
 
+    memory_query = _parameters(
+        operations[("get", "/v1/memory/list")], "query"
+    )
+    assert memory_query["limit"]["schema"]["maximum"] == (
+        memory_core.MEMORY_LIST_MAX_LIMIT
+    )
+    assert memory_query["limit"]["schema"]["default"] == (
+        memory_core.MEMORY_LIST_DEFAULT_LIMIT
+    )
+
     memory_id = _parameters(operations[("get", "/v1/memory/get")], "query")["id"]
     assert memory_id["required"] is True
     memory_delete_id = _parameters(
         operations[("delete", "/v1/memory/delete")], "query"
     )["id"]
     assert memory_delete_id["required"] is True
+
+    memory_index_properties = set(schemas["MemoryIndexRequest"]["properties"])
+    memory_fetch_properties = set(schemas["MemoryFetchRequest"]["properties"])
+    retired_memory_fields = {
+        "include_sensitive",
+        "user_explicit_selection",
+        "is_sensitive",
+        "sensitivity_class",
+        "sensitive_scope",
+    }
+    assert memory_index_properties.isdisjoint(retired_memory_fields)
+    assert memory_fetch_properties.isdisjoint(retired_memory_fields)
+    assert retired_memory_fields.isdisjoint(json.dumps(public_schema).split('"'))
 
     perception_query = _parameters(
         operations[("get", "/v1/perception/app_open")], "query"

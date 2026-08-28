@@ -77,7 +77,6 @@ tests/test_chat_turn_failure_fields.py
 tests/test_consumer_state_cas.py
 tests/test_context_memories.py
 tests/test_copytext.py
-tests/test_data_track.py
 tests/test_dau_snapshot_scheduler.py
 tests/test_debug_trace_atomic.py
 tests/test_debug_trace_event_route.py
@@ -88,7 +87,6 @@ tests/test_dream_status.py
 tests/test_e2b_template_contract.py
 tests/test_e2e_deep_claude.py
 tests/test_e2e_deep_probes.py
-tests/test_e2e_tools.py
 tests/test_error_slug_convergence.py
 tests/test_exception_handlers.py
 tests/test_expected_consumer_commit.py
@@ -106,7 +104,6 @@ tests/test_genesis_failure_codes.py
 tests/test_genesis_floor_note.py
 tests/test_genesis_foreground.py
 tests/test_genesis_foreground_worker.py
-tests/test_genesis_import_capture_mode.py
 tests/test_genesis_keep_all.py
 tests/test_genesis_llm_client.py
 tests/test_genesis_prompts.py
@@ -185,7 +182,6 @@ tests/test_provider_tool_transcript_wire.py
 tests/test_provider_tools_acceptance.py
 tests/test_provider_tools_anthropic.py
 tests/test_provider_tools_bedrock.py
-tests/test_provider_tools_gemini.py
 tests/test_provider_tools_no_reply_text.py
 tests/test_provider_tools_openai.py
 tests/test_provider_tools_wire.py
@@ -218,7 +214,6 @@ tests/test_users_reload_targeted.py
 tests/test_v2_admission.py
 tests/test_v2_bounded_tail_degrade.py
 tests/test_v2_capacity_health.py
-tests/test_v2_capture_batch_protocol.py
 tests/test_v2_capture_lifecycle.py
 tests/test_v2_chat_clear_fence.py
 tests/test_v2_child_supervisor.py
@@ -271,7 +266,6 @@ tests/test_v2_serve_worker_images.py
 tests/test_v2_sink_retryable.py
 tests/test_v2_status_poll.py
 tests/test_v2_status_stream.py
-tests/test_v2_subagents.py
 tests/test_v2_summary_frontier_unit.py
 tests/test_v2_summary_store.py
 tests/test_v2_tail_anchor_store.py

@@ -102,6 +102,14 @@ class _RecordingBuildMessages:
         return [{"role": "user", "content": "turn"}]
 
 
+class _TranscriptBuildMessages(_RecordingBuildMessages):
+    """Expose the loop transcript to the provider-shaped request fixture."""
+
+    def __call__(self, transcript):
+        self.calls.append(list(transcript))
+        return [{"role": "user", "content": "turn"}, *transcript]
+
+
 class _AdaptiveBuildMessages(_RecordingBuildMessages):
     """Production-shaped builder whose planner owns the final message list."""
 
@@ -539,7 +547,7 @@ def test_provider_image_is_a_terminal_reply_without_synthetic_text(monkeypatch):
     ]
 
 
-def test_provider_media_mixed_with_function_calls_falls_back_without_tools(monkeypatch):
+def test_provider_media_mixed_with_calls_uses_text_only_tool_choice(monkeypatch):
     provider = _ScriptedProvider(
         [
             {
@@ -576,7 +584,10 @@ def test_provider_media_mixed_with_function_calls_falls_back_without_tools(monke
 
     assert dispatch.calls == []
     assert provider.calls[0]["allow_image_output"] is True
-    assert provider.calls[1]["tools"] is None
+    assert {spec.name for spec in provider.calls[1]["tools"]} == {
+        "workspace_list"
+    }
+    assert provider.calls[1]["tool_choice"] == "none"
     assert "allow_image_output" not in provider.calls[1]
     assert outcome.final_text == "bounded fallback"
 
@@ -1157,7 +1168,10 @@ def test_turn_reasoning_request_works_without_route_effort_and_keeps_fallback_te
     ))
 
     assert provider.calls[0]["include_reasoning"] is True
-    assert provider.calls[1]["tools"] is None
+    assert {spec.name for spec in provider.calls[1]["tools"]} == {
+        "memory_search"
+    }
+    assert provider.calls[1]["tool_choice"] == "none"
     assert "include_reasoning" not in provider.calls[1]
     assert outcome.final_text == "plain fallback"
 
@@ -2069,7 +2083,11 @@ def test_file_recovery_tool_choice_dispatches_by_provider_capability(
             "tool_calls": [{
                 "id": "f1",
                 "name": "send_file",
-                "args": {"path": "/workspace/summary.md", "revision": 1},
+                "args": {
+                    "path": "/workspace/summary.md",
+                    "revision": 1,
+                    "completion_message": "文档已生成。",
+                },
             }],
             "usage": {},
         },
@@ -2157,6 +2175,248 @@ def test_file_recovery_tool_choice_dispatches_by_provider_capability(
     assert all(item["dropped_tool_count"] > 0 for item in surfaces[:3])
 
 
+@pytest.mark.parametrize(
+    ("user_request", "wrong_message", "corrected_message"),
+    [
+        pytest.param(
+            "请直接生成并发送一个真实的 Markdown 文件，完成后用中文简短回复。",
+            "Your work is saved and ready to open now.",
+            "文件已经生成并发送，可以直接下载了。",
+            id="han-corrected",
+        ),
+        pytest.param(
+            "Create and attach a real Markdown file, then reply briefly in English.",
+            "文件已经生成并发送，可以直接下载了。",
+            "Your work is saved and ready to open now.",
+            id="latin-corrected",
+        ),
+        pytest.param(
+            "生成文件",
+            "Your work is saved and ready to open now.",
+            "文件已经生成，可以下载了。",
+            id="short-han-corrected",
+        ),
+        pytest.param(
+            "Make PDF.",
+            "文件已经生成并发送，可以直接下载了。",
+            "Your PDF is ready to download.",
+            id="short-latin-corrected",
+        ),
+        pytest.param(
+            "帮我生成一个 quarterly business report 的 TXT 文件发给我，里面写三行 summary。",
+            "The quarterly business report is ready to download.",
+            "季度业务报告已经生成并发送，可以下载了。",
+            id="han-with-latin-terms-corrected",
+        ),
+        pytest.param(
+            "Please create a file named 报告.txt for me, then reply briefly in English.",
+            "文件已经生成并发送，可以直接下载了。",
+            "Your report file is ready to download.",
+            id="latin-with-han-filename-corrected",
+        ),
+        pytest.param(
+            "Translate 你好 into English and save it as a Markdown file.",
+            "文件已经生成并发送，可以直接下载了。",
+            "Your translated file is ready to download.",
+            id="latin-with-han-quote-corrected",
+        ),
+        pytest.param(
+            "Write a Markdown file explaining what 道 means in Daoism, in English.",
+            "文件已经生成并发送，可以直接下载了。",
+            "Your explanation file is ready to download.",
+            id="latin-with-han-term-corrected",
+        ),
+        pytest.param(
+            "请生成一份 Markdown 文件，完成以后请用英文告诉我结果。",
+            "Your work is saved and ready to open now.",
+            "Your work is saved and ready to open now.",
+            id="explicit-language-confirmed",
+        ),
+    ],
+)
+def test_compact_file_delivery_corrects_or_confirms_language_before_delivery(
+    monkeypatch, user_request, wrong_message, corrected_message,
+):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "write",
+                "name": "workspace_write",
+                "args": {
+                    "path": "/workspace/final.md",
+                    "content": "# 中文附件终验",
+                    "expected_revision": 0,
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "deliver",
+                "name": "send_file",
+                "args": {
+                    "path": "/workspace/final.md",
+                    "revision": 1,
+                    "completion_message": wrong_message,
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "deliver-corrected",
+                "name": "send_file",
+                "args": {
+                    "path": "/workspace/final.md",
+                    "revision": 1,
+                    "completion_message": corrected_message,
+                },
+            }],
+            "usage": {},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=tool_call.id,
+                content=(
+                    "ok: workspace_write applied at revision 1; use the same "
+                    "path and revision 1 with send_file"
+                ),
+            )
+            for tool_call in tool_calls
+        ]
+
+    delivered = []
+
+    async def on_file(path, revision):
+        delivered.append((path, revision))
+
+    replies = _RecordingReply()
+    user_message = {"role": "user", "content": user_request}
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=replies,
+        on_file_reply=on_file,
+        required_file_suffixes=(".md",),
+        file_requirement_messages=(user_message,),
+        fold_new_messages=_RecordingFold([[], [], []]),
+        add_usage=_noop_add_usage,
+        max_calls=4,
+    ))
+
+    correction_exchange = provider.calls[2]["messages"][-1]
+    assert isinstance(correction_exchange, ToolExchange)
+    assert len(correction_exchange.results) == 1
+    correction_result = correction_exchange.results[0].content
+    assert "completion_message language mismatch" in correction_result
+    assert "same path and revision" in correction_result
+    assert delivered == [("/workspace/final.md", 1)]
+    assert replies.calls == [(corrected_message, True)]
+    assert isinstance(replies.calls[0][0], tool_loop.ValidatedFinalReply)
+    assert outcome.final_text == corrected_message
+
+
+def test_file_delivery_uses_user_only_coalesced_row_for_completion_language(
+    monkeypatch,
+):
+    """Production coalesced rows omit role until the worker prompt boundary."""
+
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "write",
+                "name": "workspace_write",
+                "args": {
+                    "path": "/workspace/final.txt",
+                    "content": "TXT 下载正常。",
+                    "expected_revision": 0,
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "deliver-wrong-language",
+                "name": "send_file",
+                "args": {
+                    "path": "/workspace/final.txt",
+                    "revision": 1,
+                    "completion_message": "Your TXT file is ready to download.",
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "deliver-corrected",
+                "name": "send_file",
+                "args": {
+                    "path": "/workspace/final.txt",
+                    "revision": 1,
+                    "completion_message": "TXT 文件已经生成，可以下载了。",
+                },
+            }],
+            "usage": {},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=tool_call.id,
+                content=(
+                    "ok: workspace_write applied at revision 1; use the same "
+                    "path and revision 1 with send_file"
+                ),
+            )
+            for tool_call in tool_calls
+        ]
+
+    delivered = []
+
+    async def on_file(path, revision):
+        delivered.append((path, revision))
+
+    replies = _RecordingReply()
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=replies,
+        on_file_reply=on_file,
+        required_file_suffixes=(".txt",),
+        file_requirement_messages=({
+            "content": (
+                "请生成并发送一个真实的 TXT 文件，完成后用中文简短回复。"
+            ),
+        },),
+        fold_new_messages=_RecordingFold([[], [], []]),
+        add_usage=_noop_add_usage,
+        max_calls=4,
+    ))
+
+    correction_exchange = provider.calls[2]["messages"][-1]
+    assert isinstance(correction_exchange, ToolExchange)
+    assert "completion_message language mismatch" in (
+        correction_exchange.results[0].content
+    )
+    assert delivered == [("/workspace/final.txt", 1)]
+    assert replies.calls == [("TXT 文件已经生成，可以下载了。", True)]
+    assert outcome.final_text == "TXT 文件已经生成，可以下载了。"
+
+
 def test_invalid_artifact_write_is_model_visible_and_retries_in_workspace(
     monkeypatch,
 ):
@@ -2195,6 +2455,7 @@ def test_invalid_artifact_write_is_model_visible_and_retries_in_workspace(
                 "args": {
                     "path": "/workspace/memory_summary.md",
                     "revision": 1,
+                    "completion_message": "Markdown 文档已经生成。",
                 },
             }],
             "usage": {},
@@ -2382,7 +2643,8 @@ def test_malformed_args_gets_one_tools_disabled_fallback_without_dispatch(monkey
     ))
 
     assert dispatch.calls == []
-    assert [call["tools"] is None for call in provider.calls] == [False, True]
+    assert {spec.name for spec in provider.calls[1]["tools"]} == {"web_search"}
+    assert provider.calls[1]["tool_choice"] == "none"
     assert reply.calls == [("I could not use tools, but here is the answer.", True)]
     assert outcome.rounds == 2
 
@@ -2428,8 +2690,10 @@ def test_tools_disabled_fallback_retries_terminal_tool_call_within_bound(
     ))
 
     assert len(provider.calls) == 3
-    assert provider.calls[1]["tools"] is None
-    assert provider.calls[2]["tools"] is None
+    assert {spec.name for spec in provider.calls[1]["tools"]} == {"web_search"}
+    assert {spec.name for spec in provider.calls[2]["tools"]} == {"web_search"}
+    assert provider.calls[1]["tool_choice"] == "none"
+    assert provider.calls[2]["tool_choice"] == "none"
     assert "write one complete, self-contained reply" in (
         provider.calls[1]["messages"][0]["content"]
     )
@@ -2494,7 +2758,8 @@ def test_duplicate_call_ids_fall_back_before_any_side_effect(monkeypatch):
     ))
 
     assert dispatch.calls == []
-    assert [call["tools"] is None for call in provider.calls] == [False, True]
+    assert {spec.name for spec in provider.calls[1]["tools"]} == {"memory_write"}
+    assert provider.calls[1]["tool_choice"] == "none"
     assert reply.calls == [("safe fallback", True)]
     assert outcome.rounds == 2
 
@@ -2522,7 +2787,8 @@ def test_per_round_tool_call_ceiling_is_all_or_nothing(monkeypatch):
     ))
 
     assert dispatch.calls == []
-    assert [call["tools"] is None for call in provider.calls] == [False, True]
+    assert {spec.name for spec in provider.calls[1]["tools"]} == {"memory_index"}
+    assert provider.calls[1]["tool_choice"] == "none"
     assert outcome.final_text == "bounded fallback"
 
 
@@ -2603,7 +2869,8 @@ def test_oversized_tool_exchange_falls_back_before_dispatch(
     ))
 
     assert dispatch.calls == []
-    assert [call["tools"] is None for call in provider.calls] == [False, True]
+    assert {spec.name for spec in provider.calls[1]["tools"]} == {"memory_index"}
+    assert provider.calls[1]["tool_choice"] == "none"
     assert outcome.final_text == "bounded fallback"
 
 
@@ -3336,3 +3603,835 @@ def test_empty_wake_without_stay_silent_catalog_fails_closed(monkeypatch):
         payload for kind, payload in events if kind == "empty_provider_response"
     )
     assert empty_event["action"] == "fail_wake_choice_tool_unavailable"
+
+
+# --- rejected tool batches remain visible to later provider rounds ---------
+
+
+def test_terminal_rejection_enters_transcript_before_bounded_retry(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "", "tool_calls": [
+            {"id": "real-1", "name": "identity_get", "args": {}}], "usage": {}},
+        {"reply": "I will keep trying", "tool_calls": [
+            {"id": "terminal-real", "name": "identity_get", "args": {}}], "usage": {}},
+        {"reply": "complete answer", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    trajectory = []
+
+    async def record_trajectory(event_kind, detail):
+        trajectory.append((event_kind, detail))
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_TranscriptBuildMessages(),
+        dispatch_tools=_RecordingDispatch(), on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[], []]), add_usage=_noop_add_usage,
+        max_calls=4, max_consecutive_tool_only_rounds=1,
+        on_trajectory_event=record_trajectory,
+    ))
+
+    rejected = [
+        item for item in provider.calls[2]["messages"]
+        if isinstance(item, ToolExchange)
+        and any((result.metadata or {}).get("rejected") for result in item.results)
+    ]
+    assert len(rejected) == 1
+    exchange = rejected[0]
+    assert exchange.calls[0].id.startswith(tool_loop.REJECTED_TOOL_CALL_ID_PREFIX)
+    assert exchange.calls[0].id != "terminal-real"
+    assert exchange.calls[0].name == "identity_get"
+    assert exchange.results[0].call_id == exchange.calls[0].id
+    assert exchange.results[0].metadata == {"rejected": "terminal_tool_call_rejected"}
+    assert "工具当前不可用,请用纯文本直接回复" in exchange.results[0].content
+    assert exchange.assistant_text == "I will keep trying"
+    rejected_events = [
+        detail for event_kind, detail in trajectory
+        if event_kind == "protocol_fallback"
+        and detail.get("reason") == "terminal_tool_call_rejected"
+    ]
+    assert rejected_events[0]["transcript_appended"] is True
+    assert outcome.final_text == "complete answer"
+
+
+def test_malformed_call_gets_fresh_prefixed_paired_rejection_id(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "checking", "tool_calls": [
+            {"id": "real-1", "name": "identity_get", "args": {}}], "usage": {}},
+        {"reply": "trying", "tool_calls": [
+            {"id": "", "name": "web_search", "args": {"query": "x"}}], "usage": {}},
+        {"reply": "plain fallback", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    trajectory = []
+
+    async def record_trajectory(event_kind, detail):
+        trajectory.append((event_kind, detail))
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_TranscriptBuildMessages(),
+        dispatch_tools=_RecordingDispatch(), on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[], []]), add_usage=_noop_add_usage,
+        max_calls=4, on_trajectory_event=record_trajectory,
+    ))
+
+    exchange = next(
+        item for item in provider.calls[2]["messages"]
+        if isinstance(item, ToolExchange)
+        and any((result.metadata or {}).get("rejected") for result in item.results)
+    )
+    assert tool_loop.REJECTED_TOOL_CALL_ID_PREFIX == "feedling_rejected_"
+    assert [call.id for call in exchange.calls] == [
+        f"{tool_loop.REJECTED_TOOL_CALL_ID_PREFIX}2_0"
+    ]
+    assert [result.call_id for result in exchange.results] == [exchange.calls[0].id]
+    transcript_ids = {
+        call.id for item in provider.calls[2]["messages"]
+        if isinstance(item, ToolExchange) for call in item.calls
+    }
+    assert "real-1" in transcript_ids
+    assert exchange.calls[0].id not in {"", "real-1"}
+    assert exchange.calls[0].name == "web_search"
+    assert exchange.results[0].metadata == {"rejected": "missing_tool_call_id"}
+    assert any(
+        event_kind == "protocol_fallback"
+        and detail.get("reason") == "invalid_or_over_budget_tool_exchange"
+        and detail.get("transcript_appended") is True
+        for event_kind, detail in trajectory
+    )
+    assert outcome.final_text == "plain fallback"
+
+
+def test_file_output_budget_is_independent_from_prompt_frontier_reserve(
+    monkeypatch,
+):
+    provider = _ScriptedProvider([
+        {"reply": "done", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    observed_frontier_reserves = []
+
+    class RecordingAdaptiveBuilder(_AdaptiveBuildMessages):
+        def plan_provider_round(self, **kwargs):
+            observed_frontier_reserves.append(kwargs["output_reserve_tokens"])
+            return super().plan_provider_round(**kwargs)
+
+    async def on_file(_path, _revision):
+        return None
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=RecordingAdaptiveBuilder(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        on_file_reply=on_file,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=3,
+        prompt_output_reserve_tokens=4096,
+        file_output_max_tokens=provider_client.CHAT_OUTPUT_MAX_TOKENS,
+    ))
+
+    assert outcome.final_text == "done"
+    assert observed_frontier_reserves == [4096]
+    assert provider.calls[0]["max_tokens"] == provider_client.CHAT_OUTPUT_MAX_TOKENS
+    assert provider.calls[0]["max_tokens"] not in {4096, 8192}
+
+
+@pytest.mark.parametrize("stop_reason", ["length", "MAX_TOKENS"])
+def test_token_limited_malformed_tool_call_fails_once_without_retry(
+    monkeypatch,
+    stop_reason,
+):
+    provider = _ScriptedProvider([{
+        "reply": "",
+        "stop_reason": stop_reason,
+        "tool_calls": [{
+            "id": "write-1",
+            "name": "workspace_write",
+            "args": {},
+            "args_raw": '{"path":"/workspace/large.io.html","content":"partial',
+            "args_ok": False,
+        }],
+        "usage": {"completion_tokens": 4096},
+    }])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch()
+    trajectory = []
+
+    async def record_trajectory(event_kind, detail):
+        trajectory.append((event_kind, detail))
+
+    async def on_file(_path, _revision):
+        return None
+
+    with pytest.raises(tool_loop.ProviderOutputTruncated, match="output_truncated"):
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=dispatch,
+            on_reply=_RecordingReply(),
+            on_file_reply=on_file,
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            max_calls=5,
+            on_trajectory_event=record_trajectory,
+        ))
+
+    assert len(provider.calls) == 1
+    assert dispatch.calls == []
+    truncated = [
+        detail
+        for event_kind, detail in trajectory
+        if event_kind == "provider_output_truncated"
+    ]
+    assert truncated == [{
+        "round": 1,
+        "reason": "output_truncated",
+        "finish_reason": provider_client.normalize_stop_reason(stop_reason),
+        "malformed_tool_arguments": True,
+        "retry": False,
+    }]
+    assert not any(
+        event_kind == "protocol_fallback"
+        and detail.get("reason") == "invalid_or_over_budget_tool_exchange"
+        for event_kind, detail in trajectory
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "required_suffix", "expected_exception"),
+    [
+        pytest.param(
+            "/workspace/card.io.html",
+            ".io.html",
+            tool_loop.CanvasDeliveryIncomplete,
+            id="canvas",
+        ),
+        pytest.param(
+            "/workspace/report.md",
+            ".md",
+            tool_loop.FileDeliveryIncomplete,
+            id="ordinary-file",
+        ),
+    ],
+)
+def test_file_reply_callback_failure_preserves_delivery_class(
+    monkeypatch,
+    path,
+    required_suffix,
+    expected_exception,
+):
+    delivery_args = {
+        "path": path,
+        "revision": 1,
+        "title": "Saved work",
+        "subtitle": "Ready to open",
+        "completion_message": "Your file is ready.",
+    }
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "stop_reason": "stop",
+            "tool_calls": [{
+                "id": "send-1",
+                "name": "send_file",
+                "args": delivery_args,
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "stop_reason": "tool_calls",
+            "tool_calls": [{
+                "id": "write-1",
+                "name": "workspace_write",
+                "args": {
+                    "path": path,
+                    "content": "saved source",
+                    "expected_revision": 0,
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "stop_reason": "stop",
+            "tool_calls": [{
+                "id": "send-2",
+                "name": "send_file",
+                "args": delivery_args,
+            }],
+            "usage": {},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    async def fail_delivery(_path, _revision, **_metadata):
+        raise RuntimeError("private loader detail")
+
+    with pytest.raises(
+        expected_exception,
+        match="file_delivery_callback_failed",
+    ) as raised:
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=_RecordingDispatch(
+                "ok: workspace_write applied at revision 1; "
+                "use revision 1 with send_file"
+            ),
+            on_reply=_RecordingReply(),
+            on_file_reply=fail_delivery,
+            required_file_suffixes=(required_suffix,),
+            fold_new_messages=_RecordingFold([[], []]),
+            add_usage=_noop_add_usage,
+            max_calls=5,
+        ))
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "private loader detail"
+    assert len(provider.calls) == 3
+
+
+def test_file_reply_callback_failure_gets_one_forced_recovery(monkeypatch):
+    path = "/workspace/card.io.html"
+    delivery_args = {
+        "path": path,
+        "revision": 1,
+        "title": "Saved work",
+        "subtitle": "Ready to open",
+        "completion_message": "Your file is ready.",
+    }
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "stop_reason": "stop",
+            "tool_calls": [{
+                "id": "send-1",
+                "name": "send_file",
+                "args": delivery_args,
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "stop_reason": "tool_calls",
+            "tool_calls": [{
+                "id": "write-1",
+                "name": "workspace_write",
+                "args": {
+                    "path": path,
+                    "content": "saved source",
+                    "expected_revision": 0,
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "stop_reason": "stop",
+            "tool_calls": [{
+                "id": "send-2",
+                "name": "send_file",
+                "args": delivery_args,
+            }],
+            "usage": {},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    delivery_attempts = 0
+
+    async def flaky_delivery(_path, _revision, **_metadata):
+        nonlocal delivery_attempts
+        delivery_attempts += 1
+        if delivery_attempts == 1:
+            raise RuntimeError("private loader detail")
+
+    dispatch = _RecordingDispatch(
+        "ok: workspace_write applied at revision 1; use revision 1 with send_file"
+    )
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        on_file_reply=flaky_delivery,
+        required_file_suffixes=(".io.html",),
+        fold_new_messages=_RecordingFold([[], []]),
+        add_usage=_noop_add_usage,
+        max_calls=5,
+    ))
+
+    assert delivery_attempts == 2
+    assert [[tc.name for tc in batch] for batch in dispatch.calls] == [
+        ["workspace_write"]
+    ]
+    assert len(provider.calls) == 3
+    assert outcome.final_text == "Your file is ready."
+
+
+def test_quote_dense_canvas_at_utf8_contract_limit_reaches_workspace_dispatch(
+    monkeypatch,
+):
+    prefix = "<html><body>"
+    suffix = "</body></html>"
+    canvas = (
+        prefix
+        + ('"' * (cap_tool_schema.SHARED_WORK_MAX_BYTES - len(prefix) - len(suffix)))
+        + suffix
+    )
+    write_call = {
+        "id": "write-large",
+        "name": "workspace_write",
+        "args": {
+            "path": "/workspace/large.io.html",
+            "content": canvas,
+            "expected_revision": 0,
+        },
+    }
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "stop_reason": "tool_calls",
+            "tool_calls": [write_call],
+            "assistant_turn": {
+                "wire": "openai_chat",
+                "payload": {
+                    "role": "assistant",
+                    "tool_calls": [write_call],
+                },
+            },
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "stop_reason": "tool_calls",
+            "tool_calls": [{
+                "id": "send-large",
+                "name": "send_file",
+                "args": {
+                    "path": "/workspace/large.io.html",
+                    "revision": 1,
+                    "title": "Large Canvas",
+                    "subtitle": "Interactive work",
+                    "completion_message": "Canvas delivered.",
+                },
+            }],
+            "usage": {},
+        },
+        {"reply": "Canvas delivered.", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch(
+        "ok: workspace_write applied at revision 1; use revision 1 with send_file"
+    )
+    delivered = []
+
+    async def on_file(path, revision, **_metadata):
+        delivered.append((path, revision))
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_TranscriptBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        on_file_reply=on_file,
+        required_file_suffixes=(".io.html",),
+        fold_new_messages=_RecordingFold([[], []]),
+        add_usage=_noop_add_usage,
+        max_calls=5,
+    ))
+
+    assert len(canvas.encode("utf-8")) == cap_tool_schema.SHARED_WORK_MAX_BYTES
+    assert len(json.dumps(write_call["args"])) > (
+        cap_tool_schema.SHARED_WORK_MAX_BYTES + 4096
+    )
+    assert [[call.name for call in batch] for batch in dispatch.calls] == [
+        ["workspace_write"]
+    ]
+    assert dispatch.calls[0][0].args["content"] == canvas
+    assert delivered == [("/workspace/large.io.html", 1)]
+    assert outcome.final_text == "Canvas delivered."
+
+
+def test_rejected_invented_tool_name_does_not_restore_unknown_schema(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "", "tool_calls": [
+            {"id": "invented-real", "name": "invented_tool", "args": {}}], "usage": {}},
+        {"reply": "plain fallback", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_TranscriptBuildMessages(),
+        dispatch_tools=_RecordingDispatch(), on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[]]), add_usage=_noop_add_usage,
+        max_calls=3,
+    ))
+
+    assert provider.calls[1]["tools"] is None
+    assert "tool_choice" not in provider.calls[1]
+    exchange = next(
+        item for item in provider.calls[1]["messages"]
+        if isinstance(item, ToolExchange)
+    )
+    assert exchange.calls[0].name == "invented_tool"
+    assert exchange.results[0].metadata == {"rejected": "unknown_tool"}
+    assert outcome.final_text == "plain fallback"
+
+
+def test_oversized_rejection_transcript_is_bounded_without_tail_copy(monkeypatch):
+    args_tail = "ARGS_SENTINEL_MUST_NOT_SURVIVE"
+    text_tail = "TEXT_SENTINEL_MUST_NOT_SURVIVE"
+    provider = _ScriptedProvider([
+        {"reply": ("p" * 1000) + text_tail, "tool_calls": [{
+            "id": "oversized-real", "name": "memory_search",
+            "args": {"query": ("x" * 1000) + args_tail},
+        }], "usage": {}},
+        {"reply": "bounded fallback", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch()
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_TranscriptBuildMessages(),
+        dispatch_tools=dispatch, on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[]]), add_usage=_noop_add_usage,
+        max_calls=3, max_tool_args_chars=64, max_tool_batch_args_chars=128,
+        max_assistant_tool_text_chars=64,
+    ))
+
+    exchange = next(
+        item for item in provider.calls[1]["messages"]
+        if isinstance(item, ToolExchange)
+    )
+    assert len(json.dumps(
+        exchange.calls[0].args, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"),
+    )) <= tool_loop.REJECTED_TOOL_ARGS_SUMMARY_CHAR_CAP
+    assert len(exchange.assistant_text) <= tool_loop.REJECTED_ASSISTANT_TEXT_CHAR_CAP
+    next_request = repr(provider.calls[1]["messages"])
+    assert args_tail not in next_request
+    assert text_tail not in next_request
+    assert dispatch.calls == []
+    assert len(provider.calls) == 2
+    assert outcome.final_text == "bounded fallback"
+
+
+def test_rejected_exchanges_do_not_spend_tool_call_budget(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "", "tool_calls": [
+            {"id": "valid", "name": "memory_index", "args": {}}], "usage": {}},
+        {"reply": "", "tool_calls": [{
+            "id": "malformed", "name": "memory_search", "args": {},
+            "args_raw": "{", "args_ok": False,
+        }], "usage": {}},
+        {"reply": "still broken", "tool_calls": [
+            {"id": "terminal", "name": "memory_search", "args": {}}], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch()
+    trajectory = []
+
+    async def record_trajectory(event_kind, detail):
+        trajectory.append((event_kind, detail))
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_TranscriptBuildMessages(),
+        dispatch_tools=dispatch, on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[], []]), add_usage=_noop_add_usage,
+        max_calls=3, on_trajectory_event=record_trajectory,
+    ))
+
+    assert [[call.id for call in batch] for batch in dispatch.calls] == [["valid"]]
+    exhausted = next(
+        detail for event_kind, detail in trajectory if event_kind == "loop_exhausted"
+    )
+    assert exhausted["tool_calls_used"] == 1
+    assert len(provider.calls) == 3
+    assert outcome.stop_reason == "budget_exhausted"
+
+
+def test_schema_invalid_call_enters_rejection_transcript(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "searching", "tool_calls": [{
+            "id": "invalid-schema", "name": "memory_search", "args": {},
+        }], "usage": {}},
+        {"reply": "plain fallback", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch()
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_TranscriptBuildMessages(),
+        dispatch_tools=dispatch, on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[]]), add_usage=_noop_add_usage,
+        max_calls=3,
+    ))
+
+    exchange = next(
+        item for item in provider.calls[1]["messages"]
+        if isinstance(item, ToolExchange)
+    )
+    assert exchange.calls[0].id.startswith(tool_loop.REJECTED_TOOL_CALL_ID_PREFIX)
+    assert exchange.calls[0].id != "invalid-schema"
+    assert exchange.results[0].metadata == {"rejected": "invalid_tool_arguments"}
+    assert dispatch.calls == []
+    assert outcome.final_text == "plain fallback"
+
+
+def test_rejected_discovery_key_stays_dispatchable_after_recovery(monkeypatch):
+    """A rejected discovery key must not be mistaken for completed work."""
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "m1", "name": "memory_search", "args": {"query": "alpha"}},
+            ],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "", "name": "memory_search", "args": {"query": "beta"}},
+            ],
+            "usage": {},
+        },
+        {"reply": "no file yet", "tool_calls": [], "usage": {}},
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "m2", "name": "memory_search", "args": {"query": "beta"}},
+            ],
+            "usage": {},
+        },
+        {"reply": "still no file", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch()
+
+    async def on_file(path, revision):
+        return None
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_TranscriptBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        on_file_reply=on_file,
+        required_file_suffixes=(".md",),
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=15,
+    ))
+
+    assert [[tc.id for tc in batch] for batch in dispatch.calls] == [["m1"], ["m2"]]
+    assert dispatch.calls[1][0].args == {"query": "beta"}
+    final_messages = provider.calls[4]["messages"]
+    retried_exchange = next(
+        item
+        for item in final_messages
+        if isinstance(item, ToolExchange) and item.calls[0].id == "m2"
+    )
+    assert retried_exchange.results[0].content == "tool-observation"
+    rejected_exchange = next(
+        item
+        for item in final_messages
+        if isinstance(item, ToolExchange)
+        and any((result.metadata or {}).get("rejected") for result in item.results)
+    )
+    assert rejected_exchange.results[0].metadata == {
+        "rejected": "missing_tool_call_id"
+    }
+    assert outcome.stop_reason == "required_file_missing"
+
+
+# --- failed identity writes get one structured retry ----------------------
+
+
+def _identity_call(call_id="identity-1"):
+    return {
+        "id": call_id,
+        "name": "identity_patch",
+        "args": {"agent_name": "星禾"},
+    }
+
+
+class _IdentityResultDispatch(_RecordingDispatch):
+    def __init__(self, content):
+        super().__init__()
+        self.content = content
+
+    async def __call__(self, tool_calls):
+        self.calls.append(list(tool_calls))
+        return [
+            ToolResult(call_id=tool_call.id, content=self.content)
+            for tool_call in tool_calls
+        ]
+
+
+def _run_identity_script(provider, dispatch, *, max_calls=4, trajectory=None):
+    delivered = []
+
+    async def on_reply(text, *, final, reasoning="", media=()):
+        if final:
+            delivered.append(text)
+
+    async def on_trajectory(event_kind, detail):
+        if trajectory is not None:
+            trajectory.append((event_kind, detail))
+
+    asyncio.run(
+        tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_TranscriptBuildMessages(),
+            dispatch_tools=dispatch,
+            on_reply=on_reply,
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            max_calls=max_calls,
+            on_trajectory_event=on_trajectory,
+        )
+    )
+    return delivered
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "error: denied",
+        "error: validation failed",
+        "queued: identity_patch",
+    ],
+)
+def test_failed_identity_write_is_bounced_once(content, monkeypatch):
+    provider = _ScriptedProvider(
+        [
+            {"reply": "", "tool_calls": [_identity_call()], "usage": {}},
+            {"reply": "已经改好了", "tool_calls": [], "usage": {}},
+            {"reply": "这次没有改成", "tool_calls": [], "usage": {}},
+        ]
+    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    delivered = _run_identity_script(
+        provider,
+        _IdentityResultDispatch(content),
+    )
+
+    assert len(provider.calls) == 3
+    assert any(
+        "没有成功" in str(message.get("content", ""))
+        for message in provider.calls[2]["messages"]
+        if isinstance(message, dict)
+    )
+    assert delivered == ["这次没有改成"]
+
+
+def test_real_background_identity_denial_is_bounced(monkeypatch):
+    denial = (
+        "error: identity write refused in background turn for identity_patch"
+    )
+    provider = _ScriptedProvider(
+        [
+            {"reply": "", "tool_calls": [_identity_call()], "usage": {}},
+            {"reply": "已经改好了", "tool_calls": [], "usage": {}},
+            {"reply": "身份写入被拒绝了", "tool_calls": [], "usage": {}},
+        ]
+    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    delivered = _run_identity_script(
+        provider,
+        _IdentityResultDispatch(denial),
+    )
+
+    assert len(provider.calls) == 3
+    assert delivered == ["身份写入被拒绝了"]
+
+
+def test_successful_identity_write_is_not_bounced(monkeypatch):
+    provider = _ScriptedProvider(
+        [
+            {"reply": "", "tool_calls": [_identity_call()], "usage": {}},
+            {"reply": "名字已经改好了", "tool_calls": [], "usage": {}},
+        ]
+    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    delivered = _run_identity_script(
+        provider,
+        _IdentityResultDispatch("ok: identity_patch applied"),
+    )
+
+    assert len(provider.calls) == 2
+    assert delivered == ["名字已经改好了"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "好的，以后叫你999",
+        "名字已经改好了",
+        "我记住了",
+        "文件我帮你改好了",
+    ],
+)
+def test_no_identity_tool_call_never_triggers_identity_bounce(text, monkeypatch):
+    provider = _ScriptedProvider(
+        [{"reply": text, "tool_calls": [], "usage": {}}]
+    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    delivered = _run_identity_script(provider, _RecordingDispatch())
+
+    assert len(provider.calls) == 1
+    assert delivered == [text]
+
+
+def test_repeated_failed_identity_writes_are_bounced_at_most_once(monkeypatch):
+    responses = [
+        {"reply": "", "tool_calls": [_identity_call("identity-1")], "usage": {}},
+        {"reply": "第一次失败", "tool_calls": [], "usage": {}},
+        {"reply": "", "tool_calls": [_identity_call("identity-2")], "usage": {}},
+        {"reply": "第二次仍然失败", "tool_calls": [], "usage": {}},
+        {"reply": "", "tool_calls": [_identity_call("identity-3")], "usage": {}},
+        {"reply": "第三次仍然失败", "tool_calls": [], "usage": {}},
+        {"reply": "", "tool_calls": [_identity_call("identity-4")], "usage": {}},
+        {"reply": "第四次仍然失败", "tool_calls": [], "usage": {}},
+    ]
+    provider = _ScriptedProvider(responses)
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    trajectory = []
+
+    delivered = _run_identity_script(
+        provider,
+        _IdentityResultDispatch("error: denied"),
+        max_calls=len(responses),
+        trajectory=trajectory,
+    )
+
+    bounced = [
+        detail
+        for event_kind, detail in trajectory
+        if event_kind == "identity_write_failed_bounced"
+    ]
+    assert len(provider.calls) == 4
+    assert len(provider.responses) == 4, "the script must retain retry budget"
+    assert len(bounced) == 1
+    assert delivered == ["第二次仍然失败"]
+
+
+def test_identity_write_tool_names_are_derived_from_write_actions():
+    assert tool_loop._IDENTITY_WRITE_TOOL_NAMES == frozenset(
+        action
+        for action in cap_registry.WRITE_ACTIONS
+        if action.startswith("identity_")
+    )
+    assert tool_loop._IDENTITY_WRITE_TOOL_NAMES

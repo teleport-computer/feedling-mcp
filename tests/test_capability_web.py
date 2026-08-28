@@ -4,8 +4,12 @@ access parity with the legacy runtime). NO live network — everything monkeypat
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import sys
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))  # noqa: E402
 from model_api_runtime import tools  # noqa: E402
 from capabilities import web as cap_web  # noqa: E402
 from capabilities import registry as cap_registry  # noqa: E402
+from model_api_runtime.v2 import pool_config  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -302,7 +307,7 @@ def test_fetch_truncates_an_oversized_body_instead_of_discarding_it(monkeypatch)
     r = cap_web.fetch("STORE", params={"url": "https://example.com/huge"})
     assert r.ok is True
     assert "the part that matters" in r.data["text"]
-    assert r.data["truncated"] is True
+    assert r.data["source_truncated"] is True
 
 
 def test_fetch_reports_a_whole_page_as_not_truncated(monkeypatch):
@@ -310,7 +315,7 @@ def test_fetch_reports_a_whole_page_as_not_truncated(monkeypatch):
                         lambda *a, **k: _FakeResponse(status_code=200, text="<p>hi</p>"))
     r = cap_web.fetch("STORE", params={"url": "https://example.com/small"})
     assert r.ok is True
-    assert r.data["truncated"] is False
+    assert r.data["source_truncated"] is False
 
 
 def test_fetch_stops_pulling_chunks_once_the_cap_is_reached(monkeypatch):
@@ -344,7 +349,7 @@ def test_a_single_chunk_larger_than_the_cap_is_sliced(monkeypatch):
                         lambda *a, **k: _OneBigChunk(status_code=200, text=""))
     r = cap_web.fetch("STORE", params={"url": "https://example.com/onebig"})
     assert r.ok is True
-    assert r.data["truncated"] is True
+    assert r.data["source_truncated"] is True
 
 
 def test_a_body_that_exactly_fills_the_cap_is_not_reported_as_truncated(monkeypatch):
@@ -358,7 +363,7 @@ def test_a_body_that_exactly_fills_the_cap_is_not_reported_as_truncated(monkeypa
                         lambda *a, **k: _Exact(status_code=200, text=""))
     r = cap_web.fetch("STORE", params={"url": "https://example.com/exact"})
     assert r.ok is True
-    assert r.data["truncated"] is False
+    assert r.data["source_truncated"] is False
 
 
 def test_truncation_inside_a_script_does_not_leak_javascript_as_text(monkeypatch):
@@ -377,16 +382,18 @@ def test_truncation_inside_a_script_does_not_leak_javascript_as_text(monkeypatch
     assert "var a=" not in r.data["text"]
 
 
-def test_truncated_is_true_when_only_the_text_cap_bit(monkeypatch):
-    """The body fit; the stripped text did not. Content still went missing, so
-    reporting `truncated: false` here would be a lie to the model."""
+def test_long_extracted_text_reports_paging_separately_from_source_cut(monkeypatch):
+    """The body fit, so source_truncated stays false; paging metadata separately
+    reports that the current result contains only the first retained slice."""
     html = "<p>" + ("word " * 5_000) + "</p>"
     assert len(html.encode()) < cap_web._FETCH_MAX_BODY_BYTES
     monkeypatch.setattr(cap_web, "_stream_get",
                         lambda *a, **k: _FakeResponse(status_code=200, text=html))
     r = cap_web.fetch("STORE", params={"url": "https://example.com/long-text"})
     assert r.ok is True
-    assert r.data["truncated"] is True
+    assert r.data["source_truncated"] is False
+    assert r.data["has_more"] is True
+    assert r.data["next_offset"] == r.data["returned_chars"]
 
 
 def test_a_lying_content_length_does_not_skip_the_page(monkeypatch):
@@ -428,18 +435,337 @@ def test_web_actions_are_read_actions():
     assert "web_fetch" not in cap_registry.WRITE_ACTIONS
 
 
-def test_truncated_is_delivered_before_the_text_so_it_survives_the_result_cap(monkeypatch):
-    """Key order is load-bearing, not cosmetic.
-
-    The dict is json-dumped and hard-cut at executor._RESULT_CHAR_CAP (2000)
-    before it reaches the model. With `truncated` last it was cut off every
-    single time on exactly the pages where it mattered — the long ones.
-    """
+def test_paged_payload_structurally_fits_the_literal_atomic_result_cap(monkeypatch):
+    """Independent 8000 anchor: production constants cannot rise while this
+    test follows them and turns a real prompt-budget regression falsely green."""
     import json as _json
 
     monkeypatch.setattr(cap_web, "_stream_get",
                         lambda *a, **k: _FakeResponse(
                             status_code=200, text="<p>" + ("word " * 5_000) + "</p>"))
     r = cap_web.fetch("STORE", params={"url": "https://example.com/long"})
-    assert list(r.data)[0] == "truncated"
-    assert "truncated" in _json.dumps(r.data, ensure_ascii=False)[:2000]
+    rendered = _json.dumps(r.data, ensure_ascii=False)
+    assert 7000 < len(rendered) <= 8000
+    assert r.data["has_more"] is True
+    assert r.data["returned_chars"] == len(r.data["text"])
+
+
+def test_same_attempt_two_offsets_make_one_outbound_request(monkeypatch):
+    calls = {"n": 0}
+    body = "<p>" + ("0123456789" * 2500) + "</p>"
+
+    def fake_get(*args, **kwargs):
+        calls["n"] += 1
+        return _FakeResponse(status_code=200, text=body)
+
+    monkeypatch.setattr(cap_web, "_stream_get", fake_get)
+    session = cap_web.WebFetchSession()
+    first = cap_web.fetch(
+        "STORE", params={"url": "https://example.com/paged"},
+        web_fetch_session=session,
+    )
+    second = cap_web.fetch(
+        "STORE",
+        params={
+            "url": "https://example.com/paged",
+            "offset": first.data["next_offset"],
+        },
+        web_fetch_session=session,
+    )
+
+    assert first.ok is second.ok is True
+    assert calls["n"] == 1
+    assert second.data["offset"] == first.data["next_offset"]
+    assert second.data["text"] != first.data["text"]
+    assert second.data["total_chars"] == first.data["total_chars"]
+
+
+def test_offset_cache_miss_is_stable_and_never_refetches(monkeypatch):
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        cap_web,
+        "_stream_get",
+        lambda *args, **kwargs: calls.__setitem__("n", calls["n"] + 1),
+    )
+    session = cap_web.WebFetchSession()
+
+    first = cap_web.fetch(
+        "STORE",
+        params={"url": "https://example.com/miss", "offset": 10},
+        web_fetch_session=session,
+    )
+    second = cap_web.fetch(
+        "STORE",
+        params={"url": "https://example.com/miss", "offset": 10},
+        web_fetch_session=session,
+    )
+
+    assert first.to_dict() == second.to_dict()
+    assert first.error["code"] == "capability_invalid_input"
+    assert calls["n"] == 0
+
+
+@pytest.mark.parametrize("offset", [-1, 1.5, "10", True, None])
+def test_invalid_offset_shape_is_rejected_before_network(monkeypatch, offset):
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        cap_web,
+        "_stream_get",
+        lambda *args, **kwargs: calls.__setitem__("n", calls["n"] + 1),
+    )
+
+    result = cap_web.fetch(
+        "STORE",
+        params={"url": "https://example.com/invalid-offset", "offset": offset},
+    )
+
+    assert result.error["code"] == "capability_invalid_input"
+    assert calls["n"] == 0
+
+
+def test_stateless_fetch_rejects_continuation_without_refetching(monkeypatch):
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        cap_web,
+        "_stream_get",
+        lambda *args, **kwargs: calls.__setitem__("n", calls["n"] + 1),
+    )
+
+    result = cap_web.fetch(
+        "STORE",
+        params={"url": "https://example.com/stateless", "offset": 1},
+    )
+
+    assert result.error["code"] == "capability_invalid_input"
+    assert calls["n"] == 0
+
+
+def test_offset_beyond_retained_text_is_invalid_without_refetch(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_get(*args, **kwargs):
+        calls["n"] += 1
+        return _FakeResponse(status_code=200, text="<p>short</p>")
+
+    monkeypatch.setattr(cap_web, "_stream_get", fake_get)
+    session = cap_web.WebFetchSession()
+    first = cap_web.fetch(
+        "STORE",
+        params={"url": "https://example.com/short"},
+        web_fetch_session=session,
+    )
+    result = cap_web.fetch(
+        "STORE",
+        params={
+            "url": "https://example.com/short",
+            "offset": first.data["total_chars"] + 1,
+        },
+        web_fetch_session=session,
+    )
+
+    assert result.error["code"] == "capability_invalid_input"
+    assert calls["n"] == 1
+
+
+def test_separate_attempt_session_refetches_the_same_url(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_get(*args, **kwargs):
+        calls["n"] += 1
+        return _FakeResponse(status_code=200, text="<p>fresh each attempt</p>")
+
+    monkeypatch.setattr(cap_web, "_stream_get", fake_get)
+    for _ in range(2):
+        result = cap_web.fetch(
+            "STORE",
+            params={"url": "https://example.com/fresh"},
+            web_fetch_session=cap_web.WebFetchSession(),
+        )
+        assert result.ok is True
+    assert calls["n"] == 2
+
+
+def test_continuation_waits_only_after_zero_offset_loader_has_started(monkeypatch):
+    calls = {"n": 0}
+    url = "https://example.com/concurrent"
+    loader_started = threading.Event()
+    release_loader = threading.Event()
+
+    def fake_get(*args, **kwargs):
+        calls["n"] += 1
+        loader_started.set()
+        assert release_loader.wait(timeout=2)
+        return _FakeResponse(status_code=200, text="<p>" + ("abcdef" * 3000) + "</p>")
+
+    monkeypatch.setattr(cap_web, "_stream_get", fake_get)
+    session = cap_web.WebFetchSession()
+    session.prepare_batch([
+        SimpleNamespace(name="web_fetch", args={"url": url, "offset": 0}),
+        SimpleNamespace(name="web_fetch", args={"url": url, "offset": 100}),
+    ])
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            cap_web.fetch,
+            "STORE",
+            params={"url": url},
+            web_fetch_session=session,
+        )
+        assert loader_started.wait(timeout=2)
+        later = pool.submit(
+            cap_web.fetch,
+            "STORE",
+            params={"url": url, "offset": 100},
+            web_fetch_session=session,
+        )
+        release_loader.set()
+        first_result = first.result(timeout=2)
+        later_result = later.result(timeout=2)
+
+    assert first_result.ok is later_result.ok is True
+    assert calls["n"] == 1
+    assert later_result.data["offset"] == 100
+
+
+def test_planned_continuation_does_not_wait_for_an_owner_that_has_not_started(
+    monkeypatch,
+):
+    url = "https://example.com/planned"
+    session = cap_web.WebFetchSession()
+    session.prepare_batch([
+        SimpleNamespace(name="web_fetch", args={"url": url, "offset": 0}),
+    ])
+    monkeypatch.setattr(
+        session._condition,
+        "wait",
+        lambda **_kwargs: pytest.fail("planned continuation entered Condition.wait"),
+    )
+
+    started_at = time.monotonic()
+    result = session.document(
+        url,
+        offset=10,
+        loader=lambda: pytest.fail("a continuation must never become the loader"),
+    )
+    elapsed = time.monotonic() - started_at
+
+    assert result.error["code"] == "capability_upstream_error"
+    assert result.error["retryable"] is True
+    assert elapsed < 1.0
+
+
+def test_session_wait_timeout_is_below_every_shared_broker_stall_budget():
+    runtime = pool_config.RuntimePoolConfig.from_env()
+    smallest_stall_budget = min(slot.stall_budget_sec for slot in runtime.slots)
+
+    assert 0 < cap_web._FETCH_SESSION_WAIT_TIMEOUT_SEC < smallest_stall_budget
+
+
+@pytest.mark.parametrize("offset", [-1, 1.5, "10", True, None])
+def test_session_document_rejects_invalid_offset_without_trusting_fetch(offset):
+    result = cap_web.WebFetchSession().document(
+        "https://example.com/direct",
+        offset=offset,
+        loader=lambda: pytest.fail("invalid offset reached the loader"),
+    )
+
+    assert result.error["code"] == "capability_invalid_input"
+    assert result.error["retryable"] is False
+
+
+def test_session_wait_deadline_returns_retryable_error(monkeypatch):
+    url = "https://example.com/slow"
+    loader_started = threading.Event()
+    release_loader = threading.Event()
+    session = cap_web.WebFetchSession()
+    monkeypatch.setattr(cap_web, "_FETCH_SESSION_WAIT_TIMEOUT_SEC", 0.01)
+
+    def _loader():
+        loader_started.set()
+        assert release_loader.wait(timeout=2)
+        return cap_web._FetchDocument(url=url, text="complete", source_truncated=False)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        owner = pool.submit(session.document, url, offset=0, loader=_loader)
+        assert loader_started.wait(timeout=2)
+        timed_out = session.document(
+            url,
+            offset=1,
+            loader=lambda: pytest.fail("continuation became owner"),
+        )
+        release_loader.set()
+        assert owner.result(timeout=2).text == "complete"
+
+    assert timed_out.error["code"] == "capability_upstream_error"
+    assert timed_out.error["retryable"] is True
+
+
+def test_redirect_final_url_alias_reuses_retained_document(monkeypatch):
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        if url.endswith("/start"):
+            return _FakeResponse(status_code=302, headers={"location": "/final"})
+        return _FakeResponse(status_code=200, text="<p>" + ("alias" * 3000) + "</p>")
+
+    monkeypatch.setattr(cap_web, "_stream_get", fake_get)
+    session = cap_web.WebFetchSession()
+    first = cap_web.fetch(
+        "STORE", params={"url": "https://example.com/start"},
+        web_fetch_session=session,
+    )
+    continued = cap_web.fetch(
+        "STORE",
+        params={"url": "https://example.com/final", "offset": 100},
+        web_fetch_session=session,
+    )
+
+    assert first.ok is continued.ok is True
+    assert calls == ["https://example.com/start", "https://example.com/final"]
+
+
+def test_session_capacity_rejects_new_url_without_evicting_old(monkeypatch):
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        return _FakeResponse(status_code=200, text="<p>" + (url[-1] * 200) + "</p>")
+
+    monkeypatch.setattr(cap_web, "_stream_get", fake_get)
+    session = cap_web.WebFetchSession(max_urls=1, max_chars=10_000)
+    first = cap_web.fetch(
+        "STORE", params={"url": "https://example.com/a"},
+        web_fetch_session=session,
+    )
+    rejected = cap_web.fetch(
+        "STORE", params={"url": "https://example.com/b"},
+        web_fetch_session=session,
+    )
+    continued = cap_web.fetch(
+        "STORE", params={"url": "https://example.com/a", "offset": 10},
+        web_fetch_session=session,
+    )
+
+    assert first.ok is continued.ok is True
+    assert rejected.error["code"] == "capability_unavailable"
+    assert calls == ["https://example.com/a"]
+
+
+def test_session_total_character_cap_rejects_retention_honestly(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_get(*args, **kwargs):
+        calls["n"] += 1
+        return _FakeResponse(status_code=200, text="<p>too large to retain</p>")
+
+    monkeypatch.setattr(cap_web, "_stream_get", fake_get)
+    result = cap_web.fetch(
+        "STORE",
+        params={"url": "https://example.com/large"},
+        web_fetch_session=cap_web.WebFetchSession(max_urls=8, max_chars=5),
+    )
+
+    assert result.ok is False
+    assert result.error["code"] == "capability_unavailable"
+    assert result.error["retryable"] is False
+    assert calls["n"] == 1

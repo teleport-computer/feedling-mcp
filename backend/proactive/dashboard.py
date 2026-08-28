@@ -21,6 +21,8 @@ from core import util
 
 from core import store as core_store
 from core.store import UserStore
+from core.store_sections import StoreSection
+from notices import status_reason as notices_status_reason
 from proactive import service
 from proactive.observability_v2 import (
     ProactiveMetricsAggregatorV2,
@@ -85,6 +87,11 @@ def _derive_message_delivery_status(live_status: str, alert_status: str) -> str:
 
 
 def _proactive_debug_snapshot(store: UserStore) -> dict:
+    store.ensure_sections(
+        {StoreSection.CHAT, StoreSection.FRAMES},
+        reason="first_use",
+        strict=True,
+    )
     # The debug dashboard is used as an investigation surface, not a tiny
     # status widget. Read enough rows to cover a normal day of proactive
     # activity; the renderer still lets callers cap visible sections via
@@ -132,6 +139,15 @@ def _proactive_debug_snapshot(store: UserStore) -> dict:
     enriched_jobs: list[dict] = []
     for job in jobs:
         row = dict(job)
+        # Single redaction point for the whole debug surface: the HTML render,
+        # the zh translation pass that POSTs candidates to an external model,
+        # and the /v1/proactive/debug JSON all branch from these rows. This page
+        # authenticates as the user, not as admin, so an upstream provider error
+        # body carried in status_reason would reach an even wider audience than
+        # the admin surface.
+        row["status_reason"] = notices_status_reason.sanitize_status_reason(
+            row.get("status_reason")
+        )
         msg = messages_by_job.get(str(job.get("job_id") or ""))
         if msg:
             live_status = str(msg.get("live_activity_status") or "")

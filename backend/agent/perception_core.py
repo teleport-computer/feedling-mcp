@@ -16,8 +16,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import os
+import time
 from typing import Any
 
+from perception import catalog as perception_catalog
 from perception import history as perception_history
 from perception import service as perception_service
 from perception import permissions as perception_permissions
@@ -305,8 +307,39 @@ def perception_digest_payload(store, *, days_raw: str | None) -> dict[str, Any]:
         signal: perception_store.list_perception_daily(uid, signal, days)
         for signal in history_signals
     }
+    try:
+        state = perception_store.get_state(uid)
+    except Exception:
+        state = {}
+    if not isinstance(state, Mapping):
+        state = {}
+    last_report_ts_by_signal = {
+        signal: {
+            field: (
+                state[field].get("ts")
+                if isinstance(state.get(field), Mapping)
+                else None
+            )
+            for field in perception_catalog.SIGNALS[signal].outputs
+        }
+        for signal in history_signals
+        if signal in perception_catalog.SIGNALS
+    }
+    timezone_cell = state.get("timezone")
+    timezone_name = (
+        timezone_cell.get("v")
+        if isinstance(timezone_cell, Mapping) and isinstance(timezone_cell.get("v"), str)
+        else None
+    )
+    now = time.time()
     notable_max = _digest_notable_max()
-    changes = perception_history.notable_changes(rows_by_signal, max_changes=notable_max)
+    changes = perception_history.notable_changes(
+        rows_by_signal,
+        last_report_ts_by_signal=last_report_ts_by_signal,
+        now=now,
+        timezone_name=timezone_name,
+        max_changes=notable_max,
+    )
     try:
         snapshot = perception_service.snapshot(uid)
         pull = perception_service.pull_snapshot(uid)
@@ -320,6 +353,9 @@ def perception_digest_payload(store, *, days_raw: str | None) -> dict[str, Any]:
         snapshot=snapshot,
         pull_snapshot=pull,
         rows_by_signal=rows_by_signal,
+        last_report_ts_by_signal=last_report_ts_by_signal,
+        now=now,
+        timezone_name=timezone_name,
         photos=photos,
         max_health_notable=notable_max,
     )

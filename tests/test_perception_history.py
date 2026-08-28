@@ -2,7 +2,11 @@
 
 Pure functions — no DB. Covers each shape + the key property that NEW fields
 flow through with zero code change (docs/PERCEPTION_HISTORY_SPEC, since removed — see git history; principle #2)."""
-from perception import history
+from datetime import datetime, timezone
+
+import pytest
+
+from perception import catalog, history
 
 
 def test_is_historized_skips_pure_instant():
@@ -168,7 +172,17 @@ def test_notable_changes_discovers_numeric_fields_sorts_and_caps():
         ],
     }
 
-    changes = history.notable_changes(rows_by_signal, max_changes=2)
+    now = 1_000_000.0
+    changes = history.notable_changes(
+        rows_by_signal,
+        last_report_ts_by_signal={
+            "health_activity": {"active_energy_kcal": now},
+            "weather": {"temperature": now},
+        },
+        now=now,
+        timezone_name="Asia/Shanghai",
+        max_changes=2,
+    )
 
     assert [(c["signal"], c["field"]) for c in changes] == [
         ("health_activity", "active_energy_kcal"),
@@ -194,7 +208,76 @@ def test_notable_changes_requires_two_baseline_values_and_current_delta():
         ],
     }
 
-    assert history.notable_changes(rows_by_signal) == []
+    assert history.notable_changes(
+        rows_by_signal,
+        last_report_ts_by_signal={},
+        now=1_000_000.0,
+        timezone_name=None,
+    ) == []
+
+
+def _step_count_rows():
+    return {
+        "health_vitals": [
+            {"date": "2026-08-23", "doc": {"step_count": {"max": 1000}}},
+            {"date": "2026-08-24", "doc": {"step_count": {"max": 1000}}},
+            {"date": "2026-08-25", "doc": {"step_count": {"max": 1800}}},
+        ]
+    }
+
+
+def test_notable_changes_mirrors_fresh_and_stale_using_catalog_ttl():
+    report_ts = datetime(2026, 8, 25, 15, 41, tzinfo=timezone.utc).timestamp()
+    ttl = catalog.SIGNALS["health_vitals"].ttl_sec
+    reports = {"health_vitals": {"step_count": report_ts}}
+
+    fresh = history.notable_changes(
+        _step_count_rows(),
+        last_report_ts_by_signal=reports,
+        now=report_ts + ttl,
+        timezone_name="Asia/Shanghai",
+    )[0]
+    stale = history.notable_changes(
+        _step_count_rows(),
+        last_report_ts_by_signal=reports,
+        now=report_ts + ttl + 1,
+        timezone_name="Asia/Shanghai",
+    )[0]
+
+    assert fresh["current"] == 1800.0
+    assert "last_known" not in fresh
+    assert "as_of" not in fresh
+    assert "current" not in stale
+    assert stale["last_known"] == 1800.0
+    assert stale["as_of"] == "2026-08-25 23:41"
+    for field in ("signal", "field", "baseline_median", "delta", "direction", "magnitude"):
+        assert stale[field] == fresh[field]
+
+
+def test_notable_changes_missing_field_timestamp_is_last_known_without_as_of():
+    change = history.notable_changes(
+        _step_count_rows(),
+        last_report_ts_by_signal={},
+        now=1_000_000.0,
+        timezone_name="Asia/Shanghai",
+    )[0]
+
+    assert "current" not in change
+    assert change["last_known"] == 1800.0
+    assert change["as_of"] is None
+
+
+@pytest.mark.parametrize("timezone_name", [None, "not/a-zone"])
+def test_notable_changes_unknown_timezone_labels_utc(timezone_name):
+    report_ts = datetime(2026, 8, 25, 15, 41, tzinfo=timezone.utc).timestamp()
+    change = history.notable_changes(
+        _step_count_rows(),
+        last_report_ts_by_signal={"health_vitals": {"step_count": report_ts}},
+        now=report_ts + catalog.SIGNALS["health_vitals"].ttl_sec + 1,
+        timezone_name=timezone_name,
+    )[0]
+
+    assert change["as_of"] == "2026-08-25 15:41 UTC"
 
 
 def test_cross_domain_recent_balances_domains_and_folds_health():
@@ -236,6 +319,12 @@ def test_cross_domain_recent_balances_domains_and_folds_health():
 
     board = history.cross_domain_recent(
         snapshot=snapshot, pull_snapshot=pull, rows_by_signal=rows_by_signal,
+        last_report_ts_by_signal={
+            "health_vitals": {"resting_heart_rate": 1_000_000.0},
+            "health_activity": {"active_energy_kcal": 1_000_000.0},
+        },
+        now=1_000_000.0,
+        timezone_name="Asia/Shanghai",
         photos=photos, max_health_notable=8,
     )
 
@@ -261,6 +350,7 @@ def test_cross_domain_recent_balances_domains_and_folds_health():
 def test_cross_domain_recent_degrades_to_empty_on_no_inputs():
     board = history.cross_domain_recent(
         snapshot=None, pull_snapshot=None, rows_by_signal=None, photos=None,
+        last_report_ts_by_signal={}, now=1_000_000.0, timezone_name=None,
     )
     assert board["health"]["notable"] == []
     assert board["media"]["now"] is None

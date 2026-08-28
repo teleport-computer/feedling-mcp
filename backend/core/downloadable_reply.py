@@ -17,6 +17,10 @@ _INTERNAL_URI_RE = re.compile(
     r"(?:sandbox:|file:)(?://)?[^\s<>\]\)]+",
     re.IGNORECASE,
 )
+_INTERNAL_FILE_MARKER_RE = re.compile(
+    r"\[\s*file\s*[：:]\s*[^\]\r\n]+\]",
+    re.IGNORECASE,
+)
 _INTERNAL_ABSOLUTE_PATH_RE = re.compile(
     r"(?<![\w])/(?:Users|private|tmp|workspace)/(?:[^\s<>\]\),，。；;]+)",
     re.IGNORECASE,
@@ -50,6 +54,7 @@ def sanitize_downloadable_reply(
     for pattern in (
         _CODEX_FILE_CITATION_RE,
         _INTERNAL_MARKDOWN_LINK_RE,
+        _INTERNAL_FILE_MARKER_RE,
         _INTERNAL_URI_RE,
         _INTERNAL_ABSOLUTE_PATH_RE,
         _INTERNAL_WINDOWS_PATH_RE,

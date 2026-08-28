@@ -603,7 +603,13 @@ def test_heartbeat_injects_v1_factual_board(monkeypatch):
                 "media": {"now": {"title": "Blue", "artist": "Joni Mitchell"}},
                 "app": {"now": "Notes", "recent": ["Notes", "Safari"]},
                 "weather": {"condition": "clear", "temperature": 21.5},
-                "health": {"notable": [{"field": "step_count", "current": 365}]},
+                "health": {
+                    "notable": [{
+                        "field": "step_count",
+                        "last_known": 365,
+                        "as_of": "2026-08-25 23:41",
+                    }]
+                },
             },
         }
 
@@ -638,6 +644,8 @@ def test_heartbeat_injects_v1_factual_board(monkeypatch):
     assert "Blue" in joined
     assert "Notes" in joined
     assert "365" in joined
+    assert "last_known" in joined
+    assert "2026-08-25 23:41" in joined
     assert "21.5" in joined
     assert "step_count" in joined
 

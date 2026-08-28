@@ -12,8 +12,12 @@ external content.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
+import json
 import os
 import re
+import threading
+import time
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -23,6 +27,7 @@ from model_api_runtime import tools
 
 from capabilities import errors
 from capabilities import html_extract
+from capabilities import result_budget
 from capabilities.types import CapabilityResult, ok, err
 
 _DEFAULT_SEARCH_LIMIT = 5
@@ -39,10 +44,23 @@ _FETCH_TIMEOUT_SEC = 8.0
 # inside its decoder first. It is a retention cap, not a bandwidth guarantee.
 #
 # It is deliberately NOT the bound that protects the prompt. Two later stages do
-# that, and they are the real limit on what reaches the model:
-# tool dispatcher result caps and tool_loop's tool_result_char_cap, both 2000.
-# Raising a limit here without raising those would only look like it worked.
+# that, and they are the real limit on what reaches the model: web_fetch first
+# shrinks structurally to its shared 8000-character atomic JSON policy, then
+# the executor and tool loop preserve that object without string-slicing it.
+# Raising a limit here alone would only increase attempt-local retained memory.
 _FETCH_MAX_BODY_BYTES = 300_000
+
+# One tool-loop attempt may retain extracted pages so the model can continue a
+# large page with ``offset`` without repeating the outbound request. These are
+# lifetime-memory ceilings, not output budgets: redirect aliases point at the
+# same document and do not count twice.
+_FETCH_SESSION_MAX_URLS = 8
+_FETCH_SESSION_MAX_CHARS = 600_000
+_FETCH_OUTPUT_URL_CHARS = 1000
+# A waiter can sit below an instance-wide enclave permit. Keep that hold below
+# every pool's stall budget; the shared broker also serves 120-second heavy slots.
+# A normal fetch may spend up to 48 seconds across six independently timed hops.
+_FETCH_SESSION_WAIT_TIMEOUT_SEC = 60.0
 
 # Kill switch for article extraction. Default ON: a flag that ships OFF is how
 # you get "the code deployed but the feature never did", which this workspace
@@ -175,6 +193,172 @@ def _drop_unterminated_tail(html: str) -> str:
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
 
+@dataclass(frozen=True)
+class _FetchDocument:
+    url: str
+    text: str
+    source_truncated: bool
+
+
+@dataclass
+class _FetchPending:
+    """Singleflight state for one request URL inside one attempt."""
+
+    loading: bool = False
+    done: bool = False
+    document: _FetchDocument | None = None
+    error: CapabilityResult | None = None
+
+
+class WebFetchSession:
+    """Attempt-scoped retained-page cache for ``web_fetch`` paging.
+
+    The worker creates a fresh instance for each chat, wake, or child tool-loop
+    attempt. There is deliberately no module-global fallback: V1 requests and
+    later attempts must not inherit another turn's page or another user's data.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_urls: int = _FETCH_SESSION_MAX_URLS,
+        max_chars: int = _FETCH_SESSION_MAX_CHARS,
+    ) -> None:
+        self.max_urls = max(1, int(max_urls))
+        self.max_chars = max(1, int(max_chars))
+        self._condition = threading.Condition()
+        self._cache: dict[str, _FetchDocument] = {}
+        self._pending: dict[str, _FetchPending] = {}
+        self._document_count = 0
+        self._total_chars = 0
+
+    def prepare_batch(self, tool_calls) -> None:
+        """Pre-register offset-zero owners before concurrent dispatch starts.
+
+        This distinguishes a planned same-batch owner from a genuine cache miss.
+        Worker admission ordering lets the owner finish first; defensive callers
+        that bypass it receive a retryable error instead of waiting indefinitely.
+        Planning creates no network or retained data.
+        """
+        with self._condition:
+            for call in tool_calls or ():
+                if str(getattr(call, "name", "")) != "web_fetch":
+                    continue
+                args = getattr(call, "args", None)
+                if not isinstance(args, dict):
+                    continue
+                raw_offset = args.get("offset", 0)
+                if type(raw_offset) is not int or raw_offset != 0:
+                    continue
+                url = str(args.get("url") or "").strip()
+                if url and url not in self._cache:
+                    self._pending.setdefault(url, _FetchPending())
+
+    def document(
+        self,
+        url: str,
+        *,
+        offset: int,
+        loader,
+    ) -> _FetchDocument | CapabilityResult:
+        """Return a retained document or run exactly one offset-zero loader."""
+        if type(offset) is not int or offset < 0:
+            return err(
+                errors.INVALID,
+                "offset must be a non-negative integer",
+                retryable=False,
+            )
+        owner = False
+        with self._condition:
+            cached = self._cache.get(url)
+            if cached is not None:
+                return cached
+            pending = self._pending.get(url)
+            if offset > 0 and pending is None:
+                return err(
+                    errors.INVALID,
+                    "offset requires an earlier web_fetch for this URL in the same turn",
+                    retryable=False,
+                )
+            if pending is None:
+                pending = self._pending.setdefault(url, _FetchPending())
+            if offset > 0 and not pending.loading and not pending.done:
+                # prepare_batch only proves an offset-zero sibling was planned;
+                # it does not prove that sibling has acquired an execution slot.
+                # Waiting here would let enough continuations occupy every outer
+                # enclave permit and prevent their owner from ever starting.
+                return err(
+                    errors.UPSTREAM,
+                    "earlier web_fetch for this URL has not started; retry",
+                    retryable=True,
+                )
+            if offset == 0 and not pending.loading and not pending.done:
+                if self._document_count >= self.max_urls:
+                    pending.error = err(
+                        errors.UNAVAILABLE,
+                        "web fetch turn cache capacity exceeded; use a different turn",
+                        retryable=False,
+                    )
+                    pending.done = True
+                    self._condition.notify_all()
+                    return pending.error
+                pending.loading = True
+                owner = True
+            wait_deadline = time.monotonic() + _FETCH_SESSION_WAIT_TIMEOUT_SEC
+            while not owner and not pending.done:
+                remaining = wait_deadline - time.monotonic()
+                if remaining <= 0:
+                    return err(
+                        errors.UPSTREAM,
+                        "timed out waiting for earlier web_fetch; retry",
+                        retryable=True,
+                    )
+                self._condition.wait(timeout=remaining)
+            if not owner:
+                return pending.document or pending.error or err(
+                    errors.UPSTREAM,
+                    "web fetch session did not retain a result",
+                    retryable=True,
+                )
+
+        try:
+            loaded = loader()
+        except Exception as exc:  # keep every singleflight waiter releasable
+            loaded = err(
+                errors.UPSTREAM,
+                f"web fetch failed: {type(exc).__name__}: {exc}",
+                retryable=True,
+            )
+        with self._condition:
+            if isinstance(loaded, CapabilityResult):
+                pending.error = loaded
+            else:
+                new_chars = len(loaded.text)
+                if (
+                    self._document_count >= self.max_urls
+                    or self._total_chars + new_chars > self.max_chars
+                ):
+                    pending.error = err(
+                        errors.UNAVAILABLE,
+                        "web fetch turn cache capacity exceeded; use a different turn",
+                        retryable=False,
+                    )
+                else:
+                    self._document_count += 1
+                    self._total_chars += new_chars
+                    pending.document = loaded
+                    self._cache[url] = loaded
+                    self._cache[loaded.url] = loaded
+            pending.loading = False
+            pending.done = True
+            self._condition.notify_all()
+            return pending.document or pending.error or err(
+                errors.UPSTREAM,
+                "web fetch session did not retain a result",
+                retryable=True,
+            )
+
+
 def _page_title(html: str) -> str:
     """The document title, or "".
 
@@ -266,17 +450,8 @@ def search(store, *, api_key=None, runtime_token=None, params=None) -> Capabilit
     return ok(data={"query": query, "results": [errors.cap_data(r) for r in capped]})
 
 
-def fetch(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityResult:
-    """params: {"url": str}. Fetches + strips HTML to text; size-capped, no API key."""
-    params = params or {}
-    url = str(params.get("url") or "").strip()
-    if not url:
-        return err(errors.INVALID, "url is required", retryable=False)
-
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        return err(errors.INVALID, "url must be an absolute http(s) url", retryable=False)
-
+def _fetch_document(url: str) -> _FetchDocument | CapabilityResult:
+    """Perform one validated outbound fetch and retain its extracted text."""
     current_url = url
     status_code = 0
     response_headers: dict = {}
@@ -317,16 +492,90 @@ def fetch(store, *, api_key=None, runtime_token=None, params=None) -> Capability
                    f"fetch failed with status {status_code}",
                    retryable=errors.retryable_for_status(status_code))
     text = _readable_text(body, content_type=str(response_headers.get("content-type") or ""))
-    capped = errors.cap_text(text)
-    # One honest flag covering BOTH places content can go missing: the raw body
-    # cut, and the text cap right here. A model told `truncated: false` while the
-    # tail was silently dropped would read "not on this page" into a fact that
-    # simply was not in the part it got.
-    # Key order matters and is load-bearing. Downstream this dict is json-dumped
-    # and hard-cut by the tool dispatcher result cap (2000), so anything placed after
-    # `text` is simply not delivered — a `truncated` flag at the end reached the
-    # model exactly never. The flag is what stops "absent from the part I read"
-    # from being reported as "absent from the page", so it goes first.
-    return ok(data={"truncated": truncated or capped != text,
-                    "url": current_url,
-                    "text": capped})
+    return _FetchDocument(
+        url=current_url[:_FETCH_OUTPUT_URL_CHARS],
+        text=text,
+        source_truncated=truncated,
+    )
+
+
+def _paged_fetch_payload(document: _FetchDocument, offset: int) -> dict:
+    """Structurally shrink one page to the shared atomic JSON result cap."""
+    total_chars = len(document.text)
+    if offset > total_chars:
+        raise ValueError("offset exceeds retained page text")
+    policy = result_budget.for_tool("web_fetch")
+    max_chars = policy.result_cap if policy is not None else 8000
+
+    def payload_for(candidate_end: int) -> dict:
+        page_text = document.text[offset:candidate_end]
+        has_more = candidate_end < total_chars
+        return {
+            "url": document.url,
+            "total_chars": total_chars,
+            "offset": offset,
+            "returned_chars": len(page_text),
+            "next_offset": candidate_end if has_more else None,
+            "has_more": has_more,
+            "source_truncated": document.source_truncated,
+            "text": page_text,
+        }
+
+    # Binary-search the largest whole text slice whose actual JSON rendering
+    # fits. The downstream atomic policy then preserves it byte-for-byte.
+    low = offset
+    high = min(total_chars, offset + max_chars)
+    while low < high:
+        candidate = (low + high + 1) // 2
+        if len(json.dumps(payload_for(candidate), ensure_ascii=False)) <= max_chars:
+            low = candidate
+        else:
+            high = candidate - 1
+    payload = payload_for(low)
+    if len(json.dumps(payload, ensure_ascii=False)) > max_chars:
+        raise RuntimeError("web_fetch result cap cannot hold its metadata")
+    return payload
+
+
+def fetch(
+    store,
+    *,
+    api_key=None,
+    runtime_token=None,
+    params=None,
+    web_fetch_session: WebFetchSession | None = None,
+) -> CapabilityResult:
+    """Fetch and page readable text; a continuation never repeats the network."""
+    params = params or {}
+    url = str(params.get("url") or "").strip()
+    if not url:
+        return err(errors.INVALID, "url is required", retryable=False)
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return err(errors.INVALID, "url must be an absolute http(s) url", retryable=False)
+    raw_offset = params.get("offset", 0)
+    if type(raw_offset) is not int or raw_offset < 0:
+        return err(errors.INVALID, "offset must be a non-negative integer", retryable=False)
+    offset = raw_offset
+
+    if web_fetch_session is None:
+        if offset > 0:
+            return err(
+                errors.INVALID,
+                "offset requires an earlier web_fetch for this URL in the same turn",
+                retryable=False,
+            )
+        document = _fetch_document(url)
+    else:
+        document = web_fetch_session.document(
+            url,
+            offset=offset,
+            loader=lambda: _fetch_document(url),
+        )
+    if isinstance(document, CapabilityResult):
+        return document
+    try:
+        return ok(data=_paged_fetch_payload(document, offset))
+    except ValueError as exc:
+        return err(errors.INVALID, str(exc), retryable=False)

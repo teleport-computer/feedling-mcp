@@ -4,6 +4,7 @@ import ast
 import importlib
 from pathlib import Path
 
+import yaml
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 
@@ -14,7 +15,7 @@ TEST_COMPOSE = ROOT / "deploy" / "docker-compose.phala.test.yaml"
 TEST_RUNNER_COMPOSE = ROOT / "deploy" / "docker-compose.phala.runner.yaml"
 PROD_COMPOSE = ROOT / "deploy" / "docker-compose.phala.yaml"
 PROD_RUNNER_COMPOSE = ROOT / "deploy" / "docker-compose.phala.prod.runner.yaml"
-EXPECTED_TEE_HEAD = "0038_v2_wake_followup_marker"
+EXPECTED_TEE_HEAD = "0039_distill_artifact_ledger"
 
 
 def _head_literal_lines(source: str) -> list[int]:
@@ -52,7 +53,7 @@ def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
     assert runtime_head == EXPECTED_TEE_HEAD
     assert (
         script.get_revision(EXPECTED_TEE_HEAD).down_revision
-        == "0037_chat_poll_index"
+        == "0038_v2_wake_followup_marker"
     )
     assert (
         script.get_revision("0036_lane_rollup_access_paths").down_revision
@@ -283,6 +284,69 @@ def test_test_main_deploy_waits_for_the_same_release_unit_preflight():
         "Build and verify the test E2B template",
     ):
         assert required in preflight
+
+
+def test_test_release_jobs_only_run_for_pushes_to_test():
+    """The shared test CVMs may only move with the auditable test branch.
+
+    Derive the release unit from its release-pin behavior and dependency graph,
+    not from the ``if`` expressions under test or mutable labels.  Otherwise
+    changing one job to a dispatch-only condition could make it disappear from
+    the assertion and turn the guard green by deleting its own offender.
+    """
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+
+    deploy_jobs = {
+        name
+        for name, job in jobs.items()
+        if any(
+            "./deploy/pin-runtime-release.sh test" in str(step.get("run") or "")
+            for step in job.get("steps", [])
+            if isinstance(step, dict)
+        )
+    }
+    # Adding/removing deploy jobs should fail this self-erasure floor and require an intentional update.
+    assert deploy_jobs == {"deploy-test-cvm", "deploy-test-runner-cvm"}, sorted(
+        deploy_jobs
+    )
+
+    def needs(job: dict) -> set[str]:
+        raw = job.get("needs")
+        return {raw} if isinstance(raw, str) else set(raw or [])
+
+    needs_by_job = {name: needs(job) for name, job in jobs.items()}
+    shared_needs = set.intersection(
+        *(needs_by_job[name] for name in sorted(deploy_jobs))
+    )
+    change_detectors = {
+        name
+        for name in shared_needs
+        if "cvm" in (jobs[name].get("outputs") or {})
+    }
+    assert change_detectors, "test deploy jobs must share a CVM change detector"
+
+    prerequisite_jobs = {
+        dependency
+        for deploy_name in deploy_jobs
+        for dependency in needs_by_job[deploy_name]
+        if needs_by_job.get(dependency, set()) & change_detectors
+    }
+    assert prerequisite_jobs, "test release unit must retain its prerequisite gate"
+
+    release_jobs = deploy_jobs | change_detectors | prerequisite_jobs
+    push_to_test = "github.ref == 'refs/heads/test' && github.event_name == 'push'"
+    cvm_changed = " && ".join(
+        f"needs.{name}.outputs.cvm == 'true'"
+        for name in sorted(change_detectors)
+    )
+    for name in release_jobs:
+        actual = " ".join(str(jobs[name].get("if") or "").split())
+        expected = (
+            push_to_test
+            if name in change_detectors
+            else f"{push_to_test} && {cvm_changed}"
+        )
+        assert actual == expected, name
 
 
 def test_test_deploys_when_the_hosted_v1_consumer_changes():

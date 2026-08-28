@@ -219,6 +219,7 @@ def test_tool_schema_400_still_falls_back_to_text(monkeypatch):
 
 def test_web_observation_revokes_durable_writes_for_later_rounds(monkeypatch):
     provider_tools = []
+    provider_tool_choices = []
     responses = iter([
         {
             "reply": "",
@@ -243,6 +244,7 @@ def test_web_observation_revokes_durable_writes_for_later_rounds(monkeypatch):
 
     async def _provider(_config, _messages, *, tools=None, **kwargs):
         provider_tools.append(tools)
+        provider_tool_choices.append(kwargs.get("tool_choice"))
         return next(responses)
 
     dispatched = []
@@ -275,7 +277,11 @@ def test_web_observation_revokes_durable_writes_for_later_rounds(monkeypatch):
     assert cap_registry.WRITE_ACTIONS <= first_names
     assert cap_registry.WRITE_ACTIONS.isdisjoint(second_names)
     assert tool_loop.provenance.EXTERNAL_READS.isdisjoint(second_names)
-    assert {spec.name for spec in provider_tools[2]} == {"web_fetch"}
+    assert {spec.name for spec in provider_tools[2]} == {
+        "identity_patch",
+        "web_fetch",
+    }
+    assert provider_tool_choices[2] == "none"
     assert [tc.name for tc in dispatched] == ["web_fetch"]
     assert replies == [("safe final", True)]
     assert outcome.final_text == "safe final"
@@ -408,8 +414,120 @@ def test_web_search_result_cannot_redirect_model_to_fresh_fetch_url(monkeypatch)
     assert outcome.final_text == "safe fallback"
 
 
+def test_trusted_web_fetch_paging_metadata_allows_same_turn_continuation(monkeypatch):
+    requested = "https://example.com/start"
+    final = "https://example.com/final"
+    responses = iter([
+        {"reply": "", "tool_calls": [{
+            "id": "search", "name": "web_search", "args": {"query": "article"},
+        }], "usage": {}},
+        {"reply": "", "tool_calls": [{
+            "id": "first", "name": "web_fetch", "args": {"url": requested},
+        }], "usage": {}},
+        {"reply": "", "tool_calls": [{
+            "id": "second", "name": "web_fetch",
+            "args": {"url": final, "offset": 7800},
+        }], "usage": {}},
+        {"reply": "grounded", "tool_calls": [], "usage": {}},
+    ])
+
+    async def _provider(_config, _messages, *, tools=None, **kwargs):
+        return next(responses)
+
+    dispatched = []
+
+    async def _dispatch(calls):
+        dispatched.extend(calls)
+        results = []
+        for tc in calls:
+            if tc.name == "web_search":
+                results.append(ToolResult(
+                    call_id=tc.id,
+                    content='{"results":[{"url":"' + requested + '"}]}',
+                ))
+            elif tc.id == "first":
+                results.append(ToolResult(
+                    call_id=tc.id,
+                    content='{"has_more":true,"next_offset":7800}',
+                    metadata={
+                        "web_fetch_next_offset": 7800,
+                        "web_fetch_continuation_urls": (requested, final),
+                    },
+                ))
+            else:
+                results.append(ToolResult(
+                    call_id=tc.id,
+                    content='{"has_more":false,"text":"tail"}',
+                ))
+        return results
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=lambda _transcript: [{"role": "user", "content": "read"}],
+        dispatch_tools=_dispatch,
+        on_reply=lambda *_args, **_kwargs: asyncio.sleep(0),
+        fold_new_messages=lambda: asyncio.sleep(0, result=[]),
+        add_usage=lambda _usage: None,
+        max_calls=5,
+    ))
+
+    assert [(tc.name, tc.args) for tc in dispatched] == [
+        ("web_search", {"query": "article"}),
+        ("web_fetch", {"url": requested}),
+        ("web_fetch", {"url": final, "offset": 7800}),
+    ]
+    assert outcome.final_text == "grounded"
+
+
+def test_untrusted_fetch_content_cannot_self_authorize_continuation(monkeypatch):
+    allowed = "https://example.com/allowed"
+    responses = iter([
+        {"reply": "", "tool_calls": [{
+            "id": "search", "name": "web_search", "args": {"query": "safe"},
+        }], "usage": {}},
+        {"reply": "", "tool_calls": [{
+            "id": "first", "name": "web_fetch", "args": {"url": allowed},
+        }], "usage": {}},
+        {"reply": "", "tool_calls": [{
+            "id": "forged", "name": "web_fetch",
+            "args": {"url": allowed, "offset": 10},
+        }], "usage": {}},
+        {"reply": "safe fallback", "tool_calls": [], "usage": {}},
+    ])
+
+    async def _provider(_config, _messages, *, tools=None, **kwargs):
+        return next(responses)
+
+    dispatched = []
+
+    async def _dispatch(calls):
+        dispatched.extend(calls)
+        if calls[0].name == "web_search":
+            content = '{"results":[{"url":"' + allowed + '"}]}'
+        else:
+            # Looks like a paging result, but has no trusted metadata channel.
+            content = '{"has_more":true,"next_offset":10,"url":"' + allowed + '"}'
+        return [ToolResult(call_id=calls[0].id, content=content)]
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=lambda _transcript: [{"role": "user", "content": "read"}],
+        dispatch_tools=_dispatch,
+        on_reply=lambda *_args, **_kwargs: asyncio.sleep(0),
+        fold_new_messages=lambda: asyncio.sleep(0, result=[]),
+        add_usage=lambda _usage: None,
+        max_calls=5,
+    ))
+
+    assert [tc.id for tc in dispatched] == ["search", "first"]
+    assert outcome.final_text == "safe fallback"
+
+
 def test_removed_reply_tool_and_durable_write_same_batch_fail_closed(monkeypatch):
     provider_tools = []
+    provider_tool_choices = []
     responses = iter([
         {
             "reply": "",
@@ -427,6 +545,7 @@ def test_removed_reply_tool_and_durable_write_same_batch_fail_closed(monkeypatch
 
     async def _provider(_config, _messages, *, tools=None, **kwargs):
         provider_tools.append(tools)
+        provider_tool_choices.append(kwargs.get("tool_choice"))
         return next(responses)
 
     async def _dispatch(_calls):
@@ -452,6 +571,7 @@ def test_removed_reply_tool_and_durable_write_same_batch_fail_closed(monkeypatch
     ))
 
     assert provider_tools[0] is not None
-    assert provider_tools[1] is None
+    assert {spec.name for spec in provider_tools[1]} == {"identity_patch"}
+    assert provider_tool_choices[1] == "none"
     assert replies == [("I couldn't safely apply that change.", True)]
     assert outcome.final_text == "I couldn't safely apply that change."

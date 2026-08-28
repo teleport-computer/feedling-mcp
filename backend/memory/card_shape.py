@@ -123,11 +123,6 @@ def has_matchable_text(card: dict, field_map: FieldMap = DEFAULT_FIELD_MAP) -> b
 # 翻译成内核认的形状 —— 这是新边界的核心
 # --------------------------------------------------------------------------- #
 
-#: 内核认的卡片形状。字段是**固定的**，内核不会去适应别的名字。
-GARDEN_CARD_FIELDS = ("id", "summary", "content", "bucket", "threads",
-                      "occurred_at", "created_at", "is_sensitive", "source")
-
-
 def to_garden_card(raw: dict, field_map: FieldMap = DEFAULT_FIELD_MAP) -> dict:
     """把 io 的任意一种卡形状，翻成内核认的那一种。
 
@@ -164,7 +159,7 @@ def to_garden_card(raw: dict, field_map: FieldMap = DEFAULT_FIELD_MAP) -> dict:
         if linked:
             out["threads"] = [linked]
     # 元数据原样带过（内核只读不写）
-    for key in ("id", "occurred_at", "created_at", "is_sensitive", "source", "type"):
+    for key in ("id", "occurred_at", "created_at", "source", "type"):
         if key in raw:
             out[key] = raw[key]
     # 角色：内核靠它挑「打底卡」，不再靠标题前缀（那对新形状的卡完全失效）

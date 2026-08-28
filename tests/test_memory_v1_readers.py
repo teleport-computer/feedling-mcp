@@ -205,6 +205,62 @@ def test_memory_list_compares_parsed_instants_and_puts_garbage_last(monkeypatch)
     assert [card["id"] for card in filtered["moments"]] == ["newer_z"]
 
 
+def test_memory_list_falls_back_to_created_at_and_cursors_that_effective_time(
+    monkeypatch,
+):
+    store = types.SimpleNamespace(user_id="usr_list_created_fallback")
+    cards = [
+        {
+            "id": "occurred",
+            "status": "active",
+            "occurred_at": "2026-08-13T12:00:00Z",
+            "created_at": "2026-08-13T12:00:00Z",
+        },
+        {
+            "id": "fallback_a",
+            "status": "active",
+            "occurred_at": "",
+            "created_at": "2026-08-14T12:00:00Z",
+        },
+        {
+            "id": "fallback_b",
+            "status": "active",
+            "occurred_at": "not-a-time",
+            "created_at": "2026-08-14T12:00:00Z",
+        },
+        {
+            "id": "invalid",
+            "status": "active",
+            "occurred_at": "",
+            "created_at": "also-not-a-time",
+        },
+    ]
+    monkeypatch.setattr(memory_service, "_load_moments", lambda _store: cards)
+
+    first, first_status = memory_core.list_moments(
+        store,
+        limit_raw=1,
+        cursor="",
+        since="",
+        include_archived_raw=True,
+    )
+    second, second_status = memory_core.list_moments(
+        store,
+        limit_raw=3,
+        cursor=first["next_cursor"],
+        since="",
+        include_archived_raw=True,
+    )
+
+    assert first_status == second_status == 200
+    assert [card["id"] for card in first["moments"]] == ["fallback_a"]
+    assert [card["id"] for card in second["moments"]] == [
+        "fallback_b",
+        "occurred",
+        "invalid",
+    ]
+
+
 def test_memory_verify_degrades_for_clean_v1_cards(monkeypatch):
     store = types.SimpleNamespace(user_id="usr_verify")
     monkeypatch.setattr(identity_service, "_relationship_age_days", lambda _store: 1)

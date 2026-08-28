@@ -303,6 +303,19 @@ def _ordered_items(items: list[dict], candidates: list[dict], limit: int) -> lis
     )[:limit]
 
 
+def _public_memory_item(item: dict) -> dict:
+    """Strip retired card-classification fields at the backend boundary.
+
+    During a rolling deploy an older enclave may still return these legacy
+    keys. Stored rows may also retain them until they are naturally rewritten.
+    Neither case may recreate the removed API concept.
+    """
+    clean = dict(item)
+    for key in ("is_sensitive", "sensitivity_class", "sensitive_scope"):
+        clean.pop(key, None)
+    return clean
+
+
 def _memory_index_partition(
     api_key: str | None,
     candidates: list[dict],
@@ -321,8 +334,6 @@ def _memory_index_partition(
     local_items, _local_unavailable = _local_memory_items(
         plaintext, owner_user_id, item_builder=builder)
     local_items = enclave_readside.memory_index_filter_items(local_items, payload)
-    if not bool(payload.get("include_sensitive", False)):
-        local_items = [item for item in local_items if not item.get("is_sensitive")]
 
     sealed_items: list[dict] = []
     if sealed:
@@ -332,7 +343,11 @@ def _memory_index_partition(
             operation="index",
             payload=payload,
         )
-        sealed_items = response.get("items") if isinstance(response.get("items"), list) else []
+        sealed_items = [
+            _public_memory_item(item)
+            for item in response.get("items", [])
+            if isinstance(item, dict)
+        ]
     items = _ordered_items(local_items + sealed_items, candidates, int(payload["limit"]))
     for item in items:
         item.pop("_search_content", None)
@@ -374,7 +389,6 @@ def memory_index_core(
             "ambient": ambient,
             "bucket": str(payload.get("bucket") or "")[:120],
             "thread": str(payload.get("thread") or "")[:120],
-            "include_sensitive": bool(payload.get("include_sensitive", False)),
             "limit": limit,
             "query": query,
     }
@@ -425,7 +439,8 @@ def memory_fetch_core(
     if not isinstance(ids, list) or any(not isinstance(mid, str) or not mid.strip() for mid in ids):
         raise ValueError("ids must be a list of non-empty strings")
     limit = effective_readside_limit(payload.get("limit"))
-    ids = [mid.strip() for mid in ids[:limit]]
+    requested_ids = [mid.strip() for mid in ids]
+    ids = requested_ids[:limit]
     include_archived = _bool_payload(payload.get("include_archived"))
     include_superseded = _bool_payload(payload.get("include_superseded"))
     moments = memory_service._load_moments(store)
@@ -454,27 +469,39 @@ def memory_fetch_core(
         store.user_id,
         item_builder=enclave_readside.build_memory_fetch_item,
     )
-    local_items = [item for item in local_items if not item.get("is_sensitive")]
     response = {"items": [], "unavailable_ids": []}
     if sealed:
         response = (post_enclave or post_enclave_readside)(
             api_key,
             sealed,
             operation="fetch",
-            payload={"ids": [m.get("id") for m in sealed], "limit": limit},
+            payload={
+                "ids": [m.get("id") for m in sealed],
+                "limit": limit,
+            },
         )
     enclave_unavailable = response.get("unavailable_ids") if isinstance(response.get("unavailable_ids"), list) else []
     unavailable_ids.extend(invalid_ids)
     unavailable_ids.extend(local_unavailable)
     unavailable_ids.extend(str(mid) for mid in enclave_unavailable if isinstance(mid, str))
-    response_items = (
-        response.get("items") if isinstance(response.get("items"), list) else []
-    )
+    response_items = [
+        _public_memory_item(item)
+        for item in response.get("items", [])
+        if isinstance(item, dict)
+    ]
     items_by_id = {
         item.get("id"): item
         for item in local_items + response_items
         if isinstance(item, dict)
     }
+    unavailable_set = {
+        str(memory_id)
+        for memory_id in unavailable_ids
+        if str(memory_id or "").strip()
+    }
+    unavailable_ids = [
+        memory_id for memory_id in ids if memory_id in unavailable_set
+    ]
     referenced_ids = {str(mid) for mid in items_by_id.keys() if str(mid or "").strip()}
     if referenced_ids:
         now = _now_iso()
@@ -495,4 +522,10 @@ def memory_fetch_core(
         "items": [items_by_id[mid] for mid in ids if mid in items_by_id],
         "missing_ids": missing_ids,
         "unavailable_ids": unavailable_ids,
+        "truncation": {
+            "truncated": len(requested_ids) > len(ids),
+            "requested_count": len(requested_ids),
+            "processed_count": len(ids),
+            "omitted_count": max(0, len(requested_ids) - len(ids)),
+        },
     }

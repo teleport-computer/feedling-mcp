@@ -130,7 +130,7 @@ def test_startup_seed_repairs_null_clocks_and_reaches_a_real_enqueued_job(
     monkeypatch.setattr(
         serve_worker.core_store,
         "get_store",
-        lambda _user_id: types.SimpleNamespace(chat_messages=[]),
+        lambda _user_id, **_kwargs: types.SimpleNamespace(chat_messages=[]),
     )
     monkeypatch.setattr(
         serve_worker.db,

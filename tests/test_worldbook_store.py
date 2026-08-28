@@ -9,6 +9,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from core import store as core_store  # noqa: E402
 from core.store import UserStore  # noqa: E402
+from core.store_sections import StoreSection  # noqa: E402
 
 
 def _uid() -> str:
@@ -46,6 +47,7 @@ def test_world_books_upsert_replaces_by_id_and_persists():
     }
 
     reloaded = UserStore(uid)
+    reloaded.ensure_sections({StoreSection.WORLD_BOOKS})
     assert {item["id"]: item["body_ct"] for item in reloaded.world_books} == {
         "wb1": "one-edited",
         "wb2": "two",
@@ -63,6 +65,7 @@ def test_world_books_delete_returns_whether_row_existed_and_persists():
     assert store.delete_world_book("missing") is False
 
     reloaded = UserStore(uid)
+    reloaded.ensure_sections({StoreSection.WORLD_BOOKS})
     assert [item["id"] for item in reloaded.world_books] == ["wb2"]
 
 

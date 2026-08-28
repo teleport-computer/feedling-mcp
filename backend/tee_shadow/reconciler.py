@@ -46,13 +46,28 @@ TABLES: dict[str, tuple[tuple[str, ...], str]] = {
         "user_id, job_id, status, source_kind, file_manifest_hash, total_chunks, "
         "received_chunks, processed_chunks, total_bytes, received_bytes, privacy_mode, "
         "metadata, output, memory_action_count, identity_status, persona_ref, "
-        "persona_sha256, error, created_at, updated_at, finalized_at, completed_at, "
+        "persona_sha256, error, failed_phase, created_at, updated_at, finalized_at, completed_at, "
         "worker_claimed_by, worker_claimed_at",
     ),
     # PK 有三列 (user_id, job_id, output_type)，不是两列；且没有单一 doc 列。
     "genesis_import_outputs": (
         ("user_id", "job_id", "output_type"),
         "user_id, job_id, output_type, ref, status, doc, created_at, updated_at",
+    ),
+    "distillation_artifact_attempts": (
+        ("attempt_id",),
+        "attempt_id, user_id, job_id, flow, distill_kind, artifact, access_path, "
+        "outcome, terminal_result, started_at, finished_at",
+    ),
+    "distillation_artifact_daily_rollup": (
+        ("day", "access_path", "distill_kind", "artifact", "outcome",
+         "terminal_result"),
+        "day, access_path, distill_kind, artifact, outcome, terminal_result, "
+        "attempts, frozen_at",
+    ),
+    "distillation_rollup_watermark": (
+        ("scope",),
+        "scope, effective_from, through_day, frozen_at",
     ),
     # Notify Relay（自部署推送中继，0020）。configs 的 PK 是 auth_token（明文中继
     # 凭证）；logs 的 id 是 GENERATED ALWAYS AS IDENTITY，见下 _IDENTITY_TABLES。

@@ -1,3 +1,4 @@
+import ast
 import pathlib
 import re
 import sys
@@ -27,8 +28,66 @@ def _model_limit(context_window_tokens: int = 2_048) -> frontier.ModelPromptLimi
     )
 
 
+def test_t336_file_output_split_preserves_default_input_budget_bytes():
+    expected = {
+        32_768: (4_096, 1_639, 27_033),
+        131_072: (4_096, 6_554, 120_422),
+        200_000: (4_096, 10_000, 185_904),
+        262_144: (4_096, 13_108, 244_940),
+        1_048_576: (4_096, 52_429, 992_051),
+    }
+
+    observed = {}
+    for context_window in expected:
+        budget = frontier.build_prompt_budget(context_window)
+        observed[context_window] = (
+            budget.output_reserve_tokens,
+            budget.safety_margin_tokens,
+            budget.input_budget_tokens,
+        )
+
+    assert observed == expected
+
+
+def test_t336_worker_file_output_default_is_bound_to_shared_wire_cap():
+    worker_path = (
+        pathlib.Path(__file__).parent.parent
+        / "backend"
+        / "model_api_runtime"
+        / "v2"
+        / "worker.py"
+    )
+    tree = ast.parse(worker_path.read_text(encoding="utf-8"))
+    positive_env_defaults = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name) or not isinstance(node.value, ast.Call):
+            continue
+        call = node.value
+        if not isinstance(call.func, ast.Name) or call.func.id != "_positive_int_env":
+            continue
+        if len(call.args) != 2 or not all(
+            isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+            for arg in call.args
+        ):
+            continue
+        positive_env_defaults[target.id] = tuple(arg.value for arg in call.args)
+
+    file_env, file_default = positive_env_defaults["FILE_OUTPUT_MAX_TOKENS"]
+    reserve_env, reserve_default = positive_env_defaults[
+        "PROMPT_OUTPUT_RESERVE_TOKENS"
+    ]
+    assert file_env == "FEEDLING_V2_FILE_OUTPUT_MAX_TOKENS"
+    assert int(file_default) == provider_client.CHAT_OUTPUT_MAX_TOKENS
+    assert int(file_default) not in {4096, 8192}
+    assert reserve_env == "FEEDLING_V2_PROMPT_OUTPUT_RESERVE_TOKENS"
+    assert int(reserve_default) == 4096
+
+
 _REAL_TOOL_COUNT = 69
-_REAL_TOOL_CATALOG_BYTES = 36_081
+_REAL_TOOL_CATALOG_BYTES = 36_426
 
 
 def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
@@ -68,6 +127,9 @@ def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
     The 2026-08-25 increase to 36,081 records the model-authored Canvas
     completion message contract, which adds 390 bytes without changing the tool
     count.
+    The T325 increase to 36,426 records the bounded proactive Canvas-offer
+    contract, which adds 345 bytes without changing the tool count or the
+    captured MCP description padding.
     """
     platform = list(tool_schema.build_tool_specs())
     mcp_count = _REAL_TOOL_COUNT - len(platform)

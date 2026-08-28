@@ -145,9 +145,12 @@ def _script_provider(monkeypatch, responses):
     return calls
 
 
-def _text_round(text, *, prompt_tokens=1, completion_tokens=1):
-    return {"reply": text, "tool_calls": [],
-            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
+def _text_round(text, *, prompt_tokens=1, completion_tokens=1, stop_reason=None):
+    result = {"reply": text, "tool_calls": [],
+              "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
+    if stop_reason is not None:
+        result["stop_reason"] = stop_reason
+    return result
 
 
 def _stay_silent_round(reason="没有值得打扰用户的新信息"):
@@ -199,6 +202,647 @@ def _patch_user_decryptable_envelopes(monkeypatch, user_id: str) -> E2EClient:
 # ------------------------------------------------------------------
 # _run_wake direct unit coverage
 # ------------------------------------------------------------------
+
+def test_discarded_wake_draft_helpers_encrypt_bound_trim_and_inject_latest(
+    monkeypatch,
+):
+    """The dedicated breadcrumb is bounded encrypted application data.
+
+    Two retained rows are useful for audit, but only the newest draft may enter
+    the next wake prompt.  The stored-text and whole-prompt limits are separate
+    contracts and the test derives both from the production module constants.
+    """
+    uid = "u_wake_discarded_draft_helpers"
+    conftest.seed_user(uid)
+    _reset(uid)
+    db.log_clear(uid, worker.WAKE_DISCARDED_DRAFT_STREAM)
+    decryptor = _patch_user_decryptable_envelopes(monkeypatch, uid)
+    store = core_store.get_store(uid)
+    latest = (
+        "LATEST_DRAFT_SENTINEL_"
+        + "新" * worker.WAKE_DISCARDED_DRAFT_TEXT_CAP
+        + "OVER_TEXT_CAP"
+    )
+
+    try:
+        for source_job_id, text in (
+            ("job-old", "OLD_DRAFT_SENTINEL"),
+            ("job-middle", "MIDDLE_DRAFT_SENTINEL"),
+            ("job-latest", latest),
+        ):
+            stored = worker._store_wake_discarded_draft(
+                store,
+                text,
+                wake_kind="heartbeat",
+                source_job_id=source_job_id,
+                collision_seq_hint=17,
+            )
+            assert stored is not None
+
+        with db.get_pool().connection() as conn:
+            rows = conn.execute(
+                "SELECT doc FROM user_logs WHERE user_id=%s AND stream=%s "
+                "ORDER BY seq",
+                (uid, worker.WAKE_DISCARDED_DRAFT_STREAM),
+            ).fetchall()
+        docs = [row[0] for row in rows]
+        assert [doc["source_job_id"] for doc in docs] == [
+            "job-middle",
+            "job-latest",
+        ]
+        assert set(docs[-1]) == {
+            "sealed_text",
+            "created_at",
+            "wake_kind",
+            "source_job_id",
+            "collision_seq_hint",
+        }
+        assert "LATEST_DRAFT_SENTINEL" not in json.dumps(
+            docs[-1], ensure_ascii=False
+        )
+
+        reads = []
+
+        def _open(envelope, api_key, *, purpose, runtime_token=""):
+            reads.append((api_key, purpose, runtime_token))
+            return decryptor.open_envelope(envelope).encode("utf-8")
+
+        monkeypatch.setattr(worker.core_envelope, "read_envelope_body", _open)
+        opened = worker._read_latest_wake_discarded_draft(
+            uid,
+            runtime_token="runtime-token",
+        )
+        assert opened is not None
+        assert opened["text"] == latest[: worker.WAKE_DISCARDED_DRAFT_TEXT_CAP]
+        assert reads == [(None, "v2_wake_discarded_draft", "runtime-token")]
+
+        rendered = worker._wake_action_context_str(
+            {"screen_share": [{"ok": True, "data": {"active": True}}]},
+            opened,
+        )
+        runtime_data = json.loads(rendered)
+        prompt_draft = runtime_data["wake_discarded_draft"]
+        prompt_segment = json.dumps(
+            {"wake_discarded_draft": prompt_draft},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        assert len(prompt_segment) <= worker.WAKE_DISCARDED_DRAFT_PROMPT_CAP
+        assert prompt_draft["text"].startswith("LATEST_DRAFT_SENTINEL")
+        assert "未送达" in prompt_draft["delivery_note"]
+        assert "用户没有看到过" in prompt_draft["delivery_note"]
+        assert "不要逐字重发" in prompt_draft["guidance"]
+        assert prompt_draft["created_at"] > 0
+        assert runtime_data["screen_share"] == {"active": True}
+
+        assert db.log_clear(uid, worker.WAKE_DISCARDED_DRAFT_STREAM) is True
+        assert db.log_read(uid, worker.WAKE_DISCARDED_DRAFT_STREAM) == []
+    finally:
+        decryptor._http.close()
+
+
+def test_discarded_wake_draft_prompt_caps_escape_dense_text_in_rendered_space():
+    """JSON expansion cannot turn a retained draft into a permanent wake failure.
+
+    Keep the zero-expansion CJK case in the helper test above as the mirror;
+    this production-shaped case is dense with newlines, quotes and backslashes.
+    """
+    unit = '想你了。\n\n"\\'
+    text = (unit * (worker.WAKE_DISCARDED_DRAFT_TEXT_CAP // len(unit) + 2))[
+        : worker.WAKE_DISCARDED_DRAFT_TEXT_CAP
+    ]
+    draft = {
+        "text": text,
+        "created_at": 1.0,
+        "wake_kind": "heartbeat",
+        "source_job_id": "escape-dense",
+    }
+
+    payload = worker._wake_discarded_draft_prompt_data(draft)
+    rendered = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    injected = payload["wake_discarded_draft"]["text"]
+    unbounded = {
+        "wake_discarded_draft": {
+            **payload["wake_discarded_draft"],
+            "text": text,
+        }
+    }
+
+    assert len(text) == worker.WAKE_DISCARDED_DRAFT_TEXT_CAP
+    assert len(
+        json.dumps(
+            unbounded,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    ) > worker.WAKE_DISCARDED_DRAFT_PROMPT_CAP
+    assert len(rendered) <= worker.WAKE_DISCARDED_DRAFT_PROMPT_CAP
+    assert injected
+    assert text.startswith(injected)
+
+
+def test_discarded_wake_draft_prompt_failure_falls_back_without_draft(
+    monkeypatch,
+):
+    grounding = {"screen_share": [{"ok": True, "data": {"active": True}}]}
+    expected = v2_context.action_context_str(grounding)
+    monkeypatch.setattr(
+        worker,
+        "_wake_discarded_draft_prompt_data",
+        lambda _draft: (_ for _ in ()).throw(AssertionError("bad draft")),
+    )
+
+    assert worker._wake_action_context_str(
+        grounding,
+        {
+            "text": "poison",
+            "created_at": 1.0,
+            "wake_kind": "heartbeat",
+            "source_job_id": "broken",
+        },
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    "last_error, expected_status, expected_error",
+    [
+        ("FINAL_REPLY_INPUT_ADVANCED", "completed", None),
+        (
+            "FINAL_REPLY_SOURCE_JOB_INACTIVE",
+            "failed",
+            "wake_failed:lostjoblease",
+        ),
+    ],
+)
+def test_non_collision_discards_leave_no_draft_breadcrumb(
+    monkeypatch, caplog, last_error, expected_status, expected_error
+):
+    """The breadcrumb predicate is the AND chain discarded ∧ chat-collision.
+
+    Each non-collision discard reason is its own mirrored negative: the
+    stale-input heartbeat discard finishes gracefully and the inactive-source
+    discard fails the lease (the logged failure code pins the reason — the
+    transactional sink terminalizes the job row itself, so an unrelated wake
+    failure must not be able to fake this half), but neither may write a
+    draft row or emit any draft lifecycle trace."""
+    uid = "u_wake_non_collision_no_breadcrumb"
+    conftest.seed_user(uid)
+    _reset(uid)
+    db.log_clear(uid, worker.WAKE_DISCARDED_DRAFT_STREAM)
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda _store, plaintext, *, item_id=None: (
+            {
+                "v": 1,
+                "id": str(item_id or "f" * 32),
+                "owner_user_id": uid,
+                "visibility": "shared",
+                "body_ct": "ciphertext-only",
+                "nonce": "nonce",
+                "K_user": "sealed-user-key",
+                "K_enclave": "sealed-enclave-key",
+            },
+            "",
+        ),
+    )
+    monkeypatch.setattr(
+        v2_effect_outbox,
+        "get_effect_disposition",
+        lambda effect_id, **_kwargs: {
+            "status": "discarded",
+            "last_error": getattr(v2_effect_outbox, last_error),
+        },
+    )
+    _script_provider(monkeypatch, [_text_round("非撞车丢弃，不该留痕")])
+    traces = []
+    deps = _wake_deps(
+        tail=[{"id": "seed", "ts": 1.0, "role": "user", "content": "hi"}],
+        has_genuine_user_history=lambda _uid: True,
+    )
+    deps.read_messages_after_seq = lambda _uid, _after_seq: []
+    deps.apply_pending_effects = serve_worker._apply_pending_effects_for_user
+    deps.read_perception_wake_context = lambda _uid, _job_id: []
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        event_type
+    )
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    assert jobs_store.mark_running(job_id, claimed_by=claimed_by)
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "heartbeat",
+            deps,
+            _BYOK,
+            asyncio.Semaphore(4),
+            claimed_by,
+        )
+    )
+
+    assert status == expected_status, _job_status(job_id)
+    if expected_error is not None:
+        assert any(
+            expected_error in record.getMessage()
+            for record in caplog.records
+        ), [record.getMessage() for record in caplog.records]
+    assert db.log_read(uid, worker.WAKE_DISCARDED_DRAFT_STREAM) == []
+    assert [t for t in traces if t.startswith("wake.discarded_draft.")] == []
+
+
+def test_only_newest_draft_is_injected_and_storage_is_bounded(monkeypatch):
+    """Retention is bounded at the storage layer and injection picks newest.
+
+    The read side re-truncates on open, so only a sealed-plaintext assertion
+    can prove the store-side cap actually ran — without it, dropping the
+    store-side truncation would keep every downstream test green while raw
+    oversized plaintext accumulates encrypted at rest."""
+    uid = "u_wake_draft_newest_and_bounded"
+    conftest.seed_user(uid)
+    _reset(uid)
+    db.log_clear(uid, worker.WAKE_DISCARDED_DRAFT_STREAM)
+    sealed = {}
+
+    def _fake_envelope(_store, plaintext, *, item_id=None):
+        sealed[str(item_id)] = bytes(plaintext)
+        return (
+            {
+                "v": 1,
+                "id": str(item_id or "f" * 32),
+                "owner_user_id": uid,
+                "visibility": "shared",
+                "body_ct": "ciphertext-only",
+                "nonce": "nonce",
+                "K_user": "sealed-user-key",
+                "K_enclave": "sealed-enclave-key",
+            },
+            "",
+        )
+
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        _fake_envelope,
+    )
+    store = core_store.get_store(uid)
+    unit = "想你了。\n\n"
+    filler = unit * (worker.WAKE_DISCARDED_DRAFT_TEXT_CAP // len(unit) + 2)
+    new_text = ("NEW_DRAFT_SENTINEL " + filler).strip()
+    assert len(new_text) > worker.WAKE_DISCARDED_DRAFT_TEXT_CAP
+
+    for source_job_id, text in (
+        ("job-old", "OLD_DRAFT_SENTINEL 旧稿"),
+        ("job-new", new_text),
+    ):
+        assert (
+            worker._store_wake_discarded_draft(
+                store,
+                text,
+                wake_kind="heartbeat",
+                source_job_id=source_job_id,
+                collision_seq_hint=3,
+            )
+            is not None
+        )
+
+    rows = db.log_read(uid, worker.WAKE_DISCARDED_DRAFT_STREAM)
+    assert [row["source_job_id"] for row in rows] == ["job-old", "job-new"]
+    newest_plaintext = sealed[rows[-1]["sealed_text"]["id"]].decode("utf-8")
+    assert len(newest_plaintext) == worker.WAKE_DISCARDED_DRAFT_TEXT_CAP
+    assert new_text.startswith(newest_plaintext)
+
+    def _open(envelope, api_key, *, purpose, runtime_token=""):
+        assert purpose == "v2_wake_discarded_draft"
+        assert runtime_token == "rt"
+        return sealed[envelope["id"]]
+
+    monkeypatch.setattr(worker.core_envelope, "read_envelope_body", _open)
+    calls = _script_provider(monkeypatch, [_text_round("换个说法接上。")])
+    traces = []
+    deps = _wake_deps(
+        tail=[{"id": "seed", "ts": 1.0, "role": "user", "content": "hi"}],
+        has_genuine_user_history=lambda _uid: True,
+    )
+    deps.read_messages_after_seq = lambda _uid, _after_seq: []
+    deps.apply_pending_effects = serve_worker._apply_pending_effects_for_user
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
+    job_id, _ = jobs_store.enqueue_job(uid, "manual_wake")
+    claimed_by = _claim(job_id)
+    assert jobs_store.mark_running(job_id, claimed_by=claimed_by)
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "manual_wake",
+            deps,
+            _BYOK,
+            asyncio.Semaphore(4),
+            claimed_by,
+        )
+    )
+
+    assert status == "completed", _job_status(job_id)
+    wire = json.dumps(calls[0]["messages"], ensure_ascii=False, default=str)
+    assert "NEW_DRAFT_SENTINEL" in wire
+    assert "OLD_DRAFT_SENTINEL" not in wire
+    assert db.log_read(uid, worker.WAKE_DISCARDED_DRAFT_STREAM) == []
+    lifecycle = [
+        trace["event_type"]
+        for trace in traces
+        if trace["event_type"].startswith("wake.discarded_draft.")
+    ]
+    assert lifecycle == [
+        "wake.discarded_draft.consumed",
+        "wake.discarded_draft.cleared",
+    ]
+    assert "DRAFT_SENTINEL" not in json.dumps(traces, ensure_ascii=False)
+
+
+def test_store_reports_nothing_when_primary_append_fails(monkeypatch):
+    """A swallowed primary write must not produce a stored report (or trim).
+
+    ``db.log_append`` returning False is the wake caller's only signal that
+    nothing durable exists; a non-None report here would emit a `stored` trace
+    for a row that was never written. The legacy ``None`` return (pre-bool
+    fakes) stays accepted."""
+    uid = "u_wake_draft_append_fails"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    def _fake_envelope(_store, plaintext, *, item_id=None):
+        return ({"v": 1, "id": str(item_id or "f" * 32)}, "")
+
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        _fake_envelope,
+    )
+    store = core_store.get_store(uid)
+    trims = []
+    monkeypatch.setattr(
+        db, "log_trim", lambda *args, **kwargs: trims.append(args) or 0
+    )
+
+    monkeypatch.setattr(db, "log_append", lambda *args, **kwargs: False)
+    assert (
+        worker._store_wake_discarded_draft(
+            store,
+            "主库写失败的草稿",
+            wake_kind="heartbeat",
+            source_job_id="job-append-false",
+            collision_seq_hint=0,
+        )
+        is None
+    )
+    assert trims == []
+
+    monkeypatch.setattr(db, "log_append", lambda *args, **kwargs: None)
+    stored = worker._store_wake_discarded_draft(
+        store,
+        "legacy fake 形状仍被接受",
+        wake_kind="heartbeat",
+        source_job_id="job-append-legacy",
+        collision_seq_hint=0,
+    )
+    assert stored is not None
+    assert stored["source_job_id"] == "job-append-legacy"
+    assert len(trims) == 1
+
+
+def test_collision_draft_write_failure_is_fail_open_without_stored_trace(
+    monkeypatch,
+):
+    """Observability failure cannot change the collision decision or job end."""
+    uid = "u_wake_collision_draft_write_failure"
+    conftest.seed_user(uid)
+    _reset(uid)
+    db.log_clear(uid, worker.WAKE_DISCARDED_DRAFT_STREAM)
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda _store, plaintext, *, item_id=None: (
+            {
+                "v": 1,
+                "id": str(item_id or "f" * 32),
+                "owner_user_id": uid,
+                "visibility": "shared",
+                "body_ct": "ciphertext-only",
+                "nonce": "nonce",
+                "K_user": "sealed-user-key",
+                "K_enclave": "sealed-enclave-key",
+            },
+            "",
+        ),
+    )
+
+    async def _fake_provider(config, messages, *, tools=None, **kwargs):
+        now = time.time()
+        db.chat_append_strict(
+            uid,
+            "user-arrived-during-failed-observation",
+            now,
+            {
+                "id": "user-arrived-during-failed-observation",
+                "role": "user",
+                "source": "chat",
+                "body_ct": "concurrent-user-ciphertext",
+                "ts": now,
+            },
+            5000,
+        )
+        return _text_round("这段撞车正文不会送达。")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _fake_provider)
+    monkeypatch.setattr(
+        worker,
+        "_store_wake_discarded_draft",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("observation store unavailable")
+        ),
+    )
+    traces = []
+    deps = _wake_deps(
+        tail=[{"id": "seed", "ts": 1.0, "role": "user", "content": "hi"}],
+        has_genuine_user_history=lambda _uid: True,
+    )
+    deps.read_messages_after_seq = lambda _uid, _after_seq: []
+    deps.apply_pending_effects = serve_worker._apply_pending_effects_for_user
+    deps.read_perception_wake_context = lambda _uid, _job_id: []
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    assert jobs_store.mark_running(job_id, claimed_by=claimed_by)
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "heartbeat",
+            deps,
+            _BYOK,
+            asyncio.Semaphore(4),
+            claimed_by,
+        )
+    )
+
+    assert status == "completed", _job_status(job_id)
+    assert _job_status(job_id) == ("completed", None)
+    assert db.log_read(uid, worker.WAKE_DISCARDED_DRAFT_STREAM) == []
+    assert "wake.discarded_draft.stored" not in {
+        trace["event_type"] for trace in traces
+    }
+
+
+def test_collision_draft_reaches_next_wake_prompt_then_clears(monkeypatch):
+    """Collision -> encrypted breadcrumb -> next applied wake is one chain.
+
+    The accepted crash window is deliberately between the first effect being
+    discarded and the best-effort breadcrumb write.  This test exercises the
+    no-crash path; it does not add compensation or retry publication.
+    """
+    uid = "u_wake_collision_draft_chain"
+    conftest.seed_user(uid)
+    _reset(uid)
+    db.log_clear(uid, worker.WAKE_DISCARDED_DRAFT_STREAM)
+    first_draft = "COLLISION_DRAFT_SENTINEL：等你忙完再继续刚才的话题。"
+    second_reply = "我换个更自然的方式接上。"
+    calls = []
+
+    def _fake_envelope(_store, plaintext, *, item_id=None):
+        return (
+            {
+                "v": 1,
+                "id": str(item_id or "f" * 32),
+                "owner_user_id": uid,
+                "visibility": "shared",
+                "body_ct": "ciphertext-only",
+                "nonce": "nonce",
+                "K_user": "sealed-user-key",
+                "K_enclave": "sealed-enclave-key",
+            },
+            "",
+        )
+
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        _fake_envelope,
+    )
+
+    async def _fake_provider(config, messages, *, tools=None, **kwargs):
+        calls.append(messages)
+        if len(calls) == 1:
+            now = time.time()
+            db.chat_append_strict(
+                uid,
+                "user-arrived-during-wake",
+                now,
+                {
+                    "id": "user-arrived-during-wake",
+                    "role": "user",
+                    "source": "chat",
+                    "body_ct": "concurrent-user-ciphertext",
+                    "ts": now,
+                },
+                5000,
+            )
+            return _text_round(first_draft)
+        return _text_round(second_reply)
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _fake_provider)
+    traces = []
+    deps = _wake_deps(
+        tail=[{"id": "seed", "ts": 1.0, "role": "user", "content": "hi"}],
+        has_genuine_user_history=lambda _uid: True,
+    )
+    deps.read_messages_after_seq = lambda _uid, _after_seq: []
+    deps.apply_pending_effects = serve_worker._apply_pending_effects_for_user
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
+    first_job, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    first_claimed_by = _claim(first_job)
+    assert jobs_store.mark_running(first_job, claimed_by=first_claimed_by)
+    first_status = asyncio.run(
+        worker._run_wake(
+            first_job,
+            uid,
+            "heartbeat",
+            deps,
+            _BYOK,
+            asyncio.Semaphore(4),
+            first_claimed_by,
+        )
+    )
+    assert first_status == "completed", _job_status(first_job)
+    raw_rows = db.log_read(uid, worker.WAKE_DISCARDED_DRAFT_STREAM)
+    assert len(raw_rows) == 1
+    assert raw_rows[0]["source_job_id"] == str(first_job)
+    assert first_draft not in json.dumps(raw_rows, ensure_ascii=False)
+
+    # The first wake's collision evidence has served its purpose.  Age the
+    # concurrent chat row so the next wake can publish without changing the
+    # collision gate or its configured window.
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE chat_messages SET ts=%s WHERE user_id=%s AND msg_id=%s",
+            (time.time() - 1000.0, uid, "user-arrived-during-wake"),
+        )
+
+    def _open(envelope, api_key, *, purpose, runtime_token=""):
+        assert purpose == "v2_wake_discarded_draft"
+        assert runtime_token == "rt"
+        return first_draft.encode("utf-8")
+
+    monkeypatch.setattr(worker.core_envelope, "read_envelope_body", _open)
+    second_job, _ = jobs_store.enqueue_job(uid, "manual_wake")
+    second_claimed_by = _claim(second_job)
+    assert jobs_store.mark_running(second_job, claimed_by=second_claimed_by)
+    second_status = asyncio.run(
+        worker._run_wake(
+            second_job,
+            uid,
+            "manual_wake",
+            deps,
+            _BYOK,
+            asyncio.Semaphore(4),
+            second_claimed_by,
+        )
+    )
+
+    assert second_status == "completed"
+    second_wire = json.dumps(calls[1], ensure_ascii=False, default=str)
+    assert first_draft in second_wire
+    assert "未送达" in second_wire
+    assert "用户没有看到过" in second_wire
+    assert "不要逐字重发" in second_wire
+    assert db.log_read(uid, worker.WAKE_DISCARDED_DRAFT_STREAM) == []
+    lifecycle = [
+        trace["event_type"]
+        for trace in traces
+        if trace["event_type"].startswith("wake.discarded_draft.")
+    ]
+    assert lifecycle == [
+        "wake.discarded_draft.stored",
+        "wake.discarded_draft.consumed",
+        "wake.discarded_draft.cleared",
+    ]
+    assert first_draft not in json.dumps(traces, ensure_ascii=False)
+
 
 def test_shadow_signals_never_reach_the_wake_provider_prompt(monkeypatch):
     """A′ signals are post-decision observations, never provider inputs.
@@ -461,6 +1105,119 @@ def test_wake_full_chain_strips_tool_markup_after_user_decrypt(monkeypatch, lane
             "reason": "tool_markup_leak_sanitized",
         }
     ]
+
+
+def test_wake_suppresses_observed_orphan_tool_call_tail(monkeypatch):
+    reply = '大热天的").\n• Let\'s check the exact timeline:\n• 16:05:'
+    uid = "u_wake_protocol_tool_call_tail"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat", trace_id="trace-fragment")
+    claimed_by = _claim(job_id)
+    _script_provider(monkeypatch, [
+        _text_round(reply)
+    ])
+    writes = []
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda *_args, **_kwargs: writes.append(True),
+    )
+    traces = []
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "在吗"}]
+    )
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "heartbeat",
+        deps,
+        _BYOK,
+        asyncio.Semaphore(4),
+        claimed_by,
+        trace_id="trace-fragment",
+    ))
+
+    assert status == "failed"
+    assert writes == []
+    assert _job_status(job_id) == (
+        "failed",
+        "wake_failed:protocol_fragment_suppressed",
+    )
+    event = next(
+        item for item in traces
+        if item["event_type"] == "reply.protocol_fragment_suppressed"
+    )
+    assert event["trace_id"] == "trace-fragment"
+    assert event["detail"] == {
+        "lane": "heartbeat",
+        "evidence": "tool_call_tail",
+        "stop_reason": "",
+        "transport_cut": False,
+        "final": True,
+    }
+    assert reply not in json.dumps(traces, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("stop_reason", [None, "length"])
+def test_wake_prose_fragment_delivery_is_not_changed_by_cut_signal(
+    monkeypatch, stop_reason
+):
+    uid = f"u_wake_protocol_delivery_{stop_reason or 'missing'}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    prose = "。今天她步数都上5000了……刚才问她"
+    _script_provider(monkeypatch, [_text_round(prose, stop_reason=stop_reason)])
+    written = []
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda _store, text: written.append(text) or {"id": "plain-no-cut"},
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "在吗"}]
+    )
+    traces = []
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "heartbeat",
+        deps,
+        _BYOK,
+        asyncio.Semaphore(4),
+        claimed_by,
+    ))
+
+    assert status == "completed"
+    assert written == [prose]
+    assert not any(
+        item["event_type"] == "reply.protocol_fragment_suppressed"
+        for item in traces
+    )
+    cut_events = [
+        item for item in traces
+        if item["event_type"] == "reply.transport_cut_observed"
+    ]
+    if stop_reason is None:
+        assert cut_events == []
+    else:
+        assert len(cut_events) == 1
+        assert cut_events[0]["detail"] == {
+            "lane": "heartbeat",
+            "stop_reason": "length",
+            "final": True,
+        }
+        assert prose not in json.dumps(cut_events, ensure_ascii=False)
 
 
 def test_wake_markup_only_reply_sleeps_without_bubble(monkeypatch):

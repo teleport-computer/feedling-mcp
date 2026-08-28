@@ -456,7 +456,6 @@ jobs:
             tests/test_garden_selection_pluggable.py \
             tests/test_garden_card_shape.py \
             tests/test_route_b_card_shape_recall.py \
-            tests/test_route_b_sensitive_gate.py \
             tests/test_memory_injection_observability.py \
             tests/test_memgarden_is_a_real_dependency.py \
             tests/test_card_leak_signals_wired.py \
@@ -486,6 +485,15 @@ jobs:
             tests/test_current_state_docs.py \
             tests/test_document_lifecycle.py \
             tests/test_repository_inventory.py \
+            -v
+
+      - name: Envelope round-trip tool drift guards
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m pytest \
+            tests/test_v1_envelope_roundtrip_tool.py \
+            tests/test_frame_envelope_roundtrip_tool.py \
             -v
 
       - name: Guard top-level pytest discovery coverage
@@ -611,7 +619,7 @@ jobs:
             tests/test_v2_quoted_memory.py \
             -v
 
-      - name: Run CI security tier 2 (72 files)
+      - name: Run CI security tier 2 (73 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
@@ -657,6 +665,7 @@ jobs:
             tests/test_genesis_identity_field_lock.py \
             tests/test_genesis_lightweight_identity.py \
             tests/test_genesis_notice.py \
+            tests/test_genesis_import_capture_mode.py \
             tests/test_genesis_v2_orchestration.py \
             tests/test_health_route_isolation.py \
             tests/test_history_import_identity.py \
@@ -778,6 +787,8 @@ jobs:
           python -m pytest \
             tests/test_ci_image_tag_width.py \
             tests/test_deploy_yaml_strict.py \
+            tests/test_store_sections.py \
+            tests/test_store_load_contract.py \
             tests/test_agent_mailbox_post.py \
             tests/test_release_pin_cas.py \
             tests/test_frame_r2_deploy_config.py \
@@ -799,7 +810,10 @@ jobs:
             tests/test_provider_usage_normalize.py \
             tests/test_provider_malformed_tool_fallback.py \
             tests/test_provider_client.py \
+            tests/test_provider_tools_gemini.py \
             tests/test_capability_web.py \
+            tests/test_web_fetch_result_budget.py \
+            tests/test_web_search_duckduckgo.py \
             tests/test_image_generation_model.py \
             tests/test_perception_tool_surface_contract.py \
             tests/test_v2_tool_trace_privacy.py \
@@ -838,6 +852,8 @@ jobs:
             tests/test_chat_incremental_sync.py \
             tests/test_v2_jobs_migration.py \
             tests/test_lane_rollup.py \
+            tests/test_distillation_ledger.py \
+            tests/test_e2e_tools.py \
             tests/test_data_track_snapshot_golden.py \
             tests/test_v2_general_watchdog_budget.py \
             tests/test_v2_jobs_store.py \
@@ -849,6 +865,7 @@ jobs:
             tests/test_v2_pool_supervisor.py \
             tests/test_capture_prompt_v1.py \
             tests/test_contract_rejection_stats.py \
+            tests/test_admin_data_quality_status.py \
             tests/test_data_track_runtime_view.py \
             tests/test_data_track_ops_views.py \
             tests/test_ops_dashboard_queries.py \
@@ -873,6 +890,7 @@ jobs:
             tests/test_t210_wake_sentinel_suppression.py \
             tests/test_v2_turn_budget_defaults.py \
             tests/test_v2_tool_loop_mcp.py \
+            tests/test_v2_subagents.py \
             tests/test_v2_worker_mcp.py \
             tests/test_v2_wake_mcp.py \
             tests/test_v2_worker_tool_loop.py \
@@ -900,10 +918,12 @@ jobs:
             tests/test_write_side_format_routing.py \
             tests/test_admin_debug_turn_view.py \
             tests/test_data_track_debug.py \
+            tests/test_data_track.py \
             tests/test_admin_discarded_reason.py \
             tests/test_admin_concentration.py \
             tests/test_admin_concentration_e2e.py \
             tests/test_admin_genesis_unavailable.py \
+            tests/test_v2_capture_batch_protocol.py \
             -v
 
       - name: Upload execution evidence (report only)

@@ -68,7 +68,6 @@ def test_emit_tool_trace_posts_agent_tool_call_with_redacted_args(monkeypatch):
         bucket="places",
         thread="",
         ambient=False,
-        include_sensitive=False,
         func=lambda _args: None,
     )
 

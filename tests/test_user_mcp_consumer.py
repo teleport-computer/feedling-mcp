@@ -900,7 +900,7 @@ def test_mcp_value_pi_injects_extension_on_chat_lane_only(monkeypatch, tmp_path)
     bridge_file = tmp_path / "index.js"
     bridge_file.write_text("// bridge")
     monkeypatch.setattr(c, "PI_MCP_BRIDGE_FILE", str(bridge_file))
-    tpl_pi = "pi --mode json -ne -xt read,edit,write {mcp} --session-id {session_id}"
+    tpl_pi = "pi --mode json -ne -xt edit,write {mcp} --session-id {session_id}"
     monkeypatch.setattr(c, "AGENT_CLI_CMD", tpl_pi)
 
     assert c._user_mcp_cli_value(tpl_pi, "chat") == f"-e {bridge_file}"
@@ -920,7 +920,7 @@ def test_mcp_value_pi_degrades_to_empty_when_bridge_file_missing(
             {"name": "jira", "enabled": True,
              "url": "https://a.example.com", "headers": {}}]})
     monkeypatch.setattr(c, "PI_MCP_BRIDGE_FILE", str(tmp_path / "missing" / "index.js"))
-    tpl_pi = "pi --mode json -ne -xt read,edit,write {mcp} --session-id {session_id}"
+    tpl_pi = "pi --mode json -ne -xt edit,write {mcp} --session-id {session_id}"
     monkeypatch.setattr(c, "AGENT_CLI_CMD", tpl_pi)
 
     assert c._user_mcp_cli_value(tpl_pi, "chat") == ""

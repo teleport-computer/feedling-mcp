@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import json
 import sys
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -7,6 +9,7 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from agent import perception_core  # noqa: E402
+from perception import catalog as perception_catalog  # noqa: E402
 from perception import history as perception_history  # noqa: E402
 from perception import service as perception_service  # noqa: E402
 from perception import store as perception_store  # noqa: E402
@@ -370,7 +373,16 @@ def test_agent_perception_digest_returns_top_notable_changes(monkeypatch):
 
     monkeypatch.setenv("FEEDLING_DIGEST_NOTABLE_MAX", "1")
     monkeypatch.setattr(perception_store, "list_perception_daily", fake_list)
-    client = _client(monkeypatch)
+    now = 1_000_000.0
+    monkeypatch.setattr(perception_core.time, "time", lambda: now)
+    client = _client(
+        monkeypatch,
+        state={
+            "timezone": {"v": "Asia/Shanghai", "ts": now},
+            "resting_heart_rate": {"v": 66.0, "ts": now},
+            "active_energy_kcal": {"v": 500.0, "ts": now},
+        },
+    )
 
     resp = client.get("/v1/agent/perception/digest?days=7")
     body = resp.get_json()
@@ -399,6 +411,74 @@ def test_agent_perception_digest_returns_top_notable_changes(monkeypatch):
         "location", "media", "app", "health", "weather",
         "mood", "reminders", "calendar", "photos", "screen",
     }
+
+
+def test_agent_perception_digest_marks_stale_rollup_last_known_in_both_views(monkeypatch):
+    rows = [
+        {"date": "2026-08-23", "doc": {"step_count": {"max": 1000}}},
+        {"date": "2026-08-24", "doc": {"step_count": {"max": 1000}}},
+        {"date": "2026-08-25", "doc": {"step_count": {"max": 1800}}},
+    ]
+    report_ts = datetime(2026, 8, 25, 15, 41, tzinfo=timezone.utc).timestamp()
+    ttl = perception_catalog.SIGNALS["health_vitals"].ttl_sec
+    monkeypatch.setattr(
+        perception_store,
+        "list_perception_daily",
+        lambda user_id, signal, days: rows if signal == "health_vitals" else [],
+    )
+    monkeypatch.setattr(perception_core.time, "time", lambda: report_ts + ttl + 1)
+    client = _client(
+        monkeypatch,
+        state={
+            "timezone": {"v": "Asia/Shanghai", "ts": report_ts},
+            "step_count": {"v": 1800, "ts": report_ts},
+        },
+    )
+
+    body = client.get("/v1/agent/perception/digest?days=7").get_json()
+    change = body["changes"][0]
+
+    assert body["domains"]["health"]["notable"] == body["changes"]
+    assert "current" not in change
+    assert change == {
+        "signal": "health_vitals",
+        "field": "step_count",
+        "last_known": 1800.0,
+        "as_of": "2026-08-25 23:41",
+        "baseline_median": 1000.0,
+        "delta": 800.0,
+        "direction": "up",
+        "magnitude": 0.8,
+    }
+
+
+def test_agent_perception_digest_is_byte_stable_while_same_report_remains_stale(monkeypatch):
+    rows = [
+        {"date": "2026-08-23", "doc": {"step_count": {"max": 1000}}},
+        {"date": "2026-08-24", "doc": {"step_count": {"max": 1000}}},
+        {"date": "2026-08-25", "doc": {"step_count": {"max": 1800}}},
+    ]
+    report_ts = datetime(2026, 8, 25, 15, 41, tzinfo=timezone.utc).timestamp()
+    ttl = perception_catalog.SIGNALS["health_vitals"].ttl_sec
+    monkeypatch.setattr(
+        perception_store,
+        "list_perception_daily",
+        lambda user_id, signal, days: rows if signal == "health_vitals" else [],
+    )
+    now_values = iter((report_ts + ttl + 1, report_ts + ttl + 600))
+    monkeypatch.setattr(perception_core.time, "time", lambda: next(now_values))
+    client = _client(
+        monkeypatch,
+        state={
+            "timezone": {"v": "Asia/Shanghai", "ts": report_ts},
+            "step_count": {"v": 1800, "ts": report_ts},
+        },
+    )
+
+    first = client.get("/v1/agent/perception/digest?days=7").get_json()
+    second = client.get("/v1/agent/perception/digest?days=7").get_json()
+
+    assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
 
 
 def test_agent_perception_digest_empty_without_baseline(monkeypatch):

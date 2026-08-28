@@ -11,6 +11,7 @@ import websockets
 
 from accounts import registry
 from core import store as core_store
+from core.store_sections import StoreSection
 from screen import frames
 
 WS_PORT = int(os.environ.get("FEEDLING_WS_PORT", 9998))
@@ -70,7 +71,7 @@ async def _ws_handler(websocket):
         return
     user_id, ws_key = resolved
 
-    store = core_store.get_store(user_id)
+    store = core_store.get_store(user_id, require={StoreSection.FRAMES})
     store.last_seen_api_key = ws_key
     print(f"[ws] client connected user={user_id} peer={websocket.remote_address}")
     try:

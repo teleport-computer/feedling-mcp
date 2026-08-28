@@ -28,6 +28,7 @@ if not os.environ.get("DATABASE_URL"):
     pytest.skip("DATABASE_URL not set — needs a real Postgres", allow_module_level=True)
 
 import db  # noqa: E402
+from core import store as core_store  # noqa: E402
 
 from conftest import seed_user  # noqa: E402
 
@@ -80,6 +81,103 @@ def test_users_roundtrip_and_archive_language_omitted_when_null():
     assert db.delete_user(uid) is True
     assert db.delete_user(uid) is False
     assert uid not in {u["user_id"] for u in db.load_all_users()}
+
+
+def test_new_user_upsert_seeds_web_enabled_only_on_actual_insert():
+    uid = _uid()
+    entry = {"user_id": uid, "created_at": "2026-08-27", "label": "new"}
+
+    assert db.upsert_user(entry, seed_web_settings_on_insert=True) is True
+    assert db.get_blob(uid, "web_settings") == {"version": 1, "enabled": True}
+
+    db.delete_user(uid)
+
+
+def test_plain_upsert_keeps_its_default_non_seeding_contract():
+    uid = _uid()
+    entry = {"user_id": uid, "created_at": "2026-08-27", "label": "ordinary"}
+
+    assert db.upsert_user(entry) is None
+    assert db.get_blob(uid, "web_settings") is None
+
+    db.delete_user(uid)
+
+
+def test_seed_retry_keeps_old_no_blob_user_off_and_still_updates_doc():
+    """Both clauses are load-bearing: DO NOTHING must protect the absent blob,
+    but must not replace the historical DO UPDATE for the users document."""
+    uid = _uid()
+    db.insert_user({"user_id": uid, "created_at": "old", "label": "before"})
+
+    edited = {"user_id": uid, "created_at": "new", "label": "after"}
+    assert db.upsert_user(edited, seed_web_settings_on_insert=True) is False
+
+    assert db.get_blob(uid, "web_settings") is None
+    assert core_store.UserStore(uid).load_web_settings() == {
+        "version": 1,
+        "enabled": False,
+    }
+    stored = {row["user_id"]: row for row in db.load_all_users()}[uid]
+    assert stored["label"] == "after"
+    assert stored["created_at"] == "new"
+
+    db.delete_user(uid)
+
+
+def test_recreated_user_does_not_overwrite_a_residual_disabled_blob(monkeypatch):
+    """Protect pre-cascade/residual RDS rows even when the user insert is new."""
+    uid = _uid()
+    entry = {"user_id": uid, "created_at": "old", "label": "first account"}
+    disabled = {"version": 1, "enabled": False}
+    state = {"blob": disabled}
+
+    class _Result:
+        def fetchone(self):
+            return (uid,)
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def transaction(self):
+            return self
+
+        def execute(self, sql, params):
+            if "INSERT INTO user_blobs" in sql and "DO UPDATE" in sql:
+                state["blob"] = params[2].obj
+            return _Result()
+
+    class _Pool:
+        def connection(self):
+            return _Connection()
+
+    from tee_shadow import mirror
+
+    monkeypatch.setattr(db, "get_pool", lambda: _Pool())
+    monkeypatch.setattr(mirror, "execute", lambda *_args, **_kwargs: None)
+
+    assert db.upsert_user(entry, seed_web_settings_on_insert=True) is True
+    assert state["blob"] == disabled
+
+
+def test_seed_retry_never_reopens_an_explicitly_disabled_user():
+    uid = _uid()
+    entry = {"user_id": uid, "created_at": "old", "label": "before"}
+    db.insert_user(entry)
+    disabled = {"version": 1, "enabled": False}
+    db.set_blob_strict(uid, "web_settings", disabled)
+
+    entry["label"] = "registered-again"
+    assert db.upsert_user(entry, seed_web_settings_on_insert=True) is False
+    assert db.get_blob(uid, "web_settings") == disabled
+    assert {row["user_id"]: row for row in db.load_all_users()}[uid]["label"] == (
+        "registered-again"
+    )
+
+    db.delete_user(uid)
 
 
 def test_users_full_doc_and_save_all():

@@ -24,18 +24,28 @@ def memory_readside_for_model_api_enabled() -> bool:
     return config.env_flag_enabled("MEMORY_READSIDE_FOR_MODEL_API")
 
 
-def memory_readside_model_api_limit(default: int = 50) -> int:
+MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT = 500
+MEMORY_READSIDE_MODEL_API_MIN_LIMIT = 1
+
+
+def memory_readside_model_api_limit() -> int:
     """自动注入的候选池大小。
 
-    2026-08-18：默认值由调用方给。两条 runtime 统一挑法之后，chat 入口传 200
-    （resident 一直在用的值）—— 池子大小是运维旋钮，不该随统一被写死。
+    正整数配置原样传给 backend；backend 的 memory/list 契约负责显式拒绝
+    超出其支持范围的值。这里不能再静默钳位，否则运维旋钮只可下调不可上调。
     """
-    raw = os.environ.get("MEMORY_READSIDE_MODEL_API_LIMIT", "")
+    raw = str(os.environ.get("MEMORY_READSIDE_MODEL_API_LIMIT", "")).strip()
     try:
-        value = int(str(raw).strip()) if str(raw).strip() else int(default)
-    except (TypeError, ValueError):
-        value = int(default)
-    return max(1, min(value, 200))
+        value = int(raw) if raw else MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "MEMORY_READSIDE_MODEL_API_LIMIT must be an integer"
+        ) from exc
+    if value < MEMORY_READSIDE_MODEL_API_MIN_LIMIT:
+        raise ValueError(
+            "MEMORY_READSIDE_MODEL_API_LIMIT must be positive"
+        )
+    return value
 
 
 def memory_readside_hard_max() -> int:
@@ -50,8 +60,8 @@ def memory_readside_hard_max() -> int:
 def memory_readside_effective_limit(raw_limit=None) -> int:
     """Mirror backend readside limit semantics inside the enclave.
 
-    FEEDLING_MEMORY_READSIDE_LIMIT controls index/fetch candidate windows:
-    - unset: 50
+    The explicit payload limit controls index/fetch candidate windows:
+    - unset: full window, capped by HARD_MAX (same as the backend)
     - positive integer: that many candidates, capped by HARD_MAX
     - 0: "full window", still capped by FEEDLING_MEMORY_READSIDE_HARD_MAX
 
@@ -59,13 +69,13 @@ def memory_readside_effective_limit(raw_limit=None) -> int:
     older route-B auto-recall path. Keep both knobs distinct.
     """
     if raw_limit is None or str(raw_limit).strip() == "":
-        raw_limit = os.environ.get("FEEDLING_MEMORY_READSIDE_LIMIT", "50")
+        raw_limit = "0"
     try:
         requested = int(str(raw_limit).strip())
     except (TypeError, ValueError):
-        requested = 50
+        requested = 0
     if requested < 0:
-        requested = 50
+        requested = 0
     hard_max = memory_readside_hard_max()
     if requested == 0:
         return hard_max
@@ -96,10 +106,6 @@ def context_moment_to_index_item(moment: dict) -> dict:
         "status": "active",
         "salience": "medium",
         "is_open_thread": False,
-        # 由 moments_to_cards 带上来的真实标记。此前这里硬写 False，
-        # selector 的敏感闸（scoring/selector.py 的 sensitive_not_allowed_for_query）
-        # 因而永不触发 —— 标了敏感的卡在普通闲聊里照样会被选中喂给模型。
-        "is_sensitive": bool(moment.get("is_sensitive")),
         "score": 0,
         "occurred_at": memory_readside_text(moment.get("occurred_at"), 80),
         "created_at": memory_readside_text(moment.get("created_at"), 80),
@@ -133,12 +139,25 @@ def select_context_memories_via_readside(
         latest_user_text,
         index_items,
         cap=cap,
-        include_sensitive=False,
+        # memgarden v0.2 defaults None to a query-keyword classification gate.
+        # IO retired card sensitivity, so explicitly keep every indexed card
+        # eligible instead of relying on today's index shape to make that gate
+        # inert.  This is a dependency-compatibility argument, not public API.
+        include_sensitive=True,
     )
     selected_ids = [memory_id for memory_id in selection.get("selected_ids", []) if memory_id in by_id]
     context_memories = [dict(by_id[memory_id]) for memory_id in selected_ids[:cap]]
-    selector_trace = selection.get("trace") if isinstance(selection.get("trace"), dict) else {}
-    selected_trace = selector_trace.get("selected") if isinstance(selector_trace.get("selected"), list) else []
+    selector_trace = dict(selection.get("trace")) if isinstance(selection.get("trace"), dict) else {}
+    # memgarden v0.2 still emits a legacy classification decision in its trace.
+    # IO no longer has that card concept, so keep the dependency detail behind
+    # this adapter rather than leaking a dead field into observability.
+    selector_trace.pop("allow_sensitive", None)
+    selected_trace = [
+        {key: value for key, value in item.items() if key != "is_sensitive"}
+        for item in selector_trace.get("selected", [])
+        if isinstance(item, dict)
+    ]
+    selector_trace["selected"] = selected_trace
     skipped = selector_trace.get("skipped_sample") if isinstance(selector_trace.get("skipped_sample"), list) else []
     trace = {
         "mode": "model_api_readside_v1",
@@ -223,15 +242,10 @@ def memory_inner_to_v1(inner: dict, envelope: dict | None = None) -> dict:
             "content": memory_readside_text(inner.get("content"), 5000),
             "bucket": memory_readside_text(inner.get("bucket"), 80) or "未分类",
             "threads": memory_readside_list(inner.get("threads"))[:8],
-            **{
-                key: inner[key]
-                for key in ("is_sensitive", "sensitivity_class", "sensitive_scope",
-                            # 通话溯源:agent 拿到它就能调 voice_transcript_read
-                            # 回看原文。这个 dict 是显式重建的,漏加 = 字段被
-                            # 静默剥掉,写进去也等于没写。
-                            "voice_call_id")
-                if key in inner
-            },
+            # 通话溯源:agent 拿到它就能调 voice_transcript_read
+            # 回看原文。这个 dict 是显式重建的,漏加 = 字段被
+            # 静默剥掉,写进去也等于没写。
+            **({"voice_call_id": inner["voice_call_id"]} if "voice_call_id" in inner else {}),
         }
 
     summary = memory_readside_summary(inner)
@@ -257,9 +271,6 @@ def memory_inner_to_v1(inner: dict, envelope: dict | None = None) -> dict:
         or memory_default_bucket(inner.get("type") or envelope.get("type")),
         "threads": threads[:8],
     }
-    for key in ("is_sensitive", "sensitivity_class", "sensitive_scope"):
-        if key in inner:
-            adapted[key] = inner[key]
     return adapted
 
 
@@ -267,16 +278,12 @@ def memory_readside_status(envelope: dict, inner: dict) -> str:
     return str(envelope.get("status") or inner.get("status") or "active").strip().lower() or "active"
 
 
-def memory_readside_is_sensitive(envelope: dict, inner: dict) -> bool:
+def memory_public_item(item: dict) -> dict:
+    """Return a memory item without retired classification metadata."""
+    clean = dict(item)
     for key in ("is_sensitive", "sensitivity_class", "sensitive_scope"):
-        value = inner.get(key)
-        if value:
-            return True if key != "is_sensitive" else bool(value)
-    for key in ("is_sensitive", "sensitivity_class"):
-        value = envelope.get(key)
-        if value:
-            return True if key != "is_sensitive" else bool(value)
-    return False
+        clean.pop(key, None)
+    return clean
 
 
 def build_memory_index_item(envelope: dict, inner: dict) -> dict:
@@ -293,7 +300,6 @@ def build_memory_index_item(envelope: dict, inner: dict) -> dict:
         "created_at": memory_readside_text(envelope.get("created_at"), 80),
         "updated_at": memory_readside_text(envelope.get("updated_at"), 80),
         "last_referenced_at": memory_readside_text(envelope.get("last_referenced_at"), 80),
-        "is_sensitive": memory_readside_is_sensitive(envelope, adapted),
         "score": float(envelope.get("score") or 0),
     }
 
@@ -327,7 +333,6 @@ def build_memory_fetch_item(envelope: dict, inner: dict) -> dict:
         "created_at": memory_readside_text(envelope.get("created_at"), 80),
         "updated_at": memory_readside_text(envelope.get("updated_at"), 80),
         "last_referenced_at": memory_readside_text(envelope.get("last_referenced_at"), 80),
-        "is_sensitive": memory_readside_is_sensitive(envelope, adapted),
         # 通话溯源。这个返回体是显式白名单,不加就到不了 agent —— 卡上写了也白写。
         # 只放 fetch 不放 index:index 是选择器用的轻量投影,多一个不参与语义的 id
         # 只是噪音;agent 在 fetch 到全文时看到它就够了。
@@ -425,10 +430,5 @@ def moments_to_cards(moments: list, authorized_user_id: str, content_sk) -> list
             "her_quote": inner.get("her_quote"),
             "context": inner.get("context"),
             "linked_dimension": inner.get("linked_dimension"),
-            # 敏感标记必须跟着卡走 —— Route B 以前在 context_moment_to_index_item
-            # 里硬写 is_sensitive=False，于是 selector 的「敏感卡不给非敏感提问」
-            # 那道闸永远看不到真实标记，等于空转（2026-08-16 查实）。
-            # 这里用与 index/fetch 同一个判据，避免第三套语义。
-            "is_sensitive": memory_readside_is_sensitive(m, inner),
         })
     return out
