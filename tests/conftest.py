@@ -407,6 +407,9 @@ if not _provisioned:
         # 也就是说无 PG 的机器上它们一直没跑。superseded 那条新用例就在
         # test_v2_tool_loop.py 里,不登记等于白写。
         "test_v2_tool_loop.py",
+        # T363 readback probe verdict logic: pure in-memory payload parsing;
+        # the production probe's only network call is never invoked here.
+        "test_tool_schema_rejection_probe.py",
         # Runtime V2 provider-round/timeout defaults: AST-only source guard.
         "test_v2_turn_budget_defaults.py",
         "test_chat_resident_consumer_image.py",

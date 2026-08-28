@@ -370,7 +370,12 @@ def test_tagged_screen_images_retry_once_without_frames(monkeypatch):
 
     monkeypatch.setattr(provider_client, "chat_completion_async", scripted)
     rejected = []
+    trajectory = []
     usage = []
+
+    async def record_trajectory(kind, payload):
+        trajectory.append((kind, payload))
+
     on_reply = _RecordingReply()
     tagged = {
         "role": "user",
@@ -391,6 +396,7 @@ def test_tagged_screen_images_retry_once_without_frames(monkeypatch):
         max_calls=3,
         tagged_image_message_key="_screen_test",
         on_tagged_images_rejected=lambda exc: rejected.append(type(exc).__name__),
+        on_trajectory_event=record_trajectory,
     ))
 
     assert len(provider.calls) == 2
@@ -399,6 +405,13 @@ def test_tagged_screen_images_retry_once_without_frames(monkeypatch):
     assert rejected == ["ProviderError"]
     assert usage == [None, {}]
     assert outcome.final_text == "text fallback"
+    initial_error = next(
+        payload for kind, payload in trajectory if kind == "provider_error"
+    )
+    assert initial_error["fallback_reason"] == "tagged_images_rejected"
+    assert initial_error["status_code"] == 404
+    assert initial_error["provider_error_class"] == "provider_config"
+    assert initial_error["dur_ms"] >= 0
 
 
 def test_tagged_image_verdict_is_not_persisted_when_text_retry_also_fails(
@@ -3127,10 +3140,14 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     usage = []
     surfaces = []
+    trajectory = []
     reply = _RecordingReply()
 
     async def record_surface(detail):
         surfaces.append(detail)
+
+    async def record_trajectory(event_kind, payload):
+        trajectory.append((event_kind, payload))
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
         provider_config=_TEST_PROVIDER_CONFIG, build_messages=_RecordingBuildMessages(),
@@ -3139,6 +3156,7 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
         max_calls=5,
         allow_image_output=True,
         on_provider_tool_surface=record_surface,
+        on_trajectory_event=record_trajectory,
     ))
 
     assert provider.calls[0]["tools"] is not None
@@ -3160,6 +3178,13 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
     assert surfaces[1]["terminal_text_round"] is True
     assert surfaces[1]["terminal_text_round_reason"] == "force_text_fallback"
     assert surfaces[1]["force_text_fallback_reason"] == "tool_schema_rejected"
+    initial_error = next(
+        payload for kind, payload in trajectory if kind == "provider_error"
+    )
+    assert initial_error["fallback_reason"] == "tool_schema_rejected"
+    assert initial_error["status_code"] == status_code
+    assert initial_error["provider_error_class"] == "provider_config"
+    assert initial_error["dur_ms"] >= 0
 
 
 def test_terminal_surface_preserves_same_round_rejection_subtype(monkeypatch):

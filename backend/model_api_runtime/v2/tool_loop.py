@@ -182,6 +182,15 @@ _PROVIDER_FORCE_TEXT_FALLBACK_REASONS = frozenset(
         "other",
     }
 )
+# Provider calls that failed, but for which the loop deliberately made a
+# degraded retry.  These values are mirrored into the plaintext attempt ledger;
+# keep them as producer-owned closed metadata, never exception text.
+_PROVIDER_ATTEMPT_FALLBACK_TAGGED_IMAGES = "tagged_images_rejected"
+_PROVIDER_ATTEMPT_FALLBACK_TOOL_SCHEMA = "tool_schema_rejected"
+_PROVIDER_ATTEMPT_FALLBACK_REASONS = frozenset({
+    _PROVIDER_ATTEMPT_FALLBACK_TAGGED_IMAGES,
+    _PROVIDER_ATTEMPT_FALLBACK_TOOL_SCHEMA,
+})
 # Keep the producer inventory separate from the public vocabulary. A regression
 # test compares the two so adding a classification branch cannot silently turn a
 # rejected round into the same empty list used by a healthy round.
@@ -2458,6 +2467,7 @@ async def run_tool_loop(
                 and getattr(exc, "status_code", None) in {400, 404, 415, 422}
             )
             if tagged_image_rejected:
+                tagged_error_facts = _provider_error_facts(exc)
                 await _trajectory(
                     "provider_error",
                     {
@@ -2465,6 +2475,16 @@ async def run_tool_loop(
                         "error_class": type(exc).__name__,
                         "tools_enabled": tools is not None,
                         "tagged_images_rejected": True,
+                        "status_code": tagged_error_facts["status_code"],
+                        "provider_error_class": tagged_error_facts[
+                            "provider_error_class"
+                        ],
+                        "dur_ms": (
+                            time.monotonic() - provider_call_started_at
+                        ) * 1000,
+                        "fallback_reason": (
+                            _PROVIDER_ATTEMPT_FALLBACK_TAGGED_IMAGES
+                        ),
                     },
                 )
                 add_usage(None)
@@ -2505,7 +2525,18 @@ async def run_tool_loop(
                 provider_error = exc
         if provider_error is not None:
             exc = provider_error
+            tool_schema_rejected = (
+                tools is not None
+                and isinstance(exc, provider_client.ProviderError)
+                and exc.status_code in {400, 422}
+                and attempts < max_calls
+                and _is_probably_tool_schema_rejection(exc)
+            )
             await _emit_provider_tool_surface(provider_surface_detail)
+            provider_error_facts = _provider_error_facts(exc)
+            provider_call_dur_ms = (
+                time.monotonic() - provider_call_started_at
+            ) * 1000
             await _provider_call_event(
                 "error",
                 {
@@ -2514,22 +2545,27 @@ async def run_tool_loop(
                     "model": str(
                         getattr(provider_config, "model", "") or ""
                     ),
-                    **_provider_error_facts(exc),
-                    "dur_ms": (
-                        time.monotonic() - provider_call_started_at
-                    ) * 1000,
+                    **provider_error_facts,
+                    "dur_ms": provider_call_dur_ms,
                 },
             )
             attempt_trace = provider_client.runtime_provider_attempt_trace(exc)
-            await _trajectory(
-                "provider_error",
-                {
-                    "round": attempts,
-                    "error_class": type(exc).__name__,
-                    "tools_enabled": tools is not None,
-                    "provider_attempt_trace": attempt_trace,
-                },
-            )
+            provider_error_detail = {
+                "round": attempts,
+                "error_class": type(exc).__name__,
+                "tools_enabled": tools is not None,
+                "provider_attempt_trace": attempt_trace,
+                "status_code": provider_error_facts["status_code"],
+                "provider_error_class": provider_error_facts[
+                    "provider_error_class"
+                ],
+                "dur_ms": provider_call_dur_ms,
+            }
+            if tool_schema_rejected:
+                provider_error_detail["fallback_reason"] = (
+                    _PROVIDER_ATTEMPT_FALLBACK_TOOL_SCHEMA
+                )
+            await _trajectory("provider_error", provider_error_detail)
             # TurnMetrics' docstring promises failed provider calls ARE counted
             # (model_calls bumped, just with no token usage) — add_usage(None)
             # before either falling back or propagating.
@@ -2613,13 +2649,7 @@ async def run_tool_loop(
                     "required_file_missing",
                     replied_intermediate,
                 )
-            if (
-                tools is not None
-                and isinstance(exc, provider_client.ProviderError)
-                and exc.status_code in {400, 422}
-                and attempts < max_calls
-                and _is_probably_tool_schema_rejection(exc)
-            ):
+            if tool_schema_rejected:
                 force_text_fallback = True
                 force_text_fallback_reason = "tool_schema_rejected"
                 await _trajectory(

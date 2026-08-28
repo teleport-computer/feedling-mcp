@@ -4528,8 +4528,9 @@ def _note_provider_attempt(
     is why "the same relay succeeds 897 times under V1" was a one-line query
     while the V2 side of the same comparison was not (usr_90184…, 2026-07-27).
 
-    Metadata only — outcome, token counts, provider/model, error CLASS. No
-    prompt, no reply, no raw error text, matching the module's contract.
+    Metadata only — outcome, token counts, provider/model, error CLASS, HTTP
+    status, and a producer-owned fallback code. No prompt, reply, or raw error
+    text, matching the module's contract.
     """
     if event_kind not in _LEDGER_EVENTS:
         return
@@ -4551,6 +4552,16 @@ def _note_provider_attempt(
             input_tokens=usage.get("prompt_tokens"),
             output_tokens=usage.get("completion_tokens"),
             error_class=str(payload.get("error_class") or "") if failed else "",
+            status_code=payload.get("status_code") if failed else None,
+            fallback_reason=(
+                str(payload.get("fallback_reason") or "") if failed else ""
+            ),
+            provider_error_class=(
+                str(payload.get("provider_error_class") or "")
+                if failed
+                else ""
+            ),
+            dur_ms=payload.get("dur_ms") if failed else None,
         )
     except Exception:  # noqa: BLE001 - telemetry must not break a turn
         pass
