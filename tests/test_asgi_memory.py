@@ -471,7 +471,12 @@ def test_index_database_failure_is_503_not_an_empty_success(user, monkeypatch):
     assert (status, body) == (503, {"error": "memory_load_failed"})
     assert events[-1]["type"] == "memory.index.called"
     assert events[-1]["status"] == "failed"
-    assert events[-1]["detail"]["reason"] == "memory_load_failed"
+    # The trace carries a closed category, not the exception text: this lane also
+    # raises RuntimeError("enclave_http_<code>:<response body>"), and the trace is
+    # user-readable. The caller still gets the full string in the response above,
+    # so the finer distinction survives where it was already disclosed.
+    assert events[-1]["detail"]["reason"] == "readside_unavailable"
+    assert events[-1]["detail"]["error_class"] == "RuntimeError"
 
 
 def test_index_invalid_limit_400_parity(user):
