@@ -1248,8 +1248,31 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
     today = datetime.now(zone).date()
     day_start, _ = _lane_rollup_day_bounds(today, zone)
     cutoff = day_start.timestamp()
-    sums = ", ".join(f"SUM({k})::int" for k in _CHAT_SNAPSHOT_COUNT_KEYS)
+    sums = ", ".join(f"SUM({k})::int AS {k}" for k in _CHAT_SNAPSHOT_COUNT_KEYS)
+    count_columns = ", ".join(
+        f"counts.{key}" for key in _CHAT_SNAPSHOT_COUNT_KEYS
+    )
+    time_columns = ", ".join(
+        f"counts.{key}"
+        for key in (
+            "first_ts", "last_ts", "proactive_last_ts",
+            "last_user_ts", "last_agent_ts",
+        )
+    )
+    closed_dimensions = ", ".join(
+        f"('{target}', {target})"
+        for _field, target, _predicate in _CHAT_ROLLUP_DIST_FIELDS
+    )
+    live_dimensions = ", ".join(
+        "(" + ", ".join((
+            f"'{target}'",
+            f"COALESCE(NULLIF(doc->>'{field}', ''), 'unknown')",
+            predicate.removeprefix(" AND ") if predicate else "TRUE",
+        )) + ")"
+        for field, target, predicate in _CHAT_ROLLUP_DIST_FIELDS
+    )
     acc: dict[str, dict] = {}
+    proactive_acc: dict[str, dict[str, dict[str, int]]] = {}
 
     # ⚠️ 两段的边界必须**互斥**：格子取 day < today，实时窗取 ts >= today 起点。
     # 少了这个 day 上界，任何落在今天或之后的格子会被两边各数一次。冻结器只冻
@@ -1257,11 +1280,40 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
     # 写出来才是。（本条是测试种子用了未来时刻、把这个重叠暴露出来后补的。）
     for row in conn.execute(
         f"""
-        SELECT user_id, {sums},
-               MIN(first_ts), MAX(last_ts), MAX(proactive_last_ts),
-               MAX(last_user_ts), MAX(last_agent_ts)
-        FROM chat_daily_rollup WHERE user_id = ANY(%s) AND day < %s
-        GROUP BY user_id
+        WITH selected AS MATERIALIZED (
+            SELECT *
+            FROM chat_daily_rollup
+            WHERE user_id = ANY(%s) AND day < %s
+        ), counts AS (
+            SELECT user_id, {sums},
+                   MIN(first_ts) AS first_ts,
+                   MAX(last_ts) AS last_ts,
+                   MAX(proactive_last_ts) AS proactive_last_ts,
+                   MAX(last_user_ts) AS last_user_ts,
+                   MAX(last_agent_ts) AS last_agent_ts
+            FROM selected
+            GROUP BY user_id
+        ), distribution_counts AS (
+            SELECT user_id, src, k, SUM(raw::int)::int AS v
+            FROM selected,
+            LATERAL (
+                VALUES {closed_dimensions}
+            ) AS dimensions(src, doc),
+            LATERAL jsonb_each_text(doc) AS entries(k, raw)
+            GROUP BY user_id, src, k
+        ), distributions AS (
+            SELECT user_id, jsonb_object_agg(src, buckets) AS folded
+            FROM (
+                SELECT user_id, src, jsonb_object_agg(k, v) AS buckets
+                FROM distribution_counts
+                GROUP BY user_id, src
+            ) per_dimension
+            GROUP BY user_id
+        )
+        SELECT counts.user_id, {count_columns}, {time_columns},
+               COALESCE(distributions.folded, '{{}}'::jsonb)
+        FROM counts
+        LEFT JOIN distributions USING (user_id)
         """,
         (ids, today.isoformat()),
     ).fetchall():
@@ -1271,38 +1323,48 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
         for offset, key in enumerate(("first_ts", "last_ts", "proactive_last_ts",
                                       "last_user_ts", "last_agent_ts")):
             cell[key] = row[1 + n + offset]
-        acc[str(row[0])] = cell
-
-    for uid, folded in conn.execute(
-        """
-        SELECT user_id, jsonb_object_agg(src, buckets)
-        FROM (
-            SELECT user_id, src, jsonb_object_agg(k, v) AS buckets
-            FROM (
-                SELECT user_id, src, k, SUM(raw::int)::int AS v
-                FROM chat_daily_rollup,
-                LATERAL (VALUES ('by_role', by_role), ('by_source', by_source),
-                                ('by_content_type', by_content_type)) AS d(src, doc),
-                LATERAL jsonb_each_text(doc) AS e(k, raw)
-                WHERE user_id = ANY(%s) AND day < %s
-                GROUP BY user_id, src, k
-            ) per_key
-            GROUP BY user_id, src
-        ) per_src
-        GROUP BY user_id
-        """,
-        (ids, today.isoformat()),
-    ).fetchall():
-        cell = acc.setdefault(str(uid), {})
+        folded = dict(row[1 + n + 5] or {})
         for key in _CHAT_SNAPSHOT_DIST_KEYS:
-            cell[key] = dict((folded or {}).get(key) or {})
+            cell[key] = dict(folded.get(key) or {})
+        acc[str(row[0])] = cell
+        proactive = {
+            key: {str(k): int(v) for k, v in (folded.get(key) or {}).items()}
+            for key in ("live_activity_status", "alert_status")
+        }
+        if any(proactive.values()):
+            proactive_acc[str(row[0])] = proactive
 
     # 当天还没冻结的那一段：单次有界查询，窗口就是今天。
     for row in conn.execute(
         f"""
-        SELECT user_id,{_CHAT_ROLLUP_COUNTS_SELECT}
-        FROM {_chat_rollup_source('user_id = ANY(%s) AND ts >= %s')} src
-        GROUP BY user_id
+        WITH live AS MATERIALIZED (
+            SELECT *
+            FROM {_chat_rollup_source('user_id = ANY(%s) AND ts >= %s')} src
+        ), counts AS (
+            SELECT user_id,{_CHAT_ROLLUP_COUNTS_SELECT}
+            FROM live
+            GROUP BY user_id
+        ), distribution_counts AS (
+            SELECT user_id, dimension, value, COUNT(*)::int AS v
+            FROM live
+            CROSS JOIN LATERAL (
+                VALUES {live_dimensions}
+            ) AS dimensions(dimension, value, included)
+            WHERE included
+            GROUP BY user_id, dimension, value
+        ), distributions AS (
+            SELECT user_id, jsonb_object_agg(dimension, buckets) AS folded
+            FROM (
+                SELECT user_id, dimension, jsonb_object_agg(value, v) AS buckets
+                FROM distribution_counts
+                GROUP BY user_id, dimension
+            ) per_dimension
+            GROUP BY user_id
+        )
+        SELECT counts.user_id, {count_columns}, {time_columns},
+               COALESCE(distributions.folded, '{{}}'::jsonb)
+        FROM counts
+        LEFT JOIN distributions USING (user_id)
         """,
         (ids, cutoff, ids, cutoff),
     ).fetchall():
@@ -1318,19 +1380,16 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
             live = row[2 + n + offset]
             if live is not None and (cell.get(key) is None or live > cell[key]):
                 cell[key] = live
-
-    for field, target, extra in _CHAT_ROLLUP_DIST_FIELDS[:3]:
-        for uid, value, count in conn.execute(
-            f"""
-            SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
-                   COUNT(*)::int
-            FROM {_chat_rollup_source(f'user_id = ANY(%s) AND ts >= %s{extra}')} src
-            GROUP BY user_id, value
-            """,
-            (field, ids, cutoff, ids, cutoff),
-        ).fetchall():
-            bucket = acc.setdefault(str(uid), {}).setdefault(target, {})
-            bucket[str(value)] = bucket.get(str(value), 0) + int(count)
+        folded = dict(row[1 + n + 5] or {})
+        for key in _CHAT_SNAPSHOT_DIST_KEYS:
+            bucket = cell.setdefault(key, {})
+            for value, count in (folded.get(key) or {}).items():
+                bucket[str(value)] = bucket.get(str(value), 0) + int(count)
+        proactive = proactive_acc.setdefault(str(row[0]), {})
+        for key in ("live_activity_status", "alert_status"):
+            bucket = proactive.setdefault(key, {})
+            for value, count in (folded.get(key) or {}).items():
+                bucket[str(value)] = bucket.get(str(value), 0) + int(count)
 
     for uid, cell in acc.items():
         if not cell.get("total"):
@@ -1344,59 +1403,7 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
                     "last_user_ts", "last_agent_ts"):
             cell.setdefault(key, None)
         ensure(out, uid)["chat"] = cell
-
-
-def _chat_proactive_status_into(conn, ids: list[str], out: dict, ensure) -> None:
-    """proactive_extra 的两个 status 分布：冻结格子 + 今天实时窗。
-
-    与 ``_chat_rollup_into`` 分开只是因为它们挂在 ``proactive_extra`` 而不是
-    ``chat`` 下；口径、边界（day < today / ts >= today 起点）、来源（live ∪
-    archive）三者完全一致，共用同一组常量。
-    """
-    zone = ZoneInfo("Asia/Shanghai")
-    today = datetime.now(zone).date()
-    day_start, _ = _lane_rollup_day_bounds(today, zone)
-    cutoff = day_start.timestamp()
-    acc: dict[str, dict[str, dict[str, int]]] = {}
-
-    for uid, folded in conn.execute(
-        """
-        SELECT user_id, jsonb_object_agg(src, buckets)
-        FROM (
-            SELECT user_id, src, jsonb_object_agg(k, v) AS buckets
-            FROM (
-                SELECT user_id, src, k, SUM(raw::int)::int AS v
-                FROM chat_daily_rollup,
-                LATERAL (VALUES ('live_activity_status', live_activity_status),
-                                ('alert_status', alert_status)) AS d(src, doc),
-                LATERAL jsonb_each_text(doc) AS e(k, raw)
-                WHERE user_id = ANY(%s) AND day < %s
-                GROUP BY user_id, src, k
-            ) per_key
-            GROUP BY user_id, src
-        ) per_src
-        GROUP BY user_id
-        """,
-        (ids, today.isoformat()),
-    ).fetchall():
-        by = acc.setdefault(str(uid), {})
-        for key, buckets in (folded or {}).items():
-            by[str(key)] = {str(k): int(v) for k, v in (buckets or {}).items()}
-
-    for field, target, extra in _CHAT_ROLLUP_DIST_FIELDS[3:]:
-        for uid, value, count in conn.execute(
-            f"""
-            SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
-                   COUNT(*)::int
-            FROM {_chat_rollup_source(f'user_id = ANY(%s) AND ts >= %s{extra}')} src
-            GROUP BY user_id, value
-            """,
-            (field, ids, cutoff, ids, cutoff),
-        ).fetchall():
-            bucket = acc.setdefault(str(uid), {}).setdefault(target, {})
-            bucket[str(value)] = bucket.get(str(value), 0) + int(count)
-
-    for uid, by in acc.items():
+    for uid, by in proactive_acc.items():
         if not any(by.values()):
             continue
         extra_block = ensure(out, uid).setdefault("proactive_extra", {})
@@ -1899,8 +1906,6 @@ def admin_data_track_snapshot(
             # 把它们冻进格子却仍从 chat_messages 现算，等于新增列只写不读、
             # 端点照样随全史增长——那正是本期要消灭的东西（codex2 2026-08-19
             # 逮到我就是这么写的：写侧改了、读侧一行没动）。
-            _chat_proactive_status_into(conn, ids, out, ensure)
-
             if include_legacy_background:
                 rows = conn.execute(
                     """
@@ -8126,6 +8131,10 @@ def get_blob(user_id: str, kind: str):
 def get_blobs_for_users(
     user_ids: list[str],
     kinds: list[str],
+    *,
+    connection_timeout: float | None = None,
+    statement_timeout_ms: int | None = None,
+    raise_on_error: bool = False,
 ) -> dict[tuple[str, str], object]:
     """Return singleton blobs for a set of users and kinds in one DB round trip.
 
@@ -8140,16 +8149,27 @@ def get_blobs_for_users(
     if not ids or not wanted_kinds:
         return {}
     try:
-        with get_pool().connection() as conn:
-            rows = conn.execute(
-                "SELECT user_id, kind, doc FROM user_blobs "
-                "WHERE user_id = ANY(%s) AND kind = ANY(%s)",
-                (ids, wanted_kinds),
-            ).fetchall()
+        connection_kwargs = (
+            {"timeout": float(connection_timeout)}
+            if connection_timeout is not None else {}
+        )
+        with get_pool().connection(**connection_kwargs) as conn:
+            timeout_scope = (
+                _local_statement_timeout(conn, int(statement_timeout_ms))
+                if statement_timeout_ms is not None else nullcontext()
+            )
+            with timeout_scope:
+                rows = conn.execute(
+                    "SELECT user_id, kind, doc FROM user_blobs "
+                    "WHERE user_id = ANY(%s) AND kind = ANY(%s)",
+                    (ids, wanted_kinds),
+                ).fetchall()
         return {(str(user_id), str(kind)): doc for user_id, kind, doc in rows}
     except Exception as e:
         log.error("[db] get_blobs_for_users(%d users,%d kinds) failed: %s",
                   len(ids), len(wanted_kinds), e)
+        if raise_on_error:
+            raise
         return {}
 
 
@@ -8794,8 +8814,11 @@ def query_trace_events_flat_page(
         since_epoch=since_epoch,
         candidate_limit=candidate_limit,
     )
-    metadata_statement = ctes + (
-        "SELECT"
+    statement = ctes + (
+        ", page AS MATERIALIZED ("
+        " SELECT f.id,f.ts FROM filtered f"
+        " ORDER BY f.ts DESC,f.id DESC OFFSET %s LIMIT %s"
+        ") SELECT"
         " (SELECT count(*) FROM filtered) AS events_total,"
         " (SELECT count(*) FROM selected_turns) AS turns_total,"
         " (SELECT count(*) FROM selected_turns WHERE terminal_status='stalled') AS stalled_turns,"
@@ -8808,27 +8831,47 @@ def query_trace_events_flat_page(
         " COALESCE((SELECT array_agg(DISTINCT subsystem ORDER BY subsystem)"
         "           FROM candidate WHERE subsystem<>''),ARRAY[]::text[]) AS subsystems,"
         " COALESCE((SELECT array_agg(DISTINCT lower(status) ORDER BY lower(status))"
-        "           FROM candidate WHERE status<>''),ARRAY[]::text[]) AS statuses"
-    )
-    page_statement = ctes + (
-        "SELECT " + ",".join("e." + column for column in _TRACE_EVENT_COLUMNS) +
-        " FROM filtered f JOIN trace_events e ON e.id=f.id AND e.ts=f.ts"
-        " ORDER BY f.ts DESC,f.id DESC OFFSET %s LIMIT %s"
+        "           FROM candidate WHERE status<>''),ARRAY[]::text[]) AS statuses,"
+        + ",".join(
+            f"event.{column} AS event_{column}"
+            for column in _TRACE_EVENT_COLUMNS
+        )
+        + " FROM (SELECT 1) anchor LEFT JOIN LATERAL ("
+        " SELECT " + ",".join("e." + column for column in _TRACE_EVENT_COLUMNS) +
+        " FROM page p JOIN trace_events e ON e.id=p.id AND e.ts=p.ts"
+        " ORDER BY p.ts DESC,p.id DESC"
+        ") event ON TRUE"
+        " ORDER BY event.ts DESC NULLS LAST,event.id DESC NULLS LAST"
     )
     connection_kwargs = {"timeout": float(connection_timeout)}
     with get_pool().connection(**connection_kwargs) as conn:
         with _local_statement_timeout(conn, statement_timeout_ms):
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
-                    metadata_statement,
-                    [*cte_params, int(candidate_limit)],
+                    statement,
+                    [
+                        *cte_params,
+                        bounded_offset,
+                        bounded_limit + 1,
+                        int(candidate_limit),
+                    ],
                 )
-                metadata = dict(cur.fetchone() or {})
-                cur.execute(
-                    page_statement,
-                    [*cte_params, bounded_offset, bounded_limit + 1],
-                )
-                rows = [dict(row) for row in cur.fetchall()]
+                result_rows = [dict(row) for row in cur.fetchall()]
+
+    metadata_keys = (
+        "events_total", "turns_total", "stalled_turns", "error_turns",
+        "scan_truncated", "users", "subsystems", "statuses",
+    )
+    first = result_rows[0] if result_rows else {}
+    metadata = {key: first.get(key) for key in metadata_keys}
+    rows = [
+        {
+            column: result_row.get(f"event_{column}")
+            for column in _TRACE_EVENT_COLUMNS
+        }
+        for result_row in result_rows
+        if result_row.get("event_id") is not None
+    ]
 
     for row in rows:
         timestamp = row.get("ts")

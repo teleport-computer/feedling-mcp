@@ -4,6 +4,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
@@ -41,7 +43,7 @@ def _patch_blob_reads(monkeypatch, blobs: dict) -> None:
     monkeypatch.setattr(
         data_track.db,
         "get_blobs_for_users",
-        lambda user_ids, kinds: {
+        lambda user_ids, kinds, **_kwargs: {
             (uid, kind): blobs[(uid, kind)]
             for uid in user_ids
             for kind in kinds
@@ -710,7 +712,9 @@ def test_flat_payload_fetches_page_lookahead_not_the_old_full_scan(monkeypatch):
         return [], True
 
     monkeypatch.setattr(data_track.db, "query_trace_event_turn_rows", sibling_rows)
-    monkeypatch.setattr(data_track.db, "get_blobs_for_users", lambda *_a: {})
+    monkeypatch.setattr(
+        data_track.db, "get_blobs_for_users", lambda *_a, **_kwargs: {}
+    )
 
     with bind("view=debug&mode=flat&limit=2"):
         payload = data_track._data_track_debug_payload()
@@ -725,6 +729,77 @@ def test_flat_payload_fetches_page_lookahead_not_the_old_full_scan(monkeypatch):
     assert payload["summary"]["scan_truncated"] is True
 
 
+@pytest.mark.parametrize("mode", ["flat", "timeline"])
+def test_debug_payload_propagates_bounded_trace_flag_read_failure(
+    monkeypatch, mode,
+):
+    """A trace-flag read failure is an explicit /debug failure contract.
+
+    Returning an empty flag map would falsely report that tracing is disabled.
+    Both debug query modes must share one deadline across their bounded reads,
+    request fail-closed flag lookup, and propagate its error; the ASGI route's
+    TimeoutError test pins the resulting 503 mapping.
+    """
+    with registry._users_lock:
+        registry._users[:] = [
+            {"user_id": "user_a", "principal_id": "p_a"},
+        ]
+
+    event = _event(100, "user_a", "agent.reply", trace_id="t-flag-read")
+    monkeypatch.setattr(data_track.db, "query_trace_events", lambda **_kwargs: [event])
+    monkeypatch.setattr(
+        data_track.db,
+        "query_trace_events_flat_page",
+        lambda **_kwargs: {
+            "events_total": 1,
+            "turns_total": 1,
+            "stalled_turns": 0,
+            "error_turns": 0,
+            "scan_truncated": False,
+            "users": [{"user_id": "user_a", "events": 1, "last_ts": 100}],
+            "subsystems": ["agent"],
+            "statuses": ["ok"],
+            "rows": [event],
+        },
+    )
+    monkeypatch.setattr(
+        data_track.db,
+        "query_trace_event_turn_rows",
+        lambda **_kwargs: ([event], False),
+    )
+    calls = []
+
+    def failing_flag_read(_user_ids, _kinds, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("raise_on_error"):
+            raise TimeoutError("trace flag read timed out")
+        return {}
+
+    monkeypatch.setattr(data_track.db, "get_blobs_for_users", failing_flag_read)
+    real_limits = data_track._debug_db_limits
+    deadlines = []
+
+    def record_deadline(deadline):
+        deadlines.append(deadline)
+        return real_limits(deadline)
+
+    monkeypatch.setattr(data_track, "_debug_db_limits", record_deadline)
+
+    with bind(f"view=debug&mode={mode}&user_id=user_a"):
+        with pytest.raises(TimeoutError, match="trace flag read timed out"):
+            data_track._data_track_debug_payload()
+
+    # Every bounded read in one request spends from the same wall-clock budget.
+    # Do not pin the exact read count: adding another bounded read is safe as
+    # long as it consumes the original request deadline instead of refreshing it.
+    assert len(deadlines) >= 2
+    assert len(set(deadlines)) == 1
+    assert len(calls) == 1
+    assert calls[0]["raise_on_error"] is True
+    assert 0 < calls[0]["connection_timeout"] <= 1.0
+    assert 0 < calls[0]["statement_timeout_ms"] <= 2_000
+
+
 def test_debug_trace_query_limits_have_literal_policy_anchors():
     # These independent literals intentionally survive mutations of the source
     # constants; every query-shape test derives its runtime input from them.
@@ -732,6 +807,21 @@ def test_debug_trace_query_limits_have_literal_policy_anchors():
     assert data_track.DEBUG_TRACE_SIBLING_CAP == 5_000
     assert data_track.DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS == 2_000
     assert data_track.DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC == 1.0
+    assert data_track.DEBUG_TRACE_DB_TOTAL_TIMEOUT_SEC == 2.75
+
+
+def test_debug_query_limits_shrink_against_one_deadline(monkeypatch):
+    clock = iter((100.0, 102.5, 102.74))
+    monkeypatch.setattr(data_track.time, "monotonic", lambda: next(clock))
+
+    first = data_track._debug_db_limits(102.75)
+    second = data_track._debug_db_limits(102.75)
+
+    assert first == pytest.approx((0.6875, 2_000))
+    assert second[0] == pytest.approx(0.0625)
+    assert second[1] == 137
+    with pytest.raises(TimeoutError, match="deadline exhausted"):
+        data_track._debug_db_limits(102.75)
 
 
 def test_debug_page_renders_nav_filters_and_redacts_plaintext_by_default(monkeypatch):

@@ -709,8 +709,8 @@ def test_flat_trace_query_uses_narrow_cap_and_page_plus_one(monkeypatch):
             executions.append((self.current, list(params)))
             return self
 
-        def fetchone(self):
-            return {
+        def fetchall(self):
+            return [{
                 "events_total": 0,
                 "turns_total": 0,
                 "stalled_turns": 0,
@@ -719,10 +719,8 @@ def test_flat_trace_query_uses_narrow_cap_and_page_plus_one(monkeypatch):
                 "users": [],
                 "subsystems": [],
                 "statuses": [],
-            }
-
-        def fetchall(self):
-            return []
+                "event_id": None,
+            }]
 
     class FakeConnection:
         def __enter__(self):
@@ -767,9 +765,11 @@ def test_flat_trace_query_uses_narrow_cap_and_page_plus_one(monkeypatch):
         "SELECT set_config('statement_timeout', %s, true)",
         ["2000ms"],
     )
-    metadata_sql, metadata_params = executions[1]
-    page_sql, page_params = executions[2]
-    raw_candidate = metadata_sql.split("), candidate AS", 1)[0]
+    assert len(executions) == 2, (
+        "the metadata and page must share one candidate scan and one timeout"
+    )
+    statement_sql, statement_params = executions[1]
+    raw_candidate = statement_sql.split("), candidate AS", 1)[0]
     candidate_projection = raw_candidate.split("SELECT", 1)[1].split(
         "FROM trace_events", 1
     )[0]
@@ -783,10 +783,12 @@ def test_flat_trace_query_uses_narrow_cap_and_page_plus_one(monkeypatch):
         "detail::text,content_excerpt::text) ILIKE %s",
         "terminal_status=%s",
     ):
-        assert clause in metadata_sql
-    assert metadata_params[-5:] == [cap + 1, cap, "stalled", "stalled", cap]
-    assert page_params[-6:] == [cap + 1, cap, "stalled", "stalled", 1, 3]
-    assert "JOIN trace_events e ON e.id=f.id AND e.ts=f.ts" in page_sql
+        assert clause in statement_sql
+    assert statement_params[-7:] == [
+        cap + 1, cap, "stalled", "stalled", 1, 3, cap,
+    ]
+    assert "JOIN trace_events e ON e.id=p.id AND e.ts=p.ts" in statement_sql
+    assert "ORDER BY event.ts DESC NULLS LAST,event.id DESC NULLS LAST" in statement_sql
 
 
 def test_flat_status_filter_matches_python_stall_semantics(tee_primary):
@@ -811,6 +813,20 @@ def test_flat_status_filter_matches_python_stall_semantics(tee_primary):
         assert result["turns_total"] == 1
         assert result["stalled_turns"] == 1
         assert [row["trace_id"] for row in result["rows"]] == ["trace-stalled"]
+
+        page = db.query_trace_events_flat_page(
+            user_id=uid,
+            limit=2,
+            candidate_limit=data_track.DEBUG_TRACE_CANDIDATE_CAP,
+            connection_timeout=data_track.DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC,
+            statement_timeout_ms=data_track.DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS,
+        )
+        assert [row["trace_id"] for row in page["rows"]] == [
+            "trace-ok", "trace-ok", "trace-stalled",
+        ]
+        assert [row["ts"] for row in page["rows"]] == sorted(
+            (row["ts"] for row in page["rows"]), reverse=True
+        )
     finally:
         db.delete_trace_events_for_user(uid)
 

@@ -286,6 +286,29 @@ def test_get_blobs_for_users_batches_and_omits_missing_rows():
     }
 
 
+def test_get_blobs_for_users_can_propagate_a_bounded_read_failure(monkeypatch):
+    connection_kwargs = []
+
+    class BrokenPool:
+        @staticmethod
+        def connection(**kwargs):
+            connection_kwargs.append(kwargs)
+            raise RuntimeError("pool unavailable")
+
+    monkeypatch.setattr(db, "get_pool", lambda: BrokenPool())
+
+    assert db.get_blobs_for_users(["usr_a"], ["trace"]) == {}
+    with pytest.raises(RuntimeError, match="pool unavailable"):
+        db.get_blobs_for_users(
+            ["usr_a"],
+            ["trace"],
+            connection_timeout=0.25,
+            statement_timeout_ms=100,
+            raise_on_error=True,
+        )
+    assert connection_kwargs == [{}, {"timeout": 0.25}]
+
+
 def test_blob_delete_and_list_by_prefix():
     uid = _uid()
     seed_user(uid)
