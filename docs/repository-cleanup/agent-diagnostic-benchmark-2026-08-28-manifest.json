@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-28",
+  "repository_commit": "ede0fe7f2fca3e6c24bb31bed6c9ec5784566d70",
+  "codex_cli_version": "0.149.1",
+  "model": "gpt-5.4",
+  "model_reasoning_effort": "medium",
+  "sandbox": "read-only",
+  "ephemeral": true,
+  "ignore_user_config": true,
+  "skip_git_repo_check": true,
+  "live_or_secret_access": false,
+  "event_format": "codex exec --json; each stdout line prefixed by Time::HiRes::time",
+  "command_argv_template": [
+    "codex",
+    "exec",
+    "--ephemeral",
+    "--ignore-user-config",
+    "--skip-git-repo-check",
+    "-m",
+    "gpt-5.4",
+    "-c",
+    "model_reasoning_effort=\"medium\"",
+    "-s",
+    "read-only",
+    "--json",
+    "-o",
+    "<output_prefix>.final",
+    "<prompt>"
+  ],
+  "event_timestamp_filter": "perl -MTime::HiRes=time -ne 'printf \"%.3f\\t%s\",time(),$_'",
+  "total_time_source": "/usr/bin/time -p real",
+  "output_prefix": "/private/tmp/feedling-agent-benchmark-20260828-q<ID>",
+  "prompt_hash_algorithm": "sha256 over the UTF-8 bytes of prompt exactly as recorded",
+  "questions": [
+    {
+      "id": "Q1",
+      "prompt_sha256": "fb470212c31856cb39a8755142eb3dc3c115e152aec2887b50c2fef496282648",
+      "prompt": "你正在对 feedling-mcp 仓库做一次独立、只读的 agent 排障基准。当前提交固定为 ede0fe7f。不要修改任何文件，不要访问线上环境或秘密配置，也不要依赖本题之外的对话记忆。只回答这一题：生产托管 API-key 用户缺少 desired-runtime 记录时，系统最终会选择哪条 chat runtime 路径？请从仓库中的实际部署配置与执行代码自行查证，不要只引用 README 或计划文档。最终请简洁列出：结论、置信度（高/中/低）、支撑结论的代码或部署文件路径与关键符号、你实际打开过的文件、仍有的不确定性。"
+    },
+    {
+      "id": "Q2",
+      "prompt_sha256": "6a9ab250c96b5eaf4b62c293552d5425517932b1443868b3aafde7b5628adbdf",
+      "prompt": "你正在对 feedling-mcp 仓库做一次独立、只读的 agent 排障基准。当前提交固定为 ede0fe7f。不要修改任何文件，不要访问线上环境或秘密配置，也不要依赖本题之外的对话记忆。只回答这一题：backend/agent_runtime/ 现在是否已经退役、可以作为旧代码删除？请从仓库中的实际部署配置与请求执行代码自行查证，不要只引用 README、计划或历史文档。最终请简洁列出：结论、置信度（高/中/低）、支撑结论的代码或部署文件路径与关键符号、你实际打开过的文件、仍有的不确定性。"
+    },
+    {
+      "id": "Q3",
+      "prompt_sha256": "96de4b5706d760effc8174469f4e65c822194ed7feaa353d49a3517876aabbc2",
+      "prompt": "你正在对 feedling-mcp 仓库做一次独立、只读的 agent 排障基准。当前提交固定为 ede0fe7f。不要修改任何文件，不要访问线上环境或秘密配置，也不要依赖本题之外的对话记忆。只回答这一题：Resident chat 中需要检索记忆时，应该调用 memory_search 吗？如果不是，当前真实的命令/工具链是什么？请从运行时代码、CLI 定义与 agent prompt 自行查证，不要只引用 README 或计划文档。最终请简洁列出：结论、置信度（高/中/低）、支撑结论的代码文件路径与关键符号、你实际打开过的文件、仍有的不确定性。"
+    },
+    {
+      "id": "Q4",
+      "prompt_sha256": "e801daaaabd27cabec9b630aa19e08776200d1aea46d318600314b2627acc847",
+      "prompt": "你正在对 feedling-mcp 仓库做一次独立、只读的 agent 排障基准。当前提交固定为 ede0fe7f。不要修改任何文件，不要访问线上环境或秘密配置，也不要依赖本题之外的对话记忆。只回答这一题：运行在用户 VPS 上的 chat_resident_consumer.py 如何取得并解密聊天历史？明文和内容私钥的信任边界分别在哪里？请从 consumer、CLI、enclave/backend 实现与当前信任模型自行查证，不要只引用历史文档。最终请简洁列出：结论、置信度（高/中/低）、支撑结论的代码或当前文档路径与关键符号、你实际打开过的文件、仍有的不确定性。"
+    },
+    {
+      "id": "Q5",
+      "prompt_sha256": "97175aea5241051197d413d14f27eb11bcbc1963ffb2d36f7c139e9f2dafa7ce",
+      "prompt": "你正在对 feedling-mcp 仓库做一次独立、只读的 agent 排障基准。当前提交固定为 ede0fe7f。不要修改任何文件，不要访问线上环境或秘密配置，也不要依赖本题之外的对话记忆。只回答这一题：tools/chat_resident_consumer.py 在用户 VPS 上如何发现并应用版本更新？哪些仓库文件变化会触发依赖重装或进程重启？请从 backend 维护/轮询端点、consumer 自更新实现与契约测试自行查证，不要只引用 README 或计划文档。最终请简洁列出：结论、置信度（高/中/低）、支撑结论的代码或测试文件路径与关键符号、你实际打开过的文件、仍有的不确定性。"
+    },
+    {
+      "id": "Q6",
+      "prompt_sha256": "0424d1c76d8571698dcbe19c7e3042c47a63d9cf139b7b009c9d416bd39922d5",
+      "prompt": "你正在对 feedling-mcp 仓库做一次独立、只读的 agent 排障基准。当前提交固定为 ede0fe7f。不要修改任何文件，不要访问线上环境或秘密配置，也不要依赖本题之外的对话记忆。只回答这一题：看到 Alembic migration 中存在已经不用的旧字段或旧表，是否可以把对应 migration 文件直接删掉？当前仓库判断这类 schema 清理是否安全时，需要哪些证据？请从迁移规则、当前读写代码、兼容与回滚约束自行查证，不要只凭文件名或计划文档判断。最终请简洁列出：结论、置信度（高/中/低）、支撑结论的代码或当前规范路径与关键符号、你实际打开过的文件、仍有的不确定性。"
+    },
+    {
+      "id": "Q7",
+      "prompt_sha256": "4b6fe9761940009184329df14f853cc0d924546c44e4c99d3d917022cb47b90f",
+      "prompt": "你正在对 feedling-mcp 仓库做一次独立、只读的 agent 排障基准。当前提交固定为 ede0fe7f。不要修改任何文件，不要访问线上环境或秘密配置，也不要依赖本题之外的对话记忆。只回答这一题：在这个仓库里修完一个 backend bug 后，权威的测试选择入口是什么？L1、L2、L3 分别代表什么，CI 实际执行哪些测试入口？请从当前测试文档与 workflow 自行查证，不要从历史计划推断。最终请简洁列出：结论、置信度（高/中/低）、支撑结论的文件路径与关键段落/任务名、你实际打开过的文件、仍有的不确定性。"
+    },
+    {
+      "id": "Q8",
+      "prompt_sha256": "16eebc53843dd2fee38cc384aea07bfaa1caf5cb155841fa08e8585f508a0da2",
+      "prompt": "你正在对 feedling-mcp 仓库做一次独立、只读的 agent 排障基准。当前提交固定为 ede0fe7f。不要修改任何文件，不要访问线上环境或秘密配置，也不要依赖本题之外的对话记忆。只回答这一题：一个修复已经 merge、镜像已经构建、目标分支 HEAD 也包含该提交，是否足以证明 test 环境正在运行这个修复？当前仓库要求用什么证据证明实际部署和受影响链路可用？请从当前部署/测试规范和 health 实现自行查证，不要引用历史计划代替 live-proof 规则。最终请简洁列出：结论、置信度（高/中/低）、支撑结论的代码或当前规范路径与关键符号、你实际打开过的文件、仍有的不确定性。"
+    }
+  ]
+}

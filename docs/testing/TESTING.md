@@ -240,7 +240,8 @@ V2 的 bug 表面很杂,底下集中在**五段共用代码**上(上下文组装
   - forge build/test/coverage（合约）
   - 起后端 → `tests/test_api.py --multi-tenant` → 隔离回归（`test_db.py` `test_multi_tenant_isolation.py`）→ Round 3 V2 回归
   - `docker compose build --no-cache`（`--require-hashes`）+ healthcheck
-  - syntax + static（pyflakes）
+  - syntax + static（`compileall` + language eval + dependency provenance；当前
+    workflow 不运行 pyflakes，所以 L1 的本地 pyflakes 仍需自行执行）
 - **`continuity-canary.yml`**（每日 06:17 UTC cron）：prod day-0 信封解密连续性（`tools/continuity_canary.py`）——防"某天起解不开老信封"。
 - **`deploy-test-contract.yml`**（手动）：部署 FeedlingAppAuth 到 Sepolia。
 - **`docker-publish.yml`**：镜像发布。
