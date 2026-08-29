@@ -37,7 +37,7 @@ from chat.reply_language import (
     DEFAULT_FAILURE_FALLBACK_EN,
     DEFAULT_FAILURE_FALLBACK_ZH,
     failure_fallback_reply,
-    infer_reply_language_policy,
+    infer_reply_language,
 )
 from core import wake_bus
 from memgarden import timestamps as memory_timestamps
@@ -4336,9 +4336,7 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         language = accounts_registry._get_user_archive_language(user_id) or ""
     except Exception:  # noqa: BLE001 — locale lookup must not block failure delivery
         language = ""
-    language_policy = infer_reply_language_policy(
-        {},
-        [],
+    reply_language = infer_reply_language(
         archive_language=language,
     )
     user_text = notices_catalog.user_text_for(
@@ -4362,7 +4360,7 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
             if error_class in _DIRECT_NOTICE_ERROR_CLASSES
             or blame == "user_provider"
             else failure_fallback_reply(
-                language_policy,
+                reply_language,
                 zh=_TERMINAL_FAILURE_FALLBACK_REPLY,
                 en=_TERMINAL_FAILURE_FALLBACK_REPLY_EN,
             )

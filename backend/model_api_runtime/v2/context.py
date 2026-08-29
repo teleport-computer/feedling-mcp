@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from chat.reply_language import infer_reply_language_policy, local_time_labels
+from chat.reply_language import infer_reply_language, local_time_labels
 from agent_protocol_core import self_thinking
 import worldbook_match
 from voice.message_filter import VOICE_CALL_RECORD_ROLE, conversation_rows
@@ -795,13 +795,11 @@ def build_temporal_context(
     now_value = float(now_ts)
     now_utc = datetime.fromtimestamp(now_value, tz=timezone.utc)
     now_local = now_utc.astimezone(zone)
-    language_policy = infer_reply_language_policy(
-        {},
-        [],
+    reply_language = infer_reply_language(
         locale=str(locale or ""),
         archive_language=str(archive_language or ""),
     )
-    labels = local_time_labels(now_local, language_policy)
+    labels = local_time_labels(now_local, reply_language)
 
     last_ts = _finite_timestamp(last_user_message_ts)
     last_sent_at = (

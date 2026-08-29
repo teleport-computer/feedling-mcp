@@ -675,8 +675,8 @@ def test_terminal_failure_fallback_uses_shared_reply_language_policy(
 
     result = jobs_store.reconcile_terminal_failure_outbox(job_id=job_id)
 
-    policy = reply_language.infer_reply_language_policy(
-        {}, [], archive_language=archive_language
+    policy = reply_language.infer_reply_language(
+        archive_language=archive_language
     )
     expected = (
         reply_language.DEFAULT_FAILURE_FALLBACK_EN
