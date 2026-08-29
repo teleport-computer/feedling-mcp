@@ -273,7 +273,13 @@ async def extract(
         outcome = session.result()
         if outcome.error:
             return None, str(outcome.error)
-        return outcome.cards, None
+        # 两条 lane 的「原始产物」字段名不同 —— capture 是卡，dream 是合并方案。
+        # 下游的 to_actions 要的正是这个原始形状（它自己封信封、打溯源），
+        # 不是组件那份带 mount 的 mutations。
+        items = getattr(outcome, "cards", None)
+        if items is None:
+            items = getattr(outcome, "consolidations", [])
+        return items, None
 
     retried_once = False
     reply, call_error, response_shape = await _call(prompt)

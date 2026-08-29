@@ -63,18 +63,23 @@ def _load_key_pool() -> dict[str, str]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="anthropic/claude-sonnet-4.6")
+    # OpenRouter 的额度会用光（实测撞过两次）。留一条换 provider 的路，
+    # 免得一个 key 超额就整条 e2e 跑不了。
+    ap.add_argument("--provider", default="openrouter",
+                    help="openrouter / deepseek / anthropic / openai")
     args = ap.parse_args()
 
     pool = _load_key_pool()
-    key = pool.get("E2E_KEY_OPENROUTER") or os.environ.get("E2E_KEY_OPENROUTER", "")
+    key_name = f"E2E_KEY_{args.provider.upper()}"
+    key = pool.get(key_name) or os.environ.get(key_name, "")
     if not key:
-        print("SKIP: no E2E_KEY_OPENROUTER in ~/.feedling-e2e-keys.env")
+        print(f"SKIP: no {key_name} in ~/.feedling-e2e-keys.env")
         return 0
 
     with E2EClient.provision(route="model_api") as c:
         print(f"probe user: {c.user_id} model={args.model}")
         r = c.post("/v1/model_api/setup", json={
-            "provider": "openrouter", "model": args.model, "api_key": key})
+            "provider": args.provider, "model": args.model, "api_key": key})
         if not check("model_api setup", r.status_code in (200, 201),
                      f"{r.status_code} {r.text[:120]}"):
             return 1

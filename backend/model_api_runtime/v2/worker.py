@@ -12261,6 +12261,19 @@ async def _run_extraction(
                 build_semantic_prompt=build_capture_semantic_retry_prompt,
                 build_truncation_prompt=build_truncation_retry_prompt,
             )
+            # 组件的会话 —— 提示词和重问由它决定。模型端口传 None 是刻意的：
+            # 会话模式下组件不自己调模型，provider 那步归 extract()。
+            _capture_session = garden_component.build_garden(
+                garden_component.CallableModel(lambda _p: ""),
+            ).capture_session(mg_contracts.CaptureRequest(
+                window=window,
+                locale=capture_locale,
+                buckets=str(ctx.get("buckets") or ""),
+                threads=str(ctx.get("threads") or ""),
+                identity=str(ctx.get("identity") or ""),
+                ai_name=ctx.get("ai_name", ""),
+                user_name=ctx.get("user_name", ""),
+            ))
         else:
             prompt = build_dream_prompt(
                 ai_name=ctx.get("ai_name", ""),
@@ -12299,6 +12312,26 @@ async def _run_extraction(
                 ),
                 build_truncation_prompt=build_truncation_retry_prompt,
             )
+            # 整理也走组件的会话。和 capture 同构 —— provider 那步仍归
+            # extract()，组件只决定问什么、怎么重问。
+            #
+            # known_ids 是墓碑卡守卫：整理结果里不许出现喂进去的卡 id，
+            # 出现了就是模型把整理注记当成了内容本身（usr_a40e 事故）。
+            _capture_session = garden_component.build_garden(
+                garden_component.CallableModel(lambda _p: ""),
+            ).maintenance_session(mg_contracts.MaintenanceRequest(
+                cards=list(ctx.get("card_items") or []),
+                all_cards=list(ctx.get("card_items") or []),
+                locale=infer_garden_language(
+                    ctx.get("identity") if isinstance(ctx.get("identity"), dict) else None,
+                    written=user_written_text(prompt_tail),
+                    existing_buckets=str(ctx.get("buckets") or ""),
+                ),
+                ai_name=ctx.get("ai_name", ""),
+                user_name=ctx.get("user_name", ""),
+                recent_conversations=window,
+                known_ids=tuple(dream_known_ids),
+            ))
 
         async def _extraction_trajectory(kind: str, payload: dict) -> None:
             nonlocal dream_model_attempts
@@ -12382,12 +12415,22 @@ async def _run_extraction(
 
             async def _invoke_capture_provider() -> tuple[Any, str | None]:
                 _report_turn_progress("extraction_provider_start")
+                # capture 走 GardenComponent 的会话：**它决定问什么、怎么重问**，
+                # provider 那一步仍归 extract()（截断检测要看 finish_reason，
+                # 用量统计、失败分类、退避、轨迹都在那边）。
+                #
+                # 不直接调 garden.acapture() 的原因：那个自带循环，会把 provider
+                # 调用抢过去 —— 等于放弃上面那些能力，是净退步。
+                #
+                # dream lane 仍走原路径（它的 session API 还没做），所以下面两个
+                # 分支的 prompt/parse/parse_retry 仍然保留。
                 result = await _extract_with_provider_health(
                     user_id,
                     provider_config=provider_config,
                     prompt=prompt,
                     parse=parse,
                     parse_retry=parse_retry,
+                    session=_capture_session,
                     max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
                     failure_detail_out=extraction_failure_detail.update,
                     progress_cb=lambda stage, attempt: _report_turn_progress(
@@ -12521,12 +12564,16 @@ async def _run_extraction(
                 counts=dream_counts,
             )
             _report_turn_progress("extraction_provider_start")
+            # dream 也走组件的会话（见上面建 _capture_session 那段）。
+            # prompt/parse/parse_retry 仍传着 —— 会话模式下 extract() 忽略它们，
+            # 但保留意味着「去掉 session 就退回原路径」随时可做。
             items, reason = await _extract_with_provider_health(
                 user_id,
                 provider_config=provider_config,
                 prompt=prompt,
                 parse=parse,
                 parse_retry=parse_retry,
+                session=_capture_session,
                 max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
                 failure_detail_out=extraction_failure_detail.update,
                 progress_cb=lambda stage, attempt: _report_turn_progress(
