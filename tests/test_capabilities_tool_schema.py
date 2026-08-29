@@ -493,6 +493,7 @@ def test_identity_patch_description_advertises_list_fields_and_ops():
     assert "boundaries" in d
     assert "only one method" in d
     assert "D4" in d
+    assert ("language_" + "preference") not in d
 
 
 def test_memory_write_reason_and_relative_wake_are_described_and_valid():

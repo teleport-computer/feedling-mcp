@@ -260,17 +260,20 @@ def test_garden_adapter_keeps_shared_identity_and_hint_dependency_edges():
     assert "IDENTITY_LANGUAGE_FIELDS" in _loaded_names("_identity_texts")
 
 
-def test_garden_adapter_normalizes_explicit_hint_and_reads_identity_text() -> None:
-    """Proves both Garden evidence paths behave; it cannot locate their AST edges."""
-    explicit = garden_language_decision(
-        {"language_preference": "English"},
-        written="今天一直在处理工作和家里的事情，晚上终于有时间坐下来休息一会儿。",
-    )
-    assert (explicit["locale"], explicit["basis"]) == (
-        "en",
-        "explicit_preference",
-    )
+def test_garden_adapter_has_exactly_the_two_supported_evidence_dependencies():
+    """A renamed explicit-preference helper must not silently regain priority."""
+    assert _direct_call_names("garden_language_decision") == {
+        "_identity_texts",
+        "_language_from_hint",
+        "count_bucket_languages",
+        "decide_garden_language",
+        "len",
+        "split_bucket_names",
+    }
 
+
+def test_garden_adapter_reads_identity_text() -> None:
+    """Identity prose remains first-tier writing evidence after field retirement."""
     identity_text = garden_language_decision(
         {
             "self_introduction": (
@@ -284,3 +287,99 @@ def test_garden_adapter_normalizes_explicit_hint_and_reads_identity_text() -> No
         "en",
         "writing_language",
     )
+
+
+_RETIRED_LANGUAGE_FIELD = "language_" + "preference"
+
+
+@pytest.mark.parametrize(
+    "identity,written,locale,expected",
+    [
+        (
+            {_RETIRED_LANGUAGE_FIELD: "English"},
+            "I have been thinking carefully about work, family, and the choices ahead of me.",
+            "zh-Hans",
+            ("en", "writing_language"),
+        ),
+        (
+            {_RETIRED_LANGUAGE_FIELD: "English"},
+            "今天一直在处理工作和家里的事情，晚上终于有时间坐下来休息一会儿。",
+            "en",
+            ("zh-Hans", "writing_language"),
+        ),
+        (
+            {_RETIRED_LANGUAGE_FIELD: "中文"},
+            "I have been thinking carefully about work, family, and the choices ahead of me.",
+            "zh-Hans",
+            ("en", "writing_language"),
+        ),
+        (
+            {_RETIRED_LANGUAGE_FIELD: "中文"},
+            "今天一直在处理工作和家里的事情，晚上终于有时间坐下来休息一会儿。",
+            "en",
+            ("zh-Hans", "writing_language"),
+        ),
+        (
+            {_RETIRED_LANGUAGE_FIELD: "English"},
+            "ok thanks",
+            "en",
+            ("en", "client_locale"),
+        ),
+        (
+            {_RETIRED_LANGUAGE_FIELD: "English"},
+            "ok thanks",
+            "zh-Hans",
+            ("zh-Hans", "client_locale"),
+        ),
+        (
+            {_RETIRED_LANGUAGE_FIELD: "中文"},
+            "ok thanks",
+            "en-US",
+            ("en", "client_locale"),
+        ),
+        (
+            {_RETIRED_LANGUAGE_FIELD: "中文"},
+            "ok thanks",
+            "zh-Hans",
+            ("zh-Hans", "client_locale"),
+        ),
+        (
+            {_RETIRED_LANGUAGE_FIELD: "中文"},
+            "",
+            "",
+            ("zh-Hans", "default"),
+        ),
+        (
+            {_RETIRED_LANGUAGE_FIELD: "English"},
+            "",
+            "",
+            ("zh-Hans", "default"),
+        ),
+    ],
+    ids=(
+        "same-written-English",
+        "flip-to-written-Chinese",
+        "flip-Chinese-to-written-English",
+        "same-Chinese-via-writing",
+        "same-client-English",
+        "flip-to-client-Chinese",
+        "flip-Chinese-to-client-English",
+        "same-Chinese-via-client",
+        "same-default-Chinese",
+        "flip-to-default-Chinese",
+    ),
+)
+def test_retired_preference_behavior_change_table(
+    identity: dict, written: str, locale: str, expected: tuple[str, str]
+) -> None:
+    decision = garden_language_decision(identity, written=written, locale=locale)
+    assert (decision["locale"], decision["basis"]) == expected
+
+
+def test_garden_ignores_renamed_language_metadata() -> None:
+    """Behavioral guard: aliases cannot restore the retired priority tier."""
+    decision = garden_language_decision(
+        {"legacy_reply_language": "English", "preferred_locale": "en"},
+        written="今天一直在处理工作和家里的事情，晚上终于有时间坐下来休息一会儿。",
+    )
+    assert (decision["locale"], decision["basis"]) == ("zh-Hans", "writing_language")

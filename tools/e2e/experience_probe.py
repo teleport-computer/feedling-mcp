@@ -66,7 +66,6 @@ def _english_persona(c: E2EClient) -> tuple[int, dict]:
         "self_introduction": "I am Ivy, a calm English-speaking companion. I always reply in English.",
         "category": "companion",
         "signature": "— Ivy",
-        "language_preference": "en",
         "tone_style": "Warm, concise English. Never switch to Chinese unless the user does.",
         "custom_persona_prompt": "Always speak English, including when you open a conversation proactively.",
         "dimensions": [{"name": "warmth", "value": 80, "description": "gentle and present"}],

@@ -5,6 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
+from identity import card_policy
 from identity import distill_prompt_v1 as dp
 
 
@@ -20,41 +21,69 @@ def test_prompt_asks_for_all_persona_fields():
 
 
 # ---------------------------------------------------------------------------
-# B2 (reverses I7 / ef8e393d): the 5 user-layer fields are now distillable,
+# B2 (reverses I7 / ef8e393d): the 4 remaining user-layer fields are distillable,
 # GROUNDED — the prompt must ask for them and the parser must keep them.
 # ---------------------------------------------------------------------------
 
 _USER_LAYER_FIELDS = (
-    "user_preferred_name", "custom_persona_prompt", "language_preference",
+    "user_preferred_name", "custom_persona_prompt",
     "relationship_anchor", "stable_definitions",
 )
 
 
-def test_resident_identity_fields_now_include_the_5_user_layer_fields():
-    for field in _USER_LAYER_FIELDS:
-        assert field in dp.RESIDENT_IDENTITY_FIELDS, field
-    assert len(dp.RESIDENT_IDENTITY_FIELDS) == 14
+def test_resident_identity_fields_are_the_exact_supported_set():
+    assert dp.RESIDENT_IDENTITY_FIELDS == (
+        "agent_name", "self_introduction", "category", "signature",
+        "dimensions", "tone_style", "agent_role", "do_not_say", "boundaries",
+        "user_preferred_name", "custom_persona_prompt", "relationship_anchor",
+        "stable_definitions",
+    )
 
 
-def test_prompt_asks_for_the_5_user_layer_fields_grounded():
+def test_card_policy_profile_fields_are_the_exact_supported_set():
+    assert card_policy.PROFILE_STRING_FIELDS == (
+        "agent_name", "self_introduction", "category", "user_preferred_name",
+        "agent_role", "tone_style", "custom_persona_prompt",
+        "relationship_anchor",
+    )
+    assert card_policy.PROFILE_LIST_FIELDS == (
+        "signature", "boundaries", "do_not_say", "stable_definitions",
+    )
+
+
+def test_retired_field_has_no_live_python_reference() -> None:
+    retired_field = "language_" + "preference"
+    retired_flag = "--language-" + "preference"
+    repo = Path(__file__).resolve().parents[1]
+    offenders = []
+    for root_name in ("backend", "tools", "evals"):
+        for path in (repo / root_name).rglob("*.py"):
+            source = path.read_text(encoding="utf-8")
+            if retired_field in source or retired_flag in source:
+                offenders.append(str(path.relative_to(repo)))
+    assert offenders == []
+
+
+def test_prompt_asks_for_the_4_user_layer_fields_grounded():
     p = dp.build_resident_identity_prompt("用户上传的人设材料")
     for field in _USER_LAYER_FIELDS:
         assert field in p, field
-    assert "GROUNDING applies even more strictly to these 5" in p
+    assert "GROUNDING applies even more strictly to these 4" in p
     assert "highest-priority persona directive" in p
 
 
-def test_parse_keeps_all_5_user_layer_fields_when_present():
+def test_parse_keeps_all_4_user_layer_fields_and_drops_retired_field():
+    retired_field = "language_" + "preference"
     raw = (
         '{"agent_name":"小明","dimensions":[{"name":"直接","value":80,"description":"从不绕"}],'
         '"user_preferred_name":"老张","custom_persona_prompt":"你必须永远用第二人称、简短直接地回复我。",'
-        '"language_preference":"中文","relationship_anchor":"大学室友",'
+        f'"{retired_field}":"中文","relationship_anchor":"大学室友",'
         '"stable_definitions":["老板=我上司","deadline 一律指北京时间"]}'
     )
     out = dp.parse_identity_payload(raw)
     assert out["user_preferred_name"] == "老张"
     assert out["custom_persona_prompt"] == "你必须永远用第二人称、简短直接地回复我。"
-    assert out["language_preference"] == "中文"
+    assert retired_field not in out
     assert out["relationship_anchor"] == "大学室友"
     assert out["stable_definitions"] == ["老板=我上司", "deadline 一律指北京时间"]
 
@@ -96,18 +125,18 @@ def test_parse_caps_custom_persona_prompt_and_relationship_anchor_at_1200():
     assert len(out["user_preferred_name"]) <= 240
 
 
-def test_parse_caps_language_preference_at_240():
-    long_text = "中" * 500
-    raw = '{"agent_name":"x","dimensions":[],"language_preference":"%s"}' % long_text
+def test_parse_drops_retired_language_field_instead_of_sanitizing_it():
+    retired_field = "language_" + "preference"
+    raw = '{"agent_name":"x","dimensions":[],"%s":"English"}' % retired_field
     out = dp.parse_identity_payload(raw)
-    assert len(out["language_preference"]) == 240
+    assert out == {"agent_name": "x"}
 
 
-def test_existing_identity_partial_completion_now_reads_the_5_fields():
+def test_existing_identity_partial_completion_reads_the_4_fields():
     # RESIDENT_IDENTITY_FIELDS also drives what the consumer's "部分补全" merge
     # context shows the model (tools/chat_resident_consumer.py::_resident_existing_identity)
     # — verify the tuple itself (the thing that function filters against) covers
-    # the 5 fields, so an existing custom_persona_prompt is visible to the merge
+    # the 4 fields, so an existing custom_persona_prompt is visible to the merge
     # prompt instead of silently invisible to it.
     existing = {"agent_name": "旧名", "custom_persona_prompt": "旧指令", "stable_definitions": ["x"]}
     visible = {k: existing[k] for k in dp.RESIDENT_IDENTITY_FIELDS if existing.get(k) not in (None, "", [], {})}

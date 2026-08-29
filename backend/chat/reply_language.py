@@ -230,11 +230,10 @@ def garden_language_decision(
     人名、公司名、项目名全是拉丁字母，跟这个人说什么语言毫无关系。怎么数都救不了 ——
     问题不在怎么数，在于压根不该数它。
 
-    所以现在的证据只有三样，**桶名一样都不占**：
+    所以现在的证据只有两样，**桶名一样都不占**：
 
-        ① identity.language_preference   用户明说的,任何东西不该盖过它
-        ② 他实际在用什么语言写            身份卡正文 + 这轮对话里他自己说的话
-        ③ locale / archive_language      弱,只是设备设置
+        ① 他实际在用什么语言写            身份卡正文 + 这轮对话里他自己说的话
+        ② locale / archive_language      弱,只是设备设置
 
     ## 那「别让 工作 和 Work 并存」谁来管
 
@@ -248,15 +247,12 @@ def garden_language_decision(
     **观测量不是判据** —— 「判成中文但 9 个桶里 7 个是拉丁字母」值得记一笔
     （可能归一化没生效），不值得据此改语言。
     """
-    explicit = _language_from_hint(
-        (identity or {}).get("language_preference") if isinstance(identity, dict) else ""
-    ).language
     # 「他写的字」= 这轮对话里他自己说的话 + 身份卡正文。前者是最新最真的信号，
     # 后者在还没聊过时兜底。
     sample = "\n".join(x for x in ([written] + _identity_texts(identity or {})) if x)
 
     d = decide_garden_language(
-        explicit=explicit or None,
+        explicit=None,
         written=sample,
         locale=(
             _language_from_hint(locale).language

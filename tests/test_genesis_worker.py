@@ -782,13 +782,14 @@ def test_fact_write_rewrites_person_references_but_preserves_product_terms():
 
 
 # ---------------------------------------------------------------------------
-# B2 (reverses I7): the onboarding distiller can now also produce the 5
+# B2 (reverses I7): the onboarding distiller can now also produce the 4
 # user-layer identity fields — _fact_write must carry them from the model's
 # per-batch `identity` output into the aggregated final identity dict, and
 # _identity_only / _fact_write_output_empty must treat them as real signal.
 # ---------------------------------------------------------------------------
 
 def test_fact_write_carries_user_layer_fields_into_aggregated_identity():
+    retired_field = "language_" + "preference"
     class FakeLLM:
         def complete(self, **kwargs):
             text = json.dumps({
@@ -797,7 +798,7 @@ def test_fact_write_carries_user_layer_fields_into_aggregated_identity():
                     "agent_name": "Mira", "dimensions": [],
                     "user_preferred_name": "Seven",
                     "custom_persona_prompt": "始终用第二人称、简短直接。",
-                    "language_preference": "中文",
+                    retired_field: "中文",
                     "relationship_anchor": "大学室友",
                     "stable_definitions": ["老板=我上司", "  ", "deadline 一律北京时间"],
                 },
@@ -812,7 +813,7 @@ def test_fact_write_carries_user_layer_fields_into_aggregated_identity():
     identity = output["identity"]
     assert identity["user_preferred_name"] == "Seven"
     assert identity["custom_persona_prompt"] == "始终用第二人称、简短直接。"
-    assert identity["language_preference"] == "中文"
+    assert retired_field not in identity
     assert identity["relationship_anchor"] == "大学室友"
     # blank entries dropped, real ones kept
     assert identity["stable_definitions"] == ["老板=我上司", "deadline 一律北京时间"]

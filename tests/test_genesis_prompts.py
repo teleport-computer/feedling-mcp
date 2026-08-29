@@ -27,16 +27,17 @@ def test_fact_write_prompt_preserves_identity_firewall():
     assert payload["fact_digest"] == [{"summary": "用户喜欢草莓拿铁"}]
 
 
-def test_fact_write_prompt_asks_for_the_5_user_layer_fields_grounded():
+def test_fact_write_prompt_asks_for_the_4_user_layer_fields_grounded():
     # B2 (reverses I7): the onboarding distiller's output contract now includes
-    # the 5 user-layer fields, with an explicit carve-out from the TA-identity
+    # the 4 user-layer fields, with an explicit carve-out from the TA-identity
     # firewall (they describe the USER, so the source rule runs backwards).
     system = prompts.fact_write_messages([{"summary": "s"}])[0]["content"]
-    for field in ("user_preferred_name", "custom_persona_prompt", "language_preference",
+    for field in ("user_preferred_name", "custom_persona_prompt",
                   "relationship_anchor", "stable_definitions"):
         assert field in system, field
-    assert "Exception (applies only to these five" in system
+    assert "Exception (applies only to these four" in system
     assert "only from the person's profile or from the person's own words" in system
+    assert ("language_" + "preference") not in system
 
 
 def test_memory_recheck_prompt_is_grounded_and_memory_only():

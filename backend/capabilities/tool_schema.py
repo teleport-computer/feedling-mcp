@@ -501,7 +501,7 @@ DESCRIPTIONS: dict[str, str] = {
                        "introduce yourself. Put any of these inside a 'patch' object: "
                        "string fields agent_name, self_introduction, category, "
                        "user_preferred_name, agent_role, tone_style, "
-                       "custom_persona_prompt, language_preference, relationship_anchor; "
+                       "custom_persona_prompt, relationship_anchor; "
                        "and list fields signature, boundaries, do_not_say, "
                        "stable_definitions. Edit a list field by whole-list replacement "
                        "or with op keys add_<field>/remove_<field>/replace_<field> "
