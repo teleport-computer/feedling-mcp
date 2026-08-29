@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # 用户消息执行装配图
 
 > 目标：给定一个用户的部署、`access_mode`、托管运行时 fence、消息类型与

@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Redis 使用文档与规范
 
 > [!CAUTION]
