@@ -75,6 +75,9 @@ HEALTH_DB_STATEMENT_TIMEOUT_MS = 1000
 # connections, while keeping concurrent health requests bounded.
 HEALTH_DB_POOL_MIN_SIZE = 1
 HEALTH_DB_POOL_MAX_SIZE = 2
+_POOL_CHECK_CONNECTION = ConnectionPool.check_connection
+TEE_PRIMARY_POOL_MAX_LIFETIME_SECONDS = 180.0
+TEE_PRIMARY_TCP_USER_TIMEOUT_MS = 30000
 
 
 def _database_url() -> str:
@@ -100,6 +103,35 @@ def database_schema() -> str:
     if value not in {"rds", "tee"}:
         raise RuntimeError("FEEDLING_DATABASE_SCHEMA must be 'rds' or 'tee'")
     return value
+
+
+def _database_connection_kwargs() -> dict:
+    """Connection options shared by pools and dedicated LISTEN connections.
+
+    A promoted TEE primary crosses the Phala direct-TLS gateway. The gateway can
+    silently retire long-lived sockets; TCP keepalives make idle connections
+    observable before the next request borrows them. RDS keeps its historical
+    options unchanged.
+    """
+    kwargs = {"autocommit": True}
+    if database_schema() == "tee":
+        kwargs.update(
+            {
+                "connect_timeout": 10,
+                "keepalives": 1,
+                "keepalives_idle": 30,
+                "keepalives_interval": 10,
+                "keepalives_count": 3,
+                "tcp_user_timeout": TEE_PRIMARY_TCP_USER_TIMEOUT_MS,
+            }
+        )
+    return kwargs
+
+
+def _database_pool_lifetime_kwargs() -> dict:
+    if database_schema() == "tee":
+        return {"max_lifetime": TEE_PRIMARY_POOL_MAX_LIFETIME_SECONDS}
+    return {}
 
 
 def _pool_max_size() -> int:
@@ -148,8 +180,9 @@ def get_pool() -> ConnectionPool:
                 max_size=_pool_max_size(),
                 timeout=10,
                 max_idle=300,
-                kwargs={"autocommit": True},
+                kwargs=_database_connection_kwargs(),
                 open=True,
+                **_database_pool_lifetime_kwargs(),
             )
     return _pool
 
@@ -167,8 +200,10 @@ def get_health_pool() -> ConnectionPool:
                 max_size=HEALTH_DB_POOL_MAX_SIZE,
                 timeout=HEALTH_DB_ACQUIRE_TIMEOUT_SECONDS,
                 max_idle=300,
-                kwargs={"autocommit": True},
+                check=_POOL_CHECK_CONNECTION,
+                kwargs=_database_connection_kwargs(),
                 open=True,
+                **_database_pool_lifetime_kwargs(),
             )
     return _health_pool
 
@@ -348,7 +383,7 @@ def listen_connection() -> "psycopg.Connection":
     holds exactly one of these per worker, outside the request pool, and blocks
     on ``conn.notifies()`` — so it never consumes a pool slot. Raises on connect
     failure; the caller's reconnect loop handles it."""
-    return psycopg.connect(_database_url(), autocommit=True)
+    return psycopg.connect(_database_url(), **_database_connection_kwargs())
 
 
 # ---------------------------------------------------------------------------
