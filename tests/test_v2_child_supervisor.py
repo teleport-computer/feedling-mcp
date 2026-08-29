@@ -97,9 +97,8 @@ def _fake_target_idle_only(conn, *_args) -> None:
 
 def _fake_target_pid_then_wedge(conn, pid_holder, slot_generation) -> None:
     """Publishes its own PID into a shared `multiprocessing.Value`, sends one
-    progress heartbeat, then wedges — lets a test assert `kill_and_respawn()`
-    actually produces a fresh process (new PID), not the same one still limping
-    along."""
+    progress heartbeat, then wedges — lets recovery tests assert a terminated
+    generation cannot be reused."""
     pid_holder.value = os.getpid()
     try:
         conn.send(_progress(slot_generation))
@@ -587,13 +586,14 @@ def test_fenced_restart_does_not_spawn_until_old_process_is_confirmed_dead():
     assert proc.kill_calls == 1
 
 
-def test_watchdog_respawn_does_not_spawn_while_old_process_survives_sigkill():
+def test_kill_for_recovery_does_not_spawn_while_old_process_survives_sigkill():
     sup, proc, _expected = _supervisor_with_unkillable_process()
     starts = []
     sup._start_locked = lambda: starts.append("start")
 
-    sup.kill_and_respawn(join_timeout=0.0)
+    outcome = sup.kill_for_recovery(join_timeout=0.0)
 
+    assert outcome.terminated is False
     assert starts == []
     assert sup._proc is proc
     assert proc.kill_calls == 1
