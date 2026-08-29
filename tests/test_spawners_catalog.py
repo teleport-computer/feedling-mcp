@@ -235,7 +235,7 @@ def test_fallback_identity_write_covers_full_flag_surface():
     expected_flags = (
         "--agent-name", "--self-introduction", "--category",
         "--user-preferred-name", "--agent-role", "--tone-style",
-        "--custom-persona-prompt", "--language-preference",
+        "--custom-persona-prompt",
         "--relationship-anchor", "--signature",
         "--add-signature", "--remove-signature", "--replace-signatures",
         "--add-boundary", "--remove-boundary", "--replace-boundaries",

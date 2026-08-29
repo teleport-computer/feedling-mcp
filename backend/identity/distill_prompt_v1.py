@@ -19,14 +19,14 @@ from memgarden.text.card_text import extract_json_block
 
 # consumer 侧"部分补全"读取现有卡时要保留的字段集(Task 3 使用)。
 #
-# B2 (2026-07-23, hx): REVERSES I7 (ef8e393d) — the 5 user-layer fields below
-# (user_preferred_name, custom_persona_prompt, language_preference,
+# B2 (2026-07-23, hx): REVERSES I7 (ef8e393d) — the 4 user-layer fields below
+# (user_preferred_name, custom_persona_prompt,
 # relationship_anchor, stable_definitions) are now covered by resident distill
-# too, so this tuple is the FULL card_policy.PROFILE_FIELDS set (13) plus
-# `dimensions` (14 total) — not a 9-of-13 subset anymore.
+# too, so this tuple is the FULL card_policy.PROFILE_FIELDS set (12) plus
+# `dimensions` (13 total) — not a hand-picked subset.
 #
 # GROUNDING, not confirmation, is what keeps this safe: the prompt (_FIELDS_SPEC
-# below) instructs the model to leave each of these 5 empty unless the material
+# below) instructs the model to leave each of these 4 empty unless the material
 # gives an EXPLICIT, unambiguous signal for it — never invent one. This applies
 # with extra force to custom_persona_prompt specifically: it must only be set
 # from an explicit persona/system-prompt-style directive actually present in
@@ -38,7 +38,7 @@ from memgarden.text.card_text import extract_json_block
 RESIDENT_IDENTITY_FIELDS: tuple[str, ...] = (
     "agent_name", "self_introduction", "category", "signature",
     "dimensions", "tone_style", "agent_role", "do_not_say", "boundaries",
-    "user_preferred_name", "custom_persona_prompt", "language_preference",
+    "user_preferred_name", "custom_persona_prompt",
     "relationship_anchor", "stable_definitions",
 )
 
@@ -52,7 +52,6 @@ _STRING_CAPS = {
     # 1200 like tone_style — same card_policy/genesis.service convention for
     # the two "long free text" user-authored fields.
     "custom_persona_prompt": 1200,
-    "language_preference": 240,
     "relationship_anchor": 1200,
 }
 _LIST_FIELDS = ("signature", "do_not_say", "boundaries", "stable_definitions")
@@ -79,8 +78,6 @@ _FIELDS_SPEC = (
     "actually contains one verbatim or near-verbatim; only set it when such an explicit "
     "directive is present — never construct one by summarizing general descriptive text — "
     "empty string otherwise), "
-    "language_preference (the reply language the user explicitly asked for; empty string if "
-    "the material doesn't say), "
     "relationship_anchor (a short free-text description of the relationship the user "
     "explicitly stated, e.g. 'college roommate' or 'mentor figure'; empty string if the "
     "material doesn't say — do not infer this from tone or vibe), "
@@ -89,9 +86,9 @@ _FIELDS_SPEC = (
     "empty array if none). "
     "tone_style/agent_role/do_not_say/boundaries capture the companion's VOICE so it "
     "survives the update — extract them from the material, not just the facts. "
-    "user_preferred_name/custom_persona_prompt/language_preference/relationship_anchor/"
+    "user_preferred_name/custom_persona_prompt/relationship_anchor/"
     "stable_definitions are USER-authored signal (D1 user layer), not TA identity — GROUNDING "
-    "applies even more strictly to these 5: leave each empty/absent unless the material gives "
+    "applies even more strictly to these 4: leave each empty/absent unless the material gives "
     "an explicit, unambiguous statement for it; never infer or invent one from context, tone, "
     "or what would make a nicer-looking card. "
     "Do not invent facts not grounded in the material. "
@@ -145,10 +142,10 @@ _MERGE_TEMPLATE = (
 
 
 def build_resident_identity_prompt(document: str, existing_identity: dict | None = None) -> str:
-    """Persona 材料 → 身份卡蒸馏 prompt(B2:覆盖 RESIDENT_IDENTITY_FIELDS 这 14 个字段 ==
-    card_policy.PROFILE_FIELDS 全部 13 个 + dimensions;user_preferred_name /
-    custom_persona_prompt / language_preference / relationship_anchor /
-    stable_definitions 这 5 个用户层字段现在也蒸馏,GROUNDED——素材没有明确信号就留空,
+    """Persona 材料 → 身份卡蒸馏 prompt(B2:覆盖 RESIDENT_IDENTITY_FIELDS 这 13 个字段 ==
+    card_policy.PROFILE_FIELDS 全部 12 个 + dimensions;user_preferred_name /
+    custom_persona_prompt / relationship_anchor /
+    stable_definitions 这 4 个用户层字段现在也蒸馏,GROUNDED——素材没有明确信号就留空,
     绝不编,见 _FIELDS_SPEC)。existing_identity 非空时附合并规则(部分补全)。"""
     prompt = (
         "The user uploaded a character/persona description for the companion (you). "

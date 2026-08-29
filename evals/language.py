@@ -36,7 +36,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "backend"))
 
-from memgarden.contract import run_garden_language_contract  # noqa: E402
+from memgarden.contract import basis_matches, garden_language_cases  # noqa: E402
 
 from chat.reply_language import garden_language_decision  # noqa: E402
 
@@ -48,9 +48,8 @@ def _decider(evidence: dict) -> dict:
     人名/公司名这类不携带语言信息的专有名词。io 这边照样把 existing_buckets 传下去，
     但那只走观测字段，不参与判定；契约里那几条 James / 品牌名的用例就是在守这一点。
     """
-    identity = {"language_preference": evidence["explicit"]} if evidence.get("explicit") else {}
     d = garden_language_decision(
-        identity,
+        {},
         written=evidence.get("written") or "",
         locale=evidence.get("locale") or "",
         # 故意塞一串英文桶名进去：判定**不该**因此改变。
@@ -59,10 +58,34 @@ def _decider(evidence: dict) -> dict:
     return {"locale": d["locale"], "basis": d["basis"]}
 
 
+def _run_supported_contract() -> list[str]:
+    """Run the pinned corpus rows whose evidence contract IO still accepts.
+
+    The pinned memgarden wheel still carries an ``explicit`` input tier. IO no
+    longer stores or consumes that derived field, so those rows describe a
+    deliberately retired host input rather than the current adapter contract.
+    Written-language and locale/default rows remain independent golden cases.
+    """
+
+    cases = [case for case in garden_language_cases() if not case.get("explicit")]
+    failures: list[str] = []
+    for case in cases:
+        got = _decider({
+            "written": case.get("written") or "",
+            "locale": case.get("locale") or None,
+        })
+        if got.get("locale") != case["expect"] or not basis_matches(
+            got.get("basis"), case.get("expect_basis")
+        ):
+            failures.append(str(case["id"]))
+    print(f"支持中的语料：{len(cases) - len(failures)}/{len(cases)} 通过")
+    return failures
+
+
 def main() -> int:
     print("语料：memgarden.contract（随 wheel 分发）")
     print("判定器：io 的 chat.reply_language.garden_language_decision\n")
-    _, fails = run_garden_language_contract(_decider)
+    fails = _run_supported_contract()
     if fails:
         print(f"  失败：{', '.join(fails)}")
         return 1

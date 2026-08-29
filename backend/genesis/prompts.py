@@ -175,12 +175,12 @@ Bucket convergence (onboarding produces many cards at once — do not let bucket
 Firewall:
 - A person's profile, or a fact about the person, goes ONLY into memory. It must never become the agent's personality, dimensions, or identity (agent_name / dimensions / category).
 - The agent's identity may come only from: an uploaded AI persona, or the way the companion actually speaks and the things it actually did in the history.
-- Exception (applies only to these five "person-level" fields): user_preferred_name / custom_persona_prompt / language_preference / relationship_anchor / stable_definitions describe THE PERSON, so the rule reverses — take them only from the person's profile or from the person's own words, never inferred from the companion's tone or behavior. They are independent of the agent identity fields (agent_name etc.); do not mix them up.
+- Exception (applies only to these four "person-level" fields): user_preferred_name / custom_persona_prompt / relationship_anchor / stable_definitions describe THE PERSON, so the rule reverses — take them only from the person's profile or from the person's own words, never inferred from the companion's tone or behavior. They are independent of the agent identity fields (agent_name etc.); do not mix them up.
 
 Output JSON:
 {"memories":[{"type":"fact|event|quote|moment","bucket":"...","threads":["..."],"summary":"...","content":"...","occurred_at":"YYYY-MM-DD or empty","importance":0.5,"pulse":0.3}],
  "identity":{"agent_name":"","category":"","dimensions":[{"name":"...","value":0,"description":"..."}],
-  "user_preferred_name":"","custom_persona_prompt":"","language_preference":"",
+  "user_preferred_name":"","custom_persona_prompt":"",
   "relationship_anchor":"","stable_definitions":[]},
  "days_with_user":0,
  "relationship_anchor_evidence":"..."}
@@ -195,7 +195,6 @@ Identity-card fields (identity comes ONLY from material that describes the COMPA
 Person-level fields (GROUNDED — when the material carries no explicit signal, leave empty or an empty array. Never infer, never pad to fill the shape):
 - user_preferred_name: how the person wants to be addressed. Write it only when the person THEMSELVES states a name or form of address in the material; placeholders like "user" or "TA" are not names. Leave it empty when unstated. This is not agent_name (the companion's name) — do not swap them.
 - custom_persona_prompt: if the material contains a stretch of PERSONA INSTRUCTIONS the person wrote for the companion — something that reads like a system prompt or role definition, explicitly telling the companion how to behave — extract that instruction text verbatim. If there is no such explicit instruction, leave it empty. Do not mistake a general description of personality for an instruction; that is what dimensions and category are for.
-- language_preference: a reply-language preference the person stated outright (for example "speak Chinese with me"). Empty when absent.
 - relationship_anchor: a one-line characterization of the relationship found in the material (for example "college roommate", "mentor"). It must be something the person said themselves, not something you guessed from conversational style. Empty when unstated.
 - stable_definitions: definitions, rules, or terms the person explicitly asked to be REMEMBERED PERMANENTLY (an array, one line each — a custom form of address, a standing rule). Empty array when absent.
 

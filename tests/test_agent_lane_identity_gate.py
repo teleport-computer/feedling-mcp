@@ -39,7 +39,7 @@ def _ns(**overrides) -> argparse.Namespace:
     base = dict(
         agent_name=None, self_introduction=None, category=None,
         user_preferred_name=None, agent_role=None, tone_style=None,
-        custom_persona_prompt=None, language_preference=None,
+        custom_persona_prompt=None,
         relationship_anchor=None, relationship_days=None,
         signature=[], add_signature=[], remove_signature=[], replace_signatures=[],
         add_boundary=[], remove_boundary=[], replace_boundaries=[],
