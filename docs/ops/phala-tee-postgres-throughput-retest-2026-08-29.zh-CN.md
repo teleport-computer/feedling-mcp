@@ -1,3 +1,9 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md
+historical_reason: point-in-time
+---
+
 # Phala TEE PostgreSQL 网关优化后吞吐复测与 RDS 对比
 
 **测试日期：** 2026-08-29
