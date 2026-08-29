@@ -490,6 +490,16 @@ jobs:
             tests/test_repository_inventory.py \
             -v
 
+      - name: Store invalidation regression suite
+        env:
+          FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+        run: |
+          python -m pytest \
+            tests/test_store_cache.py \
+            tests/test_blob_wake.py \
+            tests/test_wake_bus.py \
+            -v
+
       - name: Redis retirement and recovery asset guards
         env:
           PYTHONPATH: backend

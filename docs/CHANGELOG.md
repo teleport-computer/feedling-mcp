@@ -63,6 +63,8 @@ historical_reason: point-in-time
   直接调用私有 loader 的 fallback。
 - wake bus 测试改用真实 `UserStore`，覆盖 frames/blob 的精确刷新和 proactive waiter
   唤醒；非 section 缓存对象不再被静默接受。
+- 三个相关测试文件已接入显式 CI batch，并从 uncovered baseline 移除；豁免棘轮
+  `MAX_EXEMPTED` 从 290 收紧到 287。
 - 不影响 schema、公开 API、部署拓扑或 VPS resident consumer。
 
 ## 2026-08-29 — 删除不可达的 Redis backend 客户端与生产依赖

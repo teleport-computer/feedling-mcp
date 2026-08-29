@@ -33,6 +33,8 @@ canonical_owner: self
 - GREEN：`FEEDLING_TEST_PG=postgresql://postgres:test@127.0.0.1:55432/postgres
   python -m pytest tests/test_store_cache.py tests/test_blob_wake.py tests/test_wake_bus.py -q`，
   结果 76 passed。
+- 上述三文件已进入独立 CI batch，并从 `.github/pytest-uncovered-baseline.txt` 移除；
+  覆盖棘轮先以 `MAX_EXEMPTED=290 与实际 287 条不符` RED，再收紧到 287 GREEN。
 - 广泛回归在 commit `6d3aa396` 的实现树上运行；因本机另一个 editable package 提供
   `tests/__init__.py`，显式排除两个会被错误解析到外包的 admin data-track 测试。结果为
   12,206 passed、4 skipped、9 xfailed；11 个 Genesis 失败与改动前基线相同，另 2 个

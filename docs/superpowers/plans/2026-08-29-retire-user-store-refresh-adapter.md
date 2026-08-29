@@ -82,10 +82,13 @@ This record was added after implementation because the bounded in-chat design wa
 ### Task 2: Record and verify the cleanup
 
 **Files:**
+- Modify: `.github/workflows/ci.yml`
+- Modify: `.github/pytest-uncovered-baseline.txt`
 - Modify: `docs/CHANGELOG.md`
 - Modify: `docs/repository-cleanup/candidates/README.md`
 - Modify: `docs/repository-cleanup/candidates/user-store-refresh-compatibility.md`
 - Modify: `docs/repository-cleanup/document-lifecycle-inventory.md`
+- Modify: `tests/test_pytest_coverage_ratchet.py`
 - Create: `docs/superpowers/plans/2026-08-29-retire-user-store-refresh-adapter.md`
 
 **Interfaces:**
@@ -99,7 +102,9 @@ This record was added after implementation because the bounded in-chat design wa
 - [x] **Step 2: Run local quality gates**
 
   Run focused pytest, `py_compile`, pyflakes, `git diff --check`, changed-document lifecycle
-  validation, and deterministic lifecycle inventory generation through a temporary file.
+  validation, and deterministic lifecycle inventory generation through a temporary file. Add the
+  three focused files to an explicit CI batch, remove them from the uncovered baseline, observe the
+  ratchet fail at 290 versus 287, then set `MAX_EXEMPTED = 287` and require GREEN.
 
 - [ ] **Step 3: Run CI and TEST integration gates**
 
