@@ -4,10 +4,11 @@
   "intentional_updates": [
     "T330 web_fetch integer offset and paging description",
     "T331 retire memory sensitivity schema fields",
-    "T325 route proactive Canvas offers through the V2 system prompt"
+    "T325 route proactive Canvas offers through the V2 system prompt",
+    "T378 retire identity language preference tool description"
   ],
-  "wire_bytes": 30815,
-  "wire_sha256": "114b431713cfbe33e483adcb2e07da4673a8b4b41cee5ed34f1472ea35018e5d",
+  "wire_bytes": 30794,
+  "wire_sha256": "65bf87c7a3f7f79d2bbf5c460e396d185a5dc6c8a0f46b90aa1909eeb7fc18ff",
   "schema_sha256": {
     "cancel_wake": "aeb00721a85b3b99116c51d74a4ef21bb1110a4ef5d9bd685fea91546fd6b685",
     "generate_image": "b714761c24145e5c49120b413384b7a67cd0788590b988a345a9283da41d951a",
