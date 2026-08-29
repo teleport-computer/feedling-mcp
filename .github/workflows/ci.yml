@@ -499,6 +499,15 @@ jobs:
             tests/test_frame_envelope_roundtrip_tool.py \
             -v
 
+      - name: Test-harness teardown guard
+        # FEEDLING_TEST_PG is deliberately absent: this file guards the
+        # no-Postgres path of tests/conftest.py itself, and its fake admin
+        # connection records statements instead of executing them.
+        run: |
+          python -m pytest \
+            tests/test_conftest_teardown.py \
+            -v
+
       - name: Guard top-level pytest discovery coverage
         run: |
           export LC_ALL=C

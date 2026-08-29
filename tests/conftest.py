@@ -454,6 +454,10 @@ if not _provisioned:
         # 叫醒判据(2026-08-19, 感知内核提取 Task 7)。纯:只 import
         # perception_kernel.wake 调纯函数,零 DB/零网络/零时钟(时间由测试传入)。
         "test_perception_kernel_wake.py",
+        # teardown 守卫(T394)。纯:假 admin 连接只记录语句,零 DB/零网络。
+        # ⚠️ 它守的正是无 PG 这条路径本身,所以必须留在可收集列表里 ——
+        # 漏登记的话,唯一能跑它的机器(无 PG 的开发机)反而跑不到它。
+        "test_conftest_teardown.py",
     }
     collect_ignore = sorted(
         f
@@ -649,6 +653,32 @@ def pytest_report_header(config):
     )
 
 
+def _drop_throwaway_databases(admin, dbnames):
+    """Drop each throwaway database independently, reporting every failure.
+
+    Each name gets its own ``try``: a refusal on the first one (``ObjectInUse``
+    when a backend outlived the session) must not stop the rest from being
+    attempted, and must not be swallowed — a silent teardown failure is
+    indistinguishable from a successful one, which is how 124 databases
+    accumulated unnoticed.
+    """
+    for dbname in dbnames:
+        try:
+            # Terminate stragglers (subprocess backends may not have exited yet).
+            # pg_terminate_backend() returning true only means the signal was sent.
+            admin.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s",
+                (dbname,),
+            )
+            admin.execute(f'DROP DATABASE IF EXISTS "{dbname}"')
+        except Exception as exc:
+            print(
+                f"feedling: teardown could not drop {dbname} "
+                f"({type(exc).__name__}: {exc}) — it is leaked, drop it manually",
+                file=sys.stderr,
+            )
+
+
 def pytest_unconfigure(config):
     """Drop the throwaway database(s) at the end of the session."""
     if not _provisioned:
@@ -657,16 +687,17 @@ def pytest_unconfigure(config):
         import psycopg
 
         admin = psycopg.connect(_ADMIN_URL, autocommit=True)
-        # Terminate stragglers (subprocess backends may not have exited yet).
-        for _dbname in (_TEST_DB, _TEE_DB):
-            admin.execute(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s",
-                (_dbname,),
-            )
-            admin.execute(f'DROP DATABASE IF EXISTS "{_dbname}"')
+    except Exception as exc:
+        print(
+            f"feedling: teardown could not open the admin connection "
+            f"({type(exc).__name__}: {exc}) — leaked {_TEST_DB} and {_TEE_DB}",
+            file=sys.stderr,
+        )
+        return
+    try:
+        _drop_throwaway_databases(admin, (_TEST_DB, _TEE_DB))
+    finally:
         admin.close()
-    except Exception:
-        pass
 
 
 def pytest_terminal_summary(terminalreporter):
