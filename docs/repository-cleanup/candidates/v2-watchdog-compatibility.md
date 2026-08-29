@@ -4,7 +4,7 @@ canonical_owner: self
 ---
 # 候选：删除 Runtime V2 watchdog 旧测试兼容层
 
-结论：`delete`，已实施（base: `8b5c6c70cca05f06e9041925c393dbdd1a6d0ee8`）。这里的核心是收紧接口，同时保持恢复安全顺序。
+结论：`delete`，已实施（final diff base: `4be66bfd`）。这里的核心是收紧接口，同时保持恢复安全顺序。
 
 ## 范围与证据
 

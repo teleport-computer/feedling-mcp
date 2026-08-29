@@ -158,12 +158,12 @@ async def _watchdog_loop(
     implementation (`jobs_store.pending_job_count() > 0`, wired in
     `serve_worker._serve`) is a blocking DB round trip.
 
-    On a kill decision, the affected pool/slot heartbeat is first advertised with
-    `capacity=0` (best effort; DB trouble never blocks physical recovery). The
-    watchdog snapshots the active identity, confirms the physical kill, recovers
-    only that `job_id + claimed_by` claim, then starts the replacement slot. Every
-    per-iteration exception is caught and logged so a bad slot cannot crash the
-    parent fleet's heartbeat, reaper, scheduler, or other slot watchdogs.
+    On a kill decision, the watchdog first snapshots the active identity, then
+    advertises the affected pool/slot with `capacity=0` (best effort; DB trouble
+    never blocks physical recovery), confirms the physical kill, recovers only
+    that `job_id + claimed_by` claim, and finally starts the replacement slot.
+    Every per-iteration exception is caught and logged so a bad slot cannot crash
+    the parent fleet's heartbeat, reaper, scheduler, or other slot watchdogs.
     """
     claimable_task: asyncio.Task | None = None
 

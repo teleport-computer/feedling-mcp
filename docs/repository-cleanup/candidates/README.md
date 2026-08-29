@@ -16,7 +16,7 @@ gross 删除估算均以该提交为准，实施前必须 rebase `test` 并重�
 | 2 | [Route-B 旧 selector/feature flag 岛](route-b-readside-island.md) | `delete`（已实施） | gross 删除 540 行；net 删除见实施 PR | 生产继续固定走统一 bucketed selector，旧实现和测试岛已退役 |
 | 3 | [`db.py` 三个零消费者叶子](db-dead-leaves.md) | `delete`（已实施） | gross/net 删除 37 行 | 无生产、测试、文档和动态调用证据 |
 | 4 | [`v2_user_triage.py` 旧 semantic-compaction 诊断](v2-user-triage-semantic-compaction.md) | `delete`（局部，已实施） | production gross 删除 121 行；net 删除 76 行 | 旧 body/char-budget 与泛化错误归因会误诊当前 metadata-only compaction |
-| 5 | [Runtime V2 watchdog 旧兼容层](v2-watchdog-compatibility.md) | `delete`（已实施，base `8b5c6c70`） | production gross 删除 62 行；net 删除 44 行 | 旧 test-double/旧 Python 参数已移除；当前恢复顺序由 167 例 focused suite 锁定 |
+| 5 | [Runtime V2 watchdog 旧兼容层](v2-watchdog-compatibility.md) | `delete`（已实施，final diff base `4be66bfd`） | production gross 删除 62 行；net 删除 44 行 | 旧 test-double/旧 Python 参数已移除；当前恢复顺序由 167 例 focused suite 锁定 |
 
 前五项均已实施：失效 E2E 脚本由 canonical E2E 和路由契约测试接管；Route-B 的召回、
 trace 隐私和 query 参数兼容断言已先迁到真实 bucketed 路径，再删除旧 selector、flag、

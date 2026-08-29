@@ -49,6 +49,8 @@ def test_should_kill_rejects_retired_single_timeout_kwarg():
             {"alive": True, "last_progress_age_sec": 1.0},
             child_liveness_timeout_sec=45.0,
             jobs_claimable=False,
+            turn_stall_timeout_sec=240.0,
+            turn_absolute_timeout_sec=1500.0,
             turn_hard_timeout_sec=180.0,
         )
 
