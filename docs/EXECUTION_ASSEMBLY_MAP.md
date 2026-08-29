@@ -251,7 +251,7 @@ MCP、workspace、effect sink 等实现注入 dependency-clean 的 `worker.py`�
 | `agent_runtime/supervisor.py` | 独立 runner compose command / image entrypoint | V1 runner supervisor 进程 |
 | `agent/perception_core.py` | plugin README 引用 | 被调用模块，不是 deploy 进程入口 |
 | `content/routes_asgi.py`, `content_encryption.py`, `enclave/keys.py`, `perception/store.py` | 迁移/runbook 文本引用 | 所属 backend/enclave/consumer 进程内模块 |
-| `db.py`, `object_storage.py`, `redis_pool.py` | env/setup/运维说明引用 | 共享基础设施 adapter，不是独立 Python 进程 |
+| `db.py`, `object_storage.py` | env/setup/运维说明引用 | 共享基础设施 adapter，不是独立 Python 进程 |
 | `hosted/config_store.py`, `hosted/runtime_reconciler.py` | compose env 注释引用 | backend lifespan/请求路径内模块 |
 | `proactive/dashboard.py`, `push/apns.py` | compose env 注释引用 | backend 进程内模块 |
 

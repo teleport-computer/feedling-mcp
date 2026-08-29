@@ -95,13 +95,6 @@ reportlab==5.0.0
 # (no system deps).
 Pillow>=11,<13
 
-# DEPRECATED 2026-08-20：TEE Redis CVM 已暂停，客户端入口固定拒绝构造。
-# 依赖暂留给保留实现与退役门禁测试；重新接入必须另开 spec（见
-# docs/REDIS_USAGE.md），不得直接调用现有模块。模块只用跨
-# 4.5–6.x 稳定的 async API（redis.asyncio.Redis 的 ssl_ca_certs/max_connections
-# 等 + aclose/close 兜底），故 range 放宽。
-redis>=5,<7
-
 # 记忆的编辑判断内核 —— 从本仓库提取出去的独立库（Apache-2.0，公开仓库）。
 #
 # 为什么走 GitHub Release 的 wheel URL 而不是 PyPI：

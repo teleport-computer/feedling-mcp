@@ -55,6 +55,17 @@ historical_reason: point-in-time
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-29 — 删除不可达的 Redis backend 客户端与生产依赖
+
+**[DONE] Redis CVM 的审计/恢复资产继续保留，但零消费者、固定拒绝连接的 Python
+客户端不再进入生产镜像。**
+
+- 删除 `backend/redis_pool.py` 及只验证其保留实现的单元测试；全仓没有业务调用方。
+- 从 `backend/requirements.txt` 与 hash lock 删除 `redis-py`，减少无效依赖和 agent
+  排查噪音。
+- 保留 Redis compose、镜像、TLS 配置、禁用 workflow、CVM id 和运维测试；未来恢复
+  必须先有新接入 spec，再重新实现客户端，不能把历史代码直接接回请求路径。
+
 ## 2026-08-28 — 主动回复新增协议残片窄防线与可读诊断
 
 **[DONE] 两种此前不在 JSON 协议检测器设计空间内的残片，在主动投递前有了
