@@ -3108,6 +3108,214 @@ def test_user_input_during_final_provider_call_is_folded_before_visible_reply(
     )
 
 
+def _run_ordered_voice_handoff_mirror(
+    monkeypatch,
+    *,
+    uid: str,
+    end_voice_call: bool,
+) -> dict:
+    """Run the same queued A/B turn with only the voice lifecycle changed.
+
+    Both inputs exist before the job is claimed. Ordered seq-native handling
+    therefore settles A alone and leaves B beyond the cursor. The caller can
+    compare the ended-call early return with the ordinary main-path successor
+    without changing any other arrange input.
+    """
+    conftest.seed_user(uid)
+    _reset(uid)
+    db.set_blob_strict(
+        uid,
+        "model_api_runtime",
+        {
+            "hosted_runtime_mode": "db_action_v2",
+            "v2_reply_cursor_seq": 0,
+        },
+    )
+
+    call_id = f"{uid}-call"
+    db.voice_call_create_active(uid, call_id)
+    voice_doc = {
+        **_user_doc("A", "voice A"),
+        "voice_call_id": call_id,
+        "voice_turn_id": "turn-A",
+    }
+    queued_doc = {**_user_doc("B", "queued B"), "ts": 20.0}
+    db.chat_append_strict(uid, "A", 10.0, voice_doc, 5000)
+    db.chat_append_strict(uid, "B", 20.0, queued_doc, 5000)
+    seq_a = db.chat_seq_for_msg_id(uid, "A")
+    seq_b = db.chat_seq_for_msg_id(uid, "B")
+    assert seq_a is not None and seq_b is not None and 0 < seq_a < seq_b
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == 0
+
+    generation = db.get_runtime_generation(uid)
+    job_id, coalesced = jobs_store.enqueue_job(
+        uid,
+        "chat",
+        expected_generation=generation,
+    )
+    assert coalesced is False
+    job = jobs_store.claim_next_job(f"w-{uid}")
+    assert job is not None and int(job["id"]) == job_id
+    if end_voice_call:
+        assert db.voice_call_begin_finalize(uid, call_id) == {
+            "status": "finalizing",
+            "replayed": False,
+        }
+    else:
+        assert db.voice_call_status(uid, call_id) == "active"
+
+    _patch_tool_effect_encryption(monkeypatch)
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *args, **kwargs: _FakeCapResult({}),
+    )
+    deps = _late_input_deps(uid, [])
+    deps.ordered_chat_replies = True
+    deps.read_summary_with_seq = lambda _uid: ("", 0.0, 0, 0)
+    submitted_payloads: list[dict] = []
+
+    def apply_pending_effects(user_id: str):
+        with db.get_pool().connection() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM v2_effect_outbox "
+                "WHERE user_id=%s AND effect_type=%s "
+                "AND status IN ('pending','pending_fenced_v1') "
+                "ORDER BY enqueue_seq",
+                (user_id, v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE),
+            ).fetchall()
+        submitted_payloads.extend(row[0] for row in rows)
+        return serve_worker._apply_pending_effects_for_user(user_id)
+
+    deps.apply_pending_effects = apply_pending_effects
+
+    def read_tail_after_seq(
+        user_id: str,
+        after_seq: int,
+        limit: int,
+        *,
+        through_seq: int | None = None,
+    ):
+        assert deps.read_messages_after_seq is not None
+        rows = deps.read_messages_after_seq(user_id, after_seq)
+        if through_seq is not None:
+            rows = [row for row in rows if int(row["seq"]) <= through_seq]
+        return rows[-limit:]
+
+    deps.read_tail_after_seq = read_tail_after_seq
+    assert deps.ordered_chat_replies is True
+    assert deps.read_messages_after_seq is not None
+    provider_calls = []
+
+    async def provider(_config, messages, *, tools=None, **_kwargs):
+        provider_calls.append(list(messages))
+        assert worker.context.ORDERED_REPLY_TARGET_POLICY in messages[0]["content"]
+        assert any(
+            isinstance(message, dict) and message.get("content") == "voice A"
+            for message in messages
+        )
+        assert not any(
+            isinstance(message, dict) and message.get("content") == "queued B"
+            for message in messages
+        )
+        return _text_round("answer A")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    with db.get_pool().connection() as conn:
+        effect = conn.execute(
+            "SELECT status,last_error,payload FROM v2_effect_outbox "
+            "WHERE user_id=%s AND effect_type=%s ORDER BY enqueue_seq DESC LIMIT 1",
+            (uid, v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE),
+        ).fetchone()
+        successors = conn.execute(
+            "SELECT status,reason,trace_id FROM agent_jobs "
+            "WHERE user_id=%s AND id<>%s ORDER BY id",
+            (uid, job_id),
+        ).fetchall()
+    assert effect is not None
+    assert len(submitted_payloads) == 1
+    payload = submitted_payloads[0]
+    assert payload["reply_to_message_id"] == "A"
+    assert payload["voice_call_id"] == call_id
+    assert payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY][
+        "preserve_queued_input"
+    ] is True
+    assert payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY]["through_seq"] == seq_a
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == seq_a
+    assert db.chat_max_user_seq_between(uid, seq_a, seq_b) == seq_b
+    return {
+        "status": status,
+        "job_id": job_id,
+        "seq_a": seq_a,
+        "seq_b": seq_b,
+        "effect": effect,
+        "payload": payload,
+        "successors": successors,
+        "bubbles": _bubbles(uid),
+        "provider_calls": provider_calls,
+    }
+
+
+def test_ended_voice_turn_delays_queued_input_until_reconcile(monkeypatch):
+    """Voice completion has no eager handoff, but B remains durably recoverable."""
+    uid = "u_toolloop_voice_delayed_handoff"
+    result = _run_ordered_voice_handoff_mirror(
+        monkeypatch,
+        uid=uid,
+        end_voice_call=True,
+    )
+
+    assert result["status"] == "completed"
+    assert len(result["provider_calls"]) == 1
+    assert _job_status_row(result["job_id"])[0] == "completed"
+    assert _turn_metric_row(result["job_id"]) == (1, False, "voice_call_ended")
+    assert result["effect"][:2] == (
+        "discarded",
+        v2_effect_outbox.FINAL_REPLY_VOICE_CALL_ENDED,
+    )
+    assert result["bubbles"] == []
+    # Exit-time fact: the voice-only early return skips the eager handoff.
+    assert result["successors"] == []
+
+    # Backstop fact, in the same arranged experiment: B was delayed, not lost.
+    assert db.reconcile_unenqueued_v2_messages() == 1
+    with db.get_pool().connection() as conn:
+        catchup = conn.execute(
+            "SELECT status,reason,trace_id FROM agent_jobs "
+            "WHERE user_id=%s AND id<>%s ORDER BY id",
+            (uid, result["job_id"]),
+        ).fetchall()
+    assert catchup == [("pending", "reconcile", "B")]
+
+
+def test_active_voice_turn_uses_immediate_ordered_followup(monkeypatch):
+    """The ordinary main path eagerly hands the identical queued B to a job."""
+    result = _run_ordered_voice_handoff_mirror(
+        monkeypatch,
+        uid="u_toolloop_voice_eager_handoff",
+        end_voice_call=False,
+    )
+
+    assert result["status"] == "completed"
+    assert len(result["provider_calls"]) == 1
+    assert len(result["bubbles"]) == 1
+    assert base64.b64decode(result["bubbles"][0]["body_ct"]).decode() == "answer A"
+    assert _job_status_row(result["job_id"])[0] == "completed"
+    assert _turn_metric_row(result["job_id"]) == (1, False, "ok")
+    assert result["effect"][:2] == ("applied", "")
+    assert result["successors"] == [("pending", "ordered_followup", None)]
+
+
 def test_ordered_chat_replies_settle_each_user_message_separately(monkeypatch):
     uid = "u_toolloop_ordered_replies"
     conftest.seed_user(uid)
