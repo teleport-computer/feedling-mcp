@@ -424,9 +424,7 @@ def test_chat_system_prompt_uses_shared_reply_language_policy(
     policy = reply_language.infer_reply_language(
         locale=locale
     )
-    expected = reply_language.reply_language_system_line(
-        policy, proactive=False
-    )
+    expected = reply_language.reply_language_system_line(policy)
     system_text = str(calls[0]["messages"][0]["content"])
     assert status == "completed"
     assert expected in system_text

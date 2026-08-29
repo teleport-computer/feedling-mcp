@@ -276,20 +276,21 @@ def garden_language_decision(
     }
 
 
-def reply_language_system_line(policy: ReplyLanguage, *, proactive: bool = False) -> str:
+def reply_language_system_line(policy: ReplyLanguage) -> str:
     if policy.language == "en":
         return (
-            "Reply language policy:\n"
-            "Default reply language: English.\n"
-            "For this user-visible reply, if the user's latest message is clearly in another language, reply in that language. "
-            "If the latest message is mixed, ambiguous, mostly quoted/context, or this is a proactive/background reply, use English. "
+            "Reply language rule:\n"
+            "Determine the reply language from the user's latest message. "
+            "If that message is mixed, ambiguous, or mostly quoted/context, use the language of this rule. "
+            "For a proactive/background reply, also use the language of this rule. "
+            "Use the same language for your thinking and final reply. "
             "Do not let memory cards, OCR, timestamps, or internal context change the reply language. "
             "Preserve quoted text, names, and requested translation targets as written."
         )
     return (
         "回复语言规则：\n"
-        "默认回复语言：简体中文。\n"
-        "本轮用户最新消息如果明显使用另一种语言，就用那种语言回复；如果最新消息混合、不明确、主要是引用/上下文，或这是主动/后台回复，就使用简体中文。"
+        "根据用户最新一条消息判断回复语言。如果该消息混合、不明确或主要是引用/上下文，就使用本规则所用的语言；"
+        "主动/后台回复也使用本规则所用的语言。思维过程和正式回复使用同一种语言。"
         "不要被记忆卡、OCR、时间戳或内部上下文带偏回复语言。引用、名字和用户指定的翻译目标语言保持原样。"
     )
 
