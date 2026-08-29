@@ -1,15 +1,20 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Redis 使用文档与规范
 
 > [!CAUTION]
 > **已废弃并暂停（2026-08-20）**：test/pre/prod 三套 Redis CVM 已停止，
-> 部署与监控 workflow 已禁用，`backend/redis_pool.py` 固定拒绝构造客户端。
+> 部署与监控 workflow 已禁用，未接入业务的 `backend/redis_pool.py` 与
+> `redis-py` 生产依赖已于 2026-08-29 删除。
 > 本文仅作为历史设计与未来重新评审的输入，不再是可直接采用的接入指南。
 > 恢复前必须另开 spec，确认真实业务用途、故障降级、容量与监控方案，然后同时
-> 恢复 CVM、workflow 和客户端门禁。
+> 恢复 CVM、workflow，并重新实现和评审客户端。
 >
 > 面向**接入 Redis 的后端开发者**。基础设施开通/运维见
-> `deploy/DEPLOYMENTS.md`「TEE Redis」章节；连接池实现见
-> `backend/redis_pool.py`；架构取舍见本文 §0-1 与 `docs/CHANGELOG.md`。
+> `deploy/DEPLOYMENTS.md`「TEE Redis」章节；已删除客户端的历史设计见本文 §2；
+> 架构取舍见本文 §0-1 与 `docs/CHANGELOG.md`。
 >
 > **退役时仍为零流量**：没有任何业务代码引用 Redis。
 
@@ -62,32 +67,15 @@ gateway 找不到后端、握手时直接关连接，你只会看到 `unexpected
 - **坑**：`redis-cli --tls` 默认**不**发 SNI，必须显式 `--sni <host>`
   （`deploy/verify-redis.sh` 已处理）。任何自研/低层客户端务必确认 SNI 发对。
 
-### 连接池：用 `backend/redis_pool.py`，别自己 new 客户端
+### 客户端已删除，不能直接恢复旧实现
 
-连接池已经封装在 **`backend/redis_pool.py`**（低层无业务依赖模块，与
-`object_storage.py` 同层）。它从上面那套 env 惰性构造一个**进程内共享的池化
-async 客户端**（每 worker 一个有界池，默认 16 连接），TLS/SNI/CA 校验/超时
-都设好了。**直接用它，不要在业务代码里自己 `redis.Redis(...)`**——重复建池
-会打爆连接数、也会绕过这里统一的 fail-closed 校验。
+原 `backend/redis_pool.py` 曾封装池化 async 客户端，但从未接入业务；退役后入口
+固定拒绝构造客户端，剩余实现和 `redis-py` 只被自身测试消费。两者已删除，避免
+不可达代码继续进入生产镜像并误导排查。
 
-```python
-import redis_pool
-
-if redis_pool.redis_configured():          # 未配置就完全走 PG，别碰 Redis
-    r = redis_pool.get_redis()             # 进程内单例，复用连接池
-    val = await r.get("IO:cache:...")
-```
-
-- `redis_configured()` — 本环境是否配了 Redis（以 `REDIS_HOST` 为准）。
-- `get_redis()` — 返回共享客户端；首调惰性构造，**不建连接**（redis-py 在
-  首条命令时才连），故不阻塞、不发网络。缺口令/CA 会 fail-closed 报错，
-  绝不无鉴权 / 不校验证书地连公网端点。
-- `close_redis()` — 关停时释放连接池（由 `asgi/lifespan.py` 接线时调用）。
-
-**连不上就降级到 PG，绝不阻塞主流程。** Redis 是加速层，它挂了业务必须
-仍能用（走 PG）——这也是「纯临时层」的另一面。给所有 Redis 调用套
-`try/except`（连接/超时/池耗尽都会抛），异常时当作 cache miss 处理。
-`redis_pool` 已把 socket 超时设成 3s，不会让卡住的 Redis 拖垮请求。
+未来如有真实用途，必须在新 spec 中重新定义调用方、TTL、PG 降级、连接预算、
+TLS/SNI/CA 校验和关停生命周期，再实现客户端并恢复基础设施；不得从历史文档复制
+旧代码直接接线。Redis 仍只能是可丢失的临时层，连接失败不得阻塞主流程。
 
 ---
 

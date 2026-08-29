@@ -490,6 +490,15 @@ jobs:
             tests/test_repository_inventory.py \
             -v
 
+      - name: Redis retirement and recovery asset guards
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m pytest \
+            tests/test_redis_client_retirement.py \
+            tests/test_redis_cvm_config.py \
+            -v
+
       - name: Envelope round-trip tool drift guards
         env:
           PYTHONPATH: backend

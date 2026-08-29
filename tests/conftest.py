@@ -381,10 +381,10 @@ if not _provisioned:
         # B2: pure stdlib (only imports identity.distill_prompt_v1) — was
         # missing from this list even before this task, fixed in passing.
         "test_identity_distill_prompt.py",
-        # TEE Redis：配置不变量（读 yaml/sh + subprocess，无 DB）与连接池
-        # （构造不建连接，无 DB）。
+        # TEE Redis：配置不变量（读 yaml/sh + subprocess，无 DB）与已退役
+        # backend client 的边界门禁。
         "test_redis_cvm_config.py",
-        "test_redis_pool.py",
+        "test_redis_client_retirement.py",
         # TEE 注册表守卫的元守卫：断言 CI 上 PG 真的起了（守卫本体需要 PG，
         # 无 PG 时会被下面的 collect_ignore 静默忽略）。它自己不碰 DB，必须
         # 留在可收集列表里，否则连它也会被忽略。

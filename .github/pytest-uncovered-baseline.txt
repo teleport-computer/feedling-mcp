@@ -188,8 +188,6 @@ tests/test_provider_usage.py
 tests/test_providers_manual.py
 tests/test_push_skips_deleted_account.py
 tests/test_recover_orphan_survivor.py
-tests/test_redis_cvm_config.py
-tests/test_redis_pool.py
 tests/test_redistill_server_merge.py
 tests/test_registry_db_fallback.py
 tests/test_relationship_days.py
