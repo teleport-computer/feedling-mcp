@@ -18,7 +18,7 @@ gross 删除估算均以该提交为准，实施前必须 rebase `test` 并重�
 | 4 | [`v2_user_triage.py` 旧 semantic-compaction 诊断](v2-user-triage-semantic-compaction.md) | `delete`（局部，已实施） | production gross 删除 121 行；net 删除 76 行 | 旧 body/char-budget 与泛化错误归因会误诊当前 metadata-only compaction |
 | 5 | [Runtime V2 watchdog 旧兼容层](v2-watchdog-compatibility.md) | `delete`（已实施，final diff base `4be66bfd`） | production gross 删除 62 行；net 删除 44 行 | 旧 test-double/旧 Python 参数已移除；当前恢复顺序由 167 例 focused suite 锁定 |
 | 6 | [退役 Redis backend 客户端](retired-redis-backend-client.md) | `delete`（已实施） | production gross 删除 154 行，另删 128 行自测与 `redis-py` | 业务零引用且入口固定拒绝；部署审计/恢复资产独立保留 |
-| 7 | [`UserStore` 定向刷新旧适配器](user-store-refresh-compatibility.md) | `delete`（已实施） | production gross/net 删除 23 行 | 生产缓存恒为 `UserStore`；旧分支绕过 section 状态且只被测试替身消费 |
+| 7 | [`UserStore` 定向刷新旧适配器](user-store-refresh-compatibility.md) | `delete`（已实施） | production 删除 47 行、新增 24 行，net −23 行 | 生产缓存恒为 `UserStore`；旧分支绕过 section 状态且只被测试替身消费 |
 
 前七项均已实施：失效 E2E 脚本由 canonical E2E 和路由契约测试接管；Route-B 的召回、
 trace 隐私和 query 参数兼容断言已先迁到真实 bucketed 路径，再删除旧 selector、flag、

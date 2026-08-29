@@ -205,27 +205,6 @@ def test_evicting_shell_loads_no_sections(monkeypatch):
     assert store.loaded_sections() == frozenset()
 
 
-def test_targeted_refresh_rejects_cache_entries_without_section_api(monkeypatch):
-    """Targeted invalidation must not bypass UserStore section state."""
-
-    class LegacyStoreAdapter:
-        frames_lock = threading.Lock()
-
-        def __init__(self):
-            self.loaded = False
-
-        def _load_frames_meta(self):
-            self.loaded = True
-
-    adapter = LegacyStoreAdapter()
-    monkeypatch.setitem(core_store._stores, "u-legacy-adapter", adapter)
-
-    with pytest.raises(AttributeError, match="note_section_change"):
-        core_store._refresh_store_channel("u-legacy-adapter", "frames")
-
-    assert adapter.loaded is False
-
-
 def test_refresh_failure_retains_last_good_chat(monkeypatch):
     monkeypatch.setenv("FEEDLING_STORE_LOAD_MODE", "lazy")
     core_store._stores.clear()

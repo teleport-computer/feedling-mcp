@@ -556,11 +556,41 @@ def test_store_channels_refresh_only_their_component(monkeypatch):
     assert calls == ["frames"]
     calls.clear()
     wake_bus._dispatch(json.dumps({"u": "u7", "c": "blob", "o": "OTHER"}))
-    assert set(calls) == {"world_books", "tokens", "live", "push"}
+    assert sorted(calls) == ["live", "push", "tokens", "world_books"]
     calls.clear()
     wake_bus._dispatch(json.dumps({"u": "u7", "c": "proactive", "o": "OTHER"}))
     assert calls == []
     assert proactive_waiter.is_set()
+
+
+def test_store_channel_does_not_bypass_sections_or_stop_dispatch(monkeypatch):
+    from core import store as core_store
+
+    handled = []
+
+    class LegacyStoreAdapter:
+        frames_lock = threading.Lock()
+
+        def __init__(self):
+            self.loaded = False
+
+        def _load_frames_meta(self):
+            self.loaded = True
+
+    adapter = LegacyStoreAdapter()
+    monkeypatch.setattr(core_store, "_stores", {"u-legacy-adapter": adapter})
+    monkeypatch.setattr(
+        wake_bus,
+        "_extra_handlers",
+        {"frames": [lambda user_id: handled.append(user_id)]},
+    )
+
+    wake_bus._dispatch(
+        json.dumps({"u": "u-legacy-adapter", "c": "frames", "o": "OTHER"})
+    )
+
+    assert adapter.loaded is False
+    assert handled == ["u-legacy-adapter"]
 
 
 def test_chat_sync_mode_is_validated(monkeypatch):

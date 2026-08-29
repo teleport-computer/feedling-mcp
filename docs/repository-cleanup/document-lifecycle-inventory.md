@@ -9,9 +9,9 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 
 | Lifecycle | Classified documents |
 |---|---:|
-| `current` | 56 |
+| `current` | 57 |
 | `decision` | 23 |
-| `historical` | 47 |
+| `historical` | 48 |
 | `generated` | 1 |
 
 ## current
@@ -55,6 +55,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/repository-cleanup/candidates/provider-smoke-harness.md`
 - `docs/repository-cleanup/candidates/retired-redis-backend-client.md`
 - `docs/repository-cleanup/candidates/route-b-readside-island.md`
+- `docs/repository-cleanup/candidates/user-store-refresh-compatibility.md`
 - `docs/repository-cleanup/candidates/v2-user-triage-semantic-compaction.md`
 - `docs/repository-cleanup/candidates/v2-watchdog-compatibility.md`
 - `docs/repository-cleanup/hosted-runtime-history.md`
@@ -146,6 +147,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/superpowers/plans/2026-08-25-chat-strict-snapshot-convergence.md`
 - `docs/superpowers/plans/2026-08-25-rds-trace-t306-release-validation.md`
 - `docs/superpowers/plans/2026-08-28-retire-route-b-readside-island.md`
+- `docs/superpowers/plans/2026-08-29-retire-user-store-refresh-adapter.md`
 - `docs/superpowers/specs/2026-07-09-hosted-runtime-v2-D1-full-conversation-context-design.md`
 - `docs/superpowers/specs/2026-07-10-hosted-runtime-v2-agent-loop-design.md`
 
