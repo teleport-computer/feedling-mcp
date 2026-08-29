@@ -10741,7 +10741,7 @@ async def _run_wake(
             )
             _wake_sys = context._join_policy_blocks(
                 _wake_sys,
-                reply_language_system_line(reply_language, proactive=True),
+                reply_language_system_line(reply_language),
             )
             return _make_build_messages_fn(
                 system_prompt=_wake_sys,
@@ -15902,10 +15902,7 @@ async def process_job(
         def _chat_builder():
             chat_system_prompt = context._join_policy_blocks(
                 context.chat_system_prompt(provider_config),
-                reply_language_system_line(
-                    chat_reply_language,
-                    proactive=False,
-                ),
+                reply_language_system_line(chat_reply_language),
             )
             return _make_build_messages_fn(
                 system_prompt=chat_system_prompt,

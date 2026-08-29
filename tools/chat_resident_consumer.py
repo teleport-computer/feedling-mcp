@@ -14915,10 +14915,11 @@ def _resident_reply_language(presence: dict | None = None):
 
 
 def _reply_language_line(presence: dict | None = None) -> str:
-    """The shared zh/en reply-language policy line (a default language + a soft
-    mirror of the user's latest-message language). Wired into both the proactive
-    wakes and the foreground reply so the model stops drifting to Chinese when the
-    user is in an English context."""
+    """Render the shared reply-language rule in the selected zh/en language.
+
+    Wired into both proactive wakes and foreground replies; the rendered rule
+    tells the model how to choose the language from the latest user message.
+    """
     return reply_language_system_line(_resident_reply_language(presence))
 
 
