@@ -1001,8 +1001,6 @@ def test_wake_self_thinking_on_drops_native_reasoning_fallback(monkeypatch):
         "reply_script": "latin",
         "outcome": "mismatch",
         "lane": "wake",
-        "correction_attempted": False,
-        "correction_outcome": "skipped",
     }]
 
 

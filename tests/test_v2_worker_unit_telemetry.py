@@ -241,14 +241,6 @@ def test_writing_system_classifier_requires_strictly_more_than_sixty_percent():
     assert language_follow.classify_writing_system("汉汉汉汉汉汉汉abc") == "han"
 
 
-def test_language_correction_instruction_is_pinned_verbatim():
-    assert language_follow.CORRECTION_INSTRUCTION == (
-        "你刚才这条回复,语言和这个人正在说的语言对不上。除非这个人要求过你用别的语言,"
-        "否则用这个人的语言把同一条回复重说一遍:内容、语气、分寸都不变,只换语言。"
-        "要是这个人确实要求过现在这种语言,就原样重复原回复。"
-    )
-
-
 def test_latest_user_writing_system_skips_short_newest_message():
     rows = [
         {
@@ -262,7 +254,7 @@ def test_latest_user_writing_system_skips_short_newest_message():
     assert worker._latest_user_writing_system(rows) == "han"
 
 
-def test_language_follow_trace_is_closed_enum_only_and_admin_readable():
+def test_language_follow_trace_is_observation_only_and_admin_readable():
     from admin import data_track
 
     captured = {}
@@ -287,12 +279,9 @@ def test_language_follow_trace_is_closed_enum_only_and_admin_readable():
         "reply_script": "latin",
         "outcome": "mismatch",
         "lane": "chat",
-        "correction_attempted": False,
-        "correction_outcome": "skipped",
     }
     assert set(captured["detail"]) == {
         "user_script", "reply_script", "outcome", "lane",
-        "correction_attempted", "correction_outcome",
     }
     assert "私密中文正文" not in str(captured)
     assert "private reply body" not in str(captured)
@@ -304,12 +293,12 @@ def test_language_follow_trace_is_closed_enum_only_and_admin_readable():
     malicious["detail"] = {
         **captured["detail"],
         "reply_script": "private reply body",
-        "correction_outcome": "private correction detail",
+        "correction_outcome": "corrected",
         "body": "private user text",
     }
     redacted = data_track._debug_event_public_json(malicious)["detail"]
     assert redacted["reply_script"] == "<redacted string len=18>"
-    assert redacted["correction_outcome"] == "<redacted string len=25>"
+    assert redacted["correction_outcome"] == "<redacted string len=9>"
     assert redacted["body"] == "<redacted string len=17>"
 
 
@@ -331,8 +320,6 @@ def test_language_follow_trace_skips_without_anchor_and_never_raises():
         "reply_script": "latin",
         "outcome": "skip",
         "lane": "wake",
-        "correction_attempted": False,
-        "correction_outcome": "skipped",
     }
 
     asyncio.run(worker._emit_reply_language_follow_trace(
@@ -711,15 +698,6 @@ def test_self_thinking_internal_terms_are_derived_from_tool_specs():
     }
     assert worker._self_thinking_internal_term("我会调用 memory_write") == "memory_write"
     assert worker._self_thinking_internal_term("我会聊天") is None
-
-
-def test_self_thinking_language_mismatch_is_closed_and_content_free():
-    assert worker._self_thinking_language_mismatch(
-        "Let me check this carefully", [{"role": "user", "content": "请帮我看看这个内容好吗"}]
-    ) == ("han", "latin")
-    assert worker._self_thinking_language_mismatch(
-        "我来认真看看这个内容好吗", [{"role": "user", "content": "请帮我看看这个内容好吗"}]
-    ) is None
 
 
 def test_self_thinking_absent_correction_reuses_shared_contract_without_downshift():
