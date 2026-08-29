@@ -88,6 +88,9 @@ _PROVIDER_CALL_REJECTION_REASON_INVALID_OR_OVER_BUDGET_TOOL_EXCHANGE = (
 )
 _PROVIDER_CALL_REJECTION_REASON_INVALID_STAY_SILENT_BATCH = "invalid_stay_silent_batch"
 _PROVIDER_CALL_REJECTION_REASON_INVALID_TOOL_ARGUMENTS = "invalid_tool_arguments"
+_PROVIDER_CALL_REJECTION_REASON_REPEATED_INVALID_TOOL_ARGUMENTS = (
+    "repeated_invalid_tool_arguments"
+)
 _PROVIDER_CALL_REJECTION_REASON_MISSING_TOOL_CALL_ID = "missing_tool_call_id"
 _PROVIDER_CALL_REJECTION_REASON_MISSING_TOOL_NAME = "missing_tool_name"
 _PROVIDER_CALL_REJECTION_REASON_MIXED_REPLY_AND_MUTATION = "mixed_reply_and_mutation"
@@ -221,6 +224,7 @@ _PROVIDER_FORCE_TEXT_FALLBACK_REASONS = frozenset(
         "tool_schema_rejected",
         "final_reply_correction",
         _PROVIDER_CALL_REJECTION_REASON_INVALID_OR_OVER_BUDGET_TOOL_EXCHANGE,
+        _PROVIDER_CALL_REJECTION_REASON_REPEATED_INVALID_TOOL_ARGUMENTS,
         "tool_only_stall",
         "other",
     }
@@ -245,6 +249,7 @@ _PROVIDER_CALL_REJECTION_PRODUCER_REASONS = frozenset(
         _PROVIDER_CALL_REJECTION_REASON_INVALID_OR_OVER_BUDGET_TOOL_EXCHANGE,
         _PROVIDER_CALL_REJECTION_REASON_INVALID_STAY_SILENT_BATCH,
         _PROVIDER_CALL_REJECTION_REASON_INVALID_TOOL_ARGUMENTS,
+        _PROVIDER_CALL_REJECTION_REASON_REPEATED_INVALID_TOOL_ARGUMENTS,
         _PROVIDER_CALL_REJECTION_REASON_MISSING_TOOL_CALL_ID,
         _PROVIDER_CALL_REJECTION_REASON_MISSING_TOOL_NAME,
         _PROVIDER_CALL_REJECTION_REASON_MIXED_REPLY_AND_MUTATION,
@@ -1339,6 +1344,7 @@ async def run_tool_loop(
     seen_reasoning_fragments: set[str] = set()
     force_text_fallback = False
     force_text_fallback_reason = ""
+    generic_validation_retry_used = False
     empty_response_recovery_used = False
     empty_response_retry_instruction = ""
     wake_choice_recovery_used = False
@@ -2861,16 +2867,19 @@ async def run_tool_loop(
                         for tc in pr.tool_calls
                     }
                 )
+        repeated_generic_validation = bool(
+            validation_errors
+            and compact_delivery_phase != "send_file"
+            and generic_validation_retry_used
+        )
         schema_rejection_reasons = (
             [
                 (
-                    _PROVIDER_CALL_REJECTION_REASON_INVALID_TOOL_ARGUMENTS
-                    if tc.id in validation_errors
-                    else (
-                        _PROVIDER_CALL_REJECTION_REASON_INVALID_OR_OVER_BUDGET_TOOL_EXCHANGE
-                    )
+                    _PROVIDER_CALL_REJECTION_REASON_REPEATED_INVALID_TOOL_ARGUMENTS
+                    if repeated_generic_validation
+                    else _PROVIDER_CALL_REJECTION_REASON_INVALID_TOOL_ARGUMENTS
                 )
-                for tc in pr.tool_calls
+                for _tc in pr.tool_calls
             ]
             if validation_errors
             else []
@@ -3631,12 +3640,13 @@ async def run_tool_loop(
             continue
 
         # Parsed calls with invalid domain arguments are not a broken provider
-        # protocol. During the compact Canvas delivery phase, return one native
-        # result per call and let the model correct the metadata once. This is
-        # deliberately separate from the target-mismatch retry: adding a title
-        # or subtitle must not consume the exact path/revision correction.
+        # protocol. Return one native result per call and let the model correct
+        # the all-or-nothing batch once; no call in the invalid batch is
+        # dispatched. Keep the generic retry separate from compact Canvas
+        # delivery retries so ordinary argument repair cannot consume a pending
+        # file's exact-target or metadata correction.
         if validation_errors:
-            if compact_delivery_phase != "send_file":
+            if repeated_generic_validation:
                 if attempts >= max_calls:
                     break
                 transcript.append(
@@ -3652,9 +3662,9 @@ async def run_tool_loop(
                     {
                         "round": attempts,
                         "reason": (
-                            _PROVIDER_CALL_REJECTION_REASON_INVALID_OR_OVER_BUDGET_TOOL_EXCHANGE
+                            _PROVIDER_CALL_REJECTION_REASON_REPEATED_INVALID_TOOL_ARGUMENTS
                         ),
-                        "malformed": True,
+                        "malformed": False,
                         "mixed_reply_write": False,
                         "over_tool_call_budget": False,
                         "oversized_tool_exchange": False,
@@ -3663,10 +3673,13 @@ async def run_tool_loop(
                 )
                 force_text_fallback = True
                 force_text_fallback_reason = (
-                    _PROVIDER_CALL_REJECTION_REASON_INVALID_OR_OVER_BUDGET_TOOL_EXCHANGE
+                    _PROVIDER_CALL_REJECTION_REASON_REPEATED_INVALID_TOOL_ARGUMENTS
                 )
                 continue
-            if compact_delivery_args_retry_used:
+            if (
+                compact_delivery_phase == "send_file"
+                and compact_delivery_args_retry_used
+            ):
                 delivery_path = (
                     workspace_delivery_target[0]
                     if workspace_delivery_target is not None
@@ -3708,7 +3721,10 @@ async def run_tool_loop(
                     ),
                 )
 
-            compact_delivery_args_retry_used = True
+            if compact_delivery_phase == "send_file":
+                compact_delivery_args_retry_used = True
+            else:
+                generic_validation_retry_used = True
             tool_calls_used += len(pr.tool_calls)
             validation_results: list[ToolResult] = []
             for tc in pr.tool_calls:
@@ -3747,7 +3763,8 @@ async def run_tool_loop(
                 assistant_turn=pr.assistant_turn,
             )
             transcript.append(validation_exchange)
-            compact_delivery_validation_exchange = validation_exchange
+            if compact_delivery_phase == "send_file":
+                compact_delivery_validation_exchange = validation_exchange
             continue
 
         tool_calls_used += len(pr.tool_calls)
