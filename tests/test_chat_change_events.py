@@ -257,7 +257,7 @@ def test_0098_downgrade_and_upgrade_are_repeatable():
         with db.get_pool().connection() as conn:
             assert conn.execute(
                 "SELECT version_num FROM alembic_version"
-            ).fetchall() == [("0104_distill_artifact_ledger",)]
+            ).fetchall() == [("0105_account_recover_challenges",)]
             assert conn.execute(
                 "SELECT to_regclass('chat_change_state'), "
                 "to_regclass('chat_change_events'), "

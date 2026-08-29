@@ -11,6 +11,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import sys
+import threading
+import time
 from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
@@ -27,6 +29,7 @@ from accounts import registry  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
+from db import get_pool  # noqa: E402
 
 
 @pytest.fixture()
@@ -35,7 +38,8 @@ def client(tmp_path, monkeypatch):
     registry._users[:] = []
     registry._key_to_user.clear()
     core_store._stores.clear()
-    accounts_recover._recover_challenges.clear()
+    with get_pool().connection() as conn:
+        conn.execute("DELETE FROM account_recover_challenges")
     registry._save_users()
     with make_client() as c:
         yield c
@@ -179,3 +183,100 @@ def test_recover_challenge_is_single_use(client):
     second = client.post("/v1/account/recover/verify",
                          json={"challenge_id": ch["challenge_id"], "answer": answer})
     assert second.status_code == 401
+
+
+def test_recover_challenge_persisted_in_shared_db_cross_worker(client):
+    """The challenge must live in Postgres (visible from any worker), not in a
+    process-local dict. This is the exact regression for the FEEDLING_BACKEND_
+    WORKERS=6 production defect: challenge on worker A, verify on worker B."""
+    priv, pub_bytes, pub_b64 = _new_keypair()
+    user_id, _ = _register_with_pubkey(client, pub_b64)
+    ch = client.post("/v1/account/recover/challenge", json={"public_key": pub_b64})
+    assert ch.status_code == 200, ch.get_data(as_text=True)
+    cid = ch.get_json()["challenge_id"]
+    answer = _solve_challenge(ch.get_json()["envelope"], priv, pub_bytes)
+
+    # A fresh connection (simulating another worker/process) sees the row.
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT user_id, public_key, answer_sha256, expires_at "
+            "FROM account_recover_challenges WHERE challenge_id = %s",
+            (cid,),
+        ).fetchone()
+    assert row is not None, "challenge row not visible from a second connection"
+    assert row[0] == user_id
+    assert row[1] == pub_b64
+    assert row[2] == hashlib.sha256(answer.encode("utf-8")).hexdigest()
+    assert row[2] != answer
+    assert row[3] > time.time()
+
+    # Verify from the (other) worker path succeeds.
+    vr = client.post("/v1/account/recover/verify",
+                     json={"challenge_id": cid, "answer": answer})
+    assert vr.status_code == 200, vr.get_data(as_text=True)
+    assert vr.get_json()["user_id"] == user_id
+    assert vr.get_json()["public_key"] == pub_b64
+
+
+def test_recover_challenge_expired_is_invalid(client):
+    _priv, _pub_bytes, pub_b64 = _new_keypair()
+    user_id, _ = _register_with_pubkey(client, pub_b64)
+    # Create a challenge whose 300s TTL already elapsed.
+    accounts_recover.create_challenge(
+        challenge_id="rec_expired_test",
+        user_id=user_id,
+        public_key=pub_b64,
+        challenge="deadbeef" * 8,
+        now=time.time() - accounts_recover.RECOVER_CHALLENGE_TTL_SEC - 1,
+    )
+    # Expiry is checked before the answer, so the answer value is irrelevant.
+    vr = client.post("/v1/account/recover/verify",
+                     json={"challenge_id": "rec_expired_test", "answer": "any"})
+    assert vr.status_code == 401
+    assert vr.get_json()["error"] == "invalid_or_expired_challenge"
+
+
+def test_recover_verify_missing_challenge_is_invalid(client):
+    vr = client.post("/v1/account/recover/verify",
+                     json={"challenge_id": "rec_does_not_exist", "answer": "x"})
+    assert vr.status_code == 401
+    assert vr.get_json()["error"] == "invalid_or_expired_challenge"
+
+
+def test_recover_verify_wrong_answer_is_challenge_failed(client):
+    _priv, _pub_bytes, pub_b64 = _new_keypair()
+    _register_with_pubkey(client, pub_b64)
+    ch = client.post("/v1/account/recover/challenge", json={"public_key": pub_b64})
+    cid = ch.get_json()["challenge_id"]
+    vr = client.post("/v1/account/recover/verify",
+                     json={"challenge_id": cid, "answer": "wrong-answer"})
+    assert vr.status_code == 401
+    assert vr.get_json()["error"] == "challenge_failed"
+
+
+def test_recover_challenge_concurrent_consume_single_winner(client):
+    """Two workers verifying the same challenge concurrently: exactly one wins.
+    Exercises the atomic DELETE ... RETURNING single-consume guarantee."""
+    _priv, _pub_bytes, pub_b64 = _new_keypair()
+    user_id, _ = _register_with_pubkey(client, pub_b64)
+    accounts_recover.create_challenge(
+        challenge_id="rec_concurrent_test",
+        user_id=user_id,
+        public_key=pub_b64,
+        challenge="c0ffee" * 16,
+        now=time.time(),
+    )
+    results: list[bool] = []
+    results_lock = threading.Lock()
+
+    def consume() -> None:
+        got = accounts_recover.consume_challenge("rec_concurrent_test", time.time())
+        with results_lock:
+            results.append(got is not None)
+
+    threads = [threading.Thread(target=consume) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(results) == [False, True], results
