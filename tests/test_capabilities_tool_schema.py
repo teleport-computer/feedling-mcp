@@ -66,15 +66,18 @@ def test_send_file_requires_model_authored_completion_and_canvas_metadata():
     ) is None
 
 
-def test_canvas_policy_pins_proposal_boundary_and_constant_backed_limit():
+def test_canvas_tool_description_pins_create_boundary_and_constant_backed_limit():
     description = tool_schema.DESCRIPTIONS[tool_schema.FILE_REPLY_TOOL]
     workspace_description = tool_schema.DESCRIPTIONS["workspace_write"]
     limit_kb = tool_schema.SHARED_WORK_MAX_BYTES // 1000
 
     assert ".io.html" in description
-    assert "briefly offer to make one and wait for the user's answer" in description
-    assert "casual conversation, emotional support" in description
-    assert "do not repeat an offer the user did not take up" in description
+    assert (
+        "Do not create a Canvas merely to decorate casual conversation, "
+        "emotional support"
+    ) in description
+    assert "briefly offer to make one and wait for the user's answer" not in description
+    assert "do not repeat an offer the user did not take up" not in description
     assert f"{limit_kb} KB of UTF-8 source" in workspace_description
     assert tool_schema.validate_tool_args(
         "workspace_write",
