@@ -27,7 +27,7 @@ trace 隐私和 query 参数兼容断言已先迁到真实 bucketed 路径，再
 single-timeout Python 兼容面，保留 confirmed-kill 和 exact-owner recovery 顺序；Redis
 backend 客户端则在业务零引用、入口固定拒绝的前提下连同生产依赖删除，部署审计与恢复
 资产继续保留。其余候选
-仍须独立重做引用搜索和门禁，不能从前五项的结论外推。
+仍须独立重做引用搜索和门禁，不能从前六项的结论外推。
 
 ## 延后到功能决策
 
