@@ -4864,13 +4864,20 @@ def test_rejected_exchanges_do_not_spend_tool_call_budget(monkeypatch):
     assert outcome.stop_reason == "budget_exhausted"
 
 
-def test_schema_invalid_call_enters_rejection_transcript(monkeypatch):
+def test_schema_invalid_call_gets_one_native_correction_before_dispatch(
+    monkeypatch,
+):
     invalid_call = {
         "id": "invalid-schema", "name": "memory_search", "args": {},
     }
     provider = _ScriptedProvider([
         {"reply": "searching", "tool_calls": [invalid_call], "usage": {}},
-        {"reply": "plain fallback", "tool_calls": [], "usage": {}},
+        {"reply": "", "tool_calls": [{
+            "id": "corrected-schema",
+            "name": "memory_search",
+            "args": {"query": "canvas ideas"},
+        }], "usage": {}},
+        {"reply": "done after correction", "tool_calls": [], "usage": {}},
     ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     dispatch = _RecordingDispatch()
@@ -4883,31 +4890,146 @@ def test_schema_invalid_call_enters_rejection_transcript(monkeypatch):
         provider_config=_TEST_PROVIDER_CONFIG,
         build_messages=_TranscriptBuildMessages(),
         dispatch_tools=dispatch, on_reply=_RecordingReply(),
-        fold_new_messages=_RecordingFold([[]]), add_usage=_noop_add_usage,
-        max_calls=3, on_provider_tool_surface=record_surface,
+        fold_new_messages=_RecordingFold([[], []]), add_usage=_noop_add_usage,
+        max_calls=4, on_provider_tool_surface=record_surface,
     ))
 
     exchange = next(
         item for item in provider.calls[1]["messages"]
         if isinstance(item, ToolExchange)
     )
-    assert exchange.calls[0].id.startswith(tool_loop.REJECTED_TOOL_CALL_ID_PREFIX)
-    assert exchange.calls[0].id != "invalid-schema"
-    assert set(exchange.results[0].metadata or {}) == {"rejected"}
-    schema_rejection_reason = exchange.results[0].metadata["rejected"]
-    assert (
-        schema_rejection_reason
-        in tool_loop._PROVIDER_CALL_REJECTION_PRODUCER_REASONS
-    )
+    assert exchange.calls[0].id == "invalid-schema"
+    assert exchange.results[0].call_id == "invalid-schema"
+    assert exchange.results[0].metadata is None
+    assert "error: invalid args for memory_search" in exchange.results[0].content
+    assert "Nothing in this tool batch was executed" in exchange.results[0].content
     assert cap_tool_schema.validate_tool_args(
         invalid_call["name"], invalid_call["args"]
     ) is not None
     assert [surface["call_rejection_reasons"] for surface in surfaces] == [
-        [schema_rejection_reason],
+        ["invalid_tool_arguments"],
+        [],
         [],
     ]
+    assert [[call.id for call in batch] for batch in dispatch.calls] == [
+        ["corrected-schema"]
+    ]
+    assert outcome.final_text == "done after correction"
+
+
+def test_schema_invalid_batch_executes_nothing_before_one_correction(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "checking", "tool_calls": [
+            {"id": "valid-peer", "name": "identity_get", "args": {}},
+            {"id": "invalid-peer", "name": "memory_search", "args": {}},
+        ], "usage": {}},
+        {"reply": "", "tool_calls": [
+            {"id": "valid-corrected", "name": "identity_get", "args": {}},
+            {
+                "id": "invalid-corrected",
+                "name": "memory_search",
+                "args": {"query": "canvas ideas"},
+            },
+        ], "usage": {}},
+        {"reply": "batch corrected", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch()
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_TranscriptBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[], []]),
+        add_usage=_noop_add_usage,
+        max_calls=4,
+    ))
+
+    correction_exchange = next(
+        item for item in provider.calls[1]["messages"]
+        if isinstance(item, ToolExchange)
+    )
+    assert [call.id for call in correction_exchange.calls] == [
+        "valid-peer",
+        "invalid-peer",
+    ]
+    assert [result.call_id for result in correction_exchange.results] == [
+        "valid-peer",
+        "invalid-peer",
+    ]
+    assert "another call had invalid arguments" in (
+        correction_exchange.results[0].content
+    )
+    assert "invalid args for memory_search" in (
+        correction_exchange.results[1].content
+    )
+    assert [[call.id for call in batch] for batch in dispatch.calls] == [[
+        "valid-corrected",
+        "invalid-corrected",
+    ]]
+    assert outcome.final_text == "batch corrected"
+
+
+def test_repeated_schema_invalid_call_uses_distinct_bounded_terminal_reason(
+    monkeypatch,
+):
+    provider = _ScriptedProvider([
+        {"reply": "first try", "tool_calls": [{
+            "id": "invalid-first", "name": "memory_search", "args": {},
+        }], "usage": {}},
+        {"reply": "second try", "tool_calls": [{
+            "id": "invalid-second", "name": "memory_search", "args": {},
+        }], "usage": {}},
+        {"reply": "bounded fallback", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch()
+    surfaces = []
+    trajectory = []
+
+    async def record_surface(detail):
+        surfaces.append(detail)
+
+    async def record_trajectory(event_kind, detail):
+        trajectory.append((event_kind, detail))
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_TranscriptBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[], []]),
+        add_usage=_noop_add_usage,
+        max_calls=4,
+        on_provider_tool_surface=record_surface,
+        on_trajectory_event=record_trajectory,
+    ))
+
+    repeated_reason = "repeated_invalid_tool_arguments"
+    assert [surface["call_rejection_reasons"] for surface in surfaces] == [
+        ["invalid_tool_arguments"],
+        [repeated_reason],
+        [],
+    ]
+    assert surfaces[2]["reason"] == repeated_reason
+    assert surfaces[2]["force_text_fallback_reason"] == repeated_reason
+    assert provider.calls[2]["tools"] is not None
+    assert provider.calls[2]["tool_choice"] == "none"
+    repeated_fallback = next(
+        detail for event_kind, detail in trajectory
+        if event_kind == "protocol_fallback"
+        and detail.get("reason") == repeated_reason
+    )
+    assert repeated_fallback["malformed"] is False
+    assert repeated_fallback["transcript_appended"] is True
+    assert not any(
+        detail.get("reason") == "invalid_or_over_budget_tool_exchange"
+        for event_kind, detail in trajectory
+        if event_kind == "protocol_fallback"
+    )
     assert dispatch.calls == []
-    assert outcome.final_text == "plain fallback"
+    assert outcome.final_text == "bounded fallback"
 
 
 def test_protocol_invalid_call_keeps_its_existing_surface_reason(monkeypatch):
