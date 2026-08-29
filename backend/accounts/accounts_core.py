@@ -327,14 +327,13 @@ def account_recover_challenge(payload: dict):
         visibility="local_only",
     )
     now = time.time()
-    with recover._recover_challenges_lock:
-        recover._prune_recover_challenges_locked(now)
-        recover._recover_challenges[challenge_id] = {
-            "public_key": public_key,
-            "user_id": account["user_id"],
-            "challenge": challenge,
-            "expires_at": now + recover.RECOVER_CHALLENGE_TTL_SEC,
-        }
+    recover.create_challenge(
+        challenge_id=challenge_id,
+        user_id=account["user_id"],
+        public_key=public_key,
+        challenge=challenge,
+        now=now,
+    )
     print(f"[recover:challenge] user_id={account['user_id']} challenge_id={challenge_id}")
     return {"challenge_id": challenge_id, "envelope": envelope}, 200
 
@@ -346,14 +345,13 @@ def account_recover_verify(payload: dict):
     challenge_id = str(payload.get("challenge_id") or "").strip()
     answer = str(payload.get("answer") or "")
     now = time.time()
-    with recover._recover_challenges_lock:
-        recover._prune_recover_challenges_locked(now)
-        entry = recover._recover_challenges.pop(challenge_id, None)  # one-time use
-    if not entry or entry.get("expires_at", 0) < now:
+    stored = recover.consume_challenge(challenge_id, now)  # atomic, one-time use
+    if stored is None:
         return {"error": "invalid_or_expired_challenge"}, 401
-    if not hmac.compare_digest(answer, str(entry.get("challenge") or "")):
+    if not hmac.compare_digest(recover.answer_sha256(answer), stored.answer_sha256):
         return {"error": "challenge_failed"}, 401
-    user_id = entry["user_id"]
+    user_id = stored.user_id
+    public_key = stored.public_key
     with registry._users_lock:
         user_entry = registry._find_user_entry_locked(user_id)
         if not user_entry:
@@ -372,7 +370,7 @@ def account_recover_verify(payload: dict):
         "user_id": user_id,
         "principal_id": principal_id,
         "api_key": issued["api_key"],
-        "public_key": entry["public_key"],
+        "public_key": public_key,
     }, 200
 
 

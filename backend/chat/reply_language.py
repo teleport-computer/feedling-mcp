@@ -1,8 +1,7 @@
-"""Reply-language policy for user-visible companion replies.
+"""Shared language helpers for user-visible companion behavior.
 
-Pure helper shared by hosted model_api and resident consumers. It does not read
-stores or databases; callers pass identity, durable memory text, and locale
-hints.
+Pure helpers shared by hosted model_api and resident consumers. They do not read
+stores or databases; callers pass locale/archive hints or Garden-owned text.
 """
 from __future__ import annotations
 
@@ -20,12 +19,8 @@ from memgarden.garden_language import (
 
 
 @dataclass(frozen=True)
-class ReplyLanguagePolicy:
+class ReplyLanguage:
     language: str
-    label: str
-    source: str
-    confidence: float = 0.0
-    evidence_chars: int = 0
 
 
 @dataclass(frozen=True)
@@ -36,25 +31,26 @@ class LocalTimeLabels:
     day_period: str
 
 
+@dataclass(frozen=True)
+class LanguageHintResult:
+    """Closed, content-free result of parsing one language hint.
+
+    ``absent`` and ``unparseable`` deliberately remain distinct. Both fall
+    through to weaker evidence, but collapsing them to the same empty string
+    would make it impossible for a future content-free observer to measure how
+    often a stored hint exists but cannot be understood.
+    """
+
+    language: str
+    status: str
+
+
 IDENTITY_LANGUAGE_FIELDS = (
     "custom_persona_prompt",
     "self_introduction",
     "tone_style",
     "boundaries",
 )
-MEMORY_LANGUAGE_FIELDS = (
-    "title",
-    "summary",
-    "content",
-    "description",
-    "her_quote",
-    "context",
-    "bucket",
-    "threads",
-)
-
-_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
-_LATIN_RE = re.compile(r"[A-Za-z]")
 _WEEKDAYS_EN = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 _WEEKDAYS_ZH = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 DEFAULT_FAILURE_FALLBACK_ZH = (
@@ -66,21 +62,53 @@ DEFAULT_FAILURE_FALLBACK_EN = (
 )
 
 
-def _policy(language: str, source: str, *, confidence: float = 0.0, evidence_chars: int = 0) -> ReplyLanguagePolicy:
-    if language == "en":
-        return ReplyLanguagePolicy("en", "English", source, confidence, evidence_chars)
-    return ReplyLanguagePolicy("zh-Hans", "简体中文", source, confidence, evidence_chars)
+_MACHINE_LANGUAGE_TAG_RE = re.compile(
+    r"^(?P<primary>en|zh|yue)(?:[-_][a-z0-9]{2,8})*$",
+    re.IGNORECASE,
+)
+_ENGLISH_NAMES = frozenset({"english", "英语", "英文"})
+_CHINESE_NAMES = frozenset(
+    {
+        "chinese",
+        "mandarin",
+        "cantonese",
+        "中文",
+        "汉语",
+        "漢語",
+        "普通话",
+        "普通話",
+        "简体",
+        "簡體",
+        "繁体",
+        "繁體",
+        "粤语",
+        "粵語",
+    }
+)
 
 
-def _language_from_hint(value: Any) -> str:
-    raw = str(value or "").strip().lower()
-    if not raw:
-        return ""
-    if raw.startswith("en") or "english" in raw:
+def _machine_language_from_hint(raw: str) -> str:
+    """Parse a machine-shaped locale/archive hint without prefix guessing."""
+    match = _MACHINE_LANGUAGE_TAG_RE.fullmatch(raw)
+    if match:
+        return "en" if match.group("primary").lower() == "en" else "zh-Hans"
+    lowered = raw.lower()
+    if lowered in _ENGLISH_NAMES:
         return "en"
-    if raw.startswith(("zh", "cn")) or "chinese" in raw or "中文" in raw or "简体" in raw or "繁體" in raw:
+    if lowered in _CHINESE_NAMES:
         return "zh-Hans"
     return ""
+
+
+def _language_from_hint(value: Any) -> LanguageHintResult:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return LanguageHintResult("", "absent")
+    language = _machine_language_from_hint(raw)
+    return LanguageHintResult(
+        language,
+        "parsed" if language else "unparseable",
+    )
 
 
 def _iter_text(value: Any):
@@ -105,62 +133,16 @@ def _identity_texts(identity: dict[str, Any]) -> list[str]:
     return texts
 
 
-def _memory_texts(memories: list[dict[str, Any]]) -> list[str]:
-    texts: list[str] = []
-    if not isinstance(memories, list):
-        return texts
-    for memory in memories:
-        if not isinstance(memory, dict):
-            continue
-        source = memory.get("inner") if isinstance(memory.get("inner"), dict) else memory
-        if not isinstance(source, dict):
-            continue
-        for key in MEMORY_LANGUAGE_FIELDS:
-            texts.extend(_iter_text(source.get(key)))
-    return texts
-
-
-def _counts(texts: list[str]) -> tuple[int, int]:
-    joined = "\n".join(texts)
-    return len(_CJK_RE.findall(joined)), len(_LATIN_RE.findall(joined))
-
-
-def _dominant_language(cjk: int, latin: int, *, min_evidence: int, min_confidence: float) -> tuple[str, float, int]:
-    total = cjk + latin
-    if total < min_evidence:
-        return "", 0.0, total
-    confidence = max(cjk, latin) / total if total else 0.0
-    if confidence < min_confidence:
-        return "", confidence, total
-    return ("zh-Hans" if cjk > latin else "en"), confidence, total
-
-
-def infer_reply_language_policy(
-    identity: dict,
-    memories: list[dict],
+def infer_reply_language(
     *,
     locale: str = "",
     archive_language: str = "",
-) -> ReplyLanguagePolicy:
-    explicit = _language_from_hint((identity or {}).get("language_preference") if isinstance(identity, dict) else "")
-    if explicit:
-        return _policy(explicit, "identity.language_preference", confidence=1.0)
-
-    identity_cjk, identity_latin = _counts(_identity_texts(identity or {}))
-    memory_cjk, memory_latin = _counts(_memory_texts(memories or []))
-    lang, confidence, total = _dominant_language(
-        identity_cjk + memory_cjk,
-        identity_latin + memory_latin,
-        min_evidence=32,
-        min_confidence=0.62,
-    )
-    if lang:
-        return _policy(lang, "identity_memory_dominant", confidence=confidence, evidence_chars=total)
-
-    hinted = _language_from_hint(locale) or _language_from_hint(archive_language)
-    if hinted:
-        return _policy(hinted, "locale" if _language_from_hint(locale) else "archive_language", confidence=1.0)
-    return _policy("zh-Hans", "default", confidence=0.0)
+) -> ReplyLanguage:
+    """Choose the stable language for deterministic, non-model output."""
+    locale_hint = _language_from_hint(locale)
+    archive_hint = _language_from_hint(archive_language)
+    hinted = locale_hint.language or archive_hint.language
+    return ReplyLanguage(hinted or "zh-Hans")
 
 
 #: 一条消息算「本人写的」要 role 是这个。别用 in / startswith 之类的模糊匹配 ——
@@ -268,7 +250,7 @@ def garden_language_decision(
     """
     explicit = _language_from_hint(
         (identity or {}).get("language_preference") if isinstance(identity, dict) else ""
-    )
+    ).language
     # 「他写的字」= 这轮对话里他自己说的话 + 身份卡正文。前者是最新最真的信号，
     # 后者在还没聊过时兜底。
     sample = "\n".join(x for x in ([written] + _identity_texts(identity or {})) if x)
@@ -276,7 +258,11 @@ def garden_language_decision(
     d = decide_garden_language(
         explicit=explicit or None,
         written=sample,
-        locale=_language_from_hint(locale) or _language_from_hint(archive_language) or None,
+        locale=(
+            _language_from_hint(locale).language
+            or _language_from_hint(archive_language).language
+            or None
+        ),
     )
     zh, en = count_bucket_languages(existing_buckets or "")
     names = split_bucket_names(existing_buckets or "")
@@ -290,26 +276,27 @@ def garden_language_decision(
     }
 
 
-def reply_language_system_line(policy: ReplyLanguagePolicy, *, proactive: bool = False) -> str:
+def reply_language_system_line(policy: ReplyLanguage) -> str:
     if policy.language == "en":
         return (
-            "Reply language policy:\n"
-            "Default reply language: English.\n"
-            "For this user-visible reply, if the user's latest message is clearly in another language, reply in that language. "
-            "If the latest message is mixed, ambiguous, mostly quoted/context, or this is a proactive/background reply, use English. "
+            "Reply language rule:\n"
+            "Determine the reply language from the user's latest message. "
+            "If that message is mixed, ambiguous, or mostly quoted/context, use the language of this rule. "
+            "For a proactive/background reply, also use the language of this rule. "
+            "Use the same language for your thinking and final reply. "
             "Do not let memory cards, OCR, timestamps, or internal context change the reply language. "
             "Preserve quoted text, names, and requested translation targets as written."
         )
     return (
         "回复语言规则：\n"
-        "默认回复语言：简体中文。\n"
-        "本轮用户最新消息如果明显使用另一种语言，就用那种语言回复；如果最新消息混合、不明确、主要是引用/上下文，或这是主动/后台回复，就使用简体中文。"
+        "根据用户最新一条消息判断回复语言。如果该消息混合、不明确或主要是引用/上下文，就使用本规则所用的语言；"
+        "主动/后台回复也使用本规则所用的语言。思维过程和正式回复使用同一种语言。"
         "不要被记忆卡、OCR、时间戳或内部上下文带偏回复语言。引用、名字和用户指定的翻译目标语言保持原样。"
     )
 
 
 def failure_fallback_reply(
-    policy: ReplyLanguagePolicy,
+    policy: ReplyLanguage,
     *,
     zh: str = DEFAULT_FAILURE_FALLBACK_ZH,
     en: str = DEFAULT_FAILURE_FALLBACK_EN,
@@ -338,7 +325,7 @@ def _age_text(seconds: float, language: str) -> str:
 
 def local_time_labels(
     local: datetime,
-    policy: ReplyLanguagePolicy,
+    policy: ReplyLanguage,
 ) -> LocalTimeLabels:
     """Return the shared V1/V2 weekday and day-period labels.
 
@@ -370,7 +357,7 @@ def local_time_labels(
 def format_time_anchor(
     dt,
     tz_name,
-    policy: ReplyLanguagePolicy,
+    policy: ReplyLanguage,
     *,
     since_sec=None,
     timezone_default: bool = False,

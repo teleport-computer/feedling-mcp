@@ -141,6 +141,20 @@ def test_admin_data_track_requires_admin_token(client, monkeypatch):
     assert disabled.status_code == 503
 
 
+def test_admin_data_track_snapshot_emits_explicit_breakdown_coverage(client):
+    user_id, _ = _register(client)
+
+    detail = db.admin_data_track_snapshot(
+        [user_id], include_legacy_background=True,
+    )[user_id]
+    fleet = db.admin_data_track_snapshot(
+        [user_id], include_legacy_background=False,
+    )[user_id]
+
+    assert detail["legacy_background_breakdowns_status"] == "available"
+    assert fleet["legacy_background_breakdowns_status"] == "omitted"
+
+
 def test_admin_data_track_aggregates_counts_without_content(client):
     user_id, api_key = _register(client)
     store = core_store.get_store(user_id)
@@ -2736,6 +2750,9 @@ def test_breakdown_read_failure_is_reported_not_zeroed(client, monkeypatch):
         assert row["snapshot_read_status"]["level"] != "ok", (
             "the degraded read never reached the row the admin actually sees"
         )
+        assert row["memory"]["counts_status"] == "unknown"
+        assert row["memory"]["changes_breakdowns_status"] == "unknown"
+        assert row["memory"]["capture_breakdowns_status"] == "unknown"
 
 
 def _seed_log_stream_users(client, count: int) -> list[str]:
@@ -2997,6 +3014,8 @@ def test_paged_log_read_failure_is_reported_not_zeroed(client, monkeypatch):
         assert row["snapshot_read_status"]["level"] != "ok", (
             "the degraded read never reached the row the admin actually sees"
         )
+        assert row["bootstrap_events"]["counts_status"] == "unknown"
+        assert row["bootstrap_events"]["breakdowns_status"] == "unknown"
 
 
 def _seed_frame_users(client, count: int) -> list[str]:

@@ -64,6 +64,18 @@ def min_interval_sec() -> float:
     return _env_float("FEEDLING_CAPTURE_MIN_INTERVAL_SEC", 600.0, hi=86400.0)
 
 
+def append_refresh_deferred() -> bool:
+    """Whether foreground chat writes defer Capture discovery to the tick.
+
+    ``sync`` is an emergency rollback mode that restores the pre-change
+    request-path refresh behavior without reverting the durable-seq fixes.
+    """
+    mode = os.environ.get(
+        "FEEDLING_CAPTURE_APPEND_REFRESH_MODE", "deferred"
+    )
+    return str(mode or "deferred").strip().lower() != "sync"
+
+
 def migrate_window_sec() -> float:
     # One legacy-migration batch per user per this window (default 1h). Lower to
     # drain a backlog faster in test / quiet windows.
@@ -406,7 +418,23 @@ def _enqueue_window(
     return {"enqueued": bool(enqueued), "reason": reason, "state": state, "job": job}
 
 
-def record_chat_append(store, message: Mapping[str, Any]) -> dict[str, Any]:
+def record_chat_append(
+    store,
+    message: Mapping[str, Any],
+    *,
+    defer_to_tick: bool = False,
+) -> dict[str, Any]:
+    if defer_to_tick:
+        # Latency-sensitive chat writes are already durable before this hook.
+        # The resident/V2 scheduler tick rebuilds the authoritative frontier
+        # from PostgreSQL, so the request path does not need to repeat those
+        # reads synchronously.
+        return {
+            "enqueued": False,
+            "reason": "deferred_to_tick",
+            "state": {},
+            "job": None,
+        }
     if not _is_live_capture_message(message):
         return {"enqueued": False, "reason": "ignored_message", "state": load_capture_state(store), "job": None}
     now_ts = _safe_float(message.get("ts"), time.time())
@@ -492,11 +520,10 @@ def tick_quiet_capture(
         return {"enqueued": False, "reason": "no_new_messages", "state": state, "job": None}
     if until_id == str(state.get("last_captured_until_message_id") or ""):
         return {"enqueued": False, "reason": "already_captured", "state": state, "job": None}
-    # V2 chat writes only refresh capture state; the runner-owned sweep is the
-    # sole producer. Preserve the turn-count backstop with at most one scheduler
-    # cadence of delay, while resident/import paths keep their immediate legacy
-    # ``record_chat_append`` behavior.
-    if submit is not None and int(state.get("turns_since_capture") or 0) >= turn_backstop():
+    # Foreground chat writes defer capture discovery to this durable sweep.
+    # Preserve the turn-count backstop for both resident and V2 with at most
+    # one scheduler cadence of delay.
+    if int(state.get("turns_since_capture") or 0) >= turn_backstop():
         return _enqueue_window(
             store,
             trigger="turn_backstop",

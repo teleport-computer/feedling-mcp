@@ -10,9 +10,10 @@ from types import SimpleNamespace
 import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
 from agent_protocol_core import self_thinking
-from chat.reply_language import format_time_anchor, infer_reply_language_policy
+from chat.reply_language import format_time_anchor, infer_reply_language
 from capabilities import tool_schema
-from model_api_runtime.v2 import context, language_follow, worker
+from chat import language_follow
+from model_api_runtime.v2 import context, worker
 import worldbook_readside_core
 
 
@@ -806,6 +807,21 @@ def test_t101_platform_chinese_has_no_house_style_punctuation_regressions():
     assert re.search(r"[\u3400-\u9fff],|,[\u3400-\u9fff]", platform_chinese) is None
 
 
+def test_canvas_offer_and_mirror_policy_reach_v2_system_prompt():
+    prompt = context.CHAT_SYSTEM_PROMPT
+
+    assert (
+        "如果对方没有要求制作，而一个小型交互体验可能确实有帮助、但是否合适还不确定，"
+        "先简短提议制作，等对方答复后再做。"
+    ) in prompt
+    assert (
+        "不要仅为了装饰闲聊、情绪支持，或本可直接在对话中回答的问题而制作或提议这种体验；"
+        "对方没有接受的提议不要重复。"
+    ) in prompt
+    assert "把 Canvas 写成一个完整、离线、自包含的 UTF-8 文件" in prompt
+    assert "把它写成一个完整、离线、自包含的 UTF-8 文件" not in prompt
+
+
 def test_runtime_protocol_instructions_are_chinese_but_machine_labels_stay_exact():
     policy = context._RUNTIME_CONTEXT_POLICY
 
@@ -1123,9 +1139,7 @@ def test_v1_anchor_and_v2_temporal_context_share_local_labels(
     day_period,
 ):
     now_dt = datetime(2026, 8, 12, 13, 45, tzinfo=timezone.utc)
-    policy = infer_reply_language_policy(
-        {},
-        [],
+    policy = infer_reply_language(
         locale=locale,
         archive_language=archive_language,
     )

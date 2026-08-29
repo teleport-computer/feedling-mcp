@@ -765,6 +765,7 @@ def _data_track_app_usage_from_snapshot(snap: dict) -> dict:
     aggregation). ``last_at`` is a server ingest epoch; keep it raw for the
     Shanghai-day DAU roll-up and also expose an ISO string for display."""
     au = dict(snap.get("app_usage") or {})
+    snapshot_unread = _data_track_snapshot_unread(snap)
     invalid_fields: list[str] = []
     try:
         last_epoch = float(au.get("last_at") or 0) or 0.0
@@ -799,7 +800,11 @@ def _data_track_app_usage_from_snapshot(snap: dict) -> dict:
         "sessions": _count("sessions"),
         "last_at_epoch": last_epoch,
         "last_at": _data_track_iso(last_epoch) if last_epoch else "",
-        "fields_status": "invalid" if invalid_fields else "ok",
+        "fields_status": (
+            "unknown" if snapshot_unread else (
+                "invalid" if invalid_fields else "ok"
+            )
+        ),
         "invalid_fields": sorted(set(invalid_fields)),
     }
 
@@ -840,13 +845,38 @@ def _epoch_is_today_shanghai(epoch: float, now_epoch: float) -> bool:
     return d1 == d2
 
 
+def _data_track_snapshot_unread(snapshot: dict) -> bool:
+    """Whether a snapshot producer explicitly reported that its read failed.
+
+    Older and focused test fixtures may omit ``snapshot_read_status``; absence
+    alone is not rewritten as a failure here. The endpoint layer supplies an
+    explicit ``unavailable`` status when a real snapshot result lacks it.
+    """
+    status = snapshot.get("snapshot_read_status")
+    if not isinstance(status, dict):
+        return False
+    level = str(status.get("level") or "").strip().lower()
+    return bool(level and level != "ok")
+
+
+def _data_track_breakdowns_state(snapshot: dict) -> tuple[bool, bool]:
+    """Return ``(unknown, omitted)`` for legacy background breakdowns."""
+    raw = snapshot.get("legacy_background_breakdowns_status")
+    normalized = str(raw or "").strip().lower()
+    unknown = (
+        _data_track_snapshot_unread(snapshot)
+        or not isinstance(raw, str)
+        or normalized not in {"available", "omitted"}
+    )
+    return unknown, normalized == "omitted"
+
+
 def _data_track_memory_from_snapshot(snap: dict) -> dict:
     memory = dict(snap.get("memory") or {})
     extra = dict(snap.get("memory_extra") or {})
     log_counts = dict(snap.get("log_counts") or {})
-    legacy_status = str(
-        snap.get("legacy_background_breakdowns_status") or "available"
-    )
+    snapshot_unread = _data_track_snapshot_unread(snap)
+    legacy_status_unknown, legacy_status_omitted = _data_track_breakdowns_state(snap)
     invalid_fields: list[str] = []
     by_type = {typ: 0 for typ in memory_service.MEMORY_TYPES}
     by_type.update(_data_track_count_dict(
@@ -874,7 +904,11 @@ def _data_track_memory_from_snapshot(snap: dict) -> dict:
             log_counts.get("changes_by_capture_mode"), invalid_fields=invalid_fields,
             field_prefix="memory.changes_by_capture_mode",
         ),
-        "changes_breakdowns_status": legacy_status,
+        "changes_breakdowns_status": (
+            "unknown" if legacy_status_unknown else (
+                "omitted" if legacy_status_omitted else "available"
+            )
+        ),
         "capture_jobs": int(extra.get("capture_jobs") or 0),
         "capture_jobs_by_status": _data_track_count_dict(
             log_counts.get("capture_jobs_by_status"), invalid_fields=invalid_fields,
@@ -885,19 +919,28 @@ def _data_track_memory_from_snapshot(snap: dict) -> dict:
             field_prefix="memory.capture_jobs_by_mode",
         ),
         "capture_actions_written": int(extra.get("capture_actions_written") or 0),
-        "capture_breakdowns_status": legacy_status,
+        "capture_breakdowns_status": (
+            "unknown" if legacy_status_unknown else (
+                "omitted" if legacy_status_omitted else "available"
+            )
+        ),
         "last_capture_at": _data_track_iso(extra.get("last_capture_ts")),
         "first_created_at": _data_track_iso(memory.get("first_created_at")),
         "last_created_at": _data_track_iso(memory.get("last_created_at")),
         "earliest_occurred_at": _data_track_iso(memory.get("earliest_occurred_at")),
         "latest_occurred_at": _data_track_iso(memory.get("latest_occurred_at")),
-        "counts_status": "invalid" if invalid_fields else "ok",
+        "counts_status": (
+            "unknown" if snapshot_unread else (
+                "invalid" if invalid_fields else "ok"
+            )
+        ),
         "invalid_count_fields": sorted(set(invalid_fields)),
     }
 
 
 def _data_track_chat_from_snapshot(snap: dict) -> dict:
     chat = dict(snap.get("chat") or {})
+    snapshot_unread = _data_track_snapshot_unread(snap)
     invalid_fields: list[str] = []
     by_role = _data_track_count_dict(
         chat.get("by_role"), invalid_fields=invalid_fields,
@@ -934,7 +977,11 @@ def _data_track_chat_from_snapshot(snap: dict) -> dict:
         "last_user_at": _data_track_iso(chat.get("last_user_ts")),
         "last_agent_at": _data_track_iso(chat.get("last_agent_ts")),
         "proactive_last_at": _data_track_iso(chat.get("proactive_last_ts")),
-        "counts_status": "invalid" if invalid_fields else "ok",
+        "counts_status": (
+            "unknown" if snapshot_unread else (
+                "invalid" if invalid_fields else "ok"
+            )
+        ),
         "invalid_count_fields": sorted(set(invalid_fields)),
     }
 
@@ -1041,9 +1088,8 @@ def _connection_health(route: str, access_modes: list, chat: dict) -> dict:
 def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
     logs = dict(snap.get("logs") or {})
     extra = dict(snap.get("proactive_extra") or {})
-    legacy_status = str(
-        snap.get("legacy_background_breakdowns_status") or "available"
-    )
+    snapshot_unread = _data_track_snapshot_unread(snap)
+    legacy_status_unknown, legacy_status_omitted = _data_track_breakdowns_state(snap)
     invalid_fields: list[str] = []
 
     def counts(value, name: str) -> dict:
@@ -1123,14 +1169,22 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
             extra.get("jobs_user_unavailable_by_reason"),
             "proactive.jobs_user_unavailable_by_reason",
         )),
-        "breakdowns_status": legacy_status,
+        "breakdowns_status": (
+            "unknown" if legacy_status_unknown else (
+                "omitted" if legacy_status_omitted else "available"
+            )
+        ),
         "proactive_messages": int(chat.get("proactive_messages") or 0),
         "delivery_signals": delivered,
         "live_activity_status": live_status_counts,
         "alert_status": alert_status_counts,
         "device_events": int(logs.get("device_events", {}).get("count") or 0),
         "last_at": core_util._epoch_to_iso(last_at),
-        "counts_status": "invalid" if invalid_fields else "ok",
+        "counts_status": (
+            "unknown" if snapshot_unread else (
+                "invalid" if invalid_fields else "ok"
+            )
+        ),
         "invalid_count_fields": sorted(set(invalid_fields)),
     }
 
@@ -1140,6 +1194,8 @@ def _data_track_tracking_from_snapshot(snap: dict) -> dict:
     counts = dict(snap.get("log_counts") or {})
     tracking = logs.get("tracking_events", {}) or {}
     invalid_fields: list[str] = []
+    snapshot_unread = _data_track_snapshot_unread(snap)
+    legacy_status_unknown, legacy_status_omitted = _data_track_breakdowns_state(snap)
     result = {
         "events": int(tracking.get("count") or 0),
         "by_type": _data_track_count_dict(
@@ -1147,11 +1203,17 @@ def _data_track_tracking_from_snapshot(snap: dict) -> dict:
             field_prefix="tracking.by_type",
         ),
         "last_at": _data_track_iso(tracking.get("last_ts")),
-        "breakdowns_status": str(
-            snap.get("legacy_background_breakdowns_status") or "available"
+        "breakdowns_status": (
+            "unknown" if legacy_status_unknown else (
+                "omitted" if legacy_status_omitted else "available"
+            )
         ),
     }
-    result["counts_status"] = "invalid" if invalid_fields else "ok"
+    result["counts_status"] = (
+        "unknown" if snapshot_unread else (
+            "invalid" if invalid_fields else "ok"
+        )
+    )
     result["invalid_count_fields"] = sorted(set(invalid_fields))
     return result
 
@@ -1161,6 +1223,8 @@ def _data_track_bootstrap_from_snapshot(snap: dict) -> dict:
     counts = dict(snap.get("log_counts") or {})
     bootstrap = logs.get("bootstrap_events", {}) or {}
     invalid_fields: list[str] = []
+    snapshot_unread = _data_track_snapshot_unread(snap)
+    legacy_status_unknown, legacy_status_omitted = _data_track_breakdowns_state(snap)
     result = {
         "events": int(bootstrap.get("count") or 0),
         "by_type": _data_track_count_dict(
@@ -1168,11 +1232,17 @@ def _data_track_bootstrap_from_snapshot(snap: dict) -> dict:
             field_prefix="bootstrap.by_type",
         ),
         "last_at": _data_track_iso(bootstrap.get("last_ts")),
-        "breakdowns_status": str(
-            snap.get("legacy_background_breakdowns_status") or "available"
+        "breakdowns_status": (
+            "unknown" if legacy_status_unknown else (
+                "omitted" if legacy_status_omitted else "available"
+            )
         ),
     }
-    result["counts_status"] = "invalid" if invalid_fields else "ok"
+    result["counts_status"] = (
+        "unknown" if snapshot_unread else (
+            "invalid" if invalid_fields else "ok"
+        )
+    )
     result["invalid_count_fields"] = sorted(set(invalid_fields))
     return result
 
@@ -1298,6 +1368,7 @@ def _effective_responder(
     route: str,
     consumer_state: dict | None,
     runtime: dict | None,
+    snapshot_read_status: dict | None = None,
     now_epoch: float | None = None,
 ) -> dict:
     """Classify who can answer, keeping current facts separate from samples.
@@ -1317,6 +1388,11 @@ def _effective_responder(
     runtime_state = str(
         runtime_data.get("hosted_runtime_state") or "resident"
     ).strip().lower()
+    read_status = (
+        snapshot_read_status if isinstance(snapshot_read_status, dict) else {}
+    )
+    read_level = str(read_status.get("level") or "").strip().lower()
+    read_failed = bool(read_level and read_level != "ok")
 
     raw_pollers = state.get("poll_consumers")
     pollers = raw_pollers if isinstance(raw_pollers, dict) else {}
@@ -1403,7 +1479,13 @@ def _effective_responder(
     detected = set(current)
     detected.update(item["responder"] for item in recent_polls)
 
-    if v2_owned:
+    if read_failed:
+        # Every positive/negative responder fact above comes from the same DB
+        # snapshot. A failed read is a third bucket, not evidence that nobody
+        # currently owns or polls the user.
+        effective = "unknown"
+        basis = "snapshot_read_failed"
+    elif v2_owned:
         effective = "hosted_v2"
         basis = "v2_runtime_ownership"
     elif v1_lease_active:
@@ -1431,6 +1513,7 @@ def _effective_responder(
 
     return {
         "effective_responder": effective,
+        "read_status": "read_failed" if read_failed else "ok",
         "runtime_state": runtime_state,
         "basis": basis,
         "mismatch": bool(mismatch_reasons),
@@ -1439,12 +1522,14 @@ def _effective_responder(
         "poll_observations": poll_observations,
         "recent_poll_observations": recent_polls,
         "poll_evidence_status": (
-            "invalid" if invalid_poll_identities
-            else "ok" if any(
-                item.get("last_poll_status") == "ok"
-                for item in poll_observations
+            "unknown" if read_failed else (
+                "invalid" if invalid_poll_identities
+                else "ok" if any(
+                    item.get("last_poll_status") == "ok"
+                    for item in poll_observations
+                )
+                else "missing"
             )
-            else "missing"
         ),
         "invalid_poll_identities": sorted(set(invalid_poll_identities)),
         "criteria": (
@@ -1457,6 +1542,11 @@ def _effective_responder(
 
 
 def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
+    snap = dict(snap)
+    snap.setdefault(
+        "snapshot_read_status",
+        {"level": "unavailable", "message": "取数状态缺失"},
+    )
     user_id = str(user_entry.get("user_id") or "")
     blobs = dict(snap.get("blobs") or {})
     route_data = blobs.get("onboarding_route") or {}
@@ -1559,6 +1649,7 @@ def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
             else None
         ),
         runtime=snap.get("responder_runtime"),
+        snapshot_read_status=snap.get("snapshot_read_status"),
     )
     return row
 
@@ -2163,6 +2254,14 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
             maximum=90,
         )
         detail_snapshot = db.admin_data_track_snapshot([user_id]).get(user_id, {})
+        detail_snapshot_status = dict(
+            detail_snapshot.get("snapshot_read_status") or {
+                "level": "unavailable",
+                "message": "取数状态缺失",
+            }
+        )
+        detail_snapshot["snapshot_read_status"] = detail_snapshot_status
+        row["snapshot_read_status"] = detail_snapshot_status
         row["app_usage"] = _data_track_app_usage_from_snapshot(detail_snapshot)
         row["screen_frames"] = _data_track_screen_frames_from_snapshot(
             detail_snapshot
@@ -2179,6 +2278,7 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
                 else None
             ),
             runtime=detail_snapshot.get("responder_runtime"),
+            snapshot_read_status=detail_snapshot_status,
         )
         row["daily_usage"] = db.admin_data_track_user_daily_usage(
             user_id=user_id,
@@ -2588,7 +2688,7 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     proactive_failed = 0
     # This fleet-wide payload deliberately omits the legacy JSON breakdowns;
     # one-user detail is the only path where that all-history contract remains.
-    proactive_breakdowns_available = False
+    proactive_breakdown_states: set[str] = set()
     # Ground-truth activation funnel — derived from REAL behaviour (memory
     # written / messages sent / replies received / recency), independent of the
     # onboarding-stage label. This is the trustworthy usage view: a user who has
@@ -2626,10 +2726,12 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         memory_total += row["memory"]["total"]
         proactive_jobs += row["proactive"]["jobs"]
         proactive_messages += row["proactive"]["proactive_messages"]
-        if row["proactive"].get("breakdowns_status") == "available":
+        proactive_breakdown_state = str(
+            row["proactive"].get("breakdowns_status") or "unknown"
+        )
+        proactive_breakdown_states.add(proactive_breakdown_state)
+        if proactive_breakdown_state == "available":
             proactive_failed += row["proactive"]["failed_jobs"]
-        else:
-            proactive_breakdowns_available = False
         if row.get("provider_state") == "needs_user_action":
             provider_needs_user_action += 1
         if int(row["memory"].get("total") or 0) > 0:
@@ -2687,6 +2789,14 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         lane="chat",
         within_days=int(filters.get("days") or 30),
     )
+    proactive_breakdowns_status = (
+        "unknown"
+        if "unknown" in proactive_breakdown_states
+        or not proactive_breakdown_states <= {"available", "omitted"}
+        else "available"
+        if proactive_breakdown_states == {"available"}
+        else "omitted"
+    )
     # 聊天数字的覆盖范围。顶层一份，**不进每个用户行**：那份返回按 user_id 键控，
     # 加非 uid 的键会让调用方拿到一个假用户；每行各存一份既冗余，又会让人以为
     # 覆盖是 per-user 的。complete=False 时页面必须显示缺口——一个数字旁边没有
@@ -2726,11 +2836,11 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         "proactive_jobs_total": proactive_jobs,
         "proactive_messages_total": proactive_messages,
         "proactive_failed_total": (
-            proactive_failed if proactive_breakdowns_available else None
+            proactive_failed
+            if proactive_breakdowns_status == "available"
+            else None
         ),
-        "proactive_breakdowns_status": (
-            "available" if proactive_breakdowns_available else "omitted"
-        ),
+        "proactive_breakdowns_status": proactive_breakdowns_status,
         "provider_needs_user_action": provider_needs_user_action,
         "app_usage": {
             "foreground_sec_total": au_fg_total,
@@ -2780,24 +2890,41 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         for row in page:
             uid = str(row.get("user_id") or "")
             snap = snapshot.get(uid) or {}
+            base_read_status = dict(
+                snap.get("snapshot_read_status") or {
+                    "level": "unavailable",
+                    "message": "取数状态缺失",
+                }
+            )
+
+            def lane_snap(read_status: dict) -> dict:
+                """Attach the status for the exact read feeding one mapper."""
+                out = dict(snap)
+                if base_read_status.get("level") != "ok":
+                    out["snapshot_read_status"] = base_read_status
+                else:
+                    out["snapshot_read_status"] = dict(read_status)
+                return out
+
             breakdown = memory_breakdowns.get(uid)
+            memory_snap = lane_snap(memory_read_status)
             if breakdown:
-                row["memory"] = _data_track_memory_from_snapshot({
-                    **snap,
-                    "memory": {**(snap.get("memory") or {}), **breakdown},
-                })
+                memory_snap["memory"] = {
+                    **(snap.get("memory") or {}),
+                    **breakdown,
+                }
+            row["memory"] = _data_track_memory_from_snapshot(memory_snap)
             frames = screen_frames.get(uid)
             if frames:
                 row["screen_frames"] = _data_track_screen_frames_from_snapshot({
-                    **snap,
+                    **lane_snap(screen_read_status),
                     "screen_frames": frames,
                 })
             logs = paged_logs.get(uid)
+            logs_snap = lane_snap(logs_read_status)
             if logs:
-                row["bootstrap_events"] = _data_track_bootstrap_from_snapshot({
-                    **snap,
-                    "logs": {**(snap.get("logs") or {}), **logs},
-                })
+                logs_snap["logs"] = {**(snap.get("logs") or {}), **logs}
+            row["bootstrap_events"] = _data_track_bootstrap_from_snapshot(logs_snap)
             for status in (memory_read_status, screen_read_status, logs_read_status):
                 if status.get("level") != "ok":
                     row["snapshot_read_status"] = dict(status)
@@ -6204,6 +6331,36 @@ def _ops_import_level(report: dict | None) -> tuple[str, list[str]]:
     return level, reasons
 
 
+def _chat_missing_split(delivery: dict) -> tuple[int, int, int]:
+    """把「completed 无 applied」拆成 (判得了的红, 判不了的, 本就不欠回复的).
+
+    三个桶，因为这个总量里混了三种东西：
+
+    1. **红** —— 证据本该在、也没人删过它 ⇒ 干净的缺陷信号。
+    2. **判不了** —— Clear Chat 整表删掉 ``v2_effect_outbox`` 却保留
+       ``agent_jobs``，于是一个历史上真的送达过的 job 会退化成「无证据」，
+       **与真缺陷在这张表上完全同形**。算进红等于把合规删除报成缺陷，算进绿
+       等于用不确定性洗白真缺陷 ⇒ 只能单列。
+    3. **本就不欠** —— 这条 job 按其完成路径结构上就不产生 final effect
+       （空 coalesced / 迟到输入交接 / legacy final 重生）。它进红是**假红**，
+       而假红正是本单要治的病。
+
+    SQL 侧已经把三者做成互斥（benign 优先于 shadowed），所以这里是纯算术，
+    不会两处各减一次把红减成负数。仍然 clamp：上游口径万一漂了，宁可少报红
+    也不要报出一个负数把整页读者带偏。
+
+    判决与页面共用这一处派生 —— 两边各算一次就迟早会漂成两个口径。
+    """
+    missing = int(delivery.get("completed_without_final_applied") or 0)
+    benign = int(delivery.get("completed_without_final_applied_benign") or 0)
+    shadowed = int(
+        delivery.get("completed_without_final_applied_clear_shadowed") or 0
+    )
+    benign = max(0, min(benign, missing))
+    shadowed = max(0, min(shadowed, missing - benign))
+    return missing - benign - shadowed, shadowed, benign
+
+
 def _ops_chat_level(report: dict | None) -> tuple[str, list[str]]:
     if report is None:
         return "unknown", ["聊天统计暂不可用"]
@@ -6225,11 +6382,19 @@ def _ops_chat_level(report: dict | None) -> tuple[str, list[str]]:
             level = "bad"
         if failure_rate >= 0.05:
             reasons.append(f"chat 终态未成功率 {failure_rate * 100:.1f}%")
-    missing = int(delivery.get("completed_without_final_applied") or 0)
+    unshadowed, shadowed, _benign = _chat_missing_split(delivery)
     reconciliation = int(delivery.get("final_reconciliation_jobs") or 0)
-    if missing:
+    if unshadowed:
         level = "bad"
-        reasons.append(f"{missing} 个 completed 没有 final reply server-applied 证据")
+        reasons.append(
+            f"{unshadowed} 个 completed 没有 final reply server-applied 证据"
+            "（且无 Clear Chat 痕）"
+        )
+    if shadowed:
+        reasons.append(
+            f"{shadowed} 个 completed 判不了：证据本该在，但落在该用户一次 "
+            "Clear Chat 之前，已被合规删除"
+        )
     if reconciliation:
         level = "bad"
         reasons.append(f"{reconciliation} 个 final reply 需要人工 reconcile")
@@ -6602,6 +6767,22 @@ def _render_chat_reliability_page(report: dict | None, *, within_hours: int) -> 
     delivery = report.get("reply_delivery") or {}
     failure_delivery = report.get("failure_delivery") or {}
     reply_quality = report.get("reply_quality") or {}
+    # 「未知不会显示成 0」是这一页的成文契约：总量取不到时两格都必须是 —，
+    # 遮蔽数取不到时只有那一格是 —（红仍按整个总量报，方向偏红不偏绿）。
+    _missing_total = delivery.get("completed_without_final_applied")
+    _missing_shadowed = delivery.get(
+        "completed_without_final_applied_clear_shadowed"
+    )
+    _missing_benign = delivery.get("completed_without_final_applied_benign")
+    _red, _undecidable, _benign = _chat_missing_split(delivery)
+    missing_red = _fmt_count(None if _missing_total is None else _red)
+    missing_undecidable = _fmt_count(
+        None if _missing_total is None or _missing_shadowed is None
+        else _undecidable
+    )
+    missing_benign = _fmt_count(
+        None if _missing_total is None or _missing_benign is None else _benign
+    )
     failure_rows = "".join(
         "<tr>"
         f"{_failure_code_cell(row.get('code'))}"
@@ -6645,7 +6826,9 @@ def _render_chat_reliability_page(report: dict | None, *, within_hours: int) -> 
       {_render_metric('仍在飞', _fmt_count(outcomes.get('in_flight')))}
       {_render_metric('Final pending', _fmt_count(delivery.get('final_pending_jobs')))}
       {_render_metric('需 reconcile', _fmt_count(delivery.get('final_reconciliation_jobs')))}
-      {_render_metric('Completed 无 applied', _fmt_count(delivery.get('completed_without_final_applied')))}
+      {_render_metric('Completed 无 applied（判红）', f"{missing_red} / 涉及 {_fmt_count(delivery.get('completed_without_final_applied_users'))} 用户（去重，仅判红）")}
+      {_render_metric('其中判不了（Clear Chat 已删证据）', missing_undecidable)}
+      {_render_metric('其中本就不欠回复（已交接/空回合）', missing_benign)}
       {_render_metric('失败 fallback 已投递', _fmt_count(failure_delivery.get('fallback_reply_delivered')))}
       {_render_metric('失败 fallback 待投递', _fmt_count(failure_delivery.get('fallback_reply_pending')))}
       {_render_metric('≥2 条可见回复的回合', f"{_fmt_count(reply_quality.get('multi_reply_turns'))} / {_fmt_ratio(reply_quality.get('multi_reply_turn_rate'))}")}
@@ -12011,10 +12194,20 @@ def _render_data_quality_warnings(user: dict) -> str:
     """Render only explicit parse/read failures; legitimate missing stays quiet."""
     warnings: list[str] = []
 
+    snapshot_status = (
+        user.get("snapshot_read_status")
+        if isinstance(user.get("snapshot_read_status"), dict) else {}
+    )
+    snapshot_level = str(snapshot_status.get("level") or "").strip().lower()
+    if snapshot_level and snapshot_level != "ok":
+        warnings.append(
+            str(snapshot_status.get("message") or "取数失败（记了，但这里读不出来）")
+        )
+
     memory = user.get("memory") if isinstance(user.get("memory"), dict) else {}
     if memory.get("capture_actions_written_status") == "invalid":
         warnings.append("memory capture 的 actions_written 有坏值，合计只是已读下限。")
-    if memory.get("counts_status") == "invalid":
+    if memory.get("counts_status") in {"invalid", "unknown"}:
         warnings.append("memory snapshot 的计数字段有坏值，0 不代表真实为零。")
     capture = (
         user.get("memory_capture_validation")
@@ -12030,13 +12223,13 @@ def _render_data_quality_warnings(user: dict) -> str:
         ("bootstrap_events", "bootstrap snapshot"),
     ):
         block = user.get(key) if isinstance(user.get(key), dict) else {}
-        if block.get("counts_status") == "invalid":
+        if block.get("counts_status") in {"invalid", "unknown"}:
             warnings.append(f"{label} 有坏计数，页面中的 0 不是可信测量。")
 
     app_usage = (
         user.get("app_usage") if isinstance(user.get("app_usage"), dict) else {}
     )
-    if app_usage.get("fields_status") == "invalid":
+    if app_usage.get("fields_status") in {"invalid", "unknown"}:
         warnings.append("App usage 有字段读不出来，0/空时间不是“没有使用”。")
 
     onboarding = (
@@ -12049,6 +12242,8 @@ def _render_data_quality_warnings(user: dict) -> str:
     )
     if responder.get("poll_evidence_status") == "invalid":
         warnings.append("responder poll 证据有坏时间，recent/none 结论不完整。")
+    elif responder.get("poll_evidence_status") == "unknown":
+        warnings.append("responder poll 证据暂不可读，不能判为确实没有轮询证据。")
 
     notices = user.get("notice_summaries") or []
     if any(

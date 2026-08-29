@@ -7,7 +7,18 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+from model_api_runtime.v2 import pool_config
 from model_api_runtime.v2.pool_config import RuntimePoolConfig
+
+
+def test_wake_pool_constant_is_not_named_like_lane_vocabulary():
+    # This test only guards the pool-specific constant name. The production
+    # lane-to-pool budgets are guarded at the SlotSpec output by
+    # test_slots_have_fixed_lane_allowlists_and_initial_budgets below.
+    assert pool_config._WAKE_POOL_LANES == frozenset(
+        {"heartbeat", "scheduled", "screen_watch"}
+    )
+    assert not hasattr(pool_config, "_WAKE_LANES")
 
 
 def test_defaults_build_complete_eight_slot_topology(monkeypatch):

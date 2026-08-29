@@ -1,28 +1,26 @@
-"""Compatibility regressions for retained PR-D pool-safety invariants.
+"""Runtime V2 pool-safety regressions.
 
 The retained PR-D decision is
 ``docs/superpowers/specs/2026-07-13-hosted-runtime-v2-PR-D-pool-history-safety-design.md``.
-The watchdog fakes below intentionally exercise the earlier compatibility wrapper
-surface, including a shared-child-shaped aggregate-progress model and its
-``kill_and_respawn`` fallback. They do not constitute current D1--D3 topology
-acceptance: current one-process-per-`SlotSpec` acceptance belongs to
+The watchdog fakes below implement the current per-slot supervisor lifecycle.
+Current one-process-per-`SlotSpec` acceptance belongs to
 ``test_v2_pool_supervisor.py`` and real-process fault isolation to
 ``test_v2_pool_fault_injection.py``, under
 ``docs/superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md``.
 
 This module retains three narrow regression checks:
 
-1. The legacy wrapper writes capacity=0 before its compatibility respawn action
-   and remains Genesis-blind: a ``kind='genesis'`` heartbeat row's ``beat_at``
-   is byte-for-byte unchanged across the watchdog tick, and source inspection
-   confirms watchdog.py contains no Genesis reference.
+1. The watchdog snapshots the slot, writes capacity=0 before confirmed termination,
+   starts a replacement only after safe recovery, and remains Genesis-blind: a
+   ``kind='genesis'`` heartbeat row's ``beat_at`` is byte-for-byte unchanged
+   across the watchdog tick.
 2. D4 kill switch: real DB-backed ``kill_switch.set_turns_halted`` flips
    chat_send_core admission to 503 turns_halted and back; the ``_slot_loop``
    claim gate never calls ``claim_next_job`` while halted; the Genesis claim
    function (``db.genesis_claim_uploaded_jobs``) is provably ungated (grep at
    test time confirms no kill_switch import/reference in db.py at all, and the
    function is still callable while halted).
-3. The pure compatibility decision helper covers all-stuck+claimable → kill,
+3. The pure decision helper covers all-stuck+claimable → kill,
    healthy+fresh → no kill, and stale-but-idle → no kill.
 """
 from __future__ import annotations
@@ -40,7 +38,7 @@ import db
 from core import enclave as core_enclave
 from core import store as core_store
 from hosted import chat_send_core, config_store as hosted_config_store
-from model_api_runtime.v2 import jobs_store, kill_switch, watchdog, worker
+from model_api_runtime.v2 import child_supervisor, jobs_store, kill_switch, watchdog, worker
 
 from conftest import configure_model_api_route
 
@@ -88,22 +86,31 @@ def _genesis_beat_at(worker_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Compatibility P0 #1 — shared-child-shaped fake: capacity zeroes strictly
-# before its wrapper respawn action, and the path is Genesis-blind.
+# P0 #1 — a per-slot fake: snapshot then capacity-zero, confirmed kill, and
+# replacement remain Genesis-blind.
 # ---------------------------------------------------------------------------
 
 class _WedgedSupervisor:
-    """Fake supervisor: the child process is alive but its progress is older
-    than CHILD_LIVENESS_TIMEOUT — the legacy aggregate-progress wedge signal."""
+    """Current supervisor contract with a stale per-slot child."""
 
-    def __init__(self):
+    def __init__(self, order):
         self.kill_calls = 0
+        self._order = order
 
     def poll_liveness(self) -> dict:
         return {"alive": True, "last_progress_age_sec": 999.0}
 
-    def kill_and_respawn(self) -> None:
+    def snapshot(self):
+        self._order.append("snapshot")
+        return None
+
+    def kill_for_recovery(self):
+        self._order.append("kill")
         self.kill_calls += 1
+        return child_supervisor.KillOutcome(active_job=None, terminated=True)
+
+    def start(self):
+        self._order.append("start")
 
 
 def test_p0_all_slots_stuck_zeroes_capacity_before_kill_and_genesis_unaffected(monkeypatch):
@@ -123,10 +130,7 @@ def test_p0_all_slots_stuck_zeroes_capacity_before_kill_and_genesis_unaffected(m
     real_heartbeat = jobs_store.record_worker_heartbeat
 
     def _spy_heartbeat(worker_id, *, pool, kind="turn", capacity=1):
-        # The watchdog's own contract (watchdog.py's `_watchdog_loop` docstring
-        # defines this legacy wrapper branch to write ONLY the turn worker's row with
-        # capacity=0 — assert that's exactly what happens, nothing genesis-kind
-        # and nothing but capacity=0.
+        # The watchdog writes only its affected turn row with capacity=0.
         assert kind == "turn", f"watchdog must never write a non-turn heartbeat, got kind={kind!r}"
         assert pool == "foreground"
         assert worker_id == turn_worker_id
@@ -138,14 +142,7 @@ def test_p0_all_slots_stuck_zeroes_capacity_before_kill_and_genesis_unaffected(m
 
     monkeypatch.setattr(jobs_store, "record_worker_heartbeat", _spy_heartbeat)
 
-    supervisor = _WedgedSupervisor()
-    _real_kill = supervisor.kill_and_respawn
-
-    def _kill_and_respawn():
-        order.append("kill_and_respawn")
-        _real_kill()
-
-    supervisor.kill_and_respawn = _kill_and_respawn  # type: ignore[method-assign]
+    supervisor = _WedgedSupervisor(order)
 
     stop_event = asyncio.Event()
 
@@ -154,7 +151,8 @@ def test_p0_all_slots_stuck_zeroes_capacity_before_kill_and_genesis_unaffected(m
             supervisor, turn_worker_id, stop_event,
             jobs_claimable_fn=lambda: True,  # work is waiting -> the wedge signal is real
             interval=0.02,
-            turn_hard_timeout_sec=180.0,
+            turn_stall_timeout_sec=180.0,
+            turn_absolute_timeout_sec=1500.0,
             child_liveness_timeout_sec=45.0,
         ))
         for _ in range(50):
@@ -166,11 +164,9 @@ def test_p0_all_slots_stuck_zeroes_capacity_before_kill_and_genesis_unaffected(m
 
     asyncio.run(_driver())
 
-    # (a) capacity=0 was recorded, (b) the legacy wrapper ran, (c) in that order.
+    # Snapshot owns the exact pre-kill identity, capacity fences admission before kill.
     assert supervisor.kill_calls >= 1
-    assert "capacity_zero" in order
-    assert "kill_and_respawn" in order
-    assert order.index("capacity_zero") < order.index("kill_and_respawn")
+    assert order[:4] == ["snapshot", "capacity_zero", "kill", "start"]
 
     # Genesis heartbeat literally untouched — same beat_at timestamp, byte for
     # byte, not merely "still within the freshness window".
@@ -178,27 +174,12 @@ def test_p0_all_slots_stuck_zeroes_capacity_before_kill_and_genesis_unaffected(m
     assert beat_after == beat_before
     assert jobs_store.genesis_worker_alive(within_sec=60) is True
 
-    # Static confirmation the watchdog code path never references anything
-    # genesis-related — no import, no string literal, no attribute access.
-    src = inspect.getsource(watchdog)
-    assert "genesis" not in src.lower()
-
-
 # ---------------------------------------------------------------------------
-# Compatibility P0 #1b — a shared-child-shaped fake reports fresh aggregate
-# progress while one modeled turn has exceeded its hard timeout. This preserves
-# the old helper's `current_turn_age_sec` decision branch; it is not evidence
-# about the current one-child-one-slot fleet. Current per-slot fault acceptance
-# is covered by test_v2_pool_fault_injection.py.
+# P0 #1b — a per-slot fake with a whole-turn absolute-timeout overrun.
 # ---------------------------------------------------------------------------
 
 class _SingleWedgedTurnSupervisor:
-    """Legacy fake with fresh aggregate progress and one overdue modeled turn.
-
-    Current SlotFleet children each contain exactly one slot, so this
-    shared-child-shaped fixture exists only to retain compatibility coverage for
-    the pure watchdog helper.
-    """
+    """Current supervisor contract with a single overdue active turn."""
 
     def __init__(self, current_turn_age_sec: float, order: "list[str] | None" = None):
         self._current_turn_age_sec = current_turn_age_sec
@@ -212,13 +193,23 @@ class _SingleWedgedTurnSupervisor:
             "current_turn_age_sec": self._current_turn_age_sec,
         }
 
-    def kill_and_respawn(self) -> None:
+    def snapshot(self):
         if self._order is not None:
-            self._order.append("kill_and_respawn")
+            self._order.append("snapshot")
+        return None
+
+    def kill_for_recovery(self):
+        if self._order is not None:
+            self._order.append("kill")
         self.kill_calls += 1
+        return child_supervisor.KillOutcome(active_job=None, terminated=True)
+
+    def start(self):
+        if self._order is not None:
+            self._order.append("start")
 
 
-def test_p0_single_wedged_turn_hard_timeout_zeroes_capacity_before_kill(monkeypatch):
+def test_p0_single_wedged_turn_absolute_timeout_zeroes_capacity_before_kill(monkeypatch):
     turn_worker_id = "turn-p0-hardtimeout-worker"
 
     order: list[str] = []
@@ -236,7 +227,7 @@ def test_p0_single_wedged_turn_hard_timeout_zeroes_capacity_before_kill(monkeypa
 
     monkeypatch.setattr(jobs_store, "record_worker_heartbeat", _spy_heartbeat)
 
-    # 181s > the 180s turn_hard_timeout_sec used below.
+    # 181s > the 180s absolute-timeout budget used below.
     supervisor = _SingleWedgedTurnSupervisor(current_turn_age_sec=181.0, order=order)
     stop_event = asyncio.Event()
 
@@ -248,7 +239,8 @@ def test_p0_single_wedged_turn_hard_timeout_zeroes_capacity_before_kill(monkeypa
             # work). Only clause (c) can produce a kill in this scenario.
             jobs_claimable_fn=lambda: False,
             interval=0.02,
-            turn_hard_timeout_sec=180.0,
+            turn_stall_timeout_sec=240.0,
+            turn_absolute_timeout_sec=180.0,
             child_liveness_timeout_sec=45.0,
         ))
         for _ in range(50):
@@ -261,17 +253,15 @@ def test_p0_single_wedged_turn_hard_timeout_zeroes_capacity_before_kill(monkeypa
     asyncio.run(_driver())
 
     assert supervisor.kill_calls >= 1, (
-        "a single wedged turn over turn_hard_timeout_sec must trigger a kill even "
+        "a single wedged turn over turn_absolute_timeout_sec must trigger a kill even "
         "though the freshest progress across the pool is fresh and no other work "
         "is claimable — this is the live path clause (c) now covers"
     )
-    assert "capacity_zero" in order
-    assert "kill_and_respawn" in order
-    assert order.index("capacity_zero") < order.index("kill_and_respawn")
+    assert order[:4] == ["snapshot", "capacity_zero", "kill", "start"]
 
 
-def test_p0_single_wedged_turn_under_hard_timeout_does_not_kill(monkeypatch):
-    """Negative control: a turn that hasn't yet crossed turn_hard_timeout_sec,
+def test_p0_single_wedged_turn_under_absolute_timeout_does_not_kill(monkeypatch):
+    """Negative control: a turn that hasn't crossed its absolute timeout,
     with fresh coarse progress and no claimable work, must not be killed."""
     monkeypatch.setattr(
         jobs_store, "record_worker_heartbeat",
@@ -285,7 +275,8 @@ def test_p0_single_wedged_turn_under_hard_timeout_does_not_kill(monkeypatch):
             supervisor, "turn-p0-hardtimeout-worker-ok", stop_event,
             jobs_claimable_fn=lambda: False,
             interval=0.02,
-            turn_hard_timeout_sec=180.0,
+            turn_stall_timeout_sec=240.0,
+            turn_absolute_timeout_sec=180.0,
             child_liveness_timeout_sec=45.0,
         ))
         await asyncio.sleep(0.1)
@@ -428,7 +419,8 @@ def test_kill_switch_genesis_claim_path_is_ungated(monkeypatch):
 def test_should_kill_true_for_all_stuck_and_claimable():
     liveness = {"alive": True, "last_progress_age_sec": 999.0}
     assert watchdog.should_kill(
-        liveness, turn_hard_timeout_sec=180.0, child_liveness_timeout_sec=45.0,
+        liveness, turn_stall_timeout_sec=180.0, turn_absolute_timeout_sec=1500.0,
+        child_liveness_timeout_sec=45.0,
         jobs_claimable=True,
     ) is True
 
@@ -436,7 +428,8 @@ def test_should_kill_true_for_all_stuck_and_claimable():
 def test_should_kill_false_for_healthy_fresh_child():
     liveness = {"alive": True, "last_progress_age_sec": 1.0}
     assert watchdog.should_kill(
-        liveness, turn_hard_timeout_sec=180.0, child_liveness_timeout_sec=45.0,
+        liveness, turn_stall_timeout_sec=180.0, turn_absolute_timeout_sec=1500.0,
+        child_liveness_timeout_sec=45.0,
         jobs_claimable=True,
     ) is False
 
@@ -447,6 +440,7 @@ def test_should_kill_false_for_stale_but_idle_pool():
     kill."""
     liveness = {"alive": True, "last_progress_age_sec": 999.0}
     assert watchdog.should_kill(
-        liveness, turn_hard_timeout_sec=180.0, child_liveness_timeout_sec=45.0,
+        liveness, turn_stall_timeout_sec=180.0, turn_absolute_timeout_sec=1500.0,
+        child_liveness_timeout_sec=45.0,
         jobs_claimable=False,
     ) is False

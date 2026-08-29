@@ -82,7 +82,7 @@ from chat.reply_language import (
     failure_fallback_reply,
     garden_language_decision,
     infer_garden_language,
-    infer_reply_language_policy,
+    infer_reply_language,
     reply_language_system_line,
     user_written_text,
 )
@@ -121,7 +121,7 @@ from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import slot_protocol
 from model_api_runtime.v2 import kill_switch
-from model_api_runtime.v2 import language_follow as v2_language_follow
+from chat import language_follow as v2_language_follow
 from model_api_runtime.v2 import model_identity as v2_model_identity
 from model_api_runtime.v2 import web_gate as v2_web_gate
 from model_api_runtime.v2 import prompt_frontier as v2_prompt_frontier
@@ -2802,14 +2802,7 @@ class _ProviderRoundtripTrace:
         if detail.get("empty_response_recovery") is True:
             self.empty_response_recovery_used = True
 
-        trace_detail = {"lane": self.lane, **dict(detail)}
-        trace_detail["call_rejection_reasons"] = (
-            v2_tool_loop._normalize_provider_call_rejection_reasons(
-                detail.get("call_rejection_reasons")
-            )
-        )
-        if self.lane != "chat":
-            trace_detail["wake_kind"] = self.lane
+        trace_detail = _provider_tool_surface_trace_detail(self.lane, detail)
         await asyncio.to_thread(
             self.deps.emit_debug_trace,
             self.user_id,
@@ -2825,8 +2818,9 @@ class _ProviderRoundtripTrace:
                 f"裁剪 {trace_detail['dropped_tool_count']} 个"
             ),
             explain=(
-                "记录每次 provider 请求真正携带的工具数量;不记录工具参数、"
-                "返回值或用户内容。"
+                "记录每次 provider 请求真正携带的工具数量、平台闭词表内的"
+                "撤回/不可用调用名,以及非平台工具的分桶计数;不记录 MCP 名称、"
+                "工具参数、返回值或用户内容。"
             ),
             detail=trace_detail,
         )
@@ -2980,6 +2974,29 @@ class _ProviderRoundtripTrace:
                 self.user_id,
                 type(exc).__name__.lower(),
             )
+
+
+def _provider_tool_surface_trace_detail(
+    lane: str,
+    detail: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply the production worker-owned provider-surface detail projection."""
+    trace_detail = {"lane": lane, **dict(detail)}
+    trace_detail["call_rejection_reasons"] = (
+        v2_tool_loop._normalize_provider_call_rejection_reasons(
+            detail.get("call_rejection_reasons")
+        )
+    )
+    if lane != "chat":
+        trace_detail["wake_kind"] = lane
+    return trace_detail
+
+
+def _provider_tool_surface_added_detail_keys(lane: str) -> frozenset[str]:
+    """Derive worker-owned keys from the production projection itself."""
+    loop_owned_seed = {"call_rejection_reasons": []}
+    projected = _provider_tool_surface_trace_detail(lane, loop_owned_seed)
+    return frozenset(projected).difference(loop_owned_seed)
 
 
 def _provider_tool_surface_callback(
@@ -10716,9 +10733,7 @@ async def _run_wake(
             # open its reply with a <think> block so proactive turns show a clean
             # self-authored thought instead of raw native reasoning.
             _wake_sys = _wake_system_prompt_for_lane(lane, _wake_sys)
-            language_policy = infer_reply_language_policy(
-                {},
-                [],
+            reply_language = infer_reply_language(
                 locale=str(temporal_snapshot.get("locale") or ""),
                 archive_language=str(
                     temporal_snapshot.get("archive_language") or ""
@@ -10726,7 +10741,7 @@ async def _run_wake(
             )
             _wake_sys = context._join_policy_blocks(
                 _wake_sys,
-                reply_language_system_line(language_policy, proactive=True),
+                reply_language_system_line(reply_language),
             )
             return _make_build_messages_fn(
                 system_prompt=_wake_sys,
@@ -13903,7 +13918,7 @@ async def process_job(
                 await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
             await asyncio.to_thread(_emit_status, user_id, job_id, "done")
             await asyncio.to_thread(core_wake_bus.notify, "chat", user_id)
-            tm.flush(failed=False, status="ok")
+            tm.flush(failed=False, status=jobs_store.CHAT_TURN_STATUS_OK)
             return "completed"
 
         # Load after recovery and empty-input finalization so a workspace outage
@@ -14099,9 +14114,7 @@ async def process_job(
                 prompt_snapshot_through_seq if seq_native else None
             ),
         )
-        chat_language_policy = infer_reply_language_policy(
-            {},
-            [],
+        chat_reply_language = infer_reply_language(
             locale=str(temporal_snapshot.get("locale") or ""),
             archive_language=str(
                 temporal_snapshot.get("archive_language") or ""
@@ -14110,7 +14123,7 @@ async def process_job(
 
         def _chat_failure_fallback() -> str:
             return failure_fallback_reply(
-                chat_language_policy,
+                chat_reply_language,
                 zh=_DEGENERATE_REPLY_FALLBACK,
                 en=_DEGENERATE_REPLY_FALLBACK_EN,
             )
@@ -15889,10 +15902,7 @@ async def process_job(
         def _chat_builder():
             chat_system_prompt = context._join_policy_blocks(
                 context.chat_system_prompt(provider_config),
-                reply_language_system_line(
-                    chat_language_policy,
-                    proactive=False,
-                ),
+                reply_language_system_line(chat_reply_language),
             )
             return _make_build_messages_fn(
                 system_prompt=chat_system_prompt,
@@ -16190,7 +16200,10 @@ async def process_job(
             if not completed or successor_id is None:
                 raise LostJobLease("job ownership lost during late-input handoff")
             await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
-            tm.flush(failed=False, status="input_advanced_handoff")
+            tm.flush(
+                failed=False,
+                status=jobs_store.CHAT_INPUT_ADVANCED_HANDOFF_STATUS,
+            )
             mcp_turn_outcome = "completed"
             return "completed"
         if outcome.stop_reason == "required_file_missing":

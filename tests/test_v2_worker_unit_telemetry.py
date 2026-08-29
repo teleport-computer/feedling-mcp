@@ -15,7 +15,7 @@ from agent_protocol_core import self_thinking  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
 from model_api_runtime.v2 import tool_loop  # noqa: E402
 from model_api_runtime.v2 import worker  # noqa: E402
-from model_api_runtime.v2 import language_follow  # noqa: E402
+from chat import language_follow  # noqa: E402
 from model_api_runtime.v2 import prompt_frontier  # noqa: E402
 from model_api_runtime.v2 import summary_frontier  # noqa: E402
 from notices import catalog as notices_catalog  # noqa: E402
@@ -1020,11 +1020,7 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
     deps.emit_debug_trace = lambda user_id, event_type, **fields: captured.append(
         {"user_id": user_id, "type": event_type, **fields}
     )
-    trace = worker._provider_tool_surface_callback(
-        deps, "u_roundtrip_trace", "chat", "trace-roundtrip"
-    )
-    assert trace is not None
-    asyncio.run(trace({
+    provider_surface_input = {
         "round": 2,
         "candidate_tool_count": 4,
         "sent_tool_count": 0,
@@ -1043,15 +1039,78 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
             "missing_tool_call_id",
             "unclassified_rejection",
         ],
-    }))
-    asyncio.run(trace.emit_summary())
+        "withdrawn_platform_tool_names": ["workspace_write"],
+        "withdrawn_tool_counts": {"platform": 1, "mcp": 0, "other": 0},
+        "unavailable_platform_tool_call_labels": [
+            "tool_withdrawn:workspace_write"
+        ],
+        "unavailable_tool_call_counts": {
+            "platform": 1,
+            "mcp": 0,
+            "other": 0,
+        },
+    }
+    provider_surface_lanes = (
+        "chat",
+        *sorted(worker._WAKE_LANES),
+        "other",
+    )
+    for candidate_lane in provider_surface_lanes:
+        trace = worker._provider_tool_surface_callback(
+            deps,
+            "u_roundtrip_trace",
+            candidate_lane,
+            f"trace-roundtrip-{candidate_lane}",
+        )
+        assert trace is not None
+        asyncio.run(trace(provider_surface_input))
+        asyncio.run(trace.emit_summary())
+
+    surface_by_lane = {
+        event["detail"]["lane"]: event
+        for event in captured
+        if event["type"] == "mcp.surface.provider"
+    }
+    actual_worker_added_keys_by_lane = {
+        lane: set(surface_by_lane[lane]["detail"]).difference(
+            provider_surface_input
+        )
+        for lane in provider_surface_lanes
+    }
+    expected_worker_added_keys_by_lane = {
+        lane: set(worker._provider_tool_surface_added_detail_keys(lane))
+        for lane in provider_surface_lanes
+    }
+    # Select the worst real callback/helper disagreement across the same closed
+    # lane vocabulary consumed by production.  With no disagreement, the
+    # largest production shape remains the representative below; a lane-only
+    # callback bypass becomes the representative and reaches the equality guard.
+    trace_lane = max(
+        provider_surface_lanes,
+        key=lambda lane: (
+            len(
+                actual_worker_added_keys_by_lane[lane]
+                ^ expected_worker_added_keys_by_lane[lane]
+            ),
+            len(actual_worker_added_keys_by_lane[lane]),
+        ),
+    )
+    actual_worker_added_keys = actual_worker_added_keys_by_lane[trace_lane]
+    assert (
+        actual_worker_added_keys
+        == expected_worker_added_keys_by_lane[trace_lane]
+    )
 
     roundtrip = next(
-        event for event in captured if event["type"] == "mcp.roundtrip.provider"
+        event
+        for event in captured
+        if event["type"] == "mcp.roundtrip.provider"
+        and event["detail"]["lane"] == trace_lane
     )
-    assert roundtrip["trace_id"] == "trace-roundtrip"
+    assert roundtrip["trace_id"] == f"trace-roundtrip-{trace_lane}"
     public = data_track._debug_event_public_json(roundtrip)
-    assert public["detail"]["lane"] == "chat"
+    assert public["detail"]["lane"] == trace_lane
+    assert public["detail"]["wake_kind"] == trace_lane
     assert public["detail"]["terminal_text_round_reason"] == (
         "force_text_fallback"
     )
@@ -1059,14 +1118,28 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
         "tool_schema_rejected"
     )
 
-    surface = next(
-        event for event in captured if event["type"] == "mcp.surface.provider"
-    )
-    assert surface["trace_id"] == "trace-roundtrip"
+    surface = surface_by_lane[trace_lane]
+    assert surface["trace_id"] == f"trace-roundtrip-{trace_lane}"
     assert surface["detail"]["call_rejection_reasons"] == [
         "missing_tool_call_id",
         "unclassified_rejection",
     ]
+    assert surface["detail"]["withdrawn_platform_tool_names"] == [
+        "workspace_write"
+    ]
+    assert surface["detail"]["withdrawn_tool_counts"] == {
+        "platform": 1,
+        "mcp": 0,
+        "other": 0,
+    }
+    assert surface["detail"]["unavailable_platform_tool_call_labels"] == [
+        "tool_withdrawn:workspace_write"
+    ]
+    assert surface["detail"]["unavailable_tool_call_counts"] == {
+        "platform": 1,
+        "mcp": 0,
+        "other": 0,
+    }
     assert "private model text" not in str(surface)
     surface_public = data_track._debug_event_public_json(surface)["detail"]
     assert surface_public["call_rejection_reasons"] == [

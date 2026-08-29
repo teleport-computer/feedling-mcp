@@ -202,7 +202,7 @@ from chat.reply_language import (
     format_time_anchor,
     garden_language_decision,
     infer_garden_language,
-    infer_reply_language_policy,
+    infer_reply_language,
     reply_language_system_line,
     user_written_text,
 )
@@ -10982,7 +10982,7 @@ def _wake_think_permission_line(presence: dict | None = None) -> str:
     """开关关闭时返回空串 —— 模板里连提都不提 ``<think>``。"""
     if not _wake_self_thinking_allowed():
         return ""
-    policy = _resident_reply_language_policy(presence)
+    policy = _resident_reply_language(presence)
     if policy.language != "en":
         return (
             " 你可以在 JSON 前先写一个平常的 <think>...</think> 块；它会保持私密，"
@@ -14907,22 +14907,20 @@ def _reply_protocol_block(presence: dict | None = None) -> str:
     ])
 
 
-def _resident_reply_language_policy(presence: dict | None = None):
-    """Resident-side reply-language policy via the shared helper. Resident has no
-    identity-card/memory text in hand (only whoami archive_language + presence
-    locale), so it degrades to the helper's locale → archive_language → default
-    tier — same wording, mirror rule, and time-anchor localization as model_api."""
+def _resident_reply_language(presence: dict | None = None):
+    """Resident-side locale → archive-language → default selection."""
     locale = str((presence or {}).get("locale") or "").strip()
     archive_language = str(_whoami_cache.get("archive_language") or "").strip()
-    return infer_reply_language_policy({}, [], locale=locale, archive_language=archive_language)
+    return infer_reply_language(locale=locale, archive_language=archive_language)
 
 
 def _reply_language_line(presence: dict | None = None) -> str:
-    """The shared zh/en reply-language policy line (a default language + a soft
-    mirror of the user's latest-message language). Wired into both the proactive
-    wakes and the foreground reply so the model stops drifting to Chinese when the
-    user is in an English context."""
-    return reply_language_system_line(_resident_reply_language_policy(presence))
+    """Render the shared reply-language rule in the selected zh/en language.
+
+    Wired into both proactive wakes and foreground replies; the rendered rule
+    tells the model how to choose the language from the latest user message.
+    """
+    return reply_language_system_line(_resident_reply_language(presence))
 
 
 def _native_reachout_tool_instructions() -> str:
@@ -15041,7 +15039,7 @@ def _local_time_anchor(since_sec: float | None = None, presence: dict | None = N
     tzs = _user_timezone()
     is_default = not tzs
     zone = tzs or _DEFAULT_TIMEZONE
-    policy = _resident_reply_language_policy(presence)
+    policy = _resident_reply_language(presence)
     return format_time_anchor(
         datetime.now(_tzmod.utc), zone, policy,
         since_sec=since_sec, timezone_default=is_default,
@@ -20707,6 +20705,44 @@ def run() -> None:
                     poll_messages,
                     last_ts=last_ts,
                 )
+
+            # The agent call below can occupy this single loop for up to the
+            # full turn timeout. Reconcile Capture after the claimed messages
+            # are known but before that blocking call, so a turn-backstop is
+            # never delayed by a long foreground turn. This remains fail-open:
+            # Capture availability must not prevent the user turn from running.
+            if capture_tick_enabled:
+                try:
+                    capture_result = fire_capture_tick()
+                    if capture_result.get("enqueued") or str(
+                        capture_result.get("reason") or ""
+                    ) not in {
+                        "",
+                        "no_new_messages",
+                        "quiet_not_due",
+                        "already_captured",
+                    }:
+                        log.info(
+                            "pre-turn capture tick enqueued=%s reason=%s quiet_for=%s",
+                            bool(capture_result.get("enqueued")),
+                            capture_result.get("reason"),
+                            capture_result.get("quiet_for_sec", ""),
+                        )
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        capture_tick_enabled = False
+                        log.warning(
+                            "capture tick endpoint not available on this backend; "
+                            "disabling capture tick for this process"
+                        )
+                    else:
+                        log.warning("pre-turn capture tick failed: HTTP %d", e.response.status_code)
+                except Exception as e:
+                    log.warning("pre-turn capture tick failed: %s", e)
+                finally:
+                    next_capture_tick_mono = (
+                        time.monotonic() + max(10, CAPTURE_TICK_INTERVAL_SEC)
+                    )
 
             new_ts = _process_messages(messages)
             if new_ts > last_ts:

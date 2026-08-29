@@ -1260,9 +1260,9 @@ class UserStore:
         same atomic transaction. `None` (the default) preserves
         today's `chat_append_strict`/`chat_append` behavior for local cache,
         trim, waiter, and Capture bookkeeping. Cross-worker notification comes
-        from the committed DB v2 trigger. Exact Runtime V2
-        sends only refresh that state; their runner-owned scheduler is the sole
-        capture producer and therefore never appends a legacy proactive job.
+        from the committed DB v2 trigger. Exact Runtime V2 sends defer Capture
+        discovery to their runner-owned scheduler, which is the sole capture
+        producer and therefore never appends a legacy proactive job.
 
         `reply_through_seq` is the V2 final-reply path. It requires
         `strict=True` and no `enqueue`, and commits the deterministic reply row
@@ -1556,6 +1556,7 @@ class UserStore:
         try:
             from proactive import capture_scheduler
 
+            defer_to_tick = capture_scheduler.append_refresh_deferred()
             scheduler_owned_capture = bool(
                 strict
                 and (
@@ -1567,8 +1568,14 @@ class UserStore:
                     )
                 )
             )
-            if scheduler_owned_capture:
-                capture_scheduler.refresh_capture_state_from_chat(self, now=msg["ts"])
+            if defer_to_tick:
+                capture_scheduler.record_chat_append(
+                    self, msg, defer_to_tick=True
+                )
+            elif scheduler_owned_capture:
+                capture_scheduler.refresh_capture_state_from_chat(
+                    self, now=msg["ts"]
+                )
             else:
                 capture_scheduler.record_chat_append(self, msg)
         except Exception as e:
@@ -1597,7 +1604,11 @@ class UserStore:
         try:
             from proactive import capture_scheduler
 
-            capture_scheduler.record_chat_append(self, cached_reply)
+            capture_scheduler.record_chat_append(
+                self,
+                cached_reply,
+                defer_to_tick=capture_scheduler.append_refresh_deferred(),
+            )
         except Exception as e:
             print(f"[{self.user_id}/capture] chat_append coordinator failed: {e}")
         return cached_reply
@@ -1665,7 +1676,11 @@ class UserStore:
             from proactive import capture_scheduler
 
             for cached in cached_docs:
-                capture_scheduler.record_chat_append(self, cached)
+                capture_scheduler.record_chat_append(
+                    self,
+                    cached,
+                    defer_to_tick=capture_scheduler.append_refresh_deferred(),
+                )
         except Exception as e:
             print(f"[{self.user_id}/capture] chat_append coordinator failed: {e}")
         return parent_doc, cached_docs
@@ -1713,7 +1728,11 @@ class UserStore:
         try:
             from proactive import capture_scheduler
 
-            capture_scheduler.record_chat_append(self, winner)
+            capture_scheduler.record_chat_append(
+                self,
+                winner,
+                defer_to_tick=capture_scheduler.append_refresh_deferred(),
+            )
         except Exception as e:
             print(f"[{self.user_id}/capture] chat_append coordinator failed: {e}")
         return winner, True

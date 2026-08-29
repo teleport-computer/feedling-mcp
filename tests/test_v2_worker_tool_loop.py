@@ -38,7 +38,7 @@ from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
-from model_api_runtime.v2 import language_follow
+from chat import language_follow
 from model_api_runtime.v2 import profile_store
 from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import tool_loop
@@ -421,12 +421,10 @@ def test_chat_system_prompt_uses_shared_reply_language_policy(
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
     ))
 
-    policy = reply_language.infer_reply_language_policy(
-        {}, [], locale=locale
+    policy = reply_language.infer_reply_language(
+        locale=locale
     )
-    expected = reply_language.reply_language_system_line(
-        policy, proactive=False
-    )
+    expected = reply_language.reply_language_system_line(policy)
     system_text = str(calls[0]["messages"][0]["content"])
     assert status == "completed"
     assert expected in system_text
@@ -1253,7 +1251,7 @@ def test_chat_thinking_only_keeps_existing_required_reply_fallback(
     assert status == "completed"
     bubbles = _bubbles(uid)
     assert len(bubbles) == 1
-    policy = reply_language.infer_reply_language_policy({}, [], locale=locale)
+    policy = reply_language.infer_reply_language(locale=locale)
     expected = (
         reply_language.DEFAULT_FAILURE_FALLBACK_EN
         if policy.language == "en"
@@ -1306,8 +1304,8 @@ def test_chat_degenerate_fallback_uses_shared_reply_language_policy(
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
     ))
 
-    policy = reply_language.infer_reply_language_policy(
-        {}, [], locale=locale
+    policy = reply_language.infer_reply_language(
+        locale=locale
     )
     expected = (
         reply_language.DEFAULT_FAILURE_FALLBACK_EN
@@ -1472,7 +1470,7 @@ def test_torn_protocol_tail_with_reasoning_head_becomes_fallback(
     assert status == "completed"
     bubbles = _bubbles(uid)
     assert len(bubbles) == 1
-    policy = reply_language.infer_reply_language_policy({}, [], locale=locale)
+    policy = reply_language.infer_reply_language(locale=locale)
     expected = (
         reply_language.DEFAULT_FAILURE_FALLBACK_EN
         if policy.language == "en"
@@ -1595,7 +1593,7 @@ def test_foreground_markup_only_reply_uses_existing_fallback(
 
     assert status == "completed"
     bubble = _bubbles(uid)[0]
-    policy = reply_language.infer_reply_language_policy({}, [], locale=locale)
+    policy = reply_language.infer_reply_language(locale=locale)
     expected = (
         reply_language.DEFAULT_FAILURE_FALLBACK_EN
         if policy.language == "en"

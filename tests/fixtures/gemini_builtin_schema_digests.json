@@ -3,10 +3,11 @@
   "baseline_commit": "f6d17679a273fc7455d5f58c6c40b354fba54ad4",
   "intentional_updates": [
     "T330 web_fetch integer offset and paging description",
-    "T331 retire memory sensitivity schema fields"
+    "T331 retire memory sensitivity schema fields",
+    "T325 route proactive Canvas offers through the V2 system prompt"
   ],
-  "wire_bytes": 31030,
-  "wire_sha256": "b5dde63c817fc0eaea9353ea7c2933ae4e91b7ae373fa5f1d1c97b704e503e84",
+  "wire_bytes": 30815,
+  "wire_sha256": "114b431713cfbe33e483adcb2e07da4673a8b4b41cee5ed34f1472ea35018e5d",
   "schema_sha256": {
     "cancel_wake": "aeb00721a85b3b99116c51d74a4ef21bb1110a4ef5d9bd685fea91546fd6b685",
     "generate_image": "b714761c24145e5c49120b413384b7a67cd0788590b988a345a9283da41d951a",

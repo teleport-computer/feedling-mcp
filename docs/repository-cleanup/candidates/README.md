@@ -14,13 +14,20 @@ gross 删除估算均以该提交为准，实施前必须 rebase `test` 并重�
 |---|---|---|---:|---|
 | 1 | [失效的 `e2e_model_api_test.py`](e2e-model-api-test.md) | `delete`（已实施） | gross 253 行；net 删除 239 行 | 当前 202 契约会被判失败，脚本最终又无条件返回成功 |
 | 2 | [Route-B 旧 selector/feature flag 岛](route-b-readside-island.md) | `delete`（已实施） | gross 删除 540 行；net 删除见实施 PR | 生产继续固定走统一 bucketed selector，旧实现和测试岛已退役 |
-| 3 | [`db.py` 三个零消费者叶子](db-dead-leaves.md) | `delete` | gross 约 31 行；预期 net 接近 31 行 | 无生产、测试、文档和动态调用证据 |
-| 3 | [`v2_user_triage.py` 旧 semantic-compaction 诊断](v2-user-triage-semantic-compaction.md) | `delete`（局部） | gross 约 90–110 行；net 待 diff | 旧 body/char-budget 与泛化错误归因会误诊当前 metadata-only compaction |
-| 4 | [Runtime V2 watchdog 旧兼容层](v2-watchdog-compatibility.md) | `delete` | production gross 约 35–50 行；net 待 diff | 仅服务旧 test-double/旧 Python 参数，需保留当前恢复顺序 |
+| 3 | [`db.py` 三个零消费者叶子](db-dead-leaves.md) | `delete`（已实施） | gross/net 删除 37 行 | 无生产、测试、文档和动态调用证据 |
+| 4 | [`v2_user_triage.py` 旧 semantic-compaction 诊断](v2-user-triage-semantic-compaction.md) | `delete`（局部，已实施） | production gross 删除 121 行；net 删除 76 行 | 旧 body/char-budget 与泛化错误归因会误诊当前 metadata-only compaction |
+| 5 | [Runtime V2 watchdog 旧兼容层](v2-watchdog-compatibility.md) | `delete`（已实施，final diff base `4be66bfd`） | production gross 删除 62 行；net 删除 44 行 | 旧 test-double/旧 Python 参数已移除；当前恢复顺序由 167 例 focused suite 锁定 |
+| 6 | [退役 Redis backend 客户端](retired-redis-backend-client.md) | `delete`（已实施） | production gross 删除 154 行，另删 128 行自测与 `redis-py` | 业务零引用且入口固定拒绝；部署审计/恢复资产独立保留 |
 
-前两项均已实施：失效 E2E 脚本由 canonical E2E 和路由契约测试接管；Route-B 的召回、
+前六项均已实施：失效 E2E 脚本由 canonical E2E 和路由契约测试接管；Route-B 的召回、
 trace 隐私和 query 参数兼容断言已先迁到真实 bucketed 路径，再删除旧 selector、flag、
-测试岛和陈旧文档。其余候选仍须独立重做引用搜索和门禁，不能从前两项的结论外推。
+测试岛和陈旧文档；`db.py` 的三个零消费者叶子则在现役严格读取、CAS 和 freshness
+聚合测试保护下删除；triage 工具也已去掉退役的正文大小/backlog 诊断和泛化错误归因，
+保留精确 coverage 与通用 metadata 输出；Runtime V2 watchdog 则已删去旧 test-double/
+single-timeout Python 兼容面，保留 confirmed-kill 和 exact-owner recovery 顺序；Redis
+backend 客户端则在业务零引用、入口固定拒绝的前提下连同生产依赖删除，部署审计与恢复
+资产继续保留。其余候选
+仍须独立重做引用搜索和门禁，不能从前六项的结论外推。
 
 ## 延后到功能决策
 
@@ -34,6 +41,7 @@ trace 隐私和 query 参数兼容断言已先迁到真实 bucketed 路径，再
   保护边界，不拆分。
 - Alembic 与 TEE migration 历史：属于已应用持久化链，不以零调用判定可删。
 - Redis 部署包：当前是审计/回滚恢复资产；是否退役需要独立运维决策和 live evidence。
+  这不再要求保留零消费者的 Python 客户端或 `redis-py` 生产依赖。
 - TEE reflow/prune/frames、enclave `serving.py`/`asgi_worker.py`：仍承担恢复、复制或
   TLS/attestation 信任边界。
 - `scripts/audit_resident_model_routes.py`、`tools/seed_legacy_memory.py`、
