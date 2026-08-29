@@ -35,10 +35,13 @@ canonical_owner: self
   结果 76 passed。
 - 上述三文件已进入独立 CI batch，并从 `.github/pytest-uncovered-baseline.txt` 移除；
   覆盖棘轮先以 `MAX_EXEMPTED=290 与实际 287 条不符` RED，再收紧到 287 GREEN。
-- 广泛回归在 commit `6d3aa396` 的实现树上运行；因本机另一个 editable package 提供
-  `tests/__init__.py`，显式排除两个会被错误解析到外包的 admin data-track 测试。结果为
-  12,206 passed、4 skipped、9 xfailed；11 个 Genesis 失败与改动前基线相同，另 2 个
-  `FEEDLING_TEST_PG` 缺失失败已用显式环境变量单独复跑为 2 passed。本批相关测试无新增失败。
+- PR 前回归暴露出两个 Genesis worker 文件仍 monkeypatch 已退役的 `get_store` seam；
+  7 处替身迁到生产实际调用的 `get_store_shell_only(..., reason=...)` 后，原 11 个失败消失。
+  两文件新增显式 CI batch、移出 uncovered baseline，棘轮先以 287 对实际 285 RED，再收紧
+  到 285 GREEN。
+- 广泛回归使用显式本机 PostgreSQL；因另一个 editable package 提供 `tests/__init__.py`，
+  排除两个会被错误解析到外包的 admin data-track 文件，并按其既有独立服务流程排除
+  `test_api.py`。结果为 12,220 passed、3 skipped、9 xfailed、3 subtests passed，退出码 0。
 - 合入 `test` 后仍须记录 exact deployed SHA、健康检查和 canonical P0；合入前不把本地
   结果写成 test 环境证据。
 - 未修改 schema、migration、公开 API、部署配置或 `tools/chat_resident_consumer.py`。

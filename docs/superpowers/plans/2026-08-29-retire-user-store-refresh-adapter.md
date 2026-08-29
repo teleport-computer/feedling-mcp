@@ -106,6 +106,11 @@ This record was added after implementation because the bounded in-chat design wa
   three focused files to an explicit CI batch, remove them from the uncovered baseline, observe the
   ratchet fail at 290 versus 287, then set `MAX_EXEMPTED = 287` and require GREEN.
 
+  The broad gate also exposed 11 pre-existing Genesis failures caused by stale tests monkeypatching
+  the retired `get_store` seam. Migrate those fakes to `get_store_shell_only(..., reason=...)`, add
+  both Genesis worker files to explicit CI, observe the ratchet RED at 287 versus 285, then tighten
+  it to 285. Final broad result: 12,220 passed, 3 skipped, 9 xfailed, and 3 subtests passed.
+
 - [ ] **Step 3: Run CI and TEST integration gates**
 
   Push the branch, open a PR to `test`, require CI green, merge, then verify exact deployed SHA,
