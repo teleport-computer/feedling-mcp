@@ -421,6 +421,7 @@ jobs:
             tests/test_v2_cache_retry_metrics.py \
             tests/test_v2_screen_chat.py \
             tests/test_v2_serve_worker_screen_frames.py \
+            tests/test_v2_user_triage.py \
             tests/test_v2_wake_tool_loop.py \
             -v
 

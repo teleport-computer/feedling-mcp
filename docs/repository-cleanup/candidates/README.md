@@ -15,13 +15,15 @@ gross 删除估算均以该提交为准，实施前必须 rebase `test` 并重�
 | 1 | [失效的 `e2e_model_api_test.py`](e2e-model-api-test.md) | `delete`（已实施） | gross 253 行；net 删除 239 行 | 当前 202 契约会被判失败，脚本最终又无条件返回成功 |
 | 2 | [Route-B 旧 selector/feature flag 岛](route-b-readside-island.md) | `delete`（已实施） | gross 删除 540 行；net 删除见实施 PR | 生产继续固定走统一 bucketed selector，旧实现和测试岛已退役 |
 | 3 | [`db.py` 三个零消费者叶子](db-dead-leaves.md) | `delete`（已实施） | gross/net 删除 37 行 | 无生产、测试、文档和动态调用证据 |
-| 4 | [`v2_user_triage.py` 旧 semantic-compaction 诊断](v2-user-triage-semantic-compaction.md) | `delete`（局部） | gross 约 90–110 行；net 待 diff | 旧 body/char-budget 与泛化错误归因会误诊当前 metadata-only compaction |
+| 4 | [`v2_user_triage.py` 旧 semantic-compaction 诊断](v2-user-triage-semantic-compaction.md) | `delete`（局部，已实施） | production gross 删除 121 行；net 删除 76 行 | 旧 body/char-budget 与泛化错误归因会误诊当前 metadata-only compaction |
 | 5 | [Runtime V2 watchdog 旧兼容层](v2-watchdog-compatibility.md) | `delete` | production gross 约 35–50 行；net 待 diff | 仅服务旧 test-double/旧 Python 参数，需保留当前恢复顺序 |
 
-前三项均已实施：失效 E2E 脚本由 canonical E2E 和路由契约测试接管；Route-B 的召回、
+前四项均已实施：失效 E2E 脚本由 canonical E2E 和路由契约测试接管；Route-B 的召回、
 trace 隐私和 query 参数兼容断言已先迁到真实 bucketed 路径，再删除旧 selector、flag、
 测试岛和陈旧文档；`db.py` 的三个零消费者叶子则在现役严格读取、CAS 和 freshness
-聚合测试保护下删除。其余候选仍须独立重做引用搜索和门禁，不能从前三项的结论外推。
+聚合测试保护下删除；triage 工具也已去掉退役的正文大小/backlog 诊断和泛化错误归因，
+保留精确 coverage 与通用 metadata 输出。其余候选仍须独立重做引用搜索和门禁，不能从
+前四项的结论外推。
 
 ## 延后到功能决策
 
