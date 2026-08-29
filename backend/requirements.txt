@@ -113,5 +113,5 @@ redis>=5,<7
 #
 # 升级 = 换 URL 里的版本号 + 重新 `uv pip compile --generate-hashes`。
 # 别写成 @main 或分支名：那样构建就不可复现了，整条证明链失效。
-memgarden @ https://github.com/teleport-computer/memgarden/releases/download/v0.2.0/memgarden-0.2.0-py3-none-any.whl
-agent-protocol-core @ https://github.com/teleport-computer/memgarden/releases/download/v0.2.0/agent_protocol_core-0.2.0-py3-none-any.whl
+memgarden @ https://github.com/teleport-computer/memgarden/releases/download/v0.7.0/memgarden-0.7.0-py3-none-any.whl
+agent-protocol-core @ https://github.com/teleport-computer/memgarden/releases/download/v0.7.0/agent_protocol_core-0.7.0-py3-none-any.whl
