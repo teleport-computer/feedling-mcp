@@ -7273,21 +7273,6 @@ def _self_thinking_internal_term(text: str) -> str | None:
     return self_thinking.internal_field_leak(value)
 
 
-def _self_thinking_language_mismatch(
-    thinking: str, user_rows: Iterable[dict]
-) -> tuple[str, str] | None:
-    """Return (user, thinking) scripts when visible thinking drifts languages."""
-    user_script = _latest_user_writing_system(user_rows)
-    thinking_script = v2_language_follow.classify_writing_system(thinking)
-    if (
-        user_script in {"indeterminate", "mixed"}
-        or thinking_script in {"indeterminate", "mixed"}
-        or user_script == thinking_script
-    ):
-        return None
-    return user_script, thinking_script
-
-
 def _select_thinking_surface(
     provider_reasoning: str,
     *,
@@ -7422,32 +7407,18 @@ async def _emit_reply_language_follow_trace(
     user_rows: Iterable[dict],
     visible_reply: str,
     lane: str,
-    correction_attempted: bool = False,
-    correction_outcome: str = "skipped",
 ) -> None:
     """Emit one terminal, content-free language-follow observation.
 
-    The event stays content-free while also recording the bounded foreground
-    correction disposition. Wake lanes never attempt correction and report the
-    default ``False``/``skipped`` pair.
+    This event describes the writing systems of the published reply and latest
+    classifiable user text.  It is observational only: it does not imply that a
+    foreground rewrite was attempted or available.
     """
 
     if emit_debug_trace is None:
         return
     user_script, reply_script, outcome = _reply_language_follow_observation(
         user_rows, visible_reply
-    )
-    safe_correction_outcome = (
-        correction_outcome
-        if correction_outcome
-        in {
-            "corrected",
-            "kept_original_still_mismatch",
-            "retry_error",
-            "retry_empty",
-            "skipped",
-        }
-        else "skipped"
     )
     safe_lane = "wake" if lane == "wake" else "chat"
     try:
@@ -7458,7 +7429,8 @@ async def _emit_reply_language_follow_trace(
             status="warning" if outcome == "mismatch" else "ok",
             summary="V2 回复文字系统跟随观测",
             explain=(
-                "仅记录用户与可见回复的主导文字系统、匹配结果、纠偏处置和 lane；"
+                "仅记录用户与已发布可见回复的主导文字系统、匹配结果和 lane；"
+                "该事件只做观测，不表示曾尝试或能够进行前台改写；"
                 "不记录正文、比例或思考内容。"
             ),
             detail={
@@ -7466,8 +7438,6 @@ async def _emit_reply_language_follow_trace(
                 "reply_script": reply_script,
                 "outcome": outcome,
                 "lane": safe_lane,
-                "correction_attempted": bool(correction_attempted),
-                "correction_outcome": safe_correction_outcome,
             },
         )
     except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a reply
@@ -14875,23 +14845,10 @@ async def process_job(
         thinking_trace_emitted = False
         language_trace_emitted = False
         language_user_rows: list[dict] = []
-        language_correction_attempted = False
-        language_correction_pending = False
-        language_correction_outcome = "skipped"
-        thinking_language_correction_pending = False
         self_thinking_absent_retry_requests = 0
         self_thinking_absent_retried = 0
         self_thinking_absent_retry_pending = False
         self_thinking_absent_retry_response_seen = False
-
-        def _cancel_language_correction() -> None:
-            nonlocal language_correction_attempted
-            nonlocal language_correction_pending, language_correction_outcome
-            nonlocal thinking_language_correction_pending
-            language_correction_attempted = False
-            language_correction_pending = False
-            language_correction_outcome = "skipped"
-            thinking_language_correction_pending = False
 
         def _cancel_self_thinking_absent_retry() -> None:
             nonlocal self_thinking_absent_retry_requests
@@ -14902,10 +14859,6 @@ async def process_job(
             self_thinking_absent_retried = 0
             self_thinking_absent_retry_pending = False
             self_thinking_absent_retry_response_seen = False
-
-        def _cancel_self_thinking_absent_language_retry() -> None:
-            _cancel_self_thinking_absent_retry()
-            _cancel_language_correction()
 
         async def _on_reply(
             text: str | WorkspaceFileReply,
@@ -14922,9 +14875,6 @@ async def process_job(
             nonlocal final_job_completed_atomically, voice_reply_slot
             nonlocal voice_call_ended_atomically
             nonlocal thinking_trace_emitted, language_trace_emitted
-            nonlocal language_correction_attempted
-            nonlocal language_correction_pending, language_correction_outcome
-            nonlocal thinking_language_correction_pending
             nonlocal self_thinking_absent_retry_requests
             nonlocal self_thinking_absent_retried
             nonlocal self_thinking_absent_retry_pending
@@ -15129,24 +15079,6 @@ async def process_job(
                         self_thinking_absent_retried += 1
                     self_thinking_absent_retry_pending = False
                     self_thinking_absent_retry_response_seen = False
-                else:
-                    safe_outcomes = {
-                        "corrected",
-                        "kept_original_still_mismatch",
-                        "retry_error",
-                        "retry_empty",
-                        "skipped",
-                    }
-                    language_correction_outcome = (
-                        correction_outcome
-                        if correction_outcome in safe_outcomes
-                        else "skipped"
-                    )
-                    language_correction_attempted = (
-                        language_correction_outcome != "skipped"
-                    )
-                    language_correction_pending = False
-                    thinking_language_correction_pending = False
             elif (
                 final
                 and file_reply is None
@@ -15154,7 +15086,6 @@ async def process_job(
                 and not image_replies
                 and text
             ):
-                retry_completed = False
                 if self_thinking_absent_retry_pending:
                     self_thinking_absent_retried += 1
                     self_thinking_absent_retry_response_seen = True
@@ -15164,7 +15095,6 @@ async def process_job(
                     ):
                         self_thinking_absent_retry_pending = False
                         self_thinking_absent_retry_response_seen = False
-                        retry_completed = True
                     else:
                         # A correction may improve the saved candidate only by
                         # satisfying the existing COMPLETE contract. ABSENT,
@@ -15182,93 +15112,12 @@ async def process_job(
                     correction_instruction = (
                         _SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION
                     )
-                    correction_cancel = _cancel_self_thinking_absent_retry
-                    (
-                        user_script,
-                        reply_script,
-                        follow_outcome,
-                    ) = _reply_language_follow_observation(
-                        language_user_rows, text
-                    )
-                    if (
-                        follow_outcome == "mismatch"
-                        and user_script not in {"indeterminate", "mixed"}
-                        and reply_script not in {"indeterminate", "mixed"}
-                    ):
-                        language_correction_attempted = True
-                        language_correction_pending = True
-                        correction_instruction += (
-                            "\n\n"
-                            + v2_language_follow.CORRECTION_INSTRUCTION
-                            + "\n这次重写要同时完成两件事：保留 <think>…</think> "
-                            "结构，并让思考段和可见回复都与用户语言一致。"
-                        )
-                        correction_cancel = (
-                            _cancel_self_thinking_absent_language_retry
-                        )
                     return v2_tool_loop.FinalReplyCorrectionRequest(
                         instruction=correction_instruction,
                         original_text=raw_reply_text,
                         original_reasoning=reasoning,
-                        on_cancel=correction_cancel,
+                        on_cancel=_cancel_self_thinking_absent_retry,
                     )
-                # One correction round is already consumed after an ABSENT retry.
-                # Validate any combined language requirement below, but never add
-                # a second hidden rewrite beside this bounded correction.
-                (
-                    user_script,
-                    reply_script,
-                    follow_outcome,
-                ) = _reply_language_follow_observation(language_user_rows, text)
-                visible_language_mismatch = (
-                    follow_outcome == "mismatch"
-                    and user_script not in {"indeterminate", "mixed"}
-                    and reply_script not in {"indeterminate", "mixed"}
-                )
-                thinking_mismatch = (
-                    _self_thinking_language_mismatch(
-                        self_thinking_text, language_user_rows
-                    )
-                    if self_thinking_text
-                    else None
-                )
-                if (
-                    not retry_completed
-                    and not language_correction_pending
-                    and not thinking_language_correction_pending
-                    and not correction_outcome
-                    and (visible_language_mismatch or thinking_mismatch is not None)
-                ):
-                    language_correction_attempted = True
-                    language_correction_pending = True
-                    thinking_language_correction_pending = (
-                        thinking_mismatch is not None
-                    )
-                    correction_instruction = (
-                        v2_language_follow.CORRECTION_INSTRUCTION
-                    )
-                    if self_thinking_text:
-                        correction_instruction += (
-                            "\n重写时保留 <think>…</think> 结构，并让思考段和可见回复"
-                            "都与用户语言一致。"
-                        )
-                    return v2_tool_loop.FinalReplyCorrectionRequest(
-                        instruction=correction_instruction,
-                        original_text=raw_reply_text,
-                        original_reasoning=reasoning,
-                        on_cancel=_cancel_language_correction,
-                    )
-                if language_correction_pending:
-                    if reply_script == user_script and thinking_mismatch is None:
-                        language_correction_pending = False
-                        thinking_language_correction_pending = False
-                        language_correction_outcome = "corrected"
-                    else:
-                        # The loop still owns the original candidate. Reject this
-                        # one without publishing so it can fail-open to that exact
-                        # original rather than exposing a second wrong-language
-                        # rewrite.
-                        return v2_tool_loop.FinalReplyCorrectionRejected()
             delivery_started_ns = time.monotonic_ns()
             # A cutover/ABA can happen while awaiting the provider. Fence at
             # the reply effect itself; the pre-round check is not sufficient.
@@ -15610,8 +15459,6 @@ async def process_job(
                             user_rows=language_user_rows,
                             visible_reply=text,
                             lane="chat",
-                            correction_attempted=language_correction_attempted,
-                            correction_outcome=language_correction_outcome,
                         )
                     final_job_completed_atomically = True
                     return
@@ -15698,8 +15545,6 @@ async def process_job(
                     user_rows=language_user_rows,
                     visible_reply=text,
                     lane="chat",
-                    correction_attempted=language_correction_attempted,
-                    correction_outcome=language_correction_outcome,
                 )
 
         # `seq` is exclusively the consumed user|human frontier. The base prompt's

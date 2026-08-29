@@ -38,7 +38,6 @@ from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
-from chat import language_follow
 from model_api_runtime.v2 import profile_store
 from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import tool_loop
@@ -651,13 +650,11 @@ def test_language_follow_emits_once_for_terminal_visible_body_after_thinking(
         "reply_script": "latin",
         "outcome": "match",
         "lane": "chat",
-        "correction_attempted": True,
-        "correction_outcome": "retry_error",
     }
     assert private_thinking not in json.dumps(language_traces, ensure_ascii=False)
 
 
-def test_chat_thinking_and_visible_language_mismatch_share_one_correction(
+def test_chat_thinking_language_mismatch_does_not_trigger_a_rewrite(
     monkeypatch,
 ):
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
@@ -677,10 +674,6 @@ def test_chat_thinking_and_visible_language_mismatch_share_one_correction(
         _tool_round(_tc("s2", "web_search", query="second")),
         _text_round(
             "<think>The file is ready and I will finish in English.</think>"
-            "Your work is saved and delivered successfully. You can open it now."
-        ),
-        _text_round(
-            "<think>文件已经准备好，我会用中文完成回复。</think>"
             "文件已经生成并发送，可以直接下载了。"
         ),
     ])
@@ -689,7 +682,7 @@ def test_chat_thinking_and_visible_language_mismatch_share_one_correction(
         "id": "m-thinking-visible-language-correction",
         "ts": 10.0,
         "role": "user",
-        "content": "请处理这件事情，完成以后用中文给我一句简短回复。",
+        "content": "请处理这件事情，完成以后明确使用英文给我回复。",
     }])
     deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
         {"user_id": user_id, "type": event_type, **fields}
@@ -700,15 +693,12 @@ def test_chat_thinking_and_visible_language_mismatch_share_one_correction(
     ))
 
     assert status == "completed"
-    assert len(calls) == 4
-    correction_prompt = str(calls[3]["messages"])
-    assert language_follow.CORRECTION_INSTRUCTION in correction_prompt
-    assert "思考段和可见回复都与用户语言一致" in correction_prompt
+    assert len(calls) == 3
     assert [row["body_ct"] for row in _bubbles(uid)] == [
         "文件已经生成并发送，可以直接下载了。"
     ]
     assert _bubbles(uid)[0]["thinking_body_ct"] == (
-        "文件已经准备好，我会用中文完成回复。"
+        "The file is ready and I will finish in English."
     )
     language_trace = next(
         trace for trace in traces if trace["type"] == "reply.language_follow"
@@ -718,12 +708,10 @@ def test_chat_thinking_and_visible_language_mismatch_share_one_correction(
         "reply_script": "han",
         "outcome": "match",
         "lane": "chat",
-        "correction_attempted": True,
-        "correction_outcome": "corrected",
     }
 
 
-def test_chat_language_mismatch_rewrites_once_and_publishes_matching_reply(
+def test_chat_visible_language_mismatch_does_not_trigger_a_rewrite(
     monkeypatch,
 ):
     monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
@@ -733,16 +721,14 @@ def test_chat_language_mismatch_rewrites_once_and_publishes_matching_reply(
     jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w-language-correction-success")
     _patch_real_write(monkeypatch)
-    calls = _script_provider(monkeypatch, [
-        _text_round("This is the original answer in the wrong language"),
-        _text_round("这是改写后与用户语言一致的完整中文回复"),
-    ])
+    original = "This is the original answer in the wrong language"
+    calls = _script_provider(monkeypatch, [_text_round(original)])
     traces = []
     deps = _deps(messages=[{
         "id": "m-language-correction-success",
         "ts": 10.0,
         "role": "user",
-        "content": "这是用户正在使用中文提出的完整问题内容",
+        "content": "这是完整问题内容，请你务必使用英文回答这个问题",
     }])
     deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
         {"user_id": user_id, "type": event_type, **fields}
@@ -753,112 +739,53 @@ def test_chat_language_mismatch_rewrites_once_and_publishes_matching_reply(
     ))
 
     assert status == "completed"
-    assert len(calls) == 2
-    assert calls[1]["tools"] is None
-    assert language_follow.CORRECTION_INSTRUCTION in json.dumps(
-        calls[1]["messages"], ensure_ascii=False
-    )
-    assert [row["body_ct"] for row in _bubbles(uid)] == [
-        "这是改写后与用户语言一致的完整中文回复"
-    ]
+    assert len(calls) == 1
+    assert [row["body_ct"] for row in _bubbles(uid)] == [original]
     language_trace = next(
         trace for trace in traces if trace["type"] == "reply.language_follow"
     )
     assert language_trace["detail"] == {
         "user_script": "han",
-        "reply_script": "han",
-        "outcome": "match",
+        "reply_script": "latin",
+        "outcome": "mismatch",
         "lane": "chat",
-        "correction_attempted": True,
-        "correction_outcome": "corrected",
     }
 
 
-@pytest.mark.parametrize(
-    ("retry", "expected_outcome"),
-    [
-        (
-            provider_client.ProviderError("rewrite unavailable", status_code=400),
-            "retry_error",
-        ),
-        (_text_round(""), "retry_empty"),
-    ],
-)
-def test_chat_language_correction_failure_keeps_original(
-    monkeypatch, retry, expected_outcome,
-):
-    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
-    uid = f"u_language_correction_{expected_outcome}"
-    conftest.seed_user(uid)
-    _reset(uid)
-    jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job(f"w-{expected_outcome}")
-    _patch_real_write(monkeypatch)
-    original = "This usable original answer must survive correction failure"
-    calls = _script_provider(monkeypatch, [_text_round(original), retry])
-    traces = []
-    deps = _deps(messages=[{
-        "id": f"m-{expected_outcome}",
-        "ts": 10.0,
-        "role": "user",
-        "content": "这是用户正在使用中文提出的完整问题内容",
-    }])
-    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
-        {"user_id": user_id, "type": event_type, **fields}
-    )
-
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
-    ))
-
-    assert status == "completed"
-    assert len(calls) == 2
-    assert [row["body_ct"] for row in _bubbles(uid)] == [original]
-    language_trace = next(
-        trace for trace in traces if trace["type"] == "reply.language_follow"
-    )
-    assert language_trace["detail"]["correction_attempted"] is True
-    assert language_trace["detail"]["correction_outcome"] == expected_outcome
-
-
-def test_chat_language_correction_still_mismatch_keeps_original_and_stops(
+def test_chat_thinking_language_mismatch_publishes_the_first_candidate(
     monkeypatch,
 ):
-    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
-    uid = "u_language_correction_still_mismatch"
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_thinking_correction_visible_mismatch"
     conftest.seed_user(uid)
     _reset(uid)
     jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w-language-correction-still-mismatch")
-    _patch_real_write(monkeypatch)
-    original = "This is the first usable answer in the wrong language"
+    job = jobs_store.claim_next_job("w-thinking-correction-visible-mismatch")
+    _stub_envelope_build(monkeypatch)
     calls = _script_provider(monkeypatch, [
-        _text_round(original),
-        _text_round("This retry is still written in the wrong language"),
+        _text_round(
+            "<think>I will answer after checking the request carefully.</think>"
+            "这是第一条可见中文回复，只有思考语言不一致。"
+        ),
     ])
-    traces = []
     deps = _deps(messages=[{
-        "id": "m-language-correction-still-mismatch",
+        "id": "m-thinking-correction-visible-mismatch",
         "ts": 10.0,
         "role": "user",
         "content": "这是用户正在使用中文提出的完整问题内容",
     }])
-    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
-        {"user_id": user_id, "type": event_type, **fields}
-    )
 
     status = asyncio.run(worker.process_job(
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
     ))
 
     assert status == "completed"
-    assert len(calls) == 2
-    assert [row["body_ct"] for row in _bubbles(uid)] == [original]
-    language_trace = next(
-        trace for trace in traces if trace["type"] == "reply.language_follow"
-    )
-    assert language_trace["detail"]["correction_outcome"] == (
-        "kept_original_still_mismatch"
+    assert len(calls) == 1
+    assert [row["body_ct"] for row in _bubbles(uid)] == [
+        "这是第一条可见中文回复，只有思考语言不一致。"
+    ]
+    assert _bubbles(uid)[0]["thinking_body_ct"] == (
+        "I will answer after checking the request carefully."
     )
 
 
@@ -871,7 +798,7 @@ def test_chat_language_correction_still_mismatch_keeps_original_and_stops(
         ("这是用户正在使用中文提出的完整问题内容", "okay"),
     ],
 )
-def test_chat_language_correction_skips_uncertain_or_matching_scripts(
+def test_chat_language_observation_never_rewrites_visible_reply(
     monkeypatch, user_text, reply_text,
 ):
     monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
@@ -2374,7 +2301,7 @@ def test_genuinely_unclassified_process_failure_stays_unknown(monkeypatch):
     assert terminal_row == ("turn_failed:workspace_prompt_unavailable", "unknown")
 
 
-def test_chat_self_thinking_absent_wrong_language_combines_one_correction(
+def test_chat_self_thinking_absent_retry_has_no_visible_language_rider(
     monkeypatch,
 ):
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
@@ -2412,7 +2339,7 @@ def test_chat_self_thinking_absent_wrong_language_combines_one_correction(
     assert len(calls) == 2
     retry_system = str(calls[1]["messages"][0]["content"])
     assert worker._SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION in retry_system
-    assert language_follow.CORRECTION_INSTRUCTION in retry_system
+    assert "你刚才这条回复,语言和这个人正在说的语言对不上" not in retry_system
     assert [row["body_ct"] for row in _bubbles(uid)] == [
         "文件已经生成并发送，可以直接下载了。"
     ]
@@ -2429,8 +2356,6 @@ def test_chat_self_thinking_absent_wrong_language_combines_one_correction(
         "reply_script": "han",
         "outcome": "match",
         "lane": "chat",
-        "correction_attempted": True,
-        "correction_outcome": "corrected",
     }
 
 
