@@ -1,7 +1,7 @@
 """Create the PerceptKit logical storage objects.
 
-Revision ID: 0105_perceptkit_objects
-Revises: 0104_distill_artifact_ledger
+Revision ID: 0106_perceptkit_objects
+Revises: 0105_account_recover_challenges
 
 PerceptKit defines logical objects and port semantics; choosing tables and
 indexes is the host's job. These are that choice.
@@ -19,8 +19,8 @@ This migration only creates tables. Nothing reads or writes them yet.
 from alembic import op
 
 
-revision = "0105_perceptkit_objects"
-down_revision = "0104_distill_artifact_ledger"
+revision = "0106_perceptkit_objects"
+down_revision = "0105_account_recover_challenges"
 branch_labels = None
 depends_on = None
 
