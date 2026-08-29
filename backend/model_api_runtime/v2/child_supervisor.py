@@ -327,13 +327,6 @@ class ChildSupervisor:
             self._drop_broker_generations(generations_to_drop)
         return KillOutcome(active_job=active_job, terminated=terminated)
 
-    def kill_and_respawn(self, *, join_timeout: float = 5.0) -> None:
-        """Compatibility wrapper; new recovery paths call kill/recover/start."""
-        with self._lifecycle_lock:
-            outcome = self._kill_locked(join_timeout=join_timeout)
-            if outcome.terminated:
-                self._start_locked()
-
     def kill_if_snapshot(
         self,
         expected: slot_protocol.SlotProgress,

@@ -4,8 +4,8 @@ Two layers:
 - `watchdog.should_kill` — pure decision function, no I/O, exhaustively unit tested.
 - `watchdog._watchdog_loop` — the parent asyncio loop that polls a (fake, injected)
   supervisor + a jobs-claimable predicate every ``interval`` seconds and, on a kill
-  decision, writes capacity=0 BEFORE calling `supervisor.kill_and_respawn()` (so
-  admission observes the drop immediately, without racing the actual kill).
+  decision, snapshots the slot, writes capacity=0, confirms termination, recovers
+  the exact owner, then starts its replacement.
 
 Mirrors the `_reaper_loop`/`_heartbeat_loop` driver pattern in
 `tests/test_v2_serve_worker.py` (short interval + poll-until-N-calls + stop_event.set()
@@ -19,6 +19,7 @@ import threading
 import db
 from conftest import seed_user
 from model_api_runtime.v2 import (
+    child_supervisor,
     claim_recovery,
     jobs_store,
     serve_worker,
@@ -37,6 +38,19 @@ def _kw(**overrides):
           "jobs_claimable": True}
     kw.update(overrides)
     return kw
+
+
+def test_should_kill_rejects_retired_single_timeout_kwarg():
+    """A caller must supply distinct stall and absolute budgets."""
+    import pytest
+
+    with pytest.raises(TypeError):
+        watchdog.should_kill(
+            {"alive": True, "last_progress_age_sec": 1.0},
+            child_liveness_timeout_sec=45.0,
+            jobs_claimable=False,
+            turn_hard_timeout_sec=180.0,
+        )
 
 
 def test_claim_recovery_queue_is_bounded_and_coalesces_exact_owner_key():
@@ -243,14 +257,19 @@ class _FakeSupervisor:
     def poll_liveness(self) -> dict:
         return dict(self._liveness)
 
-    def kill_and_respawn(self) -> None:
+    def snapshot(self):
+        return None
+
+    def kill_for_recovery(self):
         self.kill_calls += 1
+        return child_supervisor.KillOutcome(active_job=None, terminated=True)
+
+    def start(self) -> None:
+        pass
 
 
 def test_watchdog_orders_capacity_snapshot_kill_recover_start(monkeypatch):
-    """On a kill decision: capacity=0 must be recorded strictly before
-    kill_and_respawn() runs (admission must see the drop before the SIGKILL races
-    a fresh claim in) — assert via a shared ordering log both fakes append to."""
+    """A confirmed recovery snapshots, fences capacity, recovers exactly, then starts."""
     order: list[str] = []
 
     from model_api_runtime.v2 import jobs_store
@@ -273,10 +292,10 @@ def test_watchdog_orders_capacity_snapshot_kill_recover_start(monkeypatch):
             order.append("snapshot")
             return snapshot
 
-        def kill(self):
+        def kill_for_recovery(self):
             order.append("kill")
             self.kill_calls += 1
-            return active
+            return child_supervisor.KillOutcome(active_job=active, terminated=True)
 
         def start(self):
             order.append("start")
@@ -313,7 +332,7 @@ def test_watchdog_orders_capacity_snapshot_kill_recover_start(monkeypatch):
 
     asyncio.run(_driver())
     assert supervisor.kill_calls >= 1
-    assert order[:5] == ["capacity_zero", "snapshot", "kill", "recover", "start"]
+    assert order[:5] == ["snapshot", "capacity_zero", "kill", "recover", "start"]
 
 
 def test_watchdog_does_not_recover_claim_when_kill_is_unconfirmed(monkeypatch):
@@ -349,9 +368,6 @@ def test_watchdog_does_not_recover_claim_when_kill_is_unconfirmed(monkeypatch):
         def kill_for_recovery(self):
             self.kill_calls += 1
             return _Outcome()
-
-        def kill(self):
-            raise AssertionError("watchdog must use confirmed kill outcome")
 
         def start(self):
             self.start_calls += 1
@@ -445,9 +461,9 @@ def test_watchdog_restarts_and_queues_exact_retry_when_recovery_raises(monkeypat
         def snapshot(self):
             return snapshot
 
-        def kill(self):
+        def kill_for_recovery(self):
             self.kill_calls += 1
-            return active
+            return child_supervisor.KillOutcome(active_job=active, terminated=True)
 
         def start(self):
             self.start_calls += 1
@@ -512,7 +528,13 @@ def test_watchdog_loop_swallows_per_iteration_errors(monkeypatch):
                 raise RuntimeError("transient supervisor error")
             return {"alive": True, "last_progress_age_sec": 1.0}
 
-        def kill_and_respawn(self):
+        def snapshot(self):
+            return None
+
+        def kill_for_recovery(self):
+            return child_supervisor.KillOutcome(active_job=None, terminated=True)
+
+        def start(self):
             pass
 
     supervisor = _FlakySupervisor()
@@ -581,9 +603,10 @@ def test_capacity_write_timeout_cannot_block_kill(monkeypatch):
     monkeypatch.setattr(jobs_store, "record_worker_heartbeat", _hung_heartbeat)
 
     class _ReleasingSupervisor(_FakeSupervisor):
-        def kill_and_respawn(self):
-            super().kill_and_respawn()
+        def kill_for_recovery(self):
+            outcome = super().kill_for_recovery()
             release.set()  # let the timed-out executor thread drain cleanly
+            return outcome
 
     supervisor = _ReleasingSupervisor({"alive": False, "last_progress_age_sec": math.inf})
     stop_event = asyncio.Event()

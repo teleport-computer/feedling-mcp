@@ -14,13 +14,9 @@ reaper、scheduler 与 reconcile 的独立职责。
 **为什么要拆成 pure decision + 一个薄 parent loop**：`ChildSupervisor.poll_liveness()`
 报告单个 slot child 的时钟；谁来观察及执行恢复则属于 parent。`should_kill` 保持纯函数
 （无 I/O，输入即输出，穷举分支可测），`_watchdog_loop` 只组合一个 supervisor 与
-jobs-claimable 判定。真实 `SlotFleet` 路径的顺序是：先尽力写该 pool/slot 的
-``capacity=0``，确认 SIGKILL，按精确 ``job_id + claimed_by`` 恢复 claim，最后启动该
-slot replacement。DB 写有超时，不能阻挡物理 kill。
-
-**兼容性边界**：`_watchdog_loop` 仍接受缺少 snapshot/confirmed-kill 接口的窄测试 double，
-以保留早期 ``kill_and_respawn`` wrapper 的单元测试表面。那条 fallback 没有 exact identity，
-不是当前 `SlotFleet` 的 production recovery path。
+jobs-claimable 判定。真实 `SlotFleet` 路径的顺序是：先 snapshot 当前 slot，尽力写该
+pool/slot 的 ``capacity=0``，确认 SIGKILL，按精确 ``job_id + claimed_by`` 恢复 claim，
+最后启动该 slot replacement。DB 写有超时，不能阻挡物理 kill。
 
 **两层 liveness**：event-loop heartbeat 变旧意味着该 slot child 已不能调度，因而无需查
 队列即可恢复；slot progress 只在此 slot 的 claim/idle/turn 边界更新。progress 变旧、loop
@@ -48,8 +44,6 @@ class _SupervisorLike(Protocol):
 
     def snapshot(self): ...
 
-    def kill(self) -> slot_protocol.ActiveJobIdentity | None: ...
-
     def kill_for_recovery(self): ...
 
     def start(self) -> None: ...
@@ -60,9 +54,8 @@ def should_kill(
     *,
     child_liveness_timeout_sec: float,
     jobs_claimable: bool,
-    turn_stall_timeout_sec: float | None = None,
-    turn_absolute_timeout_sec: float | None = None,
-    turn_hard_timeout_sec: float | None = None,
+    turn_stall_timeout_sec: float,
+    turn_absolute_timeout_sec: float,
     child_startup_timeout_sec: float | None = None,
 ) -> bool:
     """PURE — no I/O, no clock reads (the caller already resolved `liveness` and
@@ -92,16 +85,6 @@ def should_kill(
     yet, or the child is confirmed dead) — the `>` comparison handles that with no
     special-casing.
     """
-    # Compatibility for the pre-split pure-function/test surface.  Production
-    # always supplies both new budgets; an older caller's one hard timeout keeps
-    # its historical absolute-age semantics rather than failing at call time.
-    if turn_stall_timeout_sec is None:
-        turn_stall_timeout_sec = turn_hard_timeout_sec
-    if turn_absolute_timeout_sec is None:
-        turn_absolute_timeout_sec = turn_hard_timeout_sec
-    if turn_stall_timeout_sec is None or turn_absolute_timeout_sec is None:
-        raise TypeError("turn stall and absolute timeout budgets are required")
-
     if not liveness.get("alive", False):
         return True
 
@@ -155,9 +138,8 @@ async def _watchdog_loop(
     jobs_claimable_fn: Callable[[], bool],
     interval: float,
     child_liveness_timeout_sec: float,
-    turn_stall_timeout_sec: float | None = None,
-    turn_absolute_timeout_sec: float | None = None,
-    turn_hard_timeout_sec: float | None = None,
+    turn_stall_timeout_sec: float,
+    turn_absolute_timeout_sec: float,
     jobs_claimable_timeout_sec: float = 5.0,
     capacity_write_timeout_sec: float = 5.0,
     recovery_timeout_sec: float = 5.0,
@@ -183,13 +165,6 @@ async def _watchdog_loop(
     per-iteration exception is caught and logged so a bad slot cannot crash the
     parent fleet's heartbeat, reaper, scheduler, or other slot watchdogs.
     """
-    if turn_stall_timeout_sec is None:
-        turn_stall_timeout_sec = turn_hard_timeout_sec
-    if turn_absolute_timeout_sec is None:
-        turn_absolute_timeout_sec = turn_hard_timeout_sec
-    if turn_stall_timeout_sec is None or turn_absolute_timeout_sec is None:
-        raise TypeError("turn stall and absolute timeout budgets are required")
-
     claimable_task: asyncio.Task | None = None
 
     def _observe_claimable_task(task: asyncio.Task) -> None:
@@ -204,6 +179,7 @@ async def _watchdog_loop(
         log.warning(
             "[v2.watchdog] kill decision worker=%s liveness=%s claimable=%s",
             worker_id, liveness, claimable)
+        snapshot = supervisor.snapshot()
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(
@@ -214,33 +190,20 @@ async def _watchdog_loop(
         except asyncio.TimeoutError:
             log.error(
                 "[v2.watchdog] capacity=0 heartbeat write timed out worker=%s "
-                "(proceeding to kill_and_respawn)", worker_id)
+                "(proceeding to confirmed kill)", worker_id)
         except Exception:  # noqa: BLE001 — best-effort; the kill must proceed regardless
             log.exception(
                 "[v2.watchdog] capacity=0 heartbeat write failed worker=%s "
-                "(proceeding to kill_and_respawn anyway)", worker_id)
-        if not all(hasattr(supervisor, name) for name in ("snapshot", "kill", "start")):
-            # Test-double compatibility while production has fully moved to
-            # the split lifecycle. No exact identity exists on this path.
-            await asyncio.to_thread(supervisor.kill_and_respawn)
+                "(proceeding to confirmed kill anyway)", worker_id)
+        outcome = await asyncio.to_thread(supervisor.kill_for_recovery)
+        if not bool(outcome.terminated):
+            log.error(
+                "[v2.watchdog] child termination unconfirmed worker=%s; "
+                "retaining DB claim and refusing replacement",
+                worker_id,
+            )
             return
-        snapshot = supervisor.snapshot()
-        kill_for_recovery = getattr(supervisor, "kill_for_recovery", None)
-        if callable(kill_for_recovery):
-            outcome = await asyncio.to_thread(kill_for_recovery)
-            if not bool(outcome.terminated):
-                log.error(
-                    "[v2.watchdog] child termination unconfirmed worker=%s; "
-                    "retaining DB claim and refusing replacement",
-                    worker_id,
-                )
-                return
-            killed_identity = outcome.active_job
-        else:
-            # Compatibility for narrow test doubles. Production supervisors
-            # expose the explicit, confirmed kill outcome above.
-            killed_identity = await asyncio.to_thread(supervisor.kill)
-        active_job = killed_identity or (
+        active_job = outcome.active_job or (
             None if snapshot is None else snapshot.active_job
         )
         try:
