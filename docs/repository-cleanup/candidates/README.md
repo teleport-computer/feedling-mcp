@@ -18,16 +18,18 @@ gross 删除估算均以该提交为准，实施前必须 rebase `test` 并重�
 | 4 | [`v2_user_triage.py` 旧 semantic-compaction 诊断](v2-user-triage-semantic-compaction.md) | `delete`（局部，已实施） | production gross 删除 121 行；net 删除 76 行 | 旧 body/char-budget 与泛化错误归因会误诊当前 metadata-only compaction |
 | 5 | [Runtime V2 watchdog 旧兼容层](v2-watchdog-compatibility.md) | `delete`（已实施，final diff base `4be66bfd`） | production gross 删除 62 行；net 删除 44 行 | 旧 test-double/旧 Python 参数已移除；当前恢复顺序由 167 例 focused suite 锁定 |
 | 6 | [退役 Redis backend 客户端](retired-redis-backend-client.md) | `delete`（已实施） | production gross 删除 154 行，另删 128 行自测与 `redis-py` | 业务零引用且入口固定拒绝；部署审计/恢复资产独立保留 |
+| 7 | [`UserStore` 定向刷新旧适配器](user-store-refresh-compatibility.md) | `delete`（已实施） | production gross/net 删除 23 行 | 生产缓存恒为 `UserStore`；旧分支绕过 section 状态且只被测试替身消费 |
 
-前六项均已实施：失效 E2E 脚本由 canonical E2E 和路由契约测试接管；Route-B 的召回、
+前七项均已实施：失效 E2E 脚本由 canonical E2E 和路由契约测试接管；Route-B 的召回、
 trace 隐私和 query 参数兼容断言已先迁到真实 bucketed 路径，再删除旧 selector、flag、
 测试岛和陈旧文档；`db.py` 的三个零消费者叶子则在现役严格读取、CAS 和 freshness
 聚合测试保护下删除；triage 工具也已去掉退役的正文大小/backlog 诊断和泛化错误归因，
 保留精确 coverage 与通用 metadata 输出；Runtime V2 watchdog 则已删去旧 test-double/
 single-timeout Python 兼容面，保留 confirmed-kill 和 exact-owner recovery 顺序；Redis
 backend 客户端则在业务零引用、入口固定拒绝的前提下连同生产依赖删除，部署审计与恢复
-资产继续保留。其余候选
-仍须独立重做引用搜索和门禁，不能从前六项的结论外推。
+资产继续保留；定向 store 刷新则统一走现役 section API，不再为测试替身直接调用私有
+loader。其余候选
+仍须独立重做引用搜索和门禁，不能从前七项的结论外推。
 
 ## 延后到功能决策
 

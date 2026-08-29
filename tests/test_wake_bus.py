@@ -522,43 +522,45 @@ def test_store_channels_refresh_only_their_component(monkeypatch):
     from core import store as core_store
 
     calls = []
+    store = core_store.UserStore("u7")
+    loaders = {
+        "_load_frames_meta": "frames",
+        "_load_world_books": "world_books",
+        "_load_tokens": "tokens",
+        "_load_live_activity_state": "live",
+        "_load_push_state": "push",
+    }
+    for method, label in loaders.items():
+        monkeypatch.setattr(
+            store,
+            method,
+            lambda label=label: calls.append(label),
+        )
+    store.ensure_sections(
+        {
+            StoreSection.FRAMES,
+            StoreSection.WORLD_BOOKS,
+            StoreSection.TOKENS,
+            StoreSection.LIVE_ACTIVITY,
+            StoreSection.PUSH_STATE,
+        }
+    )
+    calls.clear()
+    proactive_waiter = threading.Event()
+    store.proactive_job_waiters.append(proactive_waiter)
 
-    class Store:
-        user_id = "u7"
-        frames_lock = threading.Lock()
-        world_books_lock = threading.Lock()
-        proactive_job_waiters_lock = threading.Lock()
-        proactive_job_waiters = []
-
-        def _load_frames_meta(self):
-            calls.append("frames")
-
-        def _load_world_books(self):
-            calls.append("world_books")
-
-        def _load_tokens(self):
-            calls.append("tokens")
-
-        def _load_live_activity_state(self):
-            calls.append("live")
-
-        def _load_push_state(self):
-            calls.append("push")
-
-        def notify_proactive_job_waiters(self):
-            calls.append("proactive")
-
-    monkeypatch.setattr(core_store, "_stores", {"u7": Store()})
+    monkeypatch.setattr(core_store, "_stores", {"u7": store})
     monkeypatch.setattr(core_store, "_evict_store", lambda _uid: calls.append("all"))
 
     wake_bus._dispatch(json.dumps({"u": "u7", "c": "frames", "o": "OTHER"}))
     assert calls == ["frames"]
     calls.clear()
     wake_bus._dispatch(json.dumps({"u": "u7", "c": "blob", "o": "OTHER"}))
-    assert calls == ["world_books", "tokens", "live", "push"]
+    assert set(calls) == {"world_books", "tokens", "live", "push"}
     calls.clear()
     wake_bus._dispatch(json.dumps({"u": "u7", "c": "proactive", "o": "OTHER"}))
-    assert calls == ["proactive"]
+    assert calls == []
+    assert proactive_waiter.is_set()
 
 
 def test_chat_sync_mode_is_validated(monkeypatch):

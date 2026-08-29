@@ -9,9 +9,9 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 
 | Lifecycle | Classified documents |
 |---|---:|
-| `current` | 52 |
+| `current` | 56 |
 | `decision` | 23 |
-| `historical` | 45 |
+| `historical` | 47 |
 | `generated` | 1 |
 
 ## current
@@ -35,11 +35,14 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md`
 - `docs/CURRENT_STATE.md`
 - `docs/DOCUMENT_LIFECYCLE.md`
+- `docs/EXECUTION_ASSEMBLY_MAP.md`
+- `docs/MEMORY.md`
 - `docs/OPTIMIZATION_BACKLOG.md`
 - `docs/PERCEPTION_ARCHITECTURE.zh.md`
 - `docs/PERCEPTION_PROMPT_ASSETS.zh.md`
 - `docs/PROJECT_OVERVIEW.md`
 - `docs/RDS_TRACE_PARTITIONS_RUNBOOK.md`
+- `docs/REDIS_USAGE.md`
 - `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md`
 - `docs/ops/chat-incremental-sync-runbook.md`
 - `docs/ops/metadata-first-user-store-runbook.md`
@@ -50,6 +53,7 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/repository-cleanup/candidates/db-dead-leaves.md`
 - `docs/repository-cleanup/candidates/e2e-model-api-test.md`
 - `docs/repository-cleanup/candidates/provider-smoke-harness.md`
+- `docs/repository-cleanup/candidates/retired-redis-backend-client.md`
 - `docs/repository-cleanup/candidates/route-b-readside-island.md`
 - `docs/repository-cleanup/candidates/v2-user-triage-semantic-compaction.md`
 - `docs/repository-cleanup/candidates/v2-watchdog-compatibility.md`
@@ -135,11 +139,13 @@ generator: python3 tools/check_document_lifecycle.py --all --report
 - `docs/archive/superpowers/specs/2026-07-08-hosted-runtime-v2-abc-design.md`
 - `docs/archive/superpowers/specs/2026-07-09-hosted-runtime-v2-D0-rollout-infrastructure-design.md`
 - `docs/archive/superpowers/specs/2026-07-09-hosted-runtime-v2-D4-loadtest-rollout-killresident-design.md`
+- `docs/ops/phala-tee-postgres-throughput-retest-2026-08-29.zh-CN.md`
 - `docs/repository-cleanup/baseline.md`
 - `docs/superpowers/plans/2026-07-09-hosted-runtime-v2-merge-conditions-backlog.md`
 - `docs/superpowers/plans/2026-08-01-branch-promotion-guard.md`
 - `docs/superpowers/plans/2026-08-25-chat-strict-snapshot-convergence.md`
 - `docs/superpowers/plans/2026-08-25-rds-trace-t306-release-validation.md`
+- `docs/superpowers/plans/2026-08-28-retire-route-b-readside-island.md`
 - `docs/superpowers/specs/2026-07-09-hosted-runtime-v2-D1-full-conversation-context-design.md`
 - `docs/superpowers/specs/2026-07-10-hosted-runtime-v2-agent-loop-design.md`
 

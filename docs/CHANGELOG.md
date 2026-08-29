@@ -55,6 +55,16 @@ historical_reason: point-in-time
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-29 — 收敛 `UserStore` 定向刷新接口
+
+**[DONE] 跨 worker 的 frames/blob 定向刷新不再为旧测试适配器绕过 section 状态。**
+
+- `_refresh_store_channel()` 统一使用 `note_section_change()` 与 `ensure_sections()`，删除
+  直接调用私有 loader 的 fallback。
+- wake bus 测试改用真实 `UserStore`，覆盖 frames/blob 的精确刷新和 proactive waiter
+  唤醒；非 section 缓存对象不再被静默接受。
+- 不影响 schema、公开 API、部署拓扑或 VPS resident consumer。
+
 ## 2026-08-29 — 删除不可达的 Redis backend 客户端与生产依赖
 
 **[DONE] Redis CVM 的审计/恢复资产继续保留，但零消费者、固定拒绝连接的 Python
