@@ -138,3 +138,39 @@ def test_the_legacy_path_is_untouched(monkeypatch) -> None:
         parse=lambda r: parse_capture_cards(r, strict=True),
     ))
     assert err is None and len(cards) == 1
+
+
+def test_session_mode_still_emits_the_bounce_trajectory(monkeypatch) -> None:
+    """会话模式下解析和重问都发生在组件里 —— 但 io 的轨迹**不能因此变少**。
+
+    `parse_bounced` 是「这轮为什么多花了一次调用」的唯一线索。丢了它，
+    换成组件之后可观测性净退步，这层门面就是亏的。
+    """
+    from memory.garden_component import BounceTracker, CallableModel, build_garden
+
+    dirty = _reply(DIRTY)
+    provider = FakeProvider(dirty, _reply(GOOD))
+    monkeypatch.setattr(
+        v2_extraction.provider_client, "reliable_chat_completion_async", provider
+    )
+
+    events: list[tuple[str, dict]] = []
+
+    async def record(kind: str, payload: dict) -> None:
+        events.append((kind, payload))
+
+    sink = BounceTracker()
+    garden = build_garden(CallableModel(lambda p: ""), on_step=sink)
+    session = garden.capture_session(CaptureRequest(
+        window=WINDOW, locale="zh-Hans", ai_name="io", user_name="老王"))
+
+    cards, err = _run(v2_extraction.extract(
+        provider_config={}, prompt="", parse=lambda r: ([], None),
+        session=session, step_sink=sink, trajectory_out=record,
+    ))
+
+    assert err is None and len(cards) == 1
+    kinds = [k for k, _ in events]
+    assert "parse_bounced" in kinds, f"重问的轨迹丢了：{kinds}"
+    reason = next(p["reason"] for k, p in events if k == "parse_bounced")
+    assert reason, "parse_bounced 要带上原因，否则查不出为什么重问"

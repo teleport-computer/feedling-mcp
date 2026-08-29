@@ -12263,8 +12263,10 @@ async def _run_extraction(
             )
             # 组件的会话 —— 提示词和重问由它决定。模型端口传 None 是刻意的：
             # 会话模式下组件不自己调模型，provider 那步归 extract()。
+            _step_sink = garden_component.BounceTracker()
             _capture_session = garden_component.build_garden(
                 garden_component.CallableModel(lambda _p: ""),
+                on_step=_step_sink,
             ).capture_session(mg_contracts.CaptureRequest(
                 window=window,
                 locale=capture_locale,
@@ -12317,8 +12319,10 @@ async def _run_extraction(
             #
             # known_ids 是墓碑卡守卫：整理结果里不许出现喂进去的卡 id，
             # 出现了就是模型把整理注记当成了内容本身（usr_a40e 事故）。
+            _step_sink = garden_component.BounceTracker()
             _capture_session = garden_component.build_garden(
                 garden_component.CallableModel(lambda _p: ""),
+                on_step=_step_sink,
             ).maintenance_session(mg_contracts.MaintenanceRequest(
                 cards=list(ctx.get("card_items") or []),
                 all_cards=list(ctx.get("card_items") or []),
@@ -12431,6 +12435,7 @@ async def _run_extraction(
                     parse=parse,
                     parse_retry=parse_retry,
                     session=_capture_session,
+                    step_sink=_step_sink,
                     max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
                     failure_detail_out=extraction_failure_detail.update,
                     progress_cb=lambda stage, attempt: _report_turn_progress(
@@ -12574,6 +12579,7 @@ async def _run_extraction(
                 parse=parse,
                 parse_retry=parse_retry,
                 session=_capture_session,
+                step_sink=_step_sink,
                 max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
                 failure_detail_out=extraction_failure_detail.update,
                 progress_cb=lambda stage, attempt: _report_turn_progress(

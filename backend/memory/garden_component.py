@@ -123,6 +123,19 @@ class BounceTracker:
             return "bounced_empty"
         return "bounced_ok"
 
+    def drain(self) -> list[Step]:
+        """取走攒下的步骤并清空 —— 给异步宿主用。
+
+        ``on_step`` 是同步回调，而 io 的 trajectory 是 async。中间隔一层缓冲：
+        组件同步地攒，宿主在自己的 await 点把它们发出去。
+
+        不这么做的话，会话模式下宿主会**丢掉 parse_bounced / semantic_bounced
+        这些事件** —— 而它们正是「这轮为什么多花了一次调用」的唯一线索。
+        换成组件之后可观测性净退步，那这层门面就是亏的。
+        """
+        out, self.steps = self.steps, []
+        return out
+
     @property
     def reask_trigger(self) -> str:
         """这次重问是被什么触发的（format / semantic / truncation）。"""

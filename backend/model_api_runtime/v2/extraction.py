@@ -150,6 +150,7 @@ async def extract(
     failure_detail_out: Callable[[dict], None] | None = None,
     parse_retry: ParseRetry | None = None,
     session: Any = None,
+    step_sink: Any = None,
 ) -> tuple[Any, str | None]:
     """跑一次 BYOK 抽取调用并解析。**永不抛**——失败一律返回 (None, reason)。
 
@@ -250,6 +251,29 @@ async def extract(
         if failure_detail_out is not None:
             failure_detail_out(dict(response_shape))
 
+    async def _emit_component_steps() -> None:
+        """把组件汇报的步骤翻成 io 一直在用的 trajectory 事件。
+
+        会话模式下解析和重问都在组件里发生，宿主看不见 —— 不翻出来的话
+        ``parse_bounced`` / ``semantic_bounced`` 这两个事件就没了，
+        而它们正是「这轮为什么多花一次调用」的唯一线索。
+        """
+        if trajectory_out is None or step_sink is None:
+            return
+        for step in step_sink.drain():
+            if step.kind == "parsed" and step.detail.get("error"):
+                await trajectory_out("parse_bounced",
+                                     {"reason": str(step.detail.get("error"))})
+            elif step.kind == "retrying":
+                why = str(step.detail.get("kind") or "")
+                if why == "semantic":
+                    await trajectory_out(
+                        "semantic_bounced",
+                        {"reason_count": int(step.detail.get("reasons") or 0)})
+                elif why == "truncation":
+                    # 截断的重问在下面单独发（带 strategy/max_tokens），这里不重复。
+                    pass
+
     if session is not None:
         # 组件驱动：它说问什么就问什么，直到它说问完了。
         # provider 那一步走的是上面同一个 _call —— 截断、用量、失败分类、
@@ -270,6 +294,7 @@ async def extract(
                     return None, "output_truncated"
                 seen_truncation = True
             session.feed(reply or "", truncated=truncated)
+            await _emit_component_steps()
         outcome = session.result()
         if outcome.error:
             return None, str(outcome.error)
