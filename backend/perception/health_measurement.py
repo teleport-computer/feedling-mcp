@@ -22,9 +22,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, NamedTuple
 
-from perceptkit import attribution as sg_attribution
-from perceptkit import identity as sg_identity
-from perceptkit import observation as sg_observation
+from perceptkit.algorithms import attribution as sg_attribution
+from perceptkit.algorithms import identity as sg_identity
+from perceptkit.algorithms import observation as sg_observation
 
 from . import history
 

@@ -25,7 +25,7 @@ from perception import history as perception_history
 from perception import service as perception_service
 from perception import permissions as perception_permissions
 from perception import store as perception_store
-from perceptkit import trend_models
+from perceptkit.algorithms import trend_models
 from perception.agent_fields import (
     AGENT_PERCEPTION_SIGNALS,
     AGENT_SIGNAL_FIELDS as _SIGNAL_FIELDS,

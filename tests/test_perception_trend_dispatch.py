@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from agent import perception_core  # noqa: E402
 from perception import history as perception_history  # noqa: E402
 from perception import store as perception_store  # noqa: E402
-from perceptkit import trend_models  # noqa: E402
+from perceptkit.algorithms import trend_models  # noqa: E402
 
 
 class _Store:

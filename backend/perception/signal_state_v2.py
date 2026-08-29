@@ -13,7 +13,7 @@ import os
 from typing import Any, Literal
 
 import db
-from perceptkit import wake as wake_kernel
+from perceptkit.algorithms import wake as wake_kernel
 
 
 log = logging.getLogger("perception.signal_state_v2")

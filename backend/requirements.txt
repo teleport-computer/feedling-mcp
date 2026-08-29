@@ -119,4 +119,8 @@ agent-protocol-core @ https://github.com/teleport-computer/memgarden/releases/do
 # 感知内核 —— 同样从本仓库提取出去的独立库（perceptkit），走法与上面的
 # memgarden 一致：GitHub Release 的 wheel URL，理由同上（--require-hashes +
 # compose 哈希上链要求构建可复现）。
-perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.1.0/perceptkit-0.1.0-py3-none-any.whl
+# 🔴 v0.2.0 的 release **还没发**。这条 pin 和本分支的 import 是一起改的：
+# 0.2.0 把八个纯函数模块搬进了 perceptkit.algorithms（见该包 CHANGELOG），
+# 装着 0.1.0 的环境跑本分支会在 import 时就炸。
+# **合并之前必须先发 v0.2.0 的 release**，否则部署会起不来。
+perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.2.0/perceptkit-0.2.0-py3-none-any.whl

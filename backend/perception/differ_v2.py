@@ -11,7 +11,7 @@ import time
 from typing import Any, Callable, Mapping
 
 from perception import signal_state_v2
-from perceptkit import wake as wake_kernel
+from perceptkit.algorithms import wake as wake_kernel
 from proactive.observability_v2 import METRIC_PHASH_FRAME, MetricsSinkV2, record_metric_v2
 
 
