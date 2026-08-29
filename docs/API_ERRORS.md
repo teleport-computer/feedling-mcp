@@ -170,6 +170,22 @@ canonical_owner: self
 | `memory_action_failed` | — | — | `_execute_memory_actions` 的兜底默认值（正常路径下单个 action 总会带自己的 `error`，状态码随子 action） | |
 | `db_write_failed` | 500 | system | | |
 
+### readside（`/v1/memory/index`、`/v1/memory/fetch`）
+
+`memory_readside_core` 抛的 `RuntimeError` / `ValueError` 曾以 `str(e)` 原样回传，
+其中 `enclave_http_<code>:<resp.text[:180]>` 会把 enclave 的响应体带出去。现在响应体
+只取下表这个闭集：消息**在闭集里**才原样回传，否则收敛为通用码。细分类改由
+debug-trace 的 `detail.upstream` 承载（同样是闭集标签，不是上游原文）。
+
+| slug | 状态码 | blame | 说明 | 需本地化 |
+|---|---|---|---|---|
+| `readside_unavailable` | 503 | system | readside 失败且消息不在闭集内（含 `enclave_http_*`、`enclave_error:*` 及任何未知消息）；分诊看 `detail.upstream` | |
+| `memory_load_failed` | 503 | system | `memory/service.py` 载入 moments 失败 | |
+| `enclave_unavailable` | 503 | system | 未配置 `FEEDLING_ENCLAVE_URL` | |
+| `api_key_unavailable` | 503 | system | 既无 api_key 也无 runtime token | |
+| `enclave_invalid_readside_response` | 503 | system | enclave 返回的不是 JSON 对象 | |
+| `request_invalid` | 400 | — | `/fetch` 的 `ValueError` 且消息不在闭集内（`except ValueError` 也会接住调用树里任意 stdlib ValueError，其消息可能带被解析的明文） | |
+
 ## 身份（identity 路由 + identity action）
 
 | slug | 状态码 | blame | 说明 | 需本地化 |
