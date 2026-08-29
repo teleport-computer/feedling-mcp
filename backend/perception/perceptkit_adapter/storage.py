@@ -1,21 +1,26 @@
-"""PerceptKit ``StoragePort`` 的 Postgres 实现。
+"""A Postgres implementation of PerceptKit's ``StoragePort``.
 
-这是 kit 之外的东西 —— kit 只给逻辑对象和端口语义，"用什么库、建什么表"
-归宿主。它存在的意义是让一致性测试有一个**真数据库**的实现可以跑：
-内存实现天然原子、天然没有并发，那十条保证在它上面永远是绿的。
+This lives outside the kit on purpose: the kit defines logical objects and
+port semantics, and choosing a database is the host's job. Its reason for
+existing is that the conformance suite needs a real database to run against.
+In-memory storage is atomic and single-threaded by nature, so the ten
+guarantees are always green there.
 
-## 三处必须靠数据库本身，而不是靠代码自觉
+Three things are enforced by the database rather than by remembering.
 
-**跨租户隔离靠主键，不靠 WHERE。** ``subject_id`` 在每张表的主键前缀里。
-只靠每个查询记得加条件的话，漏一个就是把一个人的数据算到另一个人头上，
-而且不报错。
+Cross-tenant isolation lives in the primary key, not in a WHERE clause.
+``subject_id`` leads every key; one query that forgets the condition files
+one person's data under another and raises nothing.
 
-**当前值的并发靠 CAS，不靠读后写。** ``compare_and_put_current`` 带
-``expected_version``，输给别人就返回 False 由调用方重试 —— 两个 worker
-同时读到旧版本、都写一遍的话，晚的那个会把新值盖回去。
+The current value uses compare-and-put, not read-then-write.
+``compare_and_put_current`` takes ``expected_version`` and returns False when
+it loses, leaving the caller to re-read and re-decide. Two workers that both
+read the old version and both write would have the later one overwrite the
+newer value.
 
-**发件箱的 claim 靠 token 栅栏。** 租约过期的 worker 醒过来，只比状态
-不比 token 就会把一条别人正在处理的事件改回去。
+Claiming an outbox row hands out a fencing token. A worker returning from an
+expired lease that compares only the state, not the token, would undo the
+progress of whoever holds the row now.
 """
 from __future__ import annotations
 
@@ -51,33 +56,36 @@ def _j(value: Any) -> str | None:
 
 
 def _rev(value: Any) -> str | None:
-    """revision 一律按文本存。
+    """Store every revision as text.
 
-    **不转成数字。** ``"10"`` 和 ``10`` 是两种不同的东西，比较规则也不同 ——
-    存的时候统一成文本，比较交给 kit 的 ``decide_current_update``，
-    它比不了会明说比不了，而不是编一个顺序出来。
+    Never coerced to a number. ``"10"`` and ``10`` are different things with
+    different ordering rules; storing text and leaving the comparison to the
+    kit's ``decide_current_update`` means an incomparable pair is reported as
+    a conflict instead of being given an invented order.
     """
     return None if value is None else str(value)
 
 
 class PostgresStorage:
-    """一个 ``StoragePort`` 实现。构造时给一个 psycopg 连接。
+    """A ``StoragePort`` backed by one psycopg connection.
 
-    刻意接受**一条连接**而不是连接池：``transaction()`` 要求同一个事务里
-    的写全在一条连接上，池会把它们分到不同连接、原子性就没了。
-    宿主的 worker 每轮自己取一条连接构造一个实例。
+    Deliberately a single connection rather than a pool: ``transaction()``
+    requires every write in one transaction to be on the same connection, and
+    a pool would spread them across several, at which point atomicity is gone.
+    A host's worker takes a connection per round and builds one of these.
     """
 
     def __init__(self, conn: Any) -> None:
         self.conn = conn
         self._depth = 0
 
-    # -- 事务 ------------------------------------------------------------
+    # -- Transactions --------------------------------------------------------
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
-        """可重入。嵌套时**不开新事务**，跟着最外层一起提交或回滚 ——
-        内层单独提交会让"要么都成、要么都不成"变成一句空话。"""
+        """Re-entrant. A nested call joins the outermost transaction rather
+        than opening its own; an inner commit would turn "all or nothing" into
+        a phrase with nothing behind it."""
         if self._depth:
             self._depth += 1
             try:
@@ -97,7 +105,7 @@ class PostgresStorage:
             cur.execute(sql, params)
             return cur.fetchall() if cur.description else []
 
-    # -- 上报幂等 --------------------------------------------------------
+    # -- Report idempotency --------------------------------------------------
 
     def claim_report(self, *, subject_id, producer, report_id,
                      payload_digest, received_at) -> IngestReceipt:
@@ -120,13 +128,15 @@ class PostgresStorage:
             "WHERE subject_id=%s AND producer=%s AND report_id=%s",
             (subject_id, producer, report_id),
         )[0]
-        # 同 id 同内容 = 重传，返回原结果；同 id 不同内容 = 冲突，
-        # **不静默覆盖** —— 覆盖了就永远说不清哪份数据生效了。
+        # Same id and same content is a retransmission, so return the original
+        # result. Same id with different content is a conflict, never a silent
+        # overwrite -- overwriting leaves "which version took effect"
+        # permanently unanswerable.
         status = INGEST_DUPLICATE if prior[0] == payload_digest else INGEST_CONFLICT
         return IngestReceipt(subject_id, producer, report_id, prior[0],
                              prior[1], status)
 
-    # -- 观测 ------------------------------------------------------------
+    # -- Observations --------------------------------------------------------
 
     def append_observation(self, observation: StoredObservation) -> bool:
         o = observation
@@ -156,8 +166,9 @@ class PostgresStorage:
             sql.append("AND occurred_at >= %s"); params.append(start)
         if end is not None:
             sql.append("AND occurred_at <= %s"); params.append(end)
-        # 游标用 (occurred_at, observation_id) 而不是 OFFSET：中间插入一条
-        # 迟到数据会让 OFFSET 分页漏掉或重复一条，而且不报错。
+        # The cursor is (occurred_at, observation_id), not an OFFSET. A
+        # late-arriving row inserted mid-scan makes OFFSET paging skip or
+        # repeat an item, silently.
         if cursor:
             at, oid = json.loads(cursor)
             sql.append("AND (occurred_at, observation_id) > (%s, %s)")
@@ -194,7 +205,7 @@ class PostgresStorage:
             cur.execute(" ".join(sql), params)
             return cur.rowcount
 
-    # -- 当前值 ----------------------------------------------------------
+    # -- Current values ------------------------------------------------------
 
     def get_current(self, *, subject_id, signals):
         if not signals:
@@ -233,9 +244,10 @@ class PostgresStorage:
                 RETURNING 1
                 """, cols)
             return bool(rows)
-        # 带上 expected_version 的条件更新。**返回值必须认** —— 忽略它的话，
-        # 两个并发事务都读到旧版本，较新的那个 CAS 失败被静默丢掉，
-        # 当前值停在旧数据上，没有任何地方报错。
+        # A conditional update on expected_version. The result must be read:
+        # ignore it and two concurrent transactions both see the old version,
+        # the newer write loses its CAS and disappears, and the current value
+        # sits on stale data with nothing reporting it.
         rows = self._q(
             """
             UPDATE perceptkit_current
@@ -253,7 +265,7 @@ class PostgresStorage:
         )
         return bool(rows)
 
-    # -- 聚合 ------------------------------------------------------------
+    # -- Aggregates ----------------------------------------------------------
 
     def get_aggregate(self, *, subject_id, signal, start_date, end_date,
                       aggregation_kind=None):
@@ -291,7 +303,7 @@ class PostgresStorage:
              _j(a.source_coverage), a.updated_at),
         )
 
-    # -- 去重身份 --------------------------------------------------------
+    # -- Dedupe identities ---------------------------------------------------
 
     def remember_identity(self, identity: DurableDedupeIdentity) -> bool:
         i = identity
@@ -316,7 +328,7 @@ class PostgresStorage:
             (subject_id, signal, source, digest),
         ))
 
-    # -- 规则状态 --------------------------------------------------------
+    # -- Rule state ----------------------------------------------------------
 
     def get_rule_state(self, *, subject_id, definition_id, scope_key):
         rows = self._q(
@@ -338,7 +350,7 @@ class PostgresStorage:
             (subject_id, definition_id, scope_key, _j(state)),
         )
 
-    # -- 发件箱 ----------------------------------------------------------
+    # -- Outbox --------------------------------------------------------------
 
     def enqueue_event(self, entry: EventOutboxEntry) -> bool:
         e = entry
@@ -359,11 +371,12 @@ class PostgresStorage:
         return bool(rows)
 
     def claim_pending_event(self, *, worker_id, now, lease_seconds):
-        """原子地捞一条并占住它。
+        """Atomically pick one row and take ownership of it.
 
-        ``FOR UPDATE SKIP LOCKED`` 是这里的关键：两个 worker 同时捞，
-        各拿各的，不会都拿到同一条 —— 没有它就要靠"读了再更新"，
-        中间那一瞬两个人都会以为自己拿到了。
+        ``FOR UPDATE SKIP LOCKED`` is what makes this safe: two workers pulling
+        at once each get their own row. Without it the pattern is
+        read-then-update, and in the gap between the two both workers believe
+        they hold the same event.
         """
         expires = datetime.fromtimestamp(now.timestamp() + lease_seconds,
                                          tz=timezone.utc)
@@ -376,10 +389,11 @@ class PostgresStorage:
                        delivery_state = 'pending'
                        AND (next_attempt_at IS NULL OR next_attempt_at <= %s)
                      )
-                     -- 租约过期的 claimed 也要能被接管：原持有者可能已经死了，
-                     -- 不接管的话这条事件永远卡在 claimed，用户永远收不到。
-                     -- 接管时换一个新 claim_token，原持有者就算活过来也
-                     -- 改不动它（栅栏在 record_wake_receipt 那边）。
+                     -- An expired claim must be takeable: the original holder may be
+                     -- dead, and without takeover the event sits in `claimed` forever
+                     -- and simply never arrives. Takeover issues a fresh claim_token,
+                     -- so a revived holder cannot move it (the fence lives in
+                     -- record_wake_receipt).
                      OR (delivery_state = 'claimed' AND claim_expires_at <= %s)
                ORDER BY detected_at
                FOR UPDATE SKIP LOCKED
@@ -426,8 +440,9 @@ class PostgresStorage:
             (receipt.event_id, receipt.attempt_id, receipt.status,
              receipt.received_at, receipt.runtime_ref, receipt.reason),
         )
-        # 🔴 栅栏：只有还持着同一个 token 的人才能推进状态。租约过期的 worker
-        # 醒过来时新持有者已经换了 token，它这一句更新到零行 —— 正是要的结果。
+        # The fence: only a holder still carrying the same token may advance
+        # the state. A worker waking from an expired lease finds the token
+        # replaced, so this update touches zero rows -- which is the point.
         sql = ("UPDATE perceptkit_event_outbox "
                "SET delivery_state=%s, next_attempt_at=%s WHERE event_id=%s")
         params: list[Any] = [next_state, next_attempt_at, receipt.event_id]
@@ -436,7 +451,7 @@ class PostgresStorage:
         sql += " RETURNING 1"
         return bool(self._q(sql, params))
 
-    # -- 来源镜像 --------------------------------------------------------
+    # -- Source mirrors ------------------------------------------------------
 
     def upsert_calendar_events(self, *, subject_id, events) -> None:
         for e in events:
@@ -499,8 +514,9 @@ class PostgresStorage:
             if isinstance(at, str):
                 at = datetime.fromisoformat(at)
                 fields["start_at"] = at
-            # 时间不明的**保留** —— 和删除那边同一条纪律：证明不了它在范围外，
-            # 就不能替用户把它藏起来。
+            # Items with no known time are kept, the same discipline as the
+            # delete path: without proof it falls outside the window, we do not
+            # hide it from the user.
             if at is not None and start is not None and at < start:
                 continue
             if at is not None and end is not None and at > end:
@@ -537,7 +553,8 @@ class PostgresStorage:
     def apply_source_snapshot(self, *, subject_id, source, collection_kind,
                               sync_id, coverage_start, coverage_end,
                               snapshot_kind) -> int:
-        # 增量同步没有资格删任何东西 —— 它只知道"变了什么"，不知道"还剩什么"。
+        # An incremental sync has no standing to delete: it knows what
+        # changed, not what remains.
         if snapshot_kind != "full":
             return 0
         if collection_kind == "calendar":
@@ -546,9 +563,11 @@ class PostgresStorage:
         else:
             table, at_key = "perceptkit_reminder_mirror", "due_at"
             fields_col = "reminder_fields"
-        # 🔴 只删【能证明落在覆盖范围内】的。时间不明的一律不删 ——
-        # 证明不了它在范围内，就没有资格删它。拿局部窗口删窗口外的数据，
-        # 会让用户发现自己去年的日程凭空消失，而且不可逆。
+        # Delete only what can be proven to fall inside the covered window.
+        # Items with no known time are never deleted -- without proof they are
+        # in range there is no standing to remove them. Deleting outside the
+        # window is how a user finds last year's calendar gone, and it does not
+        # come back.
         with self.conn.cursor() as cur:
             cur.execute(
                 f"""
@@ -596,16 +615,17 @@ class PostgresStorage:
              s.last_successful_sync_at, s.coverage_start, s.coverage_end, s.cursor),
         )
 
-    # -- 删除 ------------------------------------------------------------
+    # -- Deletion ------------------------------------------------------------
 
     def purge_subject(self, *, subject_id) -> dict[str, int]:
-        """按人删干净。**一个事务里做完** —— 删一半就断电的话，
-        用户会处在"有些数据没了、有些还在"的状态，而且没人知道删到哪了。"""
+        """Delete everything for one subject, in a single transaction. Losing
+        power halfway leaves the user with some data gone and some still there,
+        and no record of where it stopped."""
         counts: dict[str, int] = {}
         with self.transaction():
             for table in _schema.TABLES:
                 if table == "perceptkit_wake_receipt":
-                    continue                    # 它按 event_id 走，下面单独处理
+                    continue                    # keyed by event_id; below
                 with self.conn.cursor() as cur:
                     cur.execute(f"DELETE FROM {table} WHERE subject_id = %s",
                                 (subject_id,))

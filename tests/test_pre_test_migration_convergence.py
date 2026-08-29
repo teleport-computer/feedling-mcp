@@ -210,6 +210,17 @@ def test_tee_migrations_reuse_the_rds_contract_sql():
     rds = _scripts("alembic")
     tee = _scripts("alembic_tee")
     assert (
+        tee.get_revision("0040_perceptkit_objects").module._UP
+        == rds.get_revision("0105_perceptkit_objects").module._UP
+    ), "the PerceptKit DDL must be byte-identical on both chains"
+    # The adapter and its conformance tests run against schema.DDL. If the
+    # migration drifts from it, the suite goes green against tables production
+    # never creates -- which is the one failure the suite exists to prevent.
+    from perception.perceptkit_adapter import schema as _pk_schema
+    assert (
+        rds.get_revision("0105_perceptkit_objects").module._UP == _pk_schema.DDL
+    ), "the migration drifted from the DDL the adapter and its tests use"
+    assert (
         tee.get_revision("0039_distill_artifact_ledger").module._UP
         == rds.get_revision("0104_distill_artifact_ledger").module._UP
     )

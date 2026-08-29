@@ -1,32 +1,31 @@
-"""DDL for PerceptKit's logical storage objects.
+"""Create the PerceptKit logical storage objects.
 
-The single source of truth for these tables. Both migration chains and the
-conformance tests reference this constant, so the tables the tests exercise
-cannot drift from the tables production creates -- a drift there means the
-suite runs green while production is still wrong, which is the exact failure
-the suite exists to prevent.
+Revision ID: 0105_perceptkit_objects
+Revises: 0104_distill_artifact_ledger
 
-Three choices are load-bearing.
+PerceptKit defines logical objects and port semantics; choosing tables and
+indexes is the host's job. These are that choice.
 
-``subject_id`` leads every primary key. Cross-tenant isolation lives in the
-key rather than in each query remembering a WHERE clause; one forgotten
-clause files one person's data under another and raises nothing.
+``_UP`` is byte-identical to the paired revision on the other chain, and a
+test asserts it also equals ``perception.perceptkit_adapter.schema.DDL``.
+The adapter and its conformance tests run against that constant, so a drift
+between it and this migration would mean the tables the tests exercise are
+not the tables production creates. Everything is IF NOT EXISTS, so
+re-running is safe.
 
-Dedupe identities get their own table. Details expire while aggregates can be
-permanent, so a dedupe record has to outlive the details it guards. Sharing a
-table would let a retention sweep take it along, after which replayed data
-counts twice into a permanent aggregate with no way back.
-
-The outbox carries a ``claim_token`` fence. A worker returning from an
-expired lease must not overwrite the state of whoever holds the row now --
-comparing only the state, not the token, lets a revived worker undo the
-progress of the live one.
+This migration only creates tables. Nothing reads or writes them yet.
 """
-from __future__ import annotations
 
-#: Create the tables. Idempotent -- every statement is IF NOT EXISTS, so
-#: re-running is safe.
-DDL = """
+from alembic import op
+
+
+revision = "0105_perceptkit_objects"
+down_revision = "0104_distill_artifact_ledger"
+branch_labels = None
+depends_on = None
+
+
+_UP = """
 CREATE TABLE IF NOT EXISTS perceptkit_ingest_receipt (
   subject_id      TEXT        NOT NULL,
   producer        TEXT        NOT NULL,
@@ -188,23 +187,13 @@ CREATE TABLE IF NOT EXISTS perceptkit_sync_state (
 );
 """
 
-#: Empty every table. Tests only. Production deletion goes through
-#: purge_subject or a retention sweep, both of which bound what they touch by
-#: subject or by time.
-TRUNCATE = """
-TRUNCATE perceptkit_ingest_receipt, perceptkit_observation, perceptkit_current,
-         perceptkit_daily_aggregate, perceptkit_dedupe_identity,
-         perceptkit_rule_state, perceptkit_event_outbox, perceptkit_wake_receipt,
-         perceptkit_calendar_mirror, perceptkit_reminder_mirror,
-         perceptkit_sync_state;
-"""
 
-TABLES = (
-    "perceptkit_ingest_receipt", "perceptkit_observation", "perceptkit_current",
-    "perceptkit_daily_aggregate", "perceptkit_dedupe_identity",
-    "perceptkit_rule_state", "perceptkit_event_outbox", "perceptkit_wake_receipt",
-    "perceptkit_calendar_mirror", "perceptkit_reminder_mirror",
-    "perceptkit_sync_state",
-)
+def upgrade() -> None:
+    op.execute(_UP)
 
-__all__ = ["DDL", "TRUNCATE", "TABLES"]
+
+def downgrade() -> None:
+    # Deliberately not implemented. These tables hold user perception data, so
+    # an automated downgrade that drops them turns a rollback into data loss.
+    # Removing them is a deliberate, manual operation.
+    pass
