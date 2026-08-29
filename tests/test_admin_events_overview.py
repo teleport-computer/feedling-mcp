@@ -252,6 +252,85 @@ def test_events_overview_does_not_leak_across_the_beijing_midnight():
     assert len(d6) == 1 and d6[0]["total"] == 1
 
 
+def test_events_overview_keeps_cross_midnight_reply_pairing_when_source_is_bounded():
+    """Day-2's first reply can answer day-1's final user message."""
+    u = _uid("events_reply_mid")
+    _seed_test_user(u)
+    db.set_blob(u, "onboarding_route", {"route": "model_api"})
+    user_ts = _bj_epoch("2026-03-05", hour=23) + 59 * 60
+    reply_ts = _bj_epoch("2026-03-06", hour=0) + 60
+    db.chat_append(
+        u,
+        "reply_midnight_user",
+        user_ts,
+        {"id": "reply_midnight_user", "role": "user", "source": "chat"},
+        5000,
+    )
+    db.chat_append(
+        u,
+        "reply_midnight_agent",
+        reply_ts,
+        {"id": "reply_midnight_agent", "role": "agent", "source": "model_api"},
+        5000,
+    )
+
+    rows = [
+        row
+        for row in db.admin_events_overview(day="2026-03-06")["reply"]
+        if row["route"] == "model_api"
+    ]
+    assert len(rows) == 1
+    assert rows[0]["user_msgs"] == 0
+    assert rows[0]["real_replies"] == 1
+    assert rows[0]["median_latency"] == pytest.approx(120.0)
+
+
+def test_events_overview_pushes_day_bounds_into_every_source(monkeypatch):
+    """Record SQL shape: row timestamps stay bare and pairing is source-bounded."""
+    executed: list[str] = []
+
+    class EmptyResult:
+        def fetchall(self):
+            return []
+
+    class RecordingConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, _params=None):
+            executed.append(str(sql))
+            return EmptyResult()
+
+    class RecordingPool:
+        def connection(self, **_kwargs):
+            return RecordingConnection()
+
+    monkeypatch.setattr(db, "get_pool", lambda: RecordingPool())
+    assert db.admin_events_overview(day="2026-03-06") == {
+        "proactive": [], "capture": [], "genesis": [], "reply": [],
+    }
+
+    queries = [sql for sql in executed if "set_config('statement_timeout'" not in sql]
+    assert len(queries) == 4
+    proactive, capture, genesis, reply = queries
+    assert proactive.count("l.ts >= EXTRACT(EPOCH FROM") == 1
+    assert proactive.count("l.ts < EXTRACT(EPOCH FROM") == 1
+    assert capture.count("l.ts >= EXTRACT(EPOCH FROM") == 2
+    assert capture.count("l.ts < EXTRACT(EPOCH FROM") == 2
+    assert capture.count("JOIN user_logs l ON l.user_id = u.user_id") == 2
+    assert genesis.count("g.created_at >= (") == 1
+    assert genesis.count("g.created_at < (") == 1
+    assert "day_rows AS MATERIALIZED" in reply
+    assert reply.count("c.ts >= EXTRACT(EPOCH FROM") == 1
+    assert reply.count("c.ts < EXTRACT(EPOCH FROM") == 2
+    assert "prior_user_rows AS" in reply
+    assert "FROM chat_messages c\n        )" not in reply
+    assert all("to_char(timezone(" not in sql for sql in queries)
+
+
 def test_events_overview_rejects_a_malformed_day_instead_of_widening():
     """坏日期必须报错，不能静默回退成全量。
 

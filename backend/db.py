@@ -2148,53 +2148,68 @@ def _dau_row(row) -> dict:
     }
 
 
-def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = "Asia/Shanghai") -> list[dict]:
-    """Return daily active-user aggregates, preferring immutable snapshots.
+def _admin_data_track_dau_rows(
+    conn,
+    *,
+    since: float,
+    scan_since: float,
+    boundary_day: str,
+    day_limit: int,
+    tz: str,
+):
+    """Run the established DAU aggregate with an independently proven bound.
 
-    A completed day uses ``dau_daily_snapshot`` once frozen. Today and days
-    before the snapshot boundary remain live. If ``since_epoch`` cuts through
-    a frozen day, that day also falls back to live data so the existing exact
-    timestamp-filter contract is preserved. Every row exposes ``frozen``.
-
-    DAU is intentionally user-initiated activity only: user chat messages plus
-    client tracking events. Agent replies, proactive writes, and synthetic
-    verify pings are excluded so automated reply loops cannot inflate activity.
+    ``since`` remains the public exact-filter contract. ``scan_since`` and
+    ``boundary_day`` only discard days that the preceding boundary query proved
+    cannot enter the final ``LIMIT``. Keeping these two concepts separate is
+    what lets an intraday ``since`` continue to invalidate a whole-day frozen
+    row without making the live scan unbounded again.
     """
-    day_limit = max(1, min(int(days or 30), 1000))
-    since = float(since_epoch or 0.0)
-    try:
-        with get_pool().connection() as conn:
-            rows = conn.execute(
-                """
+    chat_bound = " AND c.ts >= %s" if scan_since > 0 else ""
+    tracking_bound = " AND l.ts >= %s" if scan_since > 0 else ""
+    frozen_bounds = ""
+    frozen_params: list[object] = []
+    if since > 0:
+        frozen_bounds += " AND first_ts >= %s"
+        frozen_params.append(since)
+    if boundary_day:
+        frozen_bounds += " AND day >= %s"
+        frozen_params.append(boundary_day)
+
+    sql = f"""
                 WITH active AS (
-                    SELECT user_id, ts, 'chat' AS source
-                    FROM chat_messages
-                    WHERE doc->>'role' = 'user'
-                      AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
-                      AND (%s = 0 OR ts >= %s)
+                    SELECT c.user_id, c.ts, 'chat' AS source
+                    FROM users u
+                    JOIN chat_messages c ON c.user_id = u.user_id
+                    WHERE c.doc->>'role' = 'user'
+                      AND COALESCE(c.doc->>'source', '')
+                          NOT IN ('verify_ping', 'resident_maintenance')
+                      {chat_bound}
 
                     UNION ALL
 
-                    SELECT user_id, ts, 'tracking' AS source
-                    FROM user_logs
-                    WHERE stream = 'tracking_events'
-                      AND ts IS NOT NULL
-                      AND (%s = 0 OR ts >= %s)
+                    SELECT l.user_id, l.ts, 'tracking' AS source
+                    FROM users u
+                    JOIN user_logs l ON l.user_id = u.user_id
+                    WHERE l.stream = 'tracking_events'
+                      AND l.ts IS NOT NULL
+                      {tracking_bound}
                 ),
                 usage_events AS (
                     SELECT
-                        user_id,
-                        ts,
+                        l.user_id,
+                        l.ts,
                         CASE
-                          WHEN doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
-                          THEN (doc->'payload'->>'duration_sec')::bigint
+                          WHEN l.doc->'payload'->>'duration_sec' ~ '^[0-9]{{1,10}}$'
+                          THEN (l.doc->'payload'->>'duration_sec')::bigint
                           ELSE 0
                         END AS duration_sec
-                    FROM user_logs
-                    WHERE stream = 'tracking_events'
-                      AND doc->>'type' = 'app_session_end'
-                      AND ts IS NOT NULL
-                      AND (%s = 0 OR ts >= %s)
+                    FROM users u
+                    JOIN user_logs l ON l.user_id = u.user_id
+                    WHERE l.stream = 'tracking_events'
+                      AND l.doc->>'type' = 'app_session_end'
+                      AND l.ts IS NOT NULL
+                      {tracking_bound}
                 ),
                 daily AS (
                     SELECT
@@ -2260,7 +2275,7 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                            median_user_sec
                     FROM dau_daily_snapshot
                     WHERE active_events > 0
-                      AND (%s = 0 OR first_ts >= %s)
+                      {frozen_bounds}
                 ),
                 merged AS (
                     SELECT f.*, TRUE AS frozen FROM frozen_rows f
@@ -2276,9 +2291,165 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                 FROM merged
                 ORDER BY day DESC
                 LIMIT %s
+                """
+    live_params = [scan_since] * (3 if scan_since > 0 else 0)
+    return conn.execute(
+        sql,
+        (*live_params, tz, tz, tz, *frozen_params, day_limit),
+    ).fetchall()
+
+
+def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = "Asia/Shanghai") -> list[dict]:
+    """Return daily active-user aggregates, preferring immutable snapshots.
+
+    A completed day uses ``dau_daily_snapshot`` once frozen. Today and days
+    before the snapshot boundary remain live. If ``since_epoch`` cuts through
+    a frozen day, that day also falls back to live data so the existing exact
+    timestamp-filter contract is preserved. Every row exposes ``frozen``.
+
+    DAU is intentionally user-initiated activity only: user chat messages plus
+    client tracking events. Agent replies, proactive writes, and synthetic
+    verify pings are excluded so automated reply loops cannot inflate activity.
+
+    The first query finds the oldest day that can survive the requested
+    ``LIMIT`` using only activity timestamps and frozen-day metadata. The
+    expensive per-user/session aggregates then start at that boundary. This
+    preserves "latest N days with activity" across calendar gaps; a fixed
+    N-calendar-day cutoff would silently drop valid rows for a sparse fleet.
+    """
+    day_limit = max(1, min(int(days or 30), 1000))
+    since = float(since_epoch or 0.0)
+    chat_since = " AND c.ts >= s.since_epoch" if since > 0 else ""
+    tracking_since = " AND l.ts >= s.since_epoch" if since > 0 else ""
+    snapshot_since = " AND snap.first_ts >= s.since_epoch" if since > 0 else ""
+
+    try:
+        with get_pool().connection() as conn:
+            boundary = conn.execute(
+                f"""
+                WITH RECURSIVE settings AS (
+                    SELECT %s::text AS tz,
+                           %s::integer AS day_limit,
+                           %s::double precision AS since_epoch
+                ), chat_days(user_id, day, cutoff, depth) AS (
+                    SELECT u.user_id, hit.day, hit.cutoff, 1
+                    FROM users u
+                    CROSS JOIN settings s
+                    CROSS JOIN LATERAL (
+                        SELECT
+                            to_char(timezone(s.tz, to_timestamp(c.ts)), 'YYYY-MM-DD') AS day,
+                            EXTRACT(EPOCH FROM (
+                                date_trunc('day', timezone(s.tz, to_timestamp(c.ts)))
+                                AT TIME ZONE s.tz
+                            ))::double precision AS cutoff
+                        FROM chat_messages c
+                        WHERE c.user_id = u.user_id
+                          AND c.doc->>'role' = 'user'
+                          AND COALESCE(c.doc->>'source', '')
+                              NOT IN ('verify_ping', 'resident_maintenance')
+                          {chat_since}
+                        ORDER BY c.ts DESC
+                        LIMIT 1
+                    ) hit
+                    UNION
+                    SELECT prior.user_id, hit.day, hit.cutoff, prior.depth + 1
+                    FROM chat_days prior
+                    CROSS JOIN settings s
+                    CROSS JOIN LATERAL (
+                        SELECT
+                            to_char(timezone(s.tz, to_timestamp(c.ts)), 'YYYY-MM-DD') AS day,
+                            EXTRACT(EPOCH FROM (
+                                date_trunc('day', timezone(s.tz, to_timestamp(c.ts)))
+                                AT TIME ZONE s.tz
+                            ))::double precision AS cutoff
+                        FROM chat_messages c
+                        WHERE c.user_id = prior.user_id
+                          AND c.ts < prior.cutoff
+                          AND c.doc->>'role' = 'user'
+                          AND COALESCE(c.doc->>'source', '')
+                              NOT IN ('verify_ping', 'resident_maintenance')
+                          {chat_since}
+                        ORDER BY c.ts DESC
+                        LIMIT 1
+                    ) hit
+                    WHERE prior.depth < s.day_limit
+                ), tracking_days(user_id, day, cutoff, depth) AS (
+                    SELECT u.user_id, hit.day, hit.cutoff, 1
+                    FROM users u
+                    CROSS JOIN settings s
+                    CROSS JOIN LATERAL (
+                        SELECT
+                            to_char(timezone(s.tz, to_timestamp(l.ts)), 'YYYY-MM-DD') AS day,
+                            EXTRACT(EPOCH FROM (
+                                date_trunc('day', timezone(s.tz, to_timestamp(l.ts)))
+                                AT TIME ZONE s.tz
+                            ))::double precision AS cutoff
+                        FROM user_logs l
+                        WHERE l.user_id = u.user_id
+                          AND l.stream = 'tracking_events'
+                          AND l.ts IS NOT NULL
+                          {tracking_since}
+                        ORDER BY l.ts DESC
+                        LIMIT 1
+                    ) hit
+                    UNION
+                    SELECT prior.user_id, hit.day, hit.cutoff, prior.depth + 1
+                    FROM tracking_days prior
+                    CROSS JOIN settings s
+                    CROSS JOIN LATERAL (
+                        SELECT
+                            to_char(timezone(s.tz, to_timestamp(l.ts)), 'YYYY-MM-DD') AS day,
+                            EXTRACT(EPOCH FROM (
+                                date_trunc('day', timezone(s.tz, to_timestamp(l.ts)))
+                                AT TIME ZONE s.tz
+                            ))::double precision AS cutoff
+                        FROM user_logs l
+                        WHERE l.user_id = prior.user_id
+                          AND l.stream = 'tracking_events'
+                          AND l.ts IS NOT NULL
+                          AND l.ts < prior.cutoff
+                          {tracking_since}
+                        ORDER BY l.ts DESC
+                        LIMIT 1
+                    ) hit
+                    WHERE prior.depth < s.day_limit
+                ), active_days AS (
+                    SELECT day FROM chat_days
+                    UNION
+                    SELECT day FROM tracking_days
+                    UNION
+                    SELECT snap.day
+                    FROM dau_daily_snapshot snap
+                    CROSS JOIN settings s
+                    WHERE snap.active_events > 0
+                      {snapshot_since}
+                ), limited_days AS (
+                    SELECT day
+                    FROM active_days
+                    ORDER BY day DESC
+                    LIMIT (SELECT day_limit FROM settings)
+                )
+                SELECT MIN(limited_days.day),
+                       EXTRACT(EPOCH FROM (
+                           MIN(limited_days.day)::date::timestamp AT TIME ZONE settings.tz
+                       ))::double precision
+                FROM settings
+                LEFT JOIN limited_days ON TRUE
+                GROUP BY settings.tz
                 """,
-                (since, since, since, since, since, since, tz, tz, tz, since, since, day_limit),
-            ).fetchall()
+                (tz, day_limit, since),
+            ).fetchone()
+            boundary_day = str(boundary[0] or "") if boundary else ""
+            boundary_epoch = float(boundary[1] or 0.0) if boundary else 0.0
+            scan_since = max(since, boundary_epoch)
+            rows = _admin_data_track_dau_rows(
+                conn,
+                since=since,
+                scan_since=scan_since,
+                boundary_day=boundary_day,
+                day_limit=day_limit,
+                tz=tz,
+            )
         return [_dau_row(row) for row in rows]
     except Exception as e:
         log.error("[db] admin_data_track_dau failed: %s", e)
@@ -7702,13 +7873,22 @@ def admin_events_overview(*, day: str = "", tz: str = "Asia/Shanghai") -> dict:
         # the exact failure this function was changed to remove.
         raise ValueError(f"admin_events_overview: bad day {want_day!r}, want YYYY-MM-DD")
 
+    def _day_bound(*, epoch: bool, end: bool) -> str:
+        day_expr = (
+            f"('{want_day}'::date + 1)" if end else f"'{want_day}'::date"
+        )
+        bound = f"({day_expr}::timestamp AT TIME ZONE '{zone}')"
+        return f"EXTRACT(EPOCH FROM {bound})" if epoch else bound
+
     def _day_filter(ts_expr: str, *, epoch: bool = True) -> str:
         """SQL predicate scoping one row's time column to ``want_day`` in ``tz``.
 
         ``epoch=True`` for the numeric ``ts`` columns (user_logs / chat_messages),
-        False for a real timestamptz (genesis_import_jobs.created_at). Same
-        bucketing idiom as admin_data_track_dau, so this board and the DAU chart
-        can never disagree about which day a row belongs to.
+        False for a real timestamptz (genesis_import_jobs.created_at). The
+        calendar bounds are constants on the right-hand side, leaving the table
+        column bare so PostgreSQL can use its timestamp indexes. Applying
+        ``to_char(timezone(...))`` to every row preserved the same result but
+        forced a broad scan before it could reject out-of-day history.
 
         ``want_day``/``zone`` are inlined rather than bound because these SQL
         strings are assembled by f-string in the callers below; both are stripped
@@ -7716,9 +7896,9 @@ def admin_events_overview(*, day: str = "", tz: str = "Asia/Shanghai") -> dict:
         (``_valid_day``), so no caller-controlled text reaches SQL."""
         if not want_day:
             return ""
-        stamp = f"to_timestamp({ts_expr})" if epoch else f"({ts_expr})"
-        return (f" AND to_char(timezone('{zone}', {stamp}), "
-                f"'YYYY-MM-DD') = '{want_day}'")
+        start = _day_bound(epoch=epoch, end=False)
+        end = _day_bound(epoch=epoch, end=True)
+        return f" AND {ts_expr} >= {start} AND {ts_expr} < {end}"
 
     def _run(key, sql):
         try:
@@ -7776,12 +7956,14 @@ def admin_events_overview(*, day: str = "", tz: str = "Asia/Shanghai") -> dict:
                percentile_cont(0.5) WITHIN GROUP (ORDER BY m.dur) AS median_dur
         FROM (
           SELECT l.user_id, COALESCE(l.doc->>'status','') AS status, {_JOB_DUR_SEC.replace('doc','l.doc')} AS dur
-          FROM user_logs l
+          FROM users u
+          JOIN user_logs l ON l.user_id = u.user_id
           WHERE l.stream = 'memory_capture_jobs'
             {_day_filter('l.ts')}
           UNION ALL
           SELECT l.user_id, COALESCE(l.doc->>'status','') AS status, {_JOB_DUR_SEC.replace('doc','l.doc')} AS dur
-          FROM user_logs l
+          FROM users u
+          JOIN user_logs l ON l.user_id = u.user_id
           WHERE l.stream = 'proactive_jobs'
             AND COALESCE(l.doc->>'job_kind','') IN ('memory_capture','memory_dream','memory_migrate')
             {_day_filter('l.ts')}
@@ -7815,16 +7997,60 @@ def admin_events_overview(*, day: str = "", tz: str = "Asia/Shanghai") -> dict:
     # 4) 回复消息: 真回复率 + 兜底率 + 回复延迟(中位)。real_replies 排除
     #    agent_initiated_proactive(主动消息不是"对用户的回复")。latency = 每条真回复
     #    与其前一条用户消息的时间差(窗口配对)。
-    #    日期过滤只能加在 paired 之外：窗口函数要回看"这条回复之前的那条用户消息"，
-    #    在 CTE 里就按天切会让每天 0 点后的第一条回复找不到它的问句(last_user_ts 为
-    #    NULL)，于是被算成"没有真回复"——把跨零点的正常对话统计成故障。
-    rows = _run("reply", f"""
-        {_EVENTS_ROUTES_CTE}, paired AS (
-          SELECT c.user_id, c.ts, c.doc->>'role' AS role, COALESCE(c.doc->>'source','') AS src,
-            MAX(CASE WHEN c.doc->>'role' IN ('user','human') AND COALESCE(c.doc->>'source','') NOT IN ('verify_ping','resident_maintenance') THEN c.ts END)
+    #
+    #    日期过滤不能只加在 paired 外层：那会先给全历史跑窗口函数，再扔掉窗外行。
+    #    也不能只把当天行塞进窗口：零点后的第一条回复可能在回答前一天的最后一条
+    #    用户消息。day_rows + 每位当天活跃用户的一条 prior_user_rows 是窗口计算的
+    #    最小充分输入；外层仍只统计当天行，口径与原全史窗口逐字相同。
+    if want_day:
+        reply_pairing_ctes = f"""
+        , day_rows AS MATERIALIZED (
+          SELECT c.user_id, c.ts, c.doc->>'role' AS role,
+                 COALESCE(c.doc->>'source','') AS src
+          FROM chat_messages c
+          WHERE TRUE {_day_filter('c.ts')}
+        ), relevant_users AS MATERIALIZED (
+          SELECT DISTINCT user_id FROM day_rows
+        ), prior_user_rows AS (
+          SELECT DISTINCT ON (c.user_id)
+                 c.user_id, c.ts, c.doc->>'role' AS role,
+                 COALESCE(c.doc->>'source','') AS src
+          FROM chat_messages c
+          JOIN relevant_users u ON u.user_id = c.user_id
+          WHERE c.ts < {_day_bound(epoch=True, end=False)}
+            AND c.doc->>'role' IN ('user','human')
+            AND COALESCE(c.doc->>'source','')
+                NOT IN ('verify_ping','resident_maintenance')
+          ORDER BY c.user_id, c.ts DESC
+        ), pairing_source AS (
+          SELECT * FROM prior_user_rows
+          UNION ALL
+          SELECT * FROM day_rows
+        ), paired AS (
+          SELECT c.user_id, c.ts, c.role, c.src,
+            MAX(CASE WHEN c.role IN ('user','human')
+                          AND c.src NOT IN ('verify_ping','resident_maintenance')
+                     THEN c.ts END)
+              OVER (PARTITION BY c.user_id ORDER BY c.ts ROWS UNBOUNDED PRECEDING) AS last_user_ts
+          FROM pairing_source c
+        )
+        """
+    else:
+        reply_pairing_ctes = """
+        , paired AS (
+          SELECT c.user_id, c.ts, c.doc->>'role' AS role,
+                 COALESCE(c.doc->>'source','') AS src,
+            MAX(CASE WHEN c.doc->>'role' IN ('user','human')
+                          AND COALESCE(c.doc->>'source','')
+                              NOT IN ('verify_ping','resident_maintenance')
+                     THEN c.ts END)
               OVER (PARTITION BY c.user_id ORDER BY c.ts ROWS UNBOUNDED PRECEDING) AS last_user_ts
           FROM chat_messages c
         )
+        """
+    rows = _run("reply", f"""
+        {_EVENTS_ROUTES_CTE}
+        {reply_pairing_ctes}
         SELECT COALESCE(r.route,'resident') AS route,
                (COUNT(*) FILTER (WHERE p.role IN ('user','human') AND p.src NOT IN ('verify_ping','resident_maintenance')))::int AS user_msgs,
                (COUNT(DISTINCT p.last_user_ts) FILTER (WHERE p.role IN ('agent','openclaw')
