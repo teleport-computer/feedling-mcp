@@ -149,6 +149,7 @@ async def extract(
     trajectory_out: Callable[[str, dict], Awaitable[None]] | None = None,
     failure_detail_out: Callable[[dict], None] | None = None,
     parse_retry: ParseRetry | None = None,
+    session: Any = None,
 ) -> tuple[Any, str | None]:
     """跑一次 BYOK 抽取调用并解析。**永不抛**——失败一律返回 (None, reason)。
 
@@ -158,6 +159,18 @@ async def extract(
     给了 `parse_retry` 时，截断、内容闸或语义闸可带原因重问一次；三条路径共享
     **最多一次**的 provider 预算。provider 报错 / 空回复不走这条路，它们各有
     自己的重试与退避。
+
+    ## ``session``：让 GardenComponent 决定问什么
+
+    给了 ``session``（``garden.capture_session(...)`` 的返回值）时，
+    「下一步问什么、拿到回复怎么办」由组件决定，``prompt`` / ``parse`` /
+    ``parse_retry`` 一概忽略。
+
+    **provider 那一步仍然走下面同一个 ``_call``** —— 截断检测、用量统计、
+    失败分类、退避、轨迹全部照旧。这是刻意的：直接调 ``garden.acapture()``
+    会把 provider 调用抢过去，等于放弃这些能力，那是净退步。
+
+    两种模式共用一个 ``_call``，所以 provider 那一侧的行为不可能分家。
     """
 
     async def _call(
@@ -236,6 +249,31 @@ async def extract(
     def _record_truncation_failure(response_shape: dict[str, Any]) -> None:
         if failure_detail_out is not None:
             failure_detail_out(dict(response_shape))
+
+    if session is not None:
+        # 组件驱动：它说问什么就问什么，直到它说问完了。
+        # provider 那一步走的是上面同一个 _call —— 截断、用量、失败分类、
+        # 轨迹全部照旧，不因为换了驱动方式而分家。
+        seen_truncation = False
+        while True:
+            attempt_prompt = session.next_prompt()
+            if attempt_prompt is None:
+                break
+            reply, call_error, shape = await _call(attempt_prompt)
+            if call_error is not None:
+                return None, call_error
+            truncated = await _report_truncated(shape, attempt=2 if seen_truncation else 1)
+            if truncated:
+                if seen_truncation:
+                    # 换过一版更简短的提示词还是被截 —— 不再试，如实报。
+                    _record_truncation_failure(shape)
+                    return None, "output_truncated"
+                seen_truncation = True
+            session.feed(reply or "", truncated=truncated)
+        outcome = session.result()
+        if outcome.error:
+            return None, str(outcome.error)
+        return outcome.cards, None
 
     retried_once = False
     reply, call_error, response_shape = await _call(prompt)

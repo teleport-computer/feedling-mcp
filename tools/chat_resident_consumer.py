@@ -188,6 +188,8 @@ from memory import dream_trace as memory_dream_trace
 from memgarden.text import card_guard
 from memgarden.guards import dream_gates as memory_dream_gates
 from memgarden.prompts.buckets import normalize_bucket_language
+from memgarden import contracts as mg_contracts
+from memory import garden_component
 from memgarden.text.card_text import (
     count_user_token_residuals,
     is_retryable_parse_error,
@@ -15817,23 +15819,38 @@ def _process_capture_jobs(jobs: list) -> float:
             explain="这轮落卡用哪种语言写卡，以及凭什么这么判。桶名本身不落库。",
             detail=_lang,
         )
-        prompt = build_capture_prompt(
-            ai_name=ai_name,
-            user_name=user_name,
-            buckets=buckets_text,
-            threads=threads_text,
-            identity=identity_text,
-            window=window_text,
-            locale=capture_locale,
+        # 落卡走 GardenComponent —— 拼提示词 / 调模型 / 解析 / 过闸 / 重问
+        # 这一串编排在包里，io 只提供模型和观测。
+        #
+        # 换过来之前这里是 io 自己拼的（build_capture_prompt → 调 agent →
+        # parse → 打回重问），那份说明书只存在于这个文件里，Garden 内部
+        # 改个函数名 io 就编译不过。
+        #
+        # ⚠️ 产出必须和原来**逐字节相同** —— 搬的是判断逻辑，一点漂移就是
+        # 用户看得见的记忆变化。tests/test_garden_component_parity.py 逐个
+        # 形状对过：正常 / 吐脏后重问 / 重问后留空 / 重问后仍脏 / 本来就没得记。
+        _bounce_tracker = garden_component.BounceTracker()
+        _garden = garden_component.build_garden(
+            garden_component.CallableModel(
+                lambda p: _capture_agent_reply_text(call_agent(p, raw_text=True))
+            ),
+            on_step=_bounce_tracker,
         )
         try:
-            (cards, err), bounce = _memory_agent_parse_with_bounce(
-                prompt,
-                parse=parse_capture_cards,
-                build_retry_prompt=build_capture_retry_prompt,
-                lane="capture",
-                job_id=job_id,
-            )
+            _captured = _garden.capture(mg_contracts.CaptureRequest(
+                window=window_text,
+                locale=capture_locale,
+                buckets=buckets_text,
+                threads=threads_text,
+                identity=identity_text,
+                ai_name=ai_name,
+                user_name=user_name,
+            ))
+            _note_agent_turn_success()
+            cards, err = _captured.cards, _captured.error
+            bounce = _bounce_tracker.bounce(cards=cards, error=err)
+            if bounce:
+                log.warning("capture content gate bounced id=%s outcome=%s", job_id, bounce)
         except Exception as e:
             reason = _agent_call_failed_reason("capture_agent_call_failed", e)
             log.error("capture agent call failed id=%s: %s", job_id, e)
