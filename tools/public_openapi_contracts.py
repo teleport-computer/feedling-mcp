@@ -1529,8 +1529,9 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                     "Who the failure belongs to. Server-derived from error_class via the "
                     "notices catalog — a value sent here is NOT trusted (an unknown class "
                     "always falls back to system, so our own faults are never blamed on the "
-                    "user). user_provider is actionable by the user (top up / fix key / fix "
-                    "model name); system must never point the user at their own configuration."
+                    "user). user_provider is actionable by the user (top up or renew the "
+                    "provider account / fix key / fix model name); system must never point "
+                    "the user at their own configuration."
                 ),
             },
             "turn_failure_user_text": {

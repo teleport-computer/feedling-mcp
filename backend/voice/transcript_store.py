@@ -15,10 +15,10 @@ The full call transcript is archived at hangup and kept forever. Three readers:
   small chat card that stands in for the call in the transcript stream;
 - **the agent** — the ``voice_transcript_*`` tools pull an old call on demand.
 
-The archive is deliberately NOT a chat row. A chat row is read by both the
-prompt tail and the capture window, so a full transcript there would blow the
-tail (``worker._bounded_compaction_prefix`` raises on an oversized single row).
-The chat stream carries a bounded preview card; the bytes live here.
+The archive is deliberately NOT a chat row. A chat row is read by both prompt
+construction and the capture window, so putting a full call transcript there
+would duplicate a large payload across both paths. The chat stream carries a
+bounded preview card; the bytes live here.
 
 SQL is local to the voice package, matching ``voice/results.py``; unlike
 ``db.log_append`` these writes raise, because archiving happens BEFORE the

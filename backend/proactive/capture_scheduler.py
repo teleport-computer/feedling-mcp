@@ -14,6 +14,7 @@ from typing import Any, Callable, Mapping
 
 import db
 from psycopg.types.json import Jsonb
+from notices import status_reason as notices_status_reason
 from proactive import capture_daily, capture_jobs
 from memory import migration as memory_migration
 
@@ -61,6 +62,18 @@ def turn_backstop() -> int:
 
 def min_interval_sec() -> float:
     return _env_float("FEEDLING_CAPTURE_MIN_INTERVAL_SEC", 600.0, hi=86400.0)
+
+
+def append_refresh_deferred() -> bool:
+    """Whether foreground chat writes defer Capture discovery to the tick.
+
+    ``sync`` is an emergency rollback mode that restores the pre-change
+    request-path refresh behavior without reverting the durable-seq fixes.
+    """
+    mode = os.environ.get(
+        "FEEDLING_CAPTURE_APPEND_REFRESH_MODE", "deferred"
+    )
+    return str(mode or "deferred").strip().lower() != "sync"
 
 
 def migrate_window_sec() -> float:
@@ -405,7 +418,23 @@ def _enqueue_window(
     return {"enqueued": bool(enqueued), "reason": reason, "state": state, "job": job}
 
 
-def record_chat_append(store, message: Mapping[str, Any]) -> dict[str, Any]:
+def record_chat_append(
+    store,
+    message: Mapping[str, Any],
+    *,
+    defer_to_tick: bool = False,
+) -> dict[str, Any]:
+    if defer_to_tick:
+        # Latency-sensitive chat writes are already durable before this hook.
+        # The resident/V2 scheduler tick rebuilds the authoritative frontier
+        # from PostgreSQL, so the request path does not need to repeat those
+        # reads synchronously.
+        return {
+            "enqueued": False,
+            "reason": "deferred_to_tick",
+            "state": {},
+            "job": None,
+        }
     if not _is_live_capture_message(message):
         return {"enqueued": False, "reason": "ignored_message", "state": load_capture_state(store), "job": None}
     now_ts = _safe_float(message.get("ts"), time.time())
@@ -491,11 +520,10 @@ def tick_quiet_capture(
         return {"enqueued": False, "reason": "no_new_messages", "state": state, "job": None}
     if until_id == str(state.get("last_captured_until_message_id") or ""):
         return {"enqueued": False, "reason": "already_captured", "state": state, "job": None}
-    # V2 chat writes only refresh capture state; the runner-owned sweep is the
-    # sole producer. Preserve the turn-count backstop with at most one scheduler
-    # cadence of delay, while resident/import paths keep their immediate legacy
-    # ``record_chat_append`` behavior.
-    if submit is not None and int(state.get("turns_since_capture") or 0) >= turn_backstop():
+    # Foreground chat writes defer capture discovery to this durable sweep.
+    # Preserve the turn-count backstop for both resident and V2 with at most
+    # one scheduler cadence of delay.
+    if int(state.get("turns_since_capture") or 0) >= turn_backstop():
         return _enqueue_window(
             store,
             trigger="turn_backstop",
@@ -661,6 +689,19 @@ def _capture_trace_card_titles(job: Mapping[str, Any]) -> str:
     return " | ".join(str(t) for t in titles if t)[:1000]
 
 
+def _trace_safe_reason(job: Mapping[str, Any]) -> str:
+    """Reason for a trace event, redacted before it leaves the process.
+
+    Both fields are externally supplied free text — ``_job_status_patch`` stores
+    ``payload["reason"][:500]`` and ``payload["noop_reason"][:500]`` straight
+    from the request body — and ``GET /v1/debug/trace`` hands trace details back
+    on the user's own auth. ``debug_trace._safe_detail`` bounds length but does
+    not judge content, so redaction has to happen here, at the writer.
+    """
+    raw = str(job.get("status_reason") or job.get("noop_reason") or "").strip()
+    return notices_status_reason.sanitize_status_reason(raw)
+
+
 def record_migrate_job_status(store, job: Mapping[str, Any], *, status: str, now: float | None = None) -> dict[str, Any]:
     """migrate 终态只维护失败退避 streak——window 游标由 handler 自己重扫，
     这里不像 capture 那样推进 last_captured_*。"""
@@ -747,7 +788,7 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
         # render it red (see CAPTURE_RETRYABLE_TERMINAL comment in capture_jobs.py:
         # "failed = error; skipped = abnormal terminal — noop is reported as
         # completed, not skipped").
-        reason = str(job.get("status_reason") or job.get("noop_reason") or "").strip()
+        reason = _trace_safe_reason(job)
         detail = {"status": status_text}
         if reason:
             detail["reason"] = reason[:200]
@@ -763,7 +804,7 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
             detail=detail,
         )
     else:
-        reason = str(job.get("status_reason") or job.get("noop_reason") or "").strip()
+        reason = _trace_safe_reason(job)
         debug_trace.trace_event(
             store,
             subsystem="memory",

@@ -1,6 +1,8 @@
 ---
 title: Errors
 description: Handle Feedling's stable JSON error envelope.
+document_lifecycle: current
+canonical_owner: self
 ---
 
 Feedling errors use a stable machine-readable slug:
@@ -31,7 +33,8 @@ Clients should branch on `error`, not human-readable `detail`. A new message may
 be added to `detail` without changing the stable slug contract.
 
 When an error includes `blame`, use it to decide the next action:
-`user_provider` means the user's model provider settings need attention,
+`user_provider` means the user's model provider account, plan, credentials, or
+model settings need attention,
 `provider_transient` means retry/backoff is appropriate, `user_environment`
 means the user's self-hosted runtime or VPS needs attention, and `system` means
 Feedling owns the failure.

@@ -444,7 +444,10 @@ def test_db_action_v2_with_no_live_workers_refuses_before_persist(monkeypatch):
     assert jobs_after == 0
 
 
-def test_db_action_v2_over_sla_persists_and_enqueues(monkeypatch):
+@pytest.mark.parametrize("capture_refresh_mode", ["deferred", "sync"])
+def test_db_action_v2_over_sla_persists_and_enqueues(
+    monkeypatch, capture_refresh_mode
+):
     """Capacity telemetry must never discard a user's message.
 
     The old contract asserted a 503 before persistence. That made the retry UI
@@ -455,6 +458,9 @@ def test_db_action_v2_over_sla_persists_and_enqueues(monkeypatch):
     """
     uid = "u_send_v2_over_sla"
     message_id = "u-msg-over-sla"
+    monkeypatch.setenv(
+        "FEEDLING_CAPTURE_APPEND_REFRESH_MODE", capture_refresh_mode
+    )
     _seed(uid)
     store = core_store.get_store(uid)
     hosted_config_store.set_hosted_runtime_mode(store, "db_action_v2")
@@ -481,6 +487,13 @@ def test_db_action_v2_over_sla_persists_and_enqueues(monkeypatch):
         ).fetchall()
     assert message_count == 1
     assert jobs == [("chat", "pending", "chat_send", message_id)]
+    route = [
+        event for event in trace_events
+        if event.get("summary") == "agent_runtime"
+    ]
+    assert len(route) == 1
+    assert route[0]["detail"]["chat_append_duration_ms"] >= 0
+    assert route[0]["detail"]["capture_append_refresh_mode"] == capture_refresh_mode
     overload = [
         event for event in trace_events
         if event.get("summary") == "admission_over_sla"

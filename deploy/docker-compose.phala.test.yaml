@@ -148,7 +148,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: &enclave-image ghcr.io/teleport-computer/feedling:eafd538
+    image: &enclave-image ghcr.io/teleport-computer/feedling:561c78e
     command: &enclave-command ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -171,7 +171,6 @@ services:
         # awaiting the very decrypt that triggered them → decrypt p95 19.6s /
         # max 47.7s → 34s chat replies of which pi was only 3.1s.
         FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
-        MEMORY_READSIDE_FOR_MODEL_API: "true"
         # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
         # dstack-sdk treats "is this env var PRESENT?" as "use simulator"
         # even when the value is empty, so an empty string would make it
@@ -228,7 +227,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:eafd538
+    image: ghcr.io/teleport-computer/feedling:561c78e
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -284,7 +283,7 @@ services:
       # events instead of reloading the full chat window on every sync.
       FEEDLING_CHAT_SYNC_MODE: "incremental"
       FEEDLING_CHAT_HOT_CACHE_LIMIT: "256"
-      FEEDLING_STORE_LOAD_MODE: "legacy"
+      FEEDLING_STORE_LOAD_MODE: "lazy"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
       # Public HTTPS origin returned by POST /v1/voice/sessions for the
       # ElevenLabs Custom LLM callback. Keep this literal aligned with ingress
@@ -383,6 +382,9 @@ services:
       # Normal-on in test (V1-parity program 2026-08-05): product lanes are
       # hardcoded, not env-toggled, so the test state is legible in one file.
       FEEDLING_V2_CAPTURE_ENABLED: "1"
+      # Foreground Chat defaults to tick-owned Capture discovery. Set sync as
+      # an emergency rollback without reverting the durable-seq/Clear fences.
+      FEEDLING_CAPTURE_APPEND_REFRESH_MODE: "${FEEDLING_CAPTURE_APPEND_REFRESH_MODE:-deferred}"
       # Backend owns the V2-cutover profile trigger; serve-worker executes it.
       # M1-M5 (generation + MEMORY/USER prompt injection) merged 3086025c
       # (2026-07-31); normal-on since 2026-08-05 (V1-parity program).
@@ -427,7 +429,7 @@ services:
   # (deploy/docker-compose.phala.runner.yaml) is unrelated extra V2 capacity
   # and is untouched by this change.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:eafd538
+    image: ghcr.io/teleport-computer/feedling:561c78e
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
@@ -443,7 +445,7 @@ services:
       # bounded resident window as the HTTP backend.
       FEEDLING_CHAT_SYNC_MODE: "incremental"
       FEEDLING_CHAT_HOT_CACHE_LIMIT: "256"
-      FEEDLING_STORE_LOAD_MODE: "legacy"
+      FEEDLING_STORE_LOAD_MODE: "lazy"
       FEEDLING_PLAINTEXT_SHADOW_ENABLED: "0"
       # Keep Runtime V2 writes aligned with backend whoami/effective preference.
       FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "1"
@@ -547,7 +549,7 @@ services:
       retries: 3
 
   cpu-recorder:
-    image: ghcr.io/teleport-computer/feedling:eafd538
+    image: ghcr.io/teleport-computer/feedling:561c78e
     container_name: cpu-recorder
     command: ["python", "-u", "ops/cpu_recorder.py"]
     restart: unless-stopped

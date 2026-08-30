@@ -263,10 +263,11 @@ if not _provisioned:
     # Pure-unit modules that don't touch the DB — keep them collectable so a
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
-    "test_memory_injection_observability.py",
-    "test_garden_selection_pluggable.py",
-    "test_garden_card_shape.py",
-    "test_route_b_card_shape_recall.py",
+        "test_chat_language_follow_module.py",
+        "test_memory_injection_observability.py",
+        "test_garden_selection_pluggable.py",
+        "test_garden_card_shape.py",
+        "test_context_memories.py",
         "test_card_guard.py",
         # Memory Garden 内核（2026-08-14）：纯函数包，零 DB / 零网络。
         # 六个文件都在「DATABASE_URL 指向不可达地址」的环境下实测通过。
@@ -353,6 +354,7 @@ if not _provisioned:
         "test_v2_dependency_direction.py",
         "test_v2_provider_usage_tool.py",
         "test_v2_history_tools.py",
+        "test_v2_user_triage.py",
         "test_user_mcp_ca_fetch.py",
         "test_user_mcp_ca_fetch_leaf.py",
         "test_identity_value_write_path.py",
@@ -383,10 +385,10 @@ if not _provisioned:
         # B2: pure stdlib (only imports identity.distill_prompt_v1) — was
         # missing from this list even before this task, fixed in passing.
         "test_identity_distill_prompt.py",
-        # TEE Redis：配置不变量（读 yaml/sh + subprocess，无 DB）与连接池
-        # （构造不建连接，无 DB）。
+        # TEE Redis：配置不变量（读 yaml/sh + subprocess，无 DB）与已退役
+        # backend client 的边界门禁。
         "test_redis_cvm_config.py",
-        "test_redis_pool.py",
+        "test_redis_client_retirement.py",
         # TEE 注册表守卫的元守卫：断言 CI 上 PG 真的起了（守卫本体需要 PG，
         # 无 PG 时会被下面的 collect_ignore 静默忽略）。它自己不碰 DB，必须
         # 留在可收集列表里，否则连它也会被忽略。
@@ -411,6 +413,9 @@ if not _provisioned:
         # 也就是说无 PG 的机器上它们一直没跑。superseded 那条新用例就在
         # test_v2_tool_loop.py 里,不登记等于白写。
         "test_v2_tool_loop.py",
+        # T363 readback probe verdict logic: pure in-memory payload parsing;
+        # the production probe's only network call is never invoked here.
+        "test_tool_schema_rejection_probe.py",
         # Runtime V2 provider-round/timeout defaults: AST-only source guard.
         "test_v2_turn_budget_defaults.py",
         "test_chat_resident_consumer_image.py",
@@ -444,6 +449,19 @@ if not _provisioned:
         # 不碰 DB/网络。自带 sys.path 引导(backend/ + tools/)。这条留下——它测的是
         # 本仓库怎么拼 prompt，不是内核本身。
         "test_perception_prompt_golden.py",
+        # 感知能力表等价性(2026-08-19, 感知内核提取 Task 2)。纯:import 两个
+        # 声明模块比对对象同一性 + 字典遍历,零 DB/零网络。
+        "test_perception_kernel_catalog.py",
+        # 字段投影/权限判据/一瞥等价性(2026-08-19, 感知内核提取 Task 3)。纯:import
+        # 两侧模块比对对象同一性 + 纯函数调用,零 DB/零网络。自带 sys.path 引导。
+        "test_perception_kernel_projection.py",
+        # 叫醒判据(2026-08-19, 感知内核提取 Task 7)。纯:只 import
+        # perception_kernel.wake 调纯函数,零 DB/零网络/零时钟(时间由测试传入)。
+        "test_perception_kernel_wake.py",
+        # teardown 守卫(T394)。纯:假 admin 连接只记录语句,零 DB/零网络。
+        # ⚠️ 它守的正是无 PG 这条路径本身,所以必须留在可收集列表里 ——
+        # 漏登记的话,唯一能跑它的机器(无 PG 的开发机)反而跑不到它。
+        "test_conftest_teardown.py",
         # 趋势模型分发(2026-08-26)。纯:list_perception_daily 整个 monkeypatch 掉,
         # 只调 perception_core.perception_trend_payload + perceptkit.trend_models,
         # 不碰 DB。
@@ -643,6 +661,32 @@ def pytest_report_header(config):
     )
 
 
+def _drop_throwaway_databases(admin, dbnames):
+    """Drop each throwaway database independently, reporting every failure.
+
+    Each name gets its own ``try``: a refusal on the first one (``ObjectInUse``
+    when a backend outlived the session) must not stop the rest from being
+    attempted, and must not be swallowed — a silent teardown failure is
+    indistinguishable from a successful one, which is how 124 databases
+    accumulated unnoticed.
+    """
+    for dbname in dbnames:
+        try:
+            # Terminate stragglers (subprocess backends may not have exited yet).
+            # pg_terminate_backend() returning true only means the signal was sent.
+            admin.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s",
+                (dbname,),
+            )
+            admin.execute(f'DROP DATABASE IF EXISTS "{dbname}"')
+        except Exception as exc:
+            print(
+                f"feedling: teardown could not drop {dbname} "
+                f"({type(exc).__name__}: {exc}) — it is leaked, drop it manually",
+                file=sys.stderr,
+            )
+
+
 def pytest_unconfigure(config):
     """Drop the throwaway database(s) at the end of the session."""
     if not _provisioned:
@@ -651,16 +695,17 @@ def pytest_unconfigure(config):
         import psycopg
 
         admin = psycopg.connect(_ADMIN_URL, autocommit=True)
-        # Terminate stragglers (subprocess backends may not have exited yet).
-        for _dbname in (_TEST_DB, _TEE_DB):
-            admin.execute(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s",
-                (_dbname,),
-            )
-            admin.execute(f'DROP DATABASE IF EXISTS "{_dbname}"')
+    except Exception as exc:
+        print(
+            f"feedling: teardown could not open the admin connection "
+            f"({type(exc).__name__}: {exc}) — leaked {_TEST_DB} and {_TEE_DB}",
+            file=sys.stderr,
+        )
+        return
+    try:
+        _drop_throwaway_databases(admin, (_TEST_DB, _TEE_DB))
+    finally:
         admin.close()
-    except Exception:
-        pass
 
 
 def pytest_terminal_summary(terminalreporter):

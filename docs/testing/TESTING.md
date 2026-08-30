@@ -171,11 +171,12 @@ V2 的 bug 表面很杂,底下集中在**五段共用代码**上(上下文组装
 
 | 层 | 命令 / 工具 | 证明什么 | 成本 |
 |---|---|---|---|
-| **L1 本地 pytest + pyflakes** | `python -m pytest tests/ -q --ignore=tests/e2e_model_api_test.py --ignore=tests/test_api.py` + `python -m pyflakes backend/<包>` | 纯逻辑 + ASGI app 正确 | 秒级，每次都跑 |
-| **L2 本地 E2E 真链路** | `tests/e2e_model_api_test.py`（起真后端 + enclave 模拟器，走 register→setup→send）；`tools/*_roundtrip_test.py` | 加密/账号/vendor 整条路径通 | 分钟级，碰链路才跑 |
-| **L3 部署态 E2E** | test 环境发真实加密信封 → 读 `/v1/admin/data-track/debug?user_id=…`（Bearer = `~/.feedling/data-track-admin-token`） | 部署后真生效、网关/CVM 行为对 | 需部署，碰运行时行为才跑 |
+| **L1 本地 pytest + pyflakes** | `python -m pytest tests/ -q --ignore=tests/test_api.py` + `python -m pyflakes backend/<包>` | 纯逻辑 + ASGI app 正确 | 秒级，每次都跑 |
+| **L2 本地 E2E 真链路** | `tools/e2e_encryption_test.py`（本地 backend + enclave 模拟器）；`tools/*_roundtrip_test.py` | 本地加密、账号、enclave 和信封链路通 | 分钟级，碰链路才跑 |
+| **L3 部署态 E2E** | test 环境运行 `python3 tools/e2e/p0.py`，必要时再读 `/v1/admin/data-track/debug?user_id=…`（Bearer = `~/.feedling/data-track-admin-token`） | 真实 provider/runtime、网关/CVM、客户端解密、连续性与 teardown | 需部署，碰运行时行为才跑 |
 
-> L1 判据是**「零新增失败」**（有 2 个长期红的 enclave 依赖用例，backlog #12）。
+> L1 应完整通过。若本地失败而同 commit 的 CI 通过，先核对 PostgreSQL、job 级环境变量
+> 和 loopback/socket 权限；不得把环境错误登记成长期红来降低门禁。
 
 ---
 
@@ -240,7 +241,8 @@ V2 的 bug 表面很杂,底下集中在**五段共用代码**上(上下文组装
   - forge build/test/coverage（合约）
   - 起后端 → `tests/test_api.py --multi-tenant` → 隔离回归（`test_db.py` `test_multi_tenant_isolation.py`）→ Round 3 V2 回归
   - `docker compose build --no-cache`（`--require-hashes`）+ healthcheck
-  - syntax + static（pyflakes）
+  - syntax + static（`compileall` + language eval + dependency provenance；当前
+    workflow 不运行 pyflakes，所以 L1 的本地 pyflakes 仍需自行执行）
 - **`continuity-canary.yml`**（每日 06:17 UTC cron）：prod day-0 信封解密连续性（`tools/continuity_canary.py`）——防"某天起解不开老信封"。
 - **`deploy-test-contract.yml`**（手动）：部署 FeedlingAppAuth 到 Sepolia。
 - **`docker-publish.yml`**：镜像发布。
@@ -335,18 +337,19 @@ comm -23 /tmp/g-all.txt /tmp/g-cov.txt | grep -F "<你的新文件名>"
 
 ---
 
-## 5.5 V1 退役后,这些坑还算不算数?
+## 5.5 Hosted Resident / V2 并存时，这些坑还算不算数？
 
-**V1 托管运行时(`backend/agent_runtime/` 的 supervisor + 每用户 CLI 进程)已不再维护。**
-但它踩过的坑不能一删了之——因为现在跑的两条路都继承了同样的物理约束。
+**Hosted Resident 仍是活跃生产路径**：在 `FEEDLING_HOSTED_RUNTIME_POLICY=dual`
+下，`backend/agent_runtime/` 的 supervisor、每用户 CLI 进程和 Resident 生命周期都必须
+维护；Runtime V2 是并存路径，不是把前者改成历史材料的理由。
 
-判断某条老坑还成不成立,按这个分:
+判断某条旧事故经验现在怎么验证，按这个分：
 
 | 老坑属于 | 现在怎么处理 |
 |---|---|
-| **V1 托管框架专有**(supervisor 拉进程、每用户 spawner、hosted resident 生命周期) | 作废,不用再看 |
-| **resident consumer 的**(轮询、解密、工具面、会话复用) | **完全有效**——VPS 用户此刻还在用同一份 consumer 代码 |
-| **产品行为层面的**(回复不该静默、记忆不该被覆盖、主动不该刷屏) | **有效,且必须在 V2 上重新确认**——换了实现不等于换了物理 |
+| **Hosted Resident 框架专有**（supervisor 拉进程、每用户 spawner、hosted resident 生命周期） | **仍有效**——在 dual policy 和 resident desired runtime 退役前，必须保留并验证 |
+| **resident consumer 的**（轮询、解密、工具面、会话复用） | **完全有效**——Hosted Resident 和 VPS 用户都依赖同一单文件 consumer 边界 |
+| **产品行为层面的**（回复不该静默、记忆不该被覆盖、主动不该刷屏） | **两条 runtime 都有效**——必须分别验证，换了实现不等于换了物理 |
 
 ⚠️ **两个最容易误伤的地方**:
 1. `resident` 一词两义(见 §6):接入路线 `route=resident` = 用户自己的服务器;
@@ -418,7 +421,7 @@ comm -23 /tmp/g-all.txt /tmp/g-cov.txt | grep -F "<你的新文件名>"
 - **openai_compatible 中转验证，`test_status:ok` 之外还有两个独立坑**（2026-07-27 Kimi/Moonshot 验证）：
   ① **key 有区域锁**——同一家中转多个区域 endpoint，key 只在签发区有效：Moonshot 的 key 在 `api.moonshot.cn` 返 200，同 key 打 `api.moonshot.ai` 直接 `401 Invalid Authentication`。用户报 `provider_test_failed` / 401，**先核 `base_url` 区域是否配对 key 的签发区，再谈 key 废没废**（先 `curl {base_url}/models -H "Authorization: Bearer <key>"` 隔离 provider 侧）。
   ② **「能回话」≠「记忆/工具能用」，必须单独验一轮带记忆写入 + 工具调用的回合**——但**没有任何配置字段能替你预测这件事**。曾经的 `responses_unsupported` warning + `supports_responses` 探测（setup 打中转 `/responses`）是错的，2026-07-27 已删除：它的前提「LiteLLM 强制 responses→chat-completions 桥接 mangle codex 工具循环」三条全失效（网关已退役；`openai_compatible` 派生 `pi` 而非 `codex`；V2 全程 `chat_completion_async`，`/responses` 在 `provider_client` 唯一入口是 `provider == "openai"`）。实测：Kimi/Moonshot 在 V1(pi) 与 V2 两条路径上记忆写入、下一轮回读、工具调用全部正常（V2 trajectory 记到 `tool_call_started`/`tool_call_result` 各 3 次）。**验法只有跑真回合**：写一条事实 → 下一轮问回来 → 查 `/v1/memory/index` 有卡；要白盒就查 `v2_trajectory_events.event_kind`（明文列，`user_id` 过滤，删号会 CASCADE 掉，必须在 teardown 前查）。
-  旁证（可复用基线）：enclave 能连 `api.moonshot.cn`；Kimi `kimi-k2.5` 经 openai_compatible 端到端可用、原生 thinking 正常。验证走 L2/L3 真链路（`tests/e2e_model_api_test.py` / `tools/e2e/`，register→setup→send→客户端解密）——openai_compatible 只需 setup 传 `provider=openai_compatible` + `base_url` + `context_window_tokens`。
+  旁证（可复用基线）：enclave 能连 `api.moonshot.cn`；Kimi `kimi-k2.5` 经 openai_compatible 端到端可用、原生 thinking 正常。验证走 L3 `tools/e2e/p0.py` 真链路（register→setup→202 async send→客户端解密→continuity→teardown）——openai_compatible 只需 setup 传 `provider=openai_compatible` + `base_url` + `context_window_tokens`。
 - **改用户可见文案前，先从屏幕反向追到抛点**：确认这条 error code 在**目标运行时**真会走到用户面前。V2 抛的是 `prompt_frontier_exhausted`（裸协议码），不是 provider 的 `context_overflow`——改后者的话术对 V2 用户一个字都不会生效（07-26 险些上线一条死分支，撤回）。**而且"能走到"之后还有一层：客户端会按自己的规则二次翻译。** 2026-08-09 中转站地址填错那次，后端已经准确判成"地址不是 API 端点"、detail 也写对了，但返回体里带着 provider 的 `404`——iOS `providerTestFailureMessage` 会**优先按状态码映射**，`404 → "模型不存在"`，用户屏幕上仍然是一句指错方向的话。修法是后端把 `status_code` 清成 `null`，让它落到 detail 分支。**判据：改完之后去客户端把那段映射读一遍**（slug 分支 / 状态码分支 / 兜底分支，哪条先命中），别只看返回体对不对。
 - **跨环境复现之前，先把变量表列出来逐项对齐**：2026-08-07 查一个 prod 用户的空回复，我用**prod 的 key、从本机**发了十几轮请求（参数矩阵、35916 token 大 prompt、六个 endpoint 逐个锁定）**全部成功**，据此一路推翻自己的假设——而用户失败的是 **test 环境 + 另一把 key + 有 187 条历史的账号**，**三个变量都不一样**，这个对照从第一分钟起就不成立。折腾了一下午，最后是用户自己观察到"一调工具就失败"才定位。**动手复现前先写下这张表并逐项打勾**：运行时（V1 resident / V2）、driver（pi / claude / codex）、凭证（哪一把 key、哪个账号）、账号状态（历史规模、记忆条数、是否新号）、出口（本机 / CVM，`phala cvms list` 能看到 prod 不在同一个账号下）、客户端版本。**任何一项对不上，"我这边全通"就不构成证据。** 同族手法：链路里的**外部 CLI（pi 等）不是黑盒**——它装在本机 npm 缓存里，`dist/` 下就有源码。那次的真因（工具历史存在时 pi 发 `tools: []`，模型只输出思考块不说话）是**读它的 `openai-completions.js` 三分钟看出来的**，而我在那之前猜了一整天。
 - **想在本地复现 CI 的某一步,必须连 job 级 env 一起抄,不能只抄那一步的 `env:`。**2026-08-10:我照着 ci.yml 里 `Run resident consumer regression suite` 那一步的 `env:` 只设了 `FEEDLING_TEST_PG`,50 个文件里 3 个当场红(`test_v2_screen_watch_lane` / `test_v1_downloadable_files` / `test_redistill_job_exclusivity`),报错第一行是 `DATABASE_URL is not set` —— 那个变量来自 job 级 env + service container,不在步骤里。差点把它们当成真回归去追。**判据**:本地红而 CI 同一 commit 绿 = 先查环境差异,别先查代码;确认方式是看报错的**第一行**(往往直说缺哪个变量),不是看最后的 assert。反过来也成立:本地绿不等于 CI 绿 —— 同一天我只跑了自己改的那一个文件就宣布通过,结果打红了另一个文件里三条我从没打开过的断言。**改动共享函数后,要跑的是 CI 那一整套,不是你改的那一个文件**(命令就在 ci.yml 里,照抄那段 `grep -l` 的文件发现逻辑)。

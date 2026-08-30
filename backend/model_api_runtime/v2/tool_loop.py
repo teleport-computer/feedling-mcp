@@ -20,7 +20,7 @@ from capabilities import registry as cap_registry
 from capabilities import result_budget
 from capabilities import tool_schema
 from agent_protocol_core import protocol_leak, self_thinking
-from model_api_runtime.v2 import language_follow
+from chat import language_follow
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import provenance
 from model_api_runtime.v2 import tool_surface
@@ -61,6 +61,14 @@ DEFAULT_MAX_TOOL_ARGS_CHARS = 16000
 DEFAULT_MAX_TOOL_BATCH_ARGS_CHARS = 64000
 DEFAULT_MAX_NATIVE_ASSISTANT_TURN_CHARS = 65536
 DEFAULT_MAX_ASSISTANT_TOOL_TEXT_CHARS = 8192
+# ``debug_trace._safe_detail`` retains at most 20 keys and 20 list items.  This
+# module stays dependency-clean, so it cannot import debug_trace; a test at the
+# real provider-surface capture point pins both ceilings, including the worker's
+# later ``lane``/``wake_kind`` keys.  We intentionally share the two compact
+# count dictionaries instead of spending the three keys per list required by
+# ``debug_trace.bounded_names``.  A bucket count above its list length is the
+# explicit truncation signal for the emitted platform-name lists.
+_PROVIDER_TOOL_NAME_TRACE_CAP = 20
 REJECTED_TOOL_ARGS_SUMMARY_CHAR_CAP = 500
 REJECTED_ASSISTANT_TEXT_CHAR_CAP = 500
 REJECTED_TOOL_CALL_ID_PREFIX = "feedling_rejected_"
@@ -68,9 +76,41 @@ REJECTED_TOOL_NAME_PLACEHOLDER = "feedling_rejected_unknown_tool"
 MIN_TOOL_RESULT_ERROR_QUOTA = 64
 _RESULT_TRUNCATION_MARKER = "...[truncated]"
 _REJECTED_TOOL_ARGS_KEY = "_feedling_rejected_args"
-_REJECTED_TOOL_PLAIN_TEXT_INSTRUCTION = (
-    "工具当前不可用,请用纯文本直接回复"
+_UNKNOWN_TOOL_REJECTION_REASON = "unknown_tool"
+_TOOL_WITHDRAWN_REJECTION_REASON = "tool_withdrawn"
+_PROVIDER_CALL_REJECTION_REASON_ASSISTANT_TOOL_TEXT_TOO_LARGE = (
+    "assistant_tool_text_too_large"
 )
+_PROVIDER_CALL_REJECTION_REASON_DUPLICATE_TOOL_CALL_ID = "duplicate_tool_call_id"
+_PROVIDER_CALL_REJECTION_REASON_INVALID_IMAGE_REPLY_BATCH = "invalid_image_reply_batch"
+_PROVIDER_CALL_REJECTION_REASON_INVALID_OR_OVER_BUDGET_TOOL_EXCHANGE = (
+    "invalid_or_over_budget_tool_exchange"
+)
+_PROVIDER_CALL_REJECTION_REASON_INVALID_STAY_SILENT_BATCH = "invalid_stay_silent_batch"
+_PROVIDER_CALL_REJECTION_REASON_INVALID_TOOL_ARGUMENTS = "invalid_tool_arguments"
+_PROVIDER_CALL_REJECTION_REASON_REPEATED_INVALID_TOOL_ARGUMENTS = (
+    "repeated_invalid_tool_arguments"
+)
+_PROVIDER_CALL_REJECTION_REASON_MISSING_TOOL_CALL_ID = "missing_tool_call_id"
+_PROVIDER_CALL_REJECTION_REASON_MISSING_TOOL_NAME = "missing_tool_name"
+_PROVIDER_CALL_REJECTION_REASON_MIXED_REPLY_AND_MUTATION = "mixed_reply_and_mutation"
+_PROVIDER_CALL_REJECTION_REASON_NATIVE_ASSISTANT_TURN_TOO_LARGE = (
+    "native_assistant_turn_too_large"
+)
+_PROVIDER_CALL_REJECTION_REASON_PROVIDER_MEDIA_WITH_TOOL_CALLS = (
+    "provider_media_with_tool_calls"
+)
+_PROVIDER_CALL_REJECTION_REASON_TERMINAL_TOOL_CALL_REJECTED = (
+    "terminal_tool_call_rejected"
+)
+_PROVIDER_CALL_REJECTION_REASON_TOOL_ARGUMENTS_TOO_LARGE = "tool_arguments_too_large"
+_PROVIDER_CALL_REJECTION_REASON_TOOL_BATCH_ARGUMENTS_TOO_LARGE = (
+    "tool_batch_arguments_too_large"
+)
+_PROVIDER_CALL_REJECTION_REASON_TOOL_CALL_BUDGET_EXCEEDED = "tool_call_budget_exceeded"
+_PROVIDER_CALL_REJECTION_REASON_UNAPPROVED_EXTERNAL_URL = "unapproved_external_url"
+_PROVIDER_CALL_REJECTION_REASON_UNCLASSIFIED = "unclassified_rejection"
+_REJECTED_TOOL_PLAIN_TEXT_INSTRUCTION = "工具当前不可用,请用纯文本直接回复"
 MCP_MUTATION_OUTCOME_UNKNOWN_ERROR = "error: mcp_mutation_outcome_unknown"
 MUTATION_BLOCKED_AFTER_UNKNOWN_OUTCOME_ERROR = (
     "error: mutation_blocked_after_unknown_outcome"
@@ -93,7 +133,15 @@ _FILE_DELIVERY_TOOLS = frozenset(
 # These wires accept the OpenAI-style named-function ``tool_choice`` payload.
 # Other providers may expose tools but do not accept this exact forcing shape.
 _NAMED_TOOL_CHOICE_PROVIDERS = frozenset(
-    {"openai", "openrouter", "openai_compatible", "deepseek", "anthropic", "gemini", "bedrock"}
+    {
+        "openai",
+        "openrouter",
+        "openai_compatible",
+        "deepseek",
+        "anthropic",
+        "gemini",
+        "bedrock",
+    }
 )
 _WAKE_REPLY_TOOL = "reply"
 _WAKE_REPLY_TOOL_SPEC = ToolSpec(
@@ -141,6 +189,7 @@ _CONTENT_FREE_STOP_REASONS = frozenset(
         "image_safety",
         "language",
         "length",
+        "max_output_tokens",
         "malformed_function_call",
         "max_tokens",
         "other",
@@ -174,11 +223,71 @@ _PROVIDER_FORCE_TEXT_FALLBACK_REASONS = frozenset(
         "none",
         "tool_schema_rejected",
         "final_reply_correction",
-        "invalid_or_over_budget_tool_exchange",
+        _PROVIDER_CALL_REJECTION_REASON_INVALID_OR_OVER_BUDGET_TOOL_EXCHANGE,
+        _PROVIDER_CALL_REJECTION_REASON_REPEATED_INVALID_TOOL_ARGUMENTS,
         "tool_only_stall",
         "other",
     }
 )
+# Provider calls that failed, but for which the loop deliberately made a
+# degraded retry.  These values are mirrored into the plaintext attempt ledger;
+# keep them as producer-owned closed metadata, never exception text.
+_PROVIDER_ATTEMPT_FALLBACK_TAGGED_IMAGES = "tagged_images_rejected"
+_PROVIDER_ATTEMPT_FALLBACK_TOOL_SCHEMA = "tool_schema_rejected"
+_PROVIDER_ATTEMPT_FALLBACK_REASONS = frozenset({
+    _PROVIDER_ATTEMPT_FALLBACK_TAGGED_IMAGES,
+    _PROVIDER_ATTEMPT_FALLBACK_TOOL_SCHEMA,
+})
+# Keep the producer inventory separate from the public vocabulary. A regression
+# test compares the two so adding a classification branch cannot silently turn a
+# rejected round into the same empty list used by a healthy round.
+_PROVIDER_CALL_REJECTION_PRODUCER_REASONS = frozenset(
+    {
+        _PROVIDER_CALL_REJECTION_REASON_ASSISTANT_TOOL_TEXT_TOO_LARGE,
+        _PROVIDER_CALL_REJECTION_REASON_DUPLICATE_TOOL_CALL_ID,
+        _PROVIDER_CALL_REJECTION_REASON_INVALID_IMAGE_REPLY_BATCH,
+        _PROVIDER_CALL_REJECTION_REASON_INVALID_OR_OVER_BUDGET_TOOL_EXCHANGE,
+        _PROVIDER_CALL_REJECTION_REASON_INVALID_STAY_SILENT_BATCH,
+        _PROVIDER_CALL_REJECTION_REASON_INVALID_TOOL_ARGUMENTS,
+        _PROVIDER_CALL_REJECTION_REASON_REPEATED_INVALID_TOOL_ARGUMENTS,
+        _PROVIDER_CALL_REJECTION_REASON_MISSING_TOOL_CALL_ID,
+        _PROVIDER_CALL_REJECTION_REASON_MISSING_TOOL_NAME,
+        _PROVIDER_CALL_REJECTION_REASON_MIXED_REPLY_AND_MUTATION,
+        _PROVIDER_CALL_REJECTION_REASON_NATIVE_ASSISTANT_TURN_TOO_LARGE,
+        _PROVIDER_CALL_REJECTION_REASON_PROVIDER_MEDIA_WITH_TOOL_CALLS,
+        _PROVIDER_CALL_REJECTION_REASON_TERMINAL_TOOL_CALL_REJECTED,
+        _PROVIDER_CALL_REJECTION_REASON_TOOL_ARGUMENTS_TOO_LARGE,
+        _PROVIDER_CALL_REJECTION_REASON_TOOL_BATCH_ARGUMENTS_TOO_LARGE,
+        _PROVIDER_CALL_REJECTION_REASON_TOOL_CALL_BUDGET_EXCEEDED,
+        _PROVIDER_CALL_REJECTION_REASON_UNAPPROVED_EXTERNAL_URL,
+        _UNKNOWN_TOOL_REJECTION_REASON,
+        _TOOL_WITHDRAWN_REJECTION_REASON,
+    }
+)
+_PROVIDER_CALL_REJECTION_REASONS = frozenset(
+    _PROVIDER_CALL_REJECTION_PRODUCER_REASONS
+    | {_PROVIDER_CALL_REJECTION_REASON_UNCLASSIFIED}
+)
+
+
+def _normalize_provider_call_rejection_reasons(values) -> list[str]:
+    """Return unique producer-owned rejection tokens, never arbitrary text."""
+    if not isinstance(values, (list, tuple)):
+        return []
+    return list(
+        dict.fromkeys(
+            value
+            for value in values
+            if isinstance(value, str)
+            and value in _PROVIDER_CALL_REJECTION_REASONS
+        )
+    )
+
+
+def _bounded_provider_tool_names(values) -> tuple[list[str], int]:
+    """Return sorted content-free tool names plus the pre-truncation count."""
+    names = sorted({str(value) for value in (values or ()) if str(value)})
+    return names[:_PROVIDER_TOOL_NAME_TRACE_CAP], len(names)
 
 
 def _catalog():
@@ -407,6 +516,258 @@ def _serialized_chars(value) -> int | None:
         )
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _tool_args_char_limit(tc: ToolCall, default_limit: int) -> int:
+    """Allow one schema-bounded Canvas body through the generic tool guard."""
+    if (
+        tc.name == "workspace_write"
+        and tc.args_ok
+        and str(tc.args.get("path") or "").strip().casefold().endswith(".io.html")
+        and tool_schema.validate_tool_args(tc.name, tc.args) is None
+    ):
+        serialized_size = _serialized_chars(tc.args)
+        if serialized_size is not None:
+            # The closed tool schema and its capability-level UTF-8 check are
+            # authoritative here. Derive the allowance from this exact parsed
+            # argument object: JSON escaping grows with quote/backslash density,
+            # so a fixed additive allowance would silently narrow the 256KB
+            # source contract when a future output budget reaches that boundary.
+            return max(default_limit, serialized_size)
+    return default_limit
+
+
+@dataclass(frozen=True)
+class _ToolCallRejectionFacts:
+    call_ids: list[str]
+    image_reply_calls: list[ToolCall]
+    stay_silent_calls: list[ToolCall]
+    oversized_tool_exchange: bool
+    over_tool_call_budget: bool
+    malformed: bool
+    truncated_tool_arguments: bool
+    mixed_reply_write: bool
+    invalid_image_batch: bool
+    invalid_silence_batch: bool
+    rejected: bool
+    call_rejection_reasons: list[str]
+    reason_tokens: list[str]
+
+
+def _tool_call_rejection_facts(
+    pr: ProviderResponse,
+    *,
+    tools: list[ToolSpec] | None,
+    raw_finish_reason: str,
+    terminal_text_round: bool,
+    tool_calls_used: int,
+    previous_offered_tool_names: frozenset[str],
+    completed_memory_discovery_tools: set[str],
+    external_content_seen: bool,
+    allowed_fetch_urls: set[str],
+    mutating_mcp_names: set[str],
+    max_tool_args_chars: int,
+    max_tool_batch_args_chars: int,
+    max_native_assistant_turn_chars: int,
+    max_assistant_tool_text_chars: int,
+    max_tool_calls_per_round: int,
+    max_tool_calls_per_turn: int,
+) -> _ToolCallRejectionFacts:
+    """Classify one provider tool batch using content-free closed tokens."""
+    call_ids = [tc.id for tc in pr.tool_calls]
+    argument_sizes = [
+        (_serialized_chars(tc.args) if tc.args_ok else len(str(tc.args_raw or "")))
+        for tc in pr.tool_calls
+    ]
+    argument_limits = [
+        _tool_args_char_limit(tc, max_tool_args_chars)
+        for tc in pr.tool_calls
+    ]
+    batch_arguments_limit = max_tool_batch_args_chars
+    native_assistant_turn_limit = max_native_assistant_turn_chars
+    if (
+        len(pr.tool_calls) == 1
+        and argument_limits
+        and argument_limits[0] > max_tool_args_chars
+    ):
+        batch_arguments_limit = max(batch_arguments_limit, argument_limits[0])
+        native_assistant_turn_limit = max(
+            native_assistant_turn_limit,
+            argument_limits[0] + max_assistant_tool_text_chars + 8192,
+        )
+    native_turn_size = (
+        _serialized_chars(pr.assistant_turn.payload)
+        if pr.assistant_turn is not None
+        else 0
+    )
+    oversized_tool_exchange = (
+        any(
+            size is None or size > limit
+            for size, limit in zip(argument_sizes, argument_limits)
+        )
+        or sum(size or 0 for size in argument_sizes) > batch_arguments_limit
+        or native_turn_size is None
+        or native_turn_size > native_assistant_turn_limit
+        or len(pr.text) > max_assistant_tool_text_chars
+    )
+    over_tool_call_budget = (
+        len(pr.tool_calls) > max_tool_calls_per_round
+        or tool_calls_used + len(pr.tool_calls) > max_tool_calls_per_turn
+    )
+    offered_names = {spec.name for spec in (tools or [])}
+    individual_rejection_reasons: list[list[str]] = []
+    for tc in pr.tool_calls:
+        reasons: list[str] = []
+        if not tc.id:
+            reasons.append(_PROVIDER_CALL_REJECTION_REASON_MISSING_TOOL_CALL_ID)
+        if not tc.name:
+            reasons.append(_PROVIDER_CALL_REJECTION_REASON_MISSING_TOOL_NAME)
+        if not tc.args_ok:
+            reasons.append(_PROVIDER_CALL_REJECTION_REASON_INVALID_TOOL_ARGUMENTS)
+        if (
+            tc.name not in offered_names
+            and tc.name not in completed_memory_discovery_tools
+        ):
+            reasons.append(
+                _TOOL_WITHDRAWN_REJECTION_REASON
+                if tc.name in previous_offered_tool_names
+                else _UNKNOWN_TOOL_REJECTION_REASON
+            )
+        elif (
+            external_content_seen
+            and tc.name == "web_fetch"
+            and str(tc.args.get("url") or "").strip() not in allowed_fetch_urls
+        ):
+            reasons.append(_PROVIDER_CALL_REJECTION_REASON_UNAPPROVED_EXTERNAL_URL)
+        individual_rejection_reasons.append(reasons)
+    # Provider media is terminal output. Do not silently discard or retain
+    # its large inline payload when a broken relay also invents function calls.
+    malformed = (
+        (terminal_text_round and bool(pr.tool_calls))
+        or bool(pr.media)
+        or any(individual_rejection_reasons)
+    )
+    truncated_tool_arguments = provider_client.is_token_limit_stop_reason(
+        raw_finish_reason
+    ) and any(not tc.args_ok for tc in pr.tool_calls)
+    image_reply_calls = [
+        tc for tc in pr.tool_calls if tc.name == tool_schema.IMAGE_REPLY_TOOL
+    ]
+    stay_silent_calls = [
+        tc for tc in pr.tool_calls if tc.name == tool_schema.STAY_SILENT_TOOL
+    ]
+    mixed_reply_write = any(
+        tc.name
+        in {
+            tool_schema.FILE_REPLY_TOOL,
+            tool_schema.IMAGE_REPLY_TOOL,
+            tool_schema.STAY_SILENT_TOOL,
+        }
+        for tc in pr.tool_calls
+    ) and any(
+        tc.name in _PLATFORM_MUTATION_TOOLS or tc.name in mutating_mcp_names
+        for tc in pr.tool_calls
+    )
+    invalid_image_batch = bool(image_reply_calls) and (
+        len(image_reply_calls) != 1 or len(pr.tool_calls) != 1
+    )
+    invalid_silence_batch = bool(stay_silent_calls) and (
+        len(stay_silent_calls) != 1 or len(pr.tool_calls) != 1
+    )
+    duplicate_call_ids = {
+        call_id for call_id in call_ids if call_id and call_ids.count(call_id) > 1
+    }
+    batch_rejection_reasons: list[str] = []
+    if terminal_text_round:
+        batch_rejection_reasons.append(
+            _PROVIDER_CALL_REJECTION_REASON_TERMINAL_TOOL_CALL_REJECTED
+        )
+    if pr.media:
+        batch_rejection_reasons.append(
+            _PROVIDER_CALL_REJECTION_REASON_PROVIDER_MEDIA_WITH_TOOL_CALLS
+        )
+    if mixed_reply_write:
+        batch_rejection_reasons.append(
+            _PROVIDER_CALL_REJECTION_REASON_MIXED_REPLY_AND_MUTATION
+        )
+    if invalid_image_batch:
+        batch_rejection_reasons.append(
+            _PROVIDER_CALL_REJECTION_REASON_INVALID_IMAGE_REPLY_BATCH
+        )
+    if invalid_silence_batch:
+        batch_rejection_reasons.append(
+            _PROVIDER_CALL_REJECTION_REASON_INVALID_STAY_SILENT_BATCH
+        )
+    if over_tool_call_budget:
+        batch_rejection_reasons.append(
+            _PROVIDER_CALL_REJECTION_REASON_TOOL_CALL_BUDGET_EXCEEDED
+        )
+    if sum(size or 0 for size in argument_sizes) > batch_arguments_limit:
+        batch_rejection_reasons.append(
+            _PROVIDER_CALL_REJECTION_REASON_TOOL_BATCH_ARGUMENTS_TOO_LARGE
+        )
+    if native_turn_size is None or native_turn_size > native_assistant_turn_limit:
+        batch_rejection_reasons.append(
+            _PROVIDER_CALL_REJECTION_REASON_NATIVE_ASSISTANT_TURN_TOO_LARGE
+        )
+    if len(pr.text) > max_assistant_tool_text_chars:
+        batch_rejection_reasons.append(
+            _PROVIDER_CALL_REJECTION_REASON_ASSISTANT_TOOL_TEXT_TOO_LARGE
+        )
+    call_rejection_reasons: list[str] = []
+    for tc, argument_size, argument_limit, individual_reasons in zip(
+        pr.tool_calls,
+        argument_sizes,
+        argument_limits,
+        individual_rejection_reasons,
+    ):
+        reasons = list(individual_reasons)
+        if tc.id in duplicate_call_ids:
+            reasons.append(_PROVIDER_CALL_REJECTION_REASON_DUPLICATE_TOOL_CALL_ID)
+        if argument_size is None or argument_size > argument_limit:
+            reasons.append(_PROVIDER_CALL_REJECTION_REASON_TOOL_ARGUMENTS_TOO_LARGE)
+        reasons.extend(batch_rejection_reasons)
+        call_rejection_reasons.append(
+            ",".join(dict.fromkeys(reasons))
+            or _PROVIDER_CALL_REJECTION_REASON_INVALID_OR_OVER_BUDGET_TOOL_EXCHANGE
+        )
+    rejected = bool(pr.tool_calls) and (
+        malformed
+        or len(set(call_ids)) != len(call_ids)
+        or mixed_reply_write
+        or invalid_image_batch
+        or invalid_silence_batch
+        or over_tool_call_budget
+        or oversized_tool_exchange
+    )
+    reason_tokens = (
+        _normalize_provider_call_rejection_reasons(
+            [
+                token
+                for joined_reasons in call_rejection_reasons
+                for token in joined_reasons.split(",")
+            ]
+        )
+        if rejected
+        else []
+    )
+    if rejected and not reason_tokens:
+        reason_tokens = [_PROVIDER_CALL_REJECTION_REASON_UNCLASSIFIED]
+    return _ToolCallRejectionFacts(
+        call_ids=call_ids,
+        image_reply_calls=image_reply_calls,
+        stay_silent_calls=stay_silent_calls,
+        oversized_tool_exchange=oversized_tool_exchange,
+        over_tool_call_budget=over_tool_call_budget,
+        malformed=malformed,
+        truncated_tool_arguments=truncated_tool_arguments,
+        mixed_reply_write=mixed_reply_write,
+        invalid_image_batch=invalid_image_batch,
+        invalid_silence_batch=invalid_silence_batch,
+        rejected=rejected,
+        call_rejection_reasons=call_rejection_reasons,
+        reason_tokens=reason_tokens,
+    )
 
 
 def _truncate_result_content(content: str, cap: int, *, marker: str = _RESULT_TRUNCATION_MARKER) -> str:
@@ -661,6 +1022,15 @@ class ProviderEmptyReply(RuntimeError):
     """A structurally valid provider success had no foreground-usable output."""
 
 
+class ProviderOutputTruncated(RuntimeError):
+    """A provider stopped while serializing a tool call at its output limit."""
+
+    reason = "output_truncated"
+
+    def __init__(self):
+        super().__init__(self.reason)
+
+
 class FileDeliveryIncomplete(RuntimeError):
     """A requested attachment was saved but still failed bounded delivery."""
 
@@ -838,6 +1208,7 @@ async def run_tool_loop(
     max_assistant_tool_text_chars: int = DEFAULT_MAX_ASSISTANT_TOOL_TEXT_CHARS,
     prompt_context_window_overrides=None,
     prompt_output_reserve_tokens: int = prompt_frontier.DEFAULT_OUTPUT_RESERVE_TOKENS,
+    file_output_max_tokens: int = provider_client.CHAT_OUTPUT_MAX_TOKENS,
     prompt_safety_margin_tokens: int | None = None,
     prompt_estimator_utf8_bytes_per_token: float = prompt_frontier.DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN,
     prompt_image_reserve_tokens: int = prompt_frontier.DEFAULT_IMAGE_RESERVE_TOKENS,
@@ -931,6 +1302,10 @@ async def run_tool_loop(
         max_assistant_tool_text_chars,
         name="max_assistant_tool_text_chars",
     )
+    file_output_max_tokens = _positive_limit(
+        file_output_max_tokens,
+        name="file_output_max_tokens",
+    )
     normalized_empty_response_correction = str(
         empty_response_correction or _EMPTY_RESPONSE_CORRECTION
     ).strip()
@@ -961,6 +1336,7 @@ async def run_tool_loop(
     transcript: list = []
     replied_intermediate = False
     attempts = 0
+    last_offered_tool_names: frozenset[str] = frozenset()
     tool_calls_used = 0
     consecutive_tool_only_rounds = 0
     terminal_tool_call_retries = 0
@@ -968,6 +1344,7 @@ async def run_tool_loop(
     seen_reasoning_fragments: set[str] = set()
     force_text_fallback = False
     force_text_fallback_reason = ""
+    generic_validation_retry_used = False
     empty_response_recovery_used = False
     empty_response_retry_instruction = ""
     wake_choice_recovery_used = False
@@ -1137,6 +1514,7 @@ async def run_tool_loop(
     compact_delivery_validation_exchange: ToolExchange | None = None
     compact_delivery_mismatch_retry_used = False
     compact_delivery_args_retry_used = False
+    file_delivery_callback_retry_used = False
     compact_delivery_confirmation_needed = False
     # Names keep required schemas visible and completed discovery calls valid in
     # native history. Exact call keys independently decide whether dispatch would
@@ -1237,6 +1615,27 @@ async def run_tool_loop(
             emitted = on_provider_call_event(event_kind, detail)
             if inspect.isawaitable(emitted):
                 await emitted
+        except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
+            pass
+
+    async def _emit_provider_tool_surface(
+        detail: dict | None,
+        rejection_reasons=(),
+    ) -> None:
+        """Emit the request surface once its same-round response is classified."""
+        if on_provider_tool_surface is None or detail is None:
+            return
+        try:
+            await on_provider_tool_surface(
+                {
+                    **detail,
+                    "call_rejection_reasons": (
+                        _normalize_provider_call_rejection_reasons(
+                            list(rejection_reasons)
+                        )
+                    ),
+                }
+            )
         except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
             pass
 
@@ -1389,6 +1788,7 @@ async def run_tool_loop(
                         compact_delivery_validation_exchange = None
                         compact_delivery_mismatch_retry_used = False
                         compact_delivery_args_retry_used = False
+                        file_delivery_callback_retry_used = False
                         compact_delivery_confirmation_needed = False
                         if on_file_requirement_changed is not None:
                             await on_file_requirement_changed()
@@ -1995,6 +2395,10 @@ async def run_tool_loop(
                 "tail_window": tail_window,
             },
         )
+        previous_offered_tool_names = last_offered_tool_names
+        current_offered_tool_names = frozenset(
+            str(spec.name) for spec in (tools or [])
+        )
         attempts += 1
         _progress("provider_start")
         await _provider_call_event(
@@ -2007,6 +2411,7 @@ async def run_tool_loop(
         )
         provider_call_started_at = time.monotonic()
         provider_error: BaseException | None = None
+        provider_surface_detail: dict | None = None
         try:
             # V2 owns the lane-specific empty-response policy. Let the provider
             # parser return any structurally valid success so an abnormal HTTP
@@ -2055,13 +2460,14 @@ async def run_tool_loop(
                 # generated document inside workspace_write arguments. The
                 # provider client's historical 700-token default predates V2
                 # tools and truncates even modest documents into malformed
-                # JSON. Use the output budget already reserved by V2's prompt
-                # frontier; wake/child/screen lanes omit on_file_reply and keep
-                # their existing limits unchanged.
+                # JSON. File generation owns a separate output budget: the
+                # prompt frontier's reserve is input accounting, and increasing
+                # it would silently evict otherwise usable history. Wake/child/
+                # screen lanes omit on_file_reply and keep their existing limits.
                 provider_kwargs["max_tokens"] = (
-                    min(prompt_output_reserve_tokens, 512)
+                    min(file_output_max_tokens, 512)
                     if compact_delivery_phase
-                    else prompt_output_reserve_tokens
+                    else file_output_max_tokens
                 )
             if on_provider_tool_surface is not None:
                 candidate_names = {
@@ -2070,34 +2476,56 @@ async def run_tool_loop(
                 sent_names = {str(spec.name) for spec in (tools or [])}
                 mcp_candidate_names = candidate_names & mcp_names
                 mcp_sent_names = sent_names & mcp_names
-                try:
-                    await on_provider_tool_surface(
-                        {
-                            "round": attempts,
-                            "candidate_tool_count": len(candidate_names),
-                            "sent_tool_count": len(sent_names),
-                            "dropped_tool_count": len(candidate_names - sent_names),
-                            "mcp_candidate_tool_count": len(mcp_candidate_names),
-                            "mcp_sent_tool_count": len(mcp_sent_names),
-                            "mcp_dropped_tool_count": len(
-                                mcp_candidate_names - mcp_sent_names
-                            ),
-                            "reason": surface_reason or "none",
-                            "terminal_text_round": terminal_text_round,
-                            "terminal_text_round_reason": (
-                                terminal_text_round_reason
-                            ),
-                            "force_text_fallback_reason": (
-                                force_text_fallback_reason or "none"
-                            ),
-                            "empty_response_recovery": bool(
-                                empty_response_retry_instruction
-                            ),
-                            "wake_choice_required": wake_choice_required,
-                        }
+                provider_surface_detail = {
+                    "round": attempts,
+                    "candidate_tool_count": len(candidate_names),
+                    "sent_tool_count": len(sent_names),
+                    "dropped_tool_count": len(candidate_names - sent_names),
+                    "mcp_candidate_tool_count": len(mcp_candidate_names),
+                    "mcp_sent_tool_count": len(mcp_sent_names),
+                    "mcp_dropped_tool_count": len(
+                        mcp_candidate_names - mcp_sent_names
+                    ),
+                    "reason": surface_reason or "none",
+                    "terminal_text_round": terminal_text_round,
+                    "terminal_text_round_reason": terminal_text_round_reason,
+                    "force_text_fallback_reason": (
+                        force_text_fallback_reason or "none"
+                    ),
+                    "empty_response_recovery": bool(
+                        empty_response_retry_instruction
+                    ),
+                    "wake_choice_required": wake_choice_required,
+                }
+                withdrawn_names = (
+                    previous_offered_tool_names - current_offered_tool_names
+                )
+                platform_tool_names = {spec.name for spec in _catalog()}
+                withdrawn_platform_names, withdrawn_platform_count = (
+                    _bounded_provider_tool_names(
+                        withdrawn_names & platform_tool_names
                     )
-                except Exception:
-                    pass
+                )
+                provider_surface_detail.update(
+                    {
+                        "withdrawn_platform_tool_names": (
+                            withdrawn_platform_names
+                        ),
+                        "withdrawn_tool_counts": {
+                            "platform": withdrawn_platform_count,
+                            "mcp": len(withdrawn_names & mcp_names),
+                            "other": len(
+                                withdrawn_names
+                                - platform_tool_names
+                                - mcp_names
+                            ),
+                        },
+                    }
+                )
+            # Update the history at the exact outbound boundary. Classification
+            # of this response keeps the saved previous set, while a provider
+            # error followed by another loop round still remembers what was sent.
+            last_offered_tool_names = current_offered_tool_names
             result = await provider_client.reliable_chat_completion_async(
                 provider_config,
                 messages,
@@ -2116,6 +2544,7 @@ async def run_tool_loop(
                 and getattr(exc, "status_code", None) in {400, 404, 415, 422}
             )
             if tagged_image_rejected:
+                tagged_error_facts = _provider_error_facts(exc)
                 await _trajectory(
                     "provider_error",
                     {
@@ -2123,6 +2552,16 @@ async def run_tool_loop(
                         "error_class": type(exc).__name__,
                         "tools_enabled": tools is not None,
                         "tagged_images_rejected": True,
+                        "status_code": tagged_error_facts["status_code"],
+                        "provider_error_class": tagged_error_facts[
+                            "provider_error_class"
+                        ],
+                        "dur_ms": (
+                            time.monotonic() - provider_call_started_at
+                        ) * 1000,
+                        "fallback_reason": (
+                            _PROVIDER_ATTEMPT_FALLBACK_TAGGED_IMAGES
+                        ),
                     },
                 )
                 add_usage(None)
@@ -2163,6 +2602,18 @@ async def run_tool_loop(
                 provider_error = exc
         if provider_error is not None:
             exc = provider_error
+            tool_schema_rejected = (
+                tools is not None
+                and isinstance(exc, provider_client.ProviderError)
+                and exc.status_code in {400, 422}
+                and attempts < max_calls
+                and _is_probably_tool_schema_rejection(exc)
+            )
+            await _emit_provider_tool_surface(provider_surface_detail)
+            provider_error_facts = _provider_error_facts(exc)
+            provider_call_dur_ms = (
+                time.monotonic() - provider_call_started_at
+            ) * 1000
             await _provider_call_event(
                 "error",
                 {
@@ -2171,22 +2622,27 @@ async def run_tool_loop(
                     "model": str(
                         getattr(provider_config, "model", "") or ""
                     ),
-                    **_provider_error_facts(exc),
-                    "dur_ms": (
-                        time.monotonic() - provider_call_started_at
-                    ) * 1000,
+                    **provider_error_facts,
+                    "dur_ms": provider_call_dur_ms,
                 },
             )
             attempt_trace = provider_client.runtime_provider_attempt_trace(exc)
-            await _trajectory(
-                "provider_error",
-                {
-                    "round": attempts,
-                    "error_class": type(exc).__name__,
-                    "tools_enabled": tools is not None,
-                    "provider_attempt_trace": attempt_trace,
-                },
-            )
+            provider_error_detail = {
+                "round": attempts,
+                "error_class": type(exc).__name__,
+                "tools_enabled": tools is not None,
+                "provider_attempt_trace": attempt_trace,
+                "status_code": provider_error_facts["status_code"],
+                "provider_error_class": provider_error_facts[
+                    "provider_error_class"
+                ],
+                "dur_ms": provider_call_dur_ms,
+            }
+            if tool_schema_rejected:
+                provider_error_detail["fallback_reason"] = (
+                    _PROVIDER_ATTEMPT_FALLBACK_TOOL_SCHEMA
+                )
+            await _trajectory("provider_error", provider_error_detail)
             # TurnMetrics' docstring promises failed provider calls ARE counted
             # (model_calls bumped, just with no token usage) — add_usage(None)
             # before either falling back or propagating.
@@ -2270,13 +2726,7 @@ async def run_tool_loop(
                     "required_file_missing",
                     replied_intermediate,
                 )
-            if (
-                tools is not None
-                and isinstance(exc, provider_client.ProviderError)
-                and exc.status_code in {400, 422}
-                and attempts < max_calls
-                and _is_probably_tool_schema_rejection(exc)
-            ):
+            if tool_schema_rejected:
                 force_text_fallback = True
                 force_text_fallback_reason = "tool_schema_rejected"
                 await _trajectory(
@@ -2347,6 +2797,159 @@ async def run_tool_loop(
         # ProviderResponse.raw keeps its input mapping alive.
         result = provider_client.without_runtime_provider_attempt_trace(result)
         pr = ProviderResponse.from_result(result)
+        rejection_facts = (
+            _tool_call_rejection_facts(
+                pr,
+                tools=tools,
+                raw_finish_reason=raw_finish_reason,
+                terminal_text_round=terminal_text_round,
+                tool_calls_used=tool_calls_used,
+                previous_offered_tool_names=previous_offered_tool_names,
+                completed_memory_discovery_tools=(
+                    completed_memory_discovery_tools
+                ),
+                external_content_seen=external_content_seen,
+                allowed_fetch_urls=allowed_fetch_urls,
+                mutating_mcp_names=mutating_mcp_names,
+                max_tool_args_chars=max_tool_args_chars,
+                max_tool_batch_args_chars=max_tool_batch_args_chars,
+                max_native_assistant_turn_chars=(
+                    max_native_assistant_turn_chars
+                ),
+                max_assistant_tool_text_chars=max_assistant_tool_text_chars,
+                max_tool_calls_per_round=max_tool_calls_per_round,
+                max_tool_calls_per_turn=max_tool_calls_per_turn,
+            )
+            if pr.tool_calls
+            else None
+        )
+        # Parsed calls with invalid domain arguments are separate from broken
+        # provider protocol (for example ``args_ok=False`` above), but both are
+        # rejected exchanges and must be visible on the same content-free
+        # provider surface. Compute this once before emitting the surface, then
+        # reuse the exact per-call reasons in the rejection transcript below.
+        validation_errors: dict[str, str] = {}
+        if rejection_facts is not None and not rejection_facts.rejected:
+            validation_errors = {
+                tc.id: validation_error
+                for tc in pr.tool_calls
+                if tc.name not in mcp_names
+                and (
+                    validation_error := tool_schema.validate_tool_args(
+                        tc.name,
+                        tc.args,
+                        live_model_call=(compact_delivery_phase == "send_file"),
+                    )
+                )
+                is not None
+            }
+            if (
+                compact_delivery_phase == "send_file"
+                and _latest_user_delivery_request()
+            ):
+                for tc in pr.tool_calls:
+                    if (
+                        tc.name == tool_schema.FILE_REPLY_TOOL
+                        and tc.id not in validation_errors
+                        and not str(tc.args.get("completion_message") or "").strip()
+                    ):
+                        validation_errors[tc.id] = (
+                            "send_file requires completion_message for the "
+                            "visible delivery bubble"
+                        )
+            if compact_delivery_phase == "send_file" and len(pr.tool_calls) != 1:
+                validation_errors.update(
+                    {
+                        tc.id: (
+                            "pending Canvas delivery requires exactly one "
+                            "send_file call"
+                        )
+                        for tc in pr.tool_calls
+                    }
+                )
+        repeated_generic_validation = bool(
+            validation_errors
+            and compact_delivery_phase != "send_file"
+            and generic_validation_retry_used
+        )
+        schema_rejection_reasons = (
+            [
+                (
+                    _PROVIDER_CALL_REJECTION_REASON_REPEATED_INVALID_TOOL_ARGUMENTS
+                    if repeated_generic_validation
+                    else _PROVIDER_CALL_REJECTION_REASON_INVALID_TOOL_ARGUMENTS
+                )
+                for _tc in pr.tool_calls
+            ]
+            if validation_errors
+            else []
+        )
+        surface_rejection_reasons = _normalize_provider_call_rejection_reasons(
+            [
+                *(rejection_facts.reason_tokens if rejection_facts is not None else []),
+                *schema_rejection_reasons,
+            ]
+        )
+        surface_exchange_rejected = bool(
+            (rejection_facts is not None and rejection_facts.rejected)
+            or validation_errors
+        )
+        if surface_exchange_rejected and not surface_rejection_reasons:
+            surface_rejection_reasons = [_PROVIDER_CALL_REJECTION_REASON_UNCLASSIFIED]
+        if wake_choice_required or tools is None:
+            # These branches have their own terminal/empty response contracts;
+            # they never enter the generic rejected-tool-exchange path below.
+            surface_rejection_reasons = []
+        if (
+            terminal_text_round
+            and pr.tool_calls
+            and (tools is not None or pr.text.strip())
+        ):
+            surface_rejection_reasons = _normalize_provider_call_rejection_reasons(
+                [
+                    *surface_rejection_reasons,
+                    _PROVIDER_CALL_REJECTION_REASON_TERMINAL_TOOL_CALL_REJECTED,
+                ]
+            )
+        unavailable_platform_call_labels: list[str] = []
+        unavailable_call_counts = {"platform": 0, "mcp": 0, "other": 0}
+        if rejection_facts is not None:
+            platform_tool_names = {spec.name for spec in _catalog()}
+            for tc, joined_reasons in zip(
+                pr.tool_calls,
+                rejection_facts.call_rejection_reasons,
+            ):
+                reason_tokens = set(joined_reasons.split(","))
+                for reason in (
+                    _TOOL_WITHDRAWN_REJECTION_REASON,
+                    _UNKNOWN_TOOL_REJECTION_REASON,
+                ):
+                    if reason in reason_tokens:
+                        if tc.name in platform_tool_names:
+                            unavailable_call_counts["platform"] += 1
+                            unavailable_platform_call_labels.append(
+                                f"{reason}:{tc.name}"
+                            )
+                        elif tc.name in mcp_names:
+                            unavailable_call_counts["mcp"] += 1
+                        else:
+                            unavailable_call_counts["other"] += 1
+        unavailable_platform_call_labels = sorted(
+            unavailable_platform_call_labels
+        )[:_PROVIDER_TOOL_NAME_TRACE_CAP]
+        if provider_surface_detail is not None:
+            provider_surface_detail.update(
+                {
+                    "unavailable_platform_tool_call_labels": (
+                        unavailable_platform_call_labels
+                    ),
+                    "unavailable_tool_call_counts": unavailable_call_counts,
+                }
+            )
+        await _emit_provider_tool_surface(
+            provider_surface_detail,
+            surface_rejection_reasons,
+        )
 
         if wake_choice_required:
             wake_reply_calls = [
@@ -2644,8 +3247,10 @@ async def run_tool_loop(
         # executed. Give transient provider failures a small configurable number of
         # fresh chances, then terminate without returning to tool dispatch or the
         # malformed-exchange fallback.
-        if terminal_text_round and pr.tool_calls and (
-            tools is not None or pr.text.strip()
+        if (
+            terminal_text_round
+            and pr.tool_calls
+            and (tools is not None or pr.text.strip())
         ):
             retrying = (
                 terminal_tool_call_retries < max_terminal_tool_call_retries
@@ -2656,7 +3261,7 @@ async def run_tool_loop(
                     pr.tool_calls,
                     assistant_text=pr.text,
                     rejection_reasons=[
-                        "terminal_tool_call_rejected"
+                        _PROVIDER_CALL_REJECTION_REASON_TERMINAL_TOOL_CALL_REJECTED
                         for _tool_call in pr.tool_calls
                     ],
                     attempt=attempts,
@@ -2666,7 +3271,7 @@ async def run_tool_loop(
                 "protocol_fallback",
                 {
                     "round": attempts,
-                    "reason": "terminal_tool_call_rejected",
+                    "reason": _PROVIDER_CALL_REJECTION_REASON_TERMINAL_TOOL_CALL_REJECTED,
                     "action": "retry" if retrying else "terminate",
                     "retry": terminal_tool_call_retries,
                     "transcript_appended": True,
@@ -2966,133 +3571,16 @@ async def run_tool_loop(
                 delivered_media_count=len(pr.media),
             )
 
-        call_ids = [tc.id for tc in pr.tool_calls]
-        argument_sizes = [
-            (_serialized_chars(tc.args) if tc.args_ok else len(str(tc.args_raw or "")))
-            for tc in pr.tool_calls
-        ]
-        native_turn_size = (
-            _serialized_chars(pr.assistant_turn.payload)
-            if pr.assistant_turn is not None
-            else 0
-        )
-        oversized_tool_exchange = (
-            any(size is None or size > max_tool_args_chars for size in argument_sizes)
-            or sum(size or 0 for size in argument_sizes) > max_tool_batch_args_chars
-            or native_turn_size is None
-            or native_turn_size > max_native_assistant_turn_chars
-            or len(pr.text) > max_assistant_tool_text_chars
-        )
-        over_tool_call_budget = (
-            len(pr.tool_calls) > max_tool_calls_per_round
-            or tool_calls_used + len(pr.tool_calls) > max_tool_calls_per_turn
-        )
-        offered_names = {spec.name for spec in tools}
-        individual_rejection_reasons: list[list[str]] = []
-        for tc in pr.tool_calls:
-            reasons: list[str] = []
-            if not tc.id:
-                reasons.append("missing_tool_call_id")
-            if not tc.name:
-                reasons.append("missing_tool_name")
-            if not tc.args_ok:
-                reasons.append("invalid_tool_arguments")
-            if (
-                tc.name not in offered_names
-                and tc.name not in completed_memory_discovery_tools
-            ):
-                reasons.append("unknown_tool")
-            elif (
-                external_content_seen
-                and tc.name == "web_fetch"
-                and str(tc.args.get("url") or "").strip()
-                not in allowed_fetch_urls
-            ):
-                reasons.append("unapproved_external_url")
-            individual_rejection_reasons.append(reasons)
-        # Provider media is terminal output. Do not silently discard or retain
-        # its large inline payload when a broken relay also invents function
-        # calls in the same turn; fall back once with tool choice disabled.
-        malformed = (
-            (terminal_text_round and bool(pr.tool_calls))
-            or bool(pr.media)
-            or any(individual_rejection_reasons)
-        )
-        image_reply_calls = [
-            tc for tc in pr.tool_calls if tc.name == tool_schema.IMAGE_REPLY_TOOL
-        ]
-        stay_silent_calls = [
-            tc for tc in pr.tool_calls if tc.name == tool_schema.STAY_SILENT_TOOL
-        ]
-        mixed_reply_write = any(
-            tc.name in {
-                tool_schema.FILE_REPLY_TOOL,
-                tool_schema.IMAGE_REPLY_TOOL,
-                tool_schema.STAY_SILENT_TOOL,
-            }
-            for tc in pr.tool_calls
-        ) and any(
-            tc.name in _PLATFORM_MUTATION_TOOLS or tc.name in mutating_mcp_names
-            for tc in pr.tool_calls
-        )
-        invalid_image_batch = bool(image_reply_calls) and (
-            len(image_reply_calls) != 1 or len(pr.tool_calls) != 1
-        )
-        invalid_silence_batch = bool(stay_silent_calls) and (
-            len(stay_silent_calls) != 1 or len(pr.tool_calls) != 1
-        )
-        duplicate_call_ids = {
-            call_id
-            for call_id in call_ids
-            if call_id and call_ids.count(call_id) > 1
-        }
-        batch_rejection_reasons: list[str] = []
-        if terminal_text_round:
-            batch_rejection_reasons.append("terminal_tool_call_rejected")
-        if pr.media:
-            batch_rejection_reasons.append("provider_media_with_tool_calls")
-        if mixed_reply_write:
-            batch_rejection_reasons.append("mixed_reply_and_mutation")
-        if invalid_image_batch:
-            batch_rejection_reasons.append("invalid_image_reply_batch")
-        if invalid_silence_batch:
-            batch_rejection_reasons.append("invalid_stay_silent_batch")
-        if over_tool_call_budget:
-            batch_rejection_reasons.append("tool_call_budget_exceeded")
-        if sum(size or 0 for size in argument_sizes) > max_tool_batch_args_chars:
-            batch_rejection_reasons.append("tool_batch_arguments_too_large")
-        if (
-            native_turn_size is None
-            or native_turn_size > max_native_assistant_turn_chars
-        ):
-            batch_rejection_reasons.append("native_assistant_turn_too_large")
-        if len(pr.text) > max_assistant_tool_text_chars:
-            batch_rejection_reasons.append("assistant_tool_text_too_large")
-        call_rejection_reasons: list[str] = []
-        for tc, argument_size, individual_reasons in zip(
-            pr.tool_calls,
-            argument_sizes,
-            individual_rejection_reasons,
-        ):
-            reasons = list(individual_reasons)
-            if tc.id in duplicate_call_ids:
-                reasons.append("duplicate_tool_call_id")
-            if argument_size is None or argument_size > max_tool_args_chars:
-                reasons.append("tool_arguments_too_large")
-            reasons.extend(batch_rejection_reasons)
-            call_rejection_reasons.append(
-                ",".join(dict.fromkeys(reasons))
-                or "invalid_or_over_budget_tool_exchange"
-            )
-        if (
-            malformed
-            or len(set(call_ids)) != len(call_ids)
-            or mixed_reply_write
-            or invalid_image_batch
-            or invalid_silence_batch
-            or over_tool_call_budget
-            or oversized_tool_exchange
-        ):
+        assert rejection_facts is not None
+        image_reply_calls = rejection_facts.image_reply_calls
+        stay_silent_calls = rejection_facts.stay_silent_calls
+        malformed = rejection_facts.malformed
+        truncated_tool_arguments = rejection_facts.truncated_tool_arguments
+        mixed_reply_write = rejection_facts.mixed_reply_write
+        over_tool_call_budget = rejection_facts.over_tool_call_budget
+        oversized_tool_exchange = rejection_facts.oversized_tool_exchange
+        call_rejection_reasons = rejection_facts.call_rejection_reasons
+        if rejection_facts.rejected:
             # Invalid, over-budget, and duplicate-id batches are all-or-nothing:
             # executing a valid subset and then asking for a correction can
             # duplicate durable writes on the corrected round. Missing/duplicate
@@ -3104,6 +3592,25 @@ async def run_tool_loop(
             # rejected for the same reason: the bubble cannot truthfully claim
             # success before the later sink commits. The model may mutate in one
             # round and reply only after observing its result in the next.
+            # A provider that explicitly reports its output-token limit while
+            # returning unparseable tool arguments stopped in the middle of the
+            # JSON payload. Retrying the same artifact with the same budget
+            # cannot repair it and rewrites the real cause as a tool-usage error.
+            # Fail once with content-free evidence; no partial call is executed.
+            if truncated_tool_arguments:
+                await _trajectory(
+                    "provider_output_truncated",
+                    {
+                        "round": attempts,
+                        "reason": "output_truncated",
+                        "finish_reason": provider_client.normalize_stop_reason(
+                            raw_finish_reason
+                        ),
+                        "malformed_tool_arguments": True,
+                        "retry": False,
+                    },
+                )
+                raise ProviderOutputTruncated()
             if attempts >= max_calls:
                 break
             transcript.append(
@@ -3118,7 +3625,7 @@ async def run_tool_loop(
                 "protocol_fallback",
                 {
                     "round": attempts,
-                    "reason": "invalid_or_over_budget_tool_exchange",
+                    "reason": _PROVIDER_CALL_REJECTION_REASON_INVALID_OR_OVER_BUDGET_TOOL_EXCHANGE,
                     "malformed": malformed,
                     "mixed_reply_write": mixed_reply_write,
                     "over_tool_call_budget": over_tool_call_budget,
@@ -3128,67 +3635,25 @@ async def run_tool_loop(
             )
             force_text_fallback = True
             force_text_fallback_reason = (
-                "invalid_or_over_budget_tool_exchange"
+                _PROVIDER_CALL_REJECTION_REASON_INVALID_OR_OVER_BUDGET_TOOL_EXCHANGE
             )
             continue
 
         # Parsed calls with invalid domain arguments are not a broken provider
-        # protocol. During the compact Canvas delivery phase, return one native
-        # result per call and let the model correct the metadata once. This is
-        # deliberately separate from the target-mismatch retry: adding a title
-        # or subtitle must not consume the exact path/revision correction.
-        validation_errors = {
-            tc.id: validation_error
-            for tc in pr.tool_calls
-            if tc.name not in mcp_names
-            and (
-                validation_error := tool_schema.validate_tool_args(
-                    tc.name,
-                    tc.args,
-                    live_model_call=(compact_delivery_phase == "send_file"),
-                )
-            )
-            is not None
-        }
-        if compact_delivery_phase == "send_file" and _latest_user_delivery_request():
-            for tc in pr.tool_calls:
-                if (
-                    tc.name == tool_schema.FILE_REPLY_TOOL
-                    and tc.id not in validation_errors
-                    and not str(
-                    tc.args.get("completion_message") or ""
-                    ).strip()
-                ):
-                    validation_errors[tc.id] = (
-                        "send_file requires completion_message for the visible "
-                        "delivery bubble"
-                    )
-        if compact_delivery_phase == "send_file" and len(pr.tool_calls) != 1:
-            validation_errors.update(
-                {
-                    tc.id: (
-                        "pending Canvas delivery requires exactly one "
-                        "send_file call"
-                    )
-                    for tc in pr.tool_calls
-                }
-            )
+        # protocol. Return one native result per call and let the model correct
+        # the all-or-nothing batch once; no call in the invalid batch is
+        # dispatched. Keep the generic retry separate from compact Canvas
+        # delivery retries so ordinary argument repair cannot consume a pending
+        # file's exact-target or metadata correction.
         if validation_errors:
-            if compact_delivery_phase != "send_file":
+            if repeated_generic_validation:
                 if attempts >= max_calls:
                     break
                 transcript.append(
                     _rejected_tool_exchange(
                         pr.tool_calls,
                         assistant_text=pr.text,
-                        rejection_reasons=[
-                            (
-                                "invalid_tool_arguments"
-                                if tc.id in validation_errors
-                                else "invalid_or_over_budget_tool_exchange"
-                            )
-                            for tc in pr.tool_calls
-                        ],
+                        rejection_reasons=schema_rejection_reasons,
                         attempt=attempts,
                     )
                 )
@@ -3196,8 +3661,10 @@ async def run_tool_loop(
                     "protocol_fallback",
                     {
                         "round": attempts,
-                        "reason": "invalid_or_over_budget_tool_exchange",
-                        "malformed": True,
+                        "reason": (
+                            _PROVIDER_CALL_REJECTION_REASON_REPEATED_INVALID_TOOL_ARGUMENTS
+                        ),
+                        "malformed": False,
                         "mixed_reply_write": False,
                         "over_tool_call_budget": False,
                         "oversized_tool_exchange": False,
@@ -3206,18 +3673,25 @@ async def run_tool_loop(
                 )
                 force_text_fallback = True
                 force_text_fallback_reason = (
-                    "invalid_or_over_budget_tool_exchange"
+                    _PROVIDER_CALL_REJECTION_REASON_REPEATED_INVALID_TOOL_ARGUMENTS
                 )
                 continue
-            if compact_delivery_args_retry_used:
+            if (
+                compact_delivery_phase == "send_file"
+                and compact_delivery_args_retry_used
+            ):
                 delivery_path = (
                     workspace_delivery_target[0]
                     if workspace_delivery_target is not None
-                    else workspace_delivery_candidate[0]
-                    if workspace_delivery_candidate is not None
-                    else str(pr.tool_calls[0].args.get("path") or "")
-                    if pr.tool_calls
-                    else ""
+                    else (
+                        workspace_delivery_candidate[0]
+                        if workspace_delivery_candidate is not None
+                        else (
+                            str(pr.tool_calls[0].args.get("path") or "")
+                            if pr.tool_calls
+                            else ""
+                        )
+                    )
                 )
                 canvas_delivery = delivery_path.casefold().endswith(".io.html")
                 await _trajectory(
@@ -3247,7 +3721,10 @@ async def run_tool_loop(
                     ),
                 )
 
-            compact_delivery_args_retry_used = True
+            if compact_delivery_phase == "send_file":
+                compact_delivery_args_retry_used = True
+            else:
+                generic_validation_retry_used = True
             tool_calls_used += len(pr.tool_calls)
             validation_results: list[ToolResult] = []
             for tc in pr.tool_calls:
@@ -3286,7 +3763,8 @@ async def run_tool_loop(
                 assistant_turn=pr.assistant_turn,
             )
             transcript.append(validation_exchange)
-            compact_delivery_validation_exchange = validation_exchange
+            if compact_delivery_phase == "send_file":
+                compact_delivery_validation_exchange = validation_exchange
             continue
 
         tool_calls_used += len(pr.tool_calls)
@@ -3514,7 +3992,56 @@ async def run_tool_loop(
                 await _tool_event(
                     tc, "tool_call_error", {"error": type(exc).__name__}
                 )
-                raise
+                await _trajectory(
+                    "file_reply_failed",
+                    {
+                        "round": attempts,
+                        "call_id": tc.id,
+                        "canvas": is_canvas_delivery,
+                        "action": (
+                            "fail"
+                            if file_delivery_callback_retry_used
+                            else "retry"
+                        ),
+                    },
+                )
+                file_result = ToolResult(
+                    call_id=tc.id,
+                    content=(
+                        "error: file delivery did not complete. Nothing was "
+                        "attached. Create or refresh the requested source with "
+                        "workspace_write, then call send_file again using the "
+                        "returned path and revision."
+                    ),
+                )
+                reply_results[tc.id] = file_result
+                await _tool_event(
+                    tc, "tool_call_result", {"result": file_result}
+                )
+                if file_delivery_callback_retry_used:
+                    # ``send_file`` is the publication boundary. The workspace
+                    # source may already exist at the selected revision, but
+                    # loading, validating, or staging the attachment can still
+                    # fail. Export the stable path-aware class after one bounded
+                    # correction so the worker/terminal outbox cannot collapse
+                    # this into ``unknown``.
+                    raise _delivery_incomplete(
+                        workspace_path,
+                        "file_delivery_callback_failed",
+                    ) from exc
+                file_delivery_callback_retry_used = True
+                file_delivery_recovery_needed = True
+                if workspace_delivery_target is not None:
+                    # Compact delivery rounds replace the normal transcript;
+                    # carry the native result explicitly so the exact-target
+                    # retry still sees why its previous send_file failed.
+                    compact_delivery_validation_exchange = ToolExchange(
+                        calls=(tc,),
+                        results=(file_result,),
+                        assistant_text=pr.text,
+                        assistant_turn=pr.assistant_turn,
+                    )
+                continue
             delivered_file_suffixes.add(file_suffix)
             workspace_write_applied = False
             workspace_delivery_target = None
@@ -3523,6 +4050,7 @@ async def run_tool_loop(
             compact_delivery_validation_exchange = None
             compact_delivery_mismatch_retry_used = False
             compact_delivery_args_retry_used = False
+            file_delivery_callback_retry_used = False
             file_completion_message = (
                 completion_message
                 if is_canvas_delivery or current_user_request

@@ -181,7 +181,7 @@ _AGENT_PROMPT_FALLBACK_COMMANDS = (
     "python {io_cli} memory-patch --id <memory_id> [--summary <text>] [--content <text>] [--bucket <name>] [--threads <tag>] [--importance <0-1>] [--pulse <0-1>] [--type <fact|event|quote|moment>] [--source <label>] [--reason <text>]\n"
     "python {io_cli} memory-delete --id <memory_id> [--reason <text>]\n"
     "python {io_cli} identity-read\n"
-    "python {io_cli} identity-write [--agent-name <name>] [--self-introduction <text>] [--category <text>] [--user-preferred-name <text>] [--agent-role <text>] [--tone-style <text>] [--custom-persona-prompt <text>] [--language-preference <text>] [--relationship-anchor <text>] [--relationship-days <n>] [--signature <line>] [--add-signature <text>] [--remove-signature <text>] [--replace-signatures <text>] [--add-boundary <text>] [--remove-boundary <text>] [--replace-boundaries <text>] [--add-do-not-say <text>] [--remove-do-not-say <text>] [--replace-do-not-say <text>] [--add-stable-definition <text>] [--remove-stable-definition <text>] [--replace-stable-definitions <text>] [--nudge-dimension <name:±n>]\n"
+    "python {io_cli} identity-write [--agent-name <name>] [--self-introduction <text>] [--category <text>] [--user-preferred-name <text>] [--agent-role <text>] [--tone-style <text>] [--custom-persona-prompt <text>] [--relationship-anchor <text>] [--relationship-days <n>] [--signature <line>] [--add-signature <text>] [--remove-signature <text>] [--replace-signatures <text>] [--add-boundary <text>] [--remove-boundary <text>] [--replace-boundaries <text>] [--add-do-not-say <text>] [--remove-do-not-say <text>] [--replace-do-not-say <text>] [--add-stable-definition <text>] [--remove-stable-definition <text>] [--replace-stable-definitions <text>] [--nudge-dimension <name:±n>]\n"
     "python {io_cli} screen-recent [--limit <n>]\n"
     "python {io_cli} screen-read [--frame-id <id>] [--include-image]\n"
     "python {io_cli} photo-recent [--limit <n>]\n"
@@ -695,10 +695,14 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI, model: str =
     if driver == "pi":
         # --mode json: headless JSONL event stream (pi's analogue of codex --json;
         #   auto-selects print mode, no -p needed).
-        # -ne -xt read,edit,write: tool posture. Equivalent to the old `-t bash`
-        #   for the active set — pi's defaultActiveToolNames is the hardcoded
-        #   ["read","bash","edit","write"] (sdk.js:131), so excluding three
-        #   leaves exactly ["bash"] — but WITHOUT -t's fatal side effect: -t is
+        # -ne -xt edit,write: keep pi's read + bash tools while disabling its
+        #   file-mutating built-ins. read is required for images pulled during a
+        #   turn: io_cli materializes photo-read/screen-read/chat-image pixels as
+        #   image_file, and pi's read tool turns that file into an image attachment.
+        #   Re-observe both the active set and that image attachment behavior when
+        #   deploy/Dockerfile.agent-runner's pinned pi version changes.
+        #   Current-message images still use native @<path> refs. We intentionally
+        #   do not express this as `-t read,bash`: -t is
         #   an allowlist that "applies to built-in, extension, and custom tools"
         #   (pi --help), and agent-session.js:1867 filters extension-registered
         #   tools through it BEFORE they reach the registry. Under `-t bash` the
@@ -745,7 +749,7 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI, model: str =
         eff = _pi_effort(reasoning_effort)
         thinking_part = f"--thinking {eff} " if eff else ""
         return (
-            f"pi --mode json -ne -xt read,edit,write {{mcp}} "
+            f"pi --mode json -ne -xt edit,write {{mcp}} "
             f"--append-system-prompt {prompt_file} "
             f"{model_part}{thinking_part}"
             "--session-id {session_id}"
@@ -1107,9 +1111,11 @@ def _web_visible_for_user(user_id: str) -> bool:
         from web import settings_core as web_settings_core
 
         return bool(
-            web_settings_core.get_settings(core_store.get_store(user_id)).get(
-                "effective"
-            )
+            web_settings_core.get_settings(
+                core_store.get_store_shell_only(
+                    user_id, reason="web settings are direct blob reads"
+                )
+            ).get("effective")
         )
     except Exception as e:  # noqa: BLE001 — advertised-verb display must never block a spawn
         log.warning("web-visibility read failed for %s (advertising off): %s", user_id, e)

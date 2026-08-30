@@ -876,7 +876,9 @@ def store_evict(user_id: str) -> dict:
 # --------------------------------------------------------------------------- #
 
 def set_runtime_mode(user_id: str, mode: str) -> tuple[dict, int]:
-    store = core_store.get_store(user_id)
+    store = core_store.get_store_shell_only(
+        user_id, reason="runtime mode control is DB-backed"
+    )
     if mode == config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
         try:
             # Seed first. If profile persistence subsequently fails this row is
@@ -896,7 +898,9 @@ def set_runtime_mode(user_id: str, mode: str) -> tuple[dict, int]:
 
 
 def get_runtime_mode(user_id: str) -> tuple[dict, int]:
-    store = core_store.get_store(user_id)
+    store = core_store.get_store_shell_only(
+        user_id, reason="runtime mode control is DB-backed"
+    )
     try:
         mode = config_store.get_hosted_runtime_mode_strict(store)
     except Exception:
@@ -932,7 +936,11 @@ def get_runtime_allowlist() -> dict:
     for row in rows:
         try:
             mode, state, gen = cs.get_hosted_runtime_control_strict(
-                core_store.get_store(row["user_id"]))
+                core_store.get_store_shell_only(
+                    row["user_id"],
+                    reason="runtime allowlist reconciliation is DB-backed",
+                )
+            )
             row["actual"] = {"mode": mode, "state": state, "generation": gen}
             row["converged"] = (
                 (row["desired"] == "v2" and state == "v2")

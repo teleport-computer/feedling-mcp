@@ -1015,8 +1015,8 @@ def _plaintext_merge_reducer_outputs(outputs: list[dict], *, relationship_anchor
     agent_name = first_identity_name("ai_persona", "history", "memory_summary")
     dimensions = first_identity_dims("ai_persona", "history")
 
-    # B2: the 5 user-layer fields (user_preferred_name/custom_persona_prompt/
-    # language_preference/relationship_anchor/stable_definitions) are the
+    # B2: the 4 user-layer fields (user_preferred_name/custom_persona_prompt/
+    # relationship_anchor/stable_definitions) are the
     # OPPOSITE of the TA-identity firewall above — they describe the USER, so
     # (unlike agent_name/dimensions) they are read from ALL outputs INCLUDING
     # source_family=="user_profile", never excluded by it. See
@@ -1024,7 +1024,7 @@ def _plaintext_merge_reducer_outputs(outputs: list[dict], *, relationship_anchor
     # for the shared field list this mirrors.
     all_identity_outputs = [output for output in outputs if isinstance(output.get("identity"), dict)]
     user_layer: dict[str, str] = {}
-    for key in ("user_preferred_name", "custom_persona_prompt", "language_preference", "relationship_anchor"):
+    for key in ("user_preferred_name", "custom_persona_prompt", "relationship_anchor"):
         for output in all_identity_outputs:
             value = str(output["identity"].get(key) or "").strip()
             if value:

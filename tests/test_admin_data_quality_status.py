@@ -375,6 +375,89 @@ def test_d3_each_snapshot_counter_family_has_failure_and_empty_mirrors(
     assert dt._render_data_quality_warnings({payload_key: empty}) == ""
 
 
+def test_t367_snapshot_timeout_marks_all_snapshot_labels_unknown():
+    snap = {
+        "snapshot_read_status": {
+            "level": "timeout",
+            "message": "取数超时（记了，但这里读不出来）",
+        }
+    }
+    blocks = {
+        "app_usage": dt._data_track_app_usage_from_snapshot(snap),
+        "memory": dt._data_track_memory_from_snapshot(snap),
+        "chat": dt._data_track_chat_from_snapshot(snap),
+        "proactive": dt._data_track_proactive_from_snapshot(snap, {}),
+        "tracking": dt._data_track_tracking_from_snapshot(snap),
+        "bootstrap_events": dt._data_track_bootstrap_from_snapshot(snap),
+    }
+
+    assert blocks["app_usage"]["fields_status"] == "unknown"
+    for key in ("memory", "chat", "proactive", "tracking", "bootstrap_events"):
+        assert blocks[key]["counts_status"] == "unknown", key
+    for key in ("changes_breakdowns_status", "capture_breakdowns_status"):
+        assert blocks["memory"][key] == "unknown"
+    for key in ("proactive", "tracking", "bootstrap_events"):
+        assert blocks[key]["breakdowns_status"] == "unknown", key
+
+    html = dt._render_data_quality_warnings({
+        "snapshot_read_status": snap["snapshot_read_status"],
+        **blocks,
+    })
+    assert "取数超时（记了，但这里读不出来）" in html
+
+
+@pytest.mark.parametrize(
+    "snap",
+    (
+        {},
+        {"legacy_background_breakdowns_status": ""},
+        {"legacy_background_breakdowns_status": 0},
+        {"legacy_background_breakdowns_status": []},
+    ),
+)
+def test_t367_breakdown_coverage_never_defaults_unknown_input_to_available(snap):
+    blocks = (
+        dt._data_track_memory_from_snapshot(snap),
+        dt._data_track_proactive_from_snapshot(snap, {}),
+        dt._data_track_tracking_from_snapshot(snap),
+        dt._data_track_bootstrap_from_snapshot(snap),
+    )
+
+    assert blocks[0]["changes_breakdowns_status"] == "unknown"
+    assert blocks[0]["capture_breakdowns_status"] == "unknown"
+    assert blocks[1]["breakdowns_status"] == "unknown"
+    assert blocks[2]["breakdowns_status"] == "unknown"
+    assert blocks[3]["breakdowns_status"] == "unknown"
+
+
+@pytest.mark.parametrize("raw", ("available", "omitted"))
+def test_t367_breakdown_coverage_preserves_explicit_known_state(raw):
+    snap = {"legacy_background_breakdowns_status": raw}
+
+    memory = dt._data_track_memory_from_snapshot(snap)
+    assert memory["changes_breakdowns_status"] == raw
+    assert memory["capture_breakdowns_status"] == raw
+    assert dt._data_track_proactive_from_snapshot(snap, {})["breakdowns_status"] == raw
+    assert dt._data_track_tracking_from_snapshot(snap)["breakdowns_status"] == raw
+    assert dt._data_track_bootstrap_from_snapshot(snap)["breakdowns_status"] == raw
+
+
+def test_t367_responder_read_failure_marks_poll_evidence_unknown():
+    responder = dt._effective_responder(
+        route="resident",
+        consumer_state=None,
+        runtime=None,
+        snapshot_read_status={"level": "timeout", "message": "timed out"},
+    )
+
+    assert responder["effective_responder"] == "unknown"
+    assert responder["basis"] == "snapshot_read_failed"
+    assert responder["read_status"] == "read_failed"
+    assert responder["poll_evidence_status"] == "unknown"
+    warning = dt._render_data_quality_warnings({"responder": responder})
+    assert "不能判为确实没有轮询证据" in warning
+
+
 def test_d3_dau_bad_day_is_visible_in_json_and_html(monkeypatch):
     rows = [{
         "day": "not-a-day",

@@ -11,6 +11,7 @@ re-runnable without a fresh DB.
 """
 
 import base64
+import contextlib
 from datetime import datetime, timedelta
 import os
 import sys
@@ -284,6 +285,29 @@ def test_get_blobs_for_users_batches_and_omits_missing_rows():
         (uid_a, "trace"): {"events": [1]},
         (uid_b, "enabled"): {"enabled": True},
     }
+
+
+def test_get_blobs_for_users_can_propagate_a_bounded_read_failure(monkeypatch):
+    connection_kwargs = []
+
+    class BrokenPool:
+        @staticmethod
+        def connection(**kwargs):
+            connection_kwargs.append(kwargs)
+            raise RuntimeError("pool unavailable")
+
+    monkeypatch.setattr(db, "get_pool", lambda: BrokenPool())
+
+    assert db.get_blobs_for_users(["usr_a"], ["trace"]) == {}
+    with pytest.raises(RuntimeError, match="pool unavailable"):
+        db.get_blobs_for_users(
+            ["usr_a"],
+            ["trace"],
+            connection_timeout=0.25,
+            statement_timeout_ms=100,
+            raise_on_error=True,
+        )
+    assert connection_kwargs == [{}, {"timeout": 0.25}]
 
 
 def test_blob_delete_and_list_by_prefix():
@@ -830,6 +854,101 @@ def test_admin_data_track_dau_median_is_robust_to_heavy_users():
     assert day["session_dau"] == 3
     assert day["foreground_sec"] == 330            # mean per user = 110
     assert day["median_user_sec"] == 20.0          # median is not fooled by the heavy user
+
+
+def test_admin_data_track_dau_pushes_proven_limit_bound_without_calendar_drift(
+    monkeypatch,
+):
+    """The costly aggregate is bounded, but sparse-day semantics stay exact.
+
+    The two seeded activity days are more than a year apart. A fixed calendar
+    window would silently lose the older one; the optimized result must instead
+    equal the established unbounded SQL row-for-row.
+    """
+    old_user = _uid()
+    new_user = _uid()
+    for uid in (old_user, new_user):
+        seed_user(uid)
+    old_ts = _epoch("2198-01-01T18:00:00Z")
+    new_ts = _epoch("2199-06-01T18:00:00Z")
+    db.log_append(
+        old_user,
+        "tracking_events",
+        {"type": "app_session_end", "payload": {"duration_sec": 11}},
+        ts=old_ts,
+    )
+    db.log_append(
+        new_user,
+        "tracking_events",
+        {"type": "app_session_end", "payload": {"duration_sec": 22}},
+        ts=new_ts,
+    )
+
+    real_pool = db.get_pool()
+    executed: list[tuple[str, object]] = []
+
+    class RecordingConn:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, params=None, *args, **kwargs):
+            executed.append((str(sql), params))
+            if params is None:
+                return self._inner.execute(sql, *args, **kwargs)
+            return self._inner.execute(sql, params, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    @contextlib.contextmanager
+    def recording_connection(*args, **kwargs):
+        with real_pool.connection(*args, **kwargs) as conn:
+            yield RecordingConn(conn)
+
+    class RecordingPool:
+        connection = staticmethod(recording_connection)
+
+    monkeypatch.setattr(db, "get_pool", lambda: RecordingPool())
+    optimized = db.admin_data_track_dau(days=2, tz="Asia/Shanghai")
+
+    with real_pool.connection() as conn:
+        legacy = [
+            db._dau_row(row)
+            for row in db._admin_data_track_dau_rows(
+                conn,
+                since=0.0,
+                scan_since=0.0,
+                boundary_day="",
+                day_limit=2,
+                tz="Asia/Shanghai",
+            )
+        ]
+
+    assert optimized == legacy
+    assert [row["day"] for row in optimized] == ["2199-06-02", "2198-01-02"]
+
+    boundary_calls = [
+        (sql, params) for sql, params in executed if "active_days AS (" in sql
+    ]
+    aggregate_calls = [
+        (sql, params) for sql, params in executed if "WITH active AS" in sql
+    ]
+    assert len(boundary_calls) == 1
+    assert len(aggregate_calls) == 1
+    boundary_sql, boundary_params = boundary_calls[0]
+    assert "WITH RECURSIVE settings AS" in boundary_sql
+    assert boundary_sql.count("ORDER BY c.ts DESC") == 2
+    assert boundary_sql.count("ORDER BY l.ts DESC") == 2
+    assert "c.user_id = u.user_id" in boundary_sql
+    assert "l.user_id = u.user_id" in boundary_sql
+    assert boundary_params == ("Asia/Shanghai", 2, 0.0)
+    aggregate_sql, aggregate_params = aggregate_calls[0]
+    assert aggregate_sql.count("AND c.ts >= %s") == 1
+    assert aggregate_sql.count("AND l.ts >= %s") == 2
+    assert aggregate_sql.count("JOIN user_logs l ON l.user_id = u.user_id") == 2
+    assert "JOIN chat_messages c ON c.user_id = u.user_id" in aggregate_sql
+    assert list(aggregate_params[:3]) == [old_ts - 2 * 3600] * 3
+    assert "AND day >= %s" in aggregate_sql
 
 
 def test_admin_data_track_usage_histogram_boundaries_and_dau_parity():

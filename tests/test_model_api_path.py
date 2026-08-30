@@ -30,6 +30,7 @@ from hosted import setup_core  # noqa: E402
 from hosted import visual_transport  # noqa: E402
 from identity import service as identity_service  # noqa: E402
 from model_api_runtime.v2 import jobs_store, prompt_frontier  # noqa: E402
+from proactive import capture_scheduler  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -1600,6 +1601,7 @@ def test_onboarding_greeting_append_marks_introduced(client):
     row = history_import._append_model_api_onboarding_greeting(store, "hello, first greeting")
     assert row["model_api_kind"] == "onboarding_greeting"
     assert store.introduction_done() is True
+    assert capture_scheduler.load_capture_state(store)["last_seen_message_id"] == row["id"]
 
 
 def test_onboarding_greeting_append_is_idempotent_across_retries(client):

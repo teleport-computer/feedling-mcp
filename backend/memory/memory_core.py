@@ -41,6 +41,72 @@ import memory_readside_core
 
 
 # --------------------------------------------------------------------------- #
+# readside error contract
+# --------------------------------------------------------------------------- #
+
+# The readside raises RuntimeError/ValueError whose message is sometimes a fixed
+# literal and sometimes carries upstream payload -- notably
+# ``enclave_http_<code>:<resp.text[:180]>``, which echoes the enclave's response
+# body. Membership in these sets, not parsing, decides what a caller may see, so
+# an unrecognised message can only degrade to the generic code, never leak.
+#
+# Converged here at the response boundary rather than at the raise in
+# ``memory_readside_core.post_enclave_readside``, which feeds three lanes. The
+# other two match on the body on purpose -- ``tee_replicator/worker.py`` looks
+# for ``decrypt_failed`` inside it and ``v2/serve_worker.py`` for the
+# ``enclave_http_403:`` prefix -- so redacting at the producer would silently
+# blind them. Their sharing the format is deliberate, not an unfinished cleanup.
+_CLOSED_READSIDE_ERRORS = frozenset({
+    "memory_load_failed",
+    "enclave_unavailable",
+    "api_key_unavailable",
+    "enclave_invalid_readside_response",
+})
+_CLOSED_REQUEST_ERRORS = frozenset({
+    "invalid limit",
+    "ids must be a list of non-empty strings",
+})
+
+
+def _readside_error_body(e: Exception) -> dict:
+    message = str(e)
+    if message in _CLOSED_READSIDE_ERRORS:
+        return {"error": message}
+    return {"error": "readside_unavailable"}
+
+
+def _request_error_body(e: Exception) -> dict:
+    message = str(e)
+    if message in _CLOSED_REQUEST_ERRORS:
+        return {"error": message}
+    return {"error": "request_invalid"}
+
+
+# Triage moves here from the response body, which used to be where an operator
+# could tell "the enclave said 403" from "the enclave said 503". Each entry maps
+# a prefix of the upstream message to a label that is a literal *in this file*:
+# the message decides which label, never what the label contains, so no upstream
+# payload can reach the (tenant-readable) trace. Ordered specific-to-general,
+# first match wins; anything unmatched is "unknown" rather than passed through,
+# so a drift in the upstream vocabulary degrades the signal instead of leaking.
+_UPSTREAM_SIGNALS: tuple[tuple[str, str], ...] = (
+    ("enclave_http_401", "enclave_http_401"),
+    ("enclave_http_403", "enclave_http_403"),
+    ("enclave_http_404", "enclave_http_404"),
+    ("enclave_http_408", "enclave_http_408"),
+    ("enclave_http_429", "enclave_http_429"),
+    ("enclave_http_4", "enclave_http_4xx"),
+    ("enclave_http_5", "enclave_http_5xx"),
+    ("enclave_http_", "enclave_http_other"),
+    ("enclave_error:", "enclave_error"),
+    ("enclave_unavailable", "enclave_unavailable"),
+    ("api_key_unavailable", "api_key_unavailable"),
+    ("enclave_invalid_readside_response", "enclave_invalid_readside_response"),
+    ("memory_load_failed", "memory_load_failed"),
+)
+
+
+# --------------------------------------------------------------------------- #
 # readside term helpers (buckets / threads)
 # --------------------------------------------------------------------------- #
 
@@ -107,21 +173,26 @@ def index(store, api_key, payload: dict, *, post_enclave) -> tuple[dict, int]:
             post_enclave=post_enclave,
         )
     except RuntimeError as e:
-        detail = {"counts": {"limit": requested_limit}}
+        # The query is end-to-end private and the upstream exception can echo
+        # it, so neither lane reports exception text: a closed category plus the
+        # exception class, which is a bounded set carrying no message.
+        upstream = "unknown"
+        for _prefix, _label in _UPSTREAM_SIGNALS:
+            if str(e).startswith(_prefix):
+                upstream = _label
+                break
+        detail = {
+            "counts": {"limit": requested_limit},
+            "reason": "readside_unavailable",
+            "error_class": type(e).__name__,
+            "upstream": upstream,
+        }
         if is_search:
-            # The query is end-to-end private. Even the upstream exception can
-            # echo it, so the search event keeps only a stable fingerprint and
-            # a closed failure category.
-            detail.update({
-                "query_fingerprint": query_fingerprint,
-                "reason": "readside_unavailable",
-            })
-        else:
-            detail["reason"] = str(e)[:80]
+            detail["query_fingerprint"] = query_fingerprint
         debug_trace.trace_event(
             store, subsystem="memory", type=event_type, actor="agent",
             status="failed", summary=f"{operation_label} failed", detail=detail)
-        return {"error": str(e)}, 503
+        return _readside_error_body(e), 503
     _items = response.get("items") if isinstance(response.get("items"), list) else []
     detail = {"counts": {"items": len(_items), "limit": requested_limit}}
     if is_search:
@@ -146,15 +217,23 @@ def fetch(store, api_key, payload: dict, *, post_enclave) -> tuple[dict, int]:
             post_enclave=post_enclave,
         )
     except RuntimeError as e:
+        upstream = "unknown"
+        for _prefix, _label in _UPSTREAM_SIGNALS:
+            if str(e).startswith(_prefix):
+                upstream = _label
+                break
         debug_trace.trace_event(
             store, subsystem="memory", type="memory.fetch.called", actor="agent",
-            status="failed", summary="fetch failed", detail={"reason": str(e)[:80]})
-        return {"error": str(e)}, 503
+            status="failed", summary="fetch failed",
+            detail={"reason": "readside_unavailable", "error_class": type(e).__name__,
+                    "upstream": upstream})
+        return _readside_error_body(e), 503
     except ValueError as e:
         debug_trace.trace_event(
             store, subsystem="memory", type="memory.fetch.called", actor="agent",
-            status="failed", summary="fetch failed", detail={"reason": str(e)[:80]})
-        return {"error": str(e)}, 400
+            status="failed", summary="fetch failed",
+            detail={"reason": "request_invalid", "error_class": type(e).__name__})
+        return _request_error_body(e), 400
     _items = response.get("items") if isinstance(response.get("items"), list) else []
     _missing = response.get("missing_ids") if isinstance(response.get("missing_ids"), list) else []
     _unavailable = response.get("unavailable_ids") if isinstance(response.get("unavailable_ids"), list) else []

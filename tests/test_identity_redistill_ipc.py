@@ -516,18 +516,34 @@ def test_redistill_ipc_serve_forever_end_to_end(monkeypatch, short_tmp_dir):
     )
     monkeypatch.setattr(crc, "_running", True)
 
+    # bind() creates the filesystem entry before listen() makes the socket
+    # connectable.  Make that real readiness gap deterministic so the test
+    # cannot regress to treating Path.exists() as a listener-ready signal.
+    real_chmod = os.chmod
+
+    def _delay_socket_listen(path, mode):
+        real_chmod(path, mode)
+        if Path(path) == sock_path:
+            time.sleep(0.1)
+
+    monkeypatch.setattr(crc.os, "chmod", _delay_socket_listen)
+
     thread = threading.Thread(
         target=crc._redistill_ipc_serve_forever, args=(sock_path,), daemon=True)
     thread.start()
     try:
         deadline = time.time() + 5
-        while not sock_path.exists() and time.time() < deadline:
-            time.sleep(0.02)
-        assert sock_path.exists(), "listener never bound the socket"
-
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(5)
-        s.connect(str(sock_path))
+        while True:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(5)
+            try:
+                s.connect(str(sock_path))
+                break
+            except (FileNotFoundError, ConnectionRefusedError):
+                s.close()
+                if time.time() >= deadline:
+                    pytest.fail("listener never became connectable")
+                time.sleep(0.02)
         s.sendall((json.dumps(
             {"op": "redistill", "request_id": "e2e-1", "material": "end to end"}) + "\n"
         ).encode("utf-8"))

@@ -416,11 +416,14 @@ jobs:
             tests/test_card_text_gate.py \
             tests/test_card_user_referent.py \
             tests/test_garden_language_flip.py \
+            tests/test_reply_language.py \
+            tests/test_chat_language_follow_module.py \
             tests/test_pr_branch_flow.py \
             tests/test_pi_mcp_bridge.py \
             tests/test_v2_cache_retry_metrics.py \
             tests/test_v2_screen_chat.py \
             tests/test_v2_serve_worker_screen_frames.py \
+            tests/test_v2_user_triage.py \
             tests/test_v2_wake_tool_loop.py \
             -v
 
@@ -457,7 +460,7 @@ jobs:
           python -m pytest \
             tests/test_garden_selection_pluggable.py \
             tests/test_garden_card_shape.py \
-            tests/test_route_b_card_shape_recall.py \
+            tests/test_context_memories.py \
             tests/test_memory_injection_observability.py \
             tests/test_memgarden_is_a_real_dependency.py \
             tests/test_card_leak_signals_wired.py \
@@ -493,6 +496,15 @@ jobs:
             tests/test_repository_inventory.py \
             -v
 
+      - name: Redis retirement and recovery asset guards
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m pytest \
+            tests/test_redis_client_retirement.py \
+            tests/test_redis_cvm_config.py \
+            -v
+
       - name: Envelope round-trip tool drift guards
         env:
           PYTHONPATH: backend
@@ -500,6 +512,15 @@ jobs:
           python -m pytest \
             tests/test_v1_envelope_roundtrip_tool.py \
             tests/test_frame_envelope_roundtrip_tool.py \
+            -v
+
+      - name: Test-harness teardown guard
+        # FEEDLING_TEST_PG is deliberately absent: this file guards the
+        # no-Postgres path of tests/conftest.py itself, and its fake admin
+        # connection records statements instead of executing them.
+        run: |
+          python -m pytest \
+            tests/test_conftest_teardown.py \
             -v
 
       - name: Guard top-level pytest discovery coverage
@@ -655,7 +676,7 @@ jobs:
             tests/test_enclave_http_client_reuse.py \
             tests/test_enclave_route_error_helpers.py \
             tests/test_enclave_route_errors.py \
-            tests/test_enclave_routeb_readside.py \
+            tests/test_enclave_context_recall.py \
             tests/test_enclave_routes_chat.py \
             tests/test_enclave_routes_envelope.py \
             tests/test_enclave_routes_frames.py \
@@ -851,6 +872,7 @@ jobs:
             tests/test_v2_usage_rollup.py \
             tests/test_admin_proactive_observability.py \
             tests/test_wake_support_indexes_migration.py \
+            tests/test_account_recover_challenges_migration.py \
             tests/test_v2_first_chat_activation_backfill.py \
             tests/test_pre_runtime_preflight.py \
             tests/test_pre_test_migration_convergence.py \
@@ -875,6 +897,7 @@ jobs:
             tests/test_data_track_runtime_view.py \
             tests/test_data_track_ops_views.py \
             tests/test_ops_dashboard_queries.py \
+            tests/test_data_track_chat_clear_shadow.py \
             tests/test_v2_runtime_health.py \
             tests/test_v2_scheduler_wiring.py \
             tests/test_v2_screen_watch_gate.py \
@@ -923,11 +946,18 @@ jobs:
             tests/test_uploaded_envelope_gate.py \
             tests/test_write_side_format_routing.py \
             tests/test_admin_debug_turn_view.py \
+            tests/test_admin_data_track_detail_read_failure.py \
+            tests/test_admin_data_track_detail_read_failure_html.py \
+            tests/test_admin_data_track_status_label_tristate.py \
             tests/test_data_track_debug.py \
+            tests/test_data_track.py \
+            tests/test_provider_attempt_ledger.py \
+            tests/test_tool_schema_rejection_probe.py \
             tests/test_admin_discarded_reason.py \
             tests/test_admin_concentration.py \
             tests/test_admin_concentration_e2e.py \
             tests/test_admin_genesis_unavailable.py \
+            tests/test_v2_capture_batch_protocol.py \
             -v
 
       - name: Upload execution evidence (report only)

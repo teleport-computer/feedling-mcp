@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from chat.reply_language import infer_reply_language_policy, local_time_labels
+from chat.reply_language import infer_reply_language, local_time_labels
 from agent_protocol_core import self_thinking
 import worldbook_match
 from voice.message_filter import VOICE_CALL_RECORD_ROLE, conversation_rows
@@ -272,7 +272,13 @@ _CHAT_FILE_BOUNDARY_POLICY = (
 
 _CHAT_CANVAS_POLICY = (
     "当一个小型交互体验比普通聊天更适合表达对方的想法时，你也可以主动选择制作 Canvas。"
-    "把它写成一个完整、离线、自包含的 UTF-8 文件，路径使用 "
+    # The next two sentences are the equivalent Chinese rendering of the
+    # authoritative V1 Canvas boundary in agent_tools_prompt.md:49-53. Keep
+    # both surfaces in sync when that product policy changes.
+    "如果对方没有要求制作，而一个小型交互体验可能确实有帮助、但是否合适还不确定，"
+    "先简短提议制作，等对方答复后再做。不要仅为了装饰闲聊、情绪支持，或本可直接在"
+    "对话中回答的问题而制作或提议这种体验；对方没有接受的提议不要重复。"
+    "把 Canvas 写成一个完整、离线、自包含的 UTF-8 文件，路径使用 "
     "/workspace/<安全文件名>.io.html；HTML、CSS、JavaScript 和数据都必须内联。"
     "用对方当前回复语言写简洁的 <title>，IO 会把它作为卡片标题；更新已有 Canvas 时"
     "保留原路径，只有对方要求重命名时才修改 <title>。除非对方询问，否则请谈论体验本身，"
@@ -795,13 +801,11 @@ def build_temporal_context(
     now_value = float(now_ts)
     now_utc = datetime.fromtimestamp(now_value, tz=timezone.utc)
     now_local = now_utc.astimezone(zone)
-    language_policy = infer_reply_language_policy(
-        {},
-        [],
+    reply_language = infer_reply_language(
         locale=str(locale or ""),
         archive_language=str(archive_language or ""),
     )
-    labels = local_time_labels(now_local, language_policy)
+    labels = local_time_labels(now_local, reply_language)
 
     last_ts = _finite_timestamp(last_user_message_ts)
     last_sent_at = (

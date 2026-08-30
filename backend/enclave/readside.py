@@ -1,27 +1,11 @@
-"""Pure-function memory-readside adapters (no Flask/FastAPI/httpx).
-
-Moved verbatim from enclave_app.py (old L900-1299 range), dropping the
-leading underscore from names that are now this module's public surface,
-and routing cross-module calls through `config.env_flag_enabled` /
-`envelope.decrypt_envelope` / `envelope.DecryptFailure` so tests can
-monkeypatch them.
-
-`select_context_memories_via_readside` still reaches into the root
-`memgarden.scoring.selector` module (not moved as part of this migration).
-"""
+"""Pure-function memory-readside adapters (no Flask/FastAPI/httpx)."""
 
 from __future__ import annotations
 
 import json
 import os
 
-from enclave import config, envelope
-from memory import card_shape  # noqa: E402
-from memgarden.scoring.selector import select_memory_index_items  # noqa: E402
-
-
-def memory_readside_for_model_api_enabled() -> bool:
-    return config.env_flag_enabled("MEMORY_READSIDE_FOR_MODEL_API")
+from enclave import envelope
 
 
 MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT = 500
@@ -65,8 +49,8 @@ def memory_readside_effective_limit(raw_limit=None) -> int:
     - positive integer: that many candidates, capped by HARD_MAX
     - 0: "full window", still capped by FEEDLING_MEMORY_READSIDE_HARD_MAX
 
-    This is separate from MEMORY_READSIDE_MODEL_API_LIMIT, which belongs to the
-    older route-B auto-recall path. Keep both knobs distinct.
+    This is separate from MEMORY_READSIDE_MODEL_API_LIMIT, which controls the
+    automatic chat-recall candidate page. Keep both knobs distinct.
     """
     if raw_limit is None or str(raw_limit).strip() == "":
         raw_limit = "0"
@@ -80,126 +64,6 @@ def memory_readside_effective_limit(raw_limit=None) -> int:
     if requested == 0:
         return hard_max
     return max(1, min(requested, hard_max))
-
-
-def context_moment_to_index_item(moment: dict) -> dict:
-    """Convert the existing plaintext context card into a readside index item.
-
-    Route B still decrypts in-enclave, but selection now goes through the same
-    index selector used by readside/MCP. This avoids the backend top-50 prefilter
-    while unifying the matching pipe.
-    """
-
-    linked = memory_readside_text(moment.get("linked_dimension"), 160)
-    # 摘要**只能**来自可公开字段（card_fields 保证 content 不在其列）——
-    # 它会进 selector 的 skipped/selected trace，而 context_trace=1 时整个
-    # trace 会返回客户端。用正文兜底会让被拒掉的卡从 trace 漏出正文。
-    summary = memory_readside_text(card_shape.summary_of(moment), 500)
-    bucket_refs = [item for item in (linked, memory_readside_text(moment.get("type"), 40)) if item]
-    return {
-        "id": memory_readside_text(moment.get("id"), 120),
-        "summary": summary,
-        # 私有搜索语料：只在 enclave 内参与匹配，任何出口都必须剥掉。
-        # 沿用 build_memory_search_item 已有的字段名与既定语义，不新造一套。
-        "_search_content": card_shape.private_text(moment),
-        "bucket_refs": bucket_refs,
-        "status": "active",
-        "salience": "medium",
-        "is_open_thread": False,
-        "score": 0,
-        "occurred_at": memory_readside_text(moment.get("occurred_at"), 80),
-        "created_at": memory_readside_text(moment.get("created_at"), 80),
-    }
-
-
-def select_context_memories_via_readside(
-    moments: list[dict],
-    latest_user_text: str,
-    *,
-    cap: int = 8,
-) -> tuple[list[dict], dict]:
-    """Route B readside pipe: plaintext cards -> safe index -> ids -> cards."""
-
-    if not moments:
-        return [], {
-            "mode": "model_api_readside_v1",
-            "readside_enabled": True,
-            "selected": [],
-            "rejected_sample": [],
-            "index_count": 0,
-        }
-    by_id = {str(moment.get("id") or ""): moment for moment in moments if str(moment.get("id") or "")}
-    index_items = [
-        item for item in (context_moment_to_index_item(moment) for moment in moments)
-        # 只有正文、没有摘要的卡也必须进候选池 —— 此前这里只看 summary，
-        # 于是新一代形状（summary/content）的卡被整批丢弃（2026-08-16 事故根因）。
-        if item.get("id") and (item.get("summary") or item.get("_search_content"))
-    ]
-    selection = select_memory_index_items(
-        latest_user_text,
-        index_items,
-        cap=cap,
-        # memgarden v0.2 defaults None to a query-keyword classification gate.
-        # IO retired card sensitivity, so explicitly keep every indexed card
-        # eligible instead of relying on today's index shape to make that gate
-        # inert.  This is a dependency-compatibility argument, not public API.
-        include_sensitive=True,
-    )
-    selected_ids = [memory_id for memory_id in selection.get("selected_ids", []) if memory_id in by_id]
-    context_memories = [dict(by_id[memory_id]) for memory_id in selected_ids[:cap]]
-    selector_trace = dict(selection.get("trace")) if isinstance(selection.get("trace"), dict) else {}
-    # memgarden v0.2 still emits a legacy classification decision in its trace.
-    # IO no longer has that card concept, so keep the dependency detail behind
-    # this adapter rather than leaking a dead field into observability.
-    selector_trace.pop("allow_sensitive", None)
-    selected_trace = [
-        {key: value for key, value in item.items() if key != "is_sensitive"}
-        for item in selector_trace.get("selected", [])
-        if isinstance(item, dict)
-    ]
-    selector_trace["selected"] = selected_trace
-    skipped = selector_trace.get("skipped_sample") if isinstance(selector_trace.get("skipped_sample"), list) else []
-    trace = {
-        "mode": "model_api_readside_v1",
-        "readside_enabled": True,
-        "index_count": len(index_items),
-        "selected": [
-            {
-                "id": item.get("id", ""),
-                "title": memory_readside_text(by_id.get(str(item.get("id") or ""), {}).get("title"), 160),
-                "type": memory_readside_text(by_id.get(str(item.get("id") or ""), {}).get("type"), 40),
-                "score": float(item.get("score") or 0.0),
-                "confidence": memory_readside_text(item.get("confidence"), 40),
-                "matched_units": list(item.get("matched_units") or [])[:8],
-                "matched_phrases": list(item.get("matched_phrases") or [])[:6],
-                "reason": memory_readside_text(item.get("reason"), 120),
-                "bucket": "readside",
-                "selected": True,
-            }
-            for item in selected_trace[:cap]
-        ],
-        "rejected_sample": [
-            {
-                "id": item.get("id", ""),
-                "title": memory_readside_text(by_id.get(str(item.get("id") or ""), {}).get("title"), 160),
-                "type": memory_readside_text(by_id.get(str(item.get("id") or ""), {}).get("type"), 40),
-                "score": float(item.get("score") or 0.0),
-                "confidence": memory_readside_text(item.get("confidence"), 40),
-                "matched_units": list(item.get("matched_units") or [])[:8],
-                "matched_phrases": list(item.get("matched_phrases") or [])[:6],
-                "reason": memory_readside_text(item.get("reason"), 120),
-                "bucket": "rejected",
-                "selected": False,
-            }
-            for item in skipped[:8]
-        ],
-        "selector_trace": selector_trace,
-    }
-    for key in ("query_units", "query_strong_phrases", "query_rare_terms", "query_weak_terms"):
-        value = selector_trace.get(key)
-        if isinstance(value, list):
-            trace[key] = value
-    return context_memories, trace
 
 
 def memory_readside_text(value, max_chars: int = 2000) -> str:

@@ -37,7 +37,7 @@ from chat.reply_language import (
     DEFAULT_FAILURE_FALLBACK_EN,
     DEFAULT_FAILURE_FALLBACK_ZH,
     failure_fallback_reply,
-    infer_reply_language_policy,
+    infer_reply_language,
 )
 from core import wake_bus
 from memgarden import timestamps as memory_timestamps
@@ -201,6 +201,20 @@ DURABLE_TOOL_EFFECT_TYPES = frozenset({
     "workspace_batch_encrypted_v1",
 })
 
+# Chat reliability窗口上限，与下面的判别量出生日期成对使用。
+CHAT_RELIABILITY_MAX_WINDOW_HOURS = 24 * 30
+
+# `chat_message_archive.cleared_at` 是判「这条 job 的送达证据是否被合规清除
+# 删掉」的唯一锚，而它随 0052 一起落地：更早发生的 Clear 没有留下任何痕。
+# 因此窗口早于这个日期的那一段，被清除过的 job 会退回「无 clear 痕 + missing」
+# ⇒ **判红**。失效方向是假红（把合规删除报成缺陷），不是假绿。
+# ⚠️ 于是把窗口上限拉过余量，会让这个修复在窗口早段静默失效、退回原病。
+# 该不等式由 test_chat_clear_discriminant_window_margin 强制，不靠这段注释。
+# 取值 = 0052 落地那次提交的日期（origin/test 与 origin/main 同为 86fed5fe,
+# 2026-07-20）。**prod 真正跑完迁移只会在此之后**，所以由它算出的余量是上界、
+# 这道闸偏松；偏松的后果仍只是假红，不会把缺陷判绿。
+CHAT_CLEAR_ARCHIVE_AVAILABLE_FROM = datetime(2026, 7, 20, tzinfo=timezone.utc)
+
 SCHEDULED_LEASE_REQUEUE_MAX_ATTEMPTS = _positive_int_env(
     "FEEDLING_V2_SCHEDULED_REQUEUE_MAX_ATTEMPTS", "3"
 )
@@ -290,6 +304,7 @@ _DIRECT_NOTICE_ERROR_CLASSES = frozenset({
     "platform_queue_timeout",
     "platform_execution_timeout",
     "provider_timeout",
+    "provider_output_truncated",
 })
 
 # Migration 0041's database trigger rejects pending->claimed transitions from
@@ -376,6 +391,38 @@ JOB_FAILURE_CODES = frozenset({
     GENERAL_WATCHDOG_REQUEUE_EXHAUSTED,
 })
 
+# ⚠️ This one string carries TWO different meanings, and that is deliberate --
+# do not assume a single one when renaming it.  (a) On the successor job it is a
+# ``reason`` code, i.e. why that job was enqueued, and it is registered in
+# ``ENQUEUE_REASON_CODES`` below in that capacity alone.  (b) On the *completed*
+# job it is a ``last_error`` marker, i.e. why that job finished with no final
+# effect of its own.  Both are written in one transaction by
+# ``effect_outbox._handoff_legacy_chat_final_on_cursor``; chat reliability then
+# matches meaning (b) to keep that benign completion out of the defect bucket.
+# The two meanings agree on the string only by coincidence, so a rename that
+# touched one column would silently unhook the other.  One constant, bound as a
+# parameter at every write and read, keeps them from drifting apart in silence.
+LEGACY_FINAL_REGENERATION_REASON = "legacy_final_regeneration"
+
+# Terminal ``v2_turn_metrics.status`` for a turn that ended cleanly.  The E1
+# rescue in ``recent_chat_reliability`` reads it *alongside* ``failed`` because
+# ``model_calls=0`` on its own is ambiguous: the slot-failure recovery in
+# ``worker.py`` hardcodes the same 0 to mean "no visibility into how far the
+# turn got", not "no model call was made".  That recovery path is itself a
+# signal that something went wrong, so rescuing it would be a false *green*
+# aimed squarely at the jobs that had trouble.  Bound as a parameter on the read
+# side and used at the empty-coalesced write site it is paired with.
+CHAT_TURN_STATUS_OK = "ok"
+
+# Terminal ``v2_turn_metrics.status`` for the worker-side sibling of the handoff
+# above (``worker.py`` late-input branch): the turn's final reply was fenced off
+# as stale, the job completes with no final effect of its own, and a successor
+# re-reads the unconsumed input.  Unlike the outbox-side path this one leaves
+# nothing on ``agent_jobs`` -- this status is its only durable content-free
+# trace, so chat reliability reads it to keep the completion out of the defect
+# bucket.  Bound as a parameter on both the write and the read side.
+CHAT_INPUT_ADVANCED_HANDOFF_STATUS = "input_advanced_handoff"
+
 # Closed vocabulary for the public enqueue trace. ``agent_jobs.reason`` remains
 # an internal persistence field and can carry migration/private coordination
 # values; the trace producer emits a reason only when it is registered here.
@@ -388,7 +435,7 @@ ENQUEUE_REASON_CODES = frozenset({
     # the generic enqueue hook, but keeping the complete queue vocabulary here
     # prevents a second allowlist when that policy changes).
     "chat_send",
-    "legacy_final_regeneration",
+    LEGACY_FINAL_REGENERATION_REASON,
     "mutation_recovery",
     "ordered_followup",
     "reconcile",
@@ -1096,8 +1143,15 @@ def preempt_active_for_chat_on_cursor(
                 "WHERE job_id=%s AND outcome IS NULL",
                 (int(row["id"]),),
             )
+            # The platform cannot safely replay an execution that already
+            # wrote effects.  Attribute that delivery failure to our execution
+            # boundary, not to the user's provider or its quota.
             _queue_terminal_failure_on_cursor(
-                cur, int(row["id"]), str(row["user_id"]), terminal_error
+                cur,
+                int(row["id"]),
+                str(row["user_id"]),
+                terminal_error,
+                error_class="platform_execution_timeout",
             )
             job_reviews = tuple(
                 _recover_review_runner_on_cursor(cur, int(row["id"]))
@@ -4289,9 +4343,7 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         language = accounts_registry._get_user_archive_language(user_id) or ""
     except Exception:  # noqa: BLE001 — locale lookup must not block failure delivery
         language = ""
-    language_policy = infer_reply_language_policy(
-        {},
-        [],
+    reply_language = infer_reply_language(
         archive_language=language,
     )
     user_text = notices_catalog.user_text_for(
@@ -4315,13 +4367,15 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
             if error_class in _DIRECT_NOTICE_ERROR_CLASSES
             or blame == "user_provider"
             else failure_fallback_reply(
-                language_policy,
+                reply_language,
                 zh=_TERMINAL_FAILURE_FALLBACK_REPLY,
                 en=_TERMINAL_FAILURE_FALLBACK_REPLY_EN,
             )
         )
     )
-    store = core_store.get_store(user_id)
+    store = core_store.get_store_shell_only(
+        user_id, reason="terminal reply is a cold-safe committed write"
+    )
     envelope, error = core_envelope._build_shared_envelope_for_store(
         store,
         reply_text.encode("utf-8"),
@@ -6445,7 +6499,7 @@ def recent_chat_reliability(
     They cannot answer duplicate-charge or possibly-billed questions: those
     require the canonical provider-attempt ledger planned for P0-B.
     """
-    safe_hours = max(1, min(int(within_hours), 24 * 30))
+    safe_hours = max(1, min(int(within_hours), CHAT_RELIABILITY_MAX_WINDOW_HOURS))
     safe_limit = max(1, min(int(recent_limit), 200))
     # ``reply`` predates the explicit final/intermediate effect vocabulary.
     # Only legacy rows carrying the consumed-input frontier are final.  A
@@ -6508,8 +6562,19 @@ def recent_chat_reliability(
 
             cur.execute(
                 "WITH chat AS ("
-                " SELECT id,status FROM agent_jobs WHERE lane='chat' "
+                " SELECT id,user_id,status,finished_at,last_error FROM agent_jobs "
+                " WHERE lane='chat' "
                 " AND created_at >= now() - make_interval(hours => %s)"
+                # `v2_turn_metrics` is UNIQUE(job_id) since 0029, so this cannot
+                # multiply chat rows.  It is also untouched by ``chat_clear``,
+                # which is what makes it readable at all here: every table that
+                # records *delivery* lives on the user-content lane and is wiped
+                # by a compliant clear, while this one records what the runtime
+                # did.  Only content-free integers/flags are read.
+                "), turn_by_job AS ("
+                " SELECT t.job_id, t.status AS turn_status,"
+                "  t.model_calls, t.failed "
+                " FROM v2_turn_metrics t JOIN chat ON chat.id=t.job_id"
                 "), effect_by_job AS ("
                 " SELECT e.job_id, count(*)::int AS effect_rows,"
                 "  bool_or(e.status IN ('applied','applied_with_results')) AS applied,"
@@ -6522,6 +6587,39 @@ def recent_chat_reliability(
                 "     AND e.payload ? 'reply_through_seq')) "
                 " AND e.created_at >= now() - make_interval(hours => %s) "
                 " GROUP BY e.job_id"
+                # One row per chat job carrying the three labels the verdict
+                # needs.  Labelling here rather than in each FILTER is what
+                # makes the buckets provably disjoint: `benign` is subtracted
+                # once, in one place, so the red count cannot be double-reduced
+                # into a negative by two independently-written predicates.
+                "), judged AS ("
+                " SELECT chat.user_id, e.effect_rows, e.applied, e.pending,"
+                "  e.needs_reconciliation, e.discarded,"
+                "  (chat.status='completed' "
+                "   AND coalesce(e.applied,false) IS NOT TRUE) AS missing,"
+                # Structurally owed no final reply of its own.  Each disjunct is
+                # a durable content-free trace of one enumerated completion path;
+                # see the module note in the chat-verdict test for why these are
+                # per-path rather than one signal.  A job with no turn-metrics row
+                # leaves every `t.*` comparison NULL -> not benign -> stays red,
+                # which is the safe direction for a best-effort instrument.
+                "  coalesce("
+                "    chat.last_error = %s"
+                "    OR t.turn_status = %s"
+                "    OR (t.model_calls = 0 AND t.failed IS NOT TRUE"
+                "        AND t.turn_status = %s)"
+                "  , false) AS benign,"
+                # Narrow predicate: only a clear that happened AFTER this job
+                # finished can have destroyed this job's evidence.  A wide one
+                # ("this user ever cleared") would swallow real defects that
+                # happened after the clear.  NULL finished_at compares NULL ->
+                # not shadowed -> stays red.
+                "  EXISTS (SELECT 1 FROM chat_message_archive arch "
+                "    WHERE arch.user_id=chat.user_id "
+                "      AND arch.cleared_at > chat.finished_at) AS clear_shadowed "
+                " FROM chat "
+                " LEFT JOIN effect_by_job e ON e.job_id=chat.id "
+                " LEFT JOIN turn_by_job t ON t.job_id=chat.id"
                 ") SELECT "
                 " count(*) FILTER (WHERE effect_rows IS NOT NULL)::int "
                 "   AS final_effect_jobs,"
@@ -6533,11 +6631,33 @@ def recent_chat_reliability(
                 " count(*) FILTER (WHERE discarded)::int AS final_discarded_jobs,"
                 " count(*) FILTER (WHERE effect_rows > 1)::int "
                 "   AS duplicate_final_effect_jobs,"
-                " count(*) FILTER (WHERE chat.status='completed' "
-                "   AND coalesce(applied,false) IS NOT TRUE)::int "
-                "   AS completed_without_final_applied "
-                "FROM chat LEFT JOIN effect_by_job e ON e.job_id=chat.id",
-                (safe_hours, list(explicit_final_effect_types), safe_hours),
+                # Total stays the raw population so the three buckets below can
+                # be checked to sum back to it.
+                " count(*) FILTER (WHERE missing)::int "
+                "   AS completed_without_final_applied,"
+                " count(*) FILTER (WHERE missing AND benign)::int "
+                "   AS completed_without_final_applied_benign,"
+                " count(*) FILTER (WHERE missing AND NOT benign "
+                "   AND clear_shadowed)::int "
+                "   AS completed_without_final_applied_clear_shadowed,"
+                # Content-free concentration gauge, scoped to the jobs that are
+                # actually judged red: offenders can only be counted from the
+                # agent_jobs side, because an offender is defined by the
+                # *absence* of an effect row -- grouping the effect table by
+                # user cannot see them at all.  Emits one integer; no user_id
+                # ever leaves this query.
+                " count(DISTINCT user_id) FILTER "
+                "  (WHERE missing AND NOT benign AND NOT clear_shadowed)::int "
+                "   AS completed_without_final_applied_users "
+                "FROM judged",
+                (
+                    safe_hours,
+                    list(explicit_final_effect_types),
+                    safe_hours,
+                    LEGACY_FINAL_REGENERATION_REASON,
+                    CHAT_INPUT_ADVANCED_HANDOFF_STATUS,
+                    CHAT_TURN_STATUS_OK,
+                ),
             )
             effects = cur.fetchone() or {}
 
@@ -6742,6 +6862,9 @@ def recent_chat_reliability(
                 "final_pending_jobs", "final_reconciliation_jobs",
                 "final_discarded_jobs", "duplicate_final_effect_jobs",
                 "completed_without_final_applied",
+                "completed_without_final_applied_users",
+                "completed_without_final_applied_benign",
+                "completed_without_final_applied_clear_shadowed",
             )
         },
         "failure_delivery": {

@@ -63,10 +63,16 @@ _RETRYABLE_HTTPX = (httpx.TimeoutException, httpx.TransportError)
 _RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 _PROVIDER_CONFIG_STATUS = frozenset({400, 401, 402, 403, 404, 415, 422})
 _MAX_PG_BIGINT = (1 << 63) - 1
-# The chat wires cap max_tokens at 8192 when they encode the payload; image
-# bytes are billed against that same completion budget, so image requests ask
-# for the ceiling rather than a text-sized slice.
-IMAGE_OUTPUT_MAX_TOKENS = 8192
+# One provider-neutral ceiling for every chat payload builder. File-capable V2
+# turns may place a complete generated document inside tool-call arguments, so
+# the historical 8192-token wire clamp truncated otherwise valid calls before
+# the runtime could validate or save them. Keep the provider encoders on one
+# constant: a per-wire literal lets one relay appear fixed while other wires
+# silently retain the old limit.
+CHAT_OUTPUT_MAX_TOKENS = 32768
+# Generated image bytes are billed against the same completion budget. Ask for
+# the live chat-wire ceiling instead of maintaining a second stale copy.
+IMAGE_OUTPUT_MAX_TOKENS = CHAT_OUTPUT_MAX_TOKENS
 # One wall-clock budget for every link in a single image response, so a handful
 # of slow links cannot each add a fresh fetch deadline to the turn.
 IMAGE_LINK_TOTAL_DEADLINE_SECONDS = 45.0
@@ -84,6 +90,11 @@ def is_token_limit_stop_reason(value: Any) -> bool:
         "max_tokens",
         "max_output_tokens",
     }
+
+
+def cap_chat_output_tokens(value: Any) -> int:
+    """Clamp one requested completion budget to the shared chat-wire ceiling."""
+    return max(1, min(int(value), CHAT_OUTPUT_MAX_TOKENS))
 
 
 def classify_provider_error(exc: BaseException) -> str:
@@ -2512,7 +2523,7 @@ def _build_openai_responses_payload(
     payload: dict[str, Any] = {
         "model": model,
         "input": input_items,
-        "max_output_tokens": max(1, min(int(max_tokens), 8192)),
+        "max_output_tokens": cap_chat_output_tokens(max_tokens),
         "store": False,
     }
     if include_reasoning:
@@ -2683,7 +2694,7 @@ def _build_openai_compat_payload(
         "model": model,
         "messages": encoded_messages,
         "stream": False,
-        "max_tokens": max(1, min(int(max_tokens), 8192)),
+        "max_tokens": cap_chat_output_tokens(max_tokens),
     }
     # temperature is OPTIONAL on this wire: the Claude 5 / GPT-5 generation rejects
     # it outright ("`temperature` is deprecated for this model" → 400). Relays pool
@@ -3542,7 +3553,7 @@ def _build_anthropic_payload(
     json_instruction = _json_only_instruction(response_format)
     if json_instruction:
         system = f"{system}\n\n{json_instruction}".strip()
-    capped_max_tokens = max(1, min(int(max_tokens), 8192))
+    capped_max_tokens = cap_chat_output_tokens(max_tokens)
     payload: dict[str, Any] = {
         "model": model,
         "messages": provider_messages,
@@ -3782,7 +3793,7 @@ def _build_bedrock_payload(
     if json_instruction:
         system_parts.append(json_instruction)
 
-    capped_max_tokens = max(1, min(int(max_tokens), 8192))
+    capped_max_tokens = cap_chat_output_tokens(max_tokens)
     inference_config: dict[str, Any] = {"maxTokens": capped_max_tokens}
     thinking_enabled = (
         include_reasoning
@@ -4011,7 +4022,7 @@ def _build_gemini_payload(
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
     system, contents = _split_system_messages_gemini(messages)
     generation_config: dict[str, Any] = {
-        "maxOutputTokens": max(1, min(int(max_tokens), 8192)),
+        "maxOutputTokens": cap_chat_output_tokens(max_tokens),
     }
     if temperature is not None:
         generation_config["temperature"] = temperature

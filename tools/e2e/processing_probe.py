@@ -118,6 +118,22 @@ def run_processing_cell(cell: HostedCell, pool: dict[str, str], *, large: bool =
         return p.result()
 
     with E2EClient.provision(route="model_api") as c:
+        c.configure_failure_evidence(cell=f"processing:{cell.name}")
+        job_id = ""
+
+        def _finish() -> dict:
+            result = p.result()
+            non_pass = [
+                f"{case['name']}={case['result']}"
+                for case in result["cases"]
+                if case["result"] != PASS
+            ]
+            if non_pass:
+                c.preserve_failure(
+                    f"genesis job {job_id or 'uncreated'}; {'; '.join(non_pass)}"
+                )
+            return result
+
         # -- provider 配置(用自检那一次证明 key 可用)---------------------
         configured = ""
         for model in models:
@@ -131,11 +147,10 @@ def run_processing_cell(cell: HostedCell, pool: dict[str, str], *, large: bool =
                 if ((body.get("config") or {}).get("test_status") or body.get("status")) in ("ok",):
                     configured = model
                     break
-        if not p.ok("setup", bool(configured), f"model={configured or models}"):
-            return p.result()
+        if p.ok("setup", bool(configured), f"model={configured or models}") != PASS:
+            return _finish()
 
         history = _large_history() if large else HISTORY_SMALL
-        job_id = ""
         staged_id = ""
         recommended = None
 
@@ -160,7 +175,7 @@ def run_processing_cell(cell: HostedCell, pool: dict[str, str], *, large: bool =
             return PASS, f"kinds ok, est={total} tokens, recommended={recommended}"
         p.guard("estimate_contract", _estimate)
         if not staged_id:
-            return p.result()
+            return _finish()
 
         # 推荐模型:每个 provider 家族都该给得出一个快模型(§2-10)。
         # bedrock 目前设计上返回 null,其余为 null 即回归。
@@ -180,7 +195,8 @@ def run_processing_cell(cell: HostedCell, pool: dict[str, str], *, large: bool =
             return (PASS, f"job={job_id}") if job_id else (PRODUCT_FAIL, "no job_id")
         p.guard("commit", _commit)
         if not job_id:
-            return p.result()
+            return _finish()
+        c.record_failure_locator("job_id", job_id)
 
         # -- 防重:同 stage 再提交 / 处理中另开一单 --------------------------
         def _double_commit():
@@ -214,7 +230,7 @@ def run_processing_cell(cell: HostedCell, pool: dict[str, str], *, large: bool =
             final = _poll(c, job_id, timeout=1800 if large else 600, frames=frames)
         except RuntimeError as e:
             p.blocked("poll", str(e))
-            return p.result()
+            return _finish()
 
         p.ok("job_done", final.get("status") == "done",
              f"status={final.get('status')} error_class={final.get('error_class')} "
@@ -269,7 +285,7 @@ def run_processing_cell(cell: HostedCell, pool: dict[str, str], *, large: bool =
         cards = sum(int(m.get("cards") or 0) for m in final.get("materials") or [])
         p.ok("cards_written", cards > 0, f"cards={cards}")
 
-    return p.result()
+        return _finish()
 
 
 def main() -> int:

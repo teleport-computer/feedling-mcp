@@ -206,7 +206,10 @@ def test_file_capable_chat_uses_v2_output_budget_without_changing_global_default
     )
 
     assert default_max == 700
-    assert seen_kwargs == [{"require_reply": False, "max_tokens": 4096}]
+    assert seen_kwargs == [{
+        "require_reply": False,
+        "max_tokens": provider_client.CHAT_OUTPUT_MAX_TOKENS,
+    }]
 
     seen_kwargs.clear()
     asyncio.run(
@@ -1142,6 +1145,236 @@ def test_canvas_update_compact_delivery_preserves_request_and_corrects_metadata(
     )
     assert len(messages_seen) == 3
     assert replies == [("已经按你的要求更新好了。", True)]
+    assert outcome.stop_reason == "final_text"
+
+
+def test_generic_validation_retry_does_not_consume_canvas_delivery_retry(
+    monkeypatch,
+):
+    files = []
+    initial_messages = [{"role": "user", "content": "先帮我整理思路"}]
+    late_canvas_request = [{
+        "role": "user",
+        "content": "请把它做成中文 Canvas。",
+    }]
+
+    async def on_file(path, revision, *, title="", subtitle=""):
+        files.append((path, revision, title, subtitle))
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content=(
+                    "ok: workspace_write applied at revision 1"
+                    if call.name == "workspace_write"
+                    else "tool-observation"
+                ),
+                metadata=(
+                    {"workspace_revision": 1}
+                    if call.name == "workspace_write"
+                    else None
+                ),
+            )
+            for call in tool_calls
+        ]
+
+    outcome, _calls, replies, messages_seen = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "先搜索",
+                "tool_calls": [{
+                    "id": "generic-invalid",
+                    "name": "memory_search",
+                    "args": {},
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "write-canvas",
+                    "name": "workspace_write",
+                    "args": {
+                        "path": "/workspace/retry-isolation.io.html",
+                        "content": "<main>isolation</main>",
+                        "expected_revision": 0,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "canvas-invalid",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/retry-isolation.io.html",
+                        "revision": 1,
+                        "title": "纠错隔离",
+                        "subtitle": "镜像 A",
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "canvas-corrected",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/retry-isolation.io.html",
+                        "revision": 1,
+                        "title": "纠错隔离",
+                        "subtitle": "镜像 A",
+                        "completion_message": "中文 Canvas 已经做好了。",
+                    },
+                }],
+                "usage": {},
+            },
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        file_requirement_messages=initial_messages,
+        resolve_required_file_suffixes=v2_context.required_file_suffixes,
+        fold_batches=[late_canvas_request],
+        max_calls=5,
+        build_messages=lambda transcript: list(transcript),
+    )
+
+    generic_exchange = next(
+        item for item in messages_seen[1]
+        if isinstance(item, ToolExchange)
+        and item.calls[0].id == "generic-invalid"
+    )
+    assert "invalid args for memory_search" in generic_exchange.results[0].content
+    canvas_exchange = next(
+        item for item in messages_seen[3]
+        if isinstance(item, ToolExchange)
+        and item.calls[0].id == "canvas-invalid"
+    )
+    assert "completion_message" in canvas_exchange.results[0].content
+    assert files == [(
+        "/workspace/retry-isolation.io.html",
+        1,
+        "纠错隔离",
+        "镜像 A",
+    )]
+    assert replies == [("中文 Canvas 已经做好了。", True)]
+    assert outcome.stop_reason == "final_text"
+
+
+def test_send_file_validation_retry_does_not_consume_generic_validation_retry(
+    monkeypatch,
+):
+    files = []
+    trajectory_events = []
+    tool_events = []
+    initial_messages = [{"role": "user", "content": "给我一个 Word 文档"}]
+    cancellation = [{"role": "user", "content": "不用文件了，直接回答"}]
+
+    async def on_file(path, revision, *, title="", subtitle=""):
+        files.append((path, revision, title, subtitle))
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content=(
+                    "ok: workspace_write applied at revision 1"
+                    if call.name == "workspace_write"
+                    else "tool-observation"
+                ),
+                metadata=(
+                    {"workspace_revision": 1}
+                    if call.name == "workspace_write"
+                    else None
+                ),
+            )
+            for call in tool_calls
+        ]
+
+    outcome, _calls, replies, messages_seen = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "write-before-cancel",
+                    "name": "workspace_write",
+                    "args": {
+                        "path": "/workspace/cancelled.docx",
+                        "content": "# cancelled",
+                        "expected_revision": 0,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "delivery-invalid",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/cancelled.docx",
+                        "revision": 1,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "搜索",
+                "tool_calls": [{
+                    "id": "generic-after-cancel",
+                    "name": "memory_search",
+                    "args": {},
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "generic-corrected",
+                    "name": "memory_search",
+                    "args": {"query": "纠错隔离"},
+                }],
+                "usage": {},
+            },
+            {"reply": "搜索完成。", "tool_calls": [], "usage": {}},
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        required_file_suffixes=(".docx",),
+        file_requirement_messages=initial_messages,
+        resolve_required_file_suffixes=v2_context.required_file_suffixes,
+        fold_batches=[[], cancellation],
+        max_calls=6,
+        trajectory_events=trajectory_events,
+        tool_events=tool_events,
+        build_messages=lambda transcript: list(transcript),
+    )
+
+    assert [event[2] for event in tool_events if event[0] == "delivery-invalid"] == [
+        "tool_call_started",
+        "tool_call_result",
+    ]
+    assert any(
+        kind == "tool_batch_validation_failed"
+        and payload["calls"][0].id == "delivery-invalid"
+        for kind, payload in trajectory_events
+    )
+    assert [
+        event[2] for event in tool_events if event[0] == "generic-after-cancel"
+    ] == ["tool_call_started", "tool_call_result"]
+    assert any(
+        kind == "tool_batch_validation_failed"
+        and payload["calls"][0].id == "generic-after-cancel"
+        and "invalid args for memory_search" in payload["results"][0].content
+        for kind, payload in trajectory_events
+    )
+    assert files == []
+    assert replies == [("搜索完成。", True)]
     assert outcome.stop_reason == "final_text"
 
 

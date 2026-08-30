@@ -17,7 +17,7 @@ canonical_owner: self
 - [`memory-perception-history.md`](memory-perception-history.md)：Memory/Perception 历史文档的分批证据、内核/IO 边界与兼容义务。
 - [`api-product-history.md`](api-product-history.md)：API/Product 历史文档的实现证据、现行决策与公开契约 owner。
 - [`operations-history.md`](operations-history.md)：operations 历史文档的实现证据、现行运维边界与延后决策。
-- `candidates/`：候选项的生产消费者、兼容义务、验证证据和结论；只在出现强候选后创建记录。
+- [`candidates/`](candidates/)：候选项的生产消费者、兼容义务、验证证据和结论；只在出现强候选后创建记录。
 - [`tools/repository_inventory.py`](../../tools/repository_inventory.py)：确定性的 tracked 文件分类器。
 
 运行基线分类：

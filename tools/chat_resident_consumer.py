@@ -202,7 +202,7 @@ from chat.reply_language import (
     format_time_anchor,
     garden_language_decision,
     infer_garden_language,
-    infer_reply_language_policy,
+    infer_reply_language,
     reply_language_system_line,
     user_written_text,
 )
@@ -10969,13 +10969,33 @@ def _wake_self_thinking_allowed() -> bool:
     return bool(_self_thinking_v1.enabled()) and _supports_mandatory_self_thinking_v1()
 
 
-def _wake_think_permission_line() -> str:
+def _foreground_self_thinking_instruction() -> str:
+    """前台强制思考指令；与主动道共享同一开关，只保留强度差异。"""
+    if not _wake_self_thinking_allowed():
+        return ""
+    from agent_protocol_core import self_thinking as _self_thinking_v1
+
+    return _self_thinking_v1.INSTRUCTION.strip()
+
+
+def _wake_think_permission_line(presence: dict | None = None) -> str:
     """开关关闭时返回空串 —— 模板里连提都不提 ``<think>``。"""
     if not _wake_self_thinking_allowed():
         return ""
+    policy = _resident_reply_language(presence)
+    if policy.language != "en":
+        return (
+            " 你可以在 JSON 前先写一个平常的 <think>...</think> 块；它会保持私密，"
+            "不会显示成消息。如果选择思考，从第一个字到最后一个字都使用用户所用的"
+            "语言。保持你自己的私下内心独白；不要写成对用户的评估，也不要写成他们"
+            "应该做什么的行动方案。"
+        )
     return (
         " You may open with your usual <think>...</think> block before the JSON; "
-        "it stays private and is never shown as a message."
+        "it stays private and is never shown as a message. Write the whole block "
+        "in the language the user uses, from first word to last. Keep it in your "
+        "own private inner voice; do not turn it into an assessment of the user or "
+        "an action plan for what they should do."
     )
 
 
@@ -14836,7 +14856,7 @@ def _message_for_proactive_job(
         "way. Use the glance below to decide whether to look closer; pull the real tools if something makes you want "
         "to understand the moment better. Then do whatever feels right — including nothing. "
         "Never mention this wake or any system wording to the user.",
-        _reply_protocol_block(),
+        _reply_protocol_block(presence),
         _reply_language_line(presence),
         (
             "wake_metadata:\n"
@@ -14875,34 +14895,32 @@ def _message_for_proactive_job(
     return _with_worldbook("\n\n".join(parts))
 
 
-def _reply_protocol_block() -> str:
+def _reply_protocol_block(presence: dict | None = None) -> str:
     """How the agent responds — stated once (no longer repeated across the wake
     preamble + tool block)."""
     return "\n".join([
         "How to respond (exactly one of):",
         "- speak: reply in your normal voice — a few short bubbles is typical, but length and number are yours. "
-        "Return JSON {\"messages\":[\"...\"]}." + _wake_think_permission_line(),
+        "Return JSON {\"messages\":[\"...\"]}." + _wake_think_permission_line(presence),
         "- stay quiet: return {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}]}.",
         "- want to see their screen but it isn't shared: just ask, in a normal message.",
     ])
 
 
-def _resident_reply_language_policy(presence: dict | None = None):
-    """Resident-side reply-language policy via the shared helper. Resident has no
-    identity-card/memory text in hand (only whoami archive_language + presence
-    locale), so it degrades to the helper's locale → archive_language → default
-    tier — same wording, mirror rule, and time-anchor localization as model_api."""
+def _resident_reply_language(presence: dict | None = None):
+    """Resident-side locale → archive-language → default selection."""
     locale = str((presence or {}).get("locale") or "").strip()
     archive_language = str(_whoami_cache.get("archive_language") or "").strip()
-    return infer_reply_language_policy({}, [], locale=locale, archive_language=archive_language)
+    return infer_reply_language(locale=locale, archive_language=archive_language)
 
 
 def _reply_language_line(presence: dict | None = None) -> str:
-    """The shared zh/en reply-language policy line (a default language + a soft
-    mirror of the user's latest-message language). Wired into both the proactive
-    wakes and the foreground reply so the model stops drifting to Chinese when the
-    user is in an English context."""
-    return reply_language_system_line(_resident_reply_language_policy(presence))
+    """Render the shared reply-language rule in the selected zh/en language.
+
+    Wired into both proactive wakes and foreground replies; the rendered rule
+    tells the model how to choose the language from the latest user message.
+    """
+    return reply_language_system_line(_resident_reply_language(presence))
 
 
 def _native_reachout_tool_instructions() -> str:
@@ -15021,7 +15039,7 @@ def _local_time_anchor(since_sec: float | None = None, presence: dict | None = N
     tzs = _user_timezone()
     is_default = not tzs
     zone = tzs or _DEFAULT_TIMEZONE
-    policy = _resident_reply_language_policy(presence)
+    policy = _resident_reply_language(presence)
     return format_time_anchor(
         datetime.now(_tzmod.utc), zone, policy,
         since_sec=since_sec, timezone_default=is_default,
@@ -18204,19 +18222,16 @@ def _process_messages(messages: list) -> float:
                 _quoted_present, ts,
             )
 
-        # Self-authored thinking — FOREGROUND-CHAT-only (this dispatch; background
-        # lanes build their prompts elsewhere and are never asked to emit <think>).
+        # Self-authored thinking is mandatory in foreground chat. Proactive wakes
+        # use the same switch but only permit it, preserving the intentional lane
+        # intensity difference.
         # Prepended so the user's current message stays LAST (the "answer only the
         # last message" framing) and the transcript header added below stays
         # topmost. The consumer's existing tagged-thinking extraction peels the
         # <think> block into thinking_summary. Same kill switch as V2.
-        from agent_protocol_core import self_thinking as _self_thinking_v1
-
-        if (
-            _self_thinking_v1.enabled()
-            and _supports_mandatory_self_thinking_v1()
-        ):
-            content = f"{_self_thinking_v1.INSTRUCTION.strip()}\n\n{content}"
+        thinking_instruction = _foreground_self_thinking_instruction()
+        if thinking_instruction:
+            content = f"{thinking_instruction}\n\n{content}"
         # Ground every foreground turn in the real current time (+ gap since last
         # interaction) so the agent never carries a stale, e.g. overnight, frame.
         content = _prepend_time_anchor_foreground(content, ts)
@@ -20106,9 +20121,9 @@ def _resident_incremental_payload(payload: dict, existing: dict) -> dict:
 def _resident_derive_identity(document: str, job_id: str) -> dict | None:
     """Persona/identity is small (fits one context) — a single agent derive, no chunking.
     Prompt + parse 来自共享模板 identity/distill_prompt_v1(Batch 2 A1;B2 起覆盖
-    RESIDENT_IDENTITY_FIELDS 这 14 个字段 == 身份卡全部 13 个 profile 字段 + dimensions,
-    含 user_preferred_name / custom_persona_prompt / language_preference /
-    relationship_anchor / stable_definitions 这 5 个用户层字段,GROUNDED——素材没有明确
+    RESIDENT_IDENTITY_FIELDS 这 13 个字段 == 身份卡全部 12 个 profile 字段 + dimensions,
+    含 user_preferred_name / custom_persona_prompt /
+    relationship_anchor / stable_definitions 这 4 个用户层字段,GROUNDED——素材没有明确
     信号就留空,详见 distill_prompt_v1.RESIDENT_IDENTITY_FIELDS 的说明)、card_policy
     清洗、坏 JSON 重试一次(guardrail 7:报错到 setup log,不静默吞)。
     Returns a plaintext identity payload for identity.replace, or None if no persona content
@@ -20690,6 +20705,44 @@ def run() -> None:
                     poll_messages,
                     last_ts=last_ts,
                 )
+
+            # The agent call below can occupy this single loop for up to the
+            # full turn timeout. Reconcile Capture after the claimed messages
+            # are known but before that blocking call, so a turn-backstop is
+            # never delayed by a long foreground turn. This remains fail-open:
+            # Capture availability must not prevent the user turn from running.
+            if capture_tick_enabled:
+                try:
+                    capture_result = fire_capture_tick()
+                    if capture_result.get("enqueued") or str(
+                        capture_result.get("reason") or ""
+                    ) not in {
+                        "",
+                        "no_new_messages",
+                        "quiet_not_due",
+                        "already_captured",
+                    }:
+                        log.info(
+                            "pre-turn capture tick enqueued=%s reason=%s quiet_for=%s",
+                            bool(capture_result.get("enqueued")),
+                            capture_result.get("reason"),
+                            capture_result.get("quiet_for_sec", ""),
+                        )
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        capture_tick_enabled = False
+                        log.warning(
+                            "capture tick endpoint not available on this backend; "
+                            "disabling capture tick for this process"
+                        )
+                    else:
+                        log.warning("pre-turn capture tick failed: HTTP %d", e.response.status_code)
+                except Exception as e:
+                    log.warning("pre-turn capture tick failed: %s", e)
+                finally:
+                    next_capture_tick_mono = (
+                        time.monotonic() + max(10, CAPTURE_TICK_INTERVAL_SEC)
+                    )
 
             new_ts = _process_messages(messages)
             if new_ts > last_ts:

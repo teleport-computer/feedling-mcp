@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import ast
+import os
 import sys
 from pathlib import Path
 
+import psycopg
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -61,6 +63,7 @@ class _Pool:
 def test_health_pool_is_lazy_bounded_and_separate(monkeypatch):
     created = []
     ordinary_pool = object()
+    check_connection = db.ConnectionPool.check_connection
 
     class FakeConnectionPool:
         def __init__(self, *args, **kwargs):
@@ -85,9 +88,97 @@ def test_health_pool_is_lazy_bounded_and_separate(monkeypatch):
         "max_size": 2,
         "timeout": 1.0,
         "max_idle": 300,
+        "check": check_connection,
         "kwargs": {"autocommit": True},
         "open": True,
     }
+
+
+def test_health_pool_replaces_a_connection_closed_while_idle(monkeypatch):
+    dsn = os.environ.get("FEEDLING_TEST_PG")
+    if not dsn:
+        pytest.skip("FEEDLING_TEST_PG is required for the stale connection test")
+
+    monkeypatch.setenv("DATABASE_URL", dsn)
+    monkeypatch.setattr(db, "HEALTH_DB_POOL_MAX_SIZE", 1)
+    monkeypatch.setattr(db, "_health_pool", None)
+    health_pool = db.get_health_pool()
+    try:
+        with health_pool.connection(timeout=5.0) as conn:
+            stale_backend_pid = conn.execute("SELECT pg_backend_pid()").fetchone()[0]
+
+        with psycopg.connect(dsn, autocommit=True) as admin:
+            terminated = admin.execute(
+                "SELECT pg_terminate_backend(%s)", (stale_backend_pid,)
+            ).fetchone()[0]
+        assert terminated is True
+
+        with health_pool.connection(timeout=5.0) as replacement:
+            assert replacement.execute("SELECT 1").fetchone() == (1,)
+            assert replacement.execute("SELECT pg_backend_pid()").fetchone()[0] != (
+                stale_backend_pid
+            )
+    finally:
+        health_pool.close()
+        db._health_pool = None
+
+
+def test_tee_primary_pool_rotates_and_keeps_direct_tls_connections_alive(monkeypatch):
+    created = []
+
+    class FakeConnectionPool:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+            created.append(self)
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://tee-primary")
+    monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "tee")
+    monkeypatch.setattr(db, "ConnectionPool", FakeConnectionPool)
+    monkeypatch.setattr(db, "_pool", None)
+
+    pool = db.get_pool()
+
+    assert created == [pool]
+    assert pool.kwargs["max_lifetime"] == 180.0
+    assert pool.kwargs["kwargs"] == {
+        "autocommit": True,
+        "connect_timeout": 10,
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 3,
+        "tcp_user_timeout": 30000,
+    }
+
+
+def test_tee_listen_connection_uses_direct_tls_keepalives(monkeypatch):
+    calls = []
+    sentinel = object()
+
+    def fake_connect(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://tee-primary")
+    monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "tee")
+    monkeypatch.setattr(db.psycopg, "connect", fake_connect)
+
+    assert db.listen_connection() is sentinel
+    assert calls == [
+        (
+            ("postgresql://tee-primary",),
+            {
+                "autocommit": True,
+                "connect_timeout": 10,
+                "keepalives": 1,
+                "keepalives_idle": 30,
+                "keepalives_interval": 10,
+                "keepalives_count": 3,
+                "tcp_user_timeout": 30000,
+            },
+        )
+    ]
 
 
 def test_health_probe_bounds_acquire_and_statement_timeout(monkeypatch):
