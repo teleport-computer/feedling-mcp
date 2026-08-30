@@ -466,8 +466,10 @@ def test_chat_system_prompt_groups_atomic_self_thinking_with_reply_rules(
 
 def test_finalized_self_thinking_copy_is_exact_and_has_no_old_length_cap():
     assert hashlib.sha256(self_thinking.INSTRUCTION.encode()).hexdigest() == (
-        "184b0e8508a7e76b71bfb097933002e17e260a143647cd37f7b9b6ef145c74e9"
+        "dfa9f806b4fdcc189cc63d2fc1810a5326f0a3f5b9042f889e48f499ca9bc2ff"
     )
+    assert " 长短都行，一句也可以。" in self_thinking.INSTRUCTION
+    assert "想多写就多写" not in self_thinking.INSTRUCTION
     assert "240 字" not in self_thinking.INSTRUCTION
     assert "写不完就收住" not in self_thinking.INSTRUCTION
     assert "好例子（用户在说中文，所以整块是中文）" in self_thinking.INSTRUCTION

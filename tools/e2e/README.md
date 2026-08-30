@@ -67,6 +67,24 @@ E2E_KEY_DEEPSEEK=sk-…
 | `resident_maintenance_smoke.py` | resident 识别/poll/notice/genesis claim | 动 consumer 这几条时 |
 | `provider_response_envelope_probe.py` | 上游完整响应包装器不会进入 V2 气泡，且只触发一次有界纠正 | 动 provider 回复解析、V2 tool loop 或最终回复闸时 |
 | `wake_tool_markup_probe.py` | V2 manual wake 的工具标记在封装前剥离，用户私钥解密后只见正文 | 动 V2 wake 最终回复闸时 |
+| `aup_gate_probe.py` | 陪伴提示词（`self_thinking.INSTRUCTION`）没有被上游 AUP 闸拦下，**且当轮证明过自己还有判别力** | bump `agent_protocol_core` / `memgarden` pin，或改 `self_thinking` 文案时 |
+
+`aup_gate_probe` 的四个坑（写新探针时同样适用）：
+- **必须喂生产同形提示词，不能喂裸 INSTRUCTION。** 该闸对文本**非单调**：同一段
+  文案单独喂被拒、放进完整提示词里反而放行。
+- **提示词的每一段都现场从生产件重建，一个快照都不存。** 初版把 io_cli 目录、
+  MEMORY READ 段、FILE DELIVERY 段、回复语言规则存成 fixture；上真检查时
+  **三段全和分支对不上**（目录少两个参数、memory/file 段长度不符、回复语言整段改过措辞）。
+  ⇒ **快照必漂，而漂了不会有人发现**。现在这四段每轮由 `io_cli_catalog.build_catalog`、
+  consumer 的两个 block 函数、`reply_language_system_line` 现生成。
+  唯一手抄生产的是拼接胶水（`\n` 的个数），已在代码里点名。
+- **对照组必须与被测对象不同。** 第一版草稿里 live 与 canary 是同一段文本，于是它
+  **从未证明过自己能输出 PASS**——一个恒红的量具也能通过那种自测。现在 `control/distinct`
+  这一格会当场拒跑。
+- **灵敏度取决于跑在什么环境。** 裸 CI runner 上同一段文案可能根本不被拒。`canary/discriminating`
+  就是环境自检：canary 没被拒 ⇒ **这个环境测不了这件事**，换环境重跑，
+  别把它读成"我们没事"。退出码按 `deep.py` 的 qualification 口径：**默认任一非 PASS 都 rc=1**，
+  `--diagnostic` 才容忍 BLOCKED_EVIDENCE。探针自身的回归在 `tests/test_aup_gate_probe.py`。
 
 `repeat_wake_probe` 的两个坑（写新探针时同样适用）：
 - `/v1/proactive/scheduled/fire` **只触发已到期的**（`due_at <= now`），
