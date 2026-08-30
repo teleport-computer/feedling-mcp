@@ -50,6 +50,7 @@ NOW_UTC = datetime(2026, 8, 2, 12, 30, tzinfo=timezone.utc)
 _EXCLUSIVE_PYTEST_MESSAGE = (
     "本文件断言全局用户口径,必须独占一次 pytest 调用,"
     "见 ci.yml 的 Run admin usage snapshot suite"
+    "。本次调用中排在本文件之后的测试未执行"
 )
 
 
