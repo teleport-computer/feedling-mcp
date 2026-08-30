@@ -15,6 +15,7 @@ import argparse
 import pathlib
 import re
 import sys
+from datetime import datetime
 
 try:
     import psycopg
@@ -25,6 +26,9 @@ except ImportError:  # pragma: no cover - operator convenience
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 PROMPT_COVERAGE_ERROR = "turn_failed:prompt_coverage_incomplete"
+# 超过这个天数没有新 job，就提醒操作者「你可能连错库了」。这三个环境都在
+# 持续被 P0/真实流量写，静置一整天本身就值得看一眼。
+_STALE_DB_DAYS = 1.0
 
 
 def _is_prompt_coverage_error(error: str) -> bool:
@@ -64,11 +68,67 @@ def _warn(text: str) -> str:
     return f"\033[33m⚠ {text}\033[0m"
 
 
-def section_runtime(conn, uid: str) -> None:
+def db_freshness(conn) -> dict:
+    """这个库最后一次被写是什么时候 —— 用来判「我连对库了吗」。
+
+    2026-08-30 实测:`--env test` 读 .env 的 TEST_DATABASE_URL 指向一个
+    2026-08-18 就停更的旧 RDS(users 75 条、max(agent_jobs.id)=6229)，而
+    test-api.feedling.app 当天实际写入的 job id 是 10141-10199，命中 0。
+    那时的输出是 "user not found in this environment" —— 与「账号被删了」
+    完全同形，且失明方向偏向「证据没了」，最容易让人直接放弃追查。
+    """
+    facts: dict = {}
+    for label, sql in (
+        ("users_total", "SELECT count(*) AS v FROM users"),
+        ("users_newest", "SELECT max(created_at) AS v FROM users"),
+        ("jobs_max_id", "SELECT max(id) AS v FROM agent_jobs"),
+        ("jobs_newest", "SELECT max(created_at) AS v FROM agent_jobs"),
+    ):
+        try:
+            row = _one(conn, sql, ())
+            facts[label] = row["v"] if row else None
+        except Exception as e:  # noqa: BLE001 — 自检坏了也不该挡住正常分诊
+            facts[label] = f"<unavailable: {type(e).__name__}>"
+    return facts
+
+
+def _freshness_line(facts: dict) -> str:
+    return (f"users={facts.get('users_total')} newest_user={facts.get('users_newest')} "
+            f"max(agent_jobs.id)={facts.get('jobs_max_id')} "
+            f"newest_job={facts.get('jobs_newest')}")
+
+
+def section_environment(conn, env: str) -> dict:
+    """先报「我连的是哪个库、它有多新」，再报单个用户的事。"""
+    _head("environment")
+    facts = db_freshness(conn)
+    print(f"  env               {env}")
+    print(f"  db freshness      {_freshness_line(facts)}")
+    newest = facts.get("jobs_newest")
+    if isinstance(newest, datetime):
+        reference = datetime.now(newest.tzinfo) if newest.tzinfo else datetime.now()
+        stale_days = (reference - newest).total_seconds() / 86400.0
+        if stale_days > _STALE_DB_DAYS:
+            print(_warn(
+                f"这个库最后一次写入在 {stale_days:.1f} 天前 —— 很可能不是你要的环境。"
+                f" 先核对 {env.upper()}_DATABASE_URL 指向的实例，"
+                f"再相信下面任何「找不到」的结论。"))
+    return facts
+
+
+def section_runtime(conn, uid: str, freshness: dict | None = None) -> None:
     _head("runtime")
     user = _one(conn, "SELECT created_at FROM users WHERE user_id = %s", (uid,))
     if not user:
-        sys.exit(f"user {uid} not found in this environment")
+        # 「找不到这个用户」和「连错库了」在旧输出里同形。把库的新鲜度贴进
+        # 同一句话，读的人才可能分辨这两件事。
+        sys.exit(
+            f"user {uid} not found in this database.\n"
+            f"  db freshness: {_freshness_line(freshness or {})}\n"
+            "  这句话有两种可能:①这个账号确实不存在/已删 "
+            "②连的不是这个环境实际在写的库。\n"
+            "  在把它当成①之前，先确认上面的 max(agent_jobs.id) "
+            "与你预期的量级一致。")
     print(f"  created           {user['created_at']}")
 
     # V1/V2 is decided by the per-user fence, never by the allowlist: the
@@ -381,7 +441,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\033[1mRuntime V2 triage — {args.user_id} @ {args.env}\033[0m")
     with psycopg.connect(_dsn(args.env), connect_timeout=15) as conn:
-        section_runtime(conn, args.user_id)
+        freshness = section_environment(conn, args.env)
+        section_runtime(conn, args.user_id, freshness)
         failed_jobs, coverage_failures = section_jobs(
             conn, args.user_id, args.jobs
         )

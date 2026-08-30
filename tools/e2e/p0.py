@@ -23,11 +23,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from tools.e2e.config import HOSTED_CELLS, VPS_CELLS, KEYS_FILE, load_keys  # noqa: E402
-from tools.e2e.client import FAILURE_RETENTION_DAYS  # noqa: E402
+from tools.e2e.client import FAILURE_RETENTION_DAYS, VERDICT_FALLBACK  # noqa: E402
 from tools.e2e.hosted import run_hosted_cell  # noqa: E402
 from tools.e2e.vps import run_vps_cell  # noqa: E402
 
-_ICON = {"ok": "✅", "fail": "❌", "skip": "⏭️", "warn": "⚠️"}
+_ICON = {"ok": "✅", "fail": "❌", "skip": "⏭️", "warn": "⚠️",
+         # 「回来了，但交付给用户的是失败话术」自己的一格。之前它没有词，
+         # 才被 "ok" 冒名顶替(T406:hosted 格实测交付兜底 9/12，判 FAIL 只 4/12)。
+         VERDICT_FALLBACK: "🟠"}
 _ADMIN_TOKEN_FILE = Path.home() / ".feedling" / "data-track-admin-token"
 
 
@@ -91,11 +94,7 @@ def main() -> int:
     print("| cell | result | detail |")
     print("|---|---|---|")
     for r in results:
-        bad = [s for s in r["steps"] if s[1] == "fail"]
-        warn = [s for s in r["steps"] if s[1] == "warn"]
-        detail = (bad or warn or [("", "", "all steps green")])[0][2] or \
-                 (bad or warn or [("", "", "")])[0][0]
-        detail = detail.replace("|", "\\|").replace("\n", " ")
+        detail = cell_detail(r["steps"])
         print(f"| {r['cell']} | {_ICON.get(r['result'], r['result'])} {r['result']} | {detail[:80]} |")
     hard_fail = p0_blocks_release(results)
     print("=" * 62)
@@ -103,9 +102,30 @@ def main() -> int:
     return 1 if hard_fail else 0
 
 
+def cell_detail(steps: list[tuple]) -> str:
+    """报表 detail 列。标签必须从数据派生，不许无条件打印结论。
+
+    fallback 排在 "all steps green" 之前：漏掉它，一个交付了失败话术的格子
+    会在 detail 列打印「all steps green」—— 那句话就是假的。
+    """
+    bad = [s for s in steps if s[1] == "fail"]
+    soft = [s for s in steps if s[1] == VERDICT_FALLBACK]
+    warn = [s for s in steps if s[1] == "warn"]
+    picked = bad or soft or warn
+    detail = (picked or [("", "", "all steps green")])[0][2] or \
+             (picked or [("", "", "")])[0][0]
+    return detail.replace("|", "\\|").replace("\n", " ")
+
+
 def p0_blocks_release(results: list[dict]) -> bool:
-    """A single failed cell blocks test-to-main promotion."""
-    return any(result.get("result") == "fail" for result in results)
+    """A single failed cell blocks test-to-main promotion.
+
+    `fallback` 同样阻断:用户实际收到的是失败话术，那不是一次成功的发布。
+    它与 `fail` 分开只为让报表说清「回来了但是坏的」和「压根没回来」——
+    阻断力相同，可读性不同。
+    """
+    return any(result.get("result") in ("fail", VERDICT_FALLBACK)
+               for result in results)
 
 
 def _admin_confirms_absent(api_url: str, user_id: str) -> tuple[bool | None, str]:
