@@ -66,8 +66,10 @@ V2 测试 job，并未执行 continuity canary。
    fixture 标识和创建时间，并排除在清理/重置流程之外；
 3. 把“fixture 损坏/缺失”（exit 2）和“旧密文确实无法解密”（exit 1）分成不同告警，
    为两者指定可响应的 owner；
-4. 手动验证 workflow，再让信封实际老化并跨至少一次部署或密钥轮换；
-5. 显式重新启用 GitHub Actions workflow，并同步更新 `docs/testing/TESTING.md`。
+4. 通过 PR 移除 job 级退役门禁后手动验证 workflow，再让信封实际老化并跨至少
+   一次部署或密钥轮换；
+5. 通过 PR 恢复定时触发，显式重新启用 GitHub Actions workflow，并同步更新
+   `docs/testing/TESTING.md`。
 
 完整调查和原“repair”方案坐标：fleet task `T415`，mail
 `20260830T184329Z_codexcodex_to_claudeclaude_80b6ba3d`。

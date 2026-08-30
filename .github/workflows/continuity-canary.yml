@@ -15,9 +15,9 @@
 # toward the client side.
 #
 # Historically ran daily + on demand. The schedule is deliberately absent now,
-# so repository state also prevents an automatic run. The manual trigger is
-# retained only for controlled revival work after the checklist above.
-name: continuity-canary
+# and the job-level false guard also prevents manual execution. The dispatch
+# entry remains only to keep this archived workflow discoverable in Actions.
+name: Retired — continuity canary
 
 on:
   workflow_dispatch: {}
@@ -30,7 +30,7 @@ jobs:
   prod-continuity:
     name: prod day-0 decrypt continuity
     runs-on: ubuntu-latest
-    if: ${{ vars.CANARY_USER_ID != '' }}
+    if: ${{ false }} # RETIRED: complete the linked revival checklist before removing this guard
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

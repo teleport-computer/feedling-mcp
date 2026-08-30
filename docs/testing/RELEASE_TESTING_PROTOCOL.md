@@ -245,7 +245,9 @@ pi 中转** 两个代表配置上各扫一遍；每项的通过标准是括号�
 | 时间/日期正确性 | 说错时间；LTM 日期塌成今天 | 非-UTC 时区问"几点"答对；带 YYYY-MM-DD 的长期记忆上传后 occurred_at 原样保留 |
 | onboarding 首屏 | 卡进度页/身份卡空/天数错 | fresh 新号直进 app；身份卡逐字段 fallback（初始名"TA"）；天数第 1 天起算 |
 
-（解密连续性原属此类，已升级为 §3 P0 步骤 2 的硬判据。）
+（新信封即时解密连续性原属此类，已升级为 §3 P0 步骤 2 的硬判据；生产旧密文
+跨部署/密钥轮换的连续性自 2026-08-31 起不再有持续监控，见
+[`archive/CONTINUITY_CANARY_RETIREMENT_2026-08-31.md`](archive/CONTINUITY_CANARY_RETIREMENT_2026-08-31.md)。）
 
 ### 4.6 蒸馏行为子表（触碰 genesis/distill 时逐格验）
 
