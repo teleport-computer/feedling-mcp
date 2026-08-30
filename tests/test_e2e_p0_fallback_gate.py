@@ -19,6 +19,8 @@ from nacl.public import PrivateKey
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from conftest import capture_sleeps
+
 from tools.e2e import client as e2e_client, p0
 from tools.e2e.client import (
     E2EClient, TEST_API, VERDICT_FAIL, VERDICT_FALLBACK, VERDICT_OK,
@@ -159,7 +161,10 @@ def test_unsettled_turn_is_not_green(monkeypatch):
     unsettled = {"turn_id": "t", "runtime": "v2", "complete": False,
                  "phase": "running", "jobs": [{"job_id": "1", "status": "running"}]}
     c = _with_activity(monkeypatch, unsettled)
-    monkeypatch.setattr("tools.e2e.client.time.sleep", lambda _s: None)
+    # 用 conftest.capture_sleeps 而不是 monkeypatch 全局 time.sleep:后者改的是
+    # **整个进程共享**的 stdlib time,后台线程的 sleep 会被卷进来
+    # (tests/test_no_global_sleep_patching.py 专门守这一条,它抓到过我)。
+    capture_sleeps(monkeypatch, e2e_client)
     monkeypatch.setattr(e2e_client, "TURN_SETTLE_TIMEOUT", 0.0)
     verdict, detail = c.classify_reply({"activity_turn_id": "t"}, "看起来正常的回复")
     assert verdict == VERDICT_FAIL
@@ -180,11 +185,14 @@ def test_settled_turn_is_read_after_it_completes(monkeypatch):
     monkeypatch.setattr(
         c, "get", lambda path, **kw: _Resp(200, bodies.pop(0) if bodies else bodies),
         raising=False)
-    monkeypatch.setattr("tools.e2e.client.time.sleep", lambda _s: None)
+    slept = capture_sleeps(monkeypatch, e2e_client)
     verdict, detail = c.classify_reply({"activity_turn_id": "t"}, "看起来正常的回复")
     assert verdict == VERDICT_FALLBACK
     assert "turn_failed:empty_reply" in detail
     assert bodies == [], "应当一直轮询到落定为止"
+    # 记录下来的 sleep 让这一格多承一份重:它证明两次读之间**真的等了**，
+    # 而不是恰好第一次就读到了终态。
+    assert slept, "两次 turn-activity 读取之间应当有一次退避"
 
 
 # -- 辅助闸:兜底话术常量比对 -------------------------------------------------
