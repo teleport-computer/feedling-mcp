@@ -107,11 +107,21 @@ class BounceTracker:
     def __init__(self) -> None:
         self.retried = False
         self.steps: list[Step] = []
+        #: 重问之后仍没过语义检查、被组件丢掉的卡数。
+        #:
+        #: 必须传下去，否则 admin 上「模型想覆盖但没说覆盖哪张」会退化成
+        #: 「这轮没什么值得记」—— 一次模型失败被伪装成正常的空结果，查不出来。
+        #: 组件把坏卡丢在自己那一层（对的：不能吐出 target_id 为空的
+        #: supersede），代价就是宿主原来靠数 cards 得到的这个计数没了，
+        #: 只能由组件显式告诉宿主。
+        self.dropped_semantic = 0
 
     def __call__(self, step: Step) -> None:
         self.steps.append(step)
         if step.kind == "retrying":
             self.retried = True
+        elif step.kind == "dropped" and step.detail.get("why") == "semantic":
+            self.dropped_semantic += int(step.detail.get("cards") or 0)
 
     def bounce(self, *, cards: list, error: str | None) -> str:
         if not self.retried:

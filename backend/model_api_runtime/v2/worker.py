@@ -96,6 +96,8 @@ from agent_protocol_core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
 from memory import dream_trace as memory_dream_trace
+from memory import garden_component
+from memgarden import contracts as mg_contracts
 from memgarden import timestamps as memory_timestamps
 from core.downloadable_reply import sanitize_downloadable_reply
 from perception.glance import (
@@ -12231,21 +12233,6 @@ async def _run_extraction(
                 build_semantic_prompt=build_capture_semantic_retry_prompt,
                 build_truncation_prompt=build_truncation_retry_prompt,
             )
-            # 组件的会话 —— 提示词和重问由它决定。模型端口传 None 是刻意的：
-            # 会话模式下组件不自己调模型，provider 那步归 extract()。
-            _step_sink = garden_component.BounceTracker()
-            _capture_session = garden_component.build_garden(
-                garden_component.CallableModel(lambda _p: ""),
-                on_step=_step_sink,
-            ).capture_session(mg_contracts.CaptureRequest(
-                window=window,
-                locale=capture_locale,
-                buckets=str(ctx.get("buckets") or ""),
-                threads=str(ctx.get("threads") or ""),
-                identity=str(ctx.get("identity") or ""),
-                ai_name=ctx.get("ai_name", ""),
-                user_name=ctx.get("user_name", ""),
-            ))
         else:
             prompt = build_dream_prompt(
                 ai_name=ctx.get("ai_name", ""),
@@ -12365,6 +12352,26 @@ async def _run_extraction(
                         )
                     except Exception:  # noqa: BLE001 — 观测失败绝不影响落卡
                         pass
+                # 组件的会话 —— 提示词和重问由它决定。模型端口传 None 是刻意的：
+                # 会话模式下组件不自己调模型，provider 那步归 extract()。
+                #
+                # 🔴 位置很重要：必须在 capture_locale 算出来之后。
+                # 原来写在上面 lane == "capture" 那段里，那时 capture_locale
+                # 还不存在 —— NameError 被 worker 的「背景 job 静默失败」吞掉，
+                # 表现是每次 capture 都 extraction_failed:error，不报错、不冒泡。
+                _step_sink = garden_component.BounceTracker()
+                _capture_session = garden_component.build_garden(
+                    garden_component.CallableModel(lambda _p: ""),
+                    on_step=_step_sink,
+                ).capture_session(mg_contracts.CaptureRequest(
+                    window=window,
+                    locale=capture_locale,
+                    buckets=str(ctx.get("buckets") or ""),
+                    threads=str(ctx.get("threads") or ""),
+                    identity=str(ctx.get("identity") or ""),
+                    ai_name=ctx.get("ai_name", ""),
+                    user_name=ctx.get("user_name", ""),
+                ))
                 prompt = build_capture_prompt(
                     ai_name=ctx.get("ai_name", ""),
                     user_name=ctx.get("user_name", ""),

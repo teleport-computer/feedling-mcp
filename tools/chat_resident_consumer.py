@@ -15869,9 +15869,15 @@ def _process_capture_jobs(jobs: list) -> float:
             )
             continue
         reask_count = 1 if bounce else 0
-        reask_trigger = "format" if bounce else ""
+        # 触发原因问组件要,**别写死 "format"** —— 本地语义重问现在也在组件里,
+        # 写死的话一次语义打回会在指标里显示成格式打回,而这两类的处理方式不同。
+        reask_trigger = _bounce_tracker.reask_trigger if bounce else ""
         reask_outcome = (
-            "recovered"
+            # 重问之后仍不合格、被组件丢掉的卡 —— 这是失败,哪怕同一轮里还有
+            # 别的好卡活了下来。只看 bounce 的话它会显示成 recovered。
+            "failed"
+            if _bounce_tracker.dropped_semantic
+            else "recovered"
             if bounce == "bounced_ok"
             else "failed"
             if bounce == "bounced_failed"
@@ -15899,67 +15905,52 @@ def _process_capture_jobs(jobs: list) -> float:
                 },
             )
             continue
-        semantic_reasons = _capture_semantic_retry_reasons(cards)
-        if semantic_reasons and reask_count < CAPTURE_AGENT_REASK_BUDGET:
-            reask_count += 1
-            reask_trigger = "semantic"
-            try:
-                retry_text = _capture_agent_reply_text(
-                    call_agent(
-                        build_capture_semantic_retry_prompt(
-                            prompt, semantic_reasons
-                        ),
-                        raw_text=True,
-                    )
-                )
-                _note_agent_turn_success()
-                retried_cards, retry_err = parse_capture_cards(
-                    retry_text, strict=False
-                )
-            except Exception as retry_exc:
-                log.warning(
-                    "capture semantic reask failed id=%s: %s",
-                    job_id,
-                    retry_exc,
-                )
-                retried_cards, retry_err = [], "semantic_reask_failed"
-            if retry_err:
-                reask_outcome = "failed"
-            else:
-                cards = retried_cards
-                reask_outcome = (
-                    "failed"
-                    if _capture_semantic_retry_reasons(cards)
-                    else "recovered"
-                    if cards
-                    else "empty"
-                )
-        elif semantic_reasons:
-            reask_outcome = "failed"
+        # 本地可证的语义重问(「要覆盖旧卡却没给 target_id」)**已经归组件了**,
+        # 这里原来那一整段是同一件事的第二份实现 —— 切到组件之后它就成了死代码,
+        # 引用的 prompt 变量也随提示词构建搬进内核而消失(pyflakes 扫出来的)。
+        # 组件重问后仍不合格的卡会被丢掉,丢了几张看 _bounce_tracker.dropped_semantic。
+        #
+        # 服务端才知道的那一类(target_id 指向别人的卡 / 已删的卡)不在这儿,
+        # 在下面 execute_memory_actions 之后 —— 那个必须留在 io,内核没有库。
         # 残留计数(与 V2 同口径)。**刻意不在这里跑确定性改写** —— 那个改写器
         # 现有的锚点在产品语境下会改坏真内容(见 test_card_user_referent.py)。
         user_token_residual = sum(count_user_token_residuals(c) for c in cards)
         if not cards:
+            # 空的原因分两种,**不能都叫 nothing_worth_keeping**。
+            #
+            # 组件会把「要覆盖旧卡但没说覆盖哪张」的卡丢掉(它必须丢 —— 交出来
+            # 就是一条 target_id 为空的 supersede)。如果整轮只有这种卡,这里
+            # 就是空的 —— 但那是一次**模型失败**,不是「真的没什么值得记」。
+            # 两者在 admin 上长得一模一样,混在一起等于这类失败永远查不出来。
+            # 同一条道理见下面 content_gate 那句注释。
+            _dropped = _bounce_tracker.dropped_semantic
+            _noop_reason = (
+                "supersede_without_target" if _dropped else "nothing_worth_keeping"
+            )
+            _capture_result = {
+                "status": "noop",
+                "reason": _noop_reason,
+                "reask_count": reask_count,
+                "reask_trigger": reask_trigger or None,
+                "reask_outcome": reask_outcome,
+            }
+            if _dropped:
+                _capture_result["skipped"] = {"supersede_without_target": _dropped}
+                _capture_result["skipped_count"] = _dropped
             update_proactive_job_status(
                 job_id,
                 "completed",
-                "nothing_worth_keeping",
+                _noop_reason,
                 extra={
                     # content_gate 记下「这轮空是因为占位符被打回」,否则它和
                     # 「真的没什么值得记」在 admin 上长得一模一样。
                     "content_gate": bounce or None,
                     "user_token_residual": user_token_residual or None,
-                    "capture_result": {
-                        "status": "noop",
-                        "reason": "nothing_worth_keeping",
-                        "reask_count": reask_count,
-                        "reask_trigger": reask_trigger or None,
-                        "reask_outcome": reask_outcome,
-                    },
+                    "capture_result": _capture_result,
                     "capture_window": window,
                     "cards_added": 0,
                     "cards_superseded": 0,
-                    "noop_reason": "nothing_worth_keeping",
+                    "noop_reason": _noop_reason,
                 },
             )
             log.info("capture job completed noop id=%s", job_id)
@@ -15970,7 +15961,12 @@ def _process_capture_jobs(jobs: list) -> float:
                 job=job,
                 messages=messages,
             )
-            rejected_without_target = sum(
+            # 组件已经把「要覆盖但没说覆盖哪张」的卡丢掉了(它必须丢 —— 交出来
+            # 就是一条 target_id 为空的 supersede)，所以这里数 cards 是数不到的。
+            # 加上组件报的丢弃数，admin 上才还能看见 supersede_without_target；
+            # 少了它，这种模型失败会退化成「这轮没什么值得记」，和真的没内容
+            # 长得一模一样。
+            rejected_without_target = _bounce_tracker.dropped_semantic + sum(
                 1
                 for card in cards
                 if str(card.get("action") or "").strip().lower()
@@ -15988,18 +15984,30 @@ def _process_capture_jobs(jobs: list) -> float:
                 reask_count += 1
                 reask_trigger = "semantic"
                 try:
-                    retry_text = _capture_agent_reply_text(
-                        call_agent(
-                            build_capture_semantic_retry_prompt(
-                                prompt, server_semantic_reasons
-                            ),
-                            raw_text=True,
-                        )
+                    # 走组件的 recapture_with_feedback —— **理由由 io 给,
+                    # 提示词怎么措辞、怎么解析仍归内核**。
+                    #
+                    # 这一类只有 io 知道:target_id 指向的卡不属于这个人、
+                    # 或已经不存在。内核没有库,判不了;io 试着落库被自己的
+                    # 所有权闸挡回来,才拿到这个事实。
+                    #
+                    # 不在这儿自己拼提示词:那会变成第二份编排,措辞和解析规则
+                    # 在两边各写一份,然后慢慢漂开(这个文件里刚删掉一段就是
+                    # 这么来的)。
+                    _retried = _garden.recapture_with_feedback(
+                        mg_contracts.CaptureRequest(
+                            window=window_text,
+                            locale=capture_locale,
+                            buckets=buckets_text,
+                            threads=threads_text,
+                            identity=identity_text,
+                            ai_name=ai_name,
+                            user_name=user_name,
+                        ),
+                        server_semantic_reasons,
                     )
                     _note_agent_turn_success()
-                    retried_cards, retry_err = parse_capture_cards(
-                        retry_text, strict=False
-                    )
+                    retried_cards, retry_err = _retried.cards, _retried.error
                 except Exception as retry_exc:
                     log.warning(
                         "capture server-semantic reask failed id=%s: %s",

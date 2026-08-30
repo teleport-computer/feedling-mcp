@@ -97,7 +97,7 @@ Pillow>=11,<13
 
 # 记忆的编辑判断内核 —— 从本仓库提取出去的独立库（Apache-2.0，公开仓库）。
 #
-# 0.12.3 起走 PyPI。之前钉的是 GitHub Release 的 wheel URL，原因是
+# 0.12.8 起走 PyPI。之前钉的是 GitHub Release 的 wheel URL，原因是
 # PyPI 上 memory-garden 这个名字被一个同领域项目占了、我们还没发；现在以
 # memgarden 这个名字发出去了，那条理由不再成立。
 #
@@ -106,5 +106,5 @@ Pillow>=11,<13
 #
 # 本镜像用 `pip install --require-hashes`，升级 = 改这里的版本号 +
 # 重新 `uv pip compile --generate-hashes`（命令见 deploy/BUILD.md）。
-memgarden==0.12.3
-agent-protocol-core==0.12.3
+memgarden==0.12.8
+agent-protocol-core==0.12.8

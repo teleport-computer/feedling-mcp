@@ -4683,7 +4683,13 @@ def test_capture_partial_server_batch_completes_with_failed_bucket(monkeypatch):
             "content": "This valid item must still count as applied.",
         },
     ]})
-    captured, job = _install_capture_job_harness(monkeypatch, reply)
+    # 先用一次格式打回把共享的重问预算吃掉，这条用例要量的是**部分成功的
+    # 记账**，不是重问行为。预算还在的话，服务端那个 error 会触发一次语义
+    # 重问，重问结果再落一遍库，applied 就变成 2 了。
+    format_bad = json.dumps({"cards": [{
+        "action": "add", "summary": "...", "content": "[thickened summary]",
+    }]})
+    captured, job = _install_capture_job_harness(monkeypatch, [format_bad, reply])
 
     def partial_result(actions):
         captured["actions"].extend(actions)
@@ -4701,14 +4707,6 @@ def test_capture_partial_server_batch_completes_with_failed_bucket(monkeypatch):
         }
 
     monkeypatch.setattr(crc, "execute_memory_actions", partial_result)
-    # The server error would normally trigger the one semantic re-ask. Consume
-    # the shared budget as a prior format bounce marker so this test isolates
-    # partial-result accounting rather than retry behavior.
-    monkeypatch.setattr(
-        crc,
-        "_memory_agent_parse_with_bounce",
-        lambda *args, **kwargs: ((json.loads(reply)["cards"], None), "bounced_ok"),
-    )
 
     assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
     final = _capture_final_status(captured)
