@@ -1001,8 +1001,6 @@ def test_wake_self_thinking_on_drops_native_reasoning_fallback(monkeypatch):
         "reply_script": "latin",
         "outcome": "mismatch",
         "lane": "wake",
-        "correction_attempted": False,
-        "correction_outcome": "skipped",
     }]
 
 
@@ -3727,7 +3725,14 @@ def test_all_wake_lanes_receive_shared_reply_language_policy(monkeypatch, lane):
         for message in calls[0]["messages"]
         if message.get("role") == "system"
     )
-    assert "默认回复语言：简体中文" in system_text
+    expected = (
+        "回复语言规则：\n"
+        "根据用户最新一条消息判断回复语言。如果该消息混合、不明确或主要是引用/上下文，就使用本规则所用的语言；"
+        "主动/后台回复也使用本规则所用的语言。思维过程和正式回复使用同一种语言。"
+        "不要被记忆卡、OCR、时间戳或内部上下文带偏回复语言。引用、名字和用户指定的翻译目标语言保持原样。"
+    )
+    assert expected in system_text
+    assert system_text.count(expected) == 1
 
 
 def test_heartbeat_prefetch_injects_v1_facts_without_a_tool_round(monkeypatch):

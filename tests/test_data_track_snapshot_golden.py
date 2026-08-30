@@ -76,6 +76,36 @@ def _chat(uid: str) -> dict:
     return db.admin_data_track_snapshot([uid])[uid]["chat"]
 
 
+def test_snapshot_chat_read_materializes_each_source_once():
+    """The fleet read must not rescan today's live/archive rows per metric."""
+    statements: list[str] = []
+
+    class EmptyResult:
+        @staticmethod
+        def fetchall():
+            return []
+
+    class RecordingConnection:
+        @staticmethod
+        def execute(statement, _params=None):
+            statements.append(str(statement))
+            return EmptyResult()
+
+    db._chat_rollup_into(
+        RecordingConnection(),
+        ["usr_query_shape"],
+        {},
+        lambda out, uid: out.setdefault(uid, {}),
+    )
+
+    assert len(statements) == 2, (
+        "chat snapshot must use one closed-cell query and one live-window "
+        f"query, not one source scan per metric; got {len(statements)}"
+    )
+    assert sum("MATERIALIZED" in statement for statement in statements) == 2
+    assert sum("chat_message_archive" in statement for statement in statements) == 1
+
+
 @pytest.fixture()
 def clean_chat_rollup():
     with db.get_pool().connection() as conn:
@@ -290,6 +320,54 @@ def test_frozen_cells_cover_the_two_proactive_distributions(clean_chat_rollup):
         ).fetchone()
     assert live_activity == {"shown": 2}
     assert alert == {"delivered": 1, "unknown": 1}
+
+
+def test_live_proactive_status_excludes_non_proactive_messages(clean_chat_rollup):
+    """The open-day read must apply the proactive half of each predicate.
+
+    A regular message may carry the same delivery fields, so today's bounded
+    scan cannot treat field presence alone as evidence that it was proactive.
+    Keep a real proactive row as the positive control: an empty result would
+    otherwise let the exclusion assertion pass for the wrong reason.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    uid = "usr_dt_golden_live_pstatus"
+    seed_user(uid)
+    zone = ZoneInfo("Asia/Shanghai")
+    today_start = datetime.combine(
+        datetime.now(zone).date(), datetime.min.time(), tzinfo=zone,
+    ).timestamp()
+    rows = [
+        {
+            "role": "user",
+            "source": "ios",
+            "content_type": "text",
+            "live_activity_status": "regular_shown",
+            "alert_status": "regular_delivered",
+        },
+        {
+            "role": "openclaw",
+            "source": "agent_initiated_proactive",
+            "content_type": "text",
+            "live_activity_status": "proactive_shown",
+            "alert_status": "proactive_delivered",
+        },
+    ]
+    for index, doc in enumerate(rows):
+        msg_id = f"live-ps{index}"
+        db.chat_append(
+            uid,
+            msg_id,
+            today_start + 3600 + index,
+            {"id": msg_id, **doc},
+            1000,
+        )
+
+    extra = db.admin_data_track_snapshot([uid])[uid]["proactive_extra"]
+    assert extra["live_activity_status"] == {"proactive_shown": 1}
+    assert extra["alert_status"] == {"proactive_delivered": 1}
 
 
 def test_a_closed_day_is_never_rewritten(seeded_user):

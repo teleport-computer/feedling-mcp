@@ -809,8 +809,19 @@ def clear_trace(store) -> None:
 
 
 def _safe_detail(detail: dict[str, Any] | None) -> dict[str, Any]:
-    """Shallow, size-bounded copy. Detail should already be metadata-only (ids/
-    counts/reasons); this just bounds it so a careless caller can't bloat the buf."""
+    """Shallow, size-bounded copy. Bounds size only — it does not judge content.
+
+    This used to say detail "should already be metadata-only", which read as a
+    guarantee someone upstream had made and was in fact the licence to drift: a
+    caller could assume the check happened here. It cannot happen here. ``detail``
+    is an open keyspace, and a closed error code and an exception message are the
+    same character class, so there is nothing at this layer to decide between
+    them — only the write site knows where a value came from.
+
+    Since ``read_trace`` hands ``detail``/``summary``/``explain`` back to the user
+    and tracing is on by default, that contract is load-bearing:
+    ``tests/test_trace_detail_provenance.py`` is what holds write sites to it.
+    """
     if not isinstance(detail, dict):
         return {}
     out: dict[str, Any] = {}

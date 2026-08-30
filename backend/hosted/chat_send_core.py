@@ -28,6 +28,7 @@ from hosted import vision_routing
 from model_api_runtime.v2 import admission
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import kill_switch
+from proactive import capture_scheduler
 
 
 def _voice_metadata(voice_context: dict | None) -> dict[str, str]:
@@ -248,7 +249,8 @@ def model_api_chat_send_core(
         debug_trace.trace_event(
             store, subsystem="route", type="route.decided", actor="host_agent_runtime",
             status="ok", summary="admission_failopen",
-            detail={"mode": "admit", "error": str(exc)[:120]},
+            detail={"mode": "admit", "reason": "admission_unavailable",
+                    "error_class": type(exc).__name__},
         )
         _admit = True
         _est = 0.0
@@ -335,6 +337,7 @@ def model_api_chat_send_core(
     # Message INSERT and chat-job enqueue/coalesce land in one transaction.
     _envelope_id = user_env.get("id")
     _trace_id = str(_envelope_id) if isinstance(_envelope_id, str) and _envelope_id else None
+    chat_append_started = time.monotonic()
     try:
         user_row = store.append_chat(
             "user",
@@ -368,6 +371,9 @@ def model_api_chat_send_core(
             detail={"mode": "blocked", "reason": "runtime_control_changed"},
         )
         return {"error": "runtime_control_changed"}, 503
+    chat_append_duration_ms = round(
+        (time.monotonic() - chat_append_started) * 1000.0, 1
+    )
     inserted = not bool(user_row.pop("_client_msg_replayed", False))
     if inserted:
         store.notify_chat_waiters()
@@ -378,7 +384,17 @@ def model_api_chat_send_core(
         debug_trace.trace_event(
             store, subsystem="route", type="route.decided", actor="host_agent_runtime",
             turn_id=_turn_id, summary="agent_runtime",
-            detail={"mode": "agent_runtime", "has_image": bool(has_image), "has_file": bool(has_file)},
+            detail={
+                "mode": "agent_runtime",
+                "has_image": bool(has_image),
+                "has_file": bool(has_file),
+                "chat_append_duration_ms": chat_append_duration_ms,
+                "capture_append_refresh_mode": (
+                    "deferred"
+                    if capture_scheduler.append_refresh_deferred()
+                    else "sync"
+                ),
+            },
         )
     else:
         # The assistant reply may have been posted through another worker since
@@ -563,6 +579,7 @@ def _send_resident(
     # Resident send with client-msg-id dedup: a re-sent client_msg_id recovers
     # the original row instead of double-inserting.
     inserted = True
+    chat_append_started = time.monotonic()
     if client_msg_id is not None:
         user_row, inserted = store.append_chat_idempotent(
             "user",
@@ -581,6 +598,9 @@ def _send_resident(
             content_type="image" if has_image else ("file" if has_file else "text"),
             extra=extra or None,
         )
+    chat_append_duration_ms = round(
+        (time.monotonic() - chat_append_started) * 1000.0, 1
+    )
     if inserted:
         store.notify_chat_waiters()
 
@@ -589,7 +609,17 @@ def _send_resident(
         debug_trace.trace_event(
             store, subsystem="route", type="route.decided", actor="host_agent_runtime",
             turn_id=_turn_id, summary="agent_runtime",
-            detail={"mode": "agent_runtime", "has_image": bool(has_image), "has_file": bool(has_file)},
+            detail={
+                "mode": "agent_runtime",
+                "has_image": bool(has_image),
+                "has_file": bool(has_file),
+                "chat_append_duration_ms": chat_append_duration_ms,
+                "capture_append_refresh_mode": (
+                    "deferred"
+                    if capture_scheduler.append_refresh_deferred()
+                    else "sync"
+                ),
+            },
         )
     else:
         # The assistant reply may have been posted through another worker since

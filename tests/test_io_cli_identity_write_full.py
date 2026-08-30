@@ -38,7 +38,7 @@ def _ns(**overrides) -> argparse.Namespace:
     base = dict(
         agent_name=None, self_introduction=None, category=None,
         user_preferred_name=None, agent_role=None, tone_style=None,
-        custom_persona_prompt=None, language_preference=None,
+        custom_persona_prompt=None,
         relationship_anchor=None,
         signature=[], add_signature=[], remove_signature=[], replace_signatures=[],
         add_boundary=[], remove_boundary=[], replace_boundaries=[],
@@ -349,6 +349,14 @@ def test_new_string_flags_are_registered_not_unrecognized():
     r = _run("identity-write", "--category", "伙伴", "--tone-style", "温柔")
     assert "unrecognized arguments" not in r.stderr
     assert "conflicting subparser" not in r.stderr
+
+
+def test_retired_language_flag_is_rejected_and_absent_from_help():
+    retired_flag = "--language-" + "preference"
+    rejected = _run("identity-write", retired_flag, "English")
+    assert "unrecognized arguments" in rejected.stderr
+    help_result = _run("identity-write", "--help")
+    assert retired_flag not in help_result.stdout
 
 
 def test_new_list_op_flags_are_registered_not_unrecognized():

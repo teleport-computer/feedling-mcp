@@ -592,7 +592,10 @@ async def cancel_voice_call(
                 "replayed": True, "deleted": 0,
                 "retained_covered": 0, "remaining": 0,
             }, 200
-        store = core_store.get_store(user_id)
+        store = core_store.get_store_shell_only(
+            user_id,
+            reason="voice archive/card writes are cold-safe before cleanup refresh",
+        )
         if not transcript_store.exists(user_id, call_id):
             runtime_token = results.mint_enclave_token(user_id)
             turns = voice_cleanup.transcript_turns_from_rows(

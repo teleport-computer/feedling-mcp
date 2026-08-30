@@ -65,7 +65,59 @@ def _fake_capture_protocol(state: dict, terminal: list):
     }
 
 
-def test_exact_v2_chat_send_and_reply_refresh_without_legacy_enqueue(monkeypatch):
+def test_exact_v2_chat_send_and_reply_defer_without_legacy_enqueue(monkeypatch):
+    store = _Store()
+    monkeypatch.setattr(
+        core_store.db,
+        "chat_append_and_enqueue",
+        lambda *_args, **_kwargs: (1, "job-1"),
+    )
+    monkeypatch.setattr(
+        core_store.db,
+        "chat_append_effect_with_cursor",
+        lambda *_args, **_kwargs: (2, True),
+    )
+    monkeypatch.setattr(core_store.wake_bus, "notify", lambda *_args: None)
+    refreshed = []
+    deferred = []
+    monkeypatch.setattr(
+        capture_scheduler,
+        "refresh_capture_state_from_chat",
+        lambda _store, **kwargs: refreshed.append(kwargs) or {},
+    )
+    monkeypatch.setattr(
+        capture_scheduler,
+        "record_chat_append",
+        lambda *_args, **kwargs: deferred.append(kwargs),
+    )
+
+    core_store.UserStore.append_chat(
+        store,
+        "user",
+        "chat",
+        _envelope("user-1"),
+        strict=True,
+        enqueue={
+            "lane": "chat",
+            "expected_runtime_mode": "db_action_v2",
+        },
+    )
+    core_store.UserStore.append_chat(
+        store,
+        "openclaw",
+        "model_api",
+        _envelope("reply-1"),
+        strict=True,
+        reply_through_seq=1,
+    )
+
+    assert refreshed == []
+    assert len(deferred) == 2
+    assert all(call == {"defer_to_tick": True} for call in deferred)
+
+
+def test_exact_v2_sync_mode_refreshes_without_legacy_enqueue(monkeypatch):
+    monkeypatch.setenv("FEEDLING_CAPTURE_APPEND_REFRESH_MODE", "sync")
     store = _Store()
     monkeypatch.setattr(
         core_store.db,
@@ -95,7 +147,7 @@ def test_exact_v2_chat_send_and_reply_refresh_without_legacy_enqueue(monkeypatch
         store,
         "user",
         "chat",
-        _envelope("user-1"),
+        _envelope("user-sync"),
         strict=True,
         enqueue={
             "lane": "chat",
@@ -106,13 +158,141 @@ def test_exact_v2_chat_send_and_reply_refresh_without_legacy_enqueue(monkeypatch
         store,
         "openclaw",
         "model_api",
-        _envelope("reply-1"),
+        _envelope("reply-sync"),
         strict=True,
         reply_through_seq=1,
     )
 
     assert len(refreshed) == 2
     assert legacy == []
+
+
+def _start_append_with_blocked_capture_refresh(monkeypatch, append_call):
+    refresh_started = threading.Event()
+    release_refresh = threading.Event()
+    append_finished = threading.Event()
+    append_errors = []
+
+    def _slow_refresh(*_args, **_kwargs):
+        refresh_started.set()
+        release_refresh.wait(timeout=2.0)
+        return {}
+
+    monkeypatch.setattr(
+        capture_scheduler,
+        "refresh_capture_state_from_chat",
+        _slow_refresh,
+    )
+
+    def _run_append():
+        try:
+            append_call()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            append_errors.append(exc)
+        finally:
+            append_finished.set()
+
+    thread = threading.Thread(target=_run_append)
+    thread.start()
+    return (
+        thread,
+        refresh_started,
+        release_refresh,
+        append_finished,
+        append_errors,
+    )
+
+
+def test_resident_chat_append_does_not_wait_for_capture_refresh(monkeypatch):
+    store = _Store()
+    monkeypatch.setattr(
+        core_store.db,
+        "chat_append",
+        lambda *_args, **_kwargs: 1,
+    )
+    monkeypatch.setattr(core_store.wake_bus, "notify", lambda *_args: None)
+    thread, _, release, finished, errors = (
+        _start_append_with_blocked_capture_refresh(
+            monkeypatch,
+            lambda: core_store.UserStore.append_chat(
+                store, "user", "chat", _envelope("resident-user-1")
+            ),
+        )
+    )
+    try:
+        assert finished.wait(timeout=0.2)
+    finally:
+        release.set()
+        thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    assert errors == []
+
+
+def test_v2_chat_append_does_not_wait_for_capture_refresh(monkeypatch):
+    store = _Store()
+    monkeypatch.setattr(
+        core_store.db,
+        "chat_append_and_enqueue",
+        lambda *_args, **_kwargs: (1, "job-1"),
+    )
+    monkeypatch.setattr(core_store.wake_bus, "notify", lambda *_args: None)
+    thread, _, release, finished, errors = (
+        _start_append_with_blocked_capture_refresh(
+            monkeypatch,
+            lambda: core_store.UserStore.append_chat(
+                store,
+                "user",
+                "chat",
+                _envelope("v2-user-1"),
+                strict=True,
+                enqueue={
+                    "lane": "chat",
+                    "expected_runtime_mode": "db_action_v2",
+                },
+            ),
+        )
+    )
+    try:
+        assert finished.wait(timeout=0.2)
+    finally:
+        release.set()
+        thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    assert errors == []
+
+
+def test_capture_append_sync_mode_restores_synchronous_refresh(monkeypatch):
+    monkeypatch.setenv("FEEDLING_CAPTURE_APPEND_REFRESH_MODE", "sync")
+    store = _Store()
+    monkeypatch.setattr(
+        core_store.db,
+        "chat_append",
+        lambda *_args, **_kwargs: 1,
+    )
+    monkeypatch.setattr(core_store.wake_bus, "notify", lambda *_args: None)
+    thread, refresh_started, release, finished, errors = (
+        _start_append_with_blocked_capture_refresh(
+            monkeypatch,
+            lambda: core_store.UserStore.append_chat(
+                store,
+                "user",
+                "chat",
+                _envelope("resident-user-sync"),
+            ),
+        )
+    )
+    try:
+        assert refresh_started.wait(timeout=0.2)
+        assert not finished.wait(timeout=0.1)
+    finally:
+        release.set()
+        thread.join(timeout=2.0)
+
+    assert finished.is_set()
+    assert not thread.is_alive()
+    assert errors == []
 
 
 def test_transactional_v2_reply_refreshes_without_legacy_enqueue(monkeypatch):

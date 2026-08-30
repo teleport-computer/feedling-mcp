@@ -175,12 +175,19 @@ def _emit_job_enqueued_trace(user_id: str, lane: str, *, reason: str, trace_id: 
     from core import store as _wire_core_store
 
     _diagnostics_core.emit_trace_event_payload(
-        _wire_core_store.get_store(user_id),
-        {"event": {
-            "subsystem": "agent", "type": "agent.job.enqueued", "status": "ok",
-            "actor": "hosted_v2", "trace_id": str(trace_id or ""),
-            "detail": {"lane": lane, "reason": reason, "enqueue_source": lane},
-        }},
+        _wire_core_store.get_store_shell_only(
+            user_id, reason="debug trace is a durable log write"
+        ),
+        {
+            "event": {
+                "subsystem": "agent",
+                "type": "agent.job.enqueued",
+                "status": "ok",
+                "actor": "hosted_v2",
+                "trace_id": str(trace_id or ""),
+                "detail": {"lane": lane, "reason": reason, "enqueue_source": lane},
+            }
+        },
     )
 
 

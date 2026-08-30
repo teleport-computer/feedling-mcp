@@ -899,12 +899,13 @@ CVM 磁盘创建时定死、事后扩容麻烦，故按「未来可能指向 pro
 
 > [!CAUTION]
 > **已废弃并暂停（2026-08-20）**：三台 CVM 已停止，部署与监控 workflow
-> 已禁用，客户端入口也已退役。CVM id、磁盘和下述 runbook 暂时保留用于审计与
+> 已禁用；未接入业务的 backend 客户端与 `redis-py` 依赖已于 2026-08-29 删除。
+> CVM id、磁盘和下述 runbook 暂时保留用于审计与
 > 可回滚恢复；不要按本节直接重新启动。恢复前必须先完成新的接入 spec，并同步恢复
-> 监控与 `backend/redis_pool.py` 的门禁。
+> 监控并重新实现、评审客户端。
 
-**接入方看这里**：`docs/REDIS_USAGE.md`（连接池 `backend/redis_pool.py` +
-使用规范：`IO:` 前缀命名、强制 TTL、read-through）。本章节只讲开通/运维。
+**历史设计看这里**：`docs/REDIS_USAGE.md`（客户端已删除；保留 `IO:` 前缀命名、
+强制 TTL、read-through 等重新评审输入）。本章节只讲开通/运维。
 （早期设计 spec/plan 建成后已删，架构取舍见 `docs/REDIS_USAGE.md` §0-1 与
 `docs/CHANGELOG.md` 的 07-24 / 07-25 条目。）
 

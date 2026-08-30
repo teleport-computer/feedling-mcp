@@ -75,6 +75,9 @@ HEALTH_DB_STATEMENT_TIMEOUT_MS = 1000
 # connections, while keeping concurrent health requests bounded.
 HEALTH_DB_POOL_MIN_SIZE = 1
 HEALTH_DB_POOL_MAX_SIZE = 2
+_POOL_CHECK_CONNECTION = ConnectionPool.check_connection
+TEE_PRIMARY_POOL_MAX_LIFETIME_SECONDS = 180.0
+TEE_PRIMARY_TCP_USER_TIMEOUT_MS = 30000
 
 
 def _database_url() -> str:
@@ -100,6 +103,35 @@ def database_schema() -> str:
     if value not in {"rds", "tee"}:
         raise RuntimeError("FEEDLING_DATABASE_SCHEMA must be 'rds' or 'tee'")
     return value
+
+
+def _database_connection_kwargs() -> dict:
+    """Connection options shared by pools and dedicated LISTEN connections.
+
+    A promoted TEE primary crosses the Phala direct-TLS gateway. The gateway can
+    silently retire long-lived sockets; TCP keepalives make idle connections
+    observable before the next request borrows them. RDS keeps its historical
+    options unchanged.
+    """
+    kwargs = {"autocommit": True}
+    if database_schema() == "tee":
+        kwargs.update(
+            {
+                "connect_timeout": 10,
+                "keepalives": 1,
+                "keepalives_idle": 30,
+                "keepalives_interval": 10,
+                "keepalives_count": 3,
+                "tcp_user_timeout": TEE_PRIMARY_TCP_USER_TIMEOUT_MS,
+            }
+        )
+    return kwargs
+
+
+def _database_pool_lifetime_kwargs() -> dict:
+    if database_schema() == "tee":
+        return {"max_lifetime": TEE_PRIMARY_POOL_MAX_LIFETIME_SECONDS}
+    return {}
 
 
 def _pool_max_size() -> int:
@@ -148,8 +180,9 @@ def get_pool() -> ConnectionPool:
                 max_size=_pool_max_size(),
                 timeout=10,
                 max_idle=300,
-                kwargs={"autocommit": True},
+                kwargs=_database_connection_kwargs(),
                 open=True,
+                **_database_pool_lifetime_kwargs(),
             )
     return _pool
 
@@ -167,8 +200,10 @@ def get_health_pool() -> ConnectionPool:
                 max_size=HEALTH_DB_POOL_MAX_SIZE,
                 timeout=HEALTH_DB_ACQUIRE_TIMEOUT_SECONDS,
                 max_idle=300,
-                kwargs={"autocommit": True},
+                check=_POOL_CHECK_CONNECTION,
+                kwargs=_database_connection_kwargs(),
                 open=True,
+                **_database_pool_lifetime_kwargs(),
             )
     return _health_pool
 
@@ -348,7 +383,7 @@ def listen_connection() -> "psycopg.Connection":
     holds exactly one of these per worker, outside the request pool, and blocks
     on ``conn.notifies()`` — so it never consumes a pool slot. Raises on connect
     failure; the caller's reconnect loop handles it."""
-    return psycopg.connect(_database_url(), autocommit=True)
+    return psycopg.connect(_database_url(), **_database_connection_kwargs())
 
 
 # ---------------------------------------------------------------------------
@@ -1248,8 +1283,31 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
     today = datetime.now(zone).date()
     day_start, _ = _lane_rollup_day_bounds(today, zone)
     cutoff = day_start.timestamp()
-    sums = ", ".join(f"SUM({k})::int" for k in _CHAT_SNAPSHOT_COUNT_KEYS)
+    sums = ", ".join(f"SUM({k})::int AS {k}" for k in _CHAT_SNAPSHOT_COUNT_KEYS)
+    count_columns = ", ".join(
+        f"counts.{key}" for key in _CHAT_SNAPSHOT_COUNT_KEYS
+    )
+    time_columns = ", ".join(
+        f"counts.{key}"
+        for key in (
+            "first_ts", "last_ts", "proactive_last_ts",
+            "last_user_ts", "last_agent_ts",
+        )
+    )
+    closed_dimensions = ", ".join(
+        f"('{target}', {target})"
+        for _field, target, _predicate in _CHAT_ROLLUP_DIST_FIELDS
+    )
+    live_dimensions = ", ".join(
+        "(" + ", ".join((
+            f"'{target}'",
+            f"COALESCE(NULLIF(doc->>'{field}', ''), 'unknown')",
+            predicate.removeprefix(" AND ") if predicate else "TRUE",
+        )) + ")"
+        for field, target, predicate in _CHAT_ROLLUP_DIST_FIELDS
+    )
     acc: dict[str, dict] = {}
+    proactive_acc: dict[str, dict[str, dict[str, int]]] = {}
 
     # ⚠️ 两段的边界必须**互斥**：格子取 day < today，实时窗取 ts >= today 起点。
     # 少了这个 day 上界，任何落在今天或之后的格子会被两边各数一次。冻结器只冻
@@ -1257,11 +1315,40 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
     # 写出来才是。（本条是测试种子用了未来时刻、把这个重叠暴露出来后补的。）
     for row in conn.execute(
         f"""
-        SELECT user_id, {sums},
-               MIN(first_ts), MAX(last_ts), MAX(proactive_last_ts),
-               MAX(last_user_ts), MAX(last_agent_ts)
-        FROM chat_daily_rollup WHERE user_id = ANY(%s) AND day < %s
-        GROUP BY user_id
+        WITH selected AS MATERIALIZED (
+            SELECT *
+            FROM chat_daily_rollup
+            WHERE user_id = ANY(%s) AND day < %s
+        ), counts AS (
+            SELECT user_id, {sums},
+                   MIN(first_ts) AS first_ts,
+                   MAX(last_ts) AS last_ts,
+                   MAX(proactive_last_ts) AS proactive_last_ts,
+                   MAX(last_user_ts) AS last_user_ts,
+                   MAX(last_agent_ts) AS last_agent_ts
+            FROM selected
+            GROUP BY user_id
+        ), distribution_counts AS (
+            SELECT user_id, src, k, SUM(raw::int)::int AS v
+            FROM selected,
+            LATERAL (
+                VALUES {closed_dimensions}
+            ) AS dimensions(src, doc),
+            LATERAL jsonb_each_text(doc) AS entries(k, raw)
+            GROUP BY user_id, src, k
+        ), distributions AS (
+            SELECT user_id, jsonb_object_agg(src, buckets) AS folded
+            FROM (
+                SELECT user_id, src, jsonb_object_agg(k, v) AS buckets
+                FROM distribution_counts
+                GROUP BY user_id, src
+            ) per_dimension
+            GROUP BY user_id
+        )
+        SELECT counts.user_id, {count_columns}, {time_columns},
+               COALESCE(distributions.folded, '{{}}'::jsonb)
+        FROM counts
+        LEFT JOIN distributions USING (user_id)
         """,
         (ids, today.isoformat()),
     ).fetchall():
@@ -1271,38 +1358,48 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
         for offset, key in enumerate(("first_ts", "last_ts", "proactive_last_ts",
                                       "last_user_ts", "last_agent_ts")):
             cell[key] = row[1 + n + offset]
-        acc[str(row[0])] = cell
-
-    for uid, folded in conn.execute(
-        """
-        SELECT user_id, jsonb_object_agg(src, buckets)
-        FROM (
-            SELECT user_id, src, jsonb_object_agg(k, v) AS buckets
-            FROM (
-                SELECT user_id, src, k, SUM(raw::int)::int AS v
-                FROM chat_daily_rollup,
-                LATERAL (VALUES ('by_role', by_role), ('by_source', by_source),
-                                ('by_content_type', by_content_type)) AS d(src, doc),
-                LATERAL jsonb_each_text(doc) AS e(k, raw)
-                WHERE user_id = ANY(%s) AND day < %s
-                GROUP BY user_id, src, k
-            ) per_key
-            GROUP BY user_id, src
-        ) per_src
-        GROUP BY user_id
-        """,
-        (ids, today.isoformat()),
-    ).fetchall():
-        cell = acc.setdefault(str(uid), {})
+        folded = dict(row[1 + n + 5] or {})
         for key in _CHAT_SNAPSHOT_DIST_KEYS:
-            cell[key] = dict((folded or {}).get(key) or {})
+            cell[key] = dict(folded.get(key) or {})
+        acc[str(row[0])] = cell
+        proactive = {
+            key: {str(k): int(v) for k, v in (folded.get(key) or {}).items()}
+            for key in ("live_activity_status", "alert_status")
+        }
+        if any(proactive.values()):
+            proactive_acc[str(row[0])] = proactive
 
     # 当天还没冻结的那一段：单次有界查询，窗口就是今天。
     for row in conn.execute(
         f"""
-        SELECT user_id,{_CHAT_ROLLUP_COUNTS_SELECT}
-        FROM {_chat_rollup_source('user_id = ANY(%s) AND ts >= %s')} src
-        GROUP BY user_id
+        WITH live AS MATERIALIZED (
+            SELECT *
+            FROM {_chat_rollup_source('user_id = ANY(%s) AND ts >= %s')} src
+        ), counts AS (
+            SELECT user_id,{_CHAT_ROLLUP_COUNTS_SELECT}
+            FROM live
+            GROUP BY user_id
+        ), distribution_counts AS (
+            SELECT user_id, dimension, value, COUNT(*)::int AS v
+            FROM live
+            CROSS JOIN LATERAL (
+                VALUES {live_dimensions}
+            ) AS dimensions(dimension, value, included)
+            WHERE included
+            GROUP BY user_id, dimension, value
+        ), distributions AS (
+            SELECT user_id, jsonb_object_agg(dimension, buckets) AS folded
+            FROM (
+                SELECT user_id, dimension, jsonb_object_agg(value, v) AS buckets
+                FROM distribution_counts
+                GROUP BY user_id, dimension
+            ) per_dimension
+            GROUP BY user_id
+        )
+        SELECT counts.user_id, {count_columns}, {time_columns},
+               COALESCE(distributions.folded, '{{}}'::jsonb)
+        FROM counts
+        LEFT JOIN distributions USING (user_id)
         """,
         (ids, cutoff, ids, cutoff),
     ).fetchall():
@@ -1318,19 +1415,16 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
             live = row[2 + n + offset]
             if live is not None and (cell.get(key) is None or live > cell[key]):
                 cell[key] = live
-
-    for field, target, extra in _CHAT_ROLLUP_DIST_FIELDS[:3]:
-        for uid, value, count in conn.execute(
-            f"""
-            SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
-                   COUNT(*)::int
-            FROM {_chat_rollup_source(f'user_id = ANY(%s) AND ts >= %s{extra}')} src
-            GROUP BY user_id, value
-            """,
-            (field, ids, cutoff, ids, cutoff),
-        ).fetchall():
-            bucket = acc.setdefault(str(uid), {}).setdefault(target, {})
-            bucket[str(value)] = bucket.get(str(value), 0) + int(count)
+        folded = dict(row[1 + n + 5] or {})
+        for key in _CHAT_SNAPSHOT_DIST_KEYS:
+            bucket = cell.setdefault(key, {})
+            for value, count in (folded.get(key) or {}).items():
+                bucket[str(value)] = bucket.get(str(value), 0) + int(count)
+        proactive = proactive_acc.setdefault(str(row[0]), {})
+        for key in ("live_activity_status", "alert_status"):
+            bucket = proactive.setdefault(key, {})
+            for value, count in (folded.get(key) or {}).items():
+                bucket[str(value)] = bucket.get(str(value), 0) + int(count)
 
     for uid, cell in acc.items():
         if not cell.get("total"):
@@ -1344,59 +1438,7 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
                     "last_user_ts", "last_agent_ts"):
             cell.setdefault(key, None)
         ensure(out, uid)["chat"] = cell
-
-
-def _chat_proactive_status_into(conn, ids: list[str], out: dict, ensure) -> None:
-    """proactive_extra 的两个 status 分布：冻结格子 + 今天实时窗。
-
-    与 ``_chat_rollup_into`` 分开只是因为它们挂在 ``proactive_extra`` 而不是
-    ``chat`` 下；口径、边界（day < today / ts >= today 起点）、来源（live ∪
-    archive）三者完全一致，共用同一组常量。
-    """
-    zone = ZoneInfo("Asia/Shanghai")
-    today = datetime.now(zone).date()
-    day_start, _ = _lane_rollup_day_bounds(today, zone)
-    cutoff = day_start.timestamp()
-    acc: dict[str, dict[str, dict[str, int]]] = {}
-
-    for uid, folded in conn.execute(
-        """
-        SELECT user_id, jsonb_object_agg(src, buckets)
-        FROM (
-            SELECT user_id, src, jsonb_object_agg(k, v) AS buckets
-            FROM (
-                SELECT user_id, src, k, SUM(raw::int)::int AS v
-                FROM chat_daily_rollup,
-                LATERAL (VALUES ('live_activity_status', live_activity_status),
-                                ('alert_status', alert_status)) AS d(src, doc),
-                LATERAL jsonb_each_text(doc) AS e(k, raw)
-                WHERE user_id = ANY(%s) AND day < %s
-                GROUP BY user_id, src, k
-            ) per_key
-            GROUP BY user_id, src
-        ) per_src
-        GROUP BY user_id
-        """,
-        (ids, today.isoformat()),
-    ).fetchall():
-        by = acc.setdefault(str(uid), {})
-        for key, buckets in (folded or {}).items():
-            by[str(key)] = {str(k): int(v) for k, v in (buckets or {}).items()}
-
-    for field, target, extra in _CHAT_ROLLUP_DIST_FIELDS[3:]:
-        for uid, value, count in conn.execute(
-            f"""
-            SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
-                   COUNT(*)::int
-            FROM {_chat_rollup_source(f'user_id = ANY(%s) AND ts >= %s{extra}')} src
-            GROUP BY user_id, value
-            """,
-            (field, ids, cutoff, ids, cutoff),
-        ).fetchall():
-            bucket = acc.setdefault(str(uid), {}).setdefault(target, {})
-            bucket[str(value)] = bucket.get(str(value), 0) + int(count)
-
-    for uid, by in acc.items():
+    for uid, by in proactive_acc.items():
         if not any(by.values()):
             continue
         extra_block = ensure(out, uid).setdefault("proactive_extra", {})
@@ -1663,6 +1705,9 @@ def admin_data_track_snapshot(
     out: dict[str, dict] = {
         uid: {
             "app_usage": {"foreground_sec": 0, "sessions": 0, "last_at": None},
+            "legacy_background_breakdowns_status": (
+                "available" if include_legacy_background else "omitted"
+            ),
             "snapshot_read_status": {"level": "ok", "message": ""},
         }
         for uid in ids
@@ -1899,8 +1944,6 @@ def admin_data_track_snapshot(
             # 把它们冻进格子却仍从 chat_messages 现算，等于新增列只写不读、
             # 端点照样随全史增长——那正是本期要消灭的东西（codex2 2026-08-19
             # 逮到我就是这么写的：写侧改了、读侧一行没动）。
-            _chat_proactive_status_into(conn, ids, out, ensure)
-
             if include_legacy_background:
                 rows = conn.execute(
                     """
@@ -2143,53 +2186,68 @@ def _dau_row(row) -> dict:
     }
 
 
-def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = "Asia/Shanghai") -> list[dict]:
-    """Return daily active-user aggregates, preferring immutable snapshots.
+def _admin_data_track_dau_rows(
+    conn,
+    *,
+    since: float,
+    scan_since: float,
+    boundary_day: str,
+    day_limit: int,
+    tz: str,
+):
+    """Run the established DAU aggregate with an independently proven bound.
 
-    A completed day uses ``dau_daily_snapshot`` once frozen. Today and days
-    before the snapshot boundary remain live. If ``since_epoch`` cuts through
-    a frozen day, that day also falls back to live data so the existing exact
-    timestamp-filter contract is preserved. Every row exposes ``frozen``.
-
-    DAU is intentionally user-initiated activity only: user chat messages plus
-    client tracking events. Agent replies, proactive writes, and synthetic
-    verify pings are excluded so automated reply loops cannot inflate activity.
+    ``since`` remains the public exact-filter contract. ``scan_since`` and
+    ``boundary_day`` only discard days that the preceding boundary query proved
+    cannot enter the final ``LIMIT``. Keeping these two concepts separate is
+    what lets an intraday ``since`` continue to invalidate a whole-day frozen
+    row without making the live scan unbounded again.
     """
-    day_limit = max(1, min(int(days or 30), 1000))
-    since = float(since_epoch or 0.0)
-    try:
-        with get_pool().connection() as conn:
-            rows = conn.execute(
-                """
+    chat_bound = " AND c.ts >= %s" if scan_since > 0 else ""
+    tracking_bound = " AND l.ts >= %s" if scan_since > 0 else ""
+    frozen_bounds = ""
+    frozen_params: list[object] = []
+    if since > 0:
+        frozen_bounds += " AND first_ts >= %s"
+        frozen_params.append(since)
+    if boundary_day:
+        frozen_bounds += " AND day >= %s"
+        frozen_params.append(boundary_day)
+
+    sql = f"""
                 WITH active AS (
-                    SELECT user_id, ts, 'chat' AS source
-                    FROM chat_messages
-                    WHERE doc->>'role' = 'user'
-                      AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
-                      AND (%s = 0 OR ts >= %s)
+                    SELECT c.user_id, c.ts, 'chat' AS source
+                    FROM users u
+                    JOIN chat_messages c ON c.user_id = u.user_id
+                    WHERE c.doc->>'role' = 'user'
+                      AND COALESCE(c.doc->>'source', '')
+                          NOT IN ('verify_ping', 'resident_maintenance')
+                      {chat_bound}
 
                     UNION ALL
 
-                    SELECT user_id, ts, 'tracking' AS source
-                    FROM user_logs
-                    WHERE stream = 'tracking_events'
-                      AND ts IS NOT NULL
-                      AND (%s = 0 OR ts >= %s)
+                    SELECT l.user_id, l.ts, 'tracking' AS source
+                    FROM users u
+                    JOIN user_logs l ON l.user_id = u.user_id
+                    WHERE l.stream = 'tracking_events'
+                      AND l.ts IS NOT NULL
+                      {tracking_bound}
                 ),
                 usage_events AS (
                     SELECT
-                        user_id,
-                        ts,
+                        l.user_id,
+                        l.ts,
                         CASE
-                          WHEN doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
-                          THEN (doc->'payload'->>'duration_sec')::bigint
+                          WHEN l.doc->'payload'->>'duration_sec' ~ '^[0-9]{{1,10}}$'
+                          THEN (l.doc->'payload'->>'duration_sec')::bigint
                           ELSE 0
                         END AS duration_sec
-                    FROM user_logs
-                    WHERE stream = 'tracking_events'
-                      AND doc->>'type' = 'app_session_end'
-                      AND ts IS NOT NULL
-                      AND (%s = 0 OR ts >= %s)
+                    FROM users u
+                    JOIN user_logs l ON l.user_id = u.user_id
+                    WHERE l.stream = 'tracking_events'
+                      AND l.doc->>'type' = 'app_session_end'
+                      AND l.ts IS NOT NULL
+                      {tracking_bound}
                 ),
                 daily AS (
                     SELECT
@@ -2255,7 +2313,7 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                            median_user_sec
                     FROM dau_daily_snapshot
                     WHERE active_events > 0
-                      AND (%s = 0 OR first_ts >= %s)
+                      {frozen_bounds}
                 ),
                 merged AS (
                     SELECT f.*, TRUE AS frozen FROM frozen_rows f
@@ -2271,9 +2329,165 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                 FROM merged
                 ORDER BY day DESC
                 LIMIT %s
+                """
+    live_params = [scan_since] * (3 if scan_since > 0 else 0)
+    return conn.execute(
+        sql,
+        (*live_params, tz, tz, tz, *frozen_params, day_limit),
+    ).fetchall()
+
+
+def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = "Asia/Shanghai") -> list[dict]:
+    """Return daily active-user aggregates, preferring immutable snapshots.
+
+    A completed day uses ``dau_daily_snapshot`` once frozen. Today and days
+    before the snapshot boundary remain live. If ``since_epoch`` cuts through
+    a frozen day, that day also falls back to live data so the existing exact
+    timestamp-filter contract is preserved. Every row exposes ``frozen``.
+
+    DAU is intentionally user-initiated activity only: user chat messages plus
+    client tracking events. Agent replies, proactive writes, and synthetic
+    verify pings are excluded so automated reply loops cannot inflate activity.
+
+    The first query finds the oldest day that can survive the requested
+    ``LIMIT`` using only activity timestamps and frozen-day metadata. The
+    expensive per-user/session aggregates then start at that boundary. This
+    preserves "latest N days with activity" across calendar gaps; a fixed
+    N-calendar-day cutoff would silently drop valid rows for a sparse fleet.
+    """
+    day_limit = max(1, min(int(days or 30), 1000))
+    since = float(since_epoch or 0.0)
+    chat_since = " AND c.ts >= s.since_epoch" if since > 0 else ""
+    tracking_since = " AND l.ts >= s.since_epoch" if since > 0 else ""
+    snapshot_since = " AND snap.first_ts >= s.since_epoch" if since > 0 else ""
+
+    try:
+        with get_pool().connection() as conn:
+            boundary = conn.execute(
+                f"""
+                WITH RECURSIVE settings AS (
+                    SELECT %s::text AS tz,
+                           %s::integer AS day_limit,
+                           %s::double precision AS since_epoch
+                ), chat_days(user_id, day, cutoff, depth) AS (
+                    SELECT u.user_id, hit.day, hit.cutoff, 1
+                    FROM users u
+                    CROSS JOIN settings s
+                    CROSS JOIN LATERAL (
+                        SELECT
+                            to_char(timezone(s.tz, to_timestamp(c.ts)), 'YYYY-MM-DD') AS day,
+                            EXTRACT(EPOCH FROM (
+                                date_trunc('day', timezone(s.tz, to_timestamp(c.ts)))
+                                AT TIME ZONE s.tz
+                            ))::double precision AS cutoff
+                        FROM chat_messages c
+                        WHERE c.user_id = u.user_id
+                          AND c.doc->>'role' = 'user'
+                          AND COALESCE(c.doc->>'source', '')
+                              NOT IN ('verify_ping', 'resident_maintenance')
+                          {chat_since}
+                        ORDER BY c.ts DESC
+                        LIMIT 1
+                    ) hit
+                    UNION
+                    SELECT prior.user_id, hit.day, hit.cutoff, prior.depth + 1
+                    FROM chat_days prior
+                    CROSS JOIN settings s
+                    CROSS JOIN LATERAL (
+                        SELECT
+                            to_char(timezone(s.tz, to_timestamp(c.ts)), 'YYYY-MM-DD') AS day,
+                            EXTRACT(EPOCH FROM (
+                                date_trunc('day', timezone(s.tz, to_timestamp(c.ts)))
+                                AT TIME ZONE s.tz
+                            ))::double precision AS cutoff
+                        FROM chat_messages c
+                        WHERE c.user_id = prior.user_id
+                          AND c.ts < prior.cutoff
+                          AND c.doc->>'role' = 'user'
+                          AND COALESCE(c.doc->>'source', '')
+                              NOT IN ('verify_ping', 'resident_maintenance')
+                          {chat_since}
+                        ORDER BY c.ts DESC
+                        LIMIT 1
+                    ) hit
+                    WHERE prior.depth < s.day_limit
+                ), tracking_days(user_id, day, cutoff, depth) AS (
+                    SELECT u.user_id, hit.day, hit.cutoff, 1
+                    FROM users u
+                    CROSS JOIN settings s
+                    CROSS JOIN LATERAL (
+                        SELECT
+                            to_char(timezone(s.tz, to_timestamp(l.ts)), 'YYYY-MM-DD') AS day,
+                            EXTRACT(EPOCH FROM (
+                                date_trunc('day', timezone(s.tz, to_timestamp(l.ts)))
+                                AT TIME ZONE s.tz
+                            ))::double precision AS cutoff
+                        FROM user_logs l
+                        WHERE l.user_id = u.user_id
+                          AND l.stream = 'tracking_events'
+                          AND l.ts IS NOT NULL
+                          {tracking_since}
+                        ORDER BY l.ts DESC
+                        LIMIT 1
+                    ) hit
+                    UNION
+                    SELECT prior.user_id, hit.day, hit.cutoff, prior.depth + 1
+                    FROM tracking_days prior
+                    CROSS JOIN settings s
+                    CROSS JOIN LATERAL (
+                        SELECT
+                            to_char(timezone(s.tz, to_timestamp(l.ts)), 'YYYY-MM-DD') AS day,
+                            EXTRACT(EPOCH FROM (
+                                date_trunc('day', timezone(s.tz, to_timestamp(l.ts)))
+                                AT TIME ZONE s.tz
+                            ))::double precision AS cutoff
+                        FROM user_logs l
+                        WHERE l.user_id = prior.user_id
+                          AND l.stream = 'tracking_events'
+                          AND l.ts IS NOT NULL
+                          AND l.ts < prior.cutoff
+                          {tracking_since}
+                        ORDER BY l.ts DESC
+                        LIMIT 1
+                    ) hit
+                    WHERE prior.depth < s.day_limit
+                ), active_days AS (
+                    SELECT day FROM chat_days
+                    UNION
+                    SELECT day FROM tracking_days
+                    UNION
+                    SELECT snap.day
+                    FROM dau_daily_snapshot snap
+                    CROSS JOIN settings s
+                    WHERE snap.active_events > 0
+                      {snapshot_since}
+                ), limited_days AS (
+                    SELECT day
+                    FROM active_days
+                    ORDER BY day DESC
+                    LIMIT (SELECT day_limit FROM settings)
+                )
+                SELECT MIN(limited_days.day),
+                       EXTRACT(EPOCH FROM (
+                           MIN(limited_days.day)::date::timestamp AT TIME ZONE settings.tz
+                       ))::double precision
+                FROM settings
+                LEFT JOIN limited_days ON TRUE
+                GROUP BY settings.tz
                 """,
-                (since, since, since, since, since, since, tz, tz, tz, since, since, day_limit),
-            ).fetchall()
+                (tz, day_limit, since),
+            ).fetchone()
+            boundary_day = str(boundary[0] or "") if boundary else ""
+            boundary_epoch = float(boundary[1] or 0.0) if boundary else 0.0
+            scan_since = max(since, boundary_epoch)
+            rows = _admin_data_track_dau_rows(
+                conn,
+                since=since,
+                scan_since=scan_since,
+                boundary_day=boundary_day,
+                day_limit=day_limit,
+                tz=tz,
+            )
         return [_dau_row(row) for row in rows]
     except Exception as e:
         log.error("[db] admin_data_track_dau failed: %s", e)
@@ -7697,13 +7911,22 @@ def admin_events_overview(*, day: str = "", tz: str = "Asia/Shanghai") -> dict:
         # the exact failure this function was changed to remove.
         raise ValueError(f"admin_events_overview: bad day {want_day!r}, want YYYY-MM-DD")
 
+    def _day_bound(*, epoch: bool, end: bool) -> str:
+        day_expr = (
+            f"('{want_day}'::date + 1)" if end else f"'{want_day}'::date"
+        )
+        bound = f"({day_expr}::timestamp AT TIME ZONE '{zone}')"
+        return f"EXTRACT(EPOCH FROM {bound})" if epoch else bound
+
     def _day_filter(ts_expr: str, *, epoch: bool = True) -> str:
         """SQL predicate scoping one row's time column to ``want_day`` in ``tz``.
 
         ``epoch=True`` for the numeric ``ts`` columns (user_logs / chat_messages),
-        False for a real timestamptz (genesis_import_jobs.created_at). Same
-        bucketing idiom as admin_data_track_dau, so this board and the DAU chart
-        can never disagree about which day a row belongs to.
+        False for a real timestamptz (genesis_import_jobs.created_at). The
+        calendar bounds are constants on the right-hand side, leaving the table
+        column bare so PostgreSQL can use its timestamp indexes. Applying
+        ``to_char(timezone(...))`` to every row preserved the same result but
+        forced a broad scan before it could reject out-of-day history.
 
         ``want_day``/``zone`` are inlined rather than bound because these SQL
         strings are assembled by f-string in the callers below; both are stripped
@@ -7711,9 +7934,9 @@ def admin_events_overview(*, day: str = "", tz: str = "Asia/Shanghai") -> dict:
         (``_valid_day``), so no caller-controlled text reaches SQL."""
         if not want_day:
             return ""
-        stamp = f"to_timestamp({ts_expr})" if epoch else f"({ts_expr})"
-        return (f" AND to_char(timezone('{zone}', {stamp}), "
-                f"'YYYY-MM-DD') = '{want_day}'")
+        start = _day_bound(epoch=epoch, end=False)
+        end = _day_bound(epoch=epoch, end=True)
+        return f" AND {ts_expr} >= {start} AND {ts_expr} < {end}"
 
     def _run(key, sql):
         try:
@@ -7771,12 +7994,14 @@ def admin_events_overview(*, day: str = "", tz: str = "Asia/Shanghai") -> dict:
                percentile_cont(0.5) WITHIN GROUP (ORDER BY m.dur) AS median_dur
         FROM (
           SELECT l.user_id, COALESCE(l.doc->>'status','') AS status, {_JOB_DUR_SEC.replace('doc','l.doc')} AS dur
-          FROM user_logs l
+          FROM users u
+          JOIN user_logs l ON l.user_id = u.user_id
           WHERE l.stream = 'memory_capture_jobs'
             {_day_filter('l.ts')}
           UNION ALL
           SELECT l.user_id, COALESCE(l.doc->>'status','') AS status, {_JOB_DUR_SEC.replace('doc','l.doc')} AS dur
-          FROM user_logs l
+          FROM users u
+          JOIN user_logs l ON l.user_id = u.user_id
           WHERE l.stream = 'proactive_jobs'
             AND COALESCE(l.doc->>'job_kind','') IN ('memory_capture','memory_dream','memory_migrate')
             {_day_filter('l.ts')}
@@ -7810,16 +8035,60 @@ def admin_events_overview(*, day: str = "", tz: str = "Asia/Shanghai") -> dict:
     # 4) 回复消息: 真回复率 + 兜底率 + 回复延迟(中位)。real_replies 排除
     #    agent_initiated_proactive(主动消息不是"对用户的回复")。latency = 每条真回复
     #    与其前一条用户消息的时间差(窗口配对)。
-    #    日期过滤只能加在 paired 之外：窗口函数要回看"这条回复之前的那条用户消息"，
-    #    在 CTE 里就按天切会让每天 0 点后的第一条回复找不到它的问句(last_user_ts 为
-    #    NULL)，于是被算成"没有真回复"——把跨零点的正常对话统计成故障。
-    rows = _run("reply", f"""
-        {_EVENTS_ROUTES_CTE}, paired AS (
-          SELECT c.user_id, c.ts, c.doc->>'role' AS role, COALESCE(c.doc->>'source','') AS src,
-            MAX(CASE WHEN c.doc->>'role' IN ('user','human') AND COALESCE(c.doc->>'source','') NOT IN ('verify_ping','resident_maintenance') THEN c.ts END)
+    #
+    #    日期过滤不能只加在 paired 外层：那会先给全历史跑窗口函数，再扔掉窗外行。
+    #    也不能只把当天行塞进窗口：零点后的第一条回复可能在回答前一天的最后一条
+    #    用户消息。day_rows + 每位当天活跃用户的一条 prior_user_rows 是窗口计算的
+    #    最小充分输入；外层仍只统计当天行，口径与原全史窗口逐字相同。
+    if want_day:
+        reply_pairing_ctes = f"""
+        , day_rows AS MATERIALIZED (
+          SELECT c.user_id, c.ts, c.doc->>'role' AS role,
+                 COALESCE(c.doc->>'source','') AS src
+          FROM chat_messages c
+          WHERE TRUE {_day_filter('c.ts')}
+        ), relevant_users AS MATERIALIZED (
+          SELECT DISTINCT user_id FROM day_rows
+        ), prior_user_rows AS (
+          SELECT DISTINCT ON (c.user_id)
+                 c.user_id, c.ts, c.doc->>'role' AS role,
+                 COALESCE(c.doc->>'source','') AS src
+          FROM chat_messages c
+          JOIN relevant_users u ON u.user_id = c.user_id
+          WHERE c.ts < {_day_bound(epoch=True, end=False)}
+            AND c.doc->>'role' IN ('user','human')
+            AND COALESCE(c.doc->>'source','')
+                NOT IN ('verify_ping','resident_maintenance')
+          ORDER BY c.user_id, c.ts DESC
+        ), pairing_source AS (
+          SELECT * FROM prior_user_rows
+          UNION ALL
+          SELECT * FROM day_rows
+        ), paired AS (
+          SELECT c.user_id, c.ts, c.role, c.src,
+            MAX(CASE WHEN c.role IN ('user','human')
+                          AND c.src NOT IN ('verify_ping','resident_maintenance')
+                     THEN c.ts END)
+              OVER (PARTITION BY c.user_id ORDER BY c.ts ROWS UNBOUNDED PRECEDING) AS last_user_ts
+          FROM pairing_source c
+        )
+        """
+    else:
+        reply_pairing_ctes = """
+        , paired AS (
+          SELECT c.user_id, c.ts, c.doc->>'role' AS role,
+                 COALESCE(c.doc->>'source','') AS src,
+            MAX(CASE WHEN c.doc->>'role' IN ('user','human')
+                          AND COALESCE(c.doc->>'source','')
+                              NOT IN ('verify_ping','resident_maintenance')
+                     THEN c.ts END)
               OVER (PARTITION BY c.user_id ORDER BY c.ts ROWS UNBOUNDED PRECEDING) AS last_user_ts
           FROM chat_messages c
         )
+        """
+    rows = _run("reply", f"""
+        {_EVENTS_ROUTES_CTE}
+        {reply_pairing_ctes}
         SELECT COALESCE(r.route,'resident') AS route,
                (COUNT(*) FILTER (WHERE p.role IN ('user','human') AND p.src NOT IN ('verify_ping','resident_maintenance')))::int AS user_msgs,
                (COUNT(DISTINCT p.last_user_ts) FILTER (WHERE p.role IN ('agent','openclaw')
@@ -8097,13 +8366,6 @@ def _blob_revision(doc) -> int:
     return int(raw)
 
 
-def _next_blob_revision(doc) -> int:
-    revision = _blob_revision(doc)
-    if revision >= 999_999_999_999_999_999:
-        raise RuntimeError("blob mirror revision exhausted")
-    return revision + 1
-
-
 def get_blob_strict(user_id: str, kind: str):
     """Return a blob or ``None`` for a genuine miss; propagate DB failures."""
     with get_pool().connection() as conn:
@@ -8126,6 +8388,10 @@ def get_blob(user_id: str, kind: str):
 def get_blobs_for_users(
     user_ids: list[str],
     kinds: list[str],
+    *,
+    connection_timeout: float | None = None,
+    statement_timeout_ms: int | None = None,
+    raise_on_error: bool = False,
 ) -> dict[tuple[str, str], object]:
     """Return singleton blobs for a set of users and kinds in one DB round trip.
 
@@ -8140,16 +8406,27 @@ def get_blobs_for_users(
     if not ids or not wanted_kinds:
         return {}
     try:
-        with get_pool().connection() as conn:
-            rows = conn.execute(
-                "SELECT user_id, kind, doc FROM user_blobs "
-                "WHERE user_id = ANY(%s) AND kind = ANY(%s)",
-                (ids, wanted_kinds),
-            ).fetchall()
+        connection_kwargs = (
+            {"timeout": float(connection_timeout)}
+            if connection_timeout is not None else {}
+        )
+        with get_pool().connection(**connection_kwargs) as conn:
+            timeout_scope = (
+                _local_statement_timeout(conn, int(statement_timeout_ms))
+                if statement_timeout_ms is not None else nullcontext()
+            )
+            with timeout_scope:
+                rows = conn.execute(
+                    "SELECT user_id, kind, doc FROM user_blobs "
+                    "WHERE user_id = ANY(%s) AND kind = ANY(%s)",
+                    (ids, wanted_kinds),
+                ).fetchall()
         return {(str(user_id), str(kind)): doc for user_id, kind, doc in rows}
     except Exception as e:
         log.error("[db] get_blobs_for_users(%d users,%d kinds) failed: %s",
                   len(ids), len(wanted_kinds), e)
+        if raise_on_error:
+            raise
         return {}
 
 
@@ -8794,8 +9071,11 @@ def query_trace_events_flat_page(
         since_epoch=since_epoch,
         candidate_limit=candidate_limit,
     )
-    metadata_statement = ctes + (
-        "SELECT"
+    statement = ctes + (
+        ", page AS MATERIALIZED ("
+        " SELECT f.id,f.ts FROM filtered f"
+        " ORDER BY f.ts DESC,f.id DESC OFFSET %s LIMIT %s"
+        ") SELECT"
         " (SELECT count(*) FROM filtered) AS events_total,"
         " (SELECT count(*) FROM selected_turns) AS turns_total,"
         " (SELECT count(*) FROM selected_turns WHERE terminal_status='stalled') AS stalled_turns,"
@@ -8808,27 +9088,47 @@ def query_trace_events_flat_page(
         " COALESCE((SELECT array_agg(DISTINCT subsystem ORDER BY subsystem)"
         "           FROM candidate WHERE subsystem<>''),ARRAY[]::text[]) AS subsystems,"
         " COALESCE((SELECT array_agg(DISTINCT lower(status) ORDER BY lower(status))"
-        "           FROM candidate WHERE status<>''),ARRAY[]::text[]) AS statuses"
-    )
-    page_statement = ctes + (
-        "SELECT " + ",".join("e." + column for column in _TRACE_EVENT_COLUMNS) +
-        " FROM filtered f JOIN trace_events e ON e.id=f.id AND e.ts=f.ts"
-        " ORDER BY f.ts DESC,f.id DESC OFFSET %s LIMIT %s"
+        "           FROM candidate WHERE status<>''),ARRAY[]::text[]) AS statuses,"
+        + ",".join(
+            f"event.{column} AS event_{column}"
+            for column in _TRACE_EVENT_COLUMNS
+        )
+        + " FROM (SELECT 1) anchor LEFT JOIN LATERAL ("
+        " SELECT " + ",".join("e." + column for column in _TRACE_EVENT_COLUMNS) +
+        " FROM page p JOIN trace_events e ON e.id=p.id AND e.ts=p.ts"
+        " ORDER BY p.ts DESC,p.id DESC"
+        ") event ON TRUE"
+        " ORDER BY event.ts DESC NULLS LAST,event.id DESC NULLS LAST"
     )
     connection_kwargs = {"timeout": float(connection_timeout)}
     with get_pool().connection(**connection_kwargs) as conn:
         with _local_statement_timeout(conn, statement_timeout_ms):
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
-                    metadata_statement,
-                    [*cte_params, int(candidate_limit)],
+                    statement,
+                    [
+                        *cte_params,
+                        bounded_offset,
+                        bounded_limit + 1,
+                        int(candidate_limit),
+                    ],
                 )
-                metadata = dict(cur.fetchone() or {})
-                cur.execute(
-                    page_statement,
-                    [*cte_params, bounded_offset, bounded_limit + 1],
-                )
-                rows = [dict(row) for row in cur.fetchall()]
+                result_rows = [dict(row) for row in cur.fetchall()]
+
+    metadata_keys = (
+        "events_total", "turns_total", "stalled_turns", "error_turns",
+        "scan_truncated", "users", "subsystems", "statuses",
+    )
+    first = result_rows[0] if result_rows else {}
+    metadata = {key: first.get(key) for key in metadata_keys}
+    rows = [
+        {
+            column: result_row.get(f"event_{column}")
+            for column in _TRACE_EVENT_COLUMNS
+        }
+        for result_row in result_rows
+        if result_row.get("event_id") is not None
+    ]
 
     for row in rows:
         timestamp = row.get("ts")
@@ -11745,15 +12045,6 @@ def chat_poll_candidates_strict(
             (user_id, float(since), float(redelivery_floor), bounded),
         ).fetchall()
     return [_chat_project_row(row) for row in rows]
-
-
-def chat_load_recent(user_id: str, limit: int) -> list[dict]:
-    """Legacy best-effort wrapper around :func:`chat_load_recent_strict`."""
-    try:
-        return chat_load_recent_strict(user_id, limit)
-    except Exception as e:
-        log.error("[db] chat_load_recent(%s,%s) failed: %s", user_id, limit, e)
-        return []
 
 
 def chat_history_page_strict(
@@ -16610,27 +16901,6 @@ def memory_load(user_id: str) -> list[dict]:
     except Exception as e:
         log.error("[db] memory_load(%s) failed: %s", user_id, e)
         return []
-
-
-def memory_profile_source_snapshot(user_id: str) -> dict:
-    """Content-free Memory Garden fingerprint used by profile refresh policy.
-
-    The profile generator itself still reads/decrypts every eligible card
-    through the enclave readside.  This aggregate is deliberately DB-only so a
-    normal chat turn can decide whether a seven-day-old profile is stale
-    without disclosing or loading any card plaintext.
-    """
-    with get_pool().connection() as conn:
-        row = conn.execute(
-            "SELECT count(*)::bigint, "
-            "COALESCE(max(doc->>'updated_at'), '') "
-            "FROM memory_moments WHERE user_id=%s",
-            (str(user_id),),
-        ).fetchone()
-    return {
-        "card_count": int(row[0]) if row and row[0] is not None else 0,
-        "max_updated_at": str(row[1] or "") if row else "",
-    }
 
 
 def memory_upsert(user_id: str, moment_id: str, occurred_at: str, doc: dict) -> bool:

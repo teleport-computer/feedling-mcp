@@ -75,7 +75,6 @@ tests/test_chat_turn_activity_unit.py
 tests/test_chat_turn_activity_v2.py
 tests/test_chat_turn_failure_fields.py
 tests/test_consumer_state_cas.py
-tests/test_context_memories.py
 tests/test_copytext.py
 tests/test_dau_snapshot_scheduler.py
 tests/test_debug_trace_atomic.py
@@ -170,7 +169,6 @@ tests/test_proactive_multi_trigger_burst.py
 tests/test_proactive_poll_core.py
 tests/test_prod_runner_health_config.py
 tests/test_provider_async_native.py
-tests/test_provider_attempt_ledger.py
 tests/test_provider_catalog_unit.py
 tests/test_provider_client_async.py
 tests/test_provider_client_async_reliable.py
@@ -190,13 +188,10 @@ tests/test_provider_usage.py
 tests/test_providers_manual.py
 tests/test_push_skips_deleted_account.py
 tests/test_recover_orphan_survivor.py
-tests/test_redis_cvm_config.py
-tests/test_redis_pool.py
 tests/test_redistill_server_merge.py
 tests/test_registry_db_fallback.py
 tests/test_relationship_days.py
 tests/test_repair_v2_bricked_frontier.py
-tests/test_reply_language.py
 tests/test_request_id.py
 tests/test_resident_maintenance.py
 tests/test_retention_daily.py

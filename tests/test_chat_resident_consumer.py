@@ -511,6 +511,55 @@ def test_invalid_key_exits_on_startup():
     assert exc_info.value.code != 0
 
 
+def test_run_fires_capture_tick_before_a_long_foreground_turn(monkeypatch):
+    order = []
+    message = {"id": "user-before-long-turn", "role": "user", "content": "hi", "ts": 2.0}
+
+    monkeypatch.setattr(crc, "_running", True)
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_load_whoami_with_retries", lambda: True)
+    monkeypatch.setattr(crc, "_warn_if_agent_entry_may_drift", lambda: None)
+    monkeypatch.setattr(crc, "_resident_ipc_listener_enabled", lambda: False)
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "")
+    monkeypatch.setattr(crc, "_apply_infra_health", lambda _status: None)
+    monkeypatch.setattr(crc, "_load_checkpoint", lambda: 1.0)
+    monkeypatch.setattr(crc, "_save_checkpoint", lambda _ts: None)
+    monkeypatch.setattr(crc, "_load_proactive_checkpoint", lambda: 0.0)
+    monkeypatch.setattr(crc, "PROACTIVE_POLL_ENABLED", False)
+    monkeypatch.setattr(crc, "CAPTURE_TICK_ENABLED", True)
+    monkeypatch.setattr(crc, "CAPTURE_TICK_START_DELAY_SEC", 3600)
+    monkeypatch.setattr(crc, "_refresh_auth_header", lambda: None)
+    monkeypatch.setattr(crc, "_process_resident_distill_once", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        crc,
+        "poll_chat",
+        lambda _since: {"timed_out": False, "messages": [message]},
+    )
+    monkeypatch.setattr(crc, "_maybe_apply_user_mcp", lambda: None)
+    monkeypatch.setattr(crc, "_process_vision_probe", lambda _result: None)
+    monkeypatch.setattr(
+        crc,
+        "_filter_messages_to_poll_ids",
+        lambda _history, poll_messages, **_kwargs: poll_messages,
+    )
+    monkeypatch.setattr(
+        crc,
+        "fire_capture_tick",
+        lambda: order.append("capture") or {"enqueued": False, "reason": "quiet_not_due"},
+    )
+
+    def _process(_messages):
+        order.append("process")
+        crc._running = False
+        return 2.0
+
+    monkeypatch.setattr(crc, "_process_messages", _process)
+
+    crc.run()
+
+    assert order == ["capture", "process"]
+
+
 def test_whoami_startup_retries_transient_failure(monkeypatch):
     """Startup whoami should tolerate transient network failures."""
     calls = []
@@ -9946,35 +9995,39 @@ def test_load_whoami_defaults_archive_language_to_empty_when_absent(monkeypatch)
 def test_reply_language_line_prefers_presence_locale(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
     # presence locale (zh) must win over archive_language (en): the shared helper
-    # returns the 简体中文 policy line, confirming locale precedence.
+    # returns the Chinese rendering, confirming locale precedence.
     line = crc._reply_language_line({"locale": "zh-Hans"})
-    assert "简体中文" in line
-    assert "English" not in line
+    assert line.startswith("回复语言规则：\n根据用户最新一条消息判断回复语言。")
+    assert "Reply language rule" not in line
 
 
 def test_reply_language_line_falls_back_to_archive_language(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
     line = crc._reply_language_line(None)
-    assert "Default reply language: English" in line
+    assert line.startswith(
+        "Reply language rule:\nDetermine the reply language from the user's latest message."
+    )
 
 
 def test_reply_language_line_treats_empty_locale_as_missing(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
     line = crc._reply_language_line({"locale": ""})
-    assert "Default reply language: English" in line
+    assert line.startswith(
+        "Reply language rule:\nDetermine the reply language from the user's latest message."
+    )
 
 
 def test_reply_language_line_defaults_to_chinese_with_no_locale_or_archive(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": ""})
     line = crc._reply_language_line(None)
-    assert "中文" in line
+    assert line.startswith("回复语言规则：\n根据用户最新一条消息判断回复语言。")
     assert "Always reply in the user's own language." != line
 
 
 def test_reply_language_line_defaults_to_chinese_when_archive_language_key_missing(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {})
     line = crc._reply_language_line(None)
-    assert "中文" in line
+    assert line.startswith("回复语言规则：\n根据用户最新一条消息判断回复语言。")
 
 
 # ---------------------------------------------------------------------------
@@ -11863,7 +11916,7 @@ def test_foreground_prepend_includes_language_line_and_time(monkeypatch):
     crc._last_interaction_unix = 0.0
     out = crc._prepend_time_anchor_foreground("hello", 1000.0)
     assert "current_time:" in out
-    assert "Reply language policy" in out  # language line now wired into foreground
+    assert "Reply language rule" in out  # language line now wired into foreground
     assert out.rstrip().endswith("hello")
 
 

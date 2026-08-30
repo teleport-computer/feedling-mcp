@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Feedling 发版测试方案（Release Testing Protocol）
 
 > 2026-07-17 · Seven 定框架，Claude 落地。与 `docs/testing/TESTING.md`（开发循环的
@@ -270,6 +274,24 @@ usr_fee1 教训：模型是复读机——转写标签/prompt 术语/硬编码�
   显式声明"仅指令内标记"；
 - 改称谓/术语时全仓 grep（backend/enclave/consumer/iOS xcstrings）——usr_fee1
   第一轮就漏了 enclave readside 的 legacy 路径。
+
+### 4.8 上游 AUP 闸（注入文本会不会被**模型厂商**拒收）
+
+2026-08-16→08-18 上游收紧审查，`self_thinking.INSTRUCTION` 被判 "reverse engineering
+or duplicating model outputs"。resident + claude-code 用户从此每一轮都拿兜底话，
+**而后端一无所知**（driver 不上报、runtime_error 404、last_runtime_error 单值覆盖）
+——用户先撞见，我们后知道。§4.7 管的是"这些词会不会出现在用户屏幕上"，
+本节管的是"这些词会不会让整轮请求根本发不出去"。
+
+- **触发器**：bump `agent_protocol_core` / `memgarden` pin，或改动 `self_thinking`
+  任一文案 → 必跑 `python3 tools/e2e/aup_gate_probe.py`；
+- **只有 `OVERALL: PASS` 才算放行**，且这句话**在代码里成立**：默认 qualification 模式下
+  任一非 PASS ⇒ `rc=1`（与 `deep.py` 同口径），`--diagnostic` 才容忍 `BLOCKED_EVIDENCE`。
+  `BLOCKED_EVIDENCE` 的意思是**这一轮没量到闸的状态**（canary 失去判别力），不是绿；
+- **必须跑在与 E2E rig 同构的环境**（真实订阅登录态的 `claude` CLI）。裸 CI runner
+  上同一段文案可能根本不被拒——那时探针给的 PASS 不含信息；
+- 定位被拒段落只能**逐段实测**，不许读文本推理：该闸对文本**非单调**，
+  单独喂通过的片段放回整段可能仍被拒（T409 实测，读文本推理 0/3）。
 
 ## 5. VPS harness × 功能矩阵 E2E（新功能触碰 consumer 时加跑）
 

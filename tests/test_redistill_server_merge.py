@@ -62,13 +62,14 @@ def _seed(user_id: str, blobs: dict, card: dict) -> None:
         "relationship_anchor_source": "test",
     }
     card.clear()
+    retired_field = "language_" + "preference"
     card.update({
         "agent_name": "旧名",
         "self_introduction": "旧介绍",
         "tone_style": "旧语气",
         "custom_persona_prompt": "用户亲手写的 persona,不可丢",
         "user_preferred_name": "老张",
-        "language_preference": "中文",
+        retired_field: "中文",
         "relationship_anchor": "大学室友",
         "stable_definitions": ["老板=我上司"],
     })
@@ -143,13 +144,16 @@ def test_redistill_merge_preserves_unaddressed_custom_persona_prompt(monkeypatch
     assert card["self_introduction"] == "旧介绍"
 
 
-def test_redistill_merge_lands_all_5_user_layer_fields(monkeypatch):
-    """B2: a distill output that addresses all 5 user-layer fields at once must
-    land every one of them (the server-side merge in
+def test_redistill_merge_lands_supported_user_layer_fields_only(monkeypatch):
+    """A distill output addressing user-layer fields lands only supported keys.
+
+    The server-side merge in
     genesis.service._merge_identity_replace_payload is generic over
     card_policy's field lists, so this is really "the distiller's output made
     it into `identity` at all" — see test_identity_distill_prompt.py for the
-    distiller/parser side)."""
+    distiller/parser side.
+    """
+    retired_field = "language_" + "preference"
     user_id = "u_redistill_merge_all_user_layer"
     blobs: dict[tuple[str, str], dict] = {}
     card: dict = {}
@@ -164,7 +168,7 @@ def test_redistill_merge_lands_all_5_user_layer_fields(monkeypatch):
         {"identity": {
             "user_preferred_name": "老王",
             "custom_persona_prompt": "新的 persona 指令",
-            "language_preference": "英文",
+            retired_field: "英文",
             "relationship_anchor": "前同事",
             "stable_definitions": ["新术语=新含义"],
         }},
@@ -174,7 +178,7 @@ def test_redistill_merge_lands_all_5_user_layer_fields(monkeypatch):
     assert status == "updated"
     assert card["user_preferred_name"] == "老王"
     assert card["custom_persona_prompt"] == "新的 persona 指令"
-    assert card["language_preference"] == "英文"
+    assert retired_field not in card
     assert card["relationship_anchor"] == "前同事"
     assert card["stable_definitions"] == ["新术语=新含义"]
     # unaddressed core fields survive untouched
@@ -182,11 +186,13 @@ def test_redistill_merge_lands_all_5_user_layer_fields(monkeypatch):
     assert card["tone_style"] == "旧语气"
 
 
-def test_redistill_merge_material_without_user_layer_fields_preserves_existing(monkeypatch):
-    """Grounding + no-clobber: material that never mentions the 5 user-layer
+def test_redistill_merge_material_without_user_layer_fields_preserves_supported_existing(monkeypatch):
+    """Grounding + no-clobber: material that never mentions the 4 user-layer
     fields (the distiller found no signal for them) must leave the existing
     card's values exactly as they were — same "没提的字段永不丢失" rule as any
-    other field."""
+    other supported field. A normal rewrite does not carry the retired key.
+    """
+    retired_field = "language_" + "preference"
     user_id = "u_redistill_merge_no_user_layer_signal"
     blobs: dict[tuple[str, str], dict] = {}
     card: dict = {}
@@ -208,7 +214,7 @@ def test_redistill_merge_material_without_user_layer_fields_preserves_existing(m
     assert card["agent_name"] == "新名"
     assert card["user_preferred_name"] == "老张"
     assert card["custom_persona_prompt"] == "用户亲手写的 persona,不可丢"
-    assert card["language_preference"] == "中文"
+    assert retired_field not in card
     assert card["relationship_anchor"] == "大学室友"
     assert card["stable_definitions"] == ["老板=我上司"]
 

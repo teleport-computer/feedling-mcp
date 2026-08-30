@@ -1,0 +1,295 @@
+{
+  "schema_version": 1,
+  "sites": [
+    {
+      "count": 1,
+      "path": "backend/accounts/accounts_core.py",
+      "reason": "access-mode mutation uses DB-backed control state"
+    },
+    {
+      "count": 1,
+      "path": "backend/accounts/accounts_core.py",
+      "reason": "onboarding route is a direct blob read"
+    },
+    {
+      "count": 2,
+      "path": "backend/accounts/auth_core.py",
+      "reason": "authentication returns identity, locks, and waiters"
+    },
+    {
+      "count": 1,
+      "path": "backend/admin/admin_core.py",
+      "reason": "runtime allowlist reconciliation is DB-backed"
+    },
+    {
+      "count": 2,
+      "path": "backend/admin/admin_core.py",
+      "reason": "runtime mode control is DB-backed"
+    },
+    {
+      "count": 1,
+      "path": "backend/agent_runtime/spawners.py",
+      "reason": "web settings are direct blob reads"
+    },
+    {
+      "count": 1,
+      "path": "backend/agent_runtime/supervisor.py",
+      "reason": "notice resolution is a durable log write"
+    },
+    {
+      "count": 1,
+      "path": "backend/agent_runtime/supervisor.py",
+      "reason": "notices are durable log writes"
+    },
+    {
+      "count": 1,
+      "path": "backend/asgi_app.py",
+      "reason": "debug trace is a durable log write"
+    },
+    {
+      "count": 1,
+      "path": "backend/genesis/worker.py",
+      "reason": "genesis failure handling uses direct DB/blob helpers"
+    },
+    {
+      "count": 1,
+      "path": "backend/genesis/worker.py",
+      "reason": "genesis reaper uses direct DB/blob helpers"
+    },
+    {
+      "count": 1,
+      "path": "backend/genesis/worker.py",
+      "reason": "genesis reclaim uses direct DB/blob helpers"
+    },
+    {
+      "count": 1,
+      "path": "backend/genesis/worker.py",
+      "reason": "genesis state and tracing use direct DB/blob helpers"
+    },
+    {
+      "count": 1,
+      "path": "backend/genesis/worker.py",
+      "reason": "resident genesis reaper uses direct DB/blob helpers"
+    },
+    {
+      "count": 1,
+      "path": "backend/genesis/worker.py",
+      "reason": "unclaimed genesis reaper uses direct DB/blob helpers"
+    },
+    {
+      "count": 1,
+      "path": "backend/hosted/runtime_reconciler.py",
+      "reason": "runtime control tuple is DB-backed"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/jobs_store.py",
+      "reason": "terminal reply is a cold-safe committed write"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/profile_store.py",
+      "reason": "envelope construction needs identity only"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "capture scheduler state is DB/blob backed"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "capture state is a direct blob read"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "capture status uses direct DB/blob helpers"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "checkpoint envelope construction needs identity only"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "debug trace is a durable log write"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "dream scheduler state is DB/blob backed"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "dream status uses direct DB/blob helpers"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "file capability reads exact DB/object rows"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "identity capability uses durable helpers"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "image capability reads exact DB rows"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "image generation output is a cold-safe write"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "legacy reply effect is a cold-safe committed write"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "memory actions use durable helpers"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "memory envelope construction needs identity only"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "memory quoted-card reads are DB/readside backed"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "profile memory reads use DB/readside helpers"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "provider configuration is a direct blob read"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "reply effect is a cold-safe committed write"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "runtime mode dependency is DB-backed"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "schedule capability uses durable helpers"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "scheduled wake control is DB-backed"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "scheduler runtime mode is DB-backed"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "screen decrypt reads an exact frame row"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "screen-watch runtime fence is DB-backed"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "summary envelope construction needs identity only"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "trajectory envelope construction needs identity only"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "transactional reply uses cold-safe post-commit reconciliation"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "turn memory reads use DB/readside helpers"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "wake gate state uses direct DB/blob helpers"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "web-tools setting is a direct blob read"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "workspace batch capability uses exact DB rows"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "workspace capability uses exact DB rows"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/worker.py",
+      "reason": "chat lane reads bounded DB inputs and durable cursors"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/worker.py",
+      "reason": "wake lane reads bounded DB inputs and durable cursors"
+    },
+    {
+      "count": 1,
+      "path": "backend/perception/service.py",
+      "reason": "V2 perception enqueue uses durable helpers"
+    },
+    {
+      "count": 1,
+      "path": "backend/perception/service.py",
+      "reason": "activation readiness uses direct DB/blob helpers"
+    },
+    {
+      "count": 1,
+      "path": "backend/perception/service.py",
+      "reason": "legacy perception enqueue is a cold-safe write"
+    },
+    {
+      "count": 1,
+      "path": "backend/perception/service.py",
+      "reason": "perception runtime fence is DB-backed"
+    },
+    {
+      "count": 1,
+      "path": "backend/perception/service.py",
+      "reason": "proactive settings are a direct blob read"
+    },
+    {
+      "count": 1,
+      "path": "backend/voice/routes_asgi.py",
+      "reason": "voice archive/card writes are cold-safe before cleanup refresh"
+    }
+  ]
+}

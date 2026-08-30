@@ -181,7 +181,7 @@ _AGENT_PROMPT_FALLBACK_COMMANDS = (
     "python {io_cli} memory-patch --id <memory_id> [--summary <text>] [--content <text>] [--bucket <name>] [--threads <tag>] [--importance <0-1>] [--pulse <0-1>] [--type <fact|event|quote|moment>] [--source <label>] [--reason <text>]\n"
     "python {io_cli} memory-delete --id <memory_id> [--reason <text>]\n"
     "python {io_cli} identity-read\n"
-    "python {io_cli} identity-write [--agent-name <name>] [--self-introduction <text>] [--category <text>] [--user-preferred-name <text>] [--agent-role <text>] [--tone-style <text>] [--custom-persona-prompt <text>] [--language-preference <text>] [--relationship-anchor <text>] [--relationship-days <n>] [--signature <line>] [--add-signature <text>] [--remove-signature <text>] [--replace-signatures <text>] [--add-boundary <text>] [--remove-boundary <text>] [--replace-boundaries <text>] [--add-do-not-say <text>] [--remove-do-not-say <text>] [--replace-do-not-say <text>] [--add-stable-definition <text>] [--remove-stable-definition <text>] [--replace-stable-definitions <text>] [--nudge-dimension <name:±n>]\n"
+    "python {io_cli} identity-write [--agent-name <name>] [--self-introduction <text>] [--category <text>] [--user-preferred-name <text>] [--agent-role <text>] [--tone-style <text>] [--custom-persona-prompt <text>] [--relationship-anchor <text>] [--relationship-days <n>] [--signature <line>] [--add-signature <text>] [--remove-signature <text>] [--replace-signatures <text>] [--add-boundary <text>] [--remove-boundary <text>] [--replace-boundaries <text>] [--add-do-not-say <text>] [--remove-do-not-say <text>] [--replace-do-not-say <text>] [--add-stable-definition <text>] [--remove-stable-definition <text>] [--replace-stable-definitions <text>] [--nudge-dimension <name:±n>]\n"
     "python {io_cli} screen-recent [--limit <n>]\n"
     "python {io_cli} screen-read [--frame-id <id>] [--include-image]\n"
     "python {io_cli} photo-recent [--limit <n>]\n"
@@ -1111,9 +1111,11 @@ def _web_visible_for_user(user_id: str) -> bool:
         from web import settings_core as web_settings_core
 
         return bool(
-            web_settings_core.get_settings(core_store.get_store(user_id)).get(
-                "effective"
-            )
+            web_settings_core.get_settings(
+                core_store.get_store_shell_only(
+                    user_id, reason="web settings are direct blob reads"
+                )
+            ).get("effective")
         )
     except Exception as e:  # noqa: BLE001 — advertised-verb display must never block a spawn
         log.warning("web-visibility read failed for %s (advertising off): %s", user_id, e)

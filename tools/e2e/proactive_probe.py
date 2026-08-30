@@ -216,7 +216,6 @@ def _install_quality_identity(c) -> None:
             "主动开口时称呼用户七七，并自然包含短语‘此刻陪你’；"
             "用一到两句简体中文，提到当前采用上海时区，不提模型、供应商或系统。"
         ),
-        "language_preference": "zh-Hans",
         "signature": ["此刻陪你"],
         "dimensions": [{"name": "温和", "value": 82, "description": "具体而不打扰"}],
     }, action="proactive quality")

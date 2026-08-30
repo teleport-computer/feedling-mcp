@@ -15,11 +15,12 @@ from agent_protocol_core import self_thinking  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
 from model_api_runtime.v2 import tool_loop  # noqa: E402
 from model_api_runtime.v2 import worker  # noqa: E402
-from model_api_runtime.v2 import language_follow  # noqa: E402
+from chat import language_follow  # noqa: E402
 from model_api_runtime.v2 import prompt_frontier  # noqa: E402
 from model_api_runtime.v2 import summary_frontier  # noqa: E402
 from notices import catalog as notices_catalog  # noqa: E402
 from provider_types import ToolCall, ToolExchange, ToolResult  # noqa: E402
+import provider_attempt_ledger  # noqa: E402
 
 
 def test_thinking_extra_preserves_plaintext_body():
@@ -171,6 +172,44 @@ def test_provider_attempt_ledger_inherits_job_lane_when_event_omits_it(monkeypat
     assert captured["kwargs"]["provider"] == "anthropic"
 
 
+def test_provider_attempt_ledger_receives_closed_failure_facts(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        provider_attempt_ledger,
+        "record_runtime_attempt",
+        lambda user_id, **kwargs: captured.update(user_id=user_id, **kwargs),
+    )
+
+    worker._note_provider_attempt(
+        "u_fallback",
+        "provider_error",
+        {
+            "lane": "chat",
+            "error_class": "ProviderError",
+            "status_code": 422,
+            "fallback_reason": "tool_schema_rejected",
+            "provider_error_class": "provider_config",
+            "dur_ms": 321.5,
+        },
+        job_id=42,
+        provider="openrouter",
+        model="relay-model",
+    )
+
+    assert captured["user_id"] == "u_fallback"
+    assert captured["parent_key"] == "v2job:42"
+    assert captured["provider"] == "openrouter"
+    assert captured["model"] == "relay-model"
+    assert captured["status_code"] == 422
+    assert captured["fallback_reason"] == "tool_schema_rejected"
+    assert captured["provider_error_class"] == "provider_config"
+    assert captured["dur_ms"] == 321.5
+    assert (
+        provider_attempt_ledger.VALID_FALLBACK_REASONS
+        == tool_loop._PROVIDER_ATTEMPT_FALLBACK_REASONS
+    )
+
+
 def _minimal_deps():
     return worker.TurnDeps(
         read_messages=lambda _uid: [],
@@ -202,14 +241,6 @@ def test_writing_system_classifier_requires_strictly_more_than_sixty_percent():
     assert language_follow.classify_writing_system("汉汉汉汉汉汉汉abc") == "han"
 
 
-def test_language_correction_instruction_is_pinned_verbatim():
-    assert language_follow.CORRECTION_INSTRUCTION == (
-        "你刚才这条回复,语言和这个人正在说的语言对不上。除非这个人要求过你用别的语言,"
-        "否则用这个人的语言把同一条回复重说一遍:内容、语气、分寸都不变,只换语言。"
-        "要是这个人确实要求过现在这种语言,就原样重复原回复。"
-    )
-
-
 def test_latest_user_writing_system_skips_short_newest_message():
     rows = [
         {
@@ -223,7 +254,7 @@ def test_latest_user_writing_system_skips_short_newest_message():
     assert worker._latest_user_writing_system(rows) == "han"
 
 
-def test_language_follow_trace_is_closed_enum_only_and_admin_readable():
+def test_language_follow_trace_is_observation_only_and_admin_readable():
     from admin import data_track
 
     captured = {}
@@ -248,12 +279,9 @@ def test_language_follow_trace_is_closed_enum_only_and_admin_readable():
         "reply_script": "latin",
         "outcome": "mismatch",
         "lane": "chat",
-        "correction_attempted": False,
-        "correction_outcome": "skipped",
     }
     assert set(captured["detail"]) == {
         "user_script", "reply_script", "outcome", "lane",
-        "correction_attempted", "correction_outcome",
     }
     assert "私密中文正文" not in str(captured)
     assert "private reply body" not in str(captured)
@@ -265,12 +293,12 @@ def test_language_follow_trace_is_closed_enum_only_and_admin_readable():
     malicious["detail"] = {
         **captured["detail"],
         "reply_script": "private reply body",
-        "correction_outcome": "private correction detail",
+        "correction_outcome": "corrected",
         "body": "private user text",
     }
     redacted = data_track._debug_event_public_json(malicious)["detail"]
     assert redacted["reply_script"] == "<redacted string len=18>"
-    assert redacted["correction_outcome"] == "<redacted string len=25>"
+    assert redacted["correction_outcome"] == "<redacted string len=9>"
     assert redacted["body"] == "<redacted string len=17>"
 
 
@@ -292,8 +320,6 @@ def test_language_follow_trace_skips_without_anchor_and_never_raises():
         "reply_script": "latin",
         "outcome": "skip",
         "lane": "wake",
-        "correction_attempted": False,
-        "correction_outcome": "skipped",
     }
 
     asyncio.run(worker._emit_reply_language_follow_trace(
@@ -674,15 +700,6 @@ def test_self_thinking_internal_terms_are_derived_from_tool_specs():
     assert worker._self_thinking_internal_term("我会聊天") is None
 
 
-def test_self_thinking_language_mismatch_is_closed_and_content_free():
-    assert worker._self_thinking_language_mismatch(
-        "Let me check this carefully", [{"role": "user", "content": "请帮我看看这个内容好吗"}]
-    ) == ("han", "latin")
-    assert worker._self_thinking_language_mismatch(
-        "我来认真看看这个内容好吗", [{"role": "user", "content": "请帮我看看这个内容好吗"}]
-    ) is None
-
-
 def test_self_thinking_absent_correction_reuses_shared_contract_without_downshift():
     instruction = worker._SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION
 
@@ -981,11 +998,7 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
     deps.emit_debug_trace = lambda user_id, event_type, **fields: captured.append(
         {"user_id": user_id, "type": event_type, **fields}
     )
-    trace = worker._provider_tool_surface_callback(
-        deps, "u_roundtrip_trace", "chat", "trace-roundtrip"
-    )
-    assert trace is not None
-    asyncio.run(trace({
+    provider_surface_input = {
         "round": 2,
         "candidate_tool_count": 4,
         "sent_tool_count": 0,
@@ -998,15 +1011,84 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
         "terminal_text_round_reason": "force_text_fallback",
         "force_text_fallback_reason": "tool_schema_rejected",
         "empty_response_recovery": False,
-    }))
-    asyncio.run(trace.emit_summary())
+        "call_rejection_reasons": [
+            "missing_tool_call_id",
+            "private model text",
+            "missing_tool_call_id",
+            "unclassified_rejection",
+        ],
+        "withdrawn_platform_tool_names": ["workspace_write"],
+        "withdrawn_tool_counts": {"platform": 1, "mcp": 0, "other": 0},
+        "unavailable_platform_tool_call_labels": [
+            "tool_withdrawn:workspace_write"
+        ],
+        "unavailable_tool_call_counts": {
+            "platform": 1,
+            "mcp": 0,
+            "other": 0,
+        },
+    }
+    provider_surface_lanes = (
+        "chat",
+        *sorted(worker._WAKE_LANES),
+        "other",
+    )
+    for candidate_lane in provider_surface_lanes:
+        trace = worker._provider_tool_surface_callback(
+            deps,
+            "u_roundtrip_trace",
+            candidate_lane,
+            f"trace-roundtrip-{candidate_lane}",
+        )
+        assert trace is not None
+        asyncio.run(trace(provider_surface_input))
+        asyncio.run(trace.emit_summary())
+
+    surface_by_lane = {
+        event["detail"]["lane"]: event
+        for event in captured
+        if event["type"] == "mcp.surface.provider"
+    }
+    actual_worker_added_keys_by_lane = {
+        lane: set(surface_by_lane[lane]["detail"]).difference(
+            provider_surface_input
+        )
+        for lane in provider_surface_lanes
+    }
+    expected_worker_added_keys_by_lane = {
+        lane: set(worker._provider_tool_surface_added_detail_keys(lane))
+        for lane in provider_surface_lanes
+    }
+    # Select the worst real callback/helper disagreement across the same closed
+    # lane vocabulary consumed by production.  With no disagreement, the
+    # largest production shape remains the representative below; a lane-only
+    # callback bypass becomes the representative and reaches the equality guard.
+    trace_lane = max(
+        provider_surface_lanes,
+        key=lambda lane: (
+            len(
+                actual_worker_added_keys_by_lane[lane]
+                ^ expected_worker_added_keys_by_lane[lane]
+            ),
+            len(actual_worker_added_keys_by_lane[lane]),
+        ),
+    )
+    actual_worker_added_keys = actual_worker_added_keys_by_lane[trace_lane]
+    assert (
+        actual_worker_added_keys
+        == expected_worker_added_keys_by_lane[trace_lane]
+    )
 
     roundtrip = next(
-        event for event in captured if event["type"] == "mcp.roundtrip.provider"
+        event
+        for event in captured
+        if event["type"] == "mcp.roundtrip.provider"
+        and event["detail"]["lane"] == trace_lane
     )
-    assert roundtrip["trace_id"] == "trace-roundtrip"
+    assert roundtrip["trace_id"] == f"trace-roundtrip-{trace_lane}"
     public = data_track._debug_event_public_json(roundtrip)
-    assert public["detail"]["lane"] == "chat"
+    assert public["detail"]["lane"] == trace_lane
+    assert public["detail"]["wake_kind"] == trace_lane
     assert public["detail"]["terminal_text_round_reason"] == (
         "force_text_fallback"
     )
@@ -1014,15 +1096,52 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
         "tool_schema_rejected"
     )
 
-    surface = next(
-        event for event in captured if event["type"] == "mcp.surface.provider"
-    )
-    assert surface["trace_id"] == "trace-roundtrip"
+    surface = surface_by_lane[trace_lane]
+    assert surface["trace_id"] == f"trace-roundtrip-{trace_lane}"
+    assert surface["detail"]["call_rejection_reasons"] == [
+        "missing_tool_call_id",
+        "unclassified_rejection",
+    ]
+    assert surface["detail"]["withdrawn_platform_tool_names"] == [
+        "workspace_write"
+    ]
+    assert surface["detail"]["withdrawn_tool_counts"] == {
+        "platform": 1,
+        "mcp": 0,
+        "other": 0,
+    }
+    assert surface["detail"]["unavailable_platform_tool_call_labels"] == [
+        "tool_withdrawn:workspace_write"
+    ]
+    assert surface["detail"]["unavailable_tool_call_counts"] == {
+        "platform": 1,
+        "mcp": 0,
+        "other": 0,
+    }
+    assert "private model text" not in str(surface)
     surface_public = data_track._debug_event_public_json(surface)["detail"]
+    assert surface_public["call_rejection_reasons"] == [
+        "missing_tool_call_id",
+        "unclassified_rejection",
+    ]
     assert surface_public["lane"].startswith("<redacted string")
     assert surface_public["terminal_text_round_reason"].startswith(
         "<redacted string"
     )
+    forged_surface = {
+        **surface,
+        "detail": {
+            **surface["detail"],
+            "call_rejection_reasons": [
+                "missing_tool_call_id",
+                "private model text",
+            ],
+        },
+    }
+    forged_reasons = data_track._debug_event_public_json(forged_surface)[
+        "detail"
+    ]["call_rejection_reasons"]
+    assert all(value.startswith("<redacted string") for value in forged_reasons)
 
 
 def test_provider_roundtrip_trace_normalizes_unknowns_and_admin_redacts_forgery():

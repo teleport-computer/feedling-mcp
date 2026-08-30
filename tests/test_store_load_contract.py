@@ -3,87 +3,38 @@
 from __future__ import annotations
 
 import ast
+import difflib
+import json
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKEND_ROOT = REPO_ROOT / "backend"
+sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(BACKEND_ROOT))
+
+from tools.store_shell_only_inventory import (  # noqa: E402
+    derive_shell_only_sites,
+    render_inventory,
+)
+
+
+SHELL_ONLY_SNAPSHOT = REPO_ROOT / "tests/fixtures/store_shell_only_sites.json"
 
 
 @dataclass(frozen=True)
 class CallSite:
     path: str
     lineno: int
-    has_require_keyword: bool = False
+    has_effective_require: bool = False
+    review_reason: str = ""
 
 
-# Every implicit get_store call retained after migration must be reviewed here.
-# The line number intentionally makes code movement require a fresh review.
-SHELL_ONLY_GET_STORE_SITES: dict[tuple[str, int], str] = {
-    ("backend/accounts/accounts_core.py", 226): "access-mode mutation uses DB-backed control state",
-    ("backend/accounts/accounts_core.py", 263): "onboarding route is a direct blob read",
-    ("backend/accounts/auth_core.py", 166): "authentication returns identity, locks, and waiters",
-    ("backend/accounts/auth_core.py", 179): "authentication returns identity, locks, and waiters",
-    ("backend/admin/admin_core.py", 879): "runtime mode control is DB-backed",
-    ("backend/admin/admin_core.py", 899): "runtime mode control is DB-backed",
-    ("backend/admin/admin_core.py", 935): "runtime allowlist reconciliation is DB-backed",
-    ("backend/agent_runtime/spawners.py", 1114): "web settings are direct blob reads",
-    ("backend/agent_runtime/supervisor.py", 242): "notices are durable log writes",
-    ("backend/agent_runtime/supervisor.py", 268): "notice resolution is a durable log write",
-    ("backend/asgi_app.py", 178): "debug trace is a durable log write",
-    ("backend/genesis/worker.py", 1910): "genesis state and tracing use direct DB/blob helpers",
-    ("backend/genesis/worker.py", 2036): "genesis reaper uses direct DB/blob helpers",
-    ("backend/genesis/worker.py", 2097): "genesis reclaim uses direct DB/blob helpers",
-    ("backend/genesis/worker.py", 2141): "resident genesis reaper uses direct DB/blob helpers",
-    ("backend/genesis/worker.py", 2210): "unclaimed genesis reaper uses direct DB/blob helpers",
-    ("backend/genesis/worker.py", 2272): "genesis failure handling uses direct DB/blob helpers",
-    ("backend/hosted/runtime_reconciler.py", 54): "runtime control tuple is DB-backed",
-    ("backend/model_api_runtime/v2/jobs_store.py", 4325): "terminal reply is a cold-safe committed write",
-    ("backend/model_api_runtime/v2/profile_store.py", 227): "envelope construction needs identity only",
-    ("backend/model_api_runtime/v2/serve_worker.py", 839): "provider configuration is a direct blob read",
-    ("backend/model_api_runtime/v2/serve_worker.py", 1425): "memory quoted-card reads are DB/readside backed",
-    ("backend/model_api_runtime/v2/serve_worker.py", 1785): "summary envelope construction needs identity only",
-    ("backend/model_api_runtime/v2/serve_worker.py", 1844): "checkpoint envelope construction needs identity only",
-    ("backend/model_api_runtime/v2/serve_worker.py", 1886): "wake gate state uses direct DB/blob helpers",
-    ("backend/model_api_runtime/v2/serve_worker.py", 1916): "scheduled wake control is DB-backed",
-    ("backend/model_api_runtime/v2/serve_worker.py", 2060): "image capability reads exact DB rows",
-    ("backend/model_api_runtime/v2/serve_worker.py", 2162): "screen decrypt reads an exact frame row",
-    ("backend/model_api_runtime/v2/serve_worker.py", 2486): "file capability reads exact DB/object rows",
-    ("backend/model_api_runtime/v2/serve_worker.py", 2694): "image generation output is a cold-safe write",
-    ("backend/model_api_runtime/v2/serve_worker.py", 2882): "profile memory reads use DB/readside helpers",
-    ("backend/model_api_runtime/v2/serve_worker.py", 2978): "turn memory reads use DB/readside helpers",
-    ("backend/model_api_runtime/v2/serve_worker.py", 3141): "memory actions use durable helpers",
-    ("backend/model_api_runtime/v2/serve_worker.py", 3204): "memory envelope construction needs identity only",
-    ("backend/model_api_runtime/v2/serve_worker.py", 3219): "capture scheduler state is DB/blob backed",
-    ("backend/model_api_runtime/v2/serve_worker.py", 3250): "dream scheduler state is DB/blob backed",
-    ("backend/model_api_runtime/v2/serve_worker.py", 3346): "screen-watch runtime fence is DB-backed",
-    ("backend/model_api_runtime/v2/serve_worker.py", 3609): "reply effect is a cold-safe committed write",
-    ("backend/model_api_runtime/v2/serve_worker.py", 3623): "legacy reply effect is a cold-safe committed write",
-    ("backend/model_api_runtime/v2/serve_worker.py", 3647): "transactional reply uses cold-safe post-commit reconciliation",
-    ("backend/model_api_runtime/v2/serve_worker.py", 3932): "identity capability uses durable helpers",
-    ("backend/model_api_runtime/v2/serve_worker.py", 4027): "schedule capability uses durable helpers",
-    ("backend/model_api_runtime/v2/serve_worker.py", 4081): "workspace capability uses exact DB rows",
-    ("backend/model_api_runtime/v2/serve_worker.py", 4163): "workspace batch capability uses exact DB rows",
-    ("backend/model_api_runtime/v2/serve_worker.py", 4681): "trajectory envelope construction needs identity only",
-    ("backend/model_api_runtime/v2/serve_worker.py", 4730): "capture state is a direct blob read",
-    ("backend/model_api_runtime/v2/serve_worker.py", 4772): "dream status uses direct DB/blob helpers",
-    ("backend/model_api_runtime/v2/serve_worker.py", 4802): "capture status uses direct DB/blob helpers",
-    ("backend/model_api_runtime/v2/serve_worker.py", 5011): "debug trace is a durable log write",
-    ("backend/model_api_runtime/v2/serve_worker.py", 5070): "runtime mode dependency is DB-backed",
-    ("backend/model_api_runtime/v2/serve_worker.py", 5079): "web-tools setting is a direct blob read",
-    ("backend/model_api_runtime/v2/serve_worker.py", 5154): "scheduler runtime mode is DB-backed",
-    ("backend/model_api_runtime/v2/worker.py", 8878): "wake lane reads bounded DB inputs and durable cursors",
-    ("backend/model_api_runtime/v2/worker.py", 13695): "chat lane reads bounded DB inputs and durable cursors",
-    ("backend/perception/service.py", 89): "perception runtime fence is DB-backed",
-    ("backend/perception/service.py", 652): "proactive settings are a direct blob read",
-    ("backend/perception/service.py", 720): "activation readiness uses direct DB/blob helpers",
-    ("backend/perception/service.py", 858): "V2 perception enqueue uses durable helpers",
-    ("backend/perception/service.py", 1018): "legacy perception enqueue is a cold-safe write",
-    ("backend/voice/routes_asgi.py", 595): "voice archive/card writes are cold-safe before cleanup refresh",
-}
+# Shell-only store calls carry their non-empty review reason at the call site.
+# The scanner below derives the complete inventory directly from production AST.
 
 
 def _python_files():
@@ -96,6 +47,39 @@ def _call_name(call: ast.Call) -> str:
         return func.id
     if isinstance(func, ast.Attribute):
         return func.attr
+    return ""
+
+
+def _is_statically_falsy(node: ast.expr) -> bool:
+    if isinstance(node, ast.Constant):
+        return not bool(node.value)
+    if isinstance(node, (ast.List, ast.Set, ast.Tuple)):
+        return not node.elts
+    if isinstance(node, ast.Dict):
+        return not node.keys
+    return (
+        isinstance(node, ast.Call)
+        and _call_name(node) in {"dict", "frozenset", "list", "set", "tuple"}
+        and not node.args
+        and not node.keywords
+    )
+
+
+def _has_effective_require(call: ast.Call) -> bool:
+    return any(
+        keyword.arg == "require" and not _is_statically_falsy(keyword.value)
+        for keyword in call.keywords
+    )
+
+
+def _review_reason(call: ast.Call) -> str:
+    for keyword in call.keywords:
+        if (
+            keyword.arg == "reason"
+            and isinstance(keyword.value, ast.Constant)
+            and isinstance(keyword.value.value, str)
+        ):
+            return keyword.value.value.strip()
     return ""
 
 
@@ -113,31 +97,135 @@ def _find_calls(name: str, *, exclude: set[str] | None = None) -> list[CallSite]
                     CallSite(
                         path=relative,
                         lineno=node.lineno,
-                        has_require_keyword=any(
-                            keyword.arg == "require" for keyword in node.keywords
-                        ),
+                        has_effective_require=_has_effective_require(node),
+                        review_reason=_review_reason(node),
                     )
                 )
     return sorted(sites, key=lambda site: (site.path, site.lineno))
 
 
 def test_no_direct_user_store_construction():
-    assert _find_calls(
-        "UserStore", exclude={"backend/core/store.py"}
-    ) == []
+    assert _find_calls("UserStore", exclude={"backend/core/store.py"}) == []
 
 
 def test_get_store_sites_are_explicit_or_reviewed_shell_only():
     implicit = {
         (site.path, site.lineno)
         for site in _find_calls("get_store")
-        if site.path != "backend/core/store.py" and not site.has_require_keyword
+        if site.path != "backend/core/store.py" and not site.has_effective_require
     }
-    assert implicit == set(SHELL_ONLY_GET_STORE_SITES), (
-        "classify each implicit get_store call as an explicit section load or "
-        "a reviewed shell-only site"
+    assert implicit == set(), (
+        "replace each implicit get_store call with a real section requirement "
+        "or get_store_shell_only(..., reason=...)"
     )
-    assert all(reason.strip() for reason in SHELL_ONLY_GET_STORE_SITES.values())
+    shell_only = _find_calls("get_store_shell_only", exclude={"backend/core/store.py"})
+    assert shell_only, "shell-only scanner must find production declarations"
+    assert {
+        "backend/accounts/accounts_core.py",
+        "backend/model_api_runtime/v2/serve_worker.py",
+        "backend/voice/routes_asgi.py",
+    } <= {site.path for site in shell_only}
+    assert all(site.review_reason for site in shell_only)
+
+
+def test_shell_only_inventory_matches_reviewed_snapshot():
+    expected = SHELL_ONLY_SNAPSHOT.read_text()
+    actual = render_inventory(REPO_ROOT)
+    diff = "".join(
+        difflib.unified_diff(
+            expected.splitlines(keepends=True),
+            actual.splitlines(keepends=True),
+            fromfile="reviewed snapshot",
+            tofile="derived inventory",
+        )
+    )
+
+    assert actual == expected, (
+        "shell-only Store call inventory changed; review the semantic diff, then "
+        "run `python tools/store_shell_only_inventory.py --write` to accept it:\n"
+        f"{diff}"
+    )
+
+
+def test_shell_only_snapshot_matches_independent_scanner():
+    snapshot = json.loads(SHELL_ONLY_SNAPSHOT.read_text())
+    snapshot_counts = Counter(
+        {
+            (entry["path"], entry["reason"]): entry["count"]
+            for entry in snapshot["sites"]
+        }
+    )
+    independently_scanned = Counter(
+        (site.path, site.review_reason)
+        for site in _find_calls(
+            "get_store_shell_only", exclude={"backend/core/store.py"}
+        )
+    )
+
+    assert snapshot_counts == independently_scanned
+
+
+def test_shell_only_inventory_identity_ignores_file_local_refactors(tmp_path):
+    backend = tmp_path / "backend"
+    backend.mkdir()
+    source = backend / "worker.py"
+    source.write_text(
+        "def run(user_id):\n"
+        "    return get_store_shell_only(user_id, reason='direct DB helper')\n"
+    )
+    baseline = derive_shell_only_sites(tmp_path)
+
+    source.write_text(
+        "# unrelated heading\n"
+        "# another unrelated line\n"
+        "def renamed_run(user_id):\n"
+        "    return get_store_shell_only(\n"
+        "        user_id, reason='direct DB helper'\n"
+        "    )\n"
+    )
+
+    assert derive_shell_only_sites(tmp_path) == baseline
+
+
+def test_shell_only_inventory_identity_detects_a_new_site(tmp_path):
+    backend = tmp_path / "backend"
+    backend.mkdir()
+    source = backend / "worker.py"
+    source.write_text(
+        "def first(user_id):\n"
+        "    return get_store_shell_only(user_id, reason='first helper')\n"
+    )
+    baseline = derive_shell_only_sites(tmp_path)
+
+    source.write_text(
+        source.read_text()
+        + "\ndef second(user_id):\n"
+        + "    return get_store_shell_only(user_id, reason='first helper')\n"
+    )
+    updated = derive_shell_only_sites(tmp_path)
+
+    assert len(updated) == len(baseline) == 1
+    assert baseline[0].count == 1
+    assert updated[0].count == 2
+
+
+def test_empty_require_does_not_leave_the_implicit_audit_surface():
+    for expression in ("()", "[]", "None", "False", "set()"):
+        call = ast.parse(f"get_store('user', require={expression})").body[0].value
+        assert isinstance(call, ast.Call)
+        assert not _has_effective_require(call), expression
+
+
+def test_shell_only_store_requires_a_nonempty_review_reason():
+    from core import store as core_store
+
+    for reason in ("", "   ", None):
+        try:
+            core_store.get_store_shell_only("audit-user", reason=reason)
+        except ValueError as exc:
+            assert str(exc) == "shell-only store reason required"
+        else:
+            raise AssertionError(f"accepted empty shell-only reason: {reason!r}")
 
 
 def test_no_production_legacy_compatibility_calls():

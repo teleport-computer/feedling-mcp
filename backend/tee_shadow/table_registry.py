@@ -360,6 +360,12 @@ REGISTRY: dict[str, Entry] = {
         "且过期即删，不搬 RDS 历史；TEE-primary 后由当前主库本地产生",
         required_in_tee=True,
     ),
+    "account_recover_challenges": Entry(
+        SKIP,
+        "账号恢复挑战，TTL 300 秒；verify 成功走原子 DELETE ... RETURNING 单次消费，"
+        "过期/被顶替的旧挑战由下一次 create_challenge 清理——不是持久用户资产，复制"
+        "只会制造不可消费的陈旧哈希，且没必要把恢复凭据哈希材料扩散到第二个存储",
+    ),
     "bak_20260710_usr450_blobs": Entry(
         SKIP, "2026-07-10 单用户事故的一次性人工备份表，非生产数据", manual=True),
     "bak_20260710_usr450_chat": Entry(
