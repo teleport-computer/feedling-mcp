@@ -12,6 +12,17 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 now structurally starts verified provider continuations with the
+  required `<think>` tag on text-only terminal requests.** The omitted prefix is
+  restored before the existing thinking parser runs. A normal provider stop
+  without a closing thinking tag preserves the ordinary reply and existing
+  bounded-correction behavior, while token-limited or stop-unknown fragments
+  remain fail-closed. Capability is gated by provider and model from live
+  request/response evidence; unknown custom endpoints and providers or model
+  generations that reject or ignore assistant continuation keep their previous
+  prompt and bounded-correction behavior.
+  Tool and image rounds are unchanged.
+
 - **A scheduled reminder that cannot be safely resumed after foreground Chat
   preempts it now reports the existing `platform_execution_timeout` class
   instead of `unknown`.** Pristine reminders still return to the queue, the
