@@ -1,4 +1,11 @@
-# §4 day-0 decrypt continuity canary (PROD).
+# RETIRED / DISABLED 2026-08-31 — DO NOT TREAT THIS AS AN ACTIVE CHECK.
+#
+# Seven retired this workflow as a PRODUCT JUDGMENT. The GitHub Actions workflow
+# was disabled on 2026-08-31. This file remains only as executable history; do
+# not re-enable it without completing the revival checklist in:
+# docs/testing/archive/CONTINUITY_CANARY_RETIREMENT_2026-08-31.md
+#
+# Historical behavior: §4 day-0 decrypt continuity canary (PROD).
 #
 # Proves the live PROD enclave can still open an OLD envelope — the exact question
 # the 2026-07 "decrypt failed" false alarm raised, which the §3 deploy canary
