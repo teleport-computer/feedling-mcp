@@ -27,6 +27,7 @@ user knows the sentence is wrong.
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Any, Mapping
 
 #: iOS snapshot key -> kit signal. Names that differ get reconciled here,
@@ -130,6 +131,44 @@ def snapshot_timezone(payload: Mapping[str, Any]) -> str | None:
     return None
 
 
+#: A signal whose decrypted payload arrives as a bare scalar, and the manifest
+#: field that scalar belongs to.
+#:
+#: `storage_items` is **not uniform**, which is easy to miss and impossible to
+#: see from a hand-written fixture. Plain operation signals arrive with `data`
+#: as an object. Decrypted sensitive signals arrive with `data` as a **JSON
+#: string**, and for a single-output signal the live path unwraps it further to
+#: just the value -- so motion_state shows up as the string `"walking"`, not
+#: `{"state": "walking"}`.
+#:
+#: Read naively, those become `observed` observations with no value, and the
+#: contract rejects every one of them. That is most of perception: location,
+#: playback, motion and all of health ride this path.
+SCALAR_FIELD: dict[str, str] = {
+    "motion_state": "state",
+    "music_playback": "playback_state",
+}
+
+
+def _unwrap(data: Any, signal: str) -> Any:
+    """Bring both shapes of `data` back to one object.
+
+    A JSON string is parsed; a bare scalar is put back under the field the
+    signal declares for it. Anything still unrecognisable is returned as-is so
+    the pipeline rejects it loudly rather than storing a shape nobody expects.
+    """
+    if isinstance(data, str) and data not in ("",):
+        try:
+            data = json.loads(data)
+        except ValueError:
+            return data
+    if data is not None and not isinstance(data, Mapping):
+        field = SCALAR_FIELD.get(signal)
+        if field:
+            return {field: data}
+    return data
+
+
 def _availability(data: Any, signal: str | None = None) -> str:
     """The three-state decision -- the most important few lines in here."""
     if data is None:
@@ -142,6 +181,31 @@ def _availability(data: Any, signal: str | None = None) -> str:
         if status is not None and str(status).lower() not in AUTHORIZED_VALUES:
             return "unavailable"    # the in-payload authorization case
     return "observed"
+
+
+def _music_fields(value: Mapping[str, Any], *, reason: str | None) -> dict[str, Any]:
+    """Fill the two fields the manifest requires but iOS cannot send.
+
+    ``track_key`` replaces Apple's persistent song id, which the iOS side
+    deliberately dropped years ago because it can be walked back to the user's
+    whole library. Hashing (title, artist) gives a stable identity instead. The
+    cost is real and worth stating: a live version and a studio version of the
+    same song by the same artist become one track to us.
+
+    ``edge_quality`` is per-record because iOS gives real playback edges only
+    for the system player. A report triggered by `playback_changed` saw an
+    actual event, so its start and end are measured; anything sampled by the
+    keepalive snapshot is inferred from adjacent points and is estimated.
+    Collapsing both to "estimated" would throw away the half that is accurate.
+    """
+    title = str(value.get("title") or "")
+    artist = str(value.get("artist") or "")
+    out: dict[str, Any] = {}
+    if title or artist:
+        out["track_key"] = hashlib.sha256(
+            f"{title}\u0000{artist}".encode()).hexdigest()[:16]
+    out["edge_quality"] = "measured" if reason == "playback_changed" else "estimated"
+    return out
 
 
 def _rename(signal: str, value: Mapping[str, Any]) -> dict[str, Any]:
@@ -175,7 +239,8 @@ def report_id_for(payload: Mapping[str, Any]) -> str:
     return "ios-" + hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
 
-def to_envelope(payload: Mapping[str, Any], *, occurred_at: str) -> dict[str, Any]:
+def to_envelope(payload: Mapping[str, Any], *, occurred_at: str,
+                reason: str | None = None) -> dict[str, Any]:
     """Turn one iOS snapshot into a standard report envelope.
 
     ``occurred_at`` comes from the caller: the whole snapshot is sampled at one
@@ -195,7 +260,7 @@ def to_envelope(payload: Mapping[str, Any], *, occurred_at: str) -> dict[str, An
             # would fail the whole report.
             continue
 
-        data = item.get("data")
+        data = _unwrap(item.get("data"), signal)
         availability = _availability(data, signal)
         obs: dict[str, Any] = {
             "signal": signal,
@@ -206,7 +271,10 @@ def to_envelope(payload: Mapping[str, Any], *, occurred_at: str) -> dict[str, An
         if timezone_id:
             obs["timezone"] = timezone_id
         if availability == "observed" and isinstance(data, Mapping):
-            obs["value"] = _rename(signal, data)
+            value = _rename(signal, data)
+            if signal == "music_playback":
+                value.update(_music_fields(data, reason=reason))
+            obs["value"] = value
         observations.append(obs)
 
     return {

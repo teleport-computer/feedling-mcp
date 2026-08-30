@@ -468,6 +468,9 @@ def _ingest_snapshot_v2_inner(
 
 
 
+_log = logging.getLogger(__name__)
+
+
 def _perceptkit_shadow(user_id: str, storage_items: list, *, client_ts=None) -> None:
     """Fire the PerceptKit shadow run. Import is local and failure is swallowed.
 
@@ -478,8 +481,11 @@ def _perceptkit_shadow(user_id: str, storage_items: list, *, client_ts=None) -> 
     try:
         from .perceptkit_adapter import shadow
         shadow.observe(user_id, storage_items, client_ts=client_ts)
-    except Exception:                              # noqa: BLE001 -- deliberate
-        pass
+    except Exception as exc:                       # noqa: BLE001 -- deliberate
+        # Swallowed, but never silently: a shadow that stops running and says
+        # nothing is indistinguishable from a shadow that runs and finds
+        # nothing, and the second one is the whole point of having it.
+        _log.warning("perceptkit shadow could not start (report unaffected): %s", exc)
 
 
 def ingest_device_event_v2(user_id: str, event: dict) -> dict:

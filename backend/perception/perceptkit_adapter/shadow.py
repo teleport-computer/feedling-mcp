@@ -97,7 +97,11 @@ def observe(
         if not envelope["observations"]:
             return summary
 
-        from backend import db  # imported late: db pulls in the pool at import
+        # `import db`, not `from backend import db`: backend/ is on sys.path,
+        # which is how every other module here reaches it. The wrong spelling
+        # raises ImportError, gets swallowed by the caller's guard, and the
+        # shadow silently never runs -- which is exactly what happened.
+        import db
 
         with db.get_pool().connection() as conn:
             conn.autocommit = True
