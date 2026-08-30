@@ -189,11 +189,18 @@ upload_material / send_chat / run_consumer / teardown）。
 | 步 | 动作 | 通过标准 |
 |---|---|---|
 | 1 | 注册临时账号（对应 route/driver），配 provider key，`/v1/model_api/setup` test | test_status=ok |
-| 2 | 发一条文字消息 | ≤120s 收到 agent 回复，**且用账号私钥解出非空明文**（解不开=硬 fail——usr_f13f 事故：AI 狂发、用户屏幕全乱码，后端毫无感知），无协议碎片泄漏 |
+| 2 | 发一条文字消息 | ≤120s 收到 agent 回复，**且用账号私钥解出明文**；明文**非空、且不是后端兜底话术**（解不开=硬 fail——usr_f13f 事故：AI 狂发、用户屏幕全乱码，后端毫无感知），无协议碎片泄漏 |
 | 3 | 追问一条（上下文连续性） | 回复能接上文（会话/注入正常） |
 | 4 | 触发一次记忆写入（明确给一个事实） | `/v1/memory/index` 出现对应卡 |
 | 5 | 错误气泡 sanity：故意发超长/停 key 场景跳过，仅检查无 unknown 类气泡出现在本轮 | 聊天里 0 条 system 气泡 |
 | 6 | 删号 | reset 200 |
+
+> **⚠️ 步骤 2 判三态，「非空」不是通过标准**（2026-08-31 起，随 T406 落地）：失效时交付给用户的
+> 兜底话术本身就是一个非空字符串（中英各一条，如「我这会儿有点慢，刚刚没接上。你稍后再发一次，
+> 我会继续接。」），只测非空会把它判绿。⇒ 判 `ok` / `fallback` / `fail` 三态，**`fallback` 与 `fail`
+> 一样阻断发版**。自动化侧 `tools/e2e/client.py` 已如此：主闸读 `GET /v1/chat/turn-activity/{turn_id}`
+> 的 `failure` 字段（`complete`/`phase`/`jobs[].status` 三个都可能说"成了"，只有它会反对），
+> 副闸比对**从 runtime 模块派生**的兜底常量集——别在本文档里抄一份字面量，那是会漂的第二份拷贝。
 
 **VPS 侧 P0**（本地起 consumer 连 test 环境，三个 harness 各一遍）：
 Claude Code / Codex / Hermes 各：注册 resident 账号 → 本地 consumer 起 →
