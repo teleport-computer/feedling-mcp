@@ -64,6 +64,7 @@ docker inspect python:3.12-slim --format '{{index .RepoDigests 0}}'
 uv pip compile backend/requirements.txt \
     --generate-hashes \
     --python-version 3.12 \
+    --python-platform linux \
     -o backend/requirements.lock
 
 # The image installs a second lockfile too (deploy/Dockerfile) — regenerate
