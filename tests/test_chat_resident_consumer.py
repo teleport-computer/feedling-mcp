@@ -5773,6 +5773,117 @@ def test_capture_empty_window_fails_fast_without_identity_fetch(monkeypatch):
     assert ("cap_empty_window", "failed", "capture_window_unavailable") in statuses
 
 
+def test_resident_capture_ignores_content_block_metadata_for_language(monkeypatch):
+    """The resident Capture call site must decide from text blocks, not keys."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    message = {
+        "id": "m-block",
+        "role": "user",
+        "source": "chat",
+        "content": [
+            {"type": "text", "text": "我今天很难过"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,AAAA"},
+            },
+        ],
+    }
+    seen = {}
+
+    def _fake_capture_prompt(**kwargs):
+        seen["locale"] = kwargs["locale"]
+        return "prompt"
+
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda _job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *_a, **_kw: None)
+    monkeypatch.setattr(crc, "_capture_window_messages", lambda _job: [message])
+    monkeypatch.setattr(
+        crc,
+        "_capture_identity_context",
+        lambda: ({}, "小舟", "小雨", ""),
+    )
+    monkeypatch.setattr(crc, "_capture_window_text", lambda *_a, **_kw: "窗口")
+    monkeypatch.setattr(crc, "_capture_memory_terms_context", lambda: ("", ""))
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        crc,
+        "build_capture_prompt",
+        _fake_capture_prompt,
+    )
+    monkeypatch.setattr(
+        crc,
+        "_memory_agent_parse_with_bounce",
+        lambda *_a, **_kw: (([], None), ""),
+    )
+    job = {
+        "schema_version": 2,
+        "job_id": "cap_block_language",
+        "job_kind": "memory_capture",
+        "source": "memory_capture",
+        "ts": 322.0,
+    }
+
+    assert crc._process_capture_jobs([job]) == pytest.approx(322.0)
+    assert seen == {"locale": "zh-Hans"}
+
+
+def test_resident_dream_ignores_content_block_metadata_for_language(monkeypatch):
+    """The resident Dream call site must make the same language decision."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    history = [{
+        "id": "m-block",
+        "ts": 1.0,
+        "role": "user",
+        "source": "chat",
+        "content": [
+            {"type": "text", "text": "我今天很难过"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,AAAA"},
+            },
+        ],
+    }]
+    seen = {}
+
+    def _fake_dream_prompt(**kwargs):
+        seen["locale"] = kwargs["locale"]
+        return "prompt"
+
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda _job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *_a, **_kw: None)
+    monkeypatch.setattr(crc, "_emit_resident_dream_lifecycle", lambda *_a, **_kw: None)
+    monkeypatch.setattr(crc, "_dream_cards_context", lambda: ("cards", {"c1": {}}))
+    monkeypatch.setattr(
+        crc,
+        "_capture_identity_context",
+        lambda: ({}, "小舟", "小雨", ""),
+    )
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda **_kw: history)
+    monkeypatch.setattr(crc, "_capture_memory_terms_context", lambda: ("", ""))
+    monkeypatch.setattr(
+        crc,
+        "build_dream_prompt",
+        _fake_dream_prompt,
+    )
+    monkeypatch.setattr(
+        crc,
+        "_memory_agent_parse_with_bounce",
+        lambda *_a, **_kw: (([], [], None), ""),
+    )
+    job = {
+        "schema_version": 2,
+        "job_id": "dream_block_language",
+        "job_kind": "memory_dream",
+        "source": "memory_dream",
+        "ts": 323.0,
+    }
+
+    assert crc._process_dream_jobs([job]) == pytest.approx(323.0)
+    assert seen == {"locale": "zh-Hans"}
+
+
 def test_process_proactive_malformed_json_reason_does_not_post(monkeypatch):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()

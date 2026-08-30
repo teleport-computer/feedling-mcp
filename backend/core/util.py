@@ -5,9 +5,31 @@ import os
 import re
 import uuid
 from datetime import datetime
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 _ENV_TRUTHY = {"1", "true", "yes", "y", "on"}
+
+
+def text_of(content: Any) -> str:
+    """Extract human-readable text from plain or OpenAI-style content.
+
+    Non-text blocks (for example ``image_url`` metadata) are deliberately
+    ignored so protocol field names cannot become user-writing evidence.
+    """
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+            elif isinstance(part, str) and part.strip():
+                parts.append(part.strip())
+        return "\n".join(parts).strip()
+    return str(content or "").strip()
 
 
 def _env_flag_enabled(name: str, default: str = "false") -> bool:

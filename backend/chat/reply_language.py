@@ -11,6 +11,7 @@ import re
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from core import util as core_util
 from memgarden.garden_language import (
     count_bucket_languages,
     decide_garden_language,
@@ -171,7 +172,7 @@ def user_written_text(messages, *, limit: int = USER_WRITING_SAMPLE_MESSAGES) ->
             continue
         if str(m.get("role") or "").strip().lower() != _USER_ROLE:
             continue
-        body = str(m.get("content") or m.get("text") or "").strip()
+        body = core_util.text_of(m.get("content") or m.get("text") or "")
         if body:
             out.append(body)
     return "\n".join(out)
