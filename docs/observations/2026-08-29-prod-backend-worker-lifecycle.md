@@ -1,3 +1,8 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/CURRENT_STATE.md
+historical_reason: point-in-time
+---
 # Prod Backend Gunicorn Worker 12 小时生命周期观测报告
 
 **观测日期**：2026-08-29
