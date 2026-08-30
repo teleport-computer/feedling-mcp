@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tools.e2e.client import E2EClient  # noqa: E402
 from tools.e2e.hosted import _hosted_send  # noqa: E402
-from tools.e2e.probe_common import mem_index, new_marker  # noqa: E402
+from tools.e2e.probe_common import force_capture_until_enqueued, mem_index, new_marker  # noqa: E402
 
 CAPTURE_POLL_SEC = 300.0
 POLL_EVERY_SEC = 15.0
@@ -124,7 +124,11 @@ def main() -> int:
         _sent, err = _hosted_send(c, zh_text)
         if not check("chat send (中文)", not err, err or ""):
             return 1
-        c.post("/v1/capture/force", json={})
+        forced = force_capture_until_enqueued(c)
+        if not check("capture 真的入队了（中文那轮）",
+                     bool(forced.get("enqueued")) or forced.get("reason") == "already_captured",
+                     f"{forced}", pass_detail=str(forced.get("reason") or "enqueued")):
+            return 1
         cards = _wait_for_new_cards(c, known=set(), timeout=CAPTURE_POLL_SEC)
         if not check("中文花园建立了", bool(cards),
                      f"waited {CAPTURE_POLL_SEC:.0f}s, no card",
@@ -147,7 +151,11 @@ def main() -> int:
         _sent, err = _hosted_send(c, en_text)
         if not check("chat send (英文)", not err, err or ""):
             return 1
-        c.post("/v1/capture/force", json={})
+        forced = force_capture_until_enqueued(c)
+        if not check("capture 真的入队了（英文那轮）",
+                     bool(forced.get("enqueued")) or forced.get("reason") == "already_captured",
+                     f"{forced}", pass_detail=str(forced.get("reason") or "enqueued")):
+            return 1
         after = _wait_for_new_cards(c, known=before_ids, timeout=CAPTURE_POLL_SEC)
 
         new_cards = [i for i in after if str(i.get("id") or "") not in before_ids]

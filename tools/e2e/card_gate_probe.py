@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tools.e2e.client import E2EClient  # noqa: E402
 from tools.e2e.hosted import _hosted_send  # noqa: E402
-from tools.e2e.probe_common import mem_fetch, mem_index, new_marker  # noqa: E402
+from tools.e2e.probe_common import force_capture_until_enqueued, mem_fetch, mem_index, new_marker  # noqa: E402
 
 # card_text 的判据要在断言里复用 —— 探针和线上必须是同一把尺子。
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "backend"))
@@ -95,9 +95,15 @@ def main() -> int:
         if not check("chat send", not err, err or ""):
             return 1
 
-        r = c.post("/v1/capture/force", json={})
-        if not check("capture/force accepted", r.status_code in (200, 202),
-                     f"{r.status_code} {r.text[:120]}"):
+        # ⚠️ 不能只看 HTTP 200 —— force 在「还没有新消息」时返回
+        # {"enqueued": false, "reason": "no_new_messages"}，HTTP 仍是 200。
+        # 发完消息立刻 force 时消息常常还没落库，于是什么都没排上，
+        # 而探针会干等 300 秒等一张永远不会出现的卡（踩过，看起来像间歇 bug）。
+        forced = force_capture_until_enqueued(c)
+        if not check("capture 真的入队了（不只是 HTTP 200）",
+                     bool(forced.get("enqueued")) or forced.get("reason") == "already_captured",
+                     f"{forced}",
+                     pass_detail=str(forced.get("reason") or "enqueued")):
             return 1
 
         card = None

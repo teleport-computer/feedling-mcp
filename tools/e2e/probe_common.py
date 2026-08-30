@@ -194,3 +194,34 @@ def install_identity(c, identity: dict) -> tuple[int, dict]:
         return r.status_code, r.json()
     except Exception:  # noqa: BLE001
         return r.status_code, {"_text": r.text[:200]}
+
+
+def force_capture_until_enqueued(c, *, tries: int = 8, wait_sec: float = 5.0) -> dict:
+    """调 ``/v1/capture/force`` 直到**真的入队**，返回最后一次的响应体。
+
+    ## 为什么要重试
+
+    ``force_capture`` 在「自上次抽取以来没有新消息」时返回
+    ``{"enqueued": false, "reason": "no_new_messages"}`` —— 而 HTTP 仍是 200。
+
+    探针发完消息立刻调 force，这时消息**还没落库**，于是什么都没入队；
+    探针却因为看到 200 就认为「触发成功」，然后干等 300 秒等一张永远不会出现的卡。
+
+    这是踩过的坑：e2e 时好时坏，看起来像间歇性 bug，实际是探针在等一个
+    从未被调度的任务。**HTTP 200 不等于事情发生了** —— 要看响应体。
+
+    ``already_captured`` 也算成功：那说明这个窗口已经抽过了，不需要再排。
+    """
+    import time as _time
+
+    last: dict = {}
+    for _ in range(max(1, tries)):
+        r = c.post("/v1/capture/force", json={})
+        try:
+            last = r.json() if r.status_code < 400 else {"http": r.status_code}
+        except Exception:  # noqa: BLE001
+            last = {"http": r.status_code, "text": r.text[:200]}
+        if last.get("enqueued") or str(last.get("reason") or "") == "already_captured":
+            return last
+        _time.sleep(wait_sec)
+    return last
