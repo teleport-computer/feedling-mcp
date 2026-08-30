@@ -100,16 +100,17 @@ backend/
 └── db.py · content_encryption.py · provider_client.py · provider_types.py ·
     enclave_app.py · dstack_tls.py · hosted_runtime.py · semantic_analysis.py ·
     memory_readside_core.py · memory_index_selector.py ·
-    context_memory_selection.py · object_storage.py · redis_pool.py ·
+    context_memory_selection.py · object_storage.py ·
     provider_attempt_ledger.py · worldbook_match.py ·
     worldbook_readside_core.py · debug_trace.py
                     ← 底层独立模块，保持无业务依赖
 ```
 
-> **Redis 已废弃并暂停（2026-08-20）**：三套 CVM 均已停止，
-> `backend/redis_pool.py` 的入口固定拒绝构造客户端。不要接入缓存 / 锁 / 队列；
+> **Redis 已废弃并暂停（2026-08-20）**：三套 CVM 均已停止；零消费者的
+> `backend/redis_pool.py` 与 `redis-py` 生产依赖已于 2026-08-29 删除。
+> 不要接入缓存 / 锁 / 队列；
 > 如需恢复，必须另开 spec，重新评审 `docs/REDIS_USAGE.md` 的约束、基础设施与监控，
-> 再显式移除退役门禁。
+> 再重新实现和评审客户端。
 
 **决策表——你的代码属于哪里：**
 

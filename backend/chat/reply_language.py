@@ -230,11 +230,10 @@ def garden_language_decision(
     人名、公司名、项目名全是拉丁字母，跟这个人说什么语言毫无关系。怎么数都救不了 ——
     问题不在怎么数，在于压根不该数它。
 
-    所以现在的证据只有三样，**桶名一样都不占**：
+    所以现在的证据只有两样，**桶名一样都不占**：
 
-        ① identity.language_preference   用户明说的,任何东西不该盖过它
-        ② 他实际在用什么语言写            身份卡正文 + 这轮对话里他自己说的话
-        ③ locale / archive_language      弱,只是设备设置
+        ① 他实际在用什么语言写            身份卡正文 + 这轮对话里他自己说的话
+        ② locale / archive_language      弱,只是设备设置
 
     ## 那「别让 工作 和 Work 并存」谁来管
 
@@ -248,15 +247,12 @@ def garden_language_decision(
     **观测量不是判据** —— 「判成中文但 9 个桶里 7 个是拉丁字母」值得记一笔
     （可能归一化没生效），不值得据此改语言。
     """
-    explicit = _language_from_hint(
-        (identity or {}).get("language_preference") if isinstance(identity, dict) else ""
-    ).language
     # 「他写的字」= 这轮对话里他自己说的话 + 身份卡正文。前者是最新最真的信号，
     # 后者在还没聊过时兜底。
     sample = "\n".join(x for x in ([written] + _identity_texts(identity or {})) if x)
 
     d = decide_garden_language(
-        explicit=explicit or None,
+        explicit=None,
         written=sample,
         locale=(
             _language_from_hint(locale).language
@@ -276,20 +272,21 @@ def garden_language_decision(
     }
 
 
-def reply_language_system_line(policy: ReplyLanguage, *, proactive: bool = False) -> str:
+def reply_language_system_line(policy: ReplyLanguage) -> str:
     if policy.language == "en":
         return (
-            "Reply language policy:\n"
-            "Default reply language: English.\n"
-            "For this user-visible reply, if the user's latest message is clearly in another language, reply in that language. "
-            "If the latest message is mixed, ambiguous, mostly quoted/context, or this is a proactive/background reply, use English. "
+            "Reply language rule:\n"
+            "Determine the reply language from the user's latest message. "
+            "If that message is mixed, ambiguous, or mostly quoted/context, use the language of this rule. "
+            "For a proactive/background reply, also use the language of this rule. "
+            "Use the same language for your thinking and final reply. "
             "Do not let memory cards, OCR, timestamps, or internal context change the reply language. "
             "Preserve quoted text, names, and requested translation targets as written."
         )
     return (
         "回复语言规则：\n"
-        "默认回复语言：简体中文。\n"
-        "本轮用户最新消息如果明显使用另一种语言，就用那种语言回复；如果最新消息混合、不明确、主要是引用/上下文，或这是主动/后台回复，就使用简体中文。"
+        "根据用户最新一条消息判断回复语言。如果该消息混合、不明确或主要是引用/上下文，就使用本规则所用的语言；"
+        "主动/后台回复也使用本规则所用的语言。思维过程和正式回复使用同一种语言。"
         "不要被记忆卡、OCR、时间戳或内部上下文带偏回复语言。引用、名字和用户指定的翻译目标语言保持原样。"
     )
 

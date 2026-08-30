@@ -330,14 +330,14 @@ def _strip_identity(doc: dict) -> dict:
     return clean
 
 
-# B2: the 5 user-layer identity fields (D1) that a distiller may now populate
+# B2: the 4 user-layer identity fields (D1) that a distiller may now populate
 # alongside agent_name/dimensions — see genesis/prompts.py FACT_WRITE_PROMPT's
 # "用户层字段" block and genesis/service.py's PROFILE_STRING/LIST_FIELDS-driven
 # plumbing. Kept as one tuple here so the "does this identity dict carry ANY
 # signal" checks below (_identity_only / _fact_write_output_empty) don't drift
 # from what _fact_write actually aggregates.
 _USER_LAYER_STRING_FIELDS = (
-    "user_preferred_name", "custom_persona_prompt", "language_preference",
+    "user_preferred_name", "custom_persona_prompt",
     "relationship_anchor",
 )
 _USER_LAYER_LIST_FIELD = "stable_definitions"

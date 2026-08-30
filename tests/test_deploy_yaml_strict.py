@@ -231,8 +231,8 @@ def test_test_environment_attests_lazy_store_with_incremental_chat_sync():
         assert "${" not in environment["FEEDLING_STORE_LOAD_MODE"]
 
 
-def test_prod_environment_attests_lazy_store_with_incremental_256_row_chat():
-    """PROD promotion must preserve the TEST-proven lazy Store contract."""
+def test_prod_environment_keeps_legacy_store_with_incremental_256_row_chat():
+    """PROD must keep the reviewed rollback while TEST continues lazy validation."""
     path = ROOT / "deploy" / "docker-compose.phala.yaml"
     compose = load_yaml_strict(
         path.read_text(),
@@ -243,7 +243,7 @@ def test_prod_environment_attests_lazy_store_with_incremental_256_row_chat():
         environment = compose["services"][service_name]["environment"]
         assert environment["FEEDLING_CHAT_SYNC_MODE"] == "incremental"
         assert environment["FEEDLING_CHAT_HOT_CACHE_LIMIT"] == "256"
-        assert environment["FEEDLING_STORE_LOAD_MODE"] == "lazy"
+        assert environment["FEEDLING_STORE_LOAD_MODE"] == "legacy"
         assert "${" not in environment["FEEDLING_CHAT_SYNC_MODE"]
         assert "${" not in environment["FEEDLING_CHAT_HOT_CACHE_LIMIT"]
         assert "${" not in environment["FEEDLING_STORE_LOAD_MODE"]

@@ -970,7 +970,6 @@ _STRING_FIELDS: tuple[str, ...] = (
     "agent_role",
     "tone_style",
     "custom_persona_prompt",
-    "language_preference",
     "relationship_anchor",
 )
 
@@ -2114,8 +2113,6 @@ def main():
                     help="系统蒸馏出的语气/风格描述")
     iw.add_argument("--custom-persona-prompt", dest="custom_persona_prompt", default=None,
                     help="用户手写的人设覆盖指令,优先级高于 --tone-style")
-    iw.add_argument("--language-preference", dest="language_preference", default=None,
-                    help="回复使用的语言偏好")
     iw.add_argument("--relationship-anchor", dest="relationship_anchor", default=None,
                     help="关系锚点描述文本")
     iw.add_argument("--relationship-days", dest="relationship_days", type=int, default=None,

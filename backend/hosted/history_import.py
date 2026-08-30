@@ -24,6 +24,7 @@ from accounts import registry
 from bootstrap import gates as boot_gates
 from core import util as core_util
 from identity import service as identity_service
+from identity import card_policy
 from identity.user_naming import _naming_rule, rewrite_user_reference, sanitize_user_name
 from memgarden.text import card_guard
 from memgarden.prompts.buckets import normalize_bucket_language
@@ -2587,7 +2588,9 @@ def _normalize_identity_payload(raw, memories: list[dict], days: int, language: 
     fallback = _fallback_identity_payload(memories, days, language)
     if not isinstance(raw, dict):
         return fallback
-    payload = dict(raw.get("identity") if isinstance(raw.get("identity"), dict) else raw)
+    source_payload = raw.get("identity") if isinstance(raw.get("identity"), dict) else raw
+    supported_fields = card_policy.PROFILE_FIELDS | {"dimensions"}
+    payload = {key: value for key, value in source_payload.items() if key in supported_fields}
     dims = payload.get("dimensions")
     if not isinstance(dims, list):
         return fallback
@@ -2662,7 +2665,7 @@ def _normalize_identity_payload(raw, memories: list[dict], days: int, language: 
         else:
             payload.pop(list_field, None)
 
-    # B2: 5 user-layer fields (D1). GROUNDED — only ever set when the model
+    # B2: 4 user-layer fields (D1). GROUNDED — only ever set when the model
     # actually produced a value; omit empties (don't write empty keys), same
     # convention as tone_style/agent_role/do_not_say/boundaries above. This
     # omit-on-empty behavior is also what lets the UPDATE-merge path
@@ -2678,7 +2681,7 @@ def _normalize_identity_payload(raw, memories: list[dict], days: int, language: 
         payload["user_preferred_name"] = user_preferred_name
     else:
         payload.pop("user_preferred_name", None)
-    # user_preferred_name, custom_persona_prompt, relationship_anchor, language_preference,
+    # user_preferred_name, custom_persona_prompt, relationship_anchor,
     # stable_definitions are user-layer fields (D1). custom_persona_prompt and
     # relationship_anchor are user instructions, not display prose — any language is
     # valid (an English-authored persona directive in a zh card is the user's intent,
@@ -2689,15 +2692,6 @@ def _normalize_identity_payload(raw, memories: list[dict], days: int, language: 
         payload["custom_persona_prompt"] = custom_persona_prompt
     else:
         payload.pop("custom_persona_prompt", None)
-    # language_preference names a language (e.g. "English") and can legitimately
-    # be non-Chinese even when the rest of the card is zh — same reasoning as
-    # user_preferred_name (a name can be non-Chinese too), so it skips the
-    # english-only-under-zh guard applied to prose fields above.
-    language_preference = str(payload.get("language_preference") or "").strip()[:240]
-    if language_preference:
-        payload["language_preference"] = language_preference
-    else:
-        payload.pop("language_preference", None)
     relationship_anchor = str(payload.get("relationship_anchor") or "").strip()[:1200]
     if relationship_anchor:
         payload["relationship_anchor"] = relationship_anchor
@@ -2778,8 +2772,6 @@ def _derive_identity_with_provider(
         "actually contain one verbatim or near-verbatim; only set it when such an explicit "
         "directive is present — never construct one by summarizing general descriptive text — "
         "empty string otherwise), "
-        "language_preference (the reply language the user explicitly asked for; empty string if "
-        "the sources don't say), "
         "relationship_anchor (a short free-text description of the relationship the user "
         "explicitly stated, e.g. 'college roommate' or 'mentor figure'; empty string if the "
         "sources don't say — do not infer this from tone or vibe), "
@@ -2792,11 +2784,11 @@ def _derive_identity_with_provider(
         "Source priority: AI Persona materials are the primary source for the AI companion's identity, voice, role, name, and boundaries. "
         "Memory Garden cards are secondary evidence and may refine the identity. Chat History can show how the AI behaved in relationship. "
         "User Profile describes the user only; use it as relationship context, never as the AI companion's self-description. "
-        "Exception: user_preferred_name/custom_persona_prompt/language_preference/relationship_anchor/"
+        "Exception: user_preferred_name/custom_persona_prompt/relationship_anchor/"
         "stable_definitions are USER-authored signal (D1 user layer), not the AI companion's identity — "
-        "the source priority above is REVERSED for these 5: extract them only from User Profile sources "
+        "the source priority above is REVERSED for these 4: extract them only from User Profile sources "
         "and the user's own explicit statements, never from the AI companion's tone or behavior. "
-        "GROUNDING applies even more strictly to these 5: leave each empty/absent unless the sources give "
+        "GROUNDING applies even more strictly to these 4: leave each empty/absent unless the sources give "
         "an explicit, unambiguous statement for it; never infer or invent one from context, tone, or what "
         "would make a nicer-looking card. "
         "If there are no AI Persona materials, infer the companion only from assistant-side chat evidence, relationship patterns, and AI-related Memory Garden cards; otherwise keep the identity generic and ask the user to name/define the companion later. "

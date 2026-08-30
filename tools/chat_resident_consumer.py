@@ -14917,10 +14917,11 @@ def _resident_reply_language(presence: dict | None = None):
 
 
 def _reply_language_line(presence: dict | None = None) -> str:
-    """The shared zh/en reply-language policy line (a default language + a soft
-    mirror of the user's latest-message language). Wired into both the proactive
-    wakes and the foreground reply so the model stops drifting to Chinese when the
-    user is in an English context."""
+    """Render the shared reply-language rule in the selected zh/en language.
+
+    Wired into both proactive wakes and foreground replies; the rendered rule
+    tells the model how to choose the language from the latest user message.
+    """
     return reply_language_system_line(_resident_reply_language(presence))
 
 
@@ -20137,9 +20138,9 @@ def _resident_incremental_payload(payload: dict, existing: dict) -> dict:
 def _resident_derive_identity(document: str, job_id: str) -> dict | None:
     """Persona/identity is small (fits one context) — a single agent derive, no chunking.
     Prompt + parse 来自共享模板 identity/distill_prompt_v1(Batch 2 A1;B2 起覆盖
-    RESIDENT_IDENTITY_FIELDS 这 14 个字段 == 身份卡全部 13 个 profile 字段 + dimensions,
-    含 user_preferred_name / custom_persona_prompt / language_preference /
-    relationship_anchor / stable_definitions 这 5 个用户层字段,GROUNDED——素材没有明确
+    RESIDENT_IDENTITY_FIELDS 这 13 个字段 == 身份卡全部 12 个 profile 字段 + dimensions,
+    含 user_preferred_name / custom_persona_prompt /
+    relationship_anchor / stable_definitions 这 4 个用户层字段,GROUNDED——素材没有明确
     信号就留空,详见 distill_prompt_v1.RESIDENT_IDENTITY_FIELDS 的说明)、card_policy
     清洗、坏 JSON 重试一次(guardrail 7:报错到 setup log,不静默吞)。
     Returns a plaintext identity payload for identity.replace, or None if no persona content

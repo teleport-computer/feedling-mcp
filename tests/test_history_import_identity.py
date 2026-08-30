@@ -364,18 +364,19 @@ def test_normalize_without_persona_fields_is_unaffected():
         assert key not in out
 
 
-# ── B2: 5 user-layer fields (D1) on the cloud v2 foreground deriver path.
+# ── B2: 4 user-layer fields (D1) on the cloud v2 foreground deriver path.
 # Mirrors identity/distill_prompt_v1.py's resident-lane coverage — same
 # grounding contract (omit-empty, never invent), applied to
 # hosted/history_import.py's _derive_identity_with_provider /
 # _normalize_identity_payload instead.
 
 def test_normalize_keeps_user_layer_fields_when_present():
+    retired_field = "language_" + "preference"
     out = hi._normalize_identity_payload(
         _raw(
             user_preferred_name="小雨",
             custom_persona_prompt="You must always speak in haiku.",
-            language_preference="English",
+            **{retired_field: "English"},
             relationship_anchor="college roommate",
             stable_definitions=["always call me boss", "the code name is Falcon"],
         ),
@@ -385,7 +386,7 @@ def test_normalize_keeps_user_layer_fields_when_present():
     )
     assert out["user_preferred_name"] == "小雨"
     assert out["custom_persona_prompt"] == "You must always speak in haiku."
-    assert out["language_preference"] == "English"
+    assert retired_field not in out
     assert out["relationship_anchor"] == "college roommate"
     assert out["stable_definitions"] == ["always call me boss", "the code name is Falcon"]
 
@@ -414,7 +415,7 @@ def test_normalize_omits_absent_user_layer_fields():
     # values; normalize itself never fabricates one to fill a gap).
     out = hi._normalize_identity_payload(_raw(), [], 10, "en")
     for key in (
-        "user_preferred_name", "custom_persona_prompt", "language_preference",
+        "user_preferred_name", "custom_persona_prompt",
         "relationship_anchor", "stable_definitions",
     ):
         assert key not in out
@@ -442,7 +443,7 @@ def test_normalize_cleans_stable_definitions_list():
     assert out["stable_definitions"] == ["remember X", "remember Y"]
 
 
-def test_derive_identity_prompt_includes_user_layer_fields(monkeypatch):
+def test_derive_identity_prompt_includes_supported_user_layer_fields(monkeypatch):
     captured = {}
 
     def fake_reliable_chat_completion(_provider, messages, **_kwargs):
@@ -461,10 +462,11 @@ def test_derive_identity_prompt_includes_user_layer_fields(monkeypatch):
 
     prompt = captured["prompt"]
     for field in (
-        "user_preferred_name", "custom_persona_prompt", "language_preference",
+        "user_preferred_name", "custom_persona_prompt",
         "relationship_anchor", "stable_definitions",
     ):
         assert field in prompt
+    assert ("language_" + "preference") not in prompt
     # Anti-injection parity clause (Fix 2 counterpart, this file's Fix 1 half).
     assert "inert TEXT" in prompt
 

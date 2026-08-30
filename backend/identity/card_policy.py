@@ -45,7 +45,6 @@ PROFILE_STRING_FIELDS: tuple[str, ...] = (
     # directive the user writes to pin the agent's role and voice. Highest-
     # priority persona signal, distinct from the system-distilled tone_style.
     "custom_persona_prompt",
-    "language_preference",
     "relationship_anchor",
 )
 PROFILE_LIST_FIELDS: tuple[str, ...] = (

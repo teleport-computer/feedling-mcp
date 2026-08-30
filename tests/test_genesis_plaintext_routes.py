@@ -2238,7 +2238,8 @@ def test_plaintext_relationship_anchor_uses_earliest_timestamp_when_no_date():
 # those fields describe the user rather than TA.
 # ---------------------------------------------------------------------------
 
-def test_plaintext_merge_reducer_outputs_reads_user_layer_fields_from_user_profile():
+def test_plaintext_merge_reducer_outputs_reads_supported_user_layer_fields_from_user_profile():
+    retired_field = "language_" + "preference"
     outputs = [
         {
             "source_family": "user_profile",
@@ -2247,7 +2248,7 @@ def test_plaintext_merge_reducer_outputs_reads_user_layer_fields_from_user_profi
                 "dimensions": [{"name": "should be ignored", "value": 1}],
                 "user_preferred_name": "Seven",
                 "custom_persona_prompt": "始终用第二人称、简短直接。",
-                "language_preference": "中文",
+                retired_field: "中文",
                 "relationship_anchor": "大学室友",
                 "stable_definitions": ["老板=我上司"],
             },
@@ -2268,7 +2269,7 @@ def test_plaintext_merge_reducer_outputs_reads_user_layer_fields_from_user_profi
     # user-layer fields DO come from the user_profile output.
     assert identity["user_preferred_name"] == "Seven"
     assert identity["custom_persona_prompt"] == "始终用第二人称、简短直接。"
-    assert identity["language_preference"] == "中文"
+    assert retired_field not in identity
     assert identity["relationship_anchor"] == "大学室友"
     assert identity["stable_definitions"] == ["老板=我上司"]
 
@@ -2294,7 +2295,7 @@ def test_plaintext_merge_reducer_outputs_without_user_layer_signal_omits_it():
     merged = plaintext._plaintext_merge_reducer_outputs(outputs)
 
     identity = merged["identity"]
-    for key in ("user_preferred_name", "custom_persona_prompt", "language_preference",
+    for key in ("user_preferred_name", "custom_persona_prompt",
                 "relationship_anchor", "stable_definitions"):
         assert key not in identity, key
 

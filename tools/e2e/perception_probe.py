@@ -169,7 +169,6 @@ def _install_grounding_identity(c) -> None:
             "每次主动醒来先调用 perception.location；若 place_label 可用，"
             "必须在发给用户的消息里逐字写出该 place_label，不能猜测或改写。"
         ),
-        "language_preference": "zh-Hans",
         "dimensions": [{"name": "证据诚实", "value": 95}],
     }, action="perception grounding")
 
