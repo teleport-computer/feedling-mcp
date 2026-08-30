@@ -15,6 +15,7 @@ from typing import Literal
 
 MIN_LETTER_COUNT = 10
 DOMINANT_SHARE = 0.60
+MIXED_SCRIPT_SHELL_MIN_COUNT = 5
 
 WritingSystem = Literal[
     "han",
@@ -81,17 +82,40 @@ def classify_writing_system(text: str) -> WritingSystem:
     denominator.  Punctuation, digits, emoji, whitespace, and combining marks
     do not vote.  Fewer than ten letters is indeterminate; otherwise a system
     must exceed (not merely equal) 60 percent, or the result is mixed.
+
+    Raw Han-character and Latin-letter counts are not comparable units.  For a
+    Han/Latin mixture, use its ordered writing-system shell instead: matching
+    first and last letter systems, backed by at least five letters in that
+    system, identify the host sentence when it encloses an insertion.  When the
+    outer systems differ, the original strict raw-character threshold is
+    retained, so a Chinese sentence ending in a Latin term may still classify
+    as Latin or mixed.  If neither system clears it, the result remains mixed.
     """
 
     counts = {system: 0 for system in _COUNTED_SYSTEMS}
     total = 0
+    first_system = ""
+    last_system = ""
     for character in str(text or ""):
         if not unicodedata.category(character).startswith("L"):
             continue
-        counts[_letter_system(character)] += 1
+        system = _letter_system(character)
+        counts[system] += 1
         total += 1
+        if not first_system:
+            first_system = system
+        last_system = system
     if total < MIN_LETTER_COUNT:
         return "indeterminate"
+
+    if counts["han"] and counts["latin"]:
+        if (
+            first_system == last_system
+            and first_system in {"han", "latin"}
+            and counts[first_system] >= MIXED_SCRIPT_SHELL_MIN_COUNT
+        ):
+            return first_system  # type: ignore[return-value]
+
     dominant = max(_COUNTED_SYSTEMS, key=counts.__getitem__)
     if counts[dominant] / total > DOMINANT_SHARE:
         return dominant  # type: ignore[return-value]

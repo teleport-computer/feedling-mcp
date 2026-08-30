@@ -237,8 +237,50 @@ def test_writing_system_classifier_uses_only_letters(text, expected):
 
 
 def test_writing_system_classifier_requires_strictly_more_than_sixty_percent():
-    assert language_follow.classify_writing_system("汉汉汉汉汉汉abcd") == "mixed"
-    assert language_follow.classify_writing_system("汉汉汉汉汉汉汉abc") == "han"
+    assert language_follow.classify_writing_system("汉汉汉汉汉汉абвг") == "mixed"
+    assert language_follow.classify_writing_system("汉汉汉汉汉汉汉абв") == "han"
+    assert language_follow.classify_writing_system("abcdefабвг") == "mixed"
+    assert language_follow.classify_writing_system("abcdefgабв") == "latin"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "你可以用 Notion 或者 Obsidian 记下来。",
+        "我今天用 Python 写了个脚本 debug 了半天 finally 跑通了真开心",
+        "这个 pull request 的 review comment 我已经 resolve 了",
+    ],
+)
+def test_writing_system_classifier_keeps_latin_terms_inside_han_shell(text):
+    assert language_follow.classify_writing_system(text) == "han"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Please use Notion or Obsidian to keep these notes organized.",
+        "The phrase 中文内容 appears here, but this request is written in English.",
+        "My teacher wrote 今天天气很好我们去公园 on the board.",
+        "The sign said 请勿吸烟谢谢配合 but nobody cared.",
+        "Can you explain what 情人眼里出西施 means in English?",
+        "He keeps saying 我不知道我不知道我不知道 over and over.",
+        "Translate 春眠不觉晓处处闻啼鸟 to English please.",
+        "Please explain 今天天气很好我们去公园 now",
+    ],
+)
+def test_writing_system_classifier_keeps_true_english_latin(text):
+    assert language_follow.classify_writing_system(text) == "latin"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "这是中文句子 abcdef",
+        "abcdef 这是中文句子",
+    ],
+)
+def test_writing_system_classifier_leaves_cross_script_shell_ambiguous(text):
+    assert language_follow.classify_writing_system(text) == "mixed"
 
 
 def test_latest_user_writing_system_skips_short_newest_message():
