@@ -69,6 +69,10 @@ FIELD_ALIASES: dict[str, dict[str, str]] = {
     "battery": {"level": "level_ratio", "charging": "is_charging",
                 "low_power_mode": "is_low_power_mode_enabled"},
     "focus_state": {"focused": "is_active"},
+    # iOS sends {state, active}; the manifest declares broadcast_state and
+    # is_active. Without this the whole observation is rejected for a missing
+    # required field -- which is how the shadow run found it.
+    "broadcast": {"active": "is_active"},
     "time_context": {"timezone": "time_zone_id", "local_time": None},
     "weather": {"temperature": "temperature_c",
                 "apparent_temperature": "apparent_temperature_c",
@@ -82,6 +86,10 @@ FIELD_ALIASES: dict[str, dict[str, str]] = {
 DROPPED_FIELDS: dict[str, set[str]] = {
     # Authorization is expressed through availability, not as its own field.
     "focus_state": {"authorization_status"},
+    # iOS sends a broadcast state string; the manifest models only the boolean
+    # (the spec's §5 table lists is_active and nothing else). Dropped here so
+    # the reason is visible, rather than silently filtered at the boundary.
+    "broadcast": {"state"},
     # Local time is derivable from time_zone_id plus occurred_at.
     "time_context": {"local_time"},
 }
@@ -100,6 +108,26 @@ AUTH_STATUS_FIELDS: dict[str, str] = {
 
 #: Which values of that field count as authorized.
 AUTHORIZED_VALUES = {"authorized", "granted", "allowed"}
+
+
+def snapshot_timezone(payload: Mapping[str, Any]) -> str | None:
+    """The IANA timezone the whole snapshot was taken in.
+
+    iOS puts it in the ``time`` item, and every other item in the same
+    snapshot was sampled at the same moment in the same place. Not carrying it
+    across means every observation falls back to the UTC offset in
+    ``occurred_at`` -- and an offset is not a timezone: New York's -04:00 and
+    -05:00 are the same zone in different seasons, so the day a DST transition
+    happens gets attributed wrong, silently.
+    """
+    for item in payload.get("context_snapshot", []):
+        if item.get("key") != "time":
+            continue
+        data = item.get("data")
+        if isinstance(data, Mapping):
+            tz = data.get("timezone")
+            return tz if isinstance(tz, str) and tz else None
+    return None
 
 
 def _availability(data: Any, signal: str | None = None) -> str:
@@ -155,6 +183,7 @@ def to_envelope(payload: Mapping[str, Any], *, occurred_at: str) -> dict[str, An
     that, not the host's own clock.
     """
     observations: list[dict[str, Any]] = []
+    timezone_id = snapshot_timezone(payload)
     for item in payload.get("context_snapshot", []):
         key = item.get("key")
         if key in IGNORED_KEYS:
@@ -174,6 +203,8 @@ def to_envelope(payload: Mapping[str, Any], *, occurred_at: str) -> dict[str, An
             "occurred_at": occurred_at,
             "availability": availability,
         }
+        if timezone_id:
+            obs["timezone"] = timezone_id
         if availability == "observed" and isinstance(data, Mapping):
             obs["value"] = _rename(signal, data)
         observations.append(obs)
