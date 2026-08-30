@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # 历史报告与模板 —— 这里的东西**不是规范**
 
 放这儿的是一次性产物:某次测试的实战报告、某个 PR 的验收证据、某次部署的清单快照。
@@ -11,3 +15,4 @@
 | `RUNTIME_V2_DEEP_TEST_2026-08-06.md` | 2026-08-06 那晚 V2 深度测试的实战报告 |
 | `IMAGEGEN_HISTORY_SEARCH_TEST_2026-08-08.md` | 生图+历史搜索两个功能的 PR 验收证据 |
 | `PROD_DEPLOY_VERIFICATION_2026-07.md` | 2026-07 某次部署的清单**模板/快照**(复选框是空的) |
+| `CONTINUITY_CANARY_RETIREMENT_2026-08-31.md` | 生产旧密文连续性 canary 的退役决定、证据边界和恢复条件 |

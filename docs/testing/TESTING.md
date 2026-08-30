@@ -244,7 +244,10 @@ V2 的 bug 表面很杂,底下集中在**五段共用代码**上(上下文组装
   - `docker compose build --no-cache`（`--require-hashes`）+ healthcheck
   - syntax + static（`compileall` + language eval + dependency provenance；当前
     workflow 不运行 pyflakes，所以 L1 的本地 pyflakes 仍需自行执行）
-- **`continuity-canary.yml`**（每日 06:17 UTC cron）：prod day-0 信封解密连续性（`tools/continuity_canary.py`）——防"某天起解不开老信封"。
+- **`continuity-canary.yml`（已退役，2026-08-31 禁用）**：原 prod day-0
+  信封解密连续性 canary。Seven 以产品判断停止该 workflow；生产旧密文跨轮换
+  可读的独特覆盖不再活跃。事实边界和恢复条件见
+  [`archive/CONTINUITY_CANARY_RETIREMENT_2026-08-31.md`](archive/CONTINUITY_CANARY_RETIREMENT_2026-08-31.md)。
 - **`deploy-test-contract.yml`**（手动）：部署 FeedlingAppAuth 到 Sepolia。
 - **`docker-publish.yml`**：镜像发布。
 
