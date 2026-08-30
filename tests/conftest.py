@@ -263,6 +263,10 @@ if not _provisioned:
     # Pure-unit modules that don't touch the DB — keep them collectable so a
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
+        # AUP 哨兵探针自身的回归（2026-08-30 T411）：纯单测，外部边界全 monkeypatch，
+        # 零 DB / 零网络 / 不调用 claude。**它最需要能跑的时刻正是本地无 PG 时**——
+        # 不登记就会被 collect_ignore 静默跳过，量具的守卫恰好在那时消失。
+        "test_aup_gate_probe.py",
         "test_chat_language_follow_module.py",
         "test_memory_injection_observability.py",
         "test_garden_selection_pluggable.py",

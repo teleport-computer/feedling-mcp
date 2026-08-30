@@ -469,6 +469,7 @@ jobs:
             tests/test_memgarden_storage_port.py \
             tests/test_memgarden_dreaming.py \
             tests/test_self_thinking_prompt_probe.py \
+            tests/test_aup_gate_probe.py \
             -v
 
       - name: Perception kernel unit tests

@@ -1,0 +1,22 @@
+{
+  "_readme": [
+    "AUP 哨兵探针(tools/e2e/aup_gate_probe.py)的固定件指纹。",
+    "**这里只有两个固定件**，且都不是从生产派生的文本。提示词里每一段会随生产演进而变的",
+    "文本(io_cli 目录 / MEMORY READ / FILE DELIVERY / 时间锚+回复语言及其胶水)都由探针",
+    "现场从生产件调出来，不存快照——初版存过,四段里三段已经漂了且无人发现;",
+    "二版手抄胶水又比生产多了一个换行。",
+    "改了这两个固定件 → 跑 --write-manifest 并人眼过 diff。"
+  ],
+  "sha256": {
+    "canary_instruction_v0.2.0.txt": "184b0e8508a7e76b71bfb097933002e17e260a143647cd37f7b9b6ef145c74e9",
+    "user_message.txt": "ae7de3c5e9d73e26b05520b5b3373f00c1124a1fc9ecc1d29575b0db82dd9983"
+  },
+  "provenance": {
+    "user_message.txt": "探针自己的用户消息，不是产品文案。",
+    "canary_instruction_v0.2.0.txt": {
+      "what": "agent_protocol_core v0.2.0 的 self_thinking.INSTRUCTION 原文(693 字符)",
+      "why": "2026-08-30 实测：放进生产同形提示词里发出去会被 AUP 闸拒。",
+      "role": "对照组/量具自检，**不是产品文案**。它某天不再被拒 ⇒ 闸挪了或环境变了，探针失去判别力——那时要重新取一段基线，不是删掉这一格。"
+    }
+  }
+}
