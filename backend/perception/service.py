@@ -443,6 +443,11 @@ def _ingest_snapshot_v2_inner(
 
     if storage_items:
         results.update(_ingest_snapshot_storage_only(user_id, storage_items, client_ts=client_ts))
+        # PerceptKit shadow. Runs beside the live path, writes only to the
+        # kit's own tables, and cannot raise -- see perceptkit_adapter.shadow.
+        # It is handed the already-decrypted items, so it costs no extra
+        # enclave calls. Nothing below reads its result.
+        _perceptkit_shadow(user_id, storage_items, client_ts=client_ts)
     for key, plaintext in location_anchor_observations:
         if results.get(key) != "accepted":
             continue
@@ -458,6 +463,21 @@ def _ingest_snapshot_v2_inner(
             submit_wake=_submit_wake_event_v2_compat,
         )
     return results
+
+
+
+def _perceptkit_shadow(user_id: str, storage_items: list, *, client_ts=None) -> None:
+    """Fire the PerceptKit shadow run. Import is local and failure is swallowed.
+
+    Local import keeps the kit off the module-import path of the live service:
+    if the package is missing or a version is skewed, perception reports keep
+    working and only the shadow goes quiet.
+    """
+    try:
+        from .perceptkit_adapter import shadow
+        shadow.observe(user_id, storage_items, client_ts=client_ts)
+    except Exception:                              # noqa: BLE001 -- deliberate
+        pass
 
 
 def ingest_device_event_v2(user_id: str, event: dict) -> dict:
