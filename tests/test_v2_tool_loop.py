@@ -216,6 +216,56 @@ def test_tool_loop_threads_visual_fallback_deadline_to_main_provider(monkeypatch
     assert provider.calls[0]["absolute_deadline"] == deadline
 
 
+def test_terminal_self_thinking_round_requests_assistant_prefill(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "<think>reason</think>hello", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(
+        provider_client, "reliable_chat_completion_async", provider
+    )
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=1,
+        suppress_native_reasoning=True,
+    ))
+
+    assert outcome.stop_reason == "final_text"
+    assert provider.calls[0]["tools"] is None
+    assert provider.calls[0].get("assistant_prefill") == (
+        provider_client.SELF_THINKING_ASSISTANT_PREFILL
+    )
+
+
+def test_nonterminal_tool_round_does_not_request_assistant_prefill(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "plain final", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(
+        provider_client, "reliable_chat_completion_async", provider
+    )
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=2,
+        suppress_native_reasoning=True,
+    ))
+
+    assert outcome.stop_reason == "final_text"
+    assert provider.calls[0]["tools"] is not None
+    assert "assistant_prefill" not in provider.calls[0]
+
+
 def test_provider_call_trace_failure_does_not_change_the_reply(monkeypatch):
     provider = _ScriptedProvider([
         {"reply": "hello", "stop_reason": "end_turn", "tool_calls": [], "usage": {}},

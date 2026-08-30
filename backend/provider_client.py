@@ -1337,6 +1337,115 @@ def _synthesized_assistant_payload(exchange: ToolExchange, wire: str):
     raise ProviderError(f"unknown tool exchange wire: {wire}")
 
 
+SELF_THINKING_ASSISTANT_PREFILL = "<think>"
+
+
+def _model_supports_assistant_prefill(provider: str, model: str) -> bool:
+    """Return only capabilities demonstrated on the provider's live wire.
+
+    Assistant-role history is not itself evidence of continuation semantics:
+    OpenAI Chat/Responses, DeepSeek, and sampled custom relays all accepted the
+    final assistant item while generating a fresh answer. Keep this allowlist
+    model-specific because newer generations on the same provider can reject
+    the exact request shape accepted by older ones.
+    """
+    normalized_provider = normalize_provider(provider)
+    normalized_model = str(model or "").strip().lower()
+    claude_45 = bool(
+        re.search(
+            r"(?:^|/)claude-(?:haiku|sonnet|opus)-4(?:[.-])5(?:[-.]|$)",
+            normalized_model,
+        )
+    )
+    gemini_continuation = bool(
+        re.search(r"(?:^|/)gemini-(?:2[.]5|3[.]1)(?:[-.]|$)", normalized_model)
+    )
+    if normalized_provider == "anthropic":
+        return claude_45
+    if normalized_provider == "gemini":
+        return gemini_continuation
+    if normalized_provider == "openrouter":
+        return (
+            normalized_model.startswith("anthropic/") and claude_45
+        ) or (
+            normalized_model.startswith("google/") and gemini_continuation
+        )
+    return False
+
+
+def _effective_assistant_prefill(
+    *,
+    provider: str,
+    model: str,
+    requested: str,
+    tools: "list[ToolSpec] | None" = None,
+    tool_choice: str | dict[str, Any] | None = None,
+    allow_image_output: bool = False,
+) -> str:
+    """Gate continuation by provider/model and by a text-only request shape."""
+    prefill = str(requested or "")
+    if prefill != SELF_THINKING_ASSISTANT_PREFILL:
+        return ""
+    if allow_image_output:
+        return ""
+    if tools:
+        choice_disables_tools = tool_choice == "none" or tool_choice == {
+            "type": "none"
+        }
+        if not choice_disables_tools or normalize_provider(provider) == "gemini":
+            return ""
+    if not _model_supports_assistant_prefill(provider, model):
+        return ""
+    return prefill
+
+
+def _assistant_prefill_message(wire: str, text: str) -> dict[str, Any]:
+    """Encode one assistant continuation prefix for a provider-native wire."""
+    if wire == "openai_chat":
+        return {"role": "assistant", "content": text}
+    if wire == "anthropic":
+        return {
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+        }
+    if wire == "gemini":
+        return {"role": "model", "parts": [{"text": text}]}
+    raise ProviderError(f"unsupported assistant prefill wire: {wire}")
+
+
+def _reconstruct_assistant_prefill(
+    text: str,
+    prefill: str,
+    *,
+    stop_reason: str = "",
+) -> str:
+    """Restore an omitted prefix without turning a normal reply into thinking.
+
+    Continuation-capable providers omit the supplied prefix from their response,
+    but a request can still finish with an ordinary answer instead of continuing
+    it.  A closing ``</think>`` is structural proof that continuation happened.
+    Otherwise, an explicit non-token-limit stop preserves the provider text and
+    lets the existing ABSENT correction path handle it.  Token-limit and missing
+    stop signals stay fail-closed: prefixing a truncated/unknown fragment keeps
+    private partial thinking out of the visible reply.
+    """
+    reply = str(text or "")
+    if not prefill:
+        return reply
+    if not reply:
+        return ""
+    stripped = reply.lstrip()
+    if stripped.startswith(prefill):
+        return prefill + stripped[len(prefill) :]
+    if re.search(r"<\s*/\s*think\s*>", reply, re.IGNORECASE):
+        return prefill + reply
+    if normalize_stop_reason(stop_reason) and not is_token_limit_stop_reason(
+        stop_reason
+    ):
+        return reply
+    return prefill + reply
+
+
 def _assistant_payload_for_wire(exchange: ToolExchange, wire: str):
     _validate_tool_exchange(exchange)
     native = exchange.assistant_turn
@@ -2688,6 +2797,7 @@ def _build_openai_compat_payload(
     prompt_cache_key: str = "",
     tool_choice: str | dict[str, Any] | None = None,
     allow_image_output: bool = False,
+    assistant_prefill: str = "",
 ) -> dict[str, Any]:
     encoded_messages = _encode_messages_openai_chat(messages)
     payload: dict[str, Any] = {
@@ -2727,6 +2837,13 @@ def _build_openai_compat_payload(
                 payload["messages"] = _mark_openai_chat_cache_breakpoint(
                     encoded_messages
                 )
+    # ``assistant_prefill`` is already capability-gated once by the dispatcher.
+    # Builders only encode the effective value so payload and parser cannot
+    # diverge if runtime model mapping changes later.
+    if assistant_prefill:
+        payload["messages"].append(
+            _assistant_prefill_message("openai_chat", assistant_prefill)
+        )
     return payload
 
 
@@ -3399,6 +3516,7 @@ def _parse_openai_compat_body(
     provider: str,
     model: str,
     require_reply: bool,
+    assistant_prefill: str = "",
 ) -> dict[str, Any]:
     try:
         body = resp.json()
@@ -3421,14 +3539,18 @@ def _parse_openai_compat_body(
         assistant_payload = {}
     if not isinstance(assistant_payload, dict):
         assistant_payload = {}
+    reply = _extract_reply(
+        body, required=require_reply and not tool_calls and not media
+    )
+    stop_reason = _extract_openai_compatible_stop_reason(body)
     return {
-        "reply": _extract_reply(
-            body, required=require_reply and not tool_calls and not media
+        "reply": _reconstruct_assistant_prefill(
+            reply, assistant_prefill, stop_reason=stop_reason
         ),
         "reasoning": _extract_openai_compatible_reasoning(body),
         "usage": _normalize_usage(provider, body.get("usage")),
         "raw_id": body.get("id", ""),
-        "stop_reason": _extract_openai_compatible_stop_reason(body),
+        "stop_reason": stop_reason,
         "provider": provider,
         "model": model,
         "tool_calls": tool_calls,
@@ -3541,6 +3663,7 @@ def _build_anthropic_payload(
     tools: "list[ToolSpec] | None" = None,
     prompt_cache_key: str = "",
     tool_choice: str | dict[str, Any] | None = None,
+    assistant_prefill: str = "",
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
     cacheable_system_parts = [
         _content_text(message.get("content"))
@@ -3601,6 +3724,10 @@ def _build_anthropic_payload(
     # The opaque affinity key itself is intentionally not sent on Anthropic's
     # wire.  ``cache_control`` lives on the stable system/message content block
     # above; top-level cache_control is not part of the Messages API schema.
+    if assistant_prefill:
+        payload["messages"].append(
+            _assistant_prefill_message("anthropic", assistant_prefill)
+        )
 
     url = f"{base_url.rstrip('/')}/messages"
     headers = {
@@ -3616,19 +3743,24 @@ def _parse_anthropic_body(
     *,
     model: str,
     require_reply: bool,
+    assistant_prefill: str = "",
 ) -> dict[str, Any]:
     # See _parse_openai_compat_body: a pure tool-call response has no reply text
     # and must not be rejected — require reply only when no tool_calls are present.
     tool_calls = _decode_tool_calls_anthropic(body)
     content = body.get("content")
+    reply = _extract_anthropic_reply(
+        body, required=require_reply and not tool_calls
+    )
+    stop_reason = str(body.get("stop_reason") or "").strip()
     return {
-        "reply": _extract_anthropic_reply(
-            body, required=require_reply and not tool_calls
+        "reply": _reconstruct_assistant_prefill(
+            reply, assistant_prefill, stop_reason=stop_reason
         ),
         "reasoning": _extract_anthropic_reasoning(body),
         "usage": _normalize_usage("anthropic", body.get("usage")),
         "raw_id": body.get("id", ""),
-        "stop_reason": str(body.get("stop_reason") or "").strip(),
+        "stop_reason": stop_reason,
         "provider": "anthropic",
         "model": model,
         "tool_calls": tool_calls,
@@ -4019,6 +4151,7 @@ def _build_gemini_payload(
     tools: "list[ToolSpec] | None" = None,
     allow_image_output: bool = False,
     tool_choice: str | dict[str, Any] | None = None,
+    assistant_prefill: str = "",
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
     system, contents = _split_system_messages_gemini(messages)
     generation_config: dict[str, Any] = {
@@ -4051,6 +4184,10 @@ def _build_gemini_payload(
             payload["toolConfig"] = {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [tool_choice["function"]["name"]]}}
         elif tool_choice == "required":
             payload["toolConfig"] = {"functionCallingConfig": {"mode": "ANY"}}
+    if assistant_prefill:
+        payload["contents"].append(
+            _assistant_prefill_message("gemini", assistant_prefill)
+        )
 
     url = f"{base_url.rstrip('/')}/models/{quote(model, safe='')}:generateContent"
     headers = {
@@ -4065,6 +4202,7 @@ def _parse_gemini_body(
     *,
     model: str,
     require_reply: bool,
+    assistant_prefill: str = "",
 ) -> dict[str, Any]:
     # See _parse_openai_compat_body: a pure tool-call response has no reply text
     # and must not be rejected — require reply only when no tool_calls are present.
@@ -4076,14 +4214,18 @@ def _parse_gemini_body(
         assistant_payload = {}
     if not isinstance(assistant_payload, dict):
         assistant_payload = {}
+    reply = _extract_gemini_reply(
+        body, required=require_reply and not tool_calls and not media
+    )
+    stop_reason = _extract_gemini_stop_reason(body)
     return {
-        "reply": _extract_gemini_reply(
-            body, required=require_reply and not tool_calls and not media
+        "reply": _reconstruct_assistant_prefill(
+            reply, assistant_prefill, stop_reason=stop_reason
         ),
         "reasoning": _extract_gemini_reasoning(body),
         "usage": _normalize_usage("gemini", body.get("usageMetadata")),
         "raw_id": body.get("responseId", ""),
-        "stop_reason": _extract_gemini_stop_reason(body),
+        "stop_reason": stop_reason,
         "provider": "gemini",
         "model": model,
         "tool_calls": tool_calls,
@@ -4819,6 +4961,7 @@ async def _chat_completion_async_impl(
     include_reasoning: bool = False,
     tools: "list[ToolSpec] | None" = None,
     tool_choice: str | dict[str, Any] | None = None,
+    assistant_prefill: str = "",
     _attempt_trace: list[dict[str, Any]] | None,
     allow_image_output: bool = False,
 ) -> dict[str, Any]:
@@ -4829,6 +4972,14 @@ async def _chat_completion_async_impl(
     key = (config.api_key or "").strip()
     if not key:
         raise ProviderError("api_key required")
+    effective_prefill = _effective_assistant_prefill(
+        provider=provider,
+        model=request_model,
+        requested=assistant_prefill,
+        tools=tools,
+        tool_choice=tool_choice,
+        allow_image_output=allow_image_output,
+    )
 
     # anthropic / gemini / openai-responses 各自的编解码与同步版共享单实现
     # （_build_<wire>_payload / _parse_<wire>_body），这里只保留 async
@@ -4942,6 +5093,7 @@ async def _chat_completion_async_impl(
             tools=tools,
             prompt_cache_key=config.prompt_cache_key,
             tool_choice=tool_choice,
+            assistant_prefill=effective_prefill,
         )
 
         async def post_anthropic(request_payload: dict[str, Any]) -> httpx.Response:
@@ -4997,7 +5149,12 @@ async def _chat_completion_async_impl(
             raise ProviderError("provider returned non-json response") from e
         if not isinstance(body, dict):
             raise ProviderError("provider returned non-object response")
-        result = _parse_anthropic_body(body, model=model, require_reply=require_reply)
+        result = _parse_anthropic_body(
+            body,
+            model=model,
+            require_reply=require_reply,
+            assistant_prefill=effective_prefill,
+        )
         return _with_request_diagnostics(
             result,
             initial_payload=payload,
@@ -5097,6 +5254,7 @@ async def _chat_completion_async_impl(
             tools=tools,
             allow_image_output=allow_image_output,
             tool_choice=tool_choice,
+            assistant_prefill=effective_prefill,
         )
         async def post_gemini(request_payload: dict[str, Any]) -> httpx.Response:
             try:
@@ -5123,7 +5281,12 @@ async def _chat_completion_async_impl(
             raise ProviderError("provider returned non-json response") from e
         if not isinstance(body, dict):
             raise ProviderError("provider returned non-object response")
-        return _parse_gemini_body(body, model=model, require_reply=require_reply)
+        return _parse_gemini_body(
+            body,
+            model=model,
+            require_reply=require_reply,
+            assistant_prefill=effective_prefill,
+        )
 
     if provider == "openai" and _openai_uses_responses_for_reasoning(request_model):
         payload, url, headers = _build_openai_responses_payload(
@@ -5220,6 +5383,7 @@ async def _chat_completion_async_impl(
         prompt_cache_key=config.prompt_cache_key,
         tool_choice=tool_choice,
         allow_image_output=allow_image_output,
+        assistant_prefill=effective_prefill,
     )
 
     async def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
@@ -5274,7 +5438,11 @@ async def _chat_completion_async_impl(
         _raise_for_provider_status(resp)
 
     result = _parse_openai_compat_body(
-        resp, provider=provider, model=request_model, require_reply=require_reply
+        resp,
+        provider=provider,
+        model=request_model,
+        require_reply=require_reply,
+        assistant_prefill=effective_prefill,
     )
     return _with_request_diagnostics(
         result,
@@ -5298,6 +5466,7 @@ async def chat_completion_async(
     tools: "list[ToolSpec] | None" = None,
     tool_choice: str | dict[str, Any] | None = None,
     allow_image_output: bool = False,
+    assistant_prefill: str = "",
 ) -> dict[str, Any]:
     """Native async completion, optionally retaining every HTTP attempt.
 
@@ -5323,6 +5492,7 @@ async def chat_completion_async(
             tools=tools,
             tool_choice=tool_choice,
             allow_image_output=allow_image_output,
+            assistant_prefill=assistant_prefill,
             _attempt_trace=attempt_trace,
         )
     except Exception as exc:  # noqa: BLE001 -- annotate and preserve original
