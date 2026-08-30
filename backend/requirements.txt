@@ -106,5 +106,23 @@ Pillow>=11,<13
 #
 # 本镜像用 `pip install --require-hashes`，升级 = 改这里的版本号 +
 # 重新 `uv pip compile --generate-hashes`（命令见 deploy/BUILD.md）。
+#
+# 🔴 升版本 = 同时接收**其他人**合进 memgarden main 的改动
+#
+# memgarden 是团队共享的仓库，发版是从 main 的当前状态切的 —— 不是从「谁改了
+# 什么」切的。所以把这里从 X 升到 Y，io 拿到的是 X..Y 区间里**所有人**的改动，
+# 不只是你要的那一个。
+#
+# 而且 `agent-protocol-core` 和 `memgarden` 在**同一个仓库**里（`self_thinking`
+# 在前者）。io 两个都装，所以只碰了 core 的改动也会跟着进来。
+#
+# 升之前先看一眼区间：
+#
+#     git -C <memgarden checkout> log --oneline vX..vY
+#
+# 实例（2026-08-30）：为了发自己的修复从 0.12.0 升到 0.12.8，顺带带进了别人的
+# self-thinking 措辞改动（一行字），io 锁提示词逐字节不变的那组哈希测试红了。
+# 那组测试拦住了它 —— 这正是它存在的理由。真正危险的不是带进来，是带进来而
+# 不知道。
 memgarden==0.12.8
 agent-protocol-core==0.12.8
