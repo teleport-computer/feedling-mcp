@@ -390,6 +390,9 @@ if not _provisioned:
         # 留在可收集列表里，否则连它也会被忽略。
         "test_tee_registry_guard_enforced.py",
         "test_self_thinking_parse.py",
+        # T403 bilingual prompt A/B harness: pure scoring, provenance, and
+        # offline plan gates. Provider execution is never invoked by the tests.
+        "test_self_thinking_prompt_probe.py",
         # Voice hangup summary prompt builder. Pure — no DB.
         "test_voice_cleanup.py",
         # History-search 纯逻辑内核（planner/cursor/归一化）。Pure — 只
