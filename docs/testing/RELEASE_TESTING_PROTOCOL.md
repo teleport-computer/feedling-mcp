@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Feedling 发版测试方案（Release Testing Protocol）
 
 > 2026-07-17 · Seven 定框架，Claude 落地。与 `docs/testing/TESTING.md`（开发循环的
