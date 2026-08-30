@@ -276,6 +276,11 @@ if not _provisioned:
         # 无 Postgres 时也该跑，否则本地「全绿」是假的。
         "test_memgarden_is_a_real_dependency.py",
         "test_card_leak_signals_wired.py",
+        # 2026-08-30 接 GardenComponent 这批：三条都是纯的
+        # （AST 扫描 / 假模型），不碰 DB、不碰网络。不登记的话无库环境下
+        # 会被静默跳过，本地「全绿」就是假的。
+        "test_orchestration_is_not_reimplemented.py",
+        "test_garden_component_parity.py",
         "test_memgarden_dream_migrate_golden.py",
         "test_memgarden_policies.py",
         "test_memgarden_capture_golden.py",

@@ -199,7 +199,6 @@ from memory.dream_prompt_v1 import (
     build_dream_retry_prompt,
     parse_dream_consolidations,
 )
-from memgarden.prompts.migrate import build_migrate_prompt, parse_migrated_cards
 from chat.reply_language import (
     format_time_anchor,
     garden_language_decision,
@@ -17459,19 +17458,27 @@ def _process_migrate_jobs(jobs: list) -> float:
         hash_by_id = {str(r.get("id")): str(r.get("old_body_hash") or "") for r in batch}
         _identity, ai_name, user_name, _identity_text = _capture_identity_context()
         buckets_text, threads_text = _capture_memory_terms_context()
-        prompt = build_migrate_prompt(
-            ai_name=ai_name,
-            user_name=user_name,
-            old_cards=_migrate_render_old_cards(batch),
-            vocab=f"已有桶: {buckets_text}\n已有线索: {threads_text}",
-            locale=infer_garden_language(
-                _identity,
-                existing_buckets=buckets_text,
-                archive_language=str(_whoami_cache.get("archive_language") or "").strip(),
+        # 迁移走 GardenComponent —— 拼提示词 / 调模型 / 解析在包里。
+        # 白名单必填是接口保证的：模型可能凭空造 id，那会把不存在的卡
+        # 「升级」成新内容或覆盖别的卡。
+        _migrate_garden = garden_component.build_garden(
+            garden_component.CallableModel(
+                lambda p: _capture_agent_reply_text(call_agent(p, raw_text=True))
             ),
         )
         try:
-            reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
+            _migrated = _migrate_garden.migrate(mg_contracts.MigrateRequest(
+                old_cards=_migrate_render_old_cards(batch),
+                allowed_ids=tuple(sorted(allowed_ids)),
+                vocab=f"已有桶: {buckets_text}\n已有线索: {threads_text}",
+                ai_name=ai_name,
+                user_name=user_name,
+                locale=infer_garden_language(
+                    _identity,
+                    existing_buckets=buckets_text,
+                    archive_language=str(_whoami_cache.get("archive_language") or "").strip(),
+                ),
+            ))
         except Exception as e:
             reason = _agent_call_failed_reason("migrate_agent_call_failed", e)
             log.error("migrate agent call failed id=%s: %s", job_id, e)
@@ -17480,8 +17487,8 @@ def _process_migrate_jobs(jobs: list) -> float:
                 extra={"migrate_result": {"status": "failed", "reason": reason}},
             )
             continue
-        upgrades, unmigrated_ids, err = parse_migrated_cards(
-            reply_text, allowed_ids=allowed_ids, signals=IO_LEAK_SIGNALS
+        upgrades, unmigrated_ids, err = (
+            _migrated.upgrades, _migrated.unmigrated_ids, _migrated.error
         )
         if err:
             update_proactive_job_status(

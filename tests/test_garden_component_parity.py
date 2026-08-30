@@ -150,3 +150,65 @@ def test_the_leak_signals_are_actually_wired() -> None:
                     "content": "<|channel|>analysis<|message|>用户提到了健康问题"})
     _cards, err, _ = _component([dirty, dirty])
     assert err, "带 harmony 标记的卡应该被拦下来"
+
+
+# --------------------------------------------------------------- 迁移
+
+from memgarden.prompts.migrate import (  # noqa: E402
+    build_migrate_prompt,
+    parse_migrated_cards,
+)
+from memgarden import MigrateRequest  # noqa: E402
+
+OLD_CARDS = "- [m_1] 面试挂了\n- [m_2] 换了工作"
+VOCAB = "已有桶: 工作、健康\n已有线索: 面试、压力"
+UPGRADE = {"id": "m_1", "bucket": "工作", "threads": ["面试"],
+           "summary": "面试第三次挂在算法题",
+           "content": "今年第三次没过，都卡在算法题上，他开始怀疑自己适不适合这行。"}
+
+
+def _migrate_legacy(reply: str) -> tuple:
+    """原路径：io 自己拼的那几步。"""
+    prompt = build_migrate_prompt(
+        ai_name="io", user_name="老王", old_cards=OLD_CARDS,
+        vocab=VOCAB, locale=LOCALE)
+    assert prompt
+    return parse_migrated_cards(reply, allowed_ids={"m_1", "m_2"},
+                                signals=IO_LEAK_SIGNALS)
+
+
+def _migrate_component(reply: str) -> tuple:
+    out = build_garden(CallableModel(lambda p: reply)).migrate(MigrateRequest(
+        old_cards=OLD_CARDS, allowed_ids=("m_1", "m_2"), vocab=VOCAB,
+        ai_name="io", user_name="老王", locale=LOCALE))
+    return out.upgrades, out.unmigrated_ids, out.error
+
+
+@pytest.mark.parametrize("name,reply", [
+    ("一张升级成功", json.dumps({"upgrades": [UPGRADE]}, ensure_ascii=False)),
+    ("两张都升级", json.dumps({"upgrades": [
+        UPGRADE, {**UPGRADE, "id": "m_2", "summary": "换了份新工作",
+                  "content": "上个月换到一家更小的公司，节奏慢一些。"}]},
+        ensure_ascii=False)),
+    ("模型返回了不该动的 id", json.dumps({"upgrades": [
+        UPGRADE, {**UPGRADE, "id": "m_999"}]}, ensure_ascii=False)),
+    ("整份格式坏了", "这不是 JSON"),
+])
+def test_migrate_component_matches_the_legacy_path(name: str, reply: str) -> None:
+    old = _migrate_legacy(reply)
+    new = _migrate_component(reply)
+    assert new[0] == old[0], f"「{name}」升级结果不一样"
+    assert sorted(new[1]) == sorted(old[1]), f"「{name}」未升级列表不一样"
+    assert new[2] == old[2], f"「{name}」错误码不一样"
+
+
+def test_migrate_component_asks_the_model_the_same_thing() -> None:
+    """提示词逐字节相同 —— 提示词变了模型产出就会变，那是用户看得见的。"""
+    legacy = build_migrate_prompt(
+        ai_name="io", user_name="老王", old_cards=OLD_CARDS,
+        vocab=VOCAB, locale=LOCALE)
+    seen: list[str] = []
+    build_garden(CallableModel(lambda p: seen.append(p) or "{}")).migrate(
+        MigrateRequest(old_cards=OLD_CARDS, allowed_ids=("m_1", "m_2"),
+                       vocab=VOCAB, ai_name="io", user_name="老王", locale=LOCALE))
+    assert seen == [legacy]
