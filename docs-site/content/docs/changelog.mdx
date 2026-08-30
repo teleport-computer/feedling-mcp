@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **A scheduled reminder that cannot be safely resumed after foreground Chat
+  preempts it now reports the existing `platform_execution_timeout` class
+  instead of `unknown`.** Pristine reminders still return to the queue, the
+  failure remains attributed to the system, and the localized scheduled-failure
+  message is unchanged.
+
 - **Chat writes no longer wait for Memory Capture discovery queries.** Resident
   and Runtime V2 now reconcile the durable Capture frontier on the existing
   periodic tick, including the turn-count backstop, so Capture can begin up to
