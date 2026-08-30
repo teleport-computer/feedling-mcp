@@ -13,6 +13,7 @@ from agent_protocol_core import self_thinking
 from chat.reply_language import format_time_anchor, infer_reply_language
 from capabilities import tool_schema
 from chat import language_follow
+from core import util as core_util
 from model_api_runtime.v2 import context, worker
 import worldbook_readside_core
 
@@ -1031,14 +1032,15 @@ def test_needs_compaction_counts_nonblank():
 
 
 def test_text_of_handles_str_list_and_none():
-    assert context.text_of("  hi  ") == "hi"
-    assert context.text_of(None) == ""
-    assert context.text_of([
+    assert core_util.text_of("  hi  ") == "hi"
+    assert core_util.text_of(None) == ""
+    assert core_util.text_of([
         {"type": "text", "text": "look at this"},
         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}},
-    ]) == "look at this"
+        "  and this  ",
+    ]) == "look at this\nand this"
     # image-only block list has no text
-    assert context.text_of([
+    assert core_util.text_of([
         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}},
     ]) == ""
 

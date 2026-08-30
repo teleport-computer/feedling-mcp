@@ -1903,7 +1903,7 @@ async def _call_image_generation_dependency(
 
 def _required_file_missing_fallback(messages: list[dict]) -> str:
     user_text = "\n".join(
-        context.text_of(message.get("content"))
+        core_util.text_of(message.get("content"))
         for message in messages
     )
     if re.search(r"[\u4e00-\u9fff]", user_text):
@@ -7375,7 +7375,7 @@ def _latest_user_writing_system(rows: Iterable[dict]) -> str:
     for row in reversed(list(rows)):
         if str(row.get("role") or "") not in {"user", "human"}:
             continue
-        text = context.text_of(row.get("content")).strip()
+        text = core_util.text_of(row.get("content")).strip()
         if not text:
             continue
         script = v2_language_follow.classify_writing_system(text)
@@ -7824,7 +7824,7 @@ def _render_capture_line(message: dict, voice_transcripts: dict,
     label = transcript_speaker_label(
         str(message.get("role") or ""), user_name=user_name, ai_name=ai_name
     )
-    return f"- {label}: {context.text_of(message.get('content'))}"
+    return f"- {label}: {core_util.text_of(message.get('content'))}"
 
 
 async def _rebalance_summary_frontier(
@@ -13221,7 +13221,7 @@ def _inject_tail_images(
                 continue
             observation = str(observations.get(message_id) or "").strip()
             if observation:
-                caption = context.text_of(row.get("content"))
+                caption = core_util.text_of(row.get("content"))
                 if caption == "[image]":
                     caption = ""
                 observation_block = json.dumps(
@@ -13244,7 +13244,7 @@ def _inject_tail_images(
                 )
             mime = str((got or {}).get("image_mime") or "image/jpeg")
             blocks: list[dict] = []
-            caption = context.text_of(row.get("content"))
+            caption = core_util.text_of(row.get("content"))
             if caption and caption != "[image]":
                 blocks.append({"type": "text", "text": caption})
             blocks.append({
@@ -13267,7 +13267,7 @@ def _inject_tail_images(
             continue
         mime = str(got.get("image_mime") or "image/jpeg")
         blocks: list[dict] = []
-        caption = context.text_of(row.get("content"))
+        caption = core_util.text_of(row.get("content"))
         if caption and caption != "[image]":
             blocks.append({"type": "text", "text": caption})
         blocks.append(
@@ -13303,7 +13303,7 @@ def _inject_tail_files(tail: list[dict], *, user_id: str, read_files) -> list[di
         text = str((got or {}).get("text") or "")
         error = str((got or {}).get("error") or "")
         if error:
-            marker = context.text_of(row.get("content")) or "[file]"
+            marker = core_util.text_of(row.get("content")) or "[file]"
             out.append(
                 {
                     **row,
