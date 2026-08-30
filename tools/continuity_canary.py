@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""§4 day-0 decrypt continuity canary.
+"""Retired §4 day-0 decrypt continuity canary.
 
-The §3 deploy canary only proves NEW writes round-trip. THIS incident's real
-question was "can the enclave still open OLD envelopes?" — which needs an old
-envelope that never changes. So: take the permanent canary user's OLDEST stored
-chat envelope (written once, long ago) and prove the live enclave still decrypts
-it. The moment ANY old data becomes undecryptable, this goes red the same day,
-and its green during a "decrypt failed" report instantly reframes triage to
-"client-side".
+RETIRED 2026-08-31 by Seven's product judgment. The GitHub Actions workflow is
+disabled and its schedule was removed. This script remains as executable
+history; do not interpret it as an active daily signal. Revival requirements:
+docs/testing/archive/CONTINUITY_CANARY_RETIREMENT_2026-08-31.md
+
+Historical purpose: the §3 deploy canary only proved NEW writes round-trip. The
+continuity canary instead took a permanent canary user's OLDEST stored chat
+envelope (written once, long ago) and asked the live enclave to decrypt it. When
+the workflow was active and its fixture was healthy, a daily failure could flag
+old data becoming undecryptable; a green result during a "decrypt failed" report
+could redirect triage toward the client side.
 
 Auth uses a runtime token (HMAC over user_id) minted from the shared
 FEEDLING_RUNTIME_TOKEN_SECRET the enclave already holds — no long-lived api key

@@ -7,19 +7,19 @@
 #
 # Historical behavior: §4 day-0 decrypt continuity canary (PROD).
 #
-# Proves the live PROD enclave can still open an OLD envelope — the exact question
-# the 2026-07 "decrypt failed" false alarm raised, which the §3 deploy canary
-# (new writes only) cannot answer. Reads the permanent canary user's OLDEST stored
-# chat envelope from the prod DB and decrypts it through the prod enclave. Green
-# during a "decrypt failed" report instantly reframes triage to "client-side".
+# It proved whether the live PROD enclave could still open an OLD envelope — the
+# exact question the 2026-07 "decrypt failed" false alarm raised, which the §3
+# deploy canary (new writes only) could not answer. It read the permanent canary
+# user's OLDEST stored chat envelope from the prod DB and asked the prod enclave
+# to decrypt it. A green result could redirect a "decrypt failed" investigation
+# toward the client side.
 #
-# Runs daily + on demand. INERT until the repo var CANARY_USER_ID is set, so
-# merging it is a no-op until you opt in.
+# Historically ran daily + on demand. The schedule is deliberately absent now,
+# so repository state also prevents an automatic run. The manual trigger is
+# retained only for controlled revival work after the checklist above.
 name: continuity-canary
 
 on:
-  schedule:
-    - cron: "17 6 * * *"   # daily ~06:17 UTC
   workflow_dispatch: {}
 
 concurrency:
