@@ -36,7 +36,7 @@ tool/script taxonomy。清单记录当前 owner、分类、生命周期和**精�
 | E13 | [`docs/TRACE_T138_BLOCK0.md`](../TRACE_T138_BLOCK0.md) 给出 `scripts/trace-write-rate-report.py --days 7`；`tests/test_trace_write_stats.py` 锁住其底层 measurement。 |
 | E14 | [`README.md`](../../README.md) 和 [`deploy/DEPLOYMENTS.md`](../../deploy/DEPLOYMENTS.md) 给出 `tools/audit_live_cvm.py` 的 audit command/证据。 |
 | E15 | `.github/workflows/backfill-v2-profiles.yml` 是 `tools/backfill_v2_profiles.py` 的 manual operator workflow。 |
-| E16 | `deploy/feedling-chat-resident.service` 的 `ExecStart`、`backend/agent_runtime/spawners.py` 的 hosted runner argv、`deploy/Dockerfile.agent-runner` 和 [`tools/README.md`](../../tools/README.md) 都以精确固定路径消费 resident consumer；`tests/test_chat_resident_self_update.py` 还锁住其随 checkout 更新的文件集。 |
+| E16 | `deploy/feedling-chat-resident.service` 的 `ExecStart` 和 `backend/agent_runtime/spawners.py` 的 hosted runner argv 都以精确固定路径执行 resident consumer；`deploy/Dockerfile.agent-runner` 以 `COPY tools/ ./tools/` 将整个工具目录随 image 交付。[`tools/README.md`](../../tools/README.md) 是 operator entrypoint，`tests/test_chat_resident_self_update.py` 锁住 consumer 的 checkout 更新文件集。 |
 | E17 | [`deploy/SELF_HOSTING.md`](../../deploy/SELF_HOSTING.md) 和根 `README.md` 都给出 `python tools/check_chat_pipeline.py` 诊断命令。 |
 | E18 | `.github/workflows/ci.yml` 执行 `tools/check_document_lifecycle.py` 及 `tools/ci_execution_evidence.py attest/report`；`tests/test_document_lifecycle.py` 锁住 lifecycle generator front matter。 |
 | E19 | [`docs/testing/TESTING.md`](../testing/TESTING.md) 说明 `.github/workflows/continuity-canary.yml` 已于 2026-08-31 禁用，并链接其 archive/恢复条件。 |
@@ -111,7 +111,7 @@ tool/script taxonomy。清单记录当前 owner、分类、生命周期和**精�
 | `tools/seed_copytext.py`（1） | Product copy operations | active diagnostic | retain | E35 |
 | `tools/seed_legacy_memory.py`（1） | Memory compatibility | test support | retain | E36 |
 | `tools/store_shell_only_inventory.py`（1） | Store-load contract | generated helper | retain | E37 |
-| `tools/strict_yaml.py`（1） | Deployment configuration parsing | production companion | retain | E41 |
+| `tools/strict_yaml.py`（1） | Deployment configuration validation | test support | retain | E41 |
 | `tools/user_mcp_ca_fetch.py`<br>`tools/user_mcp_materialize.py`（2） | Resident user-MCP runtime | production companion | **retain-protected** | E38 |
 | `tools/v2_user_triage.py`（1） | Runtime V2 operations | active diagnostic | retain | E39 |
 | `tools/verify_enclave_domain.py`（1） | Attestation deployment | deployment | retain | E40 |
@@ -129,12 +129,12 @@ tool/script taxonomy。清单记录当前 owner、分类、生命周期和**精�
 
 | 分类 | 路径数 |
 |---|---:|
-| production companion | 10 |
+| production companion | 9 |
 | deployment | 7 |
 | recovery | 4 |
 | migration | 2 |
 | active diagnostic | 28 |
-| test support | 65 |
+| test support | 66 |
 | generated helper | 5 |
 | historical | 1 |
 | **Task 5 taxonomy assets** | **122** |
