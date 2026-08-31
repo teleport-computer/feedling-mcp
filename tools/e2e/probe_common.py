@@ -196,7 +196,9 @@ def install_identity(c, identity: dict) -> tuple[int, dict]:
         return r.status_code, {"_text": r.text[:200]}
 
 
-def force_capture_until_enqueued(c, *, tries: int = 24, wait_sec: float = 5.0) -> dict:
+def force_capture_until_enqueued(
+    c, *, tries: int = 24, wait_sec: float = 5.0, wait_throttle: bool = False,
+) -> dict:
     """调 ``/v1/capture/force`` 直到**真的入队**，返回最后一次的响应体。
 
     ## 为什么要重试
@@ -212,6 +214,10 @@ def force_capture_until_enqueued(c, *, tries: int = 24, wait_sec: float = 5.0) -
 
     ``already_captured`` 也算成功：那说明这个窗口已经抽过了，不需要再排。
 
+    ``wait_throttle=True`` 时**等过节流**再继续 —— 打到 test / pre 这类真实环境时用。
+    那里的 ``FEEDLING_CAPTURE_MIN_INTERVAL_SEC`` 是部署配置，改不了也不该改，
+    只能等。默认关着：本地栈应当把这个值调小，等 10 分钟纯属浪费。
+
     ``min_interval`` 是**节流阀，不是失败** —— 两次 capture 之间默认要隔
     ``FEEDLING_CAPTURE_MIN_INTERVAL_SEC``（默认 600 秒）。多轮探针几乎必然撞上。
     干等 10 分钟没意义（探针测的是落卡内容，不是节流），所以这里不重试它，
@@ -226,6 +232,9 @@ def force_capture_until_enqueued(c, *, tries: int = 24, wait_sec: float = 5.0) -
     import time as _time
 
     last: dict = {}
+    if wait_throttle:
+        # 节流阀默认 600 秒;按 5 秒一轮要 120 次才等得过去,原来的 24 次不够。
+        tries = max(tries, 150)
     for _ in range(max(1, tries)):
         r = c.post("/v1/capture/force", json={})
         try:
@@ -234,7 +243,7 @@ def force_capture_until_enqueued(c, *, tries: int = 24, wait_sec: float = 5.0) -
             last = {"http": r.status_code, "text": r.text[:200]}
         if last.get("enqueued") or str(last.get("reason") or "") == "already_captured":
             return last
-        if str(last.get("reason") or "") == "min_interval":
+        if str(last.get("reason") or "") == "min_interval" and not wait_throttle:
             # 等不出来的:默认 600 秒。与其静默干等到超时、再报一个看不懂的
             # 「没入队」,不如立刻说清楚这是配置问题和怎么解。
             last = dict(last)

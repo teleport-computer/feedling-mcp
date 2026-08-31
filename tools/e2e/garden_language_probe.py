@@ -96,6 +96,11 @@ def _wait_for_new_cards(c, *, known: set[str], timeout: float) -> list[dict]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--wait-throttle", action="store_true",
+        help="等过 capture 节流阀(默认 600 秒)。打到 test/pre 这类真实环境时加，"
+             "那里的节流是部署配置、改不了也不该改。本地栈请改配置而不是干等。",
+    )
     ap.add_argument("--provider", default="deepseek")
     ap.add_argument("--model", default="deepseek-chat")
     args = ap.parse_args()
@@ -124,7 +129,7 @@ def main() -> int:
         _sent, err = _hosted_send(c, zh_text)
         if not check("chat send (中文)", not err, err or ""):
             return 1
-        forced = force_capture_until_enqueued(c)
+        forced = force_capture_until_enqueued(c, wait_throttle=args.wait_throttle)
         if not check("capture 真的入队了（中文那轮）",
                      bool(forced.get("enqueued")) or forced.get("reason") == "already_captured",
                      f"{forced}", pass_detail=str(forced.get("reason") or "enqueued")):
@@ -151,7 +156,7 @@ def main() -> int:
         _sent, err = _hosted_send(c, en_text)
         if not check("chat send (英文)", not err, err or ""):
             return 1
-        forced = force_capture_until_enqueued(c)
+        forced = force_capture_until_enqueued(c, wait_throttle=args.wait_throttle)
         if not check("capture 真的入队了（英文那轮）",
                      bool(forced.get("enqueued")) or forced.get("reason") == "already_captured",
                      f"{forced}", pass_detail=str(forced.get("reason") or "enqueued")):
