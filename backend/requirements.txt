@@ -97,14 +97,32 @@ Pillow>=11,<13
 
 # 记忆的编辑判断内核 —— 从本仓库提取出去的独立库（Apache-2.0，公开仓库）。
 #
-# 为什么走 GitHub Release 的 wheel URL 而不是 PyPI：
-#   1. PyPI 上 memory-garden 已被一个同领域的项目占用，我们叫 memgarden；
-#      发 PyPI 是后续的事，Release 先跑通接入。
-#   2. 本镜像用 `pip install --require-hashes`，每个依赖都必须有 sha256。
-#      git+ 依赖给不出稳定 wheel 哈希，Release 上的固定 wheel 可以 —— 这也是
-#      compose 哈希上链所要求的「构建可复现」。
+# 0.12.8 起走 PyPI。之前钉的是 GitHub Release 的 wheel URL，原因是
+# PyPI 上 memory-garden 这个名字被一个同领域项目占了、我们还没发；现在以
+# memgarden 这个名字发出去了，那条理由不再成立。
 #
-# 升级 = 换 URL 里的版本号 + 重新 `uv pip compile --generate-hashes`。
-# 别写成 @main 或分支名：那样构建就不可复现了，整条证明链失效。
-memgarden @ https://github.com/teleport-computer/memgarden/releases/download/v0.2.1/memgarden-0.2.1-py3-none-any.whl
-agent-protocol-core @ https://github.com/teleport-computer/memgarden/releases/download/v0.2.1/agent_protocol_core-0.2.1-py3-none-any.whl
+# agent-protocol-core 是同源的姊妹包，和 memgarden 锁步同版本 ——
+# memgarden 自己依赖它的精确版本，两边版本号必须一起改。
+#
+# 本镜像用 `pip install --require-hashes`，升级 = 改这里的版本号 +
+# 重新 `uv pip compile --generate-hashes`（命令见 deploy/BUILD.md）。
+#
+# 🔴 升版本 = 同时接收**其他人**合进 memgarden main 的改动
+#
+# memgarden 是团队共享的仓库，发版是从 main 的当前状态切的 —— 不是从「谁改了
+# 什么」切的。所以把这里从 X 升到 Y，io 拿到的是 X..Y 区间里**所有人**的改动，
+# 不只是你要的那一个。
+#
+# 而且 `agent-protocol-core` 和 `memgarden` 在**同一个仓库**里（`self_thinking`
+# 在前者）。io 两个都装，所以只碰了 core 的改动也会跟着进来。
+#
+# 升之前先看一眼区间：
+#
+#     git -C <memgarden checkout> log --oneline vX..vY
+#
+# 实例（2026-08-30）：为了发自己的修复从 0.12.0 升到 0.12.8，顺带带进了别人的
+# self-thinking 措辞改动（一行字），io 锁提示词逐字节不变的那组哈希测试红了。
+# 那组测试拦住了它 —— 这正是它存在的理由。真正危险的不是带进来，是带进来而
+# 不知道。
+memgarden==0.12.9
+agent-protocol-core==0.12.9

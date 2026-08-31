@@ -466,6 +466,17 @@ def test_chat_system_prompt_groups_atomic_self_thinking_with_reply_rules(
 
 
 def test_finalized_self_thinking_copy_is_exact_and_has_no_old_length_cap():
+    """这段文案在 agent-protocol-core 里，**不是 io 的**。
+
+    所以升 memgarden/core 的版本时这条会红 —— 这是设计如此：那个包是团队共享
+    的，发版从它的 main 切，升一次就会带上区间里所有人的改动。红了先看
+    `git -C <memgarden> log --oneline vX..vY` 确认改的是什么，再更新这个哈希。
+    详见 backend/requirements.txt 里 memgarden 那段的说明。
+
+    2026-08-30：0.12.0 → 0.12.8 带进了长度那句的措辞改动
+    （「想多写就多写，一句带过也行，不用凑字数也不用收着。」→「长短都行，
+    一句也可以。」），本意不变、仍然没有字数上限，哈希跟着更新。
+    """
     assert hashlib.sha256(self_thinking.INSTRUCTION.encode()).hexdigest() == (
         "dfa9f806b4fdcc189cc63d2fc1810a5326f0a3f5b9042f889e48f499ca9bc2ff"
     )

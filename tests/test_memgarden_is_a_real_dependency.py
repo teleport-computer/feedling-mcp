@@ -45,33 +45,51 @@ def test_kernel_is_not_imported_from_backend():
     assert (REPO / "backend") not in where.parents, f"memgarden 来自 backend/：{where}"
 
 
-def test_lock_pins_a_hash_locked_release_asset():
-    """lock 里必须钉一个具体版本的 wheel URL，且带哈希。
+def test_lock_pins_an_exact_hash_locked_version():
+    """lock 里必须钉一个**具体版本**，且带哈希。
 
     ⚠️ **哈希锁住的是字节，不是出处。** 这条测试之前叫 "immutable"，那是过度声称
     （codex code_review 2026-08-23 指出，实测 GitHub Release 的 `immutable` 字段
     确实是 false）。准确的说法是：
 
-        能保证   同一个 URL 被换成不同字节时，构建会失败而不是静默换包
-        不保证   这些字节由公开 tag 的源码构建 —— tag 可移动、asset 可删可重传，
-                 而且 tag 未签名、没有 build attestation
+        能保证   同一个版本被换成不同字节时，构建会失败而不是静默换包
+        不保证   这些字节由公开 tag 的源码构建
 
-    要补上「出处」这一环，得由 tag 绑定的 CI 构建 Release 并生成 artifact
-    attestation，升级依赖时验证 tag commit / digest / provenance 三者。那是独立
-    一批活，见 HANDOFF 里的待拍板项。
+    出处那一环现在由包那边补上了：memgarden 的发布流水线走 PyPI Trusted
+    Publishing（仓库不存 token），每个 wheel 同时挂 GitHub Release 并带
+    build provenance attestation，可以 `gh attestation verify` 验。
 
-    这里守住的是底线：钉分支（@main）会让构建完全不可复现，compose 哈希上链的
-    整条证明链直接失效。
+    ## 0.12.3 起从 Release URL 换成了 PyPI
+
+    之前钉的是 `memgarden @ https://.../releases/download/vX/....whl`，
+    原因只有一个：那时两个包**还没发到 PyPI**。现在发了，就用正常钉法。
+
+    这里守住的是底线：钉分支（@main）或不钉版本，会让构建完全不可复现，
+    compose 哈希上链的整条证明链直接失效。
     """
     lock = (REPO / "backend" / "requirements.lock").read_text(encoding="utf-8")
     lines = lock.splitlines()
-    for pkg in ("memgarden @", "agent-protocol-core @"):
-        idx = next((i for i, l in enumerate(lines) if l.startswith(pkg)), None)
-        assert idx is not None, f"lock 里没有 {pkg}"
-        url = lines[idx]
-        assert "/releases/download/v" in url, f"{pkg} 不是 Release 的固定 wheel：{url}"
-        assert url.endswith(".whl \\") or url.endswith(".whl"), f"{pkg} 不是 wheel：{url}"
-        assert any("--hash=sha256:" in l for l in lines[idx:idx + 3]), f"{pkg} 缺哈希"
+    for pkg in ("memgarden", "agent-protocol-core"):
+        idx = next((i for i, l in enumerate(lines) if l.startswith(f"{pkg}==")), None)
+        assert idx is not None, (
+            f"lock 里没有钉死版本的 {pkg}== —— 是不是又钉成 URL 或分支了？"
+        )
+        assert any("--hash=sha256:" in l for l in lines[idx:idx + 4]), f"{pkg} 缺哈希"
+
+
+def test_the_two_packages_move_in_lockstep():
+    """两个包必须同版本 —— memgarden 依赖 agent-protocol-core 的**精确版本**。
+
+    只升一个会直接 ResolutionImpossible；更坏的情况是 lock 已经生成好了、
+    构建时才炸，而那时 compose 哈希都已经算过一轮了。
+    """
+    import re
+
+    req = (REPO / "backend" / "requirements.txt").read_text(encoding="utf-8")
+    got = {m.group(1): m.group(2) for m in
+           re.finditer(r"^(memgarden|agent-protocol-core)==(\S+)", req, re.M)}
+    assert len(got) == 2, f"requirements.txt 里没同时钉住两个包：{got}"
+    assert len(set(got.values())) == 1, f"两个包版本不一致：{got}"
 
 
 @pytest.mark.parametrize("mod", ["memgarden", "agent_protocol_core"])

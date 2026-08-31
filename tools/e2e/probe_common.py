@@ -194,3 +194,54 @@ def install_identity(c, identity: dict) -> tuple[int, dict]:
         return r.status_code, r.json()
     except Exception:  # noqa: BLE001
         return r.status_code, {"_text": r.text[:200]}
+
+
+def force_capture_until_enqueued(c, *, tries: int = 24, wait_sec: float = 5.0) -> dict:
+    """调 ``/v1/capture/force`` 直到**真的入队**，返回最后一次的响应体。
+
+    ## 为什么要重试
+
+    ``force_capture`` 在「自上次抽取以来没有新消息」时返回
+    ``{"enqueued": false, "reason": "no_new_messages"}`` —— 而 HTTP 仍是 200。
+
+    探针发完消息立刻调 force，这时消息**还没落库**，于是什么都没入队；
+    探针却因为看到 200 就认为「触发成功」，然后干等 300 秒等一张永远不会出现的卡。
+
+    这是踩过的坑：e2e 时好时坏，看起来像间歇性 bug，实际是探针在等一个
+    从未被调度的任务。**HTTP 200 不等于事情发生了** —— 要看响应体。
+
+    ``already_captured`` 也算成功：那说明这个窗口已经抽过了，不需要再排。
+
+    ``min_interval`` 是**节流阀，不是失败** —— 两次 capture 之间默认要隔
+    ``FEEDLING_CAPTURE_MIN_INTERVAL_SEC``（默认 600 秒）。多轮探针几乎必然撞上。
+    干等 10 分钟没意义（探针测的是落卡内容，不是节流），所以这里不重试它，
+    而是直接把话说清楚：本地 e2e 栈起服务时把这个值调小。
+
+    ``capture_already_pending`` **必须继续重试**，不能当失败：多轮探针（比如
+    先中文后英文）第二轮调 force 时，第一轮的 capture 往往还在跑。这是正常的
+    串行排队，等它跑完就能排上 —— 直接判失败的话，探针会把「还没轮到」报成
+    「功能坏了」。默认重试窗口按最慢的一轮 capture 留（8×5s = 40s 偏紧，
+    实测一轮 45s 左右，所以这里放宽到 24 次）。
+    """
+    import time as _time
+
+    last: dict = {}
+    for _ in range(max(1, tries)):
+        r = c.post("/v1/capture/force", json={})
+        try:
+            last = r.json() if r.status_code < 400 else {"http": r.status_code}
+        except Exception:  # noqa: BLE001
+            last = {"http": r.status_code, "text": r.text[:200]}
+        if last.get("enqueued") or str(last.get("reason") or "") == "already_captured":
+            return last
+        if str(last.get("reason") or "") == "min_interval":
+            # 等不出来的:默认 600 秒。与其静默干等到超时、再报一个看不懂的
+            # 「没入队」,不如立刻说清楚这是配置问题和怎么解。
+            last = dict(last)
+            last["hint"] = (
+                "capture 节流阀挡住了(默认 600 秒一次)。本地 e2e 起后端时加上 "
+                "FEEDLING_CAPTURE_MIN_INTERVAL_SEC=1 再跑。"
+            )
+            return last
+        _time.sleep(wait_sec)
+    return last
