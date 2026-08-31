@@ -255,9 +255,14 @@ def test_0098_downgrade_and_upgrade_are_repeatable():
 
         command.upgrade(cfg, "head")
         with db.get_pool().connection() as conn:
+            # 这个文件盯的是 0098 能不能来回降级升级，不是当前 head 叫什么。
+            # 写死 head 的断言每加一个 revision 就要有人照着报错填一次数字，
+            # 而照着填的人不会去想它到底在保证什么。
+            from alembic.script import ScriptDirectory
+            expected_head = ScriptDirectory.from_config(cfg).get_current_head()
             assert conn.execute(
                 "SELECT version_num FROM alembic_version"
-            ).fetchall() == [("0105_account_recover_challenges",)]
+            ).fetchall() == [(expected_head,)]
             assert conn.execute(
                 "SELECT to_regclass('chat_change_state'), "
                 "to_regclass('chat_change_events'), "
