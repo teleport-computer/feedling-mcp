@@ -196,7 +196,7 @@ def install_identity(c, identity: dict) -> tuple[int, dict]:
         return r.status_code, {"_text": r.text[:200]}
 
 
-def force_capture_until_enqueued(c, *, tries: int = 8, wait_sec: float = 5.0) -> dict:
+def force_capture_until_enqueued(c, *, tries: int = 24, wait_sec: float = 5.0) -> dict:
     """调 ``/v1/capture/force`` 直到**真的入队**，返回最后一次的响应体。
 
     ## 为什么要重试
@@ -211,6 +211,12 @@ def force_capture_until_enqueued(c, *, tries: int = 8, wait_sec: float = 5.0) ->
     从未被调度的任务。**HTTP 200 不等于事情发生了** —— 要看响应体。
 
     ``already_captured`` 也算成功：那说明这个窗口已经抽过了，不需要再排。
+
+    ``capture_already_pending`` **必须继续重试**，不能当失败：多轮探针（比如
+    先中文后英文）第二轮调 force 时，第一轮的 capture 往往还在跑。这是正常的
+    串行排队，等它跑完就能排上 —— 直接判失败的话，探针会把「还没轮到」报成
+    「功能坏了」。默认重试窗口按最慢的一轮 capture 留（8×5s = 40s 偏紧，
+    实测一轮 45s 左右，所以这里放宽到 24 次）。
     """
     import time as _time
 
