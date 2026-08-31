@@ -40,7 +40,8 @@ change as a cleanup side effect.
 
 | Area | Source navigation | Contract |
 |---|---|---|
-| Import-time configuration | `Config` section and module-level `FEEDLING_API_URL`, `FEEDLING_API_KEY`, `AGENT_MODE`, `CHECKPOINT_FILE`, `AGENT_SESSION_FILE_TEMPLATE`, and `FEEDLING_RUNTIME_TOKEN_FILE`. | The environment names are part of the VPS env-file, E2E, and hosted `consumer_env` seam. The module reads them at import time; preserve that import behavior and the runtime-token/API-key authentication fallback. |
+| Import-time configuration | `Config` section and module-level `FEEDLING_API_URL`, `FEEDLING_API_KEY`, `AGENT_MODE`, `CHECKPOINT_FILE`, and `AGENT_SESSION_FILE_TEMPLATE`. | The environment names are part of the VPS env-file, E2E, and hosted `consumer_env` seam. The module reads them at import time; preserve that import behavior. |
+| Running release and hosted authentication | `Decrypt sources — at least one must be set for v1 encrypted backends` section: `RUNNING_COMMIT` and `FEEDLING_RUNTIME_TOKEN_FILE`. | Preserve the running-commit identity and runtime-token/API-key authentication fallback. The token file also marks hosted runs, which must not self-update. |
 | Checkpoints | `Checkpoint (persist last processed message timestamp)` section: `_load_checkpoint()`, `_save_checkpoint()`, `_load_proactive_checkpoint()`, and `_save_proactive_checkpoint()`. | Preserve the checkpoint file location behavior and JSON state shape, including `last_ts`, `last_job_ts`, `api_key_fingerprint`, and scoped `user_id`. It is the restart/redelivery cursor, not disposable cache. |
 | Native-agent sessions | `Agent backends` section: `_load_agent_session_id()`, `_save_agent_session_id()`, `_clear_agent_session_id()`, and `_prepare_cli_command()`. | Preserve session-file placement and metadata/resume semantics. CLI session rotation or `--resume` behavior is a user-facing continuity contract. |
 | Poll, decrypt, and reply wire | `Decrypt sources — plaintext content for v1 encrypted messages`, `Feedling API helpers`, and `Main loop` sections, especially `poll_chat()`, `_process_messages()`, and `run()`. | Preserve poll/response endpoint handling, encrypted-message processing, checkpoint advancement rules, and the single foreground loop. |
@@ -79,7 +80,8 @@ file; do not reformat or split it merely to make this index shorter.
 
 | Responsibility | Existing section header | Stable symbols to start from |
 |---|---|---|
-| Environment, paths, runtime mode, and process-wide policy | `Config` | `FEEDLING_API_URL`, `FEEDLING_API_KEY`, `AGENT_MODE`, `CHECKPOINT_FILE`, `AGENT_SESSION_FILE_TEMPLATE`, `RUNNING_COMMIT` |
+| Environment, paths, runtime mode, and process-wide policy | `Config` | `FEEDLING_API_URL`, `FEEDLING_API_KEY`, `AGENT_MODE`, `CHECKPOINT_FILE`, `AGENT_SESSION_FILE_TEMPLATE` |
+| Running release identity and hosted token mode | `Decrypt sources — at least one must be set for v1 encrypted backends` | `RUNNING_COMMIT`, `FEEDLING_RUNTIME_TOKEN_FILE` |
 | Backend commit convergence | `Self-update — keep a self-hosted resident on the commit the backend deploys` | `_runtime_repo_files()`, `_should_self_update()`, `_git_changed_files()`, `_apply_self_update()`, `_run_self_update()`, `_maybe_self_update()` |
 | Chat/proactive cursors and replay protection | `Checkpoint (persist last processed message timestamp)` and `Message dedup` | `_load_checkpoint()`, `_save_checkpoint()`, `_load_proactive_checkpoint()`, `_save_proactive_checkpoint()`, `_msg_key()` |
 | Decrypt sources and health | `Decrypt sources — plaintext content for v1 encrypted messages` and `Resident decrypt-source health — reported to the backend on every poll` | `get_decrypted_history()`, `_poll_decrypt_since()`, `_apply_infra_health()` |
