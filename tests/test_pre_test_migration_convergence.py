@@ -26,7 +26,11 @@ def _database_url(base: str, database: str) -> str:
 
 def test_rds_pre_and_test_heads_converge():
     script = _scripts("alembic")
-    assert script.get_heads() == ["0105_account_recover_challenges"]
+    assert script.get_heads() == ["0106_perceptkit_objects"]
+    assert (
+        script.get_revision("0106_perceptkit_objects").down_revision
+        == "0105_account_recover_challenges"
+    )
     assert (
         script.get_revision("0105_account_recover_challenges").down_revision
         == "0104_distill_artifact_ledger"
@@ -107,7 +111,11 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0039_distill_artifact_ledger"]
+    assert script.get_heads() == ["0040_perceptkit_objects"]
+    assert (
+        script.get_revision("0040_perceptkit_objects").down_revision
+        == "0039_distill_artifact_ledger"
+    )
     assert (
         script.get_revision("0039_distill_artifact_ledger").down_revision
         == "0038_v2_wake_followup_marker"

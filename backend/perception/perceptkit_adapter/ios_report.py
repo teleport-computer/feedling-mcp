@@ -79,6 +79,29 @@ FIELD_ALIASES: dict[str, dict[str, str]] = {
                 "apparent_temperature": "apparent_temperature_c",
                 "humidity": "humidity_ratio",
                 "precipitation_chance": "precipitation_probability"},
+    # The four below were found by the shadow's first comparison against real
+    # data: iOS was sending each of these and the manifest was dropping it as
+    # undeclared, so blood pressure, body fat and workout duration reached the
+    # live path and never reached the kit at all.
+    "health_body": {"body_fat_pct": "body_fat_ratio"},
+    "health_metabolic": {"blood_pressure_systolic": "blood_pressure_systolic_mmhg",
+                         "blood_pressure_diastolic": "blood_pressure_diastolic_mmhg"},
+    "health_workout": {"duration_min": "duration_minutes"},
+    "audio_route": {"device_name": "device_label"},
+    "music_playback": {"album_title": "album"},
+}
+
+#: Renames that are not only renames. Applied **after** the alias, keyed by
+#: the manifest's name.
+#:
+#: ``body_fat_pct`` -> ``body_fat_ratio`` is the reason this exists. Renaming
+#: it alone stores 18.4 in a field the manifest declares as a ratio in
+#: ``[0, 1]`` -- 1840% body fat. Nothing crashes: the range check rejects it,
+#: and body fat silently never arrives. A pair of names this similar with a
+#: 100x difference between them is exactly what a hand-maintained alias table
+#: gets wrong.
+FIELD_TRANSFORMS: dict[str, dict[str, Any]] = {
+    "health_body": {"body_fat_ratio": lambda v: v / 100.0},
 }
 
 #: Fields iOS sends that the manifest does not declare. Dropped explicitly
@@ -93,6 +116,74 @@ DROPPED_FIELDS: dict[str, set[str]] = {
     "broadcast": {"state"},
     # Local time is derivable from time_zone_id plus occurred_at.
     "time_context": {"local_time"},
+    # Split off into its own `steps` signal below; leaving it here too would
+    # store the same number twice under two aggregation rules.
+    "health_vitals": {"step_count"},
+    # The manifest counts workouts by aggregating the records themselves, so
+    # a device-supplied daily count would be a second, disagreeing answer to
+    # the same question.
+    "health_workout": {"count_today"},
+    # iOS deliberately sends only how many mood labels there were, never which
+    # ones -- there are ~40 categories and they are unusually revealing. The
+    # manifest declares `labels`, which iOS will not send, and `recorded_at`,
+    # for which iOS sends a same-day boolean. Dropped here rather than
+    # half-mapped; reconciling the two is sevenfloor's call, not a rename.
+    "health_mood": {"label_count", "recorded_today"},
+    # iOS reports how long the state has been running; the manifest models the
+    # label only and derives duration from adjacent observations.
+    "motion_state": {"started_at", "confidence"},
+    # `duration` is the track's total length. The manifest's position_seconds
+    # is where playback currently is -- a different fact, not a rename, and
+    # iOS does not report it. Dropped rather than aliased into the wrong field.
+    "music_playback": {"duration", "media_type"},
+}
+
+
+#: Producer vocabulary -> manifest vocabulary, per field.
+#:
+#: **This is where the most expensive class of bug in this file lives.** A name
+#: mismatch fails loudly on every report; a *value* mismatch fails only for the
+#: values that differ, so it hides behind whichever value the test fixture
+#: happened to use. Both entries below were invisible until the shadow compared
+#: real data:
+#:
+#:   motion "still"       iOS's word for standing still; the manifest says
+#:                        "stationary". Every observation of the single most
+#:                        common state a person is in was being rejected, while
+#:                        "walking" -- the value the fixture used -- passed.
+#:   motion "in_vehicle"  same, against "automotive".
+#:
+#: Left unmapped deliberately: playback "unknown". The manifest has no state
+#: for it and guessing one puts a fabricated answer in front of the user; a
+#: rejection is visible in the shadow report, a wrong guess is not.
+VALUE_MAPS: dict[str, dict[str, dict[str, str]]] = {
+    "motion_state": {"state": {"still": "stationary",
+                               "in_vehicle": "automotive"}},
+    "music_playback": {"playback_state": {
+        # Stopped by something outside the app -- a call, another player.
+        # Indistinguishable from paused to anyone reading it.
+        "interrupted": "paused",
+        # Scrubbing. Audio is engaged; the manifest has no seeking state.
+        "seeking_forward": "playing",
+        "seeking_backward": "playing",
+    }},
+}
+
+
+#: Fields iOS packs into one signal that the manifest models as a signal of
+#: its own: ``{ios signal: {ios field: (target signal, target field)}}``.
+#:
+#: Steps is the case. iOS puts ``step_count`` inside ``health_vitals``; the
+#: manifest gives it its own signal because a running day total aggregates
+#: differently from a vitals reading -- it is monotonic within the day, so the
+#: day's value is the last one, not the average of the readings.
+#:
+#: Without this the field is simply dropped as undeclared, which is how it
+#: went missing: steps reached the live path and never reached the kit. It
+#: cost one line in the divergence report to notice and would have cost
+#: nothing to keep missing.
+SPLIT_OFF: dict[str, dict[str, tuple[str, str]]] = {
+    "health_vitals": {"step_count": ("steps", "step_count")},
 }
 
 
@@ -217,11 +308,20 @@ def _rename(signal: str, value: Mapping[str, Any]) -> dict[str, Any]:
     """
     alias = FIELD_ALIASES.get(signal, {})
     dropped = DROPPED_FIELDS.get(signal, set())
+    transforms = FIELD_TRANSFORMS.get(signal, {})
+    values_map = VALUE_MAPS.get(signal, {})
     out: dict[str, Any] = {}
     for k, v in value.items():
         if v is None or k in dropped:
             continue
-        out[alias.get(k, k)] = v
+        name = alias.get(k, k)
+        fn = transforms.get(name)
+        if fn is not None and isinstance(v, (int, float)) and not isinstance(v, bool):
+            v = fn(v)
+        vocab = values_map.get(name)
+        if vocab and isinstance(v, str):
+            v = vocab.get(v, v)
+        out[name] = v
     return out
 
 
@@ -277,6 +377,26 @@ def to_envelope(payload: Mapping[str, Any], *, occurred_at: str,
             obs["value"] = value
         observations.append(obs)
 
+        # Fields that belong to a signal of their own. Emitted as separate
+        # observations so each gets the aggregation its own signal declares.
+        for src, (target, field) in SPLIT_OFF.get(signal, {}).items():
+            raw = data.get(src) if isinstance(data, Mapping) else None
+            if raw is None:
+                # Absence stays absence. Emitting `no_data` here would claim
+                # the device reported "no steps" every time a vitals reading
+                # arrives without one, which is a different sentence.
+                continue
+            split_obs: dict[str, Any] = {
+                "signal": target,
+                "signal_schema_version": 1,
+                "occurred_at": occurred_at,
+                "availability": "observed",
+                "value": {field: raw},
+            }
+            if timezone_id:
+                split_obs["timezone"] = timezone_id
+            observations.append(split_obs)
+
     return {
         "schema_version": 1,
         "report_id": report_id_for(payload),
@@ -286,4 +406,5 @@ def to_envelope(payload: Mapping[str, Any], *, occurred_at: str,
 
 
 __all__ = ["KEY_TO_SIGNAL", "IGNORED_KEYS", "FIELD_ALIASES", "DROPPED_FIELDS",
-           "AUTH_STATUS_FIELDS", "AUTHORIZED_VALUES", "report_id_for", "to_envelope"]
+           "FIELD_TRANSFORMS", "VALUE_MAPS", "AUTH_STATUS_FIELDS", "AUTHORIZED_VALUES",
+           "SPLIT_OFF", "report_id_for", "to_envelope"]

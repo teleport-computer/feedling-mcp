@@ -21,6 +21,12 @@ The outbox carries a ``claim_token`` fence. A worker returning from an
 expired lease must not overwrite the state of whoever holds the row now --
 comparing only the state, not the token, lets a revived worker undo the
 progress of the live one.
+
+One table here is not the kit's: ``perceptkit_shadow_divergence`` is where the
+shadow records how the kit's conclusions compare with the live path's. It
+lives in this file so it is created by the same migration and removed by the
+same ``purge_subject`` as everything else -- it holds real readings, and a
+diagnostic table that account deletion forgets about is a leak.
 """
 from __future__ import annotations
 
@@ -186,6 +192,30 @@ CREATE TABLE IF NOT EXISTS perceptkit_sync_state (
   cursor                 TEXT,
   PRIMARY KEY (subject_id, source, collection_kind)
 );
+
+-- Host-side, not part of the kit's model. The shadow writes one row per
+-- (field, verdict) and bumps a counter, rather than one row per report: the
+-- question it answers is "does this field ever disagree, and what did it look
+-- like the last time", and that needs a running tally, not a log. Bounded by
+-- construction -- subjects x fields x verdicts -- so it needs no sweep.
+--
+-- Sample values are stored only for the verdicts that need diagnosing. An
+-- `agree` row carries counts and nothing else; there is nothing to debug and
+-- no reason to keep a copy of the reading.
+CREATE TABLE IF NOT EXISTS perceptkit_shadow_divergence (
+  subject_id     TEXT        NOT NULL,
+  signal         TEXT        NOT NULL,
+  field          TEXT        NOT NULL,
+  verdict        TEXT        NOT NULL,
+  occurrences    BIGINT      NOT NULL DEFAULT 0,
+  first_seen_at  TIMESTAMPTZ NOT NULL,
+  last_seen_at   TIMESTAMPTZ NOT NULL,
+  last_live      TEXT,
+  last_kit       TEXT,
+  last_report_id TEXT,
+  note           TEXT,
+  PRIMARY KEY (subject_id, signal, field, verdict)
+);
 """
 
 #: Empty every table. Tests only. Production deletion goes through
@@ -196,7 +226,7 @@ TRUNCATE perceptkit_ingest_receipt, perceptkit_observation, perceptkit_current,
          perceptkit_daily_aggregate, perceptkit_dedupe_identity,
          perceptkit_rule_state, perceptkit_event_outbox, perceptkit_wake_receipt,
          perceptkit_calendar_mirror, perceptkit_reminder_mirror,
-         perceptkit_sync_state;
+         perceptkit_sync_state, perceptkit_shadow_divergence;
 """
 
 TABLES = (
@@ -204,7 +234,7 @@ TABLES = (
     "perceptkit_daily_aggregate", "perceptkit_dedupe_identity",
     "perceptkit_rule_state", "perceptkit_event_outbox", "perceptkit_wake_receipt",
     "perceptkit_calendar_mirror", "perceptkit_reminder_mirror",
-    "perceptkit_sync_state",
+    "perceptkit_sync_state", "perceptkit_shadow_divergence",
 )
 
 __all__ = ["DDL", "TRUNCATE", "TABLES"]

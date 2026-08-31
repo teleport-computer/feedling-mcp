@@ -321,6 +321,8 @@ if not _provisioned:
         # has zero I/O; the wiring test uses an in-memory FakeStore, no Postgres).
         "test_health_measurement.py",
         "test_perception_health_measurement_wiring.py",
+        # iOS 上报 -> kit 信封的翻译层。纯函数，不碰库。
+        "test_perceptkit_ios_adapter.py",
         "test_provider_client.py",
         "test_provider_tools_gemini.py",
         "test_provider_catalog_unit.py",

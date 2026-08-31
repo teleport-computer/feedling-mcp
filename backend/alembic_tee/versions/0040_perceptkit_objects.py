@@ -14,6 +14,11 @@ not the tables production creates. Everything is IF NOT EXISTS, so
 re-running is safe.
 
 This migration only creates tables. Nothing reads or writes them yet.
+
+It also carries the ``phase4_primary_prepared`` head bump that every TEE head
+before it carries: a prepared primary records the schema head it was prepared
+to, and a new head that leaves that record pointing at the previous one says
+the primary is ready for a schema it has not got.
 """
 
 from alembic import op
@@ -185,11 +190,48 @@ CREATE TABLE IF NOT EXISTS perceptkit_sync_state (
   cursor                 TEXT,
   PRIMARY KEY (subject_id, source, collection_kind)
 );
+
+-- Host-side, not part of the kit's model. The shadow writes one row per
+-- (field, verdict) and bumps a counter, rather than one row per report: the
+-- question it answers is "does this field ever disagree, and what did it look
+-- like the last time", and that needs a running tally, not a log. Bounded by
+-- construction -- subjects x fields x verdicts -- so it needs no sweep.
+--
+-- Sample values are stored only for the verdicts that need diagnosing. An
+-- `agree` row carries counts and nothing else; there is nothing to debug and
+-- no reason to keep a copy of the reading.
+CREATE TABLE IF NOT EXISTS perceptkit_shadow_divergence (
+  subject_id     TEXT        NOT NULL,
+  signal         TEXT        NOT NULL,
+  field          TEXT        NOT NULL,
+  verdict        TEXT        NOT NULL,
+  occurrences    BIGINT      NOT NULL DEFAULT 0,
+  first_seen_at  TIMESTAMPTZ NOT NULL,
+  last_seen_at   TIMESTAMPTZ NOT NULL,
+  last_live      TEXT,
+  last_kit       TEXT,
+  last_report_id TEXT,
+  note           TEXT,
+  PRIMARY KEY (subject_id, signal, field, verdict)
+);
+"""
+
+
+_UPDATE_PREPARED_HEAD = """
+UPDATE server_config
+SET value = convert_to(
+  jsonb_set(convert_from(value, 'UTF8')::jsonb, '{tee_heads}',
+            '["0040_perceptkit_objects"]'::jsonb)::text,
+  'UTF8'
+)
+WHERE key = 'phase4_primary_prepared'
+  AND COALESCE(convert_from(value, 'UTF8')::jsonb->>'prepared', 'false') = 'true';
 """
 
 
 def upgrade() -> None:
     op.execute(_UP)
+    op.execute(_UPDATE_PREPARED_HEAD)
 
 
 def downgrade() -> None:

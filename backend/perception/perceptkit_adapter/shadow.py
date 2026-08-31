@@ -2,8 +2,13 @@
 
 Nothing here changes what the user sees. The existing ingest keeps doing
 everything it did before, byte for byte; this takes the same already-decrypted
-snapshot, pushes it through the kit, and writes the result to the kit's own
-tables. Then somebody can compare.
+snapshot, pushes it through the kit, writes the result to the kit's own
+tables, and then compares the two conclusions field by field (see
+``compare.py``) into a running tally.
+
+That last step is the point. Running the kit beside the live path only proves
+it does not crash on real data; the question worth asking is whether it
+reaches the same conclusions, and where it does not.
 
 ## Why shadow first rather than switching
 
@@ -62,6 +67,27 @@ def _report_id(user_id: str, items: Sequence[Mapping[str, Any]],
                           "client_ts": client_ts})
 
 
+def _live_state(user_id: str) -> dict:
+    """The live path's current projection for this user.
+
+    Read through the store rather than the read API: the read API layers
+    freshness rules and presentation on top, and comparing the kit against a
+    presented value would credit or blame it for decisions it never made.
+    """
+    from .. import store
+    try:
+        return store.get_state(user_id) or {}
+    except Exception:                              # noqa: BLE001
+        return {}
+
+
+def _tally(findings) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for f in findings:
+        out[f.verdict] = out.get(f.verdict, 0) + 1
+    return out
+
+
 def observe(
     user_id: str,
     storage_items: Sequence[Mapping[str, Any]],
@@ -103,12 +129,26 @@ def observe(
         # shadow silently never runs -- which is exactly what happened.
         import db
 
+        from . import compare as _compare
+
+        signals = {o["signal"] for o in envelope["observations"]}
         with db.get_pool().connection() as conn:
             conn.autocommit = True
-            kit = PerceptionKit(storage=PostgresStorage(conn),
-                                signals=MINIMAL_SIGNALS)
+            storage = PostgresStorage(conn)
+            kit = PerceptionKit(storage=storage, signals=MINIMAL_SIGNALS)
             outcome = kit.ingest(envelope,
                                  context=IngestContext(user_id, received))
+            # The comparison, which is the reason the shadow exists. It runs
+            # against the live state *after* the live path has written it --
+            # the caller does that before handing control here -- so both
+            # sides have seen exactly the same report.
+            findings = _compare.compare(
+                _live_state(user_id),
+                storage.get_current(subject_id=user_id, signals=sorted(signals)),
+                signals=signals,
+            )
+            _compare.record(conn, user_id, findings, now=received,
+                            report_id=envelope["report_id"])
 
         summary = {
             "ran": True,
@@ -129,6 +169,10 @@ def observe(
                  "reasons": list(reasons)}
                 for i, reasons in list(outcome.rejected)[:20]
             ],
+            # The verdict tally for this report. `differ` and `only_live` are
+            # the two that mean the kit would have told the user something
+            # different from what the live path told them.
+            "verdicts": _tally(findings),
             "ms": round((time.monotonic() - started) * 1000, 1),
         }
         if summary["ms"] > BUDGET_SEC * 1000:

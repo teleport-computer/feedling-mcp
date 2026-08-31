@@ -185,6 +185,30 @@ CREATE TABLE IF NOT EXISTS perceptkit_sync_state (
   cursor                 TEXT,
   PRIMARY KEY (subject_id, source, collection_kind)
 );
+
+-- Host-side, not part of the kit's model. The shadow writes one row per
+-- (field, verdict) and bumps a counter, rather than one row per report: the
+-- question it answers is "does this field ever disagree, and what did it look
+-- like the last time", and that needs a running tally, not a log. Bounded by
+-- construction -- subjects x fields x verdicts -- so it needs no sweep.
+--
+-- Sample values are stored only for the verdicts that need diagnosing. An
+-- `agree` row carries counts and nothing else; there is nothing to debug and
+-- no reason to keep a copy of the reading.
+CREATE TABLE IF NOT EXISTS perceptkit_shadow_divergence (
+  subject_id     TEXT        NOT NULL,
+  signal         TEXT        NOT NULL,
+  field          TEXT        NOT NULL,
+  verdict        TEXT        NOT NULL,
+  occurrences    BIGINT      NOT NULL DEFAULT 0,
+  first_seen_at  TIMESTAMPTZ NOT NULL,
+  last_seen_at   TIMESTAMPTZ NOT NULL,
+  last_live      TEXT,
+  last_kit       TEXT,
+  last_report_id TEXT,
+  note           TEXT,
+  PRIMARY KEY (subject_id, signal, field, verdict)
+);
 """
 
 
