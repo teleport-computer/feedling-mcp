@@ -40,7 +40,7 @@ tool/script taxonomy。清单记录当前 owner、分类、生命周期和**精�
 | E17 | [`deploy/SELF_HOSTING.md`](../../deploy/SELF_HOSTING.md) 和根 `README.md` 都给出 `python tools/check_chat_pipeline.py` 诊断命令。 |
 | E18 | `.github/workflows/ci.yml` 执行 `tools/check_document_lifecycle.py` 及 `tools/ci_execution_evidence.py attest/report`；`tests/test_document_lifecycle.py` 锁住 lifecycle generator front matter。 |
 | E19 | [`docs/testing/TESTING.md`](../testing/TESTING.md) 说明 `.github/workflows/continuity-canary.yml` 已于 2026-08-31 禁用，并链接其 archive/恢复条件。 |
-| E20 | `.github/workflows/ci.yml` 执行 `cd tools/dcap && python3 -m unittest test_dcap_parse.py -v`；[`docs/PROJECT_OVERVIEW.md`](../PROJECT_OVERVIEW.md) 定义 DCAP parser 的用途。 |
+| E20 | `tools/audit_live_cvm.py` 将 `tools/dcap/` 加入 import path，直接 import `dcap_parse.parse_quote` 并在 live attestation audit 中调用；[`tools/README.md`](../../tools/README.md) 也明确 DCAP parser 由该 audit CLI 使用。`.github/workflows/ci.yml` 另行执行 `cd tools/dcap && python3 -m unittest test_dcap_parse.py -v` 覆盖 parser test/fixtures。 |
 | E21 | `.github/workflows/ci.yml` 在三条 deploy lane 执行 `tools/deploy_canary.py`；`tests/test_deploy_canary.py` 是其 review guard。 |
 | E22 | [`tools/e2e/README.md`](../../tools/e2e/README.md) 是 P0 operator command、专项 probe 和 fixture 的现行入口；`tests/test_e2e_*.py`、`tests/test_aup_gate_probe.py`、`tests/test_tool_selection_eval.py` 和 `tests/test_user_mcp_handshake_probe.py` 覆盖相应 package/probe。 |
 | E23 | [`docs/testing/TESTING.md`](../testing/TESTING.md) L2 表将 `tools/e2e_encryption_test.py` 和两种 envelope round-trip CLI 列为加密/账号/enclave 链路验证；`backend/enclave_app.py` 也明确该 E2E 脚本会拉起 enclave app。 |
@@ -91,7 +91,8 @@ tool/script taxonomy。清单记录当前 owner、分类、生命周期和**精�
 | `tools/check_document_lifecycle.py`（1） | Documentation lifecycle | generated helper | retain | E18 |
 | `tools/ci_execution_evidence.py`（1） | CI evidence | test support | retain | E18 |
 | `tools/continuity_canary.py`（1） | Encryption continuity history | historical | historical-retained | E19 |
-| `tools/dcap/dcap_parse.py`<br>`tools/dcap/test_dcap_parse.py`<br>`tools/dcap/testdata/sample_attestation.json`<br>`tools/dcap/testdata/sample_quote.hex`（4） | Attestation validation | test support | retain | E20 |
+| `tools/dcap/dcap_parse.py`（1） | Attestation validation | active diagnostic | retain | E20 |
+| `tools/dcap/test_dcap_parse.py`<br>`tools/dcap/testdata/sample_attestation.json`<br>`tools/dcap/testdata/sample_quote.hex`（3） | Attestation validation | test support | retain | E20 |
 | `tools/deploy_canary.py`（1） | Deployment safety | deployment | retain | E21 |
 | `tools/e2e/__init__.py`<br>`tools/e2e/aup_gate_probe.py`<br>`tools/e2e/card_gate_probe.py`<br>`tools/e2e/client.py`<br>`tools/e2e/config.py`<br>`tools/e2e/continuity_probe.py`<br>`tools/e2e/deep.py`<br>`tools/e2e/elevenlabs_silent_turn_probe.py`<br>`tools/e2e/experience_probe.py`<br>`tools/e2e/fixtures/aup_gate/canary_instruction_v0.2.0.txt`<br>`tools/e2e/fixtures/aup_gate/manifest.json`<br>`tools/e2e/fixtures/aup_gate/user_message.txt`<br>`tools/e2e/genesis_expired_stage_probe.py`<br>`tools/e2e/genesis_resume_probe.py`<br>`tools/e2e/hosted.py`<br>`tools/e2e/idempotency_probe.py`<br>`tools/e2e/image_autonomy_probe.py`<br>`tools/e2e/memory_probe.py`<br>`tools/e2e/memory_thinking_leak_probe.py`<br>`tools/e2e/p0.py`<br>`tools/e2e/perception_probe.py`<br>`tools/e2e/perception_wake_probe.py`<br>`tools/e2e/proactive_probe.py`<br>`tools/e2e/probe_common.py`<br>`tools/e2e/processing_probe.py`<br>`tools/e2e/provider_response_envelope_probe.py`<br>`tools/e2e/repeat_wake_probe.py`<br>`tools/e2e/resident_maintenance_smoke.py`<br>`tools/e2e/screen_watch_probe.py`<br>`tools/e2e/self_thinking_prompt_probe.py`<br>`tools/e2e/switch_matrix_probe.py`<br>`tools/e2e/temporal_probe.py`<br>`tools/e2e/tool_count_ceiling_probe.py`<br>`tools/e2e/tool_schema_rejection_probe.py`<br>`tools/e2e/tool_selection_cases.json`<br>`tools/e2e/tool_selection_eval.py`<br>`tools/e2e/turn_failure_smoke.py`<br>`tools/e2e/unlock.py`<br>`tools/e2e/user_mcp_handshake_probe.py`<br>`tools/e2e/voice_transcript_probe.py`<br>`tools/e2e/vps.py`<br>`tools/e2e/wake_tool_markup_probe.py`<br>`tools/e2e/wake_write_gate_probe.py`<br>`tools/e2e/worldbook_probe.py`（44） | Release validation | test support | retain | E22 |
 | `tools/e2e_encryption_test.py`（1） | Encryption integration validation | test support | retain | E23 |
@@ -133,8 +134,8 @@ tool/script taxonomy。清单记录当前 owner、分类、生命周期和**精�
 | deployment | 7 |
 | recovery | 4 |
 | migration | 2 |
-| active diagnostic | 28 |
-| test support | 66 |
+| active diagnostic | 29 |
+| test support | 65 |
 | generated helper | 5 |
 | historical | 1 |
 | **Task 5 taxonomy assets** | **122** |
