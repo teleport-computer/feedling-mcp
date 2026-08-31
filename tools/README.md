@@ -7,6 +7,9 @@ canonical_owner: self
 Operator-facing utilities for Feedling. Each entry is independent — none
 of these are imported by the backend at runtime.
 
+For the full owner/lifecycle inventory of every tracked `tools/`, `scripts/`,
+and `ops/` path, see [`docs/repository-cleanup/tool-script-inventory.md`](../docs/repository-cleanup/tool-script-inventory.md).
+
 ## `chat_resident_consumer.py` — independent resident chat bridge
 
 A long-running daemon that lets an agent backend participate in Feedling chat.
