@@ -257,3 +257,45 @@ def test_no_identity_at_all_still_follows_what_the_person_wrote():
         "Had a rough week at work - manager kept changing specs, "
         "stayed until 11pm three nights in a row, totally drained."
     ))["locale"] == "en"
+
+
+def test_an_established_garden_language_wins_over_one_window_in_both_runtimes():
+    """花园定了语言之后，说一句别的语言不该把它翻掉 —— 两条 runtime 都要守住。
+
+    这条盯的是 2026-08-31 实测出来的真实差异：同一个中文花园、同一句英文抱怨，
+    V1 判成中文、V2 判成英文 —— 不是判定逻辑不同，是**取证窗口宽窄不同**
+    （V2 的 capture 是增量的，窗口里只有新增那几句）。用户看到的是「我用英文
+    说了一句话，我的中文记忆开始变英文」。
+
+    hx 拍板走「锚优先」：archive_language 压过单轮书写，窗口宽窄不再决定结果。
+    """
+    from chat.reply_language import garden_language_decision
+
+    english_turn = (
+        "Rough week at work - manager kept changing specs, "
+        "stayed until 11pm three nights in a row."
+    )
+
+    # 增量窗口(V2 的形状)：这一轮全是英文
+    v2_shape = garden_language_decision(
+        "", written=english_turn, archive_language="zh-Hans"
+    )
+    # 较宽窗口(V1 的形状)：还含着之前那句中文
+    v1_shape = garden_language_decision(
+        "", written="我不吃辣，一吃就胃疼\n" + english_turn, archive_language="zh-Hans"
+    )
+    assert v2_shape["locale"] == v1_shape["locale"] == "zh-Hans", (
+        f"窗口宽窄仍然改变结果：窄={v2_shape['locale']} 宽={v1_shape['locale']}"
+    )
+    assert v2_shape["basis"] == "established_language"
+
+
+def test_a_brand_new_garden_still_follows_what_the_person_writes():
+    """还没有锚的时候（全新用户）仍然跟着他写的字走 —— 锚不能变成写死中文。"""
+    from chat.reply_language import garden_language_decision
+
+    got = garden_language_decision("", written=(
+        "Rough week at work - manager kept changing specs, "
+        "stayed until 11pm three nights in a row."
+    ), archive_language="")
+    assert got["locale"] == "en", "没有锚时应当跟随书写语言，而不是回落到默认中文"

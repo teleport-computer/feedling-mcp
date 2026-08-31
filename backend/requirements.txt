@@ -124,5 +124,5 @@ Pillow>=11,<13
 # self-thinking 措辞改动（一行字），io 锁提示词逐字节不变的那组哈希测试红了。
 # 那组测试拦住了它 —— 这正是它存在的理由。真正危险的不是带进来，是带进来而
 # 不知道。
-memgarden==0.12.8
-agent-protocol-core==0.12.8
+memgarden==0.12.9
+agent-protocol-core==0.12.9

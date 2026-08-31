@@ -250,8 +250,22 @@ def garden_language_decision(
 
     所以现在的证据只有两样，**桶名一样都不占**：
 
-        ① 他实际在用什么语言写            身份卡正文 + 这轮对话里他自己说的话
-        ② locale / archive_language      弱,只是设备设置
+        ① archive_language               **这个花园已定的语言 —— 最强**
+        ② 他实际在用什么语言写            身份卡正文 + 这轮对话里他自己说的话
+        ③ locale                         弱,只是设备设置
+
+    ## ① 为什么排在 ② 前面（2026-08-31 hx 拍板）
+
+    「他这轮写的字」原本最强。问题是**「这轮」有多宽是宿主决定的** —— 实测同一个
+    中文花园、同一句英文抱怨：V1 判成中文（取证窗口里恰好还含着之前那句中文），
+    V2 判成英文（增量窗口里只有新增的英文那句）。同一份判定逻辑，两条 runtime
+    结果相反。用户看到的就是「我用英文说了一句话，我的中文记忆开始变英文了」。
+
+    archive_language 是**账号级的、人自己定的**，不随窗口漂 —— 拿它当锚，结果就
+    不再取决于宿主的窗口有多宽。想换语言走显式设置。
+
+    ⚠️ 这个锚只能来自「人自己定的」那类。**绝不能换成桶名或卡正文** —— 那是 AI
+    之前的输出，拿输出当输入就是自我强化的环，2026-08-24 的事故正是这么放大的。
 
     ## 那「别让 工作 和 Work 并存」谁来管
 
@@ -271,12 +285,10 @@ def garden_language_decision(
 
     d = decide_garden_language(
         explicit=None,
+        # 花园已定的语言 —— 压过单轮书写。见上面「① 为什么排在 ② 前面」。
+        established=_language_from_hint(archive_language).language or None,
         written=sample,
-        locale=(
-            _language_from_hint(locale).language
-            or _language_from_hint(archive_language).language
-            or None
-        ),
+        locale=_language_from_hint(locale).language or None,
     )
     zh, en = count_bucket_languages(existing_buckets or "")
     names = split_bucket_names(existing_buckets or "")
