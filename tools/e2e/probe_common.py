@@ -212,6 +212,11 @@ def force_capture_until_enqueued(c, *, tries: int = 24, wait_sec: float = 5.0) -
 
     ``already_captured`` 也算成功：那说明这个窗口已经抽过了，不需要再排。
 
+    ``min_interval`` 是**节流阀，不是失败** —— 两次 capture 之间默认要隔
+    ``FEEDLING_CAPTURE_MIN_INTERVAL_SEC``（默认 600 秒）。多轮探针几乎必然撞上。
+    干等 10 分钟没意义（探针测的是落卡内容，不是节流），所以这里不重试它，
+    而是直接把话说清楚：本地 e2e 栈起服务时把这个值调小。
+
     ``capture_already_pending`` **必须继续重试**，不能当失败：多轮探针（比如
     先中文后英文）第二轮调 force 时，第一轮的 capture 往往还在跑。这是正常的
     串行排队，等它跑完就能排上 —— 直接判失败的话，探针会把「还没轮到」报成
@@ -228,6 +233,15 @@ def force_capture_until_enqueued(c, *, tries: int = 24, wait_sec: float = 5.0) -
         except Exception:  # noqa: BLE001
             last = {"http": r.status_code, "text": r.text[:200]}
         if last.get("enqueued") or str(last.get("reason") or "") == "already_captured":
+            return last
+        if str(last.get("reason") or "") == "min_interval":
+            # 等不出来的:默认 600 秒。与其静默干等到超时、再报一个看不懂的
+            # 「没入队」,不如立刻说清楚这是配置问题和怎么解。
+            last = dict(last)
+            last["hint"] = (
+                "capture 节流阀挡住了(默认 600 秒一次)。本地 e2e 起后端时加上 "
+                "FEEDLING_CAPTURE_MIN_INTERVAL_SEC=1 再跑。"
+            )
             return last
         _time.sleep(wait_sec)
     return last

@@ -12333,12 +12333,39 @@ async def _run_extraction(
                 #
                 # 现在喂真证据：身份卡 + 这轮对话里**他自己说的话**。
                 # 取证走共用 helper，两条 runtime 不许各写一份。
+                # 🔴 archive_language 是**跨轮的锚**,必须传。
+                #
+                # V2 的 capture 是增量的:``prompt_tail`` 只有自上次抽取以来的
+                # 新消息。用户临时说一句英文,这一轮的「他写的字」就全是英文 ——
+                # 光看这批消息,判成英文是必然的,整个中文花园会被翻掉。
+                # V1 的窗口更宽、而且一直传着这个锚,所以锁得住;V2 两样都没有。
+                # 只补身份卡不够:新用户的身份卡可能还是空的,那时锚就是唯一
+                # 能把语言钉住的东西。
+                _archive_language = ""
+                if deps.read_temporal_snapshot is not None:
+                    try:
+                        _snap = await asyncio.to_thread(
+                            deps.read_temporal_snapshot,
+                            user_id,
+                            # 不传 through_seq:这个变量在本作用域是**条件绑定**的,
+                            # 引用它可能 NameError —— 而后台 job 会把 NameError
+                            # 静默吞成 extraction_failed(同一个坑上面刚踩过)。
+                            # archive_language 是账号级的,跟消息游标无关,
+                            # 不传等价。
+                        )
+                        if isinstance(_snap, dict):
+                            _archive_language = str(
+                                _snap.get("archive_language") or ""
+                            ).strip()
+                    except Exception:  # noqa: BLE001 — 取不到锚不该让落卡失败
+                        pass
                 _lang = garden_language_decision(
                     # ctx["identity"] 是**字符串**(已渲染的身份卡正文),不是 dict ——
                     # 原来这里有个 isinstance(...) dict 的守卫,永远走 None,
                     # 等于把身份卡这份语言证据整个丢了。见 _identity_texts。
                     ctx.get("identity"),
                     written=user_written_text(prompt_tail),
+                    archive_language=_archive_language,
                     # ↓ 只落观测，不参与判定。
                     existing_buckets=str(ctx.get("buckets") or ""),
                 )
