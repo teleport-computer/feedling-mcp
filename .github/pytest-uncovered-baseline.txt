@@ -39,7 +39,6 @@ tests/test_asgi_worker_limits.py
 tests/test_backend_worker_count.py
 tests/test_backfill_chat_images.py
 tests/test_backfill_frames.py
-tests/test_blob_wake.py
 tests/test_bootstrap_gate_host_route.py
 tests/test_bootstrap_gates.py
 tests/test_bootstrap_status_verify_ping.py
@@ -106,7 +105,6 @@ tests/test_genesis_foreground_worker.py
 tests/test_genesis_keep_all.py
 tests/test_genesis_llm_client.py
 tests/test_genesis_prompts.py
-tests/test_genesis_reclaim_worker.py
 tests/test_genesis_resident_claim.py
 tests/test_genesis_resident_endpoints.py
 tests/test_genesis_resident_lease.py
@@ -116,7 +114,6 @@ tests/test_genesis_service.py
 tests/test_genesis_terms_note.py
 tests/test_genesis_unclaimed_reaper.py
 tests/test_genesis_v2_e2e.py
-tests/test_genesis_worker.py
 tests/test_genesis_worker_claim.py
 tests/test_genesis_worker_claim_migration.py
 tests/test_gunicorn_conf.py
@@ -200,7 +197,6 @@ tests/test_scene_fields.py
 tests/test_self_thinking_parse.py
 tests/test_semantic_analysis.py
 tests/test_spawners_catalog.py
-tests/test_store_cache.py
 tests/test_test_runner_health_config.py
 tests/test_user_timezone.py
 tests/test_users_channel_broadcast.py
@@ -281,7 +277,6 @@ tests/test_verify_loop_cross_worker.py
 tests/test_vision_model_v2.py
 tests/test_vision_observer.py
 tests/test_vision_observer_zero_roster.py
-tests/test_wake_bus.py
 tests/test_web_exec_routes.py
 tests/test_web_execution_core.py
 tests/test_web_settings_backfill.py

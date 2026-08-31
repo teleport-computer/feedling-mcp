@@ -2365,54 +2365,31 @@ def _refresh_store_channel(user_id: str, channel: str) -> bool:
     store = _cached_store(user_id)
     if store is None:
         return False
-    if hasattr(store, "note_section_change"):
-        sections: set[StoreSection] = set()
-        if channel == "frames":
-            candidates = (StoreSection.FRAMES,)
-        elif channel == "blob":
-            candidates = (
-                StoreSection.WORLD_BOOKS,
-                StoreSection.TOKENS,
-                StoreSection.LIVE_ACTIVITY,
-                StoreSection.PUSH_STATE,
-            )
-        elif channel == "proactive":
-            store.notify_proactive_job_waiters()
-            return True
-        else:
-            return False
-        for section in candidates:
-            if store.note_section_change(section):
-                sections.add(section)
-        if not sections:
-            return True
-        return store.ensure_sections(
-            sections,
-            reason="notify",
-            strict=False,
+    sections: set[StoreSection] = set()
+    if channel == "frames":
+        candidates = (StoreSection.FRAMES,)
+    elif channel == "blob":
+        candidates = (
+            StoreSection.WORLD_BOOKS,
+            StoreSection.TOKENS,
+            StoreSection.LIVE_ACTIVITY,
+            StoreSection.PUSH_STATE,
         )
-
-    # Compatibility path for lightweight adapters that do not implement the
-    # section API. Production UserStore instances always take the branch above.
-    previous_guard = getattr(_reload_guard, "active", False)
-    _reload_guard.active = True
-    try:
-        if channel == "frames":
-            with store.frames_lock:
-                store._load_frames_meta()
-        elif channel == "blob":
-            with store.world_books_lock:
-                store._load_world_books()
-            store._load_tokens()
-            store._load_live_activity_state()
-            store._load_push_state()
-        elif channel == "proactive":
-            store.notify_proactive_job_waiters()
-        else:
-            return False
-    finally:
-        _reload_guard.active = previous_guard
-    return True
+    elif channel == "proactive":
+        store.notify_proactive_job_waiters()
+        return True
+    else:
+        return False
+    for section in candidates:
+        if store.note_section_change(section):
+            sections.add(section)
+    if not sections:
+        return True
+    return store.ensure_sections(
+        sections,
+        reason="notify",
+        strict=False,
+    )
 
 
 def get_store(
