@@ -5,11 +5,13 @@ canonical_owner: self
 # 工具、脚本与运维表面清单
 
 审计日期：2026-08-31。本清单覆盖本次 `git ls-files tools scripts ops` 的全部
-126 个 tracked 路径：`tools/` 100 个、`scripts/` 24 个、`ops/` 2 个。其中 125 个是
-Task 5 taxonomy 的 executable/support asset；唯一的非 executable 路径
-`tools/README.md` 在文末另列为文档覆盖，**不计入**九类 tool/script taxonomy。清单记录
-当前 owner、分类、生命周期和**精确**消费者证据；不是删除清单。静态 Python import 缺失
-不能证明一个 operator CLI、部署命令或远程恢复入口已失效。
+126 个 tracked 路径：`tools/` 100 个、`scripts/` 24 个、`ops/` 2 个。其中 122 个是
+Task 5 taxonomy 的 executable/support asset；四个 tracked README
+(`scripts/loadtest/README.md`、`tools/README.md`、`tools/e2e/README.md`、
+`tools/provider_smoke/README.md`) 在文末另列为文档覆盖，**不计入**九类
+tool/script taxonomy。清单记录当前 owner、分类、生命周期和**精确**消费者证据；不是
+删除清单。静态 Python import 缺失不能证明一个 operator CLI、部署命令或远程恢复入口
+已失效。
 
 `retain` 表示保留到另一次有范围的功能/运维决策；`retain-protected` 表示不能因
 本清单或零引用搜索删除；`historical-retained` 表示保留历史/恢复上下文但不作为当前
@@ -64,7 +66,7 @@ Task 5 taxonomy 的 executable/support asset；唯一的非 executable 路径
 
 ## 分类与归属
 
-下表覆盖全部 125 个 Task 5 taxonomy asset。只有同一 owner、生命周期和证据类的路径
+下表覆盖全部 122 个 Task 5 taxonomy asset。只有同一 owner、生命周期和证据类的路径
 才会合并；fixture/package marker 也计入，避免把可执行工具的支持文件遗漏在审计外。
 
 | 路径（数量） | owner | 分类 | 生命周期 | 证据 |
@@ -74,7 +76,7 @@ Task 5 taxonomy 的 executable/support asset；唯一的非 executable 路径
 | `scripts/audit_resident_model_routes.py`（1） | Hosted Resident operations | recovery | retain | E3 |
 | `scripts/check-pr-branch-flow.sh`（1） | Release governance | deployment | retain | E4 |
 | `scripts/dump_perception_baseline.py`（1） | Perception contracts | test support | retain | E5 |
-| `scripts/loadtest/README.md`<br>`scripts/loadtest/__init__.py`<br>`scripts/loadtest/collect.py`<br>`scripts/loadtest/compare_tokens.py`<br>`scripts/loadtest/fixtures.py`<br>`scripts/loadtest/measure_resident.py`<br>`scripts/loadtest/mock_provider.py`<br>`scripts/loadtest/run_loadtest.py`（8） | Runtime V2 validation | test support | retain | E6 |
+| `scripts/loadtest/__init__.py`<br>`scripts/loadtest/collect.py`<br>`scripts/loadtest/compare_tokens.py`<br>`scripts/loadtest/fixtures.py`<br>`scripts/loadtest/measure_resident.py`<br>`scripts/loadtest/mock_provider.py`<br>`scripts/loadtest/run_loadtest.py`（7） | Runtime V2 validation | test support | retain | E6 |
 | `scripts/perf/__init__.py`<br>`scripts/perf/admin_usage_scale.py`（2） | Admin/usage operations | active diagnostic | retain | E7 |
 | `scripts/provider_probe/__init__.py`<br>`scripts/provider_probe/probe.py`（2） | Provider compatibility | active diagnostic | retain | E8 |
 | `scripts/repair_v2_bricked_summary_frontier.py`（1） | Runtime V2 recovery | recovery | retain | E9 |
@@ -91,7 +93,7 @@ Task 5 taxonomy 的 executable/support asset；唯一的非 executable 路径
 | `tools/continuity_canary.py`（1） | Encryption continuity history | historical | historical-retained | E19 |
 | `tools/dcap/dcap_parse.py`<br>`tools/dcap/test_dcap_parse.py`<br>`tools/dcap/testdata/sample_attestation.json`<br>`tools/dcap/testdata/sample_quote.hex`（4） | Attestation validation | test support | retain | E20 |
 | `tools/deploy_canary.py`（1） | Deployment safety | deployment | retain | E21 |
-| `tools/e2e/README.md`<br>`tools/e2e/__init__.py`<br>`tools/e2e/aup_gate_probe.py`<br>`tools/e2e/card_gate_probe.py`<br>`tools/e2e/client.py`<br>`tools/e2e/config.py`<br>`tools/e2e/continuity_probe.py`<br>`tools/e2e/deep.py`<br>`tools/e2e/elevenlabs_silent_turn_probe.py`<br>`tools/e2e/experience_probe.py`<br>`tools/e2e/fixtures/aup_gate/canary_instruction_v0.2.0.txt`<br>`tools/e2e/fixtures/aup_gate/manifest.json`<br>`tools/e2e/fixtures/aup_gate/user_message.txt`<br>`tools/e2e/genesis_expired_stage_probe.py`<br>`tools/e2e/genesis_resume_probe.py`<br>`tools/e2e/hosted.py`<br>`tools/e2e/idempotency_probe.py`<br>`tools/e2e/image_autonomy_probe.py`<br>`tools/e2e/memory_probe.py`<br>`tools/e2e/memory_thinking_leak_probe.py`<br>`tools/e2e/p0.py`<br>`tools/e2e/perception_probe.py`<br>`tools/e2e/perception_wake_probe.py`<br>`tools/e2e/proactive_probe.py`<br>`tools/e2e/probe_common.py`<br>`tools/e2e/processing_probe.py`<br>`tools/e2e/provider_response_envelope_probe.py`<br>`tools/e2e/repeat_wake_probe.py`<br>`tools/e2e/resident_maintenance_smoke.py`<br>`tools/e2e/screen_watch_probe.py`<br>`tools/e2e/self_thinking_prompt_probe.py`<br>`tools/e2e/switch_matrix_probe.py`<br>`tools/e2e/temporal_probe.py`<br>`tools/e2e/tool_count_ceiling_probe.py`<br>`tools/e2e/tool_schema_rejection_probe.py`<br>`tools/e2e/tool_selection_cases.json`<br>`tools/e2e/tool_selection_eval.py`<br>`tools/e2e/turn_failure_smoke.py`<br>`tools/e2e/unlock.py`<br>`tools/e2e/user_mcp_handshake_probe.py`<br>`tools/e2e/voice_transcript_probe.py`<br>`tools/e2e/vps.py`<br>`tools/e2e/wake_tool_markup_probe.py`<br>`tools/e2e/wake_write_gate_probe.py`<br>`tools/e2e/worldbook_probe.py`（45） | Release validation | test support | retain | E22 |
+| `tools/e2e/__init__.py`<br>`tools/e2e/aup_gate_probe.py`<br>`tools/e2e/card_gate_probe.py`<br>`tools/e2e/client.py`<br>`tools/e2e/config.py`<br>`tools/e2e/continuity_probe.py`<br>`tools/e2e/deep.py`<br>`tools/e2e/elevenlabs_silent_turn_probe.py`<br>`tools/e2e/experience_probe.py`<br>`tools/e2e/fixtures/aup_gate/canary_instruction_v0.2.0.txt`<br>`tools/e2e/fixtures/aup_gate/manifest.json`<br>`tools/e2e/fixtures/aup_gate/user_message.txt`<br>`tools/e2e/genesis_expired_stage_probe.py`<br>`tools/e2e/genesis_resume_probe.py`<br>`tools/e2e/hosted.py`<br>`tools/e2e/idempotency_probe.py`<br>`tools/e2e/image_autonomy_probe.py`<br>`tools/e2e/memory_probe.py`<br>`tools/e2e/memory_thinking_leak_probe.py`<br>`tools/e2e/p0.py`<br>`tools/e2e/perception_probe.py`<br>`tools/e2e/perception_wake_probe.py`<br>`tools/e2e/proactive_probe.py`<br>`tools/e2e/probe_common.py`<br>`tools/e2e/processing_probe.py`<br>`tools/e2e/provider_response_envelope_probe.py`<br>`tools/e2e/repeat_wake_probe.py`<br>`tools/e2e/resident_maintenance_smoke.py`<br>`tools/e2e/screen_watch_probe.py`<br>`tools/e2e/self_thinking_prompt_probe.py`<br>`tools/e2e/switch_matrix_probe.py`<br>`tools/e2e/temporal_probe.py`<br>`tools/e2e/tool_count_ceiling_probe.py`<br>`tools/e2e/tool_schema_rejection_probe.py`<br>`tools/e2e/tool_selection_cases.json`<br>`tools/e2e/tool_selection_eval.py`<br>`tools/e2e/turn_failure_smoke.py`<br>`tools/e2e/unlock.py`<br>`tools/e2e/user_mcp_handshake_probe.py`<br>`tools/e2e/voice_transcript_probe.py`<br>`tools/e2e/vps.py`<br>`tools/e2e/wake_tool_markup_probe.py`<br>`tools/e2e/wake_write_gate_probe.py`<br>`tools/e2e/worldbook_probe.py`（44） | Release validation | test support | retain | E22 |
 | `tools/e2e_encryption_test.py`（1） | Encryption integration validation | test support | retain | E23 |
 | `tools/export_public_openapi.py`<br>`tools/public_openapi_contracts.py`（2） | Public API documentation | generated helper | retain | E24 |
 | `tools/frame_envelope_roundtrip_test.py`<br>`tools/v1_envelope_roundtrip_test.py`（2） | Envelope integration validation | test support | retain | E23 |
@@ -102,7 +104,7 @@ Task 5 taxonomy 的 executable/support asset；唯一的非 executable 路径
 | `tools/pi_mcp_bridge/index.js`<br>`tools/pi_mcp_bridge/mcp_client.js`<br>`tools/pi_mcp_bridge/tool_mapping.js`（3） | Resident user-MCP runtime | production companion | **retain-protected** | E28 |
 | `tools/proactive_gate_eval.py`（1） | Proactive policy review | active diagnostic | retain | E29 |
 | `tools/prompt_cache_canary.py`（1） | Runtime V2 deploy validation | active diagnostic | retain | E30 |
-| `tools/provider_smoke/README.md`<br>`tools/provider_smoke/__init__.py`<br>`tools/provider_smoke/assertions.py`<br>`tools/provider_smoke/client.py`<br>`tools/provider_smoke/crypto.py`<br>`tools/provider_smoke/matrix.py`<br>`tools/provider_smoke/run_smoke.py`<br>`tools/provider_smoke/tests/__init__.py`<br>`tools/provider_smoke/tests/test_assertions.py`<br>`tools/provider_smoke/tests/test_client_helpers.py`<br>`tools/provider_smoke/tests/test_crypto.py`<br>`tools/provider_smoke/tests/test_matrix.py`<br>`tools/provider_smoke/tests/test_run_smoke_helpers.py`（13） | Provider compatibility | active diagnostic | retain (`feature-decision`) | E31 |
+| `tools/provider_smoke/__init__.py`<br>`tools/provider_smoke/assertions.py`<br>`tools/provider_smoke/client.py`<br>`tools/provider_smoke/crypto.py`<br>`tools/provider_smoke/matrix.py`<br>`tools/provider_smoke/run_smoke.py`<br>`tools/provider_smoke/tests/__init__.py`<br>`tools/provider_smoke/tests/test_assertions.py`<br>`tools/provider_smoke/tests/test_client_helpers.py`<br>`tools/provider_smoke/tests/test_crypto.py`<br>`tools/provider_smoke/tests/test_matrix.py`<br>`tools/provider_smoke/tests/test_run_smoke_helpers.py`（12） | Provider compatibility | active diagnostic | retain (`feature-decision`) | E31 |
 | `tools/recover_memory_dream_churn.py`（1） | Memory recovery | recovery | retain | E32 |
 | `tools/recover_orphan_accounts.py`（1） | Account recovery | recovery | retain | E33 |
 | `tools/repository_inventory.py`（1） | Repository cleanup | generated helper | retain | E34 |
@@ -118,7 +120,10 @@ Task 5 taxonomy 的 executable/support asset；唯一的非 executable 路径
 
 | 路径（数量） | owner | 生命周期 | 原因 |
 |---|---|---|---|
-| `tools/README.md`（1） | Tooling documentation | current | 它是本目录的 operator/documentation entrypoint，不是 tool/script asset；为保证全部 tracked-path 可导航而单列，且不纳入分类计数。 |
+| `scripts/loadtest/README.md`（1） | Runtime V2 validation documentation | current | 它是 simulated load/token harness 的 operator/runbook entrypoint，不是 tool/script asset；E6 仍是其现行使用证据。 |
+| `tools/README.md`（1） | Tooling documentation | current | 它是本目录的 operator/documentation entrypoint，不是 tool/script asset；为保证全部 tracked-path 可导航而单列。 |
+| `tools/e2e/README.md`（1） | Release validation documentation | current | 它是 P0/operator probe runbook，不是 tool/script asset；E22 仍是其现行使用证据。 |
+| `tools/provider_smoke/README.md`（1） | Provider compatibility documentation | current | 它是 smoke operator runbook，不是 tool/script asset；E31 仍是其现行使用证据。 |
 
 ## 覆盖计数与结论
 
@@ -128,12 +133,12 @@ Task 5 taxonomy 的 executable/support asset；唯一的非 executable 路径
 | deployment | 7 |
 | recovery | 4 |
 | migration | 2 |
-| active diagnostic | 29 |
-| test support | 67 |
+| active diagnostic | 28 |
+| test support | 65 |
 | generated helper | 5 |
 | historical | 1 |
-| **Task 5 taxonomy assets** | **125** |
-| 非 executable 文档覆盖 | 1 |
+| **Task 5 taxonomy assets** | **122** |
+| 非 executable 文档覆盖 | 4 |
 | **全部 tracked 路径** | **126** |
 
 - 未归类：0；`unowned candidate`：0；本批不创建 candidate record。
