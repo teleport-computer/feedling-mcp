@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import sys
 import threading
 from pathlib import Path
@@ -240,3 +241,58 @@ def test_health_executor_maps_outer_deadline_to_stable_exception():
         asyncio.run(go())
     finally:
         release.set()
+
+
+def test_health_executor_observes_late_exception_after_outer_timeout():
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    loop_errors = []
+
+    def late_failure() -> None:
+        started.set()
+        release.wait(timeout=1.0)
+        try:
+            raise RuntimeError("late database failure")
+        finally:
+            finished.set()
+
+    async def go():
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        task = asyncio.create_task(
+            health_executor.run(late_failure, deadline_seconds=0.01)
+        )
+        while not started.is_set():
+            await asyncio.sleep(0)
+        with pytest.raises(health_executor.HealthCheckTimeout):
+            await task
+
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 1.0)
+        await asyncio.sleep(0)
+        gc.collect()
+        await asyncio.sleep(0)
+
+    try:
+        asyncio.run(go())
+    finally:
+        release.set()
+
+    assert not any(
+        context.get("message") == "Future exception was never retrieved"
+        for context in loop_errors
+    )
+
+
+def test_health_executor_done_callback_consumes_asyncio_future_exception():
+    async def go():
+        future = asyncio.get_running_loop().create_future()
+        future.set_exception(RuntimeError("late database failure"))
+        assert future._log_traceback is True
+
+        health_executor._consume_future_exception(future)
+
+        assert future._log_traceback is False
+
+    asyncio.run(go())

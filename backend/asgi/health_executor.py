@@ -25,8 +25,19 @@ class HealthCheckTimeout(RuntimeError):
     """The health callable could not be admitted or finish by its deadline."""
 
 
+class HealthCheckSaturated(HealthCheckTimeout):
+    """The bounded health executor cannot admit another callable."""
+
+
 def _release_outstanding_slot(_future: Future[object]) -> None:
     _outstanding_slots.release()
+
+
+def _consume_future_exception(future: asyncio.Future[object]) -> None:
+    """Observe late failures after the request-side deadline has elapsed."""
+    if future.cancelled():
+        return
+    future.exception()
 
 
 async def run(
@@ -34,11 +45,12 @@ async def run(
     /,
     *args: P.args,
     deadline_seconds: float = HEALTH_CHECK_DEADLINE_SECONDS,
+    completion_callback: Callable[[Future[T]], None] | None = None,
     **kwargs: P.kwargs,
 ) -> T:
     loop = asyncio.get_running_loop()
     if not _outstanding_slots.acquire(blocking=False):
-        raise HealthCheckTimeout("health check executor saturated")
+        raise HealthCheckSaturated("health check executor saturated")
 
     try:
         future = _executor.submit(partial(fn, *args, **kwargs))
@@ -46,7 +58,10 @@ async def run(
         _outstanding_slots.release()
         raise
     future.add_done_callback(_release_outstanding_slot)
+    if completion_callback is not None:
+        future.add_done_callback(completion_callback)
     wrapped_future = asyncio.wrap_future(future, loop=loop)
+    wrapped_future.add_done_callback(_consume_future_exception)
     try:
         _done, pending = await asyncio.wait(
             {wrapped_future},

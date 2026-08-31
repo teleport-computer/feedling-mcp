@@ -2754,14 +2754,28 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
         },
     },
     ("get", "/healthz/runner"): {
+        "200": {
+            "description": (
+                "The runner fleet is healthy according to a live database "
+                "observation, or a transient probe failure was covered by a "
+                "cached heartbeat snapshot that is still within the configured "
+                "freshness window. The cached case has top-level \"status\": "
+                "\"degraded\" and identifies the probe failure under "
+                "\"runner_fleet\"."
+            ),
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
+        },
         "503": {
             "description": (
                 "The aggregate runner fleet is unhealthy, unavailable, or "
                 "misconfigured, or its isolated probe exceeded its three-second "
                 "health-check deadline. "
                 "The body has the same shape as the 200 response, with top-level "
-                "\"status\": \"unhealthy\" and a down \"runner_fleet\" entry "
-                "under \"checks\"."
+                "\"status\": \"unhealthy\". A successful observation that "
+                "proves fleet drift reports runner_fleet \"status\": \"down\"; "
+                "an unavailable observation with no still-fresh cached proof "
+                "reports \"status\": \"unknown\" instead of claiming the "
+                "runner is down."
             ),
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
         },

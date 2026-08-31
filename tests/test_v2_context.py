@@ -13,6 +13,7 @@ from agent_protocol_core import self_thinking
 from chat.reply_language import format_time_anchor, infer_reply_language
 from capabilities import tool_schema
 from chat import language_follow
+from core import util as core_util
 from model_api_runtime.v2 import context, worker
 import worldbook_readside_core
 
@@ -479,6 +480,8 @@ def test_finalized_self_thinking_copy_is_exact_and_has_no_old_length_cap():
     assert hashlib.sha256(self_thinking.INSTRUCTION.encode()).hexdigest() == (
         "dfa9f806b4fdcc189cc63d2fc1810a5326f0a3f5b9042f889e48f499ca9bc2ff"
     )
+    assert " 长短都行，一句也可以。" in self_thinking.INSTRUCTION
+    assert "想多写就多写" not in self_thinking.INSTRUCTION
     assert "240 字" not in self_thinking.INSTRUCTION
     assert "写不完就收住" not in self_thinking.INSTRUCTION
     assert "好例子（用户在说中文，所以整块是中文）" in self_thinking.INSTRUCTION
@@ -1040,14 +1043,15 @@ def test_needs_compaction_counts_nonblank():
 
 
 def test_text_of_handles_str_list_and_none():
-    assert context.text_of("  hi  ") == "hi"
-    assert context.text_of(None) == ""
-    assert context.text_of([
+    assert core_util.text_of("  hi  ") == "hi"
+    assert core_util.text_of(None) == ""
+    assert core_util.text_of([
         {"type": "text", "text": "look at this"},
         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}},
-    ]) == "look at this"
+        "  and this  ",
+    ]) == "look at this\nand this"
     # image-only block list has no text
-    assert context.text_of([
+    assert core_util.text_of([
         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}},
     ]) == ""
 

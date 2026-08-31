@@ -3559,7 +3559,8 @@ def _pending_reviews(job_id: int):
 def _terminal_outbox(job_id: int):
     with db.get_pool().connection() as conn:
         return conn.execute(
-            "SELECT error_code FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            "SELECT error_code,error_class "
+            "FROM v2_terminal_failure_outbox WHERE job_id=%s",
             (job_id,),
         ).fetchone()
 
@@ -3586,7 +3587,10 @@ def test_preempt_unsafe_scheduled_keeps_its_delivery_obligation():
     preempted = _preempt(uid)
 
     assert [p.recovery for p in preempted] == ["terminal"]
-    assert _terminal_outbox(job_id) == ("foreground_chat_preempted",)
+    assert _terminal_outbox(job_id) == (
+        "foreground_chat_preempted",
+        "platform_execution_timeout",
+    )
     # ⚠️ 只断失败 outbox 是不够的:`_queue_failure_review_on_cursor` 的 INSERT
     # 只接受 `status IN ('failed','expired')`,行写成 superseded 时它会**静默
     # 返回 False** —— 调用在、复核没排上,而上面那条断言照样绿。
@@ -3615,7 +3619,10 @@ def test_preempt_unsafe_scheduled_closes_out_a_dangling_mcp_attempt():
     preempted = _preempt(uid)
 
     assert [p.recovery for p in preempted] == ["terminal"]
-    assert _terminal_outbox(job_id) == ("mcp_mutation_outcome_unknown",)
+    assert _terminal_outbox(job_id) == (
+        "mcp_mutation_outcome_unknown",
+        "platform_execution_timeout",
+    )
     # ⚠️ 不能只断言 has_ambiguous:它对 NULL 和 'unknown' 都返回 True,
     # 所以「没收口」和「收口成 unknown」在它眼里一样 —— 恒真断言。
     # 必须直接读那一列。
@@ -3629,6 +3636,85 @@ def test_preempt_unsafe_scheduled_closes_out_a_dangling_mcp_attempt():
     assert outcomes == ["unknown"]
     assert jobs_store.has_ambiguous_mcp_mutation(job_id=job_id) is True
     assert _pending_reviews(job_id) == ["pending"]
+
+
+@pytest.mark.parametrize(
+    ("archive_language", "expected_text"),
+    [
+        (
+            "zh-Hans-CN",
+            "提醒没能送到\n"
+            "「提醒我喝水」原定 2026年8月17日 09:30（Asia/Shanghai） 提醒你,"
+            "试了几次都没成功。\n"
+            "这条提醒不会自动补发,需要的话可以重新设一个。",
+        ),
+        (
+            "en-US",
+            "Reminder couldn't be delivered\n"
+            "“提醒我喝水” was scheduled for 2026-08-17 09:30 "
+            "(Asia/Shanghai), but delivery still failed after several attempts.\n"
+            "This reminder will not be delivered automatically; set a new one if "
+            "you still need it.",
+        ),
+    ],
+)
+def test_preempt_unsafe_scheduled_uses_platform_class_without_changing_copy(
+    monkeypatch,
+    archive_language,
+    expected_text,
+):
+    """抢占终结属于平台执行失败，但仍走 scheduled 的普通失败原文。"""
+    uid = "u_js_preempt_sched_copy_" + archive_language.lower().replace("-", "_")
+    seed_user(uid, archive_language=archive_language)
+    _reset(uid)
+    encrypted_plaintexts: list[str] = []
+
+    def capture_failure_envelope(store, plaintext, *, item_id=None):
+        encrypted_plaintexts.append(plaintext.decode("utf-8"))
+        return _fake_failure_envelope(store, plaintext, item_id=item_id)
+
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        capture_failure_envelope,
+    )
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    db.log_append(
+        uid,
+        jobs_store.SCHEDULED_WAKE_STREAM,
+        {
+            "status": "fired",
+            "fired_job_id": job_id,
+            "note": "提醒我喝水",
+            "at": "2026-08-17T09:30:00",
+            "timezone": "Asia/Shanghai",
+            "due_at": 1_787_110_200.0,
+        },
+        item_key=f"timer-preempt-copy-{archive_language}",
+    )
+    jobs_store.claim_next_job("w")
+    jobs_store.mark_running(job_id, claimed_by="w")
+    _record_durable_platform_effect(job_id, uid)
+
+    preempted = _preempt(uid)
+    result = jobs_store.reconcile_terminal_failure_outbox(job_id=job_id)
+
+    assert [p.recovery for p in preempted] == ["terminal"]
+    assert _terminal_outbox(job_id) == (
+        "foreground_chat_preempted",
+        "platform_execution_timeout",
+    )
+    assert result["reply_delivered"] == 1
+    failure = next(
+        row
+        for row in db.chat_load_strict(uid)
+        if str(row.get("terminal_failure_job_id") or "") == str(job_id)
+    )
+    assert failure["turn_failure_error_class"] == "platform_execution_timeout"
+    assert failure["turn_failure_error_class"] != "unknown"
+    assert failure["turn_failure_error_class"] != "quota_insufficient"
+    assert failure["turn_failure_blame"] == "system"
+    assert encrypted_plaintexts == [expected_text]
 
 
 @pytest.mark.parametrize("lane", ["scheduled", "capture"])

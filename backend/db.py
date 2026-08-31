@@ -75,7 +75,6 @@ HEALTH_DB_STATEMENT_TIMEOUT_MS = 1000
 # connections, while keeping concurrent health requests bounded.
 HEALTH_DB_POOL_MIN_SIZE = 1
 HEALTH_DB_POOL_MAX_SIZE = 2
-_POOL_CHECK_CONNECTION = ConnectionPool.check_connection
 TEE_PRIMARY_POOL_MAX_LIFETIME_SECONDS = 180.0
 TEE_PRIMARY_TCP_USER_TIMEOUT_MS = 30000
 
@@ -200,7 +199,6 @@ def get_health_pool() -> ConnectionPool:
                 max_size=HEALTH_DB_POOL_MAX_SIZE,
                 timeout=HEALTH_DB_ACQUIRE_TIMEOUT_SECONDS,
                 max_idle=300,
-                check=_POOL_CHECK_CONNECTION,
                 kwargs=_database_connection_kwargs(),
                 open=True,
                 **_database_pool_lifetime_kwargs(),

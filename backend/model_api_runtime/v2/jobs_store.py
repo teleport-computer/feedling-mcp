@@ -1143,8 +1143,15 @@ def preempt_active_for_chat_on_cursor(
                 "WHERE job_id=%s AND outcome IS NULL",
                 (int(row["id"]),),
             )
+            # The platform cannot safely replay an execution that already
+            # wrote effects.  Attribute that delivery failure to our execution
+            # boundary, not to the user's provider or its quota.
             _queue_terminal_failure_on_cursor(
-                cur, int(row["id"]), str(row["user_id"]), terminal_error
+                cur,
+                int(row["id"]),
+                str(row["user_id"]),
+                terminal_error,
+                error_class="platform_execution_timeout",
             )
             job_reviews = tuple(
                 _recover_review_runner_on_cursor(cur, int(row["id"]))

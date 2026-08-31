@@ -21,7 +21,15 @@
 # If a known finding is fixed or its workflow is deleted, the next workflow or
 # baseline change is intentionally refused as stale. Remove that @allow and
 # decrement @max in the same product-repository change.
-@max 2
+@max 3
+
+# Why not fix: if: ${{ false }} intentionally prevents dispatching the retired
+# production old-ciphertext canary before its fixture and ownership are rebuilt.
+# Alternative guard: the absent schedule and Retired workflow name reinforce
+# the job-level false condition.
+# Blind spot accepted: every future if-cond finding in this file shares this
+# file|rule key and is hidden by this exemption.
+@allow .github/workflows/continuity-canary.yml|if-cond
 
 # Why not fix: if: ${{ false }} is an intentional DEPRECATED deployment gate;
 # removing it would re-enable real Redis deployment.
