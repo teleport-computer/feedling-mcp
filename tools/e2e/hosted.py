@@ -15,7 +15,10 @@ from __future__ import annotations
 import time
 import uuid
 
-from .client import E2EClient
+from .client import (
+    E2EClient, VERDICT_FALLBACK, VERDICT_OK,
+    decrypt_verdict as _decrypt_verdict,
+)
 from .config import HostedCell
 
 FIRST_REPLY_TIMEOUT = 300.0   # includes provider cold start and queue wait
@@ -70,6 +73,17 @@ def run_hosted_cell(cell: HostedCell, pool: dict[str, str]) -> dict:
             active_client.preserve_failure(f"{name}: {detail or 'failed'}")
         return ok
 
+    def verdict_step(name: str, verdict: str, detail: str) -> bool:
+        """三态记录:ok / fallback / fail。fallback 单列，不并进任何一边。
+
+        并进 ok 就是我们正在修的那个 bug;并进 fail 会让「交付了失败话术」和
+        「压根没回来」在报表上同形，而这两件事的排查方向完全不同。
+        """
+        steps.append((name, verdict, detail))
+        if verdict != VERDICT_OK and active_client is not None:
+            active_client.preserve_failure(f"{name}[{verdict}]: {detail or verdict}")
+        return verdict == VERDICT_OK
+
     models = cell.models or [m for m in [pool.get("E2E_RELAY_MODEL", "")] if m]
     if not models:
         return {"cell": cell.name, "result": "skip",
@@ -110,9 +124,13 @@ def run_hosted_cell(cell: HostedCell, pool: dict[str, str]) -> dict:
                     "user_id": c.user_id}
         reply = c.wait_reply(sent, timeout=FIRST_REPLY_TIMEOUT)
         text = c.message_text(reply) if reply else ""
-        if not step("chat", reply is not None and bool(text.strip()),
-                    f"{time.time() - sent:.0f}s; head={text[:40]!r}"):
-            return {"cell": cell.name, "result": "fail", "steps": steps,
+        # 闸不能只测「非空」：失效时交付给用户的兜底话术也是非空的，那样闸的
+        # 盲区正对着失效方向。改问后端自己的判词，见 client.classify_reply。
+        chat_verdict, chat_detail = c.classify_reply(reply, text)
+        if not verdict_step("chat", chat_verdict,
+                            f"{time.time() - sent:.0f}s; head={text[:40]!r}; "
+                            f"{chat_detail}"):
+            return {"cell": cell.name, "result": chat_verdict, "steps": steps,
                     "user_id": c.user_id}
 
         # -- tier/readability continuity (HARD P0) ----------------------------
@@ -125,9 +143,11 @@ def run_hosted_cell(cell: HostedCell, pool: dict[str, str]) -> dict:
             dec_err = ""
         except Exception as de:  # noqa: BLE001
             dec, dec_err = "", f"{type(de).__name__}: {de}"
-        if not step("decrypt", bool(dec.strip()),
-                    f"len={len(dec)}" if dec.strip() else (dec_err or "empty plaintext")):
-            return {"cell": cell.name, "result": "fail", "steps": steps,
+        # 解得开只是第一层；解出来的正文同样不能是失败话术。这一步只跑辅助闸
+        # (常量比对)——主闸已在 chat 步问过后端判词，不重复那次调用。
+        dec_verdict, dec_detail = _decrypt_verdict(dec, dec_err)
+        if not verdict_step("decrypt", dec_verdict, dec_detail):
+            return {"cell": cell.name, "result": dec_verdict, "steps": steps,
                     "user_id": c.user_id}
 
         # -- continuity -------------------------------------------------------
@@ -151,6 +171,13 @@ def run_hosted_cell(cell: HostedCell, pool: dict[str, str]) -> dict:
         bubbles = c.system_bubbles_since(run_start)
         step("no-error-bubbles", not bubbles, f"{len(bubbles)} system notice(s)")
 
-        hard_fail = any(s[1] == "fail" for s in steps)
-        return {"cell": cell.name, "result": "fail" if hard_fail else "ok",
+        # fallback 单列：它阻断发版(用户实际收到的是失败话术)，但不并进
+        # "fail"，否则「交付了失败话术」和「压根没回来」在报表上同形。
+        if any(s[1] == "fail" for s in steps):
+            result = "fail"
+        elif any(s[1] == VERDICT_FALLBACK for s in steps):
+            result = VERDICT_FALLBACK
+        else:
+            result = "ok"
+        return {"cell": cell.name, "result": result,
                 "steps": steps, "user_id": c.user_id}

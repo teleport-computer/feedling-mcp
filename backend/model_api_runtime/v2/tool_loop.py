@@ -2423,6 +2423,16 @@ async def run_tool_loop(
                 provider_kwargs["tool_choice"] = "required"
             if file_delivery_choice_required:
                 provider_kwargs["tool_choice"] = "required"
+            if suppress_native_reasoning and terminal_text_round:
+                # A continuation prefix is safe only once the loop has made
+                # this a text-only terminal request. Live Anthropic testing
+                # showed that adding it to an ordinary tool round can produce
+                # a mismatched </thinking> block or a prefix-only tool turn.
+                # Unsupported provider/model pairs discard this hint in the
+                # payload builder and therefore retain their exact old request.
+                provider_kwargs["assistant_prefill"] = (
+                    provider_client.SELF_THINKING_ASSISTANT_PREFILL
+                )
             if allow_image_output and not terminal_text_round:
                 provider_kwargs["allow_image_output"] = True
             if (

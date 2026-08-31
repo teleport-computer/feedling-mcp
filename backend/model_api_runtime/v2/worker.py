@@ -96,6 +96,8 @@ from agent_protocol_core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
 from memory import dream_trace as memory_dream_trace
+from memory import garden_component
+from memgarden import contracts as mg_contracts
 from memgarden import timestamps as memory_timestamps
 from core.downloadable_reply import sanitize_downloadable_reply
 from perception.glance import (
@@ -1903,7 +1905,7 @@ async def _call_image_generation_dependency(
 
 def _required_file_missing_fallback(messages: list[dict]) -> str:
     user_text = "\n".join(
-        context.text_of(message.get("content"))
+        core_util.text_of(message.get("content"))
         for message in messages
     )
     if re.search(r"[\u4e00-\u9fff]", user_text):
@@ -7375,7 +7377,7 @@ def _latest_user_writing_system(rows: Iterable[dict]) -> str:
     for row in reversed(list(rows)):
         if str(row.get("role") or "") not in {"user", "human"}:
             continue
-        text = context.text_of(row.get("content")).strip()
+        text = core_util.text_of(row.get("content")).strip()
         if not text:
             continue
         script = v2_language_follow.classify_writing_system(text)
@@ -7824,7 +7826,7 @@ def _render_capture_line(message: dict, voice_transcripts: dict,
     label = transcript_speaker_label(
         str(message.get("role") or ""), user_name=user_name, ai_name=ai_name
     )
-    return f"- {label}: {context.text_of(message.get('content'))}"
+    return f"- {label}: {core_util.text_of(message.get('content'))}"
 
 
 async def _rebalance_summary_frontier(
@@ -12241,7 +12243,10 @@ async def _run_extraction(
                 # 否则夜里整理一遍会把桶换成另一种语言 —— 也要喂同样的证据，
                 # 光同源不同证据一样会判出两个结果。
                 locale=infer_garden_language(
-                    ctx.get("identity") if isinstance(ctx.get("identity"), dict) else None,
+                    # ctx["identity"] 是**字符串**(已渲染的身份卡正文),不是 dict ——
+                    # 原来这里有个 isinstance(...) dict 的守卫,永远走 None,
+                    # 等于把身份卡这份语言证据整个丢了。见 _identity_texts。
+                    ctx.get("identity"),
                     written=user_written_text(prompt_tail),
                     existing_buckets=str(ctx.get("buckets") or ""),
                 ),
@@ -12269,6 +12274,31 @@ async def _run_extraction(
                 ),
                 build_truncation_prompt=build_truncation_retry_prompt,
             )
+            # 整理也走组件的会话。和 capture 同构 —— provider 那步仍归
+            # extract()，组件只决定问什么、怎么重问。
+            #
+            # known_ids 是墓碑卡守卫：整理结果里不许出现喂进去的卡 id，
+            # 出现了就是模型把整理注记当成了内容本身（usr_a40e 事故）。
+            _step_sink = garden_component.BounceTracker()
+            _capture_session = garden_component.build_garden(
+                garden_component.CallableModel(lambda _p: ""),
+                on_step=_step_sink,
+            ).maintenance_session(mg_contracts.MaintenanceRequest(
+                cards=list(ctx.get("card_items") or []),
+                all_cards=list(ctx.get("card_items") or []),
+                locale=infer_garden_language(
+                    # ctx["identity"] 是**字符串**(已渲染的身份卡正文),不是 dict ——
+                    # 原来这里有个 isinstance(...) dict 的守卫,永远走 None,
+                    # 等于把身份卡这份语言证据整个丢了。见 _identity_texts。
+                    ctx.get("identity"),
+                    written=user_written_text(prompt_tail),
+                    existing_buckets=str(ctx.get("buckets") or ""),
+                ),
+                ai_name=ctx.get("ai_name", ""),
+                user_name=ctx.get("user_name", ""),
+                recent_conversations=window,
+                known_ids=tuple(dream_known_ids),
+            ))
 
         async def _extraction_trajectory(kind: str, payload: dict) -> None:
             nonlocal dream_model_attempts
@@ -12303,9 +12333,39 @@ async def _run_extraction(
                 #
                 # 现在喂真证据：身份卡 + 这轮对话里**他自己说的话**。
                 # 取证走共用 helper，两条 runtime 不许各写一份。
+                # 🔴 archive_language 是**跨轮的锚**,必须传。
+                #
+                # V2 的 capture 是增量的:``prompt_tail`` 只有自上次抽取以来的
+                # 新消息。用户临时说一句英文,这一轮的「他写的字」就全是英文 ——
+                # 光看这批消息,判成英文是必然的,整个中文花园会被翻掉。
+                # V1 的窗口更宽、而且一直传着这个锚,所以锁得住;V2 两样都没有。
+                # 只补身份卡不够:新用户的身份卡可能还是空的,那时锚就是唯一
+                # 能把语言钉住的东西。
+                _archive_language = ""
+                if deps.read_temporal_snapshot is not None:
+                    try:
+                        _snap = await asyncio.to_thread(
+                            deps.read_temporal_snapshot,
+                            user_id,
+                            # 不传 through_seq:这个变量在本作用域是**条件绑定**的,
+                            # 引用它可能 NameError —— 而后台 job 会把 NameError
+                            # 静默吞成 extraction_failed(同一个坑上面刚踩过)。
+                            # archive_language 是账号级的,跟消息游标无关,
+                            # 不传等价。
+                        )
+                        if isinstance(_snap, dict):
+                            _archive_language = str(
+                                _snap.get("archive_language") or ""
+                            ).strip()
+                    except Exception:  # noqa: BLE001 — 取不到锚不该让落卡失败
+                        pass
                 _lang = garden_language_decision(
-                    ctx.get("identity") if isinstance(ctx.get("identity"), dict) else None,
+                    # ctx["identity"] 是**字符串**(已渲染的身份卡正文),不是 dict ——
+                    # 原来这里有个 isinstance(...) dict 的守卫,永远走 None,
+                    # 等于把身份卡这份语言证据整个丢了。见 _identity_texts。
+                    ctx.get("identity"),
                     written=user_written_text(prompt_tail),
+                    archive_language=_archive_language,
                     # ↓ 只落观测，不参与判定。
                     existing_buckets=str(ctx.get("buckets") or ""),
                 )
@@ -12328,6 +12388,26 @@ async def _run_extraction(
                         )
                     except Exception:  # noqa: BLE001 — 观测失败绝不影响落卡
                         pass
+                # 组件的会话 —— 提示词和重问由它决定。模型端口传 None 是刻意的：
+                # 会话模式下组件不自己调模型，provider 那步归 extract()。
+                #
+                # 🔴 位置很重要：必须在 capture_locale 算出来之后。
+                # 原来写在上面 lane == "capture" 那段里，那时 capture_locale
+                # 还不存在 —— NameError 被 worker 的「背景 job 静默失败」吞掉，
+                # 表现是每次 capture 都 extraction_failed:error，不报错、不冒泡。
+                _step_sink = garden_component.BounceTracker()
+                _capture_session = garden_component.build_garden(
+                    garden_component.CallableModel(lambda _p: ""),
+                    on_step=_step_sink,
+                ).capture_session(mg_contracts.CaptureRequest(
+                    window=window,
+                    locale=capture_locale,
+                    buckets=str(ctx.get("buckets") or ""),
+                    threads=str(ctx.get("threads") or ""),
+                    identity=str(ctx.get("identity") or ""),
+                    ai_name=ctx.get("ai_name", ""),
+                    user_name=ctx.get("user_name", ""),
+                ))
                 prompt = build_capture_prompt(
                     ai_name=ctx.get("ai_name", ""),
                     user_name=ctx.get("user_name", ""),
@@ -12352,12 +12432,23 @@ async def _run_extraction(
 
             async def _invoke_capture_provider() -> tuple[Any, str | None]:
                 _report_turn_progress("extraction_provider_start")
+                # capture 走 GardenComponent 的会话：**它决定问什么、怎么重问**，
+                # provider 那一步仍归 extract()（截断检测要看 finish_reason，
+                # 用量统计、失败分类、退避、轨迹都在那边）。
+                #
+                # 不直接调 garden.acapture() 的原因：那个自带循环，会把 provider
+                # 调用抢过去 —— 等于放弃上面那些能力，是净退步。
+                #
+                # dream lane 仍走原路径（它的 session API 还没做），所以下面两个
+                # 分支的 prompt/parse/parse_retry 仍然保留。
                 result = await _extract_with_provider_health(
                     user_id,
                     provider_config=provider_config,
                     prompt=prompt,
                     parse=parse,
                     parse_retry=parse_retry,
+                    session=_capture_session,
+                    step_sink=_step_sink,
                     max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
                     failure_detail_out=extraction_failure_detail.update,
                     progress_cb=lambda stage, attempt: _report_turn_progress(
@@ -12491,12 +12582,17 @@ async def _run_extraction(
                 counts=dream_counts,
             )
             _report_turn_progress("extraction_provider_start")
+            # dream 也走组件的会话（见上面建 _capture_session 那段）。
+            # prompt/parse/parse_retry 仍传着 —— 会话模式下 extract() 忽略它们，
+            # 但保留意味着「去掉 session 就退回原路径」随时可做。
             items, reason = await _extract_with_provider_health(
                 user_id,
                 provider_config=provider_config,
                 prompt=prompt,
                 parse=parse,
                 parse_retry=parse_retry,
+                session=_capture_session,
+                step_sink=_step_sink,
                 max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
                 failure_detail_out=extraction_failure_detail.update,
                 progress_cb=lambda stage, attempt: _report_turn_progress(
@@ -13221,7 +13317,7 @@ def _inject_tail_images(
                 continue
             observation = str(observations.get(message_id) or "").strip()
             if observation:
-                caption = context.text_of(row.get("content"))
+                caption = core_util.text_of(row.get("content"))
                 if caption == "[image]":
                     caption = ""
                 observation_block = json.dumps(
@@ -13244,7 +13340,7 @@ def _inject_tail_images(
                 )
             mime = str((got or {}).get("image_mime") or "image/jpeg")
             blocks: list[dict] = []
-            caption = context.text_of(row.get("content"))
+            caption = core_util.text_of(row.get("content"))
             if caption and caption != "[image]":
                 blocks.append({"type": "text", "text": caption})
             blocks.append({
@@ -13267,7 +13363,7 @@ def _inject_tail_images(
             continue
         mime = str(got.get("image_mime") or "image/jpeg")
         blocks: list[dict] = []
-        caption = context.text_of(row.get("content"))
+        caption = core_util.text_of(row.get("content"))
         if caption and caption != "[image]":
             blocks.append({"type": "text", "text": caption})
         blocks.append(
@@ -13303,7 +13399,7 @@ def _inject_tail_files(tail: list[dict], *, user_id: str, read_files) -> list[di
         text = str((got or {}).get("text") or "")
         error = str((got or {}).get("error") or "")
         if error:
-            marker = context.text_of(row.get("content")) or "[file]"
+            marker = core_util.text_of(row.get("content")) or "[file]"
             out.append(
                 {
                     **row,

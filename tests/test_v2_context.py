@@ -13,6 +13,7 @@ from agent_protocol_core import self_thinking
 from chat.reply_language import format_time_anchor, infer_reply_language
 from capabilities import tool_schema
 from chat import language_follow
+from core import util as core_util
 from model_api_runtime.v2 import context, worker
 import worldbook_readside_core
 
@@ -465,9 +466,22 @@ def test_chat_system_prompt_groups_atomic_self_thinking_with_reply_rules(
 
 
 def test_finalized_self_thinking_copy_is_exact_and_has_no_old_length_cap():
+    """这段文案在 agent-protocol-core 里，**不是 io 的**。
+
+    所以升 memgarden/core 的版本时这条会红 —— 这是设计如此：那个包是团队共享
+    的，发版从它的 main 切，升一次就会带上区间里所有人的改动。红了先看
+    `git -C <memgarden> log --oneline vX..vY` 确认改的是什么，再更新这个哈希。
+    详见 backend/requirements.txt 里 memgarden 那段的说明。
+
+    2026-08-30：0.12.0 → 0.12.8 带进了长度那句的措辞改动
+    （「想多写就多写，一句带过也行，不用凑字数也不用收着。」→「长短都行，
+    一句也可以。」），本意不变、仍然没有字数上限，哈希跟着更新。
+    """
     assert hashlib.sha256(self_thinking.INSTRUCTION.encode()).hexdigest() == (
-        "184b0e8508a7e76b71bfb097933002e17e260a143647cd37f7b9b6ef145c74e9"
+        "dfa9f806b4fdcc189cc63d2fc1810a5326f0a3f5b9042f889e48f499ca9bc2ff"
     )
+    assert " 长短都行，一句也可以。" in self_thinking.INSTRUCTION
+    assert "想多写就多写" not in self_thinking.INSTRUCTION
     assert "240 字" not in self_thinking.INSTRUCTION
     assert "写不完就收住" not in self_thinking.INSTRUCTION
     assert "好例子（用户在说中文，所以整块是中文）" in self_thinking.INSTRUCTION
@@ -1029,14 +1043,15 @@ def test_needs_compaction_counts_nonblank():
 
 
 def test_text_of_handles_str_list_and_none():
-    assert context.text_of("  hi  ") == "hi"
-    assert context.text_of(None) == ""
-    assert context.text_of([
+    assert core_util.text_of("  hi  ") == "hi"
+    assert core_util.text_of(None) == ""
+    assert core_util.text_of([
         {"type": "text", "text": "look at this"},
         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}},
-    ]) == "look at this"
+        "  and this  ",
+    ]) == "look at this\nand this"
     # image-only block list has no text
-    assert context.text_of([
+    assert core_util.text_of([
         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}},
     ]) == ""
 

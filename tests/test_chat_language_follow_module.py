@@ -89,6 +89,7 @@ def test_public_classifier_literals_survived_the_move() -> None:
     """Proves classifier literals are unchanged; cannot prove every source byte."""
     assert language_follow.MIN_LETTER_COUNT == 10
     assert language_follow.DOMINANT_SHARE == 0.60
+    assert language_follow.MIXED_SCRIPT_SHELL_MIN_COUNT == 5
     assert language_follow.WRITING_SYSTEMS == frozenset({
         "han",
         "latin",

@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tools.e2e.client import E2EClient  # noqa: E402
 from tools.e2e.hosted import _hosted_send  # noqa: E402
-from tools.e2e.probe_common import mem_fetch, mem_index, new_marker  # noqa: E402
+from tools.e2e.probe_common import force_capture_until_enqueued, mem_fetch, mem_index, new_marker  # noqa: E402
 
 # card_text 的判据要在断言里复用 —— 探针和线上必须是同一把尺子。
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "backend"))
@@ -63,18 +63,23 @@ def _load_key_pool() -> dict[str, str]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="anthropic/claude-sonnet-4.6")
+    # OpenRouter 的额度会用光（实测撞过两次）。留一条换 provider 的路，
+    # 免得一个 key 超额就整条 e2e 跑不了。
+    ap.add_argument("--provider", default="openrouter",
+                    help="openrouter / deepseek / anthropic / openai")
     args = ap.parse_args()
 
     pool = _load_key_pool()
-    key = pool.get("E2E_KEY_OPENROUTER") or os.environ.get("E2E_KEY_OPENROUTER", "")
+    key_name = f"E2E_KEY_{args.provider.upper()}"
+    key = pool.get(key_name) or os.environ.get(key_name, "")
     if not key:
-        print("SKIP: no E2E_KEY_OPENROUTER in ~/.feedling-e2e-keys.env")
+        print(f"SKIP: no {key_name} in ~/.feedling-e2e-keys.env")
         return 0
 
     with E2EClient.provision(route="model_api") as c:
         print(f"probe user: {c.user_id} model={args.model}")
         r = c.post("/v1/model_api/setup", json={
-            "provider": "openrouter", "model": args.model, "api_key": key})
+            "provider": args.provider, "model": args.model, "api_key": key})
         if not check("model_api setup", r.status_code in (200, 201),
                      f"{r.status_code} {r.text[:120]}"):
             return 1
@@ -90,9 +95,15 @@ def main() -> int:
         if not check("chat send", not err, err or ""):
             return 1
 
-        r = c.post("/v1/capture/force", json={})
-        if not check("capture/force accepted", r.status_code in (200, 202),
-                     f"{r.status_code} {r.text[:120]}"):
+        # ⚠️ 不能只看 HTTP 200 —— force 在「还没有新消息」时返回
+        # {"enqueued": false, "reason": "no_new_messages"}，HTTP 仍是 200。
+        # 发完消息立刻 force 时消息常常还没落库，于是什么都没排上，
+        # 而探针会干等 300 秒等一张永远不会出现的卡（踩过，看起来像间歇 bug）。
+        forced = force_capture_until_enqueued(c)
+        if not check("capture 真的入队了（不只是 HTTP 200）",
+                     bool(forced.get("enqueued")) or forced.get("reason") == "already_captured",
+                     f"{forced}",
+                     pass_detail=str(forced.get("reason") or "enqueued")):
             return 1
 
         card = None

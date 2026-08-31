@@ -2,8 +2,7 @@
 
 No I/O, no DB, no LLM calls — just deterministic message-list construction
 from a system prompt, an optional **untrusted** conversation summary, a
-verbatim message tail, and an optional untrusted runtime-data block. It depends
-only on stdlib and pure shared chat helpers.
+verbatim message tail, and an optional untrusted runtime-data block.
 
 提示词语言固定分四层：
 
@@ -23,6 +22,7 @@ from typing import Any, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from chat.reply_language import infer_reply_language, local_time_labels
+from core import util as core_util
 from agent_protocol_core import self_thinking
 import worldbook_match
 from voice.message_filter import VOICE_CALL_RECORD_ROLE, conversation_rows
@@ -507,24 +507,6 @@ def ordered_reply_tail(
     return ordered
 
 
-def text_of(content: Any) -> str:
-    """Extract the human-readable text from a tail row's ``content``.
-
-    ``content`` is either a plain string, or an OpenAI-style content-block list
-    (``[{"type":"text","text":...}, {"type":"image_url", ...}]``) once the worker
-    has injected images. Mirrors ``provider_client._content_text`` but is
-    replicated here to keep this module stdlib-only (dependency direction).
-    """
-    if isinstance(content, list):
-        parts = [
-            str(p.get("text") or "").strip()
-            for p in content
-            if isinstance(p, dict) and str(p.get("text") or "").strip()
-        ]
-        return "\n".join(parts).strip()
-    return str(content or "").strip()
-
-
 def _required_file_suffixes_for_text(normalized: str) -> tuple[str, ...] | None:
     intent_scope = _FILE_NEGATED_FORMAT_RE.sub(" ", normalized)
     has_action = bool(
@@ -570,7 +552,7 @@ def required_file_suffixes(messages: Sequence[dict]) -> tuple[str, ...] | None:
         if _norm_role(message.get("role")) != "user":
             continue
         normalized = unicodedata.normalize(
-            "NFKC", text_of(message.get("content"))
+            "NFKC", core_util.text_of(message.get("content"))
         ).casefold()
         if not normalized.strip():
             continue

@@ -799,6 +799,16 @@ def test_runner_health_503_description_covers_bounded_probe_deadline(
     assert "three-second health-check deadline" in runner_description
 
 
+def test_runner_health_documents_cached_degraded_and_unknown_observations(
+    operations: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    responses = operations[("get", "/healthz/runner")]["responses"]
+
+    assert "cached heartbeat snapshot" in responses["200"]["description"]
+    assert '"status": "degraded"' in responses["200"]["description"]
+    assert '"status": "unknown"' in responses["503"]["description"]
+
+
 def test_sensitive_control_planes_enforce_api_key_in_backend(
     public_schema: dict[str, Any],
 ) -> None:

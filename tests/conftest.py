@@ -263,6 +263,10 @@ if not _provisioned:
     # Pure-unit modules that don't touch the DB — keep them collectable so a
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
+        # AUP 哨兵探针自身的回归（2026-08-30 T411）：纯单测，外部边界全 monkeypatch，
+        # 零 DB / 零网络 / 不调用 claude。**它最需要能跑的时刻正是本地无 PG 时**——
+        # 不登记就会被 collect_ignore 静默跳过，量具的守卫恰好在那时消失。
+        "test_aup_gate_probe.py",
         "test_chat_language_follow_module.py",
         "test_memory_injection_observability.py",
         "test_garden_selection_pluggable.py",
@@ -276,6 +280,11 @@ if not _provisioned:
         # 无 Postgres 时也该跑，否则本地「全绿」是假的。
         "test_memgarden_is_a_real_dependency.py",
         "test_card_leak_signals_wired.py",
+        # 2026-08-30 接 GardenComponent 这批：三条都是纯的
+        # （AST 扫描 / 假模型），不碰 DB、不碰网络。不登记的话无库环境下
+        # 会被静默跳过，本地「全绿」就是假的。
+        "test_orchestration_is_not_reimplemented.py",
+        "test_garden_component_parity.py",
         "test_memgarden_dream_migrate_golden.py",
         "test_memgarden_policies.py",
         "test_memgarden_capture_golden.py",
@@ -398,6 +407,9 @@ if not _provisioned:
         # 留在可收集列表里，否则连它也会被忽略。
         "test_tee_registry_guard_enforced.py",
         "test_self_thinking_parse.py",
+        # T403 bilingual prompt A/B harness: pure scoring, provenance, and
+        # offline plan gates. Provider execution is never invoked by the tests.
+        "test_self_thinking_prompt_probe.py",
         # Voice hangup summary prompt builder. Pure — no DB.
         "test_voice_cleanup.py",
         # History-search 纯逻辑内核（planner/cursor/归一化）。Pure — 只

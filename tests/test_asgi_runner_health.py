@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -43,6 +44,24 @@ def runner_health_dependencies(monkeypatch):
         runner_health.agent_runtime_cutover,
         "supervisor_heartbeat_max_age",
         lambda: 90.0,
+    )
+    monkeypatch.setattr(runner_health.time, "monotonic", lambda: 2000.0)
+    monkeypatch.setattr(
+        runner_health,
+        "_runner_health_state",
+        {
+            "rows": None,
+            "probe_in_flight": False,
+            "retry_after": 0.0,
+            "failure_reason": None,
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runner_health,
+        "_runner_health_state_lock",
+        threading.Lock(),
+        raising=False,
     )
 
 
@@ -138,11 +157,112 @@ def test_runner_health_route_returns_503_for_heartbeat_query_error(
         "ok": False,
         "status": "unhealthy",
         "checks": {"runner_fleet": {
-            "status": "down", "reason": "runner_health_check_error",
+            "status": "unknown", "reason": "runner_health_check_error",
             "expected": 1, "healthy": 0, "observed": 0,
             "max_age_seconds": 90.0,
         }},
     }
+
+
+def test_runner_health_uses_fresh_verified_snapshot_during_transient_db_error(
+    monkeypatch, runner_health_dependencies,
+):
+    monkeypatch.setenv("FEEDLING_EXPECTED_RUNNER_COUNT", "1")
+    outcomes = iter([
+        [{"ts": 995.0, "host_all": True, "owner": "private-owner"}],
+        RuntimeError("database unavailable"),
+    ])
+
+    def heartbeat_query(**_kwargs):
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(
+        db, "list_supervisor_instance_heartbeats_for_health", heartbeat_query,
+    )
+
+    assert _asgi_get("/healthz/runner")[0] == 200
+    status, body = _asgi_get("/healthz/runner")
+
+    assert status == 200
+    assert body == {
+        "ok": True,
+        "status": "degraded",
+        "checks": {"runner_fleet": {
+            "status": "ok", "expected": 1, "healthy": 1,
+            "observed": 1, "max_age_seconds": 90.0,
+            "source": "cached",
+            "probe_reason": "runner_health_check_error",
+        }},
+    }
+    assert "private-owner" not in json.dumps(body)
+
+
+def test_runner_health_does_not_mask_expired_snapshot_during_db_error(
+    monkeypatch, runner_health_dependencies,
+):
+    monkeypatch.setenv("FEEDLING_EXPECTED_RUNNER_COUNT", "1")
+    now = [1000.0]
+    monkeypatch.setattr(runner_health.time, "time", lambda: now[0])
+    outcomes = iter([
+        [{"ts": 995.0, "host_all": True}],
+        RuntimeError("database unavailable"),
+    ])
+
+    def heartbeat_query(**_kwargs):
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(
+        db, "list_supervisor_instance_heartbeats_for_health", heartbeat_query,
+    )
+
+    assert _asgi_get("/healthz/runner")[0] == 200
+    now[0] = 1091.0
+    status, body = _asgi_get("/healthz/runner")
+
+    assert status == 503
+    assert body["checks"]["runner_fleet"] == {
+        "status": "unknown",
+        "reason": "runner_health_check_error",
+        "expected": 1,
+        "healthy": 0,
+        "observed": 0,
+        "max_age_seconds": 90.0,
+    }
+
+
+def test_runner_health_failure_backoff_reuses_snapshot_without_reprobing_db(
+    monkeypatch, runner_health_dependencies,
+):
+    monkeypatch.setenv("FEEDLING_EXPECTED_RUNNER_COUNT", "1")
+    calls = 0
+
+    def heartbeat_query(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return [{"ts": 995.0, "host_all": True}]
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(
+        db, "list_supervisor_instance_heartbeats_for_health", heartbeat_query,
+    )
+
+    assert _asgi_get("/healthz/runner")[0] == 200
+    assert _asgi_get("/healthz/runner")[0] == 200
+    status, body = _asgi_get("/healthz/runner")
+
+    assert status == 200
+    assert body["status"] == "degraded"
+    assert body["checks"]["runner_fleet"]["probe_reason"] == (
+        "runner_health_check_error"
+    )
+    assert calls == 2
 
 
 def test_parse_expected_runner_count_requires_positive_integer():

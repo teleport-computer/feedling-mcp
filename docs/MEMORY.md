@@ -4,9 +4,9 @@ canonical_owner: self
 ---
 # Memory（记忆花园）系统说明
 
-> ⚠️ **2026-08-23 起，记忆的判断内核是外部包**（`memgarden`，装自
-> https://github.com/teleport-computer/memgarden 的 Release wheel，版本钉在
-> `backend/requirements.lock`）。下面出现的 `memgarden/...` 路径指的是**那个包里**的文件，
+> ⚠️ **2026-08-23 起，记忆的判断内核是外部包**（`memgarden`，源码在
+> https://github.com/teleport-computer/memgarden ，Apache-2.0；0.12.8 起从 PyPI
+> 安装，版本钉在 `backend/requirements.lock`，和同源的 `agent-protocol-core` 锁步同版本）。下面出现的 `memgarden/...` 路径指的是**那个包里**的文件，
 > 不在本仓库。要改内核逻辑，去那个仓库改、发新版本、再更新这里的 lock。
 > 宿主侧（谁触发、怎么加解密、存哪、identity 装配、trace 落库）仍在本仓库。
 

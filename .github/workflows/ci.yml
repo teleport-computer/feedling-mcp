@@ -470,6 +470,8 @@ jobs:
             tests/test_memgarden_prompt_params.py \
             tests/test_memgarden_storage_port.py \
             tests/test_memgarden_dreaming.py \
+            tests/test_self_thinking_prompt_probe.py \
+            tests/test_aup_gate_probe.py \
             -v
 
       - name: Perception prompt golden test
@@ -494,6 +496,25 @@ jobs:
             tests/test_current_state_docs.py \
             tests/test_document_lifecycle.py \
             tests/test_repository_inventory.py \
+            -v
+
+      - name: Store invalidation regression suite
+        env:
+          FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+        run: |
+          python -m pytest \
+            tests/test_store_cache.py \
+            tests/test_blob_wake.py \
+            tests/test_wake_bus.py \
+            -v
+
+      - name: Genesis worker regression suite
+        env:
+          FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+        run: |
+          python -m pytest \
+            tests/test_genesis_worker.py \
+            tests/test_genesis_reclaim_worker.py \
             -v
 
       - name: Redis retirement and recovery asset guards
@@ -837,6 +858,7 @@ jobs:
             tests/test_provider_usage_normalize.py \
             tests/test_provider_malformed_tool_fallback.py \
             tests/test_provider_client.py \
+            tests/test_provider_assistant_prefill.py \
             tests/test_provider_tools_gemini.py \
             tests/test_capability_web.py \
             tests/test_web_fetch_result_budget.py \
@@ -882,6 +904,7 @@ jobs:
             tests/test_lane_rollup.py \
             tests/test_distillation_ledger.py \
             tests/test_e2e_tools.py \
+            tests/test_e2e_p0_fallback_gate.py \
             tests/test_data_track_snapshot_golden.py \
             tests/test_v2_general_watchdog_budget.py \
             tests/test_v2_jobs_store.py \
@@ -932,6 +955,9 @@ jobs:
             tests/test_v2_extraction.py \
             tests/test_v2_extraction_lanes.py \
             tests/test_v2_extraction_memory_integration.py \
+            tests/test_v2_extract_session.py \
+            tests/test_garden_component_parity.py \
+            tests/test_orchestration_is_not_reimplemented.py \
             tests/test_backfill_chat_bodies_to_plaintext.py \
             tests/test_byok_plaintext_read_routing.py \
             tests/test_content_encryption_preference.py \
@@ -1185,9 +1211,21 @@ jobs:
         # 这个 job 平时不装依赖。但语言 eval 要 import io 的判定函数，而它现在
         # 从 memgarden 取判据 —— 所以至少得有这两个包。只装它们，不装整个
         # requirements：eval 本身不碰 DB / 网络，几秒就装完。
+        #
+        # 取行的正则要跟 requirements.lock 里的**钉法**一致。0.12.9 之前钉的是
+        # Release 的 wheel URL(`memgarden @ https://...`),现在是 PyPI 版本号
+        # (`memgarden==0.12.9`)。写死其中一种,换钉法时这一步会 grep 到空文件、
+        # 然后 `pip install` 空清单直接退 1 —— 报错跟真正的原因毫无关系
+        # (2026-08-31 踩过,合 test 时 CI 就这么红的,部署被连带跳过)。
+        # 两种都收,以后再换也不会炸。
         run: |
-          grep -A1 -E '^memgarden @|^agent-protocol-core @' backend/requirements.lock \
-            | grep -v '^--$' > /tmp/kernel-req.txt
+          grep -A3 -E '^(memgarden|agent-protocol-core)( @|==)' backend/requirements.lock \
+            | grep -vE '^--$|^\s+#' > /tmp/kernel-req.txt
+          test -s /tmp/kernel-req.txt || {
+            echo "::error::在 backend/requirements.lock 里没找到 memgarden / agent-protocol-core —— 钉法是不是又变了?"
+            exit 1
+          }
+          cat /tmp/kernel-req.txt
           pip install --require-hashes -r /tmp/kernel-req.txt
 
       - name: 花园语言判定 eval

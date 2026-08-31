@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib
 import json
 import os
 import sys
@@ -52,6 +53,87 @@ _ORPHANS_DIR = Path.home() / ".feedling-e2e-orphans"
 _FAILURES_DIR = Path.home() / ".feedling-e2e-failures"
 _ADMIN_TOKEN_FILE = Path.home() / ".feedling" / "data-track-admin-token"
 FAILURE_RETENTION_DAYS = 7
+
+# -- turn verdict (T406) ----------------------------------------------------
+# 三态,不是两态。「回来了一条非空字符串」曾被当成成功,而失效交付的兜底话术
+# 恰好也是一条非空字符串 —— 闸的盲区正对着失效方向(实测 hojimi 格:交付兜底
+# 9/12,P0 只判 FAIL 4/12)。
+VERDICT_OK = "ok"
+VERDICT_FALLBACK = "fallback"        # 回来了,但交付给用户的是失败话术
+VERDICT_FAIL = "fail"
+# 回复气泡可能先于 job 终态可见。不等判词落定就读，会读到一份还没有 failure
+# 的判词而判绿 —— 同一个失效方向的时序版本。
+TURN_SETTLE_TIMEOUT = 60.0
+
+
+FALLBACK_SOURCE_MODULES = (
+    "model_api_runtime.v2.worker",
+    "model_api_runtime.v2.jobs_store",
+)
+# 哪个来源模块没导进来。派生集**部分**缺失时不会变空，看起来一切正常 ——
+# 所以把缺口记下来并打印，不让它悄悄变小。
+FALLBACK_SOURCE_ERRORS: dict[str, str] = {}
+
+
+def _derived_fallback_texts() -> frozenset[str]:
+    """从后端常量**派生**兜底话术全集,不在探针里写死。
+
+    写死的话,后端改一句文案,这道闸就静默失效 —— 而失效方向朝「没失败」,
+    和我们正在修的毛病同向。按名字扫 `*FALLBACK*`,新增一条兜底常量自动入集。
+    """
+    texts: set[str] = set()
+    for module_name in FALLBACK_SOURCE_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as e:  # noqa: BLE001 — 记下来，见 FALLBACK_SOURCE_ERRORS
+            FALLBACK_SOURCE_ERRORS[module_name] = f"{type(e).__name__}: {e}"
+            continue
+        for name in dir(module):
+            if "FALLBACK" not in name:
+                continue
+            value = getattr(module, name, None)
+            if isinstance(value, str) and value.strip():
+                texts.add(value.strip())
+    return frozenset(texts)
+
+
+def _aux_gate_coverage() -> str:
+    """辅助闸自报覆盖面。**命中与否都要打印** —— 督导的约束。
+
+    ⚠️ 第一版只在 miss 分支拼这一行,hit 分支提前 return ⇒ 恰恰在闸真正开火的
+    那一刻不报覆盖面(codex4 2026-08-31 实测打红)。而我在交审信里已经声称
+    「命中与否都打印」——**声称在先、验证在后**。改后每个 return 都带它。
+    """
+    line = f"aux gate checked {len(FALLBACK_TEXTS)} fallback constant(s)"
+    if FALLBACK_SOURCE_ERRORS:
+        line += (f"; ⚠ INCOMPLETE — {len(FALLBACK_SOURCE_ERRORS)}/"
+                 f"{len(FALLBACK_SOURCE_MODULES)} source module(s) unavailable: "
+                 f"{sorted(FALLBACK_SOURCE_ERRORS)}")
+    return line
+
+
+# 派生集为空 = 这道闸失明,且失明后它长得和「一切正常」一模一样。所以空集不是
+# 一个可以静默接受的状态:调用点必须把它当作「无法观测」大声报出来,绝不算通过。
+FALLBACK_TEXTS = _derived_fallback_texts()
+
+
+def decrypt_verdict(dec: str, dec_err: str) -> tuple[str, str]:
+    """解密步的三态判词。解得开只是第一层，解出来的正文也不能是失败话术。
+
+    只跑辅助闸(常量比对)——主闸的 turn-activity 判词由 chat 步问过，
+    同一轮不重复调用。
+    """
+    if not dec.strip():
+        return VERDICT_FAIL, (dec_err or "empty plaintext")
+    if not FALLBACK_TEXTS:
+        return VERDICT_FAIL, (
+            "aux fallback-copy gate UNAVAILABLE (derived constant set is empty) "
+            "— cannot observe; refusing to report green")
+    if dec.strip() in FALLBACK_TEXTS:
+        return VERDICT_FALLBACK, (
+            f"decrypted plaintext is a backend fallback constant; "
+            f"head={dec[:40]!r}; {_aux_gate_coverage()}")
+    return VERDICT_OK, f"len={len(dec)}; {_aux_gate_coverage()}"
 
 
 def _write_private_json(path: Path, body: dict) -> None:
@@ -328,7 +410,19 @@ class E2EClient:
             "locators": {key: sorted(values) for key, values in locators.items()},
             "final_provider_input": {
                 "storage": "server-side encrypted Runtime V2 trajectory",
-                "inspection": "audited break-glass trajectory inspector by job_id/trace_id",
+                # 这句读起来必须像它实际的样子。旧措辞
+                # "audited break-glass trajectory inspector by job_id/trace_id"
+                # 像是「有个按 id 查的 admin 端点」，两个人先后照着去 admin 路由表
+                # 里找那个不存在的端点，各白跑一轮。检查器是 runner-local CLI:
+                # backend/model_api_runtime/v2/trajectory_inspect.py 的 docstring
+                # 明写 "This module is intentionally not an HTTP route"。
+                "inspection": (
+                    "runner-local CLI (NOT an HTTP route): "
+                    "python -m model_api_runtime.v2.trajectory_inspect "
+                    "--user-id … --job-id … --operator-id … --reason-code … --case-ref …; "
+                    "requires FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=1 (default 0) "
+                    "and must run inside the CVM serve-worker container"
+                ),
                 "plaintext_copied_here": False,
             },
             "artifacts": self._failure_artifacts,
@@ -568,6 +662,106 @@ class E2EClient:
         h = r.json()
         return [m for m in h.get("messages") or []
                 if m.get("role") == "system" and float(m.get("ts") or 0) > since]
+
+    # -- turn verdict (T406 semantic gate) -----------------------------------
+    def turn_activity(self, reply: dict) -> tuple[dict | None, str]:
+        """后端自己对这一轮的判词。返回 (body, error)；error=="" 表示读到了。"""
+        turn_id = str(reply.get("activity_turn_id")
+                      or reply.get("reply_to_message_id") or "").strip()
+        if not turn_id:
+            return None, "reply carries no activity_turn_id"
+        try:
+            r = self.get(f"/v1/chat/turn-activity/{turn_id}")
+        except Exception as e:  # noqa: BLE001
+            return None, f"{type(e).__name__}: {e}"
+        if r.status_code != 200:
+            return None, f"{r.status_code} {r.text[:80]}"
+        body = r.json()
+        return (body if isinstance(body, dict) else None), (
+            "" if isinstance(body, dict) else "non-object turn-activity body")
+
+    def wait_turn_settled(
+        self, reply: dict, *, timeout: float | None = None,
+    ) -> tuple[dict | None, str]:
+        """等后端把这一轮的判词落定(`complete`)再读 failure。
+
+        ⚠️ 不等的话有一个**静默失效**:回复气泡先可见、job 状态后落定时，
+        我们读到的是一份还没有 `failure` 的判词 ⇒ 判绿。那正是这次要修的
+        失效方向(闸的盲区对着失效)，只不过换成了时序版本。
+        `complete` 是后端自己给的「已终态」信号，用它当落定判据。
+        """
+        # 在调用时读模块常量，不用默认参数:默认参数在**定义时**就绑死了，
+        # 那样这个超时既不能被配置也不能被测试。
+        timeout = TURN_SETTLE_TIMEOUT if timeout is None else timeout
+        # 没有轮次 id 是**永久**条件，重试改变不了它 —— 轮询只会白等一个超时。
+        # 只有「行还没写出来 / 还没落定」才值得等。
+        if not str(reply.get("activity_turn_id")
+                   or reply.get("reply_to_message_id") or "").strip():
+            return None, "reply carries no activity_turn_id"
+        deadline = time.time() + timeout
+        last_body: dict | None = None
+        last_err = ""
+        while True:
+            body, err = self.turn_activity(reply)
+            if body is not None:
+                last_body, last_err = body, ""
+                if body.get("complete"):
+                    return body, ""
+            else:
+                last_err = err
+            if time.time() >= deadline:
+                break
+            time.sleep(2)
+        if last_body is not None:
+            return None, (
+                f"turn did not settle within {timeout:.0f}s "
+                f"(complete={last_body.get('complete')!r}, "
+                f"phase={last_body.get('phase')!r}) — verdict not observable")
+        return None, last_err or "no turn-activity"
+
+    def classify_reply(self, reply: dict | None, text: str) -> tuple[str, str]:
+        """把一条回复判成 ok / fallback / fail 三态之一，返回 (verdict, detail)。
+
+        **主闸**是后端自己的判词 `turn-activity.failure`，不是字符串匹配：
+        - 它不枚举「坏文案」，只断言「这轮没失败」⇒ 换一句兜底话术不会让它失明；
+        - 判词来自**正在跑的那份部署件**，没有源码↔部署漂移的问题；
+        - `turn_response`(runtime=v2, hosted) 与 `resident_turn_response`
+          (runtime=v1, resident/vps) 都产 `failure`，所以两类 cell 共用这一道闸。
+          实测样本:hosted 失败轮 failure.code=turn_failed:empty_reply；
+          vps 失败轮 complete=True/phase=done/job=completed 三个字段都说「成了」，
+          **只有** failure 这一格说没成 —— 按 job 状态或 phase 设闸对 vps 格无效。
+
+        **辅助闸**是正文与后端兜底常量比对，只为补主闸的一个已知洞:worker 的
+        degenerate 替换会把不合格正文换成兜底话术而 job 仍 completed ⇒ 不产 failure。
+        按督导裁定，它**只能加失败、不能掩盖失败**，且命中与否都写进 detail：
+        它比对的是**仓库源码**常量而运行的是**部署件**，两边漂移时会静默失效，
+        所以它是辅助不是保证。
+        """
+        if reply is None or not text.strip():
+            return VERDICT_FAIL, "no reply or empty text"
+
+        activity, activity_err = self.wait_turn_settled(reply)
+        if activity is None:
+            # 读不到判词 = 无法观测。按 qa SOP「缺证据绝不静默通过」，判 fail。
+            return VERDICT_FAIL, f"turn-activity unreadable: {activity_err}"
+        failure = activity.get("failure")
+        if isinstance(failure, dict) and failure:
+            return VERDICT_FALLBACK, (
+                f"backend reports turn failure: runtime={activity.get('runtime')} "
+                f"code={failure.get('code')!r}; delivered head={text[:40]!r}; "
+                f"{_aux_gate_coverage()}")
+
+        # 辅助闸。派生集为空时大声说出来，不假装它通过了。
+        if not FALLBACK_TEXTS:
+            return VERDICT_FAIL, (
+                "aux fallback-copy gate UNAVAILABLE (derived constant set is empty) "
+                "— cannot observe; refusing to report green")
+        if text.strip() in FALLBACK_TEXTS:
+            return VERDICT_FALLBACK, (
+                "reply text is byte-equal to a backend fallback constant while "
+                f"turn-activity reported no failure; head={text[:40]!r}; "
+                f"{_aux_gate_coverage()}")
+        return VERDICT_OK, f"{_aux_gate_coverage()}, no match"
 
     # -- memory / distill ---------------------------------------------------
     def memory_summaries(self, *, limit: int = 50) -> list[str]:

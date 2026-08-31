@@ -63,7 +63,6 @@ class _Pool:
 def test_health_pool_is_lazy_bounded_and_separate(monkeypatch):
     created = []
     ordinary_pool = object()
-    check_connection = db.ConnectionPool.check_connection
 
     class FakeConnectionPool:
         def __init__(self, *args, **kwargs):
@@ -88,13 +87,14 @@ def test_health_pool_is_lazy_bounded_and_separate(monkeypatch):
         "max_size": 2,
         "timeout": 1.0,
         "max_idle": 300,
-        "check": check_connection,
         "kwargs": {"autocommit": True},
         "open": True,
     }
 
 
-def test_health_pool_replaces_a_connection_closed_while_idle(monkeypatch):
+def test_health_pool_discards_idle_connection_when_bounded_query_finds_it_closed(
+    monkeypatch,
+):
     dsn = os.environ.get("FEEDLING_TEST_PG")
     if not dsn:
         pytest.skip("FEEDLING_TEST_PG is required for the stale connection test")
@@ -112,6 +112,10 @@ def test_health_pool_replaces_a_connection_closed_while_idle(monkeypatch):
                 "SELECT pg_terminate_backend(%s)", (stale_backend_pid,)
             ).fetchone()[0]
         assert terminated is True
+
+        with pytest.raises(psycopg.OperationalError):
+            with health_pool.connection(timeout=5.0) as stale:
+                stale.execute("SELECT 1")
 
         with health_pool.connection(timeout=5.0) as replacement:
             assert replacement.execute("SELECT 1").fetchone() == (1,)

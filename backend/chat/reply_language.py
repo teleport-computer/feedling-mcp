@@ -11,6 +11,7 @@ import re
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from core import util as core_util
 from memgarden.garden_language import (
     count_bucket_languages,
     decide_garden_language,
@@ -124,7 +125,24 @@ def _iter_text(value: Any):
             yield from _iter_text(item)
 
 
-def _identity_texts(identity: dict[str, Any]) -> list[str]:
+def _identity_texts(identity: dict[str, Any] | str | None) -> list[str]:
+    """身份卡里能当语言证据的正文。
+
+    **两条 runtime 手里的 identity 类型不一样**，这里必须都收：
+
+        V1（resident） dict —— 原始身份卡，按 IDENTITY_LANGUAGE_FIELDS 取字段
+        V2（hosted）   str  —— 已经渲染成一段正文（enclave 解密后的明文）
+
+    2026-08-31 踩到：V2 的调用点写的是
+    ``ctx.get("identity") if isinstance(ctx.get("identity"), dict) else None``，
+    而它拿到的一直是字符串 —— 于是那个分支**永远走 None**，V2 判语言时只看
+    「这一批新消息」。用户临时说一句英文，整个中文花园就被判成英文；V1 因为
+    传的是 dict 而锁得住。同一份判定逻辑、两条 runtime 结果相反，单测抓不到
+    （两边的假 ctx 都按各自的类型写），只有在 V2 上真跑才暴露。
+    """
+    if isinstance(identity, str):
+        # 已渲染的正文：整段就是证据，没有字段可挑。
+        return [identity] if identity.strip() else []
     texts: list[str] = []
     if not isinstance(identity, dict):
         return texts
@@ -171,7 +189,7 @@ def user_written_text(messages, *, limit: int = USER_WRITING_SAMPLE_MESSAGES) ->
             continue
         if str(m.get("role") or "").strip().lower() != _USER_ROLE:
             continue
-        body = str(m.get("content") or m.get("text") or "").strip()
+        body = core_util.text_of(m.get("content") or m.get("text") or "")
         if body:
             out.append(body)
     return "\n".join(out)
@@ -203,7 +221,7 @@ def infer_garden_language(
 
 
 def garden_language_decision(
-    identity: dict | None,
+    identity: dict | str | None,
     *,
     written: str = "",
     existing_buckets: str = "",
@@ -232,8 +250,22 @@ def garden_language_decision(
 
     所以现在的证据只有两样，**桶名一样都不占**：
 
-        ① 他实际在用什么语言写            身份卡正文 + 这轮对话里他自己说的话
-        ② locale / archive_language      弱,只是设备设置
+        ① archive_language               **这个花园已定的语言 —— 最强**
+        ② 他实际在用什么语言写            身份卡正文 + 这轮对话里他自己说的话
+        ③ locale                         弱,只是设备设置
+
+    ## ① 为什么排在 ② 前面（2026-08-31 hx 拍板）
+
+    「他这轮写的字」原本最强。问题是**「这轮」有多宽是宿主决定的** —— 实测同一个
+    中文花园、同一句英文抱怨：V1 判成中文（取证窗口里恰好还含着之前那句中文），
+    V2 判成英文（增量窗口里只有新增的英文那句）。同一份判定逻辑，两条 runtime
+    结果相反。用户看到的就是「我用英文说了一句话，我的中文记忆开始变英文了」。
+
+    archive_language 是**账号级的、人自己定的**，不随窗口漂 —— 拿它当锚，结果就
+    不再取决于宿主的窗口有多宽。想换语言走显式设置。
+
+    ⚠️ 这个锚只能来自「人自己定的」那类。**绝不能换成桶名或卡正文** —— 那是 AI
+    之前的输出，拿输出当输入就是自我强化的环，2026-08-24 的事故正是这么放大的。
 
     ## 那「别让 工作 和 Work 并存」谁来管
 
@@ -249,16 +281,14 @@ def garden_language_decision(
     """
     # 「他写的字」= 这轮对话里他自己说的话 + 身份卡正文。前者是最新最真的信号，
     # 后者在还没聊过时兜底。
-    sample = "\n".join(x for x in ([written] + _identity_texts(identity or {})) if x)
+    sample = "\n".join(x for x in ([written] + _identity_texts(identity)) if x)
 
     d = decide_garden_language(
         explicit=None,
+        # 花园已定的语言 —— 压过单轮书写。见上面「① 为什么排在 ② 前面」。
+        established=_language_from_hint(archive_language).language or None,
         written=sample,
-        locale=(
-            _language_from_hint(locale).language
-            or _language_from_hint(archive_language).language
-            or None
-        ),
+        locale=_language_from_hint(locale).language or None,
     )
     zh, en = count_bucket_languages(existing_buckets or "")
     names = split_bucket_names(existing_buckets or "")

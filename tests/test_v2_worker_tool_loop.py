@@ -1976,7 +1976,11 @@ def test_chat_self_thinking_absent_final_retries_and_surfaces_complete(
 
     assert status == "completed"
     assert len(calls) == expected_calls
+    assert calls[0].get("assistant_prefill") is None
     assert calls[-1]["tools"] is None
+    assert calls[-1].get("assistant_prefill") == (
+        provider_client.SELF_THINKING_ASSISTANT_PREFILL
+    )
     retry_system = str(calls[-1]["messages"][0]["content"])
     assert worker._SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION in retry_system
     assert self_thinking.INSTRUCTION.strip() in retry_system
