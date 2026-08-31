@@ -62,6 +62,7 @@ E2E_KEY_DEEPSEEK=sk-…
 |---|---|---|
 | `repeat_wake_probe.py` | 重复定时提醒：fire 后自动续排 +24h、用**已 fired 的旧 id** 能整串取消、同刻同 repeat 去重、一次性提醒不续排 | 动 `scheduled_wake_v2` / `schedule_wake` 工具面时 |
 | `card_gate_probe.py` | 记忆卡内容闸不误杀真卡 | 动 capture/dream 判据时 |
+| `garden_language_probe.py` | 中文花园不会因一轮英文输入翻成英文 | 动花园语言判据、花园编排或 `memgarden` pin 时 |
 | `temporal_probe.py` | 模型真的读到了注入的时间锚点 | 动 V2 上下文组装时 |
 | `turn_failure_smoke.py` | 回合失败的字段/归责能下发到客户端 | 动错误分类或 consumer 兜底时 |
 | `resident_maintenance_smoke.py` | resident 识别/poll/notice/genesis claim | 动 consumer 这几条时 |

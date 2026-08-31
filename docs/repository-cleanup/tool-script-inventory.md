@@ -5,7 +5,7 @@ canonical_owner: self
 # 工具、脚本与运维表面清单
 
 审计日期：2026-08-31。本清单覆盖本次 `git ls-files tools scripts ops` 的全部
-126 个 tracked 路径：`tools/` 100 个、`scripts/` 24 个、`ops/` 2 个。其中 122 个是
+127 个 tracked 路径：`tools/` 101 个、`scripts/` 24 个、`ops/` 2 个。其中 123 个是
 Task 5 taxonomy 的 executable/support asset；四个 tracked README
 (`scripts/loadtest/README.md`、`tools/README.md`、`tools/e2e/README.md`、
 `tools/provider_smoke/README.md`) 在文末另列为文档覆盖，**不计入**九类
@@ -42,7 +42,7 @@ tool/script taxonomy。清单记录当前 owner、分类、生命周期和**精�
 | E19 | [`docs/testing/TESTING.md`](../testing/TESTING.md) 说明 `.github/workflows/continuity-canary.yml` 已于 2026-08-31 禁用，并链接其 archive/恢复条件。 |
 | E20 | `tools/audit_live_cvm.py` 将 `tools/dcap/` 加入 import path，直接 import `dcap_parse.parse_quote` 并在 live attestation audit 中调用；[`tools/README.md`](../../tools/README.md) 也明确 DCAP parser 由该 audit CLI 使用。`.github/workflows/ci.yml` 另行执行 `cd tools/dcap && python3 -m unittest test_dcap_parse.py -v` 覆盖 parser test/fixtures。 |
 | E21 | `.github/workflows/ci.yml` 在三条 deploy lane 执行 `tools/deploy_canary.py`；`tests/test_deploy_canary.py` 是其 review guard。 |
-| E22 | [`tools/e2e/README.md`](../../tools/e2e/README.md) 是 P0 operator command、专项 probe 和 fixture 的现行入口；`tests/test_e2e_*.py`、`tests/test_aup_gate_probe.py`、`tests/test_tool_selection_eval.py` 和 `tests/test_user_mcp_handshake_probe.py` 覆盖相应 package/probe。 |
+| E22 | [`tools/e2e/README.md`](../../tools/e2e/README.md) 是 P0 operator command、专项 probe 和 fixture 的现行入口，并登记 `garden_language_probe.py` 的适用变更；该 probe 自身 docstring 给出真实环境运行命令。`tests/test_e2e_*.py`、`tests/test_aup_gate_probe.py`、`tests/test_garden_language_flip.py`、`tests/test_tool_selection_eval.py` 和 `tests/test_user_mcp_handshake_probe.py` 覆盖相应 package/probe。 |
 | E23 | [`docs/testing/TESTING.md`](../testing/TESTING.md) L2 表将 `tools/e2e_encryption_test.py` 和两种 envelope round-trip CLI 列为加密/账号/enclave 链路验证；`backend/enclave_app.py` 也明确该 E2E 脚本会拉起 enclave app。 |
 | E24 | `.github/workflows/docs-site.yml` 执行 `tools/export_public_openapi.py`，并以 `tools/public_openapi_contracts.py` 作为触发路径。 |
 | E25 | `tests/test_genesis_distill_acceptance.py` import `genesis_e2e` 并检查其 acceptance report。 |
@@ -66,7 +66,7 @@ tool/script taxonomy。清单记录当前 owner、分类、生命周期和**精�
 
 ## 分类与归属
 
-下表覆盖全部 122 个 Task 5 taxonomy asset。只有同一 owner、生命周期和证据类的路径
+下表覆盖全部 123 个 Task 5 taxonomy asset。只有同一 owner、生命周期和证据类的路径
 才会合并；fixture/package marker 也计入，避免把可执行工具的支持文件遗漏在审计外。
 
 | 路径（数量） | owner | 分类 | 生命周期 | 证据 |
@@ -94,7 +94,7 @@ tool/script taxonomy。清单记录当前 owner、分类、生命周期和**精�
 | `tools/dcap/dcap_parse.py`（1） | Attestation validation | active diagnostic | retain | E20 |
 | `tools/dcap/test_dcap_parse.py`<br>`tools/dcap/testdata/sample_attestation.json`<br>`tools/dcap/testdata/sample_quote.hex`（3） | Attestation validation | test support | retain | E20 |
 | `tools/deploy_canary.py`（1） | Deployment safety | deployment | retain | E21 |
-| `tools/e2e/__init__.py`<br>`tools/e2e/aup_gate_probe.py`<br>`tools/e2e/card_gate_probe.py`<br>`tools/e2e/client.py`<br>`tools/e2e/config.py`<br>`tools/e2e/continuity_probe.py`<br>`tools/e2e/deep.py`<br>`tools/e2e/elevenlabs_silent_turn_probe.py`<br>`tools/e2e/experience_probe.py`<br>`tools/e2e/fixtures/aup_gate/canary_instruction_v0.2.0.txt`<br>`tools/e2e/fixtures/aup_gate/manifest.json`<br>`tools/e2e/fixtures/aup_gate/user_message.txt`<br>`tools/e2e/genesis_expired_stage_probe.py`<br>`tools/e2e/genesis_resume_probe.py`<br>`tools/e2e/hosted.py`<br>`tools/e2e/idempotency_probe.py`<br>`tools/e2e/image_autonomy_probe.py`<br>`tools/e2e/memory_probe.py`<br>`tools/e2e/memory_thinking_leak_probe.py`<br>`tools/e2e/p0.py`<br>`tools/e2e/perception_probe.py`<br>`tools/e2e/perception_wake_probe.py`<br>`tools/e2e/proactive_probe.py`<br>`tools/e2e/probe_common.py`<br>`tools/e2e/processing_probe.py`<br>`tools/e2e/provider_response_envelope_probe.py`<br>`tools/e2e/repeat_wake_probe.py`<br>`tools/e2e/resident_maintenance_smoke.py`<br>`tools/e2e/screen_watch_probe.py`<br>`tools/e2e/self_thinking_prompt_probe.py`<br>`tools/e2e/switch_matrix_probe.py`<br>`tools/e2e/temporal_probe.py`<br>`tools/e2e/tool_count_ceiling_probe.py`<br>`tools/e2e/tool_schema_rejection_probe.py`<br>`tools/e2e/tool_selection_cases.json`<br>`tools/e2e/tool_selection_eval.py`<br>`tools/e2e/turn_failure_smoke.py`<br>`tools/e2e/unlock.py`<br>`tools/e2e/user_mcp_handshake_probe.py`<br>`tools/e2e/voice_transcript_probe.py`<br>`tools/e2e/vps.py`<br>`tools/e2e/wake_tool_markup_probe.py`<br>`tools/e2e/wake_write_gate_probe.py`<br>`tools/e2e/worldbook_probe.py`（44） | Release validation | test support | retain | E22 |
+| `tools/e2e/__init__.py`<br>`tools/e2e/aup_gate_probe.py`<br>`tools/e2e/card_gate_probe.py`<br>`tools/e2e/client.py`<br>`tools/e2e/config.py`<br>`tools/e2e/continuity_probe.py`<br>`tools/e2e/deep.py`<br>`tools/e2e/elevenlabs_silent_turn_probe.py`<br>`tools/e2e/experience_probe.py`<br>`tools/e2e/fixtures/aup_gate/canary_instruction_v0.2.0.txt`<br>`tools/e2e/fixtures/aup_gate/manifest.json`<br>`tools/e2e/fixtures/aup_gate/user_message.txt`<br>`tools/e2e/garden_language_probe.py`<br>`tools/e2e/genesis_expired_stage_probe.py`<br>`tools/e2e/genesis_resume_probe.py`<br>`tools/e2e/hosted.py`<br>`tools/e2e/idempotency_probe.py`<br>`tools/e2e/image_autonomy_probe.py`<br>`tools/e2e/memory_probe.py`<br>`tools/e2e/memory_thinking_leak_probe.py`<br>`tools/e2e/p0.py`<br>`tools/e2e/perception_probe.py`<br>`tools/e2e/perception_wake_probe.py`<br>`tools/e2e/proactive_probe.py`<br>`tools/e2e/probe_common.py`<br>`tools/e2e/processing_probe.py`<br>`tools/e2e/provider_response_envelope_probe.py`<br>`tools/e2e/repeat_wake_probe.py`<br>`tools/e2e/resident_maintenance_smoke.py`<br>`tools/e2e/screen_watch_probe.py`<br>`tools/e2e/self_thinking_prompt_probe.py`<br>`tools/e2e/switch_matrix_probe.py`<br>`tools/e2e/temporal_probe.py`<br>`tools/e2e/tool_count_ceiling_probe.py`<br>`tools/e2e/tool_schema_rejection_probe.py`<br>`tools/e2e/tool_selection_cases.json`<br>`tools/e2e/tool_selection_eval.py`<br>`tools/e2e/turn_failure_smoke.py`<br>`tools/e2e/unlock.py`<br>`tools/e2e/user_mcp_handshake_probe.py`<br>`tools/e2e/voice_transcript_probe.py`<br>`tools/e2e/vps.py`<br>`tools/e2e/wake_tool_markup_probe.py`<br>`tools/e2e/wake_write_gate_probe.py`<br>`tools/e2e/worldbook_probe.py`（45） | Release validation | test support | retain | E22 |
 | `tools/e2e_encryption_test.py`（1） | Encryption integration validation | test support | retain | E23 |
 | `tools/export_public_openapi.py`<br>`tools/public_openapi_contracts.py`（2） | Public API documentation | generated helper | retain | E24 |
 | `tools/frame_envelope_roundtrip_test.py`<br>`tools/v1_envelope_roundtrip_test.py`（2） | Envelope integration validation | test support | retain | E23 |
@@ -135,12 +135,12 @@ tool/script taxonomy。清单记录当前 owner、分类、生命周期和**精�
 | recovery | 4 |
 | migration | 2 |
 | active diagnostic | 29 |
-| test support | 65 |
+| test support | 66 |
 | generated helper | 5 |
 | historical | 1 |
-| **Task 5 taxonomy assets** | **122** |
+| **Task 5 taxonomy assets** | **123** |
 | 非 executable 文档覆盖 | 4 |
-| **全部 tracked 路径** | **126** |
+| **全部 tracked 路径** | **127** |
 
 - 未归类：0；`unowned candidate`：0；本批不创建 candidate record。
 - `tools/chat_resident_consumer.py` 是用户 VPS 单文件分发、自更新/re-exec、systemd
