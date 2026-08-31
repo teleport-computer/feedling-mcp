@@ -64,6 +64,7 @@ PUSH_COOLDOWN_SECONDS = int(os.environ.get("FEEDLING_PUSH_COOLDOWN_SEC", 300))
 LIVE_ACTIVITY_DEDUPE_SEC = int(os.environ.get("FEEDLING_LIVE_ACTIVITY_DEDUPE_SEC", 900))
 LIVE_ACTIVITY_START_COOLDOWN_SEC = int(os.environ.get("FEEDLING_LIVE_ACTIVITY_START_COOLDOWN_SEC", 1800))
 DEVICE_EVENT_RETENTION_DAYS = int(os.environ.get("FEEDLING_DEVICE_EVENT_RETENTION_DAYS", 30))
+DEVICE_EVENT_MAX = int(os.environ.get("FEEDLING_DEVICE_EVENT_MAX", 2000))
 TRACK_EVENT_RETENTION_DAYS = int(os.environ.get("FEEDLING_TRACK_EVENT_RETENTION_DAYS", 90))
 TRACK_EVENT_MAX = int(os.environ.get("FEEDLING_TRACK_EVENT_MAX", 2000))
 PROACTIVE_JOB_MAX = int(os.environ.get("FEEDLING_PROACTIVE_JOB_MAX", 500))
@@ -2155,6 +2156,7 @@ class UserStore:
         db.log_append(self.user_id, "device_events", event, ts=self._entry_epoch(event))
         cutoff = time.time() - DEVICE_EVENT_RETENTION_DAYS * 86400
         db.log_prune_older_than(self.user_id, "device_events", cutoff)
+        db.log_trim(self.user_id, "device_events", DEVICE_EVENT_MAX)
         return event
 
     def list_device_events(self, since_epoch: float = 0.0, limit: int = 100) -> list[dict]:

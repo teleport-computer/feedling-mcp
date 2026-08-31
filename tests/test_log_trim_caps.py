@@ -9,6 +9,7 @@ The db-level ``log_trim`` mechanics are covered by test_db.py; here we only
 verify the call sites are wired and honour their configurable cap.
 """
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -49,6 +50,17 @@ def test_gate_review_stream_is_trimmed(monkeypatch):
         store.append_gate_review({"review_id": f"gr_{i}", "ts": float(i)})
     kept = db.log_read_all(store.user_id, "gate_reviews")
     assert [r["review_id"] for r in kept] == [f"gr_{i}" for i in range(6, 9)]
+
+
+def test_device_event_stream_is_trimmed(monkeypatch):
+    monkeypatch.setattr(core_store, "DEVICE_EVENT_MAX", 5)
+    store = core_store.UserStore(_uid())
+    seed_user(store.user_id)
+    now = time.time()
+    for i in range(12):
+        store.append_device_event({"event": i, "ts": now + i})
+    kept = db.log_read_all(store.user_id, "device_events")
+    assert [event["event"] for event in kept] == [7, 8, 9, 10, 11]
 
 
 def test_perception_event_stream_is_trimmed(monkeypatch):

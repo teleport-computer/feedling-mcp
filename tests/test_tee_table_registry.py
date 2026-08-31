@@ -36,6 +36,15 @@ def _tables_in(dsn_env: str) -> set[str]:
         return _tables(conn)
 
 
+def _user_logs_indexes_in(dsn_env: str) -> set[str]:
+    with psycopg.connect(os.environ[dsn_env]) as conn:
+        rows = conn.execute(
+            "SELECT indexname FROM pg_indexes "
+            "WHERE schemaname = 'public' AND tablename = 'user_logs'"
+        ).fetchall()
+    return {row[0] for row in rows}
+
+
 def _partition_parents(conn: psycopg.Connection) -> dict[str, str]:
     """Return declarative partition child -> immediate parent from the catalog."""
     rows = conn.execute(
@@ -88,6 +97,14 @@ def test_every_rds_table_is_registered():
         + "\n  ".join(missing)
         + "\n\n修法不是加白名单，是回答：这张表进不进 TEE、走哪条 lane、为什么。"
     )
+
+
+def test_user_logs_cursor_indexes_exist_in_rds_and_tee():
+    """The timestamp window read path must stay available after TEE promotion."""
+    required = {"logs_stream_seq_idx", "logs_stream_ts_idx"}
+    for dsn_env in ("DATABASE_URL", "TEE_DATABASE_URL"):
+        missing = required - _user_logs_indexes_in(dsn_env)
+        assert not missing, f"{dsn_env} is missing user_logs cursor indexes: {sorted(missing)}"
 
 
 def test_partition_children_inherit_a_registered_root_lane():

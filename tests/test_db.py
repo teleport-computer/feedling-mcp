@@ -699,6 +699,61 @@ def test_log_append_read_trim_prune():
     assert [r["event"] for r in db.log_read_all(uid, "device_events")] == [8, 9]
 
 
+def test_log_read_since_uses_timestamp_window_before_sequence_limit(monkeypatch):
+    """The database must narrow on the timestamp index before seq ordering.
+
+    ``seq`` remains the client-visible chronology, but filtering it after a
+    backwards seq scan can read an unbounded cold history for a sparse cursor.
+    The SQL sent to PostgreSQL is therefore part of the storage contract here.
+    """
+    executed: list[tuple[str, tuple]] = []
+
+    class _Result:
+        def fetchall(self):
+            return [({"event": "newer"},)]
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params):
+            executed.append((str(sql), params))
+            return _Result()
+
+    class _Pool:
+        def connection(self):
+            return _Connection()
+
+    monkeypatch.setattr(db, "get_pool", lambda: _Pool())
+
+    assert db.log_read("usr_log_window", "device_events", limit=25, since_epoch=100.0) == [
+        {"event": "newer"}
+    ]
+    sql, params = executed.pop()
+    assert "WITH time_window AS MATERIALIZED" in sql
+    assert "ts > %s" in sql
+    assert "ORDER BY seq DESC LIMIT %s" in sql
+    assert params == ("usr_log_window", "device_events", 100.0, 25)
+
+
+def test_log_read_future_cursor_returns_without_opening_a_connection(monkeypatch):
+    """A malformed/future sync cursor must not turn into an RDS scan."""
+    opened: list[bool] = []
+
+    class _Pool:
+        def connection(self):
+            opened.append(True)
+            raise AssertionError("future cursor should not query PostgreSQL")
+
+    monkeypatch.setattr(db, "get_pool", lambda: _Pool())
+
+    assert db.log_read("usr_future_cursor", "device_events", since_epoch=time.time() + 60.0) == []
+    assert opened == []
+
+
 def test_admin_data_track_snapshot_aggregates_app_sessions():
     active_uid = _uid()
     empty_uid = _uid()
