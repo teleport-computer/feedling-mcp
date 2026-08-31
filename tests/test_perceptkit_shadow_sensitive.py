@@ -27,8 +27,12 @@ pytestmark = pytest.mark.skipif(
     not DSN, reason="需要真库：设 PERCEPTKIT_TEST_PG 或 DATABASE_URL")
 
 SENSITIVE = {
+    # 精确字段是**故意**放进来的：活路径解密拿到的就是整包，
+    # 下面那条测试要证明它们一个都没跟着进 kit。
     "loc-1": {"place_label": "home", "wifi_label": "家里", "country": "CN",
-              "locality": "上海", "wifi_anchor_id": "a1b2c3d4e5f6a7b8"},
+              "locality": "上海", "wifi_anchor_id": "a1b2c3d4e5f6a7b8",
+              "signal": {"latitude": 31.23, "longitude": 121.47},
+              "bssid": "aa:bb:cc:dd:ee:ff"},
     "mot-1": {"state": "walking"},
     "pb-1": {"playback_state": "playing", "title": "夜空中最亮的星",
              "artist": "逃跑计划"},
@@ -110,17 +114,25 @@ def test_decrypted_sensitive_signals_reach_the_kit(clean_kit_tables):
     assert got["health_vitals"]["resting_heart_rate"] == 58
 
 
-def test_location_is_deliberately_not_a_pass_through_signal(clean_kit_tables):
-    """位置在端上就解析成城市/锚点了，坐标不出设备，所以它不是一条直通观测。
+def test_location_arrives_as_coarse_labels_and_nothing_precise(clean_kit_tables):
+    """位置**不是一条直通观测**：端上已经解成城市和锚点，坐标不出设备。
 
-    写成测试是为了让"它没进 kit"是有意的，而不是下一个人以为漏了。
+    先前这条断言的是「它压根没进 kit」——那当时是事实，但把一个**覆盖窟窿**
+    写成了「有意为之」。现在它进 kit 了，走的是解析后的粗标签那条路，
+    所以这条改成盯真正该盯的东西：**过界的只能是粗标签**。
     """
     from perception import service
     uid = _user("usr_shadow_location")
     service.ingest_snapshot_v2(uid, _snapshot(), client_ts=str(int(time.time())),
                                decrypt_envelope=_decrypt)
-    assert "location_city" not in _current(uid)
-    assert "proximity_anchor" not in _current(uid)
+    current = _current(uid)
+    assert "location_city" in current and "proximity_anchor" in current
+    blob = repr(current)
+    # 载荷里本来就带着这些精确字段（活路径解密拿到的是整包），
+    # 一个都不许出现在 kit 那边。
+    for precise in ("latitude", "longitude", "31.2", "121.4", "bssid",
+                    "raw_identifier"):
+        assert precise not in blob, f"精确信息进了 kit：{precise}"
 
 
 def test_the_shadow_never_breaks_the_report(clean_kit_tables, monkeypatch):

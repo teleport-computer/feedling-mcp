@@ -496,9 +496,14 @@ class PostgresStorage:
                               last_seen_sync_id = EXCLUDED.last_seen_sync_id,
                               updated_at = EXCLUDED.updated_at
                 """,
+                # `ReminderItemMirror` has no source_created_at /
+                # source_updated_at -- CalendarEventMirror does, and this was
+                # written from that one. Reading them raised on every call, so
+                # the reminder mirror never worked; the columns stay (the
+                # schema is shared with the calendar mirror) and take NULL.
                 (r.subject_id, r.source_account_id, r.source_list_id,
                  r.source_reminder_id, _j(r.reminder_fields), _rev(r.source_revision),
-                 r.source_created_at, r.source_updated_at, r.last_seen_sync_id,
+                 None, None, r.last_seen_sync_id,
                  r.updated_at),
             )
 
@@ -541,8 +546,7 @@ class PostgresStorage:
             ReminderItemMirror(
                 subject_id=r[0], source_account_id=r[1], source_list_id=r[2],
                 source_reminder_id=r[3], reminder_fields=dict(r[4]),
-                source_revision=r[5], source_created_at=r[6],
-                source_updated_at=r[7], last_seen_sync_id=r[8], updated_at=r[9],
+                source_revision=r[5], last_seen_sync_id=r[8], updated_at=r[9],
             )
             for r in rows
             if include_completed or not dict(r[4]).get("is_completed")

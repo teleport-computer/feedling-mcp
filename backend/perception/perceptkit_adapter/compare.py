@@ -153,6 +153,23 @@ COMPARABLE: dict[str, dict[str, Any]] = {
         "workout_type": "workout_type",
         "duration_minutes": "duration_min",
     },
+    "app_usage": {
+        # The Shortcut automations report a typed display name and no bundle
+        # id, so both sides hold the same string under two names.
+        "app_name": "app_name",
+        "category": "app_category",
+        # The live path stores where the app is, the kit stores what happened.
+        # Same fact, two vocabularies -- translated by LIVE_VOCABULARY below.
+        "action": "app_state",
+    },
+    "location_city": {
+        "locality": "locality",
+        "country_code": "country",
+    },
+    "proximity_anchor": {
+        "anchor_id": "wifi_anchor_id",
+        "label": "wifi_label",
+    },
 }
 
 #: Kit fields we have decided not to compare, and why. Recorded rather than
@@ -174,6 +191,21 @@ KIT_ONLY: dict[tuple[str, str], str] = {
     ("health_cycle", "end_at"): "live stores no cycle interval",
     ("health_mood", "labels"): "live stores a count, the kit stores the labels",
     ("health_mood", "recorded_at"): "live stores a same-day boolean, not a time",
+    ("app_usage", "app_id"): "no bundle id on the Shortcut path; same string as app_name",
+    ("app_usage", "open_count"): "the kit counts opens by aggregating; the live path keeps no counter",
+    ("location_city", "region"): "iOS releases the locality and country, not the administrative region",
+    ("location_city", "accuracy_m"): "derived from the fix, which never leaves the device",
+    ("location_city", "placemark_source"): "set by this adapter; nothing to compare against",
+    ("location_city", "coordinate"): "privacy_class=restricted -- never populated, never stored",
+    ("proximity_anchor", "anchor_type"): "always wifi from iOS; bluetooth is not available to a third-party app",
+    ("proximity_anchor", "is_connected"): "an anchor is only reported while connected",
+    ("proximity_anchor", "raw_identifier"): "privacy_class=restricted -- the SSID stays on the device",
+    ("photo_library_added", "count"): "the live path keeps no photo cell in state",
+    ("photo_library_added", "added_at"): "the live path keeps no photo cell in state",
+    ("screen_change", "changed"): "the live path compares a phash and wakes; it keeps no flag",
+    ("presence_recovery", "recovered_at"): "the live path fires a wake; it keeps no recovery cell",
+    ("presence_recovery", "absence_seconds"): "iOS reports that an absence ended, not how long it was",
+    ("presence_recovery", "absence_quality"): "set by this adapter from whether a duration came with it",
 }
 
 #: Live fields with no kit counterpart, and why. Same reasoning as above from
@@ -218,6 +250,18 @@ def _scalar_fallback() -> frozenset:
 SCALAR_FALLBACK = _scalar_fallback()
 
 
+#: Live-path vocabulary translated into the manifest's, per pair.
+#:
+#: Distinct from the adapter's ``VALUE_MAPS``, which translates what iOS sends.
+#: This one translates what the *live path* chose to store: it keeps where the
+#: app is (`foreground` / `closed`) while the manifest records what happened
+#: (`open` / `close`). Same fact, two vocabularies, and neither side is wrong --
+#: so the mapping is declared here rather than either side being changed.
+LIVE_VOCABULARY: dict[tuple[str, str], dict[str, str]] = {
+    ("app_usage", "action"): {"foreground": "open", "closed": "close"},
+}
+
+
 #: The live value converted into the kit's unit, per pair, where the two sides
 #: genuinely store the same fact in different units.
 #:
@@ -246,12 +290,22 @@ UNIT_BRIDGE: dict[tuple[str, str], Any] = {
 #: this, so "the kit agrees on everything we compare" can always be checked
 #: against "and here is what we do not compare".
 NOT_SHADOWED: dict[str, str] = {
-    "presence_recovery": "derived from device events; the shadow taps the snapshot ingest only",
-    "location_city": "arrives via location_signal, which the device resolves and the adapter does not pass through",
-    "screen_change": "arrives as a device event, not in the snapshot",
-    "proximity_anchor": "arrives via location_signal's wifi anchor, on the device-event path",
-    "photo_library_added": "arrives at /v1/perception/photo/evaluate, which is not shadowed",
-    "app_usage": "arrives at /v1/perception/app_open and app_close, which are not shadowed",
+    # Empty, and that took work: these six were all here, one line each, saying
+    # the shadow never saw them. Every perception entry point is tapped now
+    # (see events.py). Anything added back belongs here with its reason rather
+    # than left to look like agreement.
+}
+
+
+#: Signals the shadow observes but has nothing on the live side to compare
+#: against, and why. Different from a `NOT_SHADOWED` entry: the kit *does* get
+#: these, they land in its tables and its aggregates -- there is simply no
+#: field in `perception_state` holding the same fact, because the live path
+#: models them as events that fire rather than as state that persists.
+NO_LIVE_COUNTERPART: dict[str, str] = {
+    "photo_library_added": "the live path wakes on a photo; it keeps no photo cell in state",
+    "screen_change": "the live path compares a screen phash and wakes; it keeps no changed flag",
+    "presence_recovery": "the live path fires an unlock-after-absence wake; it keeps no recovery cell",
 }
 
 
@@ -381,7 +435,8 @@ def compare(
             # so the comparison checks that the adapter *did* translate rather
             # than reporting the translation itself as a disagreement -- and
             # still goes red if the adapter ever stops.
-            vocab = vocabularies.get(signal, {}).get(kit_field)
+            vocab = (vocabularies.get(signal, {}).get(kit_field)
+                     or LIVE_VOCABULARY.get((signal, kit_field)))
             if vocab and isinstance(live, str):
                 live = vocab.get(live, live)
             kit = typed.get(kit_field) if observed else None
@@ -526,11 +581,18 @@ def coverage(signals: Mapping[str, Any]) -> dict[str, Any]:
         if key not in NOT_SHADOWED and key not in SHAPE_DIFFERS
         and COMPARABLE.get(key)
     )
+    observed_only = sorted(
+        key for key in signals
+        if key not in NOT_SHADOWED and key not in SHAPE_DIFFERS
+        and not COMPARABLE.get(key)
+    )
     return {
         "signals_total": len(signals),
         "signals_compared": compared,
         "fields_compared": sum(len(COMPARABLE.get(k, {})) for k in compared),
+        "signals_observed_only": observed_only,
         "not_shadowed": dict(NOT_SHADOWED),
+        "no_live_counterpart": dict(NO_LIVE_COUNTERPART),
         "shape_differs": dict(SHAPE_DIFFERS),
         "kit_only_fields": {f"{s}.{f}": why for (s, f), why in KIT_ONLY.items()},
         "live_only_fields": dict(LIVE_ONLY),
@@ -538,8 +600,8 @@ def coverage(signals: Mapping[str, Any]) -> dict[str, Any]:
 
 
 __all__ = [
-    "COMPARABLE", "KIT_ONLY", "LIVE_ONLY", "SHAPE_DIFFERS", "NOT_SHADOWED",
-    "UNIT_BRIDGE", "SCALAR_FALLBACK",
+    "COMPARABLE", "KIT_ONLY", "LIVE_ONLY", "SHAPE_DIFFERS", "NOT_SHADOWED", "NO_LIVE_COUNTERPART",
+    "UNIT_BRIDGE", "LIVE_VOCABULARY", "SCALAR_FALLBACK",
     "FLOAT_REL_TOL", "MAX_SAMPLE_CHARS",
     "Divergence", "compare", "record", "summarize", "sample",
     "undeclared_pairs", "coverage",

@@ -367,6 +367,7 @@ def _ingest_snapshot_v2_inner(
     now = _coerce_ts(client_ts)
     storage_items: list[dict] = []
     location_anchor_observations: list[tuple[str, Any]] = []
+    shadow_decrypted: list[tuple[str, Any]] = []
     results: dict[str, str] = {}
 
     for item in (items or []):
@@ -435,6 +436,13 @@ def _ingest_snapshot_v2_inner(
                     # server-owned baseline.
                     if key == "location_signal":
                         location_anchor_observations.append((key, values))
+                    # Held, not fired: the shadow compares against the live
+                    # state, and the live path has not written this report yet
+                    # -- that happens below, after this loop. Comparing here
+                    # reads the *previous* report's state and calls every
+                    # field the kit just learned "only_kit".
+                    if key in _PERCEPTKIT_DECRYPTED_ENTRIES:
+                        shadow_decrypted.append((key, values))
                 else:
                     _record_decrypt_failure_v2(user_id, key, err, now)
                     _record_unavailable_observation_v2(user_id, key, now)
@@ -450,6 +458,10 @@ def _ingest_snapshot_v2_inner(
         # It is handed the already-decrypted items, so it costs no extra
         # enclave calls. Nothing below reads its result.
         _perceptkit_shadow(user_id, storage_items, client_ts=client_ts)
+    for key, values in shadow_decrypted:
+        _perceptkit_shadow_call(_PERCEPTKIT_DECRYPTED_ENTRIES[key], user_id,
+                                values, **({"occurred_at": now}
+                                           if key == "location_signal" else {}))
     for key, plaintext in location_anchor_observations:
         if results.get(key) != "accepted":
             continue
@@ -470,6 +482,17 @@ def _ingest_snapshot_v2_inner(
 
 _log = logging.getLogger(__name__)
 
+#: Decrypted signals the shadow takes a second look at, and which entry point
+#: each goes to. Location resolves to a city and a Wi-Fi anchor; calendar and
+#: reminders take the source-mirror path rather than the signal path (§7.13).
+#: All three are handed the plaintext the live path already decrypted, so they
+#: cost no extra enclave call.
+_PERCEPTKIT_DECRYPTED_ENTRIES = {
+    "location_signal": "observe_location",
+    "calendar_next_event": "mirror_calendar",
+    "reminders": "mirror_reminders",
+}
+
 
 def _perceptkit_shadow(user_id: str, storage_items: list, *, client_ts=None) -> None:
     """Fire the PerceptKit shadow run. Import is local and failure is swallowed.
@@ -478,17 +501,35 @@ def _perceptkit_shadow(user_id: str, storage_items: list, *, client_ts=None) -> 
     if the package is missing or a version is skewed, perception reports keep
     working and only the shadow goes quiet.
     """
+    _perceptkit_shadow_call("observe", user_id, storage_items, client_ts=client_ts)
+
+
+def _perceptkit_shadow_call(entry: str, *args, **kwargs) -> None:
+    """Call one shadow entry point. Import is local and failure is swallowed.
+
+    Local import keeps the kit off the module-import path of the live service:
+    if the package is missing or a version is skewed, perception keeps working
+    and only the shadow goes quiet.
+
+    Every perception entry point routes through here, so a new one costs one
+    line and inherits the guarantee -- rather than each growing its own
+    try/except that is one edit away from not having it.
+    """
     try:
         from .perceptkit_adapter import shadow
-        shadow.observe(user_id, storage_items, client_ts=client_ts)
+        getattr(shadow, entry)(*args, **kwargs)
     except Exception as exc:                       # noqa: BLE001 -- deliberate
         # Swallowed, but never silently: a shadow that stops running and says
         # nothing is indistinguishable from a shadow that runs and finds
         # nothing, and the second one is the whole point of having it.
-        _log.warning("perceptkit shadow could not start (report unaffected): %s", exc)
+        _log.warning("perceptkit shadow %s could not start (request unaffected): %s",
+                     entry, exc)
 
 
 def ingest_device_event_v2(user_id: str, event: dict) -> dict:
+    _perceptkit_shadow_call("observe_device_event", user_id,
+                            event if isinstance(event, dict) else {},
+                            occurred_at=float((event or {}).get("ts") or _now()))
     observations = device_event_observations_v2(event if isinstance(event, dict) else {})
     submitted = 0
     for observation in observations:
@@ -1466,6 +1507,10 @@ def photo_evaluate(user_id: str, metadata: dict,
             )
     else:
         _maybe_wake(user_id, "photos", catalog.PHOTO_CLUSTER_SEC, "photo_id", None, photo_id, now)
+
+    # PerceptKit shadow. After the pixels are durably stored: a photo whose
+    # storage failed is not a photo the user added.
+    _perceptkit_shadow_call("observe_photo", user_id, photo_id, occurred_at=now)
     return {"photo_id": photo_id, "metadata": meta_out, "usable": True,
             "sensitive": sensitive, "status": "stored"}, 200
 
@@ -1601,6 +1646,8 @@ def _record_app_event(user_id: str, app: str, category: str | None,
             "app_state": _cell("foreground", now, None),
         })
         store.append_app_open(user_id, {"app": app, "category": category, "ts": now}, now)
+    _perceptkit_shadow_call("observe_app_event", user_id, app, category,
+                            action="close" if closing else "open", occurred_at=now)
     return {"status": "ok", "app": app, "category": category, "ts": now}, 200
 
 

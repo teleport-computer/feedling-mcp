@@ -267,21 +267,29 @@ def test_purging_a_subject_takes_the_divergences_too(conn):
 # 覆盖面本身
 # --------------------------------------------------------------------------
 
-def test_coverage_states_what_it_does_not_cover():
-    """「kit 全都一致」只有配上「一共比了多少」才有意义。"""
+def test_coverage_accounts_for_every_signal():
+    """「kit 全都一致」只有配上「一共比了多少」才有意义。
+
+    四个桶必须刚好把 manifest 分完 —— 少一个信号没被归进任何一桶，
+    它就既不会被比、也不会有人发现它没被比。
+    """
     c = compare.coverage(MINIMAL_SIGNALS)
     assert c["signals_total"] == len(MINIMAL_SIGNALS)
-    assert len(c["signals_compared"]) + len(c["not_shadowed"]) \
-        + len(c["shape_differs"]) == c["signals_total"]
+    assert (len(c["signals_compared"]) + len(c["signals_observed_only"])
+            + len(c["not_shadowed"]) + len(c["shape_differs"])
+            == c["signals_total"])
     assert c["fields_compared"] > 0
 
 
-def test_signals_from_the_other_entry_points_are_declared_unshadowed():
-    """影子只挂在快照那一条入口上。照片、设备事件、app 开关那几条没接，
-    这件事必须写在代码里，而不是靠「怎么一条都没报」推断出来。"""
-    assert "app_usage" in compare.NOT_SHADOWED
-    assert "photo_library_added" in compare.NOT_SHADOWED
-    assert all(compare.NOT_SHADOWED.values())     # 每条都得有理由
+def test_nothing_is_left_unshadowed():
+    """先前这条断言的是「照片、app 开关那几条**没接**，而且写明了原因」。
+
+    现在都接上了，所以它反过来断言：`NOT_SHADOWED` 是空的。
+    以后要是又有信号进不来，往那里加一行**并写明原因** —— 这条会逼着写，
+    因为空字典之外的每一项都必须带理由。
+    """
+    assert compare.NOT_SHADOWED == {}
+    assert all(compare.NOT_SHADOWED.values())     # 加回来的每条都得有理由
 
 
 def test_the_declared_vocabulary_is_applied_to_the_live_side_too():

@@ -307,3 +307,29 @@ def test_a_receipt_written_twice_does_not_double_advance(clean):
     rows = store()._q("SELECT count(*) FROM perceptkit_wake_receipt "
                       "WHERE event_id=%s", ("e1",))
     assert rows[0][0] == 1
+
+
+# ---------------------------------------------------------------------------
+# 整套 conformance，跑在真 adapter 上
+# ---------------------------------------------------------------------------
+
+def test_the_real_adapter_passes_the_whole_conformance_suite(clean):
+    """**这条本该一开始就有。**
+
+    包里那套 conformance 存在的全部意义，就是让宿主自己写的 adapter
+    对着它跑一遍。io 写了一个真 Postgres 实现，却从来没有一条测试真的跑过
+    这套东西 —— 于是「提醒镜像整条不通」（写读都抛，因为读了
+    `ReminderItemMirror` 上根本不存在的字段）在库里躺着，而这个文件全绿。
+
+    ⑤ 那条内存实现证不出来（内存天然原子），但**这里跑的就是真库**，
+    所以不跳过：真库上它是有意义的。
+    """
+    from perceptkit.conformance import run_storage_conformance
+
+    def factory():
+        with connect() as c:
+            c.execute(schema.TRUNCATE)
+        return PostgresStorage(connect())
+
+    problems = run_storage_conformance(factory)
+    assert problems == [], "真 adapter 没过 conformance：\n  " + "\n  ".join(problems)
