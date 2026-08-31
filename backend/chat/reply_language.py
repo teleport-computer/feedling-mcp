@@ -125,7 +125,24 @@ def _iter_text(value: Any):
             yield from _iter_text(item)
 
 
-def _identity_texts(identity: dict[str, Any]) -> list[str]:
+def _identity_texts(identity: dict[str, Any] | str | None) -> list[str]:
+    """身份卡里能当语言证据的正文。
+
+    **两条 runtime 手里的 identity 类型不一样**，这里必须都收：
+
+        V1（resident） dict —— 原始身份卡，按 IDENTITY_LANGUAGE_FIELDS 取字段
+        V2（hosted）   str  —— 已经渲染成一段正文（enclave 解密后的明文）
+
+    2026-08-31 踩到：V2 的调用点写的是
+    ``ctx.get("identity") if isinstance(ctx.get("identity"), dict) else None``，
+    而它拿到的一直是字符串 —— 于是那个分支**永远走 None**，V2 判语言时只看
+    「这一批新消息」。用户临时说一句英文，整个中文花园就被判成英文；V1 因为
+    传的是 dict 而锁得住。同一份判定逻辑、两条 runtime 结果相反，单测抓不到
+    （两边的假 ctx 都按各自的类型写），只有在 V2 上真跑才暴露。
+    """
+    if isinstance(identity, str):
+        # 已渲染的正文：整段就是证据，没有字段可挑。
+        return [identity] if identity.strip() else []
     texts: list[str] = []
     if not isinstance(identity, dict):
         return texts
@@ -204,7 +221,7 @@ def infer_garden_language(
 
 
 def garden_language_decision(
-    identity: dict | None,
+    identity: dict | str | None,
     *,
     written: str = "",
     existing_buckets: str = "",
@@ -250,7 +267,7 @@ def garden_language_decision(
     """
     # 「他写的字」= 这轮对话里他自己说的话 + 身份卡正文。前者是最新最真的信号，
     # 后者在还没聊过时兜底。
-    sample = "\n".join(x for x in ([written] + _identity_texts(identity or {})) if x)
+    sample = "\n".join(x for x in ([written] + _identity_texts(identity)) if x)
 
     d = decide_garden_language(
         explicit=None,

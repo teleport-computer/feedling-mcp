@@ -5772,7 +5772,13 @@ def test_capture_empty_window_fails_fast_without_identity_fetch(monkeypatch):
 
 
 def test_resident_capture_ignores_content_block_metadata_for_language(monkeypatch):
-    """The resident Capture call site must decide from text blocks, not keys."""
+    """The resident Capture call site must decide from text blocks, not keys.
+
+    落点在**组件的 CaptureRequest.locale** 上，不再是 ``crc.build_capture_prompt``
+    的入参 —— V1 切到 GardenComponent 之后提示词由组件构建，监视那个函数只会
+    永远看到空 dict（测试当时就是这么静默失效的）。判定本身没变，只是观察点
+    要跟着搬。
+    """
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
     message = {
@@ -5789,9 +5795,12 @@ def test_resident_capture_ignores_content_block_metadata_for_language(monkeypatc
     }
     seen = {}
 
-    def _fake_capture_prompt(**kwargs):
-        seen["locale"] = kwargs["locale"]
-        return "prompt"
+    class _Recorder:
+        """替掉组件：只记下这轮拿到的 locale，不真去问模型。"""
+
+        def capture(self, request):
+            seen["locale"] = request.locale
+            return crc.mg_contracts.CaptureResult(cards=[], mutations=[])
 
     monkeypatch.setattr(crc, "claim_proactive_job", lambda _job_id: True)
     monkeypatch.setattr(crc, "update_proactive_job_status", lambda *_a, **_kw: None)
@@ -5805,14 +5814,7 @@ def test_resident_capture_ignores_content_block_metadata_for_language(monkeypatc
     monkeypatch.setattr(crc, "_capture_memory_terms_context", lambda: ("", ""))
     monkeypatch.setattr(crc, "_emit_debug_trace", lambda *_a, **_kw: None)
     monkeypatch.setattr(
-        crc,
-        "build_capture_prompt",
-        _fake_capture_prompt,
-    )
-    monkeypatch.setattr(
-        crc,
-        "_memory_agent_parse_with_bounce",
-        lambda *_a, **_kw: (([], None), ""),
+        crc.garden_component, "build_garden", lambda *_a, **_kw: _Recorder()
     )
     job = {
         "schema_version": 2,

@@ -212,3 +212,48 @@ def test_migrate_component_asks_the_model_the_same_thing() -> None:
         MigrateRequest(old_cards=OLD_CARDS, allowed_ids=("m_1", "m_2"),
                        vocab=VOCAB, ai_name="io", user_name="老王", locale=LOCALE))
     assert seen == [legacy]
+
+
+def test_identity_as_a_rendered_string_still_counts_as_language_evidence():
+    """V2 手里的 identity 是**字符串**，也必须能当语言证据。
+
+    这条是 2026-08-31 在 V2 上真跑探针才发现的：V2 的调用点有个
+    ``isinstance(..., dict)`` 守卫，而它拿到的一直是渲染好的正文字符串 ——
+    那个分支永远走 None，于是 V2 判语言时只看「这一批新消息」。用户临时说
+    一句英文，整个中文花园就被判成英文；V1 传 dict 所以锁得住。
+
+    **单测抓不到的原因**：两条 runtime 的假 ctx 各按各自的类型写，谁都不会
+    拿对方的类型来试。所以这里明确把两种类型都跑一遍。
+    """
+    from chat.reply_language import garden_language_decision
+
+    zh_identity_text = "他叫 hx，做前端，说话直接，不爱绕弯子。平时用中文。"
+    english_turn = (
+        "Had a rough week at work - manager kept changing specs, "
+        "stayed until 11pm three nights in a row."
+    )
+
+    as_str = garden_language_decision(zh_identity_text, written=english_turn)
+    as_dict = garden_language_decision(
+        {"self_introduction": zh_identity_text}, written=english_turn
+    )
+    assert as_str["locale"] == as_dict["locale"], (
+        f"同样的证据，字符串形态判成 {as_str['locale']}、dict 形态判成 "
+        f"{as_dict['locale']} —— 两条 runtime 会各判各的"
+    )
+    assert as_str["locale"].startswith("zh"), (
+        "中文身份卡 + 一句英文 → 花园仍应是中文；判成英文就是 08-24 那次事故的形状"
+    )
+
+
+def test_no_identity_at_all_still_follows_what_the_person_wrote():
+    """没有身份卡时退回「他自己写的字」—— 不是退回默认值。"""
+    from chat.reply_language import garden_language_decision
+
+    assert garden_language_decision(None, written="今天真的好累，加班到十一点")[
+        "locale"
+    ].startswith("zh")
+    assert garden_language_decision("", written=(
+        "Had a rough week at work - manager kept changing specs, "
+        "stayed until 11pm three nights in a row, totally drained."
+    ))["locale"] == "en"

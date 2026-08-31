@@ -12243,7 +12243,10 @@ async def _run_extraction(
                 # 否则夜里整理一遍会把桶换成另一种语言 —— 也要喂同样的证据，
                 # 光同源不同证据一样会判出两个结果。
                 locale=infer_garden_language(
-                    ctx.get("identity") if isinstance(ctx.get("identity"), dict) else None,
+                    # ctx["identity"] 是**字符串**(已渲染的身份卡正文),不是 dict ——
+                    # 原来这里有个 isinstance(...) dict 的守卫,永远走 None,
+                    # 等于把身份卡这份语言证据整个丢了。见 _identity_texts。
+                    ctx.get("identity"),
                     written=user_written_text(prompt_tail),
                     existing_buckets=str(ctx.get("buckets") or ""),
                 ),
@@ -12284,7 +12287,10 @@ async def _run_extraction(
                 cards=list(ctx.get("card_items") or []),
                 all_cards=list(ctx.get("card_items") or []),
                 locale=infer_garden_language(
-                    ctx.get("identity") if isinstance(ctx.get("identity"), dict) else None,
+                    # ctx["identity"] 是**字符串**(已渲染的身份卡正文),不是 dict ——
+                    # 原来这里有个 isinstance(...) dict 的守卫,永远走 None,
+                    # 等于把身份卡这份语言证据整个丢了。见 _identity_texts。
+                    ctx.get("identity"),
                     written=user_written_text(prompt_tail),
                     existing_buckets=str(ctx.get("buckets") or ""),
                 ),
@@ -12328,7 +12334,10 @@ async def _run_extraction(
                 # 现在喂真证据：身份卡 + 这轮对话里**他自己说的话**。
                 # 取证走共用 helper，两条 runtime 不许各写一份。
                 _lang = garden_language_decision(
-                    ctx.get("identity") if isinstance(ctx.get("identity"), dict) else None,
+                    # ctx["identity"] 是**字符串**(已渲染的身份卡正文),不是 dict ——
+                    # 原来这里有个 isinstance(...) dict 的守卫,永远走 None,
+                    # 等于把身份卡这份语言证据整个丢了。见 _identity_texts。
+                    ctx.get("identity"),
                     written=user_written_text(prompt_tail),
                     # ↓ 只落观测，不参与判定。
                     existing_buckets=str(ctx.get("buckets") or ""),
