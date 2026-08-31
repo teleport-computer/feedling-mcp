@@ -20,7 +20,12 @@ def _cfg():
 def test_alembic_single_head():
     heads = ScriptDirectory.from_config(_cfg()).get_heads()
     assert len(heads) == 1, f"expected one Alembic head, got {list(heads)}"
-    assert heads[0] == "0105_account_recover_challenges"
+    # 这个文件盯的是 0105 本身；它是不是当前 head 由后来的 revision 决定，
+    # 所以只断言「单 head」，并断言 0105 在这条链上 —— 每加一个 revision
+    # 就要来改一次的断言，改的人只会照着报错填数字，拦不住任何东西。
+    assert heads[0] is not None
+    script = ScriptDirectory.from_config(_cfg())
+    assert script.get_revision("0105_account_recover_challenges") is not None
 
 
 def test_0105_upgrade_creates_table_and_indexes():

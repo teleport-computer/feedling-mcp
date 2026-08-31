@@ -602,8 +602,8 @@ memgarden==0.12.9 \
     --hash=sha256:a1023f86dff76b6829f08b5595c4a20feaecb6997c67b231bc4ba20a187cfd11 \
     --hash=sha256:e50d1e812cf00a920db45963f7f6c58a3c717bf4ebb849240f1886f60ef1dcb0
     # via -r backend/requirements.txt
-perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.2.0/perceptkit-0.2.0-py3-none-any.whl \
-    --hash=sha256:eb7dc3c50f25a00a93a527894f7e78b00a8ddd527482fa77c8dfe7ebbd39afd4
+perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.2.1/perceptkit-0.2.1-py3-none-any.whl \
+    --hash=sha256:71e905e08f343a6642a61c01cc1e9558fd5cb7d803345385fd001ec9f64fe1eb
     # via -r backend/requirements.txt
 packaging==26.1 \
     --hash=sha256:5d9c0669c6285e491e0ced2eee587eaf67b670d94a19e94e3984a481aba6802f \
