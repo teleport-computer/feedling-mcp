@@ -8,6 +8,7 @@ from pathlib import Path
 
 import anyio.to_thread
 import httpx
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
@@ -17,6 +18,23 @@ from accounts import registry
 from asgi import health_executor
 from asgi import runner_health
 from core import wake_bus
+
+
+@pytest.fixture(autouse=True)
+def isolated_runner_health_state(monkeypatch):
+    monkeypatch.setattr(
+        runner_health,
+        "_runner_health_state",
+        {
+            "rows": None,
+            "probe_in_flight": False,
+            "retry_after": 0.0,
+            "failure_reason": None,
+        },
+    )
+    monkeypatch.setattr(
+        runner_health, "_runner_health_state_lock", threading.Lock(),
+    )
 
 
 async def _get(path: str):
@@ -59,6 +77,60 @@ def test_runner_health_maps_dedicated_deadline_to_structured_503(monkeypatch):
     assert runner.json()["checks"]["runner_fleet"]["reason"] == (
         "runner_health_check_timeout"
     )
+
+
+def test_runner_health_cancellation_keeps_probe_single_flight_until_work_finishes(
+    monkeypatch,
+):
+    monkeypatch.setenv("FEEDLING_EXPECTED_RUNNER_COUNT", "1")
+    monkeypatch.setattr(runner_health.time, "time", lambda: 1000.0)
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def blocked_heartbeat_query(**_kwargs):
+        nonlocal calls
+        calls += 1
+        started.set()
+        release.wait(timeout=2.0)
+        return [{"ts": 995.0, "host_all": True}]
+
+    monkeypatch.setattr(
+        db,
+        "list_supervisor_instance_heartbeats_for_health",
+        blocked_heartbeat_query,
+    )
+
+    async def go():
+        transport = httpx.ASGITransport(app=asgi_app.app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://t",
+        ) as client:
+            first = asyncio.create_task(client.get("/healthz/runner"))
+            assert await asyncio.to_thread(started.wait, 1.0)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+
+            second = asyncio.create_task(client.get("/healthz/runner"))
+            try:
+                await asyncio.sleep(0.05)
+                assert second.done()
+                response = await second
+                assert response.status_code == 503
+                assert response.json()["checks"]["runner_fleet"]["reason"] == (
+                    "runner_health_check_cancelled"
+                )
+                assert calls == 1
+            finally:
+                release.set()
+                await asyncio.gather(second, return_exceptions=True)
+
+    try:
+        asyncio.run(go())
+    finally:
+        release.set()
 
 
 def test_runner_health_uses_dedicated_db_pool_when_ordinary_pool_is_saturated(

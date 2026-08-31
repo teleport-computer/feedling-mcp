@@ -998,7 +998,18 @@ per-backend-worker executor with two worker threads and a four-call outstanding
 admission cap, separate from ordinary ASGI blocking work. Connection acquisition
 and health SQL each have a one-second bound, and the route has a three-second
 deadline, so business-thread saturation cannot leave the runner probe queued
-until an external monitor times out.
+until an external monitor times out. Each worker retains only the public fields
+from its latest successful heartbeat observation. If a later database probe
+times out or fails while that snapshot still proves the expected fleet is within
+the existing heartbeat freshness window, the route returns HTTP 200 with
+top-level `status: degraded` and `checks.runner_fleet.source: cached` with the
+current `checks.runner_fleet.probe_reason`.
+The snapshot is re-evaluated against the current clock on every fallback, so it
+cannot extend the runner's freshness window. Once no still-fresh proof exists,
+the route returns HTTP 503 with runner status `unknown`; only a successful
+database observation that proves count or freshness drift reports the runner as
+`down`. A per-worker 15-second failure backoff prevents repeated monitor traffic
+from filling the isolated executor with duplicate database probes.
 
 `/healthz` still does not, by itself, complete an enclave decrypt, verify a live
 runner, call a model provider, test object storage, start the screen WebSocket,
