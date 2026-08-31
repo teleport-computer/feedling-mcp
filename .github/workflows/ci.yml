@@ -490,6 +490,42 @@ jobs:
             tests/test_perception_trend_dispatch.py \
             -v
 
+      # PerceptKit（感知内核的外部包）在 io 侧的接线。三个文件要真库：
+      # 它们不走 conftest 的 DATABASE_URL，而是自己按 PERCEPTKIT_TEST_PG 连，
+      # 因为验的就是真事务边界、并发下只有一个胜者、崩溃恢复 ——
+      # 这三类在内存实现上**永远是绿的**（内存天然原子、天然无并发），
+      # 拿内存跑等于没跑。所以这里单开一个库，不借 conftest 那个。
+      #
+      # 🔴 最后那句 `-p no:cacheprovider ... | tee` + 通过数下限不是装饰：
+      # 没有 PERCEPTKIT_TEST_PG 时这批**不会报错，会安静地 skip**，
+      # 而「跳过了」和「跑过了没问题」在 CI 日志里长得一模一样。
+      # 这个仓库有过这种前科（conftest 无库时静默丢掉整批 DB 模块，
+      # 报 391 passed 而真实是 2440）。所以这里对通过数设下限。
+      - name: PerceptKit adapter + conformance suite
+        env:
+          PGPASSWORD: postgres
+          PERCEPTKIT_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/perceptkit_ci"
+          PYTHONPATH: backend
+        run: |
+          psql -h 127.0.0.1 -U postgres -tAc \
+            "SELECT 1 FROM pg_database WHERE datname='perceptkit_ci'" | grep -q 1 \
+            || psql -h 127.0.0.1 -U postgres -c "CREATE DATABASE perceptkit_ci"
+          python -m pytest \
+            tests/test_perceptkit_postgres.py \
+            tests/test_perceptkit_retention.py \
+            tests/test_perceptkit_compare.py \
+            tests/test_perceptkit_shadow_sensitive.py \
+            tests/test_perceptkit_producers.py \
+            tests/test_perceptkit_ios_adapter.py \
+            tests/test_perceptkit_worker.py \
+            -v | tee /tmp/perceptkit-pytest.log
+          passed=$(grep -oE '[0-9]+ passed' /tmp/perceptkit-pytest.log | tail -1 | grep -oE '^[0-9]+')
+          echo "PerceptKit: ${passed:-0} passed"
+          if [ "${passed:-0}" -lt 90 ]; then
+            echo "通过数过低（${passed:-0}）—— 多半是没连上库、整批被 skip 了，而不是真的只有这么多"
+            exit 1
+          fi
+
       - name: Repository truth-map unit tests
         run: |
           python -m pytest \
