@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Feedling — Reproducible Build Recipe
 
 This document lets any third party recompute the exact container image
