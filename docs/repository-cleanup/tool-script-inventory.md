@@ -5,9 +5,11 @@ canonical_owner: self
 # 工具、脚本与运维表面清单
 
 审计日期：2026-08-31。本清单覆盖本次 `git ls-files tools scripts ops` 的全部
-126 个 tracked 路径：`tools/` 100 个、`scripts/` 24 个、`ops/` 2 个。它记录
-当前 owner、分类、生命周期和**精确**消费者证据；不是删除清单。静态 Python import
-缺失不能证明一个 operator CLI、部署命令或远程恢复入口已失效。
+126 个 tracked 路径：`tools/` 100 个、`scripts/` 24 个、`ops/` 2 个。其中 125 个是
+Task 5 taxonomy 的 executable/support asset；唯一的非 executable 路径
+`tools/README.md` 在文末另列为文档覆盖，**不计入**九类 tool/script taxonomy。清单记录
+当前 owner、分类、生命周期和**精确**消费者证据；不是删除清单。静态 Python import 缺失
+不能证明一个 operator CLI、部署命令或远程恢复入口已失效。
 
 `retain` 表示保留到另一次有范围的功能/运维决策；`retain-protected` 表示不能因
 本清单或零引用搜索删除；`historical-retained` 表示保留历史/恢复上下文但不作为当前
@@ -62,8 +64,8 @@ canonical_owner: self
 
 ## 分类与归属
 
-下表的「路径」列是完备清单。只有同一 owner、生命周期和证据类的路径才会合并；
-README/fixture/package marker 也计入，避免把可执行工具的支持文件遗漏在审计外。
+下表覆盖全部 125 个 Task 5 taxonomy asset。只有同一 owner、生命周期和证据类的路径
+才会合并；fixture/package marker 也计入，避免把可执行工具的支持文件遗漏在审计外。
 
 | 路径（数量） | owner | 分类 | 生命周期 | 证据 |
 |---|---|---|---|---|
@@ -80,7 +82,6 @@ README/fixture/package marker 也计入，避免把可执行工具的支持文�
 | `scripts/tee/derive_tee_ddl.py`（1） | TEE schema migration | migration | retain | E11 |
 | `scripts/tee/replication_workflow_guard.py`（1） | TEE replication deployment | deployment | retain | E12 |
 | `scripts/trace-write-rate-report.py`（1） | Trace capacity operations | active diagnostic | retain | E13 |
-| `tools/README.md`（1） | Tooling documentation | documentation | current | 此入口和本清单互相链接；不把 README 伪装成可删除的 executable。 |
 | `tools/audit_live_cvm.py`（1） | Deployment audit | active diagnostic | retain | E14 |
 | `tools/backfill_v2_profiles.py`（1） | Hosted Runtime V2 deployment | deployment | retain | E15 |
 | `tools/chat_resident_consumer.py`<br>`tools/chat_resident_requirements.txt`（2） | Resident runtime | production companion | **retain-protected** | E16 |
@@ -113,6 +114,12 @@ README/fixture/package marker 也计入，避免把可执行工具的支持文�
 | `tools/v2_user_triage.py`（1） | Runtime V2 operations | active diagnostic | retain | E39 |
 | `tools/verify_enclave_domain.py`（1） | Attestation deployment | deployment | retain | E40 |
 
+## 非 executable 文档覆盖（不属于 Task 5 taxonomy）
+
+| 路径（数量） | owner | 生命周期 | 原因 |
+|---|---|---|---|
+| `tools/README.md`（1） | Tooling documentation | current | 它是本目录的 operator/documentation entrypoint，不是 tool/script asset；为保证全部 tracked-path 可导航而单列，且不纳入分类计数。 |
+
 ## 覆盖计数与结论
 
 | 分类 | 路径数 |
@@ -125,8 +132,9 @@ README/fixture/package marker 也计入，避免把可执行工具的支持文�
 | test support | 67 |
 | generated helper | 5 |
 | historical | 1 |
-| documentation（非 executable） | 1 |
-| **总计** | **126** |
+| **Task 5 taxonomy assets** | **125** |
+| 非 executable 文档覆盖 | 1 |
+| **全部 tracked 路径** | **126** |
 
 - 未归类：0；`unowned candidate`：0；本批不创建 candidate record。
 - `tools/chat_resident_consumer.py` 是用户 VPS 单文件分发、自更新/re-exec、systemd

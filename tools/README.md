@@ -4,8 +4,11 @@ canonical_owner: self
 ---
 # tools/
 
-Operator-facing utilities for Feedling. Each entry is independent — none
-of these are imported by the backend at runtime.
+Most operator-facing utilities in this directory are independent of the
+backend's long-lived runtime. The documented resident-runtime companions are
+exceptions: `chat_resident_consumer.py`, `io_cli.py`, `io_cli_catalog.py`, the
+user-MCP helpers, and the Pi bridge are executed or imported by the resident or
+hosted agent-runner path.
 
 For the full owner/lifecycle inventory of every tracked `tools/`, `scripts/`,
 and `ops/` path, see [`docs/repository-cleanup/tool-script-inventory.md`](../docs/repository-cleanup/tool-script-inventory.md).
