@@ -149,6 +149,8 @@ async def extract(
     trajectory_out: Callable[[str, dict], Awaitable[None]] | None = None,
     failure_detail_out: Callable[[dict], None] | None = None,
     parse_retry: ParseRetry | None = None,
+    session: Any = None,
+    step_sink: Any = None,
 ) -> tuple[Any, str | None]:
     """跑一次 BYOK 抽取调用并解析。**永不抛**——失败一律返回 (None, reason)。
 
@@ -158,6 +160,18 @@ async def extract(
     给了 `parse_retry` 时，截断、内容闸或语义闸可带原因重问一次；三条路径共享
     **最多一次**的 provider 预算。provider 报错 / 空回复不走这条路，它们各有
     自己的重试与退避。
+
+    ## ``session``：让 GardenComponent 决定问什么
+
+    给了 ``session``（``garden.capture_session(...)`` 的返回值）时，
+    「下一步问什么、拿到回复怎么办」由组件决定，``prompt`` / ``parse`` /
+    ``parse_retry`` 一概忽略。
+
+    **provider 那一步仍然走下面同一个 ``_call``** —— 截断检测、用量统计、
+    失败分类、退避、轨迹全部照旧。这是刻意的：直接调 ``garden.acapture()``
+    会把 provider 调用抢过去，等于放弃这些能力，那是净退步。
+
+    两种模式共用一个 ``_call``，所以 provider 那一侧的行为不可能分家。
     """
 
     async def _call(
@@ -236,6 +250,61 @@ async def extract(
     def _record_truncation_failure(response_shape: dict[str, Any]) -> None:
         if failure_detail_out is not None:
             failure_detail_out(dict(response_shape))
+
+    async def _emit_component_steps() -> None:
+        """把组件汇报的步骤翻成 io 一直在用的 trajectory 事件。
+
+        会话模式下解析和重问都在组件里发生，宿主看不见 —— 不翻出来的话
+        ``parse_bounced`` / ``semantic_bounced`` 这两个事件就没了，
+        而它们正是「这轮为什么多花一次调用」的唯一线索。
+        """
+        if trajectory_out is None or step_sink is None:
+            return
+        for step in step_sink.drain():
+            if step.kind == "parsed" and step.detail.get("error"):
+                await trajectory_out("parse_bounced",
+                                     {"reason": str(step.detail.get("error"))})
+            elif step.kind == "retrying":
+                why = str(step.detail.get("kind") or "")
+                if why == "semantic":
+                    await trajectory_out(
+                        "semantic_bounced",
+                        {"reason_count": int(step.detail.get("reasons") or 0)})
+                elif why == "truncation":
+                    # 截断的重问在下面单独发（带 strategy/max_tokens），这里不重复。
+                    pass
+
+    if session is not None:
+        # 组件驱动：它说问什么就问什么，直到它说问完了。
+        # provider 那一步走的是上面同一个 _call —— 截断、用量、失败分类、
+        # 轨迹全部照旧，不因为换了驱动方式而分家。
+        seen_truncation = False
+        while True:
+            attempt_prompt = session.next_prompt()
+            if attempt_prompt is None:
+                break
+            reply, call_error, shape = await _call(attempt_prompt)
+            if call_error is not None:
+                return None, call_error
+            truncated = await _report_truncated(shape, attempt=2 if seen_truncation else 1)
+            if truncated:
+                if seen_truncation:
+                    # 换过一版更简短的提示词还是被截 —— 不再试，如实报。
+                    _record_truncation_failure(shape)
+                    return None, "output_truncated"
+                seen_truncation = True
+            session.feed(reply or "", truncated=truncated)
+            await _emit_component_steps()
+        outcome = session.result()
+        if outcome.error:
+            return None, str(outcome.error)
+        # 两条 lane 的「原始产物」字段名不同 —— capture 是卡，dream 是合并方案。
+        # 下游的 to_actions 要的正是这个原始形状（它自己封信封、打溯源），
+        # 不是组件那份带 mount 的 mutations。
+        items = getattr(outcome, "cards", None)
+        if items is None:
+            items = getattr(outcome, "consolidations", [])
+        return items, None
 
     retried_once = False
     reply, call_error, response_shape = await _call(prompt)

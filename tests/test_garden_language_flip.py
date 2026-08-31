@@ -142,3 +142,23 @@ def test_lookalike_roles_do_not_count_as_the_person() -> None:
     """role 判断要精确匹配 —— "user_proxy" 之类不是本人。"""
     written = user_written_text([{"role": "user_proxy", "content": EN_SAMPLE}])
     assert written == ""
+
+
+def test_content_block_metadata_cannot_flip_chinese_writing_to_english() -> None:
+    """Only text blocks are writing evidence; image protocol keys are not."""
+    writing = "我今天很难过"
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": writing},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,AAAA"},
+            },
+        ],
+    }]
+
+    written = user_written_text(messages)
+
+    assert written == writing
+    assert infer_garden_language({}, written=written) == "zh-Hans"

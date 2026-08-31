@@ -75,9 +75,11 @@ HEALTH_DB_STATEMENT_TIMEOUT_MS = 1000
 # connections, while keeping concurrent health requests bounded.
 HEALTH_DB_POOL_MIN_SIZE = 1
 HEALTH_DB_POOL_MAX_SIZE = 2
-_POOL_CHECK_CONNECTION = ConnectionPool.check_connection
 TEE_PRIMARY_POOL_MAX_LIFETIME_SECONDS = 180.0
 TEE_PRIMARY_TCP_USER_TIMEOUT_MS = 30000
+# A sync cursor ahead of the server clock cannot match any valid log row. Do
+# not turn client clock skew or corrupted cursors into a cold RDS scan.
+LOG_READ_FUTURE_CURSOR_TOLERANCE_SECONDS = 5.0
 
 
 def _database_url() -> str:
@@ -200,7 +202,6 @@ def get_health_pool() -> ConnectionPool:
                 max_size=HEALTH_DB_POOL_MAX_SIZE,
                 timeout=HEALTH_DB_ACQUIRE_TIMEOUT_SECONDS,
                 max_idle=300,
-                check=_POOL_CHECK_CONNECTION,
                 kwargs=_database_connection_kwargs(),
                 open=True,
                 **_database_pool_lifetime_kwargs(),
@@ -18315,19 +18316,43 @@ def log_read(user_id: str, stream: str, limit: int = 100, since_epoch: float = 0
     the newest ``limit`` rows (still chronological). ``since_epoch`` filters on
     the ts column (rows with NULL ts are excluded when since_epoch is set)."""
     try:
+        if since_epoch and since_epoch > time.time() + LOG_READ_FUTURE_CURSOR_TOLERANCE_SECONDS:
+            return []
         params: list = [user_id, stream]
         where = "user_id = %s AND stream = %s"
         if since_epoch:
-            where += " AND ts > %s"
             params.append(since_epoch)
         if limit and limit > 0:
-            sql = (
-                f"SELECT doc FROM (SELECT doc, seq FROM user_logs WHERE {where} "
-                f"ORDER BY seq DESC LIMIT %s) t ORDER BY seq ASC"
-            )
+            if since_epoch:
+                # Do not let PostgreSQL satisfy the seq ordering first then
+                # filter ts from a potentially huge user stream. Materializing
+                # this bounded time window makes the existing
+                # logs_stream_ts_idx the access path, while the outer query
+                # retains the historical newest-N / ascending-seq contract.
+                sql = (
+                    "WITH time_window AS MATERIALIZED ("
+                    "  SELECT doc, seq FROM user_logs "
+                    "  WHERE user_id = %s AND stream = %s AND ts > %s"
+                    ") "
+                    "SELECT doc FROM (SELECT doc, seq FROM time_window "
+                    "ORDER BY seq DESC LIMIT %s) t ORDER BY seq ASC"
+                )
+            else:
+                sql = (
+                    f"SELECT doc FROM (SELECT doc, seq FROM user_logs WHERE {where} "
+                    f"ORDER BY seq DESC LIMIT %s) t ORDER BY seq ASC"
+                )
             params.append(limit)
         else:
-            sql = f"SELECT doc FROM user_logs WHERE {where} ORDER BY seq ASC"
+            if since_epoch:
+                sql = (
+                    "WITH time_window AS MATERIALIZED ("
+                    "  SELECT doc, seq FROM user_logs "
+                    "  WHERE user_id = %s AND stream = %s AND ts > %s"
+                    ") SELECT doc FROM time_window ORDER BY seq ASC"
+                )
+            else:
+                sql = f"SELECT doc FROM user_logs WHERE {where} ORDER BY seq ASC"
         with get_pool().connection() as conn:
             rows = conn.execute(sql, tuple(params)).fetchall()
         return [r[0] for r in rows]

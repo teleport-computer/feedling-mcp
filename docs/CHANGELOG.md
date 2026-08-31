@@ -55,6 +55,21 @@ historical_reason: point-in-time
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-29 — 收敛 `UserStore` 定向刷新接口
+
+**[DONE] 跨 worker 的 frames/blob 定向刷新不再为旧测试适配器绕过 section 状态。**
+
+- `_refresh_store_channel()` 统一使用 `note_section_change()` 与 `ensure_sections()`，删除
+  直接调用私有 loader 的 fallback。
+- wake bus 测试改用真实 `UserStore`，覆盖 frames/blob 的精确刷新和 proactive waiter
+  唤醒；非 section 缓存对象不再被静默接受。
+- 三个相关测试文件已接入显式 CI batch，并从 uncovered baseline 移除；豁免棘轮
+  `MAX_EXEMPTED` 从 290 收紧到 287。
+- PR 前回归暴露出 Genesis worker 测试仍 monkeypatch 已退役的 `get_store` seam；测试已
+  迁到生产实际使用的 `get_store_shell_only(..., reason=...)`，两个 Genesis 文件也接入
+  显式 CI，豁免棘轮继续从 287 收紧到 285。
+- 不影响 schema、公开 API、部署拓扑或 VPS resident consumer。
+
 ## 2026-08-29 — 删除不可达的 Redis backend 客户端与生产依赖
 
 **[DONE] Redis CVM 的审计/恢复资产继续保留，但零消费者、固定拒绝连接的 Python

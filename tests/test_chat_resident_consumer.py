@@ -4683,7 +4683,13 @@ def test_capture_partial_server_batch_completes_with_failed_bucket(monkeypatch):
             "content": "This valid item must still count as applied.",
         },
     ]})
-    captured, job = _install_capture_job_harness(monkeypatch, reply)
+    # 先用一次格式打回把共享的重问预算吃掉，这条用例要量的是**部分成功的
+    # 记账**，不是重问行为。预算还在的话，服务端那个 error 会触发一次语义
+    # 重问，重问结果再落一遍库，applied 就变成 2 了。
+    format_bad = json.dumps({"cards": [{
+        "action": "add", "summary": "...", "content": "[thickened summary]",
+    }]})
+    captured, job = _install_capture_job_harness(monkeypatch, [format_bad, reply])
 
     def partial_result(actions):
         captured["actions"].extend(actions)
@@ -4701,14 +4707,6 @@ def test_capture_partial_server_batch_completes_with_failed_bucket(monkeypatch):
         }
 
     monkeypatch.setattr(crc, "execute_memory_actions", partial_result)
-    # The server error would normally trigger the one semantic re-ask. Consume
-    # the shared budget as a prior format bounce marker so this test isolates
-    # partial-result accounting rather than retry behavior.
-    monkeypatch.setattr(
-        crc,
-        "_memory_agent_parse_with_bounce",
-        lambda *args, **kwargs: ((json.loads(reply)["cards"], None), "bounced_ok"),
-    )
 
     assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
     final = _capture_final_status(captured)
@@ -5771,6 +5769,119 @@ def test_capture_empty_window_fails_fast_without_identity_fetch(monkeypatch):
     }
     assert crc._process_capture_jobs([job]) == pytest.approx(321.0)
     assert ("cap_empty_window", "failed", "capture_window_unavailable") in statuses
+
+
+def test_resident_capture_ignores_content_block_metadata_for_language(monkeypatch):
+    """The resident Capture call site must decide from text blocks, not keys.
+
+    落点在**组件的 CaptureRequest.locale** 上，不再是 ``crc.build_capture_prompt``
+    的入参 —— V1 切到 GardenComponent 之后提示词由组件构建，监视那个函数只会
+    永远看到空 dict（测试当时就是这么静默失效的）。判定本身没变，只是观察点
+    要跟着搬。
+    """
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    message = {
+        "id": "m-block",
+        "role": "user",
+        "source": "chat",
+        "content": [
+            {"type": "text", "text": "我今天很难过"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,AAAA"},
+            },
+        ],
+    }
+    seen = {}
+
+    class _Recorder:
+        """替掉组件：只记下这轮拿到的 locale，不真去问模型。"""
+
+        def capture(self, request):
+            seen["locale"] = request.locale
+            return crc.mg_contracts.CaptureResult(cards=[], mutations=[])
+
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda _job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *_a, **_kw: None)
+    monkeypatch.setattr(crc, "_capture_window_messages", lambda _job: [message])
+    monkeypatch.setattr(
+        crc,
+        "_capture_identity_context",
+        lambda: ({}, "小舟", "小雨", ""),
+    )
+    monkeypatch.setattr(crc, "_capture_window_text", lambda *_a, **_kw: "窗口")
+    monkeypatch.setattr(crc, "_capture_memory_terms_context", lambda: ("", ""))
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        crc.garden_component, "build_garden", lambda *_a, **_kw: _Recorder()
+    )
+    job = {
+        "schema_version": 2,
+        "job_id": "cap_block_language",
+        "job_kind": "memory_capture",
+        "source": "memory_capture",
+        "ts": 322.0,
+    }
+
+    assert crc._process_capture_jobs([job]) == pytest.approx(322.0)
+    assert seen == {"locale": "zh-Hans"}
+
+
+def test_resident_dream_ignores_content_block_metadata_for_language(monkeypatch):
+    """The resident Dream call site must make the same language decision."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    history = [{
+        "id": "m-block",
+        "ts": 1.0,
+        "role": "user",
+        "source": "chat",
+        "content": [
+            {"type": "text", "text": "我今天很难过"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,AAAA"},
+            },
+        ],
+    }]
+    seen = {}
+
+    def _fake_dream_prompt(**kwargs):
+        seen["locale"] = kwargs["locale"]
+        return "prompt"
+
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda _job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *_a, **_kw: None)
+    monkeypatch.setattr(crc, "_emit_resident_dream_lifecycle", lambda *_a, **_kw: None)
+    monkeypatch.setattr(crc, "_dream_cards_context", lambda: ("cards", {"c1": {}}))
+    monkeypatch.setattr(
+        crc,
+        "_capture_identity_context",
+        lambda: ({}, "小舟", "小雨", ""),
+    )
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda **_kw: history)
+    monkeypatch.setattr(crc, "_capture_memory_terms_context", lambda: ("", ""))
+    monkeypatch.setattr(
+        crc,
+        "build_dream_prompt",
+        _fake_dream_prompt,
+    )
+    monkeypatch.setattr(
+        crc,
+        "_memory_agent_parse_with_bounce",
+        lambda *_a, **_kw: (([], [], None), ""),
+    )
+    job = {
+        "schema_version": 2,
+        "job_id": "dream_block_language",
+        "job_kind": "memory_dream",
+        "source": "memory_dream",
+        "ts": 323.0,
+    }
+
+    assert crc._process_dream_jobs([job]) == pytest.approx(323.0)
+    assert seen == {"locale": "zh-Hans"}
 
 
 def test_process_proactive_malformed_json_reason_does_not_post(monkeypatch):

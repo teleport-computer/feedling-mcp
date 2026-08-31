@@ -114,6 +114,36 @@ def test_response_scoring_keeps_three_numerators_separate():
     assert leading_space["reply_language_follow"] is True
 
 
+def test_response_scoring_treats_latin_terms_as_part_of_chinese_messages():
+    scored = language_eval.score_self_thinking_response(
+        (
+            "<think>我今天用 Python 写了个脚本 debug 了半天 finally 跑通了真开心</think>"
+            "你可以用 Notion 或者 Obsidian 把这件事记下来。"
+        ),
+        language="zh",
+    )
+
+    assert scored["think_script"] == "han"
+    assert scored["reply_script"] == "han"
+    assert scored["think_language_follow"] is True
+    assert scored["reply_language_follow"] is True
+
+
+def test_response_scoring_keeps_english_with_quoted_han_terms_latin():
+    scored = language_eval.score_self_thinking_response(
+        (
+            "<think>Please explain 今天天气很好我们去公园 now</think>"
+            "I can explain 今天天气很好我们去公园 in English now."
+        ),
+        language="en",
+    )
+
+    assert scored["think_script"] == "latin"
+    assert scored["reply_script"] == "latin"
+    assert scored["think_language_follow"] is True
+    assert scored["reply_language_follow"] is True
+
+
 def test_missing_think_is_measured_failure_not_unmeasured(tmp_path):
     row = _trial(tmp_path, arm="baseline", replicate=0, success=False)
 

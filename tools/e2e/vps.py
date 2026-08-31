@@ -16,7 +16,10 @@ import tempfile
 import time
 from pathlib import Path
 
-from .client import E2EClient, TEST_API, TEST_ENCLAVE
+from .client import (
+    E2EClient, TEST_API, TEST_ENCLAVE, VERDICT_FALLBACK, VERDICT_OK,
+    decrypt_verdict as _decrypt_verdict,
+)
 from .config import VpsCell
 from .unlock import verify_loop, wait_resident_consumer_passing
 
@@ -37,6 +40,17 @@ def run_vps_cell(cell: VpsCell) -> dict:
         if not ok and active_client is not None:
             active_client.preserve_failure(f"{name}: {detail or 'failed'}")
         return ok
+
+    def verdict_step(name: str, verdict: str, detail: str) -> bool:
+        """三态记录:ok / fallback / fail(与 hosted 同口径)。
+
+        这一格不是理论风险:vps-claude-code 实测被同一个盲区咬中 —— CLI 拒答、
+        consumer 发布固定 fallback，而 runner 报整格 PASS。
+        """
+        steps.append((name, verdict, detail))
+        if verdict != VERDICT_OK and active_client is not None:
+            active_client.preserve_failure(f"{name}[{verdict}]: {detail or verdict}")
+        return verdict == VERDICT_OK
 
     workdir = Path(tempfile.mkdtemp(prefix=f"feedling_e2e_{cell.name}_"))
     proc: subprocess.Popen | None = None
@@ -93,9 +107,13 @@ def run_vps_cell(cell: VpsCell) -> dict:
                 sent = c.send_chat("你好，请用一句话回应我。")
                 reply = c.wait_reply(sent, timeout=REPLY_TIMEOUT)
                 text = c.message_text(reply) if reply else ""
-                step("chat", reply is not None and bool(text.strip()),
-                     f"{time.time() - sent:.0f}s; head={text[:40]!r}" if reply
-                     else f"no reply in {REPLY_TIMEOUT:.0f}s; log tail={_tail(log_path)}")
+                # 同 hosted:只测「非空」会把 consumer 发布的固定 fallback 判成成功。
+                chat_verdict, chat_detail = c.classify_reply(reply, text)
+                verdict_step(
+                    "chat", chat_verdict,
+                    f"{time.time() - sent:.0f}s; head={text[:40]!r}; {chat_detail}"
+                    if reply else
+                    f"no reply in {REPLY_TIMEOUT:.0f}s; log tail={_tail(log_path)}")
 
                 # Tier/readability continuity (HARD P0): encrypted replies must
                 # decrypt with the user's key; plaintext replies must be canonical
@@ -107,14 +125,21 @@ def run_vps_cell(cell: VpsCell) -> dict:
                         dec_err = ""
                     except Exception as de:  # noqa: BLE001
                         dec, dec_err = "", f"{type(de).__name__}: {de}"
-                    step("decrypt", bool(dec.strip()),
-                         f"len={len(dec)}" if dec.strip() else (dec_err or "empty plaintext"))
+                    dec_verdict, dec_detail = _decrypt_verdict(dec, dec_err)
+                    verdict_step("decrypt", dec_verdict, dec_detail)
 
                 bubbles = c.system_bubbles_since(run_start)
                 step("no-error-bubbles", not bubbles, f"{len(bubbles)} system notice(s)")
 
-            hard_fail = any(s[1] == "fail" for s in steps)
-            return {"cell": cell.name, "result": "fail" if hard_fail else "ok",
+            # fallback 单列：它阻断发版(用户实际收到的是失败话术)，但不并进
+            # "fail"，否则「交付了失败话术」和「压根没回来」在报表上同形。
+            if any(s[1] == "fail" for s in steps):
+                result = "fail"
+            elif any(s[1] == VERDICT_FALLBACK for s in steps):
+                result = VERDICT_FALLBACK
+            else:
+                result = "ok"
+            return {"cell": cell.name, "result": result,
                     "steps": steps, "user_id": c.user_id, "log": str(log_path)}
     finally:
         if proc is not None and proc.poll() is None:
