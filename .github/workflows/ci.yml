@@ -839,6 +839,7 @@ jobs:
             tests/test_tee_replication_workflow_guard.py \
             tests/test_tee_requeue.py \
             tests/test_tee_requeue_coverage.py \
+            tests/test_tee_app_role_ddl_contract.py \
             tests/test_tee_primary_startup.py \
             tests/test_tee_schema.py \
             tests/test_tee_snapshot.py \
