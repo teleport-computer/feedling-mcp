@@ -2280,11 +2280,16 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
             runtime=detail_snapshot.get("responder_runtime"),
             snapshot_read_status=detail_snapshot_status,
         )
-        row["daily_usage"] = db.admin_data_track_user_daily_usage(
-            user_id=user_id,
-            days=daily_days,
-            tz="Asia/Shanghai",
-        )
+        try:
+            row["daily_usage"] = db.admin_data_track_user_daily_usage(
+                user_id=user_id,
+                days=daily_days,
+                tz="Asia/Shanghai",
+            )
+            row["daily_usage_query"] = "ok"
+        except db.AdminDataTrackDailyUsageReadError:
+            row["daily_usage"] = []
+            row["daily_usage_query"] = "failed"
         row["daily_usage_days"] = daily_days
         row["runtime"] = _runtime_summary(store)
         row["model_api_routes"] = _model_api_route_summaries(user_id)
@@ -4330,11 +4335,16 @@ def _data_track_dau_payload() -> dict:
     raw_day = str(request.args.get("day") or "").strip()
     requested_day = _validated_dau_day(raw_day) if raw_day else ""
     snapshot = db.admin_dau_snapshot_bounds()
-    rows = db.admin_data_track_dau(
-        since_epoch=float(filters.get("since_epoch") or 0),
-        days=days,
-        tz="Asia/Shanghai",
-    )
+    try:
+        rows = db.admin_data_track_dau(
+            since_epoch=float(filters.get("since_epoch") or 0),
+            days=days,
+            tz="Asia/Shanghai",
+        )
+        dau_query_status = "ok"
+    except db.AdminDataTrackDauReadError:
+        rows = []
+        dau_query_status = "failed"
     invalid_days: list[str] = []
     default_histogram_day = _default_usage_histogram_day(
         rows, invalid_days=invalid_days,
@@ -4382,6 +4392,7 @@ def _data_track_dau_payload() -> dict:
         ],
         "usage_histogram": usage_histogram,
         "observability": {
+            "dau_query": dau_query_status,
             "day_values": "invalid" if invalid_days else "ok",
             "invalid_day_rows": len(invalid_days),
         },
@@ -8965,6 +8976,13 @@ def _render_data_track_dau_page(payload: dict) -> str:
     histogram_total = int(histogram.get("total_users") or 0)
     definition = payload.get("definition", {})
     observability = payload.get("observability") or {}
+    query_warning = (
+        "<div style='background:#fff0f0;border:1px solid #d88;"
+        "border-radius:8px;padding:10px 12px;margin:12px 0;color:#8a1f1f'>"
+        "DAU 查询失败；下方空表不代表这段时间确实无人活跃。"
+        "</div>"
+        if observability.get("dau_query") == "failed" else ""
+    )
     day_warning = (
         "<div style='background:#fff8e8;border:1px solid #e3bd7a;"
         "border-radius:8px;padding:10px 12px;margin:12px 0;color:#8a4a00'>"
@@ -9134,6 +9152,7 @@ def _render_data_track_dau_page(payload: dict) -> str:
   <div class="muted">Generated {html.escape(_bj_iso(summary["generated_at"]))}. DAU timezone: {html.escape(summary["timezone"])}.</div>
   <div class="muted">Showing {html.escape(str(summary["days_returned"]))} active days. Since {html.escape(str(filters.get("since") or "all time"))}; days limit {html.escape(str(filters.get("days") or 30))}.</div>
   {_render_data_track_view_nav("dau")}
+  {query_warning}
   {day_warning}
   <section class="metrics">{metrics}</section>
   <h2>使用时长分布 · {html.escape(histogram_day or "n/a")}</h2>
@@ -12065,6 +12084,7 @@ def _render_screen_frames(user: dict) -> str:
 def _render_user_daily_usage(user: dict) -> str:
     rows = list(user.get("daily_usage") or [])
     days = int(user.get("daily_usage_days") or len(rows) or 14)
+    query_failed = user.get("daily_usage_query") == "failed"
     window_total = sum(int(row.get("foreground_sec") or 0) for row in rows)
     window_sessions = sum(int(row.get("sessions") or 0) for row in rows)
     all_time = user.get("app_usage") or {}
@@ -12094,31 +12114,44 @@ def _render_user_daily_usage(user: dict) -> str:
             "</div>"
         )
     action = f"/admin/data-track/users/{quote(str(user.get('user_id') or ''))}"
+    summary_html = (
+        "<div class='data-quality-warning'><strong>最近使用时长查询失败</strong>："
+        "下方不展示零值；这不代表该用户最近确实没有打开 App。</div>"
+        if query_failed else (
+            "<div class='daily-summary'>"
+            f"<b>窗口合计 {html.escape(_fmt_duration_sec(window_total))}</b>"
+            f" · {window_sessions} 次会话"
+            f"；全时段合计 <b>{html.escape(_fmt_duration_sec(all_time_total))}</b>"
+            f" · {all_time_sessions} 次会话"
+            "</div>"
+        )
+    )
+    usage_html = (
+        ""
+        if query_failed else (
+            "<section class='daily-usage'>"
+            + (
+                "".join(daily_rows)
+                if daily_rows
+                else "<div class='muted'>暂无使用时长数据。</div>"
+            )
+            + "</section>"
+            "<div class='muted daily-note'>"
+            "按北京日统计 app_session_end；没有上报的日期明确显示“未打开”。"
+            "前台被强杀会漏报，因此时长略偏低估。"
+            "</div>"
+        )
+    )
     return (
         f"<h2 class='daily-heading'>最近 {days} 天使用时长</h2>"
-        "<div class='daily-summary'>"
-        f"<b>窗口合计 {html.escape(_fmt_duration_sec(window_total))}</b>"
-        f" · {window_sessions} 次会话"
-        f"；全时段合计 <b>{html.escape(_fmt_duration_sec(all_time_total))}</b>"
-        f" · {all_time_sessions} 次会话"
-        "</div>"
-        f"<form class='daily-controls' method='get' action='{html.escape(action, quote=True)}'>"
+        + summary_html
+        + f"<form class='daily-controls' method='get' action='{html.escape(action, quote=True)}'>"
         f"<input name='admin_key' type='hidden' value='{html.escape(request.args.get('admin_key', ''), quote=True)}'>"
         f"<input name='events_limit' type='hidden' value='{int((user.get('tracking') or {}).get('events_limit') or 50)}'>"
         f"<label>天数 <input name='days' type='number' min='1' max='90' value='{days}'></label>"
         "<button type='submit'>更新</button>"
         "</form>"
-        "<section class='daily-usage'>"
-        + (
-            "".join(daily_rows)
-            if daily_rows
-            else "<div class='muted'>暂无使用时长数据。</div>"
-        )
-        + "</section>"
-        "<div class='muted daily-note'>"
-        "按北京日统计 app_session_end；没有上报的日期明确显示“未打开”。"
-        "前台被强杀会漏报，因此时长略偏低估。"
-        "</div>"
+        + usage_html
     )
 
 
