@@ -248,37 +248,38 @@ _TEE_PRIMARY_TRIGGERS = {
 def init_schema() -> None:
     """Bring the selected database schema to a safe application state.
 
-    The historical ``rds`` mode runs ``alembic upgrade head``.  A promoted TEE
-    database is different: its owner-only migration chain has already run in a
-    dedicated workflow, while application processes connect as the non-DDL
-    ``app`` role.  ``tee`` mode therefore performs a read-only, fail-closed head
-    assertion and must never run the RDS chain against that database.
+    Both the historical ``rds`` mode and a promoted ``tee`` database run their
+    independent Alembic chains before the process becomes ready. In TEE-primary
+    mode, the app role inherits the database owner role so its primary DSN can
+    apply the TEE chain without receiving an owner credential.
     """
     if database_schema() == "tee":
         import alembic_tee
 
-        expected_heads = {alembic_tee.current_head()}
-        with _schema_lock, psycopg.connect(_database_url(), autocommit=True) as conn:
-            actual_heads = {
-                str(row[0])
-                for row in conn.execute(
-                    "SELECT version_num FROM alembic_tee_version"
-                ).fetchall()
-            }
-            enabled_triggers = {
-                str(row[0])
-                for row in conn.execute(
-                    "SELECT tgname FROM pg_trigger "
-                    "WHERE NOT tgisinternal AND tgenabled = 'O' "
-                    "AND tgname = ANY(%s)",
-                    (list(_TEE_PRIMARY_TRIGGERS),),
-                ).fetchall()
-            }
+        with _schema_lock:
+            alembic_tee.upgrade_head()
+            expected_heads = {alembic_tee.current_head()}
+            with psycopg.connect(_database_url(), autocommit=True) as conn:
+                actual_heads = {
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT version_num FROM alembic_tee_version"
+                    ).fetchall()
+                }
+                enabled_triggers = {
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT tgname FROM pg_trigger "
+                        "WHERE NOT tgisinternal AND tgenabled = 'O' "
+                        "AND tgname = ANY(%s)",
+                        (list(_TEE_PRIMARY_TRIGGERS),),
+                    ).fetchall()
+                }
         if actual_heads != expected_heads:
             raise RuntimeError(
                 "TEE database schema is not at the application head: "
                 f"expected={sorted(expected_heads)} actual={sorted(actual_heads)}; "
-                "run the owner-only alembic_tee migration workflow before startup"
+                "automatic TEE startup migration did not converge"
             )
         if enabled_triggers != _TEE_PRIMARY_TRIGGERS:
             raise RuntimeError(
@@ -287,7 +288,7 @@ def init_schema() -> None:
                 f"actual={sorted(enabled_triggers)}; run "
                 "admin.phase4_cutover --apply --confirm-writes-frozen before startup"
             )
-        log.info("[db] TEE schema at head (read-only assertion: %s)",
+        log.info("[db] TEE schema at head (automatic Alembic upgrade: %s)",
                  ",".join(sorted(actual_heads)))
         return
 
