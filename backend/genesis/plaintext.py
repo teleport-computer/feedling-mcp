@@ -532,6 +532,9 @@ def _recommended_distill_model(store, api_key: str | None) -> str | None:
         for item in catalog.get("models") or []
         if (
             isinstance(item, dict)
+            and re.fullmatch(
+                r"[A-Za-z0-9._/:-]+", str(item.get("id") or "")
+            ) is not None
             and "thinking" not in str(item.get("id") or "").lower()
             and not _openai_compatible_gemini_flash(str(item.get("id") or ""))
         )

@@ -13,6 +13,8 @@ from alembic.script import ScriptDirectory
 ROOT = Path(__file__).parent.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 TEE_MIGRATE_WORKFLOW = ROOT / ".github" / "workflows" / "tee-migrate.yml"
+PG_DEPLOY_WORKFLOW = ROOT / ".github" / "workflows" / "pg-deploy.yml"
+REDIS_DEPLOY_WORKFLOW = ROOT / ".github" / "workflows" / "redis-deploy.yml"
 TEST_COMPOSE = ROOT / "deploy" / "docker-compose.phala.test.yaml"
 TEST_RUNNER_COMPOSE = ROOT / "deploy" / "docker-compose.phala.runner.yaml"
 PROD_COMPOSE = ROOT / "deploy" / "docker-compose.phala.yaml"
@@ -1011,8 +1013,10 @@ def test_every_test_cvm_touching_job_is_locked_to_the_test_branch():
     this set and has to justify its own branch gate.  Anchoring on the pin
     instead made such a job structurally invisible.
 
-    Scope: ``ci.yml``.  ``pg-deploy.yml`` and ``redis-deploy.yml`` reach their
-    own CVMs and are deliberately not covered here.
+    ``ci.yml`` gates test jobs on ``github.ref``.  The manual PG/Redis workflows
+    instead check out the branch selected by their environment input and resolve
+    the same environment's infrastructure inventory before every CVM sink;
+    both forms are part of this guard's scope.
     """
     # Prove the domination check before trusting it: a mention of the test ref
     # is not the same as a dependence on it.
@@ -1049,6 +1053,94 @@ def test_every_test_cvm_touching_job_is_locked_to_the_test_branch():
             f"{name} reaches a shared test CVM on runs where github.ref is not "
             f"refs/heads/test: {condition!r}"
         )
+
+    expected_refs = {
+        "${{ inputs.environment == 'prod' && 'main' || "
+        "inputs.environment == 'pre' && 'pre' || 'test' }}",
+        "${{ inputs.environment == 'prod' && 'main' || "
+        "(inputs.environment == 'pre' && 'pre' || 'test') }}",
+    }
+    for path, service in (
+        (PG_DEPLOY_WORKFLOW, "pg"),
+        (REDIS_DEPLOY_WORKFLOW, "redis"),
+    ):
+        workflow = yaml.safe_load(path.read_text())
+        triggers = workflow[True] if True in workflow else workflow["on"]
+        assert set(triggers) == {"workflow_dispatch"}, path.name
+
+        manual_jobs = workflow["jobs"]
+        reaching = _cvm_reaching_jobs(manual_jobs, _phala_reaching_scripts())
+        assert reaching == {"deploy"}, (path.name, sorted(reaching))
+        steps = manual_jobs["deploy"]["steps"]
+
+        checkouts = [
+            (index, step)
+            for index, step in enumerate(steps)
+            if str(step.get("uses") or "").startswith("actions/checkout@")
+        ]
+        assert len(checkouts) == 1, path.name
+        checkout_index, checkout = checkouts[0]
+        assert checkout.get("with", {}).get("ref") in expected_refs, path.name
+
+        resolvers = [
+            (index, step)
+            for index, step in enumerate(steps)
+            if step.get("id") == "cvm"
+        ]
+        assert len(resolvers) == 1, path.name
+        resolve_index, resolver = resolvers[0]
+        assert checkout_index < resolve_index, path.name
+        assert resolver.get("env", {}).get("ENVIRONMENT") == "${{ inputs.environment }}", (
+            path.name,
+            resolver.get("name"),
+        )
+        resolve_run = str(resolver.get("run") or "")
+        assert (
+            f'F="deploy/${{ENVIRONMENT}}-{service}-cvm-id.txt"' in resolve_run
+        ), path.name
+        cvm_assignments = [
+            line.strip()
+            for line in resolve_run.splitlines()
+            if re.match(r"^\s*CVM_ID=", line)
+        ]
+        assert cvm_assignments == [
+            'CVM_ID=$(grep -v \'^#\' "$F" | tr -d \'[:space:]\' | head -1 || true)'
+        ], path.name
+        output_line = 'echo "id=$CVM_ID" >> "$GITHUB_OUTPUT"'
+        assert resolve_run.index(cvm_assignments[0]) < resolve_run.index(output_line), (
+            path.name,
+            resolver.get("name"),
+        )
+
+        targets = 0
+        for index, step in enumerate(steps):
+            run = str(step.get("run") or "")
+            step_targets = [
+                target
+                for line in run.splitlines()
+                for position in CVM_TARGET_POSITIONS
+                for target in position.findall(line)
+            ]
+            if not step_targets:
+                continue
+            targets += len(step_targets)
+            assert index > resolve_index, path.name
+            assert step.get("env", {}).get("CVM_ID") == "${{ steps.cvm.outputs.id }}", (
+                path.name,
+                step.get("name"),
+            )
+            assert not re.search(r"^\s*(?:export\s+)?CVM_ID=", run, re.MULTILINE), (
+                path.name,
+                step.get("name"),
+            )
+            for target in step_targets:
+                variable = QUOTED_VARIABLE.fullmatch(target)
+                assert variable and variable.group(1) == "CVM_ID", (
+                    path.name,
+                    step.get("name"),
+                    target,
+                )
+        assert targets >= 2, (path.name, targets)
 
 
 def test_test_release_jobs_only_run_for_pushes_to_test():

@@ -1268,6 +1268,7 @@ def test_recommended_distill_model_catalog_priority(monkeypatch):
     def catalog(*_args, **kwargs):
         captured.update(kwargs)
         return {"models": [
+            {"id": "[限时特价不稳定按次]claude-haiku-4-5"},
             {"id": "vendor/flash-thinking"},
             {"id": "vendor/mini-fast"},
             {"id": "vendor/haiku-fast"},
