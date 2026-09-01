@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Trace 覆盖矩阵
 
 > 第二版(claude2, 2026-08-21)。**按产品事件重画,不再按代码里已有的东西画。**

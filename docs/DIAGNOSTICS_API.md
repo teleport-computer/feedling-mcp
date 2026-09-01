@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # 诊断日志收集 API
 
 让 App 一键把本地 `diagnostics.log` 上报到后端,开发者按 `user_id` 取回排查问题。
