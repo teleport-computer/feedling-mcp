@@ -185,9 +185,9 @@ def emit_trace_event_payload(store, payload):
         # nothing forwarded them here -- so every event arriving on this path
         # landed with job_id NULL and outcome_class at its default, which made
         # the taxonomy inert rather than wrong.  Untrusted resident payloads are
-        # safe: trace_event and insert_trace_events_strict each normalise an
-        # unknown class back to the default.
-        outcome_class=str(ev.get("outcome_class") or db.TRACE_OUTCOME_DEFAULT),
+        # safe: insert_trace_events_strict normalises an unknown class back to
+        # the default and records whether this input was missing or invalid.
+        outcome_class=ev.get("outcome_class"),
         trace_id=str(ev.get("trace_id") or ""),
         turn_id=str(ev.get("turn_id") or ""),
         job_id=str(ev.get("job_id") or ""),

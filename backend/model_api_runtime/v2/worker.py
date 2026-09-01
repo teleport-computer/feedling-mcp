@@ -1043,7 +1043,38 @@ def _store_wake_discarded_draft(
     fail an otherwise safely suppressed reply.
     """
     bounded = str(text or "").strip()[:WAKE_DISCARDED_DRAFT_TEXT_CAP]
-    if not bounded or wake_kind not in _WAKE_DISCARDED_DRAFT_LANES:
+    if not bounded:
+        log.warning(
+            "[v2.worker] wake discarded-draft skipped user=%s job=%s "
+            "reason=invalid_input text_present=False lane_known=%s "
+            "lane_type=%s lane_len=%d",
+            store.user_id,
+            source_job_id,
+            wake_kind in _WAKE_LANES,
+            type(wake_kind).__name__,
+            len(str(wake_kind or "")),
+        )
+        return None
+    if wake_kind not in _WAKE_DISCARDED_DRAFT_LANES:
+        if wake_kind in _WAKE_LANES:
+            log.info(
+                "[v2.worker] wake discarded-draft skipped user=%s job=%s "
+                "reason=lane_not_retained lane_type=%s lane_len=%d",
+                store.user_id,
+                source_job_id,
+                type(wake_kind).__name__,
+                len(str(wake_kind or "")),
+            )
+        else:
+            log.warning(
+                "[v2.worker] wake discarded-draft skipped user=%s job=%s "
+                "reason=invalid_input text_present=True lane_known=False "
+                "lane_type=%s lane_len=%d",
+                store.user_id,
+                source_job_id,
+                type(wake_kind).__name__,
+                len(str(wake_kind or "")),
+            )
         return None
     created_at = time.time()
     item_id = hashlib.sha256(
@@ -1085,6 +1116,13 @@ def _store_wake_discarded_draft(
     # return value; production returns an exact bool and must not emit a stored
     # trace after a swallowed primary failure.
     if persisted is False:
+        log.warning(
+            "[v2.worker] wake discarded-draft skipped user=%s job=%s "
+            "lane=%s reason=append_failed",
+            store.user_id,
+            source_job_id,
+            wake_kind,
+        )
         return None
     db.log_trim(
         str(store.user_id),
@@ -1432,7 +1470,9 @@ _COVERAGE_INCOMPLETE = "prompt_coverage_incomplete"
 # Keep the scope and kind vocabularies closed here rather than asking an admin
 # reader to infer provenance from a string shape or prefix.  ``runtime_failed``
 # is the fail-closed bucket for a future caller that forgets to register its
-# scope; it preserves a useful, content-free signal without opening the set.
+# scope; it keeps the public set closed. The normalization warning at the
+# producer boundary carries fallback provenance out-of-band, because the
+# bucket alone cannot distinguish a forgotten scope from an explicit one.
 PUBLIC_FAILURE_SCOPES = frozenset({
     "capture_recovery_failed",
     "compaction_failed",
@@ -1679,7 +1719,16 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
     else:
         candidate = type(exc).__name__.lower()
         kind = candidate if candidate in _GENERIC_FAILURE_KINDS else "error"
-    normalized_scope = scope if scope in PUBLIC_FAILURE_SCOPES else "runtime_failed"
+    if scope in PUBLIC_FAILURE_SCOPES:
+        normalized_scope = scope
+    else:
+        normalized_scope = "runtime_failed"
+        log.warning(
+            "[normalization-fallback] field=public_failure_scope "
+            "fallback=runtime_failed raw_type=%s raw_len=%d",
+            type(scope).__name__,
+            len(str(scope or "")),
+        )
     return f"{normalized_scope}:{kind}"
 
 

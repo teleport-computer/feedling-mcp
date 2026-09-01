@@ -8814,9 +8814,22 @@ TRACE_OUTCOME_CLASSES = frozenset({
     "user_unavailable",
 })
 TRACE_OUTCOME_DEFAULT = "operational_failure"
+TRACE_OUTCOME_PROVENANCE_FIELD = "outcome_class_provenance"
+TRACE_OUTCOME_PROVENANCE_VALUES = frozenset({
+    "explicit", "missing", "normalized_invalid",
+})
 _TRACE_EVENTS_RETENTION_DAYS = 30
 _TRACE_EVENTS_MIN_FUTURE_DAYS = 7
 _TRACE_EVENTS_DEFAULT_STORAGE_BUDGET_BYTES = 60_000_000_000
+
+
+def _normalize_trace_outcome_class(value: object) -> tuple[str, str]:
+    if value is None or value == "":
+        return TRACE_OUTCOME_DEFAULT, "missing"
+    candidate = str(value)
+    if candidate in TRACE_OUTCOME_CLASSES:
+        return candidate, "explicit"
+    return TRACE_OUTCOME_DEFAULT, "normalized_invalid"
 
 
 def insert_trace_events_strict(
@@ -8842,10 +8855,11 @@ def insert_trace_events_strict(
             event_ts = float(raw.get("ts") or time.time())
         except (TypeError, ValueError) as exc:
             raise ValueError("trace event ts must be numeric") from exc
-        detail = raw.get("detail") if isinstance(raw.get("detail"), dict) else {}
-        outcome_class = str(raw.get("outcome_class") or TRACE_OUTCOME_DEFAULT)
-        if outcome_class not in TRACE_OUTCOME_CLASSES:
-            outcome_class = TRACE_OUTCOME_DEFAULT
+        detail = dict(raw.get("detail")) if isinstance(raw.get("detail"), dict) else {}
+        outcome_class, outcome_provenance = _normalize_trace_outcome_class(
+            raw.get("outcome_class")
+        )
+        detail[TRACE_OUTCOME_PROVENANCE_FIELD] = outcome_provenance
         normalized.append((
             uid,
             event_ts,

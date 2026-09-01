@@ -8,11 +8,15 @@ silently expand the admin response.
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import date, datetime, timezone
 from typing import Any, Mapping
 
 import db
+
+
+log = logging.getLogger("feedling.admin.memory_metadata")
 
 _CARD_LIMIT_DEFAULT = 100
 _JOB_LIMIT_DEFAULT = 100
@@ -37,6 +41,7 @@ DREAM_JOB_FIELDS = frozenset(
         "lane",
         "status",
         "failure_code",
+        "failure_code_provenance",
         "duration_ms",
         "provider",
         "model",
@@ -49,6 +54,9 @@ DREAM_JOB_FIELDS = frozenset(
 _ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
 _LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+@-]{0,95}$")
 _ERROR_CODE_RE = re.compile(r"^[a-z0-9_:-]{1,120}$")
+_FAILURE_CODE_PROVENANCE = frozenset({
+    "explicit", "missing", "normalized_invalid", "unmeasured",
+})
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -78,7 +86,22 @@ def _safe_label(value: object) -> str:
 
 def _safe_failure_code(value: object) -> str:
     text = str(value or "").strip()
-    return text if _ERROR_CODE_RE.fullmatch(text) else "runtime_failed"
+    if _ERROR_CODE_RE.fullmatch(text):
+        return text
+    log.warning(
+        "[normalization-fallback] field=admin_failure_code "
+        "fallback=runtime_failed raw_type=%s raw_len=%d",
+        type(value).__name__,
+        len(text),
+    )
+    return "runtime_failed"
+
+
+def _safe_failure_code_provenance(value: object) -> str:
+    candidate = str(value or "")
+    if candidate in _FAILURE_CODE_PROVENANCE:
+        return candidate
+    return "unmeasured"
 
 
 def _safe_timestamp(value: object) -> str:
@@ -155,6 +178,9 @@ def dream_job_metadata_from_row(row: Mapping[str, Any]) -> dict:
             _safe_failure_code(row.get("failure_code"))
             if row.get("failure_code")
             else ""
+        ),
+        "failure_code_provenance": _safe_failure_code_provenance(
+            row.get("failure_code_provenance")
         ),
         "duration_ms": safe_duration,
         "provider": _safe_label(row.get("provider")),
@@ -266,6 +292,11 @@ def list_dream_job_metadata(
                         THEN j.last_error
                         WHEN j.last_error IS NULL OR j.last_error=''
                         THEN '' ELSE 'runtime_failed' END AS failure_code,
+                   CASE WHEN j.last_error ~ '^[a-z0-9_:-]{{1,120}}$'
+                        THEN 'explicit'
+                        WHEN j.last_error IS NULL OR j.last_error=''
+                        THEN 'missing' ELSE 'normalized_invalid'
+                   END AS failure_code_provenance,
                    CASE WHEN j.finished_at IS NOT NULL THEN
                      GREATEST(0, ROUND(EXTRACT(EPOCH FROM
                        (j.finished_at-COALESCE(j.started_at,j.claimed_at,j.created_at))
@@ -297,12 +328,13 @@ def list_dream_job_metadata(
                 "user_id": row[1],
                 "status": row[2],
                 "failure_code": row[3],
-                "duration_ms": row[4],
-                "provider": row[5],
-                "model": row[6],
-                "memory_card_count_now": row[7],
-                "created_at": row[8],
-                "finished_at": row[9],
+                "failure_code_provenance": row[4],
+                "duration_ms": row[5],
+                "provider": row[6],
+                "model": row[7],
+                "memory_card_count_now": row[8],
+                "created_at": row[9],
+                "finished_at": row[10],
             }
         )
         for row in rows

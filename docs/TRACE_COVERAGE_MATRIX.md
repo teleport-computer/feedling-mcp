@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Trace 覆盖矩阵
 
 > 第二版(claude2, 2026-08-21)。**按产品事件重画,不再按代码里已有的东西画。**
@@ -62,7 +66,7 @@
 
 | 项 | 值 | 出处 |
 |---|---|---|
-| 落地 | **append-only 表 `trace_events`**,按天分区 | `db.insert_trace_events_strict` |
+| 落地 | **append-only 表 `trace_events`**,按天分区；`detail.outcome_class_provenance` 区分显式值、缺值与非法值归一 | `db.insert_trace_events_strict` |
 | 保留 | **30 天** | `db._TRACE_EVENTS_RETENTION_DAYS` |
 | 销号 | **不删** —— 事后查 bug 用 | T184 决策 |
 | 读侧 | `db.query_trace_events`,admin `/v1/admin/data-track/debug` | `admin/data_track.py` |
