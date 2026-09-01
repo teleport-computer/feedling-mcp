@@ -194,6 +194,76 @@ def test_call_agent_cli_emits_error_on_nonzero_rc(monkeypatch):
     assert calls[1]["detail"]["error_class"] in crc.CONSUMER_ERROR_CLASSES
 
 
+def test_call_agent_cli_exit_zero_logical_failure_is_not_done(monkeypatch):
+    """The prod pi failure shape exits zero but has no assistant reply.
+
+    The trace terminal must follow the real parser outcome, not the transport
+    return code.  Reverting to ``returncode == 0`` makes this exact test emit a
+    false ``agent.model.call.done`` again.
+    """
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json")
+    monkeypatch.setattr(
+        crc,
+        "_prepare_cli_command",
+        lambda message, **kwargs: (["pi", "--mode", "json"], None),
+    )
+    result = subprocess.CompletedProcess(
+        args=["pi", "--mode", "json"],
+        returncode=0,
+        stdout=(
+            '{"type":"message_end","message":{"role":"assistant",'
+            '"content":[]},"stopReason":"error",'
+            '"errorMessage":"upstream rejected"}'
+        ),
+        stderr="",
+    )
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+
+    calls, fake_emit = _recorder()
+    monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
+
+    with pytest.raises(RuntimeError, match="pi agent produced no reply"):
+        crc.call_agent_cli("hi", trace_id="trace-pi-exit-zero-error")
+
+    assert [call["type"] for call in calls] == [
+        "agent.model.call.start",
+        "agent.model.call.error",
+    ]
+    assert calls[-1]["detail"]["driver"] == "pi"
+    assert calls[-1]["detail"]["rc"] == 0
+
+
+def test_call_agent_cli_pi_parsed_reply_remains_done(monkeypatch):
+    """A parsed reply is positive success evidence for an exit-zero driver."""
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json")
+    monkeypatch.setattr(
+        crc,
+        "_prepare_cli_command",
+        lambda message, **kwargs: (["pi", "--mode", "json"], None),
+    )
+    result = subprocess.CompletedProcess(
+        args=["pi", "--mode", "json"],
+        returncode=0,
+        stdout=(
+            '{"type":"message_end","message":{"role":"assistant",'
+            '"content":[{"type":"text","text":"ok"}]}}'
+        ),
+        stderr="",
+    )
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+
+    calls, fake_emit = _recorder()
+    monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
+
+    assert crc.call_agent_cli("hi", trace_id="trace-pi-ok") == "ok"
+    assert [call["type"] for call in calls] == [
+        "agent.model.call.start",
+        "agent.model.call.done",
+    ]
+    assert calls[-1]["detail"]["driver"] == "pi"
+    assert calls[-1]["detail"]["rc"] == 0
+
+
 def test_call_agent_cli_emits_error_on_timeout_and_reraises(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
     monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["mycli", "ask", message], None))
