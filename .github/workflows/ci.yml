@@ -491,6 +491,14 @@ jobs:
             tests/test_perception_trend_dispatch.py \
             -v
 
+      - name: E2E probe unit tests (deterministic, no live environment)
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m pytest \
+            tests/test_e2e_deep_probes.py \
+            -v
+
       # PerceptKit（感知内核的外部包）在 io 侧的接线。三个文件要真库：
       # 它们不走 conftest 的 DATABASE_URL，而是自己按 PERCEPTKIT_TEST_PG 连，
       # 因为验的就是真事务边界、并发下只有一个胜者、崩溃恢复 ——
