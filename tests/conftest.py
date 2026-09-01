@@ -338,6 +338,10 @@ if not _provisioned:
         "test_perceptkit_readback.py",
         # kit 接管唤醒那一层。规则和投递语义都是纯函数。
         "test_perceptkit_wakes.py",
+        # 历史搬家的转换。逐个信号的映射是纯函数（要库的几条自己 skip）。
+        "test_perceptkit_backfill.py",
+        # 趋势改读 kit 的日聚合。往返翻译是纯函数。
+        "test_perceptkit_trend_read.py",
         "test_provider_client.py",
         "test_provider_tools_gemini.py",
         "test_provider_catalog_unit.py",

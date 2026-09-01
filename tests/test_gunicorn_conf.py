@@ -33,7 +33,11 @@ def test_on_starting_calls_assert_hosting_ready(monkeypatch):
         called = []
         monkeypatch.setattr("hosted.agent_runtime_cutover.assert_hosting_ready",
                             lambda: called.append("hosting"))
-        monkeypatch.setattr("db.init_schema", lambda: called.append("schema"))
+        monkeypatch.setattr("db.init_schema",
+                            # gunicorn 那边传 tee_auto_migrate=True（46af533e 之后），
+                            # 假实现要能收下它 —— 收不下的话这条测的就不再是
+                            # 「启动时调了迁移」，而是「mock 的签名对不对」。
+                            lambda **_kw: called.append("schema"))
         monkeypatch.setattr(
             "hosted.config_store.reconcile_hosted_runtime_policy",
             lambda: called.append("policy") or {"policy": "per_user"},
@@ -55,7 +59,7 @@ def test_on_starting_closes_master_pool_when_policy_reconcile_fails(monkeypatch)
     monkeypatch.setattr(
         "hosted.agent_runtime_cutover.assert_hosting_ready", lambda: None
     )
-    monkeypatch.setattr("db.init_schema", lambda: None)
+    monkeypatch.setattr("db.init_schema", lambda **_kw: None)
 
     def fail_policy():
         raise RuntimeError("policy failed")

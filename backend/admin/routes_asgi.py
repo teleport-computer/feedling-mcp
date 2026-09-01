@@ -259,6 +259,42 @@ async def perceptkit_report(request: Request):
     return JSONResponse(await threadpool.run_db(_build))
 
 
+@router.post("/v1/admin/perceptkit/backfill")
+async def perceptkit_backfill(request: Request):
+    """把老路的日聚合搬进 kit 的表。
+
+    **默认只试跑**，要真写必须显式 `?apply=1` —— 和保留期清理同一个规矩：
+    先看一眼数字，再决定要不要动。这一个不删任何东西（只读老表、写新表），
+    所以比那个安全，但「先看再做」的习惯值得保持。
+
+    可以重复跑：按 (用户, 日期, 信号) 覆盖写，改了映射重跑会覆盖旧值。
+    """
+    _require_admin(request)
+    subject = request.query_params.get("user_id") or None
+    apply = (request.query_params.get("apply") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+    def _run():
+        import db
+        from perception.perceptkit_adapter import backfill
+        with db.get_pool().connection() as conn:
+            conn.autocommit = True
+            plan = backfill.run(conn, subject_id=subject, dry_run=not apply)
+            return {
+                "applied": plan.applied,
+                "rows_read": plan.rows_read,
+                "migrated_total": plan.total,
+                "migrated": plan.migrated,
+                # 跳过的必须带理由 —— 「搬完了」和「搬了一半剩下的悄悄没了」
+                # 不能长得一样。
+                "skipped": plan.skipped,
+                "skip_reasons": plan.reasons,
+                "summary": backfill.format_plan(plan),
+            }
+
+    return JSONResponse(await threadpool.run_db(_run))
+
+
 @router.get("/v1/admin/route-fence-audit")
 async def route_fence_audit(request: Request):
     """Read-only L1 inventory; remediation intentionally remains CLI-only."""

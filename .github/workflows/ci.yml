@@ -519,6 +519,8 @@ jobs:
             tests/test_perceptkit_readback.py \
             tests/test_perceptkit_wakes.py \
             tests/test_perceptkit_report.py \
+            tests/test_perceptkit_backfill.py \
+            tests/test_perceptkit_trend_read.py \
             tests/test_perceptkit_ios_adapter.py \
             tests/test_perceptkit_worker.py \
             -v | tee /tmp/perceptkit-pytest.log
