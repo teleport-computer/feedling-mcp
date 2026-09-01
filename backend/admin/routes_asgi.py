@@ -17,7 +17,8 @@ Each handler's body is produced by the same ``admin.data_track`` functions the
 Flask routes call — via ``admin.admin_core``, which runs them inside a throwaway
 Flask request context so ``request.args`` is read from the ASGI query string —
 so the data-track output is byte-for-byte the Flask output. Blocking sync
-``db.py`` work runs through ``threadpool.run_db`` (plan §5.2).
+``db.py`` work on the data-track route family runs through a bounded ASGI
+deadline; each DB callable also owns its server-side statement timeout.
 """
 
 from __future__ import annotations
@@ -47,9 +48,29 @@ from model_api_runtime.v2 import jobs_store
 router = APIRouter()
 
 DEBUG_TRACE_REQUEST_TIMEOUT_SEC = 3.0
+DATA_TRACK_REQUEST_TIMEOUT_SEC = db._ADMIN_DATA_TRACK_READ_TIMEOUT_MS / 1000
 
 _ADMIN_SESSION_COOKIE = "admin_session"
 _ADMIN_SESSION_MAX_AGE = 7 * 24 * 60 * 60
+
+
+class DataTrackQueryTimeout(RuntimeError):
+    """A bounded data-track DB read exceeded its HTTP or PostgreSQL budget."""
+
+
+async def _run_data_track_db(fn, *args):
+    try:
+        return await threadpool.run_db_bounded(
+            fn,
+            *args,
+            timeout_seconds=DATA_TRACK_REQUEST_TIMEOUT_SEC,
+        )
+    except (TimeoutError, QueryCanceled) as exc:
+        raise DataTrackQueryTimeout from exc
+
+
+async def _data_track_query_timeout(_request, _exc):
+    return responses.json_error(503, {"error": "data_track_query_timeout"})
 
 
 def _admin_session_secret() -> bytes | None:
@@ -174,14 +195,14 @@ async def admin_logout():
 @router.get("/v1/admin/data-track/summary")
 async def data_track_summary(request: Request):
     _require_admin(request)
-    payload = await threadpool.run_db(admin_core.summary_payload, request.url.query)
+    payload = await _run_data_track_db(admin_core.summary_payload, request.url.query)
     return JSONResponse(payload)
 
 
 @router.get("/v1/admin/data-track/users")
 async def data_track_users(request: Request):
     _require_admin(request)
-    payload = await threadpool.run_db(admin_core.users_payload, request.url.query)
+    payload = await _run_data_track_db(admin_core.users_payload, request.url.query)
     return JSONResponse(payload)
 
 
@@ -189,7 +210,7 @@ async def data_track_users(request: Request):
 async def data_track_dau(request: Request):
     _require_admin(request)
     try:
-        payload = await threadpool.run_db(admin_core.dau_payload, request.url.query)
+        payload = await _run_data_track_db(admin_core.dau_payload, request.url.query)
     except admin_core.InvalidDauDay:
         return JSONResponse({"error": "invalid_day"}, status_code=400)
     return JSONResponse(payload)
@@ -199,7 +220,7 @@ async def data_track_dau(request: Request):
 async def data_track_events(request: Request):
     _require_admin(request)
     try:
-        payload = await threadpool.run_db(admin_core.events_payload, request.url.query)
+        payload = await _run_data_track_db(admin_core.events_payload, request.url.query)
     except admin_core.InvalidDauDay:
         return JSONResponse({"error": "invalid_day"}, status_code=400)
     return JSONResponse(payload)
@@ -208,7 +229,7 @@ async def data_track_events(request: Request):
 @router.get("/v1/admin/data-track/growth")
 async def data_track_growth(request: Request):
     _require_admin(request)
-    payload = await threadpool.run_db(admin_core.growth_payload, request.url.query)
+    payload = await _run_data_track_db(admin_core.growth_payload, request.url.query)
     return JSONResponse(payload)
 
 
@@ -236,7 +257,7 @@ async def data_track_verdicts(request: Request):
     # throttled by the shared 4-worker admin-ops executor. Rationale continues
     # in admin_core.verdicts_payload's docstring.
     _require_admin(request)
-    payload = await threadpool.run_db(admin_core.verdicts_payload, request.url.query)
+    payload = await _run_data_track_db(admin_core.verdicts_payload, request.url.query)
     return JSONResponse(payload)
 
 
@@ -284,7 +305,9 @@ async def route_fence_audit(request: Request):
 @router.get("/v1/admin/data-track/users/{user_id}")
 async def data_track_user(user_id: str, request: Request):
     _require_admin(request)
-    body, status = await threadpool.run_db(admin_core.user_payload, request.url.query, user_id)
+    body, status = await _run_data_track_db(
+        admin_core.user_payload, request.url.query, user_id
+    )
     return JSONResponse(body, status_code=status)
 
 
@@ -327,7 +350,7 @@ async def memory_dream_jobs(request: Request):
 async def data_track_page(request: Request):
     _require_admin(request)
     try:
-        html = await threadpool.run_db(admin_core.page_html, request.url.query)
+        html = await _run_data_track_db(admin_core.page_html, request.url.query)
     except admin_core.InvalidDauDay:
         return PlainTextResponse("invalid day", status_code=400)
     return HTMLResponse(html)
@@ -340,7 +363,7 @@ async def data_track_user_lookup(request: Request):
     try:
         user_id = admin_core.normalize_data_track_user_id(raw_user_id)
     except admin_core.InvalidDataTrackUserId:
-        body = await threadpool.run_db(
+        body = await _run_data_track_db(
             admin_core.invalid_user_id_page,
             request.url.query,
             raw_user_id,
@@ -361,7 +384,9 @@ async def data_track_user_lookup(request: Request):
 @router.get("/admin/data-track/users/{user_id}")
 async def data_track_user_page(user_id: str, request: Request):
     _require_admin(request)
-    kind, body, status = await threadpool.run_db(admin_core.user_page, request.url.query, user_id)
+    kind, body, status = await _run_data_track_db(
+        admin_core.user_page, request.url.query, user_id
+    )
     if kind == "text":
         return PlainTextResponse(body, status_code=status)
     return HTMLResponse(body, status_code=status)
@@ -640,4 +665,5 @@ async def lane_rollup(request: Request):
 
 
 def register_asgi(app) -> None:
+    app.add_exception_handler(DataTrackQueryTimeout, _data_track_query_timeout)
     app.include_router(router)

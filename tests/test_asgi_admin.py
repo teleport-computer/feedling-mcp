@@ -17,11 +17,15 @@ from the query string). Covers:
 from __future__ import annotations
 
 import asyncio
+import ast
 import base64
+import inspect
 import itertools
 import json
 import re
 import sys
+import textwrap
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -237,6 +241,71 @@ def test_debug_route_deadline_abandons_a_slow_sync_worker(env, monkeypatch):
 
     assert (status, payload) == (503, {"error": "debug_query_timeout"})
     assert elapsed < 1.0
+
+
+def test_t428_all_ten_data_track_routes_use_bounded_db_bridge():
+    handlers = (
+        admin_asgi.data_track_summary,
+        admin_asgi.data_track_users,
+        admin_asgi.data_track_dau,
+        admin_asgi.data_track_events,
+        admin_asgi.data_track_growth,
+        admin_asgi.data_track_verdicts,
+        admin_asgi.data_track_user,
+        admin_asgi.data_track_page,
+        admin_asgi.data_track_user_lookup,
+        admin_asgi.data_track_user_page,
+    )
+
+    assert admin_asgi.DATA_TRACK_REQUEST_TIMEOUT_SEC == (
+        db._ADMIN_DATA_TRACK_READ_TIMEOUT_MS / 1000
+    )
+    for handler in handlers:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(handler)))
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+        bounded_calls = [
+            node
+            for node in calls
+            if isinstance(node.func, ast.Name)
+            and node.func.id == "_run_data_track_db"
+        ]
+        raw_calls = [
+            node
+            for node in calls
+            if isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "threadpool"
+            and node.func.attr == "run_db"
+        ]
+        assert len(bounded_calls) == 1, handler.__name__
+        assert raw_calls == [], handler.__name__
+
+
+def test_t428_data_track_deadline_returns_503_without_waiting_for_db(
+    env, monkeypatch
+):
+    release = threading.Event()
+    safety_release = threading.Timer(1.0, release.set)
+
+    def slow_summary(_query):
+        release.wait(1.0)
+        return {"too_late": True}
+
+    monkeypatch.setattr(admin_asgi, "DATA_TRACK_REQUEST_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(admin_asgi.admin_core, "summary_payload", slow_summary)
+    safety_release.start()
+    started = time.monotonic()
+    try:
+        status, payload = _asgi_json(
+            "GET", "/v1/admin/data-track/summary", headers=_admin()
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        safety_release.cancel()
+
+    assert (status, payload) == (503, {"error": "data_track_query_timeout"})
+    assert elapsed < 0.5
 
 
 # --------------------------------------------------------------------------- #

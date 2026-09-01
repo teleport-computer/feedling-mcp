@@ -1456,6 +1456,14 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
 _ADMIN_DATA_TRACK_READ_TIMEOUT_MS = 5000
 
 
+class AdminDataTrackDauReadError(RuntimeError):
+    """The DAU query failed; callers must not present that as a true empty set."""
+
+
+class AdminDataTrackDailyUsageReadError(RuntimeError):
+    """A user's daily usage query failed; zero-filled days would be misleading."""
+
+
 @contextmanager
 def _admin_data_track_connection():
     """Lease one bounded admin connection without poisoning the shared pool."""
@@ -2368,7 +2376,7 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
     snapshot_since = " AND snap.first_ts >= s.since_epoch" if since > 0 else ""
 
     try:
-        with get_pool().connection() as conn:
+        with _admin_data_track_connection() as conn:
             boundary = conn.execute(
                 f"""
                 WITH RECURSIVE settings AS (
@@ -2497,7 +2505,7 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
         return [_dau_row(row) for row in rows]
     except Exception as e:
         log.error("[db] admin_data_track_dau failed: %s", e)
-        return []
+        raise AdminDataTrackDauReadError("admin data-track DAU query failed") from e
 
 
 def _admin_utc_text_timestamp_sql(
@@ -2864,26 +2872,8 @@ def admin_data_track_user_daily_usage(
     except (TypeError, ValueError):
         day_limit = 14
 
-    # Keep the read-helper fail-soft contract while still returning the useful
-    # zero-filled shape if PostgreSQL is temporarily unavailable.
     try:
-        zone = ZoneInfo(tz)
-    except Exception:
-        zone = ZoneInfo("Asia/Shanghai")
-    today = datetime.now(zone).date()
-    empty = [
-        {
-            "day": (today - timedelta(days=offset)).isoformat(),
-            "foreground_sec": 0,
-            "sessions": 0,
-            "max_session_sec": 0,
-        }
-        for offset in range(day_limit)
-    ]
-    empty.reverse()
-
-    try:
-        with get_pool().connection() as conn:
+        with _admin_data_track_connection() as conn:
             rows = conn.execute(
                 """
                 WITH local_clock AS (
@@ -2963,7 +2953,9 @@ def admin_data_track_user_daily_usage(
             day_limit,
             e,
         )
-        return empty
+        raise AdminDataTrackDailyUsageReadError(
+            "admin data-track daily usage query failed"
+        ) from e
 
 
 def _completed_dau_row(conn, *, day: date, tz: str) -> dict:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -491,6 +492,7 @@ def test_d3_dau_bad_day_is_visible_in_json_and_html(monkeypatch):
         bad = dt._data_track_dau_payload()
         bad_html = dt._render_data_track_dau_page(bad)
     assert bad["observability"] == {
+        "dau_query": "ok",
         "day_values": "invalid",
         "invalid_day_rows": 1,
     }
@@ -501,10 +503,59 @@ def test_d3_dau_bad_day_is_visible_in_json_and_html(monkeypatch):
         empty = dt._data_track_dau_payload()
         empty_html = dt._render_data_track_dau_page(empty)
     assert empty["observability"] == {
+        "dau_query": "ok",
         "day_values": "ok",
         "invalid_day_rows": 0,
     }
     assert "DAU 行里有 day 值读不出来" not in empty_html
+
+
+def test_t428_dau_query_failure_is_distinct_from_true_zero(monkeypatch):
+    state = {"failed": False}
+
+    class EmptyResult:
+        def fetchone(self):
+            return None, None
+
+        def fetchall(self):
+            return []
+
+    class EmptyConnection:
+        def execute(self, *_args, **_kwargs):
+            return EmptyResult()
+
+    @contextlib.contextmanager
+    def connection():
+        if state["failed"]:
+            raise RuntimeError("injected query failure")
+        yield EmptyConnection()
+
+    monkeypatch.setattr(dt.db, "admin_dau_snapshot_bounds", lambda: {})
+    monkeypatch.setattr(dt.db, "_admin_data_track_connection", connection)
+    monkeypatch.setattr(
+        dt.db,
+        "admin_data_track_usage_histogram",
+        lambda **kwargs: {
+            "day": kwargs["day"],
+            "total_users": 0,
+            "buckets": [],
+        },
+    )
+
+    with bind("view=dau"):
+        true_zero = dt._data_track_dau_payload()
+        true_zero_html = dt._render_data_track_dau_page(true_zero)
+    state["failed"] = True
+    with bind("view=dau"):
+        query_failed = dt._data_track_dau_payload()
+        query_failed_html = dt._render_data_track_dau_page(query_failed)
+
+    assert true_zero["rows"] == query_failed["rows"] == []
+    assert true_zero["observability"] != query_failed["observability"]
+    assert true_zero["observability"]["dau_query"] == "ok"
+    assert query_failed["observability"]["dau_query"] == "failed"
+    assert "DAU 查询失败" not in true_zero_html
+    assert "DAU 查询失败" in query_failed_html
 
 
 def test_d4_bad_consumer_poll_is_distinct_from_no_poll():
