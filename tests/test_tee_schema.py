@@ -219,6 +219,20 @@ def _tee_conn():
     return psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True)
 
 
+def _shared_public_tables() -> set[str]:
+    """Shared-table denominator independent of any contract being compared."""
+    query = (
+        "SELECT tablename FROM pg_tables WHERE schemaname='public' "
+        "ORDER BY tablename"
+    )
+
+    def tables(url: str) -> set[str]:
+        with psycopg.connect(url) as conn:
+            return {row[0] for row in conn.execute(query).fetchall()}
+
+    return tables(os.environ["DATABASE_URL"]) & tables(os.environ["TEE_DATABASE_URL"])
+
+
 def test_tee_schema_has_all_tables():
     # agent_runtime_instances / agent_runtime_supervisor_heartbeats: 0002_drop_retired_
     # hosted_supervisor 曾按"V1 supervisor 已退役"把这两张表从这里的 want 集合里撤下
@@ -354,11 +368,11 @@ def test_tee_primary_shared_unique_contracts_match_runtime_schema():
 
     rds = contracts(os.environ["DATABASE_URL"])
     tee = contracts(os.environ["TEE_DATABASE_URL"])
-    shared = set(rds) & set(tee)
+    shared = _shared_public_tables()
     missing = {
-        table: sorted(rds[table] - tee[table], key=repr)
+        table: sorted(rds.get(table, set()) - tee.get(table, set()), key=repr)
         for table in sorted(shared)
-        if rds[table] - tee[table]
+        if rds.get(table, set()) - tee.get(table, set())
     }
     assert missing == {}
 
@@ -486,13 +500,32 @@ def test_tee_primary_shared_runtime_indexes_match_runtime_schema():
 
     rds = indexes(os.environ["DATABASE_URL"])
     tee = indexes(os.environ["TEE_DATABASE_URL"])
-    shared = set(rds) & set(tee)
+    shared = _shared_public_tables()
     missing = {
-        table: sorted(rds[table] - tee[table], key=repr)
+        table: sorted(rds.get(table, set()) - tee.get(table, set()), key=repr)
         for table in sorted(shared)
-        if rds[table] - tee[table]
+        if rds.get(table, set()) - tee.get(table, set())
     }
     assert missing == {}
+
+
+def test_tee_index_parity_denominator_includes_an_indexless_shared_table():
+    """Dropping every TEE index for one table must not erase the offender."""
+    table = "_tee_index_denominator_probe"
+    with (
+        psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as rds,
+        psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as tee,
+    ):
+        rds.execute(f"CREATE TABLE {table} (id text UNIQUE)")
+        tee.execute(f"CREATE TABLE {table} (id text)")
+        try:
+            with pytest.raises(AssertionError, match=table):
+                test_tee_primary_shared_unique_contracts_match_runtime_schema()
+            with pytest.raises(AssertionError, match=table):
+                test_tee_primary_shared_runtime_indexes_match_runtime_schema()
+        finally:
+            rds.execute(f"DROP TABLE {table}")
+            tee.execute(f"DROP TABLE {table}")
 
 
 def test_tee_voice_call_sessions_match_the_primary_lifecycle_contract():
