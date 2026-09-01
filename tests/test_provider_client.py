@@ -495,6 +495,22 @@ def test_build_openai_compat_payload_shape():
     assert "response_format" not in p2
 
 
+@pytest.mark.parametrize("invalid", [0, -1, None, "not-an-integer"])
+def test_chat_output_budget_rejects_invalid_instead_of_mimicking_empty_reply(
+    invalid,
+):
+    with pytest.raises(ValueError, match="positive integer"):
+        pc.cap_chat_output_tokens(invalid)
+
+
+def test_chat_output_budget_preserves_legal_one_and_shared_ceiling():
+    assert pc.cap_chat_output_tokens(1) == 1
+    assert (
+        pc.cap_chat_output_tokens(pc.CHAT_OUTPUT_MAX_TOKENS * 2)
+        == pc.CHAT_OUTPUT_MAX_TOKENS
+    )
+
+
 def test_all_chat_payload_builders_share_the_output_ceiling():
     source = Path(pc.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)

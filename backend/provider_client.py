@@ -93,8 +93,20 @@ def is_token_limit_stop_reason(value: Any) -> bool:
 
 
 def cap_chat_output_tokens(value: Any) -> int:
-    """Clamp one requested completion budget to the shared chat-wire ceiling."""
-    return max(1, min(int(value), CHAT_OUTPUT_MAX_TOKENS))
+    """Clamp to the ceiling; reject invalid/non-positive budgets with ValueError.
+
+    Rewriting a caller bug to one token is indistinguishable from an empty
+    provider reply and wrongly attributes the failure to the provider.
+    """
+    try:
+        requested = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "chat output token budget must be a positive integer"
+        ) from exc
+    if requested <= 0:
+        raise ValueError("chat output token budget must be a positive integer")
+    return min(requested, CHAT_OUTPUT_MAX_TOKENS)
 
 
 def classify_provider_error(exc: BaseException) -> str:
