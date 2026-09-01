@@ -4803,6 +4803,7 @@ def test_dream_job_merge_writes_multi_supersede_without_chat_or_delivery(monkeyp
     assert [row["type"] for row in captured["traces"]] == [
         "memory.dream.start",
         "memory.dream.model.start",
+        "agent.turn.success",
         "memory.dream.model.done",
         "memory.dream.done",
     ]
@@ -5108,7 +5109,9 @@ def _foreground_reply_harness(monkeypatch, agent_result, *, actions_ok=True):
     )
     monkeypatch.setattr(
         crc, "_notify_agent_turn_failure",
-        lambda exc, *, foreground: captured["failures"].append((str(exc), foreground)),
+        lambda exc, *, foreground, **kwargs: captured["failures"].append(
+            (str(exc), foreground, kwargs)
+        ),
     )
     if actions_ok:
         monkeypatch.setattr(
@@ -5198,6 +5201,7 @@ def test_foreground_degenerate_with_fallback_disabled_posts_nothing(monkeypatch)
 
     assert _visible_replies(captured) == []
     assert captured["failures"] and captured["failures"][0][1] is True  # foreground
+    assert captured["failures"][0][2] == {"lane": "chat", "trace_id": "u-nofb"}
     assert result_ts == pytest.approx(5555.0)
 
 
@@ -5420,7 +5424,9 @@ def _degenerate_test_harness(monkeypatch, agent_result):
     monkeypatch.setattr(
         crc,
         "_notify_agent_turn_failure",
-        lambda exc, *, foreground: captured["failures"].append((str(exc), foreground)),
+        lambda exc, *, foreground, **kwargs: captured["failures"].append(
+            (str(exc), foreground, kwargs)
+        ),
     )
     monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
     monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
@@ -5447,6 +5453,11 @@ def test_process_proactive_degenerate_only_reply_fails_without_post(monkeypatch)
     failed = [s for s in captured["statuses"] if s[1] == "failed"]
     assert failed and failed[-1][2] == "degenerate_reply_suppressed"
     assert captured["failures"] and captured["failures"][-1][1] is False
+    assert captured["failures"][-1][2] == {
+        "lane": "proactive",
+        "trace_id": "pj_degen_only",
+        "job_id": "pj_degen_only",
+    }
     assert crc._self_wake_streak == 0  # no self-wake scheduled → streak untouched
 
 
@@ -6885,7 +6896,11 @@ def test_process_proactive_cards_json_reply_does_not_post_fallback(monkeypatch):
         "call_agent_http",
         lambda message, images=None, raw_text=False: '{"cards": []}',
     )
-    monkeypatch.setattr(crc, "_notify_agent_turn_failure", lambda e, foreground=True: None)
+    monkeypatch.setattr(
+        crc,
+        "_notify_agent_turn_failure",
+        lambda e, foreground=True, **kwargs: None,
+    )
     monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg_leak"})
     monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
     monkeypatch.setattr(
