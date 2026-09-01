@@ -905,14 +905,39 @@ def _legacy_wake_control_decision(user_id: str, cap_key: str, new_value=None):
     )
 
 
-def _submit_wake_event_v2_compat(event) -> None:
+def _perceptkit_owns_wakes() -> bool:
+    """kit 是不是接管了唤醒投递。
+
+    读不出来时返回 False（= 老路照投）。「开关读不出来」几乎一定是配置问题，
+    那时候维持切换前的行为最不意外 —— 而且少叫一次用户不会知道，
+    多叫一次他会。
+    """
+    try:
+        from .perceptkit_adapter import shadow
+        return shadow.wakes_enabled()
+    except Exception:                              # noqa: BLE001
+        return False
+
+
+def _submit_wake_event_v2_compat(event, *, from_kit: bool = False) -> bool:
     """Compatibility output: V2 differ event -> old proactive job queue.
 
     The wake has already been mechanically selected by PerceptionDifferV2. This
     function only applies the V2 switch gate and writes a legacy job so the
     existing hosted/resident consumers can pick it up during the strangler
     migration.
+
+    🔴 **两条路不能同时投递。** kit 接管唤醒之后，老路的 differ 仍然照常算
+    （它的结论要留着对照），但**不再落地成打扰** —— 否则同一次「回到家」会
+    排两条 job，用户被提醒两遍。kit 走 ``from_kit=True`` 直接放行。
+
+    挡在这里而不是挡在 differ：差异要继续算、继续记，只是不投递。
     """
+    if not from_kit and _perceptkit_owns_wakes():
+        log.info("perceptkit owns wakes; live trigger=%s not delivered",
+                 getattr(event, "trigger", "?"))
+        return False
+
     from proactive.controls_v2 import evaluate_wake_control_v2  # lazy
 
     settings = _settings_v2_for_user(event.user_id)
@@ -934,7 +959,7 @@ def _submit_wake_event_v2_compat(event) -> None:
             "origin_refs": list(event.origin_refs or ()),
             "ts": now,
         }, now)
-        return
+        return False
     if not decision.accepted:
         store.append_event(event.user_id, {
             "cap": "runtime_v2",
@@ -946,7 +971,7 @@ def _submit_wake_event_v2_compat(event) -> None:
             "origin_refs": list(event.origin_refs or ()),
             "ts": now,
         }, now)
-        return
+        return False
     wake_capability = _RUNTIME_V2_WAKE_CAPABILITY_BY_TRIGGER.get(
         str(event.trigger or "").strip().lower(), ""
     )
@@ -974,7 +999,7 @@ def _submit_wake_event_v2_compat(event) -> None:
             "origin_refs": list(event.origin_refs or ()),
             "ts": now,
         }, now)
-        return
+        return False
     store.append_event(event.user_id, {
         "cap": "runtime_v2",
         "type": "wake",
@@ -988,6 +1013,7 @@ def _submit_wake_event_v2_compat(event) -> None:
         "ts": now,
     }, now)
     _fire_wake_event_v2(event)
+    return True
 
 
 def _fire_wake_event_v2(event) -> None:

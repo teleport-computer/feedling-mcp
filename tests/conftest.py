@@ -336,6 +336,8 @@ if not _provisioned:
         "test_perceptkit_producers.py",
         # 切换那一层的翻译。纯函数部分不碰库（要库的几条自己 skip）。
         "test_perceptkit_readback.py",
+        # kit 接管唤醒那一层。规则和投递语义都是纯函数。
+        "test_perceptkit_wakes.py",
         "test_provider_client.py",
         "test_provider_tools_gemini.py",
         "test_provider_catalog_unit.py",

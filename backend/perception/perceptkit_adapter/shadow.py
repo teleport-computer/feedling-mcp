@@ -81,6 +81,53 @@ def _live_state(user_id: str) -> dict:
         return {}
 
 
+#: kit 负责唤醒。**默认开**，出问题设成 0 立刻回到老路判定 —— 和
+#: `FEEDLING_PERCEPTKIT_PRIMARY` 一样是回滚闸，不是等人来开的门。
+#:
+#: 两条路**不能同时投递**：老路和 kit 会为同一件事各叫一次，用户被提醒两遍。
+#: 所以这个开关是「谁来投」的单选，不是「多加一路」的加法。
+WAKE_ENV_FLAG = "FEEDLING_PERCEPTKIT_WAKES"
+
+
+def wakes_enabled() -> bool:
+    """kit 是不是负责投递唤醒。
+
+    额外一条：**store 被换成测试假实现时不投**。和快照读取那边同一个理由 ——
+    唤醒是有副作用的（写队列、写事件流），一个自以为完全隔离的测试不该因为
+    另一条路的真库写入而时红时绿。
+    """
+    if (os.environ.get(WAKE_ENV_FLAG, "1") or "1").strip().lower() in (
+            "0", "false", "no", "off"):
+        return False
+    from .. import store
+    if getattr(store, "__name__", "") != "perception.store":
+        return False
+    return enabled()
+
+
+def _kit(storage):
+    """带上规则和 WakePort 的 kit。
+
+    投递走 ``dispatch=True`` 同步做。kit 的默认是留在发件箱、由 worker 去投，
+    理由是别把 agent runtime 的延迟叠到上报接口上 —— io 这边不适用：我们投的
+    是**排队**（写一条 job），不是等 agent 想完话，耗时毫秒级。事件仍然先落
+    发件箱再投，崩溃了下次还能补投。
+    """
+    from perceptkit.kit import PerceptionKit
+    from perceptkit.manifest.minimal import MINIMAL_SIGNALS
+
+    from .wake_port import FeedlingWakePort
+    from .wake_rules import wake_definitions
+
+    on = wakes_enabled()
+    return PerceptionKit(
+        storage=storage,
+        signals=MINIMAL_SIGNALS,
+        wake=FeedlingWakePort() if on else None,
+        definitions=wake_definitions() if on else (),
+    )
+
+
 def _live_timezone(user_id: str) -> str | None:
     """The user's timezone as the live path last recorded it.
 
@@ -147,9 +194,10 @@ def observe(
         with db.get_pool().connection() as conn:
             conn.autocommit = True
             storage = PostgresStorage(conn)
-            kit = PerceptionKit(storage=storage, signals=MINIMAL_SIGNALS)
+            kit = _kit(storage)
             outcome = kit.ingest(envelope,
-                                 context=IngestContext(user_id, received))
+                                 context=IngestContext(user_id, received),
+                                 dispatch=wakes_enabled())
             # The comparison, which is the reason the shadow exists. It runs
             # against the live state *after* the live path has written it --
             # the caller does that before handing control here -- so both
@@ -218,8 +266,9 @@ def _run(user_id: str, envelope: Mapping[str, Any], *,
     with db.get_pool().connection() as conn:
         conn.autocommit = True
         storage = PostgresStorage(conn)
-        kit = PerceptionKit(storage=storage, signals=MINIMAL_SIGNALS)
-        outcome = kit.ingest(envelope, context=IngestContext(user_id, received))
+        kit = _kit(storage)
+        outcome = kit.ingest(envelope, context=IngestContext(user_id, received),
+                             dispatch=wakes_enabled())
         findings = []
         if compare_signals:
             findings = _compare.compare(
@@ -385,7 +434,7 @@ def mirror_reminders(user_id: str, payload: Mapping[str, Any]) -> dict[str, Any]
 
 
 __all__ = [
-    "ENV_FLAG", "BUDGET_SEC", "enabled", "observe",
+    "ENV_FLAG", "WAKE_ENV_FLAG", "BUDGET_SEC", "enabled", "wakes_enabled", "observe",
     "observe_photo", "observe_device_event", "observe_app_event",
     "observe_location", "mirror_calendar", "mirror_reminders",
 ]
