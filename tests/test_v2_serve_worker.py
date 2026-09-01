@@ -417,7 +417,9 @@ def test_main_configures_parent_pool_to_eight_before_db_startup(monkeypatch):
         lambda value: order.append(("configure", value)) or value,
     )
     monkeypatch.setattr(
-        serve_worker.db, "init_schema", lambda: order.append(("init", None))
+        serve_worker.db,
+        "init_schema",
+        lambda *, tee_auto_migrate=False: order.append(("init", tee_auto_migrate)),
     )
     monkeypatch.setattr(serve_worker, "wire_assembly", lambda: None)
     monkeypatch.setattr(
@@ -434,7 +436,7 @@ def test_main_configures_parent_pool_to_eight_before_db_startup(monkeypatch):
 
     assert order == [
         ("configure", 8),
-        ("init", None),
+        ("init", True),
         ("trace_stop", None),
     ]
 

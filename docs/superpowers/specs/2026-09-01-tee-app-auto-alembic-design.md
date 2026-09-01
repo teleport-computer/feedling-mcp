@@ -1,3 +1,7 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # TEE App-Role Automatic Alembic Design
 
 ## Goal

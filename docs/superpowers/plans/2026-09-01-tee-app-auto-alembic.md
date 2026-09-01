@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: docs/superpowers/specs/2026-09-01-tee-app-auto-alembic-design.md
+---
 # TEE App-Role Automatic Alembic Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
