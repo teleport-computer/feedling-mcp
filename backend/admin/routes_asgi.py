@@ -240,6 +240,25 @@ async def data_track_verdicts(request: Request):
     return JSONResponse(payload)
 
 
+@router.get("/v1/admin/perceptkit")
+async def perceptkit_report(request: Request):
+    """切换期的观测口：kit 和老路差在哪，唤醒都去哪了。
+
+    只读。`?user_id=` 可以缩到一个人 —— 排查「他说没收到提醒」的时候，
+    全局汇总答不了那个问题。
+    """
+    _require_admin(request)
+    subject = request.query_params.get("user_id") or None
+
+    def _build():
+        import db
+        from perception.perceptkit_adapter import report
+        with db.get_pool().connection() as conn:
+            return report.build(conn, subject_id=subject)
+
+    return JSONResponse(await threadpool.run_db(_build))
+
+
 @router.get("/v1/admin/route-fence-audit")
 async def route_fence_audit(request: Request):
     """Read-only L1 inventory; remediation intentionally remains CLI-only."""
