@@ -84,7 +84,8 @@ app_id，SAN 通配就够；日后要 verify-full 再按实际 app_id 重签 ser
 for r in OWNER APP REPLICATOR MONITORING; do echo "$r=$(openssl rand -hex 32)"; done
 ```
 **必须用 `openssl rand -hex`**（纯十六进制）——引号 / `$` / 反引号会破坏 ensure-roles 的
-SQL 与 compose 环境注入。角色：`feedling_owner`(owner) / `app`(读写业务表,无 DDL) /
+SQL 与 compose 环境注入。角色：`feedling_owner`(owner) / `app`(读写业务表，并在
+TEE-primary 启动期通过继承 owner 执行 Alembic) /
 `tee_replicator` / `monitoring`(pg_monitor,读不了业务表)。
 
 ### 2.3 钉镜像 + `phala deploy` 创建 CVM
@@ -125,6 +126,23 @@ python3 -c "from alembic_tee import upgrade_head; upgrade_head()"
 `alembic_tee` head 对齐。版本表叫 **`alembic_tee_version`**，不是 `alembic_version`；
 不要用本文历史表数或 revision 编号代替 release head 检查。
 
+### 2.4.1 TEE-primary 的正常迁移路径（当前）
+
+扶正后的 TEE-primary 环境不把迁移放进 CI。`ensure-roles.sh` 由 owner 身份幂等执行
+`GRANT feedling_owner TO app`；因此服务仍只接收 app 的 `DATABASE_URL`，却能在
+Gunicorn master 与独立 `serve-worker` 的 `db.init_schema()` 中、**就绪之前**运行
+`alembic_tee upgrade head`。服务随后才检查 `alembic_tee_version` 和 primary trigger
+清单；任何迁移或检查异常都会使新进程启动失败，而不是接流量。
+
+这是有意扩大 app 的权限边界：app DSN 可以进行 owner 可做的 DDL，不能再把它当作
+CRUD-only 凭证；但 owner DSN 不注入后端、runner 或常规部署。受保护的 owner migration
+workflow 仍可作为人工初始化/诊断通道，不能替代正常发布时的启动前迁移。
+
+操作顺序是先以 owner 凭证完成 role provisioning，再进行一次正常后端部署。若新进程的
+迁移失败，保持其 unready，并让上一健康版本继续服务。权限回退仅在代码不再依赖自动迁移
+后由 owner 执行 `REVOKE feedling_owner FROM app;`；不要把 Alembic downgrade 当作自动
+回滚机制。
+
 新 PG CVM 或新网关上线前还要验证长连接契约：至少两个 worker 通过真实数据库完成一次
 跨 worker `NOTIFY`，让 listener 经历超过预期 idle 窗口的 soak，并主动断开连接确认
 `backend/core/wake_bus.py` 能重连和 catch-up。若网关存在 idle cutoff，把 `DATABASE_URL`
@@ -153,7 +171,8 @@ phala deploy --cvm-id <CVM_ID> --compose compose.prod.yaml \
 一整套 `<ENV_PREFIX>_*`（照 test 的 `TEST_*` 命名，pre 使用 `PRE_*`）基础设施机密：
 `PG_OWNER/APP/REPLICATOR/MONITORING_DB_PASSWORD`、`PG_SERVER_CERT_B64/KEY_B64`、
 `WALG_S3_PREFIX/LIBSODIUM_KEY`、`PG_BACKUP_R2_ENDPOINT/ACCESS_KEY_ID/SECRET_ACCESS_KEY`、
-owner migration DSN/CA 与 `PHALA_CLOUD_API_KEY`。应用 DSN 与 selector 按目标拓扑配置：
+owner migration DSN/CA（仅受保护的人工初始化/诊断通道）与 `PHALA_CLOUD_API_KEY`。应用
+DSN 与 selector 按目标拓扑配置：
 legacy shadow 阶段才使用 `TEE_DATABASE_URL` + `FEEDLING_TEE_DUAL_WRITE`；TEE-primary 阶段
 由环境 `DATABASE_URL` 使用 app role，并按 migration runbook 清空旧 shadow 变量。
 `gh secret set <NAME> --repo <owner>/<repo>`（值从变量引用、别回显）。CVM ID 写进
@@ -222,16 +241,17 @@ gh workflow run "TEE migrate" -f environment=pre -f confirm=MIGRATE-TEE
 # prod 需要 confirm=MIGRATE-TEE-PROD（typo guard，防误触）
 ```
 
-`.github/workflows/tee-migrate.yml`（`workflow_dispatch`，仿 `pg-deploy.yml` 的
-typo-guard 模式）：
+对于 exact TEE-primary 环境，正常 backend/runner 发布会在启动前自动迁移；不要为每次
+release dispatch 下列 workflow。`.github/workflows/tee-migrate.yml` 保留为受保护的
+人工初始化/诊断通道（`workflow_dispatch`，仿 `pg-deploy.yml` 的 typo-guard 模式）：
 - test/pre/prod 分别跑 `test`/`pre`/`main` 分支——与 app 发布流向一致。
 - 在 **GitHub runner**（公网）上直连 TEE，用 **owner 角色**
-  `<ENV>_TEE_MIGRATION_DSN`（runner 将其导出为 `TEE_MIGRATION_DATABASE_URL`；CVM 里的
-  backend 只有 app 角色，没有 DDL 权限，
-  所以不能走 `tee-replicate.yml` 那种「admin 端点遥控 CVM 内进程」的模式）。
+  `<ENV>_TEE_MIGRATION_DSN`（runner 将其导出为 `TEE_MIGRATION_DATABASE_URL`；该通道
+  不向运行中的 CVM 注入 owner DSN）。TEE-primary 的 app 角色已继承 owner，常规迁移
+  仍由 CVM 启动前的 app DSN 完成。
 - 连接**强制 `sslmode=verify-full` + CA**（`<ENV>_TEE_PG_CA_PEM` secret），不照抄
-  生产 backend 的 `sslmode=require`——那是因为 backend 与 TEE 同在 Phala 内网且只有
-  无 DDL 的 app 角色；这里是公网 + owner 角色执行 DDL，必须验证服务端身份。
+  生产 backend 的 `sslmode=require`——backend 与 TEE 同在 Phala 内网；这里是公网 +
+  owner 角色执行 DDL，必须验证服务端身份。
 - 三套环境的机密（`TEST_*`/`PRE_*`/`PROD_*`）**都注入，在 shell 里按 `environment` 挑**，
   绝不用 GitHub 表达式 `${{ environment == 'prod' && secrets.PROD_X || secrets.TEST_X }}`
   ——GH 的 `&&`/`||` 是 JS 语义（空串是 falsy），`PROD_X` 恰好为空时会静默 fallback 到

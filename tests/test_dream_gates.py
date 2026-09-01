@@ -90,9 +90,13 @@ def test_fuse_env_overrides(monkeypatch):
     """
     monkeypatch.setenv("MEMGARDEN_DREAM_FUSE_RATIO", "0.5")
     monkeypatch.setenv("MEMGARDEN_DREAM_FUSE_MIN_CARDS", "3")
+    monkeypatch.setenv("FEEDLING_DREAM_FUSE_RATIO", "0.5")
+    monkeypatch.setenv("FEEDLING_DREAM_FUSE_MIN_CARDS", "3")
     assert dream_gates.blast_radius_exceeded(4, 6) is True       # 67% > 50% 且 ≥3
     monkeypatch.setenv("MEMGARDEN_DREAM_FUSE_RATIO", "not-a-number")
     monkeypatch.setenv("MEMGARDEN_DREAM_FUSE_MIN_CARDS", "-1")
+    monkeypatch.setenv("FEEDLING_DREAM_FUSE_RATIO", "not-a-number")
+    monkeypatch.setenv("FEEDLING_DREAM_FUSE_MIN_CARDS", "-1")
     assert dream_gates.blast_radius_exceeded(4, 6) is False      # 坏值回默认 0.8/10
 
 

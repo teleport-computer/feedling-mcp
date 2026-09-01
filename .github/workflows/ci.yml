@@ -840,6 +840,7 @@ jobs:
             tests/test_tee_replication_workflow_guard.py \
             tests/test_tee_requeue.py \
             tests/test_tee_requeue_coverage.py \
+            tests/test_tee_app_role_ddl_contract.py \
             tests/test_tee_primary_startup.py \
             tests/test_tee_schema.py \
             tests/test_tee_snapshot.py \
@@ -1540,8 +1541,8 @@ jobs:
           retention-days: 90
 
       # TEST can promote its owner-migrated TEE database to DATABASE_URL. The
-      # app role cannot run DDL, so prove both the migration head and the real
-      # application startup contract before either CVM is mutated.
+      # CI never executes TEE DDL. Verify the application connection can run the
+      # startup migration against the same database before either CVM is mutated.
       - name: Prepare TEST TEE schema preflight credentials
         if: ${{ vars.TEST_FEEDLING_DATABASE_SCHEMA == 'tee' }}
         env:
@@ -1576,7 +1577,7 @@ jobs:
           FEEDLING_TEE_DUAL_WRITE: ${{ secrets.TEST_FEEDLING_TEE_DUAL_WRITE }}
         run: python deploy/check-database-topology.py
 
-      - name: Require TEST TEE schema at release head before mutating either CVM
+      - name: Validate TEST TEE startup migration authorization before mutating either CVM
         if: ${{ vars.TEST_FEEDLING_DATABASE_SCHEMA == 'tee' }}
         env:
           TEST_DSN: ${{ secrets.TEST_TEE_MIGRATION_DSN }}
@@ -1585,14 +1586,8 @@ jobs:
           export TEE_MIGRATION_DATABASE_URL="${TEST_DSN}&sslrootcert=/tmp/test-tee-ca.crt"
           python - <<'PY'
           import os
-          import sys
           import psycopg
-          from alembic.config import Config
-          from alembic.script import ScriptDirectory
 
-          cfg = Config("backend/alembic_tee/alembic.ini")
-          cfg.set_main_option("script_location", "backend/alembic_tee")
-          expected = set(ScriptDirectory.from_config(cfg).get_heads())
           fingerprint_sql = (
               "SELECT current_database(), COALESCE(inet_server_addr()::text, ''), "
               "inet_server_port()"
@@ -1600,38 +1595,40 @@ jobs:
           with psycopg.connect(os.environ["TEE_MIGRATION_DATABASE_URL"]) as conn:
               owner_fingerprint = tuple(conn.execute(fingerprint_sql).fetchone())
               owner_user = str(conn.execute("SELECT current_user").fetchone()[0])
-              actual = {
-                  str(row[0])
-                  for row in conn.execute(
-                      "SELECT version_num FROM alembic_tee_version"
-                  ).fetchall()
-              }
           with psycopg.connect(os.environ["APP_DATABASE_URL"]) as conn:
               app_fingerprint = tuple(conn.execute(fingerprint_sql).fetchone())
+              app_user = str(conn.execute("SELECT current_user").fetchone()[0])
+              app_can_migrate = bool(
+                  conn.execute(
+                      "SELECT pg_has_role(current_user, 'feedling_owner', 'member')"
+                  ).fetchone()[0]
+              )
+          if owner_user != "feedling_owner":
+              print(
+                  "::error::TEST_TEE_MIGRATION_DSN must use the feedling_owner "
+                  f"role; got {owner_user!r}. No TEST CVM was changed."
+              )
+              raise SystemExit(1)
           if owner_fingerprint != app_fingerprint:
               print(
                   "::error::TEST_DATABASE_URL and TEST_TEE_MIGRATION_DSN must "
                   "target the same database. No TEST CVM was changed."
               )
               raise SystemExit(1)
-          print(f"TEST TEE schema: expected={sorted(expected)} actual={sorted(actual)}")
-          if actual != expected:
+          if app_user != "app":
               print(
-                  "::error title=TEST TEE schema migration required::"
-                  f"expected {sorted(expected)}, got {sorted(actual)}; "
-                  "run the TEE migrate workflow for test, then rerun failed jobs. "
+                  "::error::TEST_DATABASE_URL must use the TEE app role; "
+                  f"got {app_user!r}. "
                   "No TEST CVM was changed."
               )
               raise SystemExit(1)
-
-          sys.path.insert(0, "backend")
-          os.environ["FEEDLING_DATABASE_SCHEMA"] = "tee"
-          os.environ["DATABASE_URL"] = os.environ["APP_DATABASE_URL"]
-
-          import db
-
-          db.init_schema()
-          print("TEST TEE application startup contract: ok")
+          if not app_can_migrate:
+              print(
+                  "::error::TEST_DATABASE_URL app role must inherit feedling_owner "
+                  "for TEE startup migrations. No TEST CVM was changed."
+              )
+              raise SystemExit(1)
+          print("TEST TEE startup migration authorization: ok")
           PY
 
       - name: Require both Runtime V2 images before mutating either CVM
@@ -1830,7 +1827,7 @@ jobs:
           FEEDLING_TEE_DUAL_WRITE: ${{ secrets.PROD_FEEDLING_TEE_DUAL_WRITE }}
         run: python deploy/check-database-topology.py
 
-      - name: Require PROD TEE schema at release head before mutating any CVM
+      - name: Validate PROD TEE startup migration authorization before mutating any CVM
         if: ${{ steps.prod_release_config.outputs.database_schema == 'tee' }}
         env:
           PROD_DSN: ${{ secrets.PROD_TEE_MIGRATION_DSN }}
@@ -1839,14 +1836,8 @@ jobs:
           export TEE_MIGRATION_DATABASE_URL="${PROD_DSN}&sslrootcert=/tmp/prod-tee-ca.crt"
           python - <<'PY'
           import os
-          import sys
           import psycopg
-          from alembic.config import Config
-          from alembic.script import ScriptDirectory
 
-          cfg = Config("backend/alembic_tee/alembic.ini")
-          cfg.set_main_option("script_location", "backend/alembic_tee")
-          expected = set(ScriptDirectory.from_config(cfg).get_heads())
           fingerprint_sql = (
               "SELECT current_database(), COALESCE(inet_server_addr()::text, ''), "
               "inet_server_port()"
@@ -1854,15 +1845,14 @@ jobs:
           with psycopg.connect(os.environ["TEE_MIGRATION_DATABASE_URL"]) as conn:
               owner_fingerprint = tuple(conn.execute(fingerprint_sql).fetchone())
               owner_user = str(conn.execute("SELECT current_user").fetchone()[0])
-              actual = {
-                  str(row[0])
-                  for row in conn.execute(
-                      "SELECT version_num FROM alembic_tee_version"
-                  ).fetchall()
-              }
           with psycopg.connect(os.environ["APP_DATABASE_URL"]) as conn:
               app_fingerprint = tuple(conn.execute(fingerprint_sql).fetchone())
               app_user = str(conn.execute("SELECT current_user").fetchone()[0])
+              app_can_migrate = bool(
+                  conn.execute(
+                      "SELECT pg_has_role(current_user, 'feedling_owner', 'member')"
+                  ).fetchone()[0]
+              )
           if owner_user != "feedling_owner":
               print(
                   "::error::PROD_TEE_MIGRATION_DSN must use the feedling_owner "
@@ -1881,24 +1871,14 @@ jobs:
                   f"got {app_user!r}. No production CVM was changed."
               )
               raise SystemExit(1)
-          print(f"PROD TEE schema: expected={sorted(expected)} actual={sorted(actual)}")
-          if actual != expected:
+          if not app_can_migrate:
               print(
-                  "::error title=PROD TEE schema migration required::"
-                  f"expected {sorted(expected)}, got {sorted(actual)}; "
-                  "run the TEE migrate workflow for prod, then rerun failed jobs. "
+                  "::error::DATABASE_URL app role must inherit feedling_owner "
+                  "for TEE startup migrations. "
                   "No production CVM was changed."
               )
               raise SystemExit(1)
-
-          sys.path.insert(0, "backend")
-          os.environ["FEEDLING_DATABASE_SCHEMA"] = "tee"
-          os.environ["DATABASE_URL"] = os.environ["APP_DATABASE_URL"]
-
-          import db
-
-          db.init_schema()
-          print("PROD TEE application startup contract: ok")
+          print("PROD TEE startup migration authorization: ok")
           PY
 
       - name: Build and verify the production E2B template
@@ -2095,12 +2075,8 @@ jobs:
           fi
           exit "$missing"
 
-      # PRE can run with the owner-migrated TEE database as DATABASE_URL.  The
-      # app role deliberately cannot run DDL and startup fails closed when the
-      # database is behind the release head.  Check that contract before
-      # `phala deploy`; otherwise a push containing a new alembic_tee revision
-      # replaces the healthy CVM first and only discovers the missing owner
-      # migration while backend and serve-worker restart-loop.
+      # CI never executes TEE DDL. Verify the application connection can run the
+      # startup migration against the same database before either CVM is mutated.
       - name: Prepare PRE TEE schema preflight credentials
         if: ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA == 'tee' }}
         env:
@@ -2135,47 +2111,57 @@ jobs:
           FEEDLING_TEE_DUAL_WRITE: ${{ secrets.PRE_FEEDLING_TEE_DUAL_WRITE }}
         run: python deploy/check-database-topology.py
 
-      - name: Require PRE TEE schema at release head before mutating either CVM
+      - name: Validate PRE TEE startup migration authorization before mutating either CVM
         if: ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA == 'tee' }}
         env:
           PRE_DSN: ${{ secrets.PRE_TEE_MIGRATION_DSN }}
+          APP_DATABASE_URL: ${{ secrets.PRE_DATABASE_URL }}
         run: |
           export TEE_MIGRATION_DATABASE_URL="${PRE_DSN}&sslrootcert=/tmp/pre-tee-ca.crt"
           python - <<'PY'
           import os
-          import sys
           import psycopg
-          from alembic.config import Config
-          from alembic.script import ScriptDirectory
 
-          cfg = Config("backend/alembic_tee/alembic.ini")
-          cfg.set_main_option("script_location", "backend/alembic_tee")
-          expected = set(ScriptDirectory.from_config(cfg).get_heads())
+          fingerprint_sql = (
+              "SELECT current_database(), COALESCE(inet_server_addr()::text, ''), "
+              "inet_server_port()"
+          )
           with psycopg.connect(os.environ["TEE_MIGRATION_DATABASE_URL"]) as conn:
-              actual = {
-                  str(row[0])
-                  for row in conn.execute(
-                      "SELECT version_num FROM alembic_tee_version"
-                  ).fetchall()
-              }
-          print(f"PRE TEE schema: expected={sorted(expected)} actual={sorted(actual)}")
-          if actual != expected:
+              owner_fingerprint = tuple(conn.execute(fingerprint_sql).fetchone())
+              owner_user = str(conn.execute("SELECT current_user").fetchone()[0])
+          with psycopg.connect(os.environ["APP_DATABASE_URL"]) as conn:
+              app_fingerprint = tuple(conn.execute(fingerprint_sql).fetchone())
+              app_user = str(conn.execute("SELECT current_user").fetchone()[0])
+              app_can_migrate = bool(
+                  conn.execute(
+                      "SELECT pg_has_role(current_user, 'feedling_owner', 'member')"
+                  ).fetchone()[0]
+              )
+          if owner_user != "feedling_owner":
               print(
-                  "::error title=PRE TEE schema migration required::"
-                  f"expected {sorted(expected)}, got {sorted(actual)}; "
-                  "run the TEE migrate workflow for pre, then rerun failed jobs. "
-                  "No PRE CVM was changed."
+                  "::error::PRE_TEE_MIGRATION_DSN must use the feedling_owner "
+                  f"role; got {owner_user!r}. No PRE CVM was changed."
               )
               raise SystemExit(1)
-
-          sys.path.insert(0, "backend")
-          os.environ["FEEDLING_DATABASE_SCHEMA"] = "tee"
-          os.environ["DATABASE_URL"] = os.environ["TEE_MIGRATION_DATABASE_URL"]
-
-          import db
-
-          db.init_schema()
-          print("PRE TEE application startup contract: ok")
+          if owner_fingerprint != app_fingerprint:
+              print(
+                  "::error::PRE_DATABASE_URL and PRE_TEE_MIGRATION_DSN must "
+                  "target the same database. No PRE CVM was changed."
+              )
+              raise SystemExit(1)
+          if app_user != "app":
+              print(
+                  "::error::PRE_DATABASE_URL must use the TEE app role; "
+                  f"got {app_user!r}. No PRE CVM was changed."
+              )
+              raise SystemExit(1)
+          if not app_can_migrate:
+              print(
+                  "::error::PRE_DATABASE_URL app role must inherit feedling_owner "
+                  "for TEE startup migrations. No PRE CVM was changed."
+              )
+              raise SystemExit(1)
+          print("PRE TEE startup migration authorization: ok")
           PY
 
       - name: Build and verify the content-addressed E2B template
