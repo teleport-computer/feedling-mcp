@@ -36,6 +36,7 @@ canonical_owner: self
 | `thinking_envelope_missing_fields` | 400 | — | 同上，thinking 信封 | |
 | `anchor_required` | 400 | — | 记忆动作缺 anchor（detail.mem_type） | |
 | `service_busy` | 503 | system | db 连接池耗尽，可退避重试 | ✅ |
+| `data_track_query_timeout` | 503 | system | admin data-track 查询超过 HTTP 或 PostgreSQL 预算 | |
 | `service_unavailable` | 503 | system | admin token 未配置 | ✅ |
 | `not_found` | 404 | — | 通用资源不存在 | ✅ |
 | `not_owned` | 403 | — | 资源不属于调用者 | ✅ |

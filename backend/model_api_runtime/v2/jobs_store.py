@@ -323,7 +323,15 @@ def _terminal_error_code(error: object) -> str:
     ``last_runtime_error`` through the reconciler.
     """
     value = str(error or "")
-    return value if _TERMINAL_ERROR_CODE_RE.fullmatch(value) else "runtime_failed"
+    if _TERMINAL_ERROR_CODE_RE.fullmatch(value):
+        return value
+    log.warning(
+        "[normalization-fallback] field=terminal_error_code "
+        "fallback=runtime_failed raw_type=%s raw_len=%d",
+        type(error).__name__,
+        len(value),
+    )
+    return "runtime_failed"
 
 
 def _terminal_error_class(error: object, error_class: object = "") -> str:

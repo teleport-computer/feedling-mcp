@@ -712,6 +712,38 @@ def test_data_track_admin_connection_sets_session_timeout_and_resets(
     ]
 
 
+def test_t428_dau_and_daily_usage_use_bounded_admin_connection(monkeypatch):
+    calls = []
+
+    class EmptyResult:
+        def fetchone(self):
+            return None, None
+
+        def fetchall(self):
+            return []
+
+    class FakeConnection:
+        def execute(self, *_args, **_kwargs):
+            return EmptyResult()
+
+    @contextlib.contextmanager
+    def bounded_connection():
+        calls.append("bounded")
+        yield FakeConnection()
+
+    def raw_pool_must_not_be_used():
+        raise AssertionError("admin data-track read bypassed bounded connection")
+
+    monkeypatch.setattr(db, "_admin_data_track_connection", bounded_connection)
+    monkeypatch.setattr(db, "get_pool", raw_pool_must_not_be_used)
+
+    assert db.admin_data_track_dau(days=1) == []
+    assert db.admin_data_track_user_daily_usage(
+        user_id="usr_t428", days=1
+    ) == []
+    assert calls == ["bounded", "bounded"]
+
+
 def test_admin_data_track_reports_screen_frame_storage_and_freshness(client):
     user_id, _ = _register(client)
     with db.get_pool().connection() as conn:
@@ -974,6 +1006,7 @@ def test_user_detail_daily_usage_json_page_and_events_limit(client):
     assert res.status_code == 200, res.get_data(as_text=True)
     user = res.get_json()["user"]
     assert user["daily_usage_days"] == 3
+    assert user["daily_usage_query"] == "ok"
     assert len(user["daily_usage"]) == 3
     assert user["daily_usage"][0]["foreground_sec"] == 40
     assert user["daily_usage"][1]["foreground_sec"] == 0
@@ -1005,6 +1038,65 @@ def test_user_detail_daily_usage_json_page_and_events_limit(client):
     assert "未打开" in body
     assert first_day.isoformat() in body
     assert (first_day + timedelta(days=1)).isoformat() in body
+
+
+def test_t428_daily_usage_query_failure_is_distinct_from_true_zero(
+    client, monkeypatch
+):
+    user_id, _ = _register(client)
+    real_daily_usage = db.admin_data_track_user_daily_usage
+    state = {"failed": False}
+
+    @contextlib.contextmanager
+    def broken_connection():
+        raise RuntimeError("injected daily usage query failure")
+        yield  # pragma: no cover - makes this a contextmanager generator
+
+    def daily_usage(*, user_id, days, tz):
+        if state["failed"]:
+            with monkeypatch.context() as failure_patch:
+                failure_patch.setattr(
+                    db, "_admin_data_track_connection", broken_connection
+                )
+                return real_daily_usage(user_id=user_id, days=days, tz=tz)
+        return [{
+            "day": "2030-01-01",
+            "foreground_sec": 0,
+            "sessions": 0,
+            "max_session_sec": 0,
+        }]
+
+    monkeypatch.setattr(db, "admin_data_track_user_daily_usage", daily_usage)
+
+    def detail_json():
+        response = client.get(
+            f"/v1/admin/data-track/users/{user_id}?days=1",
+            headers=_admin_headers(),
+        )
+        assert response.status_code == 200, response.get_data(as_text=True)
+        return response.get_json()["user"]
+
+    true_zero = detail_json()
+    true_zero_html = client.get(
+        f"/admin/data-track/users/{user_id}?days=1",
+        headers=_admin_headers(),
+    ).get_data(as_text=True)
+    state["failed"] = True
+    query_failed = detail_json()
+    query_failed_html = client.get(
+        f"/admin/data-track/users/{user_id}?days=1",
+        headers=_admin_headers(),
+    ).get_data(as_text=True)
+
+    assert true_zero["daily_usage"] != query_failed["daily_usage"]
+    assert true_zero["daily_usage_query"] == "ok"
+    assert query_failed["daily_usage"] == []
+    assert query_failed["daily_usage_query"] == "failed"
+    assert "未打开" in true_zero_html
+    assert "最近使用时长查询失败" not in true_zero_html
+    assert "最近使用时长查询失败" in query_failed_html
+    assert "不代表该用户最近确实没有打开 App" in query_failed_html
+    assert "未打开" not in query_failed_html
 
 
 def test_uid_lookup_form_strip_validation_and_admin_key_passthrough(client):

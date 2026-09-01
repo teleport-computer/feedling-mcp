@@ -1456,6 +1456,14 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
 _ADMIN_DATA_TRACK_READ_TIMEOUT_MS = 5000
 
 
+class AdminDataTrackDauReadError(RuntimeError):
+    """The DAU query failed; callers must not present that as a true empty set."""
+
+
+class AdminDataTrackDailyUsageReadError(RuntimeError):
+    """A user's daily usage query failed; zero-filled days would be misleading."""
+
+
 @contextmanager
 def _admin_data_track_connection():
     """Lease one bounded admin connection without poisoning the shared pool."""
@@ -2368,7 +2376,7 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
     snapshot_since = " AND snap.first_ts >= s.since_epoch" if since > 0 else ""
 
     try:
-        with get_pool().connection() as conn:
+        with _admin_data_track_connection() as conn:
             boundary = conn.execute(
                 f"""
                 WITH RECURSIVE settings AS (
@@ -2497,7 +2505,7 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
         return [_dau_row(row) for row in rows]
     except Exception as e:
         log.error("[db] admin_data_track_dau failed: %s", e)
-        return []
+        raise AdminDataTrackDauReadError("admin data-track DAU query failed") from e
 
 
 def _admin_utc_text_timestamp_sql(
@@ -2864,26 +2872,8 @@ def admin_data_track_user_daily_usage(
     except (TypeError, ValueError):
         day_limit = 14
 
-    # Keep the read-helper fail-soft contract while still returning the useful
-    # zero-filled shape if PostgreSQL is temporarily unavailable.
     try:
-        zone = ZoneInfo(tz)
-    except Exception:
-        zone = ZoneInfo("Asia/Shanghai")
-    today = datetime.now(zone).date()
-    empty = [
-        {
-            "day": (today - timedelta(days=offset)).isoformat(),
-            "foreground_sec": 0,
-            "sessions": 0,
-            "max_session_sec": 0,
-        }
-        for offset in range(day_limit)
-    ]
-    empty.reverse()
-
-    try:
-        with get_pool().connection() as conn:
+        with _admin_data_track_connection() as conn:
             rows = conn.execute(
                 """
                 WITH local_clock AS (
@@ -2963,7 +2953,9 @@ def admin_data_track_user_daily_usage(
             day_limit,
             e,
         )
-        return empty
+        raise AdminDataTrackDailyUsageReadError(
+            "admin data-track daily usage query failed"
+        ) from e
 
 
 def _completed_dau_row(conn, *, day: date, tz: str) -> dict:
@@ -8814,9 +8806,22 @@ TRACE_OUTCOME_CLASSES = frozenset({
     "user_unavailable",
 })
 TRACE_OUTCOME_DEFAULT = "operational_failure"
+TRACE_OUTCOME_PROVENANCE_FIELD = "outcome_class_provenance"
+TRACE_OUTCOME_PROVENANCE_VALUES = frozenset({
+    "explicit", "missing", "normalized_invalid",
+})
 _TRACE_EVENTS_RETENTION_DAYS = 30
 _TRACE_EVENTS_MIN_FUTURE_DAYS = 7
 _TRACE_EVENTS_DEFAULT_STORAGE_BUDGET_BYTES = 60_000_000_000
+
+
+def _normalize_trace_outcome_class(value: object) -> tuple[str, str]:
+    if value is None or value == "":
+        return TRACE_OUTCOME_DEFAULT, "missing"
+    candidate = str(value)
+    if candidate in TRACE_OUTCOME_CLASSES:
+        return candidate, "explicit"
+    return TRACE_OUTCOME_DEFAULT, "normalized_invalid"
 
 
 def insert_trace_events_strict(
@@ -8842,10 +8847,11 @@ def insert_trace_events_strict(
             event_ts = float(raw.get("ts") or time.time())
         except (TypeError, ValueError) as exc:
             raise ValueError("trace event ts must be numeric") from exc
-        detail = raw.get("detail") if isinstance(raw.get("detail"), dict) else {}
-        outcome_class = str(raw.get("outcome_class") or TRACE_OUTCOME_DEFAULT)
-        if outcome_class not in TRACE_OUTCOME_CLASSES:
-            outcome_class = TRACE_OUTCOME_DEFAULT
+        detail = dict(raw.get("detail")) if isinstance(raw.get("detail"), dict) else {}
+        outcome_class, outcome_provenance = _normalize_trace_outcome_class(
+            raw.get("outcome_class")
+        )
+        detail[TRACE_OUTCOME_PROVENANCE_FIELD] = outcome_provenance
         normalized.append((
             uid,
             event_ts,

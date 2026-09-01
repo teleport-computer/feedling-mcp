@@ -107,6 +107,58 @@ def test_unknown_exception_class_and_scope_collapse_to_registered_buckets():
     assert "turn_failed:secret_token" not in worker.PUBLIC_FAILURE_CODES
 
 
+def test_runtime_failed_fallbacks_emit_provenance_but_explicit_values_do_not(
+    caplog,
+):
+    class SecretToken(RuntimeError):
+        pass
+
+    with caplog.at_level("WARNING"):
+        assert jobs_store._terminal_error_code("PRIVATE FREE TEXT") == (
+            "runtime_failed"
+        )
+    assert "field=terminal_error_code fallback=runtime_failed" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        assert jobs_store._terminal_error_class("PRIVATE FREE TEXT") == "unknown"
+    assert "field=terminal_error_code fallback=runtime_failed" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        assert jobs_store._terminal_error_code("runtime_failed") == (
+            "runtime_failed"
+        )
+    assert "field=terminal_error_code" not in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        assert jobs_store._terminal_error_class("runtime_failed") == "unknown"
+    assert "field=terminal_error_code" not in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        invalid_scope_code = worker._safe_failure_code(
+            "private scope", SecretToken("private")
+        )
+    assert invalid_scope_code.startswith("runtime_failed:")
+    assert "field=public_failure_scope fallback=runtime_failed" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        explicit_scope_code = worker._safe_failure_code(
+            "runtime_failed", SecretToken("private")
+        )
+    assert explicit_scope_code.startswith("runtime_failed:")
+    assert "field=public_failure_scope" not in caplog.text
+
+    # The fallback remains inside the producer-derived public vocabulary; no
+    # new public sentinel was introduced to carry provenance.
+    assert invalid_scope_code == explicit_scope_code
+    assert invalid_scope_code in worker.PUBLIC_FAILURE_CODES
+    assert explicit_scope_code in worker.PUBLIC_FAILURE_CODES
+
+
 def test_user_unavailable_outcomes_are_exact_and_producer_registered():
     expected = frozenset({
         "turn_failed:quota_insufficient",

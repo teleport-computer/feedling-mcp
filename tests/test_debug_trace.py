@@ -42,7 +42,18 @@ def _reset(monkeypatch, store):
     def insert_events(uid, new_events):
         target = rows.setdefault(uid, [])
         for event in new_events:
-            target.append({**event, "user_id": uid, "id": len(target) + 1})
+            outcome, provenance = db._normalize_trace_outcome_class(
+                event.get("outcome_class")
+            )
+            detail = dict(event.get("detail") or {})
+            detail[db.TRACE_OUTCOME_PROVENANCE_FIELD] = provenance
+            target.append({
+                **event,
+                "outcome_class": outcome,
+                "detail": detail,
+                "user_id": uid,
+                "id": len(target) + 1,
+            })
         return len(new_events)
 
     def query_events(*, user_id="", subsystem="", limit=200, offset=0, **_kwargs):
@@ -325,9 +336,32 @@ def test_outcome_class_defaults_validates_and_round_trips(monkeypatch):
     debug_trace.trace_event(
         store, subsystem="route", type="invalid", outcome_class="not-a-class"
     )
-    events = debug_trace.read_trace(store)
-    assert events[0]["outcome_class"] == debug_trace.TRACE_OUTCOME_DEFAULT
-    assert events[1]["outcome_class"] == explicit
+    debug_trace.trace_event(store, subsystem="route", type="missing")
+    debug_trace.trace_event(
+        store,
+        subsystem="route",
+        type="explicit-default",
+        outcome_class=debug_trace.TRACE_OUTCOME_DEFAULT,
+    )
+    events = {event["type"]: event for event in debug_trace.read_trace(store)}
+    assert events["explicit"]["outcome_class"] == explicit
+    assert events["explicit"]["detail"][
+        db.TRACE_OUTCOME_PROVENANCE_FIELD
+    ] == "explicit"
+    assert events["invalid"]["outcome_class"] == debug_trace.TRACE_OUTCOME_DEFAULT
+    assert events["invalid"]["detail"][
+        db.TRACE_OUTCOME_PROVENANCE_FIELD
+    ] == "normalized_invalid"
+    assert events["missing"]["outcome_class"] == debug_trace.TRACE_OUTCOME_DEFAULT
+    assert events["missing"]["detail"][
+        db.TRACE_OUTCOME_PROVENANCE_FIELD
+    ] == "missing"
+    assert events["explicit-default"]["outcome_class"] == (
+        debug_trace.TRACE_OUTCOME_DEFAULT
+    )
+    assert events["explicit-default"]["detail"][
+        db.TRACE_OUTCOME_PROVENANCE_FIELD
+    ] == "explicit"
 
 
 def test_set_enabled_never_caches_a_failed_or_unreadable_write(monkeypatch):

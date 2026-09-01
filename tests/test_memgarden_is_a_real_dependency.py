@@ -26,7 +26,15 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 
 def test_no_local_copy_of_the_kernel():
     """仓库里不许再有内核的源码副本。"""
-    for stale in ("backend/memgarden", "backend/memory_garden", "backend/agent_protocol_core"):
+    # ⚠️ backend/agent_protocol_core **不在这个名单里**，是刻意的。
+    #
+    # 2026-09-02 起它是 io 自己的模块（思维链的产品实现：人格文案、屏幕监看
+    # 说辞、FEEDLING_ 开关），从 memgarden 仓库搬回来的 —— 那些东西本来就不
+    # 该跟一个公开的记忆库一起发。它不是内核的副本，内核也不再依赖它。
+    #
+    # 这条守卫要防的是另一件事：把**内核**的源码拷回 io，导致 io 优先 import
+    # 本地那份、装进来的包被无声架空。
+    for stale in ("backend/memgarden", "backend/memory_garden"):
         assert not (REPO / stale).exists(), (
             f"{stale} 又出现了 —— io 会优先 import 它，装进来的包被无声架空"
         )
@@ -69,7 +77,7 @@ def test_lock_pins_an_exact_hash_locked_version():
     """
     lock = (REPO / "backend" / "requirements.lock").read_text(encoding="utf-8")
     lines = lock.splitlines()
-    for pkg in ("memgarden", "agent-protocol-core"):
+    for pkg in ("memgarden",):
         idx = next((i for i, l in enumerate(lines) if l.startswith(f"{pkg}==")), None)
         assert idx is not None, (
             f"lock 里没有钉死版本的 {pkg}== —— 是不是又钉成 URL 或分支了？"
@@ -77,22 +85,25 @@ def test_lock_pins_an_exact_hash_locked_version():
         assert any("--hash=sha256:" in l for l in lines[idx:idx + 4]), f"{pkg} 缺哈希"
 
 
-def test_the_two_packages_move_in_lockstep():
-    """两个包必须同版本 —— memgarden 依赖 agent-protocol-core 的**精确版本**。
+def test_the_kernel_brings_nothing_else_along():
+    """memgarden 必须是**零依赖**的 —— 装它不该连带装上别的包。
 
-    只升一个会直接 ResolutionImpossible；更坏的情况是 lock 已经生成好了、
-    构建时才炸，而那时 compose 哈希都已经算过一轮了。
+    2026-09-02 之前它依赖同源的 agent-protocol-core，而那个包里装的是 io 自己
+    的思维链实现（人格文案、屏幕监看说辞、FEEDLING_ 开关）。别人
+    `pip install memgarden` 会连带拿到 io 的产品设定，而内核一次都用不到它们。
+    那套已经搬回 backend/agent_protocol_core/。
+
+    这条守的是「别又长回来」：往内核加依赖之前先问一句，接入方装 Garden 时
+    多出来的那个包，他认识吗、用得上吗。
     """
-    import re
-
-    req = (REPO / "backend" / "requirements.txt").read_text(encoding="utf-8")
-    got = {m.group(1): m.group(2) for m in
-           re.finditer(r"^(memgarden|agent-protocol-core)==(\S+)", req, re.M)}
-    assert len(got) == 2, f"requirements.txt 里没同时钉住两个包：{got}"
-    assert len(set(got.values())) == 1, f"两个包版本不一致：{got}"
+    lock = (REPO / "backend" / "requirements.lock").read_text(encoding="utf-8")
+    assert "agent-protocol-core" not in lock, (
+        "agent-protocol-core 又回到锁文件里了 —— 它是 io 的东西，"
+        "不该作为 memgarden 的依赖被装进来"
+    )
 
 
-@pytest.mark.parametrize("mod", ["memgarden", "agent_protocol_core"])
+@pytest.mark.parametrize("mod", ["memgarden"])
 def test_declared_in_requirements_not_just_the_lock(mod):
     """requirements.txt 也要有 —— 只写进 lock 的话，下次 compile 就被抹掉了。"""
     req = (REPO / "backend" / "requirements.txt").read_text(encoding="utf-8")

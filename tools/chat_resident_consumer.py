@@ -1180,13 +1180,36 @@ def _report_runtime_error(
         return False
 
 
-def _notify_agent_turn_failure(exc: BaseException, *, foreground: bool) -> None:
+def _notify_agent_turn_failure(
+    exc: BaseException,
+    *,
+    foreground: bool,
+    lane: str = "",
+    trace_id: str = "",
+    job_id: str = "",
+) -> None:
     """腿①+②：分类 → 上报设置页/admin；仅前台失败（限流后）才发聊天 system 横幅。
 
     后台车道失败不进聊天流（Seven 2026-07-11）——观测走 _report_runtime_error
     + debug 日志。永不抛出：通知是回合失败的旁路，绝不能让它把失败变得更糟。"""
     try:
         notice = classify_agent_error(exc)
+        # Paired with agent.turn.success at the success-reporting locus below.
+        # Reuse this exact notice: reclassifying a synthetic exception here would
+        # let the time series disagree with last_runtime_error_class again.
+        _emit_debug_trace(
+            "agent",
+            "agent.turn.failure",
+            status="error",
+            trace_id=trace_id,
+            job_id=job_id,
+            detail={
+                "error_class": notice.error_class,
+                "blame": notice.blame,
+                "foreground": bool(foreground),
+                "lane": lane,
+            },
+        )
         _report_runtime_error(
             notice.detail,
             notice.error_class,
@@ -1240,6 +1263,33 @@ def _suppress_duplicate_upstream_banner(notice: "AgentErrorNotice") -> None:
     if notice is None:
         return
     _system_notice_last_sent[notice.error_class] = time.monotonic()
+
+
+def _emit_agent_turn_success(
+    *,
+    foreground: bool,
+    lane: str,
+    trace_id: str = "",
+    job_id: str = "",
+) -> None:
+    """Emit one denominator event at a terminal locus paired with failure.
+
+    This is intentionally separate from ``_note_agent_turn_success``: that
+    helper runs for internal model attempts and retries, while failure reporting
+    happens once at the owning chat/job layer. Mixing those units creates a
+    plausible-looking but invalid failure rate.
+
+    Debug trace is config-gated, so readers must report the users represented in
+    each window. They must also cap the window at trace partition retention
+    (currently 30 days by default).
+    """
+    _emit_debug_trace(
+        "agent",
+        "agent.turn.success",
+        trace_id=trace_id,
+        job_id=job_id,
+        detail={"foreground": bool(foreground), "lane": lane},
+    )
 
 
 def _note_agent_turn_success() -> None:
@@ -15846,6 +15896,12 @@ def _process_capture_jobs(jobs: list) -> float:
                 ai_name=ai_name,
                 user_name=user_name,
             ))
+            _emit_agent_turn_success(
+                foreground=False,
+                lane="capture",
+                trace_id=job_id,
+                job_id=job_id,
+            )
             _note_agent_turn_success()
             cards, err = _captured.cards, _captured.error
             bounce = _bounce_tracker.bounce(cards=cards, error=err)
@@ -15854,7 +15910,13 @@ def _process_capture_jobs(jobs: list) -> float:
         except Exception as e:
             reason = _agent_call_failed_reason("capture_agent_call_failed", e)
             log.error("capture agent call failed id=%s: %s", job_id, e)
-            _notify_agent_turn_failure(e, foreground=False)
+            _notify_agent_turn_failure(
+                e,
+                foreground=False,
+                lane="capture",
+                trace_id=job_id,
+                job_id=job_id,
+            )
             update_proactive_job_status(
                 job_id,
                 "failed",
@@ -16524,10 +16586,22 @@ def _process_dream_jobs(jobs: list) -> float:
                 lane="dream",
                 job_id=job_id,
             )
+            _emit_agent_turn_success(
+                foreground=False,
+                lane="dream",
+                trace_id=job_id,
+                job_id=job_id,
+            )
         except Exception as e:
             reason = _agent_call_failed_reason("dream_agent_call_failed", e)
             log.error("dream agent call failed id=%s: %s", job_id, e)
-            _notify_agent_turn_failure(e, foreground=False)
+            _notify_agent_turn_failure(
+                e,
+                foreground=False,
+                lane="dream",
+                trace_id=job_id,
+                job_id=job_id,
+            )
             update_proactive_job_status(
                 job_id,
                 "failed",
@@ -16971,12 +17045,24 @@ def _process_proactive_jobs(jobs: list) -> float:
                 update_proactive_job_status(
                     job_id, "failed", f"provider_payment_required: {e}"
                 )
-                _notify_agent_turn_failure(e, foreground=False)
+                _notify_agent_turn_failure(
+                    e,
+                    foreground=False,
+                    lane="proactive",
+                    trace_id=job_id,
+                    job_id=job_id,
+                )
                 continue
             log.error("proactive agent call failed; not posting fallback: %s", e)
             _note_proactive_failure()
             update_proactive_job_status(job_id, "failed", f"agent_call_failed: {e}")
-            _notify_agent_turn_failure(e, foreground=False)
+            _notify_agent_turn_failure(
+                e,
+                foreground=False,
+                lane="proactive",
+                trace_id=job_id,
+                job_id=job_id,
+            )
             continue
         _clear_provider_payment_cooldown()
         _clear_proactive_failure()
@@ -16993,6 +17079,9 @@ def _process_proactive_jobs(jobs: list) -> float:
             _notify_agent_turn_failure(
                 _reply_parse_failure_exc(parse_failure_class),
                 foreground=False,
+                lane="proactive",
+                trace_id=job_id,
+                job_id=job_id,
             )
             update_proactive_job_status(job_id, "failed", "agent_reply_parse_failed")
             continue
@@ -17027,9 +17116,18 @@ def _process_proactive_jobs(jobs: list) -> float:
             _notify_agent_turn_failure(
                 ValueError("agent produced only a degenerate reply fragment; not posting"),
                 foreground=False,
+                lane="proactive",
+                trace_id=job_id,
+                job_id=job_id,
             )
             update_proactive_job_status(job_id, "failed", "degenerate_reply_suppressed")
             continue
+        _emit_agent_turn_success(
+            foreground=False,
+            lane="proactive",
+            trace_id=job_id,
+            job_id=job_id,
+        )
         _note_agent_turn_success()
         # NOTE: the self-wake loop streak is advanced at the schedule point below
         # (only when the agent asks for its OWN next wake), NOT on every idle
@@ -18543,7 +18641,12 @@ def _process_messages(messages: list) -> float:
             else:
                 # 关兜底时没有回复写入可挂排他性，当场通知（此配置下 failover 双
                 # 通知是边角，接受）。
-                _notify_agent_turn_failure(e, foreground=True)
+                _notify_agent_turn_failure(
+                    e,
+                    foreground=True,
+                    lane="chat",
+                    trace_id=trace_id,
+                )
                 log.warning("agent error fallback disabled by env; this user turn will not get a visible reply")
                 if outbound_file_turn_active:
                     _finish_outbound_attachment_turn(trace_id)
@@ -18932,7 +19035,12 @@ def _process_messages(messages: list) -> float:
                     replies = [_fallback_reply_for(raw_user_content_for_lang)]
                     pending_failure_notice = stream_cut
                 else:
-                    _notify_agent_turn_failure(stream_cut, foreground=True)
+                    _notify_agent_turn_failure(
+                        stream_cut,
+                        foreground=True,
+                        lane="chat",
+                        trace_id=trace_id,
+                    )
                     log.warning(
                         "degenerate-only turn and fallback disabled by env; "
                         "this user turn will not get a visible reply"
@@ -19024,7 +19132,18 @@ def _process_messages(messages: list) -> float:
             break
 
         if pending_failure_notice is not None and posted_any:
-            _notify_agent_turn_failure(pending_failure_notice, foreground=True)
+            _notify_agent_turn_failure(
+                pending_failure_notice,
+                foreground=True,
+                lane="chat",
+                trace_id=trace_id,
+            )
+        elif pending_failure_notice is None:
+            _emit_agent_turn_success(
+                foreground=True,
+                lane="chat",
+                trace_id=trace_id,
+            )
 
         # The turn is settled (posted, or terminally rejected): absorbed
         # backlog messages are now truly consumed by this carrier.
