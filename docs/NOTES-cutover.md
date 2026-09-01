@@ -1,3 +1,10 @@
+---
+document_lifecycle: historical
+historical_reason: implemented
+canonical_owner: docs/PERCEPTION_ARCHITECTURE.zh.md
+---
+<!-- 读侧收口：把「到达时间」换成「测量时间」，批次落地记录。当前架构以 canonical_owner 那份为准，这里只留当时的取舍。 -->
+
 # The arrival-time -> measured-time cutover: closing the read-side gap
 
 Scope: `docs/NOTES-measured-at-ingest.md` landed the *write* side of the

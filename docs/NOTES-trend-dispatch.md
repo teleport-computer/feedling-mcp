@@ -1,3 +1,10 @@
+---
+document_lifecycle: historical
+historical_reason: implemented
+canonical_owner: docs/PERCEPTION_ARCHITECTURE.zh.md
+---
+<!-- trend 端点改走 perceptkit.trend_models 的落地记录。当前架构以 canonical_owner 那份为准，这里只留当时的取舍。 -->
+
 # Trend endpoint dispatch on `perceptkit.trend_models`
 
 Branch: `feat/perceptkit-rewire`. Commit: see `git log` (this file is

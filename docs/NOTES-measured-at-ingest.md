@@ -1,3 +1,10 @@
+---
+document_lifecycle: historical
+historical_reason: implemented
+canonical_owner: docs/PERCEPTION_ARCHITECTURE.zh.md
+---
+<!-- measured_at / sample_id 写侧落地记录。当前架构以 canonical_owner 那份为准，这里只留当时的取舍。 -->
+
 # measured_at / sample_id ingest — parsing-only landing
 
 Scope: accept the new optional per-field metadata the iOS app has started

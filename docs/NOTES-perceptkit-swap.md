@@ -1,3 +1,10 @@
+---
+document_lifecycle: historical
+historical_reason: implemented
+canonical_owner: docs/PERCEPTION_ARCHITECTURE.zh.md
+---
+<!-- 把内置 perception_kernel 换成外部 perceptkit 包的落地记录。当前架构以 canonical_owner 那份为准，这里只留当时的取舍。 -->
+
 # NOTES — swap `backend/perception_kernel/` for the `perceptkit` package
 
 Branch: `feat/perceptkit-integration`, based on `origin/test`. Mirrors how
