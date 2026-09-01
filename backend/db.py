@@ -18496,6 +18496,7 @@ def delete_user_data(user_id: str) -> None:
         "v2_conversation_summary_segments",
         "v2_conversation_summary",
         "v2_turn_metrics",
+        "v2_trajectory_events",
         "chat_message_archive",
         "chat_messages",
         "memory_moments",
