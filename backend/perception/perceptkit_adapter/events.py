@@ -183,7 +183,11 @@ def app_event_envelope(app: str, category: str | None, *, action: str,
                      _report_id("app", name.casefold(), action, at), [
         _observation("app_usage",
                      {"app_id": name, "app_name": name,
-                      "category": (category or None), "action": action},
+                      "category": (category or None), "action": action,
+                      # 一次打开贡献 1，当天求和 = 「今天打开了几次」。
+                      # 不发这个字段的话那个聚合永远是空的 —— 而这正是
+                      # app_usage 唯一保证答得准的问题。close 不计数。
+                      **({"open_count": 1} if action == "open" else {})},
                      occurred_at=at, timezone_id=timezone_id,
                      source_event_id=_report_id("app", name.casefold(), action, at)),
     ])

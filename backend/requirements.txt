@@ -133,4 +133,4 @@ agent-protocol-core==0.12.10
 # 0.2.0 把八个纯函数模块搬进了 perceptkit.algorithms（见该包 CHANGELOG），
 # 所以这条 pin 和本分支的 import 是一起改的：装着 0.1.0 的环境跑本分支会在
 # import 时就炸。release 已发（2026-08-31，tag v0.2.0，commit f591a80）。
-perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.2.1/perceptkit-0.2.1-py3-none-any.whl
+perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.2.3/perceptkit-0.2.3-py3-none-any.whl
