@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import json
+import os
 import math
 import time
 from datetime import datetime
@@ -1224,26 +1225,95 @@ def stable_context_locale(user_id: str) -> str | None:
     return None
 
 
-def _catalog_snapshot_fields(user_id: str, now: float | None = None, *, include_query_tools: bool = False) -> dict:
-    now = now or _now()
-    state = store.get_state(user_id)
-    snap: dict = {}
+#: kit 当主、老路当参照。**默认开**，出问题设成 0 立刻回到老路 ——
+#: 它是回滚闸，不是等人来开的门。关掉之后行为和切换之前逐字节一致。
+PERCEPTKIT_PRIMARY_FLAG = "FEEDLING_PERCEPTKIT_PRIMARY"
+
+
+def _perceptkit_primary() -> bool:
+    return (os.environ.get(PERCEPTKIT_PRIMARY_FLAG, "1") or "1").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
+def _wanted_snapshot_fields(*, include_query_tools: bool) -> dict[str, float]:
+    """这次快照该出现哪些字段，各自的过期秒数是多少。
+
+    过期判据仍然按**老路的目录**算。切换要换的是数据来源，不是「什么算过期」;
+    两件事一起改，出了问题分不清是谁的。
+    """
+    wanted: dict[str, float] = {}
     for sig in catalog.SIGNALS.values():
         cap = catalog.CAPABILITIES.get(sig.capability)
         if not cap or not (cap.context_field or (include_query_tools and cap.query_tool)):
             continue
         for f in sig.outputs:
-            if f == "user_state":
-                continue
-            cell = state.get(f)
-            if not isinstance(cell, dict):
-                snap[f] = None
-                continue
-            if f not in _STABLE_CONTEXT_FIELDS and (now - float(cell.get("ts") or 0)) > sig.ttl_sec:
-                snap[f] = None  # stale -> agent treats as "don't infer"
-            else:
-                snap[f] = cell.get("v")  # null cell -> None (= no permission now)
+            if f != "user_state":
+                wanted[f] = sig.ttl_sec
+    return wanted
+
+
+def _catalog_snapshot_fields(user_id: str, now: float | None = None, *, include_query_tools: bool = False) -> dict:
+    now = now or _now()
+    state = store.get_state(user_id)
+    wanted = _wanted_snapshot_fields(include_query_tools=include_query_tools)
+
+    if _perceptkit_primary():
+        merged = _perceptkit_snapshot(user_id, state, wanted=wanted, now=now)
+        if merged is not None:
+            return merged
+
+    snap: dict = {}
+    for field, ttl in wanted.items():
+        cell = state.get(field)
+        if not isinstance(cell, dict):
+            snap[field] = None
+            continue
+        if field not in _STABLE_CONTEXT_FIELDS and (now - float(cell.get("ts") or 0)) > ttl:
+            snap[field] = None  # stale -> agent treats as "don't infer"
+        else:
+            snap[field] = cell.get("v")  # null cell -> None (= no permission now)
     return snap
+
+
+def _perceptkit_snapshot(user_id: str, state: dict, *, wanted: dict, now: float):
+    """用 kit 的结果拼这份快照；kit 供不上的字段仍从 ``state`` 读。
+
+    返回 None = 这次没用上 kit，调用方走原来的老路。**任何异常都返回 None** ——
+    读感知快照是每次唤醒、每次对话都要走的路，为了一个数据来源的切换让它
+    报错，是自己给自己制造事故。
+    """
+    try:
+        # 测试会把 `store` 换成内存假实现来隔离。那时候去读真库，等于让一个
+        # 自以为完全隔离的测试**读到上一次跑留下的行** —— 而且时好时坏。
+        # 数据来源要跟着 store 一起被替换掉，否则这层就是个隔离漏洞。
+        if getattr(store, "__name__", "") != "perception.store":
+            return None
+
+        import db
+
+        from .perceptkit_adapter import compare, readback
+
+        signals = sorted(compare.COMPARABLE)
+        with db.get_pool().connection() as conn:
+            conn.autocommit = True
+            from .perceptkit_adapter.storage import PostgresStorage
+            current = PostgresStorage(conn).get_current(
+                subject_id=user_id, signals=signals)
+        snap, sources, conflicts = readback.merged_snapshot(
+            state, current, wanted=wanted, now=now,
+            stable_fields=_STABLE_CONTEXT_FIELDS,
+        )
+        summary = readback.summarize(sources, conflicts)
+        # 冲突逐条打出来（带字段名和两个值）。只报数量的日志等于说
+        # 「有问题」然后不说是什么。
+        if conflicts:
+            _log.warning("perceptkit primary: %s", summary)
+        else:
+            _log.info("perceptkit primary: %s", summary)
+        return snap
+    except Exception as exc:                       # noqa: BLE001 -- deliberate
+        _log.warning("perceptkit primary fell back to the live path: %s", exc)
+        return None
 
 
 def _merged_app_events(

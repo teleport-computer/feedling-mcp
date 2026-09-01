@@ -334,6 +334,8 @@ if not _provisioned:
         "test_perceptkit_ios_adapter.py",
         # 快照之外那几条入口的信封构造。同样是纯函数。
         "test_perceptkit_producers.py",
+        # 切换那一层的翻译。纯函数部分不碰库（要库的几条自己 skip）。
+        "test_perceptkit_readback.py",
         "test_provider_client.py",
         "test_provider_tools_gemini.py",
         "test_provider_catalog_unit.py",
