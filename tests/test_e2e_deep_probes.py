@@ -5,6 +5,8 @@ import pytest
 
 from tools.e2e import perception_probe, proactive_probe
 
+from conftest import capture_sleeps
+
 
 class _Response:
     def __init__(self, status_code: int, body: dict):
@@ -19,6 +21,7 @@ class _Response:
 def test_proactive_model_cases_always_run_and_invariants_run_once(monkeypatch):
     monkeypatch.setattr(proactive_probe, "_case_user_turn_priority", lambda _c: "priority")
     monkeypatch.setattr(proactive_probe, "_case_proactive_message_quality", lambda _c: "quality")
+    monkeypatch.setattr(proactive_probe, "_case_scheduled_must_deliver", lambda _c: "scheduled")
     monkeypatch.setattr(proactive_probe, "_case_wake_coalescing", lambda _c: "coalesced")
     monkeypatch.setattr(proactive_probe, "_case_stale_wake_expiry", lambda _c: "expired")
     monkeypatch.setattr(proactive_probe, "_case_dream_latest_only", lambda _c: "latest")
@@ -30,11 +33,12 @@ def test_proactive_model_cases_always_run_and_invariants_run_once(monkeypatch):
     assert provider_only == {
         "area": "proactive",
         "cases": [
-            {"name": "user_turn_priority", "result": "PASS", "detail": "priority"},
             {"name": "proactive_message_quality", "result": "PASS", "detail": "quality"},
+            {"name": "user_turn_priority", "result": "PASS", "detail": "priority"},
+            {"name": "scheduled_must_deliver", "result": "PASS", "detail": "scheduled"},
         ],
     }
-    assert len(with_invariants["cases"]) == 8
+    assert len(with_invariants["cases"]) == 9
     assert {case["result"] for case in with_invariants["cases"]} == {"PASS", "BLOCKED_EVIDENCE"}
 
 
@@ -124,7 +128,154 @@ def test_transport_failure_uses_explicit_result_enum():
     }
 
 
-def test_user_turn_priority_does_not_require_injection_like_echo(monkeypatch):
+def test_wake_terminal_state_separates_legal_sleep_from_unaudited_misfire():
+    base = {
+        "v2_recent_jobs": {
+            "jobs": [{"job_id": 17, "lane": "manual_wake", "status": "completed"}],
+        },
+        "v2_wake_activity": {"recent_failures": [], "recent_silences": []},
+    }
+    silent = {
+        **base,
+        "v2_wake_activity": {
+            "recent_failures": [],
+            "recent_silences": [{
+                "job_id": 17,
+                "lane": "manual_wake",
+                "reason": "explicit_silence_suppressed",
+            }],
+        },
+    }
+
+    assert proactive_probe._wake_terminal_state(silent, "17") == (
+        "silent",
+        "explicit_silence_suppressed",
+    )
+    assert proactive_probe._wake_terminal_state(base, "17") == (
+        "completed_without_output",
+        "completed without visible reply or explicit sleep",
+    )
+
+
+@pytest.mark.parametrize(
+    ("silences", "expected_result", "detail_fragment"),
+    [
+        ([{"job_id": 17, "reason": "explicit_silence_suppressed"}],
+         "BLOCKED_EVIDENCE", "legally slept"),
+        ([], "PRODUCT_FAIL", "completed without visible reply"),
+    ],
+)
+def test_wake_delivery_waiter_preserves_silent_and_misfire_extremes(
+    monkeypatch,
+    silences,
+    expected_result,
+    detail_fragment,
+):
+    times = iter((0.0, 0.0, 2.0))
+    snapshot = {
+        "v2_recent_jobs": {"jobs": [{"job_id": 17, "status": "completed"}]},
+        "v2_wake_activity": {
+            "recent_failures": [],
+            "recent_silences": silences,
+        },
+    }
+    monkeypatch.setattr(proactive_probe.time, "time", lambda: next(times))
+    capture_sleeps(monkeypatch, proactive_probe)
+    monkeypatch.setattr(proactive_probe, "_history", lambda *_a, **_kw: [])
+    monkeypatch.setattr(proactive_probe, "_admin_user", lambda _c: snapshot)
+
+    with pytest.raises(proactive_probe._ProbeIssue) as exc:
+        proactive_probe._wait_for_wake_delivery(
+            object(), 0.0, "17", action="quality", timeout=1.0,
+        )
+
+    assert exc.value.result == expected_result
+    assert detail_fragment in exc.value.detail
+
+
+def test_collision_wait_has_recent_and_clear_window_extremes(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(proactive_probe.time, "time", lambda: 100.0)
+    capture_sleeps(monkeypatch, proactive_probe, sleeps)
+    monkeypatch.setattr(
+        proactive_probe,
+        "_history",
+        lambda *_a, **_kw: [{"role": "user", "ts": 50.0}],
+    )
+
+    waited = proactive_probe._wait_out_chat_collision(object(), window=90.0)
+
+    assert waited == 46.0
+    assert sleeps == [46.0]
+
+    sleeps.clear()
+    monkeypatch.setattr(
+        proactive_probe,
+        "_history",
+        lambda *_a, **_kw: [{"role": "user", "ts": 4.0}],
+    )
+    assert proactive_probe._wait_out_chat_collision(object(), window=90.0) == 0.0
+    assert sleeps == []
+
+
+def test_quality_probe_does_not_create_a_setup_chat_inside_collision_window(monkeypatch):
+    client = _PriorityClient()
+    reply = {"role": "agent", "id": "quality-reply", "ts": 12.0}
+    monkeypatch.setattr(proactive_probe, "_install_quality_identity", lambda _c: None)
+    monkeypatch.setattr(proactive_probe, "_save_settings", lambda _c, _patch: {})
+    monkeypatch.setattr(proactive_probe, "_wait_out_chat_collision", lambda _c: 0.0)
+    monkeypatch.setattr(proactive_probe.time, "time", lambda: 10.0)
+    capture_sleeps(monkeypatch, proactive_probe)
+    monkeypatch.setattr(
+        proactive_probe,
+        "_body",
+        lambda *_a, **_kw: {"job": {"id": "wake-quality", "lane": "manual_wake"}},
+    )
+    monkeypatch.setattr(
+        proactive_probe,
+        "_wait_for_wake_delivery",
+        lambda *_a, **_kw: reply,
+    )
+    monkeypatch.setattr(
+        proactive_probe,
+        "_send_hosted",
+        lambda *_a, **_kw: pytest.fail("quality probe must not create a setup user turn"),
+    )
+    monkeypatch.setattr(
+        proactive_probe,
+        "_decrypt",
+        lambda *_a, **_kw: "七七，此刻陪你，也会记得上海时区。",
+    )
+    monkeypatch.setattr(proactive_probe, "_history", lambda *_a, **_kw: [reply])
+
+    detail = proactive_probe._case_proactive_message_quality(client)
+
+    assert "collision_wait=0.0s" in detail
+    assert [path for path, _body in client.posts] == ["/v1/proactive/tick"]
+
+
+def test_proactive_reply_correlation_has_exact_and_unrelated_job_extremes(monkeypatch):
+    exact = {"role": "agent", "id": "reply-1", "proactive_job_id": "pj-1", "ts": 1}
+    unrelated = {"role": "agent", "id": "reply-2", "proactive_job_id": "pj-2", "ts": 1}
+    monkeypatch.setattr(proactive_probe.time, "time", lambda: 0.0)
+    monkeypatch.setattr(proactive_probe, "_history", lambda *_a, **_kw: [exact])
+    assert proactive_probe._wait_for_proactive_reply(
+        object(), "pj-1", 0.0, timeout=1.0,
+    ) == exact
+
+    times = iter((0.0, 0.0, 2.0))
+    monkeypatch.setattr(proactive_probe.time, "time", lambda: next(times))
+    capture_sleeps(monkeypatch, proactive_probe)
+    monkeypatch.setattr(proactive_probe, "_history", lambda *_a, **_kw: [unrelated])
+    with pytest.raises(proactive_probe._ProbeIssue) as exc:
+        proactive_probe._wait_for_proactive_reply(
+            object(), "pj-1", 0.0, timeout=1.0,
+        )
+    assert exc.value.result == "PRODUCT_FAIL"
+    assert "no correlated must-deliver reply" in exc.value.detail
+
+
+def test_user_turn_priority_runs_no_competition_control_without_echo_requirement(monkeypatch):
     rows = [
         {"role": "user", "id": "old-user", "reply_message_id": "old-reply", "ts": 11},
         {"role": "agent", "id": "old-reply", "ts": 12},
@@ -135,6 +286,7 @@ def test_user_turn_priority_does_not_require_injection_like_echo(monkeypatch):
 
     monkeypatch.setattr(proactive_probe, "_install_quality_identity", lambda _c: None)
     monkeypatch.setattr(proactive_probe, "_save_settings", lambda _c, _patch: {})
+    monkeypatch.setattr(proactive_probe, "_wait_out_chat_collision", lambda _c: 0.0)
     monkeypatch.setattr(proactive_probe.time, "time", lambda: 10.0)
     monkeypatch.setattr(
         proactive_probe,
@@ -157,11 +309,25 @@ def test_user_turn_priority_does_not_require_injection_like_echo(monkeypatch):
         "_decrypt",
         lambda *_a, **_kw: "I will not repeat an injection-like token, but I can still answer you.",
     )
+    call_order = []
+    monkeypatch.setattr(
+        proactive_probe,
+        "_wait_for_wake_delivery",
+        lambda *_a, **_kw: call_order.append("control") or {
+            "role": "agent", "id": "control-reply", "ts": 11,
+        },
+    )
 
-    detail = proactive_probe._case_user_turn_priority(_PriorityClient())
+    client = _PriorityClient()
+    detail = proactive_probe._case_user_turn_priority(client)
 
-    assert "correlated user reply arrived" in detail
+    assert "no-competition wake delivered" in detail
     assert "只回复" not in sent_text[0]
+    assert call_order == ["control"]
+    assert [path for path, _body in client.posts] == [
+        "/v1/proactive/tick",
+        "/v1/proactive/tick",
+    ]
 
 
 def test_user_turn_priority_rejects_uncorrelated_wake_before_reply(monkeypatch):
@@ -172,6 +338,7 @@ def test_user_turn_priority_rejects_uncorrelated_wake_before_reply(monkeypatch):
     ]
     monkeypatch.setattr(proactive_probe, "_install_quality_identity", lambda _c: None)
     monkeypatch.setattr(proactive_probe, "_save_settings", lambda _c, _patch: {})
+    monkeypatch.setattr(proactive_probe, "_wait_out_chat_collision", lambda _c: 0.0)
     monkeypatch.setattr(proactive_probe.time, "time", lambda: 10.0)
     monkeypatch.setattr(
         proactive_probe,
@@ -185,6 +352,11 @@ def test_user_turn_priority_rejects_uncorrelated_wake_before_reply(monkeypatch):
         lambda *_a, **_kw: (rows[-1], rows),
     )
     monkeypatch.setattr(proactive_probe, "_decrypt", lambda *_a, **_kw: "ordinary answer")
+    monkeypatch.setattr(
+        proactive_probe,
+        "_wait_for_wake_delivery",
+        lambda *_a, **_kw: {"role": "agent", "id": "control-reply", "ts": 11},
+    )
 
     with pytest.raises(proactive_probe._ProbeIssue) as exc:
         proactive_probe._case_user_turn_priority(_PriorityClient())
@@ -192,6 +364,58 @@ def test_user_turn_priority_rejects_uncorrelated_wake_before_reply(monkeypatch):
     assert exc.value.result == "PRODUCT_FAIL"
 
 
+def test_scheduled_must_deliver_has_queued_green_and_not_queued_red(monkeypatch):
+    class Client:
+        fire_queued = 1
+
+        def post(self, path, *, json):
+            if path == "/v1/proactive/scheduled/actions":
+                return _Response(200, {
+                    "results": [{"status": "scheduled", "timer_id": "timer-1"}],
+                })
+            if path == "/v1/proactive/scheduled/fire":
+                return _Response(200, {
+                    "queued": self.fire_queued,
+                    "results": [{
+                        "status": "fired",
+                        "timer_id": "timer-1",
+                        "wake_id": "wake-1",
+                    }],
+                    "jobs": [{"job_id": "pj-1", "wake_id": "wake-1"}],
+                })
+            raise AssertionError(path)
+
+    client = Client()
+    monkeypatch.setattr(proactive_probe, "_install_quality_identity", lambda _c: None)
+    monkeypatch.setattr(proactive_probe, "_save_settings", lambda _c, _patch: {})
+    monkeypatch.setattr(proactive_probe.time, "time", lambda: 10.0)
+    monkeypatch.setattr(
+        proactive_probe,
+        "_wait_for_proactive_reply",
+        lambda _c, job_id, _since: {
+            "role": "agent", "id": "scheduled-reply", "proactive_job_id": job_id,
+        },
+    )
+    monkeypatch.setattr(
+        proactive_probe,
+        "_decrypt",
+        lambda *_a, **_kw: "到时间了，这是你要的提醒。",
+    )
+
+    detail = proactive_probe._case_scheduled_must_deliver(client)
+    assert "one correlated decryptable reply" in detail
+
+    client.fire_queued = 0
+    with pytest.raises(proactive_probe._ProbeIssue) as exc:
+        proactive_probe._case_scheduled_must_deliver(client)
+    assert exc.value.result == "PRODUCT_FAIL"
+    assert "did not fire exactly once" in exc.value.detail
+
+
 class _PriorityClient:
+    def __init__(self):
+        self.posts = []
+
     def post(self, _path, **_kwargs):
+        self.posts.append((_path, _kwargs.get("json")))
         return _Response(200, {})
