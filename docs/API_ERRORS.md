@@ -66,6 +66,7 @@ canonical_owner: self
 | `model_api_not_tested` | 400 | user_provider | 已配置但未通过测试 | ✅ |
 | `model_api_config_invalid` | 400 | user_provider | | ✅ |
 | `model_api_key_decrypt_failed` | 400 | system | | ✅ |
+| `image_generation_key_decrypt_failed` | 409 | user_provider | `POST /v1/image-generation/generate` 无法解开已固定生图路由的 provider key；不会据此改写 route health | ✅ |
 | `model_api_key_envelope_missing` | 400/404 | user_provider | 同 model_api_not_configured 的两条路径 | ✅ |
 | `model_api_credential_write_failed` | 500 | system | 写 model_api_credentials 失败（DB 异常被 db.py 吞成 None） | |
 | `model_api_route_write_failed` | 500 | system | 写/激活 model_api_routes 失败（DB 异常，或 route 被并发删除） | |
