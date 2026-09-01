@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 
 import db
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
 from accounts.auth_core import AuthResult
@@ -257,6 +257,24 @@ async def chat_history_clear(request: Request, auth: AuthResult = Depends(requir
 @router.get("/v1/chat/messages/{message_id}/body")
 async def chat_message_body(message_id: str, auth: AuthResult = Depends(require_auth)):
     body, status = await threadpool.run_db(chat_core.message_body, auth.store, message_id)
+    return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/chat/workspace/body")
+async def chat_workspace_body(
+    filename: str = Query(
+        ...,
+        min_length=1,
+        max_length=120,
+        description="Original case-preserving .io.html file_name from the Chat row.",
+    ),
+    auth: AuthResult = Depends(require_auth),
+):
+    body, status = await threadpool.run_db(
+        chat_core.workspace_canvas_body,
+        auth.store,
+        filename,
+    )
     return JSONResponse(body, status_code=status)
 
 
