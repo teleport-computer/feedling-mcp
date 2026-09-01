@@ -371,6 +371,105 @@ def test_resident_local_decrypt_bug_does_not_poison_route_health(monkeypatch):
     assert marked == [], "local credential bugs are not provider route evidence"
 
 
+def test_resident_decrypt_contract_failure_has_specific_code_without_route_verdict(
+    monkeypatch,
+):
+    marked = []
+    monkeypatch.setattr(
+        image_generator.db,
+        "model_api_image_generation_route",
+        lambda _uid: _route(),
+    )
+    monkeypatch.setattr(
+        image_generator.core_envelope,
+        "decrypt_provider_key_envelope",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("enclave_http_400:invalid envelope")
+        ),
+    )
+    monkeypatch.setattr(
+        image_generator.db,
+        "model_api_route_mark_image_generation_test",
+        lambda _uid, _rid, **kwargs: marked.append(kwargs) or True,
+    )
+
+    body, status = image_generator.generate_with_pinned_route(
+        _store(),
+        {"prompt": "draw a red robot"},
+        caller_api_key="caller-key",
+    )
+
+    assert status == 409
+    assert body["error"] == "image_generation_key_decrypt_failed"
+    assert body["error_class"] == "image_generation_key_decrypt_failed"
+    assert marked == [], "credential decrypt failures are not provider route evidence"
+
+
+def test_resident_enclave_unavailable_stays_retryable_without_route_verdict(
+    monkeypatch,
+):
+    marked = []
+    monkeypatch.setattr(
+        image_generator.db,
+        "model_api_image_generation_route",
+        lambda _uid: _route(),
+    )
+    monkeypatch.setattr(
+        image_generator.core_envelope,
+        "decrypt_provider_key_envelope",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("enclave_unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        image_generator.db,
+        "model_api_route_mark_image_generation_test",
+        lambda _uid, _rid, **kwargs: marked.append(kwargs) or True,
+    )
+
+    body, status = image_generator.generate_with_pinned_route(
+        _store(),
+        {"prompt": "draw a red robot"},
+        caller_api_key="caller-key",
+    )
+
+    assert status == 503
+    assert body["error"] == "image_generation_unavailable"
+    assert marked == [], "enclave outages are not provider route evidence"
+
+
+def test_resident_unknown_decrypt_runtime_error_remains_server_failure(
+    monkeypatch,
+):
+    marked = []
+    monkeypatch.setattr(
+        image_generator.db,
+        "model_api_image_generation_route",
+        lambda _uid: _route(),
+    )
+    monkeypatch.setattr(
+        image_generator.core_envelope,
+        "decrypt_provider_key_envelope",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("enclave_brand_new_mode")
+        ),
+    )
+    monkeypatch.setattr(
+        image_generator.db,
+        "model_api_route_mark_image_generation_test",
+        lambda _uid, _rid, **kwargs: marked.append(kwargs) or True,
+    )
+
+    with pytest.raises(RuntimeError, match="^enclave_brand_new_mode$"):
+        image_generator.generate_with_pinned_route(
+            _store(),
+            {"prompt": "draw a red robot"},
+            caller_api_key="caller-key",
+        )
+
+    assert marked == [], "unknown local failures are not provider route evidence"
+
+
 def test_resident_normalization_bug_does_not_poison_route_health(monkeypatch):
     marked = []
 

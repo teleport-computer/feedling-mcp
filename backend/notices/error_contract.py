@@ -194,6 +194,7 @@ def _image_generation_specs() -> tuple[ErrorSpec, ...]:
         ("image_generation_quota_insufficient", "user_provider", "生图模型服务额度不足，充值后再试。", "The image generation service has insufficient quota. Add credit and try again."),
         ("image_generation_model_not_found", "user_provider", "当前生图模型不可用，请到设置里更换模型。", "The image generation model is unavailable. Choose another model in Settings."),
         ("image_generation_model_not_ready", "user_provider", "生图模型尚未准备好，请到设置里重新保存或更换模型。", "The image generation model isn't ready. Save it again or choose another model in Settings."),
+        ("image_generation_key_decrypt_failed", "user_provider", "生图模型尚未准备好，请到设置里重新保存或更换模型。", "The image generation model isn't ready. Save it again or choose another model in Settings."),
         ("image_generation_rate_limited", "provider_transient", "生图模型请求太多，请稍等几分钟再试。", "The image generation service is rate limited. Try again in a few minutes."),
         ("image_generation_unavailable", "provider_transient", "生图模型暂时无法连接，请稍后重试。", "The image generation service is temporarily unavailable. Try again later."),
         ("image_generation_invalid_output", "provider_transient", "生图模型没有返回有效图片，请重试或更换模型。", "The image generation model returned no valid image. Try again or choose another model."),

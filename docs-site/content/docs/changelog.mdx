@@ -12,6 +12,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Dedicated image generation now returns an actionable credential-decryption
+  error instead of a generic HTTP 500.** A known saved-envelope or key-decoding
+  failure returns HTTP 409 with `image_generation_key_decrypt_failed`, without
+  marking the provider route unhealthy. Enclave availability failures remain a
+  retryable `image_generation_unavailable` HTTP 503, while unexpected local
+  programming errors remain visible as server failures.
+
 - **Runner fleet health no longer converts brief PostgreSQL latency into a false
   runner-down result.** After a successful observation, `GET /healthz/runner`
   can return HTTP 200 with `status: degraded` from the last verified heartbeat

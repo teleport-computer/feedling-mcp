@@ -14,6 +14,16 @@ from provider_types import ProviderResponse
 
 
 _MAX_PROMPT_CHARS = 8_000
+_EXPECTED_KEY_DECRYPT_VALUE_ERRORS = frozenset({
+    "envelope_body_b64_invalid",
+    "envelope_owner_mismatch",
+    "envelope_shape_unrecognized",
+    "plaintext_envelope_required",
+})
+_EXPECTED_KEY_DECRYPT_RUNTIME_ERRORS = frozenset({
+    "api_key_unavailable",
+    "enclave_invalid_decrypt_response",
+})
 log = logging.getLogger(__name__)
 
 
@@ -40,12 +50,39 @@ def _status_for_error(error_code: str) -> int:
     return {
         "image_generation_model_required": 409,
         "image_generation_model_not_ready": 409,
+        "image_generation_key_decrypt_failed": 409,
         "image_generation_auth_invalid": 401,
         "image_generation_quota_insufficient": 402,
         "image_generation_model_not_found": 404,
         "image_generation_rate_limited": 429,
         "image_generation_unavailable": 503,
     }.get(error_code, 400)
+
+
+def _key_decrypt_failure_code(exc: BaseException) -> str:
+    """Map only the documented envelope/enclave failure contract.
+
+    Internal programming errors such as ``TypeError`` must keep escaping so a
+    helper signature drift cannot masquerade as a credential problem. Enclave
+    availability failures reuse the existing retryable 503 class instead of
+    telling the user to save an unchanged provider key again.
+    """
+    detail = str(exc)
+    if detail == "enclave_unavailable" or detail.startswith("enclave_error:"):
+        return "image_generation_unavailable"
+    if detail.startswith("enclave_http_5"):
+        return "image_generation_unavailable"
+    if isinstance(exc, UnicodeDecodeError):
+        return "image_generation_key_decrypt_failed"
+    if isinstance(exc, ValueError) and detail in _EXPECTED_KEY_DECRYPT_VALUE_ERRORS:
+        return "image_generation_key_decrypt_failed"
+    if isinstance(exc, RuntimeError) and (
+        detail in _EXPECTED_KEY_DECRYPT_RUNTIME_ERRORS
+        or detail.startswith("enclave_http_")
+        or detail.startswith("enclave_plaintext_decode:")
+    ):
+        return "image_generation_key_decrypt_failed"
+    return ""
 
 
 def normalize_provider_media(result: object) -> list[dict[str, str]]:
@@ -147,11 +184,22 @@ def generate_with_pinned_route(
         code = "image_generation_model_not_ready"
         return {"error": code, "error_class": code}, _status_for_error(code)
 
-    provider_key = core_envelope.decrypt_provider_key_envelope(
-        envelope,
-        caller_api_key,
-        runtime_token=caller_runtime_token,
-    ).decode("utf-8")
+    try:
+        provider_key = core_envelope.decrypt_provider_key_envelope(
+            envelope,
+            caller_api_key,
+            runtime_token=caller_runtime_token,
+        ).decode("utf-8")
+    except (RuntimeError, ValueError) as exc:
+        code = _key_decrypt_failure_code(exc)
+        if not code:
+            raise
+        return {
+            "error": code,
+            "error_class": code,
+            "provider": provider[:80],
+            "model": model[:96],
+        }, _status_for_error(code)
     config = provider_client.ProviderConfig(
         provider,
         model,
