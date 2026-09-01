@@ -245,19 +245,22 @@ _TEE_PRIMARY_TRIGGERS = {
 }
 
 
-def init_schema() -> None:
+def init_schema(*, tee_auto_migrate: bool = False) -> None:
     """Bring the selected database schema to a safe application state.
 
-    Both the historical ``rds`` mode and a promoted ``tee`` database run their
-    independent Alembic chains before the process becomes ready. In TEE-primary
-    mode, the app role inherits the database owner role so its primary DSN can
-    apply the TEE chain without receiving an owner credential.
+    The historical ``rds`` mode always runs its Alembic chain. A promoted
+    ``tee`` database upgrades only when a real process startup explicitly sets
+    ``tee_auto_migrate``; preflight callers retain their read-only head and
+    trigger assertions. In TEE-primary mode, the app role inherits the database
+    owner role so its primary DSN can apply the TEE chain without receiving an
+    owner credential.
     """
     if database_schema() == "tee":
         import alembic_tee
 
         with _schema_lock:
-            alembic_tee.upgrade_head()
+            if tee_auto_migrate:
+                alembic_tee.upgrade_head()
             expected_heads = {alembic_tee.current_head()}
             with psycopg.connect(_database_url(), autocommit=True) as conn:
                 actual_heads = {
@@ -288,7 +291,8 @@ def init_schema() -> None:
                 f"actual={sorted(enabled_triggers)}; run "
                 "admin.phase4_cutover --apply --confirm-writes-frozen before startup"
             )
-        log.info("[db] TEE schema at head (automatic Alembic upgrade: %s)",
+        mode = "automatic Alembic upgrade" if tee_auto_migrate else "read-only assertion"
+        log.info("[db] TEE schema at head (%s: %s)", mode,
                  ",".join(sorted(actual_heads)))
         return
 

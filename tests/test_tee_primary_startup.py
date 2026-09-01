@@ -63,9 +63,26 @@ def test_tee_primary_allows_missing_audit_marker_when_triggers_are_ready(
         events=events,
     )
 
-    db.init_schema()
+    db.init_schema(tee_auto_migrate=True)
 
     assert events == ["upgrade", "head", "triggers"]
+
+
+def test_tee_primary_preflight_checks_without_upgrading(monkeypatch):
+    import db
+
+    events: list[str] = []
+    _configure_startup(
+        monkeypatch,
+        actual_head="test_tee_head",
+        expected_head="test_tee_head",
+        triggers=db._TEE_PRIMARY_TRIGGERS,
+        events=events,
+    )
+
+    db.init_schema()
+
+    assert events == ["head", "triggers"]
 
 
 def test_tee_primary_rejects_migration_head_mismatch(monkeypatch):
@@ -119,7 +136,23 @@ def test_tee_primary_startup_propagates_migration_failure(monkeypatch):
     monkeypatch.setattr(alembic_tee, "upgrade_head", fail_upgrade)
 
     with pytest.raises(RuntimeError, match="migration failed"):
-        db.init_schema()
+        db.init_schema(tee_auto_migrate=True)
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "backend/gunicorn_conf.py",
+        "backend/model_api_runtime/v2/serve_worker.py",
+        "backend/serve_dev.py",
+    ),
+)
+def test_real_startup_entrypoints_opt_into_tee_auto_migration(path):
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / path).read_text(encoding="utf-8")
+
+    assert "db.init_schema(tee_auto_migrate=True)" in source
 
 
 def test_preservation_revert_stays_blocked_without_marker_after_cutover():
