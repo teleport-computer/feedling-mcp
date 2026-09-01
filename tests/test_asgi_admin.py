@@ -400,6 +400,7 @@ def test_memory_truncation_real_action_is_queryable_through_admin_data_track(
             "original_chars": len(raw_content),
             "truncated_chars": len(raw_content) - 5000,
         },
+        db.TRACE_OUTCOME_PROVENANCE_FIELD: "missing",
     }
     assert secret not in json.dumps(payload, ensure_ascii=False)
 
@@ -818,6 +819,7 @@ def test_dream_job_metadata_supports_filters_pagination_and_no_bodies(env):
         "lane": "dream",
         "status": "failed",
         "failure_code": "upstream_unavailable",
+        "failure_code_provenance": "explicit",
         "duration_ms": 289000,
         "provider": "openai",
         "model": "gpt-5.5",
@@ -833,6 +835,7 @@ def test_dream_job_metadata_supports_filters_pagination_and_no_bodies(env):
     assert status == 200
     assert second["pagination"]["has_more"] is False
     assert second["jobs"][0]["failure_code"] == "runtime_failed"
+    assert second["jobs"][0]["failure_code_provenance"] == "normalized_invalid"
     assert second["jobs"][0]["duration_ms"] == 25000
     rendered = json.dumps([first, second])
     for forbidden in ("prompt", "reply", "content", "body", "NEVER RETURN"):
@@ -877,6 +880,7 @@ def test_metadata_projection_rejects_unexpected_content_fields():
             "user_id": "usr_safe",
             "status": "failed",
             "failure_code": "no_json_object",
+            "failure_code_provenance": "explicit",
             "duration_ms": 42,
             "provider": "openai",
             "model": "gpt-5.5",
@@ -887,6 +891,64 @@ def test_metadata_projection_rejects_unexpected_content_fields():
     assert set(card) == memory_metadata.CARD_FIELDS
     assert set(job) == memory_metadata.DREAM_JOB_FIELDS
     assert "SECRET" not in json.dumps([card, job])
+
+    unmeasured_job = memory_metadata.dream_job_metadata_from_row(
+        {
+            "job_id": 8,
+            "user_id": "usr_safe",
+            "status": "failed",
+            "failure_code": "runtime_failed",
+            "duration_ms": 1,
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "memory_card_count_now": 0,
+        }
+    )
+    assert unmeasured_job["failure_code_provenance"] == "unmeasured"
+
+
+def test_admin_failure_code_fallback_has_provenance_without_new_public_code(
+    env,
+    caplog,
+):
+    uid, _key = _register()
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO agent_jobs "
+            "(user_id,lane,status,last_error,created_at,finished_at) VALUES "
+            "(%s,'dream','failed','runtime_failed',now()-interval '2 seconds',now()),"
+            "(%s,'dream','failed','PRIVATE FREE TEXT',now()-interval '1 second',now())",
+            (uid, uid),
+        )
+
+    status, body = _asgi_json(
+        "GET",
+        f"/v1/admin/memory-dream-jobs?user_id={uid}&status=failed&limit=10",
+        headers=_admin(),
+    )
+
+    assert status == 200
+    assert {
+        (job["failure_code"], job["failure_code_provenance"])
+        for job in body["jobs"]
+    } == {
+        ("runtime_failed", "explicit"),
+        ("runtime_failed", "normalized_invalid"),
+    }
+    assert "PRIVATE FREE TEXT" not in json.dumps(body)
+
+    with caplog.at_level("WARNING", logger=memory_metadata.log.name):
+        assert memory_metadata._safe_failure_code("PRIVATE FREE TEXT") == (
+            "runtime_failed"
+        )
+    assert "field=admin_failure_code fallback=runtime_failed" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger=memory_metadata.log.name):
+        assert memory_metadata._safe_failure_code("runtime_failed") == (
+            "runtime_failed"
+        )
+    assert "field=admin_failure_code" not in caplog.text
 
 
 # --------------------------------------------------------------------------- #

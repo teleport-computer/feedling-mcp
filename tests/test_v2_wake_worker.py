@@ -30,6 +30,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -570,7 +571,7 @@ def test_only_newest_draft_is_injected_and_storage_is_bounded(monkeypatch):
     assert "DRAFT_SENTINEL" not in json.dumps(traces, ensure_ascii=False)
 
 
-def test_store_reports_nothing_when_primary_append_fails(monkeypatch):
+def test_store_reports_nothing_when_primary_append_fails(monkeypatch, caplog):
     """A swallowed primary write must not produce a stored report (or trim).
 
     ``db.log_append`` returning False is the wake caller's only signal that
@@ -596,16 +597,18 @@ def test_store_reports_nothing_when_primary_append_fails(monkeypatch):
     )
 
     monkeypatch.setattr(db, "log_append", lambda *args, **kwargs: False)
-    assert (
-        worker._store_wake_discarded_draft(
-            store,
-            "主库写失败的草稿",
-            wake_kind="heartbeat",
-            source_job_id="job-append-false",
-            collision_seq_hint=0,
+    with caplog.at_level("WARNING"):
+        assert (
+            worker._store_wake_discarded_draft(
+                store,
+                "主库写失败的草稿",
+                wake_kind="heartbeat",
+                source_job_id="job-append-false",
+                collision_seq_hint=0,
+            )
+            is None
         )
-        is None
-    )
+    assert "reason=append_failed" in caplog.text
     assert trims == []
 
     monkeypatch.setattr(db, "log_append", lambda *args, **kwargs: None)
@@ -619,6 +622,78 @@ def test_store_reports_nothing_when_primary_append_fails(monkeypatch):
     assert stored is not None
     assert stored["source_job_id"] == "job-append-legacy"
     assert len(trims) == 1
+
+
+@pytest.mark.parametrize(
+    ("text", "wake_kind", "expected_signal"),
+    [
+        ("", "heartbeat", "text_present=False lane_known=True"),
+        ("discarded words", "invalid_lane", "text_present=True lane_known=False"),
+    ],
+)
+def test_discarded_draft_invalid_input_is_observed_without_changing_control_flow(
+    monkeypatch,
+    caplog,
+    text,
+    wake_kind,
+    expected_signal,
+):
+    store = type("_Store", (), {"user_id": "u_wake_draft_invalid"})()
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda *_args, **_kwargs: pytest.fail("invalid input must return early"),
+    )
+
+    with caplog.at_level("WARNING"):
+        result = worker._store_wake_discarded_draft(
+            store,
+            text,
+            wake_kind=wake_kind,
+            source_job_id="job-invalid-input",
+            collision_seq_hint=0,
+        )
+
+    assert result is None
+    assert "reason=invalid_input" in caplog.text
+    assert expected_signal in caplog.text
+
+
+def test_legal_nonretained_wake_lanes_are_not_reported_as_invalid(
+    monkeypatch,
+    caplog,
+):
+    store = type("_Store", (), {"user_id": "u_wake_draft_nonretained"})()
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a non-retained lane must return before envelope construction"
+        ),
+    )
+    nonretained_lanes = (
+        worker._WAKE_LANES - worker._WAKE_DISCARDED_DRAFT_LANES
+    )
+    assert nonretained_lanes
+
+    for wake_kind in nonretained_lanes:
+        caplog.clear()
+        with caplog.at_level("INFO", logger=worker.log.name):
+            result = worker._store_wake_discarded_draft(
+                store,
+                "discarded words",
+                wake_kind=wake_kind,
+                source_job_id="job-nonretained-lane",
+                collision_seq_hint=0,
+            )
+
+        assert result is None
+        assert "reason=lane_not_retained" in caplog.text
+        assert "reason=invalid_input" not in caplog.text
+        assert not [
+            record for record in caplog.records
+            if record.levelno >= logging.WARNING
+        ]
 
 
 def test_collision_draft_write_failure_is_fail_open_without_stored_trace(
