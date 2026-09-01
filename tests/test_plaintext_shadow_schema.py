@@ -170,6 +170,7 @@ def test_plaintext_migration_dsn_takes_priority_without_database_url_fallback(
 ) -> None:
     from alembic_tee.connection import migration_database_url
 
+    monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "rds")
     monkeypatch.setenv("DATABASE_URL", "postgresql://wrong/primary")
     monkeypatch.setenv("TEE_DATABASE_URL", "postgresql://legacy/target")
     monkeypatch.setenv("TEE_MIGRATION_DATABASE_URL", "postgresql://legacy/owner")
@@ -184,3 +185,13 @@ def test_plaintext_migration_dsn_takes_priority_without_database_url_fallback(
     monkeypatch.delenv("TEE_DATABASE_URL")
     with pytest.raises(RuntimeError, match="migration database URL is not set"):
         migration_database_url()
+
+
+def test_tee_primary_migration_uses_app_database_url(monkeypatch) -> None:
+    from alembic_tee.connection import migration_database_url
+
+    monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "tee")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://app/primary")
+    monkeypatch.setenv("TEE_MIGRATION_DATABASE_URL", "postgresql://owner/legacy")
+
+    assert migration_database_url() == "postgresql+psycopg://app/primary"
