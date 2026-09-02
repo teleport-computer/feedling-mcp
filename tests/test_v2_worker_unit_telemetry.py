@@ -66,6 +66,17 @@ def test_safe_failure_codes_are_members_of_the_producer_export():
         assert "private" not in code
 
 
+def test_wake_choice_invalid_crosses_every_terminal_code_boundary():
+    exc = tool_loop.WakeChoiceInvalid()
+    code = worker._safe_failure_code("wake_failed", exc)
+
+    assert code == "wake_failed:choice_invalid"
+    assert code in worker.PUBLIC_FAILURE_CODES
+    assert jobs_store._TERMINAL_ERROR_CODE_RE.fullmatch(code)
+    assert jobs_store._terminal_error_class(code) == "reply_parse_failed"
+    assert "reply_parse_failed" not in jobs_store._DIRECT_NOTICE_ERROR_CLASSES
+
+
 def test_canvas_delivery_failure_is_not_classified_as_provider_connection():
     exc = tool_loop.CanvasDeliveryIncomplete("invalid_canvas_delivery_args")
 

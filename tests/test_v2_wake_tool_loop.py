@@ -56,10 +56,15 @@ def _reset(uid):
 
 
 @pytest.fixture(autouse=True)
-def _clean_agent_jobs_table():
+def _clean_agent_jobs_table(monkeypatch):
     """Mirrors test_v2_worker.py's fixture: claim_next_job() is a global claim,
     not filtered by user_id, so a stray row from another test module would
     otherwise get claimed here instead of this file's own row."""
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "resolve_content_encryption",
+        lambda _user_id: "off",
+    )
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs")
     yield
@@ -142,7 +147,12 @@ def _text_round(text, *, prompt_tokens=1, completion_tokens=1):
 
 def _wake_reply_round(text, *, prompt_tokens=1, completion_tokens=1):
     return _tool_round(
-        _tc("wake-reply-test", "reply", text=text),
+        _tc(
+            "wake-reply-test",
+            "reply",
+            think="I want to say this now.",
+            text=text,
+        ),
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
     )
@@ -271,9 +281,9 @@ def test_wake_terminal_plain_text_fails_without_proactive_bubble(monkeypatch):
     assert row is not None
     assert row[0] >= 1           # >=1 model call
     assert row[1] is True
-    assert row[2] == "wake_failed:empty_reply"
+    assert row[2] == "wake_failed:choice_invalid"
     assert row[3] == 0
-    assert _job_status(job_id) == ("failed", "wake_failed:empty_reply")
+    assert _job_status(job_id) == ("failed", "wake_failed:choice_invalid")
 
 
 def test_wake_enqueued_without_sink_is_not_counted_as_visible(monkeypatch):

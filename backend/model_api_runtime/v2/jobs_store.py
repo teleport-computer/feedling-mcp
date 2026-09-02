@@ -347,6 +347,13 @@ def _terminal_error_class(error: object, error_class: object = "") -> str:
         return "provider_timeout"
     if "prompt_frontier_exhausted" in code:
         return "context_overflow"
+    if code == "wake_failed:choice_invalid":
+        # The provider returned content, but it did not satisfy the wake's
+        # structured reply/stay_silent contract. Keep this separate from a
+        # genuinely empty provider response without minting a new user-facing
+        # notice class; reply_parse_failed is system-owned and intentionally
+        # absent from _DIRECT_NOTICE_ERROR_CLASSES.
+        return "reply_parse_failed"
     if code.endswith(":empty_reply"):
         return "provider_empty_reply"
     return "unknown"

@@ -491,23 +491,31 @@ def test_finalized_self_thinking_copy_is_exact_and_has_no_old_length_cap():
     )
 
 
-def test_chat_heartbeat_and_screen_watch_use_one_shared_instruction(monkeypatch):
+def test_chat_keeps_shared_instruction_while_proactive_uses_structured_choice(
+    monkeypatch,
+):
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
     shared = self_thinking.INSTRUCTION
 
     assert context.self_thinking.INSTRUCTION is shared
     assert worker.self_thinking.INSTRUCTION is shared
 
-    prompts = {
-        "chat": context.chat_system_prompt(SimpleNamespace(model="deepseek-chat")),
-        "heartbeat": worker._wake_system_prompt_for_lane(
-            "heartbeat", worker._WAKE_SYSTEM_PROMPT
-        ),
-        "screen_watch": worker._wake_system_prompt_for_lane(
-            "screen_watch", worker._SCREEN_WATCH_SYSTEM_PROMPT
-        ),
-    }
-    assert all(prompt.count(shared.strip()) == 1 for prompt in prompts.values())
+    chat_prompt = context.chat_system_prompt(SimpleNamespace(model="deepseek-chat"))
+    heartbeat_prompt = worker._wake_system_prompt_for_lane(
+        "heartbeat", worker._WAKE_SYSTEM_PROMPT
+    )
+    screen_prompt = worker._wake_system_prompt_for_lane(
+        "screen_watch", worker._SCREEN_WATCH_SYSTEM_PROMPT
+    )
+
+    assert chat_prompt.count(shared.strip()) == 1
+    for prompt in (heartbeat_prompt, screen_prompt):
+        assert shared.strip() not in prompt
+        assert (
+            "<think>Let me update the name and match a boastful tone</think>"
+            not in prompt
+        )
+        assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() in prompt
 
 
 def test_ordered_reply_tail_restores_causal_order_and_hides_later_users():
