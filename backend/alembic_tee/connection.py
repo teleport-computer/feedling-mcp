@@ -3,11 +3,35 @@ from __future__ import annotations
 
 import os
 import re
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 # Anything that *starts* with a URL scheme is URL-form; a '://' appearing
 # later (e.g. inside a libpq-quoted password) must not suppress conversion.
 _URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+
+
+class InvalidPostgresDSNError(RuntimeError):
+    """The configured migration DSN is not a supported PostgreSQL shape."""
+
+
+def _reject_unix_socket_host(host: str) -> None:
+    if any(candidate.startswith("/") for candidate in host.split(",")):
+        raise InvalidPostgresDSNError(
+            "TEE migration DSN Unix-socket hosts are not supported; "
+            "configure an explicit TCP host"
+        )
+
+
+def _reject_url_unix_socket_host(url: str) -> None:
+    try:
+        query = parse_qsl(urlsplit(url).query, keep_blank_values=True)
+    except ValueError as exc:
+        raise InvalidPostgresDSNError(
+            "TEE migration PostgreSQL URL could not be parsed"
+        ) from exc
+    for name, value in query:
+        if name == "host":
+            _reject_unix_socket_host(value)
 
 
 def _keyword_dsn_to_url(dsn: str) -> str:
@@ -20,7 +44,12 @@ def _keyword_dsn_to_url(dsn: str) -> str:
     psycopg's own conninfo parser — never hand-split — and fail closed
     on anything it rejects.
     """
-    from psycopg.conninfo import conninfo_to_dict
+    try:
+        from psycopg.conninfo import conninfo_to_dict
+    except ImportError as exc:
+        raise InvalidPostgresDSNError(
+            "TEE migration DSN normalization requires psycopg's conninfo parser"
+        ) from exc
 
     try:
         params = {
@@ -29,7 +58,7 @@ def _keyword_dsn_to_url(dsn: str) -> str:
             if v is not None
         }
     except Exception as exc:
-        raise RuntimeError(
+        raise InvalidPostgresDSNError(
             "TEE migration DSN is in libpq keyword form but could not be "
             f"parsed: {exc}"
         ) from exc
@@ -39,6 +68,8 @@ def _keyword_dsn_to_url(dsn: str) -> str:
     dbname = params.pop("dbname", "")
     user = params.pop("user", "")
     password = params.pop("password", "")
+
+    _reject_unix_socket_host(host)
 
     auth = ""
     if user:
@@ -87,15 +118,22 @@ def _keyword_dsn_to_url(dsn: str) -> str:
 
 
 def _normalize_postgres_url(url: str) -> str:
-    if url.startswith("postgresql+"):
-        return url
-    if url.startswith("postgresql://"):
-        return "postgresql+psycopg://" + url[len("postgresql://"):]
-    if url.startswith("postgres://"):
-        return "postgresql+psycopg://" + url[len("postgres://"):]
-    if "=" in url and not _URL_SCHEME_RE.match(url):
+    if not url:
+        raise InvalidPostgresDSNError("TEE migration DSN must not be empty")
+    if url.startswith("postgresql+") and _URL_SCHEME_RE.match(url):
+        normalized = url
+    elif url.startswith("postgresql://"):
+        normalized = "postgresql+psycopg://" + url[len("postgresql://"):]
+    elif url.startswith("postgres://"):
+        normalized = "postgresql+psycopg://" + url[len("postgres://"):]
+    elif "=" in url and not _URL_SCHEME_RE.match(url):
         return _keyword_dsn_to_url(url)
-    return url
+    else:
+        raise InvalidPostgresDSNError(
+            "TEE migration DSN must be a PostgreSQL URL or libpq keyword/value DSN"
+        )
+    _reject_url_unix_socket_host(normalized)
+    return normalized
 
 
 def migration_database_url() -> str:
