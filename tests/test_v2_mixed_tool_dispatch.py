@@ -377,6 +377,75 @@ def test_platform_mutation_failure_remains_terminal():
     asyncio.run(_scenario())
 
 
+def test_discarded_platform_mutation_is_a_bounded_model_visible_failure():
+    failures = {}
+    call = _call("write", "identity_nudge")
+
+    first = worker._recover_discarded_platform_mutation(
+        call,
+        {"status": "discarded", "last_error": "private sink detail"},
+        failures,
+    )
+    second = worker._recover_discarded_platform_mutation(
+        call,
+        {"status": "discarded"},
+        failures,
+    )
+
+    assert first == ToolResult(
+        call_id="write", content=worker._PLATFORM_READ_FAILED
+    )
+    assert second.content == worker._PLATFORM_READ_FAILED
+    assert "private sink detail" not in first.content
+    with pytest.raises(RuntimeError, match="discarded"):
+        worker._recover_discarded_platform_mutation(
+            call,
+            {"status": "discarded"},
+            failures,
+        )
+    assert failures == {"identity_nudge": 3}
+
+
+@pytest.mark.parametrize(
+    "disposition, expected_status",
+    [
+        pytest.param(None, "missing", id="missing-row"),
+        pytest.param(
+            {
+                "status": "pending",
+                "last_error": "dispatch_failed:EffectTerminalError",
+            },
+            "pending",
+            id="pending-even-with-terminal-error-text",
+        ),
+        pytest.param(
+            {"status": "reconciliation_required"},
+            "reconciliation_required",
+            id="reconciliation-required",
+        ),
+        pytest.param(
+            {"status": "delivery_uncertain"},
+            "delivery_uncertain",
+            id="delivery-uncertain",
+        ),
+        pytest.param(
+            {"status": "future_status"},
+            "future_status",
+            id="unknown-future-status",
+        ),
+    ],
+)
+def test_non_discarded_platform_mutation_dispositions_fail_closed(
+    disposition, expected_status,
+):
+    with pytest.raises(RuntimeError, match=expected_status):
+        worker._recover_discarded_platform_mutation(
+            _call("write", "identity_nudge"),
+            disposition,
+            {},
+        )
+
+
 def test_subagent_lost_lease_is_not_converted_to_a_task_error():
     async def _scenario():
         async def _lost_lease(_calls):

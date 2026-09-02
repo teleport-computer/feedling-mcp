@@ -2610,6 +2610,85 @@ def test_chat_mixed_valid_invalid_workspace_batch_applies_valid_call(
     assert captured["results"][1].content.startswith("error: unparseable args")
 
 
+def test_chat_discarded_identity_write_reaches_model_and_turn_continues(
+    monkeypatch,
+):
+    """The production chat dispatcher trusts the exact durable row status.
+
+    This uses a real encrypted tool-effect enqueue and real disposition read.
+    Only the sink boundary is scripted to make that exact identity row
+    terminal-discarded; the following provider round and final reply prove the
+    write failure is an observation rather than a terminal turn exception.
+    """
+    uid = "u_toolloop_discarded_identity_write"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-discarded-identity")
+    _patch_real_write(monkeypatch)
+    _patch_tool_effect_encryption(monkeypatch)
+    calls = _script_provider(
+        monkeypatch,
+        [
+            _tool_round(
+                _tc(
+                    "identity-write",
+                    "identity_nudge",
+                    dimension="warmth",
+                    delta=1,
+                )
+            ),
+            _text_round("Here is the answer."),
+            _text_round("Here is the answer."),
+        ],
+    )
+
+    def apply_with_discarded_identity(user_id: str):
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE v2_effect_outbox SET status='discarded', "
+                "last_error='dispatch_failed:EffectTerminalError' "
+                "WHERE user_id=%s AND effect_type='identity_encrypted_v1' "
+                "AND status IN ('pending','pending_fenced_v1')",
+                (user_id,),
+            )
+        return _apply_effects(user_id)
+
+    deps = _deps(
+        messages=[
+            {"id": "m1", "ts": 10.0, "role": "user", "content": "hi"},
+        ]
+    )
+    deps.apply_pending_effects = apply_with_discarded_identity
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert len(calls) == 3
+    assert _tool_result_contents(calls[1]) == {worker._PLATFORM_READ_FAILED}
+    assert _tool_result_contents(calls[2]) == {worker._PLATFORM_READ_FAILED}
+    assert "EffectTerminalError" not in str(calls[1]["messages"])
+    with db.get_pool().connection() as conn:
+        identity_row = conn.execute(
+            "SELECT status,last_error FROM v2_effect_outbox "
+            "WHERE user_id=%s AND effect_type='identity_encrypted_v1'",
+            (uid,),
+        ).fetchone()
+    assert identity_row == (
+        "discarded",
+        "dispatch_failed:EffectTerminalError",
+    )
+    assert _bubbles(uid)[0]["body_ct"] == "Here is the answer."
+
+
 def test_chat_photo_read_observation_reaches_next_model_round_without_base64(
     monkeypatch,
 ):

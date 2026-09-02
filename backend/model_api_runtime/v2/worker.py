@@ -1496,21 +1496,52 @@ def _recover_platform_read_failure(
     dedicated recoverable type is admitted; subclasses and every unrelated
     (including future) exception type fail closed so neither a new control
     signal nor a bare-``RuntimeError`` invariant can be swallowed by default.
-    Platform mutations deliberately do not use this helper: an outbox/sink
-    failure may have an unknown durable outcome and a model retry would receive
-    a new effect id.
+    Platform mutations use the same bounded result only through
+    ``_recover_discarded_platform_mutation`` after the exact durable outbox row
+    proves that the effect was discarded. An outbox/sink exception or every
+    other disposition still propagates because its outcome is not proven safe.
     """
     if isinstance(exc, _TOOL_CONTROL_FLOW_EXCEPTIONS):
         raise exc
     if type(exc) is not RecoverablePlatformReadError:
         raise exc
 
+    return _bounded_platform_failure_result(tc, exc, failures_by_tool)
+
+
+def _bounded_platform_failure_result(
+    tc,
+    failure: BaseException,
+    failures_by_tool: dict[str, int],
+) -> ToolResult:
+    """Return a content-free failure under the turn-wide per-tool ceiling."""
     tool_name = str(tc.name)
     failure_count = failures_by_tool.get(tool_name, 0) + 1
     failures_by_tool[tool_name] = failure_count
     if failure_count > MAX_RECOVERABLE_PLATFORM_READ_FAILURES_PER_TOOL:
-        raise exc
+        raise failure
     return ToolResult(call_id=tc.id, content=_PLATFORM_READ_FAILED)
+
+
+def _recover_discarded_platform_mutation(
+    tc,
+    disposition: dict[str, Any] | None,
+    failures_by_tool: dict[str, int],
+) -> ToolResult:
+    """Recover only a write whose exact durable row proves non-delivery.
+
+    Safety derives from the persisted disposition, never from the exception
+    class that led the outbox sink there. Missing, pending, reconciliation,
+    delivery-uncertain, and future statuses all fail closed. Workspace batches
+    deliberately do not use this single-effect recovery path.
+    """
+    status = "missing" if disposition is None else disposition.get("status")
+    failure = RuntimeError(
+        "platform write was not durably applied: " + str(status)
+    )
+    if status != "discarded":
+        raise failure
+    return _bounded_platform_failure_result(tc, failure, failures_by_tool)
 
 
 class TurnError(RuntimeError):
@@ -9956,11 +9987,10 @@ async def _run_wake(
                     if disposition is not None and disposition.get("last_error"):
                         evidence["last_error"] = str(disposition["last_error"])
                     if disposition is None or disposition["status"] != "applied":
-                        status = (
-                            "missing" if disposition is None else disposition["status"]
-                        )
-                        raise RuntimeError(
-                            "platform write was not durably applied: " + status
+                        return _recover_discarded_platform_mutation(
+                            tc,
+                            disposition,
+                            recoverable_platform_read_failures,
                         )
                     durable_result = disposition.get("result")
                     schedule_metadata = (
@@ -14852,11 +14882,10 @@ async def process_job(
                     if disposition is not None and disposition.get("last_error"):
                         evidence["last_error"] = str(disposition["last_error"])
                     if disposition is None or disposition["status"] != "applied":
-                        status = (
-                            "missing" if disposition is None else disposition["status"]
-                        )
-                        raise RuntimeError(
-                            "platform write was not durably applied: " + status
+                        return _recover_discarded_platform_mutation(
+                            tc,
+                            disposition,
+                            recoverable_platform_read_failures,
                         )
                     return ToolResult(
                         call_id=tc.id,
