@@ -104,3 +104,50 @@ def test_the_switch_defaults_on_and_can_be_turned_off(monkeypatch):
     monkeypatch.setattr(history, "store", None, raising=False)
     monkeypatch.setenv(history.ENV_FLAG, "0")
     assert history.enabled() is False
+
+
+# ---------------------------------------------------------------------------
+# 切换那一刻，趋势不能从 90 天塌成 1 天
+#
+# 2026-09-02 在 prod 上真的发生了：kit 当天上午才开始落数据，而读这一层是
+# 「kit 有数据就整份用 kit」——于是每个信号的历史都只剩当天那一行。
+# 不报错，agent 只会说"数据不够"，没有任何东西说得清为什么。
+# ---------------------------------------------------------------------------
+
+def _legacy(n=30):
+    return [{"date": f"2026-08-{d:02d}", "doc": {"m": 400 + d}} for d in range(1, n + 1)]
+
+
+def test_the_first_kit_day_does_not_erase_the_legacy_history():
+    from perception.store import _merge_daily
+    got = _merge_daily(_legacy(), [{"date": "2026-09-02", "doc": {"m": 431}}], 30)
+    assert len(got) == 30, f"只剩 {len(got)} 天 —— 历史被 kit 那一行盖掉了"
+    assert got[-1]["date"] == "2026-09-02"
+    assert got[0]["date"] == "2026-08-02"          # 按 days 截断，保留最近的
+
+
+def test_a_day_both_sides_have_goes_to_the_kit():
+    """混着用会让同一条曲线上半段一个口径、下半段另一个，比少几天更难发现。"""
+    from perception.store import _merge_daily
+    got = _merge_daily([{"date": "2026-09-02", "doc": {"m": 1}}],
+                       [{"date": "2026-09-02", "doc": {"m": 2}}], 30)
+    assert len(got) == 1 and got[0]["doc"]["m"] == 2
+
+
+def test_an_empty_side_changes_nothing():
+    from perception.store import _merge_daily
+    legacy = _legacy()
+    assert _merge_daily(legacy, [], 30) == legacy
+    kit = [{"date": "2026-09-02", "doc": {"m": 431}}]
+    assert _merge_daily([], kit, 30) == kit
+
+
+def test_a_legacy_read_failure_still_returns_what_the_kit_has():
+    """老表读挂了也别把 kit 已经有的那几天一起丢掉。"""
+    from unittest.mock import patch
+    import perception.store as store
+    kit = [{"date": "2026-09-02", "doc": {"m": 431}}]
+    with patch("perception.perceptkit_adapter.history.enabled", return_value=True), \
+         patch("perception.perceptkit_adapter.history.daily_rollups", return_value=kit), \
+         patch("perception.store.get_pool", side_effect=RuntimeError("db down")):
+        assert store.list_perception_daily("u", "health_sleep", days=30) == kit
