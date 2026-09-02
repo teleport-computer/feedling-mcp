@@ -214,3 +214,90 @@ def test_a_single_next_event_payload_is_accepted_too():
     rows = events.calendar_rows(
         {"calendar_next_event": {"event_id": "ev9", "title": "牙医"}})
     assert [r["source_event_id"] for r in rows] == ["ev9"]
+
+
+# ---------------------------------------------------------------------------
+# 照片身份必须来自设备，不能是内容信封 id
+#
+# 信封 id 每次上传都是新的（它标识一坨密文，不标识一张照片）。用它当身份，
+# 同一张照片重传两次就是两张 —— 而 photo_library_added 的每日新增数是
+# **永久保存**的：数字永久错、没人报错、重算那天也修不回来，因为第二次的
+# 贡献看上去和第一次一样合法。
+# ---------------------------------------------------------------------------
+
+def test_the_device_identity_wins_over_the_envelope_id():
+    from perception import service
+    meta = {"source_event_id": "a" * 64, "scene_hint": "food"}
+    assert service._photo_identity(meta, "envelope-1") == "a" * 64
+    # 同一张照片第二次上传 —— 信封 id 变了，身份不变。
+    assert service._photo_identity(meta, "envelope-2") == "a" * 64
+
+
+def test_a_client_that_sends_no_identity_still_works():
+    """老版本 app 没有这个字段。行为退回旧的（仍会重复计数），但不能报错。"""
+    from perception import service
+    assert service._photo_identity({"scene_hint": "food"}, "envelope-1") == "envelope-1"
+
+
+@pytest.mark.parametrize("bad", [
+    "", " ", "x" * 129, "  padded  ", 12345, None, ["a"], {"a": 1},
+])
+def test_an_unusable_identity_falls_back_instead_of_being_truncated(bad):
+    """这个端点是公开的。
+
+    截断是**更糟**的选择：两张不同照片被截成同一个身份，会把它们合并成一张，
+    和重复计数是同一类错，只是方向相反。宁可退回旧行为。
+    """
+    from perception import service
+    assert service._photo_identity({"source_event_id": bad}, "fallback") == "fallback"
+
+
+def test_the_same_identity_twice_lands_on_the_same_report_id():
+    """身份稳定还不够 —— 得真的让 kit 认出是同一件事。"""
+    from perception.perceptkit_adapter.events import photo_envelope
+    first = photo_envelope("stable-id", occurred_at=AT)
+    again = photo_envelope("stable-id", occurred_at=AT)
+    assert first["report_id"] == again["report_id"]
+    assert first["observations"][0]["source_event_id"] == "stable-id"
+    # 不同照片必须落在不同 report_id，否则第二张会被当成重传丢掉。
+    other = photo_envelope("another-id", occurred_at=AT)
+    assert other["report_id"] != first["report_id"]
+
+
+def test_retransmitting_one_photo_does_not_double_the_permanent_daily_count():
+    """这条才是这个 bug 本身。
+
+    前面几条只证明"身份传对了"。真正的后果在这里：新增数是**永久**聚合，
+    多算一次就永久错一次。上传失败重试、网络抖动重发、游标回退重扫 ——
+    每一种都会走到这条路上。
+    """
+    from datetime import datetime, timezone
+    from perceptkit import IngestContext, PerceptionKit
+    from perceptkit.conformance import InMemoryStorage
+    from perception.perceptkit_adapter.events import photo_envelope
+
+    at = datetime(2026, 8, 31, 9, 0, tzinfo=timezone.utc)
+    storage = InMemoryStorage()
+    kit = PerceptionKit(storage=storage, signals=MINIMAL_SIGNALS)
+
+    def send(identity):
+        env = photo_envelope(identity, occurred_at=AT, timezone_id="Asia/Shanghai")
+        return kit.ingest(env, context=IngestContext("u", at))
+
+    def count():
+        rows = storage.get_aggregate(subject_id="u", signal="photo_library_added",
+                                     start_date=at.date(), end_date=at.date())
+        return rows[0].typed_aggregate["count"]["total"] if rows else 0
+
+    send("stable-photo-1")
+    assert count() == 1
+    send("stable-photo-1")                       # 同一张，重传
+    assert count() == 1, "重传把永久新增数多算了一次"
+
+    send("stable-photo-2")                       # 另一张，真的该 +1
+    assert count() == 2
+
+    # 反过来证明这条测试在测什么：身份不稳（每次新 id）就一定会多算。
+    send("envelope-id-a")
+    send("envelope-id-b")                        # 同一张照片、两个信封 id
+    assert count() == 4, "身份不稳时确实会重复累加 —— 这正是要避免的那个后果"
