@@ -50,7 +50,7 @@ _EXCLUDED = frozenset({"chat_image_read", "chat_file_read", "perception_glance"}
 _STR = {"type": "string"}
 _INT = {"type": "integer"}
 _BOOL = {"type": "boolean"}
-_TRUE_BOOL = {"type": "boolean", "enum": [True], "default": True}
+_BOOL_DEFAULT_TRUE = {"type": "boolean", "default": True}
 _NO_ARGS: dict = {"type": "object", "properties": {}}
 
 _IDENTITY_DIMENSION = {
@@ -332,7 +332,10 @@ PARAMS: dict[str, dict] = {
     # params.get("include_image") (bool).
     "photo_read": {
         "type": "object",
-        "properties": {"photo_id": _STR, "include_image": _TRUE_BOOL},
+        "properties": {
+            "photo_id": _STR,
+            "include_image": _BOOL_DEFAULT_TRUE,
+        },
         "required": ["photo_id"],
     },
 
@@ -931,6 +934,12 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
     error = _validate_value(args, schema, path="args")
     if error:
         return error
+    if name == "photo_read" and args.get("include_image") is False:
+        # Gemini's function-declaration enum only accepts strings, so the
+        # provider-facing schema cannot express a true-only boolean without
+        # making an OpenAI-compatible Gemini route reject the whole catalog.
+        # Keep the execution contract authoritative at the local argument gate.
+        return "args.include_image has unsupported value"
     if name == "identity_patch":
         # Run the SAME merge the capability runs, so a call that validates here can't
         # quietly lose a field later. Import direction is safe: registry already pulls
