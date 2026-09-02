@@ -4159,6 +4159,75 @@ def test_regular_wake_empty_enters_required_terminal_choice(monkeypatch):
     assert outcome.stop_reason == "stay_silent"
 
 
+def test_regular_wake_schema_rejection_retries_with_only_terminal_choice_tools(
+    monkeypatch,
+):
+    """A broken user-MCP schema cannot poison the forced wake decision round."""
+
+    broken_mcp_name = "third_party_bad_schema"
+
+    class _RejectBrokenSchemaThenReply:
+        def __init__(self):
+            self.calls = []
+
+        async def __call__(self, config, messages, *, tools=None, **kwargs):
+            self.calls.append({"tools": tools, **kwargs})
+            offered_names = {spec.name for spec in (tools or [])}
+            if broken_mcp_name in offered_names:
+                raise provider_client.ProviderError(
+                    "unknown tool function schema rejected",
+                    status_code=400,
+                )
+            return {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "wake-reply-after-schema-rejection",
+                    "name": "reply",
+                    "args": {
+                        "think": "I still want to say this now.",
+                        "text": "structured reply after schema rejection",
+                    },
+                }],
+                "usage": {},
+            }
+
+    provider = _RejectBrokenSchemaThenReply()
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    replies = _RecordingReply()
+    broken_mcp_spec = ToolSpec(
+        name=broken_mcp_name,
+        description="Third-party test schema rejected by the provider.",
+        parameters={"type": "object", "properties": {}},
+    )
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=replies,
+        on_stay_silent=lambda _reason: None,
+        regular_wake_choice_required=True,
+        fold_new_messages=_RecordingFold([[]]),
+        add_usage=_noop_add_usage,
+        max_calls=3,
+        require_reply=False,
+        extra_tool_specs=[broken_mcp_spec],
+    ))
+
+    assert len(provider.calls) == 2
+    first_names = {spec.name for spec in provider.calls[0]["tools"]}
+    assert {broken_mcp_name, "memory_index", "reply", "stay_silent"} <= first_names
+    assert "tool_choice" not in provider.calls[0]
+    assert {spec.name for spec in provider.calls[1]["tools"]} == {
+        "reply",
+        "stay_silent",
+    }
+    assert provider.calls[1]["tool_choice"] == "required"
+    assert replies.calls == [("structured reply after schema rejection", True)]
+    assert outcome.stop_reason == "final_text"
+    assert outcome.rounds == 2
+
+
 def test_tool_then_empty_wake_forces_terminal_reply_without_preamble_duplicate(
     monkeypatch,
 ):
