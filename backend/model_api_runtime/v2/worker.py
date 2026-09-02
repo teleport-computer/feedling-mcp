@@ -10090,6 +10090,15 @@ async def _run_wake(
             nonlocal shadow_decision_allowed
             nonlocal wake_self_thinking_failed
             nonlocal discarded_draft_cleared
+            if (
+                lane != "scheduled"
+                and not isinstance(text, v2_tool_loop.ValidatedWakeReply)
+            ):
+                # The tool loop currently calls wake on_reply only for terminal
+                # text. Keep this source check at the effect boundary as well so
+                # a future intermediate callback cannot turn free-form provider
+                # text into a proactive bubble.
+                raise v2_tool_loop.ProviderEmptyReply("empty_reply")
             text = str(text or "").strip()
             wake_self_thinking_failed = False
             if provider_reply_signal.transport_cut:
@@ -10913,6 +10922,7 @@ async def _run_wake(
                 # 正是 T154 之前的那个洞,顺序反了会把洞做成默认行为。
                 tool_schema_collapse_policy=TOOL_SCHEMA_COLLAPSE_POLICY,
                 on_stay_silent=(_on_stay_silent if lane != "scheduled" else None),
+                regular_wake_choice_required=(lane != "scheduled"),
                 memory_delete_allowed=False,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,

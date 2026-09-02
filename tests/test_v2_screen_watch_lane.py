@@ -125,6 +125,21 @@ def _text_round(text, *, prompt_tokens=1, completion_tokens=1):
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
 
 
+def _wake_reply_round(text, *, prompt_tokens=1, completion_tokens=1):
+    return {
+        "reply": "",
+        "tool_calls": [{
+            "id": "wake-reply-test",
+            "name": "reply",
+            "args": {"text": text},
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+        },
+    }
+
+
 # ------------------------------------------------------------------
 # Dispatch: screen_watch is a wake lane.
 # ------------------------------------------------------------------
@@ -151,7 +166,7 @@ def test_screen_watch_turn_passes_safe_screen_context_and_its_own_prompt(monkeyp
     async def _fake(config, messages, *, tools=None, **_kwargs):
         seen["messages"] = messages
         seen["tools"] = tools
-        return _text_round("你在看这个报错？")
+        return _wake_reply_round("你在看这个报错？")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
 
@@ -280,7 +295,7 @@ def test_screen_watch_does_not_deadlock_when_cap_data_reacquires_enclave_sem(mon
         cap_registry, "run_capability", lambda action_type, store, **k: _FakeCapResult())
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
-        return _text_round("spotted it")
+        return _wake_reply_round("spotted it")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})

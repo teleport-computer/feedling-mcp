@@ -140,7 +140,29 @@ def _script_provider(monkeypatch, responses):
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
         calls.append({"messages": messages, "tools": tools, **_kwargs})
-        return next(it)
+        response = next(it)
+        offered_names = {spec.name for spec in (tools or [])}
+        # Most worker tests script the semantic outcome, not provider protocol
+        # compliance. When the regular wake surface offers ``reply``, model a
+        # cooperative provider by placing a scripted non-empty reply in that
+        # structured terminal tool. Tests for non-cooperation use their own
+        # provider stub so this convenience cannot make the regression guard pass.
+        if (
+            "reply" in offered_names
+            and cap_tool_schema.STAY_SILENT_TOOL in offered_names
+            and str(response.get("reply") or "").strip()
+            and not response.get("tool_calls")
+        ):
+            return {
+                **response,
+                "reply": "",
+                "tool_calls": [{
+                    "id": "wake-reply-test",
+                    "name": "reply",
+                    "args": {"text": response["reply"]},
+                }],
+            }
+        return response
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
     return calls
@@ -161,6 +183,18 @@ def _stay_silent_round(reason="没有值得打扰用户的新信息"):
             "id": "stay-silent-test",
             "name": cap_tool_schema.STAY_SILENT_TOOL,
             "args": {"reason": reason},
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+
+
+def _wake_reply_round(text, *, preamble=""):
+    return {
+        "reply": preamble,
+        "tool_calls": [{
+            "id": "wake-reply-test",
+            "name": "reply",
+            "args": {"text": text},
         }],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1},
     }
@@ -737,7 +771,7 @@ def test_collision_draft_write_failure_is_fail_open_without_stored_trace(
             },
             5000,
         )
-        return _text_round("这段撞车正文不会送达。")
+        return _wake_reply_round("这段撞车正文不会送达。")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake_provider)
     monkeypatch.setattr(
@@ -835,8 +869,8 @@ def test_collision_draft_reaches_next_wake_prompt_then_clears(monkeypatch):
                 },
                 5000,
             )
-            return _text_round(first_draft)
-        return _text_round(second_reply)
+            return _wake_reply_round(first_draft)
+        return _wake_reply_round(second_reply)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake_provider)
     traces = []
@@ -965,7 +999,7 @@ def test_run_wake_reply_written_and_job_completed(monkeypatch):
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
         seen["messages"] = messages
-        return _text_round("hey, how did that go?")
+        return _wake_reply_round("hey, how did that go?")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
     written = {}
@@ -1392,7 +1426,7 @@ def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypat
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
         provider_messages.append(messages)
-        return _text_round(reply_text)
+        return _wake_reply_round(reply_text)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
 
@@ -1475,7 +1509,7 @@ def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
     claimed_by = _claim(job_id)
     responses = iter([
         {
-            "reply": "",
+            "reply": "tool-round free text must stay internal",
             "tool_calls": [{
                 "id": "read",
                 "name": "memory_index",
@@ -1483,7 +1517,15 @@ def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
             }],
             "usage": {},
         },
-        _text_round("workspace-aware wake"),
+        {
+            "reply": "unpublished terminal preamble",
+            "tool_calls": [{
+                "id": "wake-reply",
+                "name": "reply",
+                "args": {"text": "workspace-aware wake"},
+            }],
+            "usage": {},
+        },
     ])
     provider_calls = []
 
@@ -1505,10 +1547,13 @@ def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
         "run_capability",
         lambda *_args, **_kwargs: _Result(),
     )
+    written_replies = []
     monkeypatch.setattr(
         worker,
         "_write_encrypted_reply",
-        lambda _store, _text: {"id": "wake-reply"},
+        lambda _store, text: (
+            written_replies.append(text) or {"id": "wake-reply"}
+        ),
     )
     loader_calls = []
     deps = _wake_deps(
@@ -1535,6 +1580,7 @@ def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
     ))
 
     assert status == "completed"
+    assert written_replies == ["workspace-aware wake"]
     assert loader_calls == ["rt"]
     assert len(provider_calls) == 2
     assert all(
@@ -2597,7 +2643,7 @@ def test_ordinary_heartbeat_final_reply_persists_glance_before_finish(
         return {"glance": glance}
 
     async def fake_provider(*args, **kwargs):
-        return _text_round("A quiet proactive reply.")
+        return _wake_reply_round("A quiet proactive reply.")
 
     def fake_envelope(_store, _text, *, item_id=None):
         return (
@@ -2850,7 +2896,7 @@ def test_run_perception_wake_hands_late_context_to_successor(monkeypatch):
         )
         assert late_job_id == job_id
         assert late_coalesced is True
-        return _text_round("This reply is stale after the late event.")
+        return _wake_reply_round("This reply is stale after the late event.")
 
     async def _empty_glance(*_args, **_kwargs):
         return None, None
@@ -3264,6 +3310,55 @@ def test_scheduled_tool_budget_exhaustion_never_retries(monkeypatch):
     assert _job_status(job_id) == (
         "failed",
         "wake_failed:tool_budget_exhausted",
+    )
+
+
+def test_wake_effect_boundary_rejects_unstructured_intermediate_text(
+    monkeypatch,
+):
+    """A future tool-loop intermediate callback cannot reopen the bubble path."""
+    uid = "u_wake_unstructured_intermediate"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+
+    async def _emit_unstructured_intermediate(**kwargs):
+        assert kwargs["regular_wake_choice_required"] is True
+        await kwargs["on_reply"](
+            "free-form tool-round text must not be delivered",
+            final=False,
+        )
+
+    monkeypatch.setattr(
+        worker.v2_tool_loop,
+        "run_tool_loop",
+        _emit_unstructured_intermediate,
+    )
+    written = []
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda _store, text: written.append(text) or {"id": "unexpected"},
+    )
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "heartbeat",
+        _wake_deps(tail=[{
+            "id": "m1", "ts": 1.0, "role": "user", "content": "hi",
+        }]),
+        _BYOK,
+        asyncio.Semaphore(4),
+        claimed_by,
+    ))
+
+    assert status == "failed"
+    assert written == []
+    assert _job_status(job_id) == (
+        "failed",
+        "wake_failed:empty_reply",
     )
 
 
@@ -3708,6 +3803,9 @@ def _seen_lane_policy(monkeypatch):
 
     async def _spy(*a, **kw):
         seen["require_reply"] = kw.get("require_reply")
+        seen["regular_wake_choice_required"] = kw.get(
+            "regular_wake_choice_required"
+        )
         seen["on_provider_tool_surface"] = kw.get("on_provider_tool_surface")
         return await orig(*a, **kw)
 
@@ -3716,15 +3814,20 @@ def _seen_lane_policy(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "lane,expected_require_reply",
+    "lane,expected_require_reply,expected_regular_wake_choice",
     [
-        ("scheduled", True),
-        ("heartbeat", False),
-        ("manual_wake", False),
-        ("screen_watch", False),
+        ("scheduled", True, False),
+        ("heartbeat", False, True),
+        ("manual_wake", False, True),
+        ("screen_watch", False, True),
     ],
 )
-def test_only_scheduled_wake_demands_a_reply(monkeypatch, lane, expected_require_reply):
+def test_only_scheduled_wake_demands_a_reply(
+    monkeypatch,
+    lane,
+    expected_require_reply,
+    expected_regular_wake_choice,
+):
     """心跳沉默=成功，定时提醒沉默=提醒丢了。两条道必须传不同的策略。
 
     参数化而不是写两个用例：这个不对称本身就是被测对象，分开写的话有人只改
@@ -3753,6 +3856,10 @@ def test_only_scheduled_wake_demands_a_reply(monkeypatch, lane, expected_require
     assert deps is not None
 
     assert seen["require_reply"] is expected_require_reply, seen
+    assert (
+        seen["regular_wake_choice_required"]
+        is expected_regular_wake_choice
+    ), seen
     assert seen["on_provider_tool_surface"] is not None, seen
 
 
@@ -3942,10 +4049,10 @@ def test_screen_watch_prefetch_injects_bounded_ocr_app_and_pixels(monkeypatch):
     assert {"memory_write", "schedule_wake"}.isdisjoint(offered), (
         "无人值守的屏幕轮不许再提供平台写工具(T107)"
     )
-    # 读屏能力仍保留；T208 删除了所有 lane 的模型侧 reply tool，
-    # 可见文本改由 terminal response 单路径产生。
+    # 读屏能力仍保留；T436 只为非 scheduled 主动道重新引入结构化 reply，
+    # 用它替代 T208 的自由 terminal response 出口。T107 的屏幕写闸不变。
     assert "screen_read" in offered
-    assert "reply" not in offered
+    assert "reply" in offered
 
 
 def test_screen_watch_without_frames_keeps_identity_writes(monkeypatch):
