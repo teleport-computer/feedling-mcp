@@ -63,6 +63,11 @@ _REM_AT = ("CASE WHEN reminder_fields->>'due_at' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
            "THEN (reminder_fields->>'due_at')::timestamptz END")
 
 
+#: Rows removed per bounded sweep call. A sweep that needs more comes back
+#: next round; one that takes an unbounded lock is its own incident.
+_SWEEP_MAX_ROWS = 2000
+
+
 def _j(value: Any) -> str | None:
     return None if value is None else json.dumps(value, sort_keys=True, default=str)
 
@@ -278,6 +283,25 @@ class PostgresStorage:
         return bool(rows)
 
     # -- Aggregates ----------------------------------------------------------
+
+    def delete_aggregates(self, *, subject_id, signal, before) -> int:
+        """Retention for daily aggregates. Which signals and which cutoff is
+        decided by the kit (``PerceptionKit.run_retention``); this only
+        executes one bounded delete.
+
+        Bounded by ctid + LIMIT for the same reason the observation sweep is:
+        an unbounded DELETE against a large table holds locks long enough to
+        be its own incident.
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM perceptkit_daily_aggregate WHERE ctid IN ("
+                "  SELECT ctid FROM perceptkit_daily_aggregate"
+                "   WHERE subject_id = %s AND signal = %s AND local_date < %s"
+                "   LIMIT %s)",
+                (subject_id, signal, before, _SWEEP_MAX_ROWS),
+            )
+            return cur.rowcount
 
     def get_aggregate(self, *, subject_id, signal, start_date, end_date,
                       aggregation_kind=None):

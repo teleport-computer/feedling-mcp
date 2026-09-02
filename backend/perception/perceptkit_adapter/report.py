@@ -40,6 +40,46 @@ def build(conn: Any, *, subject_id: str | None = None) -> dict[str, Any]:
         },
         "wakes": _wakes(conn, subject_id),
         "coverage": coverage,
+        "photo_identity": _photo_identity(conn, subject_id),
+    }
+
+
+#: 设备给的稳定身份自带这个前缀。见 iOS 的 stableAssetIdentity。
+_PHOTO_SCHEME = "ph1\\_%"
+
+
+def _photo_identity(conn: Any, subject_id: str | None) -> dict[str, Any]:
+    """有多少照片带了设备身份，多少还在走信封 id 兜底。
+
+    这一格回答的是「iOS 那半到底有没有到」。没有它就只能猜：兜底路径**不报错**
+    （它就是旧行为），所以一个没升级的 app、或者一次前缀改动，表现出来只是
+    "每日新增数偶尔多算一点"，看不出是哪儿的问题。
+
+    兜底不是坏事，是老版本 app 的正常样子。真正要盯的是它**降不下去** ——
+    那说明新版没铺开，或者身份根本没送到。
+    """
+    sql = """
+      SELECT CASE WHEN source_event_id LIKE %s THEN 'device_stable'
+                  ELSE 'envelope_fallback' END AS scheme,
+             COUNT(*)
+      FROM perceptkit_observation
+      WHERE signal = 'photo_library_added' {and_subject}
+      GROUP BY 1
+    """.format(and_subject="AND subject_id = %s" if subject_id else "")
+    params: list[Any] = [_PHOTO_SCHEME]
+    if subject_id:
+        params.append(subject_id)
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        counts = {scheme: int(n) for scheme, n in cur.fetchall()}
+    stable = counts.get("device_stable", 0)
+    fallback = counts.get("envelope_fallback", 0)
+    total = stable + fallback
+    return {
+        "device_stable": stable,
+        # 走兜底的照片重传一次就会让当天的永久新增数多算一次。
+        "envelope_fallback": fallback,
+        "stable_share": round(stable / total, 4) if total else None,
     }
 
 
