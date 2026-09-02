@@ -1455,6 +1455,64 @@ class CaptureHalted(RuntimeError):
     """The fleet halt closed while a background Capture job was in flight."""
 
 
+_TOOL_CONTROL_FLOW_EXCEPTIONS = (
+    LostJobLease,
+    RuntimeModeChanged,
+    CaptureHalted,
+    asyncio.CancelledError,
+)
+
+# Give the model the first failure plus one retry/route-change opportunity. A
+# third same-tool failure in one turn is no longer returned to the model: it
+# propagates and terminates the turn instead of feeding an unbounded bad-tool
+# loop. Counts live in the enclosing chat/wake/child turn, not one provider
+# batch, so repeated calls across rounds share the same ceiling.
+MAX_RECOVERABLE_PLATFORM_READ_FAILURES_PER_TOOL = 2
+_PLATFORM_READ_FAILED = "error: tool_execution_failed"
+
+
+class RecoverablePlatformReadError(RuntimeError):
+    """A read dispatcher explicitly proved safe to return to the model."""
+
+
+class _ToolReadFailureMustPropagate(RuntimeError):
+    """Fail-closed wrapper for an unclassified child tool exception."""
+
+
+_SUBAGENT_FATAL_EXCEPTIONS = _TOOL_CONTROL_FLOW_EXCEPTIONS + (
+    _ToolReadFailureMustPropagate,
+)
+
+
+def _recover_platform_read_failure(
+    tc,
+    exc: BaseException,
+    failures_by_tool: dict[str, int],
+) -> ToolResult:
+    """Return one content-free read failure only for a closed safe allowlist.
+
+    Ownership/cancellation signals are derived from this worker's existing
+    control-flow catches and are always re-raised explicitly. Only the exact
+    dedicated recoverable type is admitted; subclasses and every unrelated
+    (including future) exception type fail closed so neither a new control
+    signal nor a bare-``RuntimeError`` invariant can be swallowed by default.
+    Platform mutations deliberately do not use this helper: an outbox/sink
+    failure may have an unknown durable outcome and a model retry would receive
+    a new effect id.
+    """
+    if isinstance(exc, _TOOL_CONTROL_FLOW_EXCEPTIONS):
+        raise exc
+    if type(exc) is not RecoverablePlatformReadError:
+        raise exc
+
+    tool_name = str(tc.name)
+    failure_count = failures_by_tool.get(tool_name, 0) + 1
+    failures_by_tool[tool_name] = failure_count
+    if failure_count > MAX_RECOVERABLE_PLATFORM_READ_FAILURES_PER_TOOL:
+        raise exc
+    return ToolResult(call_id=tc.id, content=_PLATFORM_READ_FAILED)
+
+
 class TurnError(RuntimeError):
     """A turn cannot safely produce or cover its required final reply."""
 
@@ -3799,6 +3857,7 @@ async def _dispatch_mixed_tool_calls(
     on_progress: Callable[[str], None] | None = None,
     on_tool_event: Callable[[Any, str, dict], Awaitable[None]] | None = None,
     mcp_called_names: list[str] | None = None,
+    recoverable_platform_read_failures: dict[str, int] | None = None,
 ) -> list[ToolResult]:
     """Run one provider batch with mixed-read overlap and ordered mutations.
 
@@ -3832,6 +3891,8 @@ async def _dispatch_mixed_tool_calls(
         return round(max(0, time.monotonic_ns() - started_ns) / 1_000_000.0, 3)
 
     read_gate = asyncio.Semaphore(max(1, int(read_parallelism)))
+    if recoverable_platform_read_failures is None:
+        recoverable_platform_read_failures = {}
     mutating_mcp_names = frozenset(str(name) for name in mutating_mcp_names)
     reads: list[tuple[str, Any]] = []
     task_calls: list[Any] = []
@@ -4012,24 +4073,33 @@ async def _dispatch_mixed_tool_calls(
         started_ns = time.monotonic_ns()
         try:
             await _event(tc, "tool_call_started", {"phase": f"{kind}_read"})
-            if kind == "mcp":
-                # wait_for encloses admission as well as transport: this is a total
-                # wall deadline, not another per-socket idle timeout.
-                result = await _mcp_result(tc, mutating=False, use_read_gate=True)
-            else:
-                async with read_gate:
-                    result = await dispatch_platform_one(tc)
-        except Exception as exc:
-            await _event(
-                tc,
-                "tool_call_error",
-                {
-                    "phase": f"{kind}_read",
-                    "error_class": type(exc).__name__,
-                    "duration_ms": _duration_ms(started_ns),
-                },
-            )
-            raise
+            try:
+                if kind == "mcp":
+                    # wait_for encloses admission as well as transport: this is a
+                    # total wall deadline, not another per-socket idle timeout.
+                    result = await _mcp_result(
+                        tc, mutating=False, use_read_gate=True
+                    )
+                else:
+                    async with read_gate:
+                        result = await dispatch_platform_one(tc)
+            except Exception as exc:
+                await _event(
+                    tc,
+                    "tool_call_error",
+                    {
+                        "phase": f"{kind}_read",
+                        "error_class": type(exc).__name__,
+                        "duration_ms": _duration_ms(started_ns),
+                    },
+                )
+                if kind != "platform":
+                    raise
+                result = _recover_platform_read_failure(
+                    tc,
+                    exc,
+                    recoverable_platform_read_failures,
+                )
         finally:
             if is_fetch_owner:
                 # Release continuations even when dispatch or observability
@@ -4067,6 +4137,8 @@ async def _dispatch_mixed_tool_calls(
         else:
             try:
                 task_results = await dispatch_task_batch(task_calls)
+            except _SUBAGENT_FATAL_EXCEPTIONS:
+                raise
             except Exception:  # noqa: BLE001 — child failures stay model-visible
                 results = [
                     ToolResult(
@@ -6288,6 +6360,7 @@ def _make_task_batch_dispatcher(
             child_tool_event = _make_tool_trajectory_callback(child_recorder)
             child_read_gate = asyncio.Semaphore(MAX_READ_ACTION_PARALLELISM)
             child_web_fetch_session = cap_web.WebFetchSession()
+            child_read_failures_by_tool: dict[str, int] = {}
             # Computed ONCE and referenced by both the offer side
             # (disabled_tool_names below) and the execute side
             # (_child_dispatch). Deriving each independently is precisely how
@@ -6346,31 +6419,43 @@ def _make_task_batch_dispatcher(
                                 "tool_call_started",
                                 {"phase": "subagent_read"},
                             )
-                        async with child_read_gate:
-                            (result,) = await v2_executor.dispatch_tool_calls(
-                                [tc],
-                                store=store,
-                                api_key=api_key,
-                                runtime_token=runtime_token,
-                                enclave_sem=enclave_sem,
-                                turn_authorization=False,
-                                enqueue_write_effect=_no_child_write,
-                                before_write=None,
-                                observe_photo=observe_photo,
-                                read_parallelism=1,
-                                web_fetch_session=child_web_fetch_session,
-                            )
-                    except Exception as exc:
-                        if child_tool_event is not None:
-                            await child_tool_event(
-                                tc,
-                                "tool_call_error",
-                                {
-                                    "phase": "subagent_read",
-                                    "error_class": type(exc).__name__,
-                                },
-                            )
-                        raise
+                        try:
+                            async with child_read_gate:
+                                (result,) = await v2_executor.dispatch_tool_calls(
+                                    [tc],
+                                    store=store,
+                                    api_key=api_key,
+                                    runtime_token=runtime_token,
+                                    enclave_sem=enclave_sem,
+                                    turn_authorization=False,
+                                    enqueue_write_effect=_no_child_write,
+                                    before_write=None,
+                                    observe_photo=observe_photo,
+                                    read_parallelism=1,
+                                    web_fetch_session=child_web_fetch_session,
+                                )
+                        except Exception as exc:
+                            if child_tool_event is not None:
+                                await child_tool_event(
+                                    tc,
+                                    "tool_call_error",
+                                    {
+                                        "phase": "subagent_read",
+                                        "error_class": type(exc).__name__,
+                                    },
+                                )
+                            # The helper re-raises every unclassified type. The
+                            # subagent batch normally isolates child failures,
+                            # so wrap those unknowns in an explicit fatal signal
+                            # that survives that isolation boundary.
+                            try:
+                                result = _recover_platform_read_failure(
+                                    tc, exc, child_read_failures_by_tool
+                                )
+                            except _TOOL_CONTROL_FLOW_EXCEPTIONS:
+                                raise
+                            except Exception as unsafe_exc:
+                                raise _ToolReadFailureMustPropagate from unsafe_exc
                     finally:
                         if is_fetch_owner:
                             fetch_event.set()
@@ -6464,6 +6549,7 @@ def _make_task_batch_dispatcher(
             return await v2_subagents.run_task_batch(
                 task_calls,
                 run_child=_run_child,
+                propagated_exception_types=_SUBAGENT_FATAL_EXCEPTIONS,
             )
         except v2_subagents.SubagentBatchError:
             # Invalid/oversized batches execute zero children. Preserve every
@@ -9778,6 +9864,7 @@ async def _run_wake(
             observe_photo=observe_photo,
             trajectory_recorder=trajectory_recorder,
         )
+        recoverable_platform_read_failures: dict[str, int] = {}
 
         async def _dispatch_tools(tool_calls):
             cancelled = await _web_batch_cancellation(
@@ -10048,6 +10135,9 @@ async def _run_wake(
                 on_progress=_report_turn_progress,
                 on_tool_event=wake_tool_event,
                 mcp_called_names=mcp_called_names,
+                recoverable_platform_read_failures=(
+                    recoverable_platform_read_failures
+                ),
             )
             dispatched_by_id = {str(r.call_id): r for r in dispatched}
             return [
@@ -14597,6 +14687,7 @@ async def process_job(
             effect_evidence_by_call=effect_evidence_by_call,
             emit_debug_trace=deps.emit_debug_trace,
         )
+        recoverable_platform_read_failures: dict[str, int] = {}
 
         async def _dispatch_tools(tool_calls):
             cancelled = await _web_batch_cancellation(
@@ -14994,6 +15085,9 @@ async def process_job(
                 on_progress=_report_turn_progress,
                 on_tool_event=chat_tool_activity_callback,
                 mcp_called_names=mcp_called_names,
+                recoverable_platform_read_failures=(
+                    recoverable_platform_read_failures
+                ),
             )
             dispatched_by_id = {str(result.call_id): result for result in dispatched}
             results = [
