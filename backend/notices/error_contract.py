@@ -132,7 +132,17 @@ def _chat_specs() -> tuple[ErrorSpec, ...]:
         _spec("provider_empty_reply", "chat", "provider", "provider_transient", "你的模型服务这次返回了空回复，稍后再试；反复出现请检查模型渠道或中转的稳定性。"),
         _spec("file_delivery_incomplete", "chat", "delivery", "system", "文件内容已经保存，但附件发送没有完成。请稍后再试。", en="The file was saved, but its attachment was not delivered. Please try again later.", matcher=r"\bfile_delivery_incomplete\b"),
         _spec("canvas_file_delivery_incomplete", "chat", "delivery", "system", "画布内容已经保存，但卡片更新没有完成。请稍后再试。", en="The Canvas content was saved, but its card update did not finish. Please try again later.", matcher=r"\bcanvas_file_delivery_incomplete\b"),
-        _spec("reply_parse_failed", "chat", "provider", "system", "系统处理回复时出了问题，我们会尽快排查。"),
+        _spec(
+            "reply_parse_failed",
+            "chat",
+            "provider",
+            "system",
+            "系统处理回复时出了问题，我们会尽快排查。请再发一次。",
+            en=(
+                "Something went wrong while we processed the reply. "
+                "We're looking into it — please send it again."
+            ),
+        ),
         _spec("unknown", "chat", "provider", "system", "连接模型服务时出了问题。"),
         _spec(UNREGISTERED_ERROR_CLASS, "chat", "contract", "system", "系统返回了未注册的错误分类，我们已记录并会尽快排查。", en="The runtime returned an unregistered error classification. We recorded it for investigation."),
     )
