@@ -229,7 +229,9 @@ Proactive runtime and temporal context is labeled as application data rather
 than presented as a new user message. An ordinary heartbeat does not call the
 model until the account has genuine conversation history. Once history exists,
 heartbeat and screen-watch moments leave speaking and staying silent as equal
-model choices; scheduled reminders remain explicit delivery requests.
+model choices. The terminal choice is structured as either `reply` (with separate
+thinking and visible-message fields) or `stay_silent`; scheduled reminders remain
+explicit delivery requests.
 
 ## Collection items
 

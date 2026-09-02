@@ -63,7 +63,12 @@ _MCP_SPEC = ToolSpec(
 
 
 @pytest.fixture(autouse=True)
-def _clean_agent_jobs_table():
+def _clean_agent_jobs_table(monkeypatch):
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "resolve_content_encryption",
+        lambda _user_id: "off",
+    )
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs")
     yield
@@ -129,13 +134,13 @@ def _script_provider(monkeypatch, responses):
     return calls
 
 
-def _wake_reply_round(text):
+def _wake_reply_round(text, *, think="I want to say this now."):
     return {
         "reply": "",
         "tool_calls": [{
             "id": "wake-reply-test",
             "name": "reply",
-            "args": {"text": text},
+            "args": {"think": think, "text": text},
         }],
         "usage": {},
     }

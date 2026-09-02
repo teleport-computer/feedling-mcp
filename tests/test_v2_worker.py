@@ -286,13 +286,19 @@ def _text_round(text, *, prompt_tokens=1, completion_tokens=1):
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
 
 
-def _wake_reply_round(text, *, prompt_tokens=1, completion_tokens=1):
+def _wake_reply_round(
+    text,
+    *,
+    think="I want to say this now.",
+    prompt_tokens=1,
+    completion_tokens=1,
+):
     return {
         "reply": "",
         "tool_calls": [{
             "id": "wake-reply-test",
             "name": "reply",
-            "args": {"text": text},
+            "args": {"think": think, "text": text},
         }],
         "usage": {
             "prompt_tokens": prompt_tokens,
