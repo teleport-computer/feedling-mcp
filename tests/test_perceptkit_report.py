@@ -116,3 +116,66 @@ def test_it_can_be_narrowed_to_one_person(conn):
         now=T0, report_id="r2")
     only = report.build(conn, subject_id="u1")["perception"]["divergences"]
     assert [r["signal"] for r in only] == ["battery"]
+
+
+# ---------------------------------------------------------------------------
+# 一个 100% 被拒的信号必须是响的
+#
+# 2026-09-02：外部审查说「iOS adapter 只覆盖部分信号」，我数代码得出「全覆盖」
+# 并据此顶了回去 —— 实际上 health_sleep 的每一条上报都被拒（iOS 送四个每日
+# 分钟总数，manifest 要「一条观测 = 一个睡眠阶段」，stage 必填）。
+#
+# 证据当时就在这份报告里：signals_seen 是 22 个而 manifest 有 23 个。
+# 但那要求读的人先记得 23 这个数、再去数一遍。三层都不报错：
+# 拒收不进任何计数、摄入照样返回成功、快照那侧静默回退到老路。
+# ---------------------------------------------------------------------------
+
+def test_a_signal_that_never_arrives_is_named_not_left_to_be_counted_out():
+    from perceptkit.manifest.minimal import MINIMAL_SIGNALS
+    from perception.perceptkit_adapter import report
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *a): pass
+        # (信号, 总行数, observed 行数)
+        def fetchall(self): return [("battery", 3, 3), ("weather", 2, 2)]
+
+    class _Conn:
+        def cursor(self): return _Cur()
+
+    cov = report._coverage(_Conn(), "u")
+    missing = set(cov["signals_never_seen"])
+    assert "health_sleep" in missing
+    # 名单必须是「声明过的减去见过的」，不是一个手写常量 —— 手写的会漂。
+    assert missing == set(MINIMAL_SIGNALS) - {"battery", "weather"}
+    assert "battery" not in missing
+
+
+def test_a_signal_that_only_ever_arrives_absent_is_named_too():
+    """**这一条才是真正踩到的那个。**
+
+    health_sleep 的真数据每条都被拒，但「权限关闭」「这轮没读到」那两种
+    没有 value、不过字段校验，照常落一行 —— 于是它出现在 signals_seen 里，
+    看上去接通了，连 signals_never_seen 都抓不到它。
+
+    「只有缺席、从没有过在场」和「这个信号根本没接」外观一样，
+    和「我们把它的真数据全拒了」外观也一样。
+    """
+    from perception.perceptkit_adapter import report
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *a): pass
+        def fetchall(self):
+            return [("battery", 5, 5),          # 正常
+                    ("health_sleep", 9, 0),      # 有行，但一条真数据都没有
+                    ("weather", 4, 1)]           # 偶尔读不到，但有过在场
+
+    class _Conn:
+        def cursor(self): return _Cur()
+
+    cov = report._coverage(_Conn(), "u")
+    assert cov["signals_never_observed"] == ["health_sleep"]
+    assert "health_sleep" not in cov["signals_never_seen"], "它有行，不属于'从没见过'"
