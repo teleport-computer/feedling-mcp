@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import os
 from pathlib import Path
 
@@ -268,6 +269,77 @@ def test_unparseable_keyword_dsn_fails_closed_with_named_error(monkeypatch) -> N
         migration_database_url()
 
 
+def test_non_dsn_text_fails_closed_with_named_error() -> None:
+    from alembic_tee.connection import (
+        InvalidPostgresDSNError,
+        _normalize_postgres_url,
+    )
+
+    with pytest.raises(
+        InvalidPostgresDSNError,
+        match="PostgreSQL URL or libpq keyword/value DSN",
+    ):
+        _normalize_postgres_url("not-a-dsn")
+
+
+def test_empty_dsn_fails_closed_with_named_error() -> None:
+    from alembic_tee.connection import (
+        InvalidPostgresDSNError,
+        _normalize_postgres_url,
+    )
+
+    with pytest.raises(InvalidPostgresDSNError, match="must not be empty"):
+        _normalize_postgres_url("")
+
+
+def test_missing_conninfo_parser_has_clear_named_error(monkeypatch) -> None:
+    from alembic_tee.connection import (
+        InvalidPostgresDSNError,
+        _keyword_dsn_to_url,
+    )
+
+    real_import = builtins.__import__
+
+    def reject_conninfo_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "psycopg.conninfo":
+            raise ImportError("simulated missing conninfo parser")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", reject_conninfo_import)
+    with pytest.raises(
+        InvalidPostgresDSNError,
+        match="requires psycopg's conninfo parser",
+    ):
+        _keyword_dsn_to_url("host=db.example dbname=feedling")
+
+
+@pytest.mark.parametrize(
+    ("reserved", "encoded"),
+    [
+        ("@", "%40"),
+        (":", "%3A"),
+        ("/", "%2F"),
+        ("?", "%3F"),
+        ("#", "%23"),
+        ("&", "%26"),
+    ],
+)
+def test_keyword_dsn_password_preserves_reserved_characters(
+    reserved: str,
+    encoded: str,
+) -> None:
+    from alembic_tee.connection import _keyword_dsn_to_url
+    from sqlalchemy.engine.url import make_url
+
+    password = f"before{reserved}after"
+    url = _keyword_dsn_to_url(
+        f"user=app password='{password}' host=db.example dbname=feedling"
+    )
+
+    assert encoded in url
+    assert make_url(url).password == password
+
+
 def test_keyword_dsn_with_url_like_password_still_converts(monkeypatch) -> None:
     """'://' inside a quoted value must not suppress conversion (QA finding)."""
     from alembic_tee.connection import migration_database_url
@@ -290,9 +362,19 @@ def test_keyword_dsn_with_url_like_password_still_converts(monkeypatch) -> None:
     assert parsed.database == "feedling"
 
 
-def test_keyword_dsn_shapes_url_cannot_express_are_refused(monkeypatch) -> None:
-    """Unix-socket hosts / password-without-user must fail closed, not misroute."""
-    from alembic_tee.connection import migration_database_url
+@pytest.mark.parametrize(
+    "dsn",
+    [
+        "host=/var/run/postgresql dbname=feedling",
+        "postgresql:///feedling?host=/var/run/postgresql",
+    ],
+)
+def test_unix_socket_host_is_explicitly_refused(monkeypatch, dsn: str) -> None:
+    """No configured migration DSN uses sockets, so refuse rather than guess."""
+    from alembic_tee.connection import (
+        InvalidPostgresDSNError,
+        migration_database_url,
+    )
 
     monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "rds")
     for var in (
@@ -301,12 +383,23 @@ def test_keyword_dsn_shapes_url_cannot_express_are_refused(monkeypatch) -> None:
     ):
         monkeypatch.delenv(var, raising=False)
 
-    monkeypatch.setenv(
-        "TEE_DATABASE_URL", "host=/var/run/postgresql dbname=feedling"
-    )
-    with pytest.raises(RuntimeError, match="losslessly|cannot parse"):
+    monkeypatch.setenv("TEE_DATABASE_URL", dsn)
+    with pytest.raises(
+        InvalidPostgresDSNError,
+        match="Unix-socket hosts are not supported",
+    ):
         migration_database_url()
 
+
+def test_keyword_dsn_password_without_user_is_refused(monkeypatch) -> None:
+    from alembic_tee.connection import migration_database_url
+
+    monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "rds")
+    for var in (
+        "PLAINTEXT_SHADOW_MIGRATION_DATABASE_URL",
+        "TEE_MIGRATION_DATABASE_URL",
+    ):
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv(
         "TEE_DATABASE_URL", "password=secret host=h dbname=d"
     )
