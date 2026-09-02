@@ -1326,12 +1326,13 @@ _DEGENERATE_REPLY_FALLBACK_EN = (
     ).strip()
     or DEFAULT_FAILURE_FALLBACK_EN
 )
-_DEGENERATE_REPLY_ERROR_CLASS = "upstream_unavailable"
+_DEGENERATE_REPLY_ERROR_CLASS = "reply_parse_failed"
 # A torn/leaked protocol-JSON fragment (stream-cut relay split the envelope
-# across reasoning/content). Same blame as a degenerate reply — the relay, not
-# us — but a distinct failure reason keeps flaky-relay users visible in the
-# job_failed_reasons aggregation instead of hiding behind a plain sleep.
-_PROTOCOL_FRAGMENT_ERROR_CLASS = "upstream_unavailable"
+# across reasoning/content). It joins the closed reply-parse family while its
+# distinct failure reason stays visible in job_failed_reasons. The neutral
+# notice deliberately does not promise whether the model, relay, or our parser
+# caused the malformed shape.
+_PROTOCOL_FRAGMENT_ERROR_CLASS = "reply_parse_failed"
 _PROTOCOL_FRAGMENT_REASON = "protocol_fragment_suppressed"
 _LOCAL_TOOL_CALL_TAIL_EVIDENCE = "tool_call_tail"
 _TOOL_CALL_TAIL_RE = re.compile(
