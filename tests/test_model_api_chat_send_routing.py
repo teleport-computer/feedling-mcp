@@ -14,6 +14,7 @@ from accounts import registry as accounts_registry  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
 from bootstrap import gates as boot_gates  # noqa: E402
 from core import config as core_config  # noqa: E402
+from core import chat_images  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
 from core import store as core_store  # noqa: E402
@@ -576,6 +577,86 @@ def test_send_image_turn_also_routes(client, monkeypatch):
         assert conn.execute(
             "SELECT count(*) FROM agent_jobs WHERE user_id=%s", (user_id,)
         ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    [
+        ({"image_b64": "AAAA", "images": [{"image_b64": "AAAA"}]},
+         "image_payload_conflict"),
+        ({"images": []}, "image_list_empty"),
+        ({"images": [{"image_b64": "AAAA"}] * 10},
+         "image_count_exceeds_limit"),
+    ],
+)
+def test_multi_image_entry_rejections_are_explicit(client, payload, error):
+    _user_id, api_key = _register(client)
+    response = client.post(
+        "/v1/model_api/chat/send", json=payload, headers=_headers(api_key)
+    )
+    assert response.status_code == 400
+    assert response.get_json()["error"] == error
+    if error == "image_count_exceeds_limit":
+        assert response.get_json()["max_images"] == chat_images.MAX_CHAT_IMAGES_PER_MESSAGE
+
+
+def test_exactly_nine_images_are_accepted_and_bundled(client, monkeypatch):
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(
+        core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder()
+    )
+    _setup_openrouter(client, api_key, monkeypatch)
+    _mark_active_route_vision_ready(user_id)
+    images = [
+        {"image_b64": _b64(f"image-{index}".encode()), "image_mime": "image/png"}
+        for index in range(9)
+    ]
+    response = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "nine", "images": images},
+        headers=_headers(api_key),
+    )
+    assert response.status_code == 202, response.get_data(as_text=True)
+    row_id = response.get_json()["user_message"]["id"]
+    row = next(m for m in core_store.get_store(user_id).chat_messages if m["id"] == row_id)
+    assert row["image_bundle_version"] == chat_images.CHAT_IMAGE_BUNDLE_VERSION
+    assert row["image_count"] == 9
+    assert row["image_mimes"] == ["image/png"] * 9
+
+
+def test_one_item_images_keeps_legacy_storage_shape(client, monkeypatch):
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(
+        core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder()
+    )
+    _setup_openrouter(client, api_key, monkeypatch)
+    _mark_active_route_vision_ready(user_id)
+    legacy_response = client.post(
+        "/v1/model_api/chat/send",
+        json={"image_b64": _b64(b"one"), "image_mime": "image/webp"},
+        headers=_headers(api_key),
+    )
+    assert legacy_response.status_code == 202, legacy_response.get_data(as_text=True)
+    response = client.post(
+        "/v1/model_api/chat/send",
+        json={"images": [{"image_b64": _b64(b"one"), "image_mime": "image/webp"}]},
+        headers=_headers(api_key),
+    )
+    assert response.status_code == 202, response.get_data(as_text=True)
+    row_id = response.get_json()["user_message"]["id"]
+    row = next(m for m in core_store.get_store(user_id).chat_messages if m["id"] == row_id)
+    legacy_id = legacy_response.get_json()["user_message"]["id"]
+    legacy_row = next(
+        m for m in core_store.get_store(user_id).chat_messages if m["id"] == legacy_id
+    )
+    assert row["content_type"] == "image"
+    assert row["image_mime"] == "image/webp"
+    assert not (set(chat_images.MULTI_IMAGE_STORAGE_FIELDS) & set(row))
+    # Envelope bytes/ids are freshly randomized on each send, but the stored
+    # document field shape and every non-envelope semantic value are identical.
+    assert set(row) == set(legacy_row)
+    for key in ("role", "source", "content_type", "image_mime", "visibility"):
+        assert row[key] == legacy_row[key]
 
 
 def test_send_image_turn_persists_real_mime(client, monkeypatch):

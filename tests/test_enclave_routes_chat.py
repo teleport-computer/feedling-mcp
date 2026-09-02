@@ -14,6 +14,8 @@ from enclave import backend_client, envelope as envmod, keys  # noqa: E402
 from enclave import state as enclave_state  # noqa: E402
 from enclave.readside import MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT  # noqa: E402
 from enclave.routes import build_app  # noqa: E402
+from enclave.routes import chat as enclave_chat  # noqa: E402
+from core import chat_images  # noqa: E402
 
 
 @pytest.fixture()
@@ -37,6 +39,38 @@ def _wire(monkeypatch, messages, moments=None):
     async def fake_sk():
         return object()
     monkeypatch.setattr(keys, "get_content_sk", fake_sk)
+
+
+def test_multi_image_history_returns_and_omits_each_image(monkeypatch):
+    bundle = chat_images.encode_image_bundle([
+        (b"one", "image/jpeg"), (b"two", "image/png")
+    ])
+    row = {
+        "id": "m-images", "role": "user", "ts": 1.0, "v": 1,
+        "content_type": "image", "visibility": "shared",
+        "owner_user_id": "usr_a", "body_ct": "cipher",
+        "image_bundle_version": 1, "image_count": 2,
+        "image_mimes": ["image/jpeg", "image/png"],
+    }
+    monkeypatch.setattr(envmod, "read_envelope", lambda *_args: bundle)
+    messages, errors = enclave_chat._decrypt_history_items([row], "usr_a", object())
+    assert errors == []
+    assert messages[0]["images"] == [
+        {"image_b64": base64.b64encode(b"one").decode(), "image_mime": "image/jpeg"},
+        {"image_b64": base64.b64encode(b"two").decode(), "image_mime": "image/png"},
+    ]
+
+    omitted = {**row, "body_omitted": True, "body_omitted_reason": "image_body"}
+    omitted.pop("body_ct")
+    messages, errors = enclave_chat._decrypt_history_items(
+        [omitted], "usr_a", object()
+    )
+    assert errors == []
+    assert messages[0]["images"] == [
+        {"image_omitted": True, "image_mime": "image/jpeg"},
+        {"image_omitted": True, "image_mime": "image/png"},
+    ]
+    assert all("image_b64" not in item for item in messages[0]["images"])
 
 
 def test_memory_list_fetch_overlaps_history_decrypt(client, monkeypatch):

@@ -3,6 +3,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))  # noq
 
 import httpx  # noqa: E402
 from capabilities import chat as cap_chat  # noqa: E402
+from core import chat_images  # noqa: E402
 import types  # noqa: E402
 
 
@@ -108,3 +109,27 @@ def test_image_read_plaintext_binary_never_calls_enclave(monkeypatch):
 
     assert result.ok is True
     assert result.data["image_b64"] == "AAAA"
+
+
+def test_image_read_returns_every_image_from_plaintext_bundle(monkeypatch):
+    import base64
+
+    store = types.SimpleNamespace(user_id="usr_plain")
+    bundle = chat_images.encode_image_bundle([
+        (b"one", "image/jpeg"), (b"two", "image/png")
+    ])
+    monkeypatch.setattr(cap_chat.db, "chat_get_strict", lambda *_args: {
+        "id": "img-bundle",
+        "content_type": "image",
+        "body_b64": base64.b64encode(bundle).decode("ascii"),
+        "body_size_bytes": len(bundle),
+        "image_bundle_version": 1,
+        "owner_user_id": "usr_plain",
+        "visibility": "shared",
+    })
+    result = cap_chat.image_read(store, params={"id": "img-bundle"})
+    assert result.ok is True
+    assert result.data["images"] == [
+        {"image_mime": "image/jpeg", "image_b64": base64.b64encode(b"one").decode()},
+        {"image_mime": "image/png", "image_b64": base64.b64encode(b"two").decode()},
+    ]

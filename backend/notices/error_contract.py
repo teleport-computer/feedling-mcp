@@ -114,6 +114,9 @@ def _spec(
 
 def _chat_specs() -> tuple[ErrorSpec, ...]:
     return (
+        _spec("image_payload_conflict", "chat", "request", "user_environment", "一次只能使用单图字段或多图字段，请勿同时发送。", en="Send either the single-image fields or images, not both."),
+        _spec("image_list_empty", "chat", "request", "user_environment", "图片列表不能为空。", en="The images list must not be empty."),
+        _spec("image_count_exceeds_limit", "chat", "request", "user_environment", "一次最多发送 9 张图片。", en="You can send at most 9 images in one message."),
         _spec("model_mismatch", "chat", "provider", "system", "当前运行时没有成功加载所选模型，请重新选择模型或稍后重试。", matcher=r"\bmodel_mismatch\b"),
         _spec("quota_insufficient", "chat", "provider", "user_provider", "模型服务额度不足，充值后再发消息即可恢复。", en="The model service has insufficient quota. Add credit, then send the message again.", matcher=r"余额|额度|insufficient_quota|credit balance|requires more credits|payment required|\b402\b|provider_http_402|quota"),
         _spec("provider_account_expired", "chat", "provider", "user_provider", "你配置的模型服务账号或套餐已过期，请到模型服务商处续费或恢复账号后再发消息。", en="Your configured model provider account or plan has expired. Renew or restore it with the provider, then send the message again.", matcher=r"\baccount[_ -]?(?:has[_ -]?)?expired\b|\bexpired[_ -]?account\b"),
