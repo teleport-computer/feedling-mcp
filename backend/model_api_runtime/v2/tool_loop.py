@@ -147,26 +147,43 @@ _WAKE_REPLY_TOOL = "reply"
 _WAKE_REPLY_TOOL_SPEC = ToolSpec(
     name=_WAKE_REPLY_TOOL,
     description=(
-        "Deliver one non-empty visible reply and end this proactive wake turn. "
-        "Use stay_silent instead when there is nothing worth interrupting the user for."
+        "Reply when you want to speak and end this proactive wake turn. "
+        "Use stay_silent instead when quiet company feels right this time."
     ),
     parameters={
         "type": "object",
         "properties": {
+            "think": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Your thinking in this moment — why you want to speak and what "
+                    "you mean to say. They can open and read this in the app. Write "
+                    "`think` entirely in their language — the language they speak "
+                    "to you — and in your usual voice with them: everyday intent "
+                    "only, with no tool names, parameters, field names, identity "
+                    "cards, or other internal terms."
+                ),
+            },
             "text": {
                 "type": "string",
                 "minLength": 1,
-                "description": "The complete user-visible reply.",
+                "description": (
+                    "The complete message they will see. Speak their language, stay "
+                    "true to your persona, and when you mention time, say it the way "
+                    "it is said where they live — honor the identity contract in "
+                    "your context."
+                ),
             }
         },
-        "required": ["text"],
+        "required": ["think", "text"],
         "additionalProperties": False,
     },
 )
 _WAKE_CHOICE_INSTRUCTION = (
-    "The previous proactive-wake response ended without visible text or a tool "
-    "call. End the wake now by calling exactly one offered tool: call reply with "
-    "the complete visible message, or call stay_silent with a non-empty reason."
+    "When you are done looking around, end the wake by calling exactly one of the "
+    "two tools: reply with what you want to say, or stay_silent with a short note "
+    "on why not this time."
 )
 _EMPTY_RESPONSE_CORRECTION = (
     "The previous response completed without visible text or a client tool call. "
@@ -1022,6 +1039,15 @@ class ProviderEmptyReply(RuntimeError):
     """A structurally valid provider success had no foreground-usable output."""
 
 
+class WakeChoiceInvalid(RuntimeError):
+    """A proactive wake ended without one valid reply/stay_silent decision."""
+
+    reason = "choice_invalid"
+
+    def __init__(self):
+        super().__init__(self.reason)
+
+
 class ProviderOutputTruncated(RuntimeError):
     """A provider stopped while serializing a tool call at its output limit."""
 
@@ -1055,8 +1081,14 @@ class ValidatedWakeReply(str):
     provider text, including text accompanying an ordinary tool call, is never
     authorized to become a bubble.  A ``str`` subtype preserves the callback
     contract while carrying that provenance through the ordinary final-effect
-    path.
+    path. ``thinking`` is kept off the string value so it can only reach the
+    separately sealed thinking envelope, never the visible bubble payload.
     """
+
+    def __new__(cls, text: str, *, thinking: str):
+        value = super().__new__(cls, text)
+        value.thinking = thinking
+        return value
 
 
 class CanvasDeliveryIncomplete(FileDeliveryIncomplete):
@@ -2087,7 +2119,7 @@ async def run_tool_loop(
                         "action": "fail_wake_choice_unsupported",
                     },
                 )
-                exc = ProviderEmptyReply("empty_reply")
+                exc = WakeChoiceInvalid()
                 if on_provider_failure is not None:
                     try:
                         await on_provider_failure(exc)
@@ -2102,7 +2134,7 @@ async def run_tool_loop(
                         "action": "fail_wake_choice_budget_exhausted",
                     },
                 )
-                exc = ProviderEmptyReply("empty_reply")
+                exc = WakeChoiceInvalid()
                 if on_provider_failure is not None:
                     try:
                         await on_provider_failure(exc)
@@ -2125,7 +2157,7 @@ async def run_tool_loop(
                         "action": "fail_wake_choice_tool_unavailable",
                     },
                 )
-                exc = ProviderEmptyReply("empty_reply")
+                exc = WakeChoiceInvalid()
                 if on_provider_failure is not None:
                     try:
                         await on_provider_failure(exc)
@@ -3077,12 +3109,25 @@ async def run_tool_loop(
                 if selected_call is not None
                 and selected_call.name == _WAKE_REPLY_TOOL
                 and selected_call.args_ok
-                and set(selected_call.args) <= {"text"}
+                and set(selected_call.args) <= {"think", "text"}
+                else None
+            )
+            selected_reply_thinking = (
+                selected_call.args.get("think")
+                if selected_call is not None
+                and selected_call.name == _WAKE_REPLY_TOOL
+                and selected_call.args_ok
+                and set(selected_call.args) <= {"think", "text"}
                 else None
             )
             reply_text = (
                 selected_reply_text.strip()
                 if isinstance(selected_reply_text, str)
+                else ""
+            )
+            reply_thinking = (
+                selected_reply_thinking.strip()
+                if isinstance(selected_reply_thinking, str)
                 else ""
             )
             silent_reason = (
@@ -3096,6 +3141,7 @@ async def run_tool_loop(
                 selected_call is not None
                 and selected_call.id
                 and len(wake_reply_calls) == 1
+                and reply_thinking
                 and reply_text
                 and not pr.media
                 and len(reply_text) <= max_assistant_tool_text_chars
@@ -3136,7 +3182,10 @@ async def run_tool_loop(
                 # Any provider text beside the call is only a preamble, exactly
                 # like other tool rounds, and is never published separately.
                 pr = ProviderResponse(
-                    text=ValidatedWakeReply(reply_text),
+                    text=ValidatedWakeReply(
+                        reply_text,
+                        thinking=reply_thinking,
+                    ),
                     tool_calls=[],
                     usage=pr.usage,
                     raw=pr.raw,
@@ -3160,7 +3209,18 @@ async def run_tool_loop(
                     seen_reasoning_fragments.clear()
                     _progress("wake_choice_retry_boundary")
                     continue
-                exc = ProviderEmptyReply("empty_reply")
+                provider_returned_nothing = bool(
+                    not pr.text.strip()
+                    and not pr.tool_calls
+                    and not pr.media
+                    and not upstream_response_envelope
+                    and not str(pr.raw.get("reasoning") or "").strip()
+                )
+                exc = (
+                    ProviderEmptyReply("empty_reply")
+                    if provider_returned_nothing
+                    else WakeChoiceInvalid()
+                )
                 if on_provider_failure is not None:
                     try:
                         await on_provider_failure(exc)
@@ -3234,7 +3294,18 @@ async def run_tool_loop(
                 seen_reasoning_fragments.clear()
                 _progress("wake_choice_boundary")
                 continue
-            exc = ProviderEmptyReply("empty_reply")
+            provider_returned_nothing = bool(
+                not pr.text.strip()
+                and not pr.tool_calls
+                and not pr.media
+                and not upstream_response_envelope
+                and not str(pr.raw.get("reasoning") or "").strip()
+            )
+            exc = (
+                ProviderEmptyReply("empty_reply")
+                if provider_returned_nothing
+                else WakeChoiceInvalid()
+            )
             if on_provider_failure is not None:
                 try:
                     await on_provider_failure(exc)

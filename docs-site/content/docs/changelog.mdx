@@ -220,16 +220,14 @@ change must not be interpreted as an API guarantee.
   falls back to the system notification sound without a per-account backend
   preference or uploaded audio.
 
-- **Hosted proactive wakes now make an explicit speak-or-sleep choice after an
-  empty model round.** The first round still receives the full wake tool surface.
-  If it ends without visible text or a tool call, including after earlier tool
-  work in the same turn, Runtime V2 spends one attempt from the existing turn
-  budget on only `reply` and `stay_silent` and requires one of them. A selected
-  `stay_silent` completes the wake with its auditable reason; the existing
-  thinking-only silence form remains supported. Providers that cannot enforce
-  the choice, exhausted turns, and invalid forced responses fail through the
-  existing `empty_reply` outcome instead of being accepted as unclassified
-  silence.
+- **Hosted proactive wakes now finish with an explicit speak-or-sleep choice as
+  their normal flow.** Earlier rounds retain the full wake tool surface so the
+  companion can look around before deciding. A spoken result must use `reply`
+  with separate thinking and visible-message fields; quiet company uses
+  `stay_silent` with an auditable reason. Invalid or missing choices fail silently
+  with a dedicated `choice_invalid` outcome, while a genuinely blank provider
+  response remains `empty_reply`; free-form text is never used as a rescue
+  message. Scheduled reminders keep their existing must-deliver flow.
 
 - **Dedicated image observation now has a bounded, exact-main recovery path.**
   Rate limiting, temporary unavailability, an empty observation, or an explicitly

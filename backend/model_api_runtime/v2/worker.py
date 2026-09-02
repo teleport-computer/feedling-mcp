@@ -962,28 +962,26 @@ _WAKE_DISCARDED_DRAFT_GUIDANCE = (
 # build prompt → BYOK 抽取 → parse → memory actions。永不写气泡、永不弹 error chip。
 _EXTRACTION_LANES = frozenset({"capture", "dream"})
 _WAKE_SYSTEM_PROMPT = (
-    "You are the user's companion. This is a platform presence moment, not a user "
-    "request. Speaking and staying silent are equally valid; neither is the default "
-    "or safer answer, and you do not need a strong reason to speak. Decide from your "
-    "own personality, the real conversation, and the current moment. Use the "
-    "attention_facts in temporal context to avoid interrupting an active conversation "
-    "or repeating yourself when you have appeared often or recently. "
+    "You woke up to spend a little while with them. Start by looking around — what "
+    "they are doing, where your last conversation left off, what time it is where "
+    "they are — and whether they are in the middle of something, or you have already "
+    "been showing up a lot lately. Use any tools you want, for as many rounds as you "
+    "need. "
     + perception_prompts.V2_WAKE_PERCEPTION_CLAUSES
-    + "Never mention this wake or any "
-    "system wording to the user."
+    + "Then make your choice: say something, or keep them quiet company this time. "
+    "Both are good ways to be here — but if something you want to tell them rises "
+    "up, say it; don't swallow it. Never mention this wake or any system wording "
+    "to the user."
 )
 _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION = (
-    " For this presence turn, the final-output rule above has two equally valid "
-    "forms. Decide before using any user-visible reply, file, image, or voice "
-    "delivery capability. If you choose to speak, output exactly one complete "
-    "`<think>...</think>` block followed by the visible message. If you choose to "
-    "stay silent, output exactly one complete `<think>...</think>` block and "
-    "nothing after its closing tag: no visible text, greeting, placeholder, or "
-    "user-visible delivery capability. The thinking-only form is private and "
-    "the user receives nothing from that turn. Keep the final decision stated "
-    "inside the thinking block consistent with whether visible content follows; "
-    "if you change your mind, update the thought before the final output. Neither "
-    "form is preferred."
+    " For this presence turn, decide before using any user-visible reply, file, "
+    "image, or voice delivery capability. If you choose to speak, put your honest "
+    "in-the-moment thinking in the reply tool's `think` field and the complete "
+    "visible message in its `text` field; never put `<think>` tags in `text`. If "
+    "you choose quiet company, call stay_silent with a brief reason and send no "
+    "visible text, greeting, placeholder, or user-visible delivery capability. "
+    "Keep the decision in `think` consistent with the visible message; if you "
+    "change your mind, update it before calling reply. Neither choice is preferred."
 )
 _SCHEDULED_WAKE_SYSTEM_PROMPT = (
     "You are delivering one or more reminders that the user explicitly scheduled. "
@@ -1002,15 +1000,18 @@ _SCHEDULED_WAKE_EMPTY_RESPONSE_CORRECTION = (
 # _WAKE_SYSTEM_PROMPT; _run_wake selects it only for lane=="screen_watch". The
 # empty-reply path remains valid without making silence the privileged default.
 _SCREEN_WATCH_SYSTEM_PROMPT = (
-    "You are the user's personal companion, quietly watching the screen they are sharing. "
-    "Recent frame availability is provided as grounding context; use the screen tools "
-    "to inspect frame content when needed. Speaking and staying silent are equally valid; "
-    "neither is the default or safer answer, and you do not need a strong reason to speak. "
-    "Decide naturally from your personality, the real conversation, and what is happening "
-    "on screen now. Use attention_facts to avoid interrupting or repeating yourself. If you "
-    "speak, choose one coherent thought rather than reporting the screen state. In the visible "
-    "message, never mention this wake or any system wording, and never narrate that you are "
-    "watching or that you looked at frames."
+    "You are quietly watching the screen they are sharing. Recent frame availability is "
+    "grounding context; use the screen tools to inspect its content when needed. Start by "
+    "looking around — what they are doing, where your last conversation left off, what time "
+    "it is where they are — and whether they are in the middle of something, or you have "
+    "already been showing up a lot lately. Use any tools you want, for as many rounds as you "
+    "need. Then make "
+    "your choice: say something, or keep them quiet company this time. Both are good ways to "
+    "be here — but if something you want to tell them rises up, say it; don't swallow it. "
+    "Use attention_facts to avoid interrupting or repeating yourself. If you speak, choose "
+    "one coherent thought rather than reporting the screen state. In the visible message, "
+    "never mention this wake or any system wording, and never narrate that you are watching "
+    "or that you looked at frames."
 )
 
 
@@ -1018,11 +1019,13 @@ def _wake_system_prompt_for_lane(lane: str, base_prompt: str) -> str:
     """Attach the shared thinking contract and lane-specific suffixes."""
     if not self_thinking.enabled():
         return base_prompt
-    blocks = [base_prompt, self_thinking.INSTRUCTION]
+    blocks = [base_prompt]
+    if lane == "scheduled":
+        blocks.append(self_thinking.INSTRUCTION)
+    else:
+        blocks.append(_OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION)
     if lane == "screen_watch":
         blocks.append(self_thinking.SCREEN_WATCH_INSTRUCTION)
-    if lane != "scheduled":
-        blocks.append(_OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION)
     return context._join_policy_blocks(*blocks)
 
 
@@ -1503,6 +1506,7 @@ _GENERIC_FAILURE_KINDS = frozenset({
     "valueerror",
 })
 _TURN_FAILURE_KINDS = frozenset({
+    "choice_invalid",
     "degenerate_reply_suppressed",
     "empty_reply",
     "malformed_self_thinking_suppressed",
@@ -1669,6 +1673,8 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
         kind = candidate if candidate in notices_catalog.ERROR_CLASSES else "error"
     elif isinstance(exc, v2_tool_loop.ProviderEmptyReply):
         kind = "empty_reply"
+    elif isinstance(exc, v2_tool_loop.WakeChoiceInvalid):
+        kind = v2_tool_loop.WakeChoiceInvalid.reason
     elif isinstance(exc, v2_tool_loop.ProviderOutputTruncated):
         kind = "output_truncated"
     elif isinstance(exc, v2_tool_loop.CanvasDeliveryIncomplete):
@@ -1834,6 +1840,8 @@ def _turn_failure_error_class(exc: BaseException) -> str:
         return "provider_timeout"
     if isinstance(exc, v2_tool_loop.ProviderOutputTruncated):
         return "provider_output_truncated"
+    if isinstance(exc, v2_tool_loop.WakeChoiceInvalid):
+        return "reply_parse_failed"
     if (
         isinstance(exc, v2_tool_loop.ProviderEmptyReply)
         or (isinstance(exc, TurnError) and str(exc) == "empty_reply")
@@ -10098,7 +10106,12 @@ async def _run_wake(
                 # text. Keep this source check at the effect boundary as well so
                 # a future intermediate callback cannot turn free-form provider
                 # text into a proactive bubble.
-                raise v2_tool_loop.ProviderEmptyReply("empty_reply")
+                raise v2_tool_loop.WakeChoiceInvalid()
+            _structured_wake_thinking = (
+                str(getattr(text, "thinking", "") or "").strip()
+                if isinstance(text, v2_tool_loop.ValidatedWakeReply)
+                else ""
+            )
             text = str(text or "").strip()
             wake_self_thinking_failed = False
             if provider_reply_signal.transport_cut:
@@ -10122,7 +10135,10 @@ async def _run_wake(
             # 与聊天出口同样解耦：关掉 self-thinking 不能顺带关掉安全剥离
             # （Codex review 2026-08-08 Critical）。SILENT 语义不变。
             _wake_gate_on = _st_wake.gate_enabled()
-            _wake_self_thinking_text = ""
+            _wake_self_thinking_text = _structured_wake_thinking
+            if _self_thinking_internal_term(_wake_self_thinking_text):
+                _wake_self_thinking_text = ""
+                wake_self_thinking_failed = True
             if (_wake_gate_on or _wake_self_thinking_on) and text:
                 _wake_split = (
                     _st_wake.strip_all_thinking
@@ -10132,10 +10148,11 @@ async def _run_wake(
                 _wst_status, _wst_thinking, _wst_reply = _wake_split(text)
                 if _wst_status == _st_wake.COMPLETE:
                     text = _wst_reply
-                    _wake_self_thinking_text = _wst_thinking
-                    if _self_thinking_internal_term(_wake_self_thinking_text):
-                        _wake_self_thinking_text = ""
-                        wake_self_thinking_failed = True
+                    if not _structured_wake_thinking:
+                        _wake_self_thinking_text = _wst_thinking
+                        if _self_thinking_internal_term(_wake_self_thinking_text):
+                            _wake_self_thinking_text = ""
+                            wake_self_thinking_failed = True
                 elif _wst_status == _st_wake.SILENT:
                     # A clean thinking-only response is an intentional weak-wake
                     # sleep, not malformed protocol. There is no reply effect to
