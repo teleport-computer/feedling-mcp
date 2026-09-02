@@ -36,14 +36,24 @@ large table takes locks for long enough to be its own incident.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, time as dtime, timezone
 from typing import Any, Mapping
 
-from perceptkit.manifest.types import PERMANENT, SignalDefinition
+from perceptkit.manifest.types import SignalDefinition
+from perceptkit.retention import plan_retention
 
 #: Rows removed per table per round. A sweep that needs more comes back for
 #: the rest next round; one that takes an unbounded lock is its own incident.
 DEFAULT_MAX_ROWS = 2000
+
+#: The kit's stable skip codes, worded for this report.
+_SKIP_TEXT = {
+    "no_history": "keeps no history; nothing to sweep",
+    "details_permanent": "details are permanent",
+    "details_undeclared": "no declared detail retention -- skipped, not defaulted",
+    "aggregates_permanent": "aggregates are permanent",
+    "aggregates_undeclared": "no declared aggregate retention -- skipped, not defaulted",
+}
 
 
 @dataclass
@@ -54,6 +64,10 @@ class SweepPlan:
     aggregates: dict[str, int] = field(default_factory=dict)
     #: ``(signal, why)`` -- signals deliberately left alone.
     skipped: list[tuple[str, str]] = field(default_factory=list)
+    #: ``(signal, kind) -> cutoff``, straight from the kit's plan. Counting and
+    #: deleting must use the *same* line; recomputing it twice is how a sweep
+    #: ends up reporting one number and deleting another.
+    cutoffs: dict[tuple[str, str], date] = field(default_factory=dict)
     #: True once rows have actually been removed.
     applied: bool = False
 
@@ -62,8 +76,9 @@ class SweepPlan:
         return sum(self.observations.values()) + sum(self.aggregates.values())
 
 
-def _cutoff(now: datetime, days: int) -> datetime:
-    return now - timedelta(days=days)
+def _as_datetime(day: date) -> datetime:
+    """The observation cutoff is a timestamp; the kit's plan speaks in dates."""
+    return datetime.combine(day, dtime.min, tzinfo=timezone.utc)
 
 
 def plan_sweep(
@@ -75,37 +90,41 @@ def plan_sweep(
 ) -> SweepPlan:
     """Count what a sweep would remove. **Reads only.**
 
-    Run this first, read the numbers, and only then consider ``run_sweep``.
+    The rules -- which signals, which cutoff, what to skip and why -- come from
+    ``perceptkit.retention.plan_retention``. They used to be re-derived here,
+    which meant two copies of "details and aggregates are two different
+    retentions", "PERMANENT is skipped", "an undeclared retention is skipped
+    rather than defaulted". Every one of those is wrong silently: the system
+    keeps working and the user just quietly loses history, or the table quietly
+    never shrinks. One copy, in the kit.
+
+    This file keeps the part that is genuinely the host's: bounded SQL, and a
+    sweep across every subject at once, which is what an operator wants and
+    what the kit's per-subject entry deliberately does not offer.
     """
     plan = SweepPlan()
-    for key in sorted(signals):
-        sig = signals[key]
-
-        if not sig.stores_history:
-            plan.skipped.append((key, "keeps no history; nothing to sweep"))
-            continue
-        if sig.history_retention_days == PERMANENT:
-            plan.skipped.append((key, "details are permanent"))
-        else:
-            cutoff = _cutoff(now, sig.history_retention_days)
-            plan.observations[key] = _count(
+    kit_plan = plan_retention(signals, now=now)
+    # The kit hands back a stable code; the wording is this report's job. Its
+    # own `detail` is Chinese (the package is written that way) and printing it
+    # straight into this English operator report reads as a bug in the report.
+    plan.skipped = [(sk.signal, _SKIP_TEXT.get(sk.code, sk.code))
+                    for sk in kit_plan.skipped]
+    for action in kit_plan.actions:
+        if action.kind == "observations":
+            plan.observations[action.signal] = _count(
                 conn,
                 "SELECT count(*) FROM (SELECT 1 FROM perceptkit_observation "
                 "WHERE signal = %s AND occurred_at < %s LIMIT %s) t",
-                (key, cutoff, max_rows),
+                (action.signal, _as_datetime(action.before), max_rows),
             )
-
-        agg_days = sig.effective_aggregate_retention_days
-        if agg_days == PERMANENT:
-            plan.skipped.append((key, "aggregates are permanent"))
-            continue
-        agg_cutoff = _cutoff(now, agg_days).date()
-        plan.aggregates[key] = _count(
-            conn,
-            "SELECT count(*) FROM (SELECT 1 FROM perceptkit_daily_aggregate "
-            "WHERE signal = %s AND local_date < %s LIMIT %s) t",
-            (key, agg_cutoff, max_rows),
-        )
+        else:
+            plan.aggregates[action.signal] = _count(
+                conn,
+                "SELECT count(*) FROM (SELECT 1 FROM perceptkit_daily_aggregate "
+                "WHERE signal = %s AND local_date < %s LIMIT %s) t",
+                (action.signal, action.before, max_rows),
+            )
+    plan.cutoffs = {(a.signal, a.kind): a.before for a in kit_plan.actions}
     return plan
 
 
@@ -127,7 +146,6 @@ def run_sweep(
         return plan
 
     for key in sorted(plan.observations):
-        sig = signals[key]
         # Details only. The dedupe identities in perceptkit_dedupe_identity are
         # deliberately never touched here: once the details are gone they are
         # the only thing keeping a replayed report from counting twice into a
@@ -137,17 +155,15 @@ def run_sweep(
             "DELETE FROM perceptkit_observation WHERE ctid IN ("
             "  SELECT ctid FROM perceptkit_observation"
             "   WHERE signal = %s AND occurred_at < %s LIMIT %s)",
-            (key, _cutoff(now, sig.history_retention_days), max_rows),
+            (key, _as_datetime(plan.cutoffs[(key, "observations")]), max_rows),
         )
     for key in sorted(plan.aggregates):
-        sig = signals[key]
         _exec(
             conn,
             "DELETE FROM perceptkit_daily_aggregate WHERE ctid IN ("
             "  SELECT ctid FROM perceptkit_daily_aggregate"
             "   WHERE signal = %s AND local_date < %s LIMIT %s)",
-            (key, _cutoff(now, sig.effective_aggregate_retention_days).date(),
-             max_rows),
+            (key, plan.cutoffs[(key, "aggregates")], max_rows),
         )
     plan.applied = True
     return plan

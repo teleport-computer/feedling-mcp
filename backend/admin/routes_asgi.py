@@ -29,6 +29,7 @@ import math
 import os
 import re
 import time
+from datetime import datetime, timezone
 from urllib.parse import parse_qs, quote, urlencode
 
 from fastapi import APIRouter, HTTPException, Request
@@ -278,6 +279,46 @@ async def perceptkit_report(request: Request):
             return report.build(conn, subject_id=subject)
 
     return JSONResponse(await threadpool.run_db(_build))
+
+
+@router.post("/v1/admin/perceptkit/retention")
+async def perceptkit_retention(request: Request):
+    """按 manifest 清理过期数据。**默认只试跑**，要真删必须显式 `?apply=1`。
+
+    在此之前这个清理器**没有任何调用方** —— 代码在、测试也在，但从来没跑过，
+    所以过期数据一直躺着。而「有限保留期的数据永远不删」不会报错，
+    只会让库一直长。
+
+    规则来自 kit（`perceptkit.retention.plan_retention`），这里只负责执行：
+    明细和聚合是两个保留期、永久的跳过、没声明的不猜。报告里会列出
+    **故意没删的和为什么** —— 一份只说"删了 0 条"的报告，读不出
+    「是没到期，还是规则写错了」。
+
+    🔴 这是感知这块唯一会永久删用户数据的动作。先看一眼试跑的数字，再决定。
+    """
+    _require_admin(request)
+    apply = (request.query_params.get("apply") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+    def _run():
+        import db
+        from perceptkit.manifest import MINIMAL_SIGNALS
+        from perception.perceptkit_adapter import retention
+        with db.get_pool().connection() as conn:
+            plan = retention.run_sweep(
+                conn, MINIMAL_SIGNALS, now=datetime.now(timezone.utc),
+                dry_run=not apply,
+            )
+        return {
+            "applied": plan.applied,
+            "observations": plan.observations,
+            "aggregates": plan.aggregates,
+            "skipped": [{"signal": k, "why": why} for k, why in plan.skipped],
+            "total": plan.total,
+            "report": retention.format_plan(plan),
+        }
+
+    return JSONResponse(await threadpool.run_db(_run))
 
 
 @router.post("/v1/admin/perceptkit/backfill")

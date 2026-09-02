@@ -1604,11 +1604,39 @@ def photo_evaluate(user_id: str, metadata: dict,
     else:
         _maybe_wake(user_id, "photos", catalog.PHOTO_CLUSTER_SEC, "photo_id", None, photo_id, now)
 
-    # PerceptKit shadow. After the pixels are durably stored: a photo whose
-    # storage failed is not a photo the user added.
-    _perceptkit_shadow_call("observe_photo", user_id, photo_id, occurred_at=now)
+    # PerceptKit. After the pixels are durably stored: a photo whose storage
+    # failed is not a photo the user added.
+    #
+    # The identity is the device's stable one, NOT photo_id. photo_id is the
+    # content envelope's id -- a fresh value per upload, by design, because it
+    # keys one blob of ciphertext. Using it here means the same photo sent
+    # twice arrives as two different photos, and `photo_library_added` keeps
+    # its daily counts forever: the number is wrong permanently, nothing
+    # reports it, and re-running the day cannot repair it because the second
+    # contribution looks exactly as legitimate as the first.
+    #
+    # Falls back to photo_id for clients that do not send one yet. That is the
+    # old behaviour, not a fix -- those clients still double-count on retry.
+    _perceptkit_shadow_call(
+        "observe_photo", user_id, _photo_identity(metadata, photo_id),
+        occurred_at=now)
     return {"photo_id": photo_id, "metadata": meta_out, "usable": True,
             "sensitive": sensitive, "status": "stored"}, 200
+
+
+def _photo_identity(metadata: dict, fallback: str) -> str:
+    """The device's stable id for this photo, or the envelope id if absent.
+
+    Bounded and type-checked because this endpoint is public: an unbounded
+    string here would go straight into an identity column and a dedupe key.
+    Anything unusable falls back rather than being truncated -- a truncated
+    identity silently merges two different photos into one, which is the same
+    class of wrong as duplicating one, just in the other direction.
+    """
+    raw = metadata.get("source_event_id")
+    if isinstance(raw, str) and 0 < len(raw) <= 128 and raw.strip() == raw:
+        return raw
+    return fallback
 
 
 def photos_recent(user_id: str, limit: int = 20) -> tuple[dict, int]:

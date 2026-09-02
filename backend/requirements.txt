@@ -134,4 +134,17 @@ memgarden==0.13.1
 # 0.2.0 把八个纯函数模块搬进了 perceptkit.algorithms（见该包 CHANGELOG），
 # 所以这条 pin 和本分支的 import 是一起改的：装着 0.1.0 的环境跑本分支会在
 # import 时就炸。release 已发（2026-08-31，tag v0.2.0，commit f591a80）。
-perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.2.4/perceptkit-0.2.4-py3-none-any.whl
+#
+# 0.2.5 → 0.2.7（2026-09-02，外部审查那一轮）。这次同样是 pin 和代码一起改，
+# 装着 0.2.4 跑本分支会在 import 时就炸（缺 StoragePort.list_events /
+# delete_aggregates、缺 PerceptionKit.run_retention）。区间里的三件事：
+#
+#   0.2.5  终态事件查得到（新增 list_events 端口）；翻页 offset 真的下推到存储；
+#          照片每日新增数不再永远是 1（daily_total 取 max → occurrence_count 求和）
+#   0.2.6  清理有了统一入口 run_retention + delete_aggregates 端口；
+#          重算时同一源事实只留最高修订，不再把错值和改正值一起折进去
+#   0.2.7  跳过原因带稳定 code，文案归宿主（本文件的 retention.py 用它渲染英文）
+#
+# ⚠️ 0.2.5 那条照片计数的修复会**改变已有数字的含义**：历史上被写成 1 的日子
+# 修不回来（明细只留 7 天，更早的连重算的原料都没有），从上线那天起才对。
+perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.2.7/perceptkit-0.2.7-py3-none-any.whl

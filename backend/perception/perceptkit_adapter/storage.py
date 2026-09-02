@@ -51,6 +51,23 @@ from perceptkit.contracts.records import (
 from . import schema as _schema
 
 
+#: The mirror keeps its timestamps inside the JSONB payload, so ordering and
+#: window filtering need a cast. ``CASE`` is used rather than ``OR`` because
+#: Postgres does not promise the branches of an ``OR`` are evaluated left to
+#: right -- one row holding a non-timestamp string would abort the whole query.
+#: A value that doesn't look like a date comes out NULL, which lands it in the
+#: "time unknown" bucket that the window filter deliberately keeps.
+_CAL_AT = ("CASE WHEN event_fields->>'start_at' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' "
+           "THEN (event_fields->>'start_at')::timestamptz END")
+_REM_AT = ("CASE WHEN reminder_fields->>'due_at' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' "
+           "THEN (reminder_fields->>'due_at')::timestamptz END")
+
+
+#: Rows removed per bounded sweep call. A sweep that needs more comes back
+#: next round; one that takes an unbounded lock is its own incident.
+_SWEEP_MAX_ROWS = 2000
+
+
 def _j(value: Any) -> str | None:
     return None if value is None else json.dumps(value, sort_keys=True, default=str)
 
@@ -267,6 +284,25 @@ class PostgresStorage:
 
     # -- Aggregates ----------------------------------------------------------
 
+    def delete_aggregates(self, *, subject_id, signal, before) -> int:
+        """Retention for daily aggregates. Which signals and which cutoff is
+        decided by the kit (``PerceptionKit.run_retention``); this only
+        executes one bounded delete.
+
+        Bounded by ctid + LIMIT for the same reason the observation sweep is:
+        an unbounded DELETE against a large table holds locks long enough to
+        be its own incident.
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM perceptkit_daily_aggregate WHERE ctid IN ("
+                "  SELECT ctid FROM perceptkit_daily_aggregate"
+                "   WHERE subject_id = %s AND signal = %s AND local_date < %s"
+                "   LIMIT %s)",
+                (subject_id, signal, before, _SWEEP_MAX_ROWS),
+            )
+            return cur.rowcount
+
     def get_aggregate(self, *, subject_id, signal, start_date, end_date,
                       aggregation_kind=None):
         sql = ["SELECT * FROM perceptkit_daily_aggregate "
@@ -419,6 +455,33 @@ class PostgresStorage:
         sql.append("ORDER BY detected_at LIMIT %s"); params.append(limit)
         return [self._outbox(r) for r in self._q(" ".join(sql), params)]
 
+    def list_events(self, *, subject_id, delivery_states=None, event_type=None,
+                    start=None, end=None, limit=50, offset=0):
+        """Any delivery state, newest first -- the "why didn't it wake me" query.
+
+        Deliberately NOT ``list_pending_events``: that one filters out every
+        terminal state, and ``suppressed`` / ``rejected`` are exactly the
+        states that answer the question.  Every filter is pushed into SQL --
+        looking for a suppressed event inside "the most recent batch" finds
+        nothing and says nothing, which reads as "no such event was ever
+        produced" and sends the investigation the wrong way.
+        """
+        sql = ["SELECT * FROM perceptkit_event_outbox WHERE subject_id=%s"]
+        params: list[Any] = [subject_id]
+        if delivery_states:
+            states = list(delivery_states)
+            sql.append("AND delivery_state = ANY(%s)"); params.append(states)
+        if event_type is not None:
+            sql.append("AND event_type=%s"); params.append(event_type)
+        if start is not None:
+            sql.append("AND occurred_at >= %s"); params.append(start)
+        if end is not None:
+            sql.append("AND occurred_at <= %s"); params.append(end)
+        sql.append("ORDER BY occurred_at DESC, event_id DESC "
+                   "LIMIT %s OFFSET %s")
+        params += [limit, offset]
+        return [self._outbox(r) for r in self._q(" ".join(sql), params)]
+
     @staticmethod
     def _outbox(r: tuple) -> EventOutboxEntry:
         return EventOutboxEntry(
@@ -507,52 +570,73 @@ class PostgresStorage:
                  r.updated_at),
             )
 
-    def list_calendar_events(self, *, subject_id, start=None, end=None, limit=50):
-        rows = self._q(
-            "SELECT * FROM perceptkit_calendar_mirror WHERE subject_id=%s",
-            (subject_id,),
-        )
+    def list_calendar_events(self, *, subject_id, start=None, end=None,
+                             limit=50, offset=0):
+        sql = [f"SELECT * FROM perceptkit_calendar_mirror WHERE subject_id=%s"]
+        params: list[Any] = [subject_id]
+        # Items with no known time are kept, the same discipline as the
+        # delete path: without proof it falls outside the window, we do not
+        # hide it from the user. Hence ``IS NULL OR``.
+        if start is not None:
+            sql.append(f"AND ({_CAL_AT} IS NULL OR {_CAL_AT} >= %s)")
+            params.append(start)
+        if end is not None:
+            sql.append(f"AND ({_CAL_AT} IS NULL OR {_CAL_AT} <= %s)")
+            params.append(end)
+        # Window, order and offset all go into SQL. Reading a fixed batch and
+        # slicing it in Python is a silent truncation: the cursor only ever
+        # walks that batch, so item N+1 is unreachable and nothing reports it
+        # -- what the user sees is "I have no events in August".
+        sql.append(f"ORDER BY {_CAL_AT} NULLS LAST, source_event_id "
+                   f"LIMIT %s OFFSET %s")
+        params += [limit, offset]
+        rows = self._q(" ".join(sql), params)
         out = []
         for r in rows:
             fields = dict(r[4])
             at = fields.get("start_at")
             if isinstance(at, str):
-                at = datetime.fromisoformat(at)
-                fields["start_at"] = at
-            # Items with no known time are kept, the same discipline as the
-            # delete path: without proof it falls outside the window, we do not
-            # hide it from the user.
-            if at is not None and start is not None and at < start:
-                continue
-            if at is not None and end is not None and at > end:
-                continue
+                try:
+                    fields["start_at"] = datetime.fromisoformat(at)
+                except ValueError:
+                    # One unparseable timestamp in the mirror must not take the
+                    # whole query down. It is left as the raw string so the
+                    # caller can see what is actually stored; the SQL side
+                    # already treats it as "time unknown" rather than dropping
+                    # the row. Raising here turns one bad row into "the user
+                    # has no calendar at all".
+                    pass
             out.append(CalendarEventMirror(
                 subject_id=r[0], source_account_id=r[1], source_calendar_id=r[2],
                 source_event_id=r[3], event_fields=fields, source_revision=r[5],
                 recurrence_identity=r[6], source_created_at=r[7],
                 source_updated_at=r[8], last_seen_sync_id=r[9], updated_at=r[10],
             ))
-        out.sort(key=lambda m: (m.event_fields.get("start_at") is None,
-                                m.event_fields.get("start_at") or datetime.min,
-                                m.source_event_id))
-        return out[:limit]
+        # No re-sort, no re-slice: SQL already ordered and paged. Doing it
+        # again here would silently reorder within the page, and the old
+        # in-Python sort also crashed outright on a row whose start_at is
+        # not a parseable timestamp (str vs datetime).
+        return out
 
-    def list_reminders(self, *, subject_id, include_completed=False, limit=50):
-        rows = self._q(
-            "SELECT * FROM perceptkit_reminder_mirror WHERE subject_id=%s",
-            (subject_id,),
-        )
-        out = [
+    def list_reminders(self, *, subject_id, include_completed=False,
+                       limit=50, offset=0):
+        sql = ["SELECT * FROM perceptkit_reminder_mirror WHERE subject_id=%s"]
+        params: list[Any] = [subject_id]
+        if not include_completed:
+            sql.append("AND COALESCE((reminder_fields->>'is_completed')::bool, "
+                       "false) = false")
+        # Same reason as list_calendar_events: offset must reach the database.
+        sql.append(f"ORDER BY {_REM_AT} NULLS LAST, source_reminder_id "
+                   f"LIMIT %s OFFSET %s")
+        params += [limit, offset]
+        return [
             ReminderItemMirror(
                 subject_id=r[0], source_account_id=r[1], source_list_id=r[2],
                 source_reminder_id=r[3], reminder_fields=dict(r[4]),
                 source_revision=r[5], last_seen_sync_id=r[8], updated_at=r[9],
             )
-            for r in rows
-            if include_completed or not dict(r[4]).get("is_completed")
+            for r in self._q(" ".join(sql), params)
         ]
-        out.sort(key=lambda m: m.source_reminder_id)
-        return out[:limit]
 
     def apply_source_snapshot(self, *, subject_id, source, collection_kind,
                               sync_id, coverage_start, coverage_end,

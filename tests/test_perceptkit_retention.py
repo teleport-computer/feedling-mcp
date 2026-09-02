@@ -180,3 +180,58 @@ def test_an_applied_sweep_says_so_loudly(db):
     text = retention.format_plan(
         retention.run_sweep(db, MINIMAL_SIGNALS, now=NOW, dry_run=False))
     assert "APPLIED" in text and "rows are gone" in text
+
+
+# ---------------------------------------------------------------------------
+# 规则只有一份：策略来自 kit，这里只负责执行
+# ---------------------------------------------------------------------------
+
+def test_the_cutoffs_come_from_the_kit_not_from_a_second_copy_here(db):
+    """数出来的和删掉的必须是**同一条截止线**。
+
+    以前计划和执行各算一遍 —— 中间只要有一处不一致，报告说的和实际删的
+    就是两回事，而且看不出来。
+    """
+    from datetime import timedelta
+    from perceptkit.retention import plan_retention
+
+    plan = retention.plan_sweep(db, MINIMAL_SIGNALS, now=NOW)
+    kit = plan_retention(MINIMAL_SIGNALS, now=NOW)
+    assert plan.cutoffs == {(a.signal, a.kind): a.before for a in kit.actions}
+    assert plan.cutoffs, "一条动作都没有的话这条测试什么也没验到"
+
+    # 光比计划不够 —— 得证明 **DELETE 真的用了这条线**。
+    # weather 明细 7 天：第 8 天该走，第 6 天该留。
+    s = PostgresStorage(db)
+    s.append_observation(obs("weather", 8, "just-outside"))
+    s.append_observation(obs("weather", 6, "just-inside"))
+    retention.run_sweep(db, MINIMAL_SIGNALS, now=NOW, dry_run=False)
+    left = {r[0] for r in db.execute(
+        "SELECT observation_id FROM perceptkit_observation").fetchall()}
+    assert left == {"just-inside"}, (
+        f"删完剩下 {left} —— 计划里的截止线和 DELETE 用的不是同一条")
+
+
+def test_the_report_is_written_in_this_report_s_language(db):
+    """kit 的理由文案是中文，这份运维报告是英文。
+
+    直接把 kit 的 detail 印出来会变成半中半英 —— 一个库不该替宿主决定
+    报告用什么语言，所以 kit 给 code、这里给文案。
+    """
+    s = PostgresStorage(db)
+    s.append_observation(obs("weather", 30, "old"))
+    text = retention.format_plan(retention.plan_sweep(db, MINIMAL_SIGNALS, now=NOW))
+    assert "permanent" in text
+    assert "永久" not in text, "kit 的中文理由漏进了英文报告"
+
+
+def test_an_unknown_skip_code_shows_the_code_instead_of_vanishing(db):
+    """kit 以后多一个跳过原因时，这份报告不能把它变成空白。
+
+    映射表查不到就把 code 原样印出来 —— 看到一个没见过的标识，比看到
+    一行空白强得多。
+    """
+    plan = retention.plan_sweep(db, MINIMAL_SIGNALS, now=NOW)
+    assert all(why for _, why in plan.skipped)
+    assert "brand_new_reason" == retention._SKIP_TEXT.get(
+        "brand_new_reason", "brand_new_reason")
