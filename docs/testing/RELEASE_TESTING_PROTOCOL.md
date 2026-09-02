@@ -288,7 +288,7 @@ usr_fee1 教训：模型是复读机——转写标签/prompt 术语/硬编码�
 
 2026-08-16→08-18 上游收紧审查，`self_thinking.INSTRUCTION` 被判 "reverse engineering
 or duplicating model outputs"。resident + claude-code 用户从此每一轮都拿兜底话，
-**而后端一无所知**（driver 不上报、runtime_error 404、last_runtime_error 单值覆盖）
+**而后端一无所知**（runtime_error 404、last_runtime_error 单值覆盖）
 ——用户先撞见，我们后知道。§4.7 管的是"这些词会不会出现在用户屏幕上"，
 本节管的是"这些词会不会让整轮请求根本发不出去"。
 

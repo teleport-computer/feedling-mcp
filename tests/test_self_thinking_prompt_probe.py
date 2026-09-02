@@ -1,9 +1,68 @@
+"""T403 自我思考文案评测台的单测。
+
+🔴 **整个文件当前被跳过 —— 台子的两个比较对象都不存在了。**
+
+它的设计是拿两版文案做 A/B：
+
+    基准 = **已安装的 agent-protocol-core 发行包**里的文案
+    候选 = **memgarden 仓库**里 packages/agent-protocol-core/… 的源码
+
+2026-09-02 把这套思维链实现从 memgarden 仓库搬回了 io
+（`backend/agent_protocol_core/`）—— 那里面是 io 的产品设定（人格文案、屏幕
+监看说辞、FEEDLING_ 开关），不该跟一个公开的记忆库一起发。搬完之后：
+
+    发行包没有了（memgarden 0.13.1 起零依赖）
+    memgarden 仓库里那份候选源码也没有了
+
+于是 `metadata.distribution("agent-protocol-core")` 直接抛异常，9 条用例全红，
+**并且挡住了 test 的部署**。
+
+**这里只做隔离，一行逻辑都没改**：台子归 Xiaoting（T403），怎么调整由他定 ——
+比如基准改成从 io 的模块读、候选换个放法。改好之后把下面这个 skip 删掉即可。
+"""
 from __future__ import annotations
 
 import copy
 from pathlib import Path
 
 import pytest
+
+def _distribution_baseline_still_exists() -> str:
+    """台子的前提：``agent_protocol_core`` import 到的，就是那个**已安装的发行包**。
+
+    搬家之后这个前提在两种环境下都不成立，而且症状不一样 —— 所以两种都要认：
+
+        CI（干净环境）  包压根没装 → metadata.distribution 抛异常
+        本机（装过旧版）包还在，但 io 的 backend/agent_protocol_core/ 会把它
+                        盖住 → import 到的文件和发行包的文件对不上
+
+    第二种最容易漏判：包「在」，看起来一切正常，实际基准已经不是它了。
+    """
+    try:
+        from importlib import metadata as _metadata
+
+        dist = _metadata.distribution("agent-protocol-core")
+        expected = Path(
+            dist.locate_file("agent_protocol_core/self_thinking.py")
+        ).resolve()
+    except Exception as exc:  # noqa: BLE001
+        return f"agent-protocol-core 已不是安装的发行包（{type(exc).__name__}）"
+
+    from agent_protocol_core import self_thinking as _st
+
+    actual = Path(str(_st.__file__)).resolve()
+    if actual != expected:
+        return f"import 到的不是发行包那份：{actual}"
+    return ""
+
+
+if (_why := _distribution_baseline_still_exists()):
+    pytest.skip(
+        f"T403 评测台的基准是已安装的 agent-protocol-core 发行包 —— {_why}。"
+        "该包已于 2026-09-02 搬回 io（backend/agent_protocol_core/），"
+        "不再单独发布。台子需要改造，归 Xiaoting（T403）。",
+        allow_module_level=True,
+    )
 
 from agent_protocol_core import self_thinking as installed_self_thinking
 from evals import language as language_eval

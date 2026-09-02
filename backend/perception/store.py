@@ -566,7 +566,25 @@ def merge_perception_daily(user_id: str, date: str, signal: str, merge_fn, ts: f
 
 def list_perception_daily(user_id: str, signal: str, days: int = 30) -> list[dict]:
     """Most-recent ``days`` rollups for a signal, ascending by date:
-    [{"date": "YYYY-MM-DD", "doc": {...}}]."""
+    [{"date": "YYYY-MM-DD", "doc": {...}}].
+
+    优先读 kit 的日聚合，读不到才回老表。趋势工具（「我最近睡得比以前少吗」）
+    走的就是这里 —— 老路一停写，老表就冻在那天，而这个函数是它唯一的读者。
+
+    ``None`` 和空列表不是一回事：``None`` 是「kit 这个信号翻不回老形状、
+    或者一条都没有」，那时读老表；空列表是「kit 说这几天确实没数据」。
+    """
+    try:
+        from .perceptkit_adapter import history as _pk_history
+        if _pk_history.enabled():
+            rows = _pk_history.daily_rollups(user_id, signal, days)
+            if rows is not None:
+                return rows
+    except Exception as e:                         # noqa: BLE001
+        # 趋势读不出来不该让整轮对话失败。吞掉但记一笔 ——
+        # 悄悄回退到老表、而老表已经停写的话，用户看到的是「没有历史」，
+        # 没有任何东西说得清为什么。
+        log.warning("perceptkit trend read fell back to the legacy table: %s", e)
     limit = max(1, min(int(days), 400))
     try:
         with get_pool().connection() as conn:

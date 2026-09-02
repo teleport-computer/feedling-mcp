@@ -36,6 +36,7 @@ canonical_owner: self
 | `thinking_envelope_missing_fields` | 400 | — | 同上，thinking 信封 | |
 | `anchor_required` | 400 | — | 记忆动作缺 anchor（detail.mem_type） | |
 | `service_busy` | 503 | system | db 连接池耗尽，可退避重试 | ✅ |
+| `data_track_query_timeout` | 503 | system | admin data-track 查询超过 HTTP 或 PostgreSQL 预算 | |
 | `service_unavailable` | 503 | system | admin token 未配置 | ✅ |
 | `not_found` | 404 | — | 通用资源不存在 | ✅ |
 | `not_owned` | 403 | — | 资源不属于调用者 | ✅ |
@@ -66,6 +67,7 @@ canonical_owner: self
 | `model_api_not_tested` | 400 | user_provider | 已配置但未通过测试 | ✅ |
 | `model_api_config_invalid` | 400 | user_provider | | ✅ |
 | `model_api_key_decrypt_failed` | 400 | system | | ✅ |
+| `image_generation_key_decrypt_failed` | 409 | user_provider | `POST /v1/image-generation/generate` 无法解开已固定生图路由的 provider key；不会据此改写 route health | ✅ |
 | `model_api_key_envelope_missing` | 400/404 | user_provider | 同 model_api_not_configured 的两条路径 | ✅ |
 | `model_api_credential_write_failed` | 500 | system | 写 model_api_credentials 失败（DB 异常被 db.py 吞成 None） | |
 | `model_api_route_write_failed` | 500 | system | 写/激活 model_api_routes 失败（DB 异常，或 route 被并发删除） | |
@@ -131,6 +133,8 @@ canonical_owner: self
 | `already_answered` | 409 | — | 静默处理，不弹窗 | ✅ |
 | `content_pk_fpr_mismatch` | 409 | — | 信封封的钥 ≠ 当前注册内容钥（写手 whoami 缓存陈旧）；带 `current_public_key_fpr`/`envelope_content_pk_fpr`，写手应刷新 whoami 重封重试 | |
 | `message_not_found` | 404 | — | | ✅ |
+| `invalid_canvas_filename` | 400 | — | Canvas 活内容读取只接受原始 `.io.html` basename；拒绝路径、穿越、控制字符和改写后的名字 | |
+| `workspace_entry_not_found` | 404 | — | Canvas 对应的当前 workspace 条目不存在；客户端可回退消息附件正文 | |
 | `user_message_envelope_failed` | 409 | — | | ✅ |
 | `confirmation_required` | 400 | — | 清空聊天 / 账号重置缺确认字段 | |
 | `chat_clear_failed` | 500 | system | | |

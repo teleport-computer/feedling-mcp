@@ -5,7 +5,8 @@ from __future__ import annotations
 import pytest
 
 
-def _configure_startup(monkeypatch, *, actual_head, expected_head, triggers):
+def _configure_startup(monkeypatch, *, actual_head, expected_head, triggers, events):
+    import alembic_tee
     import db
     from alembic.script import ScriptDirectory
 
@@ -25,8 +26,10 @@ def _configure_startup(monkeypatch, *, actual_head, expected_head, triggers):
 
         def execute(self, query, params=None):
             if "alembic_tee_version" in query:
+                events.append("head")
                 return _Rows([(actual_head,)])
             if "pg_trigger" in query:
+                events.append("triggers")
                 return _Rows([(name,) for name in triggers])
             raise AssertionError(f"unexpected startup query: {query}")
 
@@ -43,6 +46,7 @@ def _configure_startup(monkeypatch, *, actual_head, expected_head, triggers):
         "from_config",
         classmethod(lambda cls, config: _Scripts()),
     )
+    monkeypatch.setattr(alembic_tee, "upgrade_head", lambda: events.append("upgrade"))
 
 
 def test_tee_primary_allows_missing_audit_marker_when_triggers_are_ready(
@@ -50,24 +54,47 @@ def test_tee_primary_allows_missing_audit_marker_when_triggers_are_ready(
 ):
     import db
 
+    events: list[str] = []
     _configure_startup(
         monkeypatch,
         actual_head="test_tee_head",
         expected_head="test_tee_head",
         triggers=db._TEE_PRIMARY_TRIGGERS,
+        events=events,
+    )
+
+    db.init_schema(tee_auto_migrate=True)
+
+    assert events == ["upgrade", "head", "triggers"]
+
+
+def test_tee_primary_preflight_checks_without_upgrading(monkeypatch):
+    import db
+
+    events: list[str] = []
+    _configure_startup(
+        monkeypatch,
+        actual_head="test_tee_head",
+        expected_head="test_tee_head",
+        triggers=db._TEE_PRIMARY_TRIGGERS,
+        events=events,
     )
 
     db.init_schema()
+
+    assert events == ["head", "triggers"]
 
 
 def test_tee_primary_rejects_migration_head_mismatch(monkeypatch):
     import db
 
+    events: list[str] = []
     _configure_startup(
         monkeypatch,
         actual_head="stale_tee_head",
         expected_head="release_tee_head",
         triggers=db._TEE_PRIMARY_TRIGGERS,
+        events=events,
     )
 
     with pytest.raises(RuntimeError, match="not at the application head"):
@@ -77,15 +104,55 @@ def test_tee_primary_rejects_migration_head_mismatch(monkeypatch):
 def test_tee_primary_rejects_missing_primary_trigger(monkeypatch):
     import db
 
+    events: list[str] = []
     _configure_startup(
         monkeypatch,
         actual_head="test_tee_head",
         expected_head="test_tee_head",
         triggers=db._TEE_PRIMARY_TRIGGERS - {"chat_messages_retire_r2_body"},
+        events=events,
     )
 
     with pytest.raises(RuntimeError, match="primary triggers are incomplete"):
         db.init_schema()
+
+
+def test_tee_primary_startup_propagates_migration_failure(monkeypatch):
+    import alembic_tee
+    import db
+
+    events: list[str] = []
+    _configure_startup(
+        monkeypatch,
+        actual_head="test_tee_head",
+        expected_head="test_tee_head",
+        triggers=db._TEE_PRIMARY_TRIGGERS,
+        events=events,
+    )
+
+    def fail_upgrade() -> None:
+        raise RuntimeError("migration failed")
+
+    monkeypatch.setattr(alembic_tee, "upgrade_head", fail_upgrade)
+
+    with pytest.raises(RuntimeError, match="migration failed"):
+        db.init_schema(tee_auto_migrate=True)
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "backend/gunicorn_conf.py",
+        "backend/model_api_runtime/v2/serve_worker.py",
+        "backend/serve_dev.py",
+    ),
+)
+def test_real_startup_entrypoints_opt_into_tee_auto_migration(path):
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / path).read_text(encoding="utf-8")
+
+    assert "db.init_schema(tee_auto_migrate=True)" in source
 
 
 def test_preservation_revert_stays_blocked_without_marker_after_cutover():

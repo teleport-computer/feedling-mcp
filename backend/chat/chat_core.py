@@ -45,10 +45,12 @@ from chat import activity_store as chat_activity_store
 from core import chat_activity as chat_activity_projection
 from core import envelope as core_envelope
 from core.store import UserStore
+from model_api_runtime.v2 import jobs_store as v2_jobs_store
 from notices import catalog as notices_catalog
 from notices import core as notices_core
 from proactive import service as proactive_service
 from push import service as push_service
+from workspace import backends as workspace_backends
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +67,7 @@ _ENVELOPE_REQUIRED = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id
 _FILE_NAME_BIDI_CONTROLS = frozenset(
     chr(code) for code in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))
 )
+_CANVAS_FILENAME_MAX_CHARS = 120
 
 
 def _stale_key_conflict(store: UserStore, envelope: dict) -> tuple[dict, int] | None:
@@ -623,6 +626,53 @@ def message_body(store: UserStore, message_id: str) -> tuple[dict, int]:
     if not msg or msg.get("source") == "verify_ping":
         return {"error": "message_not_found"}, 404
     return {"message": chat_service._chat_history_item(msg, include_image_body=True)}, 200
+
+
+def _canvas_workspace_path(filename: str) -> str | None:
+    """Map one published Canvas filename to its exact workspace path.
+
+    Matching is deliberately case- and normalization-sensitive. Workspace paths
+    are authoritative and can legally differ only by case or Unicode form, while
+    iOS's display-only canvas id folds those distinctions. The client must pass
+    the original ``file_name`` from the Chat row unchanged; guessing a folded
+    match could return the wrong Canvas.
+    """
+    if not isinstance(filename, str) or not filename:
+        return None
+    if filename != filename.strip() or len(filename) > _CANVAS_FILENAME_MAX_CHARS:
+        return None
+    if (
+        filename in {".", ".."}
+        or "/" in filename
+        or "\\" in filename
+        or "\x00" in filename
+        or any(not char.isprintable() for char in filename)
+        or any(char in _FILE_NAME_BIDI_CONTROLS for char in filename)
+        or not filename.casefold().endswith(".io.html")
+    ):
+        return None
+    candidate = f"/workspace/{filename}"
+    try:
+        canonical = workspace_backends.canonical_path(candidate)
+    except workspace_backends.WorkspaceInvalidPath:
+        return None
+    return canonical if canonical == candidate else None
+
+
+def workspace_canvas_body(store: UserStore, filename: str) -> tuple[dict, int]:
+    """Return the caller's current opaque Canvas workspace envelope."""
+    path = _canvas_workspace_path(filename)
+    if path is None:
+        return {"error": "invalid_canvas_filename"}, 400
+    row = v2_jobs_store.get_workspace_entry(store.user_id, path)
+    if row is None or str(row.get("kind") or "") != "workspace":
+        return {"error": "workspace_entry_not_found"}, 404
+    return {
+        "filename": filename,
+        "revision": int(row["revision"]),
+        "mime_type": str(row.get("mime_type") or "text/html"),
+        "envelope": dict(row["content_envelope"]),
+    }, 200
 
 
 # --------------------------------------------------------------------------- #

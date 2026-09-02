@@ -179,6 +179,20 @@ class FakeStore:
         self.frames.pop((uid, frame_id), None)
 
 
+
+@pytest.fixture(autouse=True)
+def _legacy_wake_delivery(monkeypatch):
+    """这个文件验的是**老路**的唤醒判定和投递。
+
+    kit 接管唤醒之后，老路照旧算、但不再投递（否则同一件事叫两遍）。
+    这些用例问的是「老路自己对不对」，所以显式把开关关掉 —— 而不是改成
+    断言「什么都没发生」：那样一来，老路真的算错了也看不出来，
+    而它现在还是 kit 的对照组。
+
+    kit 那一侧的投递由 tests/test_perceptkit_wakes.py 盯着。
+    """
+    monkeypatch.setenv("FEEDLING_PERCEPTKIT_WAKES", "0")
+
 @pytest.fixture
 def env(monkeypatch):
     fake = FakeStore()

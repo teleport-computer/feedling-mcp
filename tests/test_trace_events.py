@@ -155,9 +155,47 @@ def test_strict_insert_and_query_use_ts_id_order(tee_primary):
         ) == 2
         rows = db.query_trace_events(user_id=uid)
         assert [row["trace_id"] for row in rows] == ["second", "first"]
-        assert rows[0]["detail"] == {"safe": True}
+        assert rows[0]["detail"] == {
+            "safe": True,
+            db.TRACE_OUTCOME_PROVENANCE_FIELD: "missing",
+        }
         assert rows[0]["content_excerpt"] == {"kind": "text", "chars": 3}
         assert rows[0]["outcome_class"] == db.TRACE_OUTCOME_DEFAULT
+    finally:
+        db.delete_trace_events_for_user(uid)
+
+
+def test_trace_outcome_default_provenance_distinguishes_three_inputs(tee_primary):
+    uid = _uid()
+    now = datetime.now(_ZONE).timestamp()
+    missing = _event(ts=now, trace_id="outcome-missing")
+    invalid = {
+        **_event(ts=now + 1, trace_id="outcome-invalid"),
+        "outcome_class": "not-a-class",
+    }
+    explicit = {
+        **_event(ts=now + 2, trace_id="outcome-explicit"),
+        "outcome_class": db.TRACE_OUTCOME_DEFAULT,
+    }
+    try:
+        assert db.insert_trace_events_strict(uid, [missing, invalid, explicit]) == 3
+        rows = {
+            row["trace_id"]: row
+            for row in db.query_trace_events(user_id=uid)
+        }
+        assert {
+            rows[trace_id]["outcome_class"]
+            for trace_id in rows
+        } == {db.TRACE_OUTCOME_DEFAULT}
+        assert rows["outcome-missing"]["detail"][
+            db.TRACE_OUTCOME_PROVENANCE_FIELD
+        ] == "missing"
+        assert rows["outcome-invalid"]["detail"][
+            db.TRACE_OUTCOME_PROVENANCE_FIELD
+        ] == "normalized_invalid"
+        assert rows["outcome-explicit"]["detail"][
+            db.TRACE_OUTCOME_PROVENANCE_FIELD
+        ] == "explicit"
     finally:
         db.delete_trace_events_for_user(uid)
 

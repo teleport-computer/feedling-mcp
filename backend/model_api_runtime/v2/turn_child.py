@@ -229,8 +229,8 @@ def main(
     reaper 同一个 `worker_id`，只是这份 slot 现在跑在另一个进程里）。
 
     在**全新的**解释器里重新做一遍 `serve_worker.main()` 里"跑 turn 所需"的那部分启动
-    步骤：`db.init_schema()` 是幂等的（alembic upgrade head，见 db.py docstring），可以
-    放心在每个子进程里重跑；`wire_assembly()` 同样幂等（load_users/register_handler/
+    步骤：`db.init_schema()` 是幂等的（TEE-primary 下为只读 schema 断言；见 db.py
+    docstring），可以放心在每个子进程里重跑；`wire_assembly()` 同样幂等（load_users/register_handler/
     start_listener 都自身幂等）。DB 连接池是模块级懒加载单例，spawn 出来的子进程根本没
     继承父进程已经建好的那份（`spawn` start method 是全新解释器，不像 `fork` 会拷贝父
     进程的内存/fd 状态）——子进程第一次真正用到 DB 时会在自己的地址空间里另起一份。

@@ -156,7 +156,7 @@ try:
 except ImportError:
     _ENCRYPTION_AVAILABLE = False
 
-from perception_kernel import prompts as perception_prompts
+from perceptkit import prompts as perception_prompts
 
 import generated_image
 import provider_client as _provider_client
@@ -1180,13 +1180,36 @@ def _report_runtime_error(
         return False
 
 
-def _notify_agent_turn_failure(exc: BaseException, *, foreground: bool) -> None:
+def _notify_agent_turn_failure(
+    exc: BaseException,
+    *,
+    foreground: bool,
+    lane: str = "",
+    trace_id: str = "",
+    job_id: str = "",
+) -> None:
     """腿①+②：分类 → 上报设置页/admin；仅前台失败（限流后）才发聊天 system 横幅。
 
     后台车道失败不进聊天流（Seven 2026-07-11）——观测走 _report_runtime_error
     + debug 日志。永不抛出：通知是回合失败的旁路，绝不能让它把失败变得更糟。"""
     try:
         notice = classify_agent_error(exc)
+        # Paired with agent.turn.success at the success-reporting locus below.
+        # Reuse this exact notice: reclassifying a synthetic exception here would
+        # let the time series disagree with last_runtime_error_class again.
+        _emit_debug_trace(
+            "agent",
+            "agent.turn.failure",
+            status="error",
+            trace_id=trace_id,
+            job_id=job_id,
+            detail={
+                "error_class": notice.error_class,
+                "blame": notice.blame,
+                "foreground": bool(foreground),
+                "lane": lane,
+            },
+        )
         _report_runtime_error(
             notice.detail,
             notice.error_class,
@@ -1240,6 +1263,33 @@ def _suppress_duplicate_upstream_banner(notice: "AgentErrorNotice") -> None:
     if notice is None:
         return
     _system_notice_last_sent[notice.error_class] = time.monotonic()
+
+
+def _emit_agent_turn_success(
+    *,
+    foreground: bool,
+    lane: str,
+    trace_id: str = "",
+    job_id: str = "",
+) -> None:
+    """Emit one denominator event at a terminal locus paired with failure.
+
+    This is intentionally separate from ``_note_agent_turn_success``: that
+    helper runs for internal model attempts and retries, while failure reporting
+    happens once at the owning chat/job layer. Mixing those units creates a
+    plausible-looking but invalid failure rate.
+
+    Debug trace is config-gated, so readers must report the users represented in
+    each window. They must also cap the window at trace partition retention
+    (currently 30 days by default).
+    """
+    _emit_debug_trace(
+        "agent",
+        "agent.turn.success",
+        trace_id=trace_id,
+        job_id=job_id,
+        detail={"foreground": bool(foreground), "lane": lane},
+    )
 
 
 def _note_agent_turn_success() -> None:
@@ -9892,7 +9942,163 @@ _CODEX_MISSING_SESSION_RE = re.compile(
 )
 
 
-def call_agent_cli(
+def _emit_cli_model_call_terminal(
+    context: dict[str, Any],
+    *,
+    trace_id: str,
+    succeeded: bool,
+    failure: BaseException | None = None,
+) -> None:
+    """Emit the CLI model terminal from the call's real return/raise result.
+
+    A zero process exit is transport evidence, not turn-success evidence: pi
+    exits zero for provider/API failures too.  The public ``call_agent_cli``
+    wrapper calls this helper only after the implementation either returned a
+    parsed result (positive success evidence) or raised.  Unknown output shapes
+    therefore fail closed into ``agent.model.call.error`` instead of silently
+    becoming ``done``.
+    """
+    if not context.get("started"):
+        return
+    try:
+        cmd = list(context.get("cmd") or [])
+        result = context.get("result")
+        started_at = context.get("started_at")
+        dur_ms = max(
+            0,
+            int(
+                (time.monotonic() - float(started_at)) * 1000
+                if started_at is not None
+                else 0
+            ),
+        )
+        driver = (
+            "pi" if _is_pi_cmd(cmd)
+            else ("codex" if _is_codex_cmd(cmd) else "claude")
+        )
+        rc = getattr(result, "returncode", None)
+        stdout = getattr(result, "stdout", "") or ""
+        stderr = getattr(result, "stderr", "") or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        else:
+            stdout = str(stdout)
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        else:
+            stderr = str(stderr)
+
+        metrics: dict[str, Any] = {
+            "driver": driver,
+            "rc": rc,
+            "agent_ms": None,
+            "api_ms": None,
+            "num_turns": None,
+            "steps": None,
+            "input_tokens": None,
+            "output_tokens": None,
+        }
+        if result is not None:
+            try:
+                metrics.update(_cli_turn_metrics(cmd, result, dur_ms))
+            except Exception as exc:  # noqa: BLE001 — trace must stay fail-open
+                log.debug("model terminal metrics parse failed: %s", exc)
+
+        trace_turn = AgentTurn()
+        if succeeded:
+            try:
+                trace_turn = _agent_turn_from_raw(stdout)
+            except Exception as exc:  # noqa: BLE001 — trace must stay fail-open
+                log.debug("thinking trace parse failed: %s", exc)
+            stdout_had_thinking_marker = (
+                '"type":"thinking"' in stdout
+                or '"type": "thinking"' in stdout
+                or "thinking_delta" in stdout
+            )
+            if (
+                metrics["driver"] == "claude"
+                and stdout_had_thinking_marker
+                and not trace_turn.thinking_summary
+            ):
+                log.warning("claude stdout had thinking markers but parser yielded none")
+
+        error_class = ""
+        if not succeeded:
+            if isinstance(failure, subprocess.TimeoutExpired):
+                error_class = "turn_timeout"
+            elif failure is not None:
+                error_class = classify_agent_error(failure).error_class
+            else:
+                error_class = "unknown"
+
+        excerpt = {
+            "reply_head": stdout[:1000],
+            "stderr_head": stderr[:500],
+        }
+        if not succeeded:
+            error_detail = _cli_error_detail(stdout, stderr)
+            if not error_detail and failure is not None:
+                error_detail = str(failure)[:500]
+            excerpt = {"error_detail": error_detail, **excerpt}
+
+        if succeeded:
+            explain = (
+                f"模型返回（{metrics['driver']}，{dur_ms}ms"
+                + (
+                    f"，{metrics['num_turns']} 轮"
+                    if metrics.get("num_turns")
+                    else ""
+                )
+                + "）"
+            )
+        elif isinstance(failure, subprocess.TimeoutExpired):
+            explain = (
+                f"模型调用超时（{AGENT_TURN_TIMEOUT_SEC}s 上限，"
+                "FEEDLING_AGENT_TURN_TIMEOUT_SEC 可调）— 卡在模型这一步"
+            )
+        elif rc not in (None, 0):
+            explain = f"模型调用失败 rc={rc}"
+        else:
+            explain = f"模型调用未产生可用结果（{metrics['driver']}，rc={rc}）"
+
+        _emit_debug_trace(
+            "agent",
+            "agent.model.call.done" if succeeded else "agent.model.call.error",
+            status="ok" if succeeded else "error",
+            trace_id=trace_id,
+            dur_ms=dur_ms,
+            summary=(
+                f"cli turn succeeded rc={rc} {metrics['driver']}"
+                if succeeded
+                else f"cli turn failed rc={rc} {metrics['driver']}"
+            ),
+            explain=explain,
+            detail={
+                **{
+                    key: metrics.get(key)
+                    for key in (
+                        "driver",
+                        "rc",
+                        "agent_ms",
+                        "api_ms",
+                        "num_turns",
+                        "steps",
+                        "input_tokens",
+                        "output_tokens",
+                    )
+                },
+                "error_class": error_class,
+                "thinking_present": bool(trace_turn.thinking_summary),
+                "thinking_source": trace_turn.thinking_source or "",
+                "thinking_len": len(trace_turn.thinking_summary or ""),
+            },
+            content_excerpt=excerpt,
+        )
+    except Exception as exc:  # noqa: BLE001 — observability must never affect a turn
+        log.debug("model terminal trace emission failed: %s", exc)
+
+
+def _call_agent_cli_impl(
     message: str,
     image_paths: list[str] | None = None,
     raw_text: bool = False,
@@ -9904,6 +10110,7 @@ def call_agent_cli(
     outbound_fence: bool = False,
     cancellation: _VoiceTurnCancellation | None = None,
     absolute_deadline: float | None = None,
+    _model_call_trace: dict[str, Any] | None = None,
 ) -> Any:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
@@ -9952,6 +10159,13 @@ def call_agent_cli(
     command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
     _turn_t0 = time.monotonic()
+    if _model_call_trace is not None:
+        _model_call_trace.update({
+            "started": True,
+            "started_at": _turn_t0,
+            "cmd": list(cmd),
+            "result": None,
+        })
     _emit_debug_trace("agent", "agent.model.call.start", trace_id=trace_id,
                       summary="cli turn start",
                       explain="模型调用发起（" + ("pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude")) + "）",
@@ -10102,11 +10316,6 @@ def call_agent_cli(
                 "ts": time.time(),
             })
             _queue_provider_attempt_ledger(timeout_rows)
-        _emit_debug_trace("agent", "agent.model.call.error", status="error", trace_id=trace_id,
-                          dur_ms=(time.monotonic() - _turn_t0) * 1000,
-                          summary="cli turn timeout",
-                          explain=f"模型调用超时（{AGENT_TURN_TIMEOUT_SEC}s 上限，FEEDLING_AGENT_TURN_TIMEOUT_SEC 可调）— 卡在模型这一步",
-                          detail={"error_class": "turn_timeout"})
         log.warning(
             "[turn-timing] driver=%s rc=timeout wall_ms=%d (hit %ds subprocess cap)",
             "pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude"),
@@ -10114,6 +10323,8 @@ def call_agent_cli(
             AGENT_TURN_TIMEOUT_SEC,
         )
         raise
+    if _model_call_trace is not None:
+        _model_call_trace.update({"cmd": list(cmd), "result": result})
     _wall_ms = int((time.monotonic() - _turn_t0) * 1000)
     for _stream_name in ("stdout", "stderr"):
         _repl = (getattr(result, _stream_name, "") or "").count("\ufffd")
@@ -10125,63 +10336,6 @@ def call_agent_cli(
             )
     _log_cli_turn_timing(cmd, result, _wall_ms)
     _m = _cli_turn_metrics(cmd, result, _wall_ms)
-    _trace_turn = AgentTurn()
-    if result.returncode == 0:
-        try:
-            _trace_turn = _agent_turn_from_raw(result.stdout or "")
-        except Exception as e:  # noqa: BLE001 — observability must never affect a turn
-            log.debug("thinking trace parse failed: %s", e)
-    _stdout_had_thinking_marker = (
-        '"type":"thinking"' in (result.stdout or "")
-        or '"type": "thinking"' in (result.stdout or "")
-        or "thinking_delta" in (result.stdout or "")
-    )
-    if (
-        result.returncode == 0
-        and _m["driver"] == "claude"
-        and _stdout_had_thinking_marker
-        and not _trace_turn.thinking_summary
-    ):
-        log.warning("claude stdout had thinking markers but parser yielded none")
-    _excerpt = {"reply_head": (result.stdout or "")[:1000],
-                "stderr_head": (result.stderr or "")[:500]}
-    if result.returncode != 0:
-        # `reply_head` almost never contains the cause. codex opens every stream
-        # with a `thread.started` plus two harmless notices (deprecated
-        # `[features].collab`, missing model metadata for the `gw-<uid>` alias)
-        # that eat ~500 of the 1000 bytes; the failing `error` event lands past
-        # the cap. Every failure therefore *looks* identical in the trace no
-        # matter what killed it — a `web_search` 400 and an upstream 403 both
-        # truncate to the same two notices, and both have been misdiagnosed as a
-        # "collab crash". `_cli_error_detail` already pulls the last top-level
-        # error event for the RuntimeError below (the notices are nested under
-        # `item.completed` and never match), so surface the same string here.
-        _excerpt = {"error_detail": _cli_error_detail(result.stdout or "", result.stderr or ""),
-                    **_excerpt}
-    _trace_error_class = ""
-    if result.returncode != 0:
-        _trace_failure = RuntimeError(
-            f"cli agent exited {result.returncode}: "
-            f"{_cli_error_detail(result.stdout or '', result.stderr or '')}"
-        )
-        _trace_error_class = classify_agent_error(_trace_failure).error_class
-    _emit_debug_trace(
-        "agent", "agent.model.call.done" if result.returncode == 0 else "agent.model.call.error",
-        status="ok" if result.returncode == 0 else "error", trace_id=trace_id, dur_ms=_wall_ms,
-        summary=f"cli turn rc={result.returncode} {_m['driver']}",
-        explain=(f"模型返回（{_m['driver']}，{_wall_ms}ms" +
-                 (f"，{_m['num_turns']} 轮" if _m.get('num_turns') else "") + "）"
-                 if result.returncode == 0 else f"模型调用失败 rc={result.returncode}"),
-        detail={
-            **{k: _m[k] for k in ("driver", "rc", "agent_ms", "api_ms", "num_turns",
-                                  "steps", "input_tokens", "output_tokens")},
-            "error_class": _trace_error_class,
-            "thinking_present": bool(_trace_turn.thinking_summary),
-            "thinking_source": _trace_turn.thinking_source or "",
-            "thinking_len": len(_trace_turn.thinking_summary or ""),
-        },
-        content_excerpt=_excerpt,
-    )
     if ledger_enabled:
         _queue_provider_attempt_ledger(_provider_attempt_rows_for_result(
             cmd,
@@ -10294,6 +10448,8 @@ def call_agent_cli(
                 stdout_line=runtime_stream.feed if runtime_stream is not None else None,
                 **run_extra,
             )
+            if _model_call_trace is not None:
+                _model_call_trace.update({"cmd": list(cmd), "result": result})
             if ledger_enabled:
                 _queue_provider_attempt_ledger(_provider_attempt_rows_for_result(
                     cmd,
@@ -10372,6 +10528,8 @@ def call_agent_cli(
                 _run_kwargs,
                 stdout_line=runtime_stream.feed if runtime_stream is not None else None,
             )
+            if _model_call_trace is not None:
+                _model_call_trace.update({"cmd": list(cmd), "result": result})
             if ledger_enabled:
                 _queue_provider_attempt_ledger(_provider_attempt_rows_for_result(
                     cmd,
@@ -10530,6 +10688,59 @@ def call_agent_cli(
             f"cli agent produced no usable output (exit={result.returncode})"
         )
     return text
+
+
+def call_agent_cli(
+    message: str,
+    image_paths: list[str] | None = None,
+    raw_text: bool = False,
+    trace_id: str = "",
+    lane: str = "background",
+    attempt_trigger: str = "first",
+    stream_update: Callable[[int, str, bool], None] | None = None,
+    isolated_session: bool = False,
+    outbound_fence: bool = False,
+    cancellation: _VoiceTurnCancellation | None = None,
+    absolute_deadline: float | None = None,
+) -> Any:
+    """Run one resident CLI turn and trace its parsed outcome fail-closed.
+
+    A normal return from the implementation is the success-positive evidence:
+    every supported driver has already passed its real output parser at that
+    point.  Any exception, including an exit-zero output shape that parsed to no
+    reply, is an error.  This keeps trace classification driver-independent and
+    prevents a new exit-zero driver from silently joining the success bucket.
+    """
+    model_call_trace: dict[str, Any] = {}
+    try:
+        value = _call_agent_cli_impl(
+            message,
+            image_paths=image_paths,
+            raw_text=raw_text,
+            trace_id=trace_id,
+            lane=lane,
+            attempt_trigger=attempt_trigger,
+            stream_update=stream_update,
+            isolated_session=isolated_session,
+            outbound_fence=outbound_fence,
+            cancellation=cancellation,
+            absolute_deadline=absolute_deadline,
+            _model_call_trace=model_call_trace,
+        )
+    except Exception as exc:
+        _emit_cli_model_call_terminal(
+            model_call_trace,
+            trace_id=trace_id,
+            succeeded=False,
+            failure=exc,
+        )
+        raise
+    _emit_cli_model_call_terminal(
+        model_call_trace,
+        trace_id=trace_id,
+        succeeded=True,
+    )
+    return value
 
 
 def _sanitize_reply_text(text: str) -> str:
@@ -15846,6 +16057,12 @@ def _process_capture_jobs(jobs: list) -> float:
                 ai_name=ai_name,
                 user_name=user_name,
             ))
+            _emit_agent_turn_success(
+                foreground=False,
+                lane="capture",
+                trace_id=job_id,
+                job_id=job_id,
+            )
             _note_agent_turn_success()
             cards, err = _captured.cards, _captured.error
             bounce = _bounce_tracker.bounce(cards=cards, error=err)
@@ -15854,7 +16071,13 @@ def _process_capture_jobs(jobs: list) -> float:
         except Exception as e:
             reason = _agent_call_failed_reason("capture_agent_call_failed", e)
             log.error("capture agent call failed id=%s: %s", job_id, e)
-            _notify_agent_turn_failure(e, foreground=False)
+            _notify_agent_turn_failure(
+                e,
+                foreground=False,
+                lane="capture",
+                trace_id=job_id,
+                job_id=job_id,
+            )
             update_proactive_job_status(
                 job_id,
                 "failed",
@@ -16524,10 +16747,22 @@ def _process_dream_jobs(jobs: list) -> float:
                 lane="dream",
                 job_id=job_id,
             )
+            _emit_agent_turn_success(
+                foreground=False,
+                lane="dream",
+                trace_id=job_id,
+                job_id=job_id,
+            )
         except Exception as e:
             reason = _agent_call_failed_reason("dream_agent_call_failed", e)
             log.error("dream agent call failed id=%s: %s", job_id, e)
-            _notify_agent_turn_failure(e, foreground=False)
+            _notify_agent_turn_failure(
+                e,
+                foreground=False,
+                lane="dream",
+                trace_id=job_id,
+                job_id=job_id,
+            )
             update_proactive_job_status(
                 job_id,
                 "failed",
@@ -16971,12 +17206,24 @@ def _process_proactive_jobs(jobs: list) -> float:
                 update_proactive_job_status(
                     job_id, "failed", f"provider_payment_required: {e}"
                 )
-                _notify_agent_turn_failure(e, foreground=False)
+                _notify_agent_turn_failure(
+                    e,
+                    foreground=False,
+                    lane="proactive",
+                    trace_id=job_id,
+                    job_id=job_id,
+                )
                 continue
             log.error("proactive agent call failed; not posting fallback: %s", e)
             _note_proactive_failure()
             update_proactive_job_status(job_id, "failed", f"agent_call_failed: {e}")
-            _notify_agent_turn_failure(e, foreground=False)
+            _notify_agent_turn_failure(
+                e,
+                foreground=False,
+                lane="proactive",
+                trace_id=job_id,
+                job_id=job_id,
+            )
             continue
         _clear_provider_payment_cooldown()
         _clear_proactive_failure()
@@ -16993,6 +17240,9 @@ def _process_proactive_jobs(jobs: list) -> float:
             _notify_agent_turn_failure(
                 _reply_parse_failure_exc(parse_failure_class),
                 foreground=False,
+                lane="proactive",
+                trace_id=job_id,
+                job_id=job_id,
             )
             update_proactive_job_status(job_id, "failed", "agent_reply_parse_failed")
             continue
@@ -17027,9 +17277,18 @@ def _process_proactive_jobs(jobs: list) -> float:
             _notify_agent_turn_failure(
                 ValueError("agent produced only a degenerate reply fragment; not posting"),
                 foreground=False,
+                lane="proactive",
+                trace_id=job_id,
+                job_id=job_id,
             )
             update_proactive_job_status(job_id, "failed", "degenerate_reply_suppressed")
             continue
+        _emit_agent_turn_success(
+            foreground=False,
+            lane="proactive",
+            trace_id=job_id,
+            job_id=job_id,
+        )
         _note_agent_turn_success()
         # NOTE: the self-wake loop streak is advanced at the schedule point below
         # (only when the agent asks for its OWN next wake), NOT on every idle
@@ -18543,7 +18802,12 @@ def _process_messages(messages: list) -> float:
             else:
                 # 关兜底时没有回复写入可挂排他性，当场通知（此配置下 failover 双
                 # 通知是边角，接受）。
-                _notify_agent_turn_failure(e, foreground=True)
+                _notify_agent_turn_failure(
+                    e,
+                    foreground=True,
+                    lane="chat",
+                    trace_id=trace_id,
+                )
                 log.warning("agent error fallback disabled by env; this user turn will not get a visible reply")
                 if outbound_file_turn_active:
                     _finish_outbound_attachment_turn(trace_id)
@@ -18932,7 +19196,12 @@ def _process_messages(messages: list) -> float:
                     replies = [_fallback_reply_for(raw_user_content_for_lang)]
                     pending_failure_notice = stream_cut
                 else:
-                    _notify_agent_turn_failure(stream_cut, foreground=True)
+                    _notify_agent_turn_failure(
+                        stream_cut,
+                        foreground=True,
+                        lane="chat",
+                        trace_id=trace_id,
+                    )
                     log.warning(
                         "degenerate-only turn and fallback disabled by env; "
                         "this user turn will not get a visible reply"
@@ -19024,7 +19293,18 @@ def _process_messages(messages: list) -> float:
             break
 
         if pending_failure_notice is not None and posted_any:
-            _notify_agent_turn_failure(pending_failure_notice, foreground=True)
+            _notify_agent_turn_failure(
+                pending_failure_notice,
+                foreground=True,
+                lane="chat",
+                trace_id=trace_id,
+            )
+        elif pending_failure_notice is None:
+            _emit_agent_turn_success(
+                foreground=True,
+                lane="chat",
+                trace_id=trace_id,
+            )
 
         # The turn is settled (posted, or terminally rejected): absorbed
         # backlog messages are now truly consumed by this carrier.

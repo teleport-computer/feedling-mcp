@@ -12,6 +12,21 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Canvas viewers can now fetch the current workspace revision instead of
+  remaining pinned to the attachment published in an older Chat message.**
+  `GET /v1/chat/workspace/body` accepts the original `.io.html` `file_name`,
+  resolves it inside the authenticated user's workspace, and returns the
+  current shared envelope. Matching is exact and case-sensitive; invalid paths
+  are rejected, and a missing live entry returns a compatibility-friendly 404
+  so clients can retain the historical message-body fallback.
+
+- **Dedicated image generation now returns an actionable credential-decryption
+  error instead of a generic HTTP 500.** A known saved-envelope or key-decoding
+  failure returns HTTP 409 with `image_generation_key_decrypt_failed`, without
+  marking the provider route unhealthy. Enclave availability failures remain a
+  retryable `image_generation_unavailable` HTTP 503, while unexpected local
+  programming errors remain visible as server failures.
+
 - **Runner fleet health no longer converts brief PostgreSQL latency into a false
   runner-down result.** After a successful observation, `GET /healthz/runner`
   can return HTTP 200 with `status: degraded` from the last verified heartbeat

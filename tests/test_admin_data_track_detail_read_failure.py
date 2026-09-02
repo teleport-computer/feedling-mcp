@@ -10,9 +10,9 @@
   * `frame_envelopes` 只被 snapshot 读(`_screen_frames_into`,db.py:1504,在
     snapshot 内于 db.py:1682 被调用 —— 早于 app_usage 与 responder_runtime 两段
     查询,所以这两块都吃到这次失败)。
-  * `user_logs` 还被 `admin_data_track_user_daily_usage` 读,而那条路径**没有**
-    statement_timeout ⇒ 无界读者会一直阻塞而不是失败(实测请求耗时 30.13s 后
-    照常成功)。锁错表 = 复现不出生产那个形状。
+  * `user_logs` 还被 `admin_data_track_user_daily_usage` 读；那条路径现在也有
+    statement_timeout。锁它会让 snapshot 和 daily_usage 一起失败，破坏本测试
+    需要的「只有 snapshot 失败」对照。锁错表 = 复现不出生产那个形状。
 
 健康态 daily_usage 仍然读得到,故障态 app_usage 归零 —— 这就是生产上
 「全时段计数 < 自己的 14 天切片」那个内部矛盾的本地复刻。
@@ -169,7 +169,7 @@ def _healthy_then_broken(client, monkeypatch) -> tuple[dict, dict, int]:
     with RealReadFailure():
         broken = _detail(client, user_id)
 
-    # 自证:注入确实只打中了 snapshot(daily_usage 走另一条无 timeout 的路)
+    # 自证:注入只打中了读 frame_envelopes 的 snapshot；daily_usage 只读 user_logs。
     assert _daily_sum(broken) == expected, (
         "daily_usage 也挂了 ⇒ 锁选错表,复现的不是生产那个形状"
     )

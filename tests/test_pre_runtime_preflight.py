@@ -13,11 +13,13 @@ from alembic.script import ScriptDirectory
 ROOT = Path(__file__).parent.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 TEE_MIGRATE_WORKFLOW = ROOT / ".github" / "workflows" / "tee-migrate.yml"
+PG_DEPLOY_WORKFLOW = ROOT / ".github" / "workflows" / "pg-deploy.yml"
+REDIS_DEPLOY_WORKFLOW = ROOT / ".github" / "workflows" / "redis-deploy.yml"
 TEST_COMPOSE = ROOT / "deploy" / "docker-compose.phala.test.yaml"
 TEST_RUNNER_COMPOSE = ROOT / "deploy" / "docker-compose.phala.runner.yaml"
 PROD_COMPOSE = ROOT / "deploy" / "docker-compose.phala.yaml"
 PROD_RUNNER_COMPOSE = ROOT / "deploy" / "docker-compose.phala.prod.runner.yaml"
-EXPECTED_TEE_HEAD = "0039_distill_artifact_ledger"
+EXPECTED_TEE_HEAD = "0040_perceptkit_objects"
 
 # The two inventory files that name the shared test CVMs.  Every job that
 # reaches one of those machines has to learn its target from here.
@@ -504,6 +506,10 @@ def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
     assert runtime_head == EXPECTED_TEE_HEAD
     assert (
         script.get_revision(EXPECTED_TEE_HEAD).down_revision
+        == "0039_distill_artifact_ledger"
+    )
+    assert (
+        script.get_revision("0039_distill_artifact_ledger").down_revision
         == "0038_v2_wake_followup_marker"
     )
     assert (
@@ -650,7 +656,7 @@ def test_preflight_validates_entire_two_cvm_release_before_mutation():
         assert required in preflight
 
 
-def test_preflight_blocks_tee_primary_deploy_before_mutating_a_cvm():
+def test_preflight_validates_tee_startup_migration_authorization_before_mutating_a_cvm():
     source = WORKFLOW.read_text()
     preflight = _job(
         source,
@@ -662,16 +668,18 @@ def test_preflight_blocks_tee_primary_deploy_before_mutating_a_cvm():
         "PRE_FEEDLING_DATABASE_SCHEMA == 'tee'",
         "PRE_TEE_MIGRATION_DSN",
         "PRE_TEE_PG_CA_PEM",
-        "backend/alembic_tee/alembic.ini",
-        "SELECT version_num FROM alembic_tee_version",
-        "PRE TEE schema migration required",
-        "run the TEE migrate workflow for pre",
+        "APP_DATABASE_URL",
+        "owner_fingerprint != app_fingerprint",
+        'owner_user != "feedling_owner"',
+        'app_user != "app"',
+        "pg_has_role(current_user, 'feedling_owner', 'member')",
+        "PRE_DATABASE_URL app role must inherit feedling_owner",
         "No PRE CVM was changed",
     ):
         assert required in preflight
 
     schema_gate = preflight.index(
-        "Require PRE TEE schema at release head before mutating either CVM"
+        "Validate PRE TEE startup migration authorization before mutating either CVM"
     )
     image_gate = preflight.index(
         "Require both Runtime V2 images before mutating either CVM"
@@ -679,7 +687,7 @@ def test_preflight_blocks_tee_primary_deploy_before_mutating_a_cvm():
     assert schema_gate < image_gate
 
 
-def test_pre_release_gates_run_the_application_startup_contract():
+def test_pre_release_gates_keep_tee_migration_out_of_ci_preflight():
     preflight = _job(
         WORKFLOW.read_text(),
         "validate-pre-runtime-prerequisites",
@@ -687,10 +695,12 @@ def test_pre_release_gates_run_the_application_startup_contract():
     )
     tee_migrate = TEE_MIGRATE_WORKFLOW.read_text()
 
-    for source in (preflight, tee_migrate):
-        assert 'os.environ["FEEDLING_DATABASE_SCHEMA"] = "tee"' in source
-        assert 'os.environ["DATABASE_URL"] = os.environ["TEE_MIGRATION_DATABASE_URL"]' in source
-        assert "db.init_schema()" in source
+    assert "db.init_schema()" not in preflight
+    assert "SELECT version_num FROM alembic_tee_version" not in preflight
+
+    assert 'os.environ["FEEDLING_DATABASE_SCHEMA"] = "tee"' in tee_migrate
+    assert 'os.environ["DATABASE_URL"] = os.environ["TEE_MIGRATION_DATABASE_URL"]' in tee_migrate
+    assert "db.init_schema()" in tee_migrate
 
     assert "Assert PRE application startup contract" in tee_migrate
 
@@ -1003,8 +1013,10 @@ def test_every_test_cvm_touching_job_is_locked_to_the_test_branch():
     this set and has to justify its own branch gate.  Anchoring on the pin
     instead made such a job structurally invisible.
 
-    Scope: ``ci.yml``.  ``pg-deploy.yml`` and ``redis-deploy.yml`` reach their
-    own CVMs and are deliberately not covered here.
+    ``ci.yml`` gates test jobs on ``github.ref``.  The manual PG/Redis workflows
+    instead check out the branch selected by their environment input and resolve
+    the same environment's infrastructure inventory before every CVM sink;
+    both forms are part of this guard's scope.
     """
     # Prove the domination check before trusting it: a mention of the test ref
     # is not the same as a dependence on it.
@@ -1041,6 +1053,94 @@ def test_every_test_cvm_touching_job_is_locked_to_the_test_branch():
             f"{name} reaches a shared test CVM on runs where github.ref is not "
             f"refs/heads/test: {condition!r}"
         )
+
+    expected_refs = {
+        "${{ inputs.environment == 'prod' && 'main' || "
+        "inputs.environment == 'pre' && 'pre' || 'test' }}",
+        "${{ inputs.environment == 'prod' && 'main' || "
+        "(inputs.environment == 'pre' && 'pre' || 'test') }}",
+    }
+    for path, service in (
+        (PG_DEPLOY_WORKFLOW, "pg"),
+        (REDIS_DEPLOY_WORKFLOW, "redis"),
+    ):
+        workflow = yaml.safe_load(path.read_text())
+        triggers = workflow[True] if True in workflow else workflow["on"]
+        assert set(triggers) == {"workflow_dispatch"}, path.name
+
+        manual_jobs = workflow["jobs"]
+        reaching = _cvm_reaching_jobs(manual_jobs, _phala_reaching_scripts())
+        assert reaching == {"deploy"}, (path.name, sorted(reaching))
+        steps = manual_jobs["deploy"]["steps"]
+
+        checkouts = [
+            (index, step)
+            for index, step in enumerate(steps)
+            if str(step.get("uses") or "").startswith("actions/checkout@")
+        ]
+        assert len(checkouts) == 1, path.name
+        checkout_index, checkout = checkouts[0]
+        assert checkout.get("with", {}).get("ref") in expected_refs, path.name
+
+        resolvers = [
+            (index, step)
+            for index, step in enumerate(steps)
+            if step.get("id") == "cvm"
+        ]
+        assert len(resolvers) == 1, path.name
+        resolve_index, resolver = resolvers[0]
+        assert checkout_index < resolve_index, path.name
+        assert resolver.get("env", {}).get("ENVIRONMENT") == "${{ inputs.environment }}", (
+            path.name,
+            resolver.get("name"),
+        )
+        resolve_run = str(resolver.get("run") or "")
+        assert (
+            f'F="deploy/${{ENVIRONMENT}}-{service}-cvm-id.txt"' in resolve_run
+        ), path.name
+        cvm_assignments = [
+            line.strip()
+            for line in resolve_run.splitlines()
+            if re.match(r"^\s*CVM_ID=", line)
+        ]
+        assert cvm_assignments == [
+            'CVM_ID=$(grep -v \'^#\' "$F" | tr -d \'[:space:]\' | head -1 || true)'
+        ], path.name
+        output_line = 'echo "id=$CVM_ID" >> "$GITHUB_OUTPUT"'
+        assert resolve_run.index(cvm_assignments[0]) < resolve_run.index(output_line), (
+            path.name,
+            resolver.get("name"),
+        )
+
+        targets = 0
+        for index, step in enumerate(steps):
+            run = str(step.get("run") or "")
+            step_targets = [
+                target
+                for line in run.splitlines()
+                for position in CVM_TARGET_POSITIONS
+                for target in position.findall(line)
+            ]
+            if not step_targets:
+                continue
+            targets += len(step_targets)
+            assert index > resolve_index, path.name
+            assert step.get("env", {}).get("CVM_ID") == "${{ steps.cvm.outputs.id }}", (
+                path.name,
+                step.get("name"),
+            )
+            assert not re.search(r"^\s*(?:export\s+)?CVM_ID=", run, re.MULTILINE), (
+                path.name,
+                step.get("name"),
+            )
+            for target in step_targets:
+                variable = QUOTED_VARIABLE.fullmatch(target)
+                assert variable and variable.group(1) == "CVM_ID", (
+                    path.name,
+                    step.get("name"),
+                    target,
+                )
+        assert targets >= 2, (path.name, targets)
 
 
 def test_test_release_jobs_only_run_for_pushes_to_test():
@@ -1159,7 +1259,7 @@ def test_test_compose_forwards_database_schema_to_every_database_client():
     assert selector in runner
 
 
-def test_test_preflight_blocks_tee_primary_before_mutating_either_cvm():
+def test_test_preflight_validates_tee_startup_migration_authorization_before_mutating_either_cvm():
     preflight = _job(
         WORKFLOW.read_text(),
         "validate-test-runtime-prerequisites",
@@ -1171,20 +1271,17 @@ def test_test_preflight_blocks_tee_primary_before_mutating_either_cvm():
         "TEST_TEE_MIGRATION_DSN",
         "TEST_TEE_PG_CA_PEM",
         "APP_DATABASE_URL",
-        "backend/alembic_tee/alembic.ini",
-        "SELECT version_num FROM alembic_tee_version",
         "owner_fingerprint != app_fingerprint",
-        "TEST TEE schema migration required",
-        "run the TEE migrate workflow for test",
+        'owner_user != "feedling_owner"',
+        'app_user != "app"',
+        "pg_has_role(current_user, 'feedling_owner', 'member')",
+        "TEST_DATABASE_URL app role must inherit feedling_owner",
         "No TEST CVM was changed",
-        'os.environ["FEEDLING_DATABASE_SCHEMA"] = "tee"',
-        'os.environ["DATABASE_URL"] = os.environ["APP_DATABASE_URL"]',
-        "db.init_schema()",
     ):
         assert required in preflight
 
     schema_gate = preflight.index(
-        "Require TEST TEE schema at release head before mutating either CVM"
+        "Validate TEST TEE startup migration authorization before mutating either CVM"
     )
     image_gate = preflight.index(
         "Require both Runtime V2 images before mutating either CVM"
@@ -1257,7 +1354,7 @@ def test_prod_compose_forwards_database_schema_to_every_database_client():
     assert selector in runner
 
 
-def test_prod_preflight_blocks_unready_tee_primary_before_mutating_any_cvm():
+def test_prod_preflight_validates_tee_startup_migration_authorization_before_mutating_any_cvm():
     preflight = _job(
         WORKFLOW.read_text(),
         "validate-prod-runner-topology",
@@ -1269,22 +1366,17 @@ def test_prod_preflight_blocks_unready_tee_primary_before_mutating_any_cvm():
         "PROD_TEE_MIGRATION_DSN",
         "PROD_TEE_PG_CA_PEM",
         "APP_DATABASE_URL",
-        "backend/alembic_tee/alembic.ini",
-        "SELECT version_num FROM alembic_tee_version",
         "owner_fingerprint != app_fingerprint",
         'owner_user != "feedling_owner"',
-        "current_user",
-        "PROD TEE schema migration required",
-        "run the TEE migrate workflow for prod",
+        'app_user != "app"',
+        "pg_has_role(current_user, 'feedling_owner', 'member')",
+        "DATABASE_URL app role must inherit feedling_owner",
         "No production CVM was changed",
-        'os.environ["FEEDLING_DATABASE_SCHEMA"] = "tee"',
-        'os.environ["DATABASE_URL"] = os.environ["APP_DATABASE_URL"]',
-        "db.init_schema()",
     ):
         assert required in preflight
 
     schema_gate = preflight.index(
-        "Require PROD TEE schema at release head before mutating any CVM"
+        "Validate PROD TEE startup migration authorization before mutating any CVM"
     )
     image_gate = preflight.index(
         "Require both production images before mutating either CVM"
@@ -1292,14 +1384,14 @@ def test_prod_preflight_blocks_unready_tee_primary_before_mutating_any_cvm():
     assert schema_gate < image_gate
 
 
-def test_prod_preflight_reads_owner_role_before_enforcing_it():
+def test_prod_preflight_checks_owner_and_app_migration_roles():
     preflight = _job(
         WORKFLOW.read_text(),
         "validate-prod-runner-topology",
         "detect-cvm-changes-pre",
     )
     schema_step = preflight.split(
-        "- name: Require PROD TEE schema at release head before mutating any CVM",
+        "- name: Validate PROD TEE startup migration authorization before mutating any CVM",
         1,
     )[1].split("\n      - name:", 1)[0]
 
@@ -1309,6 +1401,8 @@ def test_prod_preflight_reads_owner_role_before_enforcing_it():
     enforcement = 'if owner_user != "feedling_owner":'
     assert assignment in schema_step
     assert schema_step.index(assignment) < schema_step.index(enforcement)
+    assert 'if app_user != "app":' in schema_step
+    assert "if not app_can_migrate:" in schema_step
 
 
 def test_prod_preflight_rejects_invalid_selector_and_stale_shadow_wiring():

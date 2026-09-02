@@ -80,12 +80,35 @@ def test_fuse_needs_both_ratio_and_floor():
 
 
 def test_fuse_env_overrides(monkeypatch):
+    """内核只认 ``MEMGARDEN_*``。
+
+    memgarden 0.12.10 把旧的 ``FEEDLING_*`` 回退删了 —— 理由成立（公共包的
+    配置名里不该有宿主专属前缀，别人 `pip install memgarden` 之后不知道
+    Feedling 是什么）。删的时候核实过「io 的 deploy / CI / 代码里一处都没设」，
+    **这句话对，但漏了测试**：这个文件设的就是那两个名字，于是 0.12.10 一进来
+    它就红了。宿主真要沿用旧名，得在自己这边读 env 再当参数传进去。
+    """
+    monkeypatch.setenv("MEMGARDEN_DREAM_FUSE_RATIO", "0.5")
+    monkeypatch.setenv("MEMGARDEN_DREAM_FUSE_MIN_CARDS", "3")
     monkeypatch.setenv("FEEDLING_DREAM_FUSE_RATIO", "0.5")
     monkeypatch.setenv("FEEDLING_DREAM_FUSE_MIN_CARDS", "3")
     assert dream_gates.blast_radius_exceeded(4, 6) is True       # 67% > 50% 且 ≥3
+    monkeypatch.setenv("MEMGARDEN_DREAM_FUSE_RATIO", "not-a-number")
+    monkeypatch.setenv("MEMGARDEN_DREAM_FUSE_MIN_CARDS", "-1")
     monkeypatch.setenv("FEEDLING_DREAM_FUSE_RATIO", "not-a-number")
     monkeypatch.setenv("FEEDLING_DREAM_FUSE_MIN_CARDS", "-1")
     assert dream_gates.blast_radius_exceeded(4, 6) is False      # 坏值回默认 0.8/10
+
+
+def test_the_old_host_prefix_is_not_read_any_more(monkeypatch):
+    """旧前缀必须**不**生效。
+
+    只把上面那条改名，读起来像「名字换了一下」；真正该锁住的是
+    「宿主专属的名字不再能从外面拨动内核」—— 哪天回退被谁加回去，这条会红。
+    """
+    monkeypatch.setenv("FEEDLING_DREAM_FUSE_RATIO", "0.5")
+    monkeypatch.setenv("FEEDLING_DREAM_FUSE_MIN_CARDS", "3")
+    assert dream_gates.blast_radius_exceeded(4, 6) is False      # 吃默认 0.8/10
 
 
 # ---------------------------------------------------------------------------

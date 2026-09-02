@@ -101,8 +101,10 @@ Pillow>=11,<13
 # PyPI 上 memory-garden 这个名字被一个同领域项目占了、我们还没发；现在以
 # memgarden 这个名字发出去了，那条理由不再成立。
 #
-# agent-protocol-core 是同源的姊妹包，和 memgarden 锁步同版本 ——
-# memgarden 自己依赖它的精确版本，两边版本号必须一起改。
+# memgarden 现在是**零依赖**的（2026-09-02 起）。原来跟它锁步的
+# agent-protocol-core 已经搬进 backend/agent_protocol_core/ —— 那里面装的是
+# io 自己的思维链实现（人格文案、屏幕监看说辞、FEEDLING_ 开关），本来就不该
+# 跟着一个公开的记忆库一起发。
 #
 # 本镜像用 `pip install --require-hashes`，升级 = 改这里的版本号 +
 # 重新 `uv pip compile --generate-hashes`（命令见 deploy/BUILD.md）。
@@ -124,5 +126,12 @@ Pillow>=11,<13
 # self-thinking 措辞改动（一行字），io 锁提示词逐字节不变的那组哈希测试红了。
 # 那组测试拦住了它 —— 这正是它存在的理由。真正危险的不是带进来，是带进来而
 # 不知道。
-memgarden==0.12.9
-agent-protocol-core==0.12.9
+memgarden==0.13.1
+
+# 感知内核 —— 同样从本仓库提取出去的独立库（perceptkit），走法与上面的
+# memgarden 一致：GitHub Release 的 wheel URL，理由同上（--require-hashes +
+# compose 哈希上链要求构建可复现）。
+# 0.2.0 把八个纯函数模块搬进了 perceptkit.algorithms（见该包 CHANGELOG），
+# 所以这条 pin 和本分支的 import 是一起改的：装着 0.1.0 的环境跑本分支会在
+# import 时就炸。release 已发（2026-08-31，tag v0.2.0，commit f591a80）。
+perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.2.4/perceptkit-0.2.4-py3-none-any.whl

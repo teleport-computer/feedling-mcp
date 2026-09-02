@@ -3,6 +3,7 @@
 用例全部取自 prod 真实报错串（spec §测试）。
 Run:  python -m pytest tests/test_consumer_error_classify.py -q
 """
+import ast
 import os
 import subprocess
 import sys
@@ -33,6 +34,12 @@ except ModuleNotFoundError:
     sys.modules["content_encryption"] = _fake_enc
 
 import tools.chat_resident_consumer as crc  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _keep_turn_trace_emission_synchronous(monkeypatch):
+    """Tests in this module opt in to capturing turn events explicitly."""
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **kw: None)
 
 
 def _cls(exc):
@@ -139,6 +146,114 @@ def test_background_failures_never_banner(monkeypatch):
     crc._notify_agent_turn_failure(RuntimeError("cli agent exited 1: 余额不足"), foreground=False)
     assert sent == []          # 聊天流零横幅
     assert len(reported) == 2  # 设置页/admin 腿照发
+
+
+def test_failure_trace_reuses_runtime_error_classification(monkeypatch):
+    """One failure must persist and trace the exact same classification."""
+    runtime_error_payloads = []
+    trace_events = []
+
+    monkeypatch.setattr(
+        crc._HTTP,
+        "post",
+        lambda url, **kw: runtime_error_payloads.append(kw["json"]) or _FakeResp(200),
+    )
+    monkeypatch.setattr(
+        crc,
+        "_emit_debug_trace",
+        lambda subsystem, type, **kw: trace_events.append(
+            {"subsystem": subsystem, "type": type, **kw}
+        ),
+    )
+
+    crc._notify_agent_turn_failure(
+        RuntimeError("cli agent exited 1: invalid x-api-key"),
+        foreground=False,
+        lane="dream",
+        trace_id="dream-1",
+        job_id="dream-1",
+    )
+
+    assert len(runtime_error_payloads) == 1
+    assert trace_events == [
+        {
+            "subsystem": "agent",
+            "type": "agent.turn.failure",
+            "status": "error",
+            "trace_id": "dream-1",
+            "job_id": "dream-1",
+            "detail": {
+                "error_class": runtime_error_payloads[0]["error_class"],
+                "blame": "user_provider",
+                "foreground": False,
+                "lane": "dream",
+            },
+        }
+    ]
+
+
+def test_turn_outcome_sites_share_owner_layer_and_failure_has_no_bypass():
+    """Derive the caller population and reject unit/population drift."""
+    source_path = Path(crc.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    parents = {
+        child: node
+        for node in ast.walk(tree)
+        for child in ast.iter_child_nodes(node)
+    }
+
+    def _call_name(node):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            return node.func.id
+        return ""
+
+    def _owner(node):
+        while node is not None and not isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            node = parents.get(node)
+        return node.name if node is not None else ""
+
+    notify_calls = [
+        node for node in ast.walk(tree)
+        if _call_name(node) == "_notify_agent_turn_failure"
+    ]
+    success_calls = [
+        node for node in ast.walk(tree)
+        if _call_name(node) == "_emit_agent_turn_success"
+    ]
+    assert notify_calls and success_calls
+
+    failure_owners = {_owner(node) for node in notify_calls}
+    success_owners = [_owner(node) for node in success_calls]
+    assert set(success_owners) == failure_owners
+    assert len(success_owners) == len(set(success_owners)), (
+        "each owning chat/job function must emit one terminal success, not "
+        "one event per internal model attempt"
+    )
+
+    for call in notify_calls:
+        keywords = {item.arg for item in call.keywords}
+        assert "lane" in keywords
+        assert "trace_id" in keywords or "job_id" in keywords
+
+    failure_reports = []
+    for node in ast.walk(tree):
+        if _call_name(node) != "_report_runtime_error":
+            continue
+        provider_result = next(
+            (item.value for item in node.keywords if item.arg == "provider_result"),
+            None,
+        )
+        if (
+            isinstance(provider_result, ast.Constant)
+            and provider_result.value == "failure"
+        ):
+            failure_reports.append(node)
+    assert failure_reports
+    assert {_owner(node) for node in failure_reports} == {
+        "_notify_agent_turn_failure"
+    }
 
 
 def test_foreground_provider_transient_wave_merges_to_one_banner(monkeypatch):
@@ -286,6 +401,32 @@ def test_note_success_clears_reported_flag_after_respawn(monkeypatch):
         }
     ]
     assert crc._runtime_error_reported is False
+
+
+def test_success_trace_has_matching_population_dimensions(monkeypatch):
+    trace_events = []
+    monkeypatch.setattr(
+        crc,
+        "_emit_debug_trace",
+        lambda subsystem, type, **kw: trace_events.append(
+            {"subsystem": subsystem, "type": type, **kw}
+        ),
+    )
+
+    crc._emit_agent_turn_success(
+        foreground=False,
+        lane="dream",
+        trace_id="dream-1",
+        job_id="dream-1",
+    )
+
+    assert trace_events == [{
+        "subsystem": "agent",
+        "type": "agent.turn.success",
+        "trace_id": "dream-1",
+        "job_id": "dream-1",
+        "detail": {"foreground": False, "lane": "dream"},
+    }]
 
 
 def test_clear_failure_keeps_flag_and_retries_next_success(monkeypatch):

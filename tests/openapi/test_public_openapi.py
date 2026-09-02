@@ -214,7 +214,8 @@ def test_public_operation_and_parameter_inventory(
     # validators; only the two config mutations carry request bodies.
     # The authenticated resident generation exchange adds one prompt-bearing
     # operation.
-    assert len(operations) == 176
+    # GET /v1/chat/workspace/body adds one bodyless Canvas live-read operation.
+    assert len(operations) == 177
     assert sum("requestBody" in operation for operation in operations.values()) == 84
 
     query_operations = {
@@ -223,7 +224,7 @@ def test_public_operation_and_parameter_inventory(
     header_operations = {
         key for key, operation in operations.items() if _parameters(operation, "header")
     }
-    assert len(query_operations) == 33
+    assert len(query_operations) == 34
     assert header_operations == set(EXPECTED_HEADER_OPERATIONS)
 
     for key, expected_names in EXPECTED_HEADER_OPERATIONS.items():
@@ -399,6 +400,22 @@ def test_chat_memory_and_perception_contracts_are_concrete(
     }
     assert history_query["limit"]["schema"]["maximum"] == 200
     assert history_query["include_image_bodies"]["deprecated"] is True
+
+    canvas_operation = operations[("get", "/v1/chat/workspace/body")]
+    canvas_query = _parameters(canvas_operation, "query")
+    assert set(canvas_query) == {"filename"}
+    assert canvas_query["filename"]["required"] is True
+    assert canvas_query["filename"]["schema"]["maxLength"] == 120
+    assert canvas_operation["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ] == {"$ref": "#/components/schemas/CanvasWorkspaceBodyResponse"}
+    canvas_response = schemas["CanvasWorkspaceBodyResponse"]
+    assert set(canvas_response["required"]) == {
+        "filename", "revision", "mime_type", "envelope"
+    }
+    assert canvas_response["properties"]["envelope"] == {
+        "$ref": "#/components/schemas/EncryptedEnvelope"
+    }
 
     memory_query = _parameters(
         operations[("get", "/v1/memory/list")], "query"

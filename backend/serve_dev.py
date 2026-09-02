@@ -34,7 +34,7 @@ def main() -> None:
 
     import db
 
-    db.init_schema()
+    db.init_schema(tee_auto_migrate=True)
 
     from hosted import config_store
 

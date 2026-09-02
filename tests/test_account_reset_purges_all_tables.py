@@ -269,6 +269,73 @@ def test_db_belt_purges_usage_rollups_without_deleting_parent_user(client):
         conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
 
 
+def test_db_belt_explicitly_purges_v2_trajectory_events(client):
+    """The reset belt must not rely on a trajectory FK cascade.
+
+    TEE-primary intentionally has no v2_trajectory_events -> stream/users FK,
+    so exercise the belt while the parent user and stream still exist.  The
+    event can disappear here only through delete_user_data's explicit list.
+    """
+    uid, _api_key = _register(client)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_runtime_state "
+            "(user_id,hosted_runtime_state,runtime_generation) "
+            "VALUES (%s,'v2',1) ON CONFLICT (user_id) DO NOTHING",
+            (uid,),
+        )
+        job_id = conn.execute(
+            "INSERT INTO agent_jobs "
+            "(user_id,lane,status,expected_runtime_generation) "
+            "VALUES (%s,'chat','pending',1) RETURNING id",
+            (uid,),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO v2_trajectory_streams (job_id,user_id) VALUES (%s,%s)",
+            (job_id, uid),
+        )
+        conn.execute(
+            "INSERT INTO v2_trajectory_events "
+            "(job_id,user_id,event_index,event_kind,idempotency_key,"
+            "payload_envelope,payload_bytes) "
+            "VALUES (%s,%s,0,'turn_started','reset-belt',%s,10)",
+            (
+                job_id,
+                uid,
+                db.Jsonb({
+                    "v": 1,
+                    "id": "reset-belt-event",
+                    "owner_user_id": uid,
+                    "visibility": "shared",
+                    "body_ct": "ciphertext",
+                    "nonce": "nonce",
+                    "K_user": "wrapped-user-key",
+                    "K_enclave": "wrapped-enclave-key",
+                }),
+            ),
+        )
+
+    try:
+        db.delete_user_data(uid)
+
+        with db.get_pool().connection() as conn:
+            assert conn.execute(
+                "SELECT count(*) FROM users WHERE user_id=%s", (uid,)
+            ).fetchone() == (1,)
+            assert conn.execute(
+                "SELECT count(*) FROM v2_trajectory_streams "
+                "WHERE job_id=%s AND user_id=%s",
+                (job_id, uid),
+            ).fetchone() == (1,)
+            assert conn.execute(
+                "SELECT count(*) FROM v2_trajectory_events WHERE user_id=%s",
+                (uid,),
+            ).fetchone() == (0,)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
 @pytest.fixture()
 def seeded_user(client) -> dict:
     """已注册 + 各 per-user 表有行的用户（供 R2-failure 测试沿用既有 fixture 风格）。"""

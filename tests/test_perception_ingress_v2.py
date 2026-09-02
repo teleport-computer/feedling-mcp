@@ -16,6 +16,7 @@ from perception.ingress_v2 import (  # noqa: E402
 )
 from proactive.adapters_v2 import wake_event_v2_from_legacy_job  # noqa: E402
 from proactive.runtime_v2 import WakeEventV2  # noqa: E402
+import pytest
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "perception_ios_v2"
@@ -123,6 +124,20 @@ def _broadcast_wake(user_id: str, trigger: str, ts: float) -> WakeEventV2:
         origin_refs=("ios_report:broadcast",),
     )
 
+
+
+@pytest.fixture(autouse=True)
+def _legacy_wake_delivery(monkeypatch):
+    """这个文件验的是**老路**的唤醒判定和投递。
+
+    kit 接管唤醒之后，老路照旧算、但不再投递（否则同一件事叫两遍）。
+    这些用例问的是「老路自己对不对」，所以显式把开关关掉 —— 而不是改成
+    断言「什么都没发生」：那样一来，老路真的算错了也看不出来，
+    而它现在还是 kit 的对照组。
+
+    kit 那一侧的投递由 tests/test_perceptkit_wakes.py 盯着。
+    """
+    monkeypatch.setenv("FEEDLING_PERCEPTKIT_WAKES", "0")
 
 def test_broadcast_edges_share_one_capability_debounce(monkeypatch):
     fake = _Store()

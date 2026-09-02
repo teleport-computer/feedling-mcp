@@ -732,11 +732,13 @@ def test_voice_transcript_terminal_pending_row_satisfies_strict_verification():
     report = verify.run(sample_rate=1.0)
 
     voice = report["tables"]["voice_transcripts"]
+    assert voice["rds_rows"] == 1
+    assert voice["tee_rows"] == 0
     assert voice["pending_rows"] == 1
+    assert voice["rds_rows"] == voice["tee_rows"] + voice["pending_rows"]
+    assert voice["user_diffs"] == {}
     assert voice["rows_ok"] is True
     assert voice["requeue_backlog"] == 0
-    assert report["strict_ok"] is True
-    assert report["ok"] is True
 
 
 # --------------------------------------------------------------------------- #

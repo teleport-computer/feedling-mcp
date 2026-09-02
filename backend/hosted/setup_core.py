@@ -107,7 +107,7 @@ def _emit_model_api_probe_trace(
     model: str,
     phase: str,
     status: str = "ok",
-    outcome_class: str = debug_trace.TRACE_OUTCOME_DEFAULT,
+    outcome_class: str | None = None,
     usage: dict | None = None,
     error_class: str = "",
     dur_ms: float | None = None,

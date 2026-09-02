@@ -6512,7 +6512,7 @@ def main() -> None:
     # runs this once per deploy; this worker is its own entrypoint in the runner
     # CVM (see module docstring) with no shared master migration hook, so it must
     # not assume the schema is already at head.
-    db.init_schema()
+    db.init_schema(tee_auto_migrate=True)
     wire_assembly()
     # 周期性全量刷新单例：丢失/异常的 users notify 的显式自愈通道。放在运行时入口
     # 而非 wire_assembly（后者被 13 处测试调用），避免一个改写 registry._users 的

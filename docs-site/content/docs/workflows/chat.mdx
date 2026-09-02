@@ -16,6 +16,18 @@ The hosted path is asynchronous. A successful send is always `202`, even when
 the assistant ciphertext is already available. It never returns a plaintext
 assistant reply.
 
+An IO Canvas card may outlive the Chat attachment that first published it.
+Authenticated clients can read the current Canvas source with
+`GET /v1/chat/workspace/body?filename=<original-file_name>`. The endpoint accepts
+only the original `.io.html` basename from the Chat row, derives the private
+`/workspace` path server-side, and performs an exact case- and
+Unicode-normalization-sensitive lookup. It returns the current revision and the
+opaque shared `envelope`; encrypted accounts open it with the same content key
+used for Chat, while plaintext-tier accounts receive the standard `body` shape.
+A `404 workspace_entry_not_found` is a normal compatibility signal: clients
+should fall back to `GET /v1/chat/messages/{message_id}/body` so historical
+cards whose live workspace entry is unavailable remain readable.
+
 Backend workers create metadata-only per-user Store shells and load an in-memory
 section only when a path explicitly needs that projection. Chat history,
 resident long-poll selection, and Hosted Runtime V2 prompt-tail assembly remain

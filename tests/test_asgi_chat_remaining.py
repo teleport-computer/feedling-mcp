@@ -37,6 +37,7 @@ from bootstrap import gates as boot_gates  # noqa: E402
 from chat import consumer as chat_consumer  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
+from model_api_runtime.v2 import jobs_store as v2_jobs_store  # noqa: E402
 from runtime.waiters import registry  # noqa: E402
 
 
@@ -123,6 +124,7 @@ def test_all_routes_bad_auth_is_fixed_401(user):
         ("GET", "/v1/chat/history", None),
         ("DELETE", "/v1/chat/history", {"confirm": "clear-chat-history"}),
         ("GET", "/v1/chat/messages/whatever/body", None),
+        ("GET", "/v1/chat/workspace/body?filename=work.io.html", None),
         ("POST", "/v1/chat/verify_loop", {"timeout_sec": 0}),
     ]:
         status, resp = _asgi(method, path, headers=bad, json=body)
@@ -274,6 +276,150 @@ def test_message_body_not_found_parity(user):
     a_status, a_body = _asgi("GET", "/v1/chat/messages/missing/body", headers=_hk(api_key))
     f = _flask_client().get("/v1/chat/messages/missing/body", headers=_hk(api_key))
     assert (a_status, a_body) == (f.status_code, f.get_json()) == (404, {"error": "message_not_found"})
+
+
+def test_workspace_canvas_body_returns_current_workspace_not_stale_message(user):
+    uid, api_key = user
+    filename = "living-letter.io.html"
+    stale_message = b"<html><body>stale message copy</body></html>"
+    current_workspace = "<html><body>current workspace revision</body></html>"
+    stale_envelope = {
+        "id": "canvas-stale-message",
+        "body_b64": _b64(stale_message),
+        "body_size_bytes": len(stale_message),
+        "visibility": "shared",
+        "owner_user_id": uid,
+    }
+    store = core_store.get_store(uid)
+    store.append_chat(
+        "openclaw",
+        "model_api",
+        stale_envelope,
+        content_type="file",
+        extra={
+            "file_name": filename,
+            "file_mime": "text/html",
+            "file_byte_count": len(stale_message),
+        },
+        strict=True,
+    )
+    written = v2_jobs_store.put_workspace_entry_cas(
+        uid,
+        f"/workspace/{filename}",
+        kind="workspace",
+        content_envelope={
+            "id": "canvas-current-workspace",
+            "body": current_workspace,
+            "visibility": "shared",
+            "owner_user_id": uid,
+        },
+        mime_type="text/html",
+        source_ref="",
+        expected_revision=0,
+    )
+    assert written is not None
+
+    status, body = _asgi(
+        "GET",
+        "/v1/chat/workspace/body",
+        headers=_hk(api_key),
+        params={"filename": filename},
+    )
+    message_status, message_body = _asgi(
+        "GET",
+        "/v1/chat/messages/canvas-stale-message/body",
+        headers=_hk(api_key),
+    )
+
+    assert status == message_status == 200
+    assert body["filename"] == filename
+    assert body["revision"] == written["revision"] == 1
+    assert body["envelope"]["body"] == current_workspace
+    assert base64.b64decode(message_body["message"]["body_b64"]) == stale_message
+    assert body["envelope"]["body"].encode() != stale_message
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "../memory/WORKING.io.html",
+        "/artifacts/private.io.html",
+        "nested/work.io.html",
+        "nested\\work.io.html",
+        "not-a-canvas.html",
+    ],
+)
+def test_workspace_canvas_body_rejects_non_basename_or_non_canvas(user, filename):
+    _uid, api_key = user
+    status, body = _asgi(
+        "GET",
+        "/v1/chat/workspace/body",
+        headers=_hk(api_key),
+        params={"filename": filename},
+    )
+    assert (status, body) == (400, {"error": "invalid_canvas_filename"})
+
+
+def test_workspace_canvas_body_uses_exact_case_sensitive_filename(user):
+    uid, api_key = user
+    filename = "Case-Sensitive.io.html"
+    written = v2_jobs_store.put_workspace_entry_cas(
+        uid,
+        f"/workspace/{filename}",
+        kind="workspace",
+        content_envelope={
+            "id": "canvas-case-sensitive",
+            "body": "current",
+            "visibility": "shared",
+            "owner_user_id": uid,
+        },
+        mime_type="text/html",
+        source_ref="",
+        expected_revision=0,
+    )
+    assert written is not None
+
+    status, body = _asgi(
+        "GET",
+        "/v1/chat/workspace/body",
+        headers=_hk(api_key),
+        params={"filename": "case-sensitive.io.html"},
+    )
+    assert (status, body) == (404, {"error": "workspace_entry_not_found"})
+
+
+def test_workspace_canvas_body_never_reads_another_users_entry(user):
+    _uid, api_key = user
+    filename = "private-canvas.io.html"
+    other = make_client().post(
+        "/v1/users/register",
+        json={"public_key": _b64(b"\x22" * 32), "archive_language": "en"},
+    )
+    assert other.status_code == 201
+    other_uid = other.get_json()["user_id"]
+    written = v2_jobs_store.put_workspace_entry_cas(
+        other_uid,
+        f"/workspace/{filename}",
+        kind="workspace",
+        content_envelope={
+            "id": "other-users-canvas",
+            "body": "must not cross users",
+            "visibility": "shared",
+            "owner_user_id": other_uid,
+        },
+        mime_type="text/html",
+        source_ref="",
+        expected_revision=0,
+    )
+    assert written is not None
+
+    status, body = _asgi(
+        "GET",
+        "/v1/chat/workspace/body",
+        headers=_hk(api_key),
+        params={"filename": filename, "user_id": other_uid},
+    )
+    assert (status, body) == (404, {"error": "workspace_entry_not_found"})
 
 
 # --------------------------------------------------------------------------- #

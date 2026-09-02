@@ -1,7 +1,7 @@
-"""io 侧兼容壳 —— 已搬进 ``perception_kernel.fields``。"""
+"""io 侧兼容壳 —— 已搬进 ``perceptkit.fields``。"""
 from __future__ import annotations
 
-from perception_kernel.fields import (  # noqa: F401
+from perceptkit.fields import (  # noqa: F401
     ALLOW_VALUES,
     DENIED_VALUES,
     OFF_VALUES,

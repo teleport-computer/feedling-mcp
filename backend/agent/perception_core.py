@@ -20,10 +20,12 @@ import time
 from typing import Any
 
 from perception import catalog as perception_catalog
+from perception import health_measurement
 from perception import history as perception_history
 from perception import service as perception_service
 from perception import permissions as perception_permissions
 from perception import store as perception_store
+from perceptkit.algorithms import trend_models
 from perception.agent_fields import (
     AGENT_PERCEPTION_SIGNALS,
     AGENT_SIGNAL_FIELDS as _SIGNAL_FIELDS,
@@ -250,7 +252,31 @@ def recent_apps_payload(store, *, limit_raw: str | None, hours_raw: str | None,
 
 
 def perception_trend_payload(store, *, signal_raw: str | None, field_raw: str | None, days_raw: str | None) -> dict[str, Any]:
-    """Rolling baseline + delta for one numeric field over the last N days."""
+    """Trend for one field over the last N days, dispatched by the signal's
+    declared trend model (``perceptkit.trend_models``).
+
+    Three models, three shapes:
+      - fluctuating (default, unlisted signals): median-baseline vs. current
+        (``perception_history.read_trend`` — unchanged, byte-identical to
+        before this dispatch existed).
+      - drifting (e.g. body weight): start/end + per-month rate, no "usual
+        value" (``trend_models.read_drift``).
+      - cyclical (e.g. menstrual cycle): SHOULD be interval-since-last-onset
+        (``trend_models.read_cycles``), but that needs a list of onset
+        *event dates*, not day-rollup field snapshots. health_cycle's daily
+        doc only carries the latest flow_level/active-period values observed
+        that day (MAIN_OF_DAY shape) — there is no onset-event extraction
+        anywhere in this pipeline, and the exact field name/semantics of the
+        "active period" flag are not specified in this backend (only
+        mentioned as prose in the V2 tool catalog). Deriving onsets by
+        guessing that schema here would be fabricating data, so cyclical
+        intentionally falls back to the fluctuating path for now — see
+        docs/NOTES-trend-dispatch.md for what deriving it properly needs.
+
+    The response always carries ``model`` for the two new branches so a
+    caller can tell which shape ``trend`` is in; a response with no ``model``
+    key is the untouched legacy (fluctuating) shape.
+    """
     sig = _history_signal(signal_raw)
     if sig is None:
         raise AgentRouteError(400, {"ok": False, "error": "unknown_or_unhistorized_signal",
@@ -258,6 +284,27 @@ def perception_trend_payload(store, *, signal_raw: str | None, field_raw: str | 
     field = (field_raw or "").strip() or None
     days = _parse_days(days_raw, "30")
     rows = perception_store.list_perception_daily(store.user_id, sig, days)
+    # Cutover read-side guard: once this series has any measurement-time-aware
+    # row, drop old arrival-tagged rows before they reach trend/drift math —
+    # the two are different quantities (arrival instant vs. true measurement
+    # instant) and must never be pooled into one baseline. No-op for signals
+    # never touched by the new contract (see health_measurement.py).
+    rows = health_measurement.select_rollup_rows_after_cutover(rows)
+    model = trend_models.model_for(sig)
+
+    if model == trend_models.DRIFTING:
+        return {"ok": True, "model": model, "trend": trend_models.read_drift(rows, sig, field)}
+
+    if model == trend_models.CYCLICAL:
+        return {
+            "ok": True,
+            "model": model,
+            "fallback": "read_trend",
+            "trend": perception_history.read_trend(rows, sig, field),
+        }
+
+    # FLUCTUATING (and any signal not listed in TREND_MODEL): exactly today's
+    # behavior, no new key added.
     return {"ok": True, "trend": perception_history.read_trend(rows, sig, field)}
 
 
@@ -303,8 +350,14 @@ def perception_digest_payload(store, *, days_raw: str | None) -> dict[str, Any]:
     # History rows for the numeric/health fold (comparable) plus the two
     # non-comparable shapes the board reads directly: playback tally + place dwell.
     history_signals = set(perception_history.comparable_signals()) | {"playback", "location_signal"}
+    # Same cutover read-side guard as perception_trend_payload — the digest's
+    # "notable changes" and cross-domain board fold multiple days together
+    # through the same read_trend/read_drift math, so they need the same
+    # old/new-meaning separation.
     rows_by_signal = {
-        signal: perception_store.list_perception_daily(uid, signal, days)
+        signal: health_measurement.select_rollup_rows_after_cutover(
+            perception_store.list_perception_daily(uid, signal, days)
+        )
         for signal in history_signals
     }
     try:
