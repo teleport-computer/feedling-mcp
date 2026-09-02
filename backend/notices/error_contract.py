@@ -320,6 +320,9 @@ def consumer_specs() -> tuple[ErrorSpec, ...]:
         spec
         for spec in public_specs()
         if spec.domain in {"chat", "platform", "vision", "image_generation"}
+        # Request validation failures are returned directly by the hosted API;
+        # they never enter the resident's agent-error classifier.
+        and spec.family != "request"
         and spec.code != "image_generation_internal_error"
     )
 
