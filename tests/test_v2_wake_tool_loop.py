@@ -140,6 +140,14 @@ def _text_round(text, *, prompt_tokens=1, completion_tokens=1):
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
 
 
+def _wake_reply_round(text, *, prompt_tokens=1, completion_tokens=1):
+    return _tool_round(
+        _tc("wake-reply-test", "reply", text=text),
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    )
+
+
 def _stay_silent_round(reason="没有值得打扰用户的新信息"):
     return _tool_round(_tc("stay-silent-test", "stay_silent", reason=reason))
 
@@ -211,10 +219,10 @@ def _status_events(uid):
 
 
 # ------------------------------------------------------------------
-# Terminal plain text -> exactly one proactive bubble via the effect outbox.
+# Terminal plain text is not a valid proactive delivery decision.
 # ------------------------------------------------------------------
 
-def test_wake_terminal_plain_text_writes_exactly_one_proactive_bubble(monkeypatch):
+def test_wake_terminal_plain_text_fails_without_proactive_bubble(monkeypatch):
     uid = "u_wake_toolloop_happy"
     conftest.seed_user(uid)
     _reset(uid)
@@ -223,7 +231,11 @@ def test_wake_terminal_plain_text_writes_exactly_one_proactive_bubble(monkeypatc
 
     _patch_real_write(monkeypatch)
 
-    calls = _script_provider(monkeypatch, [_text_round("hey, thinking of you")])
+    calls = _script_provider(monkeypatch, [
+        _text_round("hey, thinking of you"),
+        _text_round("still not a structured choice"),
+        _text_round("still not a structured choice"),
+    ])
     sink_calls = []
     deps = _wake_deps(
         tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
@@ -243,27 +255,25 @@ def test_wake_terminal_plain_text_writes_exactly_one_proactive_bubble(monkeypatc
         trajectory_recorder=trajectory,
     ))
 
-    assert status == "completed"
-    assert len(calls) == 1
-    bubbles = _bubbles(uid)
-    assert len(bubbles) == 1
-    assert bubbles[0]["body_ct"] == "hey, thinking of you"
-    assert [c[0] for c in sink_calls] == ["reply"]
+    assert status == "failed"
+    assert len(calls) == 3
+    assert all(call["tool_choice"] == "required" for call in calls[1:])
+    assert _bubbles(uid) == []
+    assert sink_calls == []
     reply_dispositions = [
         payload
         for _scope, kind, payload in trajectory.events
         if kind == "reply_effect_disposition"
     ]
-    assert len(reply_dispositions) == 1
-    assert reply_dispositions[0]["status"] == "applied_unverified"
+    assert reply_dispositions == []
 
     row = _turn_metric_row(job_id)
     assert row is not None
     assert row[0] >= 1           # >=1 model call
-    assert row[1] is False       # not failed
-    assert row[2] == "ok"
-    assert row[3] == 1           # applied_unverified, not merely produced
-    assert _job_status(job_id)[0] == "completed"
+    assert row[1] is True
+    assert row[2] == "wake_failed:empty_reply"
+    assert row[3] == 0
+    assert _job_status(job_id) == ("failed", "wake_failed:empty_reply")
 
 
 def test_wake_enqueued_without_sink_is_not_counted_as_visible(monkeypatch):
@@ -273,7 +283,7 @@ def test_wake_enqueued_without_sink_is_not_counted_as_visible(monkeypatch):
     job_id, _ = jobs_store.enqueue_job(uid, "screen_watch")
     job = jobs_store.claim_next_job("w")
 
-    _script_provider(monkeypatch, [_text_round("produced but not applied")])
+    _script_provider(monkeypatch, [_wake_reply_round("produced but not applied")])
     deps = _wake_deps(
         tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
     )
@@ -494,7 +504,11 @@ def test_wake_lanes_hide_and_reject_memory_delete(monkeypatch, lane):
             "memory_write",
             actions=[{"op": "delete", "target_id": "memory-1"}],
         )),
-        _text_round("wake finished"),
+        (
+            _text_round("wake finished")
+            if lane == "scheduled"
+            else _wake_reply_round("wake finished")
+        ),
     ])
     sink_calls = []
     deps = _wake_deps(tail=[], sink_calls=sink_calls)
@@ -885,7 +899,7 @@ def test_screen_watch_lane_uses_its_own_prompt_and_screen_context(monkeypatch):
     async def _fake(config, messages, *, tools=None, **_kwargs):
         seen["messages"] = messages
         seen["tools"] = tools
-        return _text_round("你在看这个报错？")
+        return _wake_reply_round("你在看这个报错？")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
 
@@ -914,7 +928,7 @@ def _wake_offered(monkeypatch, *, user_enabled: bool, uid: str) -> set[str]:
 
     _patch_real_write(monkeypatch)
 
-    calls = _script_provider(monkeypatch, [_text_round("hey")])
+    calls = _script_provider(monkeypatch, [_wake_reply_round("hey")])
     deps = _wake_deps(
         tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
         sink_calls=[],
