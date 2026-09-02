@@ -1385,6 +1385,17 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "properties": {"id": {"type": "string"}, "ts": {"type": "number"}},
         "additionalProperties": True,
     },
+    "CanvasWorkspaceBodyResponse": {
+        "type": "object",
+        "required": ["filename", "revision", "mime_type", "envelope"],
+        "properties": {
+            "filename": {"type": "string", "minLength": 1, "maxLength": 120},
+            "revision": {"type": "integer", "minimum": 1},
+            "mime_type": {"type": "string"},
+            "envelope": {"$ref": "#/components/schemas/EncryptedEnvelope"},
+        },
+        "additionalProperties": False,
+    },
     "ChatTransportRequest": {
         "type": "object",
         "required": ["envelope"],
@@ -2493,6 +2504,15 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "Metrics the adapter cannot report are status=\"unsupported\", not omitted."
     ),
     ("get", "/v1/chat/history"): "Read encrypted chat history. Use oldest_seq as before_seq for lossless older paging and latest_seq as after_seq for lossless forward paging; timestamp watermarks remain for compatibility.",
+    ("get", "/v1/chat/workspace/body"): (
+        "Read the authenticated user's current IO Canvas workspace envelope by "
+        "the original .io.html file_name stored on its Chat attachment. The "
+        "server derives /workspace internally and uses an exact case- and "
+        "Unicode-normalization-sensitive match; clients must not pass a folded "
+        "canvas id or construct an internal path. A missing current entry is a "
+        "normal compatibility 404, after which clients may read the historical "
+        "Chat message body."
+    ),
     ("get", "/v1/chat/turn-activity/{turn_id}"): "Read display-safe activity for one V1 resident or Runtime V2 chat turn. V2 events come from backend jobs and tool dispatch; V1 events come from the authenticated resident io_cli boundary and are durably scoped to an existing user message. Both runtimes expose only bounded identifiers, state, timing, and result classification. Successful memory_search/memory_fetch events include the confirmed returned-item count and, only when every item uses the canonical bucket taxonomy, a complete category-count breakdown. Tool arguments, result bodies, assistant prose, reasoning, and custom bucket labels are never returned.",
     ("post", "/v1/chat/turn-activity/{turn_id}/events"): "Append one authenticated V1 resident tool transition. This endpoint is used by the shipped resident io_cli runtime, accepts only running/success/failure plus display-safe fixed metadata, rejects V2-owned users, and never accepts tool arguments, model prose, or result bodies.",
     ("post", "/v1/memory/index"): "Return lightweight memory cards. This is selection, not full-content retrieval; query is intentionally not exposed because it is not a search filter today.",
@@ -2612,6 +2632,32 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
 
 
 RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
+    ("get", "/v1/chat/workspace/body"): {
+        "200": {
+            "description": "The current Canvas workspace revision and opaque shared envelope.",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/CanvasWorkspaceBodyResponse"}
+                }
+            },
+        },
+        "400": {
+            "description": "filename is not a safe .io.html basename.",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                }
+            },
+        },
+        "404": {
+            "description": "No current workspace entry exists for that exact filename.",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                }
+            },
+        },
+    },
     ("post", "/v1/chat/response"): {
         "409": {
             "description": (

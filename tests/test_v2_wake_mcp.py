@@ -63,7 +63,12 @@ _MCP_SPEC = ToolSpec(
 
 
 @pytest.fixture(autouse=True)
-def _clean_agent_jobs_table():
+def _clean_agent_jobs_table(monkeypatch):
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "resolve_content_encryption",
+        lambda _user_id: "off",
+    )
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs")
     yield
@@ -127,6 +132,18 @@ def _script_provider(monkeypatch, responses):
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
     return calls
+
+
+def _wake_reply_round(text, *, think="I want to say this now."):
+    return {
+        "reply": "",
+        "tool_calls": [{
+            "id": "wake-reply-test",
+            "name": "reply",
+            "args": {"think": think, "text": text},
+        }],
+        "usage": {},
+    }
 
 
 def _tool_result_texts(messages) -> list[str]:
@@ -278,7 +295,11 @@ def test_wake_offers_and_dispatches_mcp_tool(monkeypatch, lane):
             ],
             "usage": {},
         },
-        {"reply": "小镇上很安静", "tool_calls": [], "usage": {}},
+        (
+            {"reply": "小镇上很安静", "tool_calls": [], "usage": {}}
+            if lane == "scheduled"
+            else _wake_reply_round("小镇上很安静")
+        ),
     ])
     deps = _wake_deps(
         tail=_TAIL,
@@ -317,7 +338,7 @@ def test_wake_without_folding_does_not_offer_mcp_tool_search(monkeypatch):
     claimed_by = _claim(job_id)
     _spy_reply(monkeypatch)
     calls = _script_provider(monkeypatch, [
-        {"reply": "在的", "tool_calls": [], "usage": {}},
+        _wake_reply_round("在的"),
     ])
 
     status = asyncio.run(worker._run_wake(
@@ -377,7 +398,7 @@ def test_wake_pressure_folded_platform_schema_is_searchable(monkeypatch):
             }],
             "usage": {},
         },
-        {"reply": "参数表拿到了", "tool_calls": [], "usage": {}},
+        _wake_reply_round("参数表拿到了"),
     ])
 
     status = asyncio.run(worker._run_wake(
@@ -434,7 +455,7 @@ def test_wake_refuses_folded_platform_call_before_dispatch(monkeypatch):
             }],
             "usage": {},
         },
-        {"reply": "好,我先查一下工具说明", "tool_calls": [], "usage": {}},
+        _wake_reply_round("好,我先查一下工具说明"),
     ])
 
     status = asyncio.run(worker._run_wake(
@@ -488,7 +509,7 @@ def test_wake_tool_search_injects_full_mcp_schema_before_dispatch(monkeypatch):
             ],
             "usage": {},
         },
-        {"reply": "逛完了", "tool_calls": [], "usage": {}},
+        _wake_reply_round("逛完了"),
     ])
     deps = _wake_deps(tail=_TAIL, load_mcp_turn=_make_load_turn_mcp(turn))
     schema_events = []
@@ -538,7 +559,7 @@ def test_wake_refuses_unresolved_mcp_call_before_remote_request(monkeypatch):
             ],
             "usage": {},
         },
-        {"reply": "我先查说明书", "tool_calls": [], "usage": {}},
+        _wake_reply_round("我先查说明书"),
     ])
     deps = _wake_deps(tail=_TAIL, load_mcp_turn=_make_load_turn_mcp(turn))
 
@@ -585,7 +606,7 @@ def test_wake_mcp_mutation_records_durable_attempt(monkeypatch):
             ],
             "usage": {},
         },
-        {"reply": "写完了", "tool_calls": [], "usage": {}},
+        _wake_reply_round("写完了"),
     ])
     deps = _wake_deps(tail=_TAIL, load_mcp_turn=_make_load_turn_mcp(turn))
 
@@ -642,7 +663,7 @@ def test_wake_emits_mcp_turn_usage_trace_on_wake_lane(monkeypatch):
             ],
             "usage": {},
         },
-        {"reply": "逛完了", "tool_calls": [], "usage": {}},
+        _wake_reply_round("逛完了"),
     ])
     deps = _wake_deps(
         tail=_TAIL,
@@ -680,7 +701,7 @@ def test_wake_without_mcp_servers_emits_no_usage_trace(monkeypatch):
         events.append(event)
 
     _script_provider(monkeypatch, [
-        {"reply": "在的", "tool_calls": [], "usage": {}},
+        _wake_reply_round("在的"),
     ])
     deps = _wake_deps(tail=_TAIL, emit_debug_trace=_emit)
 
@@ -719,7 +740,7 @@ def test_wake_mcp_instructions_reach_the_system_context_once(monkeypatch):
             ],
             "usage": {},
         },
-        {"reply": "逛完了", "tool_calls": [], "usage": {}},
+        _wake_reply_round("逛完了"),
     ])
     deps = _wake_deps(tail=_TAIL, load_mcp_turn=_make_load_turn_mcp(turn))
 
@@ -796,7 +817,7 @@ def test_wake_mcp_mutation_frontier_is_the_user_reply_cursor(monkeypatch):
             ],
             "usage": {},
         },
-        {"reply": "写完了", "tool_calls": [], "usage": {}},
+        _wake_reply_round("写完了"),
     ])
     # seq-native 的回复走真信封路径(不再经过 _write_encrypted_reply 打桩),
     # 所以要把信封构造也换成桩,否则回合会以「公钥未接线」失败。

@@ -286,6 +286,27 @@ def _text_round(text, *, prompt_tokens=1, completion_tokens=1):
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
 
 
+def _wake_reply_round(
+    text,
+    *,
+    think="I want to say this now.",
+    prompt_tokens=1,
+    completion_tokens=1,
+):
+    return {
+        "reply": "",
+        "tool_calls": [{
+            "id": "wake-reply-test",
+            "name": "reply",
+            "args": {"think": think, "text": text},
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+        },
+    }
+
+
 def _stay_silent_round(*, prompt_tokens=1, completion_tokens=1):
     return {
         "reply": "",
@@ -1957,7 +1978,9 @@ def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
     job = jobs_store.claim_next_job("w")
 
     _script_provider(monkeypatch, [
-        _text_round("hey, thinking of you", prompt_tokens=17, completion_tokens=4)])
+        _wake_reply_round(
+            "hey, thinking of you", prompt_tokens=17, completion_tokens=4
+        )])
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
     monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: 1)
     monkeypatch.setattr(worker.db, "chat_seqs_after_seq", lambda *_a, **_k: [1])
@@ -2913,7 +2936,7 @@ def test_wake_turn_system_prompt_states_the_live_third_party_model(monkeypatch):
     jobs_store.enqueue_job(uid, "heartbeat")
     job = jobs_store.claim_next_job("w")
 
-    calls = _script_provider(monkeypatch, [_text_round("hey")])
+    calls = _script_provider(monkeypatch, [_wake_reply_round("hey")])
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
     monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: 1)
     monkeypatch.setattr(worker.db, "chat_seqs_after_seq", lambda *_a, **_k: [1])

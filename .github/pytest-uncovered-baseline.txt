@@ -14,7 +14,6 @@ tests/test_api_errors_doc.py
 tests/test_asgi_accounts_remaining.py
 tests/test_asgi_agent.py
 tests/test_asgi_bootstrap_post.py
-tests/test_asgi_chat_remaining.py
 tests/test_asgi_client_disconnect.py
 tests/test_asgi_content.py
 tests/test_asgi_copytext.py
@@ -84,7 +83,6 @@ tests/test_dream_card_render_bucket.py
 tests/test_dream_status.py
 tests/test_e2b_template_contract.py
 tests/test_e2e_deep_claude.py
-tests/test_e2e_deep_probes.py
 tests/test_error_slug_convergence.py
 tests/test_exception_handlers.py
 tests/test_expected_consumer_commit.py

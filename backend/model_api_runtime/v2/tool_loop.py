@@ -147,26 +147,43 @@ _WAKE_REPLY_TOOL = "reply"
 _WAKE_REPLY_TOOL_SPEC = ToolSpec(
     name=_WAKE_REPLY_TOOL,
     description=(
-        "Deliver one non-empty visible reply and end this proactive wake turn. "
-        "Use stay_silent instead when there is nothing worth interrupting the user for."
+        "Reply when you want to speak and end this proactive wake turn. "
+        "Use stay_silent instead when quiet company feels right this time."
     ),
     parameters={
         "type": "object",
         "properties": {
+            "think": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Your thinking in this moment — why you want to speak and what "
+                    "you mean to say. They can open and read this in the app. Write "
+                    "`think` entirely in their language — the language they speak "
+                    "to you — and in your usual voice with them: everyday intent "
+                    "only, with no tool names, parameters, field names, identity "
+                    "cards, or other internal terms."
+                ),
+            },
             "text": {
                 "type": "string",
                 "minLength": 1,
-                "description": "The complete user-visible reply.",
+                "description": (
+                    "The complete message they will see. Speak their language, stay "
+                    "true to your persona, and when you mention time, say it the way "
+                    "it is said where they live — honor the identity contract in "
+                    "your context."
+                ),
             }
         },
-        "required": ["text"],
+        "required": ["think", "text"],
         "additionalProperties": False,
     },
 )
 _WAKE_CHOICE_INSTRUCTION = (
-    "The previous proactive-wake response ended without visible text or a tool "
-    "call. End the wake now by calling exactly one offered tool: call reply with "
-    "the complete visible message, or call stay_silent with a non-empty reason."
+    "When you are done looking around, end the wake by calling exactly one of the "
+    "two tools: reply with what you want to say, or stay_silent with a short note "
+    "on why not this time."
 )
 _EMPTY_RESPONSE_CORRECTION = (
     "The previous response completed without visible text or a client tool call. "
@@ -1022,6 +1039,15 @@ class ProviderEmptyReply(RuntimeError):
     """A structurally valid provider success had no foreground-usable output."""
 
 
+class WakeChoiceInvalid(RuntimeError):
+    """A proactive wake ended without one valid reply/stay_silent decision."""
+
+    reason = "choice_invalid"
+
+    def __init__(self):
+        super().__init__(self.reason)
+
+
 class ProviderOutputTruncated(RuntimeError):
     """A provider stopped while serializing a tool call at its output limit."""
 
@@ -1046,6 +1072,23 @@ class ValidatedFinalReply(str):
     wrong-language provider answer. A ``str`` subtype keeps the callback API and
     test equality stable while preserving that provenance at the worker boundary.
     """
+
+
+class ValidatedWakeReply(str):
+    """A proactive reply whose text came from the structured ``reply`` tool.
+
+    Non-scheduled wake delivery is fail-closed at the worker boundary: plain
+    provider text, including text accompanying an ordinary tool call, is never
+    authorized to become a bubble.  A ``str`` subtype preserves the callback
+    contract while carrying that provenance through the ordinary final-effect
+    path. ``thinking`` is kept off the string value so it can only reach the
+    separately sealed thinking envelope, never the visible bubble payload.
+    """
+
+    def __new__(cls, text: str, *, thinking: str):
+        value = super().__new__(cls, text)
+        value.thinking = thinking
+        return value
 
 
 class CanvasDeliveryIncomplete(FileDeliveryIncomplete):
@@ -1151,6 +1194,13 @@ async def run_tool_loop(
     # dispatch_tools closure; this parameter controls only the provider surface.
     memory_delete_allowed: bool = False,
     on_stay_silent=None,
+    # Non-scheduled proactive callers enable this for the whole turn. Ordinary
+    # tools remain available while the model gathers context; only the terminal
+    # decision must be exactly one reply/stay_silent tool call. Keeping this
+    # explicit (instead of inferring it from require_reply=False) preserves the
+    # foreground and scheduled contracts, which share this loop but continue to
+    # accept ordinary terminal text.
+    regular_wake_choice_required: bool = False,
     include_reasoning: bool = False,
     # Self-authored thinking: when True, NEVER request provider-native reasoning —
     # not via include_reasoning, and NOT via reasoning_effort either. The model then
@@ -1309,6 +1359,10 @@ async def run_tool_loop(
     normalized_empty_response_correction = str(
         empty_response_correction or _EMPTY_RESPONSE_CORRECTION
     ).strip()
+    if regular_wake_choice_required and on_stay_silent is None:
+        raise ValueError(
+            "regular_wake_choice_required requires on_stay_silent"
+        )
     if tool_result_char_cap < MIN_TOOL_RESULT_ERROR_QUOTA:
         raise ValueError("tool_result_char_cap is too small for stable error results")
     if (
@@ -1347,7 +1401,7 @@ async def run_tool_loop(
     generic_validation_retry_used = False
     empty_response_recovery_used = False
     empty_response_retry_instruction = ""
-    wake_choice_recovery_used = False
+    wake_choice_retry_used = False
     wake_choice_required = False
     final_reply_correction_request: FinalReplyCorrectionRequest | None = None
     final_reply_correction_instruction = ""
@@ -1795,9 +1849,24 @@ async def run_tool_loop(
 
         messages = build_messages(list(transcript))
         turn_catalog = _turn_catalog()
+        if regular_wake_choice_required:
+            turn_catalog = [
+                spec for spec in turn_catalog if spec.name != _WAKE_REPLY_TOOL
+            ] + [_WAKE_REPLY_TOOL_SPEC]
         wake_choice_tool_available = any(
             spec.name == tool_schema.STAY_SILENT_TOOL for spec in turn_catalog
         )
+        # The last configured provider call is reserved for the structured wake
+        # decision. Protocol fallbacks that would normally disable tools and ask
+        # for terminal text enter the same choice phase instead. This keeps every
+        # active-wake text outlet fail-closed without removing tools from earlier
+        # rounds.
+        if regular_wake_choice_required and not wake_choice_required and (
+            attempts == max_calls - 1 or force_text_fallback
+        ):
+            wake_choice_required = True
+            force_text_fallback = False
+            force_text_fallback_reason = ""
         # Reserve the configured final provider attempt for a terminal reply.
         # ``max_calls`` is the deployment-configurable stop threshold; the loop
         # must not grow an unbounded second budget after reaching it.
@@ -1805,7 +1874,11 @@ async def run_tool_loop(
             force_text_fallback
             or final_reply_correction_request is not None
             or compact_delivery_confirmation_needed
-            or (attempts == max_calls - 1 and not wake_choice_required)
+            or (
+                attempts == max_calls - 1
+                and not wake_choice_required
+                and not regular_wake_choice_required
+            )
         )
         terminal_text_round_reason = "none"
         if terminal_text_round:
@@ -2038,6 +2111,36 @@ async def run_tool_loop(
                     }
                 ]
         if wake_choice_required:
+            if provider_name not in _NAMED_TOOL_CHOICE_PROVIDERS:
+                await _trajectory(
+                    "wake_choice_unavailable",
+                    {
+                        "round": attempts + 1,
+                        "action": "fail_wake_choice_unsupported",
+                    },
+                )
+                exc = WakeChoiceInvalid()
+                if on_provider_failure is not None:
+                    try:
+                        await on_provider_failure(exc)
+                    except Exception:
+                        pass
+                raise exc
+            if tool_calls_used >= max_tool_calls_per_turn:
+                await _trajectory(
+                    "wake_choice_unavailable",
+                    {
+                        "round": attempts + 1,
+                        "action": "fail_wake_choice_budget_exhausted",
+                    },
+                )
+                exc = WakeChoiceInvalid()
+                if on_provider_failure is not None:
+                    try:
+                        await on_provider_failure(exc)
+                    except Exception:
+                        pass
+                raise exc
             stay_silent_spec = next(
                 (
                     spec
@@ -2054,7 +2157,7 @@ async def run_tool_loop(
                         "action": "fail_wake_choice_tool_unavailable",
                     },
                 )
-                exc = ProviderEmptyReply("empty_reply")
+                exc = WakeChoiceInvalid()
                 if on_provider_failure is not None:
                     try:
                         await on_provider_failure(exc)
@@ -2191,6 +2294,11 @@ async def run_tool_loop(
             if terminal_schema_guard
             else completed_memory_discovery_tools
         )
+        if regular_wake_choice_required:
+            required_schema_names = set(required_schema_names) | {
+                _WAKE_REPLY_TOOL,
+                tool_schema.STAY_SILENT_TOOL,
+            }
         if forced_delivery_tool:
             required_schema_names = set(required_schema_names) | {
                 forced_delivery_tool
@@ -2807,6 +2915,26 @@ async def run_tool_loop(
         # ProviderResponse.raw keeps its input mapping alive.
         result = provider_client.without_runtime_provider_attempt_trace(result)
         pr = ProviderResponse.from_result(result)
+        regular_terminal_choice_present = bool(
+            regular_wake_choice_required
+            and len(pr.tool_calls) == 1
+            and pr.tool_calls[0].name
+            in {_WAKE_REPLY_TOOL, tool_schema.STAY_SILENT_TOOL}
+        )
+        response_tool_call_budget = max_tool_calls_per_turn
+        if (
+            regular_wake_choice_required
+            and not wake_choice_required
+            and not regular_terminal_choice_present
+        ):
+            # Keep one hard-budget slot for reply/stay_silent. Ordinary wake
+            # tools may use the rest, but cannot strand the turn without a
+            # structurally valid terminal decision.
+            response_tool_call_budget -= 1
+        wake_reply_call_present = bool(
+            regular_wake_choice_required
+            and any(tc.name == _WAKE_REPLY_TOOL for tc in pr.tool_calls)
+        )
         rejection_facts = (
             _tool_call_rejection_facts(
                 pr,
@@ -2828,7 +2956,7 @@ async def run_tool_loop(
                 ),
                 max_assistant_tool_text_chars=max_assistant_tool_text_chars,
                 max_tool_calls_per_round=max_tool_calls_per_round,
-                max_tool_calls_per_turn=max_tool_calls_per_turn,
+                max_tool_calls_per_turn=response_tool_call_budget,
             )
             if pr.tool_calls
             else None
@@ -2844,6 +2972,10 @@ async def run_tool_loop(
                 tc.id: validation_error
                 for tc in pr.tool_calls
                 if tc.name not in mcp_names
+                and not (
+                    regular_wake_choice_required
+                    and tc.name == _WAKE_REPLY_TOOL
+                )
                 and (
                     validation_error := tool_schema.validate_tool_args(
                         tc.name,
@@ -2906,7 +3038,7 @@ async def run_tool_loop(
         )
         if surface_exchange_rejected and not surface_rejection_reasons:
             surface_rejection_reasons = [_PROVIDER_CALL_REJECTION_REASON_UNCLASSIFIED]
-        if wake_choice_required or tools is None:
+        if wake_choice_required or wake_reply_call_present or tools is None:
             # These branches have their own terminal/empty response contracts;
             # they never enter the generic rejected-tool-exchange path below.
             surface_rejection_reasons = []
@@ -2961,7 +3093,8 @@ async def run_tool_loop(
             surface_rejection_reasons,
         )
 
-        if wake_choice_required:
+        structured_wake_reply = False
+        if wake_choice_required or wake_reply_call_present:
             wake_reply_calls = [
                 tc for tc in pr.tool_calls if tc.name == _WAKE_REPLY_TOOL
             ]
@@ -2976,12 +3109,25 @@ async def run_tool_loop(
                 if selected_call is not None
                 and selected_call.name == _WAKE_REPLY_TOOL
                 and selected_call.args_ok
-                and set(selected_call.args) <= {"text"}
+                and set(selected_call.args) <= {"think", "text"}
+                else None
+            )
+            selected_reply_thinking = (
+                selected_call.args.get("think")
+                if selected_call is not None
+                and selected_call.name == _WAKE_REPLY_TOOL
+                and selected_call.args_ok
+                and set(selected_call.args) <= {"think", "text"}
                 else None
             )
             reply_text = (
                 selected_reply_text.strip()
                 if isinstance(selected_reply_text, str)
+                else ""
+            )
+            reply_thinking = (
+                selected_reply_thinking.strip()
+                if isinstance(selected_reply_thinking, str)
                 else ""
             )
             silent_reason = (
@@ -2995,9 +3141,11 @@ async def run_tool_loop(
                 selected_call is not None
                 and selected_call.id
                 and len(wake_reply_calls) == 1
+                and reply_thinking
                 and reply_text
                 and not pr.media
                 and len(reply_text) <= max_assistant_tool_text_chars
+                and tool_calls_used < max_tool_calls_per_turn
             )
             valid_silent_choice = bool(
                 selected_call is not None
@@ -3034,7 +3182,10 @@ async def run_tool_loop(
                 # Any provider text beside the call is only a preamble, exactly
                 # like other tool rounds, and is never published separately.
                 pr = ProviderResponse(
-                    text=reply_text,
+                    text=ValidatedWakeReply(
+                        reply_text,
+                        thinking=reply_thinking,
+                    ),
                     tool_calls=[],
                     usage=pr.usage,
                     raw=pr.raw,
@@ -3042,10 +3193,34 @@ async def run_tool_loop(
                     media=(),
                 )
                 wake_choice_required = False
+                structured_wake_reply = True
             elif valid_silent_choice:
                 wake_choice_required = False
             else:
-                exc = ProviderEmptyReply("empty_reply")
+                can_retry_wake_choice = (
+                    not wake_choice_retry_used
+                    and attempts < max_calls
+                    and tool_calls_used < max_tool_calls_per_turn
+                )
+                if can_retry_wake_choice:
+                    wake_choice_retry_used = True
+                    wake_choice_required = True
+                    reasoning_fragments.clear()
+                    seen_reasoning_fragments.clear()
+                    _progress("wake_choice_retry_boundary")
+                    continue
+                provider_returned_nothing = bool(
+                    not pr.text.strip()
+                    and not pr.tool_calls
+                    and not pr.media
+                    and not upstream_response_envelope
+                    and not str(pr.raw.get("reasoning") or "").strip()
+                )
+                exc = (
+                    ProviderEmptyReply("empty_reply")
+                    if provider_returned_nothing
+                    else WakeChoiceInvalid()
+                )
                 if on_provider_failure is not None:
                     try:
                         await on_provider_failure(exc)
@@ -3054,58 +3229,83 @@ async def run_tool_loop(
                 raise exc
 
         if (
-            not require_reply
-            and on_stay_silent is not None
-            and not pr.text.strip()
+            regular_wake_choice_required
+            and not structured_wake_reply
             and not pr.tool_calls
-            and not pr.media
         ):
             wake_choice_supported = (
                 on_stay_silent is not None
                 and provider_name in _NAMED_TOOL_CHOICE_PROVIDERS
             )
             can_force_wake_choice = (
-                on_stay_silent is not None
-                and not wake_choice_recovery_used
-                and wake_choice_supported
+                wake_choice_supported
                 and wake_choice_tool_available
                 and attempts < max_calls
                 and tool_calls_used < max_tool_calls_per_turn
             )
             if can_force_wake_choice:
                 action = "force_wake_choice"
-            elif wake_choice_required:
-                action = "fail_forced_wake_choice_empty"
             elif not wake_choice_supported:
                 action = "fail_wake_choice_unsupported"
             elif not wake_choice_tool_available:
                 action = "fail_wake_choice_tool_unavailable"
             else:
                 action = "fail_wake_choice_budget_exhausted"
-            await _trajectory(
-                "empty_provider_response",
-                {
-                    "round": attempts,
-                    "reason": "empty_provider_success",
-                    "response_shape": _empty_response_shape(pr),
-                    "action": action,
-                },
+            response_empty = bool(
+                (not pr.text.strip() or upstream_response_envelope)
+                and not pr.media
             )
-            if on_empty_provider_response is not None:
-                try:
-                    await on_empty_provider_response(_empty_response_shape(pr))
-                except Exception:
-                    # Plaintext diagnostics are best-effort and cannot alter
-                    # the recovery/failure decision below.
-                    pass
+            if response_empty:
+                await _trajectory(
+                    "empty_provider_response",
+                    {
+                        "round": attempts,
+                        "reason": (
+                            "upstream_response_envelope"
+                            if upstream_response_envelope
+                            else "empty_provider_success"
+                        ),
+                        "response_shape": _empty_response_shape(pr),
+                        "action": action,
+                    },
+                )
+                if on_empty_provider_response is not None:
+                    try:
+                        await on_empty_provider_response(
+                            _empty_response_shape(pr)
+                        )
+                    except Exception:
+                        # Plaintext diagnostics are best-effort and cannot alter
+                        # the recovery/failure decision below.
+                        pass
+            else:
+                await _trajectory(
+                    "wake_choice_response",
+                    {
+                        "round": attempts,
+                        "choice": "invalid",
+                        "tool_call_count": 0,
+                        "provider_text_present": bool(pr.text.strip()),
+                    },
+                )
             if can_force_wake_choice:
-                wake_choice_recovery_used = True
                 wake_choice_required = True
                 reasoning_fragments.clear()
                 seen_reasoning_fragments.clear()
-                _progress("wake_choice_retry_boundary")
+                _progress("wake_choice_boundary")
                 continue
-            exc = ProviderEmptyReply("empty_reply")
+            provider_returned_nothing = bool(
+                not pr.text.strip()
+                and not pr.tool_calls
+                and not pr.media
+                and not upstream_response_envelope
+                and not str(pr.raw.get("reasoning") or "").strip()
+            )
+            exc = (
+                ProviderEmptyReply("empty_reply")
+                if provider_returned_nothing
+                else WakeChoiceInvalid()
+            )
             if on_provider_failure is not None:
                 try:
                     await on_provider_failure(exc)

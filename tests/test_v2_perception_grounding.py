@@ -75,6 +75,18 @@ def _text_round(text):
             "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
 
 
+def _wake_reply_round(text, *, think="I want to say this now."):
+    return {
+        "reply": "",
+        "tool_calls": [{
+            "id": "wake-reply-test",
+            "name": "reply",
+            "args": {"think": think, "text": text},
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+
+
 def _stay_silent_round():
     return {
         "reply": "",
@@ -91,6 +103,9 @@ def _spy_provider(monkeypatch, seen):
     async def _fake(config, messages, *, tools=None, **_kwargs):
         seen["messages"] = messages
         seen["tools"] = tools
+        offered_names = {spec.name for spec in (tools or ())}
+        if {"reply", "stay_silent"} <= offered_names:
+            return _wake_reply_round("ok")
         return _text_round("ok")
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
 

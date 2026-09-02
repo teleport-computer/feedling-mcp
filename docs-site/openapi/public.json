@@ -1701,6 +1701,74 @@
         "description": "Insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether the reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded."
       }
     },
+    "/v1/chat/workspace/body": {
+      "get": {
+        "summary": "Chat Workspace Body",
+        "operationId": "chat_workspace_body_v1_chat_workspace_body_get",
+        "parameters": [
+          {
+            "name": "filename",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 120,
+              "description": "Original case-preserving .io.html file_name from the Chat row.",
+              "title": "Filename"
+            },
+            "description": "Original case-preserving .io.html file_name from the Chat row."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The current Canvas workspace revision and opaque shared envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanvasWorkspaceBodyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "filename is not a safe .io.html basename.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No current workspace entry exists for that exact filename.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Chat"
+        ],
+        "x-feedling-contract-level": "documented",
+        "description": "Read the authenticated user's current IO Canvas workspace envelope by the original .io.html file_name stored on its Chat attachment. The server derives /workspace internally and uses an exact case- and Unicode-normalization-sensitive match; clients must not pass a folded canvas id or construct an internal path. A missing current entry is a normal compatibility 404, after which clients may read the historical Chat message body."
+      }
+    },
     "/v1/content/export": {
       "get": {
         "summary": "Content Export",
@@ -10504,6 +10572,33 @@
           }
         },
         "additionalProperties": true
+      },
+      "CanvasWorkspaceBodyResponse": {
+        "type": "object",
+        "required": [
+          "filename",
+          "revision",
+          "mime_type",
+          "envelope"
+        ],
+        "properties": {
+          "filename": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "mime_type": {
+            "type": "string"
+          },
+          "envelope": {
+            "$ref": "#/components/schemas/EncryptedEnvelope"
+          }
+        },
+        "additionalProperties": false
       },
       "ChatTransportRequest": {
         "type": "object",

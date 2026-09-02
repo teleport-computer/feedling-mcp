@@ -44,11 +44,16 @@ from model_api_runtime.v2 import worker
 
 
 @pytest.fixture(autouse=True)
-def _clean_agent_jobs_table():
+def _clean_agent_jobs_table(monkeypatch):
     """Same rationale as test_v2_worker.py's identical fixture: claim_next_job()
     is a global work-queue claim with no user_id filter, so a pending row left
     behind by another test module would otherwise get claimed here instead of
     this test's own row."""
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "resolve_content_encryption",
+        lambda _user_id: "off",
+    )
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs")
     yield
@@ -78,8 +83,10 @@ def _status_events(uid):
 
 def test_screen_watch_policy_does_not_default_to_silence():
     prompt = worker._SCREEN_WATCH_SYSTEM_PROMPT.lower()
-    assert "speaking and staying silent are equally valid" in prompt
-    assert "you do not need a strong reason to speak" in prompt
+    assert "both are good ways to be here" in prompt
+    assert "don't swallow it" in prompt
+    assert "in the middle of something" in prompt
+    assert "showing up a lot lately" in prompt
     assert "only if" not in prompt
     assert "silence is the correct answer most of the time" not in prompt
 
@@ -125,6 +132,27 @@ def _text_round(text, *, prompt_tokens=1, completion_tokens=1):
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
 
 
+def _wake_reply_round(
+    text,
+    *,
+    think="I want to say this now.",
+    prompt_tokens=1,
+    completion_tokens=1,
+):
+    return {
+        "reply": "",
+        "tool_calls": [{
+            "id": "wake-reply-test",
+            "name": "reply",
+            "args": {"think": think, "text": text},
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+        },
+    }
+
+
 # ------------------------------------------------------------------
 # Dispatch: screen_watch is a wake lane.
 # ------------------------------------------------------------------
@@ -151,7 +179,7 @@ def test_screen_watch_turn_passes_safe_screen_context_and_its_own_prompt(monkeyp
     async def _fake(config, messages, *, tools=None, **_kwargs):
         seen["messages"] = messages
         seen["tools"] = tools
-        return _text_round("你在看这个报错？")
+        return _wake_reply_round("你在看这个报错？")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
 
@@ -176,7 +204,10 @@ def test_screen_watch_turn_passes_safe_screen_context_and_its_own_prompt(monkeyp
     system_msg = next(m for m in seen["messages"] if m["role"] == "system")
     assert system_msg["content"] is not None
     assert "watching the screen" in system_msg["content"]  # _SCREEN_WATCH_SYSTEM_PROMPT, not _WAKE_SYSTEM_PROMPT
-    assert self_thinking.INSTRUCTION.strip() in system_msg["content"]
+    assert self_thinking.INSTRUCTION.strip() not in system_msg["content"]
+    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() in (
+        system_msg["content"]
+    )
     assert "In the visible message" in system_msg["content"]
     assert self_thinking.SCREEN_WATCH_INSTRUCTION.strip() in system_msg["content"]
     assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() in (
@@ -280,7 +311,7 @@ def test_screen_watch_does_not_deadlock_when_cap_data_reacquires_enclave_sem(mon
         cap_registry, "run_capability", lambda action_type, store, **k: _FakeCapResult())
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
-        return _text_round("spotted it")
+        return _wake_reply_round("spotted it")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})

@@ -133,6 +133,8 @@ canonical_owner: self
 | `already_answered` | 409 | — | 静默处理，不弹窗 | ✅ |
 | `content_pk_fpr_mismatch` | 409 | — | 信封封的钥 ≠ 当前注册内容钥（写手 whoami 缓存陈旧）；带 `current_public_key_fpr`/`envelope_content_pk_fpr`，写手应刷新 whoami 重封重试 | |
 | `message_not_found` | 404 | — | | ✅ |
+| `invalid_canvas_filename` | 400 | — | Canvas 活内容读取只接受原始 `.io.html` basename；拒绝路径、穿越、控制字符和改写后的名字 | |
+| `workspace_entry_not_found` | 404 | — | Canvas 对应的当前 workspace 条目不存在；客户端可回退消息附件正文 | |
 | `user_message_envelope_failed` | 409 | — | | ✅ |
 | `confirmation_required` | 400 | — | 清空聊天 / 账号重置缺确认字段 | |
 | `chat_clear_failed` | 500 | system | | |
