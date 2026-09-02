@@ -574,12 +574,11 @@ def list_perception_daily(user_id: str, signal: str, days: int = 30) -> list[dic
     ``None`` 和空列表不是一回事：``None`` 是「kit 这个信号翻不回老形状、
     或者一条都没有」，那时读老表；空列表是「kit 说这几天确实没数据」。
     """
+    from_kit: list[dict] = []
     try:
         from .perceptkit_adapter import history as _pk_history
         if _pk_history.enabled():
-            rows = _pk_history.daily_rollups(user_id, signal, days)
-            if rows is not None:
-                return rows
+            from_kit = _pk_history.daily_rollups(user_id, signal, days) or []
     except Exception as e:                         # noqa: BLE001
         # 趋势读不出来不该让整轮对话失败。吞掉但记一笔 ——
         # 悄悄回退到老表、而老表已经停写的话，用户看到的是「没有历史」，
@@ -595,7 +594,31 @@ def list_perception_daily(user_id: str, signal: str, days: int = 30) -> list[dic
             ).fetchall()
         out = [{"date": r[0], "doc": r[1] if isinstance(r[1], dict) else {}} for r in rows]
         out.reverse()  # ascending for trend math
-        return out
+        return _merge_daily(out, from_kit, days)
     except Exception as e:
         log.error("list_perception_daily(%s,%s) failed: %s", user_id, signal, e)
-        return []
+        # 老表读挂了也别把 kit 已经有的那几天丢掉。
+        return from_kit
+
+
+def _merge_daily(legacy: list[dict], from_kit: list[dict], days: int) -> list[dict]:
+    """按天合并两份 rollup：**kit 有的那天用 kit，没有的天用老表。**
+
+    🔴 不是"二选一"。切换的那一刻 kit 只有今天这一行，而老表有几个月 ——
+    二选一的写法（kit 有数据就整份用 kit）会让用户的趋势从 90 天塌成 1 天，
+    而且**不报错**：agent 只会说"数据不够"，没有任何东西说得清为什么。
+    「我最近睡得比以前少吗」这类问题的全部价值就在那段历史里。
+
+    历史搬家（backfill）能把老数据搬进 kit，但那是**跑过一次之后**才成立的
+    前提，而且要跟用户的下一次提问抢时间。合并不需要抢：搬家变成优化，
+    不是必需品。
+
+    同一天两边都有 → 用 kit。kit 是主，且它的口径是新的；混着用会让
+    同一条曲线上半段一个口径、下半段另一个，比少几天更难发现。
+    """
+    if not from_kit:
+        return legacy
+    by_date = {r["date"]: r for r in legacy}
+    by_date.update({r["date"]: r for r in from_kit})
+    merged = [by_date[d] for d in sorted(by_date)]
+    return merged[-max(1, min(int(days), 400)):]
