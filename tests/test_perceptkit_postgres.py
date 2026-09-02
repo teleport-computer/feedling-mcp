@@ -23,8 +23,10 @@ import pytest
 psycopg = pytest.importorskip("psycopg")
 
 from perceptkit.contracts.records import (  # noqa: E402
+    CalendarEventMirror,
     CurrentProjection,
     EventOutboxEntry,
+    ReminderItemMirror,
     StoredObservation,
 )
 from perceptkit.contracts.receipt import WakeReceipt  # noqa: E402
@@ -333,3 +335,71 @@ def test_the_real_adapter_passes_the_whole_conformance_suite(clean):
 
     problems = run_storage_conformance(factory)
     assert problems == [], "真 adapter 没过 conformance：\n  " + "\n  ".join(problems)
+
+
+# ---------------------------------------------------------------------------
+# 镜像查询的 SQL 边界 —— 内存实现碰不到的那几种
+#
+# conformance 第 ⑫ 条验的是"下推有没有生效"。这里补的是 **io 自己那份 SQL**：
+# JSONB 里的时间戳不是合法日期时会不会把整条查询炸掉、时间未知的条目会不会
+# 被窗口悄悄藏起来。两个都是"一条坏数据让整个用户看不到日历"，不是少一条。
+# ---------------------------------------------------------------------------
+
+def _mirror_fixtures(s, T):
+    s.upsert_calendar_events(subject_id="u", events=[
+        CalendarEventMirror(
+            subject_id="u", source_account_id="a", source_calendar_id="c",
+            source_event_id="good",
+            event_fields={"title": "站会", "start_at": T.isoformat()}),
+        # 时间字段里是垃圾 —— 直接 ::timestamptz 会让**整条查询**抛异常。
+        CalendarEventMirror(
+            subject_id="u", source_account_id="a", source_calendar_id="c",
+            source_event_id="garbage",
+            event_fields={"title": "坏数据", "start_at": "不是时间"}),
+        # 压根没有时间 —— 按纪律必须保留，不能被窗口藏起来。
+        CalendarEventMirror(
+            subject_id="u", source_account_id="a", source_calendar_id="c",
+            source_event_id="notime", event_fields={"title": "没写时间"}),
+    ])
+
+
+def test_one_unparseable_timestamp_does_not_take_the_whole_query_down(clean):
+    s = store()
+    T = datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc)
+    _mirror_fixtures(s, T)
+    got = {e.source_event_id for e in s.list_calendar_events(
+        subject_id="u", start=T - timedelta(days=1), end=T + timedelta(days=1),
+        limit=50)}
+    assert got == {"good", "garbage", "notime"}
+
+
+def test_items_with_no_known_time_are_not_hidden_by_the_window(clean):
+    """证明不了它在范围外，就不能替用户把它藏起来 —— 和删除那边同一条纪律。"""
+    s = store()
+    T = datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc)
+    _mirror_fixtures(s, T)
+    outside = {e.source_event_id for e in s.list_calendar_events(
+        subject_id="u", start=T + timedelta(days=30), end=T + timedelta(days=31),
+        limit=50)}
+    assert outside == {"garbage", "notime"}, "时间明确且在窗外的才该被排掉"
+
+
+def test_a_reminder_without_is_completed_counts_as_open(clean):
+    """缺字段不等于已完成。SQL 里少个 COALESCE，这条提醒就整条消失。"""
+    s = store()
+    s.upsert_reminders(subject_id="u", items=[
+        ReminderItemMirror(subject_id="u", source_account_id="a",
+                           source_list_id="l", source_reminder_id="done",
+                           reminder_fields={"title": "完成的", "is_completed": True}),
+        ReminderItemMirror(subject_id="u", source_account_id="a",
+                           source_list_id="l", source_reminder_id="open",
+                           reminder_fields={"title": "没完成", "is_completed": False}),
+        ReminderItemMirror(subject_id="u", source_account_id="a",
+                           source_list_id="l", source_reminder_id="unset",
+                           reminder_fields={"title": "没这个字段"}),
+    ])
+    assert {r.source_reminder_id for r in s.list_reminders(
+        subject_id="u", limit=50)} == {"open", "unset"}
+    assert {r.source_reminder_id for r in s.list_reminders(
+        subject_id="u", include_completed=True, limit=50)} == {
+            "open", "unset", "done"}
