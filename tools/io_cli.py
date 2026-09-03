@@ -167,6 +167,27 @@ def _materialize_decrypted_image(prefix, body):
     return out
 
 
+def _materialize_decrypted_image_bundle(prefix, body):
+    """Save every image in a decrypted chat bundle, or return None."""
+    if not isinstance(body, dict) or not isinstance(body.get("images"), list):
+        return None
+    images = body["images"]
+    if not images:
+        return None
+    materialized = []
+    for index, item in enumerate(images, start=1):
+        if not isinstance(item, dict):
+            return None
+        saved = _materialize_decrypted_image(f"{prefix}_{index}", item)
+        if not isinstance(saved, dict) or not saved.get("image_file"):
+            return None
+        materialized.append(saved)
+    out = dict(body)
+    out["images"] = materialized
+    out["image_count"] = len(materialized)
+    return out
+
+
 def _env(name):
     return os.environ.get(name, "").strip()
 
@@ -845,7 +866,7 @@ def cmd_photo_read(args):
 
 
 def cmd_chat_image(args):
-    """Pull ONE past chat message's decrypted image by id, saved as a Read-able file.
+    """Pull one past chat message's decrypted image(s) as Read-able files.
 
     Chat-history images are NOT reachable via ``photo-read`` (that command hits the
     perception photo library, not the chat feed). The recent-chat transcript that
@@ -878,6 +899,23 @@ def cmd_chat_image(args):
             "message_id": mid,
             "error": "message not found in recent history",
             "hint": f"only the {args.limit} most recent messages are searched; raise --limit if the image is older",
+        }, 1)
+    if isinstance(msg.get("images"), list):
+        out = _materialize_decrypted_image_bundle(f"chat_{mid}", msg)
+        if out is None:
+            _emit({
+                "ok": False,
+                "message_id": mid,
+                "error_code": "chat_image_bundle_unavailable",
+                "error": "chat image bundle is unavailable",
+            }, 1)
+        _emit({"ok": True, "message_id": mid, **out})
+    if msg.get("image_bundle_version") is not None:
+        _emit({
+            "ok": False,
+            "message_id": mid,
+            "error_code": "chat_image_bundle_unavailable",
+            "error": "chat image bundle is unavailable",
         }, 1)
     if not msg.get("image_b64"):
         _emit({
