@@ -67,6 +67,28 @@ _REM_AT = ("CASE WHEN reminder_fields->>'due_at' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
 #: next round; one that takes an unbounded lock is its own incident.
 _SWEEP_MAX_ROWS = 2000
 
+#: Explicit column lists, not ``SELECT *``.
+#:
+#: The rows below are read positionally, and ``SELECT *`` ties those positions
+#: to the table's column order -- adding one column shifts every field after
+#: it, silently, into a neighbour of the same type. That is how a `source`
+#: ends up in `source_account_id`. Naming the columns here means the order is
+#: stated in one place next to the code that depends on it.
+_CAL_COLS = ("subject_id, source, source_account_id, source_calendar_id, "
+             "source_event_id, event_fields, source_revision, "
+             "recurrence_identity, source_created_at, source_updated_at, "
+             "last_seen_sync_id, updated_at")
+_REM_COLS = ("subject_id, source, source_account_id, source_list_id, "
+             "source_reminder_id, reminder_fields, source_revision, "
+             "last_seen_sync_id, updated_at")
+#: Order matches `SourceSyncState`'s fields. This one drifted once -- the
+#: reader passed `last_sync_id`, a keyword the record does not have, so every
+#: read raised. Nothing called it, so nothing noticed until the sync entry
+#: landed and needed it.
+_SYNC_COLS = ("subject_id, source, collection_kind, sync_cursor, "
+              "coverage_start, coverage_end, snapshot_kind, "
+              "last_attempted_at, last_successful_sync_at, last_error_code")
+
 
 def _j(value: Any) -> str | None:
     return None if value is None else json.dumps(value, sort_keys=True, default=str)
@@ -521,13 +543,13 @@ class PostgresStorage:
             self._q(
                 """
                 INSERT INTO perceptkit_calendar_mirror
-                  (subject_id, source_account_id, source_calendar_id,
+                  (subject_id, source, source_account_id, source_calendar_id,
                    source_event_id, event_fields, source_revision,
                    recurrence_identity, source_created_at, source_updated_at,
                    last_seen_sync_id, updated_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (subject_id, source_account_id, source_calendar_id,
-                             source_event_id)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (subject_id, source, source_account_id,
+                             source_calendar_id, source_event_id)
                 DO UPDATE SET event_fields = EXCLUDED.event_fields,
                               source_revision = EXCLUDED.source_revision,
                               recurrence_identity = EXCLUDED.recurrence_identity,
@@ -535,7 +557,7 @@ class PostgresStorage:
                               last_seen_sync_id = EXCLUDED.last_seen_sync_id,
                               updated_at = EXCLUDED.updated_at
                 """,
-                (e.subject_id, e.source_account_id, e.source_calendar_id,
+                (e.subject_id, e.source, e.source_account_id, e.source_calendar_id,
                  e.source_event_id, _j(e.event_fields), _rev(e.source_revision),
                  e.recurrence_identity, e.source_created_at, e.source_updated_at,
                  e.last_seen_sync_id, e.updated_at),
@@ -546,13 +568,13 @@ class PostgresStorage:
             self._q(
                 """
                 INSERT INTO perceptkit_reminder_mirror
-                  (subject_id, source_account_id, source_list_id,
+                  (subject_id, source, source_account_id, source_list_id,
                    source_reminder_id, reminder_fields, source_revision,
                    source_created_at, source_updated_at, last_seen_sync_id,
                    updated_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (subject_id, source_account_id, source_list_id,
-                             source_reminder_id)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (subject_id, source, source_account_id,
+                             source_list_id, source_reminder_id)
                 DO UPDATE SET reminder_fields = EXCLUDED.reminder_fields,
                               source_revision = EXCLUDED.source_revision,
                               source_updated_at = EXCLUDED.source_updated_at,
@@ -564,7 +586,7 @@ class PostgresStorage:
                 # written from that one. Reading them raised on every call, so
                 # the reminder mirror never worked; the columns stay (the
                 # schema is shared with the calendar mirror) and take NULL.
-                (r.subject_id, r.source_account_id, r.source_list_id,
+                (r.subject_id, r.source, r.source_account_id, r.source_list_id,
                  r.source_reminder_id, _j(r.reminder_fields), _rev(r.source_revision),
                  None, None, r.last_seen_sync_id,
                  r.updated_at),
@@ -572,7 +594,7 @@ class PostgresStorage:
 
     def list_calendar_events(self, *, subject_id, start=None, end=None,
                              limit=50, offset=0):
-        sql = [f"SELECT * FROM perceptkit_calendar_mirror WHERE subject_id=%s"]
+        sql = [f"SELECT {_CAL_COLS} FROM perceptkit_calendar_mirror WHERE subject_id=%s"]
         params: list[Any] = [subject_id]
         # Items with no known time are kept, the same discipline as the
         # delete path: without proof it falls outside the window, we do not
@@ -593,7 +615,7 @@ class PostgresStorage:
         rows = self._q(" ".join(sql), params)
         out = []
         for r in rows:
-            fields = dict(r[4])
+            fields = dict(r[5])
             at = fields.get("start_at")
             if isinstance(at, str):
                 try:
@@ -607,8 +629,9 @@ class PostgresStorage:
                     # has no calendar at all".
                     pass
             out.append(CalendarEventMirror(
-                subject_id=r[0], source_account_id=r[1], source_calendar_id=r[2],
-                source_event_id=r[3], event_fields=fields, source_revision=r[5],
+                subject_id=r[0], source=r[1], source_account_id=r[2],
+                source_calendar_id=r[3], source_event_id=r[4],
+                event_fields=fields, source_revision=r[5],
                 recurrence_identity=r[6], source_created_at=r[7],
                 source_updated_at=r[8], last_seen_sync_id=r[9], updated_at=r[10],
             ))
@@ -620,7 +643,7 @@ class PostgresStorage:
 
     def list_reminders(self, *, subject_id, include_completed=False,
                        limit=50, offset=0):
-        sql = ["SELECT * FROM perceptkit_reminder_mirror WHERE subject_id=%s"]
+        sql = [f"SELECT {_REM_COLS} FROM perceptkit_reminder_mirror WHERE subject_id=%s"]
         params: list[Any] = [subject_id]
         if not include_completed:
             sql.append("AND COALESCE((reminder_fields->>'is_completed')::bool, "
@@ -631,12 +654,49 @@ class PostgresStorage:
         params += [limit, offset]
         return [
             ReminderItemMirror(
-                subject_id=r[0], source_account_id=r[1], source_list_id=r[2],
-                source_reminder_id=r[3], reminder_fields=dict(r[4]),
-                source_revision=r[5], last_seen_sync_id=r[8], updated_at=r[9],
+                subject_id=r[0], source=r[1], source_account_id=r[2],
+                source_list_id=r[3], source_reminder_id=r[4],
+                reminder_fields=dict(r[5]), source_revision=r[6],
+                last_seen_sync_id=r[7], updated_at=r[8],
             )
             for r in self._q(" ".join(sql), params)
         ]
+
+    def delete_source_items(self, *, subject_id, source, collection_kind,
+                            source_item_ids) -> int:
+        """Deletions the source explicitly reported -- not inferred ones.
+
+        Separate from ``apply_source_snapshot`` on purpose:
+
+            snapshot    "inside coverage, not mentioned this round" -- inferred,
+                        so only a full sync may do it, and only in its window
+            this one    "the source says this one is gone" -- a fact, so an
+                        incremental sync must do it too
+
+        Without it an incremental sync has only bad options: delete nothing
+        (an event the user removed on their phone stays in the agent's view
+        forever, and keeps showing up under "what's coming up"), or treat a
+        partial list as a full one, which is worse and irreversible.
+        """
+        ids = [str(i) for i in (source_item_ids or ()) if str(i).strip()]
+        if not ids:
+            return 0
+        if collection_kind == "calendar":
+            table, id_col = "perceptkit_calendar_mirror", "source_event_id"
+        elif collection_kind == "reminders":
+            table, id_col = "perceptkit_reminder_mirror", "source_reminder_id"
+        else:
+            return 0
+        with self.conn.cursor() as cur:
+            cur.execute(
+                # `source` is part of the delete scope. Without it an `ios`
+                # deletion hits a row in another source system that happens
+                # to share the id.
+                f"DELETE FROM {table} WHERE subject_id = %s AND source = %s "
+                f"AND {id_col} = ANY(%s)",
+                (subject_id, source, ids),
+            )
+            return cur.rowcount
 
     def apply_source_snapshot(self, *, subject_id, source, collection_kind,
                               sync_id, coverage_start, coverage_end,
@@ -651,6 +711,11 @@ class PostgresStorage:
         else:
             table, at_key = "perceptkit_reminder_mirror", "due_at"
             fields_col = "reminder_fields"
+        # 🔴 Scoped by source as well as subject. Without it a full sync
+        # declaring source='ios' deletes the rows that belong to Google:
+        # they were of course not mentioned in this round. The user finds
+        # their other calendar account emptied, irreversibly.
+        #
         # Delete only what can be proven to fall inside the covered window.
         # Items with no known time are never deleted -- without proof they are
         # in range there is no standing to remove them. Deleting outside the
@@ -661,17 +726,19 @@ class PostgresStorage:
                 f"""
                 DELETE FROM {table}
                  WHERE subject_id = %s
+                   AND source = %s
                    AND (last_seen_sync_id IS DISTINCT FROM %s)
                    AND ({fields_col} ->> %s) IS NOT NULL
                    AND ({fields_col} ->> %s)::timestamptz BETWEEN %s AND %s
                 """,
-                (subject_id, sync_id, at_key, at_key, coverage_start, coverage_end),
+                (subject_id, source, sync_id, at_key, at_key,
+                 coverage_start, coverage_end),
             )
             return cur.rowcount
 
     def get_sync_state(self, *, subject_id, source, collection_kind):
         rows = self._q(
-            "SELECT * FROM perceptkit_sync_state "
+            f"SELECT {_SYNC_COLS} FROM perceptkit_sync_state "
             "WHERE subject_id=%s AND source=%s AND collection_kind=%s",
             (subject_id, source, collection_kind),
         )
@@ -679,28 +746,30 @@ class PostgresStorage:
             return None
         r = rows[0]
         return SourceSyncState(
-            subject_id=r[0], source=r[1], collection_kind=r[2], last_sync_id=r[3],
-            last_successful_sync_at=r[4], coverage_start=r[5], coverage_end=r[6],
-            cursor=r[7],
+            subject_id=r[0], source=r[1], collection_kind=r[2],
+            sync_cursor=r[3], coverage_start=r[4], coverage_end=r[5],
+            snapshot_kind=r[6], last_attempted_at=r[7],
+            last_successful_sync_at=r[8], last_error_code=r[9],
         )
 
     def put_sync_state(self, state: SourceSyncState) -> None:
         s = state
         self._q(
-            """
-            INSERT INTO perceptkit_sync_state
-              (subject_id, source, collection_kind, last_sync_id,
-               last_successful_sync_at, coverage_start, coverage_end, cursor)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            f"""
+            INSERT INTO perceptkit_sync_state ({_SYNC_COLS})
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (subject_id, source, collection_kind)
-            DO UPDATE SET last_sync_id = EXCLUDED.last_sync_id,
-                          last_successful_sync_at = EXCLUDED.last_successful_sync_at,
+            DO UPDATE SET sync_cursor = EXCLUDED.sync_cursor,
                           coverage_start = EXCLUDED.coverage_start,
                           coverage_end = EXCLUDED.coverage_end,
-                          cursor = EXCLUDED.cursor
+                          snapshot_kind = EXCLUDED.snapshot_kind,
+                          last_attempted_at = EXCLUDED.last_attempted_at,
+                          last_successful_sync_at = EXCLUDED.last_successful_sync_at,
+                          last_error_code = EXCLUDED.last_error_code
             """,
-            (s.subject_id, s.source, s.collection_kind, s.last_sync_id,
-             s.last_successful_sync_at, s.coverage_start, s.coverage_end, s.cursor),
+            (s.subject_id, s.source, s.collection_kind, s.sync_cursor,
+             s.coverage_start, s.coverage_end, s.snapshot_kind,
+             s.last_attempted_at, s.last_successful_sync_at, s.last_error_code),
         )
 
     # -- Deletion ------------------------------------------------------------

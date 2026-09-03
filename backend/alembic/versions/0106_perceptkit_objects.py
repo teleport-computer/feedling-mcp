@@ -145,8 +145,14 @@ CREATE TABLE IF NOT EXISTS perceptkit_wake_receipt (
   PRIMARY KEY (event_id, attempt_id)
 );
 
+-- `source` is part of the identity, not a label. Without it a full sync
+-- declaring source='ios' deletes rows that belong to Google: the snapshot
+-- step removes "everything in coverage this round did not mention", and
+-- another source's rows were of course not in this round. The user finds
+-- their other calendar account emptied, irreversibly.
 CREATE TABLE IF NOT EXISTS perceptkit_calendar_mirror (
   subject_id          TEXT        NOT NULL,
+  source              TEXT        NOT NULL,
   source_account_id   TEXT        NOT NULL,
   source_calendar_id  TEXT        NOT NULL,
   source_event_id     TEXT        NOT NULL,
@@ -157,11 +163,14 @@ CREATE TABLE IF NOT EXISTS perceptkit_calendar_mirror (
   source_updated_at   TIMESTAMPTZ,
   last_seen_sync_id   TEXT,
   updated_at          TIMESTAMPTZ,
-  PRIMARY KEY (subject_id, source_account_id, source_calendar_id, source_event_id)
+  PRIMARY KEY (subject_id, source, source_account_id, source_calendar_id,
+               source_event_id)
 );
 
+-- `source` in the key for the same reason as the calendar mirror above.
 CREATE TABLE IF NOT EXISTS perceptkit_reminder_mirror (
   subject_id         TEXT        NOT NULL,
+  source             TEXT        NOT NULL,
   source_account_id  TEXT        NOT NULL,
   source_list_id     TEXT        NOT NULL,
   source_reminder_id TEXT        NOT NULL,
@@ -171,18 +180,30 @@ CREATE TABLE IF NOT EXISTS perceptkit_reminder_mirror (
   source_updated_at  TIMESTAMPTZ,
   last_seen_sync_id  TEXT,
   updated_at         TIMESTAMPTZ,
-  PRIMARY KEY (subject_id, source_account_id, source_list_id, source_reminder_id)
+  PRIMARY KEY (subject_id, source, source_account_id, source_list_id,
+               source_reminder_id)
 );
 
+-- Column names track `SourceSyncState` exactly. They drifted once: the table
+-- said `last_sync_id`/`cursor` while the record said `sync_cursor`, and the
+-- reader passed a keyword the record does not have -- so every read raised.
+-- Nothing called it, so nothing noticed until the sync entry landed.
+--
+-- The failure columns are not optional bookkeeping. Without `last_error_code`
+-- and `last_attempted_at` a failed sync is indistinguishable from one that
+-- never ran, and "the calendar has been failing for three days" cannot be
+-- answered at all.
 CREATE TABLE IF NOT EXISTS perceptkit_sync_state (
-  subject_id             TEXT        NOT NULL,
-  source                 TEXT        NOT NULL,
-  collection_kind        TEXT        NOT NULL,
-  last_sync_id           TEXT,
+  subject_id              TEXT        NOT NULL,
+  source                  TEXT        NOT NULL,
+  collection_kind         TEXT        NOT NULL,
+  sync_cursor             TEXT,
+  coverage_start          TIMESTAMPTZ,
+  coverage_end            TIMESTAMPTZ,
+  snapshot_kind           TEXT,
+  last_attempted_at       TIMESTAMPTZ,
   last_successful_sync_at TIMESTAMPTZ,
-  coverage_start         TIMESTAMPTZ,
-  coverage_end           TIMESTAMPTZ,
-  cursor                 TEXT,
+  last_error_code         TEXT,
   PRIMARY KEY (subject_id, source, collection_kind)
 );
 

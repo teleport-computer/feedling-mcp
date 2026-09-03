@@ -26,7 +26,11 @@ def _database_url(base: str, database: str) -> str:
 
 def test_rds_pre_and_test_heads_converge():
     script = _scripts("alembic")
-    assert script.get_heads() == ["0106_perceptkit_objects"]
+    assert script.get_heads() == ["0107_perceptkit_mirror_source"]
+    assert (
+        script.get_revision("0107_perceptkit_mirror_source").down_revision
+        == "0106_perceptkit_objects"
+    )
     assert (
         script.get_revision("0106_perceptkit_objects").down_revision
         == "0105_account_recover_challenges"
@@ -111,7 +115,11 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0040_perceptkit_objects"]
+    assert script.get_heads() == ["0041_perceptkit_mirror_source"]
+    assert (
+        script.get_revision("0041_perceptkit_mirror_source").down_revision
+        == "0040_perceptkit_objects"
+    )
     assert (
         script.get_revision("0040_perceptkit_objects").down_revision
         == "0039_distill_artifact_ledger"
@@ -225,6 +233,10 @@ def test_tee_migrations_reuse_the_rds_contract_sql():
         tee.get_revision("0040_perceptkit_objects").module._UP
         == rds.get_revision("0106_perceptkit_objects").module._UP
     ), "the PerceptKit DDL must be byte-identical on both chains"
+    assert (
+        tee.get_revision("0041_perceptkit_mirror_source").module._UP
+        == rds.get_revision("0107_perceptkit_mirror_source").module._UP
+    ), "the mirror-source migration must be byte-identical on both chains"
     # The adapter and its conformance tests run against schema.DDL. If the
     # migration drifts from it, the suite goes green against tables production
     # never creates -- which is the one failure the suite exists to prevent.
