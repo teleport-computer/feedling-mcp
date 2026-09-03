@@ -20,6 +20,16 @@ change must not be interpreted as an API guarantee.
   unavailable on the channel and recommends switching models or trying again
   later.
 
+- **The text you send with an image is now followed again when a dedicated
+  vision model is configured.** Runtime V2 previously handed the main model the
+  observation wrapped in untrusted-data framing with your message beside it,
+  which led models to treat your own words as an instruction injected from the
+  picture and decline to act on them. The observation now reaches the main model
+  as labelled text (`Image 1:`, `Image 2:`, …) followed by your message under an
+  explicit attribution. Images you did not send — `photo_read` and `screen_read`
+  tool results, which may show text written by someone else — keep the untrusted
+  framing, as does the official resident consumer.
+
 - **Hosted Chat now accepts up to nine images in one user turn.** Use the new
   `images` array for multi-image messages; the existing `image_b64` and
   `image_mime` single-image fields remain compatible. Empty arrays, mixed old

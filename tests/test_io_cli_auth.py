@@ -93,6 +93,100 @@ def test_emit_tool_trace_posts_agent_tool_call_with_redacted_args(monkeypatch):
     assert "where was i yesterday" not in json.dumps(event, ensure_ascii=False)
 
 
+def _capture_attachment_tool_trace(monkeypatch, *, verb, exit_code, output):
+    events = []
+    monkeypatch.setenv("FEEDLING_TRACE_ID", "trace-attachment")
+    monkeypatch.setenv("FEEDLING_API_URL", "http://backend.test")
+    monkeypatch.setenv("FEEDLING_API_KEY", "k")
+    monkeypatch.setattr(io_cli, "_LAST_TOOL_OUTPUT", output)
+    monkeypatch.setattr(
+        io_cli,
+        "_http_json",
+        lambda *_args, **kwargs: events.append(kwargs["payload"]["event"])
+        or (200, {"status": "ok"}),
+    )
+
+    io_cli._emit_tool_trace(
+        types.SimpleNamespace(
+            verb=verb,
+            path="/safe/test-input",
+            name="result.txt" if verb == "send-file" else "result.png",
+            func=lambda _args: None,
+        ),
+        exit_code,
+        4.2,
+    )
+
+    assert len(events) == 1
+    return events[0]
+
+
+@pytest.mark.parametrize(
+    ("verb", "error_code"),
+    [
+        ("send-file", "wrong_file_suffix"),
+        ("send-image", "too_many_staged_images"),
+    ],
+)
+def test_attachment_failure_trace_keeps_fixed_rejection_code(
+    monkeypatch, verb, error_code
+):
+    event = _capture_attachment_tool_trace(
+        monkeypatch,
+        verb=verb,
+        exit_code=1,
+        output={"ok": False, "error": error_code},
+    )
+
+    assert event["status"] == "error"
+    assert event["detail"]["error_code"] == error_code
+
+
+def test_attachment_failure_trace_redacts_dynamic_error_path(monkeypatch):
+    sensitive_path = "/private/customer/alice/quarterly-plan.md"
+    event = _capture_attachment_tool_trace(
+        monkeypatch,
+        verb="send-file",
+        exit_code=1,
+        output={
+            "ok": False,
+            "error": f"[Errno 13] Permission denied: '{sensitive_path}'",
+        },
+    )
+
+    assert event["detail"]["error_code"] == "unclassified"
+    assert sensitive_path not in json.dumps(event["detail"], ensure_ascii=False)
+
+
+def test_non_attachment_failure_trace_has_no_attachment_error_code(monkeypatch):
+    event = _capture_attachment_tool_trace(
+        monkeypatch,
+        verb="memory-index",
+        exit_code=1,
+        output={"ok": False, "error": "backend_unavailable"},
+    )
+
+    assert event["status"] == "error"
+    assert "error_code" not in event["detail"]
+
+
+def test_successful_attachment_trace_has_no_failure_noise(monkeypatch):
+    event = _capture_attachment_tool_trace(
+        monkeypatch,
+        verb="send-file",
+        exit_code=0,
+        output={"ok": True, "staged": True, "name": "result.txt"},
+    )
+
+    assert event["status"] == "ok"
+    assert event["detail"] == {
+        "tool": "send-file",
+        "args": {"path": "/safe/test-input", "name": "result.txt"},
+        "result_status": "ok",
+        "dur_ms": 4.2,
+    }
+
+
 def test_emit_tool_trace_noops_without_trace_id(monkeypatch):
     calls = []
     monkeypatch.delenv("FEEDLING_TRACE_ID", raising=False)

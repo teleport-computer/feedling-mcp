@@ -600,8 +600,20 @@ jobs:
           export LC_ALL=C
           find tests -maxdepth 1 -type f -name 'test_*.py' -print | sort \
             > /tmp/feedling-all-tests.txt
-          grep -oE 'tests/test_[A-Za-z0-9_]+\.py' .github/workflows/ci.yml | sort -u \
-            > /tmp/feedling-named-tests.txt
+          # 覆盖 = **某个 step 真的执行了它**(pytest 参数,或 python 直跑脚本),
+          # 不是「文件名在 ci.yml 文本里出现过」。旧判据下,注释里、step 名字里
+          # 提一句就算覆盖 —— 于是「不再被执行」这件事永远不会让闸变红,
+          # 而那正是这道闸唯一要拦的事。判据与本 step 的回归测试共用同一份实现
+          # (tests/test_pytest_coverage_ratchet.py 直接 import 它),两边不会再各走一套。
+          # ⚠️ 分两步:提取器失败必须当场停。写成 `python … | sort > file` 的话,
+          # 退出码是 sort 的,提取器崩了只会留下一个空文件 —— 闸接着把**每个**测试
+          # 文件都报成「新增未覆盖」,几百行噪音里没有一句说「提取器挂了」。
+          if ! python tools/ci_executed_tests.py \
+              --workflow .github/workflows/ci.yml > /tmp/feedling-executed-raw.txt; then
+            echo "::error::tools/ci_executed_tests.py 解析 ci.yml 失败 —— 先修它,下面的覆盖差集不可信"
+            exit 1
+          fi
+          sort -u /tmp/feedling-executed-raw.txt > /tmp/feedling-named-tests.txt
           grep -l -E \
             'tools\.chat_resident_consumer|chat_resident_consumer as|import chat_resident_consumer|from tools import chat_resident_consumer|chat_resident_consumer\.py' \
             tests/test_*.py | sort \
@@ -798,7 +810,7 @@ jobs:
             tests/test_verify_enclave_domain.py \
             -v
 
-      - name: Run CI security tier 3 (71 files)
+      - name: Run CI security tier 3 (76 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
