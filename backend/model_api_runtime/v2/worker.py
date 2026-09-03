@@ -929,6 +929,36 @@ _SUBAGENT_DISABLED_TOOLS = frozenset(
     if spec.name not in _SUBAGENT_ALLOWED_TOOLS
 )
 
+
+def _identity_nudge_disabled_tools(
+    identity_card_or_persona: str,
+) -> frozenset[str]:
+    """Withhold identity_nudge unless the rendered card has dimensions.
+
+    The workspace prompt is the turn's authoritative identity snapshot. Only
+    the canonical identity-card renderer can enable nudging; a persona fallback,
+    missing dimensions line, or malformed value all fail closed. The renderer
+    emits JSON on one line, so this does not interpret user-authored prose.
+    """
+
+    disabled = frozenset({"identity_nudge"})
+    if not identity_card_or_persona.startswith(context.IDENTITY_CARD_HEADER):
+        return disabled
+    for line in identity_card_or_persona.splitlines()[1:]:
+        key, separator, encoded = line.partition(": ")
+        if key != "dimensions" or not separator:
+            continue
+        try:
+            dimensions = json.loads(encoded)
+        except (TypeError, ValueError):
+            return disabled
+        return (
+            frozenset()
+            if isinstance(dimensions, list) and dimensions
+            else disabled
+        )
+    return disabled
+
 # The retained D3 wake-lane decision: the scheduler enqueues jobs in
 # these three lanes when it decides the companion should reach out without the
 # user having spoken first. "capture" is intentionally NOT in this set — it's
@@ -9864,17 +9894,21 @@ async def _run_wake(
         # gated by the kill switch (a chat-lane concern).
         # `mcp_tool_search` 不在这里 —— 它是折叠 schema 的唯一取回口。禁掉它
         # 等于让唤醒道在压力下永久丢失工具参数(T154 之前正是如此)。
-        wake_disabled_tool_names = wake_disabled_web_tool_names | {
-            cap_tool_schema.PROVIDER_USAGE_TOOL,
-            cap_tool_schema.MEMORY_ORGANIZE_TOOL,
-            # History tools are chat-lane only (spec §6 offer gate): the
-            # proactive companion must never browse raw history on its own.
-            # Withheld unconditionally — not tied to the kill switch — and the
-            # executor's dispatch gate (history_tools_allowed defaults False)
-            # backstops any direct call that skips this catalog.
-            cap_history.HISTORY_SEARCH_TOOL,
-            cap_history.HISTORY_FETCH_TOOL,
-        }
+        wake_disabled_tool_names = (
+            wake_disabled_web_tool_names
+            | _identity_nudge_disabled_tools(identity_card_or_persona)
+            | {
+                cap_tool_schema.PROVIDER_USAGE_TOOL,
+                cap_tool_schema.MEMORY_ORGANIZE_TOOL,
+                # History tools are chat-lane only (spec §6 offer gate): the
+                # proactive companion must never browse raw history on its own.
+                # Withheld unconditionally — not tied to the kill switch — and the
+                # executor's dispatch gate (history_tools_allowed defaults False)
+                # backstops any direct call that skips this catalog.
+                cap_history.HISTORY_SEARCH_TOOL,
+                cap_history.HISTORY_FETCH_TOOL,
+            }
+        )
         _IDENTITY_WRITE_ACTIONS = frozenset(
             action
             for action in cap_registry.WRITE_ACTIONS
@@ -14657,6 +14691,7 @@ async def process_job(
             | disabled_provider_usage_tool_names
             | disabled_history_tool_names
             | disabled_mcp_search_tool_names
+            | _identity_nudge_disabled_tools(identity_card_or_persona)
         )
         # Shared across every provider round in this chat turn. A per-dispatch
         # budget would reset whenever the model asks for another tool batch and

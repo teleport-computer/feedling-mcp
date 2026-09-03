@@ -878,6 +878,13 @@ def test_chat_identity_get_result_fences_outbound_but_keeps_local_edits(
         [{"id": "m1", "ts": 10.0, "role": "user", "content": "who are you?"}],
         load_mcp_turn=_make_load_turn_mcp(turn),
     )
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: {
+        "identity_card_or_persona": worker.context.render_identity_card({
+            "agent_name": "Mira",
+            "dimensions": [{"name": "warmth", "value": 70}],
+        }),
+        "trusted_system_blocks": (),
+    }
 
     status = asyncio.run(worker.process_job(
         job,

@@ -87,7 +87,7 @@ def test_t336_worker_file_output_default_is_bound_to_shared_wire_cap():
 
 
 _REAL_TOOL_COUNT = 69
-_REAL_TOOL_CATALOG_BYTES = 36_211
+_REAL_TOOL_CATALOG_BYTES = 36_455
 
 
 def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
@@ -133,6 +133,8 @@ def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
     The T325 follow-up moves the offer path to the V2 system prompt while
     retaining the live create-path mirror in the tool description, reducing the
     real catalog by 215 bytes to 36,211. System-prompt bytes are not catalog bytes.
+    T453 adds the approved empty-dimensions setup offer to
+    identity_dimensions_set, increasing the real catalog by 244 bytes to 36,455.
     """
     platform = list(tool_schema.build_tool_specs())
     mcp_count = _REAL_TOOL_COUNT - len(platform)

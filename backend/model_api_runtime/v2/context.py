@@ -92,7 +92,10 @@ def render_identity_card(card: dict[str, Any]) -> str:
         if key not in card:
             continue
         value = card[key]
-        if value is None or value == "" or value == []:
+        # An empty dimensions list is actionable state: the model needs to see
+        # that there is no existing dimension to nudge. Other empty profile
+        # fields remain omitted so the identity card does not become noise.
+        if value is None or value == "" or (value == [] and key != "dimensions"):
             continue
         lines.append(
             f"{key}: {json.dumps(value, ensure_ascii=False, separators=(',', ':'))}"

@@ -1624,6 +1624,56 @@ def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
     assert {"web_search", "web_fetch", "task"}.isdisjoint(second_offered)
 
 
+@pytest.mark.parametrize(
+    "dimensions,identity_nudge_offered",
+    [
+        ([], False),
+        ([{"name": "warmth", "value": 70}], True),
+    ],
+    ids=("empty", "nonempty"),
+)
+def test_wake_identity_nudge_surface_requires_an_existing_dimension(
+    monkeypatch,
+    dimensions,
+    identity_nudge_offered,
+):
+    uid = f"u_wake_identity_nudge_{'on' if dimensions else 'off'}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    calls = _script_provider(monkeypatch, [_text_round("wake reply")])
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda _store, _text: {"id": "wake-reply"},
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: {
+        "identity_card_or_persona": worker.context.render_identity_card({
+            "agent_name": "Mira",
+            "dimensions": dimensions,
+        }),
+        "trusted_system_blocks": (),
+    }
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "heartbeat",
+        deps,
+        _BYOK,
+        asyncio.Semaphore(4),
+        claimed_by,
+    ))
+
+    assert status == "completed"
+    offered = {spec.name for spec in calls[0]["tools"]}
+    assert ("identity_nudge" in offered) is identity_nudge_offered
+
+
 def test_wake_workspace_prompt_failure_is_silent_before_provider(
     monkeypatch,
 ):
@@ -4201,6 +4251,13 @@ def test_screen_watch_without_frames_keeps_identity_writes(monkeypatch):
     deps = _wake_deps(
         tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "先忙会儿"}]
     )
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: {
+        "identity_card_or_persona": worker.context.render_identity_card({
+            "agent_name": "Mira",
+            "dimensions": [{"name": "warmth", "value": 70}],
+        }),
+        "trusted_system_blocks": (),
+    }
     status = asyncio.run(
         worker._run_wake(
             job_id,
