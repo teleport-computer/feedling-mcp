@@ -128,7 +128,7 @@ def test_caption_frame_no_frame_is_unavailable(monkeypatch):
 def test_recent_frames_never_calls_vlm(monkeypatch):
     # Mock uses REAL shape from db.frame_list_meta (filename, not id)
     monkeypatch.setattr(cap.db, "frame_list_meta",
-                        lambda u: [{"filename": "f1abf1abf1abf1ab.env.json", "ts": 2.0, "app": None}])
+                        lambda u, *, source: [{"filename": "f1abf1abf1abf1ab.env.json", "ts": 2.0, "app": None}])
     monkeypatch.setattr(cap, "_cached_caption", lambda u, f: "Mail inbox")
     # Actively prove that the VLM (enclave) is never contacted by recent_frames
     monkeypatch.setattr(cap, "_enclave_get",
