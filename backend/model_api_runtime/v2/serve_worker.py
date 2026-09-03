@@ -858,8 +858,9 @@ def _resolve_provider(user_id: str, *, trace_job_id: str = ""):
         return None, {"error": "runtime_token_mint_failed", "detail": str(e)[:160]}
     # api_key=None: Runtime V2 turns never hold the user's long-term
     # Feedling API key — only the runtime token authenticates to the enclave.
+    trace_scope_kwargs = {"job_id": trace_job_id} if trace_job_id else {}
     with core_enclave.coalesced_success_trace(
-        "model_api_provider_key", job_id=trace_job_id
+        "model_api_provider_key", **trace_scope_kwargs
     ):
         runtime = hosted_config_store._load_runtime_provider_config(
             store, None, runtime_token=token
