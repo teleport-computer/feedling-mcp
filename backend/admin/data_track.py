@@ -4963,6 +4963,7 @@ _RUNTIME_FAILURE_CODE_MAX = 120
 # 与单回合 trace 共用产生方导出，不在日报投影里另造一套形状/前缀规则。
 _RUNTIME_ERROR_CLASS_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 RUNTIME_OUTCOME_CLASS_LABELS = {
+    "unspecified": "未说明",
     "operational_failure": "执行故障",
     "timeout": "超时 / 失活",
     "control": "控制切流",
@@ -4970,7 +4971,7 @@ RUNTIME_OUTCOME_CLASS_LABELS = {
     "user_unavailable": "明确用户侧不可用",
 }
 RUNTIME_OUTCOME_CLASSES = frozenset(RUNTIME_OUTCOME_CLASS_LABELS)
-RUNTIME_OUTCOME_DEFAULT = "operational_failure"
+RUNTIME_OUTCOME_DEFAULT = "unspecified"
 
 
 def _runtime_operational_rate(lane: dict):
@@ -10296,6 +10297,7 @@ def _debug_friendly_step(ev: dict) -> tuple[str, str]:
 
 
 _OUTCOME_CLASS_LABELS = {
+    "unspecified": "未说明",
     "operational_failure": "运行故障",
     "timeout": "超时",
     "control": "闸拦截",

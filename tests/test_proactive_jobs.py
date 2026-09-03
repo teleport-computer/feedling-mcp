@@ -1856,6 +1856,7 @@ def test_dream_trace_hourly_heartbeat_preserves_liveness(monkeypatch):
 
     assert len(events) == 1
     assert events[0]["detail"]["emission"] == "heartbeat"
+    assert "job_id" not in events[0]
     assert events[0]["explain"] == (
         "实际入队、状态变化或每小时心跳时留一条。计数与理由落库，卡片内容不落库。"
     )

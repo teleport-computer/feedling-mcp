@@ -125,9 +125,11 @@ class _BulkTrace:
         "started_at",
         "path",
         "explain",
+        "job_id",
     )
 
-    def __init__(self, purpose: str, *, prefix: bool = False) -> None:
+    def __init__(self, purpose: str, *, prefix: bool = False,
+                 job_id: str = "") -> None:
         self.purpose = purpose
         self.prefix = prefix
         self.store = None
@@ -139,10 +141,12 @@ class _BulkTrace:
         self.started_at = time.time()
         self.path: str | None = None
         self.explain: str | None = None
+        self.job_id = str(job_id or "")
 
 
 @contextlib.contextmanager
-def coalesced_success_trace(purpose: str, *, prefix: bool = False):
+def coalesced_success_trace(purpose: str, *, prefix: bool = False,
+                            job_id: str = ""):
     """Collapse a bulk decrypt loop's per-call success events into one event.
 
     Errors and timeouts still emit individually — a failure inside a batch is
@@ -170,7 +174,7 @@ def coalesced_success_trace(purpose: str, *, prefix: bool = False):
     if purpose in scopes:
         yield
         return
-    scope = _BulkTrace(purpose, prefix=prefix)
+    scope = _BulkTrace(purpose, prefix=prefix, job_id=job_id)
     scopes[purpose] = scope
     try:
         yield
@@ -311,12 +315,20 @@ def _trace_enclave(
             scope.explain = explain
         return
     try:
+        correlation = (
+            {"job_id": scope.job_id}
+            if scope is not None
+            and scope.job_id
+            and event_type == "enclave.call.error"
+            else {}
+        )
         debug_trace.trace_event(
             store,
             subsystem="enclave",
             type=event_type,
             actor="backend",
             status=status,
+            **correlation,
             summary=summary,
             explain=explain,
             detail={

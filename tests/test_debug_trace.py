@@ -325,11 +325,7 @@ def test_records_when_flag_on_no_env_needed(monkeypatch):
 def test_outcome_class_defaults_validates_and_round_trips(monkeypatch):
     store = _Store("usr_trace_outcome")
     _reset(monkeypatch, store)
-    explicit = next(
-        item
-        for item in debug_trace.TRACE_OUTCOME_CLASSES
-        if item != debug_trace.TRACE_OUTCOME_DEFAULT
-    )
+    explicit = "operational_failure"
     debug_trace.trace_event(
         store, subsystem="route", type="explicit", outcome_class=explicit
     )
@@ -348,17 +344,15 @@ def test_outcome_class_defaults_validates_and_round_trips(monkeypatch):
     assert events["explicit"]["detail"][
         db.TRACE_OUTCOME_PROVENANCE_FIELD
     ] == "explicit"
-    assert events["invalid"]["outcome_class"] == debug_trace.TRACE_OUTCOME_DEFAULT
+    assert events["invalid"]["outcome_class"] == "unspecified"
     assert events["invalid"]["detail"][
         db.TRACE_OUTCOME_PROVENANCE_FIELD
     ] == "normalized_invalid"
-    assert events["missing"]["outcome_class"] == debug_trace.TRACE_OUTCOME_DEFAULT
+    assert events["missing"]["outcome_class"] == "unspecified"
     assert events["missing"]["detail"][
         db.TRACE_OUTCOME_PROVENANCE_FIELD
     ] == "missing"
-    assert events["explicit-default"]["outcome_class"] == (
-        debug_trace.TRACE_OUTCOME_DEFAULT
-    )
+    assert events["explicit-default"]["outcome_class"] == "unspecified"
     assert events["explicit-default"]["detail"][
         db.TRACE_OUTCOME_PROVENANCE_FIELD
     ] == "explicit"

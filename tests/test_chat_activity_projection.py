@@ -270,6 +270,7 @@ def test_chat_tool_callback_emits_content_free_v2_debug_trace(monkeypatch):
     assert user_id == "usr_trace"
     assert event_type == "agent.tool.call"
     assert kwargs["status"] == "ok"
+    assert not kwargs.get("job_id")
     assert kwargs["dur_ms"] == 12.346
     assert kwargs["detail"] == {
         "tool": "perception_snapshot",
@@ -322,6 +323,7 @@ def test_v2_debug_trace_defaults_snapshot_signals_and_keeps_safe_error_only(monk
         "dur_ms": 3.0,
         "error_code": "capability_invalid_input",
     }
+    assert traces[0]["job_id"] == "18"
     assert "private" not in repr(traces)
 
 

@@ -8802,10 +8802,10 @@ _TRACE_EVENT_COLUMNS = (
     "dur_ms",
 )
 TRACE_OUTCOME_CLASSES = frozenset({
-    "operational_failure", "timeout", "control", "safety_suppression",
-    "user_unavailable",
+    "unspecified", "operational_failure", "timeout", "control",
+    "safety_suppression", "user_unavailable",
 })
-TRACE_OUTCOME_DEFAULT = "operational_failure"
+TRACE_OUTCOME_DEFAULT = "unspecified"
 TRACE_OUTCOME_PROVENANCE_FIELD = "outcome_class_provenance"
 TRACE_OUTCOME_PROVENANCE_VALUES = frozenset({
     "explicit", "missing", "normalized_invalid",
