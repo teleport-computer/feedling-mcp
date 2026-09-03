@@ -512,7 +512,7 @@ def read_app_closes(user_id: str, limit: int = 100, since_epoch: float = 0.0) ->
 # photos never appear among screen frames.
 
 def put_photo_envelope(user_id: str, frame_id: str, ts: float, env: dict) -> bool:
-    return frame_upsert(user_id, frame_id, ts, env)
+    return frame_upsert(user_id, frame_id, ts, env, source="photo")
 
 
 def get_photo_envelope(user_id: str, frame_id: str) -> dict | None:
