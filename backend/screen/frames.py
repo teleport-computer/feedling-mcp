@@ -80,7 +80,9 @@ def _save_frame_envelope(store: UserStore, payload: dict, env: dict):
     """
     item_id = env.get("id") or uuid.uuid4().hex
     ts = payload.get("ts") or time.time()
-    if db.frame_upsert(store.user_id, item_id, ts, env) is False:
+    if db.frame_upsert(
+        store.user_id, item_id, ts, env, source="screen"
+    ) is False:
         return
 
     encrypted = bool(env.get("body_ct"))
@@ -98,16 +100,42 @@ def _save_frame_envelope(store: UserStore, payload: dict, env: dict):
         "owner_user_id": env.get("owner_user_id"),
     }
 
+    # Existing frames_meta blobs may contain photo ids from the pre-source
+    # rebuild path. Only DB rows explicitly attributed to screen are eligible
+    # for retention counting/deletion; legacy-unattributed rows fail safe and
+    # remain untouched.
+    confirmed_screen_ids = {
+        str(row.get("id") or "")
+        for row in db.frame_list_meta(store.user_id, source="screen")
+    }
+
     with store.frames_lock:
         store.frames_meta.append(meta)
-        if len(store.frames_meta) > core_store.MAX_FRAMES:
-            removed = store.frames_meta.pop(0)
-            db.frame_delete(store.user_id, removed.get("id") or removed["filename"].split(".")[0])
+        confirmed = [
+            row for row in store.frames_meta
+            if _frame_id_from_meta(row) in confirmed_screen_ids
+        ]
+        overflow = confirmed[:-core_store.MAX_FRAMES]
+        if overflow:
+            removed_ids = {_frame_id_from_meta(row) for row in overflow}
+            store.frames_meta[:] = [
+                row for row in store.frames_meta
+                if _frame_id_from_meta(row) not in removed_ids
+            ]
+            for frame_id in removed_ids:
+                db.frame_delete(store.user_id, frame_id)
         store._persist_frames_meta()  # also broadcasts the "frames" wake cross-worker
 
     body_field = "body_ct" if encrypted else "body_b64"
     body_len = len(env.get(body_field) or "")
     print(f"[ingest:{store.user_id}] saved frame id={item_id} shape={body_field} body_len={body_len}")
+
+
+def _frame_id_from_meta(meta: dict) -> str:
+    frame_id = str(meta.get("id") or "")
+    if frame_id:
+        return frame_id
+    return str(meta.get("filename") or "").split(".")[0]
 
 
 def _read_plaintext_frame(env: dict) -> dict | None:

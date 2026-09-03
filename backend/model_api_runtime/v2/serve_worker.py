@@ -3333,7 +3333,7 @@ def _latest_frame_meta(user_id: str) -> tuple[str, float]:
     `meta[-1]`。frame_id 从 `filename`（"<frame_id>.env.json"）派生，退回 `id`——与
     `screen/caption.py:_frame_id_from_entry` 同一套推导，但**内联复制**以免让本模块耦合
     进 screen 包的私有函数（且 screen/* 在本任务里是只读的）。无帧时返回 ("", 0.0)。"""
-    meta = db.frame_list_meta(user_id)
+    meta = db.frame_list_meta(user_id, source="screen")
     if not meta:
         return "", 0.0
     entry = meta[-1]

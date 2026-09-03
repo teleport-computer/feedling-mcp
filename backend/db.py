@@ -17934,6 +17934,22 @@ def model_api_autoselect_active(user_id: str) -> str | None:
 # Frame envelopes (heavy body_ct lives here; frames_meta index stays a blob)
 # ---------------------------------------------------------------------------
 
+FRAME_SOURCE_SCREEN = "screen"
+FRAME_SOURCE_PHOTO = "photo"
+# Rows written before source attribution are intentionally not assigned to
+# either normal source. They remain readable by id, but fail closed from all
+# source-filtered list/rebuild paths.
+FRAME_SOURCE_LEGACY_UNATTRIBUTED = "legacy_unattributed"
+_FRAME_SOURCES = frozenset({FRAME_SOURCE_SCREEN, FRAME_SOURCE_PHOTO})
+
+
+def _require_frame_source(source: str) -> str:
+    if not isinstance(source, str) or source not in _FRAME_SOURCES:
+        raise ValueError(
+            f"source must be one of {sorted(_FRAME_SOURCES)!r}; got {source!r}"
+        )
+    return source
+
 
 class FrameReadUnavailable(RuntimeError):
     """The frame may exist, but its durable store could not be read."""
@@ -17962,7 +17978,9 @@ def _frame_write_row(user_id: str, frame_id: str, ts: float,
         return False
 
 
-def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> bool:
+def frame_upsert(
+    user_id: str, frame_id: str, ts: float, doc: dict, *, source: str
+) -> bool:
     """Persist a v1 frame envelope.
 
     With R2 configured, the heavy ``body_ct`` is offloaded to object storage and
@@ -17981,14 +17999,20 @@ def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> bool:
     inline row. ``doc`` is offloaded out of the row only after the body is in
     R2, so the at-rest table stays small without a missing-object window.
     Returns whether a readable row was durably stored."""
+    source = _require_frame_source(source)
     body_field = (
         "body_ct" if isinstance(doc, dict) and doc.get("body_ct") is not None
         else "body_b64" if isinstance(doc, dict) and doc.get("body_b64") is not None
         else None
     )
+    env_meta = {
+        k: v for k, v in doc.items()
+        if k not in {"body_ct", "body_b64"}
+    }
+    env_meta["source"] = source
     if object_storage.enabled() and body_field is not None:
         # 1) inline first — frame readable, references no R2 object yet.
-        if not _frame_write_row(user_id, frame_id, ts, doc, None, None):
+        if not _frame_write_row(user_id, frame_id, ts, doc, env_meta, None):
             return False  # DB write failed → nothing committed, R2 untouched.
         # 2) upload; on failure keep the inline row (frame stays readable).
         try:
@@ -18000,7 +18024,6 @@ def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> bool:
         # 3) object now exists → flip to pointer as the last durable step. If
         #    this write fails the row stays inline (readable); the uploaded
         #    object is a harmless orphan.
-        env_meta = {k: v for k, v in doc.items() if k != body_field}
         if body_field == "body_b64":
             env_meta["body_object_format"] = "plaintext_v1"
             raw = base64.b64decode(str(doc[body_field]), validate=True)
@@ -18008,7 +18031,7 @@ def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> bool:
         body_key = object_storage.frame_key(user_id, frame_id)
         _frame_write_row(user_id, frame_id, ts, None, env_meta, body_key)
         return True
-    return _frame_write_row(user_id, frame_id, ts, doc, None, None)
+    return _frame_write_row(user_id, frame_id, ts, doc, env_meta, None)
 
 
 def frame_exists(user_id: str, frame_id: str) -> bool:
@@ -18110,6 +18133,9 @@ def frame_get(
                       user_id, frame_id, body_key)
             return None
         out = dict(env_meta or {})
+        # Source attribution belongs to storage metadata, not the uploaded
+        # cryptographic envelope returned to callers.
+        out.pop("source", None)
         if out.pop("body_object_format", None) == "plaintext_v1":
             try:
                 raw = base64.b64decode(body, validate=True)
@@ -18161,18 +18187,32 @@ def frame_delete(user_id: str, frame_id: str) -> None:
         object_storage.delete_frame_tee_body(user_id, frame_id)
 
 
-def frame_list_meta(user_id: str) -> list[dict]:
+def frame_list_meta(
+    user_id: str, *, source: str, unavailable_raises: bool = False
+) -> list[dict]:
     """Reconstruct a lightweight frames_meta index from the stored envelopes.
-    Used as the rebuild fallback when the frames_meta blob is missing."""
+    Used as the rebuild fallback when the frames_meta blob is missing.
+
+    Source is mandatory and validated before accessing storage. Legacy rows
+    without ``env_meta.source`` have the explicit fail-safe classification
+    ``FRAME_SOURCE_LEGACY_UNATTRIBUTED`` and are excluded from normal lists.
+    When ``unavailable_raises`` is true, storage outages remain distinguishable
+    from a valid empty source list.
+    """
+    source = _require_frame_source(source)
     try:
         with get_pool().connection() as conn:
             rows = conn.execute(
                 "SELECT frame_id, ts, COALESCE(env_meta, doc) FROM frame_envelopes "
-                "WHERE user_id = %s ORDER BY ts",
-                (user_id,),
+                "WHERE user_id = %s "
+                "AND COALESCE(NULLIF(env_meta->>'source', ''), %s) = %s "
+                "ORDER BY ts",
+                (user_id, FRAME_SOURCE_LEGACY_UNATTRIBUTED, source),
             ).fetchall()
     except Exception as e:
         log.error("[db] frame_list_meta(%s) failed: %s", user_id, e)
+        if unavailable_raises:
+            raise FrameReadUnavailable("frame list unavailable") from e
         return []
     meta: list[dict] = []
     for frame_id, ts, doc in rows:

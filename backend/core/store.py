@@ -481,7 +481,9 @@ class UserStore:
         # blob was lost). Reconstruct the lightweight index from the stored
         # frame envelope rows, prune to MAX_FRAMES, and re-persist the index.
         try:
-            recovered = db.frame_list_meta(self.user_id)  # already sorted by ts
+            recovered = db.frame_list_meta(
+                self.user_id, source="screen"
+            )  # already sorted by ts
             if len(recovered) > MAX_FRAMES:
                 drop = recovered[:-MAX_FRAMES]
                 recovered = recovered[-MAX_FRAMES:]

@@ -157,7 +157,7 @@ def test_screen_watch_switches_block_the_production_enqueue(
     monkeypatch.setattr(
         serve_worker.db,
         "frame_list_meta",
-        lambda _uid: [{"filename": "frameNEW.env.json", "ts": now}],
+        lambda _uid, *, source: [{"filename": "frameNEW.env.json", "ts": now}],
     )
     monkeypatch.setattr(
         jobs_store,
