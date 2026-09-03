@@ -50,6 +50,7 @@ class SharedEnvelopeCodec:
             envelope,
             None,
             purpose="v2_workspace_read",
+            caller_user_id=str(self.store.user_id),
             runtime_token=self.runtime_token,
         )
 

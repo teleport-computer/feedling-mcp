@@ -195,7 +195,7 @@ def test_existing_identity_preferred_name_is_read_from_encrypted_card(monkeypatc
     monkeypatch.setattr(
         hi.core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda _envelope, _key, purpose: (
+        lambda _envelope, _key, purpose, caller_user_id: (
             b'{"agent_name":"IO","user_preferred_name":"Seven"}'
             if purpose == "identity_update_merge"
             else b"{}"

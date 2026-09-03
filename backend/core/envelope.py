@@ -143,7 +143,8 @@ def envelope_content_token(envelope: dict) -> str:
 
 
 def read_envelope_body(envelope: dict, api_key: str | None, *,
-                       purpose: str, runtime_token: str = "") -> bytes:
+                       purpose: str, caller_user_id: str,
+                       runtime_token: str = "") -> bytes:
     """读出内容行的正文，按行形状路由。
 
     两种形状并存是 TEE 扶正期与 v6 加密可选之后的常态：
@@ -165,15 +166,22 @@ def read_envelope_body(envelope: dict, api_key: str | None, *,
         # 让 tests/test_model_api_profiles_config_store.py 的断言失败。
         kwargs = {"runtime_token": runtime_token} if runtime_token else {}
         return enclave._decrypt_envelope_via_enclave(
-            envelope, api_key, purpose=purpose, **kwargs)
+            envelope,
+            api_key,
+            purpose=purpose,
+            caller_user_id=caller_user_id,
+            **kwargs,
+        )
     return read_plaintext_envelope_body(envelope)
 
 
 def decrypt_provider_key_envelope(envelope: dict, api_key: str | None, *,
+                                  caller_user_id: str,
                                   runtime_token: str = "") -> bytes:
     """取出 BYOK provider key（Task 1.1）。purpose 钉死的薄 wrapper。"""
     return read_envelope_body(envelope, api_key,
                               purpose="model_api_provider_key",
+                              caller_user_id=caller_user_id,
                               runtime_token=runtime_token)
 
 

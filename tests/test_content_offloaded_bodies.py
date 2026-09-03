@@ -130,7 +130,7 @@ def test_rewrap_rewraps_an_offloaded_image_rather_than_skipping_it(client, monke
 
     seen: list[bytes] = []
 
-    def fake_decrypt(envelope, key, purpose):
+    def fake_decrypt(envelope, key, purpose, caller_user_id):
         # Proves the enclave got the REAL ciphertext, not an empty pointer.
         seen.append(base64.b64decode(envelope["body_ct"]))
         return b"plaintext"
