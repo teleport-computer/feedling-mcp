@@ -693,7 +693,7 @@ def test_send_503_when_v2_workers_not_live(client, monkeypatch):
     _setup_openrouter(client, api_key, monkeypatch)
     monkeypatch.setattr(
         core_enclave, "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-or-test",
+        lambda envelope, key, purpose, caller_user_id: b"sk-or-test",
     )
     monkeypatch.setattr(jobs_store, "workers_alive", lambda **kw: False)
 
@@ -727,7 +727,7 @@ def test_send_image_with_caption_persists_caption_envelope(client, monkeypatch):
     monkeypatch.setattr(
         core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-or-test",
+        lambda envelope, key, purpose, caller_user_id: b"sk-or-test",
     )
 
     tiny_png_b64 = _b64(b"\x89PNG\r\n\x1a\n" + b"\x00" * 10)

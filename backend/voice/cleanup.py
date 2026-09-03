@@ -180,6 +180,7 @@ def transcript_turns_from_rows(
                     doc,
                     None,
                     purpose="voice_transcript_capture",
+                    caller_user_id=str(user_id),
                     runtime_token=runtime_token,
                 )
             text = raw.decode("utf-8").strip()

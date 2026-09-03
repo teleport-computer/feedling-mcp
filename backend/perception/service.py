@@ -49,6 +49,12 @@ def _now() -> float:
 
 _FUTURE_TS_TOLERANCE_SEC = 60.0  # allow minor client clock skew
 PERCEPTION_INGRESS_RUNTIME_V2_FLAG = "perception_ingress_runtime_v2_enabled"
+PERCEPTION_DECRYPT_FAILURE_CLASSES = core_enclave.DECRYPT_FAILURE_CLASSES | frozenset({
+    "invalid_envelope",
+    "decrypt_skipped",
+    "payload_decode_error",
+    "plaintext_envelope_error",
+})
 
 
 def _coerce_ts(client_ts) -> float:
@@ -140,25 +146,52 @@ def _decrypt_signal_payload_v2(
     key: str,
     envelope: Mapping[str, Any],
     *,
+    caller_user_id: str,
     api_key: str | None = None,
     decrypt_envelope: Callable[..., bytes | str | Mapping[str, Any] | list[Any]] | None = None,
-) -> tuple[Any | None, str]:
+) -> tuple[Any | None, str, str, str]:
     if not isinstance(envelope, Mapping):
-        return None, "invalid_envelope"
+        return None, "invalid_envelope", "invalid_envelope", ""
     if (not envelope.get("body") and not envelope.get("body_b64")
             and not api_key and decrypt_envelope is None):
-        return None, "decrypt_skipped"
+        return None, "decrypt_skipped", "decrypt_skipped", ""
     try:
         # 默认走形状路由：明文行直读、信封行才打 enclave。签名与
         # _decrypt_envelope_via_enclave 逐字一致，注入方（测试/上层）不受影响。
-        decrypt = decrypt_envelope or core_envelope.read_envelope_body
-        raw = decrypt(dict(envelope), api_key, purpose=f"perception:{key}")
-        return _decode_decrypted_payload_v2(raw), ""
+        if decrypt_envelope is None:
+            raw = core_envelope.read_envelope_body(
+                dict(envelope),
+                api_key,
+                purpose=f"perception:{key}",
+                caller_user_id=caller_user_id,
+            )
+        else:
+            raw = decrypt_envelope(dict(envelope), api_key, purpose=f"perception:{key}")
+        return _decode_decrypted_payload_v2(raw), "", "", ""
     except Exception as e:
-        return None, f"decrypt_failed:{type(e).__name__}"
+        if isinstance(e, json.JSONDecodeError):
+            failure_class, detail = "payload_decode_error", "invalid_json"
+        elif isinstance(e, ValueError):
+            local_detail = str(e) if str(e) in {
+                "envelope_body_b64_invalid",
+                "envelope_owner_mismatch",
+                "envelope_shape_unrecognized",
+                "plaintext_envelope_required",
+            } else "value_error"
+            failure_class, detail = "plaintext_envelope_error", local_detail
+        else:
+            failure_class, detail = core_enclave.decrypt_failure_metadata(e)
+        return None, f"decrypt_failed:{type(e).__name__}", failure_class, detail
 
 
-def _record_decrypt_failure_v2(user_id: str, key: str, reason: str, ts: float) -> None:
+def _record_decrypt_failure_v2(
+    user_id: str,
+    key: str,
+    reason: str,
+    failure_class: str,
+    detail: str,
+    ts: float,
+) -> None:
     """Make a failed sensitive-signal decrypt visible.
 
     The ingest still answers "accepted" (the report contract is "we took your
@@ -175,6 +208,11 @@ def _record_decrypt_failure_v2(user_id: str, key: str, reason: str, ts: float) -
     silently disable burst/cluster dedup — precisely when the fleet is already
     unhealthy.
     """
+    stable_failure_class = (
+        failure_class
+        if failure_class in PERCEPTION_DECRYPT_FAILURE_CLASSES
+        else "unexpected_decrypt_error"
+    )
     log.warning("perception v2 decrypt failed for %s key=%s: %s", user_id, key, reason)
     try:
         store.append_decrypt_failure(user_id, {
@@ -182,6 +220,8 @@ def _record_decrypt_failure_v2(user_id: str, key: str, reason: str, ts: float) -
             "type": "decrypt_failed",
             "key": key,
             "reason": reason,
+            "failure_class": stable_failure_class,
+            "detail": str(detail or "")[:64],
             "ts": ts,
         }, ts)
     except Exception as e:  # observability must never break ingest
@@ -415,9 +455,10 @@ def _ingest_snapshot_v2_inner(
                     results[key] = str(shape_error.get("error") or "invalid_envelope")
                     continue
                 results[key] = "accepted"
-                plaintext, err = _decrypt_signal_payload_v2(
+                plaintext, err, failure_class, failure_detail = _decrypt_signal_payload_v2(
                     key,
                     envelope,
+                    caller_user_id=user_id,
                     api_key=api_key,
                     decrypt_envelope=decrypt_envelope,
                 )
@@ -445,7 +486,14 @@ def _ingest_snapshot_v2_inner(
                     if key in _PERCEPTKIT_DECRYPTED_ENTRIES:
                         shadow_decrypted.append((key, values))
                 else:
-                    _record_decrypt_failure_v2(user_id, key, err, now)
+                    _record_decrypt_failure_v2(
+                        user_id,
+                        key,
+                        err,
+                        failure_class,
+                        failure_detail,
+                        now,
+                    )
                     _record_unavailable_observation_v2(user_id, key, now)
             else:
                 storage_items.append(item)

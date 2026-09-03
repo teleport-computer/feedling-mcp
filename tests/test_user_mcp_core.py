@@ -259,7 +259,7 @@ def test_patch_read_only_approvals_preserves_encrypted_connection_config(
     monkeypatch.setattr(
         core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda envelope, api_key, *, purpose, runtime_token="": bytes.fromhex(
+        lambda envelope, api_key, *, purpose, caller_user_id, runtime_token="": bytes.fromhex(
             envelope["body_ct"]
         ),
     )
@@ -331,7 +331,7 @@ def test_patch_empty_read_only_approvals_revokes_existing_map(
     monkeypatch.setattr(
         core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda envelope, api_key, *, purpose, runtime_token="": bytes.fromhex(
+        lambda envelope, api_key, *, purpose, caller_user_id, runtime_token="": bytes.fromhex(
             envelope["body_ct"]
         ),
     )
@@ -426,7 +426,7 @@ def test_probe_detected_transport_persisted(store, monkeypatch):
     from core import enclave as core_enclave
     monkeypatch.setattr(
         core_enclave, "_decrypt_envelope_via_enclave",
-        lambda env, key, purpose=None: bytes.fromhex(env["body_ct"]))
+        lambda env, key, purpose=None, caller_user_id=None: bytes.fromhex(env["body_ct"]))
     from hosted import mcp_probe
     monkeypatch.setattr(
         mcp_probe, "probe",
@@ -454,7 +454,7 @@ def test_probe_persist_does_not_clobber_concurrent_write(store, monkeypatch):
     from core import enclave as core_enclave
     monkeypatch.setattr(
         core_enclave, "_decrypt_envelope_via_enclave",
-        lambda env, key, purpose=None: bytes.fromhex(env["body_ct"]))
+        lambda env, key, purpose=None, caller_user_id=None: bytes.fromhex(env["body_ct"]))
 
     # The probe stub simulates a concurrent client landing a NEW server (and so
     # rewriting the blob) while this probe is "in flight", then reports sse.
@@ -498,7 +498,7 @@ def test_probe_persist_metadata_only_uses_cas(store, monkeypatch):
     from core import enclave as core_enclave
     monkeypatch.setattr(
         core_enclave, "_decrypt_envelope_via_enclave",
-        lambda env, key, purpose=None: bytes.fromhex(env["body_ct"]))
+        lambda env, key, purpose=None, caller_user_id=None: bytes.fromhex(env["body_ct"]))
     from hosted import mcp_probe
     # hint is http (/mcp path) and detected is http → metadata-only stamp path.
     monkeypatch.setattr(

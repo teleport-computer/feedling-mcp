@@ -1149,7 +1149,12 @@ def _plaintext_existing_voice_workset_for_update(store, api_key: str | None) -> 
         envelope = blob.get("content_envelope")
         if not isinstance(envelope, dict):
             return {}
-        raw = core_envelope.read_envelope_body(envelope, api_key, purpose="genesis_voice")
+        raw = core_envelope.read_envelope_body(
+            envelope,
+            api_key,
+            purpose="genesis_voice",
+            caller_user_id=str(store.user_id),
+        )
         parsed = json.loads(raw.decode("utf-8"))
         if not isinstance(parsed, dict):
             return {}
@@ -1174,7 +1179,11 @@ def _plaintext_existing_identity_for_update(store, api_key: str | None) -> dict:
                 blob, owner_user_id=store.user_id)
         else:
             raw = core_envelope.read_envelope_body(
-                blob, api_key, purpose="identity_update_merge")
+                blob,
+                api_key,
+                purpose="identity_update_merge",
+                caller_user_id=str(store.user_id),
+            )
         parsed = json.loads(raw.decode("utf-8"))
         return parsed if isinstance(parsed, dict) else {}
     except Exception:
@@ -1301,7 +1310,12 @@ def _plaintext_existing_persona_for_update(store, api_key: str | None) -> str:
         envelope = blob.get("content_envelope")
         if not isinstance(envelope, dict):
             return ""
-        raw = core_envelope.read_envelope_body(envelope, api_key, purpose="genesis_persona")
+        raw = core_envelope.read_envelope_body(
+            envelope,
+            api_key,
+            purpose="genesis_persona",
+            caller_user_id=str(store.user_id),
+        )
         return raw.decode("utf-8")
     except Exception:
         return ""

@@ -402,6 +402,7 @@ def _build_rewrapped_envelope(
             record,
             api_key,
             purpose=f"content_rewrap:{kind}:{item_id or 'unknown'}",
+            caller_user_id=str(store.user_id),
         )
     except Exception as e:
         if already_current:

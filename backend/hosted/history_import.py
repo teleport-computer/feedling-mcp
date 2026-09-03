@@ -962,6 +962,7 @@ def _existing_import_user_name(store: UserStore, api_key: str | None) -> str:
                 identity,
                 api_key,
                 purpose="identity_update_merge",
+                caller_user_id=str(store.user_id),
             )
         payload = json.loads(raw.decode("utf-8"))
         if not isinstance(payload, dict):

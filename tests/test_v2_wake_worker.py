@@ -309,7 +309,8 @@ def test_discarded_wake_draft_helpers_encrypt_bound_trim_and_inject_latest(
 
         reads = []
 
-        def _open(envelope, api_key, *, purpose, runtime_token=""):
+        def _open(envelope, api_key, *, purpose, caller_user_id, runtime_token=""):
+            assert caller_user_id == uid
             reads.append((api_key, purpose, runtime_token))
             return decryptor.open_envelope(envelope).encode("utf-8")
 
@@ -566,8 +567,9 @@ def test_only_newest_draft_is_injected_and_storage_is_bounded(monkeypatch):
     assert len(newest_plaintext) == worker.WAKE_DISCARDED_DRAFT_TEXT_CAP
     assert new_text.startswith(newest_plaintext)
 
-    def _open(envelope, api_key, *, purpose, runtime_token=""):
+    def _open(envelope, api_key, *, purpose, caller_user_id, runtime_token=""):
         assert purpose == "v2_wake_discarded_draft"
+        assert caller_user_id == uid
         assert runtime_token == "rt"
         return sealed[envelope["id"]]
 
@@ -923,8 +925,9 @@ def test_collision_draft_reaches_next_wake_prompt_then_clears(monkeypatch):
             (time.time() - 1000.0, uid, "user-arrived-during-wake"),
         )
 
-    def _open(envelope, api_key, *, purpose, runtime_token=""):
+    def _open(envelope, api_key, *, purpose, caller_user_id, runtime_token=""):
         assert purpose == "v2_wake_discarded_draft"
+        assert caller_user_id == uid
         assert runtime_token == "rt"
         return first_draft.encode("utf-8")
 

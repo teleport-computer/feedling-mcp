@@ -57,7 +57,12 @@ def get(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityRe
                 identity, owner_user_id=str(getattr(store, "user_id", "") or ""))
         else:
             raw = core_enclave._decrypt_envelope_via_enclave(
-                identity, api_key, purpose="identity_get", runtime_token=runtime_token or "")
+                identity,
+                api_key,
+                purpose="identity_get",
+                caller_user_id=str(getattr(store, "user_id", "") or ""),
+                runtime_token=runtime_token or "",
+            )
         inner = json.loads(raw.decode("utf-8"))
         if not isinstance(inner, dict):
             raise ValueError("identity_plaintext_not_object")

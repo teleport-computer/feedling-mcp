@@ -7,6 +7,7 @@ on THIS module — callers must invoke them as ``enclave.func()``.
 
 import base64
 import contextlib
+import json
 import os
 import threading
 import time
@@ -18,6 +19,83 @@ import debug_trace
 
 _QUIET_SUCCESS_PURPOSE_PREFIXES = ("tee_replicate:",)
 _SUCCESS_TRACE_EVENT_TYPES = frozenset({"enclave.call.start", "enclave.call.done"})
+
+# Stable, content-free failure classes exposed to perception audit rows and
+# enclave traces. ``enclave_http_403`` deliberately matches the existing TEE
+# replicator vocabulary for the same upstream failure. The detail values below
+# are derived from every DecryptFailure construction reachable from
+# ``enclave.routes.envelope.decrypt``; raw response text is never persisted.
+DECRYPT_FAILURE_CLASSES = frozenset({
+    "api_key_unavailable",
+    "enclave_http_403",
+    "enclave_http_error",
+    "enclave_invalid_response",
+    "enclave_plaintext_decode",
+    "enclave_transport_error",
+    "enclave_unavailable",
+    "unexpected_decrypt_error",
+})
+_DECRYPT_403_DETAIL_PREFIXES = (
+    ("decrypt_failed: envelope missing body_ct", "envelope_missing_body_ct"),
+    ("decrypt_failed: envelope missing nonce", "envelope_missing_nonce"),
+    ("decrypt_failed: envelope missing K_enclave", "envelope_missing_k_enclave"),
+    ("decrypt_failed: envelope missing owner_user_id", "envelope_missing_owner_user_id"),
+    ("decrypt_failed: owner mismatch:", "owner_mismatch"),
+    ("decrypt_failed: base64 decode:", "base64_decode_failed"),
+    ("decrypt_failed: box_seal blob too short:", "box_seal_blob_too_short"),
+    ("decrypt_failed: ECDH failed:", "ecdh_failed"),
+    ("decrypt_failed: box_seal tag invalid:", "box_seal_tag_invalid"),
+    ("decrypt_failed: unexpected K length:", "unexpected_content_key_length"),
+    ("decrypt_failed: expected 12-byte nonce, got", "invalid_nonce_length"),
+    ("decrypt_failed: AEAD verify:", "aead_verify_failed"),
+)
+_DECRYPT_DETAIL_MAX = 64
+
+
+def _decrypt_403_detail(response_text: str) -> str:
+    """Map the enclave's bounded DecryptFailure surface to a safe slug.
+
+    The route wraps the reason in ``{"error": "decrypt_failed: ..."}``. We
+    parse that shape but retain none of its dynamic text: owner ids, exception
+    messages, and any future unrecognised response are collapsed to closed
+    labels before they reach either trace storage or user_logs.
+    """
+    message = ""
+    try:
+        payload = json.loads(str(response_text or ""))
+        if isinstance(payload, dict) and isinstance(payload.get("error"), str):
+            message = payload["error"]
+    except (TypeError, ValueError, json.JSONDecodeError):
+        message = ""
+    for prefix, detail in _DECRYPT_403_DETAIL_PREFIXES:
+        if message.startswith(prefix):
+            return detail
+    return "decrypt_failed_other" if message.startswith("decrypt_failed:") else "http_403_other"
+
+
+def _decrypt_error(message: str, *, failure_class: str, failure_detail: str = "") -> RuntimeError:
+    """Return a RuntimeError carrying bounded structured metadata.
+
+    Keeping the concrete exception type and string preserves existing callers
+    (notably TEE replicator's ``enclave_http_403`` checks). Structured consumers
+    read the attributes instead of reparsing or persisting the free-form string.
+    """
+    error = RuntimeError(message)
+    error.failure_class = (
+        failure_class
+        if failure_class in DECRYPT_FAILURE_CLASSES
+        else "unexpected_decrypt_error"
+    )
+    error.failure_detail = str(failure_detail or "")[:_DECRYPT_DETAIL_MAX]
+    return error
+
+
+def decrypt_failure_metadata(exc: Exception) -> tuple[str, str]:
+    """Return the stable class/detail attached by this module's decrypt path."""
+    failure_class = str(getattr(exc, "failure_class", "") or "")
+    if failure_class not in DECRYPT_FAILURE_CLASSES:
+        return "unexpected_decrypt_error", type(exc).__name__[:_DECRYPT_DETAIL_MAX]
+    return failure_class, str(getattr(exc, "failure_detail", "") or "")[:_DECRYPT_DETAIL_MAX]
 
 # —— Bulk-decrypt trace coalescing ——
 # `_decrypt_chat_rows` decrypts the prompt window one row at a time, up to
@@ -360,18 +438,21 @@ def _reencrypt_frame_via_enclave(envelope: dict, api_key: str | None, *,
 
 
 def _decrypt_envelope_via_enclave(envelope: dict, api_key: str | None, *, purpose: str,
-                                  runtime_token: str = "") -> bytes:
+                                  caller_user_id: str, runtime_token: str = "") -> bytes:
     """Decrypt an envelope via the enclave. Auth = api_key (``X-API-Key``) or a
     runtime token (``X-Feedling-Runtime-Token``) when a trusted background worker
     has no per-user api_key."""
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave_url:
-        raise RuntimeError("enclave_unavailable")
+        raise _decrypt_error("enclave_unavailable", failure_class="enclave_unavailable")
     if not api_key and not runtime_token:
-        raise RuntimeError("api_key_unavailable")
+        raise _decrypt_error("api_key_unavailable", failure_class="api_key_unavailable")
     headers = {"X-Feedling-Runtime-Token": runtime_token} if runtime_token else {"X-API-Key": api_key}
     path = "/v1/envelope/decrypt"
-    store = _trace_store_from_user_id(str(envelope.get("owner_user_id") or envelope.get("user_id") or ""))
+    # Trace ownership comes only from the authenticated caller threaded in by
+    # the entry point. An empty identity intentionally produces no trace; it
+    # must never fall back to client-controlled envelope metadata.
+    store = _trace_store_from_user_id(caller_user_id)
     started_at = time.time()
     _trace_enclave(
         store,
@@ -388,6 +469,7 @@ def _decrypt_envelope_via_enclave(envelope: dict, api_key: str | None, *, purpos
             timeout=20,
         )
     except httpx.HTTPError as e:
+        failure_detail = type(e).__name__[:_DECRYPT_DETAIL_MAX]
         _trace_enclave(
             store,
             "enclave.call.timeout" if isinstance(e, httpx.TimeoutException) else "enclave.call.error",
@@ -395,11 +477,25 @@ def _decrypt_envelope_via_enclave(envelope: dict, api_key: str | None, *, purpos
             path=path,
             status="error",
             summary="enclave decrypt call failed",
-            detail={"error_class": type(e).__name__},
+            detail={
+                "error_class": type(e).__name__,
+                "failure_class": "enclave_transport_error",
+                "failure_detail": failure_detail,
+            },
             dur_ms=(time.time() - started_at) * 1000,
         )
-        raise RuntimeError(f"enclave_error:{type(e).__name__}") from e
+        raise _decrypt_error(
+            f"enclave_error:{type(e).__name__}",
+            failure_class="enclave_transport_error",
+            failure_detail=failure_detail,
+        ) from e
     if resp.status_code >= 400:
+        failure_class = (
+            "enclave_http_403" if resp.status_code == 403 else "enclave_http_error"
+        )
+        failure_detail = (
+            _decrypt_403_detail(resp.text) if resp.status_code == 403 else ""
+        )
         _trace_enclave(
             store,
             "enclave.call.error",
@@ -407,10 +503,18 @@ def _decrypt_envelope_via_enclave(envelope: dict, api_key: str | None, *, purpos
             path=path,
             status="error",
             summary="enclave decrypt call returned error",
-            detail={"status_code": resp.status_code},
+            detail={
+                "status_code": resp.status_code,
+                "failure_class": failure_class,
+                "failure_detail": failure_detail,
+            },
             dur_ms=(time.time() - started_at) * 1000,
         )
-        raise RuntimeError(f"enclave_http_{resp.status_code}:{resp.text[:180]}")
+        raise _decrypt_error(
+            f"enclave_http_{resp.status_code}:{resp.text[:180]}",
+            failure_class=failure_class,
+            failure_detail=failure_detail,
+        )
     body = resp.json()
     if not isinstance(body, dict) or not isinstance(body.get("plaintext_b64"), str):
         _trace_enclave(
@@ -422,7 +526,10 @@ def _decrypt_envelope_via_enclave(envelope: dict, api_key: str | None, *, purpos
             summary="enclave decrypt call returned invalid body",
             dur_ms=(time.time() - started_at) * 1000,
         )
-        raise RuntimeError("enclave_invalid_decrypt_response")
+        raise _decrypt_error(
+            "enclave_invalid_decrypt_response",
+            failure_class="enclave_invalid_response",
+        )
     try:
         out = base64.b64decode(body["plaintext_b64"])
         _trace_enclave(
@@ -446,4 +553,8 @@ def _decrypt_envelope_via_enclave(envelope: dict, api_key: str | None, *, purpos
             detail={"error_class": type(e).__name__},
             dur_ms=(time.time() - started_at) * 1000,
         )
-        raise RuntimeError(f"enclave_plaintext_decode:{type(e).__name__}") from e
+        raise _decrypt_error(
+            f"enclave_plaintext_decode:{type(e).__name__}",
+            failure_class="enclave_plaintext_decode",
+            failure_detail=type(e).__name__,
+        ) from e

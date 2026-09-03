@@ -1155,6 +1155,7 @@ def _read_latest_wake_discarded_draft(
         row["sealed_text"],
         None,
         purpose="v2_wake_discarded_draft",
+        caller_user_id=str(user_id),
         runtime_token=runtime_token,
     )
     text = raw.decode("utf-8").strip()[:WAKE_DISCARDED_DRAFT_TEXT_CAP]

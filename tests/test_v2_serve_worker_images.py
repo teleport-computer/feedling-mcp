@@ -55,7 +55,7 @@ def test_file_row_renders_a_marker_and_never_decrypts_the_body():
     try:
         row = serve_worker._file_row(
             {"id": "m1", "file_name": "report.pdf", "file_mime": "application/pdf"},
-            mid="m1", ts=1.0, role="user", token="t")
+            mid="m1", ts=1.0, role="user", token="t", caller_user_id="u1")
     finally:
         core_enclave._decrypt_envelope_via_enclave = orig
 
@@ -74,7 +74,7 @@ def test_file_row_prefers_the_user_caption_when_present(monkeypatch):
     row = serve_worker._file_row(
         {"id": "m1", "file_name": "report.pdf", "caption_body_ct": "CT",
          "caption_id": "cap1", "owner_user_id": "u1"},
-        mid="m1", ts=1.0, role="user", token="t")
+        mid="m1", ts=1.0, role="user", token="t", caller_user_id="u1")
     assert row["content"] == "这个报告哪里有问题"
 
 
@@ -88,7 +88,7 @@ def test_file_row_fails_explicitly_when_caption_decrypt_fails(monkeypatch):
     with pytest.raises(RuntimeError, match="enclave down"):
         serve_worker._file_row(
             {"id": "m1", "file_name": "a.bin", "caption_body_ct": "CT", "caption_id": "c"},
-            mid="m1", ts=1.0, role="user", token="t")
+            mid="m1", ts=1.0, role="user", token="t", caller_user_id="u1")
 
 
 def test_a_pdf_body_would_have_crashed_the_old_generic_branch():
@@ -108,6 +108,7 @@ def test_image_row_preserves_pinned_vision_route(monkeypatch):
         ts=1.0,
         role="user",
         token="token",
+        caller_user_id="u1",
     )
 
     assert row["vision_route_id"] == "route-123"
