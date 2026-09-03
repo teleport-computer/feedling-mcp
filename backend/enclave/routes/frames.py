@@ -23,8 +23,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 import provider_client
+from core import visual
 from core.frame_ids import is_supported_frame_id
-from enclave import auth, backend_client, config, envelope, state, visual
+from enclave import auth, backend_client, config, envelope, state
 from enclave.routes._errors import backend_call_or_error, content_sk_or_503
 from enclave.routes._json import json_response_offthread
 

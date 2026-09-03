@@ -1,14 +1,25 @@
-"""Pure-function visual/frame plaintext parsing (no Flask/FastAPI/httpx).
-
-Moved verbatim from enclave_app.py (old L1802-1849), dropping the leading
-underscore from the names that are now this module's public surface.
-"""
+"""Pure visual plaintext parsing shared by backend and enclave read paths."""
 
 from __future__ import annotations
 
 import base64
 import json
 from typing import Any
+
+
+_SCREEN_FRAME_FIELDS = frozenset({
+    "image",
+    "image_mime",
+    "ocr_text",
+    "app",
+    "bundle",
+    "urls",
+    "w",
+    "h",
+    "ts",
+    "tier_hint",
+    "routing_signals",
+})
 
 
 def raw_image_mime(data: bytes) -> str | None:
@@ -38,14 +49,7 @@ IMAGE_EXTENSION_BY_MIME = {
 
 
 def parse_visual_plaintext(plaintext: bytes) -> dict[str, Any]:
-    """Decode a screen-frame JSON wrapper or a raw encrypted photo.
-
-    Screen capture envelopes contain a UTF-8 JSON object whose ``image`` field
-    is base64 JPEG. Perception photo envelopes reuse the same ciphertext
-    channel but encrypt the image bytes directly. Only recognized image file
-    signatures take the raw-photo fallback so malformed frame JSON still fails
-    closed instead of being forwarded to a vision provider as arbitrary bytes.
-    """
+    """Decode a screen-frame JSON wrapper or recognized raw photo bytes."""
     try:
         inner = json.loads(plaintext.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -57,5 +61,9 @@ def parse_visual_plaintext(plaintext: bytes) -> dict[str, Any]:
             "image_mime": image_mime,
         }
     if not isinstance(inner, dict):
-        raise ValueError("visual plaintext is not an object")
+        raise ValueError("visual plaintext schema is not an object")
+    if not _SCREEN_FRAME_FIELDS.intersection(inner):
+        raise ValueError("visual plaintext schema has no recognized frame fields")
+    if "image" in inner and not isinstance(inner["image"], str):
+        raise ValueError("visual plaintext schema image is not a string")
     return inner

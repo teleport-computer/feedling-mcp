@@ -546,4 +546,11 @@ X-API-Key: YOUR_FEEDLING_API_KEY
 ```
 
 The `decrypt_path` is user-scoped and must be called with an authorized
-credential. It is not a public object URL.
+credential. It is not a public object URL. Encrypted photo envelopes are
+decrypted inside the enclave. When content encryption is effectively off, a
+strict `body_b64` plaintext photo is validated and decoded inside the managed
+service boundary; only recognized image signatures are accepted, and that
+plaintext path never falls through to enclave decryption. VLM captioning of
+plaintext visual frames is currently unavailable; the managed service returns
+`frame_plaintext_caption_unsupported` instead of forwarding plaintext to the
+enclave.

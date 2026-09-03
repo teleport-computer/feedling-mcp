@@ -351,6 +351,13 @@ debug-trace 的 `detail.upstream` 承载（同样是闭集标签，不是上游�
 |---|---|---|---|---|
 | `device_already_enrolled` | 409 | — | 同一设备已在中继注册过（enroll 幂等冲突） | |
 
+## 屏幕与照片读取
+
+| slug | 状态码 | blame | 说明 | 需本地化 |
+|---|---|---|---|---|
+| `frame_plaintext_invalid` | 502 | system | 已存明文视觉正文既不是 JSON 屏幕帧，也不是支持的原始图片格式；不得回退 enclave | |
+| `frame_plaintext_caption_unsupported` | — | system | `screen.read` 的 VLM caption 暂不处理明文视觉帧；不得把明文帧转发给 enclave | |
+
 ---
 
 ## 已知问题（登记备查，非本次任务修复范围）
@@ -366,9 +373,9 @@ debug-trace 的 `detail.upstream` 承载（同样是闭集标签，不是上游�
   memory_core.py×2、actions.py×1）。
 - `worldbook/worldbook_core.py::_request_envelope` / `_validate_envelope`
   同样是自由文本消息，未收敛。
-- `screen/screen_read_core.py`（`/v1/screen/*` 的实际 HTTP 路由层）全部错误
-  也是自由文本（`"not found"` / `"bad filename"` 等），未收敛，故本表未列出
-  对应 slug 行。
+- `screen/screen_read_core.py`（`/v1/screen/*` 的实际 HTTP 路由层）除
+  `frame_plaintext_invalid` 外仍有自由文本错误（`"not found"` / `"bad filename"`
+  等），未收敛，故本表未逐项列出。
 
 ---
 

@@ -18,6 +18,12 @@ change must not be interpreted as an API guarantee.
   and new image forms, and batches over nine are rejected explicitly instead
   of being truncated.
 
+- **Plaintext perception photos can now be read through the same authorized
+  photo workflow as encrypted photos.** The frame reader recognizes raw JPEG,
+  PNG, WebP, HEIC, and AVIF plaintext bodies in addition to JSON screen-frame
+  bundles. Plaintext visual bodies never fall through to enclave decryption;
+  malformed stored plaintext now returns `frame_plaintext_invalid`.
+
 - **Canvas viewers can now fetch the current workspace revision instead of
   remaining pinned to the attachment published in an older Chat message.**
   `GET /v1/chat/workspace/body` accepts the original `.io.html` `file_name`,
