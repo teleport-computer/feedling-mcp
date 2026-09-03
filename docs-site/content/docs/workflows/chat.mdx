@@ -210,8 +210,11 @@ model cannot accept images.
 
 When a dedicated route is configured, IO records that exact route before the
 image turn is stored. Runtime V2 or the official resident then sends pixels only
-to that route, asks for a neutral visual observation, marks the result as
-untrusted data, and passes only that text to the main agent. The narrow recovery
+to that route, asks for a neutral visual observation, and passes only that text
+to the main agent. Runtime V2 presents it as labelled text (`Image 1:`,
+`Image 2:`, …) followed by the message the user sent with the images, marked as
+the user's own words; the official resident continues to mark the observation as
+untrusted data. The narrow recovery
 path above receives no additional time budget: the dedicated observation and
 every main-model recovery attempt share one monotonic absolute deadline. If a
 batch contains both successful observations and eligible failures, successful

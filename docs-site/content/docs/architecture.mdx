@@ -102,8 +102,17 @@ from the model selected to process it. When visible push text is enabled, that
 notification text also passes through the external push provider.
 
 A selected dedicated image observer is normally the only model provider that
-receives an image's pixels; the main provider receives an untrusted text
-observation. If the observer is rate-limited, temporarily unavailable, empty, or
+receives an image's pixels; the main provider receives a text observation
+instead. In Runtime V2 that observation reaches the main model as labelled text
+(`Image 1:`, `Image 2:`, …) followed by the user's own message under an explicit
+attribution sentence. It is not wrapped in the untrusted-data framing used for
+`photo_read` and `screen_read` tool results: those are images the model chose to
+look at and may show text written by someone other than the user, whereas an
+image sent in chat arrives with the sender's own words. Applying the stricter
+framing to a user's own caption made models read that caption as an instruction
+injected from the picture and decline to act on it. The official resident
+consumer still applies the untrusted framing on its own path.
+If the observer is rate-limited, temporarily unavailable, empty, or
 explicitly truncated, Runtime V2 may disclose only those failed images to the
 exact current main route, and only while that route's exact image-control verdict
 is still `ok`. Authentication, quota, route, compatibility, image-read, and
