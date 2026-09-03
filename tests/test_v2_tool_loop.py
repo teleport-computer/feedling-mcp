@@ -35,6 +35,29 @@ _TEST_PROVIDER_CONFIG = provider_client.ProviderConfig(
     api_key="test-key",
 )
 
+_PROVIDER_TOOL_HISTORY_REJECTION_DETAILS = (
+    "provider_http_400: The GenerateContentRequest proto is invalid:\n"
+    "  * contents[2].parts[0].function_response.name: "
+    "[REQUIRED_FIELD_MISSING]",
+    "provider_http_400: Function call is missing a thought_signature in "
+    "functionCall parts. This is required for tools to work correctly, and "
+    "missing thought_signature may lead to degraded model performance. "
+    "Additional data, function call `default_api:memory_write` , position 2. "
+    "Please refer to https://***.dev/***/***/*** for more details.",
+    "provider_http_400: Provider API error: Provider API error: Please ensure "
+    "that function call turn comes immediately after a user turn or after a "
+    "function response turn. (request id: "
+    "20260903134117388340505BvsDKsJo)",
+)
+
+_PROVIDER_TOOL_SCHEMA_REJECTION_DETAILS = (
+    "provider_http_400: Invalid value at "
+    "'tools[0].function_declarations[18].parameters.properties[mode].enum[0]' "
+    "(TYPE_STRING), true",
+    'provider_http_400: Invalid JSON payload received. Unknown name "$ref" '
+    "at 'tools[0].function_declarations[0].parameters'",
+)
+
 
 class _ScriptedProvider:
     """Records every chat_completion_async call and returns the next scripted dict."""
@@ -3345,6 +3368,142 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
     assert initial_error["status_code"] == status_code
     assert initial_error["provider_error_class"] == "provider_config"
     assert initial_error["dur_ms"] >= 0
+
+
+@pytest.mark.parametrize("detail", _PROVIDER_TOOL_HISTORY_REJECTION_DETAILS)
+def test_provider_tool_history_rejections_are_not_tool_schema_rejections(detail):
+    exc = provider_client.ProviderError(detail, status_code=400)
+
+    assert tool_loop._is_provider_tool_history_rejection(exc) is True
+    assert tool_loop._is_probably_tool_schema_rejection(exc) is False
+
+
+@pytest.mark.parametrize("detail", _PROVIDER_TOOL_SCHEMA_REJECTION_DETAILS)
+def test_observed_tool_schema_rejections_remain_schema_rejections(detail):
+    exc = provider_client.ProviderError(detail, status_code=400)
+
+    assert tool_loop._is_provider_tool_history_rejection(exc) is False
+    assert tool_loop._is_probably_tool_schema_rejection(exc) is True
+
+
+@pytest.mark.parametrize("detail", _PROVIDER_TOOL_HISTORY_REJECTION_DETAILS)
+def test_provider_tool_history_rejection_ends_turn_without_retry(
+    monkeypatch,
+    detail,
+):
+    class _AlwaysReject:
+        def __init__(self):
+            self.calls = []
+
+        async def __call__(self, config, messages, *, tools=None, **kwargs):
+            self.calls.append({"tools": tools, **kwargs})
+            raise provider_client.ProviderError(detail, status_code=400)
+
+    provider = _AlwaysReject()
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    usage = []
+    surfaces = []
+    trajectory = []
+
+    async def record_surface(surface_detail):
+        surfaces.append(surface_detail)
+
+    async def record_trajectory(event_kind, payload):
+        trajectory.append((event_kind, payload))
+
+    with pytest.raises(provider_client.ProviderError):
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=_RecordingReply(),
+            fold_new_messages=_RecordingFold([[]]),
+            add_usage=usage.append,
+            max_calls=5,
+            on_provider_tool_surface=record_surface,
+            on_trajectory_event=record_trajectory,
+        ))
+
+    assert len(provider.calls) == 1
+    assert provider.calls[0]["tools"] is not None
+    assert usage == [None]
+    assert len(surfaces) == 1
+    assert surfaces[0]["force_text_fallback_reason"] == (
+        "provider_tool_history_rejected"
+    )
+    provider_errors = [
+        payload for event_kind, payload in trajectory
+        if event_kind == "provider_error"
+    ]
+    assert len(provider_errors) == 1
+    assert provider_errors[0]["fallback_reason"] == (
+        "provider_tool_history_rejected"
+    )
+    assert all(
+        payload.get("reason") != "tool_schema_rejected"
+        and payload.get("fallback_reason") != "tool_schema_rejected"
+        for _event_kind, payload in trajectory
+    )
+    assert not any(
+        event_kind == "protocol_fallback"
+        for event_kind, _payload in trajectory
+    )
+
+
+@pytest.mark.parametrize("detail", _PROVIDER_TOOL_HISTORY_REJECTION_DETAILS)
+def test_tagged_image_tool_history_rejection_does_not_retry_without_image(
+    monkeypatch,
+    detail,
+):
+    tagged_image_key = "__tagged_image__"
+
+    class _TaggedBuild(_RecordingBuildMessages):
+        def __call__(self, transcript):
+            self.calls.append(list(transcript))
+            return [
+                {
+                    "role": "user",
+                    "content": "pic",
+                    tagged_image_key: True,
+                },
+                {"role": "user", "content": "turn"},
+            ]
+
+    class _AlwaysReject:
+        def __init__(self):
+            self.calls = []
+
+        async def __call__(self, config, messages, *, tools=None, **kwargs):
+            self.calls.append({"messages": messages, "tools": tools, **kwargs})
+            raise provider_client.ProviderError(detail, status_code=400)
+
+    provider = _AlwaysReject()
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    trajectory = []
+
+    async def record_trajectory(event_kind, payload):
+        trajectory.append((event_kind, payload))
+
+    with pytest.raises(provider_client.ProviderError):
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_TaggedBuild(),
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=_RecordingReply(),
+            fold_new_messages=_RecordingFold([[]]),
+            add_usage=_noop_add_usage,
+            max_calls=5,
+            tagged_image_message_key=tagged_image_key,
+            on_trajectory_event=record_trajectory,
+        ))
+
+    assert len(provider.calls) == 1, (
+        f"expected 1 provider call, got {len(provider.calls)}"
+    )
+    assert not any(
+        payload.get("tagged_images_rejected") is True
+        for _event_kind, payload in trajectory
+    )
 
 
 def test_terminal_surface_preserves_same_round_rejection_subtype(monkeypatch):

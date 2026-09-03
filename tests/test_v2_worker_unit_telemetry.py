@@ -270,7 +270,7 @@ def test_provider_attempt_ledger_receives_closed_failure_facts(monkeypatch):
             "lane": "chat",
             "error_class": "ProviderError",
             "status_code": 422,
-            "fallback_reason": "tool_schema_rejected",
+            "fallback_reason": "provider_tool_history_rejected",
             "provider_error_class": "provider_config",
             "dur_ms": 321.5,
         },
@@ -284,12 +284,16 @@ def test_provider_attempt_ledger_receives_closed_failure_facts(monkeypatch):
     assert captured["provider"] == "openrouter"
     assert captured["model"] == "relay-model"
     assert captured["status_code"] == 422
-    assert captured["fallback_reason"] == "tool_schema_rejected"
+    assert captured["fallback_reason"] == "provider_tool_history_rejected"
     assert captured["provider_error_class"] == "provider_config"
     assert captured["dur_ms"] == 321.5
     assert (
         provider_attempt_ledger.VALID_FALLBACK_REASONS
         == tool_loop._PROVIDER_ATTEMPT_FALLBACK_REASONS
+    )
+    assert (
+        "provider_tool_history_rejected"
+        in provider_attempt_ledger.VALID_FALLBACK_REASONS
     )
 
 
@@ -1116,6 +1120,9 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
         tool_loop._PROVIDER_TERMINAL_TEXT_ROUND_REASONS
     )
     assert "tool_schema_rejected" in (
+        tool_loop._PROVIDER_FORCE_TEXT_FALLBACK_REASONS
+    )
+    assert "provider_tool_history_rejected" in (
         tool_loop._PROVIDER_FORCE_TEXT_FALLBACK_REASONS
     )
     captured = []

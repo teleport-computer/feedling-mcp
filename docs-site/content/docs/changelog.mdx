@@ -12,6 +12,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Chat now distinguishes relay tool-history failures from tool-schema
+  incompatibility.** When a relay rejects the native tool-result transcript,
+  Runtime V2 stops after that provider call instead of dropping tools and
+  making a second request that is expected to fail identically. The resulting
+  `provider_tool_history_rejected` notice tells users that tools are temporarily
+  unavailable on the channel and recommends switching models or trying again
+  later.
+
 - **Hosted Chat now accepts up to nine images in one user turn.** Use the new
   `images` array for multi-image messages; the existing `image_b64` and
   `image_mime` single-image fields remain compatible. Empty arrays, mixed old

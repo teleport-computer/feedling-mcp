@@ -179,3 +179,60 @@ def test_chat_image_message_without_image(tmp_path, monkeypatch):
     assert obj["ok"] is True
     assert "image_file" not in obj
     assert "no image" in obj["note"].lower()
+
+
+def test_chat_image_materializes_every_bundle_image(tmp_path, monkeypatch):
+    images = [
+        {
+            "image_b64": base64.b64encode(f"pixels-{index}".encode()).decode(),
+            "image_mime": "image/jpeg" if index % 2 else "image/png",
+        }
+        for index in range(1, 4)
+    ]
+    history = {"messages": [{
+        "id": "msg_abc",
+        "role": "user",
+        "content_type": "image",
+        "content": "compare all three",
+        "image_bundle_version": 1,
+        "image_count": 3,
+        "images": images,
+    }]}
+
+    obj, code, _ = _capture_chat_image(
+        tmp_path=tmp_path, monkeypatch=monkeypatch, history_body=history
+    )
+
+    assert code == 0 and obj["ok"] is True
+    assert obj["content"] == "compare all three"
+    assert len(obj["images"]) == 3
+    assert [Path(item["image_file"]).read_bytes() for item in obj["images"]] == [
+        b"pixels-1", b"pixels-2", b"pixels-3"
+    ]
+    assert [item["image_mime"] for item in obj["images"]] == [
+        "image/jpeg", "image/png", "image/jpeg"
+    ]
+    assert all("image_b64" not in item for item in obj["images"])
+    assert all("image_hint" in item for item in obj["images"])
+
+
+def test_chat_image_bundle_without_payloads_returns_explicit_error(
+    tmp_path, monkeypatch
+):
+    history = {"messages": [{
+        "id": "msg_abc",
+        "role": "user",
+        "content_type": "image",
+        "content": "compare these",
+        "image_bundle_version": 1,
+        "image_count": 3,
+    }]}
+
+    obj, code, _ = _capture_chat_image(
+        tmp_path=tmp_path, monkeypatch=monkeypatch, history_body=history
+    )
+
+    assert code == 1 and obj["ok"] is False
+    assert obj["error_code"] == "chat_image_bundle_unavailable"
+    assert obj["error"] == "chat image bundle is unavailable"
+    assert "no image" not in obj["error"].lower()

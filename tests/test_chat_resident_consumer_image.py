@@ -50,6 +50,7 @@ except ModuleNotFoundError:
     sys.modules.setdefault("content_encryption", _fake_enc)
 
 import tools.chat_resident_consumer as crc  # noqa: E402  (after env setup)
+from core import chat_images  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -812,8 +813,143 @@ def test_history_fetch_includes_bodies_by_default(monkeypatch):
     assert "include_image_body" not in seen["params"]
 
 
+def test_plaintext_multi_image_bundle_hydrates_all_payloads_and_files(
+    tmp_path, monkeypatch
+):
+    source = [
+        ((f"image-{index}").encode(), "image/jpeg" if index % 2 else "image/png")
+        for index in range(1, 10)
+    ]
+    bundle = chat_images.encode_image_bundle(source)
+
+    class _Client:
+        def get(self, url, params=None, headers=None, timeout=None):
+            return _FakeResp({"messages": [{
+                "id": "plain-bundle",
+                "role": "user",
+                "ts": 2.0,
+                "content_type": "image",
+                "body_b64": base64.b64encode(bundle).decode(),
+                "image_bundle_version": 1,
+                "image_count": 9,
+                "image_mimes": [mime for _body, mime in source],
+            }]})
+
+    monkeypatch.setattr(crc, "_HTTP", _Client())
+    monkeypatch.setattr(crc, "IMAGE_TEMP_DIR", tmp_path)
+
+    handled, rows = crc._fetch_plaintext_or_mixed_history(
+        since=0.0, limit=20, include_image_body=True
+    )
+
+    assert handled is True
+    payloads = crc._image_payloads_from_msg(rows[0])
+    assert [item["mime_type"] for item in payloads] == [mime for _body, mime in source]
+    assert [base64.b64decode(item["data"]) for item in payloads] == [
+        body for body, _mime in source
+    ]
+    paths = crc._image_file_paths_from_payloads("plain-bundle", payloads)
+    assert len(paths) == 9
+    assert [Path(path).read_bytes() for path in paths] == [
+        body for body, _mime in source
+    ]
+
+
+def test_plaintext_legacy_single_image_hydration_shape_is_unchanged():
+    body_b64 = base64.b64encode(_PNG_MAGIC).decode()
+    row = {
+        "id": "legacy-single",
+        "content_type": "image",
+        "body_b64": body_b64,
+        "image_mime": "image/png",
+    }
+
+    assert crc._hydrate_plaintext_binary_body(row) == {
+        **row,
+        "image_b64": body_b64,
+    }
+
+
+def test_plaintext_omitted_multi_image_body_decodes_bundle(monkeypatch):
+    source = [(b"one", "image/jpeg"), (b"two", "image/png")]
+    bundle = chat_images.encode_image_bundle(source)
+
+    class _Client:
+        def get(self, url, params=None, headers=None, timeout=None):
+            if url.endswith("/v1/chat/history"):
+                return _FakeResp({"messages": [
+                    {"id": "text", "role": "user", "ts": 1.0, "body": "seed"},
+                    {
+                        "id": "plain-omitted",
+                        "role": "user",
+                        "ts": 2.0,
+                        "content_type": "image",
+                        "body_omitted": True,
+                        "body_size_bytes": len(bundle),
+                        "image_bundle_version": 1,
+                    },
+                ]})
+            assert url.endswith("/v1/chat/messages/plain-omitted/body")
+            return _FakeResp({"message": {
+                "id": "plain-omitted",
+                "content_type": "image",
+                "body_b64": base64.b64encode(bundle).decode(),
+                "image_bundle_version": 1,
+            }})
+
+    monkeypatch.setattr(crc, "_HTTP", _Client())
+
+    handled, rows = crc._fetch_plaintext_or_mixed_history(
+        since=0.0, limit=20, include_image_body=False
+    )
+
+    assert handled is True
+    hydrated = next(row for row in rows if row["id"] == "plain-omitted")
+    payloads = crc._image_payloads_from_msg(hydrated)
+    assert [base64.b64decode(item["data"]) for item in payloads] == [b"one", b"two"]
+    assert [item["mime_type"] for item in payloads] == ["image/jpeg", "image/png"]
+
+
+def test_hydrate_accepts_bundle_aware_enclave_response(tmp_path, monkeypatch):
+    images = [
+        {
+            "image_b64": base64.b64encode((f"sealed-{index}").encode()).decode(),
+            "image_mime": "image/png",
+        }
+        for index in range(1, 10)
+    ]
+    monkeypatch.setattr(
+        crc,
+        "_fetch_message_body_from_enclave",
+        lambda _mid: {
+            "id": "sealed-bundle",
+            "content_type": "image",
+            "content": "inspect all nine",
+            "images": images,
+            "image_count": 9,
+        },
+    )
+    monkeypatch.setattr(crc, "IMAGE_TEMP_DIR", tmp_path)
+
+    rows = crc._hydrate_omitted_bodies([{
+        "id": "sealed-bundle",
+        "role": "user",
+        "ts": 1.0,
+        "content_type": "image",
+        "body_omitted": True,
+        "image_bundle_version": 1,
+    }])
+
+    payloads = crc._image_payloads_from_msg(rows[0])
+    paths = crc._image_file_paths_from_payloads("sealed-bundle", payloads)
+    assert len(payloads) == len(paths) == 9
+    assert [Path(path).read_bytes() for path in paths] == [
+        (f"sealed-{index}").encode() for index in range(1, 10)
+    ]
+
+
 def test_hydrate_pulls_each_omitted_body_by_id(monkeypatch):
-    """One request per omitted body — a response can never exceed one image."""
+    """One request per omitted row bounds the response to one message body."""
     calls = []
 
     def fake_fetch(message_id):

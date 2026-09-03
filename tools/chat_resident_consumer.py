@@ -113,6 +113,7 @@ Optional:
 """
 
 import base64
+import binascii
 from collections import OrderedDict, namedtuple
 from dataclasses import dataclass, field
 import hashlib
@@ -167,6 +168,7 @@ from chat import file_display
 # Shared torn-protocol-JSON leak detector (backend/core, pure). backend/ is on
 # sys.path via the insert above, so it imports as a top-level `core.*` name.
 from agent_protocol_core import protocol_leak as _protocol_leak
+from core import chat_images as _chat_images
 from core import envelope as _core_envelope
 from core import tool_markup_leak as _tool_markup_leak
 from identity import card_view as _identity_card_view
@@ -3109,9 +3111,7 @@ def _fetch_plaintext_or_mixed_history(
             out.append({**row, "content": str(row.get("body") or "")})
             continue
         if shape == "plaintext_binary":
-            ctype = str(row.get("content_type") or "")
-            key = "file_b64" if ctype == "file" else "image_b64"
-            out.append({**row, key: str(row.get("body_b64") or "")})
+            out.append(_hydrate_plaintext_binary_body(row))
             continue
         if row.get("body_omitted") and row.get("body_size_bytes") is not None:
             message_id = str(row.get("id") or row.get("message_id") or "")
@@ -3128,10 +3128,8 @@ def _fetch_plaintext_or_mixed_history(
                 full = None
             if isinstance(full, dict):
                 merged = {**row, **full}
-                ctype = str(merged.get("content_type") or "")
                 if merged.get("body_b64") is not None:
-                    merged["file_b64" if ctype == "file" else "image_b64"] = str(
-                        merged.get("body_b64") or "")
+                    merged = _hydrate_plaintext_binary_body(merged)
                 elif isinstance(merged.get("body"), str):
                     merged["content"] = merged["body"]
                 out.append(merged)
@@ -3140,12 +3138,48 @@ def _fetch_plaintext_or_mixed_history(
     return True, _filter_since(out, since)
 
 
+def _hydrate_plaintext_binary_body(row: dict) -> dict:
+    """Expose one plaintext binary body in the consumer's decoded row shape."""
+    ctype = str(row.get("content_type") or "")
+    body_b64 = str(row.get("body_b64") or "")
+    if ctype == "file":
+        return {**row, "file_b64": body_b64}
+    if row.get("image_bundle_version") is None:
+        return {**row, "image_b64": body_b64}
+    try:
+        bundle = base64.b64decode(body_b64, validate=True)
+        unpacked = _chat_images.decode_image_bundle(bundle)
+    except (binascii.Error, ValueError) as exc:
+        log.warning(
+            "invalid plaintext image bundle [id=%s]: %s",
+            row.get("id") or row.get("message_id") or "",
+            type(exc).__name__,
+        )
+        return {
+            **row,
+            "images": [],
+            "image_bundle_error": "invalid_image_bundle",
+            "body_unavailable": True,
+        }
+    return {
+        **row,
+        "images": [
+            {
+                "image_b64": base64.b64encode(body).decode("ascii"),
+                "image_mime": mime,
+            }
+            for body, mime in unpacked
+        ],
+        "image_count": len(unpacked),
+    }
+
+
 def _fetch_message_body_from_enclave(message_id: str) -> dict | None:
     """Decrypt ONE message body via the enclave. Returns None on any failure.
 
-    Bounded by construction: a response carries at most one image (the ingest cap
-    is 2MB), so no accumulation of unanswered photos can ever make this request
-    too big to complete.
+    Bounded by construction: a response carries one stored message body. An image
+    message may expand to the bundle's bounded image list, but no accumulation of
+    unanswered image turns can make this per-message request grow without bound.
     """
     if not FEEDLING_ENCLAVE_URL or _ENCLAVE_CLIENT is None:
         return None
@@ -3205,6 +3239,8 @@ def _hydrate_omitted_bodies(messages: list[dict]) -> list[dict]:
             out.append({**m, "body_unavailable": True})
             continue
         merged = {**m, **full}
+        if merged.get("body_b64") is not None:
+            merged = _hydrate_plaintext_binary_body(merged)
         for k in ("body_omitted", "body_omitted_reason", "image_omitted", "file_omitted"):
             merged.pop(k, None)
         out.append(merged)

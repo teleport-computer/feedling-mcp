@@ -164,6 +164,16 @@ def test_record_runtime_attempt_closes_fallback_metadata(monkeypatch):
         provider_error_class="private upstream class",
         dur_ms=float("inf"),
     )
+    assert provider_attempt_ledger.record_runtime_attempt(
+        "usr_fallback",
+        parent_key="v2job:3",
+        trigger="v2_turn",
+        outcome="provider_error",
+        status_code=400,
+        fallback_reason="provider_tool_history_rejected",
+        provider_error_class="provider_config",
+        dur_ms=90,
+    )
 
     assert stored[0]["status_code"] == 422
     assert stored[0]["fallback_reason"] == "tool_schema_rejected"
@@ -173,6 +183,9 @@ def test_record_runtime_attempt_closes_fallback_metadata(monkeypatch):
     assert stored[1]["fallback_reason"] == ""
     assert stored[1]["provider_error_class"] == ""
     assert stored[1]["dur_ms"] is None
+    assert stored[2]["status_code"] == 400
+    assert stored[2]["fallback_reason"] == "provider_tool_history_rejected"
+    assert stored[2]["provider_error_class"] == "provider_config"
 
 
 def test_summarize_fallbacks_counts_only_closed_pairs():
