@@ -579,6 +579,13 @@ def test_wake_identity_write_is_visibly_refused_and_not_enqueued(
     ])
     sink_calls = []
     deps = _wake_deps(tail=[], sink_calls=sink_calls)
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: {
+        "identity_card_or_persona": worker.context.render_identity_card({
+            "agent_name": "Mira",
+            "dimensions": [{"name": "warmth", "value": 70}],
+        }),
+        "trusted_system_blocks": (),
+    }
 
     status = asyncio.run(worker._run_wake(
         job_id,

@@ -224,6 +224,21 @@ def test_workspace_prompt_prefers_complete_identity_card_without_loading_persona
     assert "decrypt_status:" not in block
 
 
+def test_identity_card_renders_empty_dimensions_without_other_empty_fields():
+    block = serve_worker.v2_context.render_identity_card({
+        "agent_name": "Mira",
+        "category": "",
+        "signature": [],
+        "boundaries": [],
+        "dimensions": [],
+    })
+
+    assert "dimensions: []" in block
+    assert "category:" not in block
+    assert "signature:" not in block
+    assert "boundaries:" not in block
+
+
 @pytest.mark.parametrize(
     "result",
     [
