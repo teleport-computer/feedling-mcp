@@ -782,13 +782,19 @@ def test_mcp_turn_usage_marks_failed_turns(monkeypatch):
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _provider_failure)
     traces = []
+    loaded_job_ids = []
+
+    async def _load_for_job(_store, *, job_id, **_kwargs):
+        loaded_job_ids.append(job_id)
+        return _FakeMcpTurn([_MCP_SPEC], [])
+
     deps = _deps(
         [{"id": "m1", "ts": 10.0, "role": "user", "content": "ping"}],
-        load_mcp_turn=_make_load_turn_mcp(_FakeMcpTurn([_MCP_SPEC], [])),
         emit_debug_trace=lambda user_id, event_type, **fields: traces.append(
             {"user_id": user_id, "type": event_type, **fields}
         ),
     )
+    deps.load_mcp_turn_for_job = _load_for_job
 
     assert asyncio.run(worker.process_job(
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
@@ -811,6 +817,9 @@ def test_mcp_turn_usage_marks_failed_turns(monkeypatch):
     assert model_events[-1]["detail"]["finish_reason"] == "http_error"
     assert model_events[-1]["detail"]["status_code"] == 402
     assert model_events[-1]["detail"]["error_class"] == "ProviderError"
+    assert not model_events[0].get("job_id")
+    assert model_events[-1]["job_id"] == str(job["id"])
+    assert loaded_job_ids == [str(job["id"])]
     assert private_provider_body not in repr(model_events)
 
 

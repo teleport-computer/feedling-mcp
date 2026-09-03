@@ -839,7 +839,7 @@ def _prompt_cache_route_scope(runtime, *, secret: bytes) -> str:
     )
 
 
-def _resolve_provider(user_id: str):
+def _resolve_provider(user_id: str, *, trace_job_id: str = ""):
     """单次解密该用户 provider key（enclave-bound，BYOK-only）。返回 (ProviderConfig|None, meta)。
 
     ``hosted_config_store._load_runtime_provider_config`` reads only this user's
@@ -858,7 +858,9 @@ def _resolve_provider(user_id: str):
         return None, {"error": "runtime_token_mint_failed", "detail": str(e)[:160]}
     # api_key=None: Runtime V2 turns never hold the user's long-term
     # Feedling API key — only the runtime token authenticates to the enclave.
-    with core_enclave.coalesced_success_trace("model_api_provider_key"):
+    with core_enclave.coalesced_success_trace(
+        "model_api_provider_key", job_id=trace_job_id
+    ):
         runtime = hosted_config_store._load_runtime_provider_config(
             store, None, runtime_token=token
         )
@@ -901,6 +903,10 @@ def _resolve_provider(user_id: str):
         capture_attempt_trace=True,
         hosted_route_updated_at=exact_version,
     ), {}
+
+
+def _resolve_provider_for_job(user_id: str, job_id: str):
+    return _resolve_provider(user_id, trace_job_id=str(job_id or ""))
 
 
 def _decrypt_chat_rows(
@@ -4971,7 +4977,9 @@ def _mcp_catalog_fingerprint_if_new(store) -> str:
     return fingerprint
 
 
-async def _load_mcp_turn_observed(store, *, lane: str = "chat", **kwargs):
+async def _load_mcp_turn_observed(
+    store, *, lane: str = "chat", job_id: str = "", **kwargs
+):
     """`mcp_tools.load_turn_mcp` + 把本轮工具面写进 admin 可见的 debug trace。
 
     为什么包在装配层而不是 loader 里:loader 在 `hosted`,worker 是依赖洁净的
@@ -5043,6 +5051,7 @@ async def _load_mcp_turn_observed(store, *, lane: str = "chat", **kwargs):
                 ),
                 detail={"driver": "v2", "lane": str(lane or "chat"),
                         **summary, **catalog_detail},
+                **({"job_id": str(job_id)} if failed and job_id else {}),
             )
             # 指纹只在 trace **确实发出去之后**才记。写在前面的话,某轮加载失败
             # 或 trace 写失败就会把这个指纹永久吃掉,后面恢复了也不再记明细
@@ -5182,6 +5191,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
             is True
         ),
         resolve_provider=_resolve_provider,
+        resolve_provider_for_job=_resolve_provider_for_job,
         mint_enclave_token=_mint_runtime_token,
         read_tail=_read_tail,
         read_tail_after_seq=_read_tail_after_seq,
@@ -5222,6 +5232,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         dream_enabled=_dream_enabled_for_user,
         apply_pending_effects=_apply_pending_effects_for_user,
         load_mcp_turn=_load_mcp_turn_observed,
+        load_mcp_turn_for_job=_load_mcp_turn_observed,
         load_workspace_prompt=_load_workspace_prompt,
         load_workspace_file=_load_workspace_file,
         seal_trajectory_payload=_seal_trajectory_payload,

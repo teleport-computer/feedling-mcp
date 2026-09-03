@@ -2348,6 +2348,29 @@ class TurnDeps:
     # complete raw sets; serve_worker applies debug_trace.bounded_names before
     # persistence so the trace sanitizer cannot silently clip them.
     emit_schema_surface_trace: Callable[..., None] | None = None
+    # Production-only correlation seam for provider-key decrypt failures. Tests
+    # and legacy callers retain the one-argument resolver above.
+    resolve_provider_for_job: Callable[[str, str], tuple[Any, dict]] | None = None
+    # Production-only correlation seam for failed MCP surface resolution.
+    load_mcp_turn_for_job: Callable[..., Any] | None = None
+
+
+async def _resolve_provider_for_current_job(
+    deps: TurnDeps, user_id: str, job_id: Any,
+) -> tuple[Any, dict]:
+    resolver = deps.resolve_provider_for_job
+    if resolver is not None:
+        return await asyncio.to_thread(resolver, user_id, str(job_id or ""))
+    return await asyncio.to_thread(deps.resolve_provider, user_id)
+
+
+async def _load_mcp_turn_for_current_job(
+    deps: TurnDeps, store, *, job_id: Any, **kwargs,
+):
+    loader = deps.load_mcp_turn_for_job
+    if loader is not None:
+        return await loader(store, job_id=str(job_id or ""), **kwargs)
+    return await deps.load_mcp_turn(store, **kwargs)
 
 
 class _EmptyMcpTurn:
@@ -2946,6 +2969,7 @@ class _ProviderRoundtripTrace:
     user_id: str
     lane: str
     trace_id: str = ""
+    job_id: str = ""
     provider_roundtrips: int = 0
     terminal_text_round_reached: bool = False
     terminal_text_round_reason: str = "none"
@@ -3056,6 +3080,11 @@ class _ProviderRoundtripTrace:
                 self.user_id,
                 f"agent.model.call.{event_kind}",
                 trace_id=self.trace_id,
+                **(
+                    {"job_id": self.job_id}
+                    if event_kind == "error" and self.job_id
+                    else {}
+                ),
                 status=(
                     "started"
                     if event_kind == "start"
@@ -3184,12 +3213,15 @@ def _provider_tool_surface_callback(
     user_id: str,
     lane: str,
     trace_id: str = "",
+    job_id: Any = "",
 ):
     """Build a best-effort content-free trace sink for one runtime lane."""
 
     if deps.emit_debug_trace is None:
         return None
-    return _ProviderRoundtripTrace(deps, user_id, lane, str(trace_id or ""))
+    return _ProviderRoundtripTrace(
+        deps, user_id, lane, str(trace_id or ""), str(job_id or "")
+    )
 
 
 def _schema_surface_trace_callback(
@@ -5215,6 +5247,11 @@ def _make_chat_tool_activity_callback(
                     status=(
                         "ok" if trace_detail["result_status"] == "ok" else "error"
                     ),
+                    **(
+                        {"job_id": str(job_id)}
+                        if trace_detail["result_status"] != "ok" and job_id
+                        else {}
+                    ),
                     summary=(
                         f"V2 {trace_detail['tool']} {trace_detail['result_status']}"
                     ),
@@ -5382,9 +5419,10 @@ async def _run_trajectory_review_turn(
 
         _report_turn_progress("trajectory_review_provider_resolve_start")
         async with enclave_sem:
-            provider_config, _meta = await asyncio.to_thread(
-                deps.resolve_provider,
+            provider_config, _meta = await _resolve_provider_for_current_job(
+                deps,
                 user_id,
+                job_id,
             )
         _report_turn_progress("trajectory_review_provider_resolve_complete")
         if provider_config is None:
@@ -9080,6 +9118,7 @@ async def _run_wake(
         user_id,
         lane,
         trace_id,
+        job_id,
     )
     provider_reply_signal = _ProviderReplySignal()
     try:
@@ -9782,9 +9821,11 @@ async def _run_wake(
         # 解密凭据,`core.envelope.read_envelope_body` 已经支持它。
         # ------------------------------------------------------------------
         mcp_turn = _EMPTY_MCP_TURN
-        if deps.load_mcp_turn is not None:
-            mcp_turn = await deps.load_mcp_turn(
+        if deps.load_mcp_turn_for_job is not None or deps.load_mcp_turn is not None:
+            mcp_turn = await _load_mcp_turn_for_current_job(
+                deps,
                 store,
+                job_id=job_id,
                 api_key=None,
                 runtime_token=token,
                 enclave_sem=enclave_sem,
@@ -13827,6 +13868,7 @@ async def process_job(
             user_id,
             lane,
             str(job.get("trace_id") or ""),
+            job_id,
         )
         if lane == "chat"
         else None
@@ -14577,9 +14619,11 @@ async def process_job(
         # fresh. Zero enabled servers => empty (no network). A down/unreadable server
         # is skipped, never fatal. Built before dispatch so the closure sees it.
         mcp_turn = _EMPTY_MCP_TURN
-        if deps.load_mcp_turn is not None:
-            mcp_turn = await deps.load_mcp_turn(
+        if deps.load_mcp_turn_for_job is not None or deps.load_mcp_turn is not None:
+            mcp_turn = await _load_mcp_turn_for_current_job(
+                deps,
                 store,
+                job_id=job_id,
                 api_key=api_key,
                 runtime_token=runtime_token,
                 enclave_sem=enclave_sem,
@@ -17233,8 +17277,8 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
             return outcome
         try:
             async with enclave_sem:
-                provider_config, _meta = await asyncio.to_thread(
-                    deps.resolve_provider, user_id
+                provider_config, _meta = await _resolve_provider_for_current_job(
+                    deps, user_id, job_id
                 )
         except Exception as provider_exc:
             if lane != "profile":

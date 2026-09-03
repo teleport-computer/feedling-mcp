@@ -658,6 +658,7 @@ def test_build_production_deps_returns_turndeps(monkeypatch):
     assert callable(deps.read_messages)
     assert callable(deps.read_messages_after_seq)
     assert callable(deps.resolve_provider)
+    assert callable(deps.resolve_provider_for_job)
     assert not hasattr(deps, "is_official")
     assert not hasattr(deps, "record_turn_metric")
     assert callable(deps.mint_enclave_token)
@@ -667,6 +668,7 @@ def test_build_production_deps_returns_turndeps(monkeypatch):
     assert callable(deps.read_summary_with_seq)
     assert callable(deps.has_genuine_user_history)
     assert callable(deps.emit_debug_trace)
+    assert callable(deps.load_mcp_turn_for_job)
     monkeypatch.setattr(
         serve_worker.db,
         "chat_latest_genuine_user_ts",
@@ -679,6 +681,23 @@ def test_build_production_deps_returns_turndeps(monkeypatch):
         lambda _user_id: 123.0,
     )
     assert deps.has_genuine_user_history("u-has-history") is True
+
+
+def test_provider_job_resolver_binds_enclave_failures_to_the_job(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        serve_worker,
+        "_resolve_provider",
+        lambda user_id, *, trace_job_id="": calls.append(
+            (user_id, trace_job_id)
+        ) or (None, {"error": "model_api_key_decrypt_failed"}),
+    )
+
+    assert serve_worker._resolve_provider_for_job("usr_provider", "job-42") == (
+        None,
+        {"error": "model_api_key_decrypt_failed"},
+    )
+    assert calls == [("usr_provider", "job-42")]
 
 
 def test_v2_debug_trace_user_seam_resolves_store_and_preserves_duration(monkeypatch):
@@ -961,13 +980,14 @@ def test_v2_mcp_mixed_reachable_and_unreachable_servers_are_traced_and_recorded(
     )
 
     turn = asyncio.run(serve_worker._load_mcp_turn_observed(
-        store, api_key="k", runtime_token="rt"))
+        store, api_key="k", runtime_token="rt", job_id="job-mcp-failure"))
 
     assert [spec.name for spec in turn.tool_specs] == ["mcp__up__search"]
     assert len(traces) == 1
     trace = traces[0]
     assert trace["type"] == "mcp.surface.resolved"
     assert trace["status"] == "error"
+    assert trace["job_id"] == "job-mcp-failure"
     assert trace["detail"]["expected"] == 2
     assert trace["detail"]["resolved"] == 1
     assert trace["detail"]["skipped"] == [
