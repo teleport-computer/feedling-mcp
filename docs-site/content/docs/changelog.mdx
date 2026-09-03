@@ -12,6 +12,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Chat now distinguishes relay tool-history failures from tool-schema
+  incompatibility.** When a relay rejects the native tool-result transcript,
+  Runtime V2 stops after that provider call instead of dropping tools and
+  making a second request that is expected to fail identically. The resulting
+  `provider_tool_history_rejected` notice tells users that tools are temporarily
+  unavailable on the channel and recommends switching models or trying again
+  later.
+
 - **The text you send with an image is now followed again when a dedicated
   vision model is configured.** Runtime V2 previously handed the main model the
   observation wrapped in untrusted-data framing with your message beside it,

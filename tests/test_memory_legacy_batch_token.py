@@ -76,7 +76,7 @@ def test_legacy_batch_threads_runtime_token_under_token_only(client, monkeypatch
 
     seen: dict = {}
 
-    def _fake_plain(moment, api_key, runtime_token=""):
+    def _fake_plain(_user_id, moment, api_key, runtime_token=""):
         seen["api_key"] = api_key
         seen["runtime_token"] = runtime_token
         return {"title": "去西湖", "description": "上周一起去了西湖"}, ""

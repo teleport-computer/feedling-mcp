@@ -2661,6 +2661,13 @@ def test_chat_discarded_identity_write_reaches_model_and_turn_continues(
             {"id": "m1", "ts": 10.0, "role": "user", "content": "hi"},
         ]
     )
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: {
+        "identity_card_or_persona": worker.context.render_identity_card({
+            "agent_name": "Mira",
+            "dimensions": [{"name": "warmth", "value": 70}],
+        }),
+        "trusted_system_blocks": (),
+    }
     deps.apply_pending_effects = apply_with_discarded_identity
 
     status = asyncio.run(
@@ -2873,6 +2880,93 @@ def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(
     assert "trusted skill" in str(system["content"])
     second_offered = {spec.name for spec in calls[1]["tools"]}
     assert {"web_search", "web_fetch", "task"}.isdisjoint(second_offered)
+
+
+@pytest.mark.parametrize(
+    "dimensions,identity_nudge_offered",
+    [
+        ([], False),
+        ([{"name": "warmth", "value": 70}], True),
+    ],
+    ids=("empty", "nonempty"),
+)
+def test_chat_identity_nudge_surface_requires_an_existing_dimension(
+    monkeypatch,
+    dimensions,
+    identity_nudge_offered,
+):
+    uid = f"u_toolloop_identity_nudge_{'on' if dimensions else 'off'}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-identity-nudge-surface")
+    _patch_real_write(monkeypatch)
+    calls = _script_provider(monkeypatch, [_text_round("done")])
+    deps = _deps(messages=[
+        {"id": "m1", "ts": 10.0, "role": "user", "content": "hi"},
+    ])
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: {
+        "identity_card_or_persona": worker.context.render_identity_card({
+            "agent_name": "Mira",
+            "dimensions": dimensions,
+        }),
+        "trusted_system_blocks": (),
+    }
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    offered = {spec.name for spec in calls[0]["tools"]}
+    assert ("identity_nudge" in offered) is identity_nudge_offered
+
+
+def test_child_surface_already_withholds_identity_nudge_as_a_write():
+    assert "identity_nudge" not in worker._SUBAGENT_ALLOWED_TOOLS
+    assert "identity_nudge" in worker._SUBAGENT_DISABLED_TOOLS
+
+
+@pytest.mark.parametrize(
+    "identity_block,disabled",
+    [
+        ("# Persona\nvoice fallback", True),
+        (worker.context.IDENTITY_CARD_HEADER, True),
+        (
+            worker.context.IDENTITY_CARD_HEADER + '\ndimensions: {"warmth":70}',
+            True,
+        ),
+        (
+            worker.context.IDENTITY_CARD_HEADER + "\ndimensions: [not-json",
+            True,
+        ),
+        (worker.context.IDENTITY_CARD_HEADER + "\ndimensions: []", True),
+        (
+            worker.context.IDENTITY_CARD_HEADER
+            + '\ndimensions: [{"name":"warmth","value":70}]',
+            False,
+        ),
+    ],
+    ids=(
+        "persona-fallback",
+        "dimensions-missing",
+        "dimensions-not-list",
+        "dimensions-malformed-json",
+        "dimensions-empty",
+        "dimensions-nonempty",
+    ),
+)
+def test_identity_nudge_gate_fails_closed_except_for_nonempty_dimensions(
+    identity_block,
+    disabled,
+):
+    disabled_tools = worker._identity_nudge_disabled_tools(identity_block)
+
+    assert ("identity_nudge" in disabled_tools) is disabled
 
 
 def test_chat_workspace_prompt_failure_is_visible_before_provider(

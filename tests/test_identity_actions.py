@@ -438,7 +438,7 @@ def test_model_api_chat_background_runtime_executes_detected_identity_rename(cli
         "test_provider_key",
         lambda cfg: {"reply": "ok", "usage": {"total_tokens": 1}},
     )
-    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose, caller_user_id: b"sk-test")
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
@@ -496,7 +496,7 @@ def test_model_api_chat_background_runtime_updates_relationship_days(client, mon
     captured_plaintexts: list = []
 
     monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose, caller_user_id: b"sk-test")
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
@@ -553,7 +553,7 @@ def test_model_api_chat_background_runtime_nudges_identity_dimension(client, mon
     captured_plaintexts: list = []
 
     monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose, caller_user_id: b"sk-test")
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
@@ -616,7 +616,7 @@ def test_memory_content_patch_reencrypts_existing_card(client, monkeypatch):
     monkeypatch.setattr(
         core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda envelope, key, *, purpose, runtime_token="":
+        lambda envelope, key, *, purpose, caller_user_id, runtime_token="":
             json.dumps(_plain_memory()).encode("utf-8"),
     )
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
@@ -739,7 +739,7 @@ def test_model_api_chat_background_runtime_writes_general_correction_memory(clie
     context_params: list[dict] = []
 
     monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose, caller_user_id: b"sk-test")
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
@@ -821,7 +821,7 @@ def test_model_api_chat_background_runtime_patches_user_preferred_name(client, m
     captured_plaintexts: list = []
 
     monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose, caller_user_id: b"sk-test")
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
@@ -988,7 +988,7 @@ def test_model_api_chat_skips_running_capture_on_ordinary_turn_until_cadence(cli
     captured_plaintexts: list = []
 
     monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose, caller_user_id: b"sk-test")
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):

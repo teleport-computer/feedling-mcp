@@ -309,7 +309,8 @@ def test_discarded_wake_draft_helpers_encrypt_bound_trim_and_inject_latest(
 
         reads = []
 
-        def _open(envelope, api_key, *, purpose, runtime_token=""):
+        def _open(envelope, api_key, *, purpose, caller_user_id, runtime_token=""):
+            assert caller_user_id == uid
             reads.append((api_key, purpose, runtime_token))
             return decryptor.open_envelope(envelope).encode("utf-8")
 
@@ -566,8 +567,9 @@ def test_only_newest_draft_is_injected_and_storage_is_bounded(monkeypatch):
     assert len(newest_plaintext) == worker.WAKE_DISCARDED_DRAFT_TEXT_CAP
     assert new_text.startswith(newest_plaintext)
 
-    def _open(envelope, api_key, *, purpose, runtime_token=""):
+    def _open(envelope, api_key, *, purpose, caller_user_id, runtime_token=""):
         assert purpose == "v2_wake_discarded_draft"
+        assert caller_user_id == uid
         assert runtime_token == "rt"
         return sealed[envelope["id"]]
 
@@ -923,8 +925,9 @@ def test_collision_draft_reaches_next_wake_prompt_then_clears(monkeypatch):
             (time.time() - 1000.0, uid, "user-arrived-during-wake"),
         )
 
-    def _open(envelope, api_key, *, purpose, runtime_token=""):
+    def _open(envelope, api_key, *, purpose, caller_user_id, runtime_token=""):
         assert purpose == "v2_wake_discarded_draft"
+        assert caller_user_id == uid
         assert runtime_token == "rt"
         return first_draft.encode("utf-8")
 
@@ -1619,6 +1622,56 @@ def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
     assert first_system.index("wake identity") < first_system.index("wake skill")
     second_offered = {spec.name for spec in provider_calls[1]["tools"]}
     assert {"web_search", "web_fetch", "task"}.isdisjoint(second_offered)
+
+
+@pytest.mark.parametrize(
+    "dimensions,identity_nudge_offered",
+    [
+        ([], False),
+        ([{"name": "warmth", "value": 70}], True),
+    ],
+    ids=("empty", "nonempty"),
+)
+def test_wake_identity_nudge_surface_requires_an_existing_dimension(
+    monkeypatch,
+    dimensions,
+    identity_nudge_offered,
+):
+    uid = f"u_wake_identity_nudge_{'on' if dimensions else 'off'}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    calls = _script_provider(monkeypatch, [_text_round("wake reply")])
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda _store, _text: {"id": "wake-reply"},
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: {
+        "identity_card_or_persona": worker.context.render_identity_card({
+            "agent_name": "Mira",
+            "dimensions": dimensions,
+        }),
+        "trusted_system_blocks": (),
+    }
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "heartbeat",
+        deps,
+        _BYOK,
+        asyncio.Semaphore(4),
+        claimed_by,
+    ))
+
+    assert status == "completed"
+    offered = {spec.name for spec in calls[0]["tools"]}
+    assert ("identity_nudge" in offered) is identity_nudge_offered
 
 
 def test_wake_workspace_prompt_failure_is_silent_before_provider(
@@ -4198,6 +4251,13 @@ def test_screen_watch_without_frames_keeps_identity_writes(monkeypatch):
     deps = _wake_deps(
         tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "先忙会儿"}]
     )
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: {
+        "identity_card_or_persona": worker.context.render_identity_card({
+            "agent_name": "Mira",
+            "dimensions": [{"name": "warmth", "value": 70}],
+        }),
+        "trusted_system_blocks": (),
+    }
     status = asyncio.run(
         worker._run_wake(
             job_id,

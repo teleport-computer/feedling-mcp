@@ -293,6 +293,7 @@ def load_plaintext(user_id: str, call_id: str, *, runtime_token: str = "",
         row["transcript"],
         api_key,
         purpose="voice_transcript_read",
+        caller_user_id=str(user_id),
         **({"runtime_token": runtime_token} if runtime_token else {}),
     )
     return plaintext.decode("utf-8")

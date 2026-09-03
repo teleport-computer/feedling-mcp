@@ -32,7 +32,8 @@ def test_plaintext_row_is_read_locally_without_touching_enclave(monkeypatch):
     monkeypatch.setattr(core_envelope.enclave, "_decrypt_envelope_via_enclave",
                         lambda *a, **kw: called.append(1) or b"WRONG")
 
-    out = core_envelope.decrypt_provider_key_envelope(_plaintext_row(), "api-key")
+    out = core_envelope.decrypt_provider_key_envelope(
+        _plaintext_row(), "api-key", caller_user_id="usr_x")
 
     assert out == b"sk-plain-123"
     assert called == [], "明文行不应触发任何 enclave 调用"
@@ -58,18 +59,23 @@ def test_envelope_row_still_goes_through_enclave(monkeypatch):
     """信封行维持现状路径，且 purpose 必须仍是 model_api_provider_key。"""
     seen = {}
 
-    def fake(envelope, api_key, *, purpose, runtime_token=""):
+    def fake(envelope, api_key, *, purpose, caller_user_id, runtime_token=""):
         seen.update(envelope=envelope, api_key=api_key, purpose=purpose,
-                    runtime_token=runtime_token)
+                    caller_user_id=caller_user_id, runtime_token=runtime_token)
         return b"sk-from-enclave"
 
     monkeypatch.setattr(core_envelope.enclave, "_decrypt_envelope_via_enclave", fake)
 
     out = core_envelope.decrypt_provider_key_envelope(
-        _envelope_row(), "api-key", runtime_token="rt-1")
+        _envelope_row(),
+        "api-key",
+        caller_user_id="usr_x",
+        runtime_token="rt-1",
+    )
 
     assert out == b"sk-from-enclave"
     assert seen["purpose"] == "model_api_provider_key"
+    assert seen["caller_user_id"] == "usr_x"
     assert seen["runtime_token"] == "rt-1"
 
 
@@ -89,9 +95,12 @@ def test_absent_runtime_token_is_not_forwarded(monkeypatch):
 
     monkeypatch.setattr(core_envelope.enclave, "_decrypt_envelope_via_enclave", fake)
 
-    core_envelope.decrypt_provider_key_envelope(_envelope_row(), "api-key")
+    core_envelope.decrypt_provider_key_envelope(
+        _envelope_row(), "api-key", caller_user_id="usr_x")
 
-    assert seen_kwargs == {}, "空 runtime_token 不应出现在下游入参里"
+    assert seen_kwargs == {"caller_user_id": "usr_x"}, (
+        "空 runtime_token 不应出现在下游入参里，但认证调用者必须透传"
+    )
 
 
 def test_unrecognized_shape_raises(monkeypatch):
@@ -104,7 +113,8 @@ def test_unrecognized_shape_raises(monkeypatch):
                         lambda *a, **kw: b"SHOULD-NOT-BE-CALLED")
 
     with pytest.raises(ValueError, match="envelope_shape_unrecognized"):
-        core_envelope.decrypt_provider_key_envelope({"id": "cred-1"}, "api-key")
+        core_envelope.decrypt_provider_key_envelope(
+            {"id": "cred-1"}, "api-key", caller_user_id="usr_x")
 
 
 def test_body_ct_wins_when_both_present(monkeypatch):
@@ -117,7 +127,8 @@ def test_body_ct_wins_when_both_present(monkeypatch):
     row = _envelope_row()
     row["body"] = "sk-stale-plaintext"
 
-    assert core_envelope.decrypt_provider_key_envelope(row, "k") == b"sk-from-enclave"
+    assert core_envelope.decrypt_provider_key_envelope(
+        row, "k", caller_user_id="usr_x") == b"sk-from-enclave"
 
 
 def test_non_string_body_is_rejected(monkeypatch):
@@ -126,7 +137,8 @@ def test_non_string_body_is_rejected(monkeypatch):
                         lambda *a, **kw: b"SHOULD-NOT-BE-CALLED")
 
     with pytest.raises(ValueError, match="envelope_shape_unrecognized"):
-        core_envelope.decrypt_provider_key_envelope({"body": {"nested": 1}}, "k")
+        core_envelope.decrypt_provider_key_envelope(
+            {"body": {"nested": 1}}, "k", caller_user_id="usr_x")
 
 
 def test_supervisor_reads_plaintext_row_without_http_call(monkeypatch):

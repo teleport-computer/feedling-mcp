@@ -74,6 +74,7 @@ def _decrypt(purpose="v2_chat_read"):
         {"owner_user_id": "usr_pool", "body_ct": "ct"},
         "api-key",
         purpose=purpose,
+        caller_user_id="usr_pool",
     )
 
 

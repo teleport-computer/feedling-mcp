@@ -42,6 +42,7 @@ KEY_VERSION = "v1"
 _CRYPTO_FIELDS = {"v", "body_ct", "body_b64", "nonce", "K_user", "K_enclave",
                   "enclave_pk_fpr", "content_pk_fpr", "body_object_format",
                   "body_sha256", "body_size_bytes", "body_key"}
+_STORAGE_FIELDS = {"source"}
 # Candidate top-level mime hints (screen frames carry the real image_mime inside
 # the ciphertext, so this is best-effort — body_mime is nullable).
 _MIME_FIELDS = ("content_type", "image_mime", "mime")
@@ -54,8 +55,9 @@ def _decryptable(meta: dict) -> bool:
 
 
 def _meta_from(envelope: dict) -> dict:
-    """TEE ``frames.meta``: semantic fields only, all crypto fields dropped."""
-    return {k: v for k, v in envelope.items() if k not in _CRYPTO_FIELDS}
+    """TEE ``frames.meta``: semantic fields only; crypto/storage fields dropped."""
+    excluded = _CRYPTO_FIELDS | _STORAGE_FIELDS
+    return {k: v for k, v in envelope.items() if k not in excluded}
 
 
 def _body_mime(meta: dict) -> str | None:
@@ -97,6 +99,8 @@ def replicate(user_id: str, frame_id: str, ts: float, row: dict, reencrypt,
         envelope = {**(env_meta or {}), "body_ct": body_ct}
     else:
         envelope = dict(doc or {})
+    for field in _STORAGE_FIELDS:
+        envelope.pop(field, None)
 
     resp = reencrypt(envelope, KEY_VERSION)
     storage_key = object_storage.put_frame_tee_body(
@@ -152,6 +156,8 @@ def replicate_plaintext(
             raise ValueError("plaintext frame digest mismatch")
     else:
         envelope = {**meta_src, "body_ct": body_b64} if body_key else dict(doc or {})
+        for field in _STORAGE_FIELDS:
+            envelope.pop(field, None)
         plaintext = decrypt(envelope)
 
     meta = _meta_from(meta_src)

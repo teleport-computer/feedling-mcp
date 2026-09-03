@@ -47,10 +47,11 @@ def test_production_deps_keep_sealed_precedence_for_hybrid_envelope(monkeypatch)
         "owner_user_id": "u1",
     }
 
-    def open_sealed(candidate, api_key, *, purpose, runtime_token):
+    def open_sealed(candidate, api_key, *, purpose, caller_user_id, runtime_token):
         assert candidate == envelope
         assert api_key is None
         assert purpose == "runtime_v2_trajectory_break_glass"
+        assert caller_user_id == "u1"
         assert runtime_token
         return sealed_encoded
 

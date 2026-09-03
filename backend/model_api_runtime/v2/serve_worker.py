@@ -182,6 +182,7 @@ def _load_genesis_persona(store, *, runtime_token: str) -> str:
                 envelope,
                 None,
                 purpose="genesis_persona",
+                caller_user_id=user_id,
                 runtime_token=str(runtime_token or ""),
             )
         return raw.decode("utf-8")
@@ -510,7 +511,7 @@ def _caption_envelope(m: dict) -> dict | None:
     }
 
 
-def _caption_text(m, *, mid, token, fallback: str) -> str:
+def _caption_text(m, *, mid, token, caller_user_id: str, fallback: str) -> str:
     """附件行（image / file）的可见文本：随附件发的那句话。
 
     选中行在进入这里之前已由 tail/compaction window 做了有界筛选。因此每个
@@ -524,7 +525,11 @@ def _caption_text(m, *, mid, token, fallback: str) -> str:
         return fallback
     caption = (
         core_envelope.read_envelope_body(
-            cap_env, None, purpose="v2_caption_read", runtime_token=token
+            cap_env,
+            None,
+            purpose="v2_caption_read",
+            caller_user_id=caller_user_id,
+            runtime_token=token,
         )
         .decode("utf-8")
         .strip()
@@ -532,9 +537,15 @@ def _caption_text(m, *, mid, token, fallback: str) -> str:
     return caption or fallback
 
 
-def _image_row(m, *, mid, ts, role, token) -> dict:
+def _image_row(m, *, mid, ts, role, token, caller_user_id: str) -> dict:
     """图片行 -> **纯文本** tail 行 + 两个非敏感标记。绝不放 b64——compaction 共用这条读路径。"""
-    text = _caption_text(m, mid=mid, token=token, fallback=_IMAGE_MARKER)
+    text = _caption_text(
+        m,
+        mid=mid,
+        token=token,
+        caller_user_id=caller_user_id,
+        fallback=_IMAGE_MARKER,
+    )
     row = {
         "id": mid,
         "ts": ts,
@@ -548,7 +559,7 @@ def _image_row(m, *, mid, ts, role, token) -> dict:
     return row
 
 
-def _file_row(m, *, mid, ts, role, token) -> dict:
+def _file_row(m, *, mid, ts, role, token, caller_user_id: str) -> dict:
     """文件行 -> **纯文本** tail 行。**绝不解密 body_ct。**
 
     文件消息的明文是**原始文件字节**（`chat_send_core`: `user_plaintext = file_parse["bytes"]`，
@@ -569,6 +580,7 @@ def _file_row(m, *, mid, ts, role, token) -> dict:
         m,
         mid=mid,
         token=token,
+        caller_user_id=caller_user_id,
         fallback=f"[file: {name}]",
     )
     display_title = str(m.get("file_display_title") or "").strip()
@@ -950,6 +962,7 @@ def _decrypt_chat_rows_inner(
                 ts=ts,
                 role=role,
                 token=token,
+                caller_user_id=user_id,
             )
         elif m.get("content_type") == "file":
             item = _file_row(
@@ -958,6 +971,7 @@ def _decrypt_chat_rows_inner(
                 ts=ts,
                 role=role,
                 token=token,
+                caller_user_id=user_id,
             )
         else:
             # Chat rows are mixed-shape during the encryption-optional rollout:
@@ -990,7 +1004,11 @@ def _decrypt_chat_rows_inner(
                 }
             else:
                 plaintext = core_envelope.read_envelope_body(
-                    m, None, purpose="v2_chat_read", runtime_token=token
+                    m,
+                    None,
+                    purpose="v2_chat_read",
+                    caller_user_id=user_id,
+                    runtime_token=token,
                 ).decode("utf-8")
                 if not plaintext.strip():
                     if not preserve_unreadable:
@@ -1569,6 +1587,7 @@ def _summary_metadata_frontier(state: dict) -> list:
 def _decrypt_summary_text(
     envelope: dict,
     *,
+    caller_user_id: str,
     runtime_token: str,
     purpose: str,
 ) -> str:
@@ -1584,6 +1603,7 @@ def _decrypt_summary_text(
             envelope,
             None,
             purpose=purpose,
+            caller_user_id=caller_user_id,
             runtime_token=runtime_token,
         )
     except RuntimeError as exc:
@@ -1624,6 +1644,7 @@ def _open_summary_frontier_state(user_id: str) -> tuple[dict | None, list]:
             )
         plaintext = _decrypt_summary_text(
             env,
+            caller_user_id=user_id,
             purpose="v2_summary_segment_read",
             runtime_token=token,
         )
@@ -1722,6 +1743,7 @@ def _read_summary_with_seq(user_id: str) -> tuple[str, float, int, int]:
     with core_enclave.coalesced_success_trace("v2_summary_read"):
         plaintext = _decrypt_summary_text(
             env,
+            caller_user_id=user_id,
             purpose="v2_summary_read",
             runtime_token=token,
         )
@@ -1755,6 +1777,7 @@ def _select_agent_profile_for_turn(
             envelope,
             None,
             purpose=f"v2_profile_{field}_read",
+            caller_user_id=user_id,
             runtime_token=token,
         )
 
@@ -2691,6 +2714,7 @@ async def _generate_image_for_chat(
                 core_envelope.decrypt_provider_key_envelope,
                 envelope,
                 api_key,
+                caller_user_id=user_id,
                 runtime_token=runtime_token,
             )
             config = provider_client.ProviderConfig(
@@ -3333,7 +3357,7 @@ def _latest_frame_meta(user_id: str) -> tuple[str, float]:
     `meta[-1]`。frame_id 从 `filename`（"<frame_id>.env.json"）派生，退回 `id`——与
     `screen/caption.py:_frame_id_from_entry` 同一套推导，但**内联复制**以免让本模块耦合
     进 screen 包的私有函数（且 screen/* 在本任务里是只读的）。无帧时返回 ("", 0.0)。"""
-    meta = db.frame_list_meta(user_id)
+    meta = db.frame_list_meta(user_id, source="screen")
     if not meta:
         return "", 0.0
     entry = meta[-1]
@@ -4442,6 +4466,7 @@ def _decrypt_tool_effect_payload(
             envelope,
             None,
             purpose="v2_effect_apply",
+            caller_user_id=user_id,
             runtime_token=runtime_token,
         )
         decoded = json.loads(plaintext.decode("utf-8"))
@@ -4779,6 +4804,7 @@ def _open_trajectory_payload(
         envelope,
         None,
         purpose="runtime_v2_trajectory_review",
+        caller_user_id=str(user_id),
         runtime_token=str(runtime_token),
     )
 

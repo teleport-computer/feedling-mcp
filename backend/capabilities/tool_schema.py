@@ -45,6 +45,13 @@ PROVIDER_USAGE_TOOL = "provider_usage"
 MEMORY_ORGANIZE_TOOL = "memory_organize"
 MCP_TOOL_SEARCH_TOOL = "mcp_tool_search"
 
+IDENTITY_DIMENSIONS_EMPTY_OFFER_COPY = (
+    "When the persona has no dimensions yet, you may offer once, when it fits "
+    "the conversation, to set up a starting set. Their agreement is the "
+    "explicit request this tool requires — record it in 'reason'. Do not call "
+    "this tool before they agree."
+)
+
 _EXCLUDED = frozenset({"chat_image_read", "chat_file_read", "perception_glance"})
 
 _STR = {"type": "string"}
@@ -540,7 +547,8 @@ DESCRIPTIONS: dict[str, str] = {
         "and optional 'description' content. Renaming edits 'name'; an empty list deletes "
         f"all dimensions; at most {card_policy.MAX_DIMENSIONS} are allowed. A non-empty "
         "'reason' describing the explicit user request is required for the encrypted audit. "
-        "For a small conversational score adjustment, keep using identity_nudge."
+        "For a small conversational score adjustment, keep using identity_nudge. "
+        + IDENTITY_DIMENSIONS_EMPTY_OFFER_COPY
     ),
     "memory_index": ("Use only when the current request actually depends on remembered "
                      "information; ordinary conversation and model/runtime identity "

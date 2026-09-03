@@ -26,7 +26,10 @@ def _wire(monkeypatch, *, frames, last_frame_id, chat_msgs, should_wake):
         "hosted_runtime_v2_enabled_strict",
         lambda store: True,
     )
-    monkeypatch.setattr(serve_worker.db, "frame_list_meta", lambda uid: list(frames))
+    monkeypatch.setattr(
+        serve_worker.db, "frame_list_meta",
+        lambda uid, *, source: list(frames),
+    )
     monkeypatch.setattr(
         jobs_store, "get_wake_schedule",
         lambda uid: {"last_screen_watch_frame_id": last_frame_id})

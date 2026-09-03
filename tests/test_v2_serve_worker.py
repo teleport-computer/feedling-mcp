@@ -915,7 +915,7 @@ def test_v2_mcp_mixed_reachable_and_unreachable_servers_are_traced_and_recorded(
     monkeypatch.setattr(
         serve_worker.mcp_tools,
         "_decrypt",
-        lambda envelope, _api_key, _runtime_token: {
+        lambda envelope, _api_key, _runtime_token, _caller_user_id: {
             "url": ("https://up.example.com/mcp" if envelope["id"] == "up"
                     else "http://127.0.0.1/private-mcp"),
             "headers": {"Authorization": "Bearer must-not-leak"},
@@ -1737,7 +1737,7 @@ def test_on_v2_job_notify_is_a_noop_without_context():
 # but doesn't slice at last-assistant and doesn't skip non-user rows).
 # ------------------------------------------------------------------
 
-def _fake_decrypt(envelope, key, *, purpose, runtime_token=""):
+def _fake_decrypt(envelope, key, *, purpose, caller_user_id, runtime_token=""):
     return f"plain-{envelope['id']}".encode()
 
 
@@ -1824,7 +1824,7 @@ def test_read_summary_decrypts_present_row(monkeypatch):
                      "watermark_seq": 19, "version": 3})
     monkeypatch.setattr(
         core_enclave, "_decrypt_envelope_via_enclave",
-        lambda envelope, key, *, purpose, runtime_token="": b"- prior chat")
+        lambda envelope, key, *, purpose, caller_user_id, runtime_token="": b"- prior chat")
 
     assert serve_worker._read_summary_with_seq("u_summary_test") == (
         "- prior chat", 7.0, 3, 19,
@@ -1924,7 +1924,7 @@ def test_read_summary_nonzero_watermark_with_empty_plaintext_fails_closed(monkey
     )
     monkeypatch.setattr(
         core_enclave, "_decrypt_envelope_via_enclave",
-        lambda envelope, key, *, purpose, runtime_token="": b" \n\t",
+        lambda envelope, key, *, purpose, caller_user_id, runtime_token="": b" \n\t",
     )
 
     with pytest.raises(v2_summary_frontier.SummaryFrontierIntegrityError):
@@ -1945,6 +1945,7 @@ def test_canonical_summary_decrypt_rejection_is_integrity_failure(monkeypatch):
     ) as caught:
         serve_worker._decrypt_summary_text(
             {"body_ct": "broken"},
+            caller_user_id="u_summary_test",
             runtime_token="rt",
             purpose="v2_summary_read",
         )
@@ -1961,6 +1962,7 @@ def test_canonical_summary_transient_enclave_failure_remains_retryable(monkeypat
     with pytest.raises(RuntimeError, match="^enclave_http_503") as caught:
         serve_worker._decrypt_summary_text(
             {"body_ct": "valid"},
+            caller_user_id="u_summary_test",
             runtime_token="rt",
             purpose="v2_summary_read",
         )

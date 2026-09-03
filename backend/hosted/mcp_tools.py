@@ -540,11 +540,16 @@ def _read_only_hint(tool: dict) -> bool:
     )
 
 
-def _decrypt(envelope, api_key, runtime_token) -> dict:
+def _decrypt(envelope, api_key, runtime_token, caller_user_id) -> dict:
     from core import envelope as core_envelope
     kwargs = {"runtime_token": runtime_token} if runtime_token else {}
     raw = core_envelope.read_envelope_body(
-        envelope, api_key, purpose="mcp_server_config", **kwargs)
+        envelope,
+        api_key,
+        purpose="mcp_server_config",
+        caller_user_id=caller_user_id,
+        **kwargs,
+    )
     secret = json.loads(raw.decode("utf-8"))
     if not isinstance(secret, dict) or not secret.get("url"):
         raise ValueError("mcp secret missing url")
@@ -594,7 +599,12 @@ async def load_turn_mcp(
         try:
             if enclave_sem is None:
                 secret = await asyncio.to_thread(
-                    _decrypt, srv["config_envelope"], api_key, runtime_token)
+                    _decrypt,
+                    srv["config_envelope"],
+                    api_key,
+                    runtime_token,
+                    str(getattr(store, "user_id", "") or ""),
+                )
             else:
                 # Each config decrypt competes through the same worker-wide
                 # enclave gate as conversation and capability decrypts. The
@@ -605,6 +615,7 @@ async def load_turn_mcp(
                         srv["config_envelope"],
                         api_key,
                         runtime_token,
+                        str(getattr(store, "user_id", "") or ""),
                     )
         except Exception:  # noqa: BLE001 — one bad config never sinks the turn
             log.warning(
