@@ -39,6 +39,7 @@ VALID_FALLBACK_REASONS = frozenset(
     {
         "tagged_images_rejected",
         "tool_schema_rejected",
+        "provider_tool_history_rejected",
     }
 )
 VALID_PROVIDER_ERROR_CLASSES = frozenset(
@@ -108,7 +109,7 @@ def summarize_fallbacks(rows: list[dict]) -> list[dict]:
     """Count provider-error fallback/status pairs in a bounded row window.
 
     This is intentionally not a distribution of every tool-loop degradation:
-    it covers only failed provider calls that caused a deliberate retry.
+    it covers failed provider calls with a closed fallback/closure reason.
     """
     counts: dict[tuple[str, int], int] = {}
     for row in rows:

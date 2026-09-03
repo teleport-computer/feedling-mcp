@@ -239,6 +239,7 @@ _PROVIDER_FORCE_TEXT_FALLBACK_REASONS = frozenset(
     {
         "none",
         "tool_schema_rejected",
+        "provider_tool_history_rejected",
         "final_reply_correction",
         _PROVIDER_CALL_REJECTION_REASON_INVALID_OR_OVER_BUDGET_TOOL_EXCHANGE,
         _PROVIDER_CALL_REJECTION_REASON_REPEATED_INVALID_TOOL_ARGUMENTS,
@@ -246,14 +247,17 @@ _PROVIDER_FORCE_TEXT_FALLBACK_REASONS = frozenset(
         "other",
     }
 )
-# Provider calls that failed, but for which the loop deliberately made a
-# degraded retry.  These values are mirrored into the plaintext attempt ledger;
-# keep them as producer-owned closed metadata, never exception text.
+# Closed reasons attached to failed provider calls. Most cause a degraded
+# retry; provider_tool_history_rejected deliberately terminates without one.
+# These values are mirrored into the plaintext attempt ledger; keep them as
+# producer-owned closed metadata, never exception text.
 _PROVIDER_ATTEMPT_FALLBACK_TAGGED_IMAGES = "tagged_images_rejected"
 _PROVIDER_ATTEMPT_FALLBACK_TOOL_SCHEMA = "tool_schema_rejected"
+_PROVIDER_ATTEMPT_FALLBACK_TOOL_HISTORY = "provider_tool_history_rejected"
 _PROVIDER_ATTEMPT_FALLBACK_REASONS = frozenset({
     _PROVIDER_ATTEMPT_FALLBACK_TAGGED_IMAGES,
     _PROVIDER_ATTEMPT_FALLBACK_TOOL_SCHEMA,
+    _PROVIDER_ATTEMPT_FALLBACK_TOOL_HISTORY,
 })
 # Keep the producer inventory separate from the public vocabulary. A regression
 # test compares the two so adding a classification branch cannot silently turn a
@@ -338,6 +342,25 @@ def _memory_discovery_call_key(tool_call) -> tuple[str, str] | None:
     )
 
 
+_PROVIDER_TOOL_HISTORY_REJECTION_MARKERS = (
+    "function_response.name: [required_field_missing]",
+    "function call is missing a thought_signature in functioncall parts",
+    "please ensure that function call turn comes immediately after a user turn "
+    "or after a function response turn",
+)
+
+
+def _is_provider_tool_history_rejection(
+    exc: provider_client.ProviderError,
+) -> bool:
+    """Return whether a relay rejected the native tool-result transcript."""
+    detail = str(exc).lower()
+    return any(
+        marker in detail
+        for marker in _PROVIDER_TOOL_HISTORY_REJECTION_MARKERS
+    )
+
+
 def _is_probably_tool_schema_rejection(exc: provider_client.ProviderError) -> bool:
     """Should a tools-enabled 400/422 be retried once WITHOUT tools?
 
@@ -347,10 +370,12 @@ def _is_probably_tool_schema_rejection(exc: provider_client.ProviderError) -> bo
     Dropping tools then re-sends the identical bad history — a second billed
     call that 400s again and masks the real error as 'tool_schema_rejected'. The
     provider surfaces its error body in the ProviderError message
-    (``provider_http_400: <detail>``), and content errors don't mention
-    tools/functions, so this gate keeps the genuine tool-schema fallback while
-    letting a content error propagate on its first call."""
+    (``provider_http_400: <detail>``). Some transcript rejections do mention
+    functions, so those exact observed families must be excluded before the
+    broader schema hints are evaluated."""
     detail = str(exc).lower()
+    if _is_provider_tool_history_rejection(exc):
+        return False
     return "tool" in detail or "function" in detail
 
 
@@ -2656,8 +2681,14 @@ async def run_tool_loop(
                 **provider_kwargs,
             )
         except Exception as exc:
+            provider_tool_history_rejected = (
+                isinstance(exc, provider_client.ProviderError)
+                and exc.status_code in {400, 422}
+                and _is_provider_tool_history_rejection(exc)
+            )
             tagged_image_rejected = (
-                not tagged_image_fallback_active
+                not provider_tool_history_rejected
+                and not tagged_image_fallback_active
                 and _has_tagged_image_message(messages, tagged_image_message_key)
                 and getattr(exc, "status_code", None) in {400, 404, 415, 422}
             )
@@ -2720,13 +2751,29 @@ async def run_tool_loop(
                 provider_error = exc
         if provider_error is not None:
             exc = provider_error
+            provider_tool_history_rejected = (
+                isinstance(exc, provider_client.ProviderError)
+                and exc.status_code in {400, 422}
+                and _is_provider_tool_history_rejection(exc)
+            )
+            # Defense in depth: the classifier already excludes these exact
+            # transcript failures. Keep the branch gate too, so broadening the
+            # schema heuristic later cannot silently restore the billed retry.
             tool_schema_rejected = (
-                tools is not None
+                not provider_tool_history_rejected
+                and tools is not None
                 and isinstance(exc, provider_client.ProviderError)
                 and exc.status_code in {400, 422}
                 and attempts < max_calls
                 and _is_probably_tool_schema_rejection(exc)
             )
+            if (
+                provider_tool_history_rejected
+                and provider_surface_detail is not None
+            ):
+                provider_surface_detail["force_text_fallback_reason"] = (
+                    _PROVIDER_ATTEMPT_FALLBACK_TOOL_HISTORY
+                )
             await _emit_provider_tool_surface(provider_surface_detail)
             provider_error_facts = _provider_error_facts(exc)
             provider_call_dur_ms = (
@@ -2756,7 +2803,11 @@ async def run_tool_loop(
                 ],
                 "dur_ms": provider_call_dur_ms,
             }
-            if tool_schema_rejected:
+            if provider_tool_history_rejected:
+                provider_error_detail["fallback_reason"] = (
+                    _PROVIDER_ATTEMPT_FALLBACK_TOOL_HISTORY
+                )
+            elif tool_schema_rejected:
                 provider_error_detail["fallback_reason"] = (
                     _PROVIDER_ATTEMPT_FALLBACK_TOOL_SCHEMA
                 )
