@@ -371,6 +371,10 @@ def test_chat_memory_and_perception_contracts_are_concrete(
     ]
     assert include_reasoning["type"] == "boolean"
     assert include_reasoning["default"] is False
+    images = schemas["HostedChatSendRequest"]["properties"]["images"]
+    assert images["minItems"] == 1
+    assert images["maxItems"] == 9
+    assert images["items"] == {"$ref": "#/components/schemas/ChatImageInput"}
 
     response_sources = schemas["ChatResponseRequest"]["properties"]["source"]["enum"]
     assert "resident_maintenance" in response_sources

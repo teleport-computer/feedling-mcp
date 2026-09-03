@@ -3234,18 +3234,27 @@ def _decode_image_b64(value: Any) -> bytes | None:
 
 
 def _image_payloads_from_msg(msg: dict) -> list[dict[str, str]]:
-    image_bytes = _decode_image_b64(msg.get("image_b64"))
-    if not image_bytes:
-        return []
-    mime = msg.get("image_mime") or "image/jpeg"
-    b64 = base64.b64encode(image_bytes).decode("ascii")
-    return [
-        {
+    raw_items = msg.get("images")
+    if not isinstance(raw_items, list):
+        raw_items = [{
+            "image_b64": msg.get("image_b64"),
+            "image_mime": msg.get("image_mime"),
+        }]
+    payloads: list[dict[str, str]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        image_bytes = _decode_image_b64(item.get("image_b64"))
+        if not image_bytes:
+            continue
+        mime = item.get("image_mime") or "image/jpeg"
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        payloads.append({
             "mime_type": str(mime),
             "data": b64,
             "data_url": f"data:{mime};base64,{b64}",
-        }
-    ]
+        })
+    return payloads
 
 
 def _image_file_paths_for_msg(msg: dict) -> list[str]:

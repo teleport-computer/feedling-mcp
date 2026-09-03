@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Chat now accepts up to nine images in one user turn.** Use the new
+  `images` array for multi-image messages; the existing `image_b64` and
+  `image_mime` single-image fields remain compatible. Empty arrays, mixed old
+  and new image forms, and batches over nine are rejected explicitly instead
+  of being truncated.
+
 - **Plaintext perception photos can now be read through the same authorized
   photo workflow as encrypted photos.** The frame reader recognizes raw JPEG,
   PNG, WebP, HEIC, and AVIF plaintext bodies in addition to JSON screen-frame

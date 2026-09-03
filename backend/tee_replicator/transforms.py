@@ -16,6 +16,10 @@
 """
 from __future__ import annotations
 
+import base64
+
+from core import chat_images
+
 # AEAD 载荷 + 包装密钥 + 信封版本/指纹：解密后即无意义，绝不写进明文 doc。
 _ENVELOPE_KEYS = {"v", "body_ct", "nonce", "K_user", "K_enclave",
                   "enclave_pk_fpr", "content_pk_fpr"}
@@ -116,10 +120,17 @@ def plaintext_chat_doc(doc: dict, decrypt) -> dict:
         # R2 pointer 本应在 worker.unpack 先水合。走到这里说明对象暂时取不到；
         # 必须作为传输错误冻结游标重试，不能伪装成 PendingDeviceMigration 后越过。
         raise RuntimeError(f"chat_r2_body_not_hydrated:{msg_id}")
+    multi_image_body: bytes | None = None
     if doc.get("body_ct"):
         if not _decryptable(doc):
             raise PendingDeviceMigration(msg_id)
-        main_body = _decrypt_body(decrypt, doc, f"tee_replicate:chat:{msg_id}")
+        if doc.get("image_bundle_version"):
+            multi_image_body = decrypt(
+                _envelope_subset(doc), purpose=f"tee_replicate:chat:{msg_id}"
+            )
+            main_body = None
+        else:
+            main_body = _decrypt_body(decrypt, doc, f"tee_replicate:chat:{msg_id}")
     elif isinstance(doc.get("body"), str):
         main_body = doc["body"]
     elif is_plaintext_pointer:
@@ -133,6 +144,18 @@ def plaintext_chat_doc(doc: dict, decrypt) -> dict:
            if not (k.startswith("thinking_") or k.startswith("caption_"))}
     if main_body is not None:
         out["body"] = main_body
+    if multi_image_body is not None:
+        unpacked = chat_images.decode_image_bundle(multi_image_body)
+        out["image_bundle_version"] = chat_images.CHAT_IMAGE_BUNDLE_VERSION
+        out["image_count"] = len(unpacked)
+        out["image_mimes"] = [mime for _body, mime in unpacked]
+        out["images"] = [
+            {
+                "image_b64": base64.b64encode(body).decode("ascii"),
+                "image_mime": mime,
+            }
+            for body, mime in unpacked
+        ]
     for prefix, key in _SUB_PREFIXES:
         sub = _sub_envelope(doc, prefix)
         if sub is None:

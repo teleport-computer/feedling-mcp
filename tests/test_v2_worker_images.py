@@ -33,6 +33,24 @@ def test_inject_builds_openai_content_blocks_with_caption_first():
                          "image_url": {"url": "data:image/png;base64,AAAA"}}
 
 
+def test_inject_builds_one_native_block_per_image_with_one_caption():
+    tail = [_img_row("m1", caption="compare")]
+    out = worker._inject_tail_images(
+        tail,
+        user_id="u",
+        read_images=_fake_reader({"m1": {"images": [
+            {"image_mime": "image/png", "image_b64": "AAAA"},
+            {"image_mime": "image/webp", "image_b64": "BBBB"},
+        ]}}),
+        active_image_ids={"m1"},
+    )
+    assert out[0]["content"] == [
+        {"type": "text", "text": "compare"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        {"type": "image_url", "image_url": {"url": "data:image/webp;base64,BBBB"}},
+    ]
+
+
 def test_inject_omits_text_block_for_the_bare_image_marker():
     """`[image]` is our own placeholder, not something the user wrote. Don't send it."""
     tail = [_img_row("m1")]

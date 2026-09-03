@@ -41,6 +41,10 @@ canonical_owner: self
 | `not_found` | 404 | — | 通用资源不存在 | ✅ |
 | `not_owned` | 403 | — | 资源不属于调用者 | ✅ |
 | `invalid_image` | 400 | — | 图片校验失败 | ✅ |
+| `invalid_images` | 400 | — | `images` 不是数组 | |
+| `image_payload_conflict` | 400 | — | 单图字段与 `images` 同时出现 | ✅ |
+| `image_list_empty` | 400 | — | `images` 是空数组 | ✅ |
+| `image_count_exceeds_limit` | 400 | — | `images` 超过 9 项；响应带 `max_images: 9` | ✅ |
 | `unsupported_file_type` | 400 | — | 聊天文件上传：文件类型不支持（heic/.doc/.xls/二进制）；detail 说明类型，hint 建议格式 | ✅ |
 | `invalid_file` | 400 | — | 聊天文件上传：file_b64 缺失/空/非法 base64 | ✅ |
 
