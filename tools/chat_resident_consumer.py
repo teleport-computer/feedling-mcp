@@ -14386,13 +14386,37 @@ def _format_message_time(ts: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
 
+def _format_prompt_message_time(ts: float) -> str:
+    """Render chat timestamps in the same labelled local zone as the prompt's
+    current-time anchor.
+
+    This is deliberately separate from ``_format_message_time``: that helper
+    is also the UTC ``occurred_at`` writer for persisted memory-card data.
+    """
+    if ts <= 0:
+        return "unknown time"
+    from datetime import datetime, timezone as _tzmod
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    zone_name = _user_timezone() or _DEFAULT_TIMEZONE
+    try:
+        zone = ZoneInfo(zone_name)
+    except (ValueError, ZoneInfoNotFoundError):
+        # Invalid cached keys must not make prompt rendering fail. Keep the
+        # fallback label honest by changing both the zone and its displayed name.
+        zone_name = "UTC"
+        zone = ZoneInfo("UTC")
+    local = datetime.fromtimestamp(ts, _tzmod.utc).astimezone(zone)
+    return f"{local.isoformat(timespec='seconds')} {zone_name}"
+
+
 def _chat_context_line(msg: dict, *, now: float, stale: bool) -> str:
     ts = _message_ts_for_context(msg)
     age = now - ts if ts > 0 else None
     flags = ["stale"] if stale else ["fresh"]
     text = _message_text_for_context(msg)
     return (
-        f"- [{_format_message_time(ts)}, {_format_age(age)}, {', '.join(flags)}] "
+        f"- [{_format_prompt_message_time(ts)}, {_format_age(age)}, {', '.join(flags)}] "
         f"{_message_role_for_context(msg)}: {text}"
     )
 
@@ -15711,10 +15735,10 @@ def _capture_window_text(messages: list[dict], *, user_label: str = "TA", agent_
                 turn_count=msg.get("voice_turn_count"),
                 user_name=user_label, ai_name=agent_label,
             )
-            lines.append(f"- [{_format_message_time(ts)}] {header}\n{body}")
+            lines.append(f"- [{_format_prompt_message_time(ts)}] {header}\n{body}")
             continue
         lines.append(
-            f"- [{_format_message_time(ts)}] "
+            f"- [{_format_prompt_message_time(ts)}] "
             f"{_capture_message_role(msg, user_label=user_label, agent_label=agent_label)}: "
             f"{msg.get('_capture_text') or _capture_message_text(msg)}"
         )
@@ -16517,7 +16541,7 @@ def _dream_recent_conversations_context(
     for msg in live[-max(1, min(DREAM_RECENT_CHAT_LIMIT, 240)):]:
         ts = _message_ts_for_context(msg)
         lines.append(
-            f"- [{_format_message_time(ts)}] "
+            f"- [{_format_prompt_message_time(ts)}] "
             f"{_capture_message_role(msg, user_label=user_label, agent_label=agent_label)}: "
             f"{msg.get('_capture_text') or _capture_message_text(msg)}"
         )
