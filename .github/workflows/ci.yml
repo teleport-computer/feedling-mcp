@@ -901,6 +901,7 @@ jobs:
             tests/test_runtime_reconciler.py \
             tests/test_hosted_runtime_mode.py \
             tests/test_chat_send_v2_enqueue.py \
+            tests/test_chat_images.py \
             tests/test_model_api_chat_send_routing.py \
             tests/test_model_api_profiles_db.py \
             tests/test_model_api_profiles_endpoints.py \
