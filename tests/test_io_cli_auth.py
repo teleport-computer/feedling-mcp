@@ -1,6 +1,8 @@
 """The independent resident io_cli uses only its account API key."""
 
+import hashlib
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -12,6 +14,82 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 import io_cli  # noqa: E402
 
 from conftest import capture_sleeps
+from notices import catalog, error_contract
+
+for key, value in {
+    "FEEDLING_API_URL": "http://localhost:5001",
+    "FEEDLING_API_KEY": "test_key_00000000",
+    "AGENT_MODE": "http",
+    "AGENT_HTTP_URL": "http://localhost:8080/chat",
+    "CHECKPOINT_FILE": "/tmp/feedling_test_io_cli_auth_checkpoint.json",
+}.items():
+    os.environ.setdefault(key, value)
+
+import chat_resident_consumer as resident  # noqa: E402
+
+
+_RESIDENT_AGENT_CLI_LOGGED_OUT_ZH = (
+    "你的 VPS 上的 AI 助手登录已失效，请到 VPS 上重新登录后再试。"
+)
+_RESIDENT_AGENT_CLI_LOGGED_OUT_EN = (
+    "Your AI assistant on the VPS is no longer signed in. Please sign in again "
+    "on the VPS and try once more."
+)
+_RESIDENT_AGENT_CLI_AUTH_FAILURES = (
+    "agent exited: Failed to authenticate: OAuth session expired and could "
+    "not be refreshed",
+    "agent exited: Not logged in · Please run /login",
+)
+
+
+def test_resident_agent_cli_logged_out_copy_is_exact_and_bilingual():
+    spec = error_contract.require_spec("resident_agent_cli_logged_out")
+
+    assert (spec.domain, spec.family, spec.blame) == (
+        "resident",
+        "resident",
+        "user_environment",
+    )
+    assert spec.safe_text_zh == _RESIDENT_AGENT_CLI_LOGGED_OUT_ZH
+    assert len(spec.safe_text_zh) == 37
+    assert hashlib.sha256(spec.safe_text_zh.encode()).hexdigest() == (
+        "8c7549f684ccf950d51d2485f1974e82d4bf24759737b70aeab287e4bc314292"
+    )
+    assert spec.safe_text_zh[20] == "\uff0c"
+    assert spec.safe_text_zh[36] == "\u3002"
+    assert "," not in spec.safe_text_zh
+    assert "." not in spec.safe_text_zh
+
+    assert spec.safe_text_en == _RESIDENT_AGENT_CLI_LOGGED_OUT_EN
+    assert len(spec.safe_text_en) == 103
+    assert spec.safe_text_en.isascii()
+    assert hashlib.sha256(spec.safe_text_en.encode()).hexdigest() == (
+        "9ae4b613fa2ba91bd37546b5485a16542315602b34075d5913332f9e8f5eedac"
+    )
+
+
+@pytest.mark.parametrize("detail", _RESIDENT_AGENT_CLI_AUTH_FAILURES)
+def test_resident_agent_cli_auth_failures_have_specific_class(detail):
+    expected_code = "resident_agent_cli_logged_out"
+
+    assert catalog.classify_upstream(detail) == expected_code
+    assert (
+        resident.classify_agent_error(RuntimeError(detail)).error_class
+        == expected_code
+    )
+
+
+@pytest.mark.parametrize("detail", ("Invalid API key", "provider_http_401"))
+def test_resident_agent_cli_matcher_does_not_steal_provider_auth(detail):
+    matcher_codes = [spec.code for spec in error_contract.matcher_specs()]
+    assert matcher_codes.index("auth_invalid") < matcher_codes.index(
+        "resident_agent_cli_logged_out"
+    )
+    assert catalog.classify_upstream(detail) == "auth_invalid"
+    assert (
+        resident.classify_agent_error(RuntimeError(detail)).error_class
+        == "auth_invalid"
+    )
 
 
 def test_auth_headers_prefers_api_key(monkeypatch):

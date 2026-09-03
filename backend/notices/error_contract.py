@@ -174,6 +174,21 @@ def _workflow_specs() -> tuple[ErrorSpec, ...]:
 
 def _resident_specs() -> tuple[ErrorSpec, ...]:
     return (
+        _spec(
+            "resident_agent_cli_logged_out",
+            "resident",
+            "resident",
+            "user_environment",
+            "你的 VPS 上的 AI 助手登录已失效，请到 VPS 上重新登录后再试。",
+            en=(
+                "Your AI assistant on the VPS is no longer signed in. Please "
+                "sign in again on the VPS and try once more."
+            ),
+            matcher=(
+                r"failed to authenticate:\s*oauth session expired and could not "
+                r"be refreshed|not logged in\s*·\s*please run /login"
+            ),
+        ),
         _spec("resident_consumer_stale", "resident", "resident", "user_environment", "你的 VPS resident consumer 版本可能太旧或没有正常接走任务，请更新并重启。"),
         _spec("resident_decrypt_source_unavailable", "resident", "resident", "user_environment", "你的 VPS resident 解密源不可用，真实加密消息暂时无法回复。"),
         _spec("resident_decrypt_health_unreported", "resident", "resident", "user_environment", "你的 VPS resident 端没有上报可验证的解密健康状态,通常是 consumer 版本太旧,请更新并重启。"),
@@ -320,7 +335,12 @@ def consumer_specs() -> tuple[ErrorSpec, ...]:
     return tuple(
         spec
         for spec in public_specs()
-        if spec.domain in {"chat", "platform", "vision", "image_generation"}
+        # Every matcher is a possible classify_agent_error result, including
+        # resident-domain CLI failures, so it belongs in the derived allowlist.
+        if (
+            spec.matcher_pattern
+            or spec.domain in {"chat", "platform", "vision", "image_generation"}
+        )
         # Request validation failures are returned directly by the hosted API;
         # they never enter the resident's agent-error classifier.
         and spec.family != "request"
