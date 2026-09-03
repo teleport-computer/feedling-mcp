@@ -15989,7 +15989,9 @@ async def process_job(
                 last_pushed = str(
                     (schedule or {}).get("last_screen_chat_frame_id") or ""
                 )
-                frame_meta = await asyncio.to_thread(db.frame_list_meta, user_id)
+                frame_meta = await asyncio.to_thread(
+                    db.frame_list_meta, user_id, source="screen"
+                )
                 selected_meta = v2_screen_chat.select_recent_session_frames(
                     frame_meta,
                     last_pushed_frame_id=last_pushed,
