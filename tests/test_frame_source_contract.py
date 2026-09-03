@@ -5,12 +5,14 @@ mislabelled source declarations fail at the exact call site.
 """
 
 import ast
+import sys
 from pathlib import Path
 
 import pytest
 
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "backend"))
 
 
 def _declared_sources(relative_path: str, function_name: str) -> list[object]:
